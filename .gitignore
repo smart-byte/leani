@@ -1,0 +1,35 @@
+/target/
+/data/
+/.env
+/.env.*
+!/config/example.toml
+/packages/sdk/dist/
+/packages/sdk/node_modules/
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+
+# Local product planning and pre-release records. These are archived with the
+# private pre-public history, not included in the release repository.
+/BACKLOG.md
+/PLAN.md
+/docs/*-PLAN.md
+/docs/IMPLEMENTATION-DESIGN.md
+/docs/IMPLEMENTATION-STATUS.md
+/docs/OPEN-SOURCE-READINESS.md
+/docs/RELEASE-CHECKLIST.md
+/docs/ROADMAP.md
+/docs/evidence/
+
+# Benchmark and validation output. Benchmark implementations and reproducible
+# input manifests remain versioned; generated measurements stay local.
+/evidence/
+/benchmark*.json
+/benchmark*.ndjson
+/benchmark-sweep-results/
+/AGENTS.md
+/docs/superpowers/
+/docs/XATU-OPTIMIZATIONS.md

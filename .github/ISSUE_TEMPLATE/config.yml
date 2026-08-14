@@ -1,0 +1,9 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/smart-byte/leani/security/advisories/new
+    about: Report vulnerabilities privately; do not open a public issue.
+  - name: Usage and design discussion
+    url: https://github.com/smart-byte/leani/discussions
+    about: Ask deployment, processor, and architecture questions.
+

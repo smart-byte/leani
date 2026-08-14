@@ -1,0 +1,92 @@
+config_version = 1
+data_dir = "./data/windowed"
+
+[chain]
+name = "ethereum-mainnet"
+chain_id = 1
+
+[budgets]
+memory_bytes = 536870912
+temporary_disk_bytes = 2147483648
+pending_delta_bytes = 268435456
+recent_raw_soft_bytes = 268435456
+recent_raw_hard_bytes = 536870912
+source_concurrency = 4
+mapper_concurrency = 4
+
+[budgets.delivery]
+maximum_retained_bytes = "1536MiB"
+maximum_history_retained_bytes = "1GiB"
+
+[budgets.store]
+maximum_physical_bytes = "2GiB"
+
+[budgets.artifacts]
+maximum_retained_bytes = "1GiB"
+maximum_pending_bytes = "256MiB"
+
+[[sources.history]]
+id = "xatu"
+kind = "xatu"
+priority = 10
+trust = "trusted_dataset"
+
+[sources.live]
+kind = "disabled"
+minimum_peers = 0
+
+[finality]
+kind = "disabled"
+checkpoint = ""
+
+[[processors]]
+id = "evm-events"
+instance = "uniswap-v2-sync-30d"
+version = "1.0.0"
+history_control = "node_owned"
+history_mode = "on_demand"
+start_block = 10000835
+publish = "finalized_only"
+
+[processors.state]
+mode = "durable"
+
+[processors.output]
+mode = "window"
+finalized_only = true
+
+[processors.output.window]
+max_blocks = 216000
+
+[processors.delivery]
+mode = "none"
+
+[processors.checkpoint]
+mode = "automatic"
+keep = 3
+
+[processors.undo]
+mode = "none"
+safety_blocks = 0
+
+[processors.settings]
+addresses = ["0xB4e16d0168e52d35CaCD2c6185b44281Ec28C9Dc"]
+
+[[processors.settings.events]]
+abi = "event Sync(uint112 reserve0, uint112 reserve1)"
+
+[processors.settings.events.output]
+collection = "uniswap_v2.sync_hourly"
+kind = "uniswap_v2.sync"
+key_fields = ["_bucket_start"]
+bucket_seconds = 3600
+
+[rpc]
+http_bind = "127.0.0.1:8545"
+ws_bind = "127.0.0.1:8546"
+historical_mode = "on_demand"
+transaction_locator = false
+minimum_recent_blocks = 128
+
+[api]
+bind = "127.0.0.1:8080"

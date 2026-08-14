@@ -1,0 +1,165 @@
+name: Prepare release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: SemVer tag to package (for example v0.1.0-alpha.1)
+        required: true
+        type: string
+      publish:
+        description: Create the GitHub release after every preparation gate passes
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+env:
+  RELEASE_VERSION: ${{ inputs.version }}
+
+jobs:
+  validate:
+    name: Validate release request
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - name: Validate version and publish ref
+        env:
+          PUBLISH: ${{ inputs.publish }}
+        run: |
+          case "$RELEASE_VERSION" in
+            v[0-9]*.[0-9]*.[0-9]*) ;;
+            *) echo "version must start with a v-prefixed SemVer" >&2; exit 1 ;;
+          esac
+          if [ "$PUBLISH" = "true" ] && [ "$GITHUB_REF" != "refs/tags/$RELEASE_VERSION" ]; then
+            echo "publishing requires dispatching this workflow from refs/tags/$RELEASE_VERSION" >&2
+            exit 1
+          fi
+          package_version=$(cargo metadata --locked --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "leani") | .version')
+          if [ "$RELEASE_VERSION" != "v$package_version" ]; then
+            echo "release version $RELEASE_VERSION does not match leani package version v$package_version" >&2
+            exit 1
+          fi
+
+  archive:
+    name: ${{ matrix.target }} archive
+    needs: validate
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            cross: false
+          - runner: ubuntu-24.04
+            target: aarch64-unknown-linux-gnu
+            cross: true
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+            cross: false
+          - runner: macos-15
+            target: aarch64-apple-darwin
+            cross: false
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - name: Install Linux cross linker
+        if: matrix.cross
+        run: sudo apt-get update && sudo apt-get install --yes gcc-aarch64-linux-gnu
+      - run: rustup target add ${{ matrix.target }}
+      - name: Build release binary
+        env:
+          CARGO_INCREMENTAL: "0"
+          LEANI_GIT_COMMIT: ${{ github.sha }}
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+          CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
+        run: cargo build --locked --release --target ${{ matrix.target }} -p leani
+      - name: Smoke release binary
+        if: ${{ !matrix.cross }}
+        run: target/${{ matrix.target }}/release/leani --version
+      - name: Package and checksum
+        run: |
+          install -d dist
+          cp target/${{ matrix.target }}/release/leani dist/
+          cp LICENSE-APACHE LICENSE-MIT README.md dist/
+          archive="leani-${RELEASE_VERSION}-${{ matrix.target }}.tar.gz"
+          tar -C dist -czf "$archive" .
+          shasum -a 256 "$archive" > "$archive.sha256"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: leani-${{ matrix.target }}
+          path: |
+            leani-*.tar.gz
+            leani-*.sha256
+          if-no-files-found: error
+          retention-days: 14
+
+  sbom:
+    name: Software bill of materials
+    needs: validate
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - run: cargo install cargo-cyclonedx --version 0.5.9 --locked
+      - run: cargo cyclonedx --format json --all
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: leani-sbom
+          path: "**/*.cdx.json"
+          if-no-files-found: error
+          retention-days: 14
+
+  assemble:
+    name: Assemble release and Homebrew formula
+    needs: [archive, sbom]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          pattern: leani-*
+          path: release-assets
+          merge-multiple: true
+      - name: Verify archives and collect checksums
+        run: |
+          cd release-assets
+          for checksum in leani-*.sha256; do sha256sum --check "$checksum"; done
+          awk '{ print $1 "  " $2 }' leani-*.sha256 | sort -k2 > SHA256SUMS
+      - name: Render Homebrew formula
+        run: |
+          scripts/render-homebrew-formula.sh \
+            "$RELEASE_VERSION" \
+            "${{ github.repository }}" \
+            release-assets/SHA256SUMS \
+            release-assets/leani.rb
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: leani-release-candidate-${{ inputs.version }}
+          path: release-assets/
+          if-no-files-found: error
+          retention-days: 14
+
+  publish:
+    name: Publish GitHub release
+    if: ${{ inputs.publish }}
+    needs: assemble
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          name: leani-release-candidate-${{ inputs.version }}
+          path: release-assets
+      - name: Create immutable release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$RELEASE_VERSION" release-assets/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --generate-notes \
+            --title "Leani $RELEASE_VERSION"

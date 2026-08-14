@@ -1,0 +1,27 @@
+[package]
+name = "leani-source-archive"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+publish = false
+
+[dependencies]
+async-trait.workspace = true
+blake3.workspace = true
+futures.workspace = true
+hex.workspace = true
+leani-primitives = { path = "../primitives" }
+leani-source-api = { path = "../source-api" }
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

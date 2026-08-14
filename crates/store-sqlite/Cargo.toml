@@ -1,0 +1,31 @@
+[package]
+name = "leani-store-sqlite"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+publish = false
+
+[dependencies]
+async-trait.workspace = true
+blake3.workspace = true
+hex.workspace = true
+leani-primitives = { path = "../primitives" }
+leani-processor-api = { path = "../processor-api" }
+leani-store-artifacts = { path = "../store-artifacts" }
+postcard.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sqlx.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+blake3.workspace = true
+semver.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true

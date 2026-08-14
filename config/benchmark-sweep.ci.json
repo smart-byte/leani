@@ -1,0 +1,38 @@
+{
+  "schema": "leani.benchmark-sweep.v2",
+  "orderSeed": 7,
+  "baseArguments": [
+    "--mode",
+    "process",
+    "--profile",
+    "materialized",
+    "--destination",
+    "rust-direct",
+    "--corpus",
+    "uniswap-like",
+    "--blocks",
+    "128",
+    "--chunk-blocks",
+    "32",
+    "--warmups",
+    "0",
+    "--runs",
+    "1",
+    "--sample-interval-ms",
+    "50"
+  ],
+  "candidates": [
+    {
+      "id": "active-chunks-1",
+      "arguments": ["--maximum-active-chunks", "1"]
+    },
+    {
+      "id": "active-chunks-2",
+      "arguments": ["--maximum-active-chunks", "2"]
+    }
+  ],
+  "gates": {
+    "minimumMeasuredRuns": 1,
+    "maximumCoefficientOfVariation": 0.05
+  }
+}

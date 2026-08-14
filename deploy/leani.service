@@ -1,0 +1,37 @@
+[Unit]
+Description=State-minimized Ethereum indexing node
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=leani
+Group=leani
+Environment=LEANI_LOG=info
+EnvironmentFile=-/etc/leani/environment
+ExecStart=/usr/local/bin/leani serve --config /etc/leani/node.toml --log-format json
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=30s
+StateDirectory=leani
+RuntimeDirectory=leani
+UMask=0027
+NoNewPrivileges=true
+PrivateDevices=true
+PrivateTmp=true
+ProtectClock=true
+ProtectControlGroups=true
+ProtectHome=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectSystem=strict
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=true
+RestrictRealtime=true
+SystemCallArchitectures=native
+LockPersonality=true
+MemoryDenyWriteExecute=true
+
+[Install]
+WantedBy=multi-user.target

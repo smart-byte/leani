@@ -1,0 +1,27 @@
+[package]
+name = "leani-processor-uniswap"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+publish = false
+
+[dependencies]
+alloy-primitives.workspace = true
+async-trait.workspace = true
+blake3.workspace = true
+leani-primitives = { path = "../primitives" }
+leani-processor-api = { path = "../processor-api" }
+postcard.workspace = true
+semver.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+leani-testkit = { path = "../testkit" }
+tokio.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,126 @@
+config_version = 1
+data_dir = "./data/externalized"
+
+[chain]
+name = "ethereum-mainnet"
+chain_id = 1
+
+[budgets]
+memory_bytes = 536870912
+temporary_disk_bytes = 2147483648
+pending_delta_bytes = 268435456
+recent_raw_soft_bytes = 268435456
+recent_raw_hard_bytes = 536870912
+source_concurrency = 4
+mapper_concurrency = 4
+
+[budgets.delivery]
+maximum_retained_bytes = "1536MiB"
+maximum_history_retained_bytes = "1GiB"
+
+[budgets.store]
+maximum_physical_bytes = "2GiB"
+
+[budgets.artifacts]
+maximum_retained_bytes = "1GiB"
+maximum_pending_bytes = "256MiB"
+
+[budgets.history_pipeline]
+maximum_active_chunks = 4
+maximum_mapped_bytes = "128MiB"
+
+[budgets.history_pipeline.commit]
+maximum_blocks = 128
+maximum_changes = 10000
+maximum_encoded_bytes = "16MiB"
+maximum_delay = "50ms"
+target_writer_hold = "20ms"
+
+[[sources.history]]
+id = "xatu"
+kind = "xatu"
+priority = 10
+trust = "trusted_dataset"
+
+[sources.live]
+kind = "disabled"
+minimum_peers = 0
+
+[finality]
+kind = "disabled"
+checkpoint = ""
+
+[[processors]]
+id = "blobs-money"
+instance = "blobs-externalized"
+version = "1.4.0"
+history_control = "application_subscriptions"
+history_mode = "on_demand"
+start_block = 19426589
+publish = "finalized_only"
+
+[processors.state]
+mode = "durable"
+
+[processors.output]
+mode = "none"
+
+[processors.delivery]
+mode = "until_acknowledged"
+max_bytes = "1GiB"
+max_age = "24h"
+on_limit = "pause"
+
+[processors.delivery.pruning]
+interval = "30s"
+minimum_batch_blocks = 64
+minimum_batch_changes = 10000
+maximum_delete_changes = 10000
+retain_finalized_blocks = 256
+retain_acknowledged_age = "1h"
+
+[[processors.delivery.consumers]]
+id = "blobs-api"
+required = true
+lease_ttl = "5m"
+
+[processors.checkpoint]
+mode = "automatic"
+keep = 3
+
+[processors.undo]
+mode = "none"
+safety_blocks = 0
+
+[processors.coverage]
+verification_segment_blocks = 8192
+
+[rpc]
+http_bind = "127.0.0.1:8545"
+ws_bind = "127.0.0.1:8546"
+historical_mode = "on_demand"
+transaction_locator = false
+minimum_recent_blocks = 128
+
+[api]
+bind = "127.0.0.1:8080"
+
+[api.delivery.history_batches]
+target_encoded_bytes = "4MiB"
+maximum_encoded_bytes = "16MiB"
+maximum_events = 20000
+maximum_processed_blocks = 8192
+maximum_delay = "50ms"
+maximum_buffered_batches = 4
+maximum_buffered_bytes = "64MiB"
+compression = "gzip"
+
+[api.delivery.live_batches]
+target_encoded_bytes = "64KiB"
+maximum_encoded_bytes = "1MiB"
+maximum_events = 1000
+maximum_processed_blocks = 8
+maximum_delay = "10ms"
+maximum_buffered_batches = 2
+maximum_buffered_bytes = "2MiB"
+compression = "gzip"

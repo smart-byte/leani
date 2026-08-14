@@ -1,0 +1,40 @@
+[package]
+name = "leani-rpc"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+publish = false
+
+[dependencies]
+axum.workspace = true
+futures.workspace = true
+alloy-consensus.workspace = true
+alloy-eips.workspace = true
+alloy-primitives.workspace = true
+alloy-rlp.workspace = true
+alloy-rpc-types-eth.workspace = true
+hex.workspace = true
+leani-primitives = { path = "../primitives" }
+leani-processor-api = { path = "../processor-api" }
+leani-processor-blobs = { path = "../processor-blobs" }
+leani-store-sqlite = { path = "../store-sqlite" }
+leani-source-api = { path = "../source-api" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+
+[dev-dependencies]
+leani-store-history = { path = "../store-history" }
+leani-testkit = { path = "../testkit" }
+tempfile.workspace = true
+tokio.workspace = true
+tokio-tungstenite.workspace = true
+tower.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,17 @@
+.git
+.github
+target
+data
+packages/sdk/node_modules
+packages/sdk/dist
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+.env
+.env.*
+AGENTS.md
+docs/PIPELINED-BACKFILL-DELIVERY-PLAN.md
+docs/RAW-HISTORY-AND-PROCESSOR-ARTIFACTS-PLAN.md
+docs/XATU-OPTIMIZATIONS.md
+docs/evidence/benchmarks/*.json
+docs/superpowers

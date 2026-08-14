@@ -1,0 +1,45 @@
+[package]
+name = "leani-source-p2p"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+alloy-consensus.workspace = true
+alloy-eips.workspace = true
+alloy-primitives.workspace = true
+alloy-rlp.workspace = true
+async-trait.workspace = true
+futures.workspace = true
+hex.workspace = true
+hickory-resolver.workspace = true
+leani-primitives = { path = "../primitives" }
+leani-source-api = { path = "../source-api" }
+postcard.workspace = true
+reth-chainspec.workspace = true
+reth-discv4.workspace = true
+reth-discv5.workspace = true
+reth-dns-discovery.workspace = true
+reth-ethereum-primitives.workspace = true
+reth-network.workspace = true
+reth-network-p2p.workspace = true
+reth-network-peers.workspace = true
+reth-primitives-traits.workspace = true
+reth-tasks.workspace = true
+secp256k1.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

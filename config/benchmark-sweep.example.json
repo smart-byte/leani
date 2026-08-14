@@ -1,0 +1,48 @@
+{
+  "schema": "leani.benchmark-sweep.v2",
+  "orderSeed": 1,
+  "baseArguments": [
+    "--mode",
+    "process",
+    "--profile",
+    "materialized",
+    "--destination",
+    "rust-direct",
+    "--corpus",
+    "blobs-like",
+    "--blocks",
+    "10000",
+    "--chunk-blocks",
+    "2048",
+    "--warmups",
+    "1",
+    "--runs",
+    "3",
+    "--sample-interval-ms",
+    "200"
+  ],
+  "candidates": [
+    {
+      "id": "active-chunks-1",
+      "arguments": ["--maximum-active-chunks", "1"]
+    },
+    {
+      "id": "active-chunks-2",
+      "arguments": ["--maximum-active-chunks", "2"]
+    },
+    {
+      "id": "active-chunks-4",
+      "arguments": ["--maximum-active-chunks", "4"]
+    },
+    {
+      "id": "active-chunks-8",
+      "arguments": ["--maximum-active-chunks", "8"]
+    }
+  ],
+  "gates": {
+    "minimumMeasuredRuns": 3,
+    "maximumCoefficientOfVariation": 0.05,
+    "maximumPeakRssBytes": 3435973836,
+    "maximumPeakPhysicalStoreBytes": 17179869184
+  }
+}

@@ -1,0 +1,15 @@
+ALTER TABLE change_log
+    ADD COLUMN parent_hash BLOB NOT NULL
+    DEFAULT X'0000000000000000000000000000000000000000000000000000000000000000'
+    CHECK (length(parent_hash) = 32);
+
+ALTER TABLE change_log
+    ADD COLUMN block_timestamp INTEGER NOT NULL DEFAULT 0;
+
+ALTER TABLE change_log
+    ADD COLUMN finality INTEGER NOT NULL DEFAULT 0
+    CHECK (finality BETWEEN 0 AND 2);
+
+UPDATE node_meta
+SET value = X'00000002'
+WHERE key = 'schema_version';

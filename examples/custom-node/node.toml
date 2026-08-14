@@ -1,0 +1,77 @@
+config_version = 1
+data_dir = "./data/custom-node-example"
+
+[chain]
+name = "ethereum-mainnet"
+chain_id = 1
+
+[budgets]
+memory_bytes = 1073741824
+temporary_disk_bytes = 5368709120
+pending_delta_bytes = 1073741824
+recent_raw_soft_bytes = 1073741824
+recent_raw_hard_bytes = 2147483648
+source_concurrency = 8
+mapper_concurrency = 8
+
+[budgets.delivery]
+maximum_retained_bytes = "1536MiB"
+maximum_history_retained_bytes = "1GiB"
+
+[budgets.store]
+maximum_physical_bytes = "2GiB"
+
+[[sources.history]]
+id = "erae"
+kind = "era_e"
+priority = 10
+trust = "trusted_dataset"
+endpoint = "https://data.ethpandaops.io/erae/mainnet/"
+
+[sources.live]
+kind = "disabled"
+minimum_peers = 0
+
+[finality]
+kind = "disabled"
+checkpoint = ""
+
+[[processors]]
+id = "example-block-summary"
+instance = "example-block-summary-local"
+version = "1.0.0"
+start_block = 19426589
+publish = "optimistic_and_finalized"
+
+[processors.state]
+mode = "durable"
+
+[processors.output]
+mode = "full"
+
+[processors.delivery]
+mode = "window"
+
+[processors.checkpoint]
+mode = "automatic"
+keep = 3
+
+[processors.undo]
+mode = "unfinalized"
+safety_blocks = 256
+
+[processors.coverage]
+verification_segment_blocks = 8192
+
+[processors.settings]
+change_kind = "example.block_summary"
+
+[rpc]
+http_bind = "127.0.0.1:9545"
+ws_bind = "127.0.0.1:9546"
+historical_mode = "on_demand"
+transaction_locator = false
+minimum_recent_blocks = 128
+
+[api]
+bind = "127.0.0.1:9080"

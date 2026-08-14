@@ -1,0 +1,516 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://leani.dev/schema/config-v1.json",
+  "title": "leani configuration v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "config_version",
+    "data_dir",
+    "chain",
+    "budgets",
+    "sources",
+    "finality",
+    "processors",
+    "rpc",
+    "api"
+  ],
+  "properties": {
+    "config_version": { "const": 1 },
+    "data_dir": { "type": "string", "minLength": 1 },
+    "chain": { "$ref": "#/$defs/chain" },
+    "raw_history": { "$ref": "#/$defs/rawHistory" },
+    "artifact_storage": { "$ref": "#/$defs/artifactStorage" },
+    "budgets": { "$ref": "#/$defs/budgets" },
+    "sources": { "$ref": "#/$defs/sources" },
+    "finality": { "$ref": "#/$defs/finality" },
+    "processors": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/processor" }
+    },
+    "rpc": { "$ref": "#/$defs/rpc" },
+    "api": { "$ref": "#/$defs/api" }
+  },
+  "$defs": {
+    "positiveInteger": { "type": "integer", "minimum": 1 },
+    "nonNegativeInteger": { "type": "integer", "minimum": 0 },
+    "humanBytes": {
+      "oneOf": [
+        { "type": "integer", "minimum": 0 },
+        {
+          "type": "string",
+          "pattern": "^[0-9]+(B|KiB|MiB|GiB|KB|MB|GB)$"
+        }
+      ]
+    },
+    "humanDuration": {
+      "oneOf": [
+        { "type": "integer", "minimum": 0 },
+        { "type": "string", "pattern": "^[0-9]+(s|m|h|d)$" }
+      ]
+    },
+    "humanMilliseconds": {
+      "oneOf": [
+        { "type": "integer", "minimum": 0 },
+        { "type": "string", "pattern": "^[0-9]+(ms|s|m|h|d)$" }
+      ]
+    },
+    "socketAddress": {
+      "type": "string",
+      "description": "IPv4 or bracketed IPv6 socket address with port"
+    },
+    "chain": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "chain_id"],
+      "properties": {
+        "name": { "type": "string", "minLength": 1 },
+        "chain_id": { "$ref": "#/$defs/positiveInteger" },
+        "merge_block": { "$ref": "#/$defs/nonNegativeInteger" }
+      }
+    },
+    "rawHistory": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "maximum_logical_bytes": { "$ref": "#/$defs/humanBytes" },
+        "maximum_physical_bytes": { "$ref": "#/$defs/humanBytes" },
+        "maximum_frame_logical_bytes": { "$ref": "#/$defs/humanBytes" },
+        "maximum_segment_logical_bytes": { "$ref": "#/$defs/humanBytes" },
+        "maximum_segment_physical_bytes": { "$ref": "#/$defs/humanBytes" },
+        "reader_connections": { "$ref": "#/$defs/positiveInteger" },
+        "maximum_source_frames": { "$ref": "#/$defs/positiveInteger" },
+        "maximum_buffered_frames": { "$ref": "#/$defs/positiveInteger" }
+      }
+    },
+    "artifactStorage": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "backend": { "enum": ["sqlite", "tiered_segments"] },
+        "segment_target_blocks": { "$ref": "#/$defs/positiveInteger" },
+        "compression": { "enum": ["none", "snappy", "deflate"] },
+        "maximum_artifact_logical_bytes": { "$ref": "#/$defs/humanBytes" },
+        "maximum_segment_logical_bytes": { "$ref": "#/$defs/humanBytes" },
+        "maximum_segment_physical_bytes": { "$ref": "#/$defs/humanBytes" },
+        "compaction_interval": { "$ref": "#/$defs/humanMilliseconds" },
+        "maximum_segments_per_cycle": { "$ref": "#/$defs/positiveInteger" }
+      }
+    },
+    "budgets": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "memory_bytes",
+        "temporary_disk_bytes",
+        "pending_delta_bytes",
+        "recent_raw_soft_bytes",
+        "recent_raw_hard_bytes",
+        "source_concurrency",
+        "mapper_concurrency"
+      ],
+      "properties": {
+        "memory_bytes": { "$ref": "#/$defs/positiveInteger" },
+        "temporary_disk_bytes": { "$ref": "#/$defs/positiveInteger" },
+        "pending_delta_bytes": { "$ref": "#/$defs/positiveInteger" },
+        "recent_raw_soft_bytes": { "$ref": "#/$defs/positiveInteger" },
+        "recent_raw_hard_bytes": { "$ref": "#/$defs/positiveInteger" },
+        "source_concurrency": { "$ref": "#/$defs/positiveInteger" },
+        "mapper_concurrency": { "$ref": "#/$defs/positiveInteger" },
+        "history_material": { "$ref": "#/$defs/historyMaterialBudget" },
+        "history_pipeline": { "$ref": "#/$defs/historyPipelineBudget" },
+        "store": { "$ref": "#/$defs/storeBudget" },
+        "artifacts": { "$ref": "#/$defs/artifactBudget" },
+        "delivery": { "$ref": "#/$defs/deliveryBudget" }
+      }
+    },
+    "historyMaterialBudget": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "mode": { "enum": ["disabled", "observe", "enabled"] },
+        "memory_bytes": { "$ref": "#/$defs/humanBytes" },
+        "maximum_buffered_frames_per_acquisition": {
+          "$ref": "#/$defs/positiveInteger"
+        },
+        "minimum_physical_chunk_blocks": {
+          "$ref": "#/$defs/positiveInteger"
+        },
+        "maximum_overfetch_ratio": {
+          "type": "number",
+          "minimum": 1.0
+        }
+      }
+    },
+    "historyPipelineBudget": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "maximum_active_chunks": { "$ref": "#/$defs/positiveInteger" },
+        "maximum_mapped_bytes": { "$ref": "#/$defs/humanBytes" },
+        "commit": { "$ref": "#/$defs/historyCommitBudget" }
+      }
+    },
+    "historyCommitBudget": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "maximum_blocks": { "$ref": "#/$defs/positiveInteger" },
+        "maximum_changes": { "$ref": "#/$defs/positiveInteger" },
+        "maximum_encoded_bytes": { "$ref": "#/$defs/humanBytes" },
+        "maximum_delay": { "$ref": "#/$defs/humanMilliseconds" },
+        "target_writer_hold": { "$ref": "#/$defs/humanMilliseconds" }
+      }
+    },
+    "deliveryBudget": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "maximum_retained_bytes": { "$ref": "#/$defs/humanBytes" },
+        "maximum_history_retained_bytes": { "$ref": "#/$defs/humanBytes" }
+      }
+    },
+    "storeBudget": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "maximum_physical_bytes": { "$ref": "#/$defs/humanBytes" }
+      }
+    },
+    "artifactBudget": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "maximum_retained_bytes": { "$ref": "#/$defs/humanBytes" },
+        "maximum_pending_bytes": { "$ref": "#/$defs/humanBytes" }
+      }
+    },
+    "historySource": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "kind", "priority", "trust"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "kind": {
+          "enum": ["xatu", "era_e", "parquet", "archive"]
+        },
+        "priority": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 65535
+        },
+        "trust": {
+          "enum": ["trusted_dataset", "verified_material"]
+        },
+        "manifest": { "type": "string" },
+        "endpoint": { "type": "string", "format": "uri" }
+      }
+    },
+    "liveSource": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "minimum_peers"],
+      "properties": {
+        "kind": { "enum": ["p2p", "disabled"] },
+        "minimum_peers": { "$ref": "#/$defs/nonNegativeInteger" },
+        "preferred_peers": { "$ref": "#/$defs/nonNegativeInteger" },
+        "max_outbound_peers": { "$ref": "#/$defs/nonNegativeInteger" },
+        "max_concurrent_dials": { "$ref": "#/$defs/nonNegativeInteger" },
+        "listener_port": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 65535
+        },
+        "discovery_port": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 65535
+        },
+        "discv5_port": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 65535
+        },
+        "enable_discv5": { "type": "boolean" },
+        "nat": { "type": "string" },
+        "trusted_peers": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "peer_refill_interval_ms": { "$ref": "#/$defs/positiveInteger" },
+        "peer_recovery_timeout_seconds": { "$ref": "#/$defs/positiveInteger" },
+        "material_request_concurrency": { "$ref": "#/$defs/positiveInteger" },
+        "material_request_blocks": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 16
+        },
+        "request_timeout_seconds": { "$ref": "#/$defs/positiveInteger" },
+        "request_retries": { "$ref": "#/$defs/positiveInteger" },
+        "request_retry_backoff_ms": { "$ref": "#/$defs/positiveInteger" },
+        "history_header_request_concurrency": { "$ref": "#/$defs/positiveInteger" },
+        "history_header_request_blocks": { "$ref": "#/$defs/positiveInteger" },
+        "persistent_retries": { "type": "boolean" },
+        "retry_backoff_max_seconds": { "$ref": "#/$defs/positiveInteger" },
+        "peer_cache_flush_seconds": { "$ref": "#/$defs/positiveInteger" },
+        "peer_cache_max_entries": { "$ref": "#/$defs/positiveInteger" },
+        "archive_reconciliation_blocks": { "$ref": "#/$defs/positiveInteger" },
+        "archive_reconciliation_interval_seconds": {
+          "$ref": "#/$defs/positiveInteger"
+        },
+        "history_fallback_blocks": {
+          "$ref": "#/$defs/positiveInteger",
+          "description": "Optional maximum finalized suffix eligible for execution-P2P history fallback. When omitted, every gap at or after the processor start block is eligible."
+        },
+        "handoff_overlap_blocks": { "$ref": "#/$defs/positiveInteger" }
+      }
+    },
+    "sources": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["history", "live"],
+      "properties": {
+        "history": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/historySource" }
+        },
+        "live": { "$ref": "#/$defs/liveSource" }
+      }
+    },
+    "finality": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "checkpoint"],
+      "properties": {
+        "kind": {
+          "enum": ["beacon_api", "consensus_p2p", "disabled"]
+        },
+        "checkpoint": { "type": "string" },
+        "checkpoint_slot": { "$ref": "#/$defs/nonNegativeInteger" },
+        "endpoints": {
+          "type": "array",
+          "items": { "type": "string", "format": "uri" }
+        },
+        "minimum_agreement": { "$ref": "#/$defs/positiveInteger" },
+        "bootnodes": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "minimum_peers": { "$ref": "#/$defs/nonNegativeInteger" },
+        "discovery_port": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 65535
+        }
+      }
+    },
+    "statePolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mode"],
+      "properties": {
+        "mode": { "enum": ["ephemeral", "durable", "checkpointed"] }
+      }
+    },
+    "outputWindow": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "max_blocks": { "$ref": "#/$defs/positiveInteger" },
+        "max_age": { "$ref": "#/$defs/humanDuration" },
+        "max_rows": { "$ref": "#/$defs/positiveInteger" },
+        "max_bytes": { "$ref": "#/$defs/humanBytes" }
+      },
+      "minProperties": 1
+    },
+    "outputPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mode"],
+      "properties": {
+        "mode": { "enum": ["none", "latest", "window", "full"] },
+        "window": { "$ref": "#/$defs/outputWindow" },
+        "finalized_only": { "type": "boolean" }
+      }
+    },
+    "consumer": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "required", "lease_ttl"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "required": { "type": "boolean" },
+        "lease_ttl": { "$ref": "#/$defs/humanDuration" }
+      }
+    },
+    "deliveryPruning": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "interval",
+        "minimum_batch_blocks",
+        "minimum_batch_changes",
+        "maximum_delete_changes",
+        "retain_finalized_blocks",
+        "retain_acknowledged_age"
+      ],
+      "properties": {
+        "interval": { "$ref": "#/$defs/humanDuration" },
+        "minimum_batch_blocks": { "$ref": "#/$defs/positiveInteger" },
+        "minimum_batch_changes": { "$ref": "#/$defs/positiveInteger" },
+        "maximum_delete_changes": { "$ref": "#/$defs/positiveInteger" },
+        "retain_finalized_blocks": { "$ref": "#/$defs/positiveInteger" },
+        "retain_acknowledged_age": { "$ref": "#/$defs/humanDuration" }
+      }
+    },
+    "deliveryPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mode"],
+      "properties": {
+        "mode": {
+          "enum": ["none", "best_effort", "window", "until_acknowledged"]
+        },
+        "max_bytes": { "$ref": "#/$defs/humanBytes" },
+        "max_age": { "$ref": "#/$defs/humanDuration" },
+        "on_limit": { "enum": ["pause", "fail", "expire_and_reset"] },
+        "pruning": { "$ref": "#/$defs/deliveryPruning" },
+        "consumers": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/consumer" }
+        }
+      }
+    },
+    "checkpointPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mode", "keep"],
+      "properties": {
+        "mode": { "enum": ["none", "automatic"] },
+        "keep": { "$ref": "#/$defs/nonNegativeInteger" }
+      }
+    },
+    "undoPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mode", "safety_blocks"],
+      "properties": {
+        "mode": { "enum": ["none", "unfinalized"] },
+        "safety_blocks": { "$ref": "#/$defs/nonNegativeInteger" }
+      }
+    },
+    "processor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "instance",
+        "version",
+        "start_block",
+        "publish",
+        "state",
+        "output",
+        "delivery",
+        "checkpoint",
+        "undo"
+      ],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "instance": { "type": "string", "minLength": 1 },
+        "version": { "type": "string", "minLength": 1 },
+        "history_control": {
+          "enum": ["node_owned", "application_subscriptions"]
+        },
+        "history_mode": { "enum": ["automatic", "on_demand"] },
+        "require_retained_input": { "type": "boolean" },
+        "start_block": { "$ref": "#/$defs/nonNegativeInteger" },
+        "publish": {
+          "enum": [
+            "optimistic_and_finalized",
+            "finalized_only",
+            "terminal_only"
+          ]
+        },
+        "state": { "$ref": "#/$defs/statePolicy" },
+        "output": { "$ref": "#/$defs/outputPolicy" },
+        "delivery": { "$ref": "#/$defs/deliveryPolicy" },
+        "checkpoint": { "$ref": "#/$defs/checkpointPolicy" },
+        "undo": { "$ref": "#/$defs/undoPolicy" },
+        "coverage": { "$ref": "#/$defs/processorCoverage" },
+        "settings": {
+          "type": "object",
+          "description": "Strictly decoded by the selected processor factory",
+          "additionalProperties": true
+        }
+      }
+    },
+    "processorCoverage": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "verification_segment_blocks": { "$ref": "#/$defs/positiveInteger" }
+      }
+    },
+    "rpc": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "http_bind",
+        "ws_bind",
+        "historical_mode",
+        "transaction_locator",
+        "minimum_recent_blocks"
+      ],
+      "properties": {
+        "http_bind": { "$ref": "#/$defs/socketAddress" },
+        "ws_bind": { "$ref": "#/$defs/socketAddress" },
+        "historical_mode": { "enum": ["on_demand", "disabled"] },
+        "transaction_locator": { "type": "boolean" },
+        "minimum_recent_blocks": { "$ref": "#/$defs/positiveInteger" }
+      }
+    },
+    "api": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["bind"],
+      "properties": {
+        "bind": { "$ref": "#/$defs/socketAddress" },
+        "bearer_token_env": { "type": "string", "minLength": 1 },
+        "delivery": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "history_batches": { "$ref": "#/$defs/deliveryBatch" },
+            "live_batches": { "$ref": "#/$defs/deliveryBatch" }
+          }
+        }
+      }
+    },
+    "deliveryBatch": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "target_encoded_bytes",
+        "maximum_encoded_bytes",
+        "maximum_events",
+        "maximum_processed_blocks",
+        "maximum_delay",
+        "maximum_buffered_batches",
+        "maximum_buffered_bytes"
+      ],
+      "properties": {
+        "target_encoded_bytes": { "$ref": "#/$defs/humanBytes" },
+        "maximum_encoded_bytes": { "$ref": "#/$defs/humanBytes" },
+        "maximum_events": { "$ref": "#/$defs/positiveInteger" },
+        "maximum_processed_blocks": { "$ref": "#/$defs/positiveInteger" },
+        "maximum_delay": { "$ref": "#/$defs/humanMilliseconds" },
+        "maximum_buffered_batches": { "$ref": "#/$defs/positiveInteger" },
+        "maximum_buffered_bytes": { "$ref": "#/$defs/humanBytes" },
+        "compression": { "enum": ["none", "gzip"] }
+      }
+    }
+  }
+}

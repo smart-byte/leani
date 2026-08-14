@@ -1,0 +1,138 @@
+[workspace]
+resolver = "3"
+members = [
+  "crates/api",
+  "crates/finality-beacon-api",
+  "crates/finality-consensus-p2p",
+  "crates/node",
+  "crates/primitives",
+  "crates/processor-api",
+  "crates/processor-blobs",
+  "crates/processor-erc20",
+  "crates/processor-evm-events",
+  "crates/processor-transaction-stats",
+  "crates/processor-uniswap",
+  "crates/rpc",
+  "crates/runtime",
+  "crates/source-api",
+  "crates/source-archive",
+  "crates/source-erae",
+  "crates/source-p2p",
+  "crates/source-xatu",
+  "crates/store-history",
+  "crates/store-artifacts",
+  "crates/store-sqlite",
+  "crates/testkit",
+  "examples/custom-node",
+]
+default-members = ["crates/node"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/smart-byte/leani"
+homepage = "https://leani.dev"
+
+[workspace.dependencies]
+alloy-consensus = { version = "2.2.0", features = ["k256"] }
+alloy-eips = "2.2.0"
+alloy-primitives = { version = "1.6.1", default-features = false, features = ["std", "serde"] }
+alloy-rlp = "0.3.16"
+alloy-rpc-types-eth = "2.2.0"
+anyhow = "1.0"
+async-trait = "0.1"
+arrow-array = "59.2.0"
+arrow-schema = "59.2.0"
+axum = { version = "0.8", features = ["ws"] }
+blake3 = "1.8"
+bytes = "1.11"
+chrono = { version = "0.4.45", default-features = false, features = ["std"] }
+clap = { version = "4.5", features = ["derive", "env"] }
+futures = "0.3"
+flate2 = "1.1"
+helios-consensus-core = { git = "https://github.com/a16z/helios", rev = "204c998a927348e1c000a664f08d5b37b1b0d924" }
+hex = "0.4"
+hickory-resolver = "0.26.1"
+http = "1.3"
+indexmap = { version = "2.12", features = ["serde"] }
+libp2p = { version = "0.56.0", default-features = false, features = [
+  "noise",
+  "secp256k1",
+  "tcp",
+  "tokio",
+  "yamux",
+] }
+libp2p-stream = "0.4.0-alpha"
+# Keep this aligned with Parquet's object_store major/minor to avoid two
+# incompatible ObjectStore trait identities. The object_store 0.13 XML
+# advisory exceptions and Leani's narrow HTTP call-path are documented in
+# deny.toml.
+object_store = { version = "0.13.2", default-features = false, features = ["http"] }
+parquet = { version = "59.2.0", default-features = false, features = [
+  "arrow",
+  "object_store",
+  "snap",
+  "brotli",
+  "flate2-zlib-rs",
+  "lz4",
+  "zstd",
+] }
+postcard = { version = "1.1", features = ["alloc"] }
+reth-chainspec = { git = "https://github.com/paradigmxyz/reth", rev = "8eb210175687c9f0c889a3b6795c16781d830e3a" }
+reth-discv4 = { git = "https://github.com/paradigmxyz/reth", rev = "8eb210175687c9f0c889a3b6795c16781d830e3a" }
+reth-discv5 = { git = "https://github.com/paradigmxyz/reth", rev = "8eb210175687c9f0c889a3b6795c16781d830e3a" }
+reth-dns-discovery = { git = "https://github.com/paradigmxyz/reth", rev = "8eb210175687c9f0c889a3b6795c16781d830e3a" }
+reth-era = { git = "https://github.com/paradigmxyz/reth", rev = "8eb210175687c9f0c889a3b6795c16781d830e3a" }
+reth-ethereum-primitives = { git = "https://github.com/paradigmxyz/reth", rev = "8eb210175687c9f0c889a3b6795c16781d830e3a" }
+reth-network = { git = "https://github.com/paradigmxyz/reth", rev = "8eb210175687c9f0c889a3b6795c16781d830e3a" }
+reth-network-p2p = { git = "https://github.com/paradigmxyz/reth", rev = "8eb210175687c9f0c889a3b6795c16781d830e3a" }
+reth-network-peers = { git = "https://github.com/paradigmxyz/reth", rev = "8eb210175687c9f0c889a3b6795c16781d830e3a" }
+reth-primitives-traits = "0.5.0"
+reth-tasks = { git = "https://github.com/paradigmxyz/reth", rev = "8eb210175687c9f0c889a3b6795c16781d830e3a" }
+secp256k1 = { version = "0.30", default-features = false, features = ["global-context"] }
+semver = { version = "1.0", features = ["serde"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+snap = "1.1"
+sqlx = { version = "0.8.6", default-features = false, features = [
+  "runtime-tokio",
+  "sqlite",
+] }
+tempfile = "3.23"
+thiserror = "2.0"
+tokio = { version = "1.48", features = [
+  "macros",
+  "net",
+  "rt-multi-thread",
+  "signal",
+  "sync",
+  "time",
+] }
+tokio-util = { version = "0.7", features = ["rt"] }
+tokio-tungstenite = "0.29"
+toml = "0.9"
+tower = { version = "0.5", features = ["util"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
+tree_hash = "0.10"
+url = { version = "2.5", features = ["serde"] }
+ssz = { package = "ethereum_ssz", version = "0.9.1" }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_debug_implementations = "warn"
+unreachable_pub = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+strip = "symbols"

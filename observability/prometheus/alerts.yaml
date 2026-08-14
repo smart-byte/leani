@@ -1,0 +1,65 @@
+groups:
+  - name: leani
+    rules:
+      - alert: LeaniMissing
+        expr: absent(leani_up) == 1
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: Leani metrics are missing
+          description: The node or its metrics scrape has been unavailable for two minutes.
+
+      - alert: LeaniNotReady
+        expr: leani_ready == 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: Leani is not ready
+          description: A required live or finality component has remained unavailable.
+
+      - alert: LeaniLiveSourceUnavailable
+        expr: leani_live_required == 1 and leani_live_ready == 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: Required live source is unavailable
+          description: Publication should be treated as degraded until P2P live ingestion recovers.
+
+      - alert: LeaniFinalityUnavailable
+        expr: leani_finality_required == 1 and leani_finality_ready == 0
+        for: 20m
+        labels:
+          severity: warning
+        annotations:
+          summary: Required finality source is unavailable
+          description: Finalized cursors and pruning must not advance while this alert is active.
+
+      - alert: LeaniProcessorStalled
+        expr: leani_processor_head_block > 0 and changes(leani_processor_head_block[10m]) == 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: Processor head is not advancing
+          description: Processor {{ $labels.processor }} has not advanced for at least ten minutes.
+
+      - alert: LeaniFinalityStalled
+        expr: leani_processor_finalized_block > 0 and changes(leani_processor_finalized_block[30m]) == 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: Processor finality is not advancing
+          description: Processor {{ $labels.processor }} has not finalized a block for at least thirty minutes.
+
+      - alert: LeaniOutboxBacklog
+        expr: leani_processor_outbox_records > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: Processor outbox is not draining
+          description: Processor {{ $labels.processor }} has retained outbox records for ten minutes.

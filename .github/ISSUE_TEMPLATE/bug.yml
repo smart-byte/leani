@@ -1,0 +1,44 @@
+name: Bug report
+description: Report a reproducible Leani defect
+title: "bug: "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: Do not report security vulnerabilities here. Use a private GitHub security advisory.
+  - type: input
+    id: version
+    attributes:
+      label: Leani version
+      description: Paste `leani --version` and the release checksum or commit.
+    validations:
+      required: true
+  - type: dropdown
+    id: deployment
+    attributes:
+      label: Deployment
+      options:
+        - Native binary
+        - Docker or Compose
+        - Custom Rust integration
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior and reproduction
+      description: Redact API tokens, private URLs, peer identities, and application data.
+    validations:
+      required: true
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Diagnostics
+      description: Include relevant doctor output, readiness reasons, logs, and config with secrets removed.
+

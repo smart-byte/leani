@@ -1,0 +1,98 @@
+config_version = 1
+data_dir = "./data/head-only"
+
+[chain]
+name = "ethereum-mainnet"
+chain_id = 1
+
+[budgets]
+memory_bytes = 536870912
+temporary_disk_bytes = 2147483648
+pending_delta_bytes = 268435456
+recent_raw_soft_bytes = 268435456
+recent_raw_hard_bytes = 536870912
+source_concurrency = 4
+mapper_concurrency = 4
+
+[budgets.delivery]
+maximum_retained_bytes = "1536MiB"
+maximum_history_retained_bytes = "1GiB"
+
+[budgets.store]
+maximum_physical_bytes = "2GiB"
+
+[budgets.artifacts]
+maximum_retained_bytes = "1GiB"
+maximum_pending_bytes = "256MiB"
+
+[[sources.history]]
+id = "xatu"
+kind = "xatu"
+priority = 10
+trust = "trusted_dataset"
+
+[sources.live]
+kind = "disabled"
+minimum_peers = 0
+
+[finality]
+kind = "disabled"
+checkpoint = ""
+
+[[processors]]
+id = "evm-events"
+instance = "weth-transfer-head"
+version = "1.0.0"
+history_control = "node_owned"
+history_mode = "automatic"
+start_block = 12965000
+publish = "optimistic_and_finalized"
+
+[processors.state]
+mode = "durable"
+
+[processors.output]
+mode = "none"
+
+[processors.delivery]
+mode = "best_effort"
+max_bytes = "64MiB"
+max_age = "1h"
+on_limit = "expire_and_reset"
+
+[processors.delivery.pruning]
+interval = "30s"
+minimum_batch_blocks = 16
+minimum_batch_changes = 1000
+maximum_delete_changes = 10000
+retain_finalized_blocks = 256
+retain_acknowledged_age = "5m"
+
+[processors.checkpoint]
+mode = "automatic"
+keep = 3
+
+[processors.undo]
+mode = "unfinalized"
+safety_blocks = 256
+
+[processors.settings]
+addresses = ["0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"]
+
+[[processors.settings.events]]
+abi = "event Transfer(address indexed from, address indexed to, uint256 value)"
+
+[processors.settings.events.output]
+collection = "weth.transfers"
+kind = "weth.transfer"
+key_fields = []
+
+[rpc]
+http_bind = "127.0.0.1:8545"
+ws_bind = "127.0.0.1:8546"
+historical_mode = "on_demand"
+transaction_locator = false
+minimum_recent_blocks = 128
+
+[api]
+bind = "127.0.0.1:8080"

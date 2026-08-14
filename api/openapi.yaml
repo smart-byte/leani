@@ -1,0 +1,1673 @@
+openapi: 3.1.0
+info:
+  title: leani native API
+  version: 1.0.0
+  description: |
+    Coverage-aware queries and durable processor changes. All cursors are
+    opaque. Ethereum quantities that can exceed JavaScript's safe integer
+    range are encoded as unsigned decimal strings.
+servers:
+  - url: http://127.0.0.1:8080
+security:
+  - {}
+  - bearerAuth: []
+paths:
+  /health/live:
+    get:
+      summary: Check process liveness
+      operationId: getLiveness
+      security: []
+      responses:
+        "200":
+          description: Process and durable store are responsive.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Health"
+        "503":
+          description: Durable store cannot be read.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Health"
+  /health/ready:
+    get:
+      summary: Check node readiness
+      operationId: getReadiness
+      security: []
+      responses:
+        "200":
+          description: All configured serving dependencies are ready.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Health"
+        "503":
+          description: One or more required serving dependencies are unavailable.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Health"
+  /metrics:
+    get:
+      summary: Read Prometheus metrics
+      operationId: getPrometheusMetrics
+      security: []
+      responses:
+        "200":
+          description: Bounded-cardinality Prometheus text exposition.
+          content:
+            text/plain:
+              schema:
+                type: string
+  /v1/status:
+    get:
+      summary: Read node and processor status
+      operationId: getStatus
+      responses:
+        "200":
+          description: Node and store status.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NodeStatus"
+        default:
+          $ref: "#/components/responses/Error"
+  /v1/capabilities:
+    get:
+      summary: Discover node capabilities
+      operationId: getCapabilities
+      responses:
+        "200":
+          description: Exact enabled and disabled capabilities.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Capabilities"
+        default:
+          $ref: "#/components/responses/Error"
+  /v1/processors:
+    get:
+      summary: List configured processors
+      operationId: listProcessors
+      responses:
+        "200":
+          description: Configured processors.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/ProcessorSummary"
+  /v1/processors/{processor}/status:
+    parameters:
+      - $ref: "#/components/parameters/Processor"
+    get:
+      summary: Read processor status
+      operationId: getProcessorStatus
+      responses:
+        "200":
+          description: Processor coverage and readiness.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProcessorCoverage"
+        default:
+          $ref: "#/components/responses/Error"
+  /v1/processors/{processor}/schema:
+    parameters:
+      - $ref: "#/components/parameters/Processor"
+    get:
+      summary: Read a processor schema
+      operationId: getProcessorSchema
+      responses:
+        "200":
+          description: Durable processor schema identity.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [processor, deltaVersion, entitySchema, changeSchema]
+                properties:
+                  processor:
+                    $ref: "#/components/schemas/ProcessorSummary"
+                  deltaVersion:
+                    $ref: "#/components/schemas/SafeInteger"
+                  entitySchema:
+                    type: string
+                  changeSchema:
+                    type: string
+        default:
+          $ref: "#/components/responses/Error"
+  /v1/processors/{processor}/changes:
+    parameters:
+      - $ref: "#/components/parameters/Processor"
+      - $ref: "#/components/parameters/After"
+      - $ref: "#/components/parameters/Limit"
+    get:
+      summary: List processor changes
+      operationId: listProcessorChanges
+      responses:
+        "200":
+          description: Durable changes after the supplied cursor.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ChangePage"
+        default:
+          $ref: "#/components/responses/Error"
+  /v1/processors/{processor}/changes/head:
+    parameters:
+      - $ref: "#/components/parameters/Processor"
+    get:
+      summary: Read the processor change head
+      operationId: getProcessorChangeHead
+      responses:
+        "200":
+          description: |
+            Current durable change-log bounds and an opaque cursor anchored at
+            the latest committed change. Consumers can snapshot state and then
+            resume after this cursor without a race.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ChangeHead"
+        default:
+          $ref: "#/components/responses/Error"
+  /v1/processors/{processor}/stream:
+    parameters:
+      - $ref: "#/components/parameters/Processor"
+      - $ref: "#/components/parameters/After"
+    get:
+      summary: Stream processor changes
+      operationId: streamProcessorChanges
+      responses:
+        "200":
+          description: |
+            Resumable SSE stream. The event id is the opaque resume cursor and
+            each data field contains one ChangeEnvelope.
+          content:
+            text/event-stream:
+              schema:
+                type: string
+        default:
+          $ref: "#/components/responses/Error"
+  /v1/processors/{processor}/collections:
+    parameters:
+      - $ref: "#/components/parameters/Processor"
+    get:
+      summary: List processor collections
+      operationId: listProcessorCollections
+      responses:
+        "200":
+          description: Retained output collections for the processor instance.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OutputCollections"
+        default:
+          $ref: "#/components/responses/Error"
+  /v1/processors/{processor}/collections/{collection}/entities:
+    parameters:
+      - $ref: "#/components/parameters/Processor"
+      - $ref: "#/components/parameters/Collection"
+    get:
+      summary: Query processor entities
+      operationId: queryProcessorEntities
+      parameters:
+        - $ref: "#/components/parameters/FromBlock"
+        - $ref: "#/components/parameters/ToBlock"
+        - $ref: "#/components/parameters/FromTimestamp"
+        - $ref: "#/components/parameters/ToTimestamp"
+        - $ref: "#/components/parameters/Limit"
+        - name: cursor
+          in: query
+          schema:
+            $ref: "#/components/schemas/Cursor"
+      responses:
+        "200":
+          description: Stable retained-output snapshot page.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GenericSnapshotPage"
+        default:
+          $ref: "#/components/responses/Error"
+  /v1/processors/{processor}/collections/{collection}/entities/{key}:
+    parameters:
+      - $ref: "#/components/parameters/Processor"
+      - $ref: "#/components/parameters/Collection"
+      - name: key
+        in: path
+        required: true
+        schema:
+          type: string
+          pattern: "^0x(?:[0-9a-fA-F]{2})*$"
+    get:
+      summary: Read a processor entity
+      operationId: getProcessorEntity
+      responses:
+        "200":
+          description: One retained processor entity.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GenericOutputEntity"
+        default:
+          $ref: "#/components/responses/Error"
+  /v1/processors/{processor}/collections/{collection}/query-and-follow:
+    parameters:
+      - $ref: "#/components/parameters/Processor"
+      - $ref: "#/components/parameters/Collection"
+    post:
+      summary: Query a collection and open a race-free follow boundary
+      operationId: queryAndFollowProcessorCollection
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/OutputQuery"
+      responses:
+        "200":
+          description: |
+            Stable snapshot page plus a change boundary from which following
+            begins without a query/stream race.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GenericSnapshotPage"
+        default:
+          $ref: "#/components/responses/Error"
+  /v1/processors/{processor}/query-snapshots/{snapshot}:
+    parameters:
+      - $ref: "#/components/parameters/Processor"
+      - name: snapshot
+        in: path
+        required: true
+        schema:
+          type: string
+          pattern: "^[0-9a-f]{32}$"
+    delete:
+      summary: Release a processor query snapshot
+      operationId: releaseProcessorQuerySnapshot
+      responses:
+        "204":
+          description: Snapshot released.
+        default:
+          $ref: "#/components/responses/Error"
+  /v1/processors/{processor}/checkpoints:
+    parameters:
+      - $ref: "#/components/parameters/Processor"
+    get:
+      summary: List processor recovery checkpoints
+      operationId: listProcessorRecoveryCheckpoints
+      responses:
+        "200":
+          description: Automatic recovery checkpoints, newest first.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [data]
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/RecoveryCheckpoint"
+        default:
+          $ref: "#/components/responses/Error"
+  /v1/processors/{processor}/checkpoints/{checkpoint}/restore:
+    parameters:
+      - $ref: "#/components/parameters/Processor"
+      - name: checkpoint
+        in: path
+        required: true
+        schema:
+          $ref: "#/components/schemas/SafeInteger"
+    post:
+      summary: Restore a processor recovery checkpoint
+      operationId: restoreProcessorRecoveryCheckpoint
+      responses:
+        "200":
+          description: Private state repaired at the exact current cursor.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RecoveryRestore"
+        default:
+          $ref: "#/components/responses/Error"
+  /v1/processors/{processor}/savepoints:
+    parameters:
+      - $ref: "#/components/parameters/Processor"
+    get:
+      summary: List processor savepoints
+      operationId: listProcessorSavepoints
+      responses:
+        "200":
+          description: Operator-created portable savepoints.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [data]
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/PortableSavepoint"
+        default:
+          $ref: "#/components/responses/Error"
+    post:
+      summary: Create a processor savepoint
+      operationId: createProcessorSavepoint
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [id]
+              properties:
+                id:
+                  type: string
+                  minLength: 1
+                  maxLength: 128
+      responses:
+        "201":
+          description: Portable savepoint created.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PortableSavepoint"
+        default:
+          $ref: "#/components/responses/Error"
+  /v1/processors/{processor}/savepoints/{savepoint}:
+    parameters:
+      - $ref: "#/components/parameters/Processor"
+      - name: savepoint
+        in: path
+        required: true
+        schema:
+          type: string
+          minLength: 1
+          maxLength: 128
+    get:
+      summary: Export a processor savepoint
+      operationId: exportProcessorSavepoint
+      responses:
+        "200":
+          description: Checksummed, versioned portable savepoint archive.
+          content:
+            application/vnd.leani.savepoint:
+              schema:
+                type: string
+                format: binary
+        default:
+          $ref: "#/components/responses/Error"
+    delete:
+      summary: Delete a processor savepoint
+      operationId: deleteProcessorSavepoint
+      responses:
+        "204":
+          description: Savepoint explicitly deleted.
+        default:
+          $ref: "#/components/responses/Error"
+  /v1/processors/{processor}/consumers:
+    parameters:
+      - $ref: "#/components/parameters/Processor"
+    get:
+      summary: List durable consumers
+      operationId: listDurableConsumers
+      responses:
+        "200":
+          description: Durable consumers for this processor instance.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [data]
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/DurableConsumer"
+        default:
+          $ref: "#/components/responses/Error"
+    post:
+      summary: Create a durable consumer
+      operationId: createDurableConsumer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateConsumer"
+      responses:
+        "201":
+          description: Durable consumer registered at the explicit start.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DurableConsumer"
+        default:
+          $ref: "#/components/responses/Error"
+  /v1/processors/{processor}/consumers/{consumer}:
+    parameters:
+      - $ref: "#/components/parameters/Processor"
+      - $ref: "#/components/parameters/Consumer"
+    get:
+      summary: Read a durable consumer
+      operationId: getDurableConsumer
+      responses:
+        "200":
+          description: Durable consumer state and lag.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DurableConsumer"
+        default:
+          $ref: "#/components/responses/Error"
+    delete:
+      summary: Revoke a durable consumer
+      operationId: revokeDurableConsumer
+      responses:
+        "200":
+          description: Consumer explicitly revoked.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DurableConsumer"
+        default:
+          $ref: "#/components/responses/Error"
+  /v1/processors/{processor}/consumers/{consumer}/lease:
+    parameters:
+      - $ref: "#/components/parameters/Processor"
+      - $ref: "#/components/parameters/Consumer"
+      - $ref: "#/components/parameters/ConsumerCredential"
+    post:
+      summary: Renew a durable consumer lease
+      operationId: renewDurableConsumerLease
+      responses:
+        "200":
+          description: Consumer lease renewed without advancing acknowledgement.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DurableConsumer"
+        default:
+          $ref: "#/components/responses/Error"
+  /v1/processors/{processor}/consumers/{consumer}/changes:
+    parameters:
+      - $ref: "#/components/parameters/Processor"
+      - $ref: "#/components/parameters/Consumer"
+      - $ref: "#/components/parameters/ConsumerCredential"
+    get:
+      summary: List durable consumer changes
+      operationId: listDurableConsumerChanges
+      parameters:
+        - $ref: "#/components/parameters/Limit"
+      responses:
+        "200":
+          description: Replay batch; advances only the delivered head.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ChangePage"
+        default:
+          $ref: "#/components/responses/Error"
+  /v1/processors/{processor}/consumers/{consumer}/ack:
+    parameters:
+      - $ref: "#/components/parameters/Processor"
+      - $ref: "#/components/parameters/Consumer"
+      - $ref: "#/components/parameters/ConsumerCredential"
+    post:
+      summary: Acknowledge durable consumer changes
+      operationId: acknowledgeDurableConsumerChanges
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [cursor]
+              properties:
+                cursor:
+                  $ref: "#/components/schemas/Cursor"
+      responses:
+        "200":
+          description: Cumulative acknowledgement advanced after sink commit.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DurableConsumer"
+        default:
+          $ref: "#/components/responses/Error"
+  /v1/q/blobs/blocks:
+    get:
+      summary: List indexed blob blocks
+      operationId: listBlobBlocks
+      parameters:
+        - name: fromBlock
+          in: query
+          required: true
+          schema:
+            $ref: "#/components/schemas/SafeInteger"
+        - name: toBlock
+          in: query
+          required: true
+          schema:
+            $ref: "#/components/schemas/SafeInteger"
+        - $ref: "#/components/parameters/Limit"
+        - name: cursor
+          in: query
+          schema:
+            $ref: "#/components/schemas/Cursor"
+        - name: allowPartial
+          in: query
+          schema:
+            type: boolean
+            default: false
+      responses:
+        "200":
+          description: Ordered blocks and explicit requested-range coverage.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BlobBlockPage"
+        "409":
+          description: The range contains unindexed gaps.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorBody"
+        default:
+          $ref: "#/components/responses/Error"
+  /v1/q/blobs/blocks/{number}:
+    parameters:
+      - name: number
+        in: path
+        required: true
+        schema:
+          $ref: "#/components/schemas/SafeInteger"
+    get:
+      summary: Read an indexed blob block
+      operationId: getBlobBlock
+      responses:
+        "200":
+          description: One indexed blob block.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BlobBlock"
+        default:
+          $ref: "#/components/responses/Error"
+  /v1/q/blobs/snapshot:
+    get:
+      summary: Read an atomic blob block snapshot
+      operationId: listBlobSnapshot
+      parameters:
+        - name: fromBlock
+          in: query
+          required: true
+          schema:
+            $ref: "#/components/schemas/SafeInteger"
+        - name: toBlock
+          in: query
+          required: true
+          schema:
+            $ref: "#/components/schemas/SafeInteger"
+        - $ref: "#/components/parameters/Limit"
+        - name: cursor
+          in: query
+          schema:
+            $ref: "#/components/schemas/Cursor"
+        - name: allowPartial
+          in: query
+          schema:
+            type: boolean
+            default: false
+      responses:
+        "200":
+          description: |
+            Ordered blob blocks with their complete blob-transaction children,
+            suitable for bulk materialized-view bootstrapping.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BlobSnapshotPage"
+        "409":
+          description: The range contains unindexed gaps.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorBody"
+        default:
+          $ref: "#/components/responses/Error"
+  /v1/q/blobs/transactions:
+    get:
+      summary: List indexed blob transactions
+      operationId: listBlobTransactions
+      parameters:
+        - name: blockNumber
+          in: query
+          required: true
+          schema:
+            $ref: "#/components/schemas/SafeInteger"
+        - $ref: "#/components/parameters/Limit"
+        - name: cursor
+          in: query
+          schema:
+            $ref: "#/components/schemas/Cursor"
+      responses:
+        "200":
+          description: Blob transactions in canonical transaction order.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BlobTransactionPage"
+        default:
+          $ref: "#/components/responses/Error"
+  /v1/q/blobs/transactions/{hash}:
+    parameters:
+      - name: hash
+        in: path
+        required: true
+        schema:
+          $ref: "#/components/schemas/Hash32"
+    get:
+      summary: Read an indexed blob transaction
+      operationId: getBlobTransaction
+      responses:
+        "200":
+          description: One indexed blob transaction.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BlobTransaction"
+        default:
+          $ref: "#/components/responses/Error"
+  /v1/q/blobs/schedule:
+    get:
+      summary: Read the active blob schedule
+      operationId: getBlobSchedule
+      parameters:
+        - name: atBlock
+          in: query
+          schema:
+            $ref: "#/components/schemas/SafeInteger"
+      responses:
+        "200":
+          description: Active known blob schedule entry.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BlobSchedule"
+        default:
+          $ref: "#/components/responses/Error"
+  /v1/q/erc20/balances/{token}/{address}:
+    parameters:
+      - name: token
+        in: path
+        required: true
+        schema:
+          $ref: "#/components/schemas/Address"
+      - name: address
+        in: path
+        required: true
+        schema:
+          $ref: "#/components/schemas/Address"
+    get:
+      summary: Read an indexed ERC-20 balance
+      operationId: getErc20Balance
+      responses:
+        "200":
+          description: Declared event-derived token balance.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Erc20Balance"
+        default:
+          $ref: "#/components/responses/Error"
+  /v1/q/uniswap/pools/{address}:
+    parameters:
+      - name: address
+        in: path
+        required: true
+        schema:
+          $ref: "#/components/schemas/Address"
+    get:
+      summary: Read an indexed Uniswap pool
+      operationId: getUniswapPool
+      responses:
+        "200":
+          description: Latest exact event-derived pool state.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/UniswapPoolPrice"
+        default:
+          $ref: "#/components/responses/Error"
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+  parameters:
+    Processor:
+      name: processor
+      in: path
+      required: true
+      schema:
+        type: string
+        minLength: 1
+    After:
+      name: after
+      in: query
+      description: Opaque cursor of the last fully committed event.
+      schema:
+        $ref: "#/components/schemas/Cursor"
+    Limit:
+      name: limit
+      in: query
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 1000
+        default: 100
+    Collection:
+      name: collection
+      in: path
+      required: true
+      schema:
+        type: string
+        minLength: 1
+    Consumer:
+      name: consumer
+      in: path
+      required: true
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 128
+    ConsumerCredential:
+      name: x-leani-consumer-credential
+      in: header
+      required: false
+      description: |
+        Consumer-scoped credential. An administrator bearer credential can be
+        used instead on the protected listener.
+      schema:
+        type: string
+        minLength: 16
+        maxLength: 512
+    FromBlock:
+      name: fromBlock
+      in: query
+      schema:
+        $ref: "#/components/schemas/SafeInteger"
+    ToBlock:
+      name: toBlock
+      in: query
+      schema:
+        $ref: "#/components/schemas/SafeInteger"
+    FromTimestamp:
+      name: fromTimestamp
+      in: query
+      schema:
+        $ref: "#/components/schemas/SafeInteger"
+    ToTimestamp:
+      name: toTimestamp
+      in: query
+      schema:
+        $ref: "#/components/schemas/SafeInteger"
+  responses:
+    Error:
+      description: Stable machine-readable error.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorBody"
+  schemas:
+    SafeInteger:
+      type: integer
+      minimum: 0
+      maximum: 9007199254740991
+    DecimalQuantity:
+      type: string
+      pattern: "^(0|[1-9][0-9]*)$"
+      examples: ["1000000000000000000"]
+    Hash32:
+      type: string
+      pattern: "^0x[0-9a-f]{64}$"
+    ByteArray32:
+      type: array
+      minItems: 32
+      maxItems: 32
+      items:
+        type: integer
+        minimum: 0
+        maximum: 255
+    Address:
+      type: string
+      pattern: "^0x[0-9a-f]{40}$"
+    Cursor:
+      type: string
+      minLength: 1
+      description: Store-, chain-, and processor-bound opaque value.
+    Finality:
+      type: string
+      enum: [optimistic, safe, finalized]
+    ProcessorSummary:
+      type: object
+      additionalProperties: false
+      required:
+        [id, instance, version, codeHash, configHash, genericApi, changeSchema, queryExtensions, subscriptions, artifactRetention, deliveryOrdering]
+      properties:
+        id:
+          type: string
+        instance:
+          type: string
+        version:
+          type: string
+        codeHash:
+          $ref: "#/components/schemas/Hash32"
+        configHash:
+          $ref: "#/components/schemas/Hash32"
+        genericApi:
+          type: string
+          const: processor-v1
+        changeSchema:
+          type: string
+        queryExtensions:
+          type: array
+          items:
+            $ref: "#/components/schemas/QueryExtensionSummary"
+        subscriptions:
+          type: boolean
+        artifactRetention:
+          type: string
+          enum: [none, window, full]
+        deliveryOrdering:
+          type: string
+          enum: [canonical, block_versioned_idempotent]
+    QueryExtensionSummary:
+      type: object
+      description: A processor-owned typed read contract and its active mounts.
+      additionalProperties: false
+      required: [id, basePath, aliasPath]
+      properties:
+        id:
+          type: string
+        basePath:
+          type: string
+          description: Canonical processor-instance-scoped route prefix.
+        aliasPath:
+          type: [string, "null"]
+          description: Optional unambiguous convenience prefix; null when unavailable.
+    QueryExtensionCapability:
+      type: object
+      description: Flattened query-extension discovery entry.
+      additionalProperties: false
+      required: [processor, id, basePath, aliasPath]
+      properties:
+        processor:
+          type: string
+        id:
+          type: string
+        basePath:
+          type: string
+        aliasPath:
+          type: [string, "null"]
+    Capabilities:
+      type: object
+      additionalProperties: false
+      required: [chainId, ethereumRpc, processors, queryExtensions]
+      properties:
+        chainId:
+          $ref: "#/components/schemas/SafeInteger"
+        ethereumRpc:
+          type: object
+          additionalProperties: true
+        processors:
+          type: array
+          items:
+            $ref: "#/components/schemas/ProcessorSummary"
+        queryExtensions:
+          type: array
+          items:
+            $ref: "#/components/schemas/QueryExtensionCapability"
+    NodeStatus:
+      type: object
+      additionalProperties: false
+      required:
+        [apiVersion, project, version, chainId, uptimeSeconds, databaseBytes, processor, processors, readiness]
+      properties:
+        apiVersion:
+          const: "1"
+        project:
+          type: string
+        version:
+          type: string
+        chainId:
+          $ref: "#/components/schemas/SafeInteger"
+        uptimeSeconds:
+          $ref: "#/components/schemas/SafeInteger"
+        databaseBytes:
+          $ref: "#/components/schemas/SafeInteger"
+        processor:
+          $ref: "#/components/schemas/ProcessorSummary"
+        processors:
+          type: array
+          items:
+            $ref: "#/components/schemas/ProcessorSummary"
+        readiness:
+          $ref: "#/components/schemas/Readiness"
+    Readiness:
+      type: object
+      additionalProperties: false
+      required: [liveRequired, liveReady, finalityRequired, finalityReady, ready]
+      properties:
+        liveRequired:
+          type: boolean
+        liveReady:
+          type: boolean
+        finalityRequired:
+          type: boolean
+        finalityReady:
+          type: boolean
+        ready:
+          type: boolean
+    Health:
+      type: object
+      additionalProperties: false
+      required: [status, uptimeSeconds, database, readiness, reasons]
+      properties:
+        status:
+          type: string
+          enum: [live, ready, not_ready, failed]
+        uptimeSeconds:
+          $ref: "#/components/schemas/SafeInteger"
+        database:
+          type: string
+          enum: [available, unavailable]
+        readiness:
+          $ref: "#/components/schemas/Readiness"
+        reasons:
+          type: array
+          items:
+            type: string
+    CoverageInterval:
+      type: object
+      additionalProperties: false
+      required: [fromBlock, toBlock, finality]
+      properties:
+        fromBlock:
+          $ref: "#/components/schemas/SafeInteger"
+        toBlock:
+          $ref: "#/components/schemas/SafeInteger"
+        finality:
+          $ref: "#/components/schemas/Finality"
+    RequestedRange:
+      type: object
+      additionalProperties: false
+      required: [fromBlock, toBlock]
+      properties:
+        fromBlock:
+          $ref: "#/components/schemas/SafeInteger"
+        toBlock:
+          $ref: "#/components/schemas/SafeInteger"
+    ProcessorCoverage:
+      type: object
+      additionalProperties: false
+      required:
+        [chainId, chainFinalizedHead, available, configuredStartBlock, processedThrough, finalizedThrough, complete, state]
+      properties:
+        chainId:
+          $ref: "#/components/schemas/SafeInteger"
+        chainFinalizedHead:
+          oneOf:
+            - $ref: "#/components/schemas/ChainFinalizedHead"
+            - type: "null"
+        requested:
+          oneOf:
+            - $ref: "#/components/schemas/RequestedRange"
+            - type: "null"
+        available:
+          type: array
+          items:
+            $ref: "#/components/schemas/CoverageInterval"
+        configuredStartBlock:
+          $ref: "#/components/schemas/SafeInteger"
+        processedThrough:
+          oneOf:
+            - $ref: "#/components/schemas/SafeInteger"
+            - type: "null"
+        finalizedThrough:
+          oneOf:
+            - $ref: "#/components/schemas/SafeInteger"
+            - type: "null"
+        complete:
+          type: boolean
+        state:
+          type: string
+          enum: [starting, backfilling, catching_up, live, degraded, failed]
+    ChainFinalizedHead:
+      type: object
+      additionalProperties: false
+      required: [number, hash]
+      properties:
+        number:
+          $ref: "#/components/schemas/SafeInteger"
+        hash:
+          $ref: "#/components/schemas/Hash32"
+    OutputCollections:
+      type: object
+      additionalProperties: false
+      required: [processor, outputMode, retained, data]
+      properties:
+        processor:
+          $ref: "#/components/schemas/ProcessorSummary"
+        outputMode:
+          type: string
+          enum: [none, latest, window, full]
+        retained:
+          type: boolean
+        data:
+          type: array
+          items:
+            type: string
+    OutputQuery:
+      type: object
+      additionalProperties: false
+      properties:
+        fromBlock:
+          $ref: "#/components/schemas/SafeInteger"
+        toBlock:
+          $ref: "#/components/schemas/SafeInteger"
+        fromTimestamp:
+          $ref: "#/components/schemas/SafeInteger"
+        toTimestamp:
+          $ref: "#/components/schemas/SafeInteger"
+        limit:
+          type: integer
+          minimum: 1
+          maximum: 1000
+    OutputBounds:
+      type: object
+      additionalProperties: false
+      required:
+        [earliestBlock, latestBlock, earliestTimestamp, latestTimestamp]
+      properties:
+        earliestBlock:
+          $ref: "#/components/schemas/SafeInteger"
+        latestBlock:
+          $ref: "#/components/schemas/SafeInteger"
+        earliestTimestamp:
+          $ref: "#/components/schemas/SafeInteger"
+        latestTimestamp:
+          $ref: "#/components/schemas/SafeInteger"
+    GenericOutputEntity:
+      type: object
+      additionalProperties: false
+      required:
+        [ordinal, key, schema, data, blockNumber, blockTimestamp, finality]
+      properties:
+        ordinal:
+          $ref: "#/components/schemas/DecimalQuantity"
+        key:
+          type: string
+          pattern: "^0x[0-9a-f]*$"
+        schema:
+          type: string
+        data: {}
+        blockNumber:
+          $ref: "#/components/schemas/SafeInteger"
+        blockTimestamp:
+          $ref: "#/components/schemas/SafeInteger"
+        finality:
+          $ref: "#/components/schemas/Finality"
+    GenericSnapshotPage:
+      type: object
+      additionalProperties: false
+      required:
+        [data, nextCursor, snapshotId, boundaryCursor, rowCount, valueBytes, expiresAtUnixMs, retainedBounds, coverage, recovery]
+      properties:
+        data:
+          type: array
+          items:
+            $ref: "#/components/schemas/GenericOutputEntity"
+        nextCursor:
+          oneOf:
+            - $ref: "#/components/schemas/Cursor"
+            - type: "null"
+        snapshotId:
+          type: string
+          pattern: "^[0-9a-f]{32}$"
+        boundaryCursor:
+          $ref: "#/components/schemas/Cursor"
+        rowCount:
+          $ref: "#/components/schemas/DecimalQuantity"
+        valueBytes:
+          $ref: "#/components/schemas/DecimalQuantity"
+        expiresAtUnixMs:
+          $ref: "#/components/schemas/DecimalQuantity"
+        retainedBounds:
+          oneOf:
+            - $ref: "#/components/schemas/OutputBounds"
+            - type: "null"
+        coverage:
+          $ref: "#/components/schemas/ProcessorCoverage"
+        recovery:
+          type: object
+          additionalProperties: false
+          required: [follow, outsideRetention]
+          properties:
+            follow:
+              type: string
+            outsideRetention:
+              const: create_processor_instance_or_source_scan
+    CreateConsumer:
+      type: object
+      additionalProperties: false
+      required: [id, role, start, leaseTtlSeconds, credential]
+      properties:
+        id:
+          type: string
+          minLength: 1
+          maxLength: 128
+        role:
+          type: string
+          enum: [required, best_effort]
+        start:
+          oneOf:
+            - type: object
+              additionalProperties: false
+              required: [position]
+              properties:
+                position:
+                  const: earliest_retained
+            - type: object
+              additionalProperties: false
+              required: [position]
+              properties:
+                position:
+                  const: current_head
+            - type: object
+              additionalProperties: false
+              required: [position, cursor]
+              properties:
+                position:
+                  const: cursor
+                cursor:
+                  $ref: "#/components/schemas/Cursor"
+        leaseTtlSeconds:
+          type: integer
+          minimum: 1
+        credential:
+          type: string
+          minLength: 16
+          maxLength: 512
+          writeOnly: true
+    DurableConsumer:
+      type: object
+      additionalProperties: false
+      required:
+        [id, processorInstance, role, state, acknowledgedSequence, deliveredSequence, acknowledgedCursor, deliveredCursor, leaseTtlMs, leaseExpiresAtUnixMs, leaseActive, lagChanges, lagBlocks, lagBytes, lagAgeMs, createdAtUnixMs, updatedAtUnixMs]
+      properties:
+        id:
+          type: string
+        processorInstance:
+          type: string
+        role:
+          type: string
+          enum: [required, best_effort]
+        state:
+          type: string
+          enum: [active, reset_required, revoked]
+        acknowledgedSequence:
+          $ref: "#/components/schemas/DecimalQuantity"
+        deliveredSequence:
+          $ref: "#/components/schemas/DecimalQuantity"
+        acknowledgedCursor:
+          $ref: "#/components/schemas/Cursor"
+        deliveredCursor:
+          $ref: "#/components/schemas/Cursor"
+        leaseTtlMs:
+          $ref: "#/components/schemas/DecimalQuantity"
+        leaseExpiresAtUnixMs:
+          $ref: "#/components/schemas/DecimalQuantity"
+        leaseActive:
+          type: boolean
+        lagChanges:
+          $ref: "#/components/schemas/DecimalQuantity"
+        lagBlocks:
+          $ref: "#/components/schemas/DecimalQuantity"
+        lagBytes:
+          $ref: "#/components/schemas/DecimalQuantity"
+        lagAgeMs:
+          $ref: "#/components/schemas/DecimalQuantity"
+        createdAtUnixMs:
+          $ref: "#/components/schemas/DecimalQuantity"
+        updatedAtUnixMs:
+          $ref: "#/components/schemas/DecimalQuantity"
+    RecoveryCheckpoint:
+      type: object
+      additionalProperties: false
+      required:
+        [checkpointId, processorInstance, blockNumber, blockHash, stateChecksum, stateBytes, createdAtUnixMs]
+      properties:
+        checkpointId:
+          $ref: "#/components/schemas/SafeInteger"
+        processorInstance:
+          type: string
+        blockNumber:
+          $ref: "#/components/schemas/SafeInteger"
+        blockHash:
+          $ref: "#/components/schemas/ByteArray32"
+        stateChecksum:
+          $ref: "#/components/schemas/ByteArray32"
+        stateBytes:
+          $ref: "#/components/schemas/SafeInteger"
+        createdAtUnixMs:
+          $ref: "#/components/schemas/SafeInteger"
+    RecoveryRestore:
+      type: object
+      additionalProperties: false
+      required:
+        [checkpointId, processor, blockNumber, blockHash, finality, sequence]
+      properties:
+        checkpointId:
+          $ref: "#/components/schemas/DecimalQuantity"
+        processor:
+          $ref: "#/components/schemas/ProcessorSummary"
+        blockNumber:
+          $ref: "#/components/schemas/SafeInteger"
+        blockHash:
+          $ref: "#/components/schemas/Hash32"
+        finality:
+          $ref: "#/components/schemas/Finality"
+        sequence:
+          $ref: "#/components/schemas/DecimalQuantity"
+    PortableSavepoint:
+      type: object
+      additionalProperties: false
+      required:
+        [savepointId, processorInstance, blockNumber, blockHash, stateChecksum, stateBytes, createdAtUnixMs]
+      properties:
+        savepointId:
+          type: string
+        processorInstance:
+          type: string
+        blockNumber:
+          $ref: "#/components/schemas/SafeInteger"
+        blockHash:
+          $ref: "#/components/schemas/ByteArray32"
+        stateChecksum:
+          $ref: "#/components/schemas/ByteArray32"
+        stateBytes:
+          $ref: "#/components/schemas/SafeInteger"
+        createdAtUnixMs:
+          $ref: "#/components/schemas/SafeInteger"
+    BlobBlock:
+      type: object
+      additionalProperties: false
+      required:
+        - network
+        - blockNumber
+        - blockHash
+        - parentHash
+        - timestamp
+        - size
+        - blobCount
+        - blobGasUsed
+        - excessBlobGas
+        - blobBaseFee
+        - executionBaseFee
+        - gasUsed
+        - gasLimit
+        - executionEthBurnedWei
+        - blobEthBurnedWei
+        - reserveFeeWei
+        - transactionCount
+        - targetBlobsPerBlock
+        - maxBlobsPerBlock
+        - transformVersion
+        - finality
+      properties:
+        network:
+          type: string
+        blockNumber:
+          $ref: "#/components/schemas/SafeInteger"
+        blockHash:
+          $ref: "#/components/schemas/Hash32"
+        parentHash:
+          $ref: "#/components/schemas/Hash32"
+        timestamp:
+          $ref: "#/components/schemas/SafeInteger"
+        size:
+          $ref: "#/components/schemas/DecimalQuantity"
+        blobCount:
+          $ref: "#/components/schemas/SafeInteger"
+        blobGasUsed:
+          $ref: "#/components/schemas/DecimalQuantity"
+        excessBlobGas:
+          $ref: "#/components/schemas/DecimalQuantity"
+        blobBaseFee:
+          $ref: "#/components/schemas/DecimalQuantity"
+        executionBaseFee:
+          $ref: "#/components/schemas/DecimalQuantity"
+        gasUsed:
+          $ref: "#/components/schemas/DecimalQuantity"
+        gasLimit:
+          $ref: "#/components/schemas/DecimalQuantity"
+        executionEthBurnedWei:
+          $ref: "#/components/schemas/DecimalQuantity"
+        blobEthBurnedWei:
+          $ref: "#/components/schemas/DecimalQuantity"
+        reserveFeeWei:
+          oneOf:
+            - $ref: "#/components/schemas/DecimalQuantity"
+            - type: "null"
+        transactionCount:
+          $ref: "#/components/schemas/SafeInteger"
+        targetBlobsPerBlock:
+          $ref: "#/components/schemas/SafeInteger"
+        maxBlobsPerBlock:
+          $ref: "#/components/schemas/SafeInteger"
+        transformVersion:
+          $ref: "#/components/schemas/SafeInteger"
+        finality:
+          $ref: "#/components/schemas/Finality"
+    BlobTransaction:
+      type: object
+      additionalProperties: false
+      required:
+        [network, blockNumber, blockHash, txHash, transactionIndex, senderAddress, blobVersionedHashes, blobCount, totalBurnedWei, executionBurnedWei, blobBurnedWei]
+      properties:
+        network:
+          type: string
+        blockNumber:
+          $ref: "#/components/schemas/SafeInteger"
+        blockHash:
+          $ref: "#/components/schemas/Hash32"
+        txHash:
+          $ref: "#/components/schemas/Hash32"
+        transactionIndex:
+          $ref: "#/components/schemas/SafeInteger"
+        senderAddress:
+          $ref: "#/components/schemas/Address"
+        blobVersionedHashes:
+          type: array
+          items:
+            $ref: "#/components/schemas/Hash32"
+        blobCount:
+          $ref: "#/components/schemas/SafeInteger"
+        totalBurnedWei:
+          $ref: "#/components/schemas/DecimalQuantity"
+        executionBurnedWei:
+          $ref: "#/components/schemas/DecimalQuantity"
+        blobBurnedWei:
+          $ref: "#/components/schemas/DecimalQuantity"
+    BlobSchedule:
+      type: object
+      additionalProperties: false
+      required:
+        [name, activationBlock, activationTimestamp, forkId, targetBlobsPerBlock, maxBlobsPerBlock, baseFeeUpdateFraction, eip7918, source]
+      properties:
+        name:
+          type: string
+        activationBlock:
+          $ref: "#/components/schemas/SafeInteger"
+        activationTimestamp:
+          $ref: "#/components/schemas/SafeInteger"
+        forkId:
+          type: string
+          pattern: "^0x[0-9a-f]{8}$"
+        targetBlobsPerBlock:
+          $ref: "#/components/schemas/SafeInteger"
+        maxBlobsPerBlock:
+          $ref: "#/components/schemas/SafeInteger"
+        baseFeeUpdateFraction:
+          $ref: "#/components/schemas/DecimalQuantity"
+        eip7918:
+          type: boolean
+        source:
+          type: string
+          enum: [chain_spec, eth_config, configured]
+    Erc20Balance:
+      type: object
+      additionalProperties: false
+      required: [token, address, balance, asOfBlock, blockHash, finality, coverageFrom, complete, method]
+      properties:
+        token:
+          $ref: "#/components/schemas/Address"
+        address:
+          $ref: "#/components/schemas/Address"
+        balance:
+          $ref: "#/components/schemas/DecimalQuantity"
+        asOfBlock:
+          $ref: "#/components/schemas/SafeInteger"
+        blockHash:
+          $ref: "#/components/schemas/Hash32"
+        finality:
+          $ref: "#/components/schemas/Finality"
+        coverageFrom:
+          $ref: "#/components/schemas/SafeInteger"
+        complete:
+          type: boolean
+        method:
+          type: string
+          const: erc20_transfer_ledger
+    UniswapPoolPrice:
+      type: object
+      additionalProperties: false
+      required: [pool, kind, reserve0, reserve1, sqrtPriceX96, blockNumber, blockHash, logIndex, finality]
+      properties:
+        pool:
+          $ref: "#/components/schemas/Address"
+        kind:
+          type: string
+          enum: [v2, v3]
+        reserve0:
+          oneOf:
+            - $ref: "#/components/schemas/DecimalQuantity"
+            - type: "null"
+        reserve1:
+          oneOf:
+            - $ref: "#/components/schemas/DecimalQuantity"
+            - type: "null"
+        sqrtPriceX96:
+          oneOf:
+            - $ref: "#/components/schemas/DecimalQuantity"
+            - type: "null"
+        blockNumber:
+          $ref: "#/components/schemas/SafeInteger"
+        blockHash:
+          $ref: "#/components/schemas/Hash32"
+        logIndex:
+          $ref: "#/components/schemas/SafeInteger"
+        finality:
+          $ref: "#/components/schemas/Finality"
+    ChangeBlock:
+      type: object
+      additionalProperties: false
+      required: [number, hash, parentHash, timestamp]
+      properties:
+        number:
+          $ref: "#/components/schemas/SafeInteger"
+        hash:
+          $ref: "#/components/schemas/Hash32"
+        parentHash:
+          $ref: "#/components/schemas/Hash32"
+        timestamp:
+          $ref: "#/components/schemas/SafeInteger"
+    ChangeEnvelope:
+      type: object
+      additionalProperties: false
+      required:
+        [apiVersion, sequence, cursor, operation, originKind, originId, publicationRevision, chainId, block, finality, kind, schema, key, data, emittedAt]
+      properties:
+        apiVersion:
+          const: "1"
+        sequence:
+          $ref: "#/components/schemas/DecimalQuantity"
+        cursor:
+          $ref: "#/components/schemas/Cursor"
+        operation:
+          type: string
+          enum: [apply, undo, finalized, reset_required]
+        originKind:
+          type: string
+          enum: [live, live_recovery, historical_backfill, recompute]
+          description: Processing lane that produced this publication.
+        originId:
+          type: string
+          description: Durable identity of the live lane, recovery, subscription, or recompute job.
+        publicationRevision:
+          $ref: "#/components/schemas/DecimalQuantity"
+        chainId:
+          $ref: "#/components/schemas/SafeInteger"
+        block:
+          oneOf:
+            - $ref: "#/components/schemas/ChangeBlock"
+            - type: "null"
+        finality:
+          $ref: "#/components/schemas/Finality"
+        kind:
+          type: string
+        schema:
+          type: string
+          description: Versioned processor change schema identifier.
+        key:
+          oneOf:
+            - type: string
+              pattern: "^0x[0-9a-f]*$"
+            - type: "null"
+        data: {}
+        coverage:
+          $ref: "#/components/schemas/ProcessorCoverage"
+          description: Present only on reset_required events.
+        emittedAt:
+          type: string
+          description: Stable emission timestamp.
+    ChangeHead:
+      type: object
+      additionalProperties: false
+      required: [earliestSequence, latestSequence, cursor]
+      properties:
+        earliestSequence:
+          oneOf:
+            - $ref: "#/components/schemas/DecimalQuantity"
+            - type: "null"
+        latestSequence:
+          oneOf:
+            - $ref: "#/components/schemas/DecimalQuantity"
+            - type: "null"
+        cursor:
+          oneOf:
+            - $ref: "#/components/schemas/Cursor"
+            - type: "null"
+    BlobSnapshotEntry:
+      type: object
+      additionalProperties: false
+      required: [block, transactions]
+      properties:
+        block:
+          $ref: "#/components/schemas/BlobBlock"
+        transactions:
+          type: array
+          items:
+            $ref: "#/components/schemas/BlobTransaction"
+    BlobBlockPage:
+      type: object
+      additionalProperties: false
+      required: [data, nextCursor, coverage]
+      properties:
+        data:
+          type: array
+          items:
+            $ref: "#/components/schemas/BlobBlock"
+        nextCursor:
+          oneOf:
+            - $ref: "#/components/schemas/Cursor"
+            - type: "null"
+        coverage:
+          $ref: "#/components/schemas/ProcessorCoverage"
+    BlobTransactionPage:
+      type: object
+      additionalProperties: false
+      required: [data, nextCursor, coverage]
+      properties:
+        data:
+          type: array
+          items:
+            $ref: "#/components/schemas/BlobTransaction"
+        nextCursor:
+          oneOf:
+            - $ref: "#/components/schemas/Cursor"
+            - type: "null"
+        coverage:
+          $ref: "#/components/schemas/ProcessorCoverage"
+    BlobSnapshotPage:
+      type: object
+      additionalProperties: false
+      required: [data, nextCursor, coverage]
+      properties:
+        data:
+          type: array
+          items:
+            $ref: "#/components/schemas/BlobSnapshotEntry"
+        nextCursor:
+          oneOf:
+            - $ref: "#/components/schemas/Cursor"
+            - type: "null"
+        coverage:
+          $ref: "#/components/schemas/ProcessorCoverage"
+    ChangePage:
+      type: object
+      additionalProperties: false
+      required: [data, nextCursor, coverage]
+      properties:
+        data:
+          type: array
+          items:
+            $ref: "#/components/schemas/ChangeEnvelope"
+        nextCursor:
+          oneOf:
+            - $ref: "#/components/schemas/Cursor"
+            - type: "null"
+        coverage:
+          $ref: "#/components/schemas/ProcessorCoverage"
+    ErrorBody:
+      type: object
+      additionalProperties: false
+      required: [error]
+      properties:
+        error:
+          type: object
+          additionalProperties: false
+          required: [code, message, retryable, requestId]
+          properties:
+            code:
+              type: string
+            message:
+              type: string
+            retryable:
+              type: boolean
+            details:
+              oneOf:
+                - type: object
+                  additionalProperties: true
+                - type: "null"
+            requestId:
+              type: string

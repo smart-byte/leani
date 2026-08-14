@@ -1,0 +1,32 @@
+[package]
+name = "leani-custom-example"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+publish = false
+
+[dependencies]
+async-trait.workspace = true
+axum.workspace = true
+blake3.workspace = true
+leani = { path = "../../crates/node" }
+leani-primitives = { path = "../../crates/primitives" }
+leani-processor-api = { path = "../../crates/processor-api" }
+postcard.workspace = true
+semver.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+toml.workspace = true
+
+[dev-dependencies]
+leani-api = { path = "../../crates/api" }
+leani-store-sqlite = { path = "../../crates/store-sqlite" }
+tempfile.workspace = true
+tower.workspace = true
+
+[lints]
+workspace = true

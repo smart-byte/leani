@@ -1,0 +1,66 @@
+{
+  "name": "@leani/sdk",
+  "version": "0.1.0",
+  "description": "Typed Leani queries and resumable live/history delivery",
+  "license": "MIT OR Apache-2.0",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./backfill": {
+      "types": "./dist/backfill.d.ts",
+      "import": "./dist/backfill.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "sideEffects": false,
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/smart-byte/leani.git",
+    "directory": "packages/sdk"
+  },
+  "homepage": "https://github.com/smart-byte/leani/tree/main/packages/sdk#readme",
+  "bugs": {
+    "url": "https://github.com/smart-byte/leani/issues"
+  },
+  "keywords": [
+    "ethereum",
+    "indexing",
+    "leani",
+    "sse"
+  ],
+  "engines": {
+    "node": ">=20",
+    "bun": ">=1.2"
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "openapi:lint": "redocly lint ../../api/openapi.yaml --extends=minimal",
+    "openapi:generate": "openapi-typescript ../../api/openapi.yaml -o src/openapi.generated.ts",
+    "openapi:check": "bun run openapi:lint && bun run openapi:generate && git diff --exit-code -- src/openapi.generated.ts",
+    "test": "bun test",
+    "test:package": "./scripts/smoke-package.sh",
+    "typecheck": "tsc --noEmit",
+    "prepack": "bun run build",
+    "prepublishOnly": "bun run openapi:check && bun run typecheck && bun test && bun run test:package"
+  },
+  "devDependencies": {
+    "@redocly/cli": "2.46.0",
+    "@types/bun": "^1.3.5",
+    "openapi-typescript": "7.13.0",
+    "typescript": "^5.9.3"
+  }
+}

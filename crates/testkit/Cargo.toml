@@ -1,0 +1,27 @@
+[package]
+name = "leani-testkit"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+publish = false
+
+[dependencies]
+alloy-primitives.workspace = true
+async-trait.workspace = true
+blake3.workspace = true
+futures.workspace = true
+hex.workspace = true
+leani-primitives = { path = "../primitives" }
+leani-processor-api = { path = "../processor-api" }
+leani-source-api = { path = "../source-api" }
+semver.workspace = true
+serde.workspace = true
+sha2.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+
+[lints]
+workspace = true

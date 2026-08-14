@@ -1,0 +1,45 @@
+services:
+  leani:
+    build:
+      context: .
+    restart: unless-stopped
+    init: true
+    ports:
+      - "127.0.0.1:8080:8080"
+      - "127.0.0.1:8545:8545"
+      - "127.0.0.1:8546:8546"
+    volumes:
+      - leani-data:/var/lib/leani
+      - type: tmpfs
+        target: /tmp/leani
+        tmpfs:
+          size: 536870912
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+
+  benchmark-postgres:
+    image: postgres:17-alpine
+    profiles: ["benchmark"]
+    environment:
+      POSTGRES_DB: leani_benchmark
+      POSTGRES_USER: leani_benchmark
+      POSTGRES_PASSWORD: leani_benchmark
+    ports:
+      - "127.0.0.1:55432:5432"
+    tmpfs:
+      - /var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U leani_benchmark -d leani_benchmark"]
+      interval: 1s
+      timeout: 3s
+      retries: 30
+
+volumes:
+  leani-data:

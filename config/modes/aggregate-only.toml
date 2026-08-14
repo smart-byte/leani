@@ -1,0 +1,81 @@
+config_version = 1
+data_dir = "./data/aggregate-only"
+
+[chain]
+name = "ethereum-mainnet"
+chain_id = 1
+
+[budgets]
+memory_bytes = 536870912
+temporary_disk_bytes = 2147483648
+pending_delta_bytes = 268435456
+recent_raw_soft_bytes = 268435456
+recent_raw_hard_bytes = 536870912
+source_concurrency = 4
+mapper_concurrency = 4
+
+[budgets.delivery]
+maximum_retained_bytes = "1536MiB"
+maximum_history_retained_bytes = "1GiB"
+
+[budgets.store]
+maximum_physical_bytes = "2GiB"
+
+[budgets.artifacts]
+maximum_retained_bytes = "1GiB"
+maximum_pending_bytes = "256MiB"
+
+[[sources.history]]
+id = "xatu"
+kind = "xatu"
+priority = 10
+trust = "trusted_dataset"
+
+[sources.live]
+kind = "disabled"
+minimum_peers = 0
+
+[finality]
+kind = "disabled"
+checkpoint = ""
+
+[[processors]]
+id = "transaction-stats"
+instance = "treasury-flow-total"
+version = "1.0.0"
+history_control = "node_owned"
+history_mode = "on_demand"
+start_block = 15537394
+publish = "finalized_only"
+
+[processors.state]
+mode = "checkpointed"
+
+[processors.output]
+mode = "latest"
+
+[processors.delivery]
+mode = "none"
+
+[processors.checkpoint]
+mode = "automatic"
+keep = 3
+
+[processors.undo]
+mode = "none"
+safety_blocks = 0
+
+[processors.settings]
+from = "0x1111111111111111111111111111111111111111"
+to = "0x2222222222222222222222222222222222222222"
+complete_from_start = true
+
+[rpc]
+http_bind = "127.0.0.1:8545"
+ws_bind = "127.0.0.1:8546"
+historical_mode = "on_demand"
+transaction_locator = false
+minimum_recent_blocks = 128
+
+[api]
+bind = "127.0.0.1:8080"

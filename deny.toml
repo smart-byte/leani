@@ -1,0 +1,68 @@
+[graph]
+all-features = true
+
+[advisories]
+ignore = [
+  # Transitive dependencies owned by the pinned Reth networking stack. They are
+  # unmaintained notices, not known vulnerabilities; revisit on every Reth bump.
+  { id = "RUSTSEC-2023-0089", reason = "atomic-polyfill is inherited through Reth-era dependencies" },
+  { id = "RUSTSEC-2024-0436", reason = "paste is inherited through the pinned Reth networking graph" },
+  { id = "RUSTSEC-2026-0173", reason = "proc-macro-error2 is inherited through Reth's aquamarine dependency" },
+  { id = "RUSTSEC-2026-0247", reason = "bitmaps is inherited through Reth's imbl transaction-pool dependency" },
+  # object_store 0.13 is the newest version compatible with Parquet 59. Leani's
+  # read-only Xatu adapter invokes only HEAD/range GET; it never invokes the
+  # WebDAV/cloud XML list and credential parsers that reach these code paths.
+  { id = "RUSTSEC-2026-0194", reason = "quick-xml parser is compiled by object_store but unreachable from Leani's HEAD/range-GET-only adapter" },
+  { id = "RUSTSEC-2026-0195", reason = "quick-xml NsReader is compiled by object_store but unreachable from Leani's HEAD/range-GET-only adapter" },
+]
+
+[licenses]
+confidence-threshold = 0.8
+allow = [
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "MIT",
+  "Unicode-3.0",
+  "Zlib",
+]
+exceptions = [
+  { allow = ["CC0-1.0"], crate = "aurora-engine-modexp" },
+  { allow = ["CC0-1.0"], crate = "secp256k1" },
+  { allow = ["CC0-1.0"], crate = "secp256k1-sys" },
+  { allow = ["CC0-1.0"], crate = "tiny-keccak" },
+  { allow = ["CDLA-Permissive-2.0"], crate = "webpki-root-certs" },
+  { allow = ["CDLA-Permissive-2.0"], crate = "webpki-roots" },
+  { allow = ["MPL-2.0"], crate = "bitmaps" },
+  { allow = ["MPL-2.0"], crate = "imbl" },
+  { allow = ["MPL-2.0"], crate = "imbl-sized-chunks" },
+]
+
+[licenses.private]
+ignore = true
+
+[[licenses.clarify]]
+crate = "helios-consensus-core"
+expression = "MIT"
+license-files = [
+  { path = "../../LICENSE", hash = 0 },
+]
+
+[bans]
+multiple-versions = "warn"
+# Workspace path dependencies intentionally omit versions because every local
+# crate is private and released as one binary. Cargo.lock remains mandatory.
+wildcards = "allow"
+highlight = "all"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = [
+  "https://github.com/a16z/helios",
+  "https://github.com/paradigmxyz/reth",
+  "https://github.com/sigp/discv5",
+]

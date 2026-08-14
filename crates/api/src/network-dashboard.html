@@ -1,0 +1,620 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <link rel="icon" href="data:,">
+  <title>leani network</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #090b10;
+      --panel: #11151d;
+      --panel-2: #171c26;
+      --line: #283141;
+      --text: #eef2f8;
+      --muted: #8f9bad;
+      --good: #4ade80;
+      --warn: #fbbf24;
+      --bad: #fb7185;
+      --accent: #7dd3fc;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background:
+        radial-gradient(circle at 15% -10%, #18334a 0, transparent 32rem),
+        var(--bg);
+      color: var(--text);
+      font: 14px/1.45 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+    }
+    main { width: min(1400px, calc(100% - 32px)); margin: 0 auto; padding: 32px 0 56px; }
+    header { display: flex; align-items: flex-start; justify-content: space-between; gap: 24px; margin-bottom: 24px; }
+    h1 { margin: 0 0 6px; font-size: clamp(22px, 4vw, 34px); letter-spacing: -.04em; }
+    h2 { margin: 0 0 14px; font-size: 14px; color: var(--muted); font-weight: 600; text-transform: uppercase; letter-spacing: .08em; }
+    p { margin: 0; color: var(--muted); }
+    button {
+      border: 1px solid var(--line); border-radius: 8px; padding: 8px 12px;
+      color: var(--text); background: var(--panel); font: inherit; cursor: pointer;
+    }
+    button:hover { border-color: var(--accent); }
+    .grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; margin-bottom: 24px; }
+    .card, section { border: 1px solid var(--line); border-radius: 12px; background: color-mix(in srgb, var(--panel) 94%, transparent); }
+    .card { padding: 16px; min-height: 104px; }
+    .label { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .07em; }
+    .value { display: block; margin-top: 10px; font-size: 24px; font-weight: 700; letter-spacing: -.04em; }
+    .subvalue { display: block; margin-top: 5px; color: var(--muted); font-size: 11px; }
+    .request-card { grid-column: span 3; }
+    .label-row { position: relative; display: flex; align-items: center; gap: 7px; width: fit-content; }
+    .info-badge {
+      display: inline-grid; place-items: center; width: 17px; height: 17px; padding: 0;
+      border: 1px solid var(--line); border-radius: 50%; color: var(--muted);
+      background: var(--panel-2); font-size: 11px; line-height: 1; cursor: help;
+    }
+    .info-badge:hover, .info-badge:focus-visible { border-color: var(--accent); color: var(--accent); outline: none; }
+    .info-tooltip {
+      position: absolute; z-index: 10; top: 25px; left: 0;
+      width: min(430px, calc(100vw - 48px)); padding: 10px 12px;
+      border: 1px solid var(--line); border-radius: 8px;
+      color: var(--text); background: #090d14; box-shadow: 0 12px 30px #0009;
+      font-size: 12px; line-height: 1.5; text-transform: none; letter-spacing: 0;
+      opacity: 0; visibility: hidden; transform: translateY(-3px);
+      transition: opacity .12s ease, transform .12s ease, visibility .12s;
+    }
+    .info-badge:hover + .info-tooltip,
+    .info-badge:focus + .info-tooltip {
+      opacity: 1; visibility: visible; transform: translateY(0);
+    }
+    .request-breakdown { display: flex; flex-wrap: wrap; gap: 8px 22px; margin-top: 7px; color: var(--muted); font-size: 12px; }
+    .request-breakdown strong { margin-right: 4px; font-size: 14px; }
+    .half-card { grid-column: span 2; }
+    .peer-card { grid-column: span 4; }
+    .peer-reasons { display: flex; flex-wrap: wrap; gap: 6px 14px; margin-top: 7px; color: var(--muted); font-size: 11px; }
+    .notice { display: flex; align-items: flex-start; gap: 11px; margin-bottom: 24px; padding: 14px 16px; border: 1px solid var(--line); border-radius: 10px; background: var(--panel); }
+    .notice .dot { flex: 0 0 auto; margin-top: 6px; }
+    .notice strong { display: block; margin-bottom: 3px; }
+    .notice p { line-height: 1.5; }
+    section { margin-top: 14px; padding: 18px; overflow: hidden; }
+    .pill { display: inline-flex; align-items: center; gap: 7px; border: 1px solid var(--line); border-radius: 999px; padding: 5px 9px; color: var(--muted); }
+    .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); box-shadow: 0 0 12px currentColor; }
+    .good { color: var(--good); } .good .dot { background: var(--good); }
+    .warn { color: var(--warn); } .warn .dot { background: var(--warn); }
+    .bad { color: var(--bad); } .bad .dot { background: var(--bad); }
+    .status-row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 12px; }
+    .table-wrap { overflow-x: auto; margin: 0 -18px -18px; }
+    table { width: 100%; border-collapse: collapse; min-width: 920px; }
+    th, td { padding: 11px 18px; border-top: 1px solid var(--line); text-align: left; white-space: nowrap; }
+    th { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .06em; background: var(--panel-2); }
+    tr.inactive { opacity: .55; }
+    code { color: var(--accent); }
+    .error { max-width: 420px; overflow: hidden; text-overflow: ellipsis; color: var(--bad); }
+    .history-table { min-width: 1420px; }
+    .history-job { max-width: 260px; overflow: hidden; text-overflow: ellipsis; }
+    .history-source { display: grid; gap: 2px; }
+    .history-source small { color: var(--muted); }
+    .coverage { display: grid; gap: 10px; }
+    .section-note { margin: -6px 0 14px; font-size: 12px; }
+    .processor { padding: 13px; border: 1px solid var(--line); border-radius: 9px; background: var(--panel-2); }
+    .processor-head { display: flex; justify-content: space-between; gap: 16px; margin-bottom: 8px; }
+    .intervals { display: flex; flex-wrap: wrap; gap: 7px; }
+    .interval { border-radius: 6px; background: #0c1119; padding: 5px 8px; color: var(--muted); }
+    .missing-ranges { display: flex; flex-wrap: wrap; gap: 7px; margin-top: 8px; }
+    .missing-range { border: 1px solid color-mix(in srgb, var(--warn) 32%, transparent); border-radius: 6px; background: color-mix(in srgb, var(--warn) 7%, #0c1119); padding: 5px 8px; color: var(--warn); }
+    .processor-detail { display: flex; flex-wrap: wrap; gap: 8px 18px; margin-top: 10px; color: var(--muted); font-size: 12px; }
+    footer { margin-top: 18px; color: var(--muted); font-size: 12px; }
+    @media (max-width: 900px) { .grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } .half-card, .request-card { grid-column: span 1; } .peer-card { grid-column: span 2; } header { display: block; } header button { margin-top: 16px; } }
+    @media (max-width: 520px) { main { width: min(100% - 20px, 1400px); padding-top: 20px; } .grid { grid-template-columns: 1fr; } .half-card, .peer-card { grid-column: span 1; } }
+  </style>
+</head>
+<body>
+<main>
+  <header>
+    <div>
+      <h1>leani network</h1>
+      <p id="updated">Waiting for the first status sample…</p>
+      <div class="status-row" id="readiness"></div>
+    </div>
+    <button id="toggle">Pause updates</button>
+  </header>
+
+  <div class="grid">
+    <div class="card">
+      <span class="label">Blocks remaining</span>
+      <strong class="value" id="blocks-remaining">—</strong>
+      <span class="subvalue" id="blocks-detail">Waiting for a catch-up target</span>
+    </div>
+    <div class="card">
+      <span class="label">Database size</span>
+      <strong class="value" id="database-size">—</strong>
+      <span class="subvalue" id="database-detail">Main database + write-ahead log</span>
+    </div>
+    <div class="card">
+      <div class="label-row">
+        <span class="label">Apply throughput</span>
+        <button class="info-badge" id="apply-throughput-info" type="button" aria-label="What does apply throughput measure?" aria-describedby="apply-throughput-help">?</button>
+        <span class="info-tooltip" id="apply-throughput-help" role="tooltip">Blocks committed into the local store from all lanes, including live P2P and historical catch-up. This is processing throughput, not network download throughput.</span>
+      </div>
+      <strong class="value" id="block-throughput">—</strong>
+      <span class="subvalue">Rolling 30-second committed-block rate · live + history</span>
+    </div>
+    <div class="card">
+      <span class="label">Storage growth</span>
+      <strong class="value" id="storage-throughput">—</strong>
+      <span class="subvalue">Rolling 30-second net on-disk rate</span>
+    </div>
+  </div>
+
+  <div class="grid">
+    <div class="card half-card">
+      <span class="label">Latest history processing</span>
+      <strong class="value" id="history-block-throughput">—</strong>
+      <span class="subvalue" id="history-block-detail">Waiting for a completed historical job</span>
+    </div>
+    <div class="card half-card">
+      <div class="label-row">
+        <span class="label">Latest history input</span>
+        <button class="info-badge" id="history-input-info" type="button" aria-label="What does history input measure?" aria-describedby="history-input-help">?</button>
+        <span class="info-tooltip" id="history-input-help" role="tooltip">Decoded execution material consumed by the processor, attributed to each archive or P2P source. It excludes HTTP compression, transport framing, and protocol overhead, so it is not an exact wire-byte measurement.</span>
+      </div>
+      <strong class="value" id="history-input-throughput">—</strong>
+      <span class="subvalue" id="history-input-detail">Waiting for a completed historical job</span>
+    </div>
+  </div>
+
+  <div class="grid">
+    <div class="card half-card"><span class="label">Active sessions</span><strong class="value" id="active">—</strong></div>
+    <div class="card half-card"><span class="label">Sync state</span><strong class="value" id="sync-state">—</strong></div>
+  </div>
+
+  <div class="grid">
+    <div class="card request-card">
+      <div class="label-row">
+        <span class="label">Material requests</span>
+        <button class="info-badge" id="material-requests-info" type="button" aria-label="What counts as a material request?" aria-describedby="material-requests-help">?</button>
+        <span class="info-tooltip" id="material-requests-help" role="tooltip">Outbound P2P requests for block bodies and transaction receipts. Header fetching, peer discovery, and API requests are excluded. The count includes every attempt since process start, including retries.</span>
+      </div>
+      <strong class="value" id="requests">—</strong>
+      <div class="request-breakdown">
+        <span><strong class="good" id="request-success">—</strong>succeeded</span>
+        <span><strong class="warn" id="request-timeout">—</strong>timed out</span>
+        <span><strong class="bad" id="request-failed">—</strong>failed</span>
+      </div>
+    </div>
+    <div class="card"><span class="label">Average local queue wait</span><strong class="value" id="queue-wait">—</strong></div>
+  </div>
+
+  <div class="grid">
+    <div class="card peer-card">
+      <div class="label-row">
+        <span class="label">Peers</span>
+        <button class="info-badge" id="peers-info" type="button" aria-label="What do the peer counts mean?" aria-describedby="peers-help">?</button>
+        <span class="info-tooltip" id="peers-help" role="tooltip">Connected slots are current physical RLPx sessions. One peer is the normal hard floor for starting work; preferred is a non-blocking healthy-pool target, and background dialing continues beyond it up to the maximum outbound limit. Known records are persisted discovery candidates, not active connections. Established and closed are cumulative since process start; closures are grouped by protocol-level reason without exposing peer identities.</span>
+      </div>
+      <strong class="value" id="connected">—</strong>
+      <span class="subvalue" id="peer-connected-detail">connected peer slots</span>
+      <div class="request-breakdown">
+        <span><strong id="known">—</strong>known records</span>
+        <span><strong id="peer-preferred">—</strong>preferred</span>
+        <span><strong id="peer-maximum">—</strong>maximum outbound</span>
+        <span><strong class="good" id="peer-established">—</strong>established</span>
+        <span><strong class="bad" id="peer-closed">—</strong>closed</span>
+      </div>
+      <div class="peer-reasons" id="peer-reasons">No disconnect reasons observed.</div>
+    </div>
+  </div>
+
+  <div class="notice warn" id="sync-summary">
+    <span class="dot"></span>
+    <div><strong>Waiting for sync status</strong><p>The first network sample has not arrived yet.</p></div>
+  </div>
+
+  <section>
+    <h2>Stored processor coverage</h2>
+    <p class="section-note">For automatic history, “contiguous” covers the configured start through the indexed cursor. For on-demand history, it covers active requested ranges (or the current live suffix when idle). It does not by itself imply live readiness.</p>
+    <div class="coverage" id="coverage"></div>
+  </section>
+
+  <section>
+    <h2>Historical catch-up log</h2>
+    <p class="section-note">Each completed job records which source types contributed, their attempts and failures, processing rate, and normalized execution-material input. Input excludes transport framing and compression overhead.</p>
+    <div class="table-wrap">
+      <table class="history-table">
+        <thead><tr><th>Updated</th><th>Job</th><th>Processor</th><th>Range</th><th>State</th><th>Source / type</th><th>Attempts</th><th>Frames</th><th>Input</th><th>Duration</th><th>Frames/s</th><th>Input/s</th><th>Last error</th></tr></thead>
+        <tbody id="history-jobs"></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section>
+    <h2>Active and recent P2P sessions</h2>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>ID</th><th>Lane</th><th>Phase</th><th>Peers</th><th>Known</th><th>Observed head</th><th>Work range</th><th>Attempts</th><th>Age</th><th>Last error</th></tr></thead>
+        <tbody id="sessions"></tbody>
+      </table>
+    </div>
+  </section>
+
+  <footer>
+    Live, history, and probes share one persistent execution P2P manager. Request queue wait is local scheduling time before a material request is dispatched; it is separate from peer response latency.
+  </footer>
+</main>
+<script>
+  const number = new Intl.NumberFormat("en-US");
+  const decimal = new Intl.NumberFormat("en-US", { maximumFractionDigits: 1 });
+  const rateWindowMilliseconds = 30_000;
+  let throughputSamples = [];
+  let running = true;
+  const el = id => document.getElementById(id);
+  const fmt = value => value == null ? "—" : number.format(value);
+  const fmtDuration = milliseconds => {
+    if (milliseconds == null) return "—";
+    const value = Number(milliseconds);
+    if (value < 1000) return `${fmt(value)}ms`;
+    if (value < 60_000) return `${decimal.format(value / 1000)}s`;
+    return `${decimal.format(value / 60_000)}m`;
+  };
+  const fmtBytes = value => {
+    if (value == null) return "—";
+    const units = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let scaled = Math.abs(Number(value));
+    let unit = 0;
+    while (scaled >= 1024 && unit < units.length - 1) {
+      scaled /= 1024;
+      unit += 1;
+    }
+    const digits = scaled >= 100 || unit === 0 ? 0 : scaled >= 10 ? 1 : 2;
+    return `${scaled.toFixed(digits)} ${units[unit]}`;
+  };
+  const esc = value => String(value ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[c]));
+  const pill = (label, ok) => `<span class="pill ${ok ? "good" : "bad"}"><span class="dot"></span>${esc(label)}</span>`;
+  const words = value => String(value ?? "").replaceAll("_", " ");
+
+  function renderNodeMetrics(data, processors) {
+    const remaining = processors
+      .map(processor => processor.blocksRemaining)
+      .filter(value => value != null);
+    const maximumRemaining = remaining.length ? Math.max(...remaining) : null;
+    const rangeCount = processors.reduce(
+      (total, processor) => total + (processor.missingRanges || []).length,
+      0
+    );
+    el("blocks-remaining").textContent = fmt(maximumRemaining);
+    el("blocks-remaining").className = `value ${maximumRemaining > 0 ? "warn" : maximumRemaining === 0 ? "good" : ""}`;
+    el("blocks-detail").textContent = maximumRemaining == null
+      ? "Waiting for a catch-up target"
+      : maximumRemaining === 0
+        ? "Observed catch-up range is fully covered"
+        : `${fmt(rangeCount)} missing range${rangeCount === 1 ? "" : "s"} across ${fmt(processors.length)} processor${processors.length === 1 ? "" : "s"}`;
+
+    const storage = data.storage || {};
+    el("database-size").textContent = fmtBytes(storage.totalOnDiskBytes);
+    el("database-detail").textContent = storage.totalOnDiskBytes == null
+      ? "Storage metrics unavailable"
+      : `DB ${fmtBytes(storage.physicalFileBytes)} · WAL ${fmtBytes(storage.walBytes)} · artifact segments ${fmtBytes(storage.artifactSegmentBytes)} · reusable ${fmtBytes(storage.freelistBytes)}`;
+
+    if (storage.appliedBlocks == null || storage.totalOnDiskBytes == null) {
+      el("block-throughput").textContent = "—";
+      el("storage-throughput").textContent = "—";
+      return;
+    }
+    const sample = {
+      at: Date.now(),
+      appliedBlocks: Number(storage.appliedBlocks),
+      totalOnDiskBytes: Number(storage.totalOnDiskBytes)
+    };
+    const previous = throughputSamples.at(-1);
+    if (previous && sample.appliedBlocks < previous.appliedBlocks) {
+      throughputSamples = [];
+    }
+    throughputSamples.push(sample);
+    throughputSamples = throughputSamples.filter(
+      candidate => candidate.at >= sample.at - rateWindowMilliseconds
+    );
+    const first = throughputSamples[0];
+    const elapsedSeconds = (sample.at - first.at) / 1000;
+    if (elapsedSeconds < 1) {
+      el("block-throughput").textContent = "sampling…";
+      el("storage-throughput").textContent = "sampling…";
+      return;
+    }
+    const blockRate = Math.max(0, sample.appliedBlocks - first.appliedBlocks) / elapsedSeconds;
+    const storageRate = (sample.totalOnDiskBytes - first.totalOnDiskBytes) / elapsedSeconds;
+    el("block-throughput").textContent = `${decimal.format(blockRate)} blocks/s`;
+    const storageSign = storageRate > 0 ? "+" : storageRate < 0 ? "−" : "";
+    el("storage-throughput").textContent = `${storageSign}${fmtBytes(storageRate)}/s`;
+  }
+
+  function renderSyncSummary(data, processors) {
+    const summary = el("sync-summary");
+    const remaining = processors
+      .map(processor => processor.blocksRemaining)
+      .filter(value => value != null);
+    const maximumRemaining = remaining.length ? Math.max(...remaining) : null;
+    const withGaps = processors.filter(processor =>
+      processor.coverage.processedThrough != null && !processor.storedRangeContiguous
+    );
+    const activeLive = (data.network.sessions || []).find(session => session.active && session.lane === "live");
+    const supervisor = data.network.supervisor || { state: "idle" };
+
+    let tone = "warn";
+    let title = "Catching up";
+    let detail = "The node has not reached live readiness yet.";
+    let syncState = "catching up";
+    if (supervisor.state === "backing_off") {
+      tone = "bad";
+      const retry = supervisor.retryInSeconds == null
+        ? "soon"
+        : `in ${fmt(supervisor.retryInSeconds)}s`;
+      title = `Network lane failed; retrying ${retry}`;
+      detail = supervisor.lastError || "The required live/finality lane exited unexpectedly.";
+      syncState = "retrying";
+    } else if (supervisor.state === "stopped" && (data.readiness.liveRequired || data.readiness.finalityRequired)) {
+      tone = "bad";
+      title = "Network supervisor stopped";
+      detail = supervisor.lastError || "The required network lane is not running.";
+      syncState = "stopped";
+    } else if (withGaps.length) {
+      tone = data.readiness.liveReady ? "warn" : "bad";
+      const activity = data.readiness.liveReady
+        ? "Following the live head while backfilling gaps"
+        : "Backfilling stored gaps";
+      title = maximumRemaining == null
+        ? activity
+        : `${activity} · ${fmt(maximumRemaining)} block${maximumRemaining === 1 ? "" : "s"} remaining`;
+      detail = `${withGaps.length} processor${withGaps.length === 1 ? "" : "s"} still contain missing blocks in their catch-up range.`
+        + (data.readiness.liveReady ? " The verified live subscription is usable in parallel." : "");
+      syncState = data.readiness.liveReady ? "live + backfill" : "gaps present";
+    } else if (data.readiness.finalityRequired && !data.readiness.finalityReady) {
+      title = "Waiting for verified finality";
+      detail = "The execution live lane cannot start until an independently verified finality anchor is available.";
+      syncState = "finality wait";
+    } else if (maximumRemaining != null && maximumRemaining > 0) {
+      const target = processors.find(processor => processor.syncTargetBlock != null)?.syncTargetBlock;
+      title = `${fmt(maximumRemaining)} block${maximumRemaining === 1 ? "" : "s"} missing through the observed peer head`;
+      detail = `Stored data is contiguous so far, but coverage has not reached observed peer head ${fmt(target)}.`
+        + (activeLive ? ` The live session is ${words(activeLive.phase)}.` : "");
+      syncState = `${fmt(maximumRemaining)} behind`;
+    } else if (data.readiness.ready) {
+      tone = "good";
+      title = "Live-ready";
+      detail = "Stored processor data is contiguous through the latest observed peer head and the verified live subscription is usable.";
+      syncState = "live";
+    } else if (activeLive) {
+      title = "Completing the live handoff";
+      detail = `Stored data is contiguous through the latest observed peer head. The live session is still ${words(activeLive.phase)}, so readiness remains false.`;
+      syncState = "handoff";
+    } else if (supervisor.state === "running") {
+      title = "Starting the required network lane";
+      detail = "The supervisor is running, but no active execution P2P session is registered yet.";
+      syncState = "starting";
+    }
+
+    summary.className = `notice ${tone}`;
+    summary.innerHTML = `<span class="dot"></span><div><strong>${esc(title)}</strong><p>${esc(detail)}</p></div>`;
+    el("sync-state").textContent = syncState;
+    el("sync-state").className = `value ${tone}`;
+  }
+
+  function renderHistory(data) {
+    const jobs = data.history?.jobs || [];
+    const latest = jobs.find(job => job.state === "completed" && job.report);
+    if (latest) {
+      const report = latest.report;
+      const elapsedSeconds = Number(report.elapsedMilliseconds) / 1000;
+      const frameRate = elapsedSeconds > 0 ? Number(report.framesMapped) / elapsedSeconds : null;
+      const inputRate = elapsedSeconds > 0 ? Number(report.sourceBytes) / elapsedSeconds : null;
+      const sourceTypes = [...new Set((report.sources || []).map(source => words(source.sourceKind)))];
+      const sourceSummary = sourceTypes.length ? sourceTypes.join(", ") : "no source input required";
+      el("history-block-throughput").textContent = frameRate == null
+        ? "—"
+        : `${decimal.format(frameRate)} frames/s`;
+      el("history-block-detail").textContent =
+        `${fmt(report.framesMapped)} mapped · ${fmt(report.framesCommitted)} committed · ${fmtDuration(report.elapsedMilliseconds)} · ${sourceSummary}`;
+      el("history-input-throughput").textContent = inputRate == null
+        ? "—"
+        : `${fmtBytes(inputRate)}/s`;
+      el("history-input-detail").textContent =
+        `${fmtBytes(report.sourceBytes)} normalized material · ${fmt(report.sourceAttempts)} source attempt${report.sourceAttempts === 1 ? "" : "s"}`;
+    } else {
+      el("history-block-throughput").textContent = "—";
+      el("history-block-detail").textContent = "Waiting for a completed historical job";
+      el("history-input-throughput").textContent = "—";
+      el("history-input-detail").textContent = "Waiting for a completed historical job";
+    }
+
+    const rows = jobs.flatMap(job => {
+      const report = job.report;
+      const sources = report?.sources?.length ? report.sources : [null];
+      return sources.map(source => {
+        const elapsed = source?.elapsedMilliseconds ?? report?.elapsedMilliseconds;
+        const elapsedSeconds = Number(elapsed) / 1000;
+        const frameRate = source && elapsedSeconds > 0
+          ? Number(source.framesMapped) / elapsedSeconds
+          : null;
+        const inputRate = source && elapsedSeconds > 0
+          ? Number(source.sourceBytes) / elapsedSeconds
+          : null;
+        const tone = job.state === "completed"
+          ? "good"
+          : job.state === "failed" || job.state === "cancelled"
+            ? "bad"
+            : "warn";
+        const error = source?.lastError || job.lastError || "";
+        return `<tr>
+          <td>${new Date(job.updatedAtUnixMs).toLocaleString()}</td>
+          <td class="history-job" title="${esc(job.id)}"><code>${esc(job.id)}</code></td>
+          <td>${esc(job.processor)}</td>
+          <td>${fmt(job.fromBlock)} → ${fmt(job.toBlock)}</td>
+          <td class="${tone}">${esc(words(job.state))}</td>
+          <td>${source
+            ? `<span class="history-source"><strong>${esc(source.sourceId)}</strong><small>${esc(words(source.sourceKind))}</small></span>`
+            : "—"}</td>
+          <td>${source ? `${fmt(source.attempts)} · ${fmt(source.failures)} failed` : fmt(job.attempts)}</td>
+          <td>${source ? `${fmt(source.framesMapped)} mapped · ${fmt(source.framesCommitted)} committed` : "—"}</td>
+          <td>${source ? fmtBytes(source.sourceBytes) : report ? fmtBytes(report.sourceBytes) : "—"}</td>
+          <td>${fmtDuration(elapsed)}</td>
+          <td>${frameRate == null ? "—" : decimal.format(frameRate)}</td>
+          <td>${inputRate == null ? "—" : `${fmtBytes(inputRate)}/s`}</td>
+          <td class="error" title="${esc(error)}">${esc(error || "—")}</td>
+        </tr>`;
+      });
+    });
+    el("history-jobs").innerHTML = rows.join("")
+      || `<tr><td colspan="13">No historical jobs have been recorded yet.</td></tr>`;
+  }
+
+  function render(data) {
+    const ready = data.readiness;
+    el("updated").textContent = `Sampled ${new Date(data.observedAtUnixSeconds * 1000).toLocaleTimeString()} · refreshing every 2 seconds`;
+    el("readiness").innerHTML = [
+      pill("network lanes " + (ready.ready ? "ready" : "not ready"), ready.ready),
+      pill("live lane " + (ready.liveReady ? "ready" : "not ready"), ready.liveReady),
+      pill("finality " + (ready.finalityReady ? "ready" : "waiting"), ready.finalityReady)
+    ].join("");
+    el("active").textContent = fmt(data.network.activeSessions);
+    el("connected").textContent = fmt(data.network.connectedPeerSlots);
+    el("known").textContent = fmt(data.network.knownPeerRecords);
+    const requests = data.network.requests || {};
+    el("requests").textContent = fmt(requests.started);
+    el("request-success").textContent = fmt(requests.succeeded);
+    el("request-timeout").textContent = fmt(requests.timedOut);
+    el("request-failed").textContent = fmt(requests.failed);
+    const peerTargets = data.network.peerTargets || {};
+    el("peer-connected-detail").textContent = peerTargets.minimum
+      ? `connected peer slots · ${fmt(peerTargets.minimum)} required to start`
+      : "connected peer slots";
+    el("peer-preferred").textContent = fmt(peerTargets.preferred);
+    el("peer-maximum").textContent = fmt(peerTargets.maxOutbound);
+    const peerLifecycle = data.network.peerLifecycle || {};
+    el("peer-established").textContent = fmt(peerLifecycle.established);
+    el("peer-closed").textContent = fmt(peerLifecycle.disconnected);
+    const disconnectReasons = [...(peerLifecycle.disconnectReasons || [])]
+      .sort((left, right) => right.count - left.count);
+    el("peer-reasons").innerHTML = disconnectReasons.length
+      ? disconnectReasons.map(reason => `<span><strong>${fmt(reason.count)}</strong> ${esc(words(reason.reason))}</span>`).join("")
+      : "No disconnect reasons observed.";
+    const averageQueueWait = requests.started
+      ? Math.round((requests.queueWaitMilliseconds || 0) / requests.started)
+      : 0;
+    el("queue-wait").textContent = `${fmt(averageQueueWait)}ms`;
+
+    const processors = data.processors || [];
+    renderNodeMetrics(data, processors);
+    renderHistory(data);
+    renderSyncSummary(data, processors);
+    el("coverage").innerHTML = processors.map(processor => {
+      const c = processor.coverage;
+      const intervals = (c.available || []).map(interval =>
+        `<span class="interval">${fmt(interval.fromBlock)} → ${fmt(interval.toBlock)} · ${esc(interval.finality)}</span>`
+      ).join("") || `<span class="interval">No committed interval</span>`;
+      const onDemand = processor.historyMode === "on_demand";
+      const status = onDemand
+        ? processor.blocksRemaining
+          ? "syncing requested history"
+          : data.readiness.liveReady
+            ? "live · history on demand"
+            : "history on demand"
+        : c.state === "live"
+          ? "live · contiguous"
+          : c.state === "catching_up"
+            ? "catching up · contiguous so far"
+            : c.state === "backfilling"
+              ? "backfilling · gaps present"
+              : words(c.state);
+      const target = processor.syncTargetBlock == null
+        ? "No active catch-up target"
+        : onDemand
+          ? `Requested through ${fmt(processor.syncTargetBlock)}`
+          : `Observed peer head ${fmt(processor.syncTargetBlock)}`;
+      const remaining = processor.blocksRemaining == null
+        ? ""
+        : processor.blocksRemaining === 0
+          ? onDemand
+            ? "active requested history covered"
+            : c.state === "live"
+              ? "observed peer head covered"
+              : processor.storedRangeContiguous
+                ? "observed peer head covered; live handoff pending"
+                : "observed peer head covered; stored gaps remain"
+          : `${fmt(processor.blocksRemaining)} blocks missing through ${onDemand ? "requested history" : "observed head"}`;
+      const pending = processor.pendingDeltas
+        ? `${fmt(processor.pendingDeltas)} pending delta${processor.pendingDeltas === 1 ? "" : "s"}`
+        : "";
+      const liveGap = processor.liveGap
+        ? `Live delivery paused before block ${fmt(processor.liveGap.firstUnappliedBlock)}${processor.pauseReason ? ` · ${words(processor.pauseReason)}` : ""}`
+        : "";
+      const missingRanges = (processor.missingRanges || []).slice(0, 8).map(range =>
+        `<span class="missing-range">Missing ${fmt(range.fromBlock)} → ${fmt(range.toBlock)} · ${fmt(range.blocks)} block${range.blocks === 1 ? "" : "s"}</span>`
+      ).join("");
+      const omittedRanges = Math.max(0, (processor.missingRanges || []).length - 8);
+      const statusTone = onDemand && processor.blocksRemaining === 0
+        ? data.readiness.liveReady ? "good" : "warn"
+        : c.state === "live"
+          ? "good"
+          : c.state === "backfilling"
+            ? "bad"
+            : "warn";
+      return `<div class="processor">
+        <div class="processor-head"><strong>${esc(processor.id)}</strong><span class="${statusTone}">${esc(status)}</span></div>
+        <div class="intervals">${intervals}</div>
+        ${missingRanges ? `<div class="missing-ranges">${missingRanges}${omittedRanges ? `<span class="missing-range">+${fmt(omittedRanges)} more ranges</span>` : ""}</div>` : ""}
+        <div class="processor-detail">
+          <span>Indexed through <code>${fmt(c.processedThrough)}</code></span>
+          <span>${esc(target)}</span>
+          ${remaining ? `<span class="${processor.blocksRemaining ? "warn" : ""}">${esc(remaining)}</span>` : ""}
+          ${pending ? `<span class="bad">${esc(pending)}</span>` : ""}
+          ${liveGap ? `<span class="bad">${esc(liveGap)}</span>` : ""}
+        </div>
+      </div>`;
+    }).join("");
+
+    el("sessions").innerHTML = (data.network.sessions || []).map(session => {
+      const range = session.fromBlock == null ? "—" : `${fmt(session.fromBlock)} → ${fmt(session.toBlock)}`;
+      return `<tr class="${session.active ? "" : "inactive"}">
+        <td><code>${fmt(session.id)}</code></td>
+        <td>${esc(session.lane)}</td>
+        <td>${esc(words(session.phase))}</td>
+        <td class="${session.connectedPeers ? "good" : session.active ? "warn" : ""}">${fmt(session.connectedPeers)}</td>
+        <td>${fmt(session.knownPeers)}</td>
+        <td>${fmt(session.observedHeadBlock)}</td>
+        <td>${range}</td>
+        <td>${fmt(session.attempts)}</td>
+        <td>${fmt(session.ageSeconds)}s</td>
+        <td class="error" title="${esc(session.lastError)}">${esc(session.lastError || "—")}</td>
+      </tr>`;
+    }).join("") || `<tr><td colspan="10">No P2P sessions have been registered yet.</td></tr>`;
+  }
+
+  async function refresh() {
+    if (!running) return;
+    try {
+      const response = await fetch("/v1/network/status", { cache: "no-store" });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      render(await response.json());
+    } catch (error) {
+      el("updated").textContent = `Status unavailable: ${error.message}`;
+      el("readiness").innerHTML = pill("dashboard disconnected", false);
+    }
+  }
+
+  el("toggle").addEventListener("click", () => {
+    running = !running;
+    el("toggle").textContent = running ? "Pause updates" : "Resume updates";
+    if (running) refresh();
+  });
+  document.querySelectorAll(".info-badge").forEach(infoBadge => {
+    infoBadge.addEventListener("keydown", event => {
+      if (event.key === "Escape") infoBadge.blur();
+    });
+  });
+  document.addEventListener("pointerdown", event => {
+    if (!event.target.closest(".label-row")) {
+      document.querySelectorAll(".info-badge").forEach(infoBadge => infoBadge.blur());
+    }
+  });
+  refresh();
+  setInterval(refresh, 2000);
+</script>
+</body>
+</html>

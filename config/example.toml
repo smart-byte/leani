@@ -1,0 +1,218 @@
+config_version = 1
+data_dir = "./data"
+
+[chain]
+name = "ethereum-mainnet"
+chain_id = 1
+# The exact execution-RPC raw-history profile rejects ranges before this block
+# because the current frame schema intentionally does not retain PoW ommers.
+merge_block = 15537394
+
+# Independent seekable raw history for reusable RPC and processor input.
+# Enabling it creates data/raw-history; data is retained only by explicit jobs.
+[raw_history]
+enabled = false
+maximum_logical_bytes = "512GiB"
+maximum_physical_bytes = "512GiB"
+maximum_frame_logical_bytes = "64MiB"
+maximum_segment_logical_bytes = "512MiB"
+maximum_segment_physical_bytes = "512MiB"
+reader_connections = 4
+maximum_source_frames = 8192
+maximum_buffered_frames = 8
+
+# Physical representation for processors whose lifecycle retains immutable
+# artifacts. `sqlite` remains the default until the million-block backend gate.
+# `tiered_segments` keeps SQLite as a durable write buffer and compacts it in
+# the background into checksummed files under data/processor-artifacts.
+[artifact_storage]
+backend = "sqlite"
+segment_target_blocks = 2048
+compression = "snappy"
+maximum_artifact_logical_bytes = "16MiB"
+maximum_segment_logical_bytes = "64MiB"
+maximum_segment_physical_bytes = "64MiB"
+compaction_interval = "100ms"
+maximum_segments_per_cycle = 4
+
+[budgets]
+memory_bytes = 1073741824
+temporary_disk_bytes = 5368709120
+pending_delta_bytes = 1073741824
+recent_raw_soft_bytes = 1073741824
+recent_raw_hard_bytes = 2147483648
+source_concurrency = 8
+mapper_concurrency = 8
+
+[budgets.store]
+maximum_physical_bytes = "2GiB"
+
+[budgets.artifacts]
+maximum_retained_bytes = "1GiB"
+maximum_pending_bytes = "256MiB"
+
+[budgets.delivery]
+maximum_retained_bytes = "1536MiB"
+maximum_history_retained_bytes = "1GiB"
+
+[budgets.history_material]
+mode = "enabled"
+memory_bytes = "256MiB"
+maximum_buffered_frames_per_acquisition = 128
+minimum_physical_chunk_blocks = 128
+maximum_overfetch_ratio = 1.25
+
+[budgets.history_pipeline]
+maximum_active_chunks = 4
+maximum_mapped_bytes = "128MiB"
+
+[budgets.history_pipeline.commit]
+maximum_blocks = 128
+maximum_changes = 10000
+maximum_encoded_bytes = "16MiB"
+maximum_delay = "50ms"
+target_writer_hold = "20ms"
+
+[[sources.history]]
+id = "xatu"
+kind = "xatu"
+priority = 10
+trust = "trusted_dataset"
+
+[[sources.history]]
+id = "erae"
+kind = "era_e"
+priority = 20
+trust = "trusted_dataset"
+endpoint = "https://data.ethpandaops.io/erae/mainnet/"
+
+[sources.live]
+kind = "p2p"
+minimum_peers = 1
+# Non-blocking operational target for a healthy pool. Requests start with one
+# peer while background dialing continues beyond this target.
+preferred_peers = 16
+# Maintain a broad, rapidly refilled persistent execution-peer pool. Peers that
+# return invalid material are penalized without restarting the whole network.
+max_outbound_peers = 100
+max_concurrent_dials = 30
+# Use fixed, distinct reachable ports in deployments; zero remains convenient
+# for isolated local processes. Expose TCP 30303 and both UDP ports.
+listener_port = 30303
+discovery_port = 30303
+discv5_port = 30304
+enable_discv5 = true
+nat = "any"
+# Optional stable enode seeds supplement discovery; they are not an allowlist.
+trusted_peers = []
+peer_refill_interval_ms = 5000
+# Rebuild discovery after a sustained zero-peer state (including host sleep or
+# an initially failed DNS/Discv bootstrap).
+peer_recovery_timeout_seconds = 300
+material_request_concurrency = 32
+# Adaptive request-width ceiling. Eight nearly doubled throughput in the
+# pinned Mainnet receipt-complete benchmark; partial/failed responses shrink
+# the live working width before it cautiously grows again.
+material_request_blocks = 8
+# Reth adapts this initial deadline per peer after successful responses.
+request_timeout_seconds = 8
+request_retries = 3
+request_retry_backoff_ms = 250
+# Prove historical fallback ranges with low-priority, protocol-sized header
+# requests. Live head requests preempt these while dialing continues.
+history_header_request_concurrency = 16
+history_header_request_blocks = 1024
+persistent_retries = true
+retry_backoff_max_seconds = 60
+peer_cache_flush_seconds = 60
+peer_cache_max_entries = 4096
+# As each interchangeable archive catches up, re-map sequential finalized
+# ranges and compare the output with the compact delta checksums produced live.
+archive_reconciliation_blocks = 64
+archive_reconciliation_interval_seconds = 300
+# Last-resort finalized P2P coverage after retained/archive sources fail.
+# Omission admits every gap at or after each processor's start block. Set an
+# explicit suffix bound when the operator needs a hard acquisition-cost limit.
+# history_fallback_blocks = 1048576
+handoff_overlap_blocks = 32
+
+[finality]
+kind = "consensus_p2p"
+checkpoint = "REPLACE_WITH_A_RECENT_WEAK_SUBJECTIVITY_CHECKPOINT"
+checkpoint_slot = 0 # replace with that checkpoint's finalized beacon slot
+minimum_peers = 2
+discovery_port = 0
+
+[[processors]]
+id = "blobs-money"
+instance = "blobs-production"
+version = "1.4.0"
+history_control = "node_owned"
+history_mode = "automatic"
+start_block = 19426589
+publish = "optimistic_and_finalized"
+
+[processors.state]
+mode = "checkpointed"
+
+[processors.artifacts]
+mode = "none"
+
+[processors.output]
+mode = "full"
+
+[processors.delivery]
+mode = "window"
+max_bytes = "1GiB"
+max_age = "24h"
+on_limit = "pause"
+
+[processors.delivery.pruning]
+interval = "30s"
+minimum_batch_blocks = 64
+minimum_batch_changes = 10000
+maximum_delete_changes = 10000
+retain_finalized_blocks = 256
+retain_acknowledged_age = "1h"
+
+[processors.checkpoint]
+mode = "automatic"
+keep = 3
+
+[processors.undo]
+mode = "unfinalized"
+safety_blocks = 256
+
+[processors.coverage]
+verification_segment_blocks = 8192
+
+[rpc]
+http_bind = "127.0.0.1:8545"
+ws_bind = "127.0.0.1:8546"
+historical_mode = "on_demand"
+transaction_locator = false
+minimum_recent_blocks = 128
+
+[api]
+bind = "127.0.0.1:8080"
+# bearer_token_env = "LEANI_API_TOKEN"
+
+[api.delivery.history_batches]
+target_encoded_bytes = "4MiB"
+maximum_encoded_bytes = "16MiB"
+maximum_events = 20000
+maximum_processed_blocks = 8192
+maximum_delay = "50ms"
+maximum_buffered_batches = 4
+maximum_buffered_bytes = "64MiB"
+compression = "gzip"
+
+[api.delivery.live_batches]
+target_encoded_bytes = "64KiB"
+maximum_encoded_bytes = "1MiB"
+maximum_events = 1000
+maximum_processed_blocks = 8
+maximum_delay = "10ms"
+maximum_buffered_batches = 2
+maximum_buffered_bytes = "2MiB"
+compression = "gzip"

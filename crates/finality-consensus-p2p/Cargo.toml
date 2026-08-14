@@ -1,0 +1,37 @@
+[package]
+name = "leani-finality-consensus-p2p"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+publish = false
+
+[dependencies]
+alloy-primitives.workspace = true
+async-trait.workspace = true
+discv5 = { git = "https://github.com/sigp/discv5", rev = "7663c00", features = ["libp2p"] }
+futures.workspace = true
+helios-consensus-core.workspace = true
+leani-finality-beacon-api = { path = "../finality-beacon-api" }
+leani-primitives = { path = "../primitives" }
+leani-source-api = { path = "../source-api" }
+libp2p.workspace = true
+libp2p-stream.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+snap.workspace = true
+ssz.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+hex.workspace = true
+tracing-subscriber.workspace = true
+
+[lints]
+workspace = true

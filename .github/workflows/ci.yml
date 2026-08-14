@@ -1,0 +1,86 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    name: Rust (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15]
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - name: Format
+        if: runner.os == 'Linux'
+        run: cargo fmt --all --check
+      - name: Test
+        run: cargo test --workspace --locked
+      - name: Smoke resumable benchmark sweep
+        if: runner.os == 'Linux'
+        run: |
+          cargo build --locked -p leani
+          target/debug/leani benchmark sweep --manifest config/benchmark-sweep.ci.json --output-directory "${{ runner.temp }}/benchmark-sweep"
+          target/debug/leani benchmark sweep --manifest config/benchmark-sweep.ci.json --output-directory "${{ runner.temp }}/benchmark-sweep"
+          ruby -rjson -e 'summary = JSON.parse(File.read(ARGV.fetch(0))); abort "sweep did not resume every candidate" unless summary.fetch("candidates").all? { |candidate| candidate.fetch("source") == "resumed" }' "${{ runner.temp }}/benchmark-sweep/sweep-summary.json"
+      - name: Clippy
+        if: runner.os == 'Linux'
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+  sdk:
+    name: TypeScript SDK
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: packages/sdk
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version-file: packages/sdk/.bun-version
+      - run: bun install --frozen-lockfile
+      - run: bun run openapi:check
+      - run: bun run typecheck
+      - run: bun test
+      - run: bun run build
+      - run: bun run test:package
+
+  contracts:
+    name: API and deployment contracts
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - name: Parse observability contracts
+        run: >-
+          ruby -e 'require "json"; require "yaml";
+          JSON.parse(File.read("observability/grafana/leani.json"));
+          YAML.safe_load(File.read("observability/prometheus/alerts.yaml"), aliases: true)'
+      - name: Validate tracked documentation links
+        run: scripts/check-doc-links.rb
+      - name: Validate release and Homebrew packaging
+        run: scripts/test-release-packaging.sh
+      - name: Validate historical-only deployment config
+        run: cargo run --locked -- doctor --json --config deploy/container.toml
+      - name: Build container
+        run: docker build --tag leani:ci .
+
+  dependencies:
+    name: Dependency policy
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          command: check
