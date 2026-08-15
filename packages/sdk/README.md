@@ -9,6 +9,12 @@ const leani = createLeaniClient({ baseUrl: "http://127.0.0.1:8080" });
 const status = await leani.status();
 ```
 
+Processor status and query responses expose inclusive `available` ranges split
+at coverage gaps and exact finality boundaries. Filter those intervals when
+selecting finalized material: `finalizedThrough` is only the highest covered
+block recorded as finalized, not a guarantee that every lower block is
+finalized or present.
+
 Processor-owned query extensions are discoverable through
 `leani.capabilities()`. Call a custom extension through the same authenticated,
 same-origin request path used by the built-in wrappers:

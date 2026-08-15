@@ -2215,6 +2215,40 @@ pub struct RequestedRange {
     to_block: u64,
 }
 
+/// Split covered ranges at finality boundaries so each interval carries the
+/// exact finality of every block inside it. Both inputs must be normalized
+/// (ascending, non-overlapping); `finalized` labels its intersection with
+/// `coverage` and everything else stays optimistic.
+fn labeled_coverage_intervals(
+    coverage: &[BlockRange],
+    finalized: &[BlockRange],
+) -> Vec<CoverageInterval> {
+    let mut intervals = Vec::new();
+    let mut remaining = finalized.iter().peekable();
+    for range in coverage {
+        let mut cursor = range.start().0;
+        let end = range.end().0;
+        loop {
+            while remaining.next_if(|range| range.end().0 < cursor).is_some() {}
+            let (to_block, finality) = match remaining.peek() {
+                Some(range) if range.start().0 <= cursor => (range.end().0.min(end), "finalized"),
+                Some(range) if range.start().0 <= end => (range.start().0 - 1, "optimistic"),
+                _ => (end, "optimistic"),
+            };
+            intervals.push(CoverageInterval {
+                from_block: cursor,
+                to_block,
+                finality,
+            });
+            match to_block.checked_add(1) {
+                Some(next) if next <= end => cursor = next,
+                _ => break,
+            }
+        }
+    }
+    intervals
+}
+
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CoverageResponse {
@@ -2271,10 +2305,13 @@ async fn coverage(
             BlockRange::new(BlockNumber(configured_start), cursor.block_number).ok()
         })
     });
-    let ranges = if let Some(range) = query_range {
-        state.store.coverage(descriptor, range).await?
+    let (ranges, finalized_ranges) = if let Some(range) = query_range {
+        (
+            state.store.coverage(descriptor, range).await?,
+            state.store.finalized_coverage(descriptor, range).await?,
+        )
     } else {
-        Vec::new()
+        (Vec::new(), Vec::new())
     };
     let finalized_through = state.store.finalized_through(descriptor).await?;
     let chain_finalized_head = state
@@ -2300,18 +2337,7 @@ async fn coverage(
             from_block: range.start().0,
             to_block: range.end().0,
         }),
-        available: ranges
-            .into_iter()
-            .map(|range| CoverageInterval {
-                from_block: range.start().0,
-                to_block: range.end().0,
-                finality: if finalized_through.is_some_and(|block| block >= range.end()) {
-                    "finalized"
-                } else {
-                    "optimistic"
-                },
-            })
-            .collect(),
+        available: labeled_coverage_intervals(&ranges, &finalized_ranges),
         configured_start_block: configured_start,
         finalized_through: finalized_through.map(|block| block.0),
         processed_through,
@@ -9799,6 +9825,51 @@ mod tests {
     }
 
     #[test]
+    fn labeled_coverage_intervals_split_around_finalized_holes() {
+        let range = |from: u64, to: u64| {
+            BlockRange::new(BlockNumber(from), BlockNumber(to)).expect("range")
+        };
+        let labels = |intervals: &[CoverageInterval]| {
+            intervals
+                .iter()
+                .map(|interval| (interval.from_block, interval.to_block, interval.finality))
+                .collect::<Vec<_>>()
+        };
+
+        let coverage = [range(5, 20), range(30, 35)];
+        let finalized = [range(5, 8), range(12, 14), range(33, 40)];
+        assert_eq!(
+            labels(&labeled_coverage_intervals(&coverage, &finalized)),
+            vec![
+                (5, 8, "finalized"),
+                (9, 11, "optimistic"),
+                (12, 14, "finalized"),
+                (15, 20, "optimistic"),
+                (30, 32, "optimistic"),
+                (33, 35, "finalized"),
+            ],
+        );
+        assert_eq!(
+            labels(&labeled_coverage_intervals(&coverage, &[])),
+            vec![(5, 20, "optimistic"), (30, 35, "optimistic")],
+        );
+        assert_eq!(
+            labels(&labeled_coverage_intervals(
+                &[range(5, 20)],
+                &[range(0, 25)]
+            )),
+            vec![(5, 20, "finalized")],
+        );
+        assert_eq!(
+            labels(&labeled_coverage_intervals(
+                &[range(0, u64::MAX)],
+                &[range(0, u64::MAX)],
+            )),
+            vec![(0, u64::MAX, "finalized")],
+        );
+    }
+
+    #[test]
     #[allow(clippy::too_many_lines)]
     fn on_demand_diagnostics_only_count_requested_history() {
         let coverage = CoverageResponse {
@@ -9998,5 +10069,73 @@ mod tests {
         assert_eq!(body["processors"][0]["storedRangeContiguous"], true);
         assert_eq!(body["processors"][0]["syncTargetBlock"], 3);
         assert_eq!(body["processors"][0]["blocksRemaining"], 2);
+    }
+
+    #[tokio::test]
+    async fn coverage_intervals_split_at_the_finalized_boundary() {
+        use leani_testkit::{BlockLocalCounter, fixture_frame};
+
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = SqliteStore::open(leani_store_sqlite::StoreConfig::new(
+            directory.path().join("finality-split.sqlite"),
+        ))
+        .await
+        .expect("store");
+        let processor = Arc::new(BlockLocalCounter::default());
+        let mut parent = BlockHash::ZERO;
+        for number in 0..=4 {
+            let mut frame = fixture_frame(number, parent);
+            frame.finality = Finality::Optimistic;
+            let delta = processor.map(&frame).await.expect("map");
+            let descriptor = processor.descriptor();
+            store
+                .apply(
+                    processor.as_ref(),
+                    ProcessorCursor {
+                        processor_id: descriptor.id.to_string(),
+                        processor_version: descriptor.version.to_string(),
+                        chain_id: frame.chain_id,
+                        block_number: frame.block.number,
+                        block_hash: frame.block.hash,
+                        finality: frame.finality,
+                        sequence: number + 1,
+                    },
+                    &delta,
+                    &[],
+                )
+                .await
+                .expect("apply");
+            parent = frame.block.hash;
+        }
+        store
+            .mark_finalized(processor.descriptor(), BlockNumber(2))
+            .await
+            .expect("mark finalized");
+
+        let configured: Arc<dyn Processor> = processor;
+        let router =
+            router_with_processors(store, vec![configured], Vec::new(), ApiConfig::default())
+                .expect("router");
+        let response = router
+            .oneshot(
+                Request::get("/v1/processors/synthetic-counter/status")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let body: Value = serde_json::from_slice(&body).expect("JSON");
+        assert_eq!(
+            body["available"],
+            json!([
+                { "fromBlock": 0, "toBlock": 2, "finality": "finalized" },
+                { "fromBlock": 3, "toBlock": 4, "finality": "optimistic" }
+            ]),
+        );
+        assert_eq!(body["finalizedThrough"], 2);
     }
 }

@@ -193,6 +193,13 @@ export interface ProcessorCoverage {
 }
 ```
 
+Every `available` interval is inclusive and has one exact finality for every
+block it contains. Intervals split at both coverage gaps and finality
+boundaries, so consumers selecting finalized material must filter these ranges
+rather than treating `finalizedThrough` as a contiguous watermark.
+`finalizedThrough` is only the highest covered block recorded as finalized;
+lower gaps or non-finalized coverage can still exist.
+
 For a block-local processor, `available` can contain several intervals while a
 backfill and head follower operate concurrently. `processedThrough` is only set
 when the complete interval begins at the configured start and has no gaps.

@@ -733,6 +733,7 @@ export interface components {
             readiness: components["schemas"]["Readiness"];
             reasons: string[];
         };
+        /** @description Inclusive covered range whose finality is uniform for every block in the interval. Ranges are split at coverage gaps and exact finality boundaries. */
         CoverageInterval: {
             fromBlock: components["schemas"]["SafeInteger"];
             toBlock: components["schemas"]["SafeInteger"];
@@ -746,9 +747,11 @@ export interface components {
             chainId: components["schemas"]["SafeInteger"];
             chainFinalizedHead: components["schemas"]["ChainFinalizedHead"] | null;
             requested?: components["schemas"]["RequestedRange"] | null;
+            /** @description Exact processor coverage split at gaps and finality boundaries. Use these intervals when selecting finalized coverage. */
             available: components["schemas"]["CoverageInterval"][];
             configuredStartBlock: components["schemas"]["SafeInteger"];
             processedThrough: components["schemas"]["SafeInteger"] | null;
+            /** @description Highest covered block recorded as finalized. This is not a contiguous-coverage guarantee; lower gaps or non-finalized blocks can exist. Inspect available intervals for exact finalized coverage. */
             finalizedThrough: components["schemas"]["SafeInteger"] | null;
             complete: boolean;
             /** @enum {string} */
