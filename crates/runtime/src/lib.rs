@@ -1485,6 +1485,10 @@ impl HistoricalRuntime {
                 .coverage_for_ranges(descriptor, &requested_ranges)
                 .await?;
             let remaining_ranges = match job.mode {
+                BackfillMode::FillMissing if job.owner == HistoricalJobOwner::Subscription => {
+                    self.subscription_fill_missing_ranges(&job, &requested_ranges)
+                        .await?
+                }
                 BackfillMode::FillMissing => requested_ranges
                     .iter()
                     .flat_map(|range| coverage_gaps(*range, &coverage))
@@ -1815,6 +1819,98 @@ impl HistoricalRuntime {
             coverage.extend(self.store.coverage(descriptor, *range).await?);
         }
         Ok(coverage)
+    }
+
+    async fn subscription_fill_missing_ranges(
+        &self,
+        job: &BackfillJob,
+        requested_ranges: &[BlockRange],
+    ) -> Result<Vec<BlockRange>, RuntimeError> {
+        let subscription = self
+            .store
+            .backfill_subscription_for_job(&job.id)
+            .await?
+            .ok_or_else(|| {
+                StoreError::Invariant(format!(
+                    "subscription job {:?} has no durable subscription metadata",
+                    job.id
+                ))
+            })?;
+        let progress = self
+            .store
+            .backfill_subscription_range_progress(&job.id)
+            .await?
+            .ok_or_else(|| {
+                StoreError::Invariant(format!(
+                    "subscription job {:?} has no durable range progress",
+                    job.id
+                ))
+            })?;
+        if subscription.ranges != requested_ranges || progress.len() != requested_ranges.len() {
+            return Err(StoreError::Invariant(format!(
+                "subscription job {:?} durable ranges differ from its immutable payload",
+                job.id
+            ))
+            .into());
+        }
+
+        let mut remaining = Vec::new();
+        for (requested, progress) in requested_ranges.iter().zip(progress) {
+            if progress.range != *requested {
+                return Err(StoreError::Invariant(format!(
+                    "subscription job {:?} range progress differs from its immutable payload",
+                    job.id
+                ))
+                .into());
+            }
+            let work = coverage_gaps(*requested, &subscription.preexisting_coverage);
+            let work_blocks = work.iter().try_fold(0_u64, |total, range| {
+                total
+                    .checked_add(range.len())
+                    .ok_or(StoreError::Numeric("subscription work blocks"))
+            })?;
+            if progress.committed_work_blocks > work_blocks {
+                return Err(StoreError::Invariant(format!(
+                    "subscription job {:?} committed {} of {} creation-time work blocks in range {}..={}",
+                    job.id,
+                    progress.committed_work_blocks,
+                    work_blocks,
+                    requested.start().0,
+                    requested.end().0,
+                ))
+                .into());
+            }
+
+            let mut committed = progress.committed_work_blocks;
+            for range in work {
+                if committed >= range.len() {
+                    committed -= range.len();
+                    continue;
+                }
+                let start = BlockNumber(
+                    range
+                        .start()
+                        .0
+                        .checked_add(committed)
+                        .ok_or(StoreError::Numeric("remaining subscription range start"))?,
+                );
+                remaining.push(BlockRange::new(start, range.end()).map_err(|error| {
+                    StoreError::Invariant(format!(
+                        "subscription job {:?} has invalid remaining work: {error}",
+                        job.id
+                    ))
+                })?);
+                committed = 0;
+            }
+            if committed != 0 {
+                return Err(StoreError::Invariant(format!(
+                    "subscription job {:?} range progress could not be reconciled",
+                    job.id
+                ))
+                .into());
+            }
+        }
+        Ok(remaining)
     }
 
     async fn verify_compact_recompute_coverage(
@@ -2880,7 +2976,7 @@ impl HistoricalRuntime {
         mode: BackfillMode,
         delivery_stream_id: Option<&str>,
     ) -> Result<ApplyOutcome, RuntimeError> {
-        if mode == BackfillMode::Recompute
+        if (mode == BackfillMode::Recompute || delivery_stream_id.is_some())
             && let Some(covered_hash) = self
                 .store
                 .coverage_hash(self.processor.descriptor(), mapped.delta.block.number)
@@ -2893,9 +2989,6 @@ impl HistoricalRuntime {
                     incoming: mapped.delta.block.hash,
                 }
                 .into());
-            }
-            if !publish_changes {
-                return Ok(ApplyOutcome::AlreadyApplied);
             }
             let sequence = self
                 .store
@@ -2913,15 +3006,19 @@ impl HistoricalRuntime {
             };
             let replay = if let Some(stream_id) = delivery_stream_id {
                 self.store
-                    .republish_block_local_to_stream(
+                    .republish_block_local_with_change_publication_to_stream(
                         self.processor.as_ref(),
                         cursor.clone(),
                         &mapped.delta,
                         sink_ids,
+                        publish_changes,
                         stream_id,
                     )
                     .await?
             } else {
+                if !publish_changes {
+                    return Ok(ApplyOutcome::AlreadyApplied);
+                }
                 self.store
                     .republish_block_local(
                         self.processor.as_ref(),
@@ -6321,6 +6418,112 @@ mod tests {
                 .expect("processor stats")
                 .undo_records,
             0
+        );
+    }
+
+    #[tokio::test]
+    async fn overlapping_subscriptions_finish_their_creation_time_work_independently() {
+        let range = BlockRange::new(BlockNumber(1), BlockNumber(4)).expect("range");
+        let processor = Arc::new(
+            BlockLocalCounter::default()
+                .with_split_delivery()
+                .with_output_none(),
+        );
+        let (_directory, store) = store().await;
+        let first = externalized_subscription_job(
+            &store,
+            processor.as_ref(),
+            "overlap-first",
+            range,
+            BackfillMode::FillMissing,
+            0,
+        )
+        .await;
+        let first_stream = first
+            .delivery_stream_id
+            .clone()
+            .expect("first history stream");
+        let second = externalized_subscription_job(
+            &store,
+            processor.as_ref(),
+            "overlap-second",
+            range,
+            BackfillMode::FillMissing,
+            1,
+        )
+        .await;
+
+        for (job, source_id) in [(second, "overlap-winner"), (first, "overlap-finisher")] {
+            let source = Arc::new(ScriptedHistorySource::from_frames(
+                fixture_source_descriptor(source_id, range),
+                frames(range),
+            ));
+            HistoricalRuntime::new(
+                store.clone(),
+                source,
+                processor.clone(),
+                HistoricalRuntimeConfig {
+                    mapper_concurrency: 2,
+                    ..HistoricalRuntimeConfig::default()
+                },
+            )
+            .expect("runtime")
+            .run(job, default_source_budget(), CancellationToken::new())
+            .await
+            .expect("overlapping subscription");
+            if source_id == "overlap-winner" {
+                let compacted = store
+                    .compact_finalized_coverage(processor.descriptor(), range.end(), 2, range.len())
+                    .await
+                    .expect("defer compaction while overlapping work is active");
+                assert_eq!(compacted.exact_coverage_deleted, 0);
+            }
+        }
+
+        let first_changes = store
+            .changes_in_stream(processor.descriptor(), &first_stream, ChainId(1), 0, 100)
+            .await
+            .expect("first subscription changes");
+        assert_eq!(
+            first_changes
+                .iter()
+                .filter(|record| record.change.kind == "synthetic.counter")
+                .count(),
+            usize::try_from(range.len()).expect("range length")
+        );
+        let completion = first_changes
+            .iter()
+            .find(|record| record.change.kind == "system.backfill_complete")
+            .expect("first completion");
+        let metadata =
+            leani_store_sqlite::decode_backfill_completion_metadata(&completion.change.payload)
+                .expect("completion metadata");
+        assert_eq!(
+            metadata.disposition,
+            leani_store_sqlite::BackfillCompletionDisposition::PublishedAll
+        );
+        assert_eq!(metadata.covered_before_request_blocks, 0);
+        assert_eq!(metadata.newly_processed_blocks, range.len());
+        assert_eq!(metadata.republished_blocks, range.len());
+        assert_eq!(
+            store
+                .backfill_subscription_range_progress("overlap-first")
+                .await
+                .expect("range progress")
+                .expect("subscription progress"),
+            vec![leani_store_sqlite::BackfillSubscriptionRangeProgress {
+                range,
+                committed_work_blocks: range.len(),
+            }]
+        );
+        assert_eq!(
+            store
+                .job("overlap-first")
+                .await
+                .expect("job")
+                .expect("first job")
+                .state,
+            JobState::Completed
         );
     }
 

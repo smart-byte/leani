@@ -738,6 +738,25 @@ impl NativeBackfillControl {
                 "processor historical backfill failed"
             );
         }
+        match store.job(job_id).await {
+            Ok(Some(mut record)) => {
+                record.state = state;
+                record.updated_at_unix_ms = Self::now_milliseconds();
+                if let Err(store_error) = store.save_job(&record).await {
+                    warn!(
+                        %job_id,
+                        error = %store_error,
+                        "failed to persist backfill scheduler state"
+                    );
+                }
+            }
+            Ok(None) => warn!(%job_id, "failed backfill has no durable scheduler record"),
+            Err(store_error) => warn!(
+                %job_id,
+                error = %store_error,
+                "failed to read scheduler record while persisting backfill failure"
+            ),
+        }
         if let Err(store_error) =
             Self::save_outcome(store, job_id, state, None, error.clone()).await
         {
@@ -6433,6 +6452,59 @@ mod tests {
     use leani_testkit::{BlockLocalCounter, fixture_frame};
 
     use super::*;
+
+    #[tokio::test]
+    async fn failed_backfill_updates_the_primary_scheduler_record() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let store = leani_store_sqlite::SqliteStore::open(leani_store_sqlite::StoreConfig::new(
+            directory.path().join("node.sqlite"),
+        ))
+        .await
+        .expect("store");
+        store
+            .save_job(&leani_store_sqlite::JobRecord {
+                id: "terminal-failure".to_owned(),
+                kind: leani_runtime::HistoricalJobOwner::Materialization
+                    .job_kind()
+                    .to_owned(),
+                state: leani_store_sqlite::JobState::Running,
+                payload: b"fixture".to_vec(),
+                checkpoint: Some(b"checkpoint".to_vec()),
+                attempts: 2,
+                updated_at_unix_ms: 1,
+            })
+            .await
+            .expect("running job");
+
+        NativeBackfillControl::record_failure(
+            &store,
+            "fixture",
+            "terminal-failure",
+            leani_runtime::HistoricalJobOwner::Materialization,
+            leani_store_sqlite::JobState::Failed,
+            Some("permanent failure".to_owned()),
+        )
+        .await;
+
+        assert_eq!(
+            store
+                .job("terminal-failure")
+                .await
+                .expect("primary job")
+                .expect("primary job exists")
+                .state,
+            leani_store_sqlite::JobState::Failed
+        );
+        assert_eq!(
+            store
+                .job("terminal-failure:outcome")
+                .await
+                .expect("outcome")
+                .expect("outcome exists")
+                .state,
+            leani_store_sqlite::JobState::Failed
+        );
+    }
 
     #[tokio::test]
     async fn tiered_artifact_supervisor_compacts_full_ranges_in_background() {

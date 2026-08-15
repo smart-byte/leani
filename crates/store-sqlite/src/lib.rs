@@ -1243,6 +1243,15 @@ pub struct BackfillSubscriptionRecord {
     pub processed_work_blocks: u64,
 }
 
+/// Durable work progress for one normalized subscription request range.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+pub struct BackfillSubscriptionRangeProgress {
+    pub range: BlockRange,
+    /// Number of blocks from this range's immutable creation-time work set
+    /// that have been atomically published to the subscription stream.
+    pub committed_work_blocks: u64,
+}
+
 /// Effective immutable history delivery-batch limits captured when a
 /// subscription is created.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -3760,6 +3769,28 @@ impl SqliteStore {
         sink_ids: &[String],
         stream_id: &str,
     ) -> Result<ReplayOutcome, StoreError> {
+        self.republish_block_local_with_change_publication_to_stream(
+            processor, cursor, delta, sink_ids, true, stream_id,
+        )
+        .await
+    }
+
+    /// Stream-selecting replay that can suppress domain changes while still
+    /// recording an atomic backfill progress boundary.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::republish_block_local_to_stream`].
+    #[allow(clippy::too_many_lines)]
+    pub async fn republish_block_local_with_change_publication_to_stream<P: Processor + ?Sized>(
+        &self,
+        processor: &P,
+        cursor: ProcessorCursor,
+        delta: &EncodedDelta,
+        sink_ids: &[String],
+        publish_changes: bool,
+        stream_id: &str,
+    ) -> Result<ReplayOutcome, StoreError> {
         if processor.descriptor().mode != ReductionMode::BlockLocal {
             return Err(StoreError::InvalidConfig(
                 "only block-local processors can republish historical changes".to_owned(),
@@ -3809,18 +3840,24 @@ impl SqliteStore {
             ));
         }
         let batch = overlay.into_batch();
+        let published_changes = if publish_changes {
+            batch.changes.as_slice()
+        } else {
+            &[]
+        };
         let publish_progress = delivery_stream_is_backfill(&self.inner.pool, stream_id).await?;
-        let mut incoming_change_bytes = batch.changes.iter().try_fold(0_u64, |total, change| {
-            let bytes = change
-                .key
-                .len()
-                .checked_add(change.payload.len())
-                .and_then(|value| u64::try_from(value).ok())
-                .ok_or(StoreError::Numeric("replayed delivery change bytes"))?;
-            total
-                .checked_add(bytes)
-                .ok_or(StoreError::Numeric("replayed delivery change bytes"))
-        })?;
+        let mut incoming_change_bytes =
+            published_changes.iter().try_fold(0_u64, |total, change| {
+                let bytes = change
+                    .key
+                    .len()
+                    .checked_add(change.payload.len())
+                    .and_then(|value| u64::try_from(value).ok())
+                    .ok_or(StoreError::Numeric("replayed delivery change bytes"))?;
+                total
+                    .checked_add(bytes)
+                    .ok_or(StoreError::Numeric("replayed delivery change bytes"))
+            })?;
         if publish_progress {
             incoming_change_bytes = incoming_change_bytes
                 .checked_add(32)
@@ -3855,7 +3892,7 @@ impl SqliteStore {
             delta.block,
             cursor.finality,
             ChangeDirection::Apply,
-            &batch.changes,
+            published_changes,
             sink_ids,
         )
         .await?;
@@ -3879,7 +3916,7 @@ impl SqliteStore {
                 stream_id,
                 delta.block.number,
                 1,
-                u64::try_from(batch.changes.len())
+                u64::try_from(published_changes.len())
                     .map_err(|_| StoreError::Numeric("republished historical changes"))?,
             )
             .await?;
@@ -3891,7 +3928,7 @@ impl SqliteStore {
             self.inner.delivery_changes_available.notify_waiters();
         }
         Ok(ReplayOutcome {
-            published_changes: batch.changes.len(),
+            published_changes: published_changes.len(),
             first_change_sequence: first,
             last_change_sequence: last,
         })
@@ -6574,6 +6611,8 @@ impl SqliteStore {
     /// replaced atomically by interval metadata and bounded parent-chain proof
     /// segments. Retained node-owned entities are intentionally untouched; the
     /// compact interval replaces only redundant finalized execution metadata.
+    /// Compaction pauses while any subscription still owns creation-time work,
+    /// because overlapping jobs may need exact rows for stream-safe replay.
     ///
     /// # Errors
     ///
@@ -6602,15 +6641,15 @@ impl SqliteStore {
             .map_err(|_| StoreError::Numeric("coverage compaction block limit"))?;
         let instance = processor_instance(descriptor);
         let _guard = self.inner.writer.lock_history().await;
-        let active_recomputes: i64 = sqlx::query_scalar(
+        let active_subscriptions: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM backfill_subscriptions
-             WHERE instance = ? AND mode = 'recompute'
+             WHERE instance = ?
                AND state IN ('waiting_for_consumer', 'queued', 'running', 'backpressured')",
         )
         .bind(&instance)
         .fetch_one(&self.inner.pool)
         .await?;
-        if active_recomputes != 0 {
+        if active_subscriptions != 0 {
             return Ok(FinalizedCoverageCompaction::default());
         }
         let rows = sqlx::query(
@@ -7908,6 +7947,56 @@ impl SqliteStore {
             })
             .collect::<Result<Vec<_>, _>>()?;
         Ok(Some(subscription))
+    }
+
+    /// Read durable per-range work progress for one backfill subscription.
+    ///
+    /// The counters apply to the immutable creation-time work set (requested
+    /// blocks minus snapshotted preexisting coverage), not to mutable shared
+    /// processor coverage. This lets a resumed subscription retain ownership
+    /// of its delivery work when another job covers an overlapping block.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when stored ranges or counters are invalid, or the
+    /// query fails.
+    pub async fn backfill_subscription_range_progress(
+        &self,
+        job_id: &str,
+    ) -> Result<Option<Vec<BackfillSubscriptionRangeProgress>>, StoreError> {
+        let subscription_id: Option<String> = sqlx::query_scalar(
+            "SELECT subscription_id FROM backfill_subscriptions WHERE job_id = ?",
+        )
+        .bind(job_id)
+        .fetch_optional(&self.inner.pool)
+        .await?;
+        let Some(subscription_id) = subscription_id else {
+            return Ok(None);
+        };
+        let rows: Vec<(i64, i64, i64)> = sqlx::query_as(
+            "SELECT from_block, to_block, committed_blocks
+             FROM backfill_subscription_ranges
+             WHERE subscription_id = ? ORDER BY ordinal",
+        )
+        .bind(subscription_id)
+        .fetch_all(&self.inner.pool)
+        .await?;
+        rows.into_iter()
+            .map(|(from, to, committed)| {
+                Ok(BackfillSubscriptionRangeProgress {
+                    range: BlockRange::new(
+                        BlockNumber(i64_u64(from, "subscription range start")?),
+                        BlockNumber(i64_u64(to, "subscription range end")?),
+                    )
+                    .map_err(|error| StoreError::Invariant(error.to_string()))?,
+                    committed_work_blocks: i64_u64(
+                        committed,
+                        "committed subscription work blocks",
+                    )?,
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map(Some)
     }
 
     /// Advance the exact durable lifecycle state for one backfill job.
@@ -19098,31 +19187,33 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn explicit_job_cancellation_cannot_be_overwritten_by_runtime_completion() {
+    async fn terminal_job_states_cannot_be_overwritten_by_late_runtime_updates() {
         let (_directory, store) = store().await;
-        let mut job = JobRecord {
-            id: "cancelled-work".to_owned(),
-            kind: "materialization_job".to_owned(),
-            state: JobState::Cancelled,
-            payload: b"cancelled".to_vec(),
-            checkpoint: Some(b"cancelled-checkpoint".to_vec()),
-            attempts: 1,
-            updated_at_unix_ms: 1,
-        };
-        store.save_job(&job).await.expect("save cancellation");
-        job.state = JobState::Completed;
-        job.checkpoint = Some(b"late-completion".to_vec());
-        job.updated_at_unix_ms = 2;
-        store.save_job(&job).await.expect("late runtime completion");
-        assert_eq!(
-            store
-                .job(&job.id)
-                .await
-                .expect("job")
-                .expect("durable job")
-                .state,
-            JobState::Cancelled
-        );
+        for terminal in [JobState::Completed, JobState::Failed, JobState::Cancelled] {
+            let mut job = JobRecord {
+                id: format!("terminal-{terminal:?}"),
+                kind: "materialization_job".to_owned(),
+                state: terminal,
+                payload: b"terminal".to_vec(),
+                checkpoint: Some(b"terminal-checkpoint".to_vec()),
+                attempts: 1,
+                updated_at_unix_ms: 1,
+            };
+            store.save_job(&job).await.expect("save terminal state");
+            job.state = JobState::Running;
+            job.checkpoint = Some(b"late-runtime-update".to_vec());
+            job.updated_at_unix_ms = 2;
+            store.save_job(&job).await.expect("late runtime update");
+            assert_eq!(
+                store
+                    .job(&job.id)
+                    .await
+                    .expect("job")
+                    .expect("durable job")
+                    .state,
+                terminal
+            );
+        }
     }
 
     #[tokio::test]

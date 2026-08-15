@@ -113,10 +113,12 @@ POST /admin/v1/materialization-jobs
 GET  /admin/v1/materialization-jobs
 GET  /admin/v1/materialization-jobs/{id}
 POST /admin/v1/materialization-jobs/{id}/cancel
+DELETE /admin/v1/materialization-jobs/{id}
 POST /admin/v1/backfill-subscriptions
 GET  /admin/v1/backfill-subscriptions
 GET  /admin/v1/backfill-subscriptions/{id}
 POST /admin/v1/backfill-subscriptions/{id}/cancel
+DELETE /admin/v1/backfill-subscriptions/{id}
 POST /admin/v1/processors/{processor}/rebuild
 POST /admin/v1/sources/{source}/probe
 ```
@@ -160,6 +162,15 @@ required consumer and independent history delivery stream atomically. Its
 not grant the application scheduling authority over a node-owned processor.
 All control routes share protected API authorization and do not alter JSON-RPC
 or WebSocket availability.
+
+A `fill_missing` subscription owns the creation-time gaps in its requested
+ranges. If another overlapping job covers one of those blocks first, the
+subscription still republishes that verified block into its independent stream;
+shared processor coverage cannot silently satisfy another subscription's
+delivery obligation. Completed, failed, and cancelled jobs are terminal and are
+never retried implicitly. After correcting a permanent failure, explicitly
+delete the terminal job before recreating the request; deletion is the retry
+boundary.
 
 ## 3. Common response model
 
