@@ -1,0 +1,44 @@
+name: Promote release site
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Published Leani release tag to promote (for example v0.1.0)
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: site-production-promotion
+  cancel-in-progress: false
+
+jobs:
+  promote:
+    name: Fast-forward site-production
+    runs-on: ubuntu-24.04
+    environment: site-production
+    env:
+      RELEASE_TAG: ${{ inputs.release_tag }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          fetch-depth: 0
+      - name: Validate release tag
+        run: |
+          case "$RELEASE_TAG" in
+            v[0-9]*.[0-9]*.[0-9]*) ;;
+            *) echo "release_tag must be a v-prefixed SemVer" >&2; exit 1 ;;
+          esac
+          git show-ref --verify --quiet "refs/tags/$RELEASE_TAG"
+          scripts/verify-site-production.rb "$RELEASE_TAG"
+          git fetch origin site-production:refs/remotes/origin/site-production || true
+          if git show-ref --verify --quiet refs/remotes/origin/site-production; then
+            git merge-base --is-ancestor refs/remotes/origin/site-production "$RELEASE_TAG^{commit}"
+          fi
+      - name: Promote exact release commit
+        run: |
+          release_commit=$(git rev-parse "$RELEASE_TAG^{commit}")
+          git push origin "$release_commit:refs/heads/site-production"

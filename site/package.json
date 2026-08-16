@@ -3,10 +3,12 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "astro dev",
-    "build": "astro build",
+    "dev": "bun run docs:prepare && astro dev",
+    "build": "bun run docs:prepare && astro build",
     "preview": "astro preview",
-    "check": "astro check && bun test",
+    "check": "bun run docs:check && astro check && bun test",
+    "docs:prepare": "bun ../scripts/docs/prepare.ts",
+    "docs:check": "bun ../scripts/docs/check.ts",
     "test": "bun test"
   },
   "dependencies": {
