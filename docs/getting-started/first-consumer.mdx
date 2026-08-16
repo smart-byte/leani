@@ -1,0 +1,39 @@
+---
+title: Attach the first consumer
+description: Register a named durable consumer, commit destination state with its opaque cursor, and acknowledge only afterward.
+section: getting-started
+order: 50
+audience:
+  - app-developer
+status: preview
+---
+
+import { Aside, Steps } from '@astrojs/starlight/components';
+import CodeExample from '@docs/components/docs/CodeExample.astro';
+
+Install the matching SDK release with `bun add @leani/sdk` or
+`npm install @leani/sdk`, then use a named consumer for state that must survive
+process restarts.
+
+<CodeExample example="durable-consumer" />
+
+<Steps>
+1. Create or inspect one stable consumer identity per destination.
+2. Treat `cursor` and `sequence` as opaque strings; do not decode the cursor or
+   coerce the sequence through JavaScript's unsafe integer range.
+3. Apply the change idempotently and persist the cursor in the same destination
+   transaction.
+4. Acknowledge Leani only after that transaction commits.
+5. On `reset_required`, rebuild from a retained snapshot or explicit backfill;
+   never skip silently to the newest event.
+</Steps>
+
+<Aside type="note" title="Why the application stores a cursor too">
+  Leani stores the server-side acknowledgement that fences pruning. Your
+  database stores which mutation actually committed. Keeping both lets a
+  restart or lost acknowledgement response prove what happened without
+  coupling application correctness to transport timing.
+</Aside>
+
+For concrete SQL, continue with the
+[PostgreSQL destination guide](/docs/guides/postgres-consumer/).

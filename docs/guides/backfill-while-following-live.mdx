@@ -1,0 +1,55 @@
+---
+title: Backfill while following live
+description: Run independent historical and live lanes, fill the exact committed gap, and hand off without overlap or omission.
+section: guides
+order: 5
+audience:
+  - operator
+  - processor-author
+status: preview
+---
+
+import { Aside, Steps } from '@astrojs/starlight/components';
+
+Leani does not make a large historical scan block head following. The live lane
+starts independently, commits canonical head work, and can recover a short live
+gap. Historical jobs fill missing committed intervals for each processor.
+
+```text
+processor start                                             observed head
+      │                                                           │
+      ├──── archive / retained / P2P history ────────┐            │
+      │                                              ├─ hash join ┤
+      └──────────────── live P2P + finality ─────────┴────────────┘
+```
+
+<Steps>
+1. Run `doctor` and inspect which historical sources satisfy the processor's
+   declared material shape.
+2. Start `serve` with live execution and finality configured. Live readiness is
+   independent of older processor coverage.
+3. For `history_control = "node_owned"`, let the node schedule missing ranges.
+   For `application_subscriptions`, create bounded backfill subscriptions from
+   the application and consume their independent history lanes.
+4. Observe exact coverage intervals, not only `processedThrough`.
+5. Accept the handoff only when parent hash, canonical ancestry, and processor
+   coverage meet at the boundary.
+</Steps>
+
+## The default gap policy
+
+If `sources.p2p.history_fallback_blocks` is omitted, P2P fallback is eligible to
+fill every history gap at or after the processor start block. Retained or archive
+sources are selected first when capable. Configure a numeric limit only when
+you intentionally want to restrict P2P recovery to a finalized suffix.
+
+<Aside type="caution" title="A failed job is terminal until acted upon">
+  Terminal failed backfill jobs are not retried forever. Inspect the recorded
+  error and either retry, cancel, or replace the job after correcting its cause.
+  Completion is published only after all overlapping ownership and coverage
+  invariants are satisfied.
+</Aside>
+
+For application-owned work, each history lane has its own lease and
+acknowledgement. A live acknowledgement never advances a history lane, and one
+history lane reconnects without resetting its siblings.

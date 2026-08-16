@@ -1,0 +1,48 @@
+---
+title: Configure native Ethereum P2P
+description: Run Leani's persistent execution P2P manager and independently anchored consensus finality without a managed execution RPC.
+section: guides
+order: 50
+audience:
+  - operator
+status: preview
+---
+
+import { Aside, Steps } from '@astrojs/starlight/components';
+
+Leani embeds an execution P2P manager for headers, bodies, receipts, discovery,
+and live subscriptions. Consensus finality is a separate trust boundary. A
+healthy execution peer set cannot assert finalized Ethereum ancestry by itself.
+
+<Steps>
+1. Start from `config/example.toml` and replace the weak-subjectivity checkpoint
+   and finalized beacon slot with a recent value obtained independently.
+2. Give the node a durable data directory. Its execution node key and bounded
+   peer cache survive restarts.
+3. Expose the configured discovery/listener ports and allow outbound execution
+   and consensus traffic.
+4. Run `doctor --json` before `serve`.
+5. Inspect `/v1/network/status`, `/debug/network`, and Prometheus metrics for
+   execution peers, live subscription usability, consensus peers, finality
+   freshness, and history recovery separately.
+</Steps>
+
+## One manager, two priorities
+
+Live and historical work share one process-wide manager and admission gate.
+Live requests have priority; bounded history chunks yield rather than replacing
+the manager or discarding healthy peer reputation. Body and receipt batch sizes
+adapt independently after partial or failed responses.
+
+## History fallback
+
+P2P history is used after capable retained/archive sources. Without an explicit
+`history_fallback_blocks` value, every gap from the processor start is eligible.
+This enables a theoretical full P2P sync, subject to peer retention and material
+availability. Setting the value opts into a bounded finalized suffix.
+
+<Aside type="caution" title="Do not conflate transport with finality">
+  Execution material is commitment- and ancestry-checked against the configured
+  consensus anchor. Keep checkpoint provenance, finality freshness, and peer
+  health visible as distinct operational signals.
+</Aside>

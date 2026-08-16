@@ -65,6 +65,15 @@ export const examples = [
     verifier: { kind: 'json-normalized' },
   },
   {
+    id: 'postgres-destination',
+    title: 'Atomic PostgreSQL destination',
+    description: 'Apply an idempotent change and persist its opaque cursor in one PostgreSQL transaction.',
+    language: 'typescript',
+    source: { file: 'examples/sdk-postgres/index.ts', region: 'postgres-destination' },
+    surfaces: ['docs'],
+    verifier: { kind: 'typescript', project: 'examples/sdk-subscription/tsconfig.json' },
+  },
+  {
     id: 'offline-quickstart',
     title: 'Offline fixture proof',
     description: 'Install a release and exercise its runtime without an Ethereum provider.',

@@ -1,0 +1,34 @@
+---
+title: Prove the release offline
+description: Exercise Leani's runtime, processor, delivery, coverage, checkpoint, and SQLite invariants without credentials or network access.
+section: getting-started
+order: 30
+audience:
+  - operator
+  - contributor
+status: preview
+---
+
+import { Aside, Steps } from '@astrojs/starlight/components';
+import CodeExample from '@docs/components/docs/CodeExample.astro';
+
+The fixture is the fastest honest proof that an installed binary can process
+and verify data. It uses deterministic blocks but runs the production storage,
+processor, change-delivery, coverage, checkpoint, and integrity paths.
+
+<CodeExample example="offline-quickstart" />
+
+<Steps>
+1. Use a new data directory; the fixture refuses to overwrite an existing one.
+2. Inspect the JSON report for `status: "passed"`, continuous coverage, the
+   expected change count, and `databaseVerified: true`.
+3. Keep the report with the version and checksum you tested.
+4. Move to a [bounded Mainnet range](/docs/getting-started/bounded-mainnet/)
+   only after this proof passes.
+</Steps>
+
+<Aside type="note" title="Fixture evidence is not Mainnet evidence">
+  This proves packaging and deterministic runtime behavior. It does not prove
+  upstream availability, peer quality, finality freshness, or real-source
+  throughput.
+</Aside>

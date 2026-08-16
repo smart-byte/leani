@@ -40,6 +40,11 @@
     Transport is at-least-once. Exactly-once application behavior comes from
     committing the destination mutation and cursor in one transaction, then acknowledging.
   </p>
+  <p class="note">
+    P2P history fallback can fill the entire eligible gap by default; setting
+    <code>history_fallback_blocks</code> opts into a bounded suffix.
+    <a href="/docs/concepts/coverage-finality-and-reorgs/">Coverage details →</a>
+  </p>
 </section>
 
 <style>

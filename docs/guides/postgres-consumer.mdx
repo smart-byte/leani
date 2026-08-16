@@ -1,0 +1,47 @@
+---
+title: Consume changes into PostgreSQL
+description: Apply Leani changes idempotently and persist the destination cursor in the same PostgreSQL transaction before acknowledgement.
+section: guides
+order: 25
+audience:
+  - app-developer
+status: preview
+---
+
+import { Aside, Steps } from '@astrojs/starlight/components';
+import CodeExample from '@docs/components/docs/CodeExample.astro';
+
+The complete example uses Bun's PostgreSQL client and the same compile-checked
+durable-consumer loop shown elsewhere. Adapt the event table to your application
+schema; keep the cursor transaction invariant intact.
+
+<CodeExample example="postgres-destination" />
+
+<Steps>
+1. Create one stable `(processor, network)` cursor row per destination.
+2. Give every applied change an idempotency key. The example uses the Leani
+   sequence scoped by processor and network.
+3. Apply the domain mutation and upsert the opaque cursor in one transaction.
+4. Return from the transaction only after PostgreSQL commits.
+5. Let the consumer acknowledge Leani. A lost response may cause redelivery,
+   which the idempotency key makes harmless.
+</Steps>
+
+Run the complete example with:
+
+```bash
+DATABASE_URL=postgres://localhost/leani_example \
+LEANI_CONSUMER_CREDENTIAL='<credential returned at registration>' \
+LEANI_PROCESSOR=blobs-money \
+bun examples/sdk-postgres/index.ts
+```
+
+<Aside type="caution" title="Do not generate timestamps for cursor correctness">
+  Store Leani's opaque cursor and sequence. An `updated_at` column is useful for
+  operations, but wall-clock time cannot establish delivery order or resume a
+  consumer.
+</Aside>
+
+If application state is lost, rebuild from a consistent retained snapshot and
+its query/follow boundary. If Leani emits `reset_required`, do not advance the
+cursor; reconcile the missing interval first.

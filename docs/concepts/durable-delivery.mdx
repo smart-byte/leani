@@ -1,0 +1,44 @@
+---
+title: Durable changes and acknowledgements
+description: Understand named consumers, opaque cursors, leases, pruning fences, snapshot handoffs, redelivery, and reset-required recovery.
+section: concepts
+order: 40
+audience:
+  - app-developer
+  - operator
+status: preview
+---
+
+Leani delivery is deliberately at-least-once. Exactly-once application effects
+come from an application transaction, not from pretending an HTTP response and
+a database commit are atomic.
+
+```text
+Leani change ─> begin destination transaction
+                ├─ apply idempotently
+                ├─ persist opaque cursor + sequence
+                └─ commit
+              ─> acknowledge Leani
+```
+
+If the acknowledgement response is lost, the same change may arrive again. The
+destination's sequence key makes the mutation idempotent, and its committed
+cursor proves what it already applied. Leani's acknowledgement separately tells
+the node what delivery history a required consumer still fences from pruning.
+
+## Leases and reset requirements
+
+A durable consumer has a stable ID, a credential, a role, an acknowledgement,
+and a finite lease. Active SDK iterators renew their lease. If a best-effort
+consumer falls behind retained history, the stream emits `reset_required` with
+coverage hints rather than skipping invisibly.
+
+## Query then follow
+
+A consistent snapshot is held across pagination and returns the boundary cursor
+needed to continue with changes after the snapshot. Release the snapshot when
+finished. This closes the race between “last row queried” and “first live event
+received” without freezing ingestion.
+
+See [Consume changes durably](/docs/guides/durable-consumer/) or the complete
+[PostgreSQL adapter](/docs/guides/postgres-consumer/).

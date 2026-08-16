@@ -1,0 +1,65 @@
+---
+title: How Leani works
+description: Follow one block from a capable Ethereum source through validation, deterministic processing, durable products, and application delivery.
+section: concepts
+order: 0
+audience:
+  - app-developer
+  - operator
+  - processor-author
+status: preview
+---
+
+import { Aside, Card, CardGrid } from '@astrojs/starlight/components';
+
+Leani is an application-specific Ethereum indexing node. It does not synchronize
+Ethereum's execution state and then ask what your application needs. It declares
+the processor's material requirements first, obtains only sources capable of
+satisfying them, and retains only the products selected by lifecycle policy.
+
+```text
+history sources ─┐
+                 ├─> normalized blocks ─> validate ─> map in parallel
+live P2P ────────┘                                  └─> reduce in order
+                                                            │
+                         query API <─ output/state/artifacts ┤
+                         your app  <─ durable change log ────┘
+```
+
+<CardGrid>
+  <Card title="Acquire by capability" icon="magnifier">
+    A planner chooses a retained, archive, RPC, or P2P source only when it
+    declares all material required for that request.
+  </Card>
+  <Card title="Validate before publish" icon="approve-check-circle">
+    Hashes, commitments, ancestry, canonicality, and finality provenance are
+    checked at the appropriate trust boundary.
+  </Card>
+  <Card title="Reduce deterministically" icon="puzzle">
+    Block-local work can run concurrently. Stateful deltas reduce in canonical
+    order with undo and checkpoint behavior defined by the processor.
+  </Card>
+  <Card title="Retain by policy" icon="database">
+    State, output, artifacts, delivery, checkpoints, undo, and raw history have
+    separate policies and budgets.
+  </Card>
+</CardGrid>
+
+The intended storage shape is:
+
+```text
+disk = application products
+     + processor state and checkpoints
+     + a bounded recent/reorg window
+     + one bounded transient input chunk
+     + optional indexes explicitly enabled by the operator
+```
+
+<Aside type="note" title="State-minimized, not stateless">
+  A token balance, latest pool price, or running aggregate is application state
+  and can be durable. Leani avoids retaining the EVM state trie and unrelated
+  chain history; it does not pretend useful indexes require no state.
+</Aside>
+
+Continue with [coverage and finality](/docs/concepts/coverage-finality-and-reorgs/)
+and [storage lifecycles](/docs/concepts/storage-products-and-lifecycles/).

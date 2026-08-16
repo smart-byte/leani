@@ -1,0 +1,42 @@
+---
+title: Storage products and lifecycles
+description: Choose independent retention policies for processor state, query output, artifacts, delivery, checkpoints, undo, and raw history.
+section: concepts
+order: 30
+audience:
+  - operator
+  - processor-author
+status: preview
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+“Retention” is not one switch. Each product answers a different recovery or
+query need and has its own budget.
+
+| Product | What it is for | Typical policy |
+|---|---|---|
+| State | Mutable reducer state needed for future blocks | durable or checkpointed |
+| Output | Entities served by generic or processor-owned queries | latest, window, full, or none |
+| Artifacts | Compact immutable results reusable for replay/export | bounded retention or none |
+| Delivery | Ordered change history for external consumers | best effort, until acknowledged, or none |
+| Checkpoints | Recovery points for processor state | automatic with a finite keep count |
+| Undo | Unfinalized branch replacement | bounded by a reorg safety depth |
+| Raw history | Reusable normalized source material | explicitly enabled, segmented, and bounded |
+
+The policies are orthogonal. An externalized processor can retain durable state
+and an acknowledgement-fenced change log while keeping no query output. A
+latest-value processor can retain one materialized entity with no delivery log.
+
+## Hard ceilings and backpressure
+
+Process memory, temporary material, mapped deltas, SQLite size, artifacts, and
+delivery history have operator ceilings. A limit action is part of the contract:
+pause work, expire a best-effort consumer with reset required, or reject growth.
+Leani must not silently discard required delivery history to remain “healthy.”
+
+<Aside type="tip" title="Start from intent, not disk size">
+  Choose what must survive a restart, what must be queryable, and what an
+  external sink already owns. Then select a checked profile and size its
+  budgets. See [Choose an operating profile](/docs/guides/choose-operating-profile/).
+</Aside>

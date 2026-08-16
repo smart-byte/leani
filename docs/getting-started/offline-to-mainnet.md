@@ -2,7 +2,7 @@
 title: Offline proof to Mainnet
 description: Prove a Leani release without network access, then move to a bounded Mainnet range and durable consumer.
 section: getting-started
-order: 20
+order: 60
 audience:
   - app-developer
   - operator

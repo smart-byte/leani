@@ -1,0 +1,46 @@
+---
+title: Choose an operating profile
+description: Select a checked lifecycle profile based on the product your application must retain, query, deliver, or externalize.
+section: guides
+order: 40
+audience:
+  - operator
+  - processor-author
+status: preview
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+Start from the ownership boundary, not from a vague “small” or “full” mode.
+Every checked profile is a complete configuration that `leani doctor` validates.
+
+| Profile | Leani owns | Best fit |
+|---|---|---|
+| `head-only` | Current state plus a bounded best-effort live log | Ephemeral head follower that can rebuild |
+| `aggregate-only` | Reducer state and latest aggregate | Counters or totals without retained events |
+| `windowed` | State plus a block/row/age/byte-bounded query window | Recent event and dashboard queries |
+| `externalized` | State plus acknowledgement-fenced delivery until the sink commits | PostgreSQL or another application-owned store |
+| `terminal` | One bounded result and delivery contract for a finite job | Reports and batch outcomes |
+| `full` | Complete configured output collection | Small, intentionally permanent application datasets |
+
+Copy the closest file from `config/modes`, change its `data_dir`, processor
+identity, start block, source credentials, and budgets, then run:
+
+```bash
+leani --config config/node.toml doctor --json
+```
+
+## Questions that choose the policy
+
+- Must processor state survive restart?
+- Does the application query Leani, or does it own the serving database?
+- Can a slow consumer be reset, or must it fence pruning?
+- Is old output reconstructible from a source or compact artifact?
+- How much unfinalized undo depth matches the publication policy?
+- Which limit action should pause work instead of discarding data?
+
+<Aside type="note" title="Profiles are examples, budgets are obligations">
+  The checked defaults demonstrate valid combinations; they are not universal
+  production sizing. Measure the processor's real output and delivery shape,
+  then set explicit memory, temporary disk, SQLite, artifact, and spool ceilings.
+</Aside>

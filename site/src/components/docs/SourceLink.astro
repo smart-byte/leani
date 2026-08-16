@@ -1,0 +1,15 @@
+---
+import buildMetadata from '../../generated/build-metadata.json';
+
+interface Props {
+  path: string;
+  label?: string;
+  view?: 'blob' | 'tree';
+}
+
+const { path, label = path, view = 'blob' } = Astro.props;
+const encodedPath = path.split('/').map(encodeURIComponent).join('/');
+const href = `https://github.com/smart-byte/leani/${view}/${encodeURIComponent(buildMetadata.docsRef)}/${encodedPath}`;
+---
+
+<a href={href}><slot>{label}</slot></a>

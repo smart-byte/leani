@@ -1,0 +1,41 @@
+---
+title: Capability honesty and the EVM-free boundary
+description: Distinguish source capabilities, configured processor products, and the intentionally refused stateful Ethereum methods.
+section: concepts
+order: 50
+audience:
+  - app-developer
+  - operator
+status: preview
+---
+
+Leani exposes what the running node can answer. Capability depends on all three
+layers:
+
+1. the source can supply the required headers, bodies, receipts, logs, or
+   consensus proof;
+2. the processor or raw-history policy retained the required product; and
+3. the query can locate the requested block or transaction exactly.
+
+That is why applications should inspect `/v1/capabilities`, processor status,
+and collection metadata instead of assuming every compiled route is usable for
+every configured node.
+
+## What the EVM-free core can do
+
+With capable sources, Leani can serve blocks, transactions, receipts, logs,
+chain metadata, subscriptions, processor snapshots, generic collections, and
+processor-owned queries. Hash-only historical lookup also requires a retained
+locator or recent material.
+
+## What it refuses
+
+Without execution state and an EVM, arbitrary `eth_call`, `eth_getBalance`,
+`eth_getCode`, `eth_getStorageAt`, `eth_estimateGas`, and debug/trace methods are
+not honest implementations. They fail explicitly. Derived balances or prices
+are processor products with documented scope; they are not substitutes for
+arbitrary historical Ethereum state.
+
+Keep an execution provider for unsupported methods and as an independent
+fallback during the preview. The exact matrix lives in
+[Ethereum JSON-RPC compatibility](/docs/reference/ethereum-json-rpc/).

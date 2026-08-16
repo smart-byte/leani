@@ -1,0 +1,30 @@
+---
+title: Architecture decisions
+description: Browse the accepted public engineering decisions that define Leani's contracts and subsystem boundaries.
+section: contributing
+order: 30
+audience:
+  - contributor
+  - processor-author
+status: preview
+---
+
+import SourceLink from '@docs/components/docs/SourceLink.astro';
+
+Accepted ADRs are immutable records. A later decision supersedes an earlier
+record rather than rewriting its historical context.
+
+1. <SourceLink path="docs/adr/0001-license-and-contract-versioning.md">Dual license and contract versioning</SourceLink>
+2. <SourceLink path="docs/adr/0002-direct-arrow-xatu-reader.md">Direct Arrow for the initial Xatu reader</SourceLink>
+3. <SourceLink path="docs/adr/0003-verified-beacon-api-finality.md">Verified Beacon API finality</SourceLink>
+4. <SourceLink path="docs/adr/0004-direct-reth-p2p-boundary.md">Direct Reth P2P boundary</SourceLink>
+5. <SourceLink path="docs/adr/0005-sqlite-transaction-overlay.md">SQLite transaction overlay</SourceLink>
+6. <SourceLink path="docs/adr/0006-durable-bounded-historical-runtime.md">Durable bounded historical runtime</SourceLink>
+7. <SourceLink path="docs/adr/0007-native-runtime-firehose-boundary.md">Native runtime first; Firehose at the edge</SourceLink>
+8. <SourceLink path="docs/adr/0008-native-api-is-the-v1-integration-boundary.md">Native API as the v1 integration boundary</SourceLink>
+9. <SourceLink path="docs/adr/0009-native-consensus-p2p-finality.md">Native consensus P2P finality</SourceLink>
+10. <SourceLink path="docs/adr/0010-persistent-p2p-and-late-archive-reconciliation.md">Persistent P2P and late archive reconciliation</SourceLink>
+11. <SourceLink path="docs/adr/0011-process-wide-execution-p2p-manager.md">Process-wide execution P2P manager</SourceLink>
+
+The links use the documentation build ref: previews point to `main`, while
+production docs point to the exact release tag carried by `site-production`.

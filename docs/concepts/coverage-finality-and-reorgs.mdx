@@ -1,0 +1,57 @@
+---
+title: Coverage, finality, and reorgs
+description: Read Leani's exact coverage intervals, understand independent finality, and handle explicit apply, undo, and finalized transitions.
+section: concepts
+order: 20
+audience:
+  - app-developer
+  - operator
+status: preview
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+Coverage answers “which block intervals did this processor commit?” Finality
+answers “what canonicality confidence does each committed interval have?” They
+are related but deliberately not collapsed into one boolean.
+
+```text
+requested       100 ─────────────────────────────── 140
+coverage        100 ───── 112     120 ───────────── 140
+finalized       100 ───────────────── 128
+safe                                      129 ── 134
+optimistic                                        135 ── 140
+```
+
+In that example, `complete` is false because `113..119` is absent. A high
+`processedThrough` value does not hide the internal gap, and finalized coverage
+does not imply the optimistic tail is absent.
+
+## Filling history gaps
+
+Leani resumes from committed coverage, not from the last downloaded object.
+Retained material and configured archive sources are preferred when capable.
+Verified execution P2P can recover the remaining finalized gaps while the live
+lane continues following head.
+
+By default, omission of `sources.p2p.history_fallback_blocks` makes every gap at
+or after the processor start block eligible. Setting it creates an explicit
+suffix boundary. It is a policy limit, not a protocol limitation or a new
+default.
+
+<Aside type="caution" title="Availability still matters">
+  Eligibility does not guarantee that peers retain very old bodies and
+  receipts. Full-gap recovery is attempted; an incapable or unavailable source
+  fails explicitly rather than converting missing history into empty output.
+</Aside>
+
+## Reorgs are delivery events
+
+For optimistic publication, downstream consumers can see `apply`, `undo`, and
+later `finalized` changes. Processor state, undo records, and published changes
+commit together. A consumer must implement these operations idempotently and
+must not infer finality from age alone.
+
+Use processor status for exact intervals and `/v1/network/status` for the
+independent live/finality lane state. Readiness can be healthy while an older
+backfill gap is still being filled.
