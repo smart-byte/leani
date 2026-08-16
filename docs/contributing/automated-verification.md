@@ -1,4 +1,13 @@
-# Leani end-to-end verification
+---
+title: Automated verification
+description: Run Leani's network-free fixtures, deterministic fault matrix, bounded evidence gates, and optional Mainnet staging checks.
+section: contributing
+order: 40
+audience:
+  - contributor
+  - operator
+status: preview
+---
 
 The project has two separate end-to-end gates. They answer different
 questions and neither substitutes for the other.

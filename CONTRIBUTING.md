@@ -9,7 +9,7 @@ correctness or storage regression can be bisected.
 Public source, processor, store, API, SDK, cursor, or durable encoding changes
 need an ADR in `docs/adr/`. Compatibility changes must include migration,
 golden-fixture, and downgrade behavior. Do not broaden RPC compatibility
-without updating `docs/RPC-COMPATIBILITY.md` and adding differential tests.
+without updating `docs/reference/ethereum-json-rpc.md` and adding differential tests.
 
 ## Local checks
 

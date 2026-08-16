@@ -2,7 +2,7 @@
   "id": "transaction-stats",
   "label": "transaction-stats",
   "caption": "Ordered aggregate with constant-sized state for top-level A-to-B transactions. Internal calls and traces are intentionally outside this processor.",
-  "docsUrl": "https://github.com/smart-byte/leani/blob/main/docs/PROCESSORS.md#transaction-stats-100",
+  "docsUrl": "/docs/reference/processor-contracts/#transaction-stats-100",
   "configLang": "toml",
   "config": "[[processors]]\nid = \"transaction-stats\"\ninstance = \"treasury-flow-total\"\nversion = \"1.0.0\"\nhistory_mode = \"on_demand\"\nstart_block = 15537394\npublish = \"finalized_only\"\n\n[processors.state]\nmode = \"checkpointed\"\n\n[processors.artifacts]\nmode = \"none\"\n\n[processors.output]\nmode = \"latest\"\n\n[processors.delivery]\nmode = \"none\"\n\n[processors.checkpoint]\nmode = \"automatic\"\nkeep = 3\n\n[processors.undo]\nmode = \"none\"\nsafety_blocks = 0\n\n[processors.settings]\nfrom = \"0x1111111111111111111111111111111111111111\"\nto = \"0x2222222222222222222222222222222222222222\"\ncomplete_from_start = true",
   "dataType": "{\n  from: Hex;\n  to: Hex;\n  count: number;\n  totalValueWei: string;\n  asOfBlock: number;\n  blockHash: Hex;\n  finality: \"optimistic\" | \"safe\" | \"finalized\";\n  coverageFrom: number;\n  complete: boolean;\n}",

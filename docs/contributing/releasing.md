@@ -1,4 +1,12 @@
-# Release process
+---
+title: Release process
+description: Cut and verify coordinated Leani binaries, crates, SDK, container, Homebrew, and release-pinned documentation.
+section: contributing
+order: 60
+audience:
+  - contributor
+status: preview
+---
 
 1. Complete the milestone gate and attach its evidence report.
 2. Run the full Rust, SDK, dependency-policy, migration, backup/restore, and

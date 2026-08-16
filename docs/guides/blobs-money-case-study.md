@@ -1,4 +1,13 @@
-# blobs.money reference processor and Leani integration
+---
+title: blobs.money integration case study
+description: See how a real application splits historical indexing, live following, query serving, and fallback responsibilities.
+section: guides
+order: 30
+audience:
+  - app-developer
+  - operator
+status: preview
+---
 
 The blobs domain is the first processor, correctness corpus, and performance
 benchmark for Leani. blobs.money now contains a native sidecar consumer,

@@ -1,4 +1,13 @@
-# Leani manual testing
+---
+title: Manual verification
+description: Rehearse catch-up, live following, subscriptions, JSON-RPC behavior, restart, and recovery against explicit acceptance checks.
+section: contributing
+order: 50
+audience:
+  - contributor
+  - operator
+status: preview
+---
 
 This guide exercises Leani the way an application such as blobs.money uses its
 native integration:
@@ -10,7 +19,7 @@ native integration:
 5. interrupt, restart, and resume from a saved change cursor.
 
 For repeatable automated gates and their evidence requirements, see
-[End-to-end verification](E2E-TESTING.md).
+[Automated verification](/docs/contributing/automated-verification/).
 
 ## Test modes
 

@@ -1,4 +1,13 @@
-# Leani custom processors
+---
+title: Processor extension contract
+description: Understand the native processor factory, settings, map/reduce, query extension, generic API, and future Wasm boundary.
+section: contributing
+order: 20
+audience:
+  - processor-author
+  - contributor
+status: preview
+---
 
 The node is an embeddable Rust library as well as a standard binary. Downstream
 projects can register application-specific native processors and compile their
@@ -235,7 +244,7 @@ the cursor in one consumer transaction is required.
 
 ## Complete example
 
-[`examples/custom-node`](../examples/custom-node) is a separate downstream
+The complete [`examples/custom-node` walkthrough](/docs/guides/custom-processor/) is a separate downstream
 binary inside the workspace. It:
 
 - defines its own strict settings type;

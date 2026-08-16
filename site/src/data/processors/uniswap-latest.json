@@ -2,7 +2,7 @@
   "id": "uniswap-latest",
   "label": "uniswap-latest",
   "caption": "Latest exact reserves or sqrtPriceX96 per configured pool—never floating point, no EVM execution. Use uniswap-observations when you need immutable history.",
-  "docsUrl": "https://github.com/smart-byte/leani/blob/main/docs/PROCESSORS.md#uniswap-observations--uniswap-latest-100",
+  "docsUrl": "/docs/reference/processor-contracts/#uniswap-observations--uniswap-latest-100",
   "configLang": "toml",
   "config": "[[processors]]\nid = \"uniswap-latest\"\ninstance = \"usdc-weth-latest\"\nversion = \"1.0.0\"\nhistory_mode = \"on_demand\"\nstart_block = 12369621\npublish = \"optimistic_and_finalized\"\n\n[processors.state]\nmode = \"checkpointed\"\n\n[processors.artifacts]\nmode = \"none\"\n\n[processors.output]\nmode = \"latest\"\n\n[processors.delivery]\nmode = \"window\"\n\n[processors.checkpoint]\nmode = \"automatic\"\nkeep = 3\n\n[processors.undo]\nmode = \"unfinalized\"\nsafety_blocks = 256\n\n[[processors.settings.pools]]\naddress = \"0x88e6A0c2dDD26FEEb64F039a2c41296FcB3f5640\"  # USDC/WETH 0.05%\nkind = \"v3\"",
   "dataType": "{\n  pool: Hex;\n  kind: \"v2\" | \"v3\";\n  reserve0: string | null;\n  reserve1: string | null;\n  sqrtPriceX96: string | null;\n  blockNumber: number;\n  blockHash: Hex;\n  logIndex: number;\n  finality: \"optimistic\" | \"safe\" | \"finalized\";\n}",

@@ -1,4 +1,13 @@
-# Leani public API and TypeScript SDK
+---
+title: Native API and delivery protocol
+description: Understand snapshots, retained queries, durable consumers, change envelopes, errors, and capability discovery.
+section: reference
+order: 70
+audience:
+  - app-developer
+  - operator
+status: preview
+---
 
 Status: implemented v1 contract baseline, 2026-08-01.
 

@@ -1,4 +1,13 @@
-# Leani data sources and upstream context
+---
+title: History and live data sources
+description: Understand how Leani selects, verifies, and combines archive, RPC, Beacon API, and native P2P sources.
+section: concepts
+order: 10
+audience:
+  - operator
+  - processor-author
+status: preview
+---
 
 Schema rechecked against the upstream Xatu schema on 2026-08-04. Public
 availability remains operational evidence and must still be probed before a

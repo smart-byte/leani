@@ -1,4 +1,18 @@
-# Preview limitations
+---
+title: Preview limitations
+description: Know Leani's current production boundaries, unsupported behavior, and explicit operator obligations before deploying it.
+section: operations
+order: 0
+audience:
+  - app-developer
+  - operator
+  - processor-author
+status: preview
+sidebar:
+  badge:
+    text: Read first
+    variant: caution
+---
 
 Leani is pre-release software. The first public preview is intended for
 evaluation, processor development, reproducible backfills, and guarded
@@ -23,5 +37,5 @@ application integrations with an independent fallback.
   control. Non-loopback deployments must use a trusted network or authenticated
   reverse proxy and must not expose admin/debug endpoints publicly.
 
-Treat this file and the [changelog](../CHANGELOG.md) as the public scope
+Treat this page and the [release process](/docs/contributing/releasing/) as the public scope
 boundary for the current preview.

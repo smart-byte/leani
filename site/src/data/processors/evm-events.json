@@ -2,7 +2,7 @@
   "id": "evm-events",
   "label": "evm-events",
   "caption": "Declarative static-ABI decoding—no EVM or contract code, just logs. Dynamic values, tuples, arrays, and anonymous events are rejected by doctor.",
-  "docsUrl": "https://github.com/smart-byte/leani/blob/main/docs/PROCESSORS.md#evm-events-100",
+  "docsUrl": "/docs/reference/processor-contracts/#evm-events-100",
   "configLang": "toml",
   "config": "[[processors]]\nid = \"evm-events\"\ninstance = \"weth-transfers\"\nversion = \"1.0.0\"\nhistory_mode = \"on_demand\"\nstart_block = 12965000\npublish = \"finalized_only\"\n\n[processors.state]\nmode = \"durable\"\n\n[processors.artifacts]\nmode = \"none\"\n\n[processors.output]\nmode = \"window\"\nfinalized_only = true\n\n[processors.output.window]\nmax_blocks = 216000\n\n[processors.delivery]\nmode = \"none\"\n\n[processors.checkpoint]\nmode = \"automatic\"\nkeep = 3\n\n[processors.undo]\nmode = \"none\"\nsafety_blocks = 0\n\n[processors.settings]\naddresses = [\"0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2\"]\n\n[[processors.settings.events]]\nabi = \"event Transfer(address indexed from, address indexed to, uint256 value)\"\n\n[processors.settings.events.output]\ncollection = \"weth.transfers\"\nkind = \"weth.transfer\"\nkey_fields = []",
   "dataType": "{\n  schemaVersion: number;\n  contract: Hex;\n  event: string;\n  signature: string;\n  blockNumber: number;\n  blockHash: Hex;\n  blockTimestamp: number;\n  bucketStartTimestamp?: number;\n  transactionHash: Hex;\n  transactionIndex: number;\n  logIndex: number;\n  finality: \"optimistic\" | \"safe\" | \"finalized\";\n  values: Record<string, string>;\n}",

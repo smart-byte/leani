@@ -1,4 +1,13 @@
-# Leani RPC compatibility and derived balances
+---
+title: Ethereum JSON-RPC compatibility
+description: See exactly which Ethereum JSON-RPC methods Leani implements, refuses, or exposes only through native APIs.
+section: reference
+order: 60
+audience:
+  - app-developer
+  - operator
+status: preview
+---
 
 Status: metadata, bounded recent-material HTTP, and live WebSocket profiles
 are implemented. Canonical header/transaction/receipt bytes are decoded into
@@ -252,4 +261,4 @@ Clients resume from a cursor. If the node has pruned the required change history
 The v1 native transport is HTTP query plus SSE, with a TypeScript SDK that
 handles reconnect and opaque cursors. Standard `eth_subscribe` remains
 WebSocket JSON-RPC and follows Ethereum's subscription semantics. See
-[API-SDK.md](API-SDK.md).
+[native API and delivery protocol](/docs/reference/native-api-and-delivery/).

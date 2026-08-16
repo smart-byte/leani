@@ -1,4 +1,12 @@
-# Leani operations
+---
+title: Operations runbook
+description: Deploy, observe, back up, restore, compact, and recover a Leani node using its explicit health and storage contracts.
+section: operations
+order: 20
+audience:
+  - operator
+status: preview
+---
 
 ## Deployment profiles
 

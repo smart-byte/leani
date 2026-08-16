@@ -1,8 +1,18 @@
-# Leani built-in processors
+---
+title: Processor contracts
+description: Reference the configuration, state, output, change, and query contracts of Leani's built-in processors.
+section: reference
+order: 55
+audience:
+  - app-developer
+  - operator
+  - processor-author
+status: preview
+---
 
 These processors ship in the standard binary. Downstream projects can assemble
 a custom binary and register independent native processors through the public
-factory/registry API; see [Custom processors](CUSTOM-PROCESSORS.md).
+factory/registry API; see [Build a custom processor](/docs/guides/custom-processor/).
 
 ## blobs-money 1.4.0
 

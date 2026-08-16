@@ -2,7 +2,7 @@
   "id": "erc20-balances",
   "label": "erc20-balances",
   "caption": "Event-derived watchlist balances with declared coverage. Exact for conventional Transfer semantics when indexing begins before the relevant initial mint; rebasing, reflection, and non-standard tokens need a different model.",
-  "docsUrl": "https://github.com/smart-byte/leani/blob/main/docs/PROCESSORS.md#erc20-balances-100",
+  "docsUrl": "/docs/reference/processor-contracts/#erc20-balances-100",
   "configLang": "toml",
   "config": "[[processors]]\nid = \"erc20-balances\"\ninstance = \"erc20-watchlist\"\nversion = \"1.0.0\"\nhistory_mode = \"on_demand\"\nstart_block = 1234567\npublish = \"optimistic_and_finalized\"\n\n[processors.state]\nmode = \"durable\"\n\n[processors.artifacts]\nmode = \"none\"\n\n[processors.output]\nmode = \"latest\"\n\n[processors.delivery]\nmode = \"window\"\n\n[processors.checkpoint]\nmode = \"automatic\"\nkeep = 3\n\n[processors.undo]\nmode = \"unfinalized\"\nsafety_blocks = 256\n\n[processors.settings]\naddresses = [\"0x1111111111111111111111111111111111111111\"]\ntokens = [\"0x2222222222222222222222222222222222222222\"]\ncomplete_from_start = true",
   "dataType": "{\n  token: Hex;\n  address: Hex;\n  balance: string;\n  asOfBlock: number;\n  blockHash: Hex;\n  finality: \"optimistic\" | \"safe\" | \"finalized\";\n  coverageFrom: number;\n  complete: boolean;\n  method: \"erc20_transfer_ledger\";\n}",

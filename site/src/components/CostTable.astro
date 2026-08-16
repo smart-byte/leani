@@ -1,6 +1,6 @@
 ---
 import costs from '../data/costs.json';
-import { EVIDENCE_URL, GITHUB_URL } from '../config';
+import { EVIDENCE_URL, sourceUrl } from '../config';
 ---
 <section id="costs" class="wrap section" aria-labelledby="cost-h">
   <h2 id="cost-h"><span class="mono"># </span>Storage is a policy, not a promise</h2>
@@ -37,8 +37,8 @@ import { EVIDENCE_URL, GITHUB_URL } from '../config';
     {costs.footnotes.map((note) => <li>{note}</li>)}
   </ol>
   <p class="evidence">
-    <a href={EVIDENCE_URL}>Real Mainnet million-block report →</a>
-    <a href={`${GITHUB_URL}/tree/main/config/modes`}>Lifecycle profiles →</a>
+    <a href={EVIDENCE_URL}>Reproduce the Mainnet evidence gate →</a>
+    <a href={sourceUrl('config/modes', 'tree')}>Lifecycle profiles →</a>
   </p>
 </section>
 

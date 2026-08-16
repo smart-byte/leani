@@ -1,4 +1,13 @@
-# Leani architecture
+---
+title: Architecture
+description: Learn Leani's invariants, component boundaries, normalized data model, planning, lanes, storage classes, and reorg model.
+section: contributing
+order: 10
+audience:
+  - contributor
+  - processor-author
+status: preview
+---
 
 ## 1. Terminology
 

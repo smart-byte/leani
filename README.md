@@ -29,7 +29,7 @@ canonical RPC types. On-demand calls use only a capability-complete configured
 history source and discard frames after the response. Unsupported methods
 continue to fail explicitly, and live readiness is only true while a
 peer-backed subscription is usable. See
-[preview limitations](docs/KNOWN-LIMITATIONS.md) before deploying it.
+[preview limitations](docs/operations/preview-limitations.md) before deploying it.
 
 ## Mission
 
@@ -90,7 +90,7 @@ RPC fallback. Production shadow parity, failure recovery, sustained staging,
 and rollback evidence are still required before removing its managed-provider
 fallback.
 
-Token balances and Uniswap prices are the next generality tests. Both can be derived from receipt logs without an EVM, subject to the semantic limits documented in [RPC compatibility](docs/RPC-COMPATIBILITY.md).
+Token balances and Uniswap prices are the next generality tests. Both can be derived from receipt logs without an EVM, subject to the semantic limits documented in [RPC compatibility](docs/reference/ethereum-json-rpc.md).
 
 ## Important boundary
 
@@ -110,23 +110,23 @@ Those methods can eventually use an optional forwarding or stateless-execution e
 
 ## User documentation
 
-- [Five-minute native and Docker quickstart](docs/QUICKSTART.md)
-- [Architecture](docs/ARCHITECTURE.md)
-- [Public API and TypeScript SDK](docs/API-SDK.md)
-- [Normalized frame archive](docs/ARCHIVE-FORMAT.md)
-- [Built-in processors](docs/PROCESSORS.md)
-- [Configuration reference and operating modes](docs/CONFIGURATION.md)
-- [Custom native processors and future Wasm packages](docs/CUSTOM-PROCESSORS.md)
-- [Manual 10,000-block, live-follow, subscription, and restart testing](docs/MANUAL-TESTING.md)
-- [Automated and public Mainnet end-to-end verification](docs/E2E-TESTING.md)
-- [Operations and failure runbooks](docs/OPERATIONS.md)
-- [Threat model](docs/THREAT-MODEL.md)
-- [RPC compatibility and balance semantics](docs/RPC-COMPATIBILITY.md)
-- [History and live data sources](docs/DATA-SOURCES.md)
-- [blobs.money reference processor and integration](docs/BLOBS-MONEY.md)
-- [Preview limitations](docs/KNOWN-LIMITATIONS.md)
+- [Offline proof and bounded Mainnet quickstart](docs/getting-started/offline-to-mainnet.md)
+- [Architecture](docs/contributing/architecture.md)
+- [Native API and delivery protocol](docs/reference/native-api-and-delivery.md)
+- [Normalized frame archive](docs/reference/archive-format.md)
+- [Built-in processor contracts](docs/reference/processor-contracts.md)
+- [Configuration guide](docs/operations/configuration-guide.md)
+- [Custom native processors and future Wasm packages](docs/contributing/processor-extension-contract.md)
+- [Manual 10,000-block, live-follow, subscription, and restart testing](docs/contributing/manual-verification.md)
+- [Automated and public Mainnet end-to-end verification](docs/contributing/automated-verification.md)
+- [Operations and failure runbooks](docs/operations/runbook.md)
+- [Trust and threat model](docs/operations/trust-and-threat-model.md)
+- [RPC compatibility and balance semantics](docs/reference/ethereum-json-rpc.md)
+- [History and live data sources](docs/concepts/data-sources.md)
+- [blobs.money integration case study](docs/guides/blobs-money-case-study.md)
+- [Preview limitations](docs/operations/preview-limitations.md)
 - [Architecture decision records](docs/adr/README.md)
-- [Release process](docs/RELEASING.md)
+- [Release process](docs/contributing/releasing.md)
 - [Changelog](CHANGELOG.md)
 
 ## Run diagnostics
@@ -134,7 +134,7 @@ Those methods can eventually use an optional forwarding or stateless-execution e
 For the complete application-style workflow—including selecting the last
 10,000 finalized blocks, concurrent catch-up and head following, consuming the
 `blobs-money` transformation stream, querying RPC, and testing restart/cursor
-resume—follow [manual testing](docs/MANUAL-TESTING.md).
+resume—follow [manual testing](docs/contributing/manual-verification.md).
 
 The checked-in example deliberately contains a finality checkpoint placeholder,
 so `doctor` reports it as non-operational without opening a database or network
@@ -381,7 +381,7 @@ The default Rust suite includes a deterministic 10,000-block hot/cold restart
 and convergence test. A separate production-adapter Mainnet runner verifies a
 real historical catch-up, exact overlap, additional head following, freshness,
 and SQLite integrity while writing a pass/fail evidence report. See
-[end-to-end verification](docs/E2E-TESTING.md).
+[end-to-end verification](docs/contributing/automated-verification.md).
 
 ## Current networking architecture
 
@@ -409,7 +409,7 @@ changes through the native API; pointing its legacy ethers/fetch code at the
 local RPC remains a compatibility and emergency-fallback option.
 
 Release validation follows the documented
-[end-to-end checks](docs/E2E-TESTING.md). blobs.money remains a reference
+[end-to-end checks](docs/contributing/automated-verification.md). blobs.money remains a reference
 processor, parity benchmark, and pre-launch integration. Its production
 cutover remains separately gated by shadow parity, failure testing, staging
 evidence, and a tested rollback path.

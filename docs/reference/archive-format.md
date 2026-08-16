@@ -1,4 +1,13 @@
-# Leani normalized frame archive
+---
+title: Normalized frame archive
+description: Reference the deterministic, checksummed archive format used to move normalized Leani frame segments.
+section: reference
+order: 80
+audience:
+  - operator
+  - contributor
+status: preview
+---
 
 Status: implemented interchange format v1.
 

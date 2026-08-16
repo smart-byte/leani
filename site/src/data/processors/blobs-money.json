@@ -2,7 +2,7 @@
   "id": "blobs-money",
   "label": "blobs-money",
   "caption": "One atomic block bundle—economics plus every blob transaction. Node commits are atomic; consumers receive at-least-once and commit their cursor before ACK.",
-  "docsUrl": "https://github.com/smart-byte/leani/blob/main/docs/PROCESSORS.md#blobs-money-140",
+  "docsUrl": "/docs/reference/processor-contracts/#blobs-money-140",
   "liveUrl": "https://blobs.money",
   "configLang": "toml",
   "config": "[[processors]]\nid = \"blobs-money\"\ninstance = \"blobs-production\"\nversion = \"1.4.0\"\nhistory_mode = \"on_demand\"\nstart_block = 19426589  # Dencun\npublish = \"optimistic_and_finalized\"\n\n[processors.state]\nmode = \"checkpointed\"\n\n[processors.artifacts]\nmode = \"none\"\n\n[processors.output]\nmode = \"full\"\n\n[processors.delivery]\nmode = \"window\"\n\n[processors.checkpoint]\nmode = \"automatic\"\nkeep = 3\n\n[processors.undo]\nmode = \"unfinalized\"\nsafety_blocks = 256",

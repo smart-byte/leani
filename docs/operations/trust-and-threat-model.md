@@ -1,4 +1,13 @@
-# Leani threat model
+---
+title: Trust and threat model
+description: Identify the assets, trust boundaries, controls, and residual risks of a Leani deployment.
+section: operations
+order: 30
+audience:
+  - operator
+  - app-developer
+status: preview
+---
 
 ## Protected assets
 

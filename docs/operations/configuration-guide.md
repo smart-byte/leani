@@ -1,9 +1,17 @@
-# Leani configuration reference
+---
+title: Configure a node
+description: Compose data sources, processor identities, lifecycle policies, API settings, credentials, and operating profiles.
+section: operations
+order: 10
+audience:
+  - operator
+  - processor-author
+status: preview
+---
 
 Leani reads strict, versioned TOML. Unknown fields are errors. The
-machine-readable contract is [`config/schema-v1.json`](../config/schema-v1.json);
-the six complete lifecycle profiles are in
-[`config/modes`](../config/modes).
+machine-readable contract is rendered in the [configuration field reference](/docs/reference/configuration/);
+six complete lifecycle profiles are checked under `config/modes`.
 
 Validate a file without opening its database or any network connection:
 

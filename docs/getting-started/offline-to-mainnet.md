@@ -1,4 +1,13 @@
-# Leani five-minute quickstart
+---
+title: Offline proof to Mainnet
+description: Prove a Leani release without network access, then move to a bounded Mainnet range and durable consumer.
+section: getting-started
+order: 20
+audience:
+  - app-developer
+  - operator
+status: preview
+---
 
 The first run is deterministic and network-free. It exercises the distributed
 binary, historical runtime, processor reduction, schema migrations, delivery
@@ -104,4 +113,5 @@ For the externalized profile, register the configured required consumer before
 backfill using `earliest_retained`. Store the returned consumer credential
 outside TOML. Read changes with that credential, commit each destination
 transaction and cursor atomically, then acknowledge the cursor. See
-[API and SDK](API-SDK.md) for exact routes and the commit-then-ack helper.
+[native API and delivery protocol](/docs/reference/native-api-and-delivery/) for
+exact semantics and the commit-then-ack helper.
