@@ -1,0 +1,56 @@
+---
+import costs from '../data/costs.json';
+import { EVIDENCE_URL, GITHUB_URL } from '../config';
+---
+<section id="costs" class="wrap section" aria-labelledby="cost-h">
+  <h2 id="cost-h"><span class="mono"># </span>Storage is a policy, not a promise</h2>
+  <p class="lede">
+    State, query output, delivery, artifacts, checkpoints, undo, and raw history
+    have independent lifecycle controls and hard budgets. Keep a current value,
+    a rolling window, a reusable history, or only an acknowledged external copy.
+  </p>
+  <div class="scroll">
+    <table>
+      <thead>
+        <tr>
+          <th scope="col">Profile</th>
+          <th scope="col">Retained by leani</th>
+          <th scope="col">Bound</th>
+          <th scope="col">Best fit</th>
+          <th scope="col">Measured example</th>
+        </tr>
+      </thead>
+      <tbody>
+        {costs.rows.map((row) => (
+          <tr class={row.highlight ? 'hl' : ''}>
+            <th scope="row" class="mono">{row.profile}</th>
+            <td>{row.retains}</td>
+            <td>{row.bound}</td>
+            <td>{row.fit}</td>
+            <td>{row.evidence}</td>
+          </tr>
+        ))}
+      </tbody>
+    </table>
+  </div>
+  <ol class="footnotes">
+    {costs.footnotes.map((note) => <li>{note}</li>)}
+  </ol>
+  <p class="evidence">
+    <a href={EVIDENCE_URL}>Real Mainnet million-block report →</a>
+    <a href={`${GITHUB_URL}/tree/main/config/modes`}>Lifecycle profiles →</a>
+  </p>
+</section>
+
+<style>
+  .lede { color: var(--ink-dim); max-width: 52ch; margin-top: 1rem; }
+  .scroll { min-width: 0; max-width: 100%; overflow-x: auto; margin-top: 2.5rem; }
+  table { border-collapse: collapse; width: 100%; min-width: 56rem; font-size: 0.95rem; }
+  th, td { text-align: left; padding: 0.9rem 1rem; border-bottom: 1px solid var(--panel-edge); vertical-align: top; }
+  thead th { color: var(--ink-dim); font-weight: 500; font-size: 0.8rem; letter-spacing: 0.08em; text-transform: uppercase; }
+  tbody th { font-weight: 400; }
+  tr.hl { background: color-mix(in srgb, var(--accent) 7%, transparent); }
+  tr.hl th { color: var(--accent); }
+  .footnotes { color: var(--ink-dim); font-size: 0.8rem; margin-top: 1.5rem; padding-left: 1.2rem; display: grid; gap: 0.4rem; }
+  .evidence { display: flex; gap: 1.25rem; flex-wrap: wrap; margin-top: 1.25rem; font-size: 0.88rem; }
+</style>

@@ -1,0 +1,75 @@
+{
+  "id": "uniswap-latest",
+  "label": "uniswap-latest",
+  "caption": "Latest exact reserves or sqrtPriceX96 per configured pool—never floating point, no EVM execution. Use uniswap-observations when you need immutable history.",
+  "docsUrl": "https://github.com/smart-byte/leani/blob/main/docs/PROCESSORS.md#uniswap-observations--uniswap-latest-100",
+  "configLang": "toml",
+  "config": "[[processors]]\nid = \"uniswap-latest\"\ninstance = \"usdc-weth-latest\"\nversion = \"1.0.0\"\nhistory_mode = \"on_demand\"\nstart_block = 12369621\npublish = \"optimistic_and_finalized\"\n\n[processors.state]\nmode = \"checkpointed\"\n\n[processors.artifacts]\nmode = \"none\"\n\n[processors.output]\nmode = \"latest\"\n\n[processors.delivery]\nmode = \"window\"\n\n[processors.checkpoint]\nmode = \"automatic\"\nkeep = 3\n\n[processors.undo]\nmode = \"unfinalized\"\nsafety_blocks = 256\n\n[[processors.settings.pools]]\naddress = \"0x88e6A0c2dDD26FEEb64F039a2c41296FcB3f5640\"  # USDC/WETH 0.05%\nkind = \"v3\"",
+  "dataType": "{\n  pool: Hex;\n  kind: \"v2\" | \"v3\";\n  reserve0: string | null;\n  reserve1: string | null;\n  sqrtPriceX96: string | null;\n  blockNumber: number;\n  blockHash: Hex;\n  logIndex: number;\n  finality: \"optimistic\" | \"safe\" | \"finalized\";\n}",
+  "sseId": "opaque-resume-cursor",
+  "helloJson": {
+    "apiVersion": "1",
+    "chainId": 1,
+    "processor": {
+      "id": "uniswap-latest",
+      "instance": "usdc-weth-latest",
+      "version": "1.0.0",
+      "codeHash": "0x91d4e7a2c05f6b83b1a09c44de72f1385ac6d90e2b57031fc8ea46b97d20835f",
+      "configHash": "0x5abc016e94d2f7c3810f5b6ea2d94c07e63b8f1259d0a47c3e18b60d72c49fa8",
+      "genericApi": "processor-v1",
+      "changeSchema": "uniswap.price.change.v1",
+      "queryExtensions": [{
+        "id": "uniswap-v1",
+        "basePath": "/v1/processors/usdc-weth-latest/query",
+        "aliasPath": "/v1/q/uniswap"
+      }],
+      "subscriptions": true,
+      "artifactRetention": "none",
+      "deliveryOrdering": "canonical"
+    },
+    "coverage": {
+      "chainId": 1,
+      "requested": null,
+      "available": [
+        { "fromBlock": 12369621, "toBlock": 25696396, "finality": "optimistic" }
+      ],
+      "configuredStartBlock": 12369621,
+      "processedThrough": 25696396,
+      "finalizedThrough": 25696313,
+      "complete": true,
+      "state": "live"
+    }
+  },
+  "outputJson": {
+    "apiVersion": "1",
+    "sequence": "231872",
+    "cursor": "opaque-resume-cursor",
+    "operation": "apply",
+    "originKind": "live",
+    "originId": "usdc-weth-latest",
+    "publicationRevision": "0",
+    "chainId": 1,
+    "block": {
+      "hash": "0xc86f87600c81fb635325cca051fef40b875ca405d1b2f57881437963321e88ff",
+      "number": 25696396,
+      "parentHash": "0x0141a01b6e38f75cd3606834c3780f581d5772460e440e7c5758b69589929168",
+      "timestamp": 1786025147
+    },
+    "finality": "optimistic",
+    "kind": "uniswap.price.current.put",
+    "schema": "uniswap.price.change.v1",
+    "key": "0x88e6a0c2ddd26feeb64f039a2c41296fcb3f5640",
+    "data": {
+      "pool": "0x88e6a0c2ddd26feeb64f039a2c41296fcb3f5640",
+      "kind": "v3",
+      "reserve0": null,
+      "reserve1": null,
+      "sqrtPriceX96": "1829233563324955304354064818",
+      "blockNumber": 25696396,
+      "blockHash": "0xc86f87600c81fb635325cca051fef40b875ca405d1b2f57881437963321e88ff",
+      "logIndex": 158,
+      "finality": "optimistic"
+    },
+    "emittedAt": "2026-08-06T14:05:51.426Z"
+  }
+}

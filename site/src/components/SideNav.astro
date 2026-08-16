@@ -1,0 +1,135 @@
+---
+interface Props { items?: [string, string][]; label?: string }
+
+const defaultItems: [string, string][] = [
+  ['#why', 'why'],
+  ['#pipeline', 'pipeline'],
+  ['#delivery', 'delivery'],
+  ['#processors', 'processors'],
+  ['#costs', 'storage'],
+  ['#rpc', 'rpc'],
+  ['#features', 'features'],
+  ['#quickstart', 'quickstart'],
+];
+
+const { items = defaultItems, label = 'Sections' } = Astro.props;
+---
+<nav class="sidenav mono" aria-label={label}>
+  <ul>
+    {items.map(([href, label]) => (
+      <li><a href={href} data-target={href.slice(1)}>{label}</a></li>
+    ))}
+  </ul>
+</nav>
+
+<details class="mobilenav mono">
+  <summary aria-label={`${label} menu`}>≡</summary>
+  <ul>
+    {items.map(([href, label]) => (
+      <li><a href={href}>{label}</a></li>
+    ))}
+  </ul>
+</details>
+
+<style>
+  /* Wide screens: fixed rail on the right. */
+  .sidenav { display: none; }
+  @media (min-width: 1400px) {
+    .sidenav {
+      display: block;
+      position: fixed;
+      right: 1.25rem;
+      top: 50%;
+      transform: translateY(-50%);
+      z-index: 5;
+      font-size: 0.75rem;
+    }
+  }
+  .sidenav ul { list-style: none; margin: 0; padding: 0; display: grid; gap: 0.45rem; }
+  .sidenav a {
+    color: var(--ink-dim);
+    text-decoration: none;
+    padding-left: 0.75rem;
+    border-left: 2px solid var(--panel-edge);
+    display: block;
+  }
+  .sidenav a:hover { color: var(--ink); }
+  .sidenav a.active { color: var(--accent); border-left-color: var(--accent); }
+
+  /* Narrow screens: collapsible menu, top right. */
+  .mobilenav {
+    position: fixed;
+    top: max(0.9rem, env(safe-area-inset-top));
+    right: max(0.9rem, env(safe-area-inset-right));
+    z-index: 10;
+    font-size: 0.85rem;
+  }
+  @media (min-width: 1400px) { .mobilenav { display: none; } }
+  .mobilenav summary {
+    cursor: pointer;
+    list-style: none;
+    user-select: none;
+    width: 2.4rem;
+    height: 2.4rem;
+    display: grid;
+    place-items: center;
+    background: var(--panel);
+    border: 1px solid var(--panel-edge);
+    border-radius: 8px;
+    color: var(--ink);
+    font-size: 1.1rem;
+  }
+  .mobilenav summary::-webkit-details-marker { display: none; }
+  .mobilenav[open] summary { color: var(--accent); border-color: var(--accent-dim); }
+  .mobilenav ul {
+    /* Out of flow so the open panel never resizes the details box and the
+       summary button stays pinned top right. */
+    position: absolute;
+    top: calc(100% + 0.5rem);
+    right: 0;
+    list-style: none;
+    margin: 0;
+    padding: 0.5rem;
+    display: grid;
+    gap: 0.15rem;
+    background: var(--panel);
+    border: 1px solid var(--panel-edge);
+    border-radius: 8px;
+    min-width: 10rem;
+  }
+  .mobilenav a {
+    color: var(--ink-dim);
+    text-decoration: none;
+    display: block;
+    padding: 0.4rem 0.6rem;
+    border-radius: 5px;
+  }
+  .mobilenav a:hover { color: var(--accent); background: color-mix(in srgb, var(--accent) 8%, transparent); }
+</style>
+
+<script>
+  // Scroll-spy for the desktop rail: the section crossing the middle band
+  // owns the highlight.
+  const links = [...document.querySelectorAll<HTMLAnchorElement>('.sidenav a')];
+  const byId = new Map(links.map((link) => [link.dataset.target!, link]));
+  const observer = new IntersectionObserver(
+    (entries) => {
+      for (const entry of entries) {
+        if (!entry.isIntersecting) continue;
+        links.forEach((link) => link.classList.remove('active'));
+        byId.get(entry.target.id)?.classList.add('active');
+      }
+    },
+    { rootMargin: '-40% 0px -55% 0px' },
+  );
+  for (const id of byId.keys()) {
+    const section = document.getElementById(id);
+    if (section) observer.observe(section);
+  }
+
+  // Collapse the mobile menu after a jump.
+  const mobile = document.querySelector<HTMLDetailsElement>('details.mobilenav');
+  mobile?.querySelectorAll('a').forEach((link) =>
+    link.addEventListener('click', () => mobile.removeAttribute('open')),
+  );
+</script>

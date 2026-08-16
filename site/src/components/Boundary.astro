@@ -1,0 +1,61 @@
+<section id="rpc" class="wrap section" aria-labelledby="rpc-h">
+  <h2 id="rpc-h"><span class="mono"># </span>An exact, capability-reported RPC subset</h2>
+  <p class="lede">
+    Existing Ethereum clients can use the block, transaction, receipt, log,
+    chain-metadata, and subscription methods leani advertises. Availability
+    still depends on configured sources, retained material, and hash locators.
+  </p>
+  <div class="grid">
+    <div class="panel">
+      <h3 class="mono ok-h">implemented exactly when available</h3>
+      <ul class="mono list">
+        <li>eth_getBlockByNumber / ByHash</li>
+        <li>eth_getBlockTransactionCountByNumber / ByHash</li>
+        <li>eth_getTransactionByBlockNumberAndIndex / ByHashAndIndex</li>
+        <li>eth_getBlockReceipts</li>
+        <li>eth_getTransactionByHash / Receipt</li>
+        <li>eth_getLogs <span class="note">(bounded recent + on-demand)</span></li>
+        <li>eth_blockNumber · eth_chainId · eth_config · eth_syncing</li>
+        <li>leani_getCapabilities</li>
+        <li>eth_subscribe: newHeads, logs <span class="note">(reorg-correct)</span></li>
+      </ul>
+      <p class="prose">
+        Number and range lookups can use capable historical sources. Hash-only
+        history is recent-only unless a locator or retained index is enabled.
+        Raw RPC history is post-Merge exact; pre-Merge ommer-aware responses are deferred.
+      </p>
+    </div>
+    <div class="panel">
+      <h3 class="mono no-h">refused, explicitly</h3>
+      <ul class="mono list dead">
+        <li>eth_call</li>
+        <li>eth_getBalance · eth_getCode · eth_getStorageAt</li>
+        <li>eth_estimateGas</li>
+        <li>debug/trace methods</li>
+      </ul>
+      <p class="prose">
+        No EVM, no state trie—so these fail explicitly instead of returning
+        something almost right. Keep an execution provider for stateful methods
+        and as an independent fallback while evaluating the public preview.
+      </p>
+    </div>
+  </div>
+</section>
+
+<style>
+  .lede { color: var(--ink-dim); max-width: 54ch; margin-top: 1rem; }
+  .grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 1.25rem; margin-top: 2.5rem; }
+  @media (max-width: 760px) { .grid { grid-template-columns: minmax(0, 1fr); } }
+  .panel { min-width: 0; background: var(--panel); border: 1px solid var(--panel-edge); border-radius: 10px; padding: 1.5rem; }
+  .panel:first-child { border-color: var(--accent-dim); }
+  h3 { font-size: 0.8rem; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; }
+  .ok-h { color: var(--accent); }
+  .no-h { color: var(--ink-dim); }
+  .list { list-style: none; padding: 0; margin-top: 1rem; display: grid; gap: 0.55rem; font-size: 0.88rem; }
+  .list li { overflow-wrap: anywhere; }
+  .list li::before { content: '▸ '; color: var(--accent-dim); }
+  .dead li { text-decoration: line-through; text-decoration-color: var(--accent-dim); color: var(--ink-dim); }
+  .dead li::before { content: '✕ '; text-decoration: none; }
+  .note { color: var(--ink-dim); font-size: 0.8em; }
+  .prose { color: var(--ink-dim); font-size: 0.9rem; margin-top: 1.25rem; }
+</style>

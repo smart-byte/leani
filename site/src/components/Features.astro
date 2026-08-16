@@ -1,0 +1,33 @@
+---
+const features = [
+  ['coverage-owned backfill', 'Coverage lives in SQLite. Restart at the first uncovered block—not at the last file or HTTP response.'],
+  ['reorg protocol', 'Apply, undo, and finalized changes make branch replacement explicit instead of silently rewriting downstream state.'],
+  ['durable consumers', 'Named consumers, leases, acknowledgements, lag telemetry, pruning fences, and commit-then-ACK helpers.'],
+  ['query then follow', 'Hold a stable multi-page snapshot and receive the exact boundary cursor needed to continue on the stream.'],
+  ['source provenance', 'Every change identifies its live, recovery, backfill, or recompute origin and publication revision.'],
+  ['capability routing', 'Trusted Xatu, commitment-checked EraE, retained raw segments, and P2P are selected only when they satisfy the request.'],
+  ['recovery built in', 'Checksummed portable savepoints, recovery checkpoints, retained artifacts, export, and replay are explicit APIs.'],
+  ['ops built in', 'Prometheus metrics, health and readiness, hard resource budgets, and a dependency-free network dashboard.'],
+];
+---
+<section id="features" class="wrap section" aria-labelledby="features-h">
+  <h2 id="features-h"><span class="mono"># </span>The operational contract is part of the product</h2>
+  <ul class="grid">
+    {features.map(([title, body]) => (
+      <li>
+        <h3 class="mono accent">{title}</h3>
+        <p>{body}</p>
+      </li>
+    ))}
+  </ul>
+</section>
+
+<style>
+  .grid {
+    list-style: none; padding: 0; margin-top: 2.5rem;
+    display: grid; grid-template-columns: repeat(auto-fill, minmax(16rem, 1fr)); gap: 1.1rem;
+  }
+  li { min-width: 0; background: var(--panel); border: 1px solid var(--panel-edge); border-radius: 10px; padding: 1.25rem; }
+  h3 { font-size: 0.95rem; font-weight: 700; }
+  p { color: var(--ink-dim); font-size: 0.9rem; margin-top: 0.5rem; }
+</style>

@@ -1,0 +1,39 @@
+---
+interface Props { title: string }
+const { title } = Astro.props;
+---
+<div class="term">
+  <div class="term-bar" aria-hidden="true">
+    <span class="dot"></span><span class="dot"></span><span class="dot"></span>
+    <span class="term-title mono">{title}</span>
+  </div>
+  <div class="term-body mono">
+    <slot />
+  </div>
+</div>
+
+<style>
+  .term {
+    min-width: 0;
+    background: var(--panel);
+    border: 1px solid var(--panel-edge);
+    border-radius: 10px;
+    overflow: hidden;
+    box-shadow: 0 12px 40px rgb(0 0 0 / 0.4);
+  }
+  .term-bar {
+    display: flex; align-items: center; gap: 0.4rem;
+    padding: 0.55rem 0.9rem;
+    border-bottom: 1px solid var(--panel-edge);
+  }
+  .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--panel-edge); }
+  .term-title { margin-left: 0.5rem; font-size: 0.75rem; color: var(--ink-dim); }
+  .term-body {
+    min-width: 0;
+    padding: 0.65rem 1.1rem; font-size: 0.85rem; line-height: 1.7;
+    overflow-x: auto;
+  }
+  .term-body :global(.t-line) { display: block; min-height: 1.7em; white-space: pre; }
+  .term-body :global(.t-dim) { color: var(--ink-dim); }
+  .term-body :global(.t-accent) { color: var(--accent); }
+</style>

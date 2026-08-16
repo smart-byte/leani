@@ -1,0 +1,45 @@
+---
+// Recursive collapsible JSON tree. Pure HTML <details>/<summary> — no JS.
+interface Props { data: unknown; name?: string; depth?: number }
+const { data, name, depth = 0 } = Astro.props;
+
+const isObj = data !== null && typeof data === 'object';
+const isArr = Array.isArray(data);
+const entries = isObj ? Object.entries(data as Record<string, unknown>) : [];
+// Open the envelope root, the payload, and its main entities; collapse the rest.
+const open = depth === 0 || name === 'data' || name === 'block' || name === 'values';
+---
+{isObj ? (
+  <details open={open} class="jt">
+    <summary>
+      {name !== undefined && <span class="k">{name}</span>}
+      <span class="p">{isArr ? `[ ${entries.length} ]` : '{ … }'}</span>
+    </summary>
+    <div class="ch">
+      {entries.map(([k, v]) => <Astro.self data={v} name={k} depth={depth + 1} />)}
+    </div>
+  </details>
+) : (
+  <div class="leaf">
+    {name !== undefined && <span class="k">{name}</span>}
+    <span class={typeof data === 'string' ? 'vs' : 'vn'}>{JSON.stringify(data)}</span>
+  </div>
+)}
+
+<style>
+  .jt, .leaf { font-size: 0.82rem; line-height: 1.7; }
+  summary {
+    cursor: pointer; list-style: none; user-select: none;
+    display: block; white-space: nowrap;
+  }
+  summary::-webkit-details-marker { display: none; }
+  summary::before { content: '▸ '; color: var(--accent-dim); }
+  details[open] > summary::before { content: '▾ '; }
+  .leaf { padding-left: 1.05rem; white-space: normal; overflow-wrap: anywhere; }
+  .ch { padding-left: 0.85rem; margin-left: 0.3rem; border-left: 1px solid var(--panel-edge); }
+  .k { color: var(--ink); }
+  .k::after { content: ': '; color: var(--ink-dim); }
+  .p { color: var(--ink-dim); }
+  .vs { color: #9ff0c4; }
+  .vn { color: var(--accent); }
+</style>

@@ -1,0 +1,38 @@
+{
+  "rows": [
+    {
+      "profile": "externalized",
+      "retains": "State, coverage, and delivery only until the required consumer ACKs",
+      "bound": "Byte/age budgets with pause-on-limit backpressure",
+      "fit": "PostgreSQL, ClickHouse, object storage, or another application-owned sink",
+      "evidence": "1M real blocks: 9.5 MB blobs / 11.4 MB Uniswap peak node files",
+      "highlight": true
+    },
+    {
+      "profile": "latest / aggregate",
+      "retains": "Current entities or constant-sized ordered state",
+      "bound": "Output cardinality plus checkpoints and configured undo",
+      "fit": "Balances, pool state, counters, totals, dashboards",
+      "evidence": "Transaction totals remain one current aggregate"
+    },
+    {
+      "profile": "window",
+      "retains": "Only the selected block, age, row, or byte window",
+      "bound": "Explicit max_blocks / max_age / max_rows / max_bytes",
+      "fit": "Recent APIs, rolling analytics, replay windows",
+      "evidence": "30-day event profile ships as a checked example"
+    },
+    {
+      "profile": "full output",
+      "retains": "Every materialized processor entity and required indexes",
+      "bound": "Grows with output cardinality and indexed history",
+      "fit": "Reusable local historical query surfaces",
+      "evidence": "1M dev-native blobs blocks: 1.58 GiB compacted DB"
+    }
+  ],
+  "footnotes": [
+    "Measured figures are workload-specific evidence, not host-size or cost guarantees. The real-source runs used gzip HTTP delivery, immediate acknowledgement, four source workers, and did not include an application database.",
+    "The 1.58 GiB full-output figure retained 2.55 million entities and 550,000 index rows. Externalized, latest, or windowed policy is the intended choice when that reusable query surface is unnecessary.",
+    "Trusted Xatu input and commitment-checked EraE input have different trust and performance profiles; retention policy does not change source trust."
+  ]
+}

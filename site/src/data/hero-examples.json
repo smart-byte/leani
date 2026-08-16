@@ -1,0 +1,75 @@
+[
+  {
+    "id": "quickstart",
+    "label": "quickstart",
+    "title": "leani — verify the released binary",
+    "note": "deterministic and network-free; public Mainnet workflow follows in the quickstart",
+    "lang": "shell",
+    "lines": [
+      { "text": "$ brew install leani-dev/tap/leani", "charMs": 8 },
+      { "text": "$ mkdir -p /tmp/leani-quickstart", "delayMs": 80, "charMs": 8 },
+      { "text": "$ leani e2e fixture --data-dir /tmp/leani-quickstart --blocks 128 \\", "charMs": 6 },
+      { "text": "    --report /tmp/leani-quickstart/report.json", "charMs": 6 },
+      { "text": "", "delayMs": 80 },
+      { "text": "runtime   128 blocks · processor reduction · delivery spool", "className": "t-dim", "delayMs": 150, "charMs": 2 },
+      { "text": "coverage  one continuous interval 1..128", "delayMs": 120, "charMs": 2 },
+      { "text": "store     migrations · checkpoints · SQLite integrity verified", "delayMs": 120, "charMs": 2 },
+      { "text": "status    passed", "className": "t-accent", "delayMs": 100, "charMs": 3 },
+      { "text": "", "delayMs": 100 },
+      { "text": "$ █", "charMs": 0, "delayMs": 200 }
+    ]
+  },
+  {
+    "id": "rpc",
+    "label": "rpc subset",
+    "title": "watch.ts — existing clients, advertised methods",
+    "note": "exact when the configured source or retained material satisfies the request",
+    "lang": "ts",
+    "lines": [
+      { "text": "// use leani for the block/receipt/log methods it advertises", "className": "t-dim", "charMs": 3 },
+      { "text": "import { createPublicClient, http, webSocket } from \"viem\";", "delayMs": 80, "charMs": 3 },
+      { "text": "", "delayMs": 60 },
+      { "text": "const eth = createPublicClient({", "charMs": 3 },
+      { "text": "  transport: http(\"http://localhost:8545\"),", "charMs": 3 },
+      { "text": "});", "charMs": 3 },
+      { "text": "", "delayMs": 60 },
+      { "text": "const receipts = await eth.getBlockReceipts({ blockNumber: 19426589n });", "charMs": 3 },
+      { "text": "// exact post-Merge response from capable historical material", "className": "t-accent", "delayMs": 150, "charMs": 3 },
+      { "text": "", "delayMs": 60 },
+      { "text": "const live = createPublicClient({ transport: webSocket(\"ws://localhost:8546\") });", "charMs": 3 },
+      { "text": "live.watchBlocks({ onBlock: (block) => update(block) });", "charMs": 3 },
+      { "text": "// reorg-correct newHeads — replacement heads after branch commit", "className": "t-accent", "delayMs": 150, "charMs": 3 },
+      { "text": "", "delayMs": 60 },
+      { "text": "// not served: eth_call · eth_getBalance · state methods — no EVM, no pretending", "className": "t-dim", "delayMs": 100, "charMs": 3 }
+    ],
+    "noteHref": "#rpc",
+    "noteLabel": "served vs refused, in full →"
+  },
+  {
+    "id": "sdk",
+    "label": "typescript sdk",
+    "title": "consume.ts — typed processor data",
+    "note": "at-least-once transport; commit application data and cursor before ACK",
+    "lang": "ts",
+    "lines": [
+      { "text": "import { commitThenAcknowledge, createLeaniClient } from \"@leani/sdk\";", "charMs": 3 },
+      { "text": "", "delayMs": 60 },
+      { "text": "const leani = createLeaniClient({ baseUrl: \"http://localhost:8080\" });", "charMs": 3 },
+      { "text": "", "delayMs": 60 },
+      { "text": "const page = await leani.processors.consumers.changes(", "charMs": 3 },
+      { "text": "  \"blobs-production\", \"blobs-api\", credential,", "charMs": 3 },
+      { "text": ");", "charMs": 3 },
+      { "text": "for (const event of page.data) {", "charMs": 3 },
+      { "text": "  await commitThenAcknowledge(", "charMs": 3 },
+      { "text": "    () => db.applyAndSaveCursor(event),", "charMs": 3 },
+      { "text": "    (cursor) => leani.processors.consumers.acknowledge(", "charMs": 3 },
+      { "text": "      \"blobs-production\", \"blobs-api\", credential, cursor,", "charMs": 3 },
+      { "text": "    ),", "charMs": 3 },
+      { "text": "  );", "charMs": 3 },
+      { "text": "}", "charMs": 3 },
+      { "text": "", "delayMs": 100 },
+      { "text": "committed + acknowledged blobs.block.put  #25696397", "className": "t-accent", "delayMs": 120, "charMs": 2 },
+      { "text": "committed + acknowledged blobs.block.put  #25696398", "className": "t-accent", "delayMs": 120, "charMs": 2 }
+    ]
+  }
+]

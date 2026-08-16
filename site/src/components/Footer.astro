@@ -1,0 +1,23 @@
+---
+import { GITHUB_URL, BLOBS_MONEY_URL } from '../config';
+---
+<footer class="wrap">
+  <p class="mono"><span class="accent">leani</span>_ — the lean Ethereum indexing node</p>
+  <nav aria-label="Footer">
+    <a href="/docs">Docs</a>
+    <a href="/docs#getting-started">Getting started</a>
+    <a href="/docs#sdk">SDK</a>
+    <a href={GITHUB_URL}>GitHub</a>
+    <a href={BLOBS_MONEY_URL}>blobs.money</a>
+  </nav>
+  <p class="fine">
+    MIT or Apache-2.0 · built by the blobs.money team · historical demo data:
+    <a href="https://github.com/ethpandaops/xatu-data">Xatu by ethPandaOps</a> (CC BY 4.0)
+  </p>
+</footer>
+
+<style>
+  footer { padding-block: 3.5rem; border-top: 1px solid var(--panel-edge); display: grid; gap: 0.9rem; }
+  nav { display: flex; gap: 1.5rem; flex-wrap: wrap; }
+  .fine { color: var(--ink-dim); font-size: 0.8rem; }
+</style>

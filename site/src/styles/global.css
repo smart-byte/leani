@@ -1,0 +1,89 @@
+:root {
+  --bg: #0b0f0d;
+  --panel: #101613;
+  --panel-edge: #21302a;
+  --ink: #e6f0ea;
+  --ink-dim: #8fa89a;
+  --accent: #3ee07f;
+  --accent-dim: #1f7a4a;
+  --font-mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, monospace;
+  --font-sans: 'Inter Variable', system-ui, sans-serif;
+  --max-width: 72rem;
+}
+
+* { box-sizing: border-box; margin: 0; }
+
+html { color-scheme: dark; scroll-behavior: smooth; }
+@media (prefers-reduced-motion: reduce) {
+  html { scroll-behavior: auto; }
+}
+
+body {
+  background: var(--bg);
+  color: var(--ink);
+  font-family: var(--font-sans);
+  line-height: 1.6;
+  -webkit-font-smoothing: antialiased;
+}
+
+.wrap { width: 100%; max-width: var(--max-width); margin-inline: auto; padding-inline: 1.25rem; }
+.section { padding-block: 6rem; }
+.mono { font-family: var(--font-mono); }
+.accent { color: var(--accent); }
+
+h1, h2, h3 { line-height: 1.15; font-weight: 650; letter-spacing: -0.01em; text-wrap: balance; }
+h2 { font-size: clamp(1.6rem, 3.5vw, 2.4rem); }
+h2 .mono { color: var(--accent); font-size: 0.85em; }
+
+[id] { scroll-margin-top: 1.5rem; }
+
+button, summary, a { touch-action: manipulation; }
+
+a { color: var(--accent); text-decoration-color: var(--accent-dim); }
+a:hover { text-decoration-thickness: 2px; }
+
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+
+.skip-link {
+  position: absolute; left: -999px; top: 0; z-index: 10;
+  background: var(--accent); color: #06130c; padding: 0.5rem 1rem;
+}
+.skip-link:focus { left: 0.5rem; top: 0.5rem; }
+
+.btn {
+  display: inline-block; padding: 0.7rem 1.4rem; border-radius: 6px;
+  font-family: var(--font-mono); font-size: 0.95rem; text-decoration: none;
+}
+.btn-primary { background: var(--accent); color: #06130c; }
+.btn-primary:hover { filter: brightness(1.1); }
+.btn-ghost { border: 1px solid var(--panel-edge); color: var(--ink); }
+.btn-ghost:hover { border-color: var(--accent-dim); }
+
+.eyebrow {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  color: var(--accent);
+  border: 1px solid var(--accent-dim);
+  border-radius: 999px;
+  padding: 0.28rem 0.65rem;
+  font-size: 0.72rem;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.eyebrow::before {
+  content: '';
+  width: 0.42rem;
+  height: 0.42rem;
+  border-radius: 50%;
+  background: var(--accent);
+}
+
+/* Token colors for highlighted terminal/code blocks (src/lib/highlight.ts). */
+.hl-prompt { color: var(--accent-dim); }
+.hl-flag { color: var(--ink-dim); }
+.hl-str { color: #9ff0c4; }
+.hl-num { color: var(--accent); }
+.hl-kw { color: var(--accent); }
+.hl-com { color: var(--ink-dim); }

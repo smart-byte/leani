@@ -1,0 +1,173 @@
+---
+import TerminalFrame from './TerminalFrame.astro';
+import { GITHUB_URL, LIMITATIONS_URL } from '../config';
+import heroExamples from '../data/hero-examples.json';
+
+import { esc, hlShell, hlTs } from '../lib/highlight';
+
+// Lines with a className keep their whole-line styling (dim context, accent
+// payoffs); everything else gets language tokens.
+const examples = heroExamples.map((example) => ({
+  ...example,
+  lines: example.lines.map((line) => ({
+    ...line,
+    html:
+      line.text && !('className' in line && line.className)
+        ? example.lang === 'ts'
+          ? hlTs(line.text)
+          : hlShell(line.text)
+        : undefined,
+  })),
+}));
+---
+<section class="hero wrap section">
+  <a class="eyebrow mono" href={LIMITATIONS_URL}>Public preview</a>
+  <p class="mono brand"><span class="accent">leani</span>_ <span class="say">(LEE-nee)</span></p>
+  <h1>Ethereum data, shaped for your&nbsp;application.</h1>
+  <p class="sub">
+    Backfill from public datasets, follow the head over Ethereum P2P, and
+    deterministically reduce blocks into only the state, outputs, and durable
+    streams you choose to retain. Coverage and source trust stay explicit.
+  </p>
+  <div class="cta">
+    <a class="btn btn-primary" href={GITHUB_URL}>GitHub <span id="stars" class="stars"></span></a>
+    <a class="btn btn-ghost" href="/docs#getting-started">Quickstart →</a>
+  </div>
+  <ol class="steps mono">
+    <li><a href="#pipeline"><span class="num">01</span> acquire — history and live head, one exact handoff</a></li>
+    <li><a href="#pipeline"><span class="num">02</span> validate — commitments, canonicality, provenance</a></li>
+    <li><a href="#processors"><span class="num">03</span> reduce — deterministic processors, ordered state</a></li>
+    <li><a href="#delivery"><span class="num">04</span> deliver — query, stream, acknowledge, prune</a></li>
+  </ol>
+
+  <div class="hero-term">
+    <div class="hero-tabs mono" role="tablist" aria-label="Hero examples">
+      {examples.map((example, i) => (
+        <button
+          role="tab"
+          id={`hero-tab-${example.id}`}
+          aria-controls={`hero-panel-${example.id}`}
+          aria-selected={i === 0 ? 'true' : 'false'}
+          tabindex={i === 0 ? 0 : -1}
+        >{example.label}</button>
+      ))}
+    </div>
+    {examples.map((example) => (
+      <div
+        class="hero-panel"
+        role="tabpanel"
+        id={`hero-panel-${example.id}`}
+        aria-labelledby={`hero-tab-${example.id}`}
+      >
+        <TerminalFrame title={example.title}>
+          <div class="hero-typer" data-lines={JSON.stringify(example.lines)}>
+            <noscript>
+              {example.lines.map((l) => (
+                <span class={`t-line ${l.className ?? ''}`} set:html={l.html ?? esc(l.text)} />
+              ))}
+            </noscript>
+          </div>
+        </TerminalFrame>
+        <p class="mono note">
+          {example.note}
+          {'noteHref' in example && (
+            <a href={(example as { noteHref: string }).noteHref}>
+              {(example as { noteLabel: string }).noteLabel}
+            </a>
+          )}
+        </p>
+      </div>
+    ))}
+  </div>
+</section>
+
+<style>
+  .hero { padding-top: 7rem; }
+  .brand { font-size: 1.1rem; margin-top: 1rem; }
+  .say { color: var(--ink-dim); font-size: 0.85rem; }
+  h1 { font-size: clamp(2.4rem, 6vw, 4.2rem); max-width: 18ch; margin-top: 0.75rem; }
+  .sub { color: var(--ink-dim); font-size: 1.15rem; max-width: 52ch; margin-top: 1.25rem; }
+  .cta { display: flex; gap: 0.9rem; margin-top: 2rem; flex-wrap: wrap; }
+  .stars { color: color-mix(in srgb, #06130c 70%, transparent); }
+  .steps {
+    list-style: none; padding: 0; margin-top: 2.5rem;
+    display: flex; gap: 1.5rem; flex-wrap: wrap;
+    font-size: 0.85rem;
+  }
+  .steps a { color: var(--ink-dim); text-decoration: none; }
+  .steps a:hover { color: var(--ink); }
+  .num { color: var(--accent); font-weight: 700; margin-right: 0.35rem; }
+  .hero-term { margin-top: 2.5rem; max-width: 54rem; }
+  .hero-term, .hero-panel { min-width: 0; }
+  .hero-tabs { display: flex; gap: 0.4rem; flex-wrap: wrap; margin-bottom: 0.75rem; }
+  .hero-tabs [role='tab'] {
+    background: none; border: 1px solid var(--panel-edge); border-radius: 6px;
+    color: var(--ink-dim); font: inherit; font-size: 0.8rem;
+    padding: 0.35rem 0.8rem; cursor: pointer;
+  }
+  .hero-tabs [role='tab']:hover { color: var(--ink); border-color: var(--accent-dim); }
+  .hero-tabs [role='tab'][aria-selected='true'] {
+    color: var(--accent); border-color: var(--accent-dim);
+  }
+  .hero-panel { margin-top: 0; }
+  .hero-panel + .hero-panel { margin-top: 1rem; }
+  .note { color: var(--ink-dim); font-size: 0.7rem; margin-top: 0.5rem; }
+</style>
+
+<script>
+  import { playTyper, onVisible, type TyperLine } from '../lib/typer';
+  import { GITHUB_URL } from '../config';
+
+  const tablist = document.querySelector<HTMLElement>('.hero-tabs');
+  const tabs = [...document.querySelectorAll<HTMLButtonElement>('.hero-tabs [role="tab"]')];
+  const panels = [...document.querySelectorAll<HTMLElement>('.hero-panel')];
+  let cancelTyper: (() => void) | null = null;
+
+  function play(panel: HTMLElement, instant = false) {
+    cancelTyper?.();
+    cancelTyper = null;
+    const host = panel.querySelector<HTMLElement>('.hero-typer');
+    if (!host) return;
+    host.replaceChildren();
+    const lines = JSON.parse(host.dataset.lines!) as TyperLine[];
+    const cancel = playTyper(host, lines, { loop: !instant, loopPauseMs: 5000 });
+    // Switching tabs should never make the reader wait: cancelling right
+    // away renders the full highlighted transcript instantly.
+    if (instant) cancel();
+    else cancelTyper = cancel;
+  }
+
+  function select(index: number, opts: { focus?: boolean; replay?: boolean } = {}) {
+    tabs.forEach((tab, i) => {
+      tab.setAttribute('aria-selected', String(i === index));
+      tab.tabIndex = i === index ? 0 : -1;
+      panels[i]!.hidden = i !== index;
+    });
+    if (opts.focus !== false) tabs[index]!.focus();
+    if (opts.replay !== false) play(panels[index]!, true);
+  }
+
+  // Panels render visible for JS-off readers; JS collapses to tab view.
+  select(0, { focus: false, replay: false });
+  if (panels[0]) onVisible(panels[0], () => play(panels[0]!));
+
+  tabs.forEach((tab, i) => tab.addEventListener('click', () => select(i)));
+  tablist?.addEventListener('keydown', (e) => {
+    const current = tabs.findIndex((t) => t.getAttribute('aria-selected') === 'true');
+    if (e.key === 'ArrowRight') select((current + 1) % tabs.length);
+    if (e.key === 'ArrowLeft') select((current - 1 + tabs.length) % tabs.length);
+    if (e.key === 'Home') select(0);
+    if (e.key === 'End') select(tabs.length - 1);
+  });
+
+  const stars = document.getElementById('stars');
+  const repoPath = new URL(GITHUB_URL).pathname.slice(1);
+  fetch(`https://api.github.com/repos/${repoPath}`)
+    .then((r) => (r.ok ? r.json() : null))
+    .then((j) => {
+      if (stars && j && typeof j.stargazers_count === 'number') {
+        stars.textContent = ` ★ ${j.stargazers_count}`;
+      }
+    })
+    .catch(() => {});
+</script>

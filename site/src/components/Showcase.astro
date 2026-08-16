@@ -1,0 +1,207 @@
+---
+import TerminalFrame from './TerminalFrame.astro';
+import JsonTree from './JsonTree.astro';
+import blobs from '../data/processors/blobs-money.json';
+import erc20 from '../data/processors/erc20-balances.json';
+import evmEvents from '../data/processors/evm-events.json';
+import uniswap from '../data/processors/uniswap-latest.json';
+import txStats from '../data/processors/transaction-stats.json';
+import custom from '../data/processors/custom.json';
+import { hlTs } from '../lib/highlight';
+
+const demos = [blobs, erc20, evmEvents, uniswap, txStats, custom];
+
+// Build-time rendering of the committed TS type strings: parse into a tree
+// (root properties visible, nested object types collapsed behind <details>)
+// and syntax-highlight leaves. Runs on trusted committed data only.
+interface TypeNode { name: string; type?: string; suffix?: string; children?: TypeNode[] }
+
+function parseTypeLines(lines: string[], start: number): { nodes: TypeNode[]; end: number } {
+  const nodes: TypeNode[] = [];
+  let i = start;
+  while (i < lines.length) {
+    const line = (lines[i] ?? '').trim();
+    if (line.startsWith('}')) return { nodes, end: i };
+    const objectStart = line.match(/^([\w?]+): \{$/);
+    if (objectStart) {
+      const inner = parseTypeLines(lines, i + 1);
+      const close = (lines[inner.end] ?? '').trim();
+      nodes.push({
+        name: objectStart[1]!,
+        suffix: close.includes('[]') ? '[]' : '',
+        children: inner.nodes,
+      });
+      i = inner.end + 1;
+      continue;
+    }
+    const leaf = line.match(/^([\w?]+): (.+);$/);
+    if (leaf) nodes.push({ name: leaf[1]!, type: leaf[2]! });
+    i++;
+  }
+  return { nodes, end: i };
+}
+
+function escapeHtml(value: string): string {
+  return value.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+function hlType(type: string): string {
+  return escapeHtml(type)
+    .replace(/"[^"]*"/g, (m) => `<span class="hl-lit">${m}</span>`)
+    .replace(/\b(string|number|boolean|null|Hex|Record)\b/g, '<span class="hl-type">$1</span>');
+}
+
+function renderTypeNodes(nodes: TypeNode[]): string {
+  return nodes
+    .map((node) =>
+      node.children
+        ? `<details class="tt"><summary><span class="hl-key">${node.name}</span><span class="dim">: { … }${node.suffix};</span></summary><div class="tt-ch">${renderTypeNodes(node.children)}</div></details>`
+        : `<span class="tt-line"><span class="hl-key">${node.name}</span><span class="dim">: </span>${hlType(node.type ?? '')}<span class="dim">;</span></span>`,
+    )
+    .join('');
+}
+
+function renderTypeCard(source: string): string {
+  return renderTypeNodes(parseTypeLines(source.split('\n'), 1).nodes);
+}
+---
+<section id="processors" class="wrap section" aria-labelledby="showcase-h">
+  <h2 id="showcase-h"><span class="mono"># </span>Processors do the work</h2>
+  <p class="lede">
+    A processor is a deterministic map/reduce over blocks, transactions,
+    receipts, and logs. Configure a built-in—or register trusted native Rust
+    code in a custom binary. These are complete processor sections, not legacy shorthand.
+  </p>
+
+  <div class="tabs mono" role="tablist" aria-label="Processor examples">
+    {demos.map((demo, i) => (
+      <button
+        role="tab"
+        id={`tab-${demo.id}`}
+        aria-controls={`panel-${demo.id}`}
+        aria-selected={i === 0 ? 'true' : 'false'}
+        tabindex={i === 0 ? 0 : -1}
+        data-demo-id={demo.id}
+      >{demo.label}</button>
+    ))}
+  </div>
+
+  {demos.map((demo) => (
+    <div
+      class="panel"
+      role="tabpanel"
+      id={`panel-${demo.id}`}
+      aria-labelledby={`tab-${demo.id}`}
+    >
+      <div class="pair">
+        <div class="stack">
+          <TerminalFrame title={demo.configLang === 'toml' ? 'node.toml' : 'main.rs'}>
+            <span class="t-line">{demo.config}</span>
+          </TerminalFrame>
+          <TerminalFrame title="extracted data format">
+            <div class="type-card" set:html={renderTypeCard(demo.dataType)} />
+          </TerminalFrame>
+          {'queryExample' in demo && (
+            <TerminalFrame title="client.ts — query custom output">
+              {(demo as { queryExample: string }).queryExample
+                .split('\n')
+                .map((line) => <span class="t-line" set:html={hlTs(line)} />)}
+            </TerminalFrame>
+          )}
+        </div>
+        <TerminalFrame title="change stream">
+          <div class="stream">
+            <span class="t-line t-dim">GET /v1/processors/{demo.helloJson.processor.instance}/stream</span>
+            <span class="t-line t-accent">event: hello</span>
+            <JsonTree data={demo.helloJson} depth={1} />
+            <span class="t-line t-dim sse-id">id: {demo.sseId}</span>
+            <span class="t-line t-accent">event: apply</span>
+            <JsonTree data={demo.outputJson} name="data" />
+          </div>
+        </TerminalFrame>
+      </div>
+      <p class="caption">
+        {demo.caption}
+        {'liveUrl' in demo && <a href={(demo as { liveUrl: string }).liveUrl}>see it live →</a>}
+        {'guideUrl' in demo && <a href={(demo as { guideUrl: string }).guideUrl}>build your own →</a>}
+        <a href={demo.docsUrl}>docs →</a>
+      </p>
+    </div>
+  ))}
+</section>
+
+<style>
+  .lede { color: var(--ink-dim); max-width: 52ch; margin-top: 1rem; }
+  .tabs { display: flex; gap: 0.4rem; flex-wrap: wrap; margin-top: 2.5rem; border-bottom: 1px solid var(--panel-edge); }
+  .tabs [role='tab'] {
+    background: none; border: 0; border-bottom: 2px solid transparent;
+    color: var(--ink-dim); font: inherit; font-size: 0.9rem;
+    padding: 0.6rem 0.9rem; cursor: pointer;
+  }
+  .tabs [role='tab'][aria-selected='true'] { color: var(--accent); border-bottom-color: var(--accent); }
+  .tabs [role='tab']:hover { color: var(--ink); }
+  .panel { margin-top: 1.75rem; }
+  .pair { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 1.25rem; align-items: start; }
+  .pair > *, .stack { min-width: 0; }
+  .stack { display: grid; gap: 1.25rem; align-content: start; }
+  @media (max-width: 900px) { .pair { grid-template-columns: 1fr; } }
+  .caption { color: var(--ink-dim); font-size: 0.9rem; margin-top: 1rem; display: flex; gap: 1rem; flex-wrap: wrap; }
+  .stream { white-space: normal; max-height: 34rem; overflow-y: auto; }
+  .type-card { color: var(--ink-dim); max-height: 28rem; overflow-y: auto; white-space: normal; }
+  .type-card :global(.tt-line) { display: block; }
+  .type-card :global(summary) { cursor: pointer; list-style: none; user-select: none; }
+  .type-card :global(summary::-webkit-details-marker) { display: none; }
+  .type-card :global(summary::before) { content: '▸ '; color: var(--accent-dim); }
+  .type-card :global(details[open] > summary::before) { content: '▾ '; }
+  .type-card :global(.tt-ch) { padding-left: 0.85rem; margin-left: 0.3rem; border-left: 1px solid var(--panel-edge); }
+  .dim, .type-card :global(.dim) { color: var(--ink-dim); }
+  :global(.hl-key) { color: var(--ink); }
+  :global(.hl-type) { color: var(--accent); }
+  :global(.hl-lit) { color: #9ff0c4; }
+  .sse-id { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 100%; }
+</style>
+
+<script>
+  const showcase = document.getElementById('processors');
+  const tablist = showcase?.querySelector<HTMLElement>('.tabs[role="tablist"]');
+  const tabs = [...(showcase?.querySelectorAll<HTMLButtonElement>('.tabs [role="tab"]') ?? [])];
+  const panels = [...(showcase?.querySelectorAll<HTMLElement>('.panel[role="tabpanel"]') ?? [])];
+
+  function select(index: number, opts: { focus?: boolean; updateUrl?: boolean } = {}) {
+    if (!tabs[index] || !panels[index]) return;
+    tabs.forEach((tab, i) => {
+      tab.setAttribute('aria-selected', String(i === index));
+      tab.tabIndex = i === index ? 0 : -1;
+      panels[i]!.hidden = i !== index;
+    });
+    if (opts.focus !== false) tabs[index]!.focus();
+    if (opts.updateUrl) {
+      history.replaceState(null, '', `#panel-${tabs[index]!.dataset.demoId}`);
+    }
+  }
+
+  // Panels render visible for JS-off readers; JS collapses to tab view.
+  const requestedIndex = () => location.hash.startsWith('#panel-')
+    ? tabs.findIndex((tab) => tab.dataset.demoId === location.hash.slice('#panel-'.length))
+    : -1;
+  const requested = requestedIndex();
+  select(requested >= 0 ? requested : 0, { focus: false });
+  window.addEventListener('hashchange', () => {
+    const index = requestedIndex();
+    if (index >= 0) select(index, { focus: false });
+  });
+
+  tabs.forEach((tab, i) => tab.addEventListener('click', () => select(i, { updateUrl: true })));
+  tablist?.addEventListener('keydown', (e) => {
+    const current = tabs.findIndex((t) => t.getAttribute('aria-selected') === 'true');
+    let next = current;
+    if (e.key === 'ArrowRight') next = (current + 1) % tabs.length;
+    if (e.key === 'ArrowLeft') next = (current - 1 + tabs.length) % tabs.length;
+    if (e.key === 'Home') next = 0;
+    if (e.key === 'End') next = tabs.length - 1;
+    if (next !== current) {
+      e.preventDefault();
+      select(next, { updateUrl: true });
+    }
+  });
+</script>

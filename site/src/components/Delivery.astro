@@ -1,0 +1,76 @@
+<section id="delivery" class="wrap section" aria-labelledby="delivery-h">
+  <p class="eyebrow mono">The durable boundary</p>
+  <h2 id="delivery-h"><span class="mono"># </span>Backfill meets live without a gap</h2>
+  <p class="lede">
+    History and head following run as independent lanes, then meet at an exact
+    parent-hash boundary. Downstream delivery uses the same committed change
+    protocol for both.
+  </p>
+
+  <ol class="flow">
+    <li>
+      <span class="num mono">01</span>
+      <h3>Resume from coverage</h3>
+      <p>Committed intervals—not downloaded files—decide the first missing block after a restart.</p>
+    </li>
+    <li>
+      <span class="num mono">02</span>
+      <h3>Commit the branch</h3>
+      <p>Apply, undo, and finality events are published only after processor state commits.</p>
+    </li>
+    <li>
+      <span class="num mono">03</span>
+      <h3>Commit, then ACK</h3>
+      <p>Named consumers atomically save application data and their cursor before acknowledging.</p>
+    </li>
+    <li>
+      <span class="num mono">04</span>
+      <h3>Prune by policy</h3>
+      <p>Required consumers fence pruning; lag and byte budgets create explicit backpressure.</p>
+    </li>
+  </ol>
+
+  <div class="contract mono" aria-label="Delivery sequence">
+    <span>historical coverage</span><span aria-hidden="true">→</span>
+    <span>exact hash handoff</span><span aria-hidden="true">→</span>
+    <span>live canonical head</span><span aria-hidden="true">→</span>
+    <span class="accent">durable cursor</span>
+  </div>
+  <p class="note">
+    Transport is at-least-once. Exactly-once application behavior comes from
+    committing the destination mutation and cursor in one transaction, then acknowledging.
+  </p>
+</section>
+
+<style>
+  h2 { margin-top: 1rem; }
+  .lede { color: var(--ink-dim); max-width: 62ch; margin-top: 1rem; }
+  .flow {
+    list-style: none;
+    padding: 0;
+    margin-top: 2.5rem;
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: 1rem;
+  }
+  .flow li { min-width: 0; border-top: 1px solid var(--accent-dim); padding-top: 1rem; }
+  .num { color: var(--accent); font-size: 0.75rem; }
+  h3 { font-size: 1rem; margin-top: 0.55rem; }
+  .flow p { color: var(--ink-dim); font-size: 0.88rem; margin-top: 0.55rem; }
+  .contract {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex-wrap: wrap;
+    gap: 0.8rem;
+    margin-top: 2.5rem;
+    padding: 1.1rem;
+    background: var(--panel);
+    border: 1px solid var(--panel-edge);
+    border-radius: 10px;
+    font-size: 0.82rem;
+  }
+  .note { color: var(--ink-dim); font-size: 0.82rem; max-width: 72ch; margin-top: 0.8rem; }
+  @media (max-width: 800px) { .flow { grid-template-columns: 1fr 1fr; } }
+  @media (max-width: 500px) { .flow { grid-template-columns: 1fr; } }
+</style>

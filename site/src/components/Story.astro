@@ -1,0 +1,52 @@
+---
+import { BLOBS_MONEY_URL } from '../config';
+---
+<section id="why" class="wrap section story" aria-labelledby="story-h">
+  <h2 id="story-h"><span class="mono"># </span>Why we built it</h2>
+  <div class="cols">
+    <div class="prose">
+      <p>
+        We run <a href={BLOBS_MONEY_URL}>blobs.money</a>, a live dashboard for
+        Ethereum blob economics. It needs block headers, every type-3
+        transaction, and receipts. Nothing else.
+      </p>
+      <p>
+        Getting that meant paying for metered RPC: millions of
+        <code>eth_getBlockByNumber</code> and <code>eth_getBlockReceipts</code>
+        calls to backfill history that public datasets already serve, then a
+        WebSocket to follow the head. The alternative — running our own full
+        node — meant terabyte-class NVMe and days of sync, keeping the whole
+        chain on disk to reduce a sliver of it to application-shaped data.
+      </p>
+      <p>
+        So we built the node we wanted. It can use fast, trusted Xatu datasets
+        for aggregation or commitment-checked EraE material for an independent
+        audit path. It follows the head over Ethereum P2P, anchors finality from
+        consensus, records provenance, and discards raw input when policy allows.
+      </p>
+      <p>
+        Then we generalized it: any data you can derive from blocks,
+        transactions, receipts, and logs — events, balances, pool prices — with
+        the same discipline. The same normalized input and deterministic
+        processor contract applies whichever capable source supplies the block.
+      </p>
+    </div>
+    <blockquote class="pull mono">
+      Your app doesn't need the whole&nbsp;chain. It needs its own&nbsp;data.
+    </blockquote>
+  </div>
+</section>
+
+<style>
+  .cols { display: grid; grid-template-columns: minmax(0, 3fr) minmax(0, 2fr); gap: 3rem; margin-top: 2.5rem; align-items: center; }
+  @media (max-width: 760px) { .cols { grid-template-columns: 1fr; } }
+  .prose { display: grid; gap: 1.1rem; max-width: 58ch; }
+  .prose code { font-family: var(--font-mono); font-size: 0.85em; color: var(--accent); }
+  .pull {
+    border-left: 3px solid var(--accent);
+    padding-left: 1.5rem;
+    font-size: clamp(1.3rem, 2.6vw, 1.8rem);
+    line-height: 1.4;
+    color: var(--ink);
+  }
+</style>

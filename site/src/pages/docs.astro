@@ -1,0 +1,745 @@
+---
+import Base from '../layouts/Base.astro';
+import TerminalFrame from '../components/TerminalFrame.astro';
+import SideNav from '../components/SideNav.astro';
+import { GITHUB_URL, LIMITATIONS_URL, QUICKSTART_URL } from '../config';
+import { hlRust, hlShell, hlTs } from '../lib/highlight';
+
+const sdkSetup = [
+  'import { createLeaniClient } from "@leani/sdk";',
+  '',
+  'const leani = createLeaniClient({',
+  '  baseUrl: "http://localhost:8080",',
+  '  token: process.env.LEANI_TOKEN,      // optional bearer',
+  '  timeoutMs: 15_000,                   // optional',
+  '  // Multi-instance nodes: use basePath from capabilities()',
+  '  // queryBasePaths: { blobs: "/v1/processors/blobs-production/query" },',
+  '  reconnect: { initialDelayMs: 250, maxDelayMs: 10_000, jitter: 0.2 },',
+  '});',
+];
+
+const customExtension = [
+  'use std::sync::Arc;',
+  'use axum::{Json, Router, extract::{Path, State}, routing::get};',
+  'use leani::{',
+  '  ApiError, ProcessorComponents, ProcessorConfig, ProcessorFactory,',
+  '  ProcessorFactoryContext, ProcessorFactoryError, QueryContext, QueryExtension,',
+  '};',
+  '',
+  'struct BlockSummaryQueries;',
+  '',
+  'impl QueryExtension for BlockSummaryQueries {',
+  '  fn id(&self) -> &\'static str { "block-summary-v1" }',
+  '  fn alias(&self) -> Option<&str> { Some("block-summaries") }',
+  '  fn routes(&self) -> Router<QueryContext> {',
+  '    Router::new().route("/{number}", get(summary))',
+  '  }',
+  '}',
+  '',
+  'async fn summary(',
+  '  State(ctx): State<QueryContext>,',
+  '  Path(number): Path<u64>,',
+  ') -> Result<Json<BlockSummary>, ApiError> {',
+  '  let bytes = ctx.entity("example.block_summaries", &number.to_be_bytes())',
+  '    .await?',
+  '    .ok_or_else(|| ApiError::not_found("block is not indexed"))?;',
+  '  let value = serde_json::from_slice(&bytes)',
+  '    .map_err(|error| ApiError::internal(&error.to_string()))?;',
+  '  Ok(Json(value))',
+  '}',
+  '',
+  'impl ProcessorFactory for BlockSummaryFactory {',
+  '  fn id(&self) -> &\'static str { "example-block-summary" }',
+  '  fn create(',
+  '    &self, config: &ProcessorConfig, _ctx: ProcessorFactoryContext,',
+  '  ) -> Result<ProcessorComponents, ProcessorFactoryError> {',
+  '    let processor = Arc::new(BlockSummaryProcessor::new(config)?);',
+  '    Ok(ProcessorComponents::new(processor)',
+  '      .with_query_extension(Arc::new(BlockSummaryQueries)))',
+  '  }',
+  '}',
+];
+
+const customConfig = [
+  '[[processors]]',
+  'id = "example-block-summary"',
+  'instance = "block-summaries"',
+  'version = "1.0.0"',
+  'start_block = 19426589',
+  'publish = "optimistic_and_finalized"',
+  '',
+  '[processors.state]',
+  'mode = "checkpointed"',
+  '',
+  '[processors.artifacts]',
+  'mode = "none"',
+  '',
+  '[processors.output]',
+  'mode = "latest"',
+  '',
+  '[processors.delivery]',
+  'mode = "window"',
+  '',
+  '[processors.checkpoint]',
+  'mode = "automatic"',
+  'keep = 3',
+  '',
+  '[processors.undo]',
+  'mode = "unfinalized"',
+  'safety_blocks = 256',
+];
+
+const customUse = [
+  'const capabilities = await leani.capabilities();',
+  'const extension = capabilities.queryExtensions.find(',
+  '  (item) => item.processor === "block-summaries",',
+  ');',
+  '',
+  'const summary = await leani.request<BlockSummary>(',
+  '  `${extension!.basePath}/19426589`,',
+  ');',
+];
+
+// Reference tables are data-driven so API review edits stay one-line diffs.
+// Source of truth: crates/api router + packages/sdk LeaniClient on main.
+
+const listeners = [
+  ['http://127.0.0.1:8080', 'native v1 query API, SSE change streams, health, metrics'],
+  ['http://127.0.0.1:8545', 'capability-reported Ethereum JSON-RPC subset over HTTP'],
+  ['ws://127.0.0.1:8546', 'JSON-RPC WebSocket — regular calls plus eth_subscribe'],
+];
+
+const nodeEndpoints = [
+  ['GET', '/v1/status', 'node identity, uptime, database size, processors, readiness'],
+  ['GET', '/v1/capabilities', 'machine-readable capability authority for this node'],
+  ['GET', '/health/live', 'process liveness (no auth)'],
+  ['GET', '/health/ready', 'component readiness: live lane, finality (no auth)'],
+  ['GET', '/v1/network/status', 'network manager phase, peers, requests (no auth)'],
+  ['GET', '/debug/network', 'dependency-free operational dashboard (no auth)'],
+  ['GET', '/metrics', 'Prometheus metrics (no auth)'],
+];
+
+const processorEndpoints = [
+  ['GET', '/v1/processors', 'list configured processors'],
+  ['GET', '/v1/processors/{p}/status', 'coverage, processed/finalized through, run state'],
+  ['GET', '/v1/processors/{p}/schema', 'delta/entity/change schema identifiers'],
+  ['GET', '/v1/processors/{p}/changes/head', 'earliest/latest retained change sequence'],
+  ['GET', '/v1/processors/{p}/changes', 'poll change envelopes after a cursor'],
+  ['GET', '/v1/processors/{p}/stream', 'SSE change stream; hello frame first'],
+  ['GET', '/v1/processors/{p}/query/*', 'optional processor-owned typed read API'],
+  ['GET', '/v1/processors/{p}/collections', 'output collections + retention mode'],
+  ['GET', '/v1/processors/{p}/collections/{c}/entities', 'query output entities (block/time range, cursor)'],
+  ['GET', '/v1/processors/{p}/collections/{c}/entities/{key}', 'fetch one output entity'],
+  ['POST', '/v1/processors/{p}/collections/{c}/query-and-follow', 'consistent snapshot query + follow cursor'],
+  ['DELETE', '/v1/processors/{p}/query-snapshots/{s}', 'release a held query snapshot'],
+  ['GET', '/v1/processors/{p}/artifacts/status', 'retained artifact ranges'],
+  ['GET', '/v1/processors/{p}/artifacts/{block}', 'fetch one artifact'],
+  ['GET', '/v1/processors/{p}/artifacts/export', 'export artifact range'],
+  ['GET', '/v1/processors/{p}/checkpoints', 'list recovery checkpoints'],
+  ['POST', '/v1/processors/{p}/checkpoints/{c}/restore', 'restore a recovery checkpoint'],
+  ['GET|POST', '/v1/processors/{p}/savepoints', 'list / create portable savepoints'],
+  ['GET|DELETE', '/v1/processors/{p}/savepoints/{s}', 'export / delete a portable savepoint'],
+];
+
+const consumerEndpoints = [
+  ['GET|POST', '/v1/processors/{p}/consumers', 'list / create durable consumers'],
+  ['GET|DELETE', '/v1/processors/{p}/consumers/{c}', 'inspect / revoke a consumer'],
+  ['POST', '/v1/processors/{p}/consumers/{c}/lease', 'renew the consumer lease'],
+  ['GET', '/v1/processors/{p}/consumers/{c}/changes', 'poll changes for this consumer'],
+  ['POST', '/v1/processors/{p}/consumers/{c}/ack', 'acknowledge a cursor (monotonic, idempotent)'],
+  ['GET', '/v1/processors/{p}/streams/live/consumers/{c}/stream', 'live-lane SSE stream for a consumer'],
+  ['POST', '/v1/processors/{p}/streams/live/consumers/{c}/ack', 'acknowledge on the live lane'],
+  ['POST|DELETE', '/v1/processors/{p}/streams/live/consumers/{c}/lease', 'renew / release the live lease'],
+  ['GET', '/v1/backfill-subscriptions/{s}/consumers/{c}/changes', 'poll a backfill subscription'],
+  ['GET', '/v1/backfill-subscriptions/{s}/consumers/{c}/stream', 'stream a backfill subscription'],
+  ['POST', '/v1/backfill-subscriptions/{s}/consumers/{c}/ack', 'acknowledge backfill progress'],
+  ['POST|DELETE', '/v1/backfill-subscriptions/{s}/consumers/{c}/lease', 'renew / release the backfill lease'],
+];
+
+const domainEndpoints = [
+  ['GET', '/v1/q/blobs/blocks', 'list blob blocks in a range'],
+  ['GET', '/v1/q/blobs/blocks/{number}', 'one blob block'],
+  ['GET', '/v1/q/blobs/snapshot', 'coverage-aware blob snapshot rows'],
+  ['GET', '/v1/q/blobs/transactions', 'blob transactions of a block'],
+  ['GET', '/v1/q/blobs/transactions/{hash}', 'one blob transaction'],
+  ['GET', '/v1/q/blobs/schedule', 'exact blob fork/BPO schedule'],
+  ['GET', '/v1/q/erc20/balances/{token}/{address}', 'watchlist ledger balance'],
+  ['GET', '/v1/q/uniswap/pools/{address}', 'current pool price observation'],
+];
+
+const adminEndpoints = [
+  ['POST', '/admin/v1/processors/{p}/lanes/live/reset', 'reset the live lane'],
+  ['DELETE', '/admin/v1/processors/{p}/artifacts', 'delete retained artifacts'],
+  ['POST', '/admin/v1/processors/{p}/artifacts/replay', 'replay from artifacts'],
+  ['GET|POST', '/admin/v1/backfill-subscriptions', 'list / create backfill subscriptions'],
+  ['GET|DELETE', '/admin/v1/backfill-subscriptions/{id}', 'inspect / delete a subscription'],
+  ['POST', '/admin/v1/backfill-subscriptions/{id}/cancel', 'cancel a subscription'],
+  ['GET|POST', '/admin/v1/materialization-jobs', 'list / create materialization jobs'],
+  ['GET|DELETE', '/admin/v1/materialization-jobs/{id}', 'inspect / delete a job'],
+  ['POST', '/admin/v1/materialization-jobs/{id}/cancel', 'cancel a job'],
+  ['GET|POST', '/admin/v1/raw-history-jobs', 'list / create raw history jobs'],
+  ['GET|DELETE', '/admin/v1/raw-history-jobs/{id}', 'inspect / delete a job'],
+  ['POST', '/admin/v1/raw-history-jobs/{id}/cancel', 'cancel a job'],
+];
+
+const envelopeFields = [
+  ['cursor', 'string', 'opaque resume/ack token — persist it'],
+  ['sequence', 'string', 'monotonic order in one store epoch (decimal string)'],
+  ['operation', '"apply" | "undo" | "finalized" | "reset_required"', 'the reorg protocol'],
+  ['originKind', '"live" | "live_recovery" | "historical_backfill" | "recompute"', 'which processing lane produced the change'],
+  ['originId', 'string', 'durable identity of that origin'],
+  ['publicationRevision', 'string', 'processor publication epoch/revision'],
+  ['finality', '"optimistic" | "safe" | "finalized"', 'durability of this change'],
+  ['kind', 'string', 'event discriminator, e.g. blobs.block.put'],
+  ['schema', 'string', 'payload contract, e.g. blobs.block-bundle.v1'],
+  ['key', 'Hex | null', 'entity key for keyed upsert/delete'],
+  ['data', 'T | null', 'typed payload; null on delete'],
+  ['block', '{ number, hash, parentHash, timestamp } | null', 'provenance of the change'],
+  ['chainId', 'number', 'wrong-network guard'],
+  ['apiVersion', '"1"', 'envelope contract version'],
+  ['coverage?', 'ProcessorCoverage', 'present only on reset_required'],
+  ['emittedAt', 'string', 'RFC 3339 UTC, millisecond precision'],
+];
+
+const rpcServed = [
+  'eth_getBlockByNumber / eth_getBlockByHash',
+  'eth_getBlockTransactionCountByNumber / eth_getBlockTransactionCountByHash',
+  'eth_getTransactionByBlockNumberAndIndex / eth_getTransactionByBlockHashAndIndex',
+  'eth_getBlockReceipts',
+  'eth_getTransactionByHash / eth_getTransactionReceipt',
+  'eth_getLogs (bounded recent + on-demand)',
+  'eth_blockNumber · eth_chainId · eth_config · eth_syncing',
+  'web3_clientVersion · net_version',
+  'leani_getCapabilities',
+  'eth_subscribe: newHeads, logs (reorg-correct, ws :8546)',
+];
+
+const rpcRefused = [
+  'eth_call',
+  'eth_getBalance · eth_getCode · eth_getStorageAt',
+  'eth_estimateGas',
+  'debug/trace methods',
+];
+
+const sdkClient = [
+  ['status()', 'NodeStatus'],
+  ['capabilities()', 'Capabilities'],
+  ['request<T>(path, params)', 'T'],
+  ['health.live() / health.ready()', 'Health'],
+];
+
+const sdkProcessors = [
+  ['processors.list()', 'ProcessorSummary[]'],
+  ['processors.status(id)', 'ProcessorCoverage'],
+  ['processors.changes(id, { after, limit })', 'Page<ChangeEnvelope>'],
+  ['processors.changeHead(id)', 'ChangeHead'],
+  ['processors.subscribe(id, { after, onHello })', 'AsyncGenerator<ChangeEnvelope>'],
+  ['processors.listCollections(id)', '{ outputMode, retained, data }'],
+  ['processors.queryEntities(id, collection, opts)', 'GenericSnapshotPage'],
+  ['processors.queryAndFollow(id, collection, opts)', 'GenericSnapshotPage'],
+  ['processors.getEntity(id, collection, key)', 'GenericOutputEntity'],
+  ['processors.releaseSnapshot(id, snapshotId)', 'void'],
+  ['processors.resetLiveLane(id)', 'LiveLaneReset'],
+];
+
+const sdkConsumers = [
+  ['consumers.create(id, { id, role, start, leaseTtlSeconds, credential })', 'DurableConsumer'],
+  ['consumers.list(id) / inspect(id, c) / revoke(id, c)', 'DurableConsumer'],
+  ['consumers.renew(id, c, credential)', 'DurableConsumer'],
+  ['consumers.changes(id, c, credential, { limit })', 'Page<ChangeEnvelope>'],
+  ['consumers.acknowledge(id, c, credential, cursor)', 'DurableConsumer'],
+];
+
+const sdkDomains = [
+  ['blobs.getBlock(n) / listBlocks / listSnapshot / getTransaction / listTransactions / getSchedule', 'blobs query API'],
+  ['blobs.subscribe({ after, onHello })', 'ChangeEnvelope<BlobsBlock | BlobTransaction>'],
+  ['erc20.getBalance(token, address) · erc20.subscribe()', 'Erc20Balance'],
+  ['uniswap.getPool(address) · uniswap.subscribe()', 'UniswapPoolPrice'],
+];
+
+const sdkHelpers = [
+  ['applyEntityChange(target, change)', 'apply put/delete into your keyed store'],
+  ['commitThenAcknowledge(commit, ack)', 'never acknowledge a failed destination commit'],
+  ['createInMemoryCursorStore(initial?)', 'CursorStore for tests and simple apps'],
+  ['compareSequences(a, b)', 'ordering beyond Number.MAX_SAFE_INTEGER'],
+  ['isResetRequired(change)', 'type guard for the reset event'],
+  ['parseSse(body)', 'raw SSE frame parser (advanced)'],
+];
+
+const sdkBackfill = [
+  ['create(request)', 'create an idempotent bounded historical subscription'],
+  ['list() · inspect(id) · cancel(id) · delete(id)', 'manage durable historical work'],
+  ['changes(id, consumer, options)', 'poll typed historical changes'],
+  ['stream(id, consumer, { batching })', 'NDJSON/gzip batch stream with explicit ACK'],
+  ['streamLive(processor, consumer)', 'durable live-lane batch stream'],
+  ['subscribe({ backfill, live })', 'unified history + exact live-handoff delivery'],
+  ['backfillBatchingProfile(name)', 'latency, balanced, or throughput limits'],
+];
+
+const docsNav: [string, string][] = [
+  ['#getting-started', 'getting started'],
+  ['#overview', 'overview'],
+  ['#trust', 'trust & security'],
+  ['#http', 'http api'],
+  ['#consumers', 'consumers'],
+  ['#lifecycle', 'lifecycle policy'],
+  ['#domains', 'domain apis'],
+  ['#custom-processors', 'custom processors'],
+  ['#admin', 'admin'],
+  ['#protocol', 'change protocol'],
+  ['#json-rpc', 'json-rpc'],
+  ['#sdk', 'typescript sdk'],
+];
+---
+<Base
+  title="leani docs — API reference"
+  description="Reference for the leani node's native v1 HTTP API, SSE change protocol, JSON-RPC subset, and the @leani/sdk TypeScript client."
+>
+  <SideNav items={docsNav} label="Docs sections" />
+
+  <header class="wrap docs-head">
+    <p class="mono brand"><a href="/" class="home"><span class="accent">leani</span>_</a> <span class="crumb">/ docs</span></p>
+    <h1>API reference</h1>
+    <p class="lede">
+      The node speaks three protocols. This reference tracks the current public
+      preview on <a href={GITHUB_URL}><span class="mono">main</span></a>; your
+      running node's <span class="mono">/v1/capabilities</span> response remains
+      the machine-readable authority for configured methods and query extensions.
+    </p>
+    <p class="preview-note">
+      Public preview: evaluate with an independent fallback. Read the
+      <a href={LIMITATIONS_URL}>production, trust, RPC, browser, and security limitations</a>.
+    </p>
+  </header>
+
+  <section id="getting-started" class="wrap section-sm" aria-label="Getting started">
+    <h2><span class="mono"># </span>Getting started</h2>
+    <p class="lede">
+      Verify the released binary without a network, then use a checked bounded
+      profile to index public Mainnet data and open the API.
+    </p>
+
+    <h3 class="mono">1 · install</h3>
+    <TerminalFrame title="shell">
+      <span class="t-line">brew install leani-dev/tap/leani</span>
+    </TerminalFrame>
+    <p class="note-p">The Homebrew package installs the binary. Docker and Cargo paths live in the <a href={QUICKSTART_URL}>repository quickstart</a>.</p>
+
+    <h3 class="mono">2 · prove the installation</h3>
+    <TerminalFrame title="shell">
+      <span class="t-line">{'mkdir -p /tmp/leani-quickstart\nleani e2e fixture \\\n  --data-dir /tmp/leani-quickstart \\\n  --blocks 128 \\\n  --report /tmp/leani-quickstart/report.json'}</span>
+    </TerminalFrame>
+    <p class="note-p">
+      Success reports <span class="mono">status: passed</span>, verified SQLite,
+      continuous <span class="mono">1..128</span> coverage, and 128 changes.
+      The command refuses to overwrite an existing fixture database.
+    </p>
+
+    <h3 class="mono">3 · download &amp; validate a bounded profile</h3>
+    <TerminalFrame title="shell">
+      <span class="t-line">{'curl -fsSLo windowed.toml \\\n  https://raw.githubusercontent.com/smart-byte/leani/main/config/modes/windowed.toml\nleani --config windowed.toml doctor --json'}</span>
+    </TerminalFrame>
+    <p class="note-p">
+      This profile deliberately disables live P2P and finality, so it needs no
+      weak-subjectivity checkpoint. Use the full quickstart to configure a live node
+      with a recent checkpoint obtained independently of the node.
+    </p>
+
+    <h3 class="mono">4 · index</h3>
+    <TerminalFrame title="shell">
+      <span class="t-line">{'leani --config windowed.toml backfill \\\n  --processor evm-events --from 10000835 --to 10001834'}</span>
+    </TerminalFrame>
+    <p class="note-p">
+      Backfills resume from committed coverage, not from downloaded files —
+      kill it any time and rerun the same command.
+    </p>
+
+    <h3 class="mono">5 · serve &amp; query</h3>
+    <TerminalFrame title="shell">
+      <span class="t-line">{'leani --config windowed.toml serve\n# in another terminal:\ncurl -s http://127.0.0.1:8080/v1/processors/uniswap-v2-sync-30d/collections'}</span>
+    </TerminalFrame>
+    <p class="note-p">
+      Use the <a href="#sdk">TypeScript SDK</a> for typed queries and resumable
+      at-least-once delivery. Exactly-once application behavior requires an
+      atomic destination-and-cursor commit before acknowledgement; see the
+      <a href="#protocol">change protocol</a>.
+    </p>
+  </section>
+
+  <section id="overview" class="wrap section-sm" aria-label="Overview">
+    <h2><span class="mono"># </span>Listeners</h2>
+    <div class="scroll">
+      <table>
+        <thead><tr><th scope="col">Address</th><th scope="col">Serves</th></tr></thead>
+        <tbody>
+          {listeners.map(([addr, what]) => (
+            <tr><td class="mono">{addr}</td><td>{what}</td></tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+    <p class="note-p">
+      Configure a bearer token to protect native and admin API routes. Health,
+      network status, the dashboard, and metrics remain unauthenticated. HTTP
+      and WebSocket RPC have no built-in authentication.
+    </p>
+  </section>
+
+  <section id="trust" class="wrap section-sm" aria-label="Trust and security">
+    <h2><span class="mono"># </span>Trust, availability &amp; security</h2>
+    <p class="lede">
+      “Verified” is not one global mode. Every source declares capabilities,
+      completeness, finality, and trust; the router admits it only when those
+      properties satisfy the request.
+    </p>
+    <div class="scroll">
+      <table>
+        <thead><tr><th scope="col">Input</th><th scope="col">What leani checks</th><th scope="col">Remaining trust</th></tr></thead>
+        <tbody>
+          <tr><th scope="row" class="mono">Xatu</th><td>schema, ordering, filters, hashes where material permits</td><td>dataset rows are trusted for execution and completeness</td></tr>
+          <tr><th scope="row" class="mono">EraE</th><td>transaction, receipt, withdrawal, ommer, and bloom commitments</td><td>archive canonicality currently trusts the publisher catalog</td></tr>
+          <tr><th scope="row" class="mono">execution P2P + consensus finality</th><td>parent links, execution material, consensus light-client updates</td><td>depends on independently sourced checkpoint and healthy peer cohorts</td></tr>
+          <tr><th scope="row" class="mono">retained raw segments</th><td>checksums, manifest, range, and original provenance</td><td>inherits the trust of the source that created the segment</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <div class="warning">
+      <p><strong>Remote deployment:</strong> terminate TLS and authenticate at a trusted reverse proxy; keep admin, debug, metrics, and unauthenticated RPC off the public internet.</p>
+      <p><strong>Browser SDK:</strong> use same-origin hosting or an application-owned proxy with an explicit CORS policy.</p>
+      <p><strong>RPC history:</strong> post-Merge raw responses are exact when material is available. Hash-only history needs locators; pre-Merge ommer-aware exactness is deferred.</p>
+    </div>
+  </section>
+
+  <section id="http" class="wrap section-sm" aria-label="HTTP API">
+    <h2><span class="mono"># </span>Native HTTP API <span class="mono dim">v1</span></h2>
+
+    <h3 class="mono">node</h3>
+    <div class="scroll">
+      <table>
+        <thead><tr><th scope="col">Method</th><th scope="col">Path</th><th scope="col">Purpose</th></tr></thead>
+        <tbody>{nodeEndpoints.map(([m, p, d]) => (
+          <tr><td class="mono method">{m}</td><td class="mono">{p}</td><td>{d}</td></tr>
+        ))}</tbody>
+      </table>
+    </div>
+
+    <h3 class="mono">processors</h3>
+    <div class="scroll">
+      <table>
+        <thead><tr><th scope="col">Method</th><th scope="col">Path</th><th scope="col">Purpose</th></tr></thead>
+        <tbody>{processorEndpoints.map(([m, p, d]) => (
+          <tr><td class="mono method">{m}</td><td class="mono">{p}</td><td>{d}</td></tr>
+        ))}</tbody>
+      </table>
+    </div>
+  </section>
+
+  <section id="consumers" class="wrap section-sm" aria-label="Durable consumers">
+    <h2><span class="mono"># </span>Durable consumers</h2>
+    <p class="lede">
+      Named, leased, acknowledged delivery on top of the change log — for
+      pipelines that must never lose an event. A consumer has a
+      <span class="mono">role</span> (<span class="mono">required</span> blocks
+      pruning, <span class="mono">best_effort</span> doesn't), a lease, and a
+      monotonic acknowledged cursor.
+    </p>
+    <div class="scroll">
+      <table>
+        <thead><tr><th scope="col">Method</th><th scope="col">Path</th><th scope="col">Purpose</th></tr></thead>
+        <tbody>{consumerEndpoints.map(([m, p, d]) => (
+          <tr><td class="mono method">{m}</td><td class="mono">{p}</td><td>{d}</td></tr>
+        ))}</tbody>
+      </table>
+    </div>
+  </section>
+
+  <section id="lifecycle" class="wrap section-sm" aria-label="Lifecycle policy">
+    <h2><span class="mono"># </span>Lifecycle policy</h2>
+    <p class="lede">
+      Each processor independently controls private state, query output,
+      delivery, replay artifacts, checkpoints, and undo. Raw-history storage is
+      a separate node-level policy. There is no universal “small database” mode.
+    </p>
+    <div class="scroll">
+      <table>
+        <thead><tr><th scope="col">Policy</th><th scope="col">Modes</th><th scope="col">Purpose</th></tr></thead>
+        <tbody>
+          <tr><th scope="row" class="mono">state</th><td class="mono">ephemeral · durable · checkpointed</td><td>private reducer state</td></tr>
+          <tr><th scope="row" class="mono">output</th><td class="mono">none · latest · window · full</td><td>queryable materialized entities</td></tr>
+          <tr><th scope="row" class="mono">delivery</th><td class="mono">none · window · until_acknowledged</td><td>downstream change spool and pruning fence</td></tr>
+          <tr><th scope="row" class="mono">artifacts</th><td class="mono">none · window · full</td><td>processor delta replay without reacquiring input</td></tr>
+          <tr><th scope="row" class="mono">checkpoint</th><td class="mono">none · automatic</td><td>local recovery generations</td></tr>
+          <tr><th scope="row" class="mono">undo</th><td class="mono">none · unfinalized</td><td>bounded optimistic reorg journal</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="note-p">
+      Window policies accept block, age, row, and byte limits. Delivery adds
+      pause/fail behavior, pruning cadence, required consumers, leases, and hard
+      global budgets. Start from the <a href={`${GITHUB_URL}/tree/main/config/modes`}>checked lifecycle profiles</a>.
+    </p>
+  </section>
+
+  <section id="domains" class="wrap section-sm" aria-label="Domain APIs">
+    <h2><span class="mono"># </span>Domain query APIs</h2>
+    <p class="lede">
+      Processor-owned read extensions are always available below
+      <span class="mono">/v1/processors/{'{p}'}/query</span>. The shorter paths
+      below are enabled only when one configured instance can claim the alias;
+      discover canonical paths through <span class="mono">/v1/capabilities</span>.
+    </p>
+    <div class="scroll">
+      <table>
+        <thead><tr><th scope="col">Method</th><th scope="col">Path</th><th scope="col">Purpose</th></tr></thead>
+        <tbody>{domainEndpoints.map(([m, p, d]) => (
+          <tr><td class="mono method">{m}</td><td class="mono">{p}</td><td>{d}</td></tr>
+        ))}</tbody>
+      </table>
+    </div>
+  </section>
+
+  <section id="custom-processors" class="wrap section-sm" aria-label="Custom processors">
+    <h2><span class="mono"># </span>Build a custom processor</h2>
+    <p class="lede">
+      A native processor owns two contracts: deterministic map/reduce output
+      and, optionally, a bounded read-only HTTP extension. Its factory returns
+      both in one component bundle, so the query route can only read the exact
+      processor instance that created it.
+    </p>
+
+    <h3 class="mono">1 · implement and bundle</h3>
+    <p class="note-p">
+      This example assumes <span class="mono">BlockSummaryProcessor</span>
+      already implements the transport-free <span class="mono">Processor</span>
+      trait and stores JSON in <span class="mono">example.block_summaries</span>.
+    </p>
+    <TerminalFrame title="src/main.rs">
+      {customExtension.map((line) => <span class="t-line" set:html={hlRust(line)} />)}
+    </TerminalFrame>
+
+    <div class="grid2 custom-grid">
+      <div>
+        <h3 class="mono">2 · configure the instance</h3>
+        <TerminalFrame title="node.toml">
+          {customConfig.map((line) => <span class="t-line" set:html={hlShell(line)} />)}
+        </TerminalFrame>
+      </div>
+      <div class="custom-run">
+        <h3 class="mono">3 · register and run</h3>
+        <TerminalFrame title="src/main.rs">
+          <span class="t-line" set:html={hlRust('let mut registry = ProcessorRegistry::new();')} />
+          <span class="t-line" set:html={hlRust('registry.register(BlockSummaryFactory)?;')} />
+          <span class="t-line" set:html={hlRust('run_with_registry(registry).await?;')} />
+        </TerminalFrame>
+        <TerminalFrame title="shell">
+          <span class="t-line" set:html={hlShell('$ cargo run --release -- --config node.toml doctor')} />
+          <span class="t-line" set:html={hlShell('$ cargo run --release -- --config node.toml serve')} />
+        </TerminalFrame>
+      </div>
+    </div>
+
+    <h3 class="mono">4 · discover and query</h3>
+    <TerminalFrame title="consumer.ts">
+      {customUse.map((line) => <span class="t-line" set:html={hlTs(line)} />)}
+    </TerminalFrame>
+    <p class="note-p">
+      Canonical paths are stable per processor instance. Optional short aliases
+      disappear when several instances claim the same name, so applications
+      should discover and use <span class="mono">basePath</span>. Scans read the
+      latest committed state; use the generic query-and-follow API for a stable
+      multi-page snapshot plus an exact stream handoff.
+    </p>
+    <p class="note-p">
+      <a href={`${GITHUB_URL}/tree/main/examples/custom-node`}>Complete runnable example →</a>
+      {' · '}
+      <a href={`${GITHUB_URL}/blob/main/docs/CUSTOM-PROCESSORS.md`}>Processor contract guide →</a>
+    </p>
+  </section>
+
+  <section id="admin" class="wrap section-sm" aria-label="Admin API">
+    <h2><span class="mono"># </span>Admin <span class="mono dim">/admin/v1</span></h2>
+    <p class="lede">Operator actions; deliberately separated from the read path.</p>
+    <div class="scroll">
+      <table>
+        <thead><tr><th scope="col">Method</th><th scope="col">Path</th><th scope="col">Purpose</th></tr></thead>
+        <tbody>{adminEndpoints.map(([m, p, d]) => (
+          <tr><td class="mono method">{m}</td><td class="mono">{p}</td><td>{d}</td></tr>
+        ))}</tbody>
+      </table>
+    </div>
+  </section>
+
+  <section id="protocol" class="wrap section-sm" aria-label="Change protocol">
+    <h2><span class="mono"># </span>Change protocol</h2>
+    <p class="lede">
+      Every stream connection opens with one synthesized
+      <span class="mono">hello</span> frame — no SSE id, never stored, never
+      acknowledged — carrying <span class="mono">{'{ apiVersion, chainId, processor, coverage }'}</span>
+      as of your resume position. Change events follow, at-least-once;
+      consumers dedupe by cursor. Every event also records its processing origin
+      and publication revision. Exactly-once lives in an atomic application
+      commit followed by acknowledgement, not in the transport.
+    </p>
+    <TerminalFrame title="stream — wire format">
+      <span class="t-line t-dim">GET /v1/processors/blobs-money/stream?after=&lt;cursor&gt;</span>
+      <span class="t-line t-accent">event: hello</span>
+      <span class="t-line">data: {'{"apiVersion":"1","chainId":1,"processor":{…},"coverage":{…}}'}</span>
+      <span class="t-line"></span>
+      <span class="t-line t-dim">id: &lt;opaque cursor&gt;</span>
+      <span class="t-line t-accent">event: apply</span>
+      <span class="t-line">data: {'{"kind":"blobs.block.put",…,"data":{…}}'}</span>
+    </TerminalFrame>
+    <h3 class="mono">envelope</h3>
+    <div class="scroll">
+      <table>
+        <thead><tr><th scope="col">Field</th><th scope="col">Type</th><th scope="col">Meaning</th></tr></thead>
+        <tbody>{envelopeFields.map(([f, t, d]) => (
+          <tr><td class="mono">{f}</td><td class="mono type">{t}</td><td>{d}</td></tr>
+        ))}</tbody>
+      </table>
+    </div>
+  </section>
+
+  <section id="json-rpc" class="wrap section-sm" aria-label="JSON-RPC">
+    <h2><span class="mono"># </span>JSON-RPC subset</h2>
+    <p class="lede">
+      The capability response is authoritative. Number/range history can use a
+      configured complete source; hash-only history is recent-only unless a
+      locator or retained index is enabled. Unavailable material returns an
+      explicit data-unavailable error instead of a fabricated null result.
+    </p>
+    <div class="grid2">
+      <div class="panel ok">
+        <h3 class="mono ok-h">implemented exactly when available</h3>
+        <ul class="mono list">{rpcServed.map((m) => <li>{m}</li>)}</ul>
+      </div>
+      <div class="panel">
+        <h3 class="mono no-h">refused, explicitly</h3>
+        <ul class="mono list dead">{rpcRefused.map((m) => <li>{m}</li>)}</ul>
+        <p class="note-p">No EVM, no state trie. Unsupported methods return an explicit error. <a href="/#rpc">Why →</a></p>
+      </div>
+    </div>
+  </section>
+
+  <section id="sdk" class="wrap section-sm" aria-label="TypeScript SDK">
+    <h2><span class="mono"># </span>TypeScript SDK <span class="mono dim">@leani/sdk</span></h2>
+    <TerminalFrame title="setup.ts">
+      {sdkSetup.map((line) => <span class="t-line" set:html={hlTs(line)} />)}
+    </TerminalFrame>
+
+    <h3 class="mono">client</h3>
+    <div class="scroll"><table>
+      <thead><tr><th scope="col">Call</th><th scope="col">Returns</th></tr></thead>
+      <tbody>{sdkClient.map(([c, r]) => (
+        <tr><td class="mono">{c}</td><td class="mono type">{r}</td></tr>
+      ))}</tbody>
+    </table></div>
+
+    <h3 class="mono">client.processors</h3>
+    <div class="scroll"><table>
+      <thead><tr><th scope="col">Call</th><th scope="col">Returns</th></tr></thead>
+      <tbody>{sdkProcessors.map(([c, r]) => (
+        <tr><td class="mono">{c}</td><td class="mono type">{r}</td></tr>
+      ))}</tbody>
+    </table></div>
+
+    <h3 class="mono">client.processors.consumers</h3>
+    <div class="scroll"><table>
+      <thead><tr><th scope="col">Call</th><th scope="col">Returns</th></tr></thead>
+      <tbody>{sdkConsumers.map(([c, r]) => (
+        <tr><td class="mono">{c}</td><td class="mono type">{r}</td></tr>
+      ))}</tbody>
+    </table></div>
+
+    <h3 class="mono">client.blobs · client.erc20 · client.uniswap</h3>
+    <div class="scroll"><table>
+      <thead><tr><th scope="col">Call</th><th scope="col">Returns / payload</th></tr></thead>
+      <tbody>{sdkDomains.map(([c, r]) => (
+        <tr><td class="mono">{c}</td><td class="mono type">{r}</td></tr>
+      ))}</tbody>
+    </table></div>
+
+    <h3 class="mono">helpers</h3>
+    <div class="scroll"><table>
+      <thead><tr><th scope="col">Function</th><th scope="col">Purpose</th></tr></thead>
+      <tbody>{sdkHelpers.map(([c, r]) => (
+        <tr><td class="mono">{c}</td><td>{r}</td></tr>
+      ))}</tbody>
+    </table></div>
+
+    <h3 class="mono">@leani/sdk/backfill</h3>
+    <p class="note-p">
+      The separate backfill entry point owns bounded historical subscriptions,
+      gzip NDJSON batch decoding, lane-specific acknowledgements, and a unified
+      history-to-live handoff. Import it explicitly so browser/query clients do
+      not pay for delivery orchestration they do not use.
+    </p>
+    <div class="scroll"><table>
+      <thead><tr><th scope="col">Call</th><th scope="col">Purpose</th></tr></thead>
+      <tbody>{sdkBackfill.map(([c, r]) => (
+        <tr><td class="mono">{c}</td><td>{r}</td></tr>
+      ))}</tbody>
+    </table></div>
+
+    <p class="note-p">
+      Errors are <span class="mono">LeaniError</span> (status, code, retryable,
+      requestId); an unresumable cursor throws
+      <span class="mono">ResetRequiredError</span>. Streams reconnect with
+      backoff and jitter, resume from the last yielded cursor, and surface each
+      connection's <span class="mono">hello</span> via
+      <span class="mono">onHello</span>.
+    </p>
+    <p class="note-p">
+      Browser use requires same-origin deployment or an application-owned
+      reverse proxy with explicit CORS. Never place a privileged admin bearer
+      token in browser code.
+    </p>
+  </section>
+
+  <footer class="wrap docs-foot">
+    <a href="/">← leani.dev</a>
+    <a href={GITHUB_URL}>GitHub</a>
+  </footer>
+</Base>
+
+<style>
+  .docs-head { padding-top: 4.5rem; }
+  .brand { font-size: 1rem; }
+  .home { text-decoration: none; color: var(--ink); }
+  .crumb { color: var(--ink-dim); }
+  h1 { font-size: clamp(2rem, 4.5vw, 3rem); margin-top: 0.6rem; }
+  .lede { color: var(--ink-dim); max-width: 60ch; margin-top: 1rem; }
+  .preview-note, .warning {
+    color: var(--ink-dim); background: var(--panel); border: 1px solid var(--accent-dim);
+    border-radius: 10px; padding: 1rem 1.15rem; margin-top: 1.25rem; max-width: 68rem;
+  }
+  .preview-note { font-size: 0.88rem; }
+  .warning { display: grid; gap: 0.65rem; font-size: 0.88rem; }
+  .warning strong { color: var(--ink); }
+  .section-sm { padding-block: 2.75rem; }
+  h2 { margin-bottom: 1.25rem; }
+  h3 { color: var(--accent); font-size: 0.85rem; font-weight: 700; margin: 1.75rem 0 0.6rem; }
+  .dim { color: var(--ink-dim); font-weight: 400; }
+  .scroll { min-width: 0; max-width: 100%; overflow-x: auto; }
+  table { border-collapse: collapse; width: 100%; min-width: 44rem; font-size: 0.88rem; }
+  th, td { text-align: left; padding: 0.5rem 0.9rem 0.5rem 0; border-bottom: 1px solid var(--panel-edge); vertical-align: top; }
+  thead th { color: var(--ink-dim); font-weight: 500; font-size: 0.72rem; letter-spacing: 0.08em; text-transform: uppercase; }
+  td.mono, td .mono { font-size: 0.82rem; }
+  .method { color: var(--accent); white-space: nowrap; }
+  .type { color: var(--ink-dim); }
+  .note-p { color: var(--ink-dim); font-size: 0.9rem; margin-top: 1rem; max-width: 62ch; }
+  .grid2 { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 1.25rem; }
+  .grid2 > * { min-width: 0; }
+  .custom-grid { align-items: start; }
+  .custom-run :global(.term) + :global(.term) { margin-top: 0.75rem; }
+  @media (max-width: 760px) { .grid2 { grid-template-columns: 1fr; } }
+  .panel { background: var(--panel); border: 1px solid var(--panel-edge); border-radius: 10px; padding: 1.5rem; }
+  .panel.ok { border-color: var(--accent-dim); }
+  .ok-h { color: var(--accent); }
+  .no-h { color: var(--ink-dim); }
+  .list { list-style: none; padding: 0; margin-top: 1rem; display: grid; gap: 0.55rem; font-size: 0.85rem; }
+  .list li::before { content: '▸ '; color: var(--accent-dim); }
+  .dead li { text-decoration: line-through; text-decoration-color: var(--accent-dim); color: var(--ink-dim); }
+  .dead li::before { content: '✕ '; text-decoration: none; }
+  .docs-foot { padding-block: 3rem; display: flex; gap: 1.5rem; border-top: 1px solid var(--panel-edge); margin-top: 2rem; }
+</style>

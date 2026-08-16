@@ -1,0 +1,70 @@
+{
+  "id": "custom",
+  "label": "write your own",
+  "caption": "Native Rust processors register state transforms and typed read extensions through the public factory API — same durability, streams, coverage, and query controls as built-ins.",
+  "guideUrl": "/docs#custom-processors",
+  "docsUrl": "https://github.com/smart-byte/leani/blob/main/docs/CUSTOM-PROCESSORS.md",
+  "configLang": "rust",
+  "config": "impl ProcessorFactory for BlockSummaryFactory {\n    fn id(&self) -> &'static str { \"example-block-summary\" }\n\n    fn create(\n        &self,\n        config: &ProcessorConfig,\n        _context: ProcessorFactoryContext,\n    ) -> Result<ProcessorComponents, ProcessorFactoryError> {\n        let processor = Arc::new(\n            BlockSummaryProcessor::new(config)?\n        );\n        Ok(ProcessorComponents::new(processor)\n            .with_query_extension(Arc::new(BlockSummaryQueries)))\n    }\n}\n\nimpl QueryExtension for BlockSummaryQueries {\n    fn id(&self) -> &'static str { \"block-summary-v1\" }\n    fn alias(&self) -> Option<&str> { Some(\"block-summaries\") }\n    fn routes(&self) -> Router<QueryContext> {\n        Router::new().route(\"/{number}\", get(summary))\n    }\n}",
+  "queryExample": "interface BlockSummary {\n  blockNumber: number;\n  timestamp: number;\n}\n\nconst summary = await leani.request<BlockSummary>(\n  \"v1/processors/block-summaries/query/25696396\",\n);\n// { blockNumber: 25696396, timestamp: 1786025147 }",
+  "dataType": "{\n  blockNumber: number;\n  timestamp: number;\n}",
+  "sseId": "opaque-resume-cursor",
+  "helloJson": {
+    "apiVersion": "1",
+    "chainId": 1,
+    "processor": {
+      "id": "example-block-summary",
+      "instance": "block-summaries",
+      "version": "1.0.0",
+      "codeHash": "0x6b30c95e17daf4820b96e5c3a1f07d48e92b56013fc7da8e045a1b7cd6390f82",
+      "configHash": "0xf05c37b1ae92d6084e1bc79f52a3d80167c04de935ab26f1780c4e3b9a51d627",
+      "genericApi": "processor-v1",
+      "changeSchema": "example.block-summary.change.v1",
+      "queryExtensions": [{
+        "id": "block-summary-v1",
+        "basePath": "/v1/processors/block-summaries/query",
+        "aliasPath": "/v1/q/block-summaries"
+      }],
+      "subscriptions": true,
+      "artifactRetention": "none",
+      "deliveryOrdering": "block_versioned_idempotent"
+    },
+    "coverage": {
+      "chainId": 1,
+      "requested": null,
+      "available": [
+        { "fromBlock": 25650000, "toBlock": 25696396, "finality": "optimistic" }
+      ],
+      "configuredStartBlock": 25650000,
+      "processedThrough": 25696396,
+      "finalizedThrough": 25696313,
+      "complete": true,
+      "state": "live"
+    }
+  },
+  "outputJson": {
+    "apiVersion": "1",
+    "sequence": "46397",
+    "cursor": "opaque-resume-cursor",
+    "operation": "apply",
+    "originKind": "historical_backfill",
+    "originId": "block-summaries",
+    "publicationRevision": "0",
+    "chainId": 1,
+    "block": {
+      "hash": "0xc86f87600c81fb635325cca051fef40b875ca405d1b2f57881437963321e88ff",
+      "number": 25696396,
+      "parentHash": "0x0141a01b6e38f75cd3606834c3780f581d5772460e440e7c5758b69589929168",
+      "timestamp": 1786025147
+    },
+    "finality": "optimistic",
+    "kind": "example.block_summary.put",
+    "schema": "example.block-summary.change.v1",
+    "key": "0x000000000188188c",
+    "data": {
+      "blockNumber": 25696396,
+      "timestamp": 1786025147
+    },
+    "emittedAt": "2026-08-06T14:05:51.502Z"
+  }
+}

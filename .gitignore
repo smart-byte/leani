@@ -5,6 +5,10 @@
 !/config/example.toml
 /packages/sdk/dist/
 /packages/sdk/node_modules/
+/site/node_modules/
+/site/dist/
+/site/.astro/
+/site/src/generated/
 *.db
 *.db-shm
 *.db-wal

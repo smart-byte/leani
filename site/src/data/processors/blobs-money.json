@@ -1,0 +1,126 @@
+{
+  "id": "blobs-money",
+  "label": "blobs-money",
+  "caption": "One atomic block bundle—economics plus every blob transaction. Node commits are atomic; consumers receive at-least-once and commit their cursor before ACK.",
+  "docsUrl": "https://github.com/smart-byte/leani/blob/main/docs/PROCESSORS.md#blobs-money-140",
+  "liveUrl": "https://blobs.money",
+  "configLang": "toml",
+  "config": "[[processors]]\nid = \"blobs-money\"\ninstance = \"blobs-production\"\nversion = \"1.4.0\"\nhistory_mode = \"on_demand\"\nstart_block = 19426589  # Dencun\npublish = \"optimistic_and_finalized\"\n\n[processors.state]\nmode = \"checkpointed\"\n\n[processors.artifacts]\nmode = \"none\"\n\n[processors.output]\nmode = \"full\"\n\n[processors.delivery]\nmode = \"window\"\n\n[processors.checkpoint]\nmode = \"automatic\"\nkeep = 3\n\n[processors.undo]\nmode = \"unfinalized\"\nsafety_blocks = 256",
+  "dataType": "{\n  block: {\n    blobBaseFee: string;\n    blobCount: number;\n    blobEthBurnedWei: string;\n    blobGasUsed: string;\n    blockHash: Hex;\n    blockNumber: number;\n    excessBlobGas: string;\n    executionBaseFee: string;\n    executionEthBurnedWei: string;\n    finality: \"optimistic\" | \"safe\" | \"finalized\";\n    gasLimit: string;\n    gasUsed: string;\n    maxBlobsPerBlock: number;\n    network: string;\n    parentHash: Hex;\n    reserveFeeWei: string;\n    size: string;\n    targetBlobsPerBlock: number;\n    timestamp: number;\n    transactionCount: number;\n    transformVersion: number;\n  };\n  transactions: {\n    blobBurnedWei: string;\n    blobCount: number;\n    blobVersionedHashes: Hex[];\n    blockHash: Hex;\n    blockNumber: number;\n    executionBurnedWei: string;\n    network: string;\n    senderAddress: Hex;\n    totalBurnedWei: string;\n    transactionIndex: number;\n    txHash: Hex;\n  }[];\n}",
+  "sseId": "opaque-resume-cursor",
+  "helloJson": {
+    "apiVersion": "1",
+    "chainId": 1,
+    "processor": {
+      "id": "blobs-money",
+      "instance": "blobs-production",
+      "version": "1.4.0",
+      "codeHash": "0x40e161bf600305182426c189c3992cb21d3efd17db43ec8902289fa2e854c352",
+      "configHash": "0x8ea21cedc162b4fa3edf143b115e0d3a87c8c958be74e0b1a61ebf8fb53bfa9f",
+      "genericApi": "processor-v1",
+      "changeSchema": "blobs.block-bundle.v1",
+      "queryExtensions": [{
+        "id": "blobs-v1",
+        "basePath": "/v1/processors/blobs-production/query",
+        "aliasPath": "/v1/q/blobs"
+      }],
+      "subscriptions": true,
+      "artifactRetention": "none",
+      "deliveryOrdering": "block_versioned_idempotent"
+    },
+    "coverage": {
+      "chainId": 1,
+      "requested": null,
+      "available": [
+        { "fromBlock": 25684620, "toBlock": 25696396, "finality": "optimistic" }
+      ],
+      "configuredStartBlock": 19426589,
+      "processedThrough": 25696396,
+      "finalizedThrough": 25696313,
+      "complete": false,
+      "state": "backfilling"
+    }
+  },
+  "outputJson": {
+    "apiVersion": "1",
+    "sequence": "12717",
+    "cursor": "opaque-resume-cursor",
+    "operation": "apply",
+    "originKind": "historical_backfill",
+    "originId": "blobs-production",
+    "publicationRevision": "0",
+    "chainId": 1,
+    "block": {
+      "hash": "0xc86f87600c81fb635325cca051fef40b875ca405d1b2f57881437963321e88ff",
+      "number": 25696396,
+      "parentHash": "0x0141a01b6e38f75cd3606834c3780f581d5772460e440e7c5758b69589929168",
+      "timestamp": 1786025147
+    },
+    "finality": "optimistic",
+    "kind": "blobs.block.put",
+    "schema": "blobs.block-bundle.v1",
+    "key": "0x000000000188188c",
+    "data": {
+      "block": {
+        "blobBaseFee": "12321493",
+        "blobCount": 6,
+        "blobEthBurnedWei": "9690016382976",
+        "blobGasUsed": "786432",
+        "blockHash": "0xc86f87600c81fb635325cca051fef40b875ca405d1b2f57881437963321e88ff",
+        "blockNumber": 25696396,
+        "excessBlobGas": "190403863",
+        "executionBaseFee": "197143888",
+        "executionEthBurnedWei": "5994753120598992",
+        "finality": "optimistic",
+        "gasLimit": "60000000",
+        "gasUsed": "30408009",
+        "maxBlobsPerBlock": 21,
+        "network": "mainnet",
+        "parentHash": "0x0141a01b6e38f75cd3606834c3780f581d5772460e440e7c5758b69589929168",
+        "reserveFeeWei": "12321493",
+        "size": "204513",
+        "targetBlobsPerBlock": 14,
+        "timestamp": 1786025147,
+        "transactionCount": 454,
+        "transformVersion": 3
+      },
+      "transactions": [
+        {
+          "blobBurnedWei": "4845008191488",
+          "blobCount": 3,
+          "blobVersionedHashes": [
+            "0x0146f2f929fb9be897ff2a9936f1ac8f606e7744b04b9ea906d3161951259234",
+            "0x0139f561c400958f0b508f994e1d8cd6ecfbcd6d983805787ea6e0dfc472f520",
+            "0x01f33795e8875843742462f60d39acbc225fd6193099521cc232c5b879c88806"
+          ],
+          "blockHash": "0xc86f87600c81fb635325cca051fef40b875ca405d1b2f57881437963321e88ff",
+          "blockNumber": 25696396,
+          "executionBurnedWei": "33289914071568",
+          "network": "mainnet",
+          "senderAddress": "0xc1b634853cb333d3ad8663715b08f41a3aec47cc",
+          "totalBurnedWei": "38134922263056",
+          "transactionIndex": 84,
+          "txHash": "0x3bb566afface910df6bc9c3a00e65e8c5bf2927b0bda0f2f71b7b76a6e583845"
+        },
+        {
+          "blobBurnedWei": "4845008191488",
+          "blobCount": 3,
+          "blobVersionedHashes": [
+            "0x01502b9cc6c74f07510c2ed06fbc52ee59704e5ef1a27abc758dcc97d04a606a",
+            "0x01c1989f8139ca3608e4b29aea0ea45ad8a7c7e83ee100448274c0e732529596",
+            "0x0154a00cadee9fff727dc668b55d2e8d28c4916e61a83e44dbb5351b828121ef"
+          ],
+          "blockHash": "0xc86f87600c81fb635325cca051fef40b875ca405d1b2f57881437963321e88ff",
+          "blockNumber": 25696396,
+          "executionBurnedWei": "28478617484928",
+          "network": "mainnet",
+          "senderAddress": "0xdaa526086787d9debe1d7f3ffdb1fe50cf8687f4",
+          "totalBurnedWei": "33323625676416",
+          "transactionIndex": 14,
+          "txHash": "0x50465aa581273298a40d3147e672268b3cbbd7a843a0a594d0b7b018db5e0a36"
+        }
+      ]
+    },
+    "emittedAt": "2026-08-06T14:05:51.194Z"
+  }
+}

@@ -1,0 +1,75 @@
+---
+import TerminalFrame from './TerminalFrame.astro';
+import { QUICKSTART_URL } from '../config';
+---
+<section id="quickstart" class="wrap section" aria-labelledby="quickstart-h">
+  <p class="eyebrow mono">No network required for step 1</p>
+  <h2 id="quickstart-h"><span class="mono"># </span>Install, prove, then connect</h2>
+  <p class="lede">
+    First exercise the released binary, migrations, processor runtime, delivery
+    spool, checkpoints, coverage, and SQLite integrity with a deterministic fixture.
+    Then run a bounded public-data API when you are ready for the network.
+  </p>
+  <div class="pair">
+    <div>
+      <p class="mono label">1 · verify the release</p>
+      <TerminalFrame title="shell">
+        <div class="command">
+          <span class="t-line" data-copy-source>{'brew install leani-dev/tap/leani\nmkdir -p /tmp/leani-quickstart\nleani e2e fixture \\\n  --data-dir /tmp/leani-quickstart \\\n  --blocks 128 \\\n  --report /tmp/leani-quickstart/report.json'}</span>
+          <button type="button" class="copy mono" data-copy-button aria-label="Copy release verification commands">copy</button>
+        </div>
+      </TerminalFrame>
+      <p class="status mono" role="status" aria-live="polite" data-copy-status></p>
+    </div>
+    <div>
+      <p class="mono label">2 · run a bounded Mainnet API</p>
+      <TerminalFrame title="shell">
+        <div class="command">
+          <span class="t-line" data-copy-source>{'curl -fsSLo windowed.toml \\\n  https://raw.githubusercontent.com/smart-byte/leani/main/config/modes/windowed.toml\nleani --config windowed.toml doctor --json\nleani --config windowed.toml backfill \\\n  --processor evm-events --from 10000835 --to 10001834\nleani --config windowed.toml serve'}</span>
+          <button type="button" class="copy mono" data-copy-button aria-label="Copy bounded Mainnet API commands">copy</button>
+        </div>
+      </TerminalFrame>
+      <p class="status mono" role="status" aria-live="polite" data-copy-status></p>
+    </div>
+  </div>
+  <p class="after">
+    In another terminal, query <span class="mono">http://127.0.0.1:8080/v1/processors/uniswap-v2-sync-30d/collections</span>.
+    Docker, Cargo, live P2P, and independently sourced checkpoint instructions are in the
+    <a href={QUICKSTART_URL}>full quickstart</a>.
+  </p>
+</section>
+
+<style>
+  h2 { margin-top: 1rem; }
+  .lede { color: var(--ink-dim); max-width: 66ch; margin-top: 1rem; }
+  .pair { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 1.25rem; margin-top: 2.5rem; }
+  .pair > div { min-width: 0; }
+  @media (max-width: 900px) { .pair { grid-template-columns: 1fr; } }
+  .label { color: var(--ink-dim); font-size: 0.8rem; margin-bottom: 0.5rem; }
+  .command { position: relative; min-width: 0; padding-right: 3.25rem; }
+  .copy {
+    position: absolute; top: 0; right: 0;
+    border: 1px solid var(--panel-edge); border-radius: 5px;
+    background: var(--bg); color: var(--ink-dim);
+    padding: 0.25rem 0.45rem; cursor: pointer; font-size: 0.7rem;
+  }
+  .copy:hover { color: var(--accent); border-color: var(--accent-dim); }
+  .status { min-height: 1.4em; color: var(--accent); font-size: 0.72rem; margin-top: 0.35rem; }
+  .after { color: var(--ink-dim); margin-top: 1.5rem; overflow-wrap: anywhere; }
+</style>
+
+<script>
+  document.querySelectorAll<HTMLElement>('#quickstart .command').forEach((command) => {
+    const source = command.querySelector<HTMLElement>('[data-copy-source]');
+    const button = command.querySelector<HTMLButtonElement>('[data-copy-button]');
+    const status = command.closest<HTMLElement>('.pair > div')?.querySelector<HTMLElement>('[data-copy-status]');
+    button?.addEventListener('click', async () => {
+      try {
+        await navigator.clipboard.writeText(source?.textContent ?? '');
+        if (status) status.textContent = 'Copied to clipboard.';
+      } catch {
+        if (status) status.textContent = 'Copy failed. Select the commands manually.';
+      }
+    });
+  });
+</script>

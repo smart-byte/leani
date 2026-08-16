@@ -1,0 +1,71 @@
+{
+  "id": "transaction-stats",
+  "label": "transaction-stats",
+  "caption": "Ordered aggregate with constant-sized state for top-level A-to-B transactions. Internal calls and traces are intentionally outside this processor.",
+  "docsUrl": "https://github.com/smart-byte/leani/blob/main/docs/PROCESSORS.md#transaction-stats-100",
+  "configLang": "toml",
+  "config": "[[processors]]\nid = \"transaction-stats\"\ninstance = \"treasury-flow-total\"\nversion = \"1.0.0\"\nhistory_mode = \"on_demand\"\nstart_block = 15537394\npublish = \"finalized_only\"\n\n[processors.state]\nmode = \"checkpointed\"\n\n[processors.artifacts]\nmode = \"none\"\n\n[processors.output]\nmode = \"latest\"\n\n[processors.delivery]\nmode = \"none\"\n\n[processors.checkpoint]\nmode = \"automatic\"\nkeep = 3\n\n[processors.undo]\nmode = \"none\"\nsafety_blocks = 0\n\n[processors.settings]\nfrom = \"0x1111111111111111111111111111111111111111\"\nto = \"0x2222222222222222222222222222222222222222\"\ncomplete_from_start = true",
+  "dataType": "{\n  from: Hex;\n  to: Hex;\n  count: number;\n  totalValueWei: string;\n  asOfBlock: number;\n  blockHash: Hex;\n  finality: \"optimistic\" | \"safe\" | \"finalized\";\n  coverageFrom: number;\n  complete: boolean;\n}",
+  "sseId": "opaque-resume-cursor",
+  "helloJson": {
+    "apiVersion": "1",
+    "chainId": 1,
+    "processor": {
+      "id": "transaction-stats",
+      "instance": "treasury-flow-total",
+      "version": "1.0.0",
+      "codeHash": "0x2ef80c395ab1d7642c9d05f1a8be3670d42c8f5019e6ba24d70c31e59f84ab06",
+      "configHash": "0xc41b9f60e82d53a7195c04dbe6f728a1b30d96c5e47f08a2361de5b09c847f13",
+      "genericApi": "processor-v1",
+      "changeSchema": "transaction-stats.change.v1",
+      "queryExtensions": [],
+      "subscriptions": true,
+      "artifactRetention": "none",
+      "deliveryOrdering": "canonical"
+    },
+    "coverage": {
+      "chainId": 1,
+      "requested": null,
+      "available": [
+        { "fromBlock": 15537394, "toBlock": 25696313, "finality": "finalized" }
+      ],
+      "configuredStartBlock": 15537394,
+      "processedThrough": 25696313,
+      "finalizedThrough": 25696313,
+      "complete": true,
+      "state": "live"
+    }
+  },
+  "outputJson": {
+    "apiVersion": "1",
+    "sequence": "8967",
+    "cursor": "opaque-resume-cursor",
+    "operation": "apply",
+    "originKind": "historical_backfill",
+    "originId": "treasury-flow-total",
+    "publicationRevision": "0",
+    "chainId": 1,
+    "block": {
+      "hash": "0x7d31c4b8e2a90f6d5c11ae08b4b32799d4c6f1502e83ba7dd06945218c3ea7b2",
+      "number": 25696313,
+      "parentHash": "0x59e8d20cc41b73361fa8b4c05b90ea1745c2d9803f617ba2ce90d4a1f8b06c33",
+      "timestamp": 1786024151
+    },
+    "finality": "finalized",
+    "kind": "transaction_stats.aggregate.put",
+    "schema": "transaction-stats.change.v1",
+    "key": "0x11111111111111111111111111111111111111112222222222222222222222222222222222222222",
+    "data": {
+      "from": "0x1111111111111111111111111111111111111111",
+      "to": "0x2222222222222222222222222222222222222222",
+      "count": 18421,
+      "totalValueWei": "8123456789000000000000",
+      "asOfBlock": 25696313,
+      "blockHash": "0x7d31c4b8e2a90f6d5c11ae08b4b32799d4c6f1502e83ba7dd06945218c3ea7b2",
+      "finality": "finalized",
+      "coverageFrom": 15537394,
+      "complete": true
+    },
+    "emittedAt": "2026-08-06T13:49:23.114Z"
+  }
+}
