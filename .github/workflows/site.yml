@@ -82,6 +82,9 @@ jobs:
       - name: Build static site
         working-directory: site
         run: bun run build
+      - name: Enforce static asset budgets
+        working-directory: site
+        run: bun run size:check
       - name: Verify static search
         working-directory: site
         run: bun run search:check

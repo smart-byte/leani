@@ -30,7 +30,7 @@ const examples = heroExamples.map((example) => ({
     streams you choose to retain. Coverage and source trust stay explicit.
   </p>
   <div class="cta">
-    <a class="btn btn-primary" href={GITHUB_URL}>GitHub <span id="stars" class="stars"></span></a>
+    <a class="btn btn-primary" href={GITHUB_URL}>GitHub</a>
     <a class="btn btn-ghost" href="/docs/getting-started/">Quickstart →</a>
   </div>
   <ol class="steps mono">
@@ -88,7 +88,6 @@ const examples = heroExamples.map((example) => ({
   h1 { font-size: clamp(2.4rem, 6vw, 4.2rem); max-width: 18ch; margin-top: 0.75rem; }
   .sub { color: var(--ink-dim); font-size: 1.15rem; max-width: 52ch; margin-top: 1.25rem; }
   .cta { display: flex; gap: 0.9rem; margin-top: 2rem; flex-wrap: wrap; }
-  .stars { color: color-mix(in srgb, #06130c 70%, transparent); }
   .steps {
     list-style: none; padding: 0; margin-top: 2.5rem;
     display: flex; gap: 1.5rem; flex-wrap: wrap;
@@ -116,7 +115,6 @@ const examples = heroExamples.map((example) => ({
 
 <script>
   import { playTyper, onVisible, type TyperLine } from '../lib/typer';
-  import { GITHUB_URL } from '../config';
 
   const tablist = document.querySelector<HTMLElement>('.hero-tabs');
   const tabs = [...document.querySelectorAll<HTMLButtonElement>('.hero-tabs [role="tab"]')];
@@ -154,20 +152,14 @@ const examples = heroExamples.map((example) => ({
   tabs.forEach((tab, i) => tab.addEventListener('click', () => select(i)));
   tablist?.addEventListener('keydown', (e) => {
     const current = tabs.findIndex((t) => t.getAttribute('aria-selected') === 'true');
-    if (e.key === 'ArrowRight') select((current + 1) % tabs.length);
-    if (e.key === 'ArrowLeft') select((current - 1 + tabs.length) % tabs.length);
-    if (e.key === 'Home') select(0);
-    if (e.key === 'End') select(tabs.length - 1);
+    let next = current;
+    if (e.key === 'ArrowRight') next = (current + 1) % tabs.length;
+    if (e.key === 'ArrowLeft') next = (current - 1 + tabs.length) % tabs.length;
+    if (e.key === 'Home') next = 0;
+    if (e.key === 'End') next = tabs.length - 1;
+    if (next !== current) {
+      e.preventDefault();
+      select(next);
+    }
   });
-
-  const stars = document.getElementById('stars');
-  const repoPath = new URL(GITHUB_URL).pathname.slice(1);
-  fetch(`https://api.github.com/repos/${repoPath}`)
-    .then((r) => (r.ok ? r.json() : null))
-    .then((j) => {
-      if (stars && j && typeof j.stargazers_count === 'number') {
-        stars.textContent = ` ★ ${j.stargazers_count}`;
-      }
-    })
-    .catch(() => {});
 </script>
