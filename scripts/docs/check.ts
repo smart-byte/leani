@@ -2,6 +2,7 @@ import { readdir, readFile } from 'node:fs/promises';
 import { createHash } from 'node:crypto';
 import { resolve } from 'node:path';
 import { prepareDocs } from './prepare';
+import { validatePublicDocs } from './validate';
 
 const repositoryRoot = resolve(import.meta.dir, '../..');
 const generatedDirectory = resolve(repositoryRoot, 'site/src/generated');
@@ -27,6 +28,7 @@ async function digestGeneratedDirectory(): Promise<string> {
   return digest.digest('hex');
 }
 
+await validatePublicDocs();
 await prepareDocs();
 const first = await digestGeneratedDirectory();
 await prepareDocs();

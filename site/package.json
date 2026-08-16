@@ -9,9 +9,12 @@
     "check": "bun run docs:check && astro check && bun test",
     "docs:prepare": "bun ../scripts/docs/prepare.ts",
     "docs:check": "bun ../scripts/docs/check.ts",
+    "docs:watch-check": "bun run docs:prepare && bun ../scripts/docs/watch-check.ts",
+    "search:check": "bun ../scripts/docs/search-check.ts",
     "test": "bun test"
   },
   "dependencies": {
+    "@astrojs/starlight": "0.41.7",
     "@fontsource-variable/inter": "^5.0.0",
     "@fontsource/jetbrains-mono": "^5.0.0",
     "astro": "7.2.0"
@@ -20,7 +23,8 @@
     "@astrojs/check": "0.9.8",
     "@types/bun": "1.3.14",
     "sharp": "0.35.3",
-    "typescript": "5.9.3"
+    "typescript": "5.9.3",
+    "yaml": "2.9.0"
   },
   "overrides": {
     "sharp": "0.35.3"

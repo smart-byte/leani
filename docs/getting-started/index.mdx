@@ -1,0 +1,54 @@
+---
+title: Getting started
+description: Choose a first-run path and prove Leani before connecting it to production data or consumers.
+section: getting-started
+order: 10
+audience:
+  - app-developer
+  - operator
+status: preview
+---
+
+import { Aside, Card, CardGrid, Steps } from '@astrojs/starlight/components';
+
+The safest first run uses Leani's deterministic fixture mode. It requires no
+Ethereum provider, writes only to a local data directory, and exercises the same
+configuration and processor lifecycle used by a network-backed node.
+
+<Steps>
+1. Install a release binary for your platform, use Homebrew from the `leani-dev`
+   tap, or build the workspace with Cargo.
+2. Run `leani doctor` against the configuration you intend to start.
+3. Prove the node with the offline fixture before adding RPC, Beacon API, or P2P
+   credentials.
+4. Query `/v1/capabilities` and `/v1/processors` instead of assuming the node was
+   compiled and configured with a particular processor.
+5. Add a bounded network range, verify exact coverage, then attach a consumer.
+</Steps>
+
+<Aside type="caution" title="The data directory is part of the configuration">
+  Processor identity, schema compatibility, retained change history, and
+  checkpoints are durable state. Do not point two independent nodes at the same
+  writable directory or casually reuse a production directory for experiments.
+</Aside>
+
+## What you can install
+
+<CardGrid>
+  <Card title="Release binary">
+    Best for a pinned, auditable deployment. Verify the published checksum before
+    starting the binary.
+  </Card>
+  <Card title="Homebrew">
+    Convenient on macOS and Linux through the `leani-dev` namespace once the
+    release formula for your version is published.
+  </Card>
+  <Card title="Cargo">
+    Useful for contributors and processor authors working against the workspace.
+    A source build is not the same artifact as a signed release binary.
+  </Card>
+</CardGrid>
+
+The next documentation migration commits split installation, offline proof,
+first-range configuration, and first-consumer integration into checked,
+copyable examples.

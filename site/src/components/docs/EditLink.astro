@@ -1,0 +1,35 @@
+---
+import buildMetadata from '../../generated/build-metadata.json';
+
+const filePath = Astro.locals.starlightRoute.entry.filePath.replaceAll('\\', '/');
+const marker = '/docs/';
+const markerIndex = filePath.lastIndexOf(marker);
+const relativePath = markerIndex >= 0 ? filePath.slice(markerIndex + marker.length) : undefined;
+const editUrl = relativePath
+  ? `https://github.com/smart-byte/leani/edit/${encodeURIComponent(buildMetadata.docsRef)}/docs/${relativePath
+      .split('/')
+      .map(encodeURIComponent)
+      .join('/')}`
+  : undefined;
+---
+
+{
+  editUrl && (
+    <a class="edit-link print:hidden" href={editUrl}>
+      Edit this page on GitHub
+    </a>
+  )
+}
+
+<style>
+  @layer starlight.core {
+    .edit-link {
+      color: var(--sl-color-gray-3);
+      text-decoration: none;
+    }
+
+    .edit-link:hover {
+      color: var(--sl-color-white);
+    }
+  }
+</style>

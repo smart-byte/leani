@@ -1,0 +1,66 @@
+---
+title: Leani documentation
+description: Build and operate application-specific Ethereum data processors with bounded, explicit state.
+section: getting-started
+order: 0
+audience:
+  - app-developer
+  - operator
+  - processor-author
+status: preview
+sidebar:
+  label: Overview
+---
+
+import { Card, CardGrid } from '@astrojs/starlight/components';
+
+Leani is an application-specific Ethereum indexing node. It follows the chain,
+runs only the processors you configure, and stores the durable products your
+application actually consumes.
+
+It is deliberately not a general-purpose archive node, SQL mirror of Ethereum,
+or promise that every JSON-RPC method is available. The node publishes its real
+capabilities, coverage, and retention so applications can make explicit choices.
+
+<CardGrid>
+  <Card title="Run the node" icon="rocket">
+    Install Leani, prove the binary offline, then index a bounded Mainnet range.
+  </Card>
+  <Card title="Consume durable changes" icon="database">
+    Query a consistent snapshot, follow changes, and acknowledge an opaque cursor
+    only after your own transaction commits.
+  </Card>
+  <Card title="Write a processor" icon="puzzle">
+    Turn blocks into typed deltas, materialized entities, artifacts, or a
+    processor-owned query API.
+  </Card>
+  <Card title="Operate honestly" icon="approve-check-circle">
+    Inspect exact coverage, data-source health, peer state, finality, and storage
+    lifecycle from native status endpoints.
+  </Card>
+</CardGrid>
+
+## The shortest useful mental model
+
+```text
+Ethereum sources → canonical blocks → processor map/reduce → durable products
+                                      ↘ change log → your application
+```
+
+Historical and live work are separate lanes. Leani can fill a history gap from
+available P2P or archive sources while the live lane continues following the
+head. A configured history limit is a policy boundary; when no limit is
+configured, the node attempts to fill the entire requested gap.
+
+## Choose your path
+
+- If you are evaluating Leani, start with [Getting started](/docs/getting-started/).
+- If you are integrating an application, learn the snapshot-and-follow and
+  durable-consumer protocol in `@leani/sdk` before persisting cursors.
+- If you are operating a node, treat `/v1/capabilities` and processor coverage as
+  runtime authorities rather than assuming a feature exists.
+- If you are extending Leani, processor factories can attach typed query routes
+  without expanding the generic API contract.
+
+The documentation on `main` is a preview. Production documentation is deployed
+only from a commit carrying the matching published release tag.
