@@ -224,6 +224,10 @@ impl ProcessorFactory for BlockSummaryFactory {
         "example-block-summary"
     }
 
+    fn description(&self) -> &'static str {
+        "Example block number and timestamp summaries"
+    }
+
     fn create(
         &self,
         configured: &ProcessorConfig,

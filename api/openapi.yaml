@@ -552,6 +552,341 @@ paths:
                 $ref: "#/components/schemas/DurableConsumer"
         default:
           $ref: "#/components/responses/Error"
+  /v1/processors/{processor}/artifacts/status:
+    parameters:
+      - $ref: "#/components/parameters/Processor"
+    get:
+      summary: Read retained processor artifact coverage
+      operationId: getProcessorArtifactStatus
+      responses:
+        "200":
+          description: Artifact retention and exact retained ranges.
+        default:
+          $ref: "#/components/responses/Error"
+  /v1/processors/{processor}/artifacts/export:
+    parameters:
+      - $ref: "#/components/parameters/Processor"
+    get:
+      summary: Export a retained processor artifact range
+      operationId: exportProcessorArtifacts
+      responses:
+        "200":
+          description: Portable processor artifact export.
+        default:
+          $ref: "#/components/responses/Error"
+  /v1/processors/{processor}/artifacts/{block}:
+    parameters:
+      - $ref: "#/components/parameters/Processor"
+      - $ref: "#/components/parameters/Block"
+    get:
+      summary: Read one retained processor artifact
+      operationId: getProcessorArtifact
+      responses:
+        "200":
+          description: Processor artifact for the requested block.
+        default:
+          $ref: "#/components/responses/Error"
+  /v1/processors/{processor}/streams/live/consumers/{consumer}/stream:
+    parameters:
+      - $ref: "#/components/parameters/Processor"
+      - $ref: "#/components/parameters/Consumer"
+      - $ref: "#/components/parameters/ConsumerCredential"
+    get:
+      summary: Stream the dedicated live lane for a durable consumer
+      operationId: streamLiveDurableConsumer
+      responses:
+        "200":
+          description: Server-sent live-lane batches.
+        default:
+          $ref: "#/components/responses/Error"
+  /v1/processors/{processor}/streams/live/consumers/{consumer}/ack:
+    parameters:
+      - $ref: "#/components/parameters/Processor"
+      - $ref: "#/components/parameters/Consumer"
+      - $ref: "#/components/parameters/ConsumerCredential"
+    post:
+      summary: Acknowledge a live-lane consumer batch
+      operationId: acknowledgeLiveDurableConsumer
+      responses:
+        "200":
+          description: Updated live-lane acknowledgement state.
+        default:
+          $ref: "#/components/responses/Error"
+  /v1/processors/{processor}/streams/live/consumers/{consumer}/lease:
+    parameters:
+      - $ref: "#/components/parameters/Processor"
+      - $ref: "#/components/parameters/Consumer"
+      - $ref: "#/components/parameters/ConsumerCredential"
+    post:
+      summary: Renew a live-lane consumer lease
+      operationId: renewLiveDurableConsumerLease
+      responses:
+        "200":
+          description: Renewed live-lane lease.
+        default:
+          $ref: "#/components/responses/Error"
+    delete:
+      summary: Release a live-lane consumer lease
+      operationId: releaseLiveDurableConsumerLease
+      responses:
+        "200":
+          description: Released live-lane lease.
+        default:
+          $ref: "#/components/responses/Error"
+  /v1/backfill-subscriptions/{subscription}/consumers/{consumer}/changes:
+    parameters:
+      - $ref: "#/components/parameters/Subscription"
+      - $ref: "#/components/parameters/Consumer"
+      - $ref: "#/components/parameters/ConsumerCredential"
+    get:
+      summary: Poll changes from one backfill subscription
+      operationId: listBackfillConsumerChanges
+      responses:
+        "200":
+          description: Retained backfill delivery batches.
+        default:
+          $ref: "#/components/responses/Error"
+  /v1/backfill-subscriptions/{subscription}/consumers/{consumer}/stream:
+    parameters:
+      - $ref: "#/components/parameters/Subscription"
+      - $ref: "#/components/parameters/Consumer"
+      - $ref: "#/components/parameters/ConsumerCredential"
+    get:
+      summary: Stream changes from one backfill subscription
+      operationId: streamBackfillConsumer
+      responses:
+        "200":
+          description: Server-sent backfill delivery batches.
+        default:
+          $ref: "#/components/responses/Error"
+  /v1/backfill-subscriptions/{subscription}/consumers/{consumer}/ack:
+    parameters:
+      - $ref: "#/components/parameters/Subscription"
+      - $ref: "#/components/parameters/Consumer"
+      - $ref: "#/components/parameters/ConsumerCredential"
+    post:
+      summary: Acknowledge a backfill subscription batch
+      operationId: acknowledgeBackfillConsumer
+      responses:
+        "200":
+          description: Updated backfill acknowledgement state.
+        default:
+          $ref: "#/components/responses/Error"
+  /v1/backfill-subscriptions/{subscription}/consumers/{consumer}/lease:
+    parameters:
+      - $ref: "#/components/parameters/Subscription"
+      - $ref: "#/components/parameters/Consumer"
+      - $ref: "#/components/parameters/ConsumerCredential"
+    post:
+      summary: Renew a backfill consumer lease
+      operationId: renewBackfillConsumerLease
+      responses:
+        "200":
+          description: Renewed backfill lease.
+        default:
+          $ref: "#/components/responses/Error"
+    delete:
+      summary: Release a backfill consumer lease
+      operationId: releaseBackfillConsumerLease
+      responses:
+        "200":
+          description: Released backfill lease.
+        default:
+          $ref: "#/components/responses/Error"
+  /admin/v1/processors/{processor}/lanes/live/reset:
+    parameters:
+      - $ref: "#/components/parameters/Processor"
+    post:
+      summary: Reset a processor live lane for replay
+      operationId: resetProcessorLiveLane
+      responses:
+        "200":
+          description: Paused live-lane reset state.
+        default:
+          $ref: "#/components/responses/Error"
+  /admin/v1/processors/{processor}/artifacts:
+    parameters:
+      - $ref: "#/components/parameters/Processor"
+    delete:
+      summary: Delete retained processor artifacts
+      operationId: deleteProcessorArtifacts
+      responses:
+        "200":
+          description: Artifact deletion result.
+        default:
+          $ref: "#/components/responses/Error"
+  /admin/v1/processors/{processor}/artifacts/replay:
+    parameters:
+      - $ref: "#/components/parameters/Processor"
+    post:
+      summary: Replay retained processor artifacts
+      operationId: replayProcessorArtifacts
+      responses:
+        "200":
+          description: Created artifact replay job.
+        default:
+          $ref: "#/components/responses/Error"
+  /admin/v1/backfill-subscriptions:
+    get:
+      summary: List backfill subscriptions
+      operationId: listBackfillSubscriptions
+      responses:
+        "200":
+          description: Backfill subscriptions.
+        default:
+          $ref: "#/components/responses/Error"
+    post:
+      summary: Create a backfill subscription
+      operationId: createBackfillSubscription
+      responses:
+        "201":
+          description: Created backfill subscription.
+        default:
+          $ref: "#/components/responses/Error"
+  /admin/v1/backfill-subscriptions/{id}:
+    parameters:
+      - $ref: "#/components/parameters/Identifier"
+    get:
+      summary: Inspect a backfill subscription
+      operationId: getBackfillSubscription
+      responses:
+        "200":
+          description: Backfill subscription state.
+        default:
+          $ref: "#/components/responses/Error"
+    delete:
+      summary: Delete a terminal backfill subscription
+      operationId: deleteBackfillSubscription
+      responses:
+        "200":
+          description: Deleted backfill subscription.
+        default:
+          $ref: "#/components/responses/Error"
+  /admin/v1/backfill-subscriptions/{id}/cancel:
+    parameters:
+      - $ref: "#/components/parameters/Identifier"
+    post:
+      summary: Cancel a backfill subscription
+      operationId: cancelBackfillSubscription
+      responses:
+        "200":
+          description: Cancelled backfill subscription.
+        default:
+          $ref: "#/components/responses/Error"
+  /admin/v1/materialization-jobs:
+    get:
+      summary: List materialization jobs
+      operationId: listMaterializationJobs
+      responses:
+        "200":
+          description: Materialization jobs.
+        default:
+          $ref: "#/components/responses/Error"
+    post:
+      summary: Create a materialization job
+      operationId: createMaterializationJob
+      responses:
+        "201":
+          description: Created materialization job.
+        default:
+          $ref: "#/components/responses/Error"
+  /admin/v1/materialization-jobs/{id}:
+    parameters:
+      - $ref: "#/components/parameters/Identifier"
+    get:
+      summary: Inspect a materialization job
+      operationId: getMaterializationJob
+      responses:
+        "200":
+          description: Materialization job state.
+        default:
+          $ref: "#/components/responses/Error"
+    delete:
+      summary: Delete a terminal materialization job
+      operationId: deleteMaterializationJob
+      responses:
+        "200":
+          description: Deleted materialization job.
+        default:
+          $ref: "#/components/responses/Error"
+  /admin/v1/materialization-jobs/{id}/cancel:
+    parameters:
+      - $ref: "#/components/parameters/Identifier"
+    post:
+      summary: Cancel a materialization job
+      operationId: cancelMaterializationJob
+      responses:
+        "200":
+          description: Cancelled materialization job.
+        default:
+          $ref: "#/components/responses/Error"
+  /admin/v1/raw-history-jobs:
+    get:
+      summary: List raw-history jobs
+      operationId: listRawHistoryJobs
+      responses:
+        "200":
+          description: Raw-history jobs.
+        default:
+          $ref: "#/components/responses/Error"
+    post:
+      summary: Create a raw-history job
+      operationId: createRawHistoryJob
+      responses:
+        "201":
+          description: Created raw-history job.
+        default:
+          $ref: "#/components/responses/Error"
+  /admin/v1/raw-history-jobs/{id}:
+    parameters:
+      - $ref: "#/components/parameters/Identifier"
+    get:
+      summary: Inspect a raw-history job
+      operationId: getRawHistoryJob
+      responses:
+        "200":
+          description: Raw-history job state.
+        default:
+          $ref: "#/components/responses/Error"
+    delete:
+      summary: Delete a terminal raw-history job
+      operationId: deleteRawHistoryJob
+      responses:
+        "200":
+          description: Deleted raw-history job.
+        default:
+          $ref: "#/components/responses/Error"
+  /admin/v1/raw-history-jobs/{id}/cancel:
+    parameters:
+      - $ref: "#/components/parameters/Identifier"
+    post:
+      summary: Cancel a raw-history job
+      operationId: cancelRawHistoryJob
+      responses:
+        "200":
+          description: Cancelled raw-history job.
+        default:
+          $ref: "#/components/responses/Error"
+  /v1/network/status:
+    get:
+      summary: Read execution network manager status
+      operationId: getNetworkStatus
+      security: []
+      responses:
+        "200":
+          description: Network phase, peers, requests, and source health.
+        default:
+          $ref: "#/components/responses/Error"
+  /debug/network:
+    get:
+      summary: Render the dependency-free network dashboard
+      operationId: getNetworkDashboard
+      security: []
+      responses:
+        "200":
+          description: Operational HTML network dashboard.
+        default:
+          $ref: "#/components/responses/Error"
   /v1/q/blobs/blocks:
     get:
       summary: List indexed blob blocks
@@ -810,6 +1145,26 @@ components:
         type: string
         minLength: 16
         maxLength: 512
+    Subscription:
+      name: subscription
+      in: path
+      required: true
+      schema:
+        type: string
+        minLength: 1
+    Identifier:
+      name: id
+      in: path
+      required: true
+      schema:
+        type: string
+        minLength: 1
+    Block:
+      name: block
+      in: path
+      required: true
+      schema:
+        $ref: "#/components/schemas/SafeInteger"
     FromBlock:
       name: fromBlock
       in: query

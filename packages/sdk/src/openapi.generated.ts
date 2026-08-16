@@ -507,6 +507,510 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/processors/{processor}/artifacts/status": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                processor: components["parameters"]["Processor"];
+            };
+            cookie?: never;
+        };
+        /** Read retained processor artifact coverage */
+        get: operations["getProcessorArtifactStatus"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/processors/{processor}/artifacts/export": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                processor: components["parameters"]["Processor"];
+            };
+            cookie?: never;
+        };
+        /** Export a retained processor artifact range */
+        get: operations["exportProcessorArtifacts"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/processors/{processor}/artifacts/{block}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                processor: components["parameters"]["Processor"];
+                block: components["parameters"]["Block"];
+            };
+            cookie?: never;
+        };
+        /** Read one retained processor artifact */
+        get: operations["getProcessorArtifact"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/processors/{processor}/streams/live/consumers/{consumer}/stream": {
+        parameters: {
+            query?: never;
+            header?: {
+                /**
+                 * @description Consumer-scoped credential. An administrator bearer credential can be
+                 *     used instead on the protected listener.
+                 */
+                "x-leani-consumer-credential"?: components["parameters"]["ConsumerCredential"];
+            };
+            path: {
+                processor: components["parameters"]["Processor"];
+                consumer: components["parameters"]["Consumer"];
+            };
+            cookie?: never;
+        };
+        /** Stream the dedicated live lane for a durable consumer */
+        get: operations["streamLiveDurableConsumer"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/processors/{processor}/streams/live/consumers/{consumer}/ack": {
+        parameters: {
+            query?: never;
+            header?: {
+                /**
+                 * @description Consumer-scoped credential. An administrator bearer credential can be
+                 *     used instead on the protected listener.
+                 */
+                "x-leani-consumer-credential"?: components["parameters"]["ConsumerCredential"];
+            };
+            path: {
+                processor: components["parameters"]["Processor"];
+                consumer: components["parameters"]["Consumer"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Acknowledge a live-lane consumer batch */
+        post: operations["acknowledgeLiveDurableConsumer"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/processors/{processor}/streams/live/consumers/{consumer}/lease": {
+        parameters: {
+            query?: never;
+            header?: {
+                /**
+                 * @description Consumer-scoped credential. An administrator bearer credential can be
+                 *     used instead on the protected listener.
+                 */
+                "x-leani-consumer-credential"?: components["parameters"]["ConsumerCredential"];
+            };
+            path: {
+                processor: components["parameters"]["Processor"];
+                consumer: components["parameters"]["Consumer"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Renew a live-lane consumer lease */
+        post: operations["renewLiveDurableConsumerLease"];
+        /** Release a live-lane consumer lease */
+        delete: operations["releaseLiveDurableConsumerLease"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/backfill-subscriptions/{subscription}/consumers/{consumer}/changes": {
+        parameters: {
+            query?: never;
+            header?: {
+                /**
+                 * @description Consumer-scoped credential. An administrator bearer credential can be
+                 *     used instead on the protected listener.
+                 */
+                "x-leani-consumer-credential"?: components["parameters"]["ConsumerCredential"];
+            };
+            path: {
+                subscription: components["parameters"]["Subscription"];
+                consumer: components["parameters"]["Consumer"];
+            };
+            cookie?: never;
+        };
+        /** Poll changes from one backfill subscription */
+        get: operations["listBackfillConsumerChanges"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/backfill-subscriptions/{subscription}/consumers/{consumer}/stream": {
+        parameters: {
+            query?: never;
+            header?: {
+                /**
+                 * @description Consumer-scoped credential. An administrator bearer credential can be
+                 *     used instead on the protected listener.
+                 */
+                "x-leani-consumer-credential"?: components["parameters"]["ConsumerCredential"];
+            };
+            path: {
+                subscription: components["parameters"]["Subscription"];
+                consumer: components["parameters"]["Consumer"];
+            };
+            cookie?: never;
+        };
+        /** Stream changes from one backfill subscription */
+        get: operations["streamBackfillConsumer"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/backfill-subscriptions/{subscription}/consumers/{consumer}/ack": {
+        parameters: {
+            query?: never;
+            header?: {
+                /**
+                 * @description Consumer-scoped credential. An administrator bearer credential can be
+                 *     used instead on the protected listener.
+                 */
+                "x-leani-consumer-credential"?: components["parameters"]["ConsumerCredential"];
+            };
+            path: {
+                subscription: components["parameters"]["Subscription"];
+                consumer: components["parameters"]["Consumer"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Acknowledge a backfill subscription batch */
+        post: operations["acknowledgeBackfillConsumer"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/backfill-subscriptions/{subscription}/consumers/{consumer}/lease": {
+        parameters: {
+            query?: never;
+            header?: {
+                /**
+                 * @description Consumer-scoped credential. An administrator bearer credential can be
+                 *     used instead on the protected listener.
+                 */
+                "x-leani-consumer-credential"?: components["parameters"]["ConsumerCredential"];
+            };
+            path: {
+                subscription: components["parameters"]["Subscription"];
+                consumer: components["parameters"]["Consumer"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Renew a backfill consumer lease */
+        post: operations["renewBackfillConsumerLease"];
+        /** Release a backfill consumer lease */
+        delete: operations["releaseBackfillConsumerLease"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/admin/v1/processors/{processor}/lanes/live/reset": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                processor: components["parameters"]["Processor"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Reset a processor live lane for replay */
+        post: operations["resetProcessorLiveLane"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/admin/v1/processors/{processor}/artifacts": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                processor: components["parameters"]["Processor"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /** Delete retained processor artifacts */
+        delete: operations["deleteProcessorArtifacts"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/admin/v1/processors/{processor}/artifacts/replay": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                processor: components["parameters"]["Processor"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Replay retained processor artifacts */
+        post: operations["replayProcessorArtifacts"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/admin/v1/backfill-subscriptions": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List backfill subscriptions */
+        get: operations["listBackfillSubscriptions"];
+        put?: never;
+        /** Create a backfill subscription */
+        post: operations["createBackfillSubscription"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/admin/v1/backfill-subscriptions/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["Identifier"];
+            };
+            cookie?: never;
+        };
+        /** Inspect a backfill subscription */
+        get: operations["getBackfillSubscription"];
+        put?: never;
+        post?: never;
+        /** Delete a terminal backfill subscription */
+        delete: operations["deleteBackfillSubscription"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/admin/v1/backfill-subscriptions/{id}/cancel": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["Identifier"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Cancel a backfill subscription */
+        post: operations["cancelBackfillSubscription"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/admin/v1/materialization-jobs": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List materialization jobs */
+        get: operations["listMaterializationJobs"];
+        put?: never;
+        /** Create a materialization job */
+        post: operations["createMaterializationJob"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/admin/v1/materialization-jobs/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["Identifier"];
+            };
+            cookie?: never;
+        };
+        /** Inspect a materialization job */
+        get: operations["getMaterializationJob"];
+        put?: never;
+        post?: never;
+        /** Delete a terminal materialization job */
+        delete: operations["deleteMaterializationJob"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/admin/v1/materialization-jobs/{id}/cancel": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["Identifier"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Cancel a materialization job */
+        post: operations["cancelMaterializationJob"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/admin/v1/raw-history-jobs": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List raw-history jobs */
+        get: operations["listRawHistoryJobs"];
+        put?: never;
+        /** Create a raw-history job */
+        post: operations["createRawHistoryJob"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/admin/v1/raw-history-jobs/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["Identifier"];
+            };
+            cookie?: never;
+        };
+        /** Inspect a raw-history job */
+        get: operations["getRawHistoryJob"];
+        put?: never;
+        post?: never;
+        /** Delete a terminal raw-history job */
+        delete: operations["deleteRawHistoryJob"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/admin/v1/raw-history-jobs/{id}/cancel": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["Identifier"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Cancel a raw-history job */
+        post: operations["cancelRawHistoryJob"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/network/status": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Read execution network manager status */
+        get: operations["getNetworkStatus"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/debug/network": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Render the dependency-free network dashboard */
+        get: operations["getNetworkDashboard"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/q/blobs/blocks": {
         parameters: {
             query?: never;
@@ -1041,6 +1545,9 @@ export interface components {
          *     used instead on the protected listener.
          */
         ConsumerCredential: string;
+        Subscription: string;
+        Identifier: string;
+        Block: components["schemas"]["SafeInteger"];
         FromBlock: components["schemas"]["SafeInteger"];
         ToBlock: components["schemas"]["SafeInteger"];
         FromTimestamp: components["schemas"]["SafeInteger"];
@@ -1803,6 +2310,726 @@ export interface operations {
                 content: {
                     "application/json": components["schemas"]["DurableConsumer"];
                 };
+            };
+            default: components["responses"]["Error"];
+        };
+    };
+    getProcessorArtifactStatus: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                processor: components["parameters"]["Processor"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Artifact retention and exact retained ranges. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            default: components["responses"]["Error"];
+        };
+    };
+    exportProcessorArtifacts: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                processor: components["parameters"]["Processor"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Portable processor artifact export. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            default: components["responses"]["Error"];
+        };
+    };
+    getProcessorArtifact: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                processor: components["parameters"]["Processor"];
+                block: components["parameters"]["Block"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Processor artifact for the requested block. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            default: components["responses"]["Error"];
+        };
+    };
+    streamLiveDurableConsumer: {
+        parameters: {
+            query?: never;
+            header?: {
+                /**
+                 * @description Consumer-scoped credential. An administrator bearer credential can be
+                 *     used instead on the protected listener.
+                 */
+                "x-leani-consumer-credential"?: components["parameters"]["ConsumerCredential"];
+            };
+            path: {
+                processor: components["parameters"]["Processor"];
+                consumer: components["parameters"]["Consumer"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Server-sent live-lane batches. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            default: components["responses"]["Error"];
+        };
+    };
+    acknowledgeLiveDurableConsumer: {
+        parameters: {
+            query?: never;
+            header?: {
+                /**
+                 * @description Consumer-scoped credential. An administrator bearer credential can be
+                 *     used instead on the protected listener.
+                 */
+                "x-leani-consumer-credential"?: components["parameters"]["ConsumerCredential"];
+            };
+            path: {
+                processor: components["parameters"]["Processor"];
+                consumer: components["parameters"]["Consumer"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Updated live-lane acknowledgement state. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            default: components["responses"]["Error"];
+        };
+    };
+    renewLiveDurableConsumerLease: {
+        parameters: {
+            query?: never;
+            header?: {
+                /**
+                 * @description Consumer-scoped credential. An administrator bearer credential can be
+                 *     used instead on the protected listener.
+                 */
+                "x-leani-consumer-credential"?: components["parameters"]["ConsumerCredential"];
+            };
+            path: {
+                processor: components["parameters"]["Processor"];
+                consumer: components["parameters"]["Consumer"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Renewed live-lane lease. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            default: components["responses"]["Error"];
+        };
+    };
+    releaseLiveDurableConsumerLease: {
+        parameters: {
+            query?: never;
+            header?: {
+                /**
+                 * @description Consumer-scoped credential. An administrator bearer credential can be
+                 *     used instead on the protected listener.
+                 */
+                "x-leani-consumer-credential"?: components["parameters"]["ConsumerCredential"];
+            };
+            path: {
+                processor: components["parameters"]["Processor"];
+                consumer: components["parameters"]["Consumer"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Released live-lane lease. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            default: components["responses"]["Error"];
+        };
+    };
+    listBackfillConsumerChanges: {
+        parameters: {
+            query?: never;
+            header?: {
+                /**
+                 * @description Consumer-scoped credential. An administrator bearer credential can be
+                 *     used instead on the protected listener.
+                 */
+                "x-leani-consumer-credential"?: components["parameters"]["ConsumerCredential"];
+            };
+            path: {
+                subscription: components["parameters"]["Subscription"];
+                consumer: components["parameters"]["Consumer"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Retained backfill delivery batches. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            default: components["responses"]["Error"];
+        };
+    };
+    streamBackfillConsumer: {
+        parameters: {
+            query?: never;
+            header?: {
+                /**
+                 * @description Consumer-scoped credential. An administrator bearer credential can be
+                 *     used instead on the protected listener.
+                 */
+                "x-leani-consumer-credential"?: components["parameters"]["ConsumerCredential"];
+            };
+            path: {
+                subscription: components["parameters"]["Subscription"];
+                consumer: components["parameters"]["Consumer"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Server-sent backfill delivery batches. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            default: components["responses"]["Error"];
+        };
+    };
+    acknowledgeBackfillConsumer: {
+        parameters: {
+            query?: never;
+            header?: {
+                /**
+                 * @description Consumer-scoped credential. An administrator bearer credential can be
+                 *     used instead on the protected listener.
+                 */
+                "x-leani-consumer-credential"?: components["parameters"]["ConsumerCredential"];
+            };
+            path: {
+                subscription: components["parameters"]["Subscription"];
+                consumer: components["parameters"]["Consumer"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Updated backfill acknowledgement state. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            default: components["responses"]["Error"];
+        };
+    };
+    renewBackfillConsumerLease: {
+        parameters: {
+            query?: never;
+            header?: {
+                /**
+                 * @description Consumer-scoped credential. An administrator bearer credential can be
+                 *     used instead on the protected listener.
+                 */
+                "x-leani-consumer-credential"?: components["parameters"]["ConsumerCredential"];
+            };
+            path: {
+                subscription: components["parameters"]["Subscription"];
+                consumer: components["parameters"]["Consumer"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Renewed backfill lease. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            default: components["responses"]["Error"];
+        };
+    };
+    releaseBackfillConsumerLease: {
+        parameters: {
+            query?: never;
+            header?: {
+                /**
+                 * @description Consumer-scoped credential. An administrator bearer credential can be
+                 *     used instead on the protected listener.
+                 */
+                "x-leani-consumer-credential"?: components["parameters"]["ConsumerCredential"];
+            };
+            path: {
+                subscription: components["parameters"]["Subscription"];
+                consumer: components["parameters"]["Consumer"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Released backfill lease. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            default: components["responses"]["Error"];
+        };
+    };
+    resetProcessorLiveLane: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                processor: components["parameters"]["Processor"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Paused live-lane reset state. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            default: components["responses"]["Error"];
+        };
+    };
+    deleteProcessorArtifacts: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                processor: components["parameters"]["Processor"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Artifact deletion result. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            default: components["responses"]["Error"];
+        };
+    };
+    replayProcessorArtifacts: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                processor: components["parameters"]["Processor"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Created artifact replay job. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            default: components["responses"]["Error"];
+        };
+    };
+    listBackfillSubscriptions: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Backfill subscriptions. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            default: components["responses"]["Error"];
+        };
+    };
+    createBackfillSubscription: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Created backfill subscription. */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            default: components["responses"]["Error"];
+        };
+    };
+    getBackfillSubscription: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["Identifier"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Backfill subscription state. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            default: components["responses"]["Error"];
+        };
+    };
+    deleteBackfillSubscription: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["Identifier"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Deleted backfill subscription. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            default: components["responses"]["Error"];
+        };
+    };
+    cancelBackfillSubscription: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["Identifier"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Cancelled backfill subscription. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            default: components["responses"]["Error"];
+        };
+    };
+    listMaterializationJobs: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Materialization jobs. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            default: components["responses"]["Error"];
+        };
+    };
+    createMaterializationJob: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Created materialization job. */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            default: components["responses"]["Error"];
+        };
+    };
+    getMaterializationJob: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["Identifier"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Materialization job state. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            default: components["responses"]["Error"];
+        };
+    };
+    deleteMaterializationJob: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["Identifier"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Deleted materialization job. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            default: components["responses"]["Error"];
+        };
+    };
+    cancelMaterializationJob: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["Identifier"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Cancelled materialization job. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            default: components["responses"]["Error"];
+        };
+    };
+    listRawHistoryJobs: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Raw-history jobs. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            default: components["responses"]["Error"];
+        };
+    };
+    createRawHistoryJob: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Created raw-history job. */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            default: components["responses"]["Error"];
+        };
+    };
+    getRawHistoryJob: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["Identifier"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Raw-history job state. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            default: components["responses"]["Error"];
+        };
+    };
+    deleteRawHistoryJob: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["Identifier"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Deleted raw-history job. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            default: components["responses"]["Error"];
+        };
+    };
+    cancelRawHistoryJob: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["Identifier"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Cancelled raw-history job. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            default: components["responses"]["Error"];
+        };
+    };
+    getNetworkStatus: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Network phase, peers, requests, and source health. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            default: components["responses"]["Error"];
+        };
+    };
+    getNetworkDashboard: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Operational HTML network dashboard. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
             };
             default: components["responses"]["Error"];
         };

@@ -1,0 +1,3610 @@
+{
+  "schemaVersion": 1,
+  "command": {
+    "name": "leani",
+    "about": "Low-storage, source-interchangeable Ethereum indexing node",
+    "usage": "Usage: leani [OPTIONS] <COMMAND>",
+    "arguments": [
+      {
+        "id": "config",
+        "long": "config",
+        "short": null,
+        "help": "Path to the versioned TOML configuration",
+        "required": false,
+        "action": "Set",
+        "defaultValues": [
+          "config/node.toml"
+        ],
+        "possibleValues": []
+      },
+      {
+        "id": "log_format",
+        "long": "log-format",
+        "short": null,
+        "help": "Log rendering format",
+        "required": false,
+        "action": "Set",
+        "defaultValues": [
+          "pretty"
+        ],
+        "possibleValues": [
+          "pretty",
+          "json"
+        ]
+      },
+      {
+        "id": "log_filter",
+        "long": "log-filter",
+        "short": null,
+        "help": "Tracing filter, e.g. `info,leani=debug`",
+        "required": false,
+        "action": "Set",
+        "defaultValues": [
+          "info"
+        ],
+        "possibleValues": []
+      },
+      {
+        "id": "help",
+        "long": "help",
+        "short": "h",
+        "help": "Print help",
+        "required": false,
+        "action": "Help",
+        "defaultValues": [],
+        "possibleValues": []
+      },
+      {
+        "id": "version",
+        "long": "version",
+        "short": "V",
+        "help": "Print version",
+        "required": false,
+        "action": "Version",
+        "defaultValues": [],
+        "possibleValues": []
+      }
+    ],
+    "subcommands": [
+      {
+        "name": "doctor",
+        "about": "Validate and describe configuration without mutating state",
+        "usage": "Usage: leani doctor [OPTIONS]",
+        "arguments": [
+          {
+            "id": "json",
+            "long": "json",
+            "short": null,
+            "help": "Emit machine-readable JSON",
+            "required": false,
+            "action": "SetTrue",
+            "defaultValues": [
+              "false"
+            ],
+            "possibleValues": [
+              "true",
+              "false"
+            ]
+          },
+          {
+            "id": "config",
+            "long": "config",
+            "short": null,
+            "help": "Path to the versioned TOML configuration",
+            "required": false,
+            "action": "Set",
+            "defaultValues": [
+              "config/node.toml"
+            ],
+            "possibleValues": []
+          },
+          {
+            "id": "log_format",
+            "long": "log-format",
+            "short": null,
+            "help": "Log rendering format",
+            "required": false,
+            "action": "Set",
+            "defaultValues": [
+              "pretty"
+            ],
+            "possibleValues": [
+              "pretty",
+              "json"
+            ]
+          },
+          {
+            "id": "log_filter",
+            "long": "log-filter",
+            "short": null,
+            "help": "Tracing filter, e.g. `info,leani=debug`",
+            "required": false,
+            "action": "Set",
+            "defaultValues": [
+              "info"
+            ],
+            "possibleValues": []
+          },
+          {
+            "id": "help",
+            "long": "help",
+            "short": "h",
+            "help": "Print help",
+            "required": false,
+            "action": "Help",
+            "defaultValues": [],
+            "possibleValues": []
+          },
+          {
+            "id": "version",
+            "long": "version",
+            "short": "V",
+            "help": "Print version",
+            "required": false,
+            "action": "Version",
+            "defaultValues": [],
+            "possibleValues": []
+          }
+        ],
+        "subcommands": []
+      },
+      {
+        "name": "serve",
+        "about": "Start configured sources, processors, stores, and serving endpoints",
+        "usage": "Usage: leani serve [OPTIONS]",
+        "arguments": [
+          {
+            "id": "config",
+            "long": "config",
+            "short": null,
+            "help": "Path to the versioned TOML configuration",
+            "required": false,
+            "action": "Set",
+            "defaultValues": [
+              "config/node.toml"
+            ],
+            "possibleValues": []
+          },
+          {
+            "id": "log_format",
+            "long": "log-format",
+            "short": null,
+            "help": "Log rendering format",
+            "required": false,
+            "action": "Set",
+            "defaultValues": [
+              "pretty"
+            ],
+            "possibleValues": [
+              "pretty",
+              "json"
+            ]
+          },
+          {
+            "id": "log_filter",
+            "long": "log-filter",
+            "short": null,
+            "help": "Tracing filter, e.g. `info,leani=debug`",
+            "required": false,
+            "action": "Set",
+            "defaultValues": [
+              "info"
+            ],
+            "possibleValues": []
+          },
+          {
+            "id": "help",
+            "long": "help",
+            "short": "h",
+            "help": "Print help",
+            "required": false,
+            "action": "Help",
+            "defaultValues": [],
+            "possibleValues": []
+          },
+          {
+            "id": "version",
+            "long": "version",
+            "short": "V",
+            "help": "Print version",
+            "required": false,
+            "action": "Version",
+            "defaultValues": [],
+            "possibleValues": []
+          }
+        ],
+        "subcommands": []
+      },
+      {
+        "name": "backfill",
+        "about": "Process a historical block range and then exit",
+        "usage": "Usage: leani backfill [OPTIONS] --from <FROM> --to <TO>",
+        "arguments": [
+          {
+            "id": "processor",
+            "long": "processor",
+            "short": null,
+            "help": "Configured processor ID",
+            "required": false,
+            "action": "Set",
+            "defaultValues": [
+              "blobs-money"
+            ],
+            "possibleValues": []
+          },
+          {
+            "id": "from",
+            "long": "from",
+            "short": null,
+            "help": null,
+            "required": true,
+            "action": "Set",
+            "defaultValues": [],
+            "possibleValues": []
+          },
+          {
+            "id": "to",
+            "long": "to",
+            "short": null,
+            "help": null,
+            "required": true,
+            "action": "Set",
+            "defaultValues": [],
+            "possibleValues": []
+          },
+          {
+            "id": "config",
+            "long": "config",
+            "short": null,
+            "help": "Path to the versioned TOML configuration",
+            "required": false,
+            "action": "Set",
+            "defaultValues": [
+              "config/node.toml"
+            ],
+            "possibleValues": []
+          },
+          {
+            "id": "log_format",
+            "long": "log-format",
+            "short": null,
+            "help": "Log rendering format",
+            "required": false,
+            "action": "Set",
+            "defaultValues": [
+              "pretty"
+            ],
+            "possibleValues": [
+              "pretty",
+              "json"
+            ]
+          },
+          {
+            "id": "log_filter",
+            "long": "log-filter",
+            "short": null,
+            "help": "Tracing filter, e.g. `info,leani=debug`",
+            "required": false,
+            "action": "Set",
+            "defaultValues": [
+              "info"
+            ],
+            "possibleValues": []
+          },
+          {
+            "id": "help",
+            "long": "help",
+            "short": "h",
+            "help": "Print help",
+            "required": false,
+            "action": "Help",
+            "defaultValues": [],
+            "possibleValues": []
+          },
+          {
+            "id": "version",
+            "long": "version",
+            "short": "V",
+            "help": "Print version",
+            "required": false,
+            "action": "Version",
+            "defaultValues": [],
+            "possibleValues": []
+          }
+        ],
+        "subcommands": []
+      },
+      {
+        "name": "source",
+        "about": "Inspect or probe configured data sources",
+        "usage": "Usage: leani source [OPTIONS] <COMMAND>",
+        "arguments": [
+          {
+            "id": "config",
+            "long": "config",
+            "short": null,
+            "help": "Path to the versioned TOML configuration",
+            "required": false,
+            "action": "Set",
+            "defaultValues": [
+              "config/node.toml"
+            ],
+            "possibleValues": []
+          },
+          {
+            "id": "log_format",
+            "long": "log-format",
+            "short": null,
+            "help": "Log rendering format",
+            "required": false,
+            "action": "Set",
+            "defaultValues": [
+              "pretty"
+            ],
+            "possibleValues": [
+              "pretty",
+              "json"
+            ]
+          },
+          {
+            "id": "log_filter",
+            "long": "log-filter",
+            "short": null,
+            "help": "Tracing filter, e.g. `info,leani=debug`",
+            "required": false,
+            "action": "Set",
+            "defaultValues": [
+              "info"
+            ],
+            "possibleValues": []
+          },
+          {
+            "id": "help",
+            "long": "help",
+            "short": "h",
+            "help": "Print help",
+            "required": false,
+            "action": "Help",
+            "defaultValues": [],
+            "possibleValues": []
+          },
+          {
+            "id": "version",
+            "long": "version",
+            "short": "V",
+            "help": "Print version",
+            "required": false,
+            "action": "Version",
+            "defaultValues": [],
+            "possibleValues": []
+          }
+        ],
+        "subcommands": [
+          {
+            "name": "probe",
+            "about": "Probe a source without changing processor state",
+            "usage": "Usage: leani source probe [OPTIONS] <COMMAND>",
+            "arguments": [
+              {
+                "id": "config",
+                "long": "config",
+                "short": null,
+                "help": "Path to the versioned TOML configuration",
+                "required": false,
+                "action": "Set",
+                "defaultValues": [
+                  "config/node.toml"
+                ],
+                "possibleValues": []
+              },
+              {
+                "id": "log_format",
+                "long": "log-format",
+                "short": null,
+                "help": "Log rendering format",
+                "required": false,
+                "action": "Set",
+                "defaultValues": [
+                  "pretty"
+                ],
+                "possibleValues": [
+                  "pretty",
+                  "json"
+                ]
+              },
+              {
+                "id": "log_filter",
+                "long": "log-filter",
+                "short": null,
+                "help": "Tracing filter, e.g. `info,leani=debug`",
+                "required": false,
+                "action": "Set",
+                "defaultValues": [
+                  "info"
+                ],
+                "possibleValues": []
+              },
+              {
+                "id": "help",
+                "long": "help",
+                "short": "h",
+                "help": "Print help",
+                "required": false,
+                "action": "Help",
+                "defaultValues": [],
+                "possibleValues": []
+              },
+              {
+                "id": "version",
+                "long": "version",
+                "short": "V",
+                "help": "Print version",
+                "required": false,
+                "action": "Version",
+                "defaultValues": [],
+                "possibleValues": []
+              }
+            ],
+            "subcommands": [
+              {
+                "name": "xatu",
+                "about": "Inspect the configured Xatu catalog",
+                "usage": "Usage: leani source probe xatu [OPTIONS] --from-block <FROM_BLOCK> --to-block <TO_BLOCK>",
+                "arguments": [
+                  {
+                    "id": "network",
+                    "long": "network",
+                    "short": null,
+                    "help": "Xatu network catalog",
+                    "required": false,
+                    "action": "Set",
+                    "defaultValues": [
+                      "mainnet"
+                    ],
+                    "possibleValues": []
+                  },
+                  {
+                    "id": "from_block",
+                    "long": "from-block",
+                    "short": null,
+                    "help": "First execution block in the inclusive probe range",
+                    "required": true,
+                    "action": "Set",
+                    "defaultValues": [],
+                    "possibleValues": []
+                  },
+                  {
+                    "id": "to_block",
+                    "long": "to-block",
+                    "short": null,
+                    "help": "Last execution block in the inclusive probe range",
+                    "required": true,
+                    "action": "Set",
+                    "defaultValues": [],
+                    "possibleValues": []
+                  },
+                  {
+                    "id": "processor",
+                    "long": "processor",
+                    "short": null,
+                    "help": "Processor projection whose required tables should be inspected",
+                    "required": false,
+                    "action": "Set",
+                    "defaultValues": [
+                      "blobs-money"
+                    ],
+                    "possibleValues": []
+                  },
+                  {
+                    "id": "from_date",
+                    "long": "from-date",
+                    "short": null,
+                    "help": "First beacon date, required to inspect daily beacon tables",
+                    "required": false,
+                    "action": "Set",
+                    "defaultValues": [],
+                    "possibleValues": []
+                  },
+                  {
+                    "id": "to_date",
+                    "long": "to-date",
+                    "short": null,
+                    "help": "Last beacon date, required to inspect daily beacon tables",
+                    "required": false,
+                    "action": "Set",
+                    "defaultValues": [],
+                    "possibleValues": []
+                  },
+                  {
+                    "id": "concurrency",
+                    "long": "concurrency",
+                    "short": null,
+                    "help": "Maximum simultaneous footer requests",
+                    "required": false,
+                    "action": "Set",
+                    "defaultValues": [
+                      "4"
+                    ],
+                    "possibleValues": []
+                  },
+                  {
+                    "id": "max_input_bytes",
+                    "long": "max-input-bytes",
+                    "short": null,
+                    "help": "Maximum projected compressed Parquet bytes",
+                    "required": false,
+                    "action": "Set",
+                    "defaultValues": [
+                      "268435456"
+                    ],
+                    "possibleValues": []
+                  },
+                  {
+                    "id": "batch_rows",
+                    "long": "batch-rows",
+                    "short": null,
+                    "help": "Arrow rows decoded in one bounded batch",
+                    "required": false,
+                    "action": "Set",
+                    "defaultValues": [
+                      "8192"
+                    ],
+                    "possibleValues": []
+                  },
+                  {
+                    "id": "report",
+                    "long": "report",
+                    "short": null,
+                    "help": "Optional JSON report destination",
+                    "required": false,
+                    "action": "Set",
+                    "defaultValues": [],
+                    "possibleValues": []
+                  },
+                  {
+                    "id": "projection_output",
+                    "long": "projection-output",
+                    "short": null,
+                    "help": "Optional destination for normalized projected frames",
+                    "required": false,
+                    "action": "Set",
+                    "defaultValues": [],
+                    "possibleValues": []
+                  },
+                  {
+                    "id": "expected_export",
+                    "long": "expected-export",
+                    "short": null,
+                    "help": "Read-only blobs.money compatibility export to compare field by field",
+                    "required": false,
+                    "action": "Set",
+                    "defaultValues": [],
+                    "possibleValues": []
+                  },
+                  {
+                    "id": "config",
+                    "long": "config",
+                    "short": null,
+                    "help": "Path to the versioned TOML configuration",
+                    "required": false,
+                    "action": "Set",
+                    "defaultValues": [
+                      "config/node.toml"
+                    ],
+                    "possibleValues": []
+                  },
+                  {
+                    "id": "log_format",
+                    "long": "log-format",
+                    "short": null,
+                    "help": "Log rendering format",
+                    "required": false,
+                    "action": "Set",
+                    "defaultValues": [
+                      "pretty"
+                    ],
+                    "possibleValues": [
+                      "pretty",
+                      "json"
+                    ]
+                  },
+                  {
+                    "id": "log_filter",
+                    "long": "log-filter",
+                    "short": null,
+                    "help": "Tracing filter, e.g. `info,leani=debug`",
+                    "required": false,
+                    "action": "Set",
+                    "defaultValues": [
+                      "info"
+                    ],
+                    "possibleValues": []
+                  },
+                  {
+                    "id": "help",
+                    "long": "help",
+                    "short": "h",
+                    "help": "Print help",
+                    "required": false,
+                    "action": "Help",
+                    "defaultValues": [],
+                    "possibleValues": []
+                  },
+                  {
+                    "id": "version",
+                    "long": "version",
+                    "short": "V",
+                    "help": "Print version",
+                    "required": false,
+                    "action": "Version",
+                    "defaultValues": [],
+                    "possibleValues": []
+                  }
+                ],
+                "subcommands": []
+              },
+              {
+                "name": "p2p",
+                "about": "Exercise the recent execution P2P boundary",
+                "usage": "Usage: leani source probe p2p [OPTIONS] --from-block <FROM_BLOCK> --to-block <TO_BLOCK>",
+                "arguments": [
+                  {
+                    "id": "from_block",
+                    "long": "from-block",
+                    "short": null,
+                    "help": "First execution block in the inclusive probe range",
+                    "required": true,
+                    "action": "Set",
+                    "defaultValues": [],
+                    "possibleValues": []
+                  },
+                  {
+                    "id": "to_block",
+                    "long": "to-block",
+                    "short": null,
+                    "help": "Last execution block in the inclusive probe range (at most 64 blocks)",
+                    "required": true,
+                    "action": "Set",
+                    "defaultValues": [],
+                    "possibleValues": []
+                  },
+                  {
+                    "id": "expected_tip",
+                    "long": "expected-tip",
+                    "short": null,
+                    "help": "Consensus-verified hash expected for `to-block`",
+                    "required": false,
+                    "action": "Set",
+                    "defaultValues": [],
+                    "possibleValues": []
+                  },
+                  {
+                    "id": "minimum_peers",
+                    "long": "minimum-peers",
+                    "short": null,
+                    "help": "Minimum connected peers before issuing requests",
+                    "required": false,
+                    "action": "Set",
+                    "defaultValues": [
+                      "3"
+                    ],
+                    "possibleValues": []
+                  },
+                  {
+                    "id": "peer_wait_seconds",
+                    "long": "peer-wait-seconds",
+                    "short": null,
+                    "help": "Maximum time to wait for peers",
+                    "required": false,
+                    "action": "Set",
+                    "defaultValues": [
+                      "300"
+                    ],
+                    "possibleValues": []
+                  },
+                  {
+                    "id": "request_timeout_seconds",
+                    "long": "request-timeout-seconds",
+                    "short": null,
+                    "help": "Timeout applied independently to each request",
+                    "required": false,
+                    "action": "Set",
+                    "defaultValues": [
+                      "30"
+                    ],
+                    "possibleValues": []
+                  },
+                  {
+                    "id": "retries",
+                    "long": "retries",
+                    "short": null,
+                    "help": "Maximum attempts per header, body, or receipt request",
+                    "required": false,
+                    "action": "Set",
+                    "defaultValues": [
+                      "5"
+                    ],
+                    "possibleValues": []
+                  },
+                  {
+                    "id": "retry_backoff_seconds",
+                    "long": "retry-backoff-seconds",
+                    "short": null,
+                    "help": "Pause between request attempts while the peer pool changes",
+                    "required": false,
+                    "action": "Set",
+                    "defaultValues": [
+                      "1"
+                    ],
+                    "possibleValues": []
+                  },
+                  {
+                    "id": "max_input_bytes",
+                    "long": "max-input-bytes",
+                    "short": null,
+                    "help": "Maximum normalized bytes accepted for the complete range",
+                    "required": false,
+                    "action": "Set",
+                    "defaultValues": [
+                      "268435456"
+                    ],
+                    "possibleValues": []
+                  },
+                  {
+                    "id": "report",
+                    "long": "report",
+                    "short": null,
+                    "help": "Optional destination for a JSON summary",
+                    "required": false,
+                    "action": "Set",
+                    "defaultValues": [],
+                    "possibleValues": []
+                  },
+                  {
+                    "id": "output",
+                    "long": "output",
+                    "short": null,
+                    "help": "Optional destination for complete normalized frames",
+                    "required": false,
+                    "action": "Set",
+                    "defaultValues": [],
+                    "possibleValues": []
+                  },
+                  {
+                    "id": "config",
+                    "long": "config",
+                    "short": null,
+                    "help": "Path to the versioned TOML configuration",
+                    "required": false,
+                    "action": "Set",
+                    "defaultValues": [
+                      "config/node.toml"
+                    ],
+                    "possibleValues": []
+                  },
+                  {
+                    "id": "log_format",
+                    "long": "log-format",
+                    "short": null,
+                    "help": "Log rendering format",
+                    "required": false,
+                    "action": "Set",
+                    "defaultValues": [
+                      "pretty"
+                    ],
+                    "possibleValues": [
+                      "pretty",
+                      "json"
+                    ]
+                  },
+                  {
+                    "id": "log_filter",
+                    "long": "log-filter",
+                    "short": null,
+                    "help": "Tracing filter, e.g. `info,leani=debug`",
+                    "required": false,
+                    "action": "Set",
+                    "defaultValues": [
+                      "info"
+                    ],
+                    "possibleValues": []
+                  },
+                  {
+                    "id": "help",
+                    "long": "help",
+                    "short": "h",
+                    "help": "Print help",
+                    "required": false,
+                    "action": "Help",
+                    "defaultValues": [],
+                    "possibleValues": []
+                  },
+                  {
+                    "id": "version",
+                    "long": "version",
+                    "short": "V",
+                    "help": "Print version",
+                    "required": false,
+                    "action": "Version",
+                    "defaultValues": [],
+                    "possibleValues": []
+                  }
+                ],
+                "subcommands": []
+              },
+              {
+                "name": "erae",
+                "about": "Exercise sparse execution-history archive reads",
+                "usage": "Usage: leani source probe erae [OPTIONS] --from-block <FROM_BLOCK> --to-block <TO_BLOCK>",
+                "arguments": [
+                  {
+                    "id": "from_block",
+                    "long": "from-block",
+                    "short": null,
+                    "help": "First execution block in the inclusive probe range",
+                    "required": true,
+                    "action": "Set",
+                    "defaultValues": [],
+                    "possibleValues": []
+                  },
+                  {
+                    "id": "to_block",
+                    "long": "to-block",
+                    "short": null,
+                    "help": "Last execution block in the inclusive probe range",
+                    "required": true,
+                    "action": "Set",
+                    "defaultValues": [],
+                    "possibleValues": []
+                  },
+                  {
+                    "id": "endpoint",
+                    "long": "endpoint",
+                    "short": null,
+                    "help": "Override the public mainnet archive base URL",
+                    "required": false,
+                    "action": "Set",
+                    "defaultValues": [],
+                    "possibleValues": []
+                  },
+                  {
+                    "id": "max_input_bytes",
+                    "long": "max-input-bytes",
+                    "short": null,
+                    "help": "Maximum sparse archive and normalized bytes",
+                    "required": false,
+                    "action": "Set",
+                    "defaultValues": [
+                      "268435456"
+                    ],
+                    "possibleValues": []
+                  },
+                  {
+                    "id": "report",
+                    "long": "report",
+                    "short": null,
+                    "help": "Optional destination for a JSON summary",
+                    "required": false,
+                    "action": "Set",
+                    "defaultValues": [],
+                    "possibleValues": []
+                  },
+                  {
+                    "id": "output",
+                    "long": "output",
+                    "short": null,
+                    "help": "Optional destination for complete normalized frames",
+                    "required": false,
+                    "action": "Set",
+                    "defaultValues": [],
+                    "possibleValues": []
+                  },
+                  {
+                    "id": "config",
+                    "long": "config",
+                    "short": null,
+                    "help": "Path to the versioned TOML configuration",
+                    "required": false,
+                    "action": "Set",
+                    "defaultValues": [
+                      "config/node.toml"
+                    ],
+                    "possibleValues": []
+                  },
+                  {
+                    "id": "log_format",
+                    "long": "log-format",
+                    "short": null,
+                    "help": "Log rendering format",
+                    "required": false,
+                    "action": "Set",
+                    "defaultValues": [
+                      "pretty"
+                    ],
+                    "possibleValues": [
+                      "pretty",
+                      "json"
+                    ]
+                  },
+                  {
+                    "id": "log_filter",
+                    "long": "log-filter",
+                    "short": null,
+                    "help": "Tracing filter, e.g. `info,leani=debug`",
+                    "required": false,
+                    "action": "Set",
+                    "defaultValues": [
+                      "info"
+                    ],
+                    "possibleValues": []
+                  },
+                  {
+                    "id": "help",
+                    "long": "help",
+                    "short": "h",
+                    "help": "Print help",
+                    "required": false,
+                    "action": "Help",
+                    "defaultValues": [],
+                    "possibleValues": []
+                  },
+                  {
+                    "id": "version",
+                    "long": "version",
+                    "short": "V",
+                    "help": "Print version",
+                    "required": false,
+                    "action": "Version",
+                    "defaultValues": [],
+                    "possibleValues": []
+                  }
+                ],
+                "subcommands": []
+              },
+              {
+                "name": "finality",
+                "about": "Exercise the configured finality boundary",
+                "usage": "Usage: leani source probe finality [OPTIONS]",
+                "arguments": [
+                  {
+                    "id": "checkpoint",
+                    "long": "checkpoint",
+                    "short": null,
+                    "help": "Override the configured weak-subjectivity checkpoint root",
+                    "required": false,
+                    "action": "Set",
+                    "defaultValues": [],
+                    "possibleValues": []
+                  },
+                  {
+                    "id": "checkpoint_slot",
+                    "long": "checkpoint-slot",
+                    "short": null,
+                    "help": "Override the finalized beacon slot associated with the checkpoint",
+                    "required": false,
+                    "action": "Set",
+                    "defaultValues": [],
+                    "possibleValues": []
+                  },
+                  {
+                    "id": "endpoints",
+                    "long": "endpoint",
+                    "short": null,
+                    "help": "Override configured Beacon API endpoints (repeatable)",
+                    "required": false,
+                    "action": "Append",
+                    "defaultValues": [],
+                    "possibleValues": []
+                  },
+                  {
+                    "id": "minimum_agreement",
+                    "long": "minimum-agreement",
+                    "short": null,
+                    "help": "Override the number of endpoints that must return the same verified anchor",
+                    "required": false,
+                    "action": "Set",
+                    "defaultValues": [],
+                    "possibleValues": []
+                  },
+                  {
+                    "id": "report",
+                    "long": "report",
+                    "short": null,
+                    "help": "Optional JSON report destination",
+                    "required": false,
+                    "action": "Set",
+                    "defaultValues": [],
+                    "possibleValues": []
+                  },
+                  {
+                    "id": "config",
+                    "long": "config",
+                    "short": null,
+                    "help": "Path to the versioned TOML configuration",
+                    "required": false,
+                    "action": "Set",
+                    "defaultValues": [
+                      "config/node.toml"
+                    ],
+                    "possibleValues": []
+                  },
+                  {
+                    "id": "log_format",
+                    "long": "log-format",
+                    "short": null,
+                    "help": "Log rendering format",
+                    "required": false,
+                    "action": "Set",
+                    "defaultValues": [
+                      "pretty"
+                    ],
+                    "possibleValues": [
+                      "pretty",
+                      "json"
+                    ]
+                  },
+                  {
+                    "id": "log_filter",
+                    "long": "log-filter",
+                    "short": null,
+                    "help": "Tracing filter, e.g. `info,leani=debug`",
+                    "required": false,
+                    "action": "Set",
+                    "defaultValues": [
+                      "info"
+                    ],
+                    "possibleValues": []
+                  },
+                  {
+                    "id": "help",
+                    "long": "help",
+                    "short": "h",
+                    "help": "Print help",
+                    "required": false,
+                    "action": "Help",
+                    "defaultValues": [],
+                    "possibleValues": []
+                  },
+                  {
+                    "id": "version",
+                    "long": "version",
+                    "short": "V",
+                    "help": "Print version",
+                    "required": false,
+                    "action": "Version",
+                    "defaultValues": [],
+                    "possibleValues": []
+                  }
+                ],
+                "subcommands": []
+              },
+              {
+                "name": "help",
+                "about": "Print this message or the help of the given subcommand(s)",
+                "usage": "Usage: leani source probe help [COMMAND]",
+                "arguments": [],
+                "subcommands": [
+                  {
+                    "name": "xatu",
+                    "about": "Inspect the configured Xatu catalog",
+                    "usage": "Usage: leani source probe help xatu",
+                    "arguments": [],
+                    "subcommands": []
+                  },
+                  {
+                    "name": "p2p",
+                    "about": "Exercise the recent execution P2P boundary",
+                    "usage": "Usage: leani source probe help p2p",
+                    "arguments": [],
+                    "subcommands": []
+                  },
+                  {
+                    "name": "erae",
+                    "about": "Exercise sparse execution-history archive reads",
+                    "usage": "Usage: leani source probe help erae",
+                    "arguments": [],
+                    "subcommands": []
+                  },
+                  {
+                    "name": "finality",
+                    "about": "Exercise the configured finality boundary",
+                    "usage": "Usage: leani source probe help finality",
+                    "arguments": [],
+                    "subcommands": []
+                  },
+                  {
+                    "name": "help",
+                    "about": "Print this message or the help of the given subcommand(s)",
+                    "usage": "Usage: leani source probe help help",
+                    "arguments": [],
+                    "subcommands": []
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "name": "help",
+            "about": "Print this message or the help of the given subcommand(s)",
+            "usage": "Usage: leani source help [COMMAND]",
+            "arguments": [],
+            "subcommands": [
+              {
+                "name": "probe",
+                "about": "Probe a source without changing processor state",
+                "usage": "Usage: leani source help probe [COMMAND]",
+                "arguments": [],
+                "subcommands": [
+                  {
+                    "name": "xatu",
+                    "about": "Inspect the configured Xatu catalog",
+                    "usage": "Usage: leani source help probe xatu",
+                    "arguments": [],
+                    "subcommands": []
+                  },
+                  {
+                    "name": "p2p",
+                    "about": "Exercise the recent execution P2P boundary",
+                    "usage": "Usage: leani source help probe p2p",
+                    "arguments": [],
+                    "subcommands": []
+                  },
+                  {
+                    "name": "erae",
+                    "about": "Exercise sparse execution-history archive reads",
+                    "usage": "Usage: leani source help probe erae",
+                    "arguments": [],
+                    "subcommands": []
+                  },
+                  {
+                    "name": "finality",
+                    "about": "Exercise the configured finality boundary",
+                    "usage": "Usage: leani source help probe finality",
+                    "arguments": [],
+                    "subcommands": []
+                  }
+                ]
+              },
+              {
+                "name": "help",
+                "about": "Print this message or the help of the given subcommand(s)",
+                "usage": "Usage: leani source help help",
+                "arguments": [],
+                "subcommands": []
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "name": "conformance",
+        "about": "Compare normalized source exports or render exact RPC response vectors",
+        "usage": "Usage: leani conformance [OPTIONS] <COMMAND>",
+        "arguments": [
+          {
+            "id": "config",
+            "long": "config",
+            "short": null,
+            "help": "Path to the versioned TOML configuration",
+            "required": false,
+            "action": "Set",
+            "defaultValues": [
+              "config/node.toml"
+            ],
+            "possibleValues": []
+          },
+          {
+            "id": "log_format",
+            "long": "log-format",
+            "short": null,
+            "help": "Log rendering format",
+            "required": false,
+            "action": "Set",
+            "defaultValues": [
+              "pretty"
+            ],
+            "possibleValues": [
+              "pretty",
+              "json"
+            ]
+          },
+          {
+            "id": "log_filter",
+            "long": "log-filter",
+            "short": null,
+            "help": "Tracing filter, e.g. `info,leani=debug`",
+            "required": false,
+            "action": "Set",
+            "defaultValues": [
+              "info"
+            ],
+            "possibleValues": []
+          },
+          {
+            "id": "help",
+            "long": "help",
+            "short": "h",
+            "help": "Print help",
+            "required": false,
+            "action": "Help",
+            "defaultValues": [],
+            "possibleValues": []
+          },
+          {
+            "id": "version",
+            "long": "version",
+            "short": "V",
+            "help": "Print version",
+            "required": false,
+            "action": "Version",
+            "defaultValues": [],
+            "possibleValues": []
+          }
+        ],
+        "subcommands": [
+          {
+            "name": "frames",
+            "about": "Compare canonical material in two normalized frame exports",
+            "usage": "Usage: leani conformance frames [OPTIONS] --left-source <LEFT_SOURCE> --left <LEFT> --right-source <RIGHT_SOURCE> --right <RIGHT> --capability <CAPABILITY>",
+            "arguments": [
+              {
+                "id": "left_source",
+                "long": "left-source",
+                "short": null,
+                "help": null,
+                "required": true,
+                "action": "Set",
+                "defaultValues": [],
+                "possibleValues": []
+              },
+              {
+                "id": "left",
+                "long": "left",
+                "short": null,
+                "help": null,
+                "required": true,
+                "action": "Set",
+                "defaultValues": [],
+                "possibleValues": []
+              },
+              {
+                "id": "right_source",
+                "long": "right-source",
+                "short": null,
+                "help": null,
+                "required": true,
+                "action": "Set",
+                "defaultValues": [],
+                "possibleValues": []
+              },
+              {
+                "id": "right",
+                "long": "right",
+                "short": null,
+                "help": null,
+                "required": true,
+                "action": "Set",
+                "defaultValues": [],
+                "possibleValues": []
+              },
+              {
+                "id": "capability",
+                "long": "capability",
+                "short": null,
+                "help": "Canonical material to compare (repeatable or comma-delimited)",
+                "required": true,
+                "action": "Append",
+                "defaultValues": [],
+                "possibleValues": [
+                  "header",
+                  "body",
+                  "transactions",
+                  "calldata",
+                  "receipts",
+                  "logs",
+                  "withdrawals",
+                  "blob-sidecars",
+                  "traces",
+                  "state-diffs",
+                  "consensus-finality"
+                ]
+              },
+              {
+                "id": "report",
+                "long": "report",
+                "short": null,
+                "help": "Optional JSON report destination",
+                "required": false,
+                "action": "Set",
+                "defaultValues": [],
+                "possibleValues": []
+              },
+              {
+                "id": "config",
+                "long": "config",
+                "short": null,
+                "help": "Path to the versioned TOML configuration",
+                "required": false,
+                "action": "Set",
+                "defaultValues": [
+                  "config/node.toml"
+                ],
+                "possibleValues": []
+              },
+              {
+                "id": "log_format",
+                "long": "log-format",
+                "short": null,
+                "help": "Log rendering format",
+                "required": false,
+                "action": "Set",
+                "defaultValues": [
+                  "pretty"
+                ],
+                "possibleValues": [
+                  "pretty",
+                  "json"
+                ]
+              },
+              {
+                "id": "log_filter",
+                "long": "log-filter",
+                "short": null,
+                "help": "Tracing filter, e.g. `info,leani=debug`",
+                "required": false,
+                "action": "Set",
+                "defaultValues": [
+                  "info"
+                ],
+                "possibleValues": []
+              },
+              {
+                "id": "help",
+                "long": "help",
+                "short": "h",
+                "help": "Print help",
+                "required": false,
+                "action": "Help",
+                "defaultValues": [],
+                "possibleValues": []
+              },
+              {
+                "id": "version",
+                "long": "version",
+                "short": "V",
+                "help": "Print version",
+                "required": false,
+                "action": "Version",
+                "defaultValues": [],
+                "possibleValues": []
+              }
+            ],
+            "subcommands": []
+          },
+          {
+            "name": "processor",
+            "about": "Compare deterministic processor deltas from two source exports",
+            "usage": "Usage: leani conformance processor [OPTIONS] --left-source <LEFT_SOURCE> --left <LEFT> --right-source <RIGHT_SOURCE> --right <RIGHT>",
+            "arguments": [
+              {
+                "id": "processor",
+                "long": "processor",
+                "short": null,
+                "help": "Configured built-in processor ID",
+                "required": false,
+                "action": "Set",
+                "defaultValues": [
+                  "blobs-money"
+                ],
+                "possibleValues": []
+              },
+              {
+                "id": "left_source",
+                "long": "left-source",
+                "short": null,
+                "help": null,
+                "required": true,
+                "action": "Set",
+                "defaultValues": [],
+                "possibleValues": []
+              },
+              {
+                "id": "left",
+                "long": "left",
+                "short": null,
+                "help": null,
+                "required": true,
+                "action": "Set",
+                "defaultValues": [],
+                "possibleValues": []
+              },
+              {
+                "id": "right_source",
+                "long": "right-source",
+                "short": null,
+                "help": null,
+                "required": true,
+                "action": "Set",
+                "defaultValues": [],
+                "possibleValues": []
+              },
+              {
+                "id": "right",
+                "long": "right",
+                "short": null,
+                "help": null,
+                "required": true,
+                "action": "Set",
+                "defaultValues": [],
+                "possibleValues": []
+              },
+              {
+                "id": "report",
+                "long": "report",
+                "short": null,
+                "help": "Optional JSON report destination",
+                "required": false,
+                "action": "Set",
+                "defaultValues": [],
+                "possibleValues": []
+              },
+              {
+                "id": "config",
+                "long": "config",
+                "short": null,
+                "help": "Path to the versioned TOML configuration",
+                "required": false,
+                "action": "Set",
+                "defaultValues": [
+                  "config/node.toml"
+                ],
+                "possibleValues": []
+              },
+              {
+                "id": "log_format",
+                "long": "log-format",
+                "short": null,
+                "help": "Log rendering format",
+                "required": false,
+                "action": "Set",
+                "defaultValues": [
+                  "pretty"
+                ],
+                "possibleValues": [
+                  "pretty",
+                  "json"
+                ]
+              },
+              {
+                "id": "log_filter",
+                "long": "log-filter",
+                "short": null,
+                "help": "Tracing filter, e.g. `info,leani=debug`",
+                "required": false,
+                "action": "Set",
+                "defaultValues": [
+                  "info"
+                ],
+                "possibleValues": []
+              },
+              {
+                "id": "help",
+                "long": "help",
+                "short": "h",
+                "help": "Print help",
+                "required": false,
+                "action": "Help",
+                "defaultValues": [],
+                "possibleValues": []
+              },
+              {
+                "id": "version",
+                "long": "version",
+                "short": "V",
+                "help": "Print version",
+                "required": false,
+                "action": "Version",
+                "defaultValues": [],
+                "possibleValues": []
+              }
+            ],
+            "subcommands": []
+          },
+          {
+            "name": "rpc",
+            "about": "Render exact Ethereum block/receipt responses from normalized frames",
+            "usage": "Usage: leani conformance rpc [OPTIONS] --frames <FRAMES>",
+            "arguments": [
+              {
+                "id": "frames",
+                "long": "frames",
+                "short": null,
+                "help": "Normalized frame export produced by a source probe",
+                "required": true,
+                "action": "Set",
+                "defaultValues": [],
+                "possibleValues": []
+              },
+              {
+                "id": "expected",
+                "long": "expected",
+                "short": null,
+                "help": "Optional reference snapshot array from an execution client",
+                "required": false,
+                "action": "Set",
+                "defaultValues": [],
+                "possibleValues": []
+              },
+              {
+                "id": "output",
+                "long": "output",
+                "short": null,
+                "help": "Optional destination for the reconstructed snapshots",
+                "required": false,
+                "action": "Set",
+                "defaultValues": [],
+                "possibleValues": []
+              },
+              {
+                "id": "report",
+                "long": "report",
+                "short": null,
+                "help": "Optional differential JSON report destination",
+                "required": false,
+                "action": "Set",
+                "defaultValues": [],
+                "possibleValues": []
+              },
+              {
+                "id": "config",
+                "long": "config",
+                "short": null,
+                "help": "Path to the versioned TOML configuration",
+                "required": false,
+                "action": "Set",
+                "defaultValues": [
+                  "config/node.toml"
+                ],
+                "possibleValues": []
+              },
+              {
+                "id": "log_format",
+                "long": "log-format",
+                "short": null,
+                "help": "Log rendering format",
+                "required": false,
+                "action": "Set",
+                "defaultValues": [
+                  "pretty"
+                ],
+                "possibleValues": [
+                  "pretty",
+                  "json"
+                ]
+              },
+              {
+                "id": "log_filter",
+                "long": "log-filter",
+                "short": null,
+                "help": "Tracing filter, e.g. `info,leani=debug`",
+                "required": false,
+                "action": "Set",
+                "defaultValues": [
+                  "info"
+                ],
+                "possibleValues": []
+              },
+              {
+                "id": "help",
+                "long": "help",
+                "short": "h",
+                "help": "Print help",
+                "required": false,
+                "action": "Help",
+                "defaultValues": [],
+                "possibleValues": []
+              },
+              {
+                "id": "version",
+                "long": "version",
+                "short": "V",
+                "help": "Print version",
+                "required": false,
+                "action": "Version",
+                "defaultValues": [],
+                "possibleValues": []
+              }
+            ],
+            "subcommands": []
+          },
+          {
+            "name": "help",
+            "about": "Print this message or the help of the given subcommand(s)",
+            "usage": "Usage: leani conformance help [COMMAND]",
+            "arguments": [],
+            "subcommands": [
+              {
+                "name": "frames",
+                "about": "Compare canonical material in two normalized frame exports",
+                "usage": "Usage: leani conformance help frames",
+                "arguments": [],
+                "subcommands": []
+              },
+              {
+                "name": "processor",
+                "about": "Compare deterministic processor deltas from two source exports",
+                "usage": "Usage: leani conformance help processor",
+                "arguments": [],
+                "subcommands": []
+              },
+              {
+                "name": "rpc",
+                "about": "Render exact Ethereum block/receipt responses from normalized frames",
+                "usage": "Usage: leani conformance help rpc",
+                "arguments": [],
+                "subcommands": []
+              },
+              {
+                "name": "help",
+                "about": "Print this message or the help of the given subcommand(s)",
+                "usage": "Usage: leani conformance help help",
+                "arguments": [],
+                "subcommands": []
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "name": "benchmark",
+        "about": "Run a reproducible historical throughput and storage measurement",
+        "usage": "Usage: leani benchmark [OPTIONS] [COMMAND]",
+        "arguments": [
+          {
+            "id": "mode",
+            "long": "mode",
+            "short": null,
+            "help": "Isolated stage or full pipeline to measure",
+            "required": false,
+            "action": "Set",
+            "defaultValues": [
+              "process"
+            ],
+            "possibleValues": [
+              "acquire",
+              "process",
+              "deliver",
+              "end-to-end"
+            ]
+          },
+          {
+            "id": "profile",
+            "long": "profile",
+            "short": null,
+            "help": "Product storage/delivery policy measured by the selected stage",
+            "required": false,
+            "action": "Set",
+            "defaultValues": [],
+            "possibleValues": [
+              "acquire-discard",
+              "raw-only",
+              "materialized",
+              "compact-artifact",
+              "compact-artifact-segment",
+              "compact-artifact-tiered",
+              "raw-artifact",
+              "raw-materialized",
+              "raw-artifact-materialized",
+              "externalized",
+              "raw-externalized"
+            ]
+          },
+          {
+            "id": "destination",
+            "long": "destination",
+            "short": null,
+            "help": "Destination path used by delivery modes",
+            "required": false,
+            "action": "Set",
+            "defaultValues": [
+              "rust-http"
+            ],
+            "possibleValues": [
+              "rust-http",
+              "rust-direct",
+              "sdk-postgres"
+            ]
+          },
+          {
+            "id": "postgres_schema",
+            "long": "postgres-schema",
+            "short": null,
+            "help": "`PostgreSQL` schema exercised by the SDK destination",
+            "required": false,
+            "action": "Set",
+            "defaultValues": [
+              "generic-event-log"
+            ],
+            "possibleValues": [
+              "generic-event-log",
+              "blobs-application"
+            ]
+          },
+          {
+            "id": "corpus",
+            "long": "corpus",
+            "short": null,
+            "help": "Deterministic material shape",
+            "required": false,
+            "action": "Set",
+            "defaultValues": [
+              "blobs-like"
+            ],
+            "possibleValues": [
+              "zero",
+              "sparse",
+              "blobs-like",
+              "uniswap-like",
+              "dense"
+            ]
+          },
+          {
+            "id": "blocks",
+            "long": "blocks",
+            "short": null,
+            "help": "Number of generated finalized blocks",
+            "required": false,
+            "action": "Set",
+            "defaultValues": [
+              "10000"
+            ],
+            "possibleValues": []
+          },
+          {
+            "id": "seed",
+            "long": "seed",
+            "short": null,
+            "help": "Stable corpus seed recorded in the report",
+            "required": false,
+            "action": "Set",
+            "defaultValues": [
+              "1"
+            ],
+            "possibleValues": []
+          },
+          {
+            "id": "chunk_blocks",
+            "long": "chunk-blocks",
+            "short": null,
+            "help": "Physical source chunk size in blocks",
+            "required": false,
+            "action": "Set",
+            "defaultValues": [
+              "2048"
+            ],
+            "possibleValues": []
+          },
+          {
+            "id": "artifact_segment_blocks",
+            "long": "artifact-segment-blocks",
+            "short": null,
+            "help": "Blocks per immutable artifact segment",
+            "required": false,
+            "action": "Set",
+            "defaultValues": [
+              "8192"
+            ],
+            "possibleValues": []
+          },
+          {
+            "id": "artifact_segment_compression",
+            "long": "artifact-segment-compression",
+            "short": null,
+            "help": "Compression used by immutable artifact segments",
+            "required": false,
+            "action": "Set",
+            "defaultValues": [
+              "snappy"
+            ],
+            "possibleValues": [
+              "none",
+              "snappy",
+              "deflate"
+            ]
+          },
+          {
+            "id": "artifact_compaction_interval_ms",
+            "long": "artifact-compaction-interval-ms",
+            "short": null,
+            "help": "Background artifact compaction cadence in milliseconds",
+            "required": false,
+            "action": "Set",
+            "defaultValues": [
+              "100"
+            ],
+            "possibleValues": []
+          },
+          {
+            "id": "artifact_compaction_maximum_segments_per_cycle",
+            "long": "artifact-compaction-maximum-segments-per-cycle",
+            "short": null,
+            "help": "Maximum artifact segments published per background cycle",
+            "required": false,
+            "action": "Set",
+            "defaultValues": [
+              "4"
+            ],
+            "possibleValues": []
+          },
+          {
+            "id": "warmups",
+            "long": "warmups",
+            "short": null,
+            "help": "Unreported warm-up runs",
+            "required": false,
+            "action": "Set",
+            "defaultValues": [
+              "1"
+            ],
+            "possibleValues": []
+          },
+          {
+            "id": "runs",
+            "long": "runs",
+            "short": null,
+            "help": "Measured runs retained in the report",
+            "required": false,
+            "action": "Set",
+            "defaultValues": [
+              "3"
+            ],
+            "possibleValues": []
+          },
+          {
+            "id": "sample_interval_ms",
+            "long": "sample-interval-ms",
+            "short": null,
+            "help": "Resource sample interval in milliseconds",
+            "required": false,
+            "action": "Set",
+            "defaultValues": [
+              "200"
+            ],
+            "possibleValues": []
+          },
+          {
+            "id": "consumer_delay_ms",
+            "long": "consumer-delay-ms",
+            "short": null,
+            "help": "Optional fixed delay after each destination batch",
+            "required": false,
+            "action": "Set",
+            "defaultValues": [
+              "0"
+            ],
+            "possibleValues": []
+          },
+          {
+            "id": "consumer_reconnect_every_batches",
+            "long": "consumer-reconnect-every-batches",
+            "short": null,
+            "help": "Reopen the SDK/PostgreSQL stream after every N acknowledged batches (zero disables)",
+            "required": false,
+            "action": "Set",
+            "defaultValues": [
+              "0"
+            ],
+            "possibleValues": []
+          },
+          {
+            "id": "consumer_drop_ack_response_once",
+            "long": "consumer-drop-ack-response-once",
+            "short": null,
+            "help": "Simulate losing the first successful SDK/PostgreSQL acknowledgement response",
+            "required": false,
+            "action": "SetTrue",
+            "defaultValues": [
+              "false"
+            ],
+            "possibleValues": [
+              "true",
+              "false"
+            ]
+          },
+          {
+            "id": "concurrent_live_blocks",
+            "long": "concurrent-live-blocks",
+            "short": null,
+            "help": "Finalized live blocks committed while history is acquired and delivered",
+            "required": false,
+            "action": "Set",
+            "defaultValues": [
+              "0"
+            ],
+            "possibleValues": []
+          },
+          {
+            "id": "live_block_interval_ms",
+            "long": "live-block-interval-ms",
+            "short": null,
+            "help": "Delay between synthetic live commits in milliseconds",
+            "required": false,
+            "action": "Set",
+            "defaultValues": [
+              "10"
+            ],
+            "possibleValues": []
+          },
+          {
+            "id": "mapper_concurrency",
+            "long": "mapper-concurrency",
+            "short": null,
+            "help": "Parallel processor map tasks",
+            "required": false,
+            "action": "Set",
+            "defaultValues": [
+              "4"
+            ],
+            "possibleValues": []
+          },
+          {
+            "id": "maximum_active_chunks",
+            "long": "maximum-active-chunks",
+            "short": null,
+            "help": "Node-wide concurrently active physical source chunks",
+            "required": false,
+            "action": "Set",
+            "defaultValues": [
+              "4"
+            ],
+            "possibleValues": []
+          },
+          {
+            "id": "maximum_mapped_bytes",
+            "long": "maximum-mapped-bytes",
+            "short": null,
+            "help": "Node-wide mapped-delta byte budget",
+            "required": false,
+            "action": "Set",
+            "defaultValues": [
+              "134217728"
+            ],
+            "possibleValues": []
+          },
+          {
+            "id": "commit_maximum_blocks",
+            "long": "commit-maximum-blocks",
+            "short": null,
+            "help": "Maximum blocks per atomic `SQLite` history commit",
+            "required": false,
+            "action": "Set",
+            "defaultValues": [
+              "128"
+            ],
+            "possibleValues": []
+          },
+          {
+            "id": "commit_maximum_changes",
+            "long": "commit-maximum-changes",
+            "short": null,
+            "help": "Maximum domain changes per atomic `SQLite` history commit",
+            "required": false,
+            "action": "Set",
+            "defaultValues": [
+              "10000"
+            ],
+            "possibleValues": []
+          },
+          {
+            "id": "commit_maximum_encoded_bytes",
+            "long": "commit-maximum-encoded-bytes",
+            "short": null,
+            "help": "Maximum stable-encoded change bytes per history commit",
+            "required": false,
+            "action": "Set",
+            "defaultValues": [
+              "16777216"
+            ],
+            "possibleValues": []
+          },
+          {
+            "id": "commit_maximum_delay_ms",
+            "long": "commit-maximum-delay-ms",
+            "short": null,
+            "help": "Flush delay for a partially filled history commit",
+            "required": false,
+            "action": "Set",
+            "defaultValues": [
+              "50"
+            ],
+            "possibleValues": []
+          },
+          {
+            "id": "commit_target_writer_hold_ms",
+            "long": "commit-target-writer-hold-ms",
+            "short": null,
+            "help": "Target p95 `SQLite` writer hold time for adaptive history commits",
+            "required": false,
+            "action": "Set",
+            "defaultValues": [
+              "20"
+            ],
+            "possibleValues": []
+          },
+          {
+            "id": "delivery_target_encoded_bytes",
+            "long": "delivery-target-encoded-bytes",
+            "short": null,
+            "help": "Target uncompressed encoded bytes per delivered history batch",
+            "required": false,
+            "action": "Set",
+            "defaultValues": [
+              "4194304"
+            ],
+            "possibleValues": []
+          },
+          {
+            "id": "delivery_maximum_encoded_bytes",
+            "long": "delivery-maximum-encoded-bytes",
+            "short": null,
+            "help": "Hard maximum uncompressed encoded bytes per delivery batch",
+            "required": false,
+            "action": "Set",
+            "defaultValues": [
+              "16777216"
+            ],
+            "possibleValues": []
+          },
+          {
+            "id": "delivery_maximum_events",
+            "long": "delivery-maximum-events",
+            "short": null,
+            "help": "Hard maximum domain events per delivery batch",
+            "required": false,
+            "action": "Set",
+            "defaultValues": [
+              "20000"
+            ],
+            "possibleValues": []
+          },
+          {
+            "id": "delivery_maximum_processed_blocks",
+            "long": "delivery-maximum-processed-blocks",
+            "short": null,
+            "help": "Hard maximum processed blocks represented by one delivery batch",
+            "required": false,
+            "action": "Set",
+            "defaultValues": [
+              "8192"
+            ],
+            "possibleValues": []
+          },
+          {
+            "id": "delivery_maximum_delay_ms",
+            "long": "delivery-maximum-delay-ms",
+            "short": null,
+            "help": "Flush delay for a partially filled delivery batch",
+            "required": false,
+            "action": "Set",
+            "defaultValues": [
+              "50"
+            ],
+            "possibleValues": []
+          },
+          {
+            "id": "delivery_maximum_buffered_batches",
+            "long": "delivery-maximum-buffered-batches",
+            "short": null,
+            "help": "Maximum encoded batches queued per connection",
+            "required": false,
+            "action": "Set",
+            "defaultValues": [
+              "4"
+            ],
+            "possibleValues": []
+          },
+          {
+            "id": "delivery_maximum_buffered_bytes",
+            "long": "delivery-maximum-buffered-bytes",
+            "short": null,
+            "help": "Maximum encoded bytes queued per connection",
+            "required": false,
+            "action": "Set",
+            "defaultValues": [
+              "67108864"
+            ],
+            "possibleValues": []
+          },
+          {
+            "id": "delivery_compression",
+            "long": "delivery-compression",
+            "short": null,
+            "help": "Delivery transport compression",
+            "required": false,
+            "action": "Set",
+            "defaultValues": [
+              "gzip"
+            ],
+            "possibleValues": [
+              "none",
+              "gzip"
+            ]
+          },
+          {
+            "id": "report",
+            "long": "report",
+            "short": null,
+            "help": "Optional JSON report destination",
+            "required": false,
+            "action": "Set",
+            "defaultValues": [],
+            "possibleValues": []
+          },
+          {
+            "id": "samples_report",
+            "long": "samples-report",
+            "short": null,
+            "help": "Optional immutable NDJSON destination for high-frequency samples",
+            "required": false,
+            "action": "Set",
+            "defaultValues": [],
+            "possibleValues": []
+          },
+          {
+            "id": "config",
+            "long": "config",
+            "short": null,
+            "help": "Path to the versioned TOML configuration",
+            "required": false,
+            "action": "Set",
+            "defaultValues": [
+              "config/node.toml"
+            ],
+            "possibleValues": []
+          },
+          {
+            "id": "log_format",
+            "long": "log-format",
+            "short": null,
+            "help": "Log rendering format",
+            "required": false,
+            "action": "Set",
+            "defaultValues": [
+              "pretty"
+            ],
+            "possibleValues": [
+              "pretty",
+              "json"
+            ]
+          },
+          {
+            "id": "log_filter",
+            "long": "log-filter",
+            "short": null,
+            "help": "Tracing filter, e.g. `info,leani=debug`",
+            "required": false,
+            "action": "Set",
+            "defaultValues": [
+              "info"
+            ],
+            "possibleValues": []
+          },
+          {
+            "id": "help",
+            "long": "help",
+            "short": "h",
+            "help": "Print help (see more with '--help')",
+            "required": false,
+            "action": "Help",
+            "defaultValues": [],
+            "possibleValues": []
+          },
+          {
+            "id": "version",
+            "long": "version",
+            "short": "V",
+            "help": "Print version",
+            "required": false,
+            "action": "Version",
+            "defaultValues": [],
+            "possibleValues": []
+          }
+        ],
+        "subcommands": [
+          {
+            "name": "sweep",
+            "about": "Run or resume a manifest-defined candidate sweep",
+            "usage": "Usage: leani benchmark sweep [OPTIONS] --manifest <MANIFEST> --output-directory <OUTPUT_DIRECTORY>",
+            "arguments": [
+              {
+                "id": "manifest",
+                "long": "manifest",
+                "short": null,
+                "help": "Versioned JSON sweep manifest",
+                "required": true,
+                "action": "Set",
+                "defaultValues": [],
+                "possibleValues": []
+              },
+              {
+                "id": "output_directory",
+                "long": "output-directory",
+                "short": null,
+                "help": "Directory containing immutable candidate reports and the sweep summary",
+                "required": true,
+                "action": "Set",
+                "defaultValues": [],
+                "possibleValues": []
+              },
+              {
+                "id": "config",
+                "long": "config",
+                "short": null,
+                "help": "Path to the versioned TOML configuration",
+                "required": false,
+                "action": "Set",
+                "defaultValues": [
+                  "config/node.toml"
+                ],
+                "possibleValues": []
+              },
+              {
+                "id": "log_format",
+                "long": "log-format",
+                "short": null,
+                "help": "Log rendering format",
+                "required": false,
+                "action": "Set",
+                "defaultValues": [
+                  "pretty"
+                ],
+                "possibleValues": [
+                  "pretty",
+                  "json"
+                ]
+              },
+              {
+                "id": "log_filter",
+                "long": "log-filter",
+                "short": null,
+                "help": "Tracing filter, e.g. `info,leani=debug`",
+                "required": false,
+                "action": "Set",
+                "defaultValues": [
+                  "info"
+                ],
+                "possibleValues": []
+              },
+              {
+                "id": "help",
+                "long": "help",
+                "short": "h",
+                "help": "Print help",
+                "required": false,
+                "action": "Help",
+                "defaultValues": [],
+                "possibleValues": []
+              },
+              {
+                "id": "version",
+                "long": "version",
+                "short": "V",
+                "help": "Print version",
+                "required": false,
+                "action": "Version",
+                "defaultValues": [],
+                "possibleValues": []
+              }
+            ],
+            "subcommands": []
+          },
+          {
+            "name": "real-source",
+            "about": "Measure a pinned Mainnet range through real history sources, processor, HTTP delivery, acknowledgement, and pruning",
+            "usage": "Usage: leani benchmark real-source [OPTIONS] --from-block <FROM_BLOCK> --to-block <TO_BLOCK> --data-dir <DATA_DIR> --report <REPORT>",
+            "arguments": [
+              {
+                "id": "processor",
+                "long": "processor",
+                "short": null,
+                "help": "Configured processor kind or instance",
+                "required": false,
+                "action": "Set",
+                "defaultValues": [
+                  "blobs-money"
+                ],
+                "possibleValues": []
+              },
+              {
+                "id": "source_policy",
+                "long": "source-policy",
+                "short": null,
+                "help": "Historical source selection policy",
+                "required": false,
+                "action": "Set",
+                "defaultValues": [
+                  "history-portfolio"
+                ],
+                "possibleValues": [
+                  "xatu-only",
+                  "erae-only",
+                  "p2p-only",
+                  "history-portfolio"
+                ]
+              },
+              {
+                "id": "from_block",
+                "long": "from-block",
+                "short": null,
+                "help": "First finalized execution block in the inclusive range",
+                "required": true,
+                "action": "Set",
+                "defaultValues": [],
+                "possibleValues": []
+              },
+              {
+                "id": "to_block",
+                "long": "to-block",
+                "short": null,
+                "help": "Last finalized execution block in the inclusive range",
+                "required": true,
+                "action": "Set",
+                "defaultValues": [],
+                "possibleValues": []
+              },
+              {
+                "id": "data_dir",
+                "long": "data-dir",
+                "short": null,
+                "help": "Fresh benchmark directory. Existing node state is rejected",
+                "required": true,
+                "action": "Set",
+                "defaultValues": [],
+                "possibleValues": []
+              },
+              {
+                "id": "consumer_delay_ms",
+                "long": "consumer-delay-ms",
+                "short": null,
+                "help": "Optional delay before acknowledging every delivered batch",
+                "required": false,
+                "action": "Set",
+                "defaultValues": [
+                  "0"
+                ],
+                "possibleValues": []
+              },
+              {
+                "id": "timeout_seconds",
+                "long": "timeout-seconds",
+                "short": null,
+                "help": "Overall wall-clock limit for acquisition, processing, and delivery",
+                "required": false,
+                "action": "Set",
+                "defaultValues": [
+                  "7200"
+                ],
+                "possibleValues": []
+              },
+              {
+                "id": "sample_interval_ms",
+                "long": "sample-interval-ms",
+                "short": null,
+                "help": "Resource/progress sampling interval",
+                "required": false,
+                "action": "Set",
+                "defaultValues": [
+                  "250"
+                ],
+                "possibleValues": []
+              },
+              {
+                "id": "source_concurrency",
+                "long": "source-concurrency",
+                "short": null,
+                "help": "Override configured historical source acquisition concurrency",
+                "required": false,
+                "action": "Set",
+                "defaultValues": [],
+                "possibleValues": []
+              },
+              {
+                "id": "mapper_concurrency",
+                "long": "mapper-concurrency",
+                "short": null,
+                "help": "Override configured processor mapper concurrency",
+                "required": false,
+                "action": "Set",
+                "defaultValues": [],
+                "possibleValues": []
+              },
+              {
+                "id": "maximum_active_chunks",
+                "long": "maximum-active-chunks",
+                "short": null,
+                "help": "Override the shared historical coordinator active-chunk ceiling",
+                "required": false,
+                "action": "Set",
+                "defaultValues": [],
+                "possibleValues": []
+              },
+              {
+                "id": "expected_output_digest",
+                "long": "expected-output-digest",
+                "short": null,
+                "help": "Optional expected BLAKE3 digest of canonical delivered domain events",
+                "required": false,
+                "action": "Set",
+                "defaultValues": [],
+                "possibleValues": []
+              },
+              {
+                "id": "delivery_compression",
+                "long": "delivery-compression",
+                "short": null,
+                "help": "Delivery transport compression. Batch sizing comes from node config",
+                "required": false,
+                "action": "Set",
+                "defaultValues": [
+                  "gzip"
+                ],
+                "possibleValues": [
+                  "none",
+                  "gzip"
+                ]
+              },
+              {
+                "id": "report",
+                "long": "report",
+                "short": null,
+                "help": "Versioned JSON evidence report",
+                "required": true,
+                "action": "Set",
+                "defaultValues": [],
+                "possibleValues": []
+              },
+              {
+                "id": "config",
+                "long": "config",
+                "short": null,
+                "help": "Path to the versioned TOML configuration",
+                "required": false,
+                "action": "Set",
+                "defaultValues": [
+                  "config/node.toml"
+                ],
+                "possibleValues": []
+              },
+              {
+                "id": "log_format",
+                "long": "log-format",
+                "short": null,
+                "help": "Log rendering format",
+                "required": false,
+                "action": "Set",
+                "defaultValues": [
+                  "pretty"
+                ],
+                "possibleValues": [
+                  "pretty",
+                  "json"
+                ]
+              },
+              {
+                "id": "log_filter",
+                "long": "log-filter",
+                "short": null,
+                "help": "Tracing filter, e.g. `info,leani=debug`",
+                "required": false,
+                "action": "Set",
+                "defaultValues": [
+                  "info"
+                ],
+                "possibleValues": []
+              },
+              {
+                "id": "help",
+                "long": "help",
+                "short": "h",
+                "help": "Print help (see more with '--help')",
+                "required": false,
+                "action": "Help",
+                "defaultValues": [],
+                "possibleValues": []
+              },
+              {
+                "id": "version",
+                "long": "version",
+                "short": "V",
+                "help": "Print version",
+                "required": false,
+                "action": "Version",
+                "defaultValues": [],
+                "possibleValues": []
+              }
+            ],
+            "subcommands": []
+          },
+          {
+            "name": "help",
+            "about": "Print this message or the help of the given subcommand(s)",
+            "usage": "Usage: leani benchmark help [COMMAND]",
+            "arguments": [],
+            "subcommands": [
+              {
+                "name": "sweep",
+                "about": "Run or resume a manifest-defined candidate sweep",
+                "usage": "Usage: leani benchmark help sweep",
+                "arguments": [],
+                "subcommands": []
+              },
+              {
+                "name": "real-source",
+                "about": "Measure a pinned Mainnet range through real history sources, processor, HTTP delivery, acknowledgement, and pruning",
+                "usage": "Usage: leani benchmark help real-source",
+                "arguments": [],
+                "subcommands": []
+              },
+              {
+                "name": "help",
+                "about": "Print this message or the help of the given subcommand(s)",
+                "usage": "Usage: leani benchmark help help",
+                "arguments": [],
+                "subcommands": []
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "name": "e2e",
+        "about": "Run explicit end-to-end verification gates",
+        "usage": "Usage: leani e2e [OPTIONS] <COMMAND>",
+        "arguments": [
+          {
+            "id": "config",
+            "long": "config",
+            "short": null,
+            "help": "Path to the versioned TOML configuration",
+            "required": false,
+            "action": "Set",
+            "defaultValues": [
+              "config/node.toml"
+            ],
+            "possibleValues": []
+          },
+          {
+            "id": "log_format",
+            "long": "log-format",
+            "short": null,
+            "help": "Log rendering format",
+            "required": false,
+            "action": "Set",
+            "defaultValues": [
+              "pretty"
+            ],
+            "possibleValues": [
+              "pretty",
+              "json"
+            ]
+          },
+          {
+            "id": "log_filter",
+            "long": "log-filter",
+            "short": null,
+            "help": "Tracing filter, e.g. `info,leani=debug`",
+            "required": false,
+            "action": "Set",
+            "defaultValues": [
+              "info"
+            ],
+            "possibleValues": []
+          },
+          {
+            "id": "help",
+            "long": "help",
+            "short": "h",
+            "help": "Print help",
+            "required": false,
+            "action": "Help",
+            "defaultValues": [],
+            "possibleValues": []
+          },
+          {
+            "id": "version",
+            "long": "version",
+            "short": "V",
+            "help": "Print version",
+            "required": false,
+            "action": "Version",
+            "defaultValues": [],
+            "possibleValues": []
+          }
+        ],
+        "subcommands": [
+          {
+            "name": "fixture",
+            "about": "Run a deterministic bounded source/runtime/SQLite fixture with no network",
+            "usage": "Usage: leani e2e fixture [OPTIONS] --data-dir <DATA_DIR>",
+            "arguments": [
+              {
+                "id": "data_dir",
+                "long": "data-dir",
+                "short": null,
+                "help": "Fresh directory for the fixture database",
+                "required": true,
+                "action": "Set",
+                "defaultValues": [],
+                "possibleValues": []
+              },
+              {
+                "id": "blocks",
+                "long": "blocks",
+                "short": null,
+                "help": "Number of deterministic finalized blocks",
+                "required": false,
+                "action": "Set",
+                "defaultValues": [
+                  "128"
+                ],
+                "possibleValues": []
+              },
+              {
+                "id": "report",
+                "long": "report",
+                "short": null,
+                "help": "Optional JSON evidence report",
+                "required": false,
+                "action": "Set",
+                "defaultValues": [],
+                "possibleValues": []
+              },
+              {
+                "id": "config",
+                "long": "config",
+                "short": null,
+                "help": "Path to the versioned TOML configuration",
+                "required": false,
+                "action": "Set",
+                "defaultValues": [
+                  "config/node.toml"
+                ],
+                "possibleValues": []
+              },
+              {
+                "id": "log_format",
+                "long": "log-format",
+                "short": null,
+                "help": "Log rendering format",
+                "required": false,
+                "action": "Set",
+                "defaultValues": [
+                  "pretty"
+                ],
+                "possibleValues": [
+                  "pretty",
+                  "json"
+                ]
+              },
+              {
+                "id": "log_filter",
+                "long": "log-filter",
+                "short": null,
+                "help": "Tracing filter, e.g. `info,leani=debug`",
+                "required": false,
+                "action": "Set",
+                "defaultValues": [
+                  "info"
+                ],
+                "possibleValues": []
+              },
+              {
+                "id": "help",
+                "long": "help",
+                "short": "h",
+                "help": "Print help",
+                "required": false,
+                "action": "Help",
+                "defaultValues": [],
+                "possibleValues": []
+              },
+              {
+                "id": "version",
+                "long": "version",
+                "short": "V",
+                "help": "Print version",
+                "required": false,
+                "action": "Version",
+                "defaultValues": [],
+                "possibleValues": []
+              }
+            ],
+            "subcommands": []
+          },
+          {
+            "name": "mainnet",
+            "about": "Backfill and follow Ethereum Mainnet using production source adapters",
+            "usage": "Usage: leani e2e mainnet [OPTIONS] --from-block <FROM_BLOCK> --data-dir <DATA_DIR>",
+            "arguments": [
+              {
+                "id": "processor",
+                "long": "processor",
+                "short": null,
+                "help": "Configured processor to verify",
+                "required": false,
+                "action": "Set",
+                "defaultValues": [
+                  "blobs-money"
+                ],
+                "possibleValues": []
+              },
+              {
+                "id": "from_block",
+                "long": "from-block",
+                "short": null,
+                "help": "First historical block in the required continuous coverage range",
+                "required": true,
+                "action": "Set",
+                "defaultValues": [],
+                "possibleValues": []
+              },
+              {
+                "id": "data_dir",
+                "long": "data-dir",
+                "short": null,
+                "help": "Fresh data directory. Existing state requires `--resume`",
+                "required": true,
+                "action": "Set",
+                "defaultValues": [],
+                "possibleValues": []
+              },
+              {
+                "id": "resume",
+                "long": "resume",
+                "short": null,
+                "help": "Reuse an existing E2E data directory after an interrupted run",
+                "required": false,
+                "action": "SetTrue",
+                "defaultValues": [
+                  "false"
+                ],
+                "possibleValues": [
+                  "true",
+                  "false"
+                ]
+              },
+              {
+                "id": "minimum_follow_blocks",
+                "long": "minimum-follow-blocks",
+                "short": null,
+                "help": "Blocks that must be followed beyond the initial finalized anchor",
+                "required": false,
+                "action": "Set",
+                "defaultValues": [
+                  "16"
+                ],
+                "possibleValues": []
+              },
+              {
+                "id": "stable_seconds",
+                "long": "stable-seconds",
+                "short": null,
+                "help": "Seconds all convergence and head-freshness assertions must remain true",
+                "required": false,
+                "action": "Set",
+                "defaultValues": [
+                  "300"
+                ],
+                "possibleValues": []
+              },
+              {
+                "id": "max_head_age_seconds",
+                "long": "max-head-age-seconds",
+                "short": null,
+                "help": "Maximum permitted age of the latest retained execution block",
+                "required": false,
+                "action": "Set",
+                "defaultValues": [
+                  "60"
+                ],
+                "possibleValues": []
+              },
+              {
+                "id": "timeout_seconds",
+                "long": "timeout-seconds",
+                "short": null,
+                "help": "Overall wall-clock limit for the staging run",
+                "required": false,
+                "action": "Set",
+                "defaultValues": [
+                  "7200"
+                ],
+                "possibleValues": []
+              },
+              {
+                "id": "report",
+                "long": "report",
+                "short": null,
+                "help": "JSON evidence report written on both success and failure",
+                "required": false,
+                "action": "Set",
+                "defaultValues": [
+                  "mainnet-e2e-report.json"
+                ],
+                "possibleValues": []
+              },
+              {
+                "id": "config",
+                "long": "config",
+                "short": null,
+                "help": "Path to the versioned TOML configuration",
+                "required": false,
+                "action": "Set",
+                "defaultValues": [
+                  "config/node.toml"
+                ],
+                "possibleValues": []
+              },
+              {
+                "id": "log_format",
+                "long": "log-format",
+                "short": null,
+                "help": "Log rendering format",
+                "required": false,
+                "action": "Set",
+                "defaultValues": [
+                  "pretty"
+                ],
+                "possibleValues": [
+                  "pretty",
+                  "json"
+                ]
+              },
+              {
+                "id": "log_filter",
+                "long": "log-filter",
+                "short": null,
+                "help": "Tracing filter, e.g. `info,leani=debug`",
+                "required": false,
+                "action": "Set",
+                "defaultValues": [
+                  "info"
+                ],
+                "possibleValues": []
+              },
+              {
+                "id": "help",
+                "long": "help",
+                "short": "h",
+                "help": "Print help",
+                "required": false,
+                "action": "Help",
+                "defaultValues": [],
+                "possibleValues": []
+              },
+              {
+                "id": "version",
+                "long": "version",
+                "short": "V",
+                "help": "Print version",
+                "required": false,
+                "action": "Version",
+                "defaultValues": [],
+                "possibleValues": []
+              }
+            ],
+            "subcommands": []
+          },
+          {
+            "name": "help",
+            "about": "Print this message or the help of the given subcommand(s)",
+            "usage": "Usage: leani e2e help [COMMAND]",
+            "arguments": [],
+            "subcommands": [
+              {
+                "name": "fixture",
+                "about": "Run a deterministic bounded source/runtime/SQLite fixture with no network",
+                "usage": "Usage: leani e2e help fixture",
+                "arguments": [],
+                "subcommands": []
+              },
+              {
+                "name": "mainnet",
+                "about": "Backfill and follow Ethereum Mainnet using production source adapters",
+                "usage": "Usage: leani e2e help mainnet",
+                "arguments": [],
+                "subcommands": []
+              },
+              {
+                "name": "help",
+                "about": "Print this message or the help of the given subcommand(s)",
+                "usage": "Usage: leani e2e help help",
+                "arguments": [],
+                "subcommands": []
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "name": "db",
+        "about": "Inspect and maintain the durable store",
+        "usage": "Usage: leani db [OPTIONS] <COMMAND>",
+        "arguments": [
+          {
+            "id": "config",
+            "long": "config",
+            "short": null,
+            "help": "Path to the versioned TOML configuration",
+            "required": false,
+            "action": "Set",
+            "defaultValues": [
+              "config/node.toml"
+            ],
+            "possibleValues": []
+          },
+          {
+            "id": "log_format",
+            "long": "log-format",
+            "short": null,
+            "help": "Log rendering format",
+            "required": false,
+            "action": "Set",
+            "defaultValues": [
+              "pretty"
+            ],
+            "possibleValues": [
+              "pretty",
+              "json"
+            ]
+          },
+          {
+            "id": "log_filter",
+            "long": "log-filter",
+            "short": null,
+            "help": "Tracing filter, e.g. `info,leani=debug`",
+            "required": false,
+            "action": "Set",
+            "defaultValues": [
+              "info"
+            ],
+            "possibleValues": []
+          },
+          {
+            "id": "help",
+            "long": "help",
+            "short": "h",
+            "help": "Print help",
+            "required": false,
+            "action": "Help",
+            "defaultValues": [],
+            "possibleValues": []
+          },
+          {
+            "id": "version",
+            "long": "version",
+            "short": "V",
+            "help": "Print version",
+            "required": false,
+            "action": "Version",
+            "defaultValues": [],
+            "possibleValues": []
+          }
+        ],
+        "subcommands": [
+          {
+            "name": "inspect",
+            "about": null,
+            "usage": "Usage: leani db inspect [OPTIONS]",
+            "arguments": [
+              {
+                "id": "config",
+                "long": "config",
+                "short": null,
+                "help": "Path to the versioned TOML configuration",
+                "required": false,
+                "action": "Set",
+                "defaultValues": [
+                  "config/node.toml"
+                ],
+                "possibleValues": []
+              },
+              {
+                "id": "log_format",
+                "long": "log-format",
+                "short": null,
+                "help": "Log rendering format",
+                "required": false,
+                "action": "Set",
+                "defaultValues": [
+                  "pretty"
+                ],
+                "possibleValues": [
+                  "pretty",
+                  "json"
+                ]
+              },
+              {
+                "id": "log_filter",
+                "long": "log-filter",
+                "short": null,
+                "help": "Tracing filter, e.g. `info,leani=debug`",
+                "required": false,
+                "action": "Set",
+                "defaultValues": [
+                  "info"
+                ],
+                "possibleValues": []
+              },
+              {
+                "id": "help",
+                "long": "help",
+                "short": "h",
+                "help": "Print help",
+                "required": false,
+                "action": "Help",
+                "defaultValues": [],
+                "possibleValues": []
+              },
+              {
+                "id": "version",
+                "long": "version",
+                "short": "V",
+                "help": "Print version",
+                "required": false,
+                "action": "Version",
+                "defaultValues": [],
+                "possibleValues": []
+              }
+            ],
+            "subcommands": []
+          },
+          {
+            "name": "verify",
+            "about": null,
+            "usage": "Usage: leani db verify [OPTIONS]",
+            "arguments": [
+              {
+                "id": "config",
+                "long": "config",
+                "short": null,
+                "help": "Path to the versioned TOML configuration",
+                "required": false,
+                "action": "Set",
+                "defaultValues": [
+                  "config/node.toml"
+                ],
+                "possibleValues": []
+              },
+              {
+                "id": "log_format",
+                "long": "log-format",
+                "short": null,
+                "help": "Log rendering format",
+                "required": false,
+                "action": "Set",
+                "defaultValues": [
+                  "pretty"
+                ],
+                "possibleValues": [
+                  "pretty",
+                  "json"
+                ]
+              },
+              {
+                "id": "log_filter",
+                "long": "log-filter",
+                "short": null,
+                "help": "Tracing filter, e.g. `info,leani=debug`",
+                "required": false,
+                "action": "Set",
+                "defaultValues": [
+                  "info"
+                ],
+                "possibleValues": []
+              },
+              {
+                "id": "help",
+                "long": "help",
+                "short": "h",
+                "help": "Print help",
+                "required": false,
+                "action": "Help",
+                "defaultValues": [],
+                "possibleValues": []
+              },
+              {
+                "id": "version",
+                "long": "version",
+                "short": "V",
+                "help": "Print version",
+                "required": false,
+                "action": "Version",
+                "defaultValues": [],
+                "possibleValues": []
+              }
+            ],
+            "subcommands": []
+          },
+          {
+            "name": "backup",
+            "about": null,
+            "usage": "Usage: leani db backup [OPTIONS] <DESTINATION>",
+            "arguments": [
+              {
+                "id": "destination",
+                "long": null,
+                "short": null,
+                "help": null,
+                "required": true,
+                "action": "Set",
+                "defaultValues": [],
+                "possibleValues": []
+              },
+              {
+                "id": "config",
+                "long": "config",
+                "short": null,
+                "help": "Path to the versioned TOML configuration",
+                "required": false,
+                "action": "Set",
+                "defaultValues": [
+                  "config/node.toml"
+                ],
+                "possibleValues": []
+              },
+              {
+                "id": "log_format",
+                "long": "log-format",
+                "short": null,
+                "help": "Log rendering format",
+                "required": false,
+                "action": "Set",
+                "defaultValues": [
+                  "pretty"
+                ],
+                "possibleValues": [
+                  "pretty",
+                  "json"
+                ]
+              },
+              {
+                "id": "log_filter",
+                "long": "log-filter",
+                "short": null,
+                "help": "Tracing filter, e.g. `info,leani=debug`",
+                "required": false,
+                "action": "Set",
+                "defaultValues": [
+                  "info"
+                ],
+                "possibleValues": []
+              },
+              {
+                "id": "help",
+                "long": "help",
+                "short": "h",
+                "help": "Print help",
+                "required": false,
+                "action": "Help",
+                "defaultValues": [],
+                "possibleValues": []
+              },
+              {
+                "id": "version",
+                "long": "version",
+                "short": "V",
+                "help": "Print version",
+                "required": false,
+                "action": "Version",
+                "defaultValues": [],
+                "possibleValues": []
+              }
+            ],
+            "subcommands": []
+          },
+          {
+            "name": "compact",
+            "about": null,
+            "usage": "Usage: leani db compact [OPTIONS]",
+            "arguments": [
+              {
+                "id": "config",
+                "long": "config",
+                "short": null,
+                "help": "Path to the versioned TOML configuration",
+                "required": false,
+                "action": "Set",
+                "defaultValues": [
+                  "config/node.toml"
+                ],
+                "possibleValues": []
+              },
+              {
+                "id": "log_format",
+                "long": "log-format",
+                "short": null,
+                "help": "Log rendering format",
+                "required": false,
+                "action": "Set",
+                "defaultValues": [
+                  "pretty"
+                ],
+                "possibleValues": [
+                  "pretty",
+                  "json"
+                ]
+              },
+              {
+                "id": "log_filter",
+                "long": "log-filter",
+                "short": null,
+                "help": "Tracing filter, e.g. `info,leani=debug`",
+                "required": false,
+                "action": "Set",
+                "defaultValues": [
+                  "info"
+                ],
+                "possibleValues": []
+              },
+              {
+                "id": "help",
+                "long": "help",
+                "short": "h",
+                "help": "Print help",
+                "required": false,
+                "action": "Help",
+                "defaultValues": [],
+                "possibleValues": []
+              },
+              {
+                "id": "version",
+                "long": "version",
+                "short": "V",
+                "help": "Print version",
+                "required": false,
+                "action": "Version",
+                "defaultValues": [],
+                "possibleValues": []
+              }
+            ],
+            "subcommands": []
+          },
+          {
+            "name": "prune-changes",
+            "about": "Prune durable changes older than a sequence while respecting active consumer leases",
+            "usage": "Usage: leani db prune-changes [OPTIONS] --processor <PROCESSOR> --before <BEFORE>",
+            "arguments": [
+              {
+                "id": "processor",
+                "long": "processor",
+                "short": null,
+                "help": null,
+                "required": true,
+                "action": "Set",
+                "defaultValues": [],
+                "possibleValues": []
+              },
+              {
+                "id": "before",
+                "long": "before",
+                "short": null,
+                "help": null,
+                "required": true,
+                "action": "Set",
+                "defaultValues": [],
+                "possibleValues": []
+              },
+              {
+                "id": "config",
+                "long": "config",
+                "short": null,
+                "help": "Path to the versioned TOML configuration",
+                "required": false,
+                "action": "Set",
+                "defaultValues": [
+                  "config/node.toml"
+                ],
+                "possibleValues": []
+              },
+              {
+                "id": "log_format",
+                "long": "log-format",
+                "short": null,
+                "help": "Log rendering format",
+                "required": false,
+                "action": "Set",
+                "defaultValues": [
+                  "pretty"
+                ],
+                "possibleValues": [
+                  "pretty",
+                  "json"
+                ]
+              },
+              {
+                "id": "log_filter",
+                "long": "log-filter",
+                "short": null,
+                "help": "Tracing filter, e.g. `info,leani=debug`",
+                "required": false,
+                "action": "Set",
+                "defaultValues": [
+                  "info"
+                ],
+                "possibleValues": []
+              },
+              {
+                "id": "help",
+                "long": "help",
+                "short": "h",
+                "help": "Print help",
+                "required": false,
+                "action": "Help",
+                "defaultValues": [],
+                "possibleValues": []
+              },
+              {
+                "id": "version",
+                "long": "version",
+                "short": "V",
+                "help": "Print version",
+                "required": false,
+                "action": "Version",
+                "defaultValues": [],
+                "possibleValues": []
+              }
+            ],
+            "subcommands": []
+          },
+          {
+            "name": "help",
+            "about": "Print this message or the help of the given subcommand(s)",
+            "usage": "Usage: leani db help [COMMAND]",
+            "arguments": [],
+            "subcommands": [
+              {
+                "name": "inspect",
+                "about": null,
+                "usage": "Usage: leani db help inspect",
+                "arguments": [],
+                "subcommands": []
+              },
+              {
+                "name": "verify",
+                "about": null,
+                "usage": "Usage: leani db help verify",
+                "arguments": [],
+                "subcommands": []
+              },
+              {
+                "name": "backup",
+                "about": null,
+                "usage": "Usage: leani db help backup",
+                "arguments": [],
+                "subcommands": []
+              },
+              {
+                "name": "compact",
+                "about": null,
+                "usage": "Usage: leani db help compact",
+                "arguments": [],
+                "subcommands": []
+              },
+              {
+                "name": "prune-changes",
+                "about": "Prune durable changes older than a sequence while respecting active consumer leases",
+                "usage": "Usage: leani db help prune-changes",
+                "arguments": [],
+                "subcommands": []
+              },
+              {
+                "name": "help",
+                "about": "Print this message or the help of the given subcommand(s)",
+                "usage": "Usage: leani db help help",
+                "arguments": [],
+                "subcommands": []
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "name": "help",
+        "about": "Print this message or the help of the given subcommand(s)",
+        "usage": "Usage: leani help [COMMAND]",
+        "arguments": [],
+        "subcommands": [
+          {
+            "name": "doctor",
+            "about": "Validate and describe configuration without mutating state",
+            "usage": "Usage: leani help doctor",
+            "arguments": [],
+            "subcommands": []
+          },
+          {
+            "name": "serve",
+            "about": "Start configured sources, processors, stores, and serving endpoints",
+            "usage": "Usage: leani help serve",
+            "arguments": [],
+            "subcommands": []
+          },
+          {
+            "name": "backfill",
+            "about": "Process a historical block range and then exit",
+            "usage": "Usage: leani help backfill",
+            "arguments": [],
+            "subcommands": []
+          },
+          {
+            "name": "source",
+            "about": "Inspect or probe configured data sources",
+            "usage": "Usage: leani help source [COMMAND]",
+            "arguments": [],
+            "subcommands": [
+              {
+                "name": "probe",
+                "about": "Probe a source without changing processor state",
+                "usage": "Usage: leani help source probe [COMMAND]",
+                "arguments": [],
+                "subcommands": [
+                  {
+                    "name": "xatu",
+                    "about": "Inspect the configured Xatu catalog",
+                    "usage": "Usage: leani help source probe xatu",
+                    "arguments": [],
+                    "subcommands": []
+                  },
+                  {
+                    "name": "p2p",
+                    "about": "Exercise the recent execution P2P boundary",
+                    "usage": "Usage: leani help source probe p2p",
+                    "arguments": [],
+                    "subcommands": []
+                  },
+                  {
+                    "name": "erae",
+                    "about": "Exercise sparse execution-history archive reads",
+                    "usage": "Usage: leani help source probe erae",
+                    "arguments": [],
+                    "subcommands": []
+                  },
+                  {
+                    "name": "finality",
+                    "about": "Exercise the configured finality boundary",
+                    "usage": "Usage: leani help source probe finality",
+                    "arguments": [],
+                    "subcommands": []
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "name": "conformance",
+            "about": "Compare normalized source exports or render exact RPC response vectors",
+            "usage": "Usage: leani help conformance [COMMAND]",
+            "arguments": [],
+            "subcommands": [
+              {
+                "name": "frames",
+                "about": "Compare canonical material in two normalized frame exports",
+                "usage": "Usage: leani help conformance frames",
+                "arguments": [],
+                "subcommands": []
+              },
+              {
+                "name": "processor",
+                "about": "Compare deterministic processor deltas from two source exports",
+                "usage": "Usage: leani help conformance processor",
+                "arguments": [],
+                "subcommands": []
+              },
+              {
+                "name": "rpc",
+                "about": "Render exact Ethereum block/receipt responses from normalized frames",
+                "usage": "Usage: leani help conformance rpc",
+                "arguments": [],
+                "subcommands": []
+              }
+            ]
+          },
+          {
+            "name": "benchmark",
+            "about": "Run a reproducible historical throughput and storage measurement",
+            "usage": "Usage: leani help benchmark [COMMAND]",
+            "arguments": [],
+            "subcommands": [
+              {
+                "name": "sweep",
+                "about": "Run or resume a manifest-defined candidate sweep",
+                "usage": "Usage: leani help benchmark sweep",
+                "arguments": [],
+                "subcommands": []
+              },
+              {
+                "name": "real-source",
+                "about": "Measure a pinned Mainnet range through real history sources, processor, HTTP delivery, acknowledgement, and pruning",
+                "usage": "Usage: leani help benchmark real-source",
+                "arguments": [],
+                "subcommands": []
+              }
+            ]
+          },
+          {
+            "name": "e2e",
+            "about": "Run explicit end-to-end verification gates",
+            "usage": "Usage: leani help e2e [COMMAND]",
+            "arguments": [],
+            "subcommands": [
+              {
+                "name": "fixture",
+                "about": "Run a deterministic bounded source/runtime/SQLite fixture with no network",
+                "usage": "Usage: leani help e2e fixture",
+                "arguments": [],
+                "subcommands": []
+              },
+              {
+                "name": "mainnet",
+                "about": "Backfill and follow Ethereum Mainnet using production source adapters",
+                "usage": "Usage: leani help e2e mainnet",
+                "arguments": [],
+                "subcommands": []
+              }
+            ]
+          },
+          {
+            "name": "db",
+            "about": "Inspect and maintain the durable store",
+            "usage": "Usage: leani help db [COMMAND]",
+            "arguments": [],
+            "subcommands": [
+              {
+                "name": "inspect",
+                "about": null,
+                "usage": "Usage: leani help db inspect",
+                "arguments": [],
+                "subcommands": []
+              },
+              {
+                "name": "verify",
+                "about": null,
+                "usage": "Usage: leani help db verify",
+                "arguments": [],
+                "subcommands": []
+              },
+              {
+                "name": "backup",
+                "about": null,
+                "usage": "Usage: leani help db backup",
+                "arguments": [],
+                "subcommands": []
+              },
+              {
+                "name": "compact",
+                "about": null,
+                "usage": "Usage: leani help db compact",
+                "arguments": [],
+                "subcommands": []
+              },
+              {
+                "name": "prune-changes",
+                "about": "Prune durable changes older than a sequence while respecting active consumer leases",
+                "usage": "Usage: leani help db prune-changes",
+                "arguments": [],
+                "subcommands": []
+              }
+            ]
+          },
+          {
+            "name": "help",
+            "about": "Print this message or the help of the given subcommand(s)",
+            "usage": "Usage: leani help help",
+            "arguments": [],
+            "subcommands": []
+          }
+        ]
+      }
+    ]
+  }
+}

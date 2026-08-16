@@ -1,0 +1,26 @@
+---
+title: Native HTTP API
+description: Generated inventory of the versioned native HTTP contract from the tracked OpenAPI document.
+section: reference
+order: 10
+audience:
+  - app-developer
+  - operator
+status: preview
+generated: true
+---
+
+import { Aside } from '@astrojs/starlight/components';
+import ReferenceTable from '@docs/components/docs/ReferenceTable.astro';
+
+This inventory is generated from `api/openapi.yaml`. Operation IDs, methods,
+paths, summaries, authentication policy, and response codes change here in the
+same pull request as the contract.
+
+<Aside type="note" title="Native API, not Ethereum JSON-RPC">
+  The native API exposes coverage, processors, durable delivery, and typed query
+  extensions. Ethereum JSON-RPC is a separate listener with an intentionally
+  bounded compatibility surface.
+</Aside>
+
+<ReferenceTable kind="http" />

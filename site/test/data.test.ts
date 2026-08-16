@@ -2,6 +2,7 @@ import { describe, expect, test } from 'bun:test';
 import { readdirSync } from 'node:fs';
 import heroExamples from '../src/data/hero-examples.json';
 import costs from '../src/data/costs.json';
+import processorCatalog from '../../docs/reference/generated/processor-catalog.json';
 
 const demoDir = new URL('../src/data/processors/', import.meta.url);
 
@@ -87,5 +88,16 @@ describe('canned data', () => {
     expect(costs.rows[0]!.highlight).toBe(true);
     expect(costs.rows[3]!.profile).toBe('full output');
     expect(costs.footnotes.length).toBeGreaterThanOrEqual(3);
+  });
+
+  test('tracked standard processor catalog includes every built-in factory', () => {
+    expect(processorCatalog.processors.map((processor) => processor.id)).toEqual([
+      'blobs-money',
+      'erc20-balances',
+      'evm-events',
+      'transaction-stats',
+      'uniswap-latest',
+      'uniswap-observations',
+    ]);
   });
 });

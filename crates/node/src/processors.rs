@@ -15,7 +15,7 @@ use leani_primitives::{Address, BlockNumber};
 use leani_processor_api::{
     LifecyclePolicies, Processor, ProcessorInstanceId, PublicationPolicy, StartPoint,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::config::{Config, ProcessorConfig, ValidationError};
@@ -31,6 +31,14 @@ pub struct ProcessorFactoryContext {
 #[error("{message}")]
 pub struct ProcessorFactoryError {
     message: String,
+}
+
+/// Stable human-facing metadata supplied by every registered processor factory.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProcessorFactoryMetadata {
+    pub id: &'static str,
+    pub description: &'static str,
 }
 
 /// One processor instance and its optional native read-only query surface.
@@ -111,7 +119,9 @@ impl ProcessorFactoryError {
 /// package runtime can later expose one factory per installed package while
 /// retaining the same node/runtime boundary.
 pub trait ProcessorFactory: Send + Sync {
-    fn id(&self) -> &str;
+    fn id(&self) -> &'static str;
+
+    fn description(&self) -> &'static str;
 
     /// Build and validate one immutable processor instance.
     ///
@@ -203,6 +213,18 @@ impl ProcessorRegistry {
     #[must_use]
     pub fn contains(&self, id: &str) -> bool {
         self.factories.contains_key(id)
+    }
+
+    /// Sorted built-in and downstream factory metadata.
+    #[must_use]
+    pub fn catalog(&self) -> Vec<ProcessorFactoryMetadata> {
+        self.factories
+            .values()
+            .map(|factory| ProcessorFactoryMetadata {
+                id: factory.id(),
+                description: factory.description(),
+            })
+            .collect()
     }
 
     /// Instantiate and cross-check one configured processor.
@@ -410,6 +432,10 @@ impl ProcessorFactory for BlobsProcessorFactory {
         "blobs-money"
     }
 
+    fn description(&self) -> &'static str {
+        "Mainnet blob blocks, transactions, fees, burn, capacity, and fork-aware schedule"
+    }
+
     fn create(
         &self,
         configured: &ProcessorConfig,
@@ -453,6 +479,10 @@ struct Erc20ProcessorFactory;
 impl ProcessorFactory for Erc20ProcessorFactory {
     fn id(&self) -> &'static str {
         "erc20-balances"
+    }
+
+    fn description(&self) -> &'static str {
+        "Watchlist ERC-20 transfer ledger with current balances"
     }
 
     fn create(
@@ -519,6 +549,10 @@ impl ProcessorFactory for EvmEventsProcessorFactory {
         "evm-events"
     }
 
+    fn description(&self) -> &'static str {
+        "ABI-decoded EVM logs with configurable entity keys and time buckets"
+    }
+
     fn create(
         &self,
         configured: &ProcessorConfig,
@@ -577,6 +611,10 @@ impl ProcessorFactory for TransactionStatsProcessorFactory {
         "transaction-stats"
     }
 
+    fn description(&self) -> &'static str {
+        "Directional transaction counts and value totals for one address pair"
+    }
+
     fn create(
         &self,
         configured: &ProcessorConfig,
@@ -631,6 +669,10 @@ impl ProcessorFactory for UniswapObservationsProcessorFactory {
         "uniswap-observations"
     }
 
+    fn description(&self) -> &'static str {
+        "Append-only Uniswap V2/V3 pool observations"
+    }
+
     fn create(
         &self,
         configured: &ProcessorConfig,
@@ -651,6 +693,10 @@ struct UniswapLatestProcessorFactory;
 impl ProcessorFactory for UniswapLatestProcessorFactory {
     fn id(&self) -> &'static str {
         "uniswap-latest"
+    }
+
+    fn description(&self) -> &'static str {
+        "Latest materialized Uniswap V2/V3 pool state with typed query routes"
     }
 
     fn create(
@@ -723,6 +769,10 @@ mod tests {
     impl ProcessorFactory for DuplicateBlobs {
         fn id(&self) -> &'static str {
             "blobs-money"
+        }
+
+        fn description(&self) -> &'static str {
+            "duplicate test factory"
         }
 
         fn create(

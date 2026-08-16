@@ -1,6 +1,7 @@
 import { mkdir, rm, writeFile } from 'node:fs/promises';
 import { resolve, sep } from 'node:path';
 import { generateExamples } from './extract-snippets';
+import { generateReference } from './generate-reference';
 
 export interface DocsBuildMetadata {
   mode: 'preview' | 'production';
@@ -38,6 +39,7 @@ export async function prepareDocs(): Promise<void> {
   await rm(generatedDirectory, { recursive: true, force: true });
   await mkdir(generatedDirectory, { recursive: true });
   await generateExamples(repositoryRoot);
+  await generateReference(repositoryRoot);
   await writeFile(
     resolve(generatedDirectory, 'build-metadata.json'),
     `${JSON.stringify(docsBuildMetadata(), null, 2)}\n`,

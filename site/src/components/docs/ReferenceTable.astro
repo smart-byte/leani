@@ -1,0 +1,236 @@
+---
+import httpReference from '../../generated/http-reference.json';
+import configReference from '../../generated/config-reference.json';
+import sdkReference from '../../generated/sdk-reference.json';
+import cliReference from '../../generated/cli-reference.json';
+import processorReference from '../../generated/processors-reference.json';
+
+interface Props {
+  kind: 'http' | 'config' | 'sdk' | 'cli' | 'processors';
+}
+
+const { kind } = Astro.props;
+
+function grouped<T>(items: T[], key: (item: T) => string): Array<[string, T[]]> {
+  const groups = new Map<string, T[]>();
+  for (const item of items) groups.set(key(item), [...(groups.get(key(item)) ?? []), item]);
+  return [...groups.entries()];
+}
+
+function topLevel(path: string): string {
+  return path.split(/[.[]/, 1)[0] || 'other';
+}
+
+type CliCommand = typeof cliReference.command;
+function cliCommands(command: CliCommand, parents: string[] = []): Array<{ path: string; command: CliCommand }> {
+  const path = [...parents, command.name];
+  return [
+    { path: path.join(' '), command },
+    ...command.subcommands.flatMap((child) => cliCommands(child as CliCommand, path)),
+  ];
+}
+---
+
+{
+  kind === 'http' && grouped(httpReference.operations, (operation) => operation.group).map(([group, operations]) => (
+    <section class="reference-group">
+      <h2>{group}</h2>
+      <div class="table-scroll">
+        <table>
+          <thead><tr><th>Method</th><th>Path</th><th>Purpose</th><th>Auth</th></tr></thead>
+          <tbody>
+            {operations.map((operation) => (
+              <tr>
+                <td><code class={`method method-${operation.method.toLowerCase()}`}>{operation.method}</code></td>
+                <td><code>{operation.path}</code></td>
+                <td>{operation.summary}</td>
+                <td>{operation.authentication}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </section>
+  ))
+}
+
+{
+  kind === 'config' && grouped(configReference.fields, (field) => topLevel(field.path)).map(([group, fields]) => (
+    <section class="reference-group">
+      <h2><code>{group}</code></h2>
+      <div class="table-scroll">
+        <table>
+          <thead><tr><th>Field</th><th>Type / values</th><th>Required here</th><th>Constraints</th></tr></thead>
+          <tbody>
+            {fields.map((field) => (
+              <tr>
+                <td><code>{field.path}</code></td>
+                <td><code>{field.kind}</code>{field.description && <small>{field.description}</small>}</td>
+                <td>{field.required ? 'yes' : 'no'}</td>
+                <td><code>{Object.keys(field.constraints).length ? JSON.stringify(field.constraints) : '—'}</code></td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </section>
+  ))
+}
+
+{
+  kind === 'sdk' && grouped(sdkReference.methods, (member) => member.name.split('.')[0]!).map(([group, members]) => (
+    <section class="reference-group">
+      <h2><code>{group}</code></h2>
+      <div class="table-scroll">
+        <table>
+          <thead><tr><th>Member</th><th>Contract</th></tr></thead>
+          <tbody>
+            {members.map((member) => (
+              <tr><td><code>{member.name}</code></td><td><code class="signature">{member.signature}</code></td></tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </section>
+  ))
+}
+
+{
+  kind === 'cli' && cliCommands(cliReference.command).map(({ path, command }) => (
+    <details class="command" open={path === 'leani'}>
+      <summary><code>{path}</code><span>{command.about}</span></summary>
+      <p><code>{command.usage}</code></p>
+      {command.arguments.length > 0 && (
+        <div class="table-scroll">
+          <table>
+            <thead><tr><th>Argument</th><th>Purpose</th><th>Default / values</th></tr></thead>
+            <tbody>
+              {command.arguments.map((argument) => (
+                <tr>
+                  <td><code>{argument.long ? `--${argument.long}` : argument.id}</code></td>
+                  <td>{argument.help}</td>
+                  <td><code>{argument.defaultValues.join(', ') || argument.possibleValues.join(' | ') || '—'}</code></td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </details>
+  ))
+}
+
+{
+  kind === 'processors' && (
+    <div class="processor-grid">
+      {processorReference.processors.map((processor) => (
+        <article id={processor.id}>
+          <h2><code>{processor.id}</code></h2>
+          <p>{processor.description}</p>
+        </article>
+      ))}
+    </div>
+  )
+}
+
+<style>
+  .reference-group + .reference-group,
+  .command + .command {
+    margin-block-start: 2rem;
+  }
+
+  .table-scroll {
+    border: 1px solid var(--sl-color-gray-5);
+    border-radius: 0.4rem;
+    overflow-x: auto;
+  }
+
+  table {
+    border-collapse: collapse;
+    font-size: var(--sl-text-sm);
+    margin: 0;
+    min-width: 42rem;
+    width: 100%;
+  }
+
+  th,
+  td {
+    border-block-end: 1px solid var(--sl-color-gray-5);
+    padding: 0.65rem 0.75rem;
+    text-align: start;
+    vertical-align: top;
+  }
+
+  th {
+    background: var(--sl-color-bg-sidebar);
+    color: var(--sl-color-gray-2);
+    font-size: var(--sl-text-xs);
+    text-transform: uppercase;
+  }
+
+  tr:last-child td {
+    border-block-end: 0;
+  }
+
+  td small {
+    color: var(--sl-color-gray-3);
+    display: block;
+    margin-block-start: 0.2rem;
+  }
+
+  .signature {
+    overflow-wrap: anywhere;
+    white-space: normal;
+  }
+
+  .method {
+    border-radius: 0.25rem;
+    display: inline-block;
+    min-width: 3.7rem;
+    padding: 0.08rem 0.3rem;
+    text-align: center;
+  }
+
+  .method-get { color: #9ff0c4; }
+  .method-post { color: #9fd6f0; }
+  .method-delete { color: #f0ae9f; }
+
+  .command {
+    border: 1px solid var(--sl-color-gray-5);
+    border-radius: 0.4rem;
+    padding: 0.75rem;
+  }
+
+  .command summary {
+    cursor: pointer;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.5rem 1rem;
+  }
+
+  .command summary span {
+    color: var(--sl-color-gray-3);
+  }
+
+  .processor-grid {
+    display: grid;
+    gap: 1rem;
+    grid-template-columns: repeat(auto-fit, minmax(min(18rem, 100%), 1fr));
+  }
+
+  .processor-grid article {
+    border: 1px solid var(--sl-color-gray-5);
+    border-radius: 0.45rem;
+    padding: 1rem;
+  }
+
+  .processor-grid h2 {
+    font-size: var(--sl-text-lg);
+    margin: 0 0 0.45rem;
+  }
+
+  .processor-grid p {
+    color: var(--sl-color-gray-3);
+    margin: 0;
+  }
+</style>

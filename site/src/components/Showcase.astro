@@ -7,6 +7,7 @@ import evmEvents from '../data/processors/evm-events.json';
 import uniswap from '../data/processors/uniswap-latest.json';
 import txStats from '../data/processors/transaction-stats.json';
 import customMetadata from '../data/processors/custom.json';
+import processorReference from '../generated/processors-reference.json';
 import { hlTs } from '../lib/highlight';
 import { exampleSource } from '../lib/examples';
 
@@ -16,6 +17,7 @@ const custom = {
   queryExample: exampleSource('custom-query-client').code,
 };
 const demos = [blobs, erc20, evmEvents, uniswap, txStats, custom];
+const builtInProcessors = processorReference.processors;
 
 // Build-time rendering of the committed TS type strings: parse into a tree
 // (root properties visible, nested object types collapsed behind <details>)
@@ -78,6 +80,12 @@ function renderTypeCard(source: string): string {
     receipts, and logs. Configure a built-in—or register trusted native Rust
     code in a custom binary. These are complete processor sections, not legacy shorthand.
   </p>
+  <div class="catalog" aria-label="Built-in processor catalog">
+    <span class="mono">standard binary · {builtInProcessors.length}</span>
+    {builtInProcessors.map((processor) => (
+      <a href={`/docs/reference/processors/#${processor.id}`}>{processor.id}</a>
+    ))}
+  </div>
 
   <div class="tabs mono" role="tablist" aria-label="Processor examples">
     {demos.map((demo, i) => (
@@ -138,6 +146,10 @@ function renderTypeCard(source: string): string {
 
 <style>
   .lede { color: var(--ink-dim); max-width: 52ch; margin-top: 1rem; }
+  .catalog { display: flex; flex-wrap: wrap; gap: 0.45rem; margin-top: 1.25rem; align-items: center; }
+  .catalog span { color: var(--ink-dim); font-size: 0.72rem; margin-right: 0.25rem; }
+  .catalog a { border: 1px solid var(--panel-edge); border-radius: 999px; color: var(--ink-dim); font-family: var(--font-mono); font-size: 0.68rem; padding: 0.18rem 0.48rem; text-decoration: none; }
+  .catalog a:hover { border-color: var(--accent-dim); color: var(--accent); }
   .tabs { display: flex; gap: 0.4rem; flex-wrap: wrap; margin-top: 2.5rem; border-bottom: 1px solid var(--panel-edge); }
   .tabs [role='tab'] {
     background: none; border: 0; border-bottom: 2px solid transparent;

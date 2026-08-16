@@ -1,0 +1,25 @@
+---
+title: Configuration fields
+description: Generated field and constraint inventory for Leani configuration schema version 1.
+section: reference
+order: 20
+audience:
+  - operator
+  - processor-author
+status: preview
+generated: true
+---
+
+import { Aside } from '@astrojs/starlight/components';
+import ReferenceTable from '@docs/components/docs/ReferenceTable.astro';
+
+This inventory is generated from `config/schema-v1.json`. “Required here” means
+required by the immediate containing object; optional objects can still contain
+required members when present.
+
+<Aside type="tip" title="Validate the assembled file">
+  JSON Schema catches structural mistakes. `leani doctor` additionally applies
+  cross-field, processor-owned, source, retention, and budget validation.
+</Aside>
+
+<ReferenceTable kind="config" />

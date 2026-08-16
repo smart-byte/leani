@@ -1,0 +1,29 @@
+{
+  "schemaVersion": 1,
+  "processors": [
+    {
+      "id": "blobs-money",
+      "description": "Mainnet blob blocks, transactions, fees, burn, capacity, and fork-aware schedule"
+    },
+    {
+      "id": "erc20-balances",
+      "description": "Watchlist ERC-20 transfer ledger with current balances"
+    },
+    {
+      "id": "evm-events",
+      "description": "ABI-decoded EVM logs with configurable entity keys and time buckets"
+    },
+    {
+      "id": "transaction-stats",
+      "description": "Directional transaction counts and value totals for one address pair"
+    },
+    {
+      "id": "uniswap-latest",
+      "description": "Latest materialized Uniswap V2/V3 pool state with typed query routes"
+    },
+    {
+      "id": "uniswap-observations",
+      "description": "Append-only Uniswap V2/V3 pool observations"
+    }
+  ]
+}

@@ -1,0 +1,20 @@
+---
+title: Built-in processors
+description: Generated catalog of every processor factory registered by the standard Leani binary.
+section: reference
+order: 50
+audience:
+  - app-developer
+  - operator
+  - processor-author
+status: preview
+generated: true
+---
+
+import ReferenceTable from '@docs/components/docs/ReferenceTable.astro';
+
+This catalog comes from `ProcessorRegistry::standard()`. Adding, removing, or
+renaming a built-in factory changes the tracked fixture in the same Rust commit.
+Runtime `/v1/capabilities` remains authoritative for one configured node.
+
+<ReferenceTable kind="processors" />

@@ -14,5 +14,5 @@ pub use leani_api::{
 pub use process::{Exit, run, run_cli_with_registry, run_with_registry};
 pub use processors::{
     ProcessorAssembly, ProcessorComponents, ProcessorFactory, ProcessorFactoryContext,
-    ProcessorFactoryError, ProcessorRegistry, ProcessorRegistryError,
+    ProcessorFactoryError, ProcessorFactoryMetadata, ProcessorRegistry, ProcessorRegistryError,
 };
