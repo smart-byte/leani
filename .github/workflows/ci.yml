@@ -53,6 +53,8 @@ jobs:
       - run: bun install --frozen-lockfile
       - run: bun run openapi:check
       - run: bun run typecheck
+      - name: Type-check canonical SDK examples
+        run: node_modules/.bin/tsc -p ../../examples/sdk-subscription/tsconfig.json --noEmit
       - run: bun test
       - run: bun run build
       - run: bun run test:package

@@ -25,7 +25,7 @@ describe('canned data', () => {
     for (const file of files) {
       const demo = (await import(new URL(file, demoDir).pathname)).default;
       ids.add(demo.id);
-      for (const key of ['id', 'label', 'caption', 'docsUrl', 'config', 'dataType'] as const) {
+      for (const key of ['id', 'label', 'caption', 'docsUrl', 'dataType'] as const) {
         expect(typeof demo[key]).toBe('string');
         expect(demo[key].length).toBeGreaterThan(0);
       }
@@ -33,7 +33,9 @@ describe('canned data', () => {
       const hasReplay = Array.isArray(demo.output) && demo.output.length > 0;
       const hasTree = demo.outputJson !== null && typeof demo.outputJson === 'object';
       expect(hasReplay || hasTree).toBe(true);
-      expect(demo.docsUrl.startsWith('https://github.com/smart-byte/leani/')).toBe(true);
+      expect(
+        demo.docsUrl.startsWith('https://github.com/smart-byte/leani/') || demo.docsUrl.startsWith('/docs/'),
+      ).toBe(true);
       if (demo.helloJson) {
         expect(demo.helloJson.processor.genericApi).toBe('processor-v1');
         expect(Array.isArray(demo.helloJson.processor.queryExtensions)).toBe(true);
@@ -46,17 +48,16 @@ describe('canned data', () => {
         expect(typeof demo.outputJson.originId).toBe('string');
         expect(typeof demo.outputJson.publicationRevision).toBe('string');
       }
-      if (demo.configLang === 'toml') {
+      if ('config' in demo && demo.configLang === 'toml') {
         expect(demo.config).not.toContain('retention =');
         for (const field of ['instance =', 'version =', '[processors.state]', '[processors.output]', '[processors.delivery]', '[processors.checkpoint]', '[processors.undo]']) {
           expect(demo.config).toContain(field);
         }
       }
       if (demo.id === 'custom') {
-        expect(demo.config).toContain('ProcessorComponents');
-        expect(demo.config).toContain('QueryExtension');
-        expect(demo.queryExample).toContain('leani.request<BlockSummary>');
-        expect(demo.guideUrl).toBe('/docs#custom-processors');
+        expect('config' in demo).toBe(false);
+        expect('queryExample' in demo).toBe(false);
+        expect(demo.guideUrl).toBe('/docs/guides/custom-processor/');
       }
     }
     expect(ids).toEqual(new Set([
@@ -67,6 +68,17 @@ describe('canned data', () => {
       'transaction-stats',
       'custom',
     ]));
+  });
+
+  test('landing custom and quickstart snippets use canonical example IDs', async () => {
+    const [showcaseSource, quickstartSource] = await Promise.all([
+      Bun.file(new URL('../src/components/Showcase.astro', import.meta.url)).text(),
+      Bun.file(new URL('../src/components/Quickstart.astro', import.meta.url)).text(),
+    ]);
+    expect(showcaseSource).toContain("exampleSource('custom-processor-extension')");
+    expect(showcaseSource).toContain("exampleSource('custom-query-client')");
+    expect(quickstartSource).toContain("exampleSource('offline-quickstart')");
+    expect(quickstartSource).toContain("exampleSource('bounded-mainnet-quickstart')");
   });
 
   test('storage table has 4 lifecycle profiles and evidence notes', () => {

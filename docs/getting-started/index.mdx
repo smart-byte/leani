@@ -10,6 +10,7 @@ status: preview
 ---
 
 import { Aside, Card, CardGrid, Steps } from '@astrojs/starlight/components';
+import CodeExample from '@docs/components/docs/CodeExample.astro';
 
 The safest first run uses Leani's deterministic fixture mode. It requires no
 Ethereum provider, writes only to a local data directory, and exercises the same
@@ -52,3 +53,11 @@ configuration and processor lifecycle used by a network-backed node.
 The next documentation migration commits split installation, offline proof,
 first-range configuration, and first-consumer integration into checked,
 copyable examples.
+
+## Prove the release offline
+
+<CodeExample example="offline-quickstart" />
+
+## Request a bounded Mainnet range
+
+<CodeExample example="bounded-mainnet-quickstart" />

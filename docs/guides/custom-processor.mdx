@@ -1,0 +1,46 @@
+---
+title: Build a custom processor
+description: Register a native Rust processor and expose a capability-discovered typed query extension.
+section: guides
+order: 10
+audience:
+  - processor-author
+status: preview
+---
+
+import { Aside, Steps } from '@astrojs/starlight/components';
+import CodeExample from '@docs/components/docs/CodeExample.astro';
+
+A downstream binary can register a processor without forking Leani. The public
+factory contract returns processor components: the state transform is required;
+query extensions are optional and owned by that processor.
+
+<Steps>
+1. Implement deterministic `map` and `reduce` behavior against the declared data
+   requirements.
+2. Register a factory under a stable processor ID.
+3. Attach a query extension when the processor needs a typed read model beyond
+   the generic collection API.
+4. Declare every state, output, delivery, checkpoint, undo, and publication
+   policy in the instance configuration.
+5. Discover the mounted extension from capabilities instead of constructing its
+   URL from an assumption.
+</Steps>
+
+## Processor-owned query route
+
+<CodeExample example="custom-processor-extension" />
+
+## Complete lifecycle configuration
+
+<CodeExample example="custom-processor-config" />
+
+## Capability-driven client
+
+<CodeExample example="custom-query-client" />
+
+<Aside type="caution" title="Native processors are trusted code">
+  A custom processor runs in the node process. Treat it like any other part of
+  your production binary: pin dependencies, review code, and test migrations and
+  reorg behavior before deployment.
+</Aside>

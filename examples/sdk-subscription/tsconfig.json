@@ -1,0 +1,11 @@
+{
+  "extends": "../../packages/sdk/tsconfig.json",
+  "compilerOptions": {
+    "baseUrl": ".",
+    "paths": {
+      "@leani/sdk": ["../../packages/sdk/src/index.ts"]
+    },
+    "noEmit": true
+  },
+  "include": ["index.ts", "../custom-node/client.ts"]
+}

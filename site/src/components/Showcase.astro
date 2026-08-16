@@ -6,9 +6,15 @@ import erc20 from '../data/processors/erc20-balances.json';
 import evmEvents from '../data/processors/evm-events.json';
 import uniswap from '../data/processors/uniswap-latest.json';
 import txStats from '../data/processors/transaction-stats.json';
-import custom from '../data/processors/custom.json';
+import customMetadata from '../data/processors/custom.json';
 import { hlTs } from '../lib/highlight';
+import { exampleSource } from '../lib/examples';
 
+const custom = {
+  ...customMetadata,
+  config: exampleSource('custom-processor-extension').code,
+  queryExample: exampleSource('custom-query-client').code,
+};
 const demos = [blobs, erc20, evmEvents, uniswap, txStats, custom];
 
 // Build-time rendering of the committed TS type strings: parse into a tree

@@ -1,0 +1,42 @@
+---
+title: Consume changes durably
+description: Persist application state and an opaque Leani cursor atomically, then acknowledge only after commit.
+section: guides
+order: 20
+audience:
+  - app-developer
+status: preview
+---
+
+import { Aside, Steps } from '@astrojs/starlight/components';
+import CodeExample from '@docs/components/docs/CodeExample.astro';
+
+The cursor in a Leani change envelope is an opaque resume and acknowledgement
+token. Store it beside the application state derived from that change. The
+destination transaction is the durable boundary; the later Leani
+acknowledgement advances retention and delivery state.
+
+<Steps>
+1. Create a stable named consumer once, or inspect the existing consumer after a
+   restart.
+2. Poll retained changes under a lease.
+3. Apply one change idempotently and store its cursor in the same destination
+   transaction.
+4. Commit the destination transaction.
+5. Acknowledge that cursor to Leani. If this request is lost, accept the same
+   change again and rely on idempotent application.
+</Steps>
+
+<CodeExample example="durable-consumer" />
+
+The destination's committed record can be normalized into a small operational
+checkpoint:
+
+<CodeExample example="durable-consumer-output" />
+
+<Aside type="danger" title="Never acknowledge before your commit">
+  An early acknowledgement can make Leani eligible to discard history your
+  application has not durably applied. A failed acknowledgement after commit is
+  safe: the event may be delivered again, so application writes must be
+  idempotent.
+</Aside>

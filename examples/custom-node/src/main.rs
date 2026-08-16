@@ -187,6 +187,7 @@ fn validate_cursor(cursor: &ProcessorCursor, delta: &EncodedDelta) -> Result<(),
 #[derive(Clone, Copy, Debug)]
 struct BlockSummaryFactory;
 
+// docs:start custom-processor-extension
 #[derive(Clone, Copy, Debug)]
 struct BlockSummaryQueryExtension;
 
@@ -237,6 +238,7 @@ impl ProcessorFactory for BlockSummaryFactory {
         )
     }
 }
+// docs:end custom-processor-extension
 
 #[tokio::main]
 async fn main() -> std::process::ExitCode {

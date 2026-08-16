@@ -1,0 +1,45 @@
+---
+import { Code } from 'astro-expressive-code/components';
+import buildMetadata from '../../generated/build-metadata.json';
+import { exampleSource, type ExampleId } from '../../lib/examples';
+
+interface Props {
+  example: ExampleId;
+  title?: string;
+}
+
+const { example: id, title } = Astro.props;
+const source = exampleSource(id);
+const sourceUrl = `https://github.com/smart-byte/leani/blob/${encodeURIComponent(buildMetadata.docsRef)}/${source.source.file
+  .split('/')
+  .map(encodeURIComponent)
+  .join('/')}`;
+---
+
+<figure class="code-example" data-example-id={id}>
+  <Code code={source.code} lang={source.language} title={title || source.title} />
+  <figcaption>
+    <span>{source.description}</span>
+    <a href={sourceUrl}>Verified source</a>
+  </figcaption>
+</figure>
+
+<style>
+  .code-example {
+    margin-block: 1.5rem;
+  }
+
+  figcaption {
+    color: var(--sl-color-gray-3);
+    display: flex;
+    flex-wrap: wrap;
+    font-size: var(--sl-text-sm);
+    gap: 0.5rem 1rem;
+    justify-content: space-between;
+    margin-block-start: 0.45rem;
+  }
+
+  figcaption a {
+    white-space: nowrap;
+  }
+</style>

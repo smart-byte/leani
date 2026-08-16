@@ -67,6 +67,9 @@ jobs:
       - name: Validate docs and site
         working-directory: site
         run: bun run check
+      - name: Verify canonical examples
+        working-directory: site
+        run: bun run examples:check
       - name: Verify cross-root docs watching
         working-directory: site
         run: bun run docs:watch-check

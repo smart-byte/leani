@@ -12,6 +12,10 @@ export default defineConfig({
       // which is a sibling of site/node_modules rather than its parent.
       alias: [
         {
+          find: /^@docs\/(.*)$/,
+          replacement: fileURLToPath(new URL('./src/$1', import.meta.url)),
+        },
+        {
           find: /^@astrojs\/starlight\/components$/,
           replacement: fileURLToPath(
             new URL('./node_modules/@astrojs/starlight/components.ts', import.meta.url),

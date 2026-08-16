@@ -2,11 +2,9 @@
   "id": "custom",
   "label": "write your own",
   "caption": "Native Rust processors register state transforms and typed read extensions through the public factory API — same durability, streams, coverage, and query controls as built-ins.",
-  "guideUrl": "/docs#custom-processors",
-  "docsUrl": "https://github.com/smart-byte/leani/blob/main/docs/CUSTOM-PROCESSORS.md",
+  "guideUrl": "/docs/guides/custom-processor/",
+  "docsUrl": "/docs/guides/custom-processor/",
   "configLang": "rust",
-  "config": "impl ProcessorFactory for BlockSummaryFactory {\n    fn id(&self) -> &'static str { \"example-block-summary\" }\n\n    fn create(\n        &self,\n        config: &ProcessorConfig,\n        _context: ProcessorFactoryContext,\n    ) -> Result<ProcessorComponents, ProcessorFactoryError> {\n        let processor = Arc::new(\n            BlockSummaryProcessor::new(config)?\n        );\n        Ok(ProcessorComponents::new(processor)\n            .with_query_extension(Arc::new(BlockSummaryQueries)))\n    }\n}\n\nimpl QueryExtension for BlockSummaryQueries {\n    fn id(&self) -> &'static str { \"block-summary-v1\" }\n    fn alias(&self) -> Option<&str> { Some(\"block-summaries\") }\n    fn routes(&self) -> Router<QueryContext> {\n        Router::new().route(\"/{number}\", get(summary))\n    }\n}",
-  "queryExample": "interface BlockSummary {\n  blockNumber: number;\n  timestamp: number;\n}\n\nconst summary = await leani.request<BlockSummary>(\n  \"v1/processors/block-summaries/query/25696396\",\n);\n// { blockNumber: 25696396, timestamp: 1786025147 }",
   "dataType": "{\n  blockNumber: number;\n  timestamp: number;\n}",
   "sseId": "opaque-resume-cursor",
   "helloJson": {

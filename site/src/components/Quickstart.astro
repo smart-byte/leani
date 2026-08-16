@@ -1,6 +1,10 @@
 ---
 import TerminalFrame from './TerminalFrame.astro';
 import { QUICKSTART_URL } from '../config';
+import { exampleSource } from '../lib/examples';
+
+const offlineQuickstart = exampleSource('offline-quickstart').code;
+const boundedMainnetQuickstart = exampleSource('bounded-mainnet-quickstart').code;
 ---
 <section id="quickstart" class="wrap section" aria-labelledby="quickstart-h">
   <p class="eyebrow mono">No network required for step 1</p>
@@ -15,7 +19,7 @@ import { QUICKSTART_URL } from '../config';
       <p class="mono label">1 · verify the release</p>
       <TerminalFrame title="shell">
         <div class="command">
-          <span class="t-line" data-copy-source>{'brew install leani-dev/tap/leani\nmkdir -p /tmp/leani-quickstart\nleani e2e fixture \\\n  --data-dir /tmp/leani-quickstart \\\n  --blocks 128 \\\n  --report /tmp/leani-quickstart/report.json'}</span>
+          <span class="t-line" data-copy-source>{offlineQuickstart}</span>
           <button type="button" class="copy mono" data-copy-button aria-label="Copy release verification commands">copy</button>
         </div>
       </TerminalFrame>
@@ -25,7 +29,7 @@ import { QUICKSTART_URL } from '../config';
       <p class="mono label">2 · run a bounded Mainnet API</p>
       <TerminalFrame title="shell">
         <div class="command">
-          <span class="t-line" data-copy-source>{'curl -fsSLo windowed.toml \\\n  https://raw.githubusercontent.com/smart-byte/leani/main/config/modes/windowed.toml\nleani --config windowed.toml doctor --json\nleani --config windowed.toml backfill \\\n  --processor evm-events --from 10000835 --to 10001834\nleani --config windowed.toml serve'}</span>
+          <span class="t-line" data-copy-source>{boundedMainnetQuickstart}</span>
           <button type="button" class="copy mono" data-copy-button aria-label="Copy bounded Mainnet API commands">copy</button>
         </div>
       </TerminalFrame>

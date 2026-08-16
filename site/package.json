@@ -10,6 +10,7 @@
     "docs:prepare": "bun ../scripts/docs/prepare.ts",
     "docs:check": "bun ../scripts/docs/check.ts",
     "docs:watch-check": "bun run docs:prepare && bun ../scripts/docs/watch-check.ts",
+    "examples:check": "bun ../scripts/docs/verify-examples.ts --shell",
     "search:check": "bun ../scripts/docs/search-check.ts",
     "test": "bun test"
   },
