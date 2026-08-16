@@ -9,9 +9,4 @@ packages/sdk/dist
 *.sqlite-wal
 .env
 .env.*
-AGENTS.md
-docs/PIPELINED-BACKFILL-DELIVERY-PLAN.md
-docs/RAW-HISTORY-AND-PROCESSOR-ARTIFACTS-PLAN.md
-docs/XATU-OPTIMIZATIONS.md
-docs/evidence/benchmarks/*.json
-docs/superpowers
+.private

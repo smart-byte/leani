@@ -12,17 +12,9 @@
 *.sqlite-shm
 *.sqlite-wal
 
-# Local product planning and pre-release records. These are archived with the
-# private pre-public history, not included in the release repository.
-/BACKLOG.md
-/PLAN.md
-/docs/*-PLAN.md
-/docs/IMPLEMENTATION-DESIGN.md
-/docs/IMPLEMENTATION-STATUS.md
-/docs/OPEN-SOURCE-READINESS.md
-/docs/RELEASE-CHECKLIST.md
-/docs/ROADMAP.md
-/docs/evidence/
+# Local product planning, pre-release records, raw evidence, and repository
+# archives live under one explicitly private tree. This is not a backup.
+/.private/
 
 # Benchmark and validation output. Benchmark implementations and reproducible
 # input manifests remain versioned; generated measurements stay local.
@@ -30,6 +22,3 @@
 /benchmark*.json
 /benchmark*.ndjson
 /benchmark-sweep-results/
-/AGENTS.md
-/docs/superpowers/
-/docs/XATU-OPTIMIZATIONS.md
