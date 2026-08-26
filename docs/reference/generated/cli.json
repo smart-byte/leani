@@ -12,9 +12,7 @@
         "help": "Path to the versioned TOML configuration",
         "required": false,
         "action": "Set",
-        "defaultValues": [
-          "config/node.toml"
-        ],
+        "defaultValues": [],
         "possibleValues": []
       },
       {
@@ -48,7 +46,7 @@
         "id": "help",
         "long": "help",
         "short": "h",
-        "help": "Print help",
+        "help": "Print help (see more with '--help')",
         "required": false,
         "action": "Help",
         "defaultValues": [],
@@ -93,9 +91,7 @@
             "help": "Path to the versioned TOML configuration",
             "required": false,
             "action": "Set",
-            "defaultValues": [
-              "config/node.toml"
-            ],
+            "defaultValues": [],
             "possibleValues": []
           },
           {
@@ -129,7 +125,7 @@
             "id": "help",
             "long": "help",
             "short": "h",
-            "help": "Print help",
+            "help": "Print help (see more with '--help')",
             "required": false,
             "action": "Help",
             "defaultValues": [],
@@ -160,9 +156,7 @@
             "help": "Path to the versioned TOML configuration",
             "required": false,
             "action": "Set",
-            "defaultValues": [
-              "config/node.toml"
-            ],
+            "defaultValues": [],
             "possibleValues": []
           },
           {
@@ -196,7 +190,7 @@
             "id": "help",
             "long": "help",
             "short": "h",
-            "help": "Print help",
+            "help": "Print help (see more with '--help')",
             "required": false,
             "action": "Help",
             "defaultValues": [],
@@ -259,9 +253,7 @@
             "help": "Path to the versioned TOML configuration",
             "required": false,
             "action": "Set",
-            "defaultValues": [
-              "config/node.toml"
-            ],
+            "defaultValues": [],
             "possibleValues": []
           },
           {
@@ -295,7 +287,7 @@
             "id": "help",
             "long": "help",
             "short": "h",
-            "help": "Print help",
+            "help": "Print help (see more with '--help')",
             "required": false,
             "action": "Help",
             "defaultValues": [],
@@ -326,9 +318,7 @@
             "help": "Path to the versioned TOML configuration",
             "required": false,
             "action": "Set",
-            "defaultValues": [
-              "config/node.toml"
-            ],
+            "defaultValues": [],
             "possibleValues": []
           },
           {
@@ -362,7 +352,7 @@
             "id": "help",
             "long": "help",
             "short": "h",
-            "help": "Print help",
+            "help": "Print help (see more with '--help')",
             "required": false,
             "action": "Help",
             "defaultValues": [],
@@ -392,9 +382,7 @@
                 "help": "Path to the versioned TOML configuration",
                 "required": false,
                 "action": "Set",
-                "defaultValues": [
-                  "config/node.toml"
-                ],
+                "defaultValues": [],
                 "possibleValues": []
               },
               {
@@ -428,7 +416,7 @@
                 "id": "help",
                 "long": "help",
                 "short": "h",
-                "help": "Print help",
+                "help": "Print help (see more with '--help')",
                 "required": false,
                 "action": "Help",
                 "defaultValues": [],
@@ -588,9 +576,7 @@
                     "help": "Path to the versioned TOML configuration",
                     "required": false,
                     "action": "Set",
-                    "defaultValues": [
-                      "config/node.toml"
-                    ],
+                    "defaultValues": [],
                     "possibleValues": []
                   },
                   {
@@ -624,7 +610,7 @@
                     "id": "help",
                     "long": "help",
                     "short": "h",
-                    "help": "Print help",
+                    "help": "Print help (see more with '--help')",
                     "required": false,
                     "action": "Help",
                     "defaultValues": [],
@@ -777,9 +763,7 @@
                     "help": "Path to the versioned TOML configuration",
                     "required": false,
                     "action": "Set",
-                    "defaultValues": [
-                      "config/node.toml"
-                    ],
+                    "defaultValues": [],
                     "possibleValues": []
                   },
                   {
@@ -813,7 +797,7 @@
                     "id": "help",
                     "long": "help",
                     "short": "h",
-                    "help": "Print help",
+                    "help": "Print help (see more with '--help')",
                     "required": false,
                     "action": "Help",
                     "defaultValues": [],
@@ -906,9 +890,7 @@
                     "help": "Path to the versioned TOML configuration",
                     "required": false,
                     "action": "Set",
-                    "defaultValues": [
-                      "config/node.toml"
-                    ],
+                    "defaultValues": [],
                     "possibleValues": []
                   },
                   {
@@ -942,7 +924,7 @@
                     "id": "help",
                     "long": "help",
                     "short": "h",
-                    "help": "Print help",
+                    "help": "Print help (see more with '--help')",
                     "required": false,
                     "action": "Help",
                     "defaultValues": [],
@@ -1023,9 +1005,7 @@
                     "help": "Path to the versioned TOML configuration",
                     "required": false,
                     "action": "Set",
-                    "defaultValues": [
-                      "config/node.toml"
-                    ],
+                    "defaultValues": [],
                     "possibleValues": []
                   },
                   {
@@ -1059,7 +1039,7 @@
                     "id": "help",
                     "long": "help",
                     "short": "h",
-                    "help": "Print help",
+                    "help": "Print help (see more with '--help')",
                     "required": false,
                     "action": "Help",
                     "defaultValues": [],
@@ -1188,9 +1168,7 @@
             "help": "Path to the versioned TOML configuration",
             "required": false,
             "action": "Set",
-            "defaultValues": [
-              "config/node.toml"
-            ],
+            "defaultValues": [],
             "possibleValues": []
           },
           {
@@ -1224,7 +1202,7 @@
             "id": "help",
             "long": "help",
             "short": "h",
-            "help": "Print help",
+            "help": "Print help (see more with '--help')",
             "required": false,
             "action": "Help",
             "defaultValues": [],
@@ -1326,9 +1304,7 @@
                 "help": "Path to the versioned TOML configuration",
                 "required": false,
                 "action": "Set",
-                "defaultValues": [
-                  "config/node.toml"
-                ],
+                "defaultValues": [],
                 "possibleValues": []
               },
               {
@@ -1362,7 +1338,7 @@
                 "id": "help",
                 "long": "help",
                 "short": "h",
-                "help": "Print help",
+                "help": "Print help (see more with '--help')",
                 "required": false,
                 "action": "Help",
                 "defaultValues": [],
@@ -1455,9 +1431,7 @@
                 "help": "Path to the versioned TOML configuration",
                 "required": false,
                 "action": "Set",
-                "defaultValues": [
-                  "config/node.toml"
-                ],
+                "defaultValues": [],
                 "possibleValues": []
               },
               {
@@ -1491,7 +1465,7 @@
                 "id": "help",
                 "long": "help",
                 "short": "h",
-                "help": "Print help",
+                "help": "Print help (see more with '--help')",
                 "required": false,
                 "action": "Help",
                 "defaultValues": [],
@@ -1562,9 +1536,7 @@
                 "help": "Path to the versioned TOML configuration",
                 "required": false,
                 "action": "Set",
-                "defaultValues": [
-                  "config/node.toml"
-                ],
+                "defaultValues": [],
                 "possibleValues": []
               },
               {
@@ -1598,7 +1570,7 @@
                 "id": "help",
                 "long": "help",
                 "short": "h",
-                "help": "Print help",
+                "help": "Print help (see more with '--help')",
                 "required": false,
                 "action": "Help",
                 "defaultValues": [],
@@ -2157,9 +2129,7 @@
             "help": "Path to the versioned TOML configuration",
             "required": false,
             "action": "Set",
-            "defaultValues": [
-              "config/node.toml"
-            ],
+            "defaultValues": [],
             "possibleValues": []
           },
           {
@@ -2243,9 +2213,7 @@
                 "help": "Path to the versioned TOML configuration",
                 "required": false,
                 "action": "Set",
-                "defaultValues": [
-                  "config/node.toml"
-                ],
+                "defaultValues": [],
                 "possibleValues": []
               },
               {
@@ -2279,7 +2247,7 @@
                 "id": "help",
                 "long": "help",
                 "short": "h",
-                "help": "Print help",
+                "help": "Print help (see more with '--help')",
                 "required": false,
                 "action": "Help",
                 "defaultValues": [],
@@ -2470,9 +2438,7 @@
                 "help": "Path to the versioned TOML configuration",
                 "required": false,
                 "action": "Set",
-                "defaultValues": [
-                  "config/node.toml"
-                ],
+                "defaultValues": [],
                 "possibleValues": []
               },
               {
@@ -2568,9 +2534,7 @@
             "help": "Path to the versioned TOML configuration",
             "required": false,
             "action": "Set",
-            "defaultValues": [
-              "config/node.toml"
-            ],
+            "defaultValues": [],
             "possibleValues": []
           },
           {
@@ -2604,7 +2568,7 @@
             "id": "help",
             "long": "help",
             "short": "h",
-            "help": "Print help",
+            "help": "Print help (see more with '--help')",
             "required": false,
             "action": "Help",
             "defaultValues": [],
@@ -2666,9 +2630,7 @@
                 "help": "Path to the versioned TOML configuration",
                 "required": false,
                 "action": "Set",
-                "defaultValues": [
-                  "config/node.toml"
-                ],
+                "defaultValues": [],
                 "possibleValues": []
               },
               {
@@ -2702,7 +2664,7 @@
                 "id": "help",
                 "long": "help",
                 "short": "h",
-                "help": "Print help",
+                "help": "Print help (see more with '--help')",
                 "required": false,
                 "action": "Help",
                 "defaultValues": [],
@@ -2840,9 +2802,7 @@
                 "help": "Path to the versioned TOML configuration",
                 "required": false,
                 "action": "Set",
-                "defaultValues": [
-                  "config/node.toml"
-                ],
+                "defaultValues": [],
                 "possibleValues": []
               },
               {
@@ -2876,7 +2836,7 @@
                 "id": "help",
                 "long": "help",
                 "short": "h",
-                "help": "Print help",
+                "help": "Print help (see more with '--help')",
                 "required": false,
                 "action": "Help",
                 "defaultValues": [],
@@ -2938,9 +2898,7 @@
             "help": "Path to the versioned TOML configuration",
             "required": false,
             "action": "Set",
-            "defaultValues": [
-              "config/node.toml"
-            ],
+            "defaultValues": [],
             "possibleValues": []
           },
           {
@@ -2974,7 +2932,7 @@
             "id": "help",
             "long": "help",
             "short": "h",
-            "help": "Print help",
+            "help": "Print help (see more with '--help')",
             "required": false,
             "action": "Help",
             "defaultValues": [],
@@ -3004,9 +2962,7 @@
                 "help": "Path to the versioned TOML configuration",
                 "required": false,
                 "action": "Set",
-                "defaultValues": [
-                  "config/node.toml"
-                ],
+                "defaultValues": [],
                 "possibleValues": []
               },
               {
@@ -3040,7 +2996,7 @@
                 "id": "help",
                 "long": "help",
                 "short": "h",
-                "help": "Print help",
+                "help": "Print help (see more with '--help')",
                 "required": false,
                 "action": "Help",
                 "defaultValues": [],
@@ -3071,9 +3027,7 @@
                 "help": "Path to the versioned TOML configuration",
                 "required": false,
                 "action": "Set",
-                "defaultValues": [
-                  "config/node.toml"
-                ],
+                "defaultValues": [],
                 "possibleValues": []
               },
               {
@@ -3107,7 +3061,7 @@
                 "id": "help",
                 "long": "help",
                 "short": "h",
-                "help": "Print help",
+                "help": "Print help (see more with '--help')",
                 "required": false,
                 "action": "Help",
                 "defaultValues": [],
@@ -3148,9 +3102,7 @@
                 "help": "Path to the versioned TOML configuration",
                 "required": false,
                 "action": "Set",
-                "defaultValues": [
-                  "config/node.toml"
-                ],
+                "defaultValues": [],
                 "possibleValues": []
               },
               {
@@ -3184,7 +3136,7 @@
                 "id": "help",
                 "long": "help",
                 "short": "h",
-                "help": "Print help",
+                "help": "Print help (see more with '--help')",
                 "required": false,
                 "action": "Help",
                 "defaultValues": [],
@@ -3215,9 +3167,7 @@
                 "help": "Path to the versioned TOML configuration",
                 "required": false,
                 "action": "Set",
-                "defaultValues": [
-                  "config/node.toml"
-                ],
+                "defaultValues": [],
                 "possibleValues": []
               },
               {
@@ -3251,7 +3201,7 @@
                 "id": "help",
                 "long": "help",
                 "short": "h",
-                "help": "Print help",
+                "help": "Print help (see more with '--help')",
                 "required": false,
                 "action": "Help",
                 "defaultValues": [],
@@ -3302,9 +3252,7 @@
                 "help": "Path to the versioned TOML configuration",
                 "required": false,
                 "action": "Set",
-                "defaultValues": [
-                  "config/node.toml"
-                ],
+                "defaultValues": [],
                 "possibleValues": []
               },
               {
@@ -3338,7 +3286,7 @@
                 "id": "help",
                 "long": "help",
                 "short": "h",
-                "help": "Print help",
+                "help": "Print help (see more with '--help')",
                 "required": false,
                 "action": "Help",
                 "defaultValues": [],

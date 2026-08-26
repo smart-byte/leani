@@ -34,8 +34,9 @@ formula, and production docs should all identify the same release tag.
 <Steps>
 1. Verify the release archive checksum or pin the container digest.
 2. Run `leani --version` and record it with your deployment configuration.
-3. Run `leani doctor --config /path/to/node.toml --json` before allowing
-   network or database access.
+3. Save the selected profile as `./leani.toml` and run `leani doctor --json`
+   before allowing network or database access. Use `LEANI_CONFIG` or
+   `--config` when the file intentionally lives elsewhere.
 4. Continue with the deterministic [offline proof](/docs/getting-started/offline-proof/).
 </Steps>
 

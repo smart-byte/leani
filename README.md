@@ -188,15 +188,16 @@ cargo run -- source probe p2p \
 ```
 
 Once a valid operational configuration is present, the durable store can be
-inspected, verified, backed up, and compacted without starting network actors:
+inspected, verified, backed up, and compacted without starting network actors.
+From the repository root, Leani discovers `config/example.toml`; installed
+workflows normally keep the selected profile at `./leani.toml`:
 
 ```bash
-cargo run -- db inspect --config config/node.toml
-cargo run -- db verify --config config/node.toml
-cargo run -- db backup ./backup.sqlite --config config/node.toml
-cargo run -- db compact --config config/node.toml
-cargo run -- db prune-changes --processor blobs-money --before 100000 \
-  --config config/node.toml
+cargo run -- db inspect
+cargo run -- db verify
+cargo run -- db backup ./backup.sqlite
+cargo run -- db compact
+cargo run -- db prune-changes --processor blobs-money --before 100000
 ```
 
 The built-in blobs processor can be backfilled through the generic durable
@@ -206,8 +207,7 @@ automatically:
 ```bash
 cargo run -- backfill \
   --from 19426589 \
-  --to 19427588 \
-  --config config/node.toml
+  --to 19427588
 ```
 
 The command resumes from committed coverage, not from downloaded files. It
@@ -224,8 +224,7 @@ reference client without mutating node state:
 cargo run -- conformance processor \
   --processor blobs-money \
   --left-source xatu --left xatu.json \
-  --right-source erae --right erae.json \
-  --config config/node.toml
+  --right-source erae --right erae.json
 
 cargo run -- conformance rpc \
   --frames erae.json \

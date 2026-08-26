@@ -9,8 +9,12 @@ use clap::{Parser, Subcommand, ValueEnum};
 #[command(name = "leani", version, propagate_version = true)]
 pub struct Cli {
     /// Path to the versioned TOML configuration.
-    #[arg(long, global = true, default_value = "config/node.toml")]
-    pub config: PathBuf,
+    ///
+    /// When omitted, Leani discovers `./leani.toml`, then the source-workspace
+    /// fallback `./config/example.toml`. `LEANI_CONFIG` provides a persistent
+    /// override without repeating this flag.
+    #[arg(long, global = true, env = "LEANI_CONFIG")]
+    pub config: Option<PathBuf>,
 
     /// Log rendering format.
     #[arg(long, global = true, value_enum, default_value_t = LogFormat::Pretty)]
@@ -634,7 +638,7 @@ mod tests {
     fn accepts_global_config_after_subcommand() {
         let cli = Cli::try_parse_from(["leani", "doctor", "--json", "--config", "fixture.toml"])
             .expect("CLI parses");
-        assert_eq!(cli.config, PathBuf::from("fixture.toml"));
+        assert_eq!(cli.config, Some(PathBuf::from("fixture.toml")));
         assert!(matches!(cli.command, Command::Doctor { json: true }));
     }
 

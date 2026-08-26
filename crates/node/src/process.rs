@@ -4,7 +4,7 @@ use std::{
     collections::BTreeMap,
     fs,
     io::IsTerminal,
-    path::Path,
+    path::{Path, PathBuf},
     process::ExitCode,
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -2579,19 +2579,21 @@ pub async fn run_cli(cli: Cli) -> Result<Exit> {
 /// execution fails.
 #[allow(clippy::too_many_lines)]
 pub async fn run_cli_with_registry(cli: Cli, registry: &ProcessorRegistry) -> Result<Exit> {
+    let working_directory = std::env::current_dir().context("resolve current working directory")?;
+    let config_path = resolve_config_path(cli.config.as_deref(), &working_directory);
     match cli.command {
-        Command::Doctor { json } => doctor(&cli.config, json, registry),
-        Command::Serve => serve(&cli.config, registry).await,
+        Command::Doctor { json } => doctor(&config_path, json, registry),
+        Command::Serve => serve(&config_path, registry).await,
         Command::Backfill {
             processor,
             from,
             to,
-        } => backfill(&cli.config, &processor, from, to, registry).await,
+        } => backfill(&config_path, &processor, from, to, registry).await,
         Command::Source {
             command: SourceCommand::Probe { source },
-        } => probe_source(source, &cli.config).await,
-        Command::Conformance { command } => conformance(command, &cli.config, registry).await,
-        Command::Db { command } => db(command, &cli.config, registry).await,
+        } => probe_source(source, &config_path).await,
+        Command::Conformance { command } => conformance(command, &config_path, registry).await,
+        Command::Db { command } => db(command, &config_path, registry).await,
         Command::Benchmark {
             command,
             mode,
@@ -2656,7 +2658,7 @@ pub async fn run_cli_with_registry(cli: Cli, registry: &ProcessorRegistry) -> Re
                         report,
                     } => {
                         Box::pin(crate::benchmark::run_real_source(
-                            &cli.config,
+                            &config_path,
                             RealSourceBenchmarkOptions {
                                 processor,
                                 source_policy,
@@ -2724,8 +2726,21 @@ pub async fn run_cli_with_registry(cli: Cli, registry: &ProcessorRegistry) -> Re
             }))
             .await
         }
-        Command::E2e { command } => e2e(command, &cli.config, registry).await,
+        Command::E2e { command } => e2e(command, &config_path, registry).await,
     }
+}
+
+fn resolve_config_path(explicit: Option<&Path>, working_directory: &Path) -> PathBuf {
+    if let Some(path) = explicit {
+        return path.to_owned();
+    }
+    for candidate in ["leani.toml", "config/example.toml"] {
+        let path = working_directory.join(candidate);
+        if path.is_file() {
+            return path;
+        }
+    }
+    working_directory.join("leani.toml")
 }
 
 #[derive(Debug, Serialize)]
@@ -2994,6 +3009,18 @@ async fn backfill(
     let range = BlockRange::new(BlockNumber(from), BlockNumber(to))?;
     let (sources, verification_policy) =
         configured_history_sources(&config, processor.as_ref(), None)?;
+    let source_ids = sources
+        .iter()
+        .map(|source| source.descriptor().id.to_string())
+        .collect::<Vec<_>>();
+    info!(
+        processor = %processor.descriptor().instance,
+        requested_from = from,
+        requested_to = to,
+        requested_blocks = range.len(),
+        source_ids = ?source_ids,
+        "starting processor historical backfill"
+    );
     let store = SqliteStore::open(configured_store_config(
         &config,
         config.data_dir.join("leani.sqlite"),
@@ -6732,6 +6759,27 @@ mod tests {
         .expect("CLI parses");
         let error = run_cli(cli).await.expect_err("missing config fails");
         assert!(error.to_string().contains("failed to read configuration"));
+    }
+
+    #[test]
+    fn configuration_discovery_prefers_explicit_then_project_local_then_workspace() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let workspace_config = directory.path().join("config/example.toml");
+        std::fs::create_dir_all(workspace_config.parent().expect("config parent"))
+            .expect("create config directory");
+        std::fs::write(&workspace_config, "workspace").expect("write workspace config");
+        assert_eq!(
+            resolve_config_path(None, directory.path()),
+            workspace_config
+        );
+
+        let local_config = directory.path().join("leani.toml");
+        std::fs::write(&local_config, "local").expect("write local config");
+        assert_eq!(resolve_config_path(None, directory.path()), local_config);
+        assert_eq!(
+            resolve_config_path(Some(Path::new("explicit.toml")), directory.path()),
+            PathBuf::from("explicit.toml")
+        );
     }
 
     #[tokio::test]

@@ -16,8 +16,17 @@ six complete lifecycle profiles are checked under `config/modes`.
 Validate a file without opening its database or any network connection:
 
 ```bash
-leani --config config/node.toml doctor --json
+cp config/modes/windowed.toml leani.toml
+leani doctor --json
 ```
+
+Without `--config`, Leani looks for `./leani.toml` and then
+`./config/example.toml` (the source-workspace fallback). Set `LEANI_CONFIG` when a
+service or shell should consistently use a configuration elsewhere. An
+explicit `--config` remains the highest-precedence override. Leani does not
+invent defaults for chain identity, source trust, finality, processor
+lifecycle, or storage budgets; those choices remain visible in the selected
+TOML.
 
 ## Root fields
 

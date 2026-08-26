@@ -23,11 +23,11 @@ Every checked profile is a complete configuration that `leani doctor` validates.
 | `terminal` | One bounded result and delivery contract for a finite job | Reports and batch outcomes |
 | `full` | Complete configured output collection | Small, intentionally permanent application datasets |
 
-Copy the closest file from `config/modes`, change its `data_dir`, processor
+Copy the closest file from `config/modes` to `./leani.toml`, change its `data_dir`, processor
 identity, start block, source credentials, and budgets, then run:
 
 ```bash
-leani --config config/node.toml doctor --json
+leani doctor --json
 ```
 
 ## Questions that choose the policy
