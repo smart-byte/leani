@@ -6,6 +6,11 @@
   --ink-dim: #8fa89a;
   --accent: #3ee07f;
   --accent-dim: #1f7a4a;
+  --syntax-keyword: var(--accent);
+  --syntax-string: #9ff0c4;
+  --syntax-number: #69e79c;
+  --syntax-name: var(--ink);
+  --syntax-muted: var(--ink-dim);
   --font-mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, monospace;
   --font-sans: 'Inter Variable', system-ui, sans-serif;
   --max-width: 72rem;
@@ -81,9 +86,8 @@ a:hover { text-decoration-thickness: 2px; }
 }
 
 /* Token colors for highlighted terminal/code blocks (src/lib/highlight.ts). */
-.hl-prompt { color: var(--accent-dim); }
-.hl-flag { color: var(--ink-dim); }
-.hl-str { color: #9ff0c4; }
-.hl-num { color: var(--accent); }
-.hl-kw { color: var(--accent); }
-.hl-com { color: var(--ink-dim); }
+.hl-prompt, .hl-flag, .hl-com { color: var(--syntax-muted); }
+.hl-str { color: var(--syntax-string); }
+.hl-num { color: var(--syntax-number); }
+.hl-kw { color: var(--syntax-keyword); }
+.hl-key { color: var(--syntax-name); }

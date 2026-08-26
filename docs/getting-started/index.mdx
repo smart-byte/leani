@@ -12,19 +12,20 @@ status: preview
 import { Aside, Card, CardGrid, Steps } from '@astrojs/starlight/components';
 import CodeExample from '@docs/components/docs/CodeExample.astro';
 
-The safest first run uses Leani's deterministic fixture mode. It requires no
-Ethereum provider, writes only to a local data directory, and exercises the same
-configuration and processor lifecycle used by a network-backed node.
+The primary first run indexes a bounded Ethereum Mainnet range from the public
+Xatu dataset. It needs no provider credentials, produces decoded application
+data you can query, and keeps the requested work and storage boundary explicit.
 
 <Steps>
 1. Install a release binary for your platform, use Homebrew from the `leani-dev`
    tap, or build the workspace with Cargo.
-2. Run `leani doctor` against the configuration you intend to start.
-3. Prove the node with the offline fixture before adding RPC, Beacon API, or P2P
-   credentials.
+2. Save the selected profile as `./leani.toml` and run `leani doctor`.
+3. Index one bounded public-data range and inspect its decoded output and exact
+   coverage.
 4. Query `/v1/capabilities` and `/v1/processors` instead of assuming the node was
    compiled and configured with a particular processor.
-5. Add a bounded network range, verify exact coverage, then attach a consumer.
+5. Use the offline fixture only when you need to isolate packaging/runtime
+   health from network-source behavior, then attach a consumer.
 </Steps>
 
 <Aside type="caution" title="The data directory is part of the configuration">
@@ -53,15 +54,15 @@ configuration and processor lifecycle used by a network-backed node.
 Choose the smallest path that proves the boundary you care about:
 
 - [Install a pinned release](/docs/getting-started/install/) and verify its identity.
-- [Prove it offline](/docs/getting-started/offline-proof/) without credentials.
 - [Index a bounded Mainnet range](/docs/getting-started/bounded-mainnet/) and inspect exact coverage.
+- [Prove it offline](/docs/getting-started/offline-proof/) when diagnosing an installation without network access.
 - [Attach a durable consumer](/docs/getting-started/first-consumer/) with commit-then-ack semantics.
 - Use the [complete quickstart](/docs/getting-started/offline-to-mainnet/) when you want the native and Docker flows on one page.
-
-## Prove the release offline
-
-<CodeExample example="offline-quickstart" />
 
 ## Request a bounded Mainnet range
 
 <CodeExample example="bounded-mainnet-quickstart" />
+
+## Optional offline installation proof
+
+<CodeExample example="offline-quickstart" />

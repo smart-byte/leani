@@ -11,11 +11,19 @@ leani e2e fixture \
 # docs:end offline-quickstart
 
 # docs:start bounded-mainnet-quickstart
+brew install leani-dev/tap/leani
+mkdir leani-quickstart && cd leani-quickstart
 LEANI_RELEASE="${LEANI_RELEASE:-v0.1.0}"
-curl -fsSLo windowed.toml \
+curl -fsSLo leani.toml \
   "https://raw.githubusercontent.com/smart-byte/leani/${LEANI_RELEASE}/config/modes/windowed.toml"
-leani --config windowed.toml doctor --json
-leani --config windowed.toml backfill \
-  --processor evm-events --from 10000835 --to 10001834
-leani --config windowed.toml serve
+leani doctor --json
+leani backfill \
+  --processor uniswap-v2-sync-30d --from 10000835 --to 10001834
+leani serve
 # docs:end bounded-mainnet-quickstart
+
+# Run this in a second terminal after `serve` starts.
+# docs:start bounded-mainnet-query
+curl -s \
+  'http://127.0.0.1:8080/v1/processors/uniswap-v2-sync-30d/collections/uniswap_v2.sync_hourly/entities?limit=3'
+# docs:end bounded-mainnet-query

@@ -33,3 +33,46 @@ export function hlRust(line: string): string {
     .replace(/\b(async|await|dyn|fn|for|impl|let|pub|struct|use)\b/g, '<span class="hl-kw">$1</span>')
     .replace(/\b(\d[\d_]*)\b(?![\w-])/g, '<span class="hl-num">$1</span>');
 }
+
+function hlTomlValue(value: string): string {
+  const token = /"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|#.*$|\b(?:true|false)\b|\b\d[\d_]*\b/g;
+  let html = '';
+  let cursor = 0;
+  for (const match of value.matchAll(token)) {
+    const index = match.index ?? cursor;
+    const text = match[0];
+    html += esc(value.slice(cursor, index));
+    const kind = text.startsWith('#')
+      ? 'hl-com'
+      : text.startsWith('"') || text.startsWith("'")
+        ? 'hl-str'
+        : text === 'true' || text === 'false'
+          ? 'hl-kw'
+          : 'hl-num';
+    html += '<span class="' + kind + '">' + esc(text) + '</span>';
+    cursor = index + text.length;
+  }
+  return html + esc(value.slice(cursor));
+}
+
+export function hlToml(line: string): string {
+  if (/^\s*#/.test(line)) return '<span class="hl-com">' + esc(line) + '</span>';
+  const section = line.match(/^(\s*)(\[\[?)([^\]]+)(\]\]?)(\s*)$/);
+  if (section) {
+    return esc(section[1] ?? '') +
+      '<span class="hl-kw">' +
+      esc(section[2] ?? '') +
+      esc(section[3] ?? '') +
+      esc(section[4] ?? '') +
+      '</span>' +
+      esc(section[5] ?? '');
+  }
+  const assignment = line.match(/^(\s*)([\w.-]+)(\s*=\s*)(.*)$/);
+  if (!assignment) return esc(line);
+  return esc(assignment[1] ?? '') +
+    '<span class="hl-key">' +
+    esc(assignment[2] ?? '') +
+    '</span>' +
+    esc(assignment[3] ?? '') +
+    hlTomlValue(assignment[4] ?? '');
+}

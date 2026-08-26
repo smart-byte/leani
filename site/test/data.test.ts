@@ -78,8 +78,8 @@ describe('canned data', () => {
     ]);
     expect(showcaseSource).toContain("exampleSource('custom-processor-extension')");
     expect(showcaseSource).toContain("exampleSource('custom-query-client')");
-    expect(quickstartSource).toContain("exampleSource('offline-quickstart')");
     expect(quickstartSource).toContain("exampleSource('bounded-mainnet-quickstart')");
+    expect(quickstartSource).toContain("exampleSource('bounded-mainnet-query')");
   });
 
   test('storage table has 4 lifecycle profiles and evidence notes', () => {

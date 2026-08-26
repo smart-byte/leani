@@ -8,7 +8,7 @@ import uniswap from '../data/processors/uniswap-latest.json';
 import txStats from '../data/processors/transaction-stats.json';
 import customMetadata from '../data/processors/custom.json';
 import processorReference from '../generated/processors-reference.json';
-import { hlTs } from '../lib/highlight';
+import { hlRust, hlToml, hlTs } from '../lib/highlight';
 import { exampleSource } from '../lib/examples';
 
 const custom = {
@@ -18,6 +18,8 @@ const custom = {
 };
 const demos = [blobs, erc20, evmEvents, uniswap, txStats, custom];
 const builtInProcessors = processorReference.processors;
+const highlightConfig = (config: string, language: string) =>
+  config.split('\n').map(language === 'rust' ? hlRust : hlToml);
 
 // Build-time rendering of the committed TS type strings: parse into a tree
 // (root properties visible, nested object types collapsed behind <details>)
@@ -110,7 +112,8 @@ function renderTypeCard(source: string): string {
       <div class="pair">
         <div class="stack">
           <TerminalFrame title={demo.configLang === 'toml' ? 'node.toml' : 'main.rs'}>
-            <span class="t-line">{demo.config}</span>
+            {highlightConfig(demo.config, demo.configLang)
+              .map((line) => <span class="t-line" set:html={line} />)}
           </TerminalFrame>
           <TerminalFrame title="extracted data format">
             <div class="type-card" set:html={renderTypeCard(demo.dataType)} />
@@ -173,9 +176,9 @@ function renderTypeCard(source: string): string {
   .type-card :global(details[open] > summary::before) { content: '▾ '; }
   .type-card :global(.tt-ch) { padding-left: 0.85rem; margin-left: 0.3rem; border-left: 1px solid var(--panel-edge); }
   .dim, .type-card :global(.dim) { color: var(--ink-dim); }
-  :global(.hl-key) { color: var(--ink); }
-  :global(.hl-type) { color: var(--accent); }
-  :global(.hl-lit) { color: #9ff0c4; }
+  :global(.hl-key) { color: var(--syntax-name); }
+  :global(.hl-type) { color: var(--syntax-keyword); }
+  :global(.hl-lit) { color: var(--syntax-string); }
   .sse-id { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 100%; }
 </style>
 

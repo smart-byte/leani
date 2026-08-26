@@ -23,7 +23,6 @@ const entries = (await getCollection('docs', ({ data }) => !data.draft)).sort((l
               <li>
                 <a href={docHref(entry.id)} aria-current={entry.id === currentId ? 'page' : undefined}>
                   {entry.data.sidebar.label || entry.data.title}
-                  {entry.data.status === 'preview' && <span class="status">Preview</span>}
                 </a>
               </li>
             ))}
@@ -84,12 +83,5 @@ const entries = (await getCollection('docs', ({ data }) => !data.draft)).sort((l
       color: var(--sl-color-white);
     }
 
-    .status {
-      color: var(--sl-color-accent-high);
-      font-family: var(--__sl-font-mono);
-      font-size: 0.64rem;
-      letter-spacing: 0.04em;
-      text-transform: uppercase;
-    }
   }
 </style>

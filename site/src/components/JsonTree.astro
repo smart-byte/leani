@@ -37,9 +37,9 @@ const open = depth === 0 || name === 'data' || name === 'block' || name === 'val
   details[open] > summary::before { content: '▾ '; }
   .leaf { padding-left: 1.05rem; white-space: normal; overflow-wrap: anywhere; }
   .ch { padding-left: 0.85rem; margin-left: 0.3rem; border-left: 1px solid var(--panel-edge); }
-  .k { color: var(--ink); }
+  .k { color: var(--syntax-name); }
   .k::after { content: ': '; color: var(--ink-dim); }
   .p { color: var(--ink-dim); }
-  .vs { color: #9ff0c4; }
-  .vn { color: var(--accent); }
+  .vs { color: var(--syntax-string); }
+  .vn { color: var(--syntax-number); }
 </style>

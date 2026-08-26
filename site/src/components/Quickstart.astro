@@ -1,45 +1,53 @@
 ---
 import TerminalFrame from './TerminalFrame.astro';
 import { QUICKSTART_URL } from '../config';
+import { hlShell } from '../lib/highlight';
 import { exampleSource } from '../lib/examples';
 
-const offlineQuickstart = exampleSource('offline-quickstart').code;
 const boundedMainnetQuickstart = exampleSource('bounded-mainnet-quickstart').code;
+const boundedMainnetQuery = exampleSource('bounded-mainnet-query').code;
+const shellLines = (source: string) => source.split('\n').map(hlShell);
 ---
 <section id="quickstart" class="wrap section" aria-labelledby="quickstart-h">
-  <p class="eyebrow mono">No network required for step 1</p>
-  <h2 id="quickstart-h"><span class="mono"># </span>Install, prove, then connect</h2>
+  <p class="eyebrow mono">Ethereum Mainnet · no API key</p>
+  <h2 id="quickstart-h"><span class="mono"># </span>Index something real</h2>
   <p class="lede">
-    First exercise the released binary, migrations, processor runtime, delivery
-    spool, checkpoints, coverage, and SQLite integrity with a deterministic fixture.
-    Then run a bounded public-data API when you are ready for the network.
+    Index 1,000 Ethereum blocks for Uniswap V2 <span class="mono">Sync</span>
+    events from the public Xatu dataset. Leani decodes the logs, builds an
+    hourly collection, and records the exact block coverage behind every query.
   </p>
   <div class="pair">
     <div>
-      <p class="mono label">1 · verify the release</p>
+      <p class="mono label">1 · install and index a bounded range</p>
       <TerminalFrame title="shell">
-        <div class="command">
-          <span class="t-line" data-copy-source>{offlineQuickstart}</span>
-          <button type="button" class="copy mono" data-copy-button aria-label="Copy release verification commands">copy</button>
+        <div class="command" data-copy-value={boundedMainnetQuickstart}>
+          <span data-copy-source>
+            {shellLines(boundedMainnetQuickstart).map((line) => <span class="t-line" set:html={line} />)}
+          </span>
+          <button type="button" class="copy mono" data-copy-button aria-label="Copy bounded Mainnet commands">copy</button>
         </div>
       </TerminalFrame>
       <p class="status mono" role="status" aria-live="polite" data-copy-status></p>
     </div>
     <div>
-      <p class="mono label">2 · run a bounded Mainnet API</p>
+      <p class="mono label">2 · query the decoded events</p>
       <TerminalFrame title="shell">
-        <div class="command">
-          <span class="t-line" data-copy-source>{boundedMainnetQuickstart}</span>
-          <button type="button" class="copy mono" data-copy-button aria-label="Copy bounded Mainnet API commands">copy</button>
+        <div class="command" data-copy-value={boundedMainnetQuery}>
+          <span data-copy-source>
+            {shellLines(boundedMainnetQuery).map((line) => <span class="t-line" set:html={line} />)}
+          </span>
+          <button type="button" class="copy mono" data-copy-button aria-label="Copy Mainnet query command">copy</button>
         </div>
       </TerminalFrame>
       <p class="status mono" role="status" aria-live="polite" data-copy-status></p>
     </div>
   </div>
   <p class="after">
-    In another terminal, query <span class="mono">http://127.0.0.1:8080/v1/processors/uniswap-v2-sync-30d/collections</span>.
-    Docker, Cargo, live P2P, and independently sourced checkpoint instructions are in the
-    <a href={QUICKSTART_URL}>full quickstart</a>.
+    The backfill prints its source portfolio and requested range up front, then
+    reports the selected source, frames committed, elapsed time, and continuous
+    <span class="mono">10000835..10001834</span> coverage. Offline release
+    verification, Docker, Cargo, live P2P, and
+    independently sourced checkpoint instructions are in the <a href={QUICKSTART_URL}>full quickstart</a>.
   </p>
 </section>
 
@@ -64,12 +72,11 @@ const boundedMainnetQuickstart = exampleSource('bounded-mainnet-quickstart').cod
 
 <script>
   document.querySelectorAll<HTMLElement>('#quickstart .command').forEach((command) => {
-    const source = command.querySelector<HTMLElement>('[data-copy-source]');
     const button = command.querySelector<HTMLButtonElement>('[data-copy-button]');
     const status = command.closest<HTMLElement>('.pair > div')?.querySelector<HTMLElement>('[data-copy-status]');
     button?.addEventListener('click', async () => {
       try {
-        await navigator.clipboard.writeText(source?.textContent ?? '');
+        await navigator.clipboard.writeText(command.dataset.copyValue ?? '');
         if (status) status.textContent = 'Copied to clipboard.';
       } catch {
         if (status) status.textContent = 'Copy failed. Select the commands manually.';
