@@ -13,6 +13,7 @@ FORBIDDEN_PATHS = [
 ].freeze
 LOCAL_PATH = %r{/(?:Users|home)/[^/\s]+/}.freeze
 LOCAL_PATH_GREP = %r{/(Users|home)/[^/[:space:]]+/}.source.freeze
+CI_BENCHMARK = /\bbenchmark(?:s|ing)?\b/i
 
 def git(*arguments, allow_failure: false)
   output, status = Open3.capture2e("git", "-C", ROOT.to_s, *arguments)
@@ -28,6 +29,16 @@ end.uniq
 abort "no commits resolved from #{refs.join(', ')}" if commits.empty?
 
 errors = []
+refs.each do |ref|
+  workflows, = git("ls-tree", "-r", "--name-only", ref, "--", ".github/workflows")
+  workflows.each_line(chomp: true) do |path|
+    contents, = git("show", "#{ref}:#{path}")
+    if CI_BENCHMARK.match?(contents)
+      errors << "#{ref}: GitHub workflow #{path} contains benchmark automation; performance evidence is local-only"
+    end
+  end
+end
+
 commits.each do |commit|
   paths, = git("ls-tree", "-r", "--name-only", commit)
   paths.each_line(chomp: true) do |path|

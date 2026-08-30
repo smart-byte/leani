@@ -282,7 +282,7 @@ runs can use `--consumer-reconnect-every-batches N` to close and independently
 fence a new stream session after each N acknowledged batches, and
 `--consumer-drop-ack-response-once` deterministically exercises recovery when
 the destination commit and node ACK succeed but the response is lost. The same
-seeded generator supports one-million-block scheduled runs without retaining
+seeded generator supports one-million-block controlled runs without retaining
 the corpus in memory. Add `--concurrent-live-blocks N` to an end-to-end
 SDK/PostgreSQL run to commit a finalized live tail while history is still
 acquired and delivered; `--live-block-interval-ms` controls its cadence. The
@@ -305,6 +305,38 @@ Generated benchmark reports and samples are intentionally ignored by Git.
 Synthetic runs measure the local source/coordinator path, not Xatu, EraE, or
 P2P transport. Keep machine, source, commit, configuration, and cold/warm-run
 context with any result shared outside the local checkout.
+
+Performance evidence is never collected or uploaded by GitHub Actions. CI
+tests benchmark logic as ordinary Rust code, but it does not execute benchmark
+commands. Run the checked suites explicitly on a quiet, controlled host; the
+runner builds a release binary, records host/tool/commit context, executes
+cases sequentially to avoid cross-case contention, and writes only beneath an
+ignored local directory:
+
+```bash
+# Fast resumability and report-contract check.
+scripts/run-controlled-benchmarks.sh smoke
+
+# The complete synthetic matrix formerly represented by CI configuration.
+scripts/run-controlled-benchmarks.sh synthetic-million
+
+# Select a smaller controlled comparison or an external evidence mount.
+LEANI_BENCHMARK_CASES="materialized end-to-end-fast-consumer" \
+LEANI_BENCHMARK_CORPORA="uniswap-like blobs-like" \
+scripts/run-controlled-benchmarks.sh synthetic-million /mnt/leani-evidence/run-01
+```
+
+The default destination is a timestamped directory under
+`.private/evidence/performance`. Passing the same explicit output directory
+resumes completed cases and refuses ambiguous partial output. The `all` and
+`delivery-faults` suites include SDK/PostgreSQL cases and therefore require a
+dedicated disposable database:
+
+```bash
+docker compose --profile benchmark up -d benchmark-postgres
+export LEANI_BENCHMARK_POSTGRES_URL=postgres://leani_benchmark:leani_benchmark@127.0.0.1:55432/leani_benchmark
+scripts/run-controlled-benchmarks.sh delivery-faults
+```
 
 Run or resume one selected-stage candidate sweep with:
 

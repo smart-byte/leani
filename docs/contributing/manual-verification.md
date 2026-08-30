@@ -435,6 +435,35 @@ public dataset has published the complete requested range. That result
 isolates archive availability; the continuous profile is responsible for
 bridging the bounded archive-to-head gap over P2P.
 
+## Controlled synthetic benchmarks
+
+Synthetic performance evidence is deliberately excluded from GitHub Actions.
+Run the checked suites on a quiet controlled host; cases execute sequentially
+and record the exact commit, dirty state, host, binary, Rust, Cargo, and Bun
+versions beside their reports:
+
+```bash
+scripts/run-controlled-benchmarks.sh smoke
+scripts/run-controlled-benchmarks.sh synthetic-million
+```
+
+Outputs default to an ignored timestamped directory under
+`.private/evidence/performance`. Set `LEANI_BENCHMARK_CASES` and
+`LEANI_BENCHMARK_CORPORA` to select a comparison, or pass an explicit second
+argument when evidence belongs on a dedicated local volume. The runner keeps
+complete results when resuming and stops on partial output instead of silently
+overwriting an interrupted measurement.
+
+The `delivery-faults` and `all` suites require
+`LEANI_BENCHMARK_POSTGRES_URL` to reference a dedicated disposable database.
+Start the checked local service with:
+
+```bash
+docker compose --profile benchmark up -d benchmark-postgres
+export LEANI_BENCHMARK_POSTGRES_URL=postgres://leani_benchmark:leani_benchmark@127.0.0.1:55432/leani_benchmark
+scripts/run-controlled-benchmarks.sh delivery-faults
+```
+
 ## Real-source delivery benchmark
 
 `benchmark real-source` measures the production fixed-range path end to end:

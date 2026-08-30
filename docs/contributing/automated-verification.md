@@ -1,6 +1,6 @@
 ---
 title: Automated verification
-description: Run Leani's network-free fixtures, deterministic fault matrix, bounded evidence gates, and optional Mainnet staging checks.
+description: Run Leani's network-free correctness fixtures and keep performance, Mainnet, fault-injection, and soak evidence on controlled hosts.
 section: contributing
 order: 40
 audience:
@@ -182,6 +182,15 @@ and API invariants. The Mainnet gate proves current external interoperability.
 A production claim requires both, followed by a fault-injected staging run and
 an independent soak whose duration and acceptance criteria are recorded by the
 release operator.
+
+GitHub Actions runs only deterministic correctness and contract checks. It
+does not run synthetic or real-source benchmarks, Mainnet evidence gates,
+fault-injected delivery measurements, or soaks, and it does not upload their
+reports. Performance evidence must be collected explicitly on a controlled
+host with `scripts/run-controlled-benchmarks.sh`; its default output is under
+the ignored `.private/evidence/performance` tree. Real-source and Mainnet runs
+remain manual because source availability, trust inputs, host state, and
+network conditions are part of the result.
 
 Do not commit a weak-subjectivity checkpoint as an evergreen trusted value.
 Record the checkpoint source and acquisition time alongside each evidence
