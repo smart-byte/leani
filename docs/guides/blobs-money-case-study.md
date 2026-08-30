@@ -30,16 +30,9 @@ The retained legacy RPC path uses a managed provider for:
 - current block number and recovery/catch-up;
 - a separate `eth_config` call for current/future blob parameters.
 
-Relevant legacy paths live in the
-[blobs.money repository](https://github.com/smart-byte/blobs.money):
-
-- `api/src/rpc/fetch.ts`
-- `api/src/rpc/client.ts`
-- `api/src/monitoring/websocket.ts`
-- `api/src/monitoring/process.ts`
-- `api/src/history/worker.ts`
-- `api/src/transform/blocks.ts`
-- `api/src/db/schema.ts`
+The application keeps that legacy path behind a runtime source toggle while
+the Leani integration is validated. Its private implementation details are not
+part of Leani's public contract.
 
 ## 2. Inputs and outputs
 

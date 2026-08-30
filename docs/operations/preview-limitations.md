@@ -37,5 +37,5 @@ application integrations with an independent fallback.
   control. Non-loopback deployments must use a trusted network or authenticated
   reverse proxy and must not expose admin/debug endpoints publicly.
 
-Treat this page and the [release process](/docs/contributing/releasing/) as the public scope
+Treat this page and the [release process](https://leani.dev/docs/contributing/releasing/) as the public scope
 boundary for the current preview.

@@ -25,6 +25,7 @@ toml.workspace = true
 [dev-dependencies]
 leani-api = { path = "../../crates/api" }
 leani-store-sqlite = { path = "../../crates/store-sqlite" }
+leani-testkit = { path = "../../crates/testkit" }
 tempfile.workspace = true
 tower.workspace = true
 

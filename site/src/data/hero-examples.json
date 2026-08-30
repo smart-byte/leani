@@ -49,28 +49,9 @@
   {
     "id": "sdk",
     "label": "typescript sdk",
-    "title": "consume.ts — typed processor data",
-    "note": "at-least-once transport; commit application data and cursor before ACK",
+    "title": "follow.ts — query once, follow without a race",
+    "note": "exact snapshot boundary; resumable SSE with explicit apply, undo, and finality",
     "lang": "ts",
-    "lines": [
-      { "text": "import { commitThenAcknowledge, createLeaniClient } from \"@leani/sdk\";", "charMs": 3 },
-      { "text": "", "delayMs": 60 },
-      { "text": "const leani = createLeaniClient({ baseUrl: \"http://localhost:8080\" });", "charMs": 3 },
-      { "text": "", "delayMs": 60 },
-      { "text": "const page = await leani.processors.consumers.changes(", "charMs": 3 },
-      { "text": "  \"blobs-production\", \"blobs-api\", credential,", "charMs": 3 },
-      { "text": ");", "charMs": 3 },
-      { "text": "for (const event of page.data) {", "charMs": 3 },
-      { "text": "  await commitThenAcknowledge(", "charMs": 3 },
-      { "text": "    () => db.applyAndSaveCursor(event),", "charMs": 3 },
-      { "text": "    (cursor) => leani.processors.consumers.acknowledge(", "charMs": 3 },
-      { "text": "      \"blobs-production\", \"blobs-api\", credential, cursor,", "charMs": 3 },
-      { "text": "    ),", "charMs": 3 },
-      { "text": "  );", "charMs": 3 },
-      { "text": "}", "charMs": 3 },
-      { "text": "", "delayMs": 100 },
-      { "text": "committed + acknowledged blobs.block.put  #25696397", "className": "t-accent", "delayMs": 120, "charMs": 2 },
-      { "text": "committed + acknowledged blobs.block.put  #25696398", "className": "t-accent", "delayMs": 120, "charMs": 2 }
-    ]
+    "example": "query-then-follow"
   }
 ]

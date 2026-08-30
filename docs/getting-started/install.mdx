@@ -23,11 +23,11 @@ formula, and production docs should all identify the same release tag.
     `smart-byte/leani` GitHub release.
   </Card>
   <Card title="Container" icon="seti:docker">
-    Pull the immutable `ghcr.io/smart-byte/leani:&lt;version&gt;` image produced by
+    Pull the immutable `ghcr.io/smart-byte/leani:<version>` image produced by
     the same release workflow.
   </Card>
   <Card title="Cargo" icon="seti:rust">
-    `cargo install leani --version &lt;version&gt; --locked`
+    `cargo install leani --version <version> --locked`
   </Card>
 </CardGrid>
 
@@ -37,7 +37,9 @@ formula, and production docs should all identify the same release tag.
 3. Save the selected profile as `./leani.toml` and run `leani doctor --json`
    before allowing network or database access. Use `LEANI_CONFIG` or
    `--config` when the file intentionally lives elsewhere.
-4. Continue with the deterministic [offline proof](/docs/getting-started/offline-proof/).
+4. Continue with a [bounded Mainnet range](/docs/getting-started/bounded-mainnet/).
+   Use the deterministic [offline proof](/docs/getting-started/offline-proof/)
+   when you need to isolate packaging or runtime health from network behavior.
 </Steps>
 
 <Aside type="caution" title="Pre-release package names are prepared, not assumed">

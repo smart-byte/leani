@@ -8,7 +8,7 @@ export const LIMITATIONS_URL = '/docs/operations/preview-limitations/';
 export const EVIDENCE_URL = '/docs/contributing/manual-verification/#real-source-delivery-benchmark';
 export const BLOBS_MONEY_URL = 'https://blobs.money';
 
-export function sourceUrl(path: string, view: 'blob' | 'tree' = 'blob'): string {
+export function sourceUrl(path: string, view: 'blob' | 'tree' | 'edit' = 'blob'): string {
   const encodedPath = path.split('/').map(encodeURIComponent).join('/');
   return `${GITHUB_URL}/${view}/${encodeURIComponent(buildMetadata.docsRef)}/${encodedPath}`;
 }

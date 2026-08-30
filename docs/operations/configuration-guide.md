@@ -10,7 +10,7 @@ status: preview
 ---
 
 Leani reads strict, versioned TOML. Unknown fields are errors. The
-machine-readable contract is rendered in the [configuration field reference](/docs/reference/configuration/);
+machine-readable contract is rendered in the [configuration field reference](https://leani.dev/docs/reference/configuration/);
 six complete lifecycle profiles are checked under `config/modes`.
 
 Validate a file without opening its database or any network connection:

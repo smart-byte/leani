@@ -38,6 +38,26 @@ jobs:
           if git show-ref --verify --quiet refs/remotes/origin/site-production; then
             git merge-base --is-ancestor refs/remotes/origin/site-production "$RELEASE_TAG^{commit}"
           fi
+          git checkout --detach "$RELEASE_TAG^{commit}"
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version-file: site/.bun-version
+      - name: Install site dependencies
+        working-directory: site
+        run: bun install --frozen-lockfile
+      - name: Validate release-pinned production site
+        working-directory: site
+        env:
+          LEANI_SITE_MODE: production
+          LEANI_DOCS_REF: ${{ inputs.release_tag }}
+        run: |
+          ../scripts/check-publication.rb HEAD
+          ../scripts/verify-site-production.rb "$RELEASE_TAG"
+          bun run check
+          bun run examples:check
+          bun run build
+          bun run size:check
+          bun run search:check
       - name: Promote exact release commit
         run: |
           release_commit=$(git rev-parse "$RELEASE_TAG^{commit}")

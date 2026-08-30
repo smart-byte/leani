@@ -37,7 +37,6 @@ export default defineConfig({
       description: 'Run the Ethereum data processors your application needs, and keep only their durable results.',
       favicon: '/favicon.svg',
       pagefind: true,
-      lastUpdated: true,
       social: [
         {
           icon: 'github',

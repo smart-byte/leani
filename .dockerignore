@@ -10,3 +10,4 @@ packages/sdk/dist
 .env
 .env.*
 .private
+AGENTS.md

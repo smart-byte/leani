@@ -261,4 +261,4 @@ Clients resume from a cursor. If the node has pruned the required change history
 The v1 native transport is HTTP query plus SSE, with a TypeScript SDK that
 handles reconnect and opaque cursors. Standard `eth_subscribe` remains
 WebSocket JSON-RPC and follows Ethereum's subscription semantics. See
-[native API and delivery protocol](/docs/reference/native-api-and-delivery/).
+[native API and delivery protocol](https://leani.dev/docs/reference/native-api-and-delivery/).

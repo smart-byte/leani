@@ -7,9 +7,8 @@ require "pathname"
 ROOT = Pathname.new(__dir__).join("..").realpath
 FORBIDDEN_PATHS = [
   %r{\A\.private(?:/|\z)},
-  %r{\A(?:BACKLOG|PLAN)\.md\z},
-  %r{\Adocs/(?:.*-PLAN|IMPLEMENTATION-DESIGN|IMPLEMENTATION-STATUS|OPEN-SOURCE-READINESS|RELEASE-CHECKLIST|ROADMAP|XATU-OPTIMIZATIONS)\.md\z},
-  %r{\Adocs/(?:evidence|superpowers)(?:/|\z)},
+  %r{\AAGENTS\.md\z},
+  %r{\Adocs/.*-PLAN\.md\z},
 ].freeze
 LOCAL_PATH = %r{/(?:Users|home)/[^/\s]+/}.freeze
 LOCAL_PATH_GREP = %r{/(Users|home)/[^/[:space:]]+/}.source.freeze

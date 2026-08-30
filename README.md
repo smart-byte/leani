@@ -110,24 +110,14 @@ Those methods can eventually use an optional forwarding or stateless-execution e
 
 ## User documentation
 
-- [Offline proof and bounded Mainnet quickstart](docs/getting-started/offline-to-mainnet.md)
-- [Architecture](docs/contributing/architecture.md)
-- [Native API and delivery protocol](docs/reference/native-api-and-delivery.md)
-- [Normalized frame archive](docs/reference/archive-format.md)
-- [Built-in processor contracts](docs/reference/processor-contracts.md)
-- [Configuration guide](docs/operations/configuration-guide.md)
-- [Custom native processors and future Wasm packages](docs/contributing/processor-extension-contract.md)
-- [Manual 10,000-block, live-follow, subscription, and restart testing](docs/contributing/manual-verification.md)
-- [Automated and public Mainnet end-to-end verification](docs/contributing/automated-verification.md)
-- [Operations and failure runbooks](docs/operations/runbook.md)
-- [Trust and threat model](docs/operations/trust-and-threat-model.md)
-- [RPC compatibility and balance semantics](docs/reference/ethereum-json-rpc.md)
-- [History and live data sources](docs/concepts/data-sources.md)
-- [blobs.money integration case study](docs/guides/blobs-money-case-study.md)
-- [Preview limitations](docs/operations/preview-limitations.md)
-- [Architecture decision records](docs/adr/README.md)
-- [Release process](docs/contributing/releasing.md)
-- [Changelog](CHANGELOG.md)
+Start at [leani.dev/docs](https://leani.dev/docs/) for the task-oriented
+documentation, including the [Mainnet quickstart](https://leani.dev/docs/getting-started/),
+[configuration reference](https://leani.dev/docs/reference/configuration/),
+[operations guidance](https://leani.dev/docs/operations/preview-limitations/),
+and [processor-author guide](https://leani.dev/docs/guides/custom-processor/).
+
+Repository contributors can also read the Markdown sources under [`docs/`](docs/)
+and the [changelog](CHANGELOG.md) directly on GitHub.
 
 ## Run diagnostics
 
@@ -168,7 +158,7 @@ The optional `beacon_api` profile uses untrusted HTTP transports and can
 require agreement across several of them:
 
 ```bash
-cargo run -- --config config/beacon-api.toml source probe finality \
+cargo run -- --config config/example.toml source probe finality \
   --checkpoint 0x... \
   --endpoint https://beacon-a.example \
   --endpoint https://beacon-b.example \

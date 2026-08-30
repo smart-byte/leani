@@ -1,0 +1,35 @@
+---
+title: Query once, then follow live
+description: Seed application state from an exact snapshot boundary, then resume the SSE stream without missing changes between the two operations.
+section: guides
+order: 15
+audience:
+  - app-developer
+status: preview
+---
+
+import { Aside, Steps } from '@astrojs/starlight/components';
+import CodeExample from '@docs/components/docs/CodeExample.astro';
+
+A normal query followed by a separate stream connection has a race: a change
+can commit after the query but before the stream starts. `queryAndFollow()`
+returns the snapshot and its opaque change boundary atomically. Passing that
+boundary to `subscribe({ after })` closes the gap.
+
+<CodeExample example="query-then-follow" />
+
+<Steps>
+1. Materialize every entity returned by the stable snapshot.
+2. Release the snapshot when the local seed is committed.
+3. Start the resumable stream at `boundaryCursor`.
+4. Apply both `apply` and `undo`; an undo envelope carries the inverse entity
+   mutation.
+5. Treat `finalized` as an explicit transition and `reset_required` as a
+   rebuild instruction. Never infer either from elapsed time.
+</Steps>
+
+<Aside type="note" title="SSE resume is not a durable acknowledgement">
+  The stream cursor closes an in-process query/follow race and reconnects the
+  live feed. For a destination that must fence Leani's retention across process
+  restarts, use a named [durable consumer](/docs/guides/durable-consumer/).
+</Aside>

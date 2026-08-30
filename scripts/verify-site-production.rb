@@ -17,7 +17,8 @@ commit = git(root, "rev-parse", "#{ref}^{commit}")
 tags = git(root, "tag", "--points-at", commit).lines.map(&:strip).grep(/\Av\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?\z/)
 abort "#{commit} must carry exactly one Leani release tag" unless tags.length == 1
 
-version = root.join("Cargo.toml").read[/^version\s*=\s*"([^"]+)"$/, 1]
+manifest = git(root, "show", "#{commit}:Cargo.toml")
+version = manifest[/^version\s*=\s*"([^"]+)"$/, 1]
 abort "could not read workspace package version" unless version
 abort "release tag #{tags.first} does not match workspace version v#{version}" unless tags.first == "v#{version}"
 

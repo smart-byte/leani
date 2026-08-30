@@ -51,6 +51,10 @@ configuration and its processor-owned settings table:
 pub trait ProcessorFactory: Send + Sync {
     fn id(&self) -> &str;
 
+    fn description(&self) -> &str {
+        self.id()
+    }
+
     fn create(
         &self,
         configured: &ProcessorConfig,
@@ -244,7 +248,7 @@ the cursor in one consumer transaction is required.
 
 ## Complete example
 
-The complete [`examples/custom-node` walkthrough](/docs/guides/custom-processor/) is a separate downstream
+The complete [`examples/custom-node` walkthrough](https://leani.dev/docs/guides/custom-processor/) is a separate downstream
 binary inside the workspace. It:
 
 - defines its own strict settings type;

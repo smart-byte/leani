@@ -8,6 +8,13 @@ record, and documented RPC contracts.
 
 ### Changed
 
+- The CLI now discovers `./leani.toml` by default; `LEANI_CONFIG` and
+  `--config` remain explicit overrides.
+- `ProcessorFactory::id` accepts an ordinary borrowed string again, and
+  `description` has a backwards-compatible default for downstream factories.
+- Public documentation and the Astro landing page now live in this monorepo,
+  render from verified examples and tracked Rust-owned contract fixtures, and
+  promote production docs only from an exact release commit.
 - Execution-P2P history fallback now admits every gap at or after the
   processor's configured start block by default. The optional
   `sources.live.history_fallback_blocks` setting applies a hard finalized

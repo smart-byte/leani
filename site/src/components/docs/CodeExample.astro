@@ -1,6 +1,6 @@
 ---
 import { Code } from 'astro-expressive-code/components';
-import buildMetadata from '../../generated/build-metadata.json';
+import { sourceUrl } from '../../config';
 import { exampleSource, type ExampleId } from '../../lib/examples';
 
 interface Props {
@@ -10,17 +10,14 @@ interface Props {
 
 const { example: id, title } = Astro.props;
 const source = exampleSource(id);
-const sourceUrl = `https://github.com/smart-byte/leani/blob/${encodeURIComponent(buildMetadata.docsRef)}/${source.source.file
-  .split('/')
-  .map(encodeURIComponent)
-  .join('/')}`;
+const verifiedSourceUrl = sourceUrl(source.source.file);
 ---
 
 <figure class="code-example" data-example-id={id}>
   <Code code={source.code} lang={source.language} title={title || source.title} />
   <figcaption>
     <span>{source.description}</span>
-    <a href={sourceUrl}>Verified source</a>
+    <a href={verifiedSourceUrl}>Verified source</a>
   </figcaption>
 </figure>
 

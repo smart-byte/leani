@@ -15,6 +15,12 @@ import CodeExample from '@docs/components/docs/CodeExample.astro';
 Start with a finite range and a checked lifecycle profile. That keeps source
 cost, temporary storage, output retention, and the correctness claim explicit.
 
+<Aside type="caution" title="Release commands become live with the first published tag">
+  The Homebrew formula and pinned `v0.1.0` configuration URL below are the
+  release path. Before that tag and formula are published, build the workspace
+  from a local checkout and use its `config/modes/windowed.toml` instead.
+</Aside>
+
 <CodeExample example="bounded-mainnet-quickstart" />
 
 Once `serve` starts, query the decoded events and their exact coverage from a
@@ -26,14 +32,14 @@ second terminal:
 1. Copy a checked profile into a new file and give it a fresh `data_dir`.
 2. Run `doctor --json`; resolve every error before starting network access.
 3. Request an explicit `--from` and `--to` range.
-4. Query `/v1/processors/&lt;id&gt;/status` and verify the returned coverage
+4. Query `/v1/processors/<id>/status` and verify the returned coverage
    interval, finality, and source provenance.
 5. Query a value inside the covered interval and deliberately query outside it
    once. An uncovered range must be reported as unavailable, never as empty.
 </Steps>
 
 <Aside type="tip" title="An omitted P2P fallback limit means the whole gap">
-  When `sources.p2p.history_fallback_blocks` is absent, every gap at or after a
+  When `sources.live.history_fallback_blocks` is absent, every gap at or after a
   processor's start block is eligible for P2P recovery. Set the option only
   when you intentionally want a bounded finalized suffix. Retained and archive
   sources remain preferred when they can satisfy the request.

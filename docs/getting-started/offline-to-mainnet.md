@@ -9,7 +9,7 @@ audience:
 status: preview
 ---
 
-The first run is deterministic and network-free. It exercises the distributed
+The optional offline diagnostic is deterministic and network-free. It exercises the distributed
 binary, historical runtime, processor reduction, schema migrations, delivery
 spool, checkpoints, coverage, and SQLite integrity.
 
@@ -77,24 +77,23 @@ It retains an hourly-bucketed window of Uniswap V2 `Sync` events without
 running an EVM:
 
 ```bash
+cp config/modes/windowed.toml leani.toml
 cargo run --locked --release -p leani -- \
-  --config config/modes/windowed.toml \
-  backfill --processor evm-events --from 10000835 --to 10001834
+  backfill --processor uniswap-v2-sync-30d --from 10000835 --to 10001834
 ```
 
 Start the historical-only API over the committed database:
 
 ```bash
-cargo run --locked --release -p leani -- \
-  --config config/modes/windowed.toml serve
+cargo run --locked --release -p leani -- serve
 ```
 
 In another terminal:
 
 ```bash
-curl -s http://127.0.0.1:8080/v1/processors/evm-events/collections
+curl -s http://127.0.0.1:8080/v1/processors/uniswap-v2-sync-30d/collections
 curl -s \
-  'http://127.0.0.1:8080/v1/processors/evm-events/collections/uniswap_v2.sync_hourly/entities?limit=10'
+  'http://127.0.0.1:8080/v1/processors/uniswap-v2-sync-30d/collections/uniswap_v2.sync_hourly/entities?limit=10'
 ```
 
 The collection route returns retained-window metadata and the entity route
@@ -113,5 +112,5 @@ For the externalized profile, register the configured required consumer before
 backfill using `earliest_retained`. Store the returned consumer credential
 outside TOML. Read changes with that credential, commit each destination
 transaction and cursor atomically, then acknowledge the cursor. See
-[native API and delivery protocol](/docs/reference/native-api-and-delivery/) for
+[native API and delivery protocol](https://leani.dev/docs/reference/native-api-and-delivery/) for
 exact semantics and the commit-then-ack helper.

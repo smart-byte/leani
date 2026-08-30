@@ -1,7 +1,0 @@
-{
-  "acknowledgedCursor": "opaque-resume-cursor",
-  "acknowledgedSequence": "46397",
-  "consumer": "analytics-production",
-  "processor": "example-block-summary-local",
-  "state": "active"
-}

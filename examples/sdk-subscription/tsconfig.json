@@ -5,9 +5,17 @@
     "paths": {
       "@leani/sdk": ["../../packages/sdk/src/index.ts"]
     },
-    "typeRoots": ["../../packages/sdk/node_modules/@types"],
+    "typeRoots": [
+      "../../packages/sdk/node_modules/@types",
+      "../../site/node_modules/@types"
+    ],
     "types": ["bun"],
     "noEmit": true
   },
-  "include": ["index.ts", "../custom-node/client.ts", "../sdk-postgres/index.ts"]
+  "include": [
+    "index.ts",
+    "../custom-node/client.ts",
+    "../sdk-postgres/index.ts",
+    "../sdk-stream/index.ts"
+  ]
 }

@@ -4318,6 +4318,7 @@ dependencies = [
  "leani-primitives",
  "leani-processor-api",
  "leani-store-sqlite",
+ "leani-testkit",
  "postcard",
  "semver 1.0.28",
  "serde",

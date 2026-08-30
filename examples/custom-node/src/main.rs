@@ -184,15 +184,16 @@ fn validate_cursor(cursor: &ProcessorCursor, delta: &EncodedDelta) -> Result<(),
     Ok(())
 }
 
+// docs:start custom-processor-extension
 #[derive(Clone, Copy, Debug)]
 struct BlockSummaryFactory;
 
-// docs:start custom-processor-extension
 #[derive(Clone, Copy, Debug)]
 struct BlockSummaryQueryExtension;
 
+#[allow(clippy::unnecessary_literal_bound)]
 impl QueryExtension for BlockSummaryQueryExtension {
-    fn id(&self) -> &'static str {
+    fn id(&self) -> &str {
         "block-summary-v1"
     }
 
@@ -219,12 +220,13 @@ async fn get_block_summary(
     Ok(Json(summary))
 }
 
+#[allow(clippy::unnecessary_literal_bound)]
 impl ProcessorFactory for BlockSummaryFactory {
-    fn id(&self) -> &'static str {
+    fn id(&self) -> &str {
         "example-block-summary"
     }
 
-    fn description(&self) -> &'static str {
+    fn description(&self) -> &str {
         "Example block number and timestamp summaries"
     }
 
@@ -322,6 +324,40 @@ mod tests {
         ))
         .await
         .expect("store");
+        let processor = processors[0].clone();
+        let mut frame = leani_testkit::fixture_frame(42, BlockHash::new([41; 32]));
+        frame.header = leani_primitives::Material::Complete(leani_primitives::HeaderEnvelope {
+            rlp: None,
+            transactions_root: None,
+            receipts_root: None,
+            withdrawals_root: None,
+            gas_limit: None,
+            gas_used: None,
+            base_fee_per_gas: None,
+            blob_gas_used: None,
+            excess_blob_gas: None,
+            size_bytes: None,
+            consensus_size_bytes: None,
+            transaction_count: None,
+        });
+        let delta = processor.map(&frame).await.expect("map fixture");
+        store
+            .apply(
+                processor.as_ref(),
+                ProcessorCursor {
+                    processor_id: processor.descriptor().id.to_string(),
+                    processor_version: processor.descriptor().version.to_string(),
+                    chain_id: frame.chain_id,
+                    block_number: frame.block.number,
+                    block_hash: frame.block.hash,
+                    finality: frame.finality,
+                    sequence: 1,
+                },
+                &delta,
+                &[],
+            )
+            .await
+            .expect("apply fixture");
         let app = leani_api::router_with_processors(
             store,
             processors,
@@ -338,7 +374,13 @@ mod tests {
             )
             .await
             .expect("response");
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body");
+        let body: serde_json::Value = serde_json::from_slice(&body).expect("JSON response");
+        assert_eq!(body["blockNumber"], 42);
+        assert_eq!(body["timestamp"], 1_700_000_042_u64);
     }
 
     #[test]

@@ -19,7 +19,7 @@ native integration:
 5. interrupt, restart, and resume from a saved change cursor.
 
 For repeatable automated gates and their evidence requirements, see
-[Automated verification](/docs/contributing/automated-verification/).
+[Automated verification](https://leani.dev/docs/contributing/automated-verification/).
 
 ## Test modes
 

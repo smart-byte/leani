@@ -2,10 +2,10 @@
 interface Props { title: string }
 const { title } = Astro.props;
 ---
-<div class="term">
-  <div class="term-bar" aria-hidden="true">
-    <span class="dot"></span><span class="dot"></span><span class="dot"></span>
-    <span class="term-title mono">{title}</span>
+<div class="term" role="group" aria-label={title}>
+  <div class="term-bar">
+    <span class="term-dots" aria-hidden="true"><span class="dot"></span><span class="dot"></span><span class="dot"></span></span>
+    <span class="term-title mono" aria-hidden="true">{title}</span>
   </div>
   <div class="term-body mono">
     <slot />
@@ -26,6 +26,7 @@ const { title } = Astro.props;
     padding: 0.55rem 0.9rem;
     border-bottom: 1px solid var(--panel-edge);
   }
+  .term-dots { display: flex; gap: 0.4rem; }
   .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--panel-edge); }
   .term-title { margin-left: 0.5rem; font-size: 0.75rem; color: var(--ink-dim); }
   .term-body {

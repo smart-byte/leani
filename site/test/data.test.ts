@@ -14,8 +14,12 @@ describe('canned data', () => {
         expect(typeof example[key]).toBe('string');
         expect(example[key].length).toBeGreaterThan(0);
       }
-      expect(example.lines.length).toBeGreaterThan(3);
-      for (const line of example.lines) expect(typeof line.text).toBe('string');
+      if (example.lines) {
+        expect(example.lines.length).toBeGreaterThan(3);
+        for (const line of example.lines) expect(typeof line.text).toBe('string');
+      } else {
+        expect(example.example).toBe('query-then-follow');
+      }
     }
   });
 

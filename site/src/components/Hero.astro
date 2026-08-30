@@ -2,15 +2,22 @@
 import TerminalFrame from './TerminalFrame.astro';
 import { GITHUB_URL, LIMITATIONS_URL } from '../config';
 import heroExamples from '../data/hero-examples.json';
+import buildMetadata from '../generated/build-metadata.json';
+import { exampleSource } from '../lib/examples';
 
 import { esc, hlShell, hlTs } from '../lib/highlight';
 
 // Lines with a className keep their whole-line styling (dim context, accent
 // payoffs); everything else gets language tokens.
-const examples = heroExamples.map((example) => ({
+const examples = heroExamples.map((example) => {
+  const lines = 'example' in example
+    ? exampleSource('query-then-follow').code.split('\n').map((text) => ({ text }))
+    : example.lines;
+  return {
   ...example,
-  lines: example.lines.map((line) => ({
+  lines: lines.map((line) => ({
     ...line,
+    className: 'className' in line ? line.className : undefined,
     html:
       line.text && !('className' in line && line.className)
         ? example.lang === 'ts'
@@ -18,7 +25,8 @@ const examples = heroExamples.map((example) => ({
           : hlShell(line.text)
         : undefined,
   })),
-}));
+  };
+});
 ---
 <section class="hero wrap section">
   <a class="eyebrow mono" href={LIMITATIONS_URL}>Public preview</a>
@@ -70,6 +78,9 @@ const examples = heroExamples.map((example) => ({
         </TerminalFrame>
         <p class="mono note">
           {example.note}
+          {buildMetadata.mode === 'preview' && example.id === 'quickstart' && (
+            <span> · release commands resolve after v0.1.0 is published</span>
+          )}
           {'noteHref' in example && (
             <a href={(example as { noteHref: string }).noteHref}>
               {(example as { noteLabel: string }).noteLabel}

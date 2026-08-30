@@ -31,4 +31,37 @@ if (process.argv.includes('--shell')) {
   }
 }
 
+if (process.argv.includes('--typescript')) {
+  const projects = new Set(
+    extracted
+      .filter((example) => example.verifier.kind === 'typescript')
+      .map((example) => example.verifier.project),
+  );
+  const tsc = resolve(repositoryRoot, 'site/node_modules/.bin/tsc');
+  for (const project of projects) {
+    const process = Bun.spawn([tsc, '-p', resolve(repositoryRoot, project), '--noEmit'], {
+      cwd: repositoryRoot,
+      stdout: 'inherit',
+      stderr: 'inherit',
+    });
+    if ((await process.exited) !== 0) throw new Error(`${project}: TypeScript verification failed`);
+  }
+}
+
+if (process.argv.includes('--cargo')) {
+  const packages = new Set(
+    extracted
+      .filter((example) => example.verifier.kind === 'cargo-test')
+      .map((example) => example.verifier.package),
+  );
+  for (const packageName of packages) {
+    const process = Bun.spawn(['cargo', 'test', '--locked', '-p', packageName], {
+      cwd: repositoryRoot,
+      stdout: 'inherit',
+      stderr: 'inherit',
+    });
+    if ((await process.exited) !== 0) throw new Error(`${packageName}: Cargo verification failed`);
+  }
+}
+
 console.log(`verified ${extracted.length} canonical examples`);

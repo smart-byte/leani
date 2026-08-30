@@ -1,15 +1,13 @@
 ---
-import buildMetadata from '../../generated/build-metadata.json';
+import { sourceUrl } from '../../config';
 
 const filePath = Astro.locals.starlightRoute.entry.filePath.replaceAll('\\', '/');
+const enabled = Astro.locals.starlightRoute.entry.data.editUrl !== false;
 const marker = '/docs/';
 const markerIndex = filePath.lastIndexOf(marker);
 const relativePath = markerIndex >= 0 ? filePath.slice(markerIndex + marker.length) : undefined;
-const editUrl = relativePath
-  ? `https://github.com/smart-byte/leani/edit/${encodeURIComponent(buildMetadata.docsRef)}/docs/${relativePath
-      .split('/')
-      .map(encodeURIComponent)
-      .join('/')}`
+const editUrl = enabled && relativePath
+  ? sourceUrl(`docs/${relativePath}`, 'edit')
   : undefined;
 ---
 

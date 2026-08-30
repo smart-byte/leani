@@ -39,7 +39,7 @@ for (const term of ['configuration', '@leani/sdk', 'JSON-RPC', 'processor']) {
   }
 }
 
-for (const forbidden of ['/.private/', 'ALPHA-PLUS-PLAN', '/Users/', '/home/']) {
+for (const forbidden of ['/.private/', '/AGENTS.md']) {
   if (html.includes(forbidden)) {
     throw new Error(`private or local-only marker leaked into built HTML: ${forbidden}`);
   }

@@ -34,7 +34,7 @@ Retained material and configured archive sources are preferred when capable.
 Verified execution P2P can recover the remaining finalized gaps while the live
 lane continues following head.
 
-By default, omission of `sources.p2p.history_fallback_blocks` makes every gap at
+By default, omission of `sources.live.history_fallback_blocks` makes every gap at
 or after the processor start block eligible. Setting it creates an explicit
 suffix boundary. It is a policy limit, not a protocol limitation or a new
 default.

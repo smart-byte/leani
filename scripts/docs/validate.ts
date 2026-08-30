@@ -11,7 +11,9 @@ import {
 const repositoryRoot = resolve(import.meta.dir, '../..');
 const docsRoot = resolve(repositoryRoot, 'docs');
 const siteRequire = createRequire(resolve(repositoryRoot, 'site/package.json'));
-const { parse } = siteRequire('yaml') as { parse: (input: string) => unknown };
+const GithubSlugger = siteRequire('github-slugger').default as new () => {
+  slug(value: string): string;
+};
 const publicRoots = [
   resolve(docsRoot, 'index.mdx'),
   ...DOC_SECTIONS.map((section) => resolve(docsRoot, section)),
@@ -31,20 +33,14 @@ interface PublicDoc {
 
 function markdownAnchors(contents: string): Set<string> {
   const anchors = new Set(['_top']);
-  const counts = new Map<string, number>();
-  for (const match of contents.matchAll(/^#{2,6}\s+(.+?)\s*#*$/gm)) {
-    const base = match[1]!
+  const slugger = new GithubSlugger();
+  const prose = contents.replace(/```[\s\S]*?```/g, '');
+  for (const match of prose.matchAll(/^#{2,6}\s+(.+?)\s*#*$/gm)) {
+    const heading = match[1]!
       .replace(/<[^>]+>/g, '')
       .replace(/[`*_~]/g, '')
-      .trim()
-      .toLocaleLowerCase('en-US')
-      .replace(/[^\p{L}\p{N}\s-]/gu, '')
-      .replace(/\s+/g, '-')
-      .replace(/-+/g, '-');
-    if (!base) continue;
-    const count = counts.get(base) ?? 0;
-    counts.set(base, count + 1);
-    anchors.add(count === 0 ? base : `${base}-${count}`);
+      .trim();
+    if (heading) anchors.add(slugger.slug(heading));
   }
   return anchors;
 }
@@ -77,7 +73,7 @@ async function collectMarkdown(path: string): Promise<string[]> {
 function frontmatterOf(contents: string, relativePath: string): Record<string, unknown> {
   const match = contents.match(/^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/);
   if (!match) throw new Error(`${relativePath}: missing YAML frontmatter`);
-  const data = parse(match[1]!) as unknown;
+  const data = Bun.YAML.parse(match[1]!) as unknown;
   if (!data || typeof data !== 'object' || Array.isArray(data)) {
     throw new Error(`${relativePath}: frontmatter must be a mapping`);
   }
@@ -168,7 +164,8 @@ export async function validatePublicDocs(): Promise<PublicDoc[]> {
   const byHref = new Map(docs.map((doc) => [doc.href, doc]));
   for (const doc of docs) {
     for (const link of linksIn(doc.contents)) {
-      if (/^(?:https?:|mailto:|tel:)/.test(link)) continue;
+      if (/^(?:mailto:|tel:)/.test(link)) continue;
+      if (/^https?:/.test(link) && !link.startsWith('https://leani.dev/docs/')) continue;
       const resolved = new URL(link, `https://leani.dev${doc.href}`);
       if (!resolved.pathname.startsWith('/docs')) continue;
       const href = resolved.pathname.endsWith('/') ? resolved.pathname : `${resolved.pathname}/`;

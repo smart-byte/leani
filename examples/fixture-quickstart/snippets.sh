@@ -1,5 +1,5 @@
-#!/usr/bin/env bash
-set -euo pipefail
+# These are independently rendered documentation snippets, not one runnable
+# script: `leani serve` intentionally remains in the foreground.
 
 # docs:start offline-quickstart
 brew install leani-dev/tap/leani
@@ -11,8 +11,7 @@ leani e2e fixture \
 # docs:end offline-quickstart
 
 # docs:start bounded-mainnet-quickstart
-brew install leani-dev/tap/leani
-mkdir leani-quickstart && cd leani-quickstart
+mkdir -p leani-quickstart && cd leani-quickstart
 LEANI_RELEASE="${LEANI_RELEASE:-v0.1.0}"
 curl -fsSLo leani.toml \
   "https://raw.githubusercontent.com/smart-byte/leani/${LEANI_RELEASE}/config/modes/windowed.toml"
@@ -26,4 +25,6 @@ leani serve
 # docs:start bounded-mainnet-query
 curl -s \
   'http://127.0.0.1:8080/v1/processors/uniswap-v2-sync-30d/collections/uniswap_v2.sync_hourly/entities?limit=3'
+curl -s \
+  'http://127.0.0.1:8080/v1/processors/uniswap-v2-sync-30d/status'
 # docs:end bounded-mainnet-query

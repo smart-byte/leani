@@ -2,7 +2,7 @@ name: Site and documentation
 
 on:
   push:
-    branches: [main, site-production]
+    branches: [main]
     paths:
       - "site/**"
       - "docs/**"
@@ -17,6 +17,7 @@ on:
       - "scripts/check-publication.rb"
       - "scripts/verify-site-production.rb"
       - ".github/workflows/site.yml"
+      - ".github/workflows/site-promote.yml"
   pull_request:
     paths:
       - "site/**"
@@ -32,6 +33,7 @@ on:
       - "scripts/check-publication.rb"
       - "scripts/verify-site-production.rb"
       - ".github/workflows/site.yml"
+      - ".github/workflows/site-promote.yml"
   workflow_dispatch:
 
 permissions:
@@ -54,19 +56,6 @@ jobs:
           bun-version-file: site/.bun-version
       - name: Verify publication history
         run: scripts/check-publication.rb HEAD
-      - name: Verify production ref
-        if: github.ref == 'refs/heads/site-production'
-        run: scripts/verify-site-production.rb HEAD
-      - name: Resolve documentation version
-        run: |
-          if [ "$GITHUB_REF" = "refs/heads/site-production" ]; then
-            docs_ref=$(git tag --points-at HEAD | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)?$')
-            echo "LEANI_SITE_MODE=production" >> "$GITHUB_ENV"
-            echo "LEANI_DOCS_REF=$docs_ref" >> "$GITHUB_ENV"
-          else
-            echo "LEANI_SITE_MODE=preview" >> "$GITHUB_ENV"
-            echo "LEANI_DOCS_REF=main" >> "$GITHUB_ENV"
-          fi
       - name: Install site dependencies
         working-directory: site
         run: bun install --frozen-lockfile

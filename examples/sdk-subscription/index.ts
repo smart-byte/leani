@@ -73,6 +73,15 @@ export async function consumeDurably<T>(
         throw new Error("retained history no longer covers this consumer; rebuild from a snapshot");
       }
 
+      // Keep the lease alive while a fetched page is being applied. A slow
+      // destination must not rely on the next acknowledgement for renewal.
+      await consumers.renew(
+        options.processor,
+        options.consumer,
+        options.credential,
+        { signal: options.signal },
+      );
+
       await destination.transaction(async (transaction) => {
         await transaction.apply(change);
         await transaction.storeLeaniCursor(change.cursor, change.sequence);

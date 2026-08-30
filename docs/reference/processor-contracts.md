@@ -12,7 +12,7 @@ status: preview
 
 These processors ship in the standard binary. Downstream projects can assemble
 a custom binary and register independent native processors through the public
-factory/registry API; see [Build a custom processor](/docs/guides/custom-processor/).
+factory/registry API; see [Build a custom processor](https://leani.dev/docs/guides/custom-processor/).
 
 ## blobs-money 1.4.0
 

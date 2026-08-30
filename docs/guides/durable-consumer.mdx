@@ -29,11 +29,6 @@ acknowledgement advances retention and delivery state.
 
 <CodeExample example="durable-consumer" />
 
-The destination's committed record can be normalized into a small operational
-checkpoint:
-
-<CodeExample example="durable-consumer-output" />
-
 <Aside type="danger" title="Never acknowledge before your commit">
   An early acknowledgement can make Leani eligible to discard history your
   application has not durably applied. A failed acknowledgement after commit is

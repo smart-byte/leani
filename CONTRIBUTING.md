@@ -23,7 +23,20 @@ cd packages/sdk
 bun install --frozen-lockfile
 bun run typecheck
 bun test
+
+cd ../../site
+bun install --frozen-lockfile
+bun run check
+bun run examples:check
+bun run build
 ```
+
+Public documentation lives in `docs/`; the Astro frontend lives in `site/`.
+Site preparation consumes tracked Rust-generated fixtures and requires only Bun.
+After changing CLI help, processor metadata, configuration schema, or SDK
+contracts, run `bun run docs:update` from `site/`; fixture regeneration also
+requires the pinned Rust toolchain. Keep private plans and raw evidence under
+the ignored `.private/` tree.
 
 Tests that require public datasets or Ethereum peers must be marked as
 integration tests, use bounded ranges, record the exact source/schema, and

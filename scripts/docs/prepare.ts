@@ -1,4 +1,6 @@
 import { mkdir, rm, writeFile } from 'node:fs/promises';
+import { readFileSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
 import { resolve, sep } from 'node:path';
 import { generateExamples } from './extract-snippets';
 import { generateReference } from './generate-reference';
@@ -12,22 +14,52 @@ export interface DocsBuildMetadata {
 const repositoryRoot = resolve(import.meta.dir, '../..');
 const generatedDirectory = resolve(repositoryRoot, 'site/src/generated');
 
-function docsBuildMetadata(): DocsBuildMetadata {
-  const mode = process.env.LEANI_SITE_MODE === 'production' ? 'production' : 'preview';
-  const docsRef = process.env.LEANI_DOCS_REF?.trim() || 'main';
+function gitValue(...arguments_: string[]): string | undefined {
+  try {
+    return execFileSync('git', ['-C', repositoryRoot, ...arguments_], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    }).trim() || undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+export function docsBuildMetadata(): DocsBuildMetadata {
+  const explicitMode = process.env.LEANI_SITE_MODE?.trim();
+  if (explicitMode && explicitMode !== 'preview' && explicitMode !== 'production') {
+    throw new Error(`invalid LEANI_SITE_MODE: ${explicitMode}`);
+  }
+  const exactTag = gitValue('describe', '--tags', '--exact-match', 'HEAD');
+  const branch =
+    process.env.CF_PAGES_BRANCH?.trim() ||
+    process.env.GITHUB_HEAD_REF?.trim() ||
+    process.env.GITHUB_REF_NAME?.trim() ||
+    gitValue('branch', '--show-current');
+  const productionBranch = branch === 'site-production';
+  const mode = explicitMode || (exactTag || productionBranch ? 'production' : 'preview');
+  let docsRef = process.env.LEANI_DOCS_REF?.trim() || exactTag;
+  if (!docsRef && mode === 'production') {
+    const manifest = readFileSync(resolve(repositoryRoot, 'Cargo.toml'), 'utf8');
+    const version = manifest.match(/^version\s*=\s*"([^"]+)"$/m)?.[1];
+    if (!version) throw new Error('could not derive production documentation tag from Cargo.toml');
+    docsRef = `v${version}`;
+  }
+  docsRef ||= branch || 'main';
   const sourceCommit =
     process.env.CF_PAGES_COMMIT_SHA?.trim() ||
     process.env.GITHUB_SHA?.trim() ||
+    gitValue('rev-parse', 'HEAD') ||
     'local';
 
-  if (!/^(main|v\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?)$/.test(docsRef)) {
-    throw new Error(`invalid LEANI_DOCS_REF: ${docsRef}`);
+  if (!/^[0-9A-Za-z][0-9A-Za-z._/-]*$/.test(docsRef) || docsRef.includes('..')) {
+    throw new Error(`invalid documentation ref: ${docsRef}`);
   }
-  if (mode === 'production' && docsRef === 'main') {
-    throw new Error('production documentation must use a release tag, not main');
+  if (mode === 'production' && !/^v\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/.test(docsRef)) {
+    throw new Error('production documentation must resolve to an exact semantic-version tag');
   }
 
-  return { mode, docsRef, sourceCommit };
+  return { mode: mode as DocsBuildMetadata['mode'], docsRef, sourceCommit };
 }
 
 export async function prepareDocs(): Promise<void> {

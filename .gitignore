@@ -19,6 +19,7 @@
 # Local product planning, pre-release records, raw evidence, and repository
 # archives live under one explicitly private tree. This is not a backup.
 /.private/
+/AGENTS.md
 
 # Benchmark and validation output. Benchmark implementations and reproducible
 # input manifests remain versioned; generated measurements stay local.

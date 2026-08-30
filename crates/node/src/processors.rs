@@ -5,6 +5,10 @@
 //! A future Wasm package loader implements the same [`ProcessorFactory`]
 //! contract.
 
+// The public factory trait deliberately permits IDs and descriptions owned by
+// dynamically loaded implementations; built-ins happen to return literals.
+#![allow(clippy::unnecessary_literal_bound)]
+
 use std::{collections::BTreeMap, fmt, sync::Arc};
 
 use leani_api::{
@@ -34,11 +38,11 @@ pub struct ProcessorFactoryError {
 }
 
 /// Stable human-facing metadata supplied by every registered processor factory.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProcessorFactoryMetadata {
-    pub id: &'static str,
-    pub description: &'static str,
+    pub id: String,
+    pub description: String,
 }
 
 /// One processor instance and its optional native read-only query surface.
@@ -119,9 +123,11 @@ impl ProcessorFactoryError {
 /// package runtime can later expose one factory per installed package while
 /// retaining the same node/runtime boundary.
 pub trait ProcessorFactory: Send + Sync {
-    fn id(&self) -> &'static str;
+    fn id(&self) -> &str;
 
-    fn description(&self) -> &'static str;
+    fn description(&self) -> &str {
+        self.id()
+    }
 
     /// Build and validate one immutable processor instance.
     ///
@@ -221,8 +227,8 @@ impl ProcessorRegistry {
         self.factories
             .values()
             .map(|factory| ProcessorFactoryMetadata {
-                id: factory.id(),
-                description: factory.description(),
+                id: factory.id().to_owned(),
+                description: factory.description().to_owned(),
             })
             .collect()
     }
@@ -428,11 +434,11 @@ fn configured_contract(
 struct BlobsProcessorFactory;
 
 impl ProcessorFactory for BlobsProcessorFactory {
-    fn id(&self) -> &'static str {
+    fn id(&self) -> &str {
         "blobs-money"
     }
 
-    fn description(&self) -> &'static str {
+    fn description(&self) -> &str {
         "Mainnet blob blocks, transactions, fees, burn, capacity, and fork-aware schedule"
     }
 
@@ -477,11 +483,11 @@ struct Erc20Settings {
 struct Erc20ProcessorFactory;
 
 impl ProcessorFactory for Erc20ProcessorFactory {
-    fn id(&self) -> &'static str {
+    fn id(&self) -> &str {
         "erc20-balances"
     }
 
-    fn description(&self) -> &'static str {
+    fn description(&self) -> &str {
         "Watchlist ERC-20 transfer ledger with current balances"
     }
 
@@ -545,11 +551,11 @@ struct ConfiguredEventOutput {
 struct EvmEventsProcessorFactory;
 
 impl ProcessorFactory for EvmEventsProcessorFactory {
-    fn id(&self) -> &'static str {
+    fn id(&self) -> &str {
         "evm-events"
     }
 
-    fn description(&self) -> &'static str {
+    fn description(&self) -> &str {
         "ABI-decoded EVM logs with configurable entity keys and time buckets"
     }
 
@@ -607,11 +613,11 @@ struct TransactionStatsSettings {
 struct TransactionStatsProcessorFactory;
 
 impl ProcessorFactory for TransactionStatsProcessorFactory {
-    fn id(&self) -> &'static str {
+    fn id(&self) -> &str {
         "transaction-stats"
     }
 
-    fn description(&self) -> &'static str {
+    fn description(&self) -> &str {
         "Directional transaction counts and value totals for one address pair"
     }
 
@@ -665,11 +671,11 @@ struct UniswapSettings {
 struct UniswapObservationsProcessorFactory;
 
 impl ProcessorFactory for UniswapObservationsProcessorFactory {
-    fn id(&self) -> &'static str {
+    fn id(&self) -> &str {
         "uniswap-observations"
     }
 
-    fn description(&self) -> &'static str {
+    fn description(&self) -> &str {
         "Append-only Uniswap V2/V3 pool observations"
     }
 
@@ -691,11 +697,11 @@ impl ProcessorFactory for UniswapObservationsProcessorFactory {
 struct UniswapLatestProcessorFactory;
 
 impl ProcessorFactory for UniswapLatestProcessorFactory {
-    fn id(&self) -> &'static str {
+    fn id(&self) -> &str {
         "uniswap-latest"
     }
 
-    fn description(&self) -> &'static str {
+    fn description(&self) -> &str {
         "Latest materialized Uniswap V2/V3 pool state with typed query routes"
     }
 
@@ -767,11 +773,11 @@ mod tests {
     struct DuplicateBlobs;
 
     impl ProcessorFactory for DuplicateBlobs {
-        fn id(&self) -> &'static str {
+        fn id(&self) -> &str {
             "blobs-money"
         }
 
-        fn description(&self) -> &'static str {
+        fn description(&self) -> &str {
             "duplicate test factory"
         }
 

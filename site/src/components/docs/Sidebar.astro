@@ -1,5 +1,6 @@
 ---
 import { getCollection } from 'astro:content';
+import { Badge } from '@astrojs/starlight/components';
 import MobileMenuFooter from '@astrojs/starlight/components/MobileMenuFooter.astro';
 import { DOC_SECTIONS, DOC_SECTION_LABELS, docHref } from '../../lib/docs';
 
@@ -22,7 +23,14 @@ const entries = (await getCollection('docs', ({ data }) => !data.draft)).sort((l
             {sectionEntries.map((entry) => (
               <li>
                 <a href={docHref(entry.id)} aria-current={entry.id === currentId ? 'page' : undefined}>
-                  {entry.data.sidebar.label || entry.data.title}
+                  <span>{entry.data.sidebar.label || entry.data.title}</span>
+                  {entry.data.sidebar.badge && (
+                    <Badge
+                      text={entry.data.sidebar.badge.text}
+                      variant={entry.data.sidebar.badge.variant}
+                      size="small"
+                    />
+                  )}
                 </a>
               </li>
             ))}

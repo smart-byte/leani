@@ -1,5 +1,5 @@
 import { createRequire } from 'node:module';
-import { readFile, writeFile } from 'node:fs/promises';
+import { readdir, readFile, writeFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 
 type JsonObject = Record<string, any>;
@@ -37,15 +37,25 @@ function authentication(security: unknown): string {
 }
 
 async function httpReference(repositoryRoot: string): Promise<JsonObject> {
-  const require = siteRequire(repositoryRoot);
-  const { parse } = require('yaml') as { parse: (input: string) => JsonObject };
-  const document = parse(await readFile(resolve(repositoryRoot, 'api/openapi.yaml'), 'utf8'));
+  const document = Bun.YAML.parse(
+    await readFile(resolve(repositoryRoot, 'api/openapi.yaml'), 'utf8'),
+  ) as JsonObject;
   const routerSource = await readFile(resolve(repositoryRoot, 'crates/api/src/lib.rs'), 'utf8');
   const routedPaths = new Set(
     Array.from(routerSource.matchAll(/\.route\(\s*"([^"]+)"/g), (match) => match[1]!).filter(
       (path) => /^(?:\/v1\/|\/admin\/|\/health\/|\/metrics$|\/debug\/)/.test(path),
     ),
   );
+  const extensionDirectory = resolve(repositoryRoot, 'crates/api/src/extensions');
+  for (const entry of await readdir(extensionDirectory, { withFileTypes: true })) {
+    if (!entry.isFile() || !entry.name.endsWith('.rs')) continue;
+    const source = await readFile(resolve(extensionDirectory, entry.name), 'utf8');
+    const alias = source.match(/fn alias\(&self\)[\s\S]*?Some\("([a-z0-9-]+)"\)/)?.[1];
+    if (!alias) continue;
+    for (const match of source.matchAll(/\.route\(\s*"([^"]+)"/g)) {
+      routedPaths.add(`/v1/q/${alias}${match[1]}`);
+    }
+  }
   const documentedPaths = new Set(Object.keys(document.paths ?? {}));
   const undocumented = [...routedPaths].filter((path) => !documentedPaths.has(path)).sort();
   if (undocumented.length > 0) {

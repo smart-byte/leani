@@ -38,7 +38,7 @@ processor start                                             observed head
 
 ## The default gap policy
 
-If `sources.p2p.history_fallback_blocks` is omitted, P2P fallback is eligible to
+If `sources.live.history_fallback_blocks` is omitted, P2P fallback is eligible to
 fill every history gap at or after the processor start block. Retained or archive
 sources are selected first when capable. Configure a numeric limit only when
 you intentionally want to restrict P2P recovery to a finalized suffix.
