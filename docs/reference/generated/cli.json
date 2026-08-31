@@ -210,6 +210,394 @@
         "subcommands": []
       },
       {
+        "name": "init",
+        "about": "Create a compact configuration for a built-in processor",
+        "usage": "Usage: leani init [OPTIONS] <PROTOCOL> <MARKETS>...",
+        "arguments": [
+          {
+            "id": "protocol",
+            "long": null,
+            "short": null,
+            "help": "Processor preset to configure",
+            "required": true,
+            "action": "Set",
+            "defaultValues": [],
+            "possibleValues": [
+              "uniswap-v3"
+            ]
+          },
+          {
+            "id": "markets",
+            "long": null,
+            "short": null,
+            "help": "One or more built-in markets, for example `ETH/USDC`",
+            "required": true,
+            "action": "Append",
+            "defaultValues": [],
+            "possibleValues": []
+          },
+          {
+            "id": "data_dir",
+            "long": "data-dir",
+            "short": null,
+            "help": "Data directory written to the generated configuration",
+            "required": false,
+            "action": "Set",
+            "defaultValues": [
+              "./data"
+            ],
+            "possibleValues": []
+          },
+          {
+            "id": "checkpoint_url",
+            "long": "checkpoint-url",
+            "short": null,
+            "help": "Checkpoint provider used for weak-subjectivity quorum (repeatable or comma-delimited)",
+            "required": false,
+            "action": "Append",
+            "defaultValues": [
+              "https://ethereum-beacon-api.publicnode.com/",
+              "https://mainnet.checkpoint.sigp.io/",
+              "https://beaconstate-mainnet.chainsafe.io/"
+            ],
+            "possibleValues": []
+          },
+          {
+            "id": "checkpoint_quorum",
+            "long": "checkpoint-quorum",
+            "short": null,
+            "help": "Number of independent checkpoint providers that must agree",
+            "required": false,
+            "action": "Set",
+            "defaultValues": [
+              "2"
+            ],
+            "possibleValues": []
+          },
+          {
+            "id": "yes",
+            "long": "yes",
+            "short": null,
+            "help": "Accept a new checkpoint provider quorum without interactive confirmation",
+            "required": false,
+            "action": "SetTrue",
+            "defaultValues": [
+              "false"
+            ],
+            "possibleValues": [
+              "true",
+              "false"
+            ]
+          },
+          {
+            "id": "config",
+            "long": "config",
+            "short": null,
+            "help": "Path to the versioned TOML configuration",
+            "required": false,
+            "action": "Set",
+            "defaultValues": [],
+            "possibleValues": []
+          },
+          {
+            "id": "log_format",
+            "long": "log-format",
+            "short": null,
+            "help": "Log rendering format",
+            "required": false,
+            "action": "Set",
+            "defaultValues": [
+              "pretty"
+            ],
+            "possibleValues": [
+              "pretty",
+              "json"
+            ]
+          },
+          {
+            "id": "log_filter",
+            "long": "log-filter",
+            "short": null,
+            "help": "Tracing filter, e.g. `info,leani=debug`",
+            "required": false,
+            "action": "Set",
+            "defaultValues": [
+              "info"
+            ],
+            "possibleValues": []
+          },
+          {
+            "id": "help",
+            "long": "help",
+            "short": "h",
+            "help": "Print help (see more with '--help')",
+            "required": false,
+            "action": "Help",
+            "defaultValues": [],
+            "possibleValues": []
+          },
+          {
+            "id": "version",
+            "long": "version",
+            "short": "V",
+            "help": "Print version",
+            "required": false,
+            "action": "Version",
+            "defaultValues": [],
+            "possibleValues": []
+          }
+        ],
+        "subcommands": []
+      },
+      {
+        "name": "subscribe",
+        "about": "Stream live market prices from an embedded processor or a running node",
+        "usage": "Usage: leani subscribe [OPTIONS] <PROTOCOL> <MARKETS>...",
+        "arguments": [
+          {
+            "id": "protocol",
+            "long": null,
+            "short": null,
+            "help": "Embedded market-data processor to activate",
+            "required": true,
+            "action": "Set",
+            "defaultValues": [],
+            "possibleValues": [
+              "uniswap-v3"
+            ]
+          },
+          {
+            "id": "markets",
+            "long": null,
+            "short": null,
+            "help": "One or more built-in markets, for example `ETH/USDC`",
+            "required": true,
+            "action": "Append",
+            "defaultValues": [],
+            "possibleValues": []
+          },
+          {
+            "id": "format",
+            "long": "format",
+            "short": null,
+            "help": "Rendering contract for stdout",
+            "required": false,
+            "action": "Set",
+            "defaultValues": [
+              "pretty"
+            ],
+            "possibleValues": [
+              "pretty",
+              "json",
+              "raw"
+            ]
+          },
+          {
+            "id": "mode",
+            "long": "mode",
+            "short": null,
+            "help": "Where the subscription processor should run",
+            "required": false,
+            "action": "Set",
+            "defaultValues": [
+              "auto"
+            ],
+            "possibleValues": [
+              "auto",
+              "client",
+              "embedded"
+            ]
+          },
+          {
+            "id": "endpoint",
+            "long": "endpoint",
+            "short": null,
+            "help": "Base URL of an already running Leani node",
+            "required": false,
+            "action": "Set",
+            "defaultValues": [],
+            "possibleValues": []
+          },
+          {
+            "id": "processor",
+            "long": "processor",
+            "short": null,
+            "help": "Processor instance or unambiguous processor kind on a running node",
+            "required": false,
+            "action": "Set",
+            "defaultValues": [
+              "uniswap-observations"
+            ],
+            "possibleValues": []
+          },
+          {
+            "id": "token",
+            "long": "token",
+            "short": null,
+            "help": "Optional bearer token for a running node",
+            "required": false,
+            "action": "Set",
+            "defaultValues": [],
+            "possibleValues": []
+          },
+          {
+            "id": "finality",
+            "long": "finality",
+            "short": null,
+            "help": "Price publication finality",
+            "required": false,
+            "action": "Set",
+            "defaultValues": [
+              "optimistic"
+            ],
+            "possibleValues": [
+              "optimistic",
+              "finalized"
+            ]
+          },
+          {
+            "id": "finality_source",
+            "long": "finality-source",
+            "short": null,
+            "help": "Finality transport for the embedded runtime",
+            "required": false,
+            "action": "Set",
+            "defaultValues": [
+              "auto"
+            ],
+            "possibleValues": [
+              "auto",
+              "beacon-api",
+              "p2p"
+            ]
+          },
+          {
+            "id": "checkpoint_url",
+            "long": "checkpoint-url",
+            "short": null,
+            "help": "Checkpoint provider used for weak-subjectivity quorum (repeatable or comma-delimited)",
+            "required": false,
+            "action": "Append",
+            "defaultValues": [
+              "https://ethereum-beacon-api.publicnode.com/",
+              "https://mainnet.checkpoint.sigp.io/",
+              "https://beaconstate-mainnet.chainsafe.io/"
+            ],
+            "possibleValues": []
+          },
+          {
+            "id": "checkpoint_quorum",
+            "long": "checkpoint-quorum",
+            "short": null,
+            "help": "Number of independent checkpoint providers that must agree",
+            "required": false,
+            "action": "Set",
+            "defaultValues": [
+              "2"
+            ],
+            "possibleValues": []
+          },
+          {
+            "id": "yes",
+            "long": "yes",
+            "short": null,
+            "help": "Accept a new checkpoint provider quorum without interactive confirmation",
+            "required": false,
+            "action": "SetTrue",
+            "defaultValues": [
+              "false"
+            ],
+            "possibleValues": [
+              "true",
+              "false"
+            ]
+          },
+          {
+            "id": "data_dir",
+            "long": "data-dir",
+            "short": null,
+            "help": "Persistent directory for the lightweight embedded runtime",
+            "required": false,
+            "action": "Set",
+            "defaultValues": [],
+            "possibleValues": []
+          },
+          {
+            "id": "once",
+            "long": "once",
+            "short": null,
+            "help": "Exit after the first matching price update",
+            "required": false,
+            "action": "SetTrue",
+            "defaultValues": [
+              "false"
+            ],
+            "possibleValues": [
+              "true",
+              "false"
+            ]
+          },
+          {
+            "id": "config",
+            "long": "config",
+            "short": null,
+            "help": "Path to the versioned TOML configuration",
+            "required": false,
+            "action": "Set",
+            "defaultValues": [],
+            "possibleValues": []
+          },
+          {
+            "id": "log_format",
+            "long": "log-format",
+            "short": null,
+            "help": "Log rendering format",
+            "required": false,
+            "action": "Set",
+            "defaultValues": [
+              "pretty"
+            ],
+            "possibleValues": [
+              "pretty",
+              "json"
+            ]
+          },
+          {
+            "id": "log_filter",
+            "long": "log-filter",
+            "short": null,
+            "help": "Tracing filter, e.g. `info,leani=debug`",
+            "required": false,
+            "action": "Set",
+            "defaultValues": [
+              "info"
+            ],
+            "possibleValues": []
+          },
+          {
+            "id": "help",
+            "long": "help",
+            "short": "h",
+            "help": "Print help (see more with '--help')",
+            "required": false,
+            "action": "Help",
+            "defaultValues": [],
+            "possibleValues": []
+          },
+          {
+            "id": "version",
+            "long": "version",
+            "short": "V",
+            "help": "Print version",
+            "required": false,
+            "action": "Version",
+            "defaultValues": [],
+            "possibleValues": []
+          }
+        ],
+        "subcommands": []
+      },
+      {
         "name": "backfill",
         "about": "Process a historical block range and then exit",
         "usage": "Usage: leani backfill [OPTIONS] --from <FROM> --to <TO>",
@@ -3374,6 +3762,20 @@
             "name": "serve",
             "about": "Start configured sources, processors, stores, and serving endpoints",
             "usage": "Usage: leani help serve",
+            "arguments": [],
+            "subcommands": []
+          },
+          {
+            "name": "init",
+            "about": "Create a compact configuration for a built-in processor",
+            "usage": "Usage: leani help init",
+            "arguments": [],
+            "subcommands": []
+          },
+          {
+            "name": "subscribe",
+            "about": "Stream live market prices from an embedded processor or a running node",
+            "usage": "Usage: leani help subscribe",
             "arguments": [],
             "subcommands": []
           },

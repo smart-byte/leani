@@ -6,7 +6,10 @@ mod extensions;
 pub use extension::{
     QueryContext, QueryExtension, QueryExtensionRegistration, QueryExtensionSummary,
 };
-pub use extensions::{BlobsQueryExtension, Erc20QueryExtension, UniswapQueryExtension};
+pub use extensions::{
+    BlobsQueryExtension, Erc20QueryExtension, UniswapObservationsQueryExtension,
+    UniswapQueryExtension,
+};
 
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
@@ -20,7 +23,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use alloy_primitives::U256;
+use alloy_primitives::{I256, U256};
 use async_trait::async_trait;
 use axum::{
     Json, Router,
@@ -142,6 +145,24 @@ impl ReadinessHandle {
 
     pub fn set_finality_ready(&self, ready: bool) {
         self.inner.finality_ready.store(ready, Ordering::Release);
+    }
+
+    /// Whether every required live/finality lane is currently ready.
+    #[must_use]
+    pub fn is_ready(&self) -> bool {
+        self.snapshot().ready
+    }
+
+    /// Whether the live execution lane has reached its ready state.
+    #[must_use]
+    pub fn live_ready(&self) -> bool {
+        self.inner.live_ready.load(Ordering::Acquire)
+    }
+
+    /// Whether the verified finality lane has reached its ready state.
+    #[must_use]
+    pub fn finality_ready(&self) -> bool {
+        self.inner.finality_ready.load(Ordering::Acquire)
     }
 
     fn snapshot(&self) -> ReadinessSnapshot {
@@ -940,7 +961,7 @@ fn validate_extension_alias(
     const BUILT_IN_ALIASES: &[(&str, &str, &str)] = &[
         ("blobs", "blobs-money", "blobs-v1"),
         ("erc20", "erc20-balances", "erc20-v1"),
-        ("uniswap", "uniswap-latest", "uniswap-v1"),
+        ("uniswap", "uniswap-latest", "uniswap-v2"),
     ];
     if alias.is_empty()
         || alias.len() > 64
@@ -3279,6 +3300,8 @@ pub struct UniswapPoolPrice {
     kind: leani_processor_uniswap::PoolKind,
     reserve0: Option<String>,
     reserve1: Option<String>,
+    amount0: Option<String>,
+    amount1: Option<String>,
     sqrt_price_x96: Option<String>,
     block_number: u64,
     block_hash: String,
@@ -3293,6 +3316,8 @@ impl From<&PoolPriceEntity> for UniswapPoolPrice {
             kind: value.kind,
             reserve0: value.reserve0.map(quantity_decimal),
             reserve1: value.reserve1.map(quantity_decimal),
+            amount0: value.amount0.map(signed_quantity_decimal),
+            amount1: value.amount1.map(signed_quantity_decimal),
             sqrt_price_x96: value.sqrt_price_x96.map(quantity_decimal),
             block_number: value.block_number.0,
             block_hash: hash_hex(value.block_hash),
@@ -6910,6 +6935,10 @@ fn quantity_decimal(value: Quantity) -> String {
     U256::from_be_bytes(value.0).to_string()
 }
 
+fn signed_quantity_decimal(value: Quantity) -> String {
+    I256::from_raw(U256::from_be_bytes(value.0)).to_string()
+}
+
 const fn finality_name(finality: Finality) -> &'static str {
     match finality {
         Finality::Optimistic => "optimistic",
@@ -7764,6 +7793,64 @@ mod tests {
             format!("/v1/processors/{instance}/query")
         );
         assert_eq!(body["queryExtensions"][0]["aliasPath"], "/v1/q/orders");
+    }
+
+    #[tokio::test]
+    async fn uniswap_observation_extension_exposes_the_immutable_pool_scope() {
+        use leani_processor_uniswap::{
+            PoolConfig, PoolKind, UniswapConfig, UniswapObservationsProcessor,
+        };
+
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = SqliteStore::open(leani_store_sqlite::StoreConfig::new(
+            directory.path().join("node.sqlite"),
+        ))
+        .await
+        .expect("store");
+        let processor: Arc<dyn Processor> = Arc::new(
+            UniswapObservationsProcessor::new(UniswapConfig {
+                start_block: BlockNumber(1),
+                pools: vec![
+                    PoolConfig {
+                        address: Address::new([0x22; 20]),
+                        kind: PoolKind::V3,
+                    },
+                    PoolConfig {
+                        address: Address::new([0x11; 20]),
+                        kind: PoolKind::V2,
+                    },
+                ],
+            })
+            .expect("processor"),
+        );
+        let instance = processor.descriptor().instance.to_string();
+        let registration = QueryExtensionRegistration::new(
+            processor.clone(),
+            Arc::new(UniswapObservationsQueryExtension),
+        );
+        let app = router_with_processors(
+            store,
+            vec![processor],
+            vec![registration],
+            ApiConfig::default(),
+        )
+        .expect("router");
+
+        let response = app
+            .oneshot(
+                Request::get(format!("/v1/processors/{instance}/query/pools"))
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 4096).await.expect("body");
+        let body: Value = serde_json::from_slice(&body).expect("JSON");
+        assert_eq!(body["data"][0]["address"], format!("0x{}", "11".repeat(20)));
+        assert_eq!(body["data"][0]["kind"], "v2");
+        assert_eq!(body["data"][1]["address"], format!("0x{}", "22".repeat(20)));
+        assert_eq!(body["data"][1]["kind"], "v3");
     }
 
     #[tokio::test]
@@ -9404,8 +9491,14 @@ mod tests {
             .await
             .expect("response");
         assert_eq!(unavailable.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(!readiness.is_ready());
+        assert!(!readiness.live_ready());
+        assert!(!readiness.finality_ready());
         readiness.set_live_ready(true);
         readiness.set_finality_ready(true);
+        assert!(readiness.is_ready());
+        assert!(readiness.live_ready());
+        assert!(readiness.finality_ready());
         let available = router
             .clone()
             .oneshot(

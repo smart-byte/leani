@@ -6,4 +6,4 @@ mod uniswap;
 
 pub use blobs::BlobsQueryExtension;
 pub use erc20::Erc20QueryExtension;
-pub use uniswap::UniswapQueryExtension;
+pub use uniswap::{UniswapObservationsQueryExtension, UniswapQueryExtension};

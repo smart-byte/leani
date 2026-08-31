@@ -9,9 +9,59 @@ audience:
 status: preview
 ---
 
-Leani reads strict, versioned TOML. Unknown fields are errors. The
-machine-readable contract is rendered in the [configuration field reference](https://leani.dev/docs/reference/configuration/);
-six complete lifecycle profiles are checked under `config/modes`.
+Leani reads strict, versioned TOML. Unknown fields are errors. Version 1 has
+two first-class document shapes: a compact processor-oriented setup with sane
+network defaults, and the fully explicit advanced schema. Both become the same
+validated runtime configuration. The machine-readable contract is rendered in
+the [configuration field reference](https://leani.dev/docs/reference/configuration/); six
+complete advanced lifecycle profiles are checked under `config/modes`.
+
+For a local Uniswap node, generate the compact form and a current trusted
+checkpoint together:
+
+```bash
+leani init uniswap-v3 ETH/USDC
+leani doctor
+```
+
+`init` requires two configured checkpoint providers to agree on one finalized
+slot and root, asks before accepting them, writes `leani.toml`, and never
+overwrites an existing file. A global `--config PATH` selects another output
+path. The generated document contains only the choices an operator normally
+needs:
+
+```toml
+config_version = 1
+network = "ethereum-mainnet"
+data_dir = "./data"
+
+[finality]
+checkpoint = "0x..."
+checkpoint_slot = 15100000
+endpoints = ["https://ethereum-beacon-api.publicnode.com/"]
+
+[uniswap]
+markets = ["ETH/USDC"]
+
+[api]
+bind = "127.0.0.1:18080"
+```
+
+The checkpoint and slot above are illustrative; the generator writes the live
+quorum result. Compact Ethereum Mainnet Uniswap configurations expand to:
+
+| Concern | Default |
+|---|---|
+| execution | native P2P, one-peer availability floor, 16-peer healthy target, 100-peer cap |
+| history | public Xatu source, on-demand processor scheduling |
+| processor | built-in pool catalog, optimistic and finalized output, checkpointed state, 256-block undo safety |
+| resources | 512 MiB memory, 2 GiB temporary disk, four source and mapper tasks |
+| retention | full query output; 64 MiB or 24 hours of change delivery |
+| listeners | ephemeral P2P ports, RPC `127.0.0.1:18545`/`18546`, API `127.0.0.1:18080` |
+
+The reviewed expansion is checked in as
+[`config/defaults/ethereum-mainnet-uniswap.toml`](../../config/defaults/ethereum-mainnet-uniswap.toml).
+Use the advanced schema below when any expanded field needs an override.
 
 Validate a file without opening its database or any network connection:
 
@@ -23,12 +73,11 @@ leani doctor --json
 Without `--config`, Leani looks for `./leani.toml` and then
 `./config/example.toml` (the source-workspace fallback). Set `LEANI_CONFIG` when a
 service or shell should consistently use a configuration elsewhere. An
-explicit `--config` remains the highest-precedence override. Leani does not
-invent defaults for chain identity, source trust, finality, processor
-lifecycle, or storage budgets; those choices remain visible in the selected
-TOML.
+explicit `--config` remains the highest-precedence override. Compact documents
+default operational tuning but never the chain identity, checkpoint trust
+root, or selected markets. Advanced documents keep every choice explicit.
 
-## Root fields
+## Advanced root fields
 
 | Field | Type | Meaning |
 |---|---|---|

@@ -92,6 +92,85 @@ fallback.
 
 Token balances and Uniswap prices are the next generality tests. Both can be derived from receipt logs without an EVM, subject to the semantic limits documented in [RPC compatibility](docs/reference/ethereum-json-rpc.md).
 
+## Stream a live Uniswap price
+
+The CLI can activate the embedded Uniswap V3 observation processor without a
+separately running Leani node or a hand-written configuration:
+
+```bash
+leani subscribe uniswap-v3 ETH/USDC
+```
+
+This naked form is the standalone example: when no configured node is
+reachable, it starts the lightweight processor itself. A cold first run can
+spend a few minutes discovering public execution peers and catching up from a
+verified finalized anchor. Leani reports that phase, then prints the newest
+still-fresh price captured during verified startup and continues with
+subsequent swaps. The checkpoint and useful peer records are cached, so later
+runs normally become ready much faster. When a local `leani.toml` exists, an
+embedded fallback also seeds its private peer cache from that node context
+without sharing the node's P2P identity or writable database.
+
+When this attaches to a running node, every requested market must already be in
+that node's Uniswap processor configuration. Leani checks the processor's pool
+catalog before opening the stream and reports the configured markets on a
+mismatch. An embedded subscription instead builds its processor scope directly
+from the markets on the command line.
+
+On first use, Leani requires two of three independent checkpoint providers to
+agree on the exact finalized consensus slot and root, then asks you to accept
+that quorum. Execution follows native P2P peers, while ongoing Beacon API
+responses are proof-checked from the accepted checkpoint. Once Leani has
+locally verified a newer light-client finality anchor and its
+consensus-committed execution hash, that anchor is persisted and reused by
+later runs without another provider request while it remains fresh.
+`subscribe` never modifies configuration files.
+
+Use consensus P2P for finality updates as well:
+
+```bash
+leani subscribe uniswap-v3 ETH/USDC --finality-source p2p
+```
+
+This still needs the quorum-provided root on a fresh installation, but does not
+need an ongoing Beacon API connection after bootstrap. The default provider set
+and `2`-provider threshold can be changed with repeatable `--checkpoint-url`
+flags and `--checkpoint-quorum`.
+
+Subscribe to several pools and pipe stable NDJSON to another Unix tool:
+
+```bash
+leani subscribe uniswap-v3 ETH/USDC ETH/USDT --format json |
+  jq --unbuffered '{market, price, baseVolume, blockNumber, finality}'
+```
+
+Each update includes the swap volume in the market's first token: ETH for
+`ETH/USDC`, WBTC for `WBTC/ETH`, and so on.
+
+From a directory with a project-local `leani.toml`, run `leani serve` in one
+terminal and the same naked subscription command in another. Auto mode detects
+the configured loopback API and attaches; `--mode client --endpoint URL` remains
+available as a fail-closed remote-node override. `--config leani.toml` reuses a
+node profile's network and finality settings for embedded mode without starting
+its listeners or other processors. See the
+[CLI and SDK walkthrough](docs/guides/uniswap-price-subscriptions.md) for the
+output contract, exact price math, and TypeScript example.
+
+Create that prepared node without hand-writing the full operational schema:
+
+```bash
+leani init uniswap-v3 ETH/USDC
+leani serve
+```
+
+`init` obtains the same two-provider checkpoint quorum used by embedded
+subscriptions, asks before trusting it, and writes a compact `leani.toml`. It
+refuses to overwrite an existing file. Use `--yes` only when accepting the
+quorum non-interactively is intentional, and use global `--config PATH` to
+select another output path. The compact file exposes the network, data path,
+trusted checkpoint, markets, and API bind; `serve` expands everything else to
+documented Mainnet defaults. Advanced full configurations remain supported.
+
 ## Important boundary
 
 Leani can replace a managed RPC for event indexing, recent block/receipt
@@ -113,6 +192,7 @@ Those methods can eventually use an optional forwarding or stateless-execution e
 Start at [leani.dev/docs](https://leani.dev/docs/) for the task-oriented
 documentation, including the [Mainnet quickstart](https://leani.dev/docs/getting-started/),
 [configuration reference](https://leani.dev/docs/reference/configuration/),
+[live Uniswap price subscriptions](https://leani.dev/docs/guides/uniswap-price-subscriptions/),
 [operations guidance](https://leani.dev/docs/operations/preview-limitations/),
 and [processor-author guide](https://leani.dev/docs/guides/custom-processor/).
 

@@ -2557,7 +2557,15 @@ pub async fn run() -> Result<Exit> {
 /// selected operation fails.
 pub async fn run_with_registry(registry: ProcessorRegistry) -> Result<Exit> {
     let cli = Cli::parse();
-    init_logging(cli.log_format, &cli.log_filter)?;
+    let log_filter = if matches!(cli.command, Command::Subscribe { .. })
+        && cli.log_filter == "info"
+        && std::env::var_os("LEANI_LOG").is_none()
+    {
+        "error,leani=warn"
+    } else {
+        &cli.log_filter
+    };
+    init_logging(cli.log_format, log_filter)?;
     Box::pin(run_cli_with_registry(cli, &registry)).await
 }
 
@@ -2580,10 +2588,70 @@ pub async fn run_cli(cli: Cli) -> Result<Exit> {
 #[allow(clippy::too_many_lines)]
 pub async fn run_cli_with_registry(cli: Cli, registry: &ProcessorRegistry) -> Result<Exit> {
     let working_directory = std::env::current_dir().context("resolve current working directory")?;
+    let requested_config = cli.config.clone();
     let config_path = resolve_config_path(cli.config.as_deref(), &working_directory);
     match cli.command {
         Command::Doctor { json } => doctor(&config_path, json, registry),
         Command::Serve => serve(&config_path, registry).await,
+        Command::Init {
+            protocol,
+            markets,
+            data_dir,
+            checkpoint_url,
+            checkpoint_quorum,
+            yes,
+        } => {
+            crate::init::init(crate::init::InitOptions {
+                protocol,
+                markets,
+                data_dir,
+                checkpoint_urls: checkpoint_url,
+                checkpoint_quorum,
+                accept_checkpoint: yes,
+                config_path: requested_config.unwrap_or_else(|| PathBuf::from("leani.toml")),
+                working_directory,
+            })
+            .await
+        }
+        Command::Subscribe {
+            protocol,
+            markets,
+            format,
+            mode,
+            endpoint,
+            processor,
+            token,
+            finality,
+            finality_source,
+            checkpoint_url,
+            checkpoint_quorum,
+            yes,
+            data_dir,
+            once,
+        } => {
+            crate::subscribe::subscribe(
+                crate::subscribe::SubscribeOptions {
+                    protocol,
+                    markets,
+                    format,
+                    mode,
+                    endpoint,
+                    processor,
+                    token,
+                    finality,
+                    finality_source,
+                    checkpoint_urls: checkpoint_url,
+                    checkpoint_quorum,
+                    accept_checkpoint: yes,
+                    data_dir,
+                    once,
+                    requested_config,
+                    working_directory,
+                },
+                registry,
+            )
+            .await
+        }
         Command::Backfill {
             processor,
             from,
@@ -3373,6 +3441,7 @@ async fn mainnet_e2e(
             network_telemetry: network_telemetry.clone(),
             cancellation: cancellation.clone(),
             backfill_control: None,
+            verified_anchor: None,
         };
         let live_source = execution_p2p_source(&config, handles.network_telemetry.clone())?;
         tokio::spawn(async move {
@@ -4503,12 +4572,18 @@ fn init_logging(format: LogFormat, filter: &str) -> Result<()> {
             .with(
                 tracing_subscriber::fmt::layer()
                     .with_ansi(std::io::stderr().is_terminal())
+                    .with_writer(std::io::stderr)
                     .with_target(true),
             )
             .try_init()
             .context("logging already initialized")?,
         LogFormat::Json => registry
-            .with(tracing_subscriber::fmt::layer().json().with_target(true))
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .json()
+                    .with_writer(std::io::stderr)
+                    .with_target(true),
+            )
             .try_init()
             .context("logging already initialized")?,
     }
@@ -5095,6 +5170,7 @@ async fn serve(path: &Path, registry: &ProcessorRegistry) -> Result<Exit> {
             network_telemetry: network_telemetry.clone(),
             cancellation: cancellation.clone(),
             backfill_control: Some(backfill_control),
+            verified_anchor: None,
         };
         Some(tokio::spawn(async move {
             Box::pin(supervise_network_lanes(
@@ -5425,6 +5501,57 @@ struct NetworkLaneHandles {
     network_telemetry: leani_source_api::NetworkTelemetry,
     cancellation: CancellationToken,
     backfill_control: Option<Arc<NativeBackfillControl>>,
+    verified_anchor:
+        Option<tokio::sync::watch::Sender<Option<leani_runtime::AppliedFinalityAnchor>>>,
+}
+
+/// Minimal network runtime used by commands that need live processing without
+/// opening the node's API/RPC listeners or starting historical job machinery.
+pub(crate) struct EmbeddedNetworkRuntime {
+    pub(crate) readiness: leani_api::ReadinessHandle,
+    pub(crate) verified_anchor:
+        tokio::sync::watch::Receiver<Option<leani_runtime::AppliedFinalityAnchor>>,
+    cancellation: CancellationToken,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl EmbeddedNetworkRuntime {
+    #[must_use]
+    pub(crate) fn is_finished(&self) -> bool {
+        self.task.is_finished()
+    }
+
+    pub(crate) async fn shutdown(self) {
+        self.cancellation.cancel();
+        let _ = self.task.await;
+    }
+}
+
+pub(crate) fn spawn_embedded_network_runtime(
+    config: Config,
+    store: leani_store_sqlite::SqliteStore,
+    processors: Vec<std::sync::Arc<dyn leani_processor_api::Processor>>,
+) -> EmbeddedNetworkRuntime {
+    let readiness = leani_api::ReadinessHandle::new(true, true);
+    let cancellation = CancellationToken::new();
+    let (committed_events, _) = tokio::sync::broadcast::channel(1_024);
+    let (verified_anchor, verified_anchor_updates) = tokio::sync::watch::channel(None);
+    let handles = NetworkLaneHandles {
+        readiness: readiness.clone(),
+        rpc_readiness: leani_rpc::RpcReadiness::default(),
+        committed_events,
+        network_telemetry: leani_source_api::NetworkTelemetry::default(),
+        cancellation: cancellation.clone(),
+        backfill_control: None,
+        verified_anchor: Some(verified_anchor),
+    };
+    let task = tokio::spawn(supervise_network_lanes(config, store, processors, handles));
+    EmbeddedNetworkRuntime {
+        readiness,
+        verified_anchor: verified_anchor_updates,
+        cancellation,
+        task,
+    }
 }
 
 pub(crate) fn execution_p2p_source(
@@ -5648,6 +5775,7 @@ async fn run_network_lanes_once(
         network_telemetry: _,
         cancellation,
         backfill_control,
+        verified_anchor,
     } = handles;
     if config.chain.chain_id != 1 {
         bail!("the direct P2P/finality lane currently supports Ethereum mainnet only");
@@ -5724,6 +5852,13 @@ async fn run_network_lanes_once(
     store
         .store_canonical_anchor(chain_id, live_anchor, Finality::Finalized)
         .await?;
+    if let Some(verified_anchor) = &verified_anchor {
+        verified_anchor.send_replace(Some(leani_runtime::AppliedFinalityAnchor {
+            block: live_anchor,
+            beacon_slot: selected.beacon_slot,
+            beacon_block_root: selected.beacon_block_root,
+        }));
+    }
     let checkpoint = ConsensusCheckpoint {
         beacon_slot: bootstrap.beacon_slot,
         beacon_block_root: bootstrap.beacon_block_root,
@@ -5788,11 +5923,8 @@ async fn run_network_lanes_once(
     let p2p_bridge_updates = {
         let control = backfill_control.clone();
         let source = live_source.as_ref().clone();
+        let verified_anchor = verified_anchor.clone();
         async move {
-            let Some(control) = control else {
-                std::future::pending::<()>().await;
-                unreachable!("pending future does not return");
-            };
             loop {
                 let applied = match applied_anchor_updates.recv().await {
                     Ok(applied) => applied,
@@ -5807,20 +5939,25 @@ async fn run_network_lanes_once(
                         bail!("applied finality anchor channel closed");
                     }
                 };
-                control
-                    .update_p2p_bridge(
-                        source.clone(),
-                        P2pHistoryAnchor {
-                            block: applied.block,
-                            consensus: ConsensusAnchor {
-                                finality: Finality::Finalized,
-                                execution_block_hash: applied.block.hash,
-                                beacon_slot: applied.beacon_slot,
-                                beacon_block_root: applied.beacon_block_root,
+                if let Some(verified_anchor) = &verified_anchor {
+                    verified_anchor.send_replace(Some(applied));
+                }
+                if let Some(control) = &control {
+                    control
+                        .update_p2p_bridge(
+                            source.clone(),
+                            P2pHistoryAnchor {
+                                block: applied.block,
+                                consensus: ConsensusAnchor {
+                                    finality: Finality::Finalized,
+                                    execution_block_hash: applied.block.hash,
+                                    beacon_slot: applied.beacon_slot,
+                                    beacon_block_root: applied.beacon_block_root,
+                                },
                             },
-                        },
-                    )
-                    .await;
+                        )
+                        .await;
+                }
             }
         }
     };

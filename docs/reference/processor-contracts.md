@@ -185,7 +185,7 @@ tokens = ["0x2222222222222222222222222222222222222222"]
 complete_from_start = true
 ```
 
-## uniswap-observations / uniswap-latest 1.0.0
+## uniswap-observations / uniswap-latest 2.0.0
 
 Two configured-pool contracts share the same exact event decoder:
 
@@ -194,8 +194,10 @@ Two configured-pool contracts share the same exact event decoder:
   `Swap(address,address,int256,int256,uint160,uint128,int24)` square-root-price
   observations.
 
-They store exact reserves and `sqrtPriceX96`, never floating-point prices.
-Applications combine these values with verified token metadata.
+They store exact reserves and `sqrtPriceX96`, never floating-point prices. V3
+swap observations also retain `amount0` and `amount1` as signed decimal int256
+values, preserving the exact pool deltas needed to derive volume. Applications
+combine these values with verified token metadata.
 `uniswap-observations` is block-local and identifies immutable observations by
 pool, block hash, and log index; it supports independent history/live delivery
 and full or windowed SQLite retention. Transaction hashes are deliberately not
@@ -208,7 +210,7 @@ per pool for slim price queries.
 [[processors]]
 id = "uniswap-observations" # or "uniswap-latest"
 instance = "usdc-weth-observations"
-version = "1.0.0"
+version = "2.0.0"
 start_block = 12369621
 publish = "optimistic_and_finalized"
 history_control = "node_owned"

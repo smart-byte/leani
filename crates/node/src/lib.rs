@@ -3,8 +3,11 @@
 mod benchmark;
 pub mod cli;
 pub mod config;
+mod init;
 pub mod process;
 pub mod processors;
+mod subscribe;
+mod uniswap_markets;
 
 pub use cli::{Cli, Command};
 pub use config::{Config, ConfigError, ProcessorConfig, ValidatedConfig};

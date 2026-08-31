@@ -320,6 +320,10 @@ export interface UniswapPoolPrice {
   kind: "v2" | "v3";
   reserve0: string | null;
   reserve1: string | null;
+  /** Signed token0 pool delta for a V3 swap, in raw token units. */
+  amount0: string | null;
+  /** Signed token1 pool delta for a V3 swap, in raw token units. */
+  amount1: string | null;
   sqrtPriceX96: string | null;
   blockNumber: number;
   blockHash: Hex;

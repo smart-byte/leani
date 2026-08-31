@@ -12,7 +12,8 @@ pub struct Cli {
     ///
     /// When omitted, Leani discovers `./leani.toml`, then the source-workspace
     /// fallback `./config/example.toml`. `LEANI_CONFIG` provides a persistent
-    /// override without repeating this flag.
+    /// override without repeating this flag. For `init`, this selects the new
+    /// file instead and defaults to `./leani.toml`.
     #[arg(long, global = true, env = "LEANI_CONFIG")]
     pub config: Option<PathBuf>,
 
@@ -38,6 +39,90 @@ pub enum Command {
     },
     /// Start configured sources, processors, stores, and serving endpoints.
     Serve,
+    /// Create a compact configuration for a built-in processor.
+    Init {
+        /// Processor preset to configure.
+        #[arg(value_enum)]
+        protocol: SubscribeProtocol,
+        /// One or more built-in markets, for example `ETH/USDC`.
+        #[arg(required = true, num_args = 1..)]
+        markets: Vec<String>,
+        /// Data directory written to the generated configuration.
+        #[arg(long, default_value = "./data")]
+        data_dir: PathBuf,
+        /// Checkpoint provider used for weak-subjectivity quorum (repeatable or comma-delimited).
+        #[arg(
+            long,
+            value_delimiter = ',',
+            default_values = [
+                "https://ethereum-beacon-api.publicnode.com/",
+                "https://mainnet.checkpoint.sigp.io/",
+                "https://beaconstate-mainnet.chainsafe.io/"
+            ],
+            env = "LEANI_CHECKPOINT_URLS"
+        )]
+        checkpoint_url: Vec<url::Url>,
+        /// Number of independent checkpoint providers that must agree.
+        #[arg(long, default_value_t = 2)]
+        checkpoint_quorum: usize,
+        /// Accept a new checkpoint provider quorum without interactive confirmation.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Stream live market prices from an embedded processor or a running node.
+    Subscribe {
+        /// Embedded market-data processor to activate.
+        #[arg(value_enum)]
+        protocol: SubscribeProtocol,
+        /// One or more built-in markets, for example `ETH/USDC`.
+        #[arg(required = true, num_args = 1..)]
+        markets: Vec<String>,
+        /// Rendering contract for stdout.
+        #[arg(long, value_enum, default_value_t = SubscribeFormat::Pretty)]
+        format: SubscribeFormat,
+        /// Where the subscription processor should run.
+        #[arg(long, value_enum, default_value_t = SubscribeMode::Auto)]
+        mode: SubscribeMode,
+        /// Base URL of an already running Leani node.
+        #[arg(long)]
+        endpoint: Option<url::Url>,
+        /// Processor instance or unambiguous processor kind on a running node.
+        #[arg(long, default_value = "uniswap-observations")]
+        processor: String,
+        /// Optional bearer token for a running node.
+        #[arg(long, env = "LEANI_API_TOKEN")]
+        token: Option<String>,
+        /// Price publication finality.
+        #[arg(long, value_enum, default_value_t = SubscribeFinality::Optimistic)]
+        finality: SubscribeFinality,
+        /// Finality transport for the embedded runtime.
+        #[arg(long, value_enum, default_value_t = SubscribeFinalitySource::Auto)]
+        finality_source: SubscribeFinalitySource,
+        /// Checkpoint provider used for weak-subjectivity quorum (repeatable or comma-delimited).
+        #[arg(
+            long,
+            value_delimiter = ',',
+            default_values = [
+                "https://ethereum-beacon-api.publicnode.com/",
+                "https://mainnet.checkpoint.sigp.io/",
+                "https://beaconstate-mainnet.chainsafe.io/"
+            ],
+            env = "LEANI_CHECKPOINT_URLS"
+        )]
+        checkpoint_url: Vec<url::Url>,
+        /// Number of independent checkpoint providers that must agree.
+        #[arg(long, default_value_t = 2)]
+        checkpoint_quorum: usize,
+        /// Accept a new checkpoint provider quorum without interactive confirmation.
+        #[arg(long)]
+        yes: bool,
+        /// Persistent directory for the lightweight embedded runtime.
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Exit after the first matching price update.
+        #[arg(long)]
+        once: bool,
+    },
     /// Process a historical block range and then exit.
     Backfill {
         /// Configured processor ID.
@@ -188,6 +273,44 @@ pub enum Command {
         #[command(subcommand)]
         command: DbCommand,
     },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum SubscribeProtocol {
+    UniswapV3,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum SubscribeFormat {
+    Pretty,
+    Json,
+    Raw,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum SubscribeMode {
+    /// Attach to a reachable node from the endpoint or local config, otherwise run embedded.
+    Auto,
+    /// Require an existing node and never fall back to an embedded runtime.
+    Client,
+    /// Always start the lightweight embedded runtime.
+    Embedded,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum SubscribeFinality {
+    Optimistic,
+    Finalized,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum SubscribeFinalitySource {
+    /// Reuse an explicit node profile, otherwise use verified Beacon API proofs.
+    Auto,
+    /// Fetch proof-carrying light-client updates over HTTP.
+    BeaconApi,
+    /// Fetch proof-carrying light-client updates from consensus P2P peers.
+    P2p,
 }
 
 /// Benchmark orchestration commands layered over individual benchmark runs.
@@ -643,9 +766,75 @@ mod tests {
     }
 
     #[test]
+    fn subscription_parses_checkpoint_quorum_and_p2p_finality() {
+        let cli = Cli::try_parse_from([
+            "leani",
+            "subscribe",
+            "uniswap-v3",
+            "ETH/USDC",
+            "--finality-source",
+            "p2p",
+            "--checkpoint-url",
+            "https://a.example/",
+            "--checkpoint-url",
+            "https://b.example/",
+            "--checkpoint-quorum",
+            "2",
+        ])
+        .expect("CLI parses");
+        let Command::Subscribe {
+            finality_source,
+            checkpoint_url,
+            checkpoint_quorum,
+            ..
+        } = cli.command
+        else {
+            panic!("expected subscribe command");
+        };
+        assert_eq!(finality_source, SubscribeFinalitySource::P2p);
+        assert_eq!(checkpoint_url.len(), 2);
+        assert_eq!(checkpoint_quorum, 2);
+    }
+
+    #[test]
+    fn processor_init_parses_compact_uniswap_setup() {
+        let cli = Cli::try_parse_from([
+            "leani",
+            "init",
+            "uniswap-v3",
+            "ETH/USDC",
+            "ETH/USDT",
+            "--yes",
+        ])
+        .expect("CLI parses");
+        let Command::Init {
+            protocol,
+            markets,
+            yes,
+            ..
+        } = cli.command
+        else {
+            panic!("expected init command");
+        };
+        assert_eq!(protocol, SubscribeProtocol::UniswapV3);
+        assert_eq!(markets, ["ETH/USDC", "ETH/USDT"]);
+        assert!(yes);
+    }
+
+    #[test]
     fn parses_all_top_level_command_skeletons() {
         for args in [
             vec!["leani", "serve"],
+            vec!["leani", "init", "uniswap-v3", "ETH/USDC", "--yes"],
+            vec![
+                "leani",
+                "subscribe",
+                "uniswap-v3",
+                "ETH/USDC",
+                "ETH/USDT",
+                "--format",
+                "json",
+            ],
             vec!["leani", "backfill", "--from", "1", "--to", "2"],
             vec![
                 "leani",

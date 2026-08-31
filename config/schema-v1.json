@@ -2,37 +2,90 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://leani.dev/schema/config-v1.json",
   "title": "leani configuration v1",
-  "type": "object",
-  "additionalProperties": false,
-  "required": [
-    "config_version",
-    "data_dir",
-    "chain",
-    "budgets",
-    "sources",
-    "finality",
-    "processors",
-    "rpc",
-    "api"
+  "oneOf": [
+    { "$ref": "#/$defs/starterConfig" },
+    { "$ref": "#/$defs/advancedConfig" }
   ],
-  "properties": {
-    "config_version": { "const": 1 },
-    "data_dir": { "type": "string", "minLength": 1 },
-    "chain": { "$ref": "#/$defs/chain" },
-    "raw_history": { "$ref": "#/$defs/rawHistory" },
-    "artifact_storage": { "$ref": "#/$defs/artifactStorage" },
-    "budgets": { "$ref": "#/$defs/budgets" },
-    "sources": { "$ref": "#/$defs/sources" },
-    "finality": { "$ref": "#/$defs/finality" },
-    "processors": {
-      "type": "array",
-      "minItems": 1,
-      "items": { "$ref": "#/$defs/processor" }
-    },
-    "rpc": { "$ref": "#/$defs/rpc" },
-    "api": { "$ref": "#/$defs/api" }
-  },
   "$defs": {
+    "starterConfig": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["config_version", "network", "finality", "uniswap"],
+      "properties": {
+        "config_version": { "const": 1 },
+        "network": { "const": "ethereum-mainnet" },
+        "data_dir": { "type": "string", "minLength": 1, "default": "./data" },
+        "finality": { "$ref": "#/$defs/starterFinality" },
+        "uniswap": { "$ref": "#/$defs/starterUniswap" },
+        "api": { "$ref": "#/$defs/starterApi" }
+      }
+    },
+    "starterFinality": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["checkpoint", "checkpoint_slot", "endpoints"],
+      "properties": {
+        "checkpoint": { "type": "string", "pattern": "^0x[0-9a-fA-F]{64}$" },
+        "checkpoint_slot": { "$ref": "#/$defs/positiveInteger" },
+        "endpoints": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string", "format": "uri" }
+        }
+      }
+    },
+    "starterUniswap": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["markets"],
+      "properties": {
+        "markets": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "enum": ["ETH/USDC", "ETH/USDT", "WBTC/ETH"] }
+        }
+      }
+    },
+    "starterApi": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "bind": { "$ref": "#/$defs/socketAddress", "default": "127.0.0.1:18080" }
+      }
+    },
+    "advancedConfig": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "config_version",
+        "data_dir",
+        "chain",
+        "budgets",
+        "sources",
+        "finality",
+        "processors",
+        "rpc",
+        "api"
+      ],
+      "properties": {
+        "config_version": { "const": 1 },
+        "data_dir": { "type": "string", "minLength": 1 },
+        "chain": { "$ref": "#/$defs/chain" },
+        "raw_history": { "$ref": "#/$defs/rawHistory" },
+        "artifact_storage": { "$ref": "#/$defs/artifactStorage" },
+        "budgets": { "$ref": "#/$defs/budgets" },
+        "sources": { "$ref": "#/$defs/sources" },
+        "finality": { "$ref": "#/$defs/finality" },
+        "processors": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/processor" }
+        },
+        "rpc": { "$ref": "#/$defs/rpc" },
+        "api": { "$ref": "#/$defs/api" }
+      }
+    },
     "positiveInteger": { "type": "integer", "minimum": 1 },
     "nonNegativeInteger": { "type": "integer", "minimum": 0 },
     "humanBytes": {

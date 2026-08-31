@@ -1092,6 +1092,21 @@ paths:
                 $ref: "#/components/schemas/UniswapPoolPrice"
         default:
           $ref: "#/components/responses/Error"
+  /v1/processors/{processor}/query/pools:
+    parameters:
+      - $ref: "#/components/parameters/Processor"
+    get:
+      summary: List pools configured for a Uniswap observation processor
+      operationId: listConfiguredUniswapPools
+      responses:
+        "200":
+          description: Immutable pool scope owned by the processor instance.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ConfiguredUniswapPools"
+        default:
+          $ref: "#/components/responses/Error"
 components:
   securitySchemes:
     bearerAuth:
@@ -1201,6 +1216,10 @@ components:
       type: string
       pattern: "^(0|[1-9][0-9]*)$"
       examples: ["1000000000000000000"]
+    SignedDecimalQuantity:
+      type: string
+      pattern: "^-?(0|[1-9][0-9]*)$"
+      examples: ["-1000000000000000000"]
     Hash32:
       type: string
       pattern: "^0x[0-9a-f]{64}$"
@@ -1838,7 +1857,7 @@ components:
     UniswapPoolPrice:
       type: object
       additionalProperties: false
-      required: [pool, kind, reserve0, reserve1, sqrtPriceX96, blockNumber, blockHash, logIndex, finality]
+      required: [pool, kind, reserve0, reserve1, amount0, amount1, sqrtPriceX96, blockNumber, blockHash, logIndex, finality]
       properties:
         pool:
           $ref: "#/components/schemas/Address"
@@ -1853,6 +1872,14 @@ components:
           oneOf:
             - $ref: "#/components/schemas/DecimalQuantity"
             - type: "null"
+        amount0:
+          oneOf:
+            - $ref: "#/components/schemas/SignedDecimalQuantity"
+            - type: "null"
+        amount1:
+          oneOf:
+            - $ref: "#/components/schemas/SignedDecimalQuantity"
+            - type: "null"
         sqrtPriceX96:
           oneOf:
             - $ref: "#/components/schemas/DecimalQuantity"
@@ -1865,6 +1892,25 @@ components:
           $ref: "#/components/schemas/SafeInteger"
         finality:
           $ref: "#/components/schemas/Finality"
+    ConfiguredUniswapPool:
+      type: object
+      additionalProperties: false
+      required: [address, kind]
+      properties:
+        address:
+          $ref: "#/components/schemas/Address"
+        kind:
+          type: string
+          enum: [v2, v3]
+    ConfiguredUniswapPools:
+      type: object
+      additionalProperties: false
+      required: [data]
+      properties:
+        data:
+          type: array
+          items:
+            $ref: "#/components/schemas/ConfiguredUniswapPool"
     ChangeBlock:
       type: object
       additionalProperties: false

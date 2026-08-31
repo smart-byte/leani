@@ -13,7 +13,7 @@ use std::{collections::BTreeMap, fmt, sync::Arc};
 
 use leani_api::{
     BlobsQueryExtension, Erc20QueryExtension, QueryExtension, QueryExtensionRegistration,
-    UniswapQueryExtension,
+    UniswapObservationsQueryExtension, UniswapQueryExtension,
 };
 use leani_primitives::{Address, BlockNumber};
 use leani_processor_api::{
@@ -689,7 +689,8 @@ impl ProcessorFactory for UniswapObservationsProcessorFactory {
                 .map_err(|error| ProcessorFactoryError::configuration(error.to_string()))?;
         let (instance, publication, lifecycle) = configured_contract(configured)?;
         let processor = processor.with_contract(instance, publication, lifecycle);
-        Ok(ProcessorComponents::new(Arc::new(processor)))
+        Ok(ProcessorComponents::new(Arc::new(processor))
+            .with_query_extension(Arc::new(UniswapObservationsQueryExtension)))
     }
 }
 

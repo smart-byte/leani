@@ -41,6 +41,111 @@ pub struct Config {
     pub api: ApiConfig,
 }
 
+/// Compact product-level configuration expanded into [`Config`] before
+/// validation. The `network` field deliberately discriminates this document
+/// from the fully explicit advanced schema.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct StarterConfig {
+    pub config_version: u32,
+    pub network: StarterNetwork,
+    #[serde(default = "default_starter_data_dir")]
+    pub data_dir: PathBuf,
+    pub finality: StarterFinalityConfig,
+    pub uniswap: StarterUniswapConfig,
+    #[serde(default)]
+    pub api: StarterApiConfig,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum StarterNetwork {
+    EthereumMainnet,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct StarterFinalityConfig {
+    pub checkpoint: String,
+    pub checkpoint_slot: u64,
+    pub endpoints: Vec<Url>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct StarterUniswapConfig {
+    pub markets: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct StarterApiConfig {
+    #[serde(default = "default_starter_api_bind")]
+    pub bind: SocketAddr,
+}
+
+impl Default for StarterApiConfig {
+    fn default() -> Self {
+        Self {
+            bind: default_starter_api_bind(),
+        }
+    }
+}
+
+fn default_starter_api_bind() -> SocketAddr {
+    "127.0.0.1:18080"
+        .parse()
+        .expect("built-in API bind is valid")
+}
+
+fn default_starter_data_dir() -> PathBuf {
+    PathBuf::from("./data")
+}
+
+impl StarterConfig {
+    pub(crate) fn uniswap(
+        data_dir: PathBuf,
+        markets: Vec<String>,
+        checkpoint: String,
+        checkpoint_slot: u64,
+        endpoints: Vec<Url>,
+    ) -> Self {
+        Self {
+            config_version: CONFIG_VERSION,
+            network: StarterNetwork::EthereumMainnet,
+            data_dir,
+            finality: StarterFinalityConfig {
+                checkpoint,
+                checkpoint_slot,
+                endpoints,
+            },
+            uniswap: StarterUniswapConfig { markets },
+            api: StarterApiConfig::default(),
+        }
+    }
+
+    fn expand(self) -> Result<Config, String> {
+        let mut config: Config = toml::from_str(include_str!(
+            "../../../config/defaults/ethereum-mainnet-uniswap.toml"
+        ))
+        .map_err(|error| format!("built-in Ethereum Mainnet defaults are invalid: {error}"))?;
+        let markets = crate::uniswap_markets::resolve_markets(&self.uniswap.markets)
+            .map_err(|error| error.to_string())?;
+        let processor =
+            crate::uniswap_markets::processor_config(&markets, "uniswap-observations", false)
+                .map_err(|error| error.to_string())?;
+
+        config.config_version = self.config_version;
+        config.data_dir = self.data_dir;
+        config.finality.checkpoint = self.finality.checkpoint;
+        config.finality.checkpoint_slot = self.finality.checkpoint_slot;
+        config.finality.endpoints = self.finality.endpoints;
+        config.processors = vec![processor];
+        config.api.bind = self.api.bind;
+        Ok(config)
+    }
+}
+
 /// Physical backend for immutable finalized processor artifacts. Lifecycle
 /// ownership remains processor-local and independent of this representation.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -1116,10 +1221,30 @@ impl Config {
             path: path.to_path_buf(),
             source,
         })?;
-        toml::from_str(&input).map_err(|source| ConfigError::Parse {
-            path: path.to_path_buf(),
-            source,
-        })
+        let document =
+            toml::from_str::<toml::Value>(&input).map_err(|source| ConfigError::Parse {
+                path: path.to_path_buf(),
+                source,
+            })?;
+        let is_starter = document
+            .as_table()
+            .is_some_and(|table| table.contains_key("network"));
+        if is_starter {
+            let starter =
+                toml::from_str::<StarterConfig>(&input).map_err(|source| ConfigError::Parse {
+                    path: path.to_path_buf(),
+                    source,
+                })?;
+            starter.expand().map_err(|detail| ConfigError::Expand {
+                path: path.to_path_buf(),
+                detail,
+            })
+        } else {
+            toml::from_str(&input).map_err(|source| ConfigError::Parse {
+                path: path.to_path_buf(),
+                source,
+            })
+        }
     }
 
     /// Perform validation that requires no I/O.
@@ -2139,6 +2264,8 @@ pub enum ConfigError {
         #[source]
         source: toml::de::Error,
     },
+    #[error("failed to expand compact configuration at {path}: {detail}")]
+    Expand { path: PathBuf, detail: String },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -2864,6 +2991,88 @@ verification_segment_blocks = 8192"#,
     }
 
     #[test]
+    fn compact_uniswap_configuration_expands_to_sane_node_defaults() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let config_path = temp.path().join("leani.toml");
+        fs::write(
+            &config_path,
+            r#"config_version = 1
+network = "ethereum-mainnet"
+data_dir = "./data"
+
+[finality]
+checkpoint = "0x1111111111111111111111111111111111111111111111111111111111111111"
+checkpoint_slot = 15000000
+endpoints = ["https://ethereum-beacon-api.publicnode.com/"]
+
+[uniswap]
+markets = ["ETH/USDC", "WBTC/ETH"]
+
+[api]
+bind = "127.0.0.1:18080"
+"#,
+        )
+        .expect("write compact config");
+
+        let config = Config::load(&config_path).expect("load compact config");
+        config
+            .clone()
+            .validate()
+            .expect("expanded configuration validates");
+        assert_eq!(config.chain.chain_id, 1);
+        assert_eq!(config.sources.live.minimum_peers, 1);
+        assert_eq!(config.sources.live.preferred_peers, 16);
+        assert_eq!(config.rpc.http_bind.port(), 18_545);
+        assert_eq!(config.api.bind.port(), 18_080);
+        assert_eq!(config.processors.len(), 1);
+        let pools = config.processors[0].settings["pools"]
+            .as_array()
+            .expect("pool array");
+        assert_eq!(pools.len(), 2);
+    }
+
+    #[test]
+    fn compact_configuration_rejects_unknown_markets_during_expansion() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let config_path = temp.path().join("leani.toml");
+        fs::write(
+            &config_path,
+            r#"config_version = 1
+network = "ethereum-mainnet"
+
+[finality]
+checkpoint = "0x1111111111111111111111111111111111111111111111111111111111111111"
+checkpoint_slot = 15000000
+endpoints = ["https://ethereum-beacon-api.publicnode.com/"]
+
+[uniswap]
+markets = ["LINK/ETH"]
+"#,
+        )
+        .expect("write compact config");
+
+        let error = Config::load(&config_path).expect_err("unknown market rejected");
+        assert!(error.to_string().contains("unknown Uniswap V3 market"));
+    }
+
+    #[test]
+    fn generated_starter_document_only_contains_product_choices() {
+        let starter = StarterConfig::uniswap(
+            PathBuf::from("./data"),
+            vec!["ETH/USDC".to_owned()],
+            format!("0x{}", "11".repeat(32)),
+            15_000_000,
+            vec![Url::parse("https://beacon.example/").expect("URL")],
+        );
+        let encoded = toml::to_string_pretty(&starter).expect("serialize starter config");
+        assert!(encoded.contains("network = \"ethereum-mainnet\""));
+        assert!(encoded.contains("markets = [\"ETH/USDC\"]"));
+        assert!(!encoded.contains("[budgets]"));
+        assert!(!encoded.contains("[sources.live]"));
+        assert!(!encoded.contains("[[processors.settings.pools]]"));
+    }
+
+    #[test]
     fn checked_in_mode_profiles_and_json_schema_track_config_v1() {
         let repository = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         for relative in [
@@ -2887,9 +3096,13 @@ verification_segment_blocks = 8192"#,
                 .unwrap_or_else(|error| panic!("{}: {error}", schema_path.display())),
         )
         .expect("configuration schema is JSON");
-        assert_eq!(schema["properties"]["config_version"]["const"], 1);
+        assert_eq!(schema["oneOf"].as_array().map(Vec::len), Some(2));
         assert_eq!(
-            schema["additionalProperties"],
+            schema["$defs"]["starterConfig"]["properties"]["config_version"]["const"],
+            1
+        );
+        assert_eq!(
+            schema["$defs"]["advancedConfig"]["additionalProperties"],
             serde_json::Value::Bool(false)
         );
     }

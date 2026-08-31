@@ -47,6 +47,10 @@ pub struct PoolPriceEntity {
     pub kind: PoolKind,
     pub reserve0: Option<Quantity>,
     pub reserve1: Option<Quantity>,
+    /// Signed token0 pool delta from a V3 `Swap`, encoded as an ABI int256 word.
+    pub amount0: Option<Quantity>,
+    /// Signed token1 pool delta from a V3 `Swap`, encoded as an ABI int256 word.
+    pub amount1: Option<Quantity>,
     pub sqrt_price_x96: Option<Quantity>,
     pub block_number: BlockNumber,
     pub block_hash: BlockHash,
@@ -95,13 +99,13 @@ impl UniswapLatestProcessor {
             .map_err(|error| ProcessorError::Input(error.to_string()))?;
         let id = ProcessorId::new("uniswap-latest")
             .map_err(|error| ProcessorError::Input(error.to_string()))?;
-        let version = Version::new(1, 0, 0);
+        let version = Version::new(2, 0, 0);
         let config_hash = BlockHash::new(*blake3::hash(&encoded).as_bytes());
         let descriptor = ProcessorDescriptor {
             instance: ProcessorInstanceId::legacy(&id, &version, config_hash),
             id,
             version,
-            code_hash: BlockHash::new(*blake3::hash(b"leani/uniswap-latest/1.0.0").as_bytes()),
+            code_hash: BlockHash::new(*blake3::hash(b"leani/uniswap-latest/2.0.0").as_bytes()),
             config_hash,
             start: StartPoint::Block(config.start_block),
             requirements: vec![DataRequirement {
@@ -123,9 +127,9 @@ impl UniswapLatestProcessor {
             publication: PublicationPolicy::OptimisticAndFinalized,
             lifecycle: LifecyclePolicies::from_legacy(RetentionPolicy::LatestState),
             schemas: ProcessorSchemas {
-                delta_version: 1,
-                entity_schema: "uniswap.price.entity.v1".to_owned(),
-                change_schema: "uniswap.price.change.v1".to_owned(),
+                delta_version: 2,
+                entity_schema: "uniswap.price.entity.v2".to_owned(),
+                change_schema: "uniswap.price.change.v2".to_owned(),
             },
         };
         Ok(Self { pools, descriptor })
@@ -180,14 +184,14 @@ impl UniswapObservationsProcessor {
             .map_err(|error| ProcessorError::Input(error.to_string()))?;
         let id = ProcessorId::new("uniswap-observations")
             .map_err(|error| ProcessorError::Input(error.to_string()))?;
-        let version = Version::new(1, 0, 0);
+        let version = Version::new(2, 0, 0);
         let config_hash = BlockHash::new(*blake3::hash(&encoded).as_bytes());
         let descriptor = ProcessorDescriptor {
             instance: ProcessorInstanceId::legacy(&id, &version, config_hash),
             id,
             version,
             code_hash: BlockHash::new(
-                *blake3::hash(b"leani/uniswap-observations/1.0.0").as_bytes(),
+                *blake3::hash(b"leani/uniswap-observations/2.0.0").as_bytes(),
             ),
             config_hash,
             start: StartPoint::Block(config.start_block),
@@ -197,9 +201,9 @@ impl UniswapObservationsProcessor {
             publication: PublicationPolicy::OptimisticAndFinalized,
             lifecycle: LifecyclePolicies::from_legacy(RetentionPolicy::FullOutputHistory),
             schemas: ProcessorSchemas {
-                delta_version: 1,
-                entity_schema: "uniswap.observation.entity.v1".to_owned(),
-                change_schema: "uniswap.observation.change.v1".to_owned(),
+                delta_version: 2,
+                entity_schema: "uniswap.observation.entity.v2".to_owned(),
+                change_schema: "uniswap.observation.change.v2".to_owned(),
             },
         };
         Ok(Self { pools, descriptor })
@@ -217,6 +221,18 @@ impl UniswapObservationsProcessor {
         self.descriptor.publication = publication;
         self.descriptor.lifecycle = lifecycle;
         self
+    }
+
+    /// Return the immutable pool scope configured for this processor instance.
+    #[must_use]
+    pub fn configured_pools(&self) -> Vec<PoolConfig> {
+        self.pools
+            .iter()
+            .map(|(address, kind)| PoolConfig {
+                address: *address,
+                kind: *kind,
+            })
+            .collect()
     }
 }
 
@@ -381,16 +397,24 @@ fn map_price_delta(
         let Some(topic) = log.topics.first() else {
             continue;
         };
-        let (reserve0, reserve1, sqrt_price_x96) = match (kind, *topic) {
-            (PoolKind::V2, topic) if topic == v2_sync_topic() => {
-                (Some(word(&log.data, 0)?), Some(word(&log.data, 1)?), None)
-            }
+        let (reserve0, reserve1, amount0, amount1, sqrt_price_x96) = match (kind, *topic) {
+            (PoolKind::V2, topic) if topic == v2_sync_topic() => (
+                Some(word(&log.data, 0)?),
+                Some(word(&log.data, 1)?),
+                None,
+                None,
+                None,
+            ),
             (PoolKind::V3, topic) if topic == v3_initialize_topic() => {
-                (None, None, Some(word(&log.data, 0)?))
+                (None, None, None, None, Some(word(&log.data, 0)?))
             }
-            (PoolKind::V3, topic) if topic == v3_swap_topic() => {
-                (None, None, Some(word(&log.data, 2)?))
-            }
+            (PoolKind::V3, topic) if topic == v3_swap_topic() => (
+                None,
+                None,
+                Some(word(&log.data, 0)?),
+                Some(word(&log.data, 1)?),
+                Some(word(&log.data, 2)?),
+            ),
             _ => continue,
         };
         observations.push(PoolPriceEntity {
@@ -398,6 +422,8 @@ fn map_price_delta(
             kind,
             reserve0,
             reserve1,
+            amount0,
+            amount1,
             sqrt_price_x96,
             block_number: block.block.number,
             block_hash: block.block.hash,
@@ -592,8 +618,8 @@ mod tests {
                 v3,
                 v3_swap_topic(),
                 &[
-                    U256::ZERO,
-                    U256::ZERO,
+                    U256::from(7),
+                    U256::from(9).wrapping_neg(),
                     U256::from(33),
                     U256::from(44),
                     U256::ZERO,
@@ -637,6 +663,16 @@ mod tests {
         assert_eq!(
             U256::from_be_bytes(v3_state.sqrt_price_x96.expect("sqrt").0),
             U256::from(33)
+        );
+        assert_eq!(
+            U256::from_be_bytes(v3_state.amount0.expect("amount0").0),
+            U256::from(7)
+        );
+        assert_eq!(
+            alloy_primitives::I256::from_raw(U256::from_be_bytes(
+                v3_state.amount1.expect("amount1").0
+            )),
+            alloy_primitives::I256::unchecked_from(-9)
         );
 
         let observations = UniswapObservationsProcessor::new(UniswapConfig {

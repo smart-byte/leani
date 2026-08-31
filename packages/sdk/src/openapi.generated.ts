@@ -1156,6 +1156,25 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/processors/{processor}/query/pools": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                processor: components["parameters"]["Processor"];
+            };
+            cookie?: never;
+        };
+        /** List pools configured for a Uniswap observation processor */
+        get: operations["listConfiguredUniswapPools"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
 }
 export type webhooks = Record<string, never>;
 export interface components {
@@ -1163,6 +1182,8 @@ export interface components {
         SafeInteger: number;
         /** @example 1000000000000000000 */
         DecimalQuantity: string;
+        /** @example -1000000000000000000 */
+        SignedDecimalQuantity: string;
         Hash32: string;
         ByteArray32: number[];
         Address: string;
@@ -1441,11 +1462,21 @@ export interface components {
             kind: "v2" | "v3";
             reserve0: components["schemas"]["DecimalQuantity"] | null;
             reserve1: components["schemas"]["DecimalQuantity"] | null;
+            amount0: components["schemas"]["SignedDecimalQuantity"] | null;
+            amount1: components["schemas"]["SignedDecimalQuantity"] | null;
             sqrtPriceX96: components["schemas"]["DecimalQuantity"] | null;
             blockNumber: components["schemas"]["SafeInteger"];
             blockHash: components["schemas"]["Hash32"];
             logIndex: components["schemas"]["SafeInteger"];
             finality: components["schemas"]["Finality"];
+        };
+        ConfiguredUniswapPool: {
+            address: components["schemas"]["Address"];
+            /** @enum {string} */
+            kind: "v2" | "v3";
+        };
+        ConfiguredUniswapPools: {
+            data: components["schemas"]["ConfiguredUniswapPool"][];
         };
         ChangeBlock: {
             number: components["schemas"]["SafeInteger"];
@@ -3245,6 +3276,29 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["UniswapPoolPrice"];
+                };
+            };
+            default: components["responses"]["Error"];
+        };
+    };
+    listConfiguredUniswapPools: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                processor: components["parameters"]["Processor"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Immutable pool scope owned by the processor instance. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ConfiguredUniswapPools"];
                 };
             };
             default: components["responses"]["Error"];
