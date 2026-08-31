@@ -1,3 +1,14 @@
+---
+title: Live Uniswap prices from the CLI and SDK
+description: Stream verified Uniswap V3 prices from a prepared node or a standalone Leani process.
+section: guides
+order: 45
+audience:
+  - app-developer
+  - operator
+status: preview
+---
+
 # Live Uniswap prices from the CLI and SDK
 
 Leani's `subscribe` command turns the built-in Uniswap V3 observation
@@ -71,12 +82,15 @@ records during a reorg.
 
 Embedded mode does not bind API or RPC ports, activate unrelated processors, or
 start a historical backfill. It starts from an independently verified finalized
-execution anchor, follows native execution P2P to the current head, and waits
-for fresh swaps. Its small SQLite store, locally verified checkpoint, and peer
-cache live under the platform data directory; use `--data-dir PATH` to select
-an explicit location. A completely cold run can take a few minutes because
-public peer discovery and the finalized-to-head catch-up are network dependent;
-subsequent runs reuse verified canonical material and the peer cache. If a
+execution anchor and connects native execution P2P. For an optimistic
+subscription it also fetches one root-checked current head block and can print
+matching swaps while the durable anchored lane catches up; finalized output
+still waits for the fully joined path. Its small SQLite store, locally verified
+checkpoint, and peer cache live under the platform data directory; use
+`--data-dir PATH` to select an explicit location. The durable lane of a
+completely cold run can take longer because public peer discovery and the
+finalized-to-head catch-up are network dependent; subsequent runs reuse
+verified canonical material and the peer cache. If a
 local configuration exists, embedded fallback seeds its private peer cache from
 the configured node context, but it never copies the node's P2P identity or
 shares its writable database. Once verified startup is complete, Leani prints
@@ -102,7 +116,8 @@ leani subscribe uniswap-v3 ETH/USDC
 Auto mode discovers the reachable `api.bind` in `./leani.toml` and attaches;
 otherwise it starts the embedded runtime. Use `--mode client --endpoint URL`
 when attaching to a remote node should be mandatory rather than automatic. The
-client takes a head cursor before opening SSE and applies the same timestamp
+client takes a head cursor, reads the node's query-only latest observation for
+an immediate still-fresh optimistic price, then opens SSE and applies the same timestamp
 freshness gate as embedded mode, so retained history and in-progress node
 catch-up are not presented as live prices. Before opening the stream, it reads
 the processor's immutable pool catalog and rejects any requested market that

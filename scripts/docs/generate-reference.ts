@@ -50,10 +50,15 @@ async function httpReference(repositoryRoot: string): Promise<JsonObject> {
   for (const entry of await readdir(extensionDirectory, { withFileTypes: true })) {
     if (!entry.isFile() || !entry.name.endsWith('.rs')) continue;
     const source = await readFile(resolve(extensionDirectory, entry.name), 'utf8');
-    const alias = source.match(/fn alias\(&self\)[\s\S]*?Some\("([a-z0-9-]+)"\)/)?.[1];
-    if (!alias) continue;
-    for (const match of source.matchAll(/\.route\(\s*"([^"]+)"/g)) {
-      routedPaths.add(`/v1/q/${alias}${match[1]}`);
+    for (const implementation of source.matchAll(
+      /impl QueryExtension for [^{]+\{([\s\S]*?)\n\}/g,
+    )) {
+      const body = implementation[1] ?? '';
+      const alias = body.match(/fn alias\(&self\)[\s\S]*?Some\("([a-z0-9-]+)"\)/)?.[1];
+      if (!alias) continue;
+      for (const match of body.matchAll(/\.route\(\s*"([^"]+)"/g)) {
+        routedPaths.add(`/v1/q/${alias}${match[1]}`);
+      }
     }
   }
   const documentedPaths = new Set(Object.keys(document.paths ?? {}));
@@ -116,15 +121,26 @@ function schemaConstraints(schema: JsonObject): JsonObject {
 async function configReference(repositoryRoot: string): Promise<JsonObject> {
   const root = await readJson(resolve(repositoryRoot, 'config/schema-v1.json'));
   const fields: JsonObject[] = [];
+  const fieldIndexes = new Map<string, number>();
   const visit = (schema: JsonObject, path: string, required: boolean): void => {
     const resolved = resolveSchema(root, schema);
-    fields.push({
+    const field = {
       path,
       required,
       kind: schemaKind(root, schema),
       description: schema.description ?? resolved.description ?? '',
       constraints: { ...schemaConstraints(resolved), ...schemaConstraints(schema) },
-    });
+    };
+    const existingIndex = fieldIndexes.get(path);
+    if (existingIndex === undefined) {
+      fieldIndexes.set(path, fields.length);
+      fields.push(field);
+    } else {
+      fields[existingIndex] = {
+        ...fields[existingIndex],
+        required: fields[existingIndex]!.required || required,
+      };
+    }
     const object = resolved.type === 'object' || resolved.properties ? resolved : undefined;
     if (object) {
       const requiredFields = new Set<string>(object.required ?? []);
@@ -142,9 +158,12 @@ async function configReference(repositoryRoot: string): Promise<JsonObject> {
       }
     }
   };
-  const rootRequired = new Set<string>(root.required ?? []);
-  for (const [name, schema] of Object.entries(root.properties ?? {})) {
-    visit(schema as JsonObject, name, rootRequired.has(name));
+  const rootVariants = Array.isArray(root.oneOf) ? root.oneOf.map((schema: JsonObject) => resolveSchema(root, schema)) : [root];
+  for (const variant of rootVariants) {
+    const rootRequired = new Set<string>(variant.required ?? []);
+    for (const [name, schema] of Object.entries(variant.properties ?? {})) {
+      visit(schema as JsonObject, name, rootRequired.has(name));
+    }
   }
   if (fields.length < 50) throw new Error(`configuration extraction found only ${fields.length} fields`);
   return { schemaVersion: 1, source: 'config/schema-v1.json', fields };

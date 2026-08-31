@@ -218,9 +218,11 @@ describe("createLeaniClient", () => {
     const account = `0x${"22".repeat(20)}` as const;
     await client.erc20.getBalance(token, account);
     await client.uniswap.getPool(token);
+    await client.uniswap.getLatestObservation(token);
     expect(requests).toEqual([
       `http://node.test/v1/q/erc20/balances/${token}/${account}`,
       `http://node.test/v1/q/uniswap/pools/${token}`,
+      `http://node.test/v1/processors/uniswap-observations/query/pools/${token}/latest`,
     ]);
   });
 

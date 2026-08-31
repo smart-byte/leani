@@ -1175,6 +1175,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/processors/{processor}/query/pools/{address}/latest": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                processor: components["parameters"]["Processor"];
+                address: components["schemas"]["Address"];
+            };
+            cookie?: never;
+        };
+        /** Read the latest observation for one configured Uniswap pool */
+        get: operations["getLatestUniswapObservation"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
 }
 export type webhooks = Record<string, never>;
 export interface components {
@@ -1477,6 +1497,10 @@ export interface components {
         };
         ConfiguredUniswapPools: {
             data: components["schemas"]["ConfiguredUniswapPool"][];
+        };
+        LatestUniswapObservation: {
+            data: components["schemas"]["UniswapPoolPrice"];
+            timestamp: components["schemas"]["SafeInteger"];
         };
         ChangeBlock: {
             number: components["schemas"]["SafeInteger"];
@@ -3299,6 +3323,30 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["ConfiguredUniswapPools"];
+                };
+            };
+            default: components["responses"]["Error"];
+        };
+    };
+    getLatestUniswapObservation: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                processor: components["parameters"]["Processor"];
+                address: components["schemas"]["Address"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Latest exact observation plus its canonical block timestamp. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["LatestUniswapObservation"];
                 };
             };
             default: components["responses"]["Error"];

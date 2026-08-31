@@ -9,12 +9,12 @@ use std::{
     collections::BTreeMap,
     str::FromStr,
     sync::Arc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use alloy_primitives::{B256, FixedBytes};
 use async_trait::async_trait;
-use futures::{StreamExt, stream};
+use futures::{StreamExt, future::join_all, stream};
 use helios_consensus_core::{
     apply_bootstrap, apply_finality_update, apply_update, calc_sync_period,
     consensus_spec::{ConsensusSpec, MainnetConsensusSpec},
@@ -41,6 +41,7 @@ pub const MAINNET_GENESIS_ROOT: B256 =
     alloy_primitives::b256!("4b363db94e286120d76eb905340fdd4e54bfe9f06bf33ff6cf5ad27f511bfe95");
 const MAX_UPDATES_PER_REQUEST: u64 = 128;
 const SLOT_SECONDS: u64 = 12;
+const PRIMED_PROBE_MAX_AGE: Duration = Duration::from_secs(30);
 const FULU_FORK_EPOCH: u64 = 411_392;
 const ELECTRA_FORK_EPOCH: u64 = 364_032;
 const MAX_BLOBS_PER_BLOCK_ELECTRA: u64 = 9;
@@ -325,6 +326,14 @@ pub struct VerifiedBeaconApi {
     config: BeaconApiConfig,
     descriptor: SourceDescriptor,
     client: reqwest::Client,
+    primed_probe: Arc<tokio::sync::Mutex<Option<PrimedProbe>>>,
+}
+
+#[derive(Clone, Debug)]
+struct PrimedProbe {
+    checkpoint_root: [u8; 32],
+    verified_at: Instant,
+    report: FinalityProbeReport,
 }
 
 impl VerifiedBeaconApi {
@@ -360,24 +369,36 @@ impl VerifiedBeaconApi {
             },
             config,
             client,
+            primed_probe: Arc::new(tokio::sync::Mutex::new(None)),
         })
     }
 
     /// Verify all configured endpoints from an explicit checkpoint root.
     pub async fn probe_root(&self, checkpoint_root: [u8; 32]) -> FinalityProbeReport {
-        let mut endpoints = Vec::with_capacity(self.config.endpoints.len());
-        for endpoint in &self.config.endpoints {
-            endpoints.push(
+        let report = self.fetch_probe_root(checkpoint_root).await;
+        self.primed_probe.lock().await.replace(PrimedProbe {
+            checkpoint_root,
+            verified_at: Instant::now(),
+            report: report.clone(),
+        });
+        report
+    }
+
+    async fn fetch_probe_root(&self, checkpoint_root: [u8; 32]) -> FinalityProbeReport {
+        let checkpoint = B256::from(checkpoint_root);
+        let endpoints = join_all(self.config.endpoints.iter().cloned().map(|endpoint| {
+            let client = self.client.clone();
+            async move {
                 match sync_endpoint(
-                    &self.client,
-                    endpoint,
-                    B256::from(checkpoint_root),
+                    &client,
+                    &endpoint,
+                    checkpoint,
                     self.config.max_checkpoint_age,
                 )
                 .await
                 {
                     Ok(result) => EndpointProbe {
-                        endpoint: endpoint.clone(),
+                        endpoint,
                         verified: true,
                         anchor: Some(result.anchor),
                         checkpoint_anchor: Some(result.checkpoint_anchor),
@@ -385,17 +406,30 @@ impl VerifiedBeaconApi {
                         error: None,
                     },
                     Err(error) => EndpointProbe {
-                        endpoint: endpoint.clone(),
+                        endpoint,
                         verified: false,
                         anchor: None,
                         checkpoint_anchor: None,
                         updates_verified: 0,
                         error: Some(error.to_string()),
                     },
-                },
-            );
-        }
+                }
+            }
+        }))
+        .await;
         select_endpoint_agreement(checkpoint_root, self.config.minimum_agreement, endpoints)
+    }
+
+    async fn take_primed_probe(&self, checkpoint_root: [u8; 32]) -> Option<FinalityProbeReport> {
+        self.primed_probe
+            .lock()
+            .await
+            .take()
+            .filter(|primed| {
+                primed.checkpoint_root == checkpoint_root
+                    && primed.verified_at.elapsed() <= PRIMED_PROBE_MAX_AGE
+            })
+            .map(|primed| primed.report)
     }
 
     fn validate_checkpoint(
@@ -455,7 +489,10 @@ impl FinalitySource for VerifiedBeaconApi {
             ));
         }
         let source = Arc::new(self.clone());
-        let initial = source.probe_root(checkpoint.beacon_block_root).await;
+        let initial = match source.take_primed_probe(checkpoint.beacon_block_root).await {
+            Some(initial) => initial,
+            None => source.fetch_probe_root(checkpoint.beacon_block_root).await,
+        };
         Self::validate_checkpoint(&checkpoint, &initial)?;
         if !initial.accepted {
             return Err(SourceError::Unavailable(format!(
@@ -518,7 +555,7 @@ async fn next_finality_event(
         }
         let report = state
             .source
-            .probe_root(state.checkpoint.beacon_block_root)
+            .fetch_probe_root(state.checkpoint.beacon_block_root)
             .await;
         if !report.accepted {
             return Some((

@@ -4,7 +4,8 @@ use axum::{
     routing::get,
 };
 use leani_processor_uniswap::{
-    CURRENT_COLLECTION, PoolKind, PoolPriceEntity, UniswapObservationsProcessor,
+    CURRENT_COLLECTION, OBSERVATION_LATEST_COLLECTION, PoolKind, PoolPriceEntity,
+    UniswapObservationsProcessor,
 };
 use serde::Serialize;
 
@@ -16,11 +17,13 @@ pub struct UniswapObservationsQueryExtension;
 
 impl QueryExtension for UniswapObservationsQueryExtension {
     fn id(&self) -> &'static str {
-        "uniswap-observations-v1"
+        "uniswap-observations-v2"
     }
 
     fn routes(&self) -> Router<QueryContext> {
-        Router::new().route("/pools", get(configured_pools))
+        Router::new()
+            .route("/pools", get(configured_pools))
+            .route("/pools/{address}/latest", get(latest_observation))
     }
 }
 
@@ -35,6 +38,13 @@ struct ConfiguredPoolsResponse {
 struct ConfiguredPool {
     address: String,
     kind: &'static str,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LatestObservationResponse {
+    data: UniswapPoolPrice,
+    timestamp: u64,
 }
 
 async fn configured_pools(
@@ -61,6 +71,28 @@ async fn configured_pools(
         })
         .collect();
     Ok(Json(ConfiguredPoolsResponse { data }))
+}
+
+async fn latest_observation(
+    State(context): State<QueryContext>,
+    Path(address): Path<String>,
+) -> Result<Json<LatestObservationResponse>, ApiError> {
+    let address = parse_address(&address)?;
+    let value = context
+        .entity(OBSERVATION_LATEST_COLLECTION, &address.0)
+        .await?
+        .ok_or_else(|| ApiError::not_found("Uniswap pool has no indexed observation"))?;
+    let entity: PoolPriceEntity = postcard::from_bytes(&value).map_err(|error| {
+        ApiError::internal(&format!("stored Uniswap observation is invalid: {error}"))
+    })?;
+    let block = context
+        .canonical_block_by_hash(entity.block_hash)
+        .await?
+        .ok_or_else(|| ApiError::internal("latest Uniswap observation block is not canonical"))?;
+    Ok(Json(LatestObservationResponse {
+        data: UniswapPoolPrice::from(&entity),
+        timestamp: block.timestamp,
+    }))
 }
 
 /// Typed latest-price queries backed by one Uniswap processor instance.

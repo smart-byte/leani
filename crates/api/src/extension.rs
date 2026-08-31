@@ -4,7 +4,7 @@ use std::{fmt, sync::Arc};
 
 use axum::Router;
 use futures::{StreamExt as _, TryStreamExt as _, stream};
-use leani_primitives::{BlockRange, ProcessorCursor};
+use leani_primitives::{BlockHash, BlockRange, BlockRef, ChainId, ProcessorCursor};
 use leani_processor_api::{Processor, ProcessorDescriptor};
 use serde::{Deserialize, Serialize};
 
@@ -143,6 +143,22 @@ impl QueryContext {
             .state
             .store
             .entity(self.descriptor(), collection, key)
+            .await?)
+    }
+
+    /// Resolve retained canonical block metadata for an entity's block hash.
+    ///
+    /// # Errors
+    ///
+    /// Returns a store error using the API's stable error envelope.
+    pub async fn canonical_block_by_hash(
+        &self,
+        block_hash: BlockHash,
+    ) -> Result<Option<BlockRef>, ApiError> {
+        Ok(self
+            .state
+            .store
+            .canonical_block_by_hash(ChainId(self.chain_id()), block_hash)
             .await?)
     }
 

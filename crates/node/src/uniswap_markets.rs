@@ -113,7 +113,7 @@ pub(crate) fn processor_config(
         r#"
 id = "uniswap-observations"
 instance = "uniswap-observations"
-version = "2.0.0"
+version = "2.1.0"
 history_control = "node_owned"
 history_mode = "on_demand"
 start_block = 12376729

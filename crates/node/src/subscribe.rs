@@ -12,9 +12,15 @@ use std::{
 
 use alloy_primitives::{Address as AlloyAddress, I256, U256, U512};
 use anyhow::{Context, Result, bail};
-use futures::StreamExt as _;
-use leani_primitives::{Address, ChainId, Finality};
-use leani_processor_uniswap::PoolPriceEntity;
+use futures::{StreamExt as _, future::join_all};
+use leani_primitives::{
+    Address, BlockFrame, BlockHash, BlockNumber, BlockRange, BlockRef, ChainId, Finality,
+};
+use leani_processor_uniswap::{PoolPriceEntity, UniswapPriceDelta};
+use leani_source_api::{
+    ChainEvent, ChainEventStream, DataRequest, FieldProjection, FilterSet, LiveSource as _,
+    LiveStart, SourceBudget, SourceError, VerificationPolicy,
+};
 use leani_store_sqlite::{ChangeDirection, ChangeRecord, SqliteStore};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -39,6 +45,8 @@ const OPTIMISTIC_PRICE_MAX_AGE: Duration = Duration::from_secs(90);
 const FINALIZED_PRICE_MAX_AGE: Duration = Duration::from_mins(30);
 const PRICE_PRECISION: usize = 8;
 const STARTUP_PRICE_SCAN_LIMIT: usize = 10_000;
+
+type ObservationKey = (Address, BlockHash, u32);
 
 pub(crate) struct SubscribeOptions {
     pub protocol: SubscribeProtocol,
@@ -155,6 +163,13 @@ struct AttachedPoolPrice {
     finality: String,
 }
 
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AttachedLatestObservation {
+    data: AttachedPoolPrice,
+    timestamp: u64,
+}
+
 #[derive(Debug)]
 struct RenderedPrice<'a> {
     market: &'a Market,
@@ -237,7 +252,13 @@ pub(crate) async fn subscribe(
             .await
         }
         SubscribeMode::Auto | SubscribeMode::Embedded => {
-            subscribe_embedded(&options, &markets, configured_path.as_deref(), registry).await
+            Box::pin(subscribe_embedded(
+                &options,
+                &markets,
+                configured_path.as_deref(),
+                registry,
+            ))
+            .await
         }
     }
 }
@@ -314,7 +335,7 @@ async fn endpoint_is_reachable(options: &SubscribeOptions, endpoint: Option<&Url
     let Some(endpoint) = endpoint else {
         return false;
     };
-    let Ok(url) = processor_url(endpoint, &options.processor, "changes/head") else {
+    let Ok(url) = endpoint.join("health/live") else {
         return false;
     };
     let request = authorized(
@@ -358,7 +379,22 @@ async fn subscribe_embedded(
         .change_bounds(processor.descriptor())
         .await?
         .map_or(0, |bounds| bounds.latest);
-    let mut runtime = spawn_embedded_network_runtime(config.clone(), store.clone(), processors);
+    let mut runtime = spawn_embedded_network_runtime(config.clone(), store.clone(), processors)?;
+    let preview_requirement = processor
+        .descriptor()
+        .requirements
+        .first()
+        .context("subscription processor omitted its data requirement")?;
+    let preview_request =
+        processor_data_request(preview_requirement, BlockRange::single(BlockNumber(0)));
+    let optimistic_snapshot = optimistic_head_snapshot(
+        runtime.verified_anchor.clone(),
+        runtime.execution_source.clone(),
+        preview_request.clone(),
+        embedded_snapshot_budget(&config),
+        runtime.cancellation_token(),
+    );
+    tokio::pin!(optimistic_snapshot);
 
     eprintln!(
         "leani: embedded Uniswap V3 processor active for {}; connecting to Ethereum peers...",
@@ -372,11 +408,19 @@ async fn subscribe_embedded(
         "leani: first-run peer discovery can take about a minute; peer state is cached for later runs"
     );
     let mut announced_ready = false;
+    let mut snapshot_pending =
+        options.finality == SubscribeFinality::Optimistic && options.format != SubscribeFormat::Raw;
+    let mut previewed = HashSet::<ObservationKey>::new();
+    let mut preview_blocks = BTreeMap::<u64, (BlockHash, Vec<PoolPriceEntity>)>::new();
+    let mut preview_stream = None::<ChainEventStream>;
     loop {
         if runtime.is_finished() {
             bail!("embedded network runtime stopped before the subscription completed");
         }
         if !announced_ready && runtime.readiness.is_ready() {
+            snapshot_pending = false;
+            preview_stream = None;
+            preview_blocks.clear();
             // The live runtime validates and catches up a finalized overlap
             // before readiness. Preserve only the newest fresh observation
             // per requested market from that work: replaying the whole overlap
@@ -409,6 +453,9 @@ async fn subscribe_embedded(
                 eprintln!("leani: live execution and verified finality are ready");
             }
             for (market, entity, record) in startup_prices {
+                if previewed.contains(&observation_key(&entity)) {
+                    continue;
+                }
                 render_local(options.format, &market, &entity, &record)?;
                 if options.once {
                     persist_current_verified_anchor(&runtime, &data_dir, &config)?;
@@ -429,6 +476,151 @@ async fn subscribe_embedded(
                     changed.context("verified anchor channel closed")?;
                     persist_current_verified_anchor(&runtime, &data_dir, &config)?;
                 }
+                snapshot = &mut optimistic_snapshot, if snapshot_pending => {
+                    snapshot_pending = false;
+                    match snapshot {
+                        Ok(frame) => {
+                            let observations = optimistic_observations(
+                                processor.as_ref(),
+                                &frame,
+                            )
+                            .await?;
+                            let rendered = render_optimistic_observations(
+                                options.format,
+                                markets,
+                                &observations,
+                                frame.block,
+                                "apply",
+                            )?;
+                            previewed.extend(rendered.iter().copied());
+                            retain_preview_block(
+                                &mut preview_blocks,
+                                &mut previewed,
+                                frame.block,
+                                observations,
+                            );
+                            if options.once && !rendered.is_empty() {
+                                persist_current_verified_anchor(&runtime, &data_dir, &config)?;
+                                runtime.shutdown().await;
+                                return Ok(Exit::Success);
+                            }
+                            match runtime.execution_source.subscribe(
+                                DataRequest {
+                                    range: BlockRange::single(frame.block.number),
+                                    ..preview_request.clone()
+                                },
+                                LiveStart::RetainedCanonical {
+                                    canonical: vec![frame.block],
+                                },
+                                embedded_snapshot_budget(&config),
+                                runtime.cancellation_token(),
+                            ).await {
+                                Ok(stream) => preview_stream = Some(stream),
+                                Err(error) => tracing::debug!(
+                                    %error,
+                                    "optimistic head preview could not follow the live tail; anchored startup continues"
+                                ),
+                            }
+                        }
+                        Err(error) => tracing::debug!(
+                            %error,
+                            "optimistic head preview was unavailable; anchored startup continues"
+                        ),
+                    }
+                }
+                event = next_preview_event(&mut preview_stream) => {
+                    let Some(event) = event else {
+                        preview_stream = None;
+                        continue;
+                    };
+                    let mut rendered_any = false;
+                    match event {
+                        Ok(ChainEvent::Block(frame)) => {
+                            let observations = optimistic_observations(
+                                processor.as_ref(),
+                                &frame,
+                            ).await?;
+                            let rendered = render_optimistic_observations(
+                                options.format,
+                                markets,
+                                &observations,
+                                frame.block,
+                                "apply",
+                            )?;
+                            rendered_any = !rendered.is_empty();
+                            previewed.extend(rendered);
+                            retain_preview_block(
+                                &mut preview_blocks,
+                                &mut previewed,
+                                frame.block,
+                                observations,
+                            );
+                        }
+                        Ok(ChainEvent::Reorg { reverted, applied }) => {
+                            for block in reverted {
+                                if let Some((hash, observations)) =
+                                    preview_blocks.remove(&block.number.0)
+                                    && hash == block.hash
+                                {
+                                    let reverted = render_optimistic_observations(
+                                        options.format,
+                                        markets,
+                                        &observations,
+                                        block,
+                                        "revert",
+                                    )?;
+                                    for key in reverted {
+                                        previewed.remove(&key);
+                                    }
+                                }
+                            }
+                            for frame in applied {
+                                let observations = optimistic_observations(
+                                    processor.as_ref(),
+                                    &frame,
+                                ).await?;
+                                let rendered = render_optimistic_observations(
+                                    options.format,
+                                    markets,
+                                    &observations,
+                                    frame.block,
+                                    "apply",
+                                )?;
+                                rendered_any |= !rendered.is_empty();
+                                previewed.extend(rendered);
+                                retain_preview_block(
+                                    &mut preview_blocks,
+                                    &mut previewed,
+                                    frame.block,
+                                    observations,
+                                );
+                            }
+                        }
+                        Ok(ChainEvent::Disconnected { reason }) => tracing::debug!(
+                            %reason,
+                            "optimistic preview tail transiently disconnected"
+                        ),
+                        Ok(ChainEvent::Reset { reason, .. }) => {
+                            tracing::debug!(
+                                %reason,
+                                "optimistic preview tail reset; anchored startup continues"
+                            );
+                            preview_stream = None;
+                        }
+                        Err(error) => {
+                            tracing::debug!(
+                                %error,
+                                "optimistic preview tail stopped; anchored startup continues"
+                            );
+                            preview_stream = None;
+                        }
+                    }
+                    if options.once && rendered_any {
+                        persist_current_verified_anchor(&runtime, &data_dir, &config)?;
+                        runtime.shutdown().await;
+                        return Ok(Exit::Success);
+                    }
+                }
                 () = store.wait_for_delivery_changes() => {}
                 () = tokio::time::sleep(Duration::from_secs(1)) => {}
             }
@@ -448,6 +640,9 @@ async fn subscribe_embedded(
                 continue;
             }
             if let Some((market, entity)) = local_price(markets, &record)? {
+                if previewed.remove(&observation_key(&entity)) {
+                    continue;
+                }
                 render_local(options.format, market, &entity, &record)?;
                 if options.once {
                     persist_current_verified_anchor(&runtime, &data_dir, &config)?;
@@ -574,7 +769,7 @@ fn subscription_data_dir(
         options.working_directory.join(".leani/subscriptions")
     };
     let mut hasher = blake3::Hasher::new();
-    hasher.update(b"uniswap-observations/2.0.0");
+    hasher.update(b"uniswap-observations/2.1.0");
     for market in markets {
         hasher.update(market.pool.as_bytes());
     }
@@ -1009,6 +1204,148 @@ fn address_matches(address: Address, expected: &str) -> bool {
         .is_ok_and(|expected| Address::from(expected) == address)
 }
 
+fn embedded_snapshot_budget(config: &Config) -> SourceBudget {
+    SourceBudget {
+        max_input_bytes: config.budgets.memory_bytes,
+        max_frame_bytes: config.budgets.memory_bytes.min(32 * 1_024 * 1_024),
+        max_frames: 64,
+        max_buffered_frames: 64,
+        max_in_flight_requests: config.budgets.source_concurrency,
+        temporary_disk_bytes: config.budgets.temporary_disk_bytes,
+    }
+}
+
+async fn optimistic_head_snapshot(
+    mut anchors: tokio::sync::watch::Receiver<Option<leani_runtime::AppliedFinalityAnchor>>,
+    source: std::sync::Arc<leani_source_p2p::RethP2pSource>,
+    mut request: DataRequest,
+    budget: SourceBudget,
+    cancellation: tokio_util::sync::CancellationToken,
+) -> Result<BlockFrame> {
+    let advertised = loop {
+        if let Some(anchor) = *anchors.borrow() {
+            break anchor.block;
+        }
+        tokio::select! {
+            changed = anchors.changed() => {
+                changed.context("verified anchor channel closed before optimistic preview")?;
+            }
+            () = cancellation.cancelled() => {
+                bail!("embedded runtime stopped before optimistic preview");
+            }
+        }
+    };
+    request.range = BlockRange::single(advertised.number);
+    source
+        .optimistic_head_snapshot(advertised, &request, budget, &cancellation)
+        .await
+        .context("fetch optimistic execution-head preview")
+}
+
+fn processor_data_request(
+    requirement: &leani_processor_api::DataRequirement,
+    range: BlockRange,
+) -> DataRequest {
+    DataRequest {
+        chain_id: ChainId(1),
+        range,
+        required: requirement.capabilities,
+        log_fields: requirement.log_fields,
+        allow_filtered: requirement.allow_filtered,
+        projection: FieldProjection::default(),
+        filters: FilterSet {
+            scope: requirement.filter.clone(),
+            senders: requirement.filter.senders.clone(),
+            recipients: requirement.filter.recipients.clone(),
+        },
+        minimum_finality: requirement.minimum_finality,
+        verification_policy: VerificationPolicy::CompleteCryptographic,
+    }
+}
+
+async fn optimistic_observations(
+    processor: &dyn leani_processor_api::Processor,
+    frame: &BlockFrame,
+) -> Result<Vec<PoolPriceEntity>> {
+    if !price_is_fresh(
+        SubscribeFinality::Optimistic,
+        frame.block.timestamp,
+        unix_seconds(),
+    ) {
+        return Ok(Vec::new());
+    }
+    let delta = processor
+        .map(frame)
+        .await
+        .context("map optimistic Uniswap head preview")?;
+    let delta: UniswapPriceDelta =
+        postcard::from_bytes(&delta.payload).context("decode optimistic Uniswap head preview")?;
+    Ok(delta.observations)
+}
+
+fn render_optimistic_observations(
+    format: SubscribeFormat,
+    markets: &[Market],
+    observations: &[PoolPriceEntity],
+    block: BlockRef,
+    operation: &str,
+) -> Result<Vec<ObservationKey>> {
+    let mut rendered = Vec::new();
+    for entity in observations {
+        let Some(market) = markets
+            .iter()
+            .find(|market| address_matches(entity.pool, market.pool))
+        else {
+            continue;
+        };
+        render_entity(
+            format,
+            market,
+            entity,
+            block,
+            Finality::Optimistic,
+            operation,
+            None,
+        )?;
+        rendered.push(observation_key(entity));
+    }
+    Ok(rendered)
+}
+
+async fn next_preview_event(
+    stream: &mut Option<ChainEventStream>,
+) -> Option<Result<ChainEvent, SourceError>> {
+    match stream {
+        Some(stream) => stream.next().await,
+        None => std::future::pending().await,
+    }
+}
+
+fn retain_preview_block(
+    blocks: &mut BTreeMap<u64, (BlockHash, Vec<PoolPriceEntity>)>,
+    previewed: &mut HashSet<ObservationKey>,
+    block: BlockRef,
+    observations: Vec<PoolPriceEntity>,
+) {
+    if let Some((_, replaced)) = blocks.insert(block.number.0, (block.hash, observations)) {
+        for entity in replaced {
+            previewed.remove(&observation_key(&entity));
+        }
+    }
+    while blocks.len() > 64 {
+        let Some((_, (_, expired))) = blocks.pop_first() else {
+            break;
+        };
+        for entity in expired {
+            previewed.remove(&observation_key(&entity));
+        }
+    }
+}
+
+const fn observation_key(entity: &PoolPriceEntity) -> ObservationKey {
+    (entity.pool, entity.block_hash, entity.log_index)
+}
+
 fn render_local(
     format: SubscribeFormat,
     market: &Market,
@@ -1020,6 +1357,26 @@ fn render_local(
         io::stdout().flush()?;
         return Ok(());
     }
+    render_entity(
+        format,
+        market,
+        entity,
+        record.block,
+        record.finality,
+        direction_name(record.direction),
+        Some(record.cursor.sequence.to_string()),
+    )
+}
+
+fn render_entity(
+    format: SubscribeFormat,
+    market: &Market,
+    entity: &PoolPriceEntity,
+    block: BlockRef,
+    finality: Finality,
+    operation: &str,
+    sequence: Option<String>,
+) -> Result<()> {
     let sqrt = entity
         .sqrt_price_x96
         .context("Uniswap V3 observation omitted sqrtPriceX96")?;
@@ -1038,16 +1395,16 @@ fn render_local(
         market,
         price,
         base_volume: base_volume(market, amount0, amount1),
-        block_number: record.block.number.0,
-        block_hash: format!("0x{}", hex::encode(record.block.hash.0)),
-        timestamp: record.block.timestamp,
+        block_number: block.number.0,
+        block_hash: format!("0x{}", hex::encode(block.hash.0)),
+        timestamp: block.timestamp,
         log_index: entity.log_index,
-        finality: finality_name(record.finality).to_owned(),
-        operation: direction_name(record.direction).to_owned(),
+        finality: finality_name(finality).to_owned(),
+        operation: operation.to_owned(),
         sqrt_price_x96: U256::from_be_bytes(sqrt.0).to_string(),
         amount0: amount0.to_string(),
         amount1: amount1.to_string(),
-        sequence: Some(record.cursor.sequence.to_string()),
+        sequence,
     };
     render_price(format, &output)
 }
@@ -1244,23 +1601,37 @@ async fn subscribe_attached(
 ) -> Result<Exit> {
     let client = reqwest::Client::new();
     validate_attached_markets(&client, options, markets, &endpoint).await?;
-    let head_url = processor_url(&endpoint, &options.processor, "changes/head")?;
-    let head = authorized(client.get(head_url), options.token.as_deref())
-        .send()
-        .await?
-        .error_for_status()?
-        .json::<ChangeHead>()
-        .await?;
-    let mut cursor = head.cursor;
-    eprintln!(
-        "leani: attached to {} for {}; waiting for fresh prices...",
-        endpoint,
-        markets
-            .iter()
-            .map(|market| market.symbol)
-            .collect::<Vec<_>>()
-            .join(", ")
-    );
+    let use_latest =
+        options.finality == SubscribeFinality::Optimistic && options.format != SubscribeFormat::Raw;
+    let (mut cursor, latest) = if use_latest {
+        attached_latest_snapshot(&client, options, markets, &endpoint).await?
+    } else {
+        (
+            attached_change_head(&client, options, &endpoint)
+                .await?
+                .cursor,
+            Vec::new(),
+        )
+    };
+    if use_latest {
+        for (market, latest) in latest {
+            if !price_is_fresh(options.finality, latest.timestamp, unix_seconds()) {
+                continue;
+            }
+            render_attached_price(
+                options.format,
+                &market,
+                &latest.data,
+                latest.timestamp,
+                "apply",
+                None,
+            )?;
+            if options.once {
+                return Ok(Exit::Success);
+            }
+        }
+    }
+    announce_attached(&endpoint, markets);
     let mut backoff = Duration::from_secs(1);
     loop {
         let mut stream_url = processor_url(&endpoint, &options.processor, "stream")?;
@@ -1307,23 +1678,8 @@ async fn subscribe_attached(
                 }
             };
             buffer.extend_from_slice(&chunk);
-            while let Some(end) = sse_event_end(&buffer) {
-                let event = buffer.drain(..end).collect::<Vec<_>>();
-                let delimiter = if event.ends_with(b"\r\n\r\n") { 4 } else { 2 };
-                let event = &event[..event.len().saturating_sub(delimiter)];
-                let Some(data) = sse_data(event)? else {
-                    continue;
-                };
-                let value: Value = serde_json::from_str(&data)?;
-                let Ok(envelope) = serde_json::from_value::<AttachedEnvelope>(value.clone()) else {
-                    continue;
-                };
-                cursor = Some(envelope.cursor.clone());
-                if render_attached(options.format, options.finality, markets, envelope, &value)?
-                    && options.once
-                {
-                    return Ok(Exit::Success);
-                }
+            if render_attached_sse_events(&mut buffer, &mut cursor, options, markets)? {
+                return Ok(Exit::Success);
             }
         }
         eprintln!(
@@ -1335,6 +1691,118 @@ async fn subscribe_attached(
         }
         backoff = backoff.saturating_mul(2).min(Duration::from_secs(30));
     }
+}
+
+fn announce_attached(endpoint: &Url, markets: &[Market]) {
+    eprintln!(
+        "leani: attached to {} for {}; waiting for fresh prices...",
+        endpoint,
+        markets
+            .iter()
+            .map(|market| market.symbol)
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+}
+
+fn render_attached_sse_events(
+    buffer: &mut Vec<u8>,
+    cursor: &mut Option<String>,
+    options: &SubscribeOptions,
+    markets: &[Market],
+) -> Result<bool> {
+    while let Some(end) = sse_event_end(buffer) {
+        let event = buffer.drain(..end).collect::<Vec<_>>();
+        let delimiter = if event.ends_with(b"\r\n\r\n") { 4 } else { 2 };
+        let event = &event[..event.len().saturating_sub(delimiter)];
+        let Some(data) = sse_data(event)? else {
+            continue;
+        };
+        let value: Value = serde_json::from_str(&data)?;
+        let Ok(envelope) = serde_json::from_value::<AttachedEnvelope>(value.clone()) else {
+            continue;
+        };
+        *cursor = Some(envelope.cursor.clone());
+        if render_attached(options.format, options.finality, markets, envelope, &value)?
+            && options.once
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+async fn attached_change_head(
+    client: &reqwest::Client,
+    options: &SubscribeOptions,
+    endpoint: &Url,
+) -> Result<ChangeHead> {
+    let head_url = processor_url(endpoint, &options.processor, "changes/head")?;
+    Ok(authorized(client.get(head_url), options.token.as_deref())
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<ChangeHead>()
+        .await?)
+}
+
+async fn attached_latest_snapshot(
+    client: &reqwest::Client,
+    options: &SubscribeOptions,
+    markets: &[Market],
+    endpoint: &Url,
+) -> Result<(Option<String>, Vec<(Market, AttachedLatestObservation)>)> {
+    const MAX_STABILITY_ATTEMPTS: usize = 8;
+
+    for attempt in 1..=MAX_STABILITY_ATTEMPTS {
+        let before = attached_change_head(client, options, endpoint).await?;
+        let latest = attached_latest_observations(client, options, markets, endpoint).await?;
+        let after = attached_change_head(client, options, endpoint).await?;
+        if before.cursor == after.cursor {
+            return Ok((after.cursor, latest));
+        }
+        tracing::debug!(
+            attempt,
+            "Uniswap changes advanced during latest-price bootstrap; retrying a stable snapshot"
+        );
+    }
+
+    let head = attached_change_head(client, options, endpoint).await?;
+    tracing::debug!(
+        "Uniswap changes remained busy during latest-price bootstrap; continuing directly from the live cursor"
+    );
+    Ok((head.cursor, Vec::new()))
+}
+
+async fn attached_latest_observations(
+    client: &reqwest::Client,
+    options: &SubscribeOptions,
+    markets: &[Market],
+    endpoint: &Url,
+) -> Result<Vec<(Market, AttachedLatestObservation)>> {
+    let responses = join_all(markets.iter().copied().map(|market| async move {
+        let url = processor_url(
+            endpoint,
+            &options.processor,
+            &format!("query/pools/{}/latest", market.pool),
+        )?;
+        let response = authorized(client.get(url), options.token.as_deref())
+            .send()
+            .await?;
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        let latest = response
+            .error_for_status()?
+            .json::<AttachedLatestObservation>()
+            .await?;
+        Ok::<_, anyhow::Error>(Some((market, latest)))
+    }))
+    .await;
+    responses
+        .into_iter()
+        .filter_map(Result::transpose)
+        .collect()
 }
 
 async fn validate_attached_markets(
@@ -1430,6 +1898,25 @@ fn render_attached(
         io::stdout().flush()?;
         return Ok(true);
     }
+    render_attached_price(
+        format,
+        market,
+        &entity,
+        timestamp,
+        &envelope.operation,
+        Some(envelope.sequence),
+    )?;
+    Ok(true)
+}
+
+fn render_attached_price(
+    format: SubscribeFormat,
+    market: &Market,
+    entity: &AttachedPoolPrice,
+    timestamp: u64,
+    operation: &str,
+    sequence: Option<String>,
+) -> Result<()> {
     let sqrt = entity
         .sqrt_price_x96
         .as_deref()
@@ -1453,18 +1940,18 @@ fn render_attached(
         price,
         base_volume: base_volume(market, amount0, amount1),
         block_number: entity.block_number,
-        block_hash: entity.block_hash,
+        block_hash: entity.block_hash.clone(),
         timestamp,
         log_index: entity.log_index,
-        finality: entity.finality,
-        operation: envelope.operation,
+        finality: entity.finality.clone(),
+        operation: operation.to_owned(),
         sqrt_price_x96: sqrt.to_owned(),
         amount0: amount0.to_string(),
         amount1: amount1.to_string(),
-        sequence: Some(envelope.sequence),
+        sequence,
     };
     render_price(format, &output)?;
-    Ok(true)
+    Ok(())
 }
 
 fn processor_url(endpoint: &Url, processor: &str, suffix: &str) -> Result<Url> {

@@ -3402,7 +3402,12 @@ impl SharedLiveRuntime {
         }
         let events = self
             .source
-            .subscribe(start, budget, cancellation.clone())
+            .subscribe(
+                compile_live_request(&self.processors, self.source.descriptor().chain_id, &start)?,
+                start,
+                budget,
+                cancellation.clone(),
+            )
             .await;
         let mut events = match events {
             Ok(events) => events,
@@ -4617,6 +4622,86 @@ fn record_apply(report: &mut SharedProcessorLiveReport, outcome: &ApplyOutcome) 
     }
 }
 
+fn compile_live_request(
+    processors: &[Arc<dyn Processor>],
+    chain_id: leani_primitives::ChainId,
+    start: &LiveStart,
+) -> Result<DataRequest, RuntimeError> {
+    let range = match start {
+        LiveStart::Head => BlockRange::single(BlockNumber(0)),
+        LiveStart::Block(block) => BlockRange::single(block.number),
+        LiveStart::AnchoredOverlap {
+            anchor,
+            overlap_blocks,
+        } => BlockRange::new(
+            BlockNumber(
+                anchor
+                    .number
+                    .0
+                    .saturating_sub(overlap_blocks.saturating_sub(1)),
+            ),
+            anchor.number,
+        )
+        .map_err(|error| RuntimeError::InvalidConfig(error.to_string()))?,
+        LiveStart::RetainedCanonical { canonical } => {
+            let first = canonical.first().ok_or_else(|| {
+                RuntimeError::InvalidConfig(
+                    "retained live start requires a non-empty canonical suffix".to_owned(),
+                )
+            })?;
+            let last = canonical.last().expect("non-empty canonical suffix");
+            BlockRange::new(first.number, last.number)
+                .map_err(|error| RuntimeError::InvalidConfig(error.to_string()))?
+        }
+        LiveStart::Cursor(cursor) => BlockRange::single(cursor.block_number),
+    };
+    let requirements = processors
+        .iter()
+        .flat_map(|processor| &processor.descriptor().requirements)
+        .collect::<Vec<_>>();
+    let first = requirements.first().copied().ok_or_else(|| {
+        RuntimeError::InvalidConfig("live processors require at least one data requirement".into())
+    })?;
+    let required = requirements
+        .iter()
+        .fold(CapabilitySet::NONE, |all, requirement| {
+            all.union(requirement.capabilities)
+        });
+    let log_fields = requirements
+        .iter()
+        .fold(LogFieldSet::NONE, |all, requirement| {
+            all.union(requirement.log_fields)
+        });
+    let minimum_finality = requirements
+        .iter()
+        .fold(Finality::Optimistic, |all, requirement| {
+            all.max(requirement.minimum_finality)
+        });
+    let allow_filtered = requirements
+        .iter()
+        .all(|requirement| requirement.allow_filtered && requirement.filter == first.filter);
+    let filters = if allow_filtered {
+        leani_source_api::FilterSet {
+            scope: first.filter.clone(),
+            senders: first.filter.senders.clone(),
+            recipients: first.filter.recipients.clone(),
+        }
+    } else {
+        leani_source_api::FilterSet::default()
+    };
+    Ok(DataRequest {
+        chain_id,
+        range,
+        required,
+        log_fields,
+        allow_filtered,
+        projection: leani_source_api::FieldProjection::default(),
+        filters,
+        minimum_finality,
+        verification_policy: VerificationPolicy::CompleteCryptographic,
+    })
+}
+
 fn signal_readiness(readiness: Option<&tokio::sync::watch::Sender<bool>>, ready: bool) {
     if let Some(readiness) = readiness {
         readiness.send_replace(ready);
@@ -4684,7 +4769,16 @@ impl LiveRuntime {
         let budget = budget.validate()?;
         let mut events = self
             .source
-            .subscribe(start, budget, cancellation.clone())
+            .subscribe(
+                compile_live_request(
+                    std::slice::from_ref(&self.processor),
+                    self.source.descriptor().chain_id,
+                    &start,
+                )?,
+                start,
+                budget,
+                cancellation.clone(),
+            )
             .await?;
         let mut report = LiveReport::default();
         loop {

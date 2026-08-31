@@ -60,7 +60,7 @@ quorum result. Compact Ethereum Mainnet Uniswap configurations expand to:
 | listeners | ephemeral P2P ports, RPC `127.0.0.1:18545`/`18546`, API `127.0.0.1:18080` |
 
 The reviewed expansion is checked in as
-[`config/defaults/ethereum-mainnet-uniswap.toml`](../../config/defaults/ethereum-mainnet-uniswap.toml).
+[`config/defaults/ethereum-mainnet-uniswap.toml`](https://github.com/smart-byte/leani/blob/main/config/defaults/ethereum-mainnet-uniswap.toml).
 Use the advanced schema below when any expanded field needs an override.
 
 Validate a file without opening its database or any network connection:

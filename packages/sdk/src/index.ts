@@ -331,6 +331,11 @@ export interface UniswapPoolPrice {
   finality: Finality;
 }
 
+export interface LatestUniswapObservation {
+  data: UniswapPoolPrice;
+  timestamp: number;
+}
+
 export interface ChangeEnvelope<T = unknown> {
   apiVersion: "1";
   sequence: string;
@@ -607,6 +612,10 @@ export interface LeaniClient {
       address: Hex,
       options?: { signal?: AbortSignal },
     ): Promise<UniswapPoolPrice>;
+    getLatestObservation(
+      address: Hex,
+      options?: { processor?: string; signal?: AbortSignal },
+    ): Promise<LatestUniswapObservation>;
     subscribe(
       options?: SubscribeOptions,
     ): AsyncGenerator<ChangeEnvelope<UniswapPoolPrice>>;
@@ -1007,6 +1016,15 @@ export function createLeaniClient(
           `${resolved.queryBasePaths.uniswap}/pools/${encodeURIComponent(assertAddress(address))}`,
           undefined,
           options,
+        ),
+      getLatestObservation: (
+        address: Hex,
+        options: { processor?: string; signal?: AbortSignal } = {},
+      ) =>
+        request<LatestUniswapObservation>(
+          `v1/processors/${encodeURIComponent(options.processor ?? "uniswap-observations")}/query/pools/${encodeURIComponent(assertAddress(address))}/latest`,
+          undefined,
+          { signal: options.signal },
         ),
       subscribe: (subscribeOptions: SubscribeOptions = {}) =>
         subscribe<UniswapPoolPrice>("uniswap-observations", subscribeOptions),

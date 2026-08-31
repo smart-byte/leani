@@ -19,6 +19,7 @@ use serde::{Deserialize, Serialize};
 
 pub const CURRENT_COLLECTION: &str = "uniswap.pools.current";
 pub const HISTORY_COLLECTION: &str = "uniswap.pools.history";
+pub const OBSERVATION_LATEST_COLLECTION: &str = "uniswap.observations.latest";
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -184,14 +185,14 @@ impl UniswapObservationsProcessor {
             .map_err(|error| ProcessorError::Input(error.to_string()))?;
         let id = ProcessorId::new("uniswap-observations")
             .map_err(|error| ProcessorError::Input(error.to_string()))?;
-        let version = Version::new(2, 0, 0);
+        let version = Version::new(2, 1, 0);
         let config_hash = BlockHash::new(*blake3::hash(&encoded).as_bytes());
         let descriptor = ProcessorDescriptor {
             instance: ProcessorInstanceId::legacy(&id, &version, config_hash),
             id,
             version,
             code_hash: BlockHash::new(
-                *blake3::hash(b"leani/uniswap-observations/2.0.0").as_bytes(),
+                *blake3::hash(b"leani/uniswap-observations/2.1.0").as_bytes(),
             ),
             config_hash,
             start: StartPoint::Block(config.start_block),
@@ -333,6 +334,7 @@ impl Processor for UniswapObservationsProcessor {
         let delta: UniswapPriceDelta = postcard::from_bytes(&delta.payload)
             .map_err(|error| ProcessorError::DeltaPayload(error.to_string()))?;
         let mut changes = Vec::with_capacity(delta.observations.len());
+        let mut latest_by_pool = BTreeMap::<Address, PoolPriceEntity>::new();
         for observation in delta.observations {
             write_entity(
                 transaction,
@@ -343,6 +345,33 @@ impl Processor for UniswapObservationsProcessor {
                 &mut changes,
             )
             .await?;
+            let replace = latest_by_pool
+                .get(&observation.pool)
+                .is_none_or(|current| observation.log_index > current.log_index);
+            if replace {
+                latest_by_pool.insert(observation.pool, observation);
+            }
+        }
+        for (pool, observation) in latest_by_pool {
+            let current = transaction
+                .get(OBSERVATION_LATEST_COLLECTION, &pool.0)
+                .await?
+                .map(|encoded| {
+                    postcard::from_bytes::<PoolPriceEntity>(&encoded)
+                        .map_err(|error| ProcessorError::State(error.to_string()))
+                })
+                .transpose()?;
+            let replace = current.as_ref().is_none_or(|current| {
+                (observation.block_number, observation.log_index)
+                    >= (current.block_number, current.log_index)
+            });
+            if replace {
+                let encoded = postcard::to_allocvec(&observation)
+                    .map_err(|error| ProcessorError::State(error.to_string()))?;
+                transaction
+                    .put(OBSERVATION_LATEST_COLLECTION, pool.0.to_vec(), encoded)
+                    .await?;
+            }
         }
         Ok(DomainChanges { changes })
     }
@@ -353,7 +382,7 @@ impl Processor for UniswapObservationsProcessor {
         _key: &[u8],
         value: &[u8],
     ) -> Result<Option<serde_json::Value>, ProcessorError> {
-        if collection != HISTORY_COLLECTION {
+        if collection != HISTORY_COLLECTION && collection != OBSERVATION_LATEST_COLLECTION {
             return Ok(None);
         }
         let entity: PoolPriceEntity = postcard::from_bytes(value)
@@ -561,7 +590,7 @@ fn validate_cursor(
 #[cfg(test)]
 mod tests {
     use alloy_primitives::U256;
-    use leani_primitives::{ChainId, Log};
+    use leani_primitives::{BlockRef, ChainId, Log};
     use leani_testkit::{MemoryReducer, fixture_frame};
 
     use super::*;
@@ -722,10 +751,57 @@ mod tests {
                     .is_some()
             );
         }
-        assert!(
+        let latest: PoolPriceEntity = postcard::from_bytes(
             observation_reducer
-                .entity(CURRENT_COLLECTION, &v2.0)
-                .is_none()
+                .entity(OBSERVATION_LATEST_COLLECTION, &v3.0)
+                .expect("latest v3 observation"),
+        )
+        .expect("decode latest observation");
+        assert_eq!(latest.pool, v3);
+        assert_eq!(latest.log_index, 1);
+
+        let older_block = BlockRef {
+            number: BlockNumber(0),
+            hash: BlockHash::new([0x44; 32]),
+            parent_hash: BlockHash::ZERO,
+            timestamp: frame.block.timestamp.saturating_sub(1),
+        };
+        let mut older = latest.clone();
+        older.block_number = older_block.number;
+        older.block_hash = older_block.hash;
+        older.finality = Finality::Finalized;
+        let older_delta = EncodedDelta::new(
+            observations.descriptor(),
+            ChainId(1),
+            older_block,
+            postcard::to_allocvec(&UniswapPriceDelta {
+                observations: vec![older],
+            })
+            .expect("older observation delta"),
         );
+        observations
+            .reduce(
+                &mut observation_reducer,
+                &ProcessorCursor {
+                    processor_id: observations.descriptor.id.to_string(),
+                    processor_version: observations.descriptor.version.to_string(),
+                    chain_id: ChainId(1),
+                    block_number: older_block.number,
+                    block_hash: older_block.hash,
+                    finality: Finality::Finalized,
+                    sequence: 2,
+                },
+                &older_delta,
+            )
+            .await
+            .expect("reduce older finalized observation");
+        let latest_after_finality: PoolPriceEntity = postcard::from_bytes(
+            observation_reducer
+                .entity(OBSERVATION_LATEST_COLLECTION, &v3.0)
+                .expect("latest observation after older finality"),
+        )
+        .expect("decode latest observation after older finality");
+        assert_eq!(latest_after_finality.block_number, frame.block.number);
+        assert_eq!(latest_after_finality.block_hash, frame.block.hash);
     }
 }

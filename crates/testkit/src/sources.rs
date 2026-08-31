@@ -354,6 +354,7 @@ impl LiveSource for ScriptedLiveSource {
 
     async fn subscribe(
         &self,
+        _request: DataRequest,
         _start: LiveStart,
         budget: SourceBudget,
         cancellation: CancellationToken,
@@ -653,6 +654,7 @@ mod tests {
         );
         let mut events = live
             .subscribe(
+                request(range),
                 LiveStart::Head,
                 default_source_budget(),
                 CancellationToken::new(),

@@ -14,7 +14,7 @@ use anyhow::{Context, Result, bail};
 use clap::Parser;
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
 use crate::{
@@ -2629,7 +2629,7 @@ pub async fn run_cli_with_registry(cli: Cli, registry: &ProcessorRegistry) -> Re
             data_dir,
             once,
         } => {
-            crate::subscribe::subscribe(
+            Box::pin(crate::subscribe::subscribe(
                 crate::subscribe::SubscribeOptions {
                     protocol,
                     markets,
@@ -2649,7 +2649,7 @@ pub async fn run_cli_with_registry(cli: Cli, registry: &ProcessorRegistry) -> Re
                     working_directory,
                 },
                 registry,
-            )
+            ))
             .await
         }
         Command::Backfill {
@@ -5178,6 +5178,7 @@ async fn serve(path: &Path, registry: &ProcessorRegistry) -> Result<Exit> {
                 supervisor_store,
                 supervisor_processors,
                 supervisor_handles,
+                None,
             ))
             .await;
         }))
@@ -5511,6 +5512,7 @@ pub(crate) struct EmbeddedNetworkRuntime {
     pub(crate) readiness: leani_api::ReadinessHandle,
     pub(crate) verified_anchor:
         tokio::sync::watch::Receiver<Option<leani_runtime::AppliedFinalityAnchor>>,
+    pub(crate) execution_source: std::sync::Arc<leani_source_p2p::RethP2pSource>,
     cancellation: CancellationToken,
     task: tokio::task::JoinHandle<()>,
 }
@@ -5519,6 +5521,11 @@ impl EmbeddedNetworkRuntime {
     #[must_use]
     pub(crate) fn is_finished(&self) -> bool {
         self.task.is_finished()
+    }
+
+    #[must_use]
+    pub(crate) fn cancellation_token(&self) -> CancellationToken {
+        self.cancellation.clone()
     }
 
     pub(crate) async fn shutdown(self) {
@@ -5531,27 +5538,36 @@ pub(crate) fn spawn_embedded_network_runtime(
     config: Config,
     store: leani_store_sqlite::SqliteStore,
     processors: Vec<std::sync::Arc<dyn leani_processor_api::Processor>>,
-) -> EmbeddedNetworkRuntime {
+) -> Result<EmbeddedNetworkRuntime> {
     let readiness = leani_api::ReadinessHandle::new(true, true);
     let cancellation = CancellationToken::new();
     let (committed_events, _) = tokio::sync::broadcast::channel(1_024);
     let (verified_anchor, verified_anchor_updates) = tokio::sync::watch::channel(None);
+    let network_telemetry = leani_source_api::NetworkTelemetry::default();
+    let execution_source = execution_p2p_source(&config, network_telemetry.clone())?;
     let handles = NetworkLaneHandles {
         readiness: readiness.clone(),
         rpc_readiness: leani_rpc::RpcReadiness::default(),
         committed_events,
-        network_telemetry: leani_source_api::NetworkTelemetry::default(),
+        network_telemetry,
         cancellation: cancellation.clone(),
         backfill_control: None,
         verified_anchor: Some(verified_anchor),
     };
-    let task = tokio::spawn(supervise_network_lanes(config, store, processors, handles));
-    EmbeddedNetworkRuntime {
+    let task = tokio::spawn(supervise_network_lanes(
+        config,
+        store,
+        processors,
+        handles,
+        Some(execution_source.clone()),
+    ));
+    Ok(EmbeddedNetworkRuntime {
         readiness,
         verified_anchor: verified_anchor_updates,
+        execution_source,
         cancellation,
         task,
-    }
+    })
 }
 
 pub(crate) fn execution_p2p_source(
@@ -5684,16 +5700,20 @@ async fn supervise_network_lanes(
     store: leani_store_sqlite::SqliteStore,
     processors: Vec<std::sync::Arc<dyn leani_processor_api::Processor>>,
     handles: NetworkLaneHandles,
+    live_source: Option<std::sync::Arc<leani_source_p2p::RethP2pSource>>,
 ) {
-    let live_source = match execution_p2p_source(&config, handles.network_telemetry.clone()) {
-        Ok(source) => source,
-        Err(error) => {
-            handles
-                .network_telemetry
-                .supervisor_backoff(&error, std::time::Duration::from_mins(1));
-            warn!(%error, "failed to construct persistent execution P2P source");
-            return;
-        }
+    let live_source = match live_source {
+        Some(source) => source,
+        None => match execution_p2p_source(&config, handles.network_telemetry.clone()) {
+            Ok(source) => source,
+            Err(error) => {
+                handles
+                    .network_telemetry
+                    .supervisor_backoff(&error, std::time::Duration::from_mins(1));
+                warn!(%error, "failed to construct persistent execution P2P source");
+                return;
+            }
+        },
     };
     let mut retry = std::time::Duration::from_secs(1);
     while !handles.cancellation.is_cancelled() {
@@ -5753,7 +5773,7 @@ async fn run_network_lanes_once(
 ) -> Result<()> {
     use std::{
         sync::Arc,
-        time::{SystemTime, UNIX_EPOCH},
+        time::{Instant, SystemTime, UNIX_EPOCH},
     };
 
     use leani_finality_beacon_api::{
@@ -5783,6 +5803,19 @@ async fn run_network_lanes_once(
     if !matches!(config.sources.live.kind, crate::config::LiveSourceKind::P2p) {
         bail!("network supervisor requires p2p live ingestion");
     }
+    let startup_started = Instant::now();
+    let chain_id = ChainId(config.chain.chain_id);
+    let execution_warmup_head = retained_canonical_tip(&store, chain_id)
+        .await?
+        .unwrap_or_else(leani_source_p2p::RethP2pSource::mainnet_genesis_block);
+    let execution_warmup = {
+        let source = live_source.clone();
+        let cancellation = cancellation.clone();
+        tokio::spawn(async move {
+            let result = source.warm_up(execution_warmup_head, &cancellation).await;
+            (execution_warmup_head, result)
+        })
+    };
     let checkpoint_root = parse_checkpoint_root(&config.finality.checkpoint)?;
     let (finality_source, selected, bootstrap): (
         Arc<dyn FinalitySource>,
@@ -5838,11 +5871,32 @@ async fn run_network_lanes_once(
             bail!("network supervisor requires a verified finality source");
         }
     };
+    info!(
+        elapsed_ms = u64::try_from(startup_started.elapsed().as_millis()).unwrap_or(u64::MAX),
+        finalized_execution_block = selected.execution_block_number,
+        "verified finality startup anchor resolved"
+    );
+    match execution_warmup.await {
+        Ok((advertised, Ok(connected))) => info!(
+            elapsed_ms = u64::try_from(startup_started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            advertised_block = advertised.number.0,
+            connected,
+            "execution peer warmup completed alongside finality verification"
+        ),
+        Ok((advertised, Err(error))) => debug!(
+            advertised_block = advertised.number.0,
+            %error,
+            "execution peer warmup did not complete; live startup will retry"
+        ),
+        Err(error) => debug!(
+            %error,
+            "execution peer warmup task stopped; live startup will retry"
+        ),
+    }
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    let chain_id = ChainId(config.chain.chain_id);
     let live_anchor = BlockRef {
         number: BlockNumber(selected.execution_block_number),
         hash: selected.execution_block_hash,
@@ -5997,7 +6051,15 @@ async fn run_network_lanes_once(
     };
     let (live_ready, mut live_ready_updates) = tokio::sync::watch::channel(false);
     let handoff_runtime = live_runtime.clone();
-    let live_start = retained_live_start(&store, chain_id, live_anchor, overlap_blocks, 64).await?;
+    let live_start = retained_live_start(
+        &store,
+        chain_id,
+        live_anchor,
+        overlap_blocks,
+        64,
+        !backfills.is_empty(),
+    )
+    .await?;
     let live = live_runtime.run_with_readiness(
         live_start,
         live_budget,
@@ -6050,6 +6112,12 @@ async fn run_network_lanes_once(
                     let ready = *live_ready_updates.borrow();
                     readiness.set_live_ready(ready);
                     rpc_readiness.set_live_ready(ready);
+                    info!(
+                        ready,
+                        elapsed_ms = u64::try_from(startup_started.elapsed().as_millis())
+                            .unwrap_or(u64::MAX),
+                        "execution live readiness changed"
+                    );
                 } else {
                     readiness.set_live_ready(false);
                     rpc_readiness.set_live_ready(false);
@@ -6058,7 +6126,14 @@ async fn run_network_lanes_once(
             }
             changed = finality_ready_updates.changed() => {
                 if changed.is_ok() {
-                    readiness.set_finality_ready(*finality_ready_updates.borrow());
+                    let ready = *finality_ready_updates.borrow();
+                    readiness.set_finality_ready(ready);
+                    info!(
+                        ready,
+                        elapsed_ms = u64::try_from(startup_started.elapsed().as_millis())
+                            .unwrap_or(u64::MAX),
+                        "verified finality readiness changed"
+                    );
                 } else {
                     readiness.set_finality_ready(false);
                     break Err(anyhow::anyhow!("finality readiness channel closed"));
@@ -6120,25 +6195,28 @@ async fn retained_live_start(
     anchor: leani_primitives::BlockRef,
     overlap_blocks: u64,
     max_reorg_depth: usize,
+    require_anchor_overlap: bool,
 ) -> Result<leani_source_api::LiveStart> {
     use leani_primitives::BlockNumber;
     use leani_source_api::LiveStart;
 
-    let fallback = || LiveStart::AnchoredOverlap {
-        anchor,
-        overlap_blocks,
+    let fallback = || {
+        if require_anchor_overlap {
+            LiveStart::AnchoredOverlap {
+                anchor,
+                overlap_blocks,
+            }
+        } else {
+            LiveStart::Block(anchor)
+        }
     };
     let Some(bounds) = store.recent_canonical_bounds(chain_id).await? else {
         return Ok(fallback());
     };
-    let required_start = anchor
-        .number
-        .0
-        .saturating_sub(overlap_blocks.saturating_sub(1));
-    if bounds.start().0 > required_start || bounds.end().0 < anchor.number.0 {
+    if bounds.start() > anchor.number || bounds.end() < anchor.number {
         return Ok(fallback());
     }
-    let validation_blocks = bounds.end().0.saturating_sub(required_start);
+    let validation_blocks = bounds.end().0.saturating_sub(anchor.number.0);
     if validation_blocks > 4_096 {
         return Ok(fallback());
     }
@@ -6146,7 +6224,7 @@ async fn retained_live_start(
         usize::try_from(validation_blocks.saturating_add(1)).unwrap_or_default(),
     );
     let mut previous = None;
-    for number in required_start..=bounds.end().0 {
+    for number in anchor.number.0..=bounds.end().0 {
         let Some(frame) = store.recent_frame(chain_id, BlockNumber(number)).await? else {
             return Ok(fallback());
         };
@@ -6176,7 +6254,7 @@ async fn retained_live_start(
         .expect("anchor-inclusive retained suffix is non-empty");
     info!(
         finalized_anchor = anchor.number.0,
-        validated_from = required_start,
+        validated_from = anchor.number.0,
         retained_from = canonical
             .first()
             .map_or(tip.number.0, |block| block.number.0),
@@ -6184,6 +6262,19 @@ async fn retained_live_start(
         "resuming execution P2P live ingestion from durable canonical material"
     );
     Ok(LiveStart::RetainedCanonical { canonical })
+}
+
+async fn retained_canonical_tip(
+    store: &leani_store_sqlite::SqliteStore,
+    chain_id: leani_primitives::ChainId,
+) -> Result<Option<leani_primitives::BlockRef>> {
+    let Some(bounds) = store.recent_canonical_bounds(chain_id).await? else {
+        return Ok(None);
+    };
+    Ok(store
+        .recent_frame(chain_id, bounds.end())
+        .await?
+        .map(|frame| frame.block))
 }
 
 #[allow(clippy::too_many_lines)]
@@ -6956,18 +7047,18 @@ mod tests {
                 .expect("recent frame");
             frames.push(frame);
         }
-        let start = retained_live_start(&store, ChainId(1), frames[2].block, 3, 64)
+        let start = retained_live_start(&store, ChainId(1), frames[2].block, 3, 64, true)
             .await
             .expect("resume start");
         let LiveStart::RetainedCanonical { canonical } = start else {
             panic!("expected retained canonical resume");
         };
-        assert_eq!(canonical.first(), Some(&frames[0].block));
+        assert_eq!(canonical.first(), Some(&frames[2].block));
         assert_eq!(canonical.last(), Some(&frames[3].block));
     }
 
     #[tokio::test]
-    async fn live_restart_refetches_when_the_retained_overlap_is_incomplete() {
+    async fn live_restart_does_not_refetch_pruned_pre_anchor_overlap() {
         use leani_primitives::{BlockHash, ChainId};
         use leani_source_api::LiveStart;
         use leani_store_sqlite::{SqliteStore, StoreConfig};
@@ -6987,16 +7078,45 @@ mod tests {
                 .expect("recent frame");
             frames.push(frame);
         }
-        let start = retained_live_start(&store, ChainId(1), frames[1].block, 3, 64)
+        let start = retained_live_start(&store, ChainId(1), frames[1].block, 3, 64, true)
+            .await
+            .expect("resume start");
+        let LiveStart::RetainedCanonical { canonical } = start else {
+            panic!("expected retained canonical resume");
+        };
+        assert_eq!(canonical, vec![frames[1].block, frames[2].block]);
+    }
+
+    #[tokio::test]
+    async fn live_restart_refetches_when_the_verified_anchor_is_absent() {
+        use leani_primitives::{BlockHash, ChainId};
+        use leani_source_api::LiveStart;
+        use leani_store_sqlite::{SqliteStore, StoreConfig};
+
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = SqliteStore::open(StoreConfig::new(directory.path().join("resume.sqlite")))
+            .await
+            .expect("store");
+        let anchor = fixture_frame(10, BlockHash::ZERO).block;
+        let frame = fixture_frame(11, BlockHash::ZERO);
+        store
+            .store_recent_frame(&frame)
+            .await
+            .expect("recent frame");
+        let start = retained_live_start(&store, ChainId(1), anchor, 3, 64, true)
             .await
             .expect("resume start");
         assert_eq!(
             start,
             LiveStart::AnchoredOverlap {
-                anchor: frames[1].block,
+                anchor,
                 overlap_blocks: 3,
             }
         );
+        let on_demand = retained_live_start(&store, ChainId(1), anchor, 3, 64, false)
+            .await
+            .expect("on-demand start");
+        assert_eq!(on_demand, LiveStart::Block(anchor));
     }
 
     #[tokio::test]

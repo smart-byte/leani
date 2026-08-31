@@ -7320,6 +7320,63 @@ mod tests {
             .expect("apply blob fixture");
     }
 
+    async fn seed_uniswap_observation(
+        store: &SqliteStore,
+        processor: &leani_processor_uniswap::UniswapObservationsProcessor,
+        pool: Address,
+    ) -> leani_primitives::BlockRef {
+        let block = leani_primitives::BlockRef {
+            number: BlockNumber(42),
+            hash: BlockHash::new([0x42; 32]),
+            parent_hash: BlockHash::new([0x41; 32]),
+            timestamp: 1_800_000_000,
+        };
+        store
+            .store_canonical_anchor(ChainId(1), block, Finality::Optimistic)
+            .await
+            .expect("canonical observation block");
+        let payload = postcard::to_allocvec(&leani_processor_uniswap::UniswapPriceDelta {
+            observations: vec![leani_processor_uniswap::PoolPriceEntity {
+                pool,
+                kind: leani_processor_uniswap::PoolKind::V3,
+                reserve0: None,
+                reserve1: None,
+                amount0: Some(Quantity::new([1; 32])),
+                amount1: Some(Quantity::new([2; 32])),
+                sqrt_price_x96: Some(Quantity::new([3; 32])),
+                block_number: block.number,
+                block_hash: block.hash,
+                log_index: 7,
+                finality: Finality::Optimistic,
+            }],
+        })
+        .expect("observation delta");
+        let delta = leani_processor_api::EncodedDelta::new(
+            processor.descriptor(),
+            ChainId(1),
+            block,
+            payload,
+        );
+        store
+            .apply(
+                processor,
+                ProcessorCursor {
+                    processor_id: processor.descriptor().id.to_string(),
+                    processor_version: processor.descriptor().version.to_string(),
+                    chain_id: ChainId(1),
+                    block_number: block.number,
+                    block_hash: block.hash,
+                    finality: Finality::Optimistic,
+                    sequence: 1,
+                },
+                &delta,
+                &[],
+            )
+            .await
+            .expect("apply observation");
+        block
+    }
+
     #[test]
     fn stream_batching_overrides_can_only_tighten_durable_limits() {
         let persisted = DeliveryBatchLimits::history_default();
@@ -7776,6 +7833,7 @@ mod tests {
         }
 
         let response = app
+            .clone()
             .oneshot(
                 Request::get("/v1/capabilities")
                     .header(header::AUTHORIZATION, "Bearer secret")
@@ -7807,7 +7865,7 @@ mod tests {
         ))
         .await
         .expect("store");
-        let processor: Arc<dyn Processor> = Arc::new(
+        let processor = Arc::new(
             UniswapObservationsProcessor::new(UniswapConfig {
                 start_block: BlockNumber(1),
                 pools: vec![
@@ -7824,6 +7882,9 @@ mod tests {
             .expect("processor"),
         );
         let instance = processor.descriptor().instance.to_string();
+        let block =
+            seed_uniswap_observation(&store, processor.as_ref(), Address::new([0x22; 20])).await;
+        let processor: Arc<dyn Processor> = processor;
         let registration = QueryExtensionRegistration::new(
             processor.clone(),
             Arc::new(UniswapObservationsQueryExtension),
@@ -7837,6 +7898,7 @@ mod tests {
         .expect("router");
 
         let response = app
+            .clone()
             .oneshot(
                 Request::get(format!("/v1/processors/{instance}/query/pools"))
                     .body(Body::empty())
@@ -7851,6 +7913,24 @@ mod tests {
         assert_eq!(body["data"][0]["kind"], "v2");
         assert_eq!(body["data"][1]["address"], format!("0x{}", "22".repeat(20)));
         assert_eq!(body["data"][1]["kind"], "v3");
+
+        let response = app
+            .oneshot(
+                Request::get(format!(
+                    "/v1/processors/{instance}/query/pools/0x{}/latest",
+                    "22".repeat(20)
+                ))
+                .body(Body::empty())
+                .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 4096).await.expect("body");
+        let body: Value = serde_json::from_slice(&body).expect("JSON");
+        assert_eq!(body["timestamp"], block.timestamp);
+        assert_eq!(body["data"]["blockNumber"], block.number.0);
+        assert_eq!(body["data"]["logIndex"], 7);
     }
 
     #[tokio::test]

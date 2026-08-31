@@ -1107,6 +1107,26 @@ paths:
                 $ref: "#/components/schemas/ConfiguredUniswapPools"
         default:
           $ref: "#/components/responses/Error"
+  /v1/processors/{processor}/query/pools/{address}/latest:
+    parameters:
+      - $ref: "#/components/parameters/Processor"
+      - name: address
+        in: path
+        required: true
+        schema:
+          $ref: "#/components/schemas/Address"
+    get:
+      summary: Read the latest observation for one configured Uniswap pool
+      operationId: getLatestUniswapObservation
+      responses:
+        "200":
+          description: Latest exact observation plus its canonical block timestamp.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LatestUniswapObservation"
+        default:
+          $ref: "#/components/responses/Error"
 components:
   securitySchemes:
     bearerAuth:
@@ -1911,6 +1931,15 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/ConfiguredUniswapPool"
+    LatestUniswapObservation:
+      type: object
+      additionalProperties: false
+      required: [data, timestamp]
+      properties:
+        data:
+          $ref: "#/components/schemas/UniswapPoolPrice"
+        timestamp:
+          $ref: "#/components/schemas/SafeInteger"
     ChangeBlock:
       type: object
       additionalProperties: false

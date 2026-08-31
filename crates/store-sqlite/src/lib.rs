@@ -6278,15 +6278,27 @@ impl SqliteStore {
         chain_id: ChainId,
     ) -> Result<Option<BlockRange>, StoreError> {
         let row = sqlx::query(
-            "SELECT MIN(canonical.block_number) AS earliest_block,
-                    MAX(canonical.block_number) AS latest_block
-             FROM canonical_blocks AS canonical
-             JOIN recent_blocks AS recent
-               ON recent.chain_id = canonical.chain_id
-              AND recent.block_number = canonical.block_number
-              AND recent.block_hash = canonical.block_hash
-             WHERE canonical.chain_id = ?",
+            "SELECT
+                 (SELECT recent.block_number
+                    FROM recent_blocks AS recent
+                    JOIN canonical_blocks AS canonical
+                      ON canonical.chain_id = recent.chain_id
+                     AND canonical.block_number = recent.block_number
+                     AND canonical.block_hash = recent.block_hash
+                   WHERE recent.chain_id = ?
+                   ORDER BY recent.block_number ASC
+                   LIMIT 1) AS earliest_block,
+                 (SELECT recent.block_number
+                    FROM recent_blocks AS recent
+                    JOIN canonical_blocks AS canonical
+                      ON canonical.chain_id = recent.chain_id
+                     AND canonical.block_number = recent.block_number
+                     AND canonical.block_hash = recent.block_hash
+                   WHERE recent.chain_id = ?
+                   ORDER BY recent.block_number DESC
+                   LIMIT 1) AS latest_block",
         )
+        .bind(u64_i64(chain_id.0, "chain_id")?)
         .bind(u64_i64(chain_id.0, "chain_id")?)
         .fetch_one(&self.inner.pool)
         .await?;

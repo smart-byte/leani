@@ -465,6 +465,7 @@ pub trait LiveSource: Send + Sync {
 
     async fn subscribe(
         &self,
+        request: DataRequest,
         start: LiveStart,
         budget: SourceBudget,
         cancellation: CancellationToken,

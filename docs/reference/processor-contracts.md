@@ -185,7 +185,7 @@ tokens = ["0x2222222222222222222222222222222222222222"]
 complete_from_start = true
 ```
 
-## uniswap-observations / uniswap-latest 2.0.0
+## uniswap-observations 2.1.0 / uniswap-latest 2.0.0
 
 Two configured-pool contracts share the same exact event decoder:
 
@@ -200,7 +200,9 @@ values, preserving the exact pool deltas needed to derive volume. Applications
 combine these values with verified token metadata.
 `uniswap-observations` is block-local and identifies immutable observations by
 pool, block hash, and log index; it supports independent history/live delivery
-and full or windowed SQLite retention. Transaction hashes are deliberately not
+and full or windowed SQLite retention. Version 2.1 also maintains a query-only
+latest-observation pointer per pool so new clients can bootstrap immediately
+before following the immutable stream. Transaction hashes are deliberately not
 part of this processor's output, allowing archive and P2P sources to omit
 transaction bodies when acquiring filtered pool logs.
 `uniswap-latest` is ordered/canonical and retains only the latest observation
@@ -210,7 +212,7 @@ per pool for slim price queries.
 [[processors]]
 id = "uniswap-observations" # or "uniswap-latest"
 instance = "usdc-weth-observations"
-version = "2.0.0"
+version = "2.1.0" # use 2.0.0 with uniswap-latest
 start_block = 12369621
 publish = "optimistic_and_finalized"
 history_control = "node_owned"

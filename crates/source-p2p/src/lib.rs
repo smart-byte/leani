@@ -2000,13 +2000,16 @@ fn parse_secret_key(encoded: &str, path: &Path) -> Result<SecretKey, P2pError> {
 struct P2pLiveState {
     source: RethP2pSource,
     session: P2pSession,
+    request: DataRequest,
     budget: SourceBudget,
     cancellation: CancellationToken,
     last: BlockRef,
     queued: VecDeque<BlockFrame>,
     recent: VecDeque<BlockRef>,
+    required_peer_head: BlockNumber,
     pending_material_attempts: usize,
     reconnect_error: Option<String>,
+    disconnect_reported: bool,
     terminal: bool,
 }
 
@@ -2016,12 +2019,15 @@ impl std::fmt::Debug for P2pLiveState {
             .debug_struct("P2pLiveState")
             .field("source", &self.source)
             .field("session", &self.session)
+            .field("request", &self.request)
             .field("budget", &self.budget)
             .field("last", &self.last)
             .field("queued", &self.queued.len())
             .field("recent", &self.recent.len())
+            .field("required_peer_head", &self.required_peer_head)
             .field("pending_material_attempts", &self.pending_material_attempts)
             .field("reconnect_error", &self.reconnect_error)
+            .field("disconnect_reported", &self.disconnect_reported)
             .field("terminal", &self.terminal)
             .finish_non_exhaustive()
     }
@@ -2109,6 +2115,386 @@ impl RethP2pSource {
     /// Gracefully stop the shared execution network and flush its peer cache.
     pub async fn shutdown(&self) {
         self.network.shutdown().await;
+    }
+
+    /// Return the execution-mainnet genesis block used as a valid status
+    /// advertisement before a caller has resolved a newer trusted anchor.
+    #[must_use]
+    pub fn mainnet_genesis_block() -> BlockRef {
+        let header = MAINNET.genesis_header();
+        BlockRef {
+            number: BlockNumber(header.number),
+            hash: BlockHash::new(MAINNET.genesis_hash().0),
+            parent_hash: BlockHash::new(header.parent_hash.0),
+            timestamp: header.timestamp,
+        }
+    }
+
+    /// Start the persistent execution network and satisfy the configured peer
+    /// availability floor without opening a logical data stream yet.
+    ///
+    /// A caller can overlap this with independent finality verification. The
+    /// later live/history subscription reuses the same manager, connected
+    /// peers, discovery state, and request scheduler.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same bounded connection, cancellation, and peer-availability
+    /// errors as a live subscription.
+    pub async fn warm_up(
+        &self,
+        advertised: BlockRef,
+        cancellation: &CancellationToken,
+    ) -> Result<usize, P2pError> {
+        self.connect(advertised, NetworkLane::Live, cancellation)
+            .await
+            .map(|(_, connected)| connected)
+    }
+
+    /// Fetch the newest self-consistent execution block advertised by the
+    /// active peer pool without first replaying every block since the finalized
+    /// anchor.
+    ///
+    /// The returned frame is deliberately optimistic: its header, body, and
+    /// receipts are root-checked, but its ancestry has not yet been joined to
+    /// the independently verified finalized anchor. Callers may use it for a
+    /// low-latency preview while the ordinary anchored live lane catches up.
+    ///
+    /// # Errors
+    ///
+    /// Returns bounded connection, peer-head, material, verification, budget,
+    /// or cancellation errors.
+    pub async fn optimistic_head_snapshot(
+        &self,
+        advertised: BlockRef,
+        request: &DataRequest,
+        budget: SourceBudget,
+        cancellation: &CancellationToken,
+    ) -> Result<BlockFrame, P2pError> {
+        let budget = budget
+            .validate()
+            .map_err(|error| P2pError::InvalidConfig(error.to_string()))?;
+        let Some(scope) = sparse_log_scope(request) else {
+            return Err(P2pError::InvalidConfig(
+                "optimistic head preview requires one compatible filtered-log request".to_owned(),
+            ));
+        };
+        if request.chain_id != self.descriptor.chain_id {
+            return Err(P2pError::InvalidConfig(
+                "optimistic head preview request belongs to another chain".to_owned(),
+            ));
+        }
+        if request
+            .log_fields
+            .contains(leani_primitives::LogField::TransactionHash)
+        {
+            return Err(P2pError::InvalidConfig(
+                "receipt-only optimistic preview cannot supply transaction hashes".to_owned(),
+            ));
+        }
+        let (session, _) = self
+            .connect(advertised, NetworkLane::Live, cancellation)
+            .await?;
+        let (head_number, head_hash) = self
+            .wait_for_peer_head(
+                &session,
+                BlockNumber(advertised.number.0.saturating_add(1)),
+                cancellation,
+            )
+            .await?;
+        let range = BlockRange::single(head_number);
+        session.set_range(Some(range));
+        session.set_phase(NetworkPhase::FetchingHeaders);
+        let (_, headers) = self
+            .fetch_headers(
+                &session.fetch,
+                range,
+                Some(head_hash),
+                false,
+                MaterialRequestPolicy {
+                    concurrency: budget.max_in_flight_requests,
+                    priority: Priority::High,
+                },
+                cancellation,
+            )
+            .await?;
+        let header = headers.first().ok_or_else(|| {
+            P2pError::InvalidResponse("optimistic head request returned no header".to_owned())
+        })?;
+        let hashes = [header.hash_slow()];
+        let bloom_positive = header_bloom_matches(scope, header);
+        let positive_receipts = if bloom_positive {
+            session.set_phase(NetworkPhase::FetchingReceipts);
+            self.fetch_sparse_receipts(
+                &session,
+                &headers,
+                &hashes,
+                MaterialRequestPolicy {
+                    concurrency: budget.max_in_flight_requests,
+                    priority: Priority::High,
+                },
+                cancellation,
+            )
+            .await?
+        } else {
+            Vec::new()
+        };
+        let exact_match_positions = positive_receipts
+            .first()
+            .is_some_and(|receipts| {
+                receipts
+                    .iter()
+                    .flat_map(|receipt| &receipt.logs)
+                    .any(|log| source_log_matches(Some(scope), log))
+            })
+            .then_some(0)
+            .into_iter()
+            .collect::<Vec<_>>();
+        let bloom_positive_indices = bloom_positive.then_some(0).into_iter().collect::<Vec<_>>();
+        let mut frames = normalize_sparse_log_frames(
+            &headers,
+            request,
+            budget,
+            &bloom_positive_indices,
+            &positive_receipts,
+            &exact_match_positions,
+            &[],
+        )?;
+        let mut frame = frames.pop().ok_or_else(|| {
+            P2pError::InvalidResponse("optimistic head request returned no frame".to_owned())
+        })?;
+        frame.finality = Finality::Optimistic;
+        session.clear_error();
+        session.set_range(None);
+        session.set_phase(NetworkPhase::FollowingHead);
+        Ok(frame)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn fetch_sparse_receipts(
+        &self,
+        session: &P2pSession,
+        headers: &[Header],
+        hashes: &[B256],
+        policy: MaterialRequestPolicy,
+        cancellation: &CancellationToken,
+    ) -> Result<Vec<Vec<Receipt>>, P2pError> {
+        let mut last_error = None;
+        let mut incomplete_responses = HashMap::new();
+        let attempts = if headers.len() > 1 {
+            1
+        } else {
+            self.config.retries
+        };
+        for attempt in 0..attempts {
+            let queued_at = Instant::now();
+            let connected_peers = session.fetch.num_connected_peers();
+            let request_limit = effective_material_concurrency(
+                connected_peers,
+                self.config.material_request_concurrency,
+                policy.concurrency,
+            );
+            let per_peer_limit = direct_peer_request_limit(request_limit, connected_peers);
+            let mut lease = self
+                .network
+                .direct_peers
+                .acquire(per_peer_limit, self.config.request_timeout, cancellation)
+                .await?;
+            let peer = lease.peer.peer_id;
+            let permit = self
+                .network
+                .request_gate
+                .acquire(request_limit, policy.priority, cancellation)
+                .await?;
+            self.config
+                .network_telemetry
+                .request_started(queued_at.elapsed());
+            let request_started_at = Instant::now();
+            let response = request_direct_receipts(
+                &lease.peer,
+                hashes,
+                self.config.request_timeout,
+                cancellation,
+            )
+            .await;
+            drop(permit);
+            match response {
+                Ok(response) => {
+                    self.request_metrics.add_response_payload_bytes(
+                        P2pRequestKind::Receipts,
+                        response.response_payload_bytes,
+                    );
+                    match validate_receipts_against_headers(headers, &response.receipts) {
+                        Ok(()) => {
+                            lease.succeeded();
+                            reward_verified_material_peer(&session.handle, peer);
+                            self.config.network_telemetry.request_succeeded();
+                            self.request_metrics.record_batch(
+                                P2pRequestKind::Receipts,
+                                response.physical_requests,
+                                response.requested_block_hashes,
+                                response.receipts.len(),
+                                request_started_at.elapsed(),
+                                P2pRequestOutcome::Succeeded,
+                            );
+                            return Ok(response.receipts);
+                        }
+                        Err(error) => {
+                            lease.failed();
+                            self.config.network_telemetry.request_failed();
+                            self.request_metrics.record_batch(
+                                P2pRequestKind::Receipts,
+                                response.physical_requests.max(1),
+                                response.requested_block_hashes,
+                                response.receipts.len(),
+                                request_started_at.elapsed(),
+                                P2pRequestOutcome::Failed,
+                            );
+                            if matches!(error, P2pError::InvalidResponse(_)) {
+                                session.handle.ban_peer(peer);
+                                self.network.direct_peers.remove(peer);
+                            } else if matches!(error, P2pError::IncompleteResponse { .. })
+                                && repeated_incomplete_response(
+                                    &mut incomplete_responses,
+                                    peer,
+                                    self.config.retries,
+                                )
+                            {
+                                debug!(
+                                    attempts = self.config.retries,
+                                    "rotating execution peer after repeated incomplete sparse receipt responses"
+                                );
+                                session.handle.disconnect_peer(peer);
+                                self.network.direct_peers.remove(peer);
+                                incomplete_responses.remove(&peer);
+                            }
+                            last_error = Some(error);
+                        }
+                    }
+                }
+                Err(P2pError::Cancelled) => return Err(P2pError::Cancelled),
+                Err(error) => {
+                    lease.failed();
+                    record_request_error(&self.config.network_telemetry, &error);
+                    self.request_metrics.record(
+                        P2pRequestKind::Receipts,
+                        hashes.len(),
+                        0,
+                        request_started_at.elapsed(),
+                        request_outcome(&error),
+                    );
+                    last_error = Some(error);
+                }
+            }
+            if attempt.saturating_add(1) < attempts {
+                retry_pause(self.config.retry_backoff, cancellation).await?;
+            }
+        }
+        Err(last_error.unwrap_or_else(|| P2pError::Request {
+            component: "sparse receipts",
+            detail: "retry budget exhausted".to_owned(),
+        }))
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn fetch_sparse_receipts_batched(
+        &self,
+        session: &P2pSession,
+        headers: &[Header],
+        hashes: &[B256],
+        policy: MaterialRequestPolicy,
+        cancellation: &CancellationToken,
+    ) -> Result<Vec<Vec<Receipt>>, P2pError> {
+        if headers.len() != hashes.len() {
+            return Err(P2pError::InvalidResponse(
+                "sparse receipt batch header/hash length mismatch".to_owned(),
+            ));
+        }
+        let batch_blocks = self.material_tuning.receipt_blocks();
+        let requests = headers
+            .chunks(batch_blocks)
+            .zip(hashes.chunks(batch_blocks))
+            .map(|(header_chunk, hash_chunk)| (header_chunk.to_vec(), hash_chunk.to_vec()))
+            .collect::<Vec<_>>();
+        let concurrency = effective_material_concurrency(
+            session.fetch.num_connected_peers(),
+            self.config.material_request_concurrency,
+            policy.concurrency,
+        );
+        let outcomes = stream::iter(requests)
+            .map(|(header_chunk, hash_chunk)| async move {
+                let result = self
+                    .fetch_sparse_receipts(
+                        session,
+                        &header_chunk,
+                        &hash_chunk,
+                        policy,
+                        cancellation,
+                    )
+                    .await;
+                (header_chunk, hash_chunk, result)
+            })
+            .buffered(concurrency)
+            .collect::<Vec<_>>()
+            .await;
+
+        let mut completed = Vec::new();
+        let mut fallback = Vec::new();
+        for (header_chunk, hash_chunk, result) in outcomes {
+            match result {
+                Ok(receipts) => completed.push((header_chunk[0].number, receipts)),
+                Err(error) if header_chunk.len() > 1 => {
+                    debug!(
+                        blocks = header_chunk.len(),
+                        %error,
+                        "splitting an unsuccessful sparse receipt request into single-block requests"
+                    );
+                    fallback.extend(header_chunk.into_iter().zip(hash_chunk));
+                }
+                Err(error) => {
+                    self.material_tuning.receipts_failed();
+                    return Err(error);
+                }
+            }
+        }
+        let recovered = stream::iter(fallback)
+            .map(|(header, hash)| async move {
+                let result = self
+                    .fetch_sparse_receipts(
+                        session,
+                        std::slice::from_ref(&header),
+                        std::slice::from_ref(&hash),
+                        policy,
+                        cancellation,
+                    )
+                    .await;
+                (header.number, result)
+            })
+            .buffered(concurrency)
+            .collect::<Vec<_>>()
+            .await;
+        let recovered_any = !recovered.is_empty();
+        for (number, result) in recovered {
+            match result {
+                Ok(receipts) => completed.push((number, receipts)),
+                Err(error) => {
+                    self.material_tuning.receipts_failed();
+                    return Err(error);
+                }
+            }
+        }
+        if recovered_any {
+            self.material_tuning.receipts_failed();
+        } else {
+            self.material_tuning.receipts_succeeded();
+        }
+        completed.sort_by_key(|(number, _)| *number);
+        let mut receipts = Vec::with_capacity(headers.len());
+        for (_, mut batch) in completed {
+            receipts.append(&mut batch);
+        }
+        validate_receipts_against_headers(headers, &receipts)?;
+        Ok(receipts)
     }
 
     async fn borrow_live_session(&self) -> Option<P2pSession> {
@@ -2426,10 +2812,151 @@ impl RethP2pSource {
         Ok((frames, response_peers.len()))
     }
 
+    async fn fetch_requested_live_range(
+        &self,
+        session: &P2pSession,
+        range: BlockRange,
+        expected_tip: Option<BlockHash>,
+        request: &DataRequest,
+        budget: SourceBudget,
+        cancellation: &CancellationToken,
+    ) -> Result<(Vec<BlockFrame>, usize), P2pError> {
+        if sparse_log_scope(request).is_none()
+            || request
+                .log_fields
+                .contains(leani_primitives::LogField::TransactionHash)
+        {
+            return self
+                .fetch_verified_range(session, range, expected_tip, budget, cancellation)
+                .await;
+        }
+        session.set_range(Some(range));
+        session.set_phase(NetworkPhase::FetchingHeaders);
+        let (_, headers) = self
+            .fetch_headers(
+                &session.fetch,
+                range,
+                expected_tip,
+                false,
+                MaterialRequestPolicy {
+                    concurrency: budget.max_in_flight_requests,
+                    priority: Priority::High,
+                },
+                cancellation,
+            )
+            .await
+            .inspect_err(|error| session.record_error(error))?;
+        let request = DataRequest {
+            range,
+            ..request.clone()
+        };
+        let frames = self
+            .fetch_sparse_live_frames(session, &headers, &request, budget, cancellation)
+            .await
+            .inspect_err(|error| session.record_error(error))?;
+        session.clear_error();
+        Ok((frames, 1))
+    }
+
+    async fn fetch_sparse_live_frames(
+        &self,
+        session: &P2pSession,
+        headers: &[Header],
+        request: &DataRequest,
+        budget: SourceBudget,
+        cancellation: &CancellationToken,
+    ) -> Result<Vec<BlockFrame>, P2pError> {
+        let scope = sparse_log_scope(request).ok_or_else(|| {
+            P2pError::InvalidConfig("live request is not eligible for sparse logs".to_owned())
+        })?;
+        let hashes = headers.iter().map(Sealable::hash_slow).collect::<Vec<_>>();
+        let bloom_positive_indices = headers
+            .iter()
+            .enumerate()
+            .filter_map(|(index, header)| header_bloom_matches(scope, header).then_some(index))
+            .collect::<Vec<_>>();
+        let positive_headers = bloom_positive_indices
+            .iter()
+            .map(|index| headers[*index].clone())
+            .collect::<Vec<_>>();
+        let positive_hashes = bloom_positive_indices
+            .iter()
+            .map(|index| hashes[*index])
+            .collect::<Vec<_>>();
+        let positive_receipts = if positive_headers.is_empty() {
+            Vec::new()
+        } else {
+            session.set_phase(NetworkPhase::FetchingReceipts);
+            self.fetch_sparse_receipts_batched(
+                session,
+                &positive_headers,
+                &positive_hashes,
+                MaterialRequestPolicy {
+                    concurrency: budget.max_in_flight_requests,
+                    priority: Priority::High,
+                },
+                cancellation,
+            )
+            .await?
+        };
+        let exact_match_positions = positive_receipts
+            .iter()
+            .enumerate()
+            .filter_map(|(position, receipts)| {
+                receipts
+                    .iter()
+                    .flat_map(|receipt| &receipt.logs)
+                    .any(|log| source_log_matches(Some(scope), log))
+                    .then_some(position)
+            })
+            .collect::<Vec<_>>();
+        let frames = normalize_sparse_log_frames(
+            headers,
+            request,
+            budget,
+            &bloom_positive_indices,
+            &positive_receipts,
+            &exact_match_positions,
+            &[],
+        )?;
+        self.request_metrics.record_sparse_log_window(
+            headers.len(),
+            bloom_positive_indices.len(),
+            exact_match_positions.len(),
+            0,
+        );
+        Ok(frames)
+    }
+
+    async fn normalize_polled_sparse_live_frame(
+        &self,
+        session: &P2pSession,
+        next: BlockNumber,
+        header: Header,
+        request: &DataRequest,
+        budget: SourceBudget,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<BlockFrame>, P2pError> {
+        let request = DataRequest {
+            range: BlockRange::single(next),
+            ..request.clone()
+        };
+        let mut frames = self
+            .fetch_sparse_live_frames(session, &[header], &request, budget, cancellation)
+            .await
+            .inspect_err(|error| session.record_error(error))?;
+        session.clear_error();
+        session.observe_head(next);
+        session.set_phase(NetworkPhase::FollowingHead);
+        Ok(frames.pop())
+    }
+
+    #[allow(clippy::too_many_lines)]
     async fn poll_next_verified_frame(
         &self,
         session: &P2pSession,
         next: BlockNumber,
+        request: &DataRequest,
         budget: SourceBudget,
         cancellation: &CancellationToken,
     ) -> Result<Option<BlockFrame>, P2pError> {
@@ -2475,6 +3002,22 @@ impl RethP2pSource {
             return Ok(None);
         };
         let hash = header.hash_slow();
+        if sparse_log_scope(request).is_some()
+            && !request
+                .log_fields
+                .contains(leani_primitives::LogField::TransactionHash)
+        {
+            return self
+                .normalize_polled_sparse_live_frame(
+                    session,
+                    next,
+                    header,
+                    request,
+                    budget,
+                    cancellation,
+                )
+                .await;
+        }
         session.set_phase(NetworkPhase::FetchingBodies);
         let material_policy = MaterialRequestPolicy {
             concurrency: budget.max_in_flight_requests,
@@ -2527,11 +3070,12 @@ impl RethP2pSource {
         Ok(frames.pop())
     }
 
-    async fn connect_and_fetch_verified_range(
+    async fn connect_and_fetch_requested_live_range(
         &self,
         advertised: BlockRef,
         range: BlockRange,
         expected_tip: Option<BlockHash>,
+        request: &DataRequest,
         budget: SourceBudget,
         cancellation: &CancellationToken,
     ) -> Result<(P2pSession, Vec<BlockFrame>, usize), P2pError> {
@@ -2559,8 +3103,29 @@ impl RethP2pSource {
                     return Err(error);
                 }
             };
+            if let Err(error) = self
+                .wait_for_peer_head(&session, advertised.number, cancellation)
+                .await
+            {
+                if matches!(error, P2pError::Cancelled) {
+                    shutdown_session(&session);
+                    return Err(P2pError::Cancelled);
+                }
+                if should_retry_session_error(&self.config, attempts, &error) {
+                    retry_pause(session_retry_delay(&self.config, attempts), cancellation).await?;
+                    continue;
+                }
+                return Err(error);
+            }
             match self
-                .fetch_verified_range(&session, range, expected_tip, budget, cancellation)
+                .fetch_requested_live_range(
+                    &session,
+                    range,
+                    expected_tip,
+                    request,
+                    budget,
+                    cancellation,
+                )
                 .await
             {
                 Ok((frames, response_peers)) => {
@@ -2596,6 +3161,7 @@ impl RethP2pSource {
     async fn discover_peer_head(
         &self,
         session: &P2pSession,
+        minimum: BlockNumber,
         cancellation: &CancellationToken,
     ) -> Result<(BlockNumber, BlockHash), P2pError> {
         session.set_range(None);
@@ -2611,6 +3177,16 @@ impl RethP2pSource {
         let mut unknown_hashes = Vec::new();
         for peer in peers {
             if let Some(number) = peer.status.latest_block {
+                if number < minimum.0 {
+                    debug!(
+                        peer_head = number,
+                        required_head = minimum.0,
+                        "rotating execution peer behind the verified live anchor"
+                    );
+                    session.handle.disconnect_peer(peer.remote_id);
+                    self.network.direct_peers.remove(peer.remote_id);
+                    continue;
+                }
                 let key = (number, peer.status.blockhash.0);
                 *declared.entry(key).or_default() += 1;
             } else if peer.status.blockhash != B256::ZERO {
@@ -2640,6 +3216,7 @@ impl RethP2pSource {
             let (_, headers) = response.split();
             if let Some(header) = headers.into_iter().next()
                 && header.hash_slow() == hash
+                && header.number >= minimum.0
             {
                 discovered.push((header.number, hash.0));
             }
@@ -2654,6 +3231,34 @@ impl RethP2pSource {
             })?;
         session.observe_head(head.0);
         Ok(head)
+    }
+
+    async fn wait_for_peer_head(
+        &self,
+        session: &P2pSession,
+        minimum: BlockNumber,
+        cancellation: &CancellationToken,
+    ) -> Result<(BlockNumber, BlockHash), P2pError> {
+        let mut attempts = 0_usize;
+        loop {
+            attempts = attempts.saturating_add(1);
+            match self
+                .discover_peer_head(session, minimum, cancellation)
+                .await
+            {
+                Ok(head) => return Ok(head),
+                Err(P2pError::Cancelled) => return Err(P2pError::Cancelled),
+                Err(error) if should_retry_session(&self.config, attempts) => {
+                    debug!(
+                        required_head = minimum.0,
+                        %error,
+                        "waiting for an execution peer at or above the verified live anchor"
+                    );
+                    retry_pause(self.config.poll_interval, cancellation).await?;
+                }
+                Err(error) => return Err(error),
+            }
+        }
     }
 
     async fn reconstruct_reorg(
@@ -2685,10 +3290,11 @@ impl RethP2pSource {
                 });
             }
             let (frames, _) = self
-                .fetch_verified_range(
+                .fetch_requested_live_range(
                     &state.session,
                     range,
                     Some(head_hash),
+                    &state.request,
                     state.budget,
                     &state.cancellation,
                 )
@@ -5116,11 +5722,32 @@ impl LiveSource for RethP2pSource {
     #[allow(clippy::too_many_lines)]
     async fn subscribe(
         &self,
+        request: DataRequest,
         start: LiveStart,
         budget: SourceBudget,
         cancellation: CancellationToken,
     ) -> Result<ChainEventStream, SourceError> {
         let budget = budget.validate()?;
+        if request.chain_id != self.descriptor.chain_id {
+            return Err(SourceError::InvalidPlan(
+                "live request belongs to another chain".to_owned(),
+            ));
+        }
+        if !self
+            .descriptor
+            .complete_capabilities
+            .with_derivable()
+            .contains_all(request.required)
+        {
+            return Err(SourceError::InvalidPlan(
+                "execution P2P live source lacks requested capabilities".to_owned(),
+            ));
+        }
+        if !self.descriptor.finality.supports(request.minimum_finality) {
+            return Err(SourceError::InvalidPlan(
+                "execution P2P live source lacks requested finality".to_owned(),
+            ));
+        }
         let (anchor, overlap_blocks, retained) = match start {
             LiveStart::Block(block) => (block, 0, None),
             LiveStart::AnchoredOverlap {
@@ -5188,23 +5815,33 @@ impl LiveSource for RethP2pSource {
             }
             Some(range)
         };
+        let required_peer_head = if retained.is_some() || overlap_blocks != 0 {
+            anchor.number
+        } else {
+            BlockNumber(anchor.number.0.saturating_add(1))
+        };
         let (session, last, queued, recent) = if let Some(recent) = retained {
             let (session, _) = self
                 .connect(anchor, NetworkLane::Live, &cancellation)
+                .await?;
+            self.wait_for_peer_head(&session, required_peer_head, &cancellation)
                 .await?;
             (session, anchor, VecDeque::new(), recent)
         } else if overlap_blocks == 0 {
             let (session, _) = self
                 .connect(anchor, NetworkLane::Live, &cancellation)
                 .await?;
+            self.wait_for_peer_head(&session, required_peer_head, &cancellation)
+                .await?;
             (session, anchor, VecDeque::new(), VecDeque::from([anchor]))
         } else {
             let range = overlap_range.expect("non-zero overlap has a range");
             let fetched = self
-                .connect_and_fetch_verified_range(
+                .connect_and_fetch_requested_live_range(
                     anchor,
                     range,
                     Some(anchor.hash),
+                    &request,
                     budget,
                     &cancellation,
                 )
@@ -5245,13 +5882,16 @@ impl LiveSource for RethP2pSource {
         let state = P2pLiveState {
             source: self.clone(),
             session,
+            request,
             budget,
             cancellation,
             last,
             queued,
             recent,
+            required_peer_head,
             pending_material_attempts: 0,
             reconnect_error: None,
+            disconnect_reported: false,
             terminal: false,
         };
         Ok(stream::unfold(state, next_live_event).boxed())
@@ -5287,10 +5927,17 @@ async fn next_live_event(
         }
         let (head_number, head_hash) = match state
             .source
-            .discover_peer_head(&state.session, &state.cancellation)
+            .discover_peer_head(
+                &state.session,
+                state.last.number.max(state.required_peer_head),
+                &state.cancellation,
+            )
             .await
         {
-            Ok(head) => head,
+            Ok(head) => {
+                state.disconnect_reported = false;
+                head
+            }
             Err(P2pError::Cancelled) => {
                 shutdown_session(&state.session);
                 return None;
@@ -5303,6 +5950,10 @@ async fn next_live_event(
                     shutdown_session(&state.session);
                     return None;
                 }
+                if state.disconnect_reported {
+                    continue;
+                }
+                state.disconnect_reported = true;
                 return Some((
                     Ok(ChainEvent::Disconnected {
                         reason: error.to_string(),
@@ -5318,6 +5969,7 @@ async fn next_live_event(
                 .poll_next_verified_frame(
                     &state.session,
                     BlockNumber(next),
+                    &state.request,
                     state.budget,
                     &state.cancellation,
                 )
@@ -5394,10 +6046,11 @@ async fn next_live_event(
         let expected_tip = (end == head_number.0).then_some(head_hash);
         let frames = state
             .source
-            .fetch_verified_range(
+            .fetch_requested_live_range(
                 &state.session,
                 range,
                 expected_tip,
+                &state.request,
                 state.budget,
                 &state.cancellation,
             )
@@ -8298,11 +8951,26 @@ mod tests {
         }
     }
 
+    fn live_request(range: BlockRange) -> DataRequest {
+        DataRequest {
+            chain_id: ChainId(1),
+            range,
+            required: CapabilitySet::of(Capability::Logs),
+            log_fields: leani_primitives::LogFieldSet::NONE,
+            allow_filtered: false,
+            projection: leani_source_api::FieldProjection::default(),
+            filters: leani_source_api::FilterSet::default(),
+            minimum_finality: Finality::Optimistic,
+            verification_policy: leani_source_api::VerificationPolicy::CompleteCryptographic,
+        }
+    }
+
     #[tokio::test]
     async fn live_source_requires_an_explicit_anchor_before_networking() {
         let source = RethP2pSource::mainnet(RethP2pConfig::default()).expect("source");
         let result = source
             .subscribe(
+                live_request(BlockRange::single(BlockNumber(0))),
                 LiveStart::Head,
                 SourceBudget {
                     max_input_bytes: 1,
@@ -8328,6 +8996,7 @@ mod tests {
         };
         let result = source
             .subscribe(
+                live_request(BlockRange::single(anchor.number)),
                 LiveStart::AnchoredOverlap {
                     anchor,
                     overlap_blocks: MAX_FIXED_RANGE_BLOCKS + 1,
