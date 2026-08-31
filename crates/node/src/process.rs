@@ -21,7 +21,7 @@ use crate::{
     benchmark::{BenchmarkOptions, RealSourceBenchmarkOptions},
     cli::{
         BenchmarkCommand, Cli, Command, ConformanceCommand, DbCommand, E2eCommand, LogFormat,
-        ProbeSource, SourceCommand,
+        ProbeSource, ResetCommand, SourceCommand,
     },
     config::{
         ArtifactStorageBackend, Config, HistoryMaterialCoordinatorMode, ProcessorConfig,
@@ -2652,6 +2652,32 @@ pub async fn run_cli_with_registry(cli: Cli, registry: &ProcessorRegistry) -> Re
             ))
             .await
         }
+        Command::Reset { command } => match command {
+            ResetCommand::All { yes } => {
+                let reset_config =
+                    (requested_config.is_some() || config_path.is_file()).then_some(config_path);
+                crate::local_state::reset_all(&crate::local_state::ResetAllOptions {
+                    confirmed: yes,
+                    config_path: reset_config,
+                    working_directory,
+                })
+            }
+            ResetCommand::Subscription {
+                protocol,
+                markets,
+                finality,
+                yes,
+            } => {
+                crate::subscribe::reset_subscription(&crate::subscribe::ResetSubscriptionOptions {
+                    protocol,
+                    markets,
+                    finality,
+                    confirmed: yes,
+                    requested_config,
+                    working_directory,
+                })
+            }
+        },
         Command::Backfill {
             processor,
             from,

@@ -123,6 +123,11 @@ pub enum Command {
         #[arg(long)]
         once: bool,
     },
+    /// Reset reconstructible local runtime state for cold-start testing.
+    Reset {
+        #[command(subcommand)]
+        command: ResetCommand,
+    },
     /// Process a historical block range and then exit.
     Backfill {
         /// Configured processor ID.
@@ -311,6 +316,31 @@ pub enum SubscribeFinalitySource {
     BeaconApi,
     /// Fetch proof-carrying light-client updates from consensus P2P peers.
     P2p,
+}
+
+#[derive(Clone, Debug, Subcommand)]
+pub enum ResetCommand {
+    /// Delete all node and embedded-subscription state in the resolved data directory.
+    All {
+        /// Reset without interactive confirmation.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Delete reconstructible state for one embedded market subscription.
+    Subscription {
+        /// Embedded market-data processor whose state should be reset.
+        #[arg(value_enum)]
+        protocol: SubscribeProtocol,
+        /// The exact market set used by `leani subscribe`.
+        #[arg(required = true, num_args = 1..)]
+        markets: Vec<String>,
+        /// Price finality used by the subscription state being reset.
+        #[arg(long, value_enum, default_value_t = SubscribeFinality::Optimistic)]
+        finality: SubscribeFinality,
+        /// Reset without interactive confirmation.
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 /// Benchmark orchestration commands layered over individual benchmark runs.
@@ -822,6 +852,50 @@ mod tests {
     }
 
     #[test]
+    fn reset_commands_are_explicitly_scoped() {
+        let cli = Cli::try_parse_from([
+            "leani",
+            "reset",
+            "subscription",
+            "uniswap-v3",
+            "ETH/USDC",
+            "--finality",
+            "finalized",
+            "--yes",
+        ])
+        .expect("CLI parses");
+        let Command::Reset {
+            command:
+                ResetCommand::Subscription {
+                    protocol,
+                    markets,
+                    finality,
+                    yes,
+                },
+        } = cli.command
+        else {
+            panic!("expected subscription reset command");
+        };
+        assert_eq!(protocol, SubscribeProtocol::UniswapV3);
+        assert_eq!(markets, ["ETH/USDC"]);
+        assert_eq!(finality, SubscribeFinality::Finalized);
+        assert!(yes);
+
+        let cli = Cli::try_parse_from(["leani", "reset", "all", "--yes"]).expect("CLI parses");
+        let Command::Reset {
+            command: ResetCommand::All { yes },
+        } = cli.command
+        else {
+            panic!("expected full reset command");
+        };
+        assert!(yes);
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the table intentionally covers every top-level command"
+    )]
     fn parses_all_top_level_command_skeletons() {
         for args in [
             vec!["leani", "serve"],
@@ -835,6 +909,15 @@ mod tests {
                 "--format",
                 "json",
             ],
+            vec![
+                "leani",
+                "reset",
+                "subscription",
+                "uniswap-v3",
+                "ETH/USDC",
+                "--yes",
+            ],
+            vec!["leani", "reset", "all", "--yes"],
             vec!["leani", "backfill", "--from", "1", "--to", "2"],
             vec![
                 "leani",

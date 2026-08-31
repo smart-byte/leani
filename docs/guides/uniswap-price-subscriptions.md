@@ -35,6 +35,35 @@ slot and block root before Leani asks you to accept it. Execution then follows
 native P2P peers, while later Beacon API responses are proof-checked from that
 agreed root. For an intentional non-interactive invocation, use `--yes`.
 
+To reproduce a completely cold embedded start, reset the reconstructible state
+for the exact protocol, market set, and finality mode, then subscribe again:
+
+```bash
+leani reset subscription uniswap-v3 ETH/USDC
+leani subscribe uniswap-v3 ETH/USDC
+```
+
+The reset prints the exact hashed subscription directory and asks for
+confirmation; `--yes` is available for an intentional scripted reset. It
+removes only that embedded subscription's checkpoint, peer cache, P2P identity,
+and SQLite state. It does not touch `leani.toml` or prepared-node state. Stop a
+matching embedded subscriber before resetting it. For a finalized subscription,
+pass `--finality finalized` to both commands.
+
+To test the binary with no retained node or subscription state at all, stop
+every Leani process that uses the configured data directory and run:
+
+```bash
+leani reset all
+```
+
+This removes the entire resolved runtime data directory, including the node
+database and WAL, raw history, processor artifacts, checkpoints, execution-peer
+cache, P2P identity, and every embedded subscription. It preserves
+`leani.toml` and the binary. The command rejects broad targets that contain the
+working directory or configuration; use `--yes` only for intentional scripted
+cold-start tests.
+
 After the light client has verified a newer finality anchor and its
 consensus-committed execution hash, Leani persists that locally verified
 anchor. Ordinary restarts reuse it without contacting the checkpoint providers

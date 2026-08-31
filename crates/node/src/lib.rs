@@ -4,6 +4,7 @@ mod benchmark;
 pub mod cli;
 pub mod config;
 mod init;
+mod local_state;
 pub mod process;
 pub mod processors;
 mod subscribe;

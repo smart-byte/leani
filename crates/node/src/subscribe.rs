@@ -32,6 +32,7 @@ use crate::{
         SubscribeProtocol,
     },
     config::{Config, FinalitySourceKind},
+    local_state,
     process::{Exit, configured_store_config, spawn_embedded_network_runtime},
     processors::ProcessorRegistry,
     uniswap_markets::{MARKET_CATALOG, Market, Token, processor_config, resolve_markets},
@@ -63,6 +64,15 @@ pub(crate) struct SubscribeOptions {
     pub accept_checkpoint: bool,
     pub data_dir: Option<PathBuf>,
     pub once: bool,
+    pub requested_config: Option<PathBuf>,
+    pub working_directory: PathBuf,
+}
+
+pub(crate) struct ResetSubscriptionOptions {
+    pub protocol: SubscribeProtocol,
+    pub markets: Vec<String>,
+    pub finality: SubscribeFinality,
+    pub confirmed: bool,
     pub requested_config: Option<PathBuf>,
     pub working_directory: PathBuf,
 }
@@ -225,7 +235,10 @@ pub(crate) async fn subscribe(
         bail!("unsupported subscription protocol");
     }
     let markets = resolve_markets(&options.markets)?;
-    let configured_path = configured_path(&options);
+    let configured_path = local_state::configured_path(
+        options.requested_config.as_deref(),
+        &options.working_directory,
+    );
     let inferred_endpoint = infer_endpoint(configured_path.as_deref())?;
     let endpoint = options.endpoint.clone().or(inferred_endpoint);
 
@@ -261,6 +274,26 @@ pub(crate) async fn subscribe(
             .await
         }
     }
+}
+
+pub(crate) fn reset_subscription(options: &ResetSubscriptionOptions) -> Result<Exit> {
+    if options.protocol != SubscribeProtocol::UniswapV3 {
+        bail!("unsupported subscription protocol");
+    }
+    let markets = resolve_markets(&options.markets)?;
+    let configured_path = local_state::configured_path(
+        options.requested_config.as_deref(),
+        &options.working_directory,
+    );
+    let data_dir = subscription_data_dir_for(
+        None,
+        &markets,
+        configured_path.as_deref(),
+        options.finality,
+        &options.working_directory,
+    )?;
+    reset_subscription_directory(&data_dir, options.confirmed)?;
+    Ok(Exit::Success)
 }
 
 pub(crate) async fn initialize_checkpoint(
@@ -303,13 +336,6 @@ pub(crate) async fn initialize_checkpoint(
         root: checkpoint.root,
         slot: checkpoint.slot,
         beacon_api_endpoints,
-    })
-}
-
-fn configured_path(options: &SubscribeOptions) -> Option<PathBuf> {
-    options.requested_config.clone().or_else(|| {
-        let local = options.working_directory.join("leani.toml");
-        local.is_file().then_some(local)
     })
 }
 
@@ -773,28 +799,92 @@ fn subscription_data_dir(
     markets: &[Market],
     config_path: Option<&Path>,
 ) -> Result<PathBuf> {
-    if let Some(path) = &options.data_dir {
-        return Ok(path.clone());
+    subscription_data_dir_for(
+        options.data_dir.as_deref(),
+        markets,
+        config_path,
+        options.finality,
+        &options.working_directory,
+    )
+}
+
+fn subscription_data_dir_for(
+    explicit_data_dir: Option<&Path>,
+    markets: &[Market],
+    config_path: Option<&Path>,
+    finality: SubscribeFinality,
+    working_directory: &Path,
+) -> Result<PathBuf> {
+    if let Some(path) = explicit_data_dir {
+        return Ok(path.to_path_buf());
     }
-    let root = if let Some(path) = config_path {
-        Config::load(path)?.data_dir.join("subscriptions")
-    } else if let Some(path) = std::env::var_os("XDG_DATA_HOME") {
-        PathBuf::from(path).join("leani/subscriptions")
-    } else if let Some(path) = std::env::var_os("HOME") {
-        PathBuf::from(path).join(".local/share/leani/subscriptions")
-    } else {
-        options.working_directory.join(".leani/subscriptions")
-    };
+    let root = local_state::runtime_data_dir(config_path, working_directory)?.join("subscriptions");
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"uniswap-observations/2.1.0");
-    for market in markets {
-        hasher.update(market.pool.as_bytes());
+    let mut pools = markets.iter().map(|market| market.pool).collect::<Vec<_>>();
+    pools.sort_unstable();
+    for pool in pools {
+        hasher.update(pool.as_bytes());
     }
-    hasher.update(match options.finality {
+    hasher.update(match finality {
         SubscribeFinality::Optimistic => b"optimistic",
         SubscribeFinality::Finalized => b"finalized",
     });
     Ok(root.join(&hasher.finalize().to_hex()[..16]))
+}
+
+fn reset_subscription_directory(data_dir: &Path, confirmed: bool) -> Result<bool> {
+    let name = data_dir
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .context("subscription state directory has no UTF-8 identity")?;
+    let parent = data_dir
+        .parent()
+        .and_then(Path::file_name)
+        .and_then(std::ffi::OsStr::to_str);
+    if parent != Some("subscriptions")
+        || name.len() != 16
+        || !name.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        bail!(
+            "refusing to reset non-derived subscription directory {}",
+            data_dir.display()
+        );
+    }
+    if !data_dir.exists() {
+        eprintln!(
+            "leani: no embedded subscription state exists at {}",
+            data_dir.display()
+        );
+        return Ok(false);
+    }
+    if !data_dir.is_dir() {
+        bail!(
+            "subscription state path is not a directory: {}",
+            data_dir.display()
+        );
+    }
+
+    eprintln!("leani: embedded subscription cold-start reset");
+    eprintln!("  directory: {}", data_dir.display());
+    eprintln!("  removes:   checkpoint, peer cache, P2P identity, and SQLite state");
+    eprintln!("Stop any embedded subscriber using this market set before continuing.");
+    if !confirmed {
+        if !io::stdin().is_terminal() {
+            bail!("subscription reset requires an interactive terminal or --yes");
+        }
+        eprint!("Reset this reconstructible subscription state? [y/N] ");
+        io::stderr().flush()?;
+        let mut answer = String::new();
+        io::stdin().read_line(&mut answer)?;
+        if !matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+            bail!("subscription reset was not confirmed");
+        }
+    }
+    fs::remove_dir_all(data_dir)
+        .with_context(|| format!("reset subscription state at {}", data_dir.display()))?;
+    eprintln!("leani: subscription state reset; the next embedded run is cold");
+    Ok(true)
 }
 
 fn seed_configured_peer_cache(config_path: Option<&Path>, data_dir: &Path) -> Result<bool> {
@@ -2387,6 +2477,49 @@ mod tests {
             fs::read(&destination).expect("read local cache"),
             b"configured"
         );
+    }
+
+    #[test]
+    fn subscription_state_identity_is_independent_of_market_order() {
+        let left =
+            resolve_markets(&["ETH/USDC".to_owned(), "ETH/USDT".to_owned()]).expect("left markets");
+        let right = resolve_markets(&["ETH/USDT".to_owned(), "ETH/USDC".to_owned()])
+            .expect("right markets");
+        let left = subscription_data_dir_for(
+            None,
+            &left,
+            None,
+            SubscribeFinality::Optimistic,
+            Path::new("."),
+        )
+        .expect("left identity");
+        let right = subscription_data_dir_for(
+            None,
+            &right,
+            None,
+            SubscribeFinality::Optimistic,
+            Path::new("."),
+        )
+        .expect("right identity");
+        assert_eq!(left.file_name(), right.file_name());
+    }
+
+    #[test]
+    fn reset_removes_only_the_exact_derived_subscription_directory() {
+        let root = tempfile::tempdir().expect("temporary directory");
+        let subscriptions = root.path().join("subscriptions");
+        let target = subscriptions.join("0123456789abcdef");
+        let sibling = subscriptions.join("fedcba9876543210");
+        fs::create_dir_all(&target).expect("target directory");
+        fs::create_dir_all(&sibling).expect("sibling directory");
+        fs::write(target.join("checkpoint.json"), b"fixture").expect("target state");
+        fs::write(sibling.join("checkpoint.json"), b"sibling").expect("sibling state");
+
+        assert!(reset_subscription_directory(&target, true).expect("reset target"));
+        assert!(!target.exists());
+        assert!(sibling.join("checkpoint.json").is_file());
+        assert!(reset_subscription_directory(&target, true).is_ok());
+        assert!(reset_subscription_directory(root.path(), true).is_err());
     }
 
     #[test]
