@@ -2131,6 +2131,7 @@ struct P2pLiveState {
     recent: VecDeque<BlockRef>,
     required_peer_head: BlockNumber,
     pending_material_attempts: usize,
+    head_unavailable_since: Option<Instant>,
     reconnect_error: Option<String>,
     disconnect_reported: bool,
     terminal: bool,
@@ -2149,6 +2150,7 @@ impl std::fmt::Debug for P2pLiveState {
             .field("recent", &self.recent.len())
             .field("required_peer_head", &self.required_peer_head)
             .field("pending_material_attempts", &self.pending_material_attempts)
+            .field("head_unavailable_since", &self.head_unavailable_since)
             .field("reconnect_error", &self.reconnect_error)
             .field("disconnect_reported", &self.disconnect_reported)
             .field("terminal", &self.terminal)
@@ -3301,10 +3303,8 @@ impl RethP2pSource {
                     debug!(
                         peer_head = number,
                         required_head = minimum.0,
-                        "rotating execution peer behind the verified live anchor"
+                        "execution peer is behind the required live head; retaining it for a grace retry"
                     );
-                    session.handle.disconnect_peer(peer.remote_id);
-                    self.network.direct_peers.remove(peer.remote_id);
                     continue;
                 }
                 let key = (number, peer.status.blockhash.0);
@@ -3320,15 +3320,33 @@ impl RethP2pSource {
             session.observe_head(BlockNumber(number));
             return Ok((BlockNumber(number), BlockHash::new(hash)));
         }
-        if let Some(head) = self
-            .resolve_advertised_peer_head(session, unknown_hashes, minimum, cancellation)
+        // Asking for the exact minimum first uses the dynamic direct-peer
+        // scheduler: newly established sessions join this request while older
+        // peers are still pending. Resolving status-only head hashes remains a
+        // fallback for peers that cannot serve the minimum by number.
+        if let Some((head, serving_peer)) = self
+            .minimum_live_head(session, minimum, cancellation)
             .await?
         {
+            if let Some((_, advertised_hash)) = unknown_hashes
+                .iter()
+                .find(|(peer_id, _)| *peer_id == serving_peer)
+                && let Some(advertised_head) = self
+                    .resolve_advertised_peer_head(
+                        session,
+                        vec![(serving_peer, *advertised_hash)],
+                        minimum,
+                        cancellation,
+                    )
+                    .await?
+            {
+                return Ok(advertised_head);
+            }
             return Ok(head);
         }
 
         if let Some(head) = self
-            .minimum_live_head(session, minimum, cancellation)
+            .resolve_advertised_peer_head(session, unknown_hashes, minimum, cancellation)
             .await?
         {
             return Ok(head);
@@ -3386,8 +3404,10 @@ impl RethP2pSource {
                 }
             };
             let Some(header) = headers.into_iter().next() else {
-                session.handle.disconnect_peer(peer_id);
-                self.network.direct_peers.remove(peer_id);
+                debug!(
+                    required_head = minimum.0,
+                    "execution peer does not serve its advertised head yet; retaining it for a grace retry"
+                );
                 continue;
             };
             if header.hash_slow() != hash {
@@ -3398,8 +3418,11 @@ impl RethP2pSource {
                 session.observe_head(head.0);
                 return Ok(Some(head));
             } else {
-                session.handle.disconnect_peer(peer_id);
-                self.network.direct_peers.remove(peer_id);
+                debug!(
+                    peer_head = header.number,
+                    required_head = minimum.0,
+                    "execution peer advertised a lagging head; retaining it for a grace retry"
+                );
             }
         }
         Ok(None)
@@ -3410,13 +3433,13 @@ impl RethP2pSource {
         session: &P2pSession,
         minimum: BlockNumber,
         cancellation: &CancellationToken,
-    ) -> Result<Option<(BlockNumber, BlockHash)>, P2pError> {
+    ) -> Result<Option<((BlockNumber, BlockHash), B512)>, P2pError> {
         // Some ETH peers expose only a head hash, and the direct status event
         // can race the request sender becoming visible locally. A header at
         // the consensus-required minimum is enough to start the anchored live
         // lane; subsequent polling advances it without trusting peer status.
         let range = BlockRange::single(minimum);
-        let (_, mut headers) = match self
+        let (serving_peer, mut headers) = match self
             .fetch_live_headers_from_untried_peers(
                 session,
                 range,
@@ -3438,7 +3461,7 @@ impl RethP2pSource {
             .expect("one validated minimum live header was returned");
         let head = (minimum, BlockHash::new(header.hash_slow().0));
         session.observe_head(minimum);
-        Ok(Some(head))
+        Ok(Some((head, serving_peer)))
     }
 
     async fn wait_for_peer_head(
@@ -6302,6 +6325,7 @@ impl LiveSource for RethP2pSource {
             recent,
             required_peer_head,
             pending_material_attempts: 0,
+            head_unavailable_since: None,
             reconnect_error: None,
             disconnect_reported: false,
             terminal: false,
@@ -6347,6 +6371,7 @@ async fn next_live_event(
             .await
         {
             Ok(head) => {
+                state.head_unavailable_since = None;
                 state.disconnect_reported = false;
                 head
             }
@@ -6355,12 +6380,29 @@ async fn next_live_event(
                 return None;
             }
             Err(error) => {
+                let grace = state
+                    .source
+                    .descriptor
+                    .expected_lag
+                    .max(state.source.config.poll_interval);
+                let unavailable_for =
+                    head_unavailable_for(&mut state.head_unavailable_since, Instant::now());
+                debug!(
+                    required_head = state.last.number.max(state.required_peer_head).0,
+                    ?unavailable_for,
+                    ?grace,
+                    %error,
+                    "live head is temporarily unavailable; retaining the verified tip and retrying peers"
+                );
                 if retry_pause(state.source.config.poll_interval, &state.cancellation)
                     .await
                     .is_err()
                 {
                     shutdown_session(&state.session);
                     return None;
+                }
+                if head_unavailable_for(&mut state.head_unavailable_since, Instant::now()) < grace {
+                    continue;
                 }
                 if state.disconnect_reported {
                     continue;
@@ -6510,6 +6552,10 @@ async fn next_live_event(
     }
 }
 
+fn head_unavailable_for(since: &mut Option<Instant>, now: Instant) -> Duration {
+    now.saturating_duration_since(*since.get_or_insert(now))
+}
+
 fn pending_live_material_delay(
     config: &RethP2pConfig,
     attempts: &mut usize,
@@ -6547,6 +6593,8 @@ async fn reconnect_live_session(
                 state.session = session;
                 state.session.set_range(None);
                 state.session.set_phase(NetworkPhase::FollowingHead);
+                state.head_unavailable_since = None;
+                state.disconnect_reported = false;
                 return Ok(());
             }
             Err(P2pError::Cancelled) => return Err(P2pError::Cancelled),
@@ -8344,6 +8392,28 @@ mod tests {
             None
         );
         assert_eq!(attempts, 5);
+    }
+
+    #[test]
+    fn live_head_unavailability_grace_retains_one_expected_block_interval() {
+        let started = Instant::now();
+        let grace = Duration::from_secs(12);
+        let mut unavailable_since = None;
+
+        assert_eq!(
+            head_unavailable_for(&mut unavailable_since, started),
+            Duration::ZERO
+        );
+        assert!(
+            head_unavailable_for(
+                &mut unavailable_since,
+                started + grace.saturating_sub(Duration::from_millis(1)),
+            ) < grace
+        );
+        assert_eq!(
+            head_unavailable_for(&mut unavailable_since, started + grace),
+            grace
+        );
     }
 
     #[test]
