@@ -36,6 +36,8 @@ nat = "any"
 kind = "beacon_api"
 checkpoint = "0x0000000000000000000000000000000000000000000000000000000000000000"
 checkpoint_slot = 0
+# Managed untrusted Beacon API transport pool. Responses are verified locally
+# from the checkpoint above; these endpoints do not serve execution data.
 endpoints = [
   "https://ethereum-beacon-api.publicnode.com/",
   "https://lodestar-mainnet.chainsafe.io/",

@@ -48,11 +48,15 @@ bind = "127.0.0.1:18080"
 ```
 
 The checkpoint and slot above are illustrative; the generator writes the live
-quorum result. Compact configurations retain the listed transports and add the
-built-in PublicNode and Lodestar verified-finality failovers. The first
-transport set to satisfy `minimum_agreement` wins, so a stalled endpoint does
-not hold up node startup. Compact Ethereum Mainnet Uniswap configurations
-expand to:
+quorum result. The checkpoint is the trust root. PublicNode and Lodestar are
+ordinary, untrusted Beacon API transports in the compact profile's managed
+transport pool; they do not provide execution blocks or Uniswap data. Leani
+queries the pool concurrently, verifies every response locally from the pinned
+checkpoint, and accepts the first set that satisfies `minimum_agreement`. With
+the compact profile's default agreement of one, the first valid response wins,
+so a stalled transport does not hold up node startup. Any endpoints listed in
+the compact document join this managed pool. Compact Ethereum Mainnet Uniswap
+configurations expand to:
 
 | Concern | Default |
 |---|---|
