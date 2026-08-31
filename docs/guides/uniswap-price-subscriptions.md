@@ -180,12 +180,14 @@ bind = "127.0.0.1:18080"
 The compact document expands to the standard local-node profile: native
 execution P2P with an opportunistic minimum of one peer and a 16-peer healthy
 target, locally verified Beacon finality over a managed transport pool that
-includes the ordinary PublicNode and Lodestar Beacon API endpoints, Xatu
-history fallback, bounded 512 MiB memory and 2 GiB temporary-disk budgets,
-on-demand Uniswap history, optimistic/finalized publication, a 256 block undo
-window, 64 MiB/24 hour delivery retention, ephemeral P2P listener ports, RPC
-on `18545`/`18546`, and the native API on `18080`. Pool addresses, fee tiers,
-and the earliest processor block come from the same built-in market catalog as
+includes the ordinary PublicNode
+(`https://ethereum-beacon-api.publicnode.com/`) and Lodestar
+(`https://lodestar-mainnet.chainsafe.io/`) Beacon API endpoints, Xatu history
+fallback, bounded 512 MiB memory and 2 GiB temporary-disk budgets, on-demand
+Uniswap history, optimistic/finalized publication, a 256 block undo window,
+64 MiB/24 hour delivery retention, ephemeral P2P listener ports, RPC on
+`18545`/`18546`, and the native API on `18080`. Pool addresses, fee tiers, and
+the earliest processor block come from the same built-in market catalog as
 `subscribe`. Operators who need to tune any of these can use the full
 configuration schema instead. The pinned checkpoint is the trust root; Beacon
 API endpoints only transport untrusted consensus data and never provide

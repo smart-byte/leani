@@ -48,15 +48,16 @@ bind = "127.0.0.1:18080"
 ```
 
 The checkpoint and slot above are illustrative; the generator writes the live
-quorum result. The checkpoint is the trust root. PublicNode and Lodestar are
-ordinary, untrusted Beacon API transports in the compact profile's managed
-transport pool; they do not provide execution blocks or Uniswap data. Leani
-queries the pool concurrently, verifies every response locally from the pinned
-checkpoint, and accepts the first set that satisfies `minimum_agreement`. With
-the compact profile's default agreement of one, the first valid response wins,
-so a stalled transport does not hold up node startup. Any endpoints listed in
-the compact document join this managed pool. Compact Ethereum Mainnet Uniswap
-configurations expand to:
+quorum result. The checkpoint is the trust root. PublicNode
+(`https://ethereum-beacon-api.publicnode.com/`) and Lodestar
+(`https://lodestar-mainnet.chainsafe.io/`) are ordinary, untrusted Beacon API
+transports in the compact profile's managed transport pool; they do not provide
+execution blocks or Uniswap data. Leani queries the pool concurrently, verifies
+every response locally from the pinned checkpoint, and accepts the first set
+that satisfies `minimum_agreement`. With the compact profile's default
+agreement of one, the first valid response wins, so a stalled transport does
+not hold up node startup. Any endpoints listed in the compact document join
+this managed pool. Compact Ethereum Mainnet Uniswap configurations expand to:
 
 | Concern | Default |
 |---|---|
