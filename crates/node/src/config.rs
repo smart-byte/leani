@@ -139,7 +139,11 @@ impl StarterConfig {
         config.data_dir = self.data_dir;
         config.finality.checkpoint = self.finality.checkpoint;
         config.finality.checkpoint_slot = self.finality.checkpoint_slot;
-        config.finality.endpoints = self.finality.endpoints;
+        for endpoint in self.finality.endpoints {
+            if !config.finality.endpoints.contains(&endpoint) {
+                config.finality.endpoints.push(endpoint);
+            }
+        }
         config.processors = vec![processor];
         config.api.bind = self.api.bind;
         Ok(config)
@@ -3022,6 +3026,14 @@ bind = "127.0.0.1:18080"
         assert_eq!(config.chain.chain_id, 1);
         assert_eq!(config.sources.live.minimum_peers, 1);
         assert_eq!(config.sources.live.preferred_peers, 16);
+        assert_eq!(config.finality.endpoints.len(), 2);
+        assert!(
+            config
+                .finality
+                .endpoints
+                .iter()
+                .any(|endpoint| endpoint.as_str() == "https://lodestar-mainnet.chainsafe.io/")
+        );
         assert_eq!(config.rpc.http_bind.port(), 18_545);
         assert_eq!(config.api.bind.port(), 18_080);
         assert_eq!(config.processors.len(), 1);

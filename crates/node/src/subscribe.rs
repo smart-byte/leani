@@ -423,7 +423,7 @@ async fn subscribe_embedded(
     tokio::pin!(optimistic_snapshot);
 
     eprintln!(
-        "leani: embedded Uniswap V3 processor active for {}; connecting to Ethereum peers...",
+        "leani: embedded Uniswap V3 processor active for {}; bootstrapping verified Ethereum data...",
         markets
             .iter()
             .map(|market| market.symbol)
@@ -431,7 +431,7 @@ async fn subscribe_embedded(
             .join(", ")
     );
     eprintln!(
-        "leani: first-run peer discovery can take about a minute; peer state is cached for later runs"
+        "leani: a cold start verifies consensus, then discovers execution peers; reusable state is cached for later runs"
     );
     let startup_started = Instant::now();
     let mut next_startup_status = Duration::from_secs(15);
@@ -447,7 +447,11 @@ async fn subscribe_embedded(
         }
         if !announced_ready && startup_started.elapsed() >= next_startup_status {
             let status = runtime.execution_source.network_status();
-            if status.connected_peer_slots == 0 {
+            if runtime.verified_anchor.borrow().is_none() {
+                eprintln!(
+                    "leani: still verifying a consensus anchor before execution peer discovery; Ctrl-C stops immediately"
+                );
+            } else if status.connected_peer_slots == 0 {
                 eprintln!(
                     "leani: still searching for a usable Ethereum peer ({} known, {} sessions accepted); Ctrl-C stops immediately",
                     status.known_peer_records, status.peer_lifecycle.established,

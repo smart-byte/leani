@@ -48,7 +48,11 @@ bind = "127.0.0.1:18080"
 ```
 
 The checkpoint and slot above are illustrative; the generator writes the live
-quorum result. Compact Ethereum Mainnet Uniswap configurations expand to:
+quorum result. Compact configurations retain the listed transports and add the
+built-in PublicNode and Lodestar verified-finality failovers. The first
+transport set to satisfy `minimum_agreement` wins, so a stalled endpoint does
+not hold up node startup. Compact Ethereum Mainnet Uniswap configurations
+expand to:
 
 | Concern | Default |
 |---|---|

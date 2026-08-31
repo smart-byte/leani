@@ -179,13 +179,16 @@ bind = "127.0.0.1:18080"
 
 The compact document expands to the standard local-node profile: native
 execution P2P with an opportunistic minimum of one peer and a 16-peer healthy
-target, Xatu history fallback, bounded 512 MiB memory and 2 GiB temporary-disk
+target, locally verified Beacon finality with built-in PublicNode and Lodestar
+transport failover, Xatu history fallback, bounded 512 MiB memory and 2 GiB temporary-disk
 budgets, on-demand Uniswap history, optimistic/finalized publication, a 256
 block undo window, 64 MiB/24 hour delivery retention, ephemeral P2P listener
 ports, RPC on `18545`/`18546`, and the native API on `18080`. Pool addresses,
 fee tiers, and the earliest processor block come from the same built-in market
 catalog as `subscribe`. Operators who need to tune any of these can use the
-full configuration schema instead.
+full configuration schema instead. Beacon transports are raced concurrently;
+the slow or unavailable transport is cancelled as soon as the configured
+agreement threshold has been cryptographically verified.
 
 ## TypeScript SDK
 

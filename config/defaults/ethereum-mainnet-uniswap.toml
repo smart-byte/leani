@@ -36,7 +36,10 @@ nat = "any"
 kind = "beacon_api"
 checkpoint = "0x0000000000000000000000000000000000000000000000000000000000000000"
 checkpoint_slot = 0
-endpoints = ["https://ethereum-beacon-api.publicnode.com/"]
+endpoints = [
+  "https://ethereum-beacon-api.publicnode.com/",
+  "https://lodestar-mainnet.chainsafe.io/",
+]
 minimum_agreement = 1
 discovery_port = 0
 

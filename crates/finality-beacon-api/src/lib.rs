@@ -14,7 +14,7 @@ use std::{
 
 use alloy_primitives::{B256, FixedBytes};
 use async_trait::async_trait;
-use futures::{StreamExt, future::join_all, stream};
+use futures::{StreamExt, stream};
 use helios_consensus_core::{
     apply_bootstrap, apply_finality_update, apply_update, calc_sync_period,
     consensus_spec::{ConsensusSpec, MainnetConsensusSpec},
@@ -386,17 +386,12 @@ impl VerifiedBeaconApi {
 
     async fn fetch_probe_root(&self, checkpoint_root: [u8; 32]) -> FinalityProbeReport {
         let checkpoint = B256::from(checkpoint_root);
-        let endpoints = join_all(self.config.endpoints.iter().cloned().map(|endpoint| {
+        let maximum_concurrency = self.config.endpoints.len();
+        let maximum_checkpoint_age = self.config.max_checkpoint_age;
+        let mut pending = stream::iter(self.config.endpoints.iter().cloned().map(|endpoint| {
             let client = self.client.clone();
             async move {
-                match sync_endpoint(
-                    &client,
-                    &endpoint,
-                    checkpoint,
-                    self.config.max_checkpoint_age,
-                )
-                .await
-                {
+                match sync_endpoint(&client, &endpoint, checkpoint, maximum_checkpoint_age).await {
                     Ok(result) => EndpointProbe {
                         endpoint,
                         verified: true,
@@ -416,8 +411,20 @@ impl VerifiedBeaconApi {
                 }
             }
         }))
-        .await;
-        select_endpoint_agreement(checkpoint_root, self.config.minimum_agreement, endpoints)
+        .buffer_unordered(maximum_concurrency);
+        let mut completed = Vec::with_capacity(maximum_concurrency);
+        while let Some(endpoint) = pending.next().await {
+            completed.push(endpoint);
+            let report = select_endpoint_agreement(
+                checkpoint_root,
+                self.config.minimum_agreement,
+                completed.clone(),
+            );
+            if report.accepted {
+                return report;
+            }
+        }
+        select_endpoint_agreement(checkpoint_root, self.config.minimum_agreement, completed)
     }
 
     async fn take_primed_probe(&self, checkpoint_root: [u8; 32]) -> Option<FinalityProbeReport> {
@@ -753,6 +760,12 @@ fn select_endpoint_agreement(
         disagreements.push(format!(
             "no verified anchor reached minimum endpoint agreement {minimum_agreement}"
         ));
+        disagreements.extend(endpoints.iter().filter_map(|endpoint| {
+            endpoint
+                .error
+                .as_ref()
+                .map(|error| format!("{} failed: {error}", endpoint.endpoint))
+        }));
     }
     FinalityProbeReport {
         verifier: format!("helios-consensus-core@{HELIOS_REVISION}"),
@@ -911,6 +924,20 @@ mod tests {
         );
         assert!(!report.accepted);
         assert_eq!(report.disagreements.len(), 1);
+    }
+
+    #[test]
+    fn failed_quorum_reports_each_transport_error() {
+        let report = select_endpoint_agreement(
+            [9; 32],
+            1,
+            vec![endpoint("https://unavailable.example", None)],
+        );
+        assert!(!report.accepted);
+        assert!(report.disagreements.iter().any(|disagreement| {
+            disagreement.contains("https://unavailable.example/")
+                && disagreement.contains("unavailable")
+        }));
     }
 
     #[test]

@@ -53,7 +53,7 @@ use reth_dns_discovery::{
 };
 use reth_ethereum_primitives::{BlockBody, Receipt};
 use reth_network::types::{
-    EthVersion, GetBlockBodies, GetReceipts, GetReceipts70, NatResolver, PeerKind,
+    EthVersion, GetBlockBodies, GetBlockHeaders, GetReceipts, GetReceipts70, NatResolver, PeerKind,
     ReputationChangeKind,
 };
 use reth_network::{
@@ -65,7 +65,7 @@ use reth_network_p2p::{
     bodies::client::BodiesClient,
     download::DownloadClient,
     error::RequestError,
-    headers::client::{HeadersClient, HeadersRequest},
+    headers::client::{HeadersClient, HeadersDirection, HeadersRequest},
     priority::Priority,
     receipts::client::ReceiptsClient,
 };
@@ -894,6 +894,15 @@ impl DirectPeerPool {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clear();
         self.changed.notify_waiters();
+    }
+
+    fn get(&self, peer_id: B512) -> Option<DirectPeer> {
+        self.peers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .find(|peer| peer.peer.peer_id == peer_id)
+            .map(|peer| peer.peer.clone())
     }
 
     async fn acquire(
@@ -3236,7 +3245,7 @@ impl RethP2pSource {
                 let key = (number, peer.status.blockhash.0);
                 *declared.entry(key).or_default() += 1;
             } else if peer.status.blockhash != B256::ZERO {
-                unknown_hashes.push(peer.status.blockhash);
+                unknown_hashes.push((peer.remote_id, peer.status.blockhash));
             }
         }
         if let Some(((number, hash), _)) = declared
@@ -3246,37 +3255,117 @@ impl RethP2pSource {
             session.observe_head(BlockNumber(number));
             return Ok((BlockNumber(number), BlockHash::new(hash)));
         }
-        unknown_hashes.sort();
-        unknown_hashes.dedup();
-        let mut discovered = Vec::new();
-        for hash in unknown_hashes.into_iter().take(8) {
-            let response = cancellable_peer_request(
-                session
-                    .fetch
-                    .get_headers(HeadersRequest::one(BlockHashOrNumber::Hash(hash))),
-                self.config.request_timeout,
-                cancellation,
-                "peer head header",
-            )
-            .await?;
-            let (_, headers) = response.split();
-            if let Some(header) = headers.into_iter().next()
-                && header.hash_slow() == hash
-                && header.number >= minimum.0
-            {
-                discovered.push((header.number, hash.0));
+        if let Some(head) = self
+            .resolve_advertised_peer_head(session, unknown_hashes, minimum, cancellation)
+            .await?
+        {
+            return Ok(head);
+        }
+
+        if let Some(head) = self
+            .minimum_live_head(session, minimum, cancellation)
+            .await?
+        {
+            return Ok(head);
+        }
+
+        Err(P2pError::Request {
+            component: "peer head",
+            detail: "connected peers did not advertise or serve a usable head".to_owned(),
+        })
+    }
+
+    async fn resolve_advertised_peer_head(
+        &self,
+        session: &P2pSession,
+        candidates: Vec<(B512, B256)>,
+        minimum: BlockNumber,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<(BlockNumber, BlockHash)>, P2pError> {
+        let candidates = candidates
+            .into_iter()
+            .take(8)
+            .filter_map(|(peer_id, hash)| {
+                self.network
+                    .direct_peers
+                    .get(peer_id)
+                    .map(|peer| (peer_id, hash, peer))
+            })
+            .collect::<Vec<_>>();
+        let concurrency = candidates.len();
+        if concurrency == 0 {
+            return Ok(None);
+        }
+        let timeout = self.config.request_timeout;
+        let mut pending = stream::iter(candidates.into_iter().map(
+            |(peer_id, hash, peer)| async move {
+                (
+                    peer_id,
+                    hash,
+                    request_direct_header(&peer, hash, timeout, cancellation).await,
+                )
+            },
+        ))
+        .buffer_unordered(concurrency);
+        while let Some((peer_id, hash, result)) = pending.next().await {
+            let headers = match result {
+                Ok(headers) => headers,
+                Err(P2pError::Cancelled) => return Err(P2pError::Cancelled),
+                Err(error) => {
+                    debug!(%error, "could not resolve the head advertised by an execution peer");
+                    continue;
+                }
+            };
+            if let Some(header) = headers.into_iter().next() {
+                if header.hash_slow() != hash {
+                    session.handle.ban_peer(peer_id);
+                    self.network.direct_peers.remove(peer_id);
+                } else if header.number >= minimum.0 {
+                    let head = (BlockNumber(header.number), BlockHash::new(hash.0));
+                    session.observe_head(head.0);
+                    return Ok(Some(head));
+                }
             }
         }
-        let head = discovered
-            .into_iter()
-            .max_by_key(|(number, _)| *number)
-            .map(|(number, hash)| (BlockNumber(number), BlockHash::new(hash)))
-            .ok_or_else(|| P2pError::Request {
-                component: "peer head",
-                detail: "connected peers did not advertise a usable head".to_owned(),
-            })?;
-        session.observe_head(head.0);
-        Ok(head)
+        Ok(None)
+    }
+
+    async fn minimum_live_head(
+        &self,
+        session: &P2pSession,
+        minimum: BlockNumber,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<(BlockNumber, BlockHash)>, P2pError> {
+        // Some ETH peers expose only a head hash, and the direct status event
+        // can race the request sender becoming visible locally. A header at
+        // the consensus-required minimum is enough to start the anchored live
+        // lane; subsequent polling advances it without trusting peer status.
+        let response = match cancellable_peer_request(
+            session.fetch.get_headers_with_priority(
+                HeadersRequest::one(BlockHashOrNumber::Number(minimum.0)),
+                Priority::High,
+            ),
+            self.config.request_timeout,
+            cancellation,
+            "minimum live header",
+        )
+        .await
+        {
+            Ok(response) => response,
+            Err(P2pError::Cancelled) => return Err(P2pError::Cancelled),
+            Err(_) => return Ok(None),
+        };
+        let (peer, headers) = response.split();
+        let Some(header) = headers.into_iter().next() else {
+            return Ok(None);
+        };
+        if header.number != minimum.0 {
+            session.fetch.report_bad_message(peer);
+            return Ok(None);
+        }
+        let head = (minimum, BlockHash::new(header.hash_slow().0));
+        session.observe_head(minimum);
+        Ok(Some(head))
     }
 
     async fn wait_for_peer_head(
@@ -6356,6 +6445,32 @@ async fn request_direct_bodies(
     Ok((response.0, response_payload_bytes))
 }
 
+async fn request_direct_header(
+    peer: &DirectPeer,
+    hash: B256,
+    timeout: Duration,
+    cancellation: &CancellationToken,
+) -> Result<Vec<Header>, P2pError> {
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    peer.messages
+        .try_send(PeerRequest::GetBlockHeaders {
+            request: GetBlockHeaders {
+                start_block: BlockHashOrNumber::Hash(hash),
+                limit: 1,
+                skip: 0,
+                direction: HeadersDirection::Rising,
+            },
+            response: sender,
+        })
+        .map_err(|error| P2pError::Request {
+            component: "peer head header",
+            detail: format!("could not queue direct request: {error:?}"),
+        })?;
+    let response =
+        await_direct_peer_response(receiver, timeout, cancellation, "peer head header").await?;
+    Ok(response.0)
+}
+
 #[derive(Debug)]
 struct DirectReceiptsResponse {
     receipts: Vec<Vec<Receipt>>,
@@ -8761,6 +8876,43 @@ mod tests {
         .expect("direct body response");
         assert_eq!(bodies, [BlockBody::default()]);
         responder.await.expect("body responder");
+    }
+
+    #[tokio::test]
+    async fn direct_head_request_uses_the_advertising_peer_session() {
+        let peer_id = B512::from([0x66; 64]);
+        let (sender, mut receiver) =
+            tokio::sync::mpsc::channel::<PeerRequest<EthNetworkPrimitives>>(1);
+        let peer = DirectPeer {
+            peer_id,
+            eth_version: EthVersion::Eth68,
+            messages: PeerRequestSender::new(peer_id, sender),
+        };
+        let hash = B256::from([0x77; 32]);
+        let responder = tokio::spawn(async move {
+            let request = receiver.recv().await.expect("direct header request");
+            let PeerRequest::GetBlockHeaders { request, response } = request else {
+                panic!("expected a header request");
+            };
+            assert_eq!(request.start_block, BlockHashOrNumber::Hash(hash));
+            assert_eq!(request.limit, 1);
+            assert_eq!(request.skip, 0);
+            assert_eq!(request.direction, HeadersDirection::Rising);
+            response
+                .send(Ok(vec![Header::default()].into()))
+                .expect("send header response");
+        });
+
+        let headers = request_direct_header(
+            &peer,
+            hash,
+            Duration::from_secs(1),
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("direct header response");
+        assert_eq!(headers, [Header::default()]);
+        responder.await.expect("header responder");
     }
 
     #[tokio::test]
