@@ -7,7 +7,7 @@ use std::{
     net::{Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
     str::FromStr,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use alloy_primitives::{Address as AlloyAddress, I256, U256, U512};
@@ -407,6 +407,8 @@ async fn subscribe_embedded(
     eprintln!(
         "leani: first-run peer discovery can take about a minute; peer state is cached for later runs"
     );
+    let startup_started = Instant::now();
+    let mut next_startup_status = Duration::from_secs(15);
     let mut announced_ready = false;
     let mut snapshot_pending =
         options.finality == SubscribeFinality::Optimistic && options.format != SubscribeFormat::Raw;
@@ -416,6 +418,21 @@ async fn subscribe_embedded(
     loop {
         if runtime.is_finished() {
             bail!("embedded network runtime stopped before the subscription completed");
+        }
+        if !announced_ready && startup_started.elapsed() >= next_startup_status {
+            let status = runtime.execution_source.network_status();
+            if status.connected_peer_slots == 0 {
+                eprintln!(
+                    "leani: still searching for a usable Ethereum peer ({} known, {} sessions accepted); Ctrl-C stops immediately",
+                    status.known_peer_records, status.peer_lifecycle.established,
+                );
+            } else {
+                eprintln!(
+                    "leani: connected to {} Ethereum peer(s); validating a current serving head...",
+                    status.connected_peer_slots,
+                );
+            }
+            next_startup_status = next_startup_status.saturating_add(Duration::from_secs(30));
         }
         if !announced_ready && runtime.readiness.is_ready() {
             snapshot_pending = false;

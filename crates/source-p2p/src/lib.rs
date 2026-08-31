@@ -43,8 +43,8 @@ use leani_primitives::{
 use leani_source_api::{
     BlockFrameStream, ChainEvent, ChainEventStream, DataRequest, FinalityModel, HistorySource,
     LiveSource, LiveStart, NetworkDisconnectReason, NetworkLane, NetworkPhase,
-    NetworkSessionTelemetry, NetworkTelemetry, Partitioning, SourceAcquisitionMetrics,
-    SourceBudget, SourceChunk, SourceDescriptor, SourceError, SourcePlan,
+    NetworkSessionTelemetry, NetworkTelemetry, NetworkTelemetrySnapshot, Partitioning,
+    SourceAcquisitionMetrics, SourceBudget, SourceChunk, SourceDescriptor, SourceError, SourcePlan,
 };
 use reth_chainspec::MAINNET;
 use reth_discv4::{DiscoveryUpdate, Discv4, Discv4Config};
@@ -1384,6 +1384,7 @@ fn spawn_mainnet_dns_peer_seeder(
     preferred_peers: usize,
     max_concurrent_dials: usize,
     refill_interval: Duration,
+    redial_interval: Duration,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let resolver = match SegmentJoiningDnsResolver::from_system_conf() {
@@ -1442,10 +1443,13 @@ fn spawn_mainnet_dns_peer_seeder(
         let mut seeded = HashSet::new();
         let mut crawler_seed_count = 0_usize;
         let mut crawler_discovered = HashSet::new();
-        // Explicitly dial every newly verified discovery record at most once.
-        // Reth owns subsequent retry/backoff decisions. Cycling this queue here
-        // would bypass those protections and repeatedly hammer full peers.
+        // Explicitly dial every newly verified discovery record immediately.
+        // Reth owns its own retry/backoff decisions; this supplemental queue
+        // never revisits a record more frequently than the configured retry
+        // ceiling. Fresh records always go first so a long-lived zero-peer
+        // process neither exhausts discovery permanently nor hammers one peer.
         let mut dial_records = VecDeque::new();
+        let mut redial_records = VecDeque::new();
         let mut dial_record_ids = HashSet::new();
         let mut eager_refill = tokio::time::interval(refill_interval);
         eager_refill.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -1468,25 +1472,46 @@ fn spawn_mainnet_dns_peer_seeder(
                         warn!(%error, "could not retry mainnet execution peer DNS tree");
                     }
                 }
-                _ = eager_refill.tick(), if !dial_records.is_empty() => {
+                _ = eager_refill.tick(), if !dial_records.is_empty() || !redial_records.is_empty() => {
                     let connected = handle.num_connected_peers();
-                    let attempts = eager_refill_attempts(
+                    let capacity = eager_refill_attempts(
                         connected,
                         preferred_peers,
                         max_concurrent_dials,
-                        dial_records.len(),
+                        usize::MAX,
                     );
-                    for _ in 0..attempts {
+                    let now = tokio::time::Instant::now();
+                    let fresh_attempts = capacity.min(dial_records.len());
+                    for _ in 0..fresh_attempts {
                         let Some(record) = dial_records.pop_front() else {
                             break;
                         };
                         connect_node_record(&handle, record);
+                        redial_records.push_back((now + redial_interval, record));
                     }
+                    let mut retry_attempts = 0_usize;
+                    while retry_attempts < capacity.saturating_sub(fresh_attempts) {
+                        let Some((retry_at, _)) = redial_records.front() else {
+                            break;
+                        };
+                        if *retry_at > now {
+                            break;
+                        }
+                        let (_, record) = redial_records
+                            .pop_front()
+                            .expect("eligible redial record is present");
+                        connect_node_record(&handle, record);
+                        redial_records.push_back((now + redial_interval, record));
+                        retry_attempts = retry_attempts.saturating_add(1);
+                    }
+                    let attempts = fresh_attempts.saturating_add(retry_attempts);
                     if attempts > 0 {
                         debug!(
                             connected_peers = connected,
                             preferred_peers,
                             attempts,
+                            fresh_attempts,
+                            retry_attempts,
                             "eagerly refilling execution peer sessions from verified discovery records"
                         );
                     }
@@ -1640,6 +1665,7 @@ where
             preferred_peers,
             max_concurrent_dials,
             peer_refill_interval,
+            redial_interval,
             shutdown,
         } = runtime;
         let mut manager = Box::pin(manager);
@@ -1649,6 +1675,7 @@ where
             preferred_peers,
             max_concurrent_dials,
             peer_refill_interval,
+            redial_interval,
         );
         let mut network_events_open = true;
         let mut zero_peers_since = Some(tokio::time::Instant::now());
@@ -1782,6 +1809,7 @@ struct NetworkManagerRuntime {
     preferred_peers: usize,
     max_concurrent_dials: usize,
     peer_refill_interval: Duration,
+    redial_interval: Duration,
     shutdown: CancellationToken,
 }
 
@@ -2095,6 +2123,23 @@ impl RethP2pSource {
             material_tuning,
             request_metrics: P2pRequestMetrics::default(),
         })
+    }
+
+    /// Return the current aggregate execution-network status without exposing
+    /// peer identities.
+    #[must_use]
+    pub fn network_status(&self) -> NetworkTelemetrySnapshot {
+        self.config.network_telemetry.snapshot()
+    }
+
+    /// Refresh the local ETH status advertised by an already-started peer
+    /// manager. This is useful when discovery begins from retained state while
+    /// verified finality resolves concurrently.
+    pub async fn update_advertised_head(&self, head: BlockRef) {
+        let state = self.network.state.lock().await;
+        if let Some(running) = state.as_ref() {
+            running.handle.update_status(block_status_head(head));
+        }
     }
 
     #[must_use]
@@ -2681,6 +2726,7 @@ impl RethP2pSource {
                 preferred_peers: self.config.preferred_peers,
                 max_concurrent_dials: self.config.max_concurrent_dials,
                 peer_refill_interval: self.config.peer_refill_interval,
+                redial_interval: self.config.retry_backoff_max,
                 shutdown: shutdown.clone(),
             },
         );

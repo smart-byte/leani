@@ -5528,9 +5528,19 @@ impl EmbeddedNetworkRuntime {
         self.cancellation.clone()
     }
 
-    pub(crate) async fn shutdown(self) {
+    pub(crate) async fn shutdown(mut self) {
         self.cancellation.cancel();
-        let _ = self.task.await;
+        if tokio::time::timeout(Duration::from_secs(1), &mut self.task)
+            .await
+            .is_err()
+        {
+            // Some networking internals finish their own cache flush and socket
+            // teardown on a fixed timer. A CLI subscription must nevertheless
+            // honor Ctrl-C promptly; aborting the supervisor after cancellation
+            // is safe because SQLite commits and peer-cache writes are atomic.
+            self.task.abort();
+            let _ = self.task.await;
+        }
     }
 }
 
@@ -5805,17 +5815,15 @@ async fn run_network_lanes_once(
     }
     let startup_started = Instant::now();
     let chain_id = ChainId(config.chain.chain_id);
-    let execution_warmup_head = retained_canonical_tip(&store, chain_id)
-        .await?
-        .unwrap_or_else(leani_source_p2p::RethP2pSource::mainnet_genesis_block);
-    let execution_warmup = {
-        let source = live_source.clone();
-        let cancellation = cancellation.clone();
-        tokio::spawn(async move {
-            let result = source.warm_up(execution_warmup_head, &cancellation).await;
-            (execution_warmup_head, result)
-        })
-    };
+    let retained_warmup_head = retained_canonical_tip(&store, chain_id).await?;
+    if let Some(head) = retained_warmup_head {
+        spawn_execution_peer_warmup(
+            live_source.clone(),
+            head,
+            cancellation.clone(),
+            startup_started,
+        );
+    }
     let checkpoint_root = parse_checkpoint_root(&config.finality.checkpoint)?;
     let (finality_source, selected, bootstrap): (
         Arc<dyn FinalitySource>,
@@ -5876,23 +5884,6 @@ async fn run_network_lanes_once(
         finalized_execution_block = selected.execution_block_number,
         "verified finality startup anchor resolved"
     );
-    match execution_warmup.await {
-        Ok((advertised, Ok(connected))) => info!(
-            elapsed_ms = u64::try_from(startup_started.elapsed().as_millis()).unwrap_or(u64::MAX),
-            advertised_block = advertised.number.0,
-            connected,
-            "execution peer warmup completed alongside finality verification"
-        ),
-        Ok((advertised, Err(error))) => debug!(
-            advertised_block = advertised.number.0,
-            %error,
-            "execution peer warmup did not complete; live startup will retry"
-        ),
-        Err(error) => debug!(
-            %error,
-            "execution peer warmup task stopped; live startup will retry"
-        ),
-    }
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -5903,6 +5894,20 @@ async fn run_network_lanes_once(
         parent_hash: BlockHash::ZERO,
         timestamp: now,
     };
+    // A cold store has no trustworthy execution head to advertise until the
+    // independently verified finality probe completes. Starting a peer manager
+    // at genesis can make current peers reject our obsolete ETH status and then
+    // hold startup behind the full peer timeout. Retained stores still overlap
+    // discovery with finality, but refresh their advertised head immediately.
+    live_source.update_advertised_head(live_anchor).await;
+    if retained_warmup_head.is_none() {
+        spawn_execution_peer_warmup(
+            live_source.clone(),
+            live_anchor,
+            cancellation.clone(),
+            startup_started,
+        );
+    }
     store
         .store_canonical_anchor(chain_id, live_anchor, Finality::Finalized)
         .await?;
@@ -6187,6 +6192,36 @@ async fn run_network_lanes_once(
     rpc_readiness.set_live_ready(false);
     readiness.set_finality_ready(false);
     result
+}
+
+fn spawn_execution_peer_warmup(
+    source: std::sync::Arc<leani_source_p2p::RethP2pSource>,
+    advertised: leani_primitives::BlockRef,
+    cancellation: CancellationToken,
+    startup_started: std::time::Instant,
+) {
+    let warmup = tokio::spawn(async move {
+        match source.warm_up(advertised, &cancellation).await {
+            Ok(connected) => info!(
+                elapsed_ms =
+                    u64::try_from(startup_started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                advertised_block = advertised.number.0,
+                connected,
+                "execution peer warmup completed alongside node startup"
+            ),
+            Err(error) if cancellation.is_cancelled() => debug!(
+                advertised_block = advertised.number.0,
+                %error,
+                "execution peer warmup cancelled"
+            ),
+            Err(error) => debug!(
+                advertised_block = advertised.number.0,
+                %error,
+                "execution peer warmup did not complete; live startup continues retrying"
+            ),
+        }
+    });
+    std::mem::drop(warmup);
 }
 
 async fn retained_live_start(
@@ -7024,6 +7059,27 @@ mod tests {
         )
         .await
         .expect("shutdown completes");
+    }
+
+    #[tokio::test]
+    async fn embedded_runtime_shutdown_aborts_an_uncooperative_network_task() {
+        let cancellation = CancellationToken::new();
+        let (_, verified_anchor) = tokio::sync::watch::channel(None);
+        let execution_source = std::sync::Arc::new(
+            leani_source_p2p::RethP2pSource::mainnet(leani_source_p2p::RethP2pConfig::default())
+                .expect("execution source"),
+        );
+        let runtime = EmbeddedNetworkRuntime {
+            readiness: leani_api::ReadinessHandle::new(true, true),
+            verified_anchor,
+            execution_source,
+            cancellation,
+            task: tokio::spawn(std::future::pending()),
+        };
+
+        tokio::time::timeout(Duration::from_millis(1_500), runtime.shutdown())
+            .await
+            .expect("embedded shutdown is bounded");
     }
 
     #[tokio::test]
