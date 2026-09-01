@@ -440,7 +440,7 @@ impl ProcessorFactory for BlockSummaryProcessorFactory {
     }
 
     fn description(&self) -> &str {
-        "Header-only Ethereum block summaries for low-latency chain following"
+        "Verified Ethereum block summaries with transaction counts"
     }
 
     fn create(
@@ -853,6 +853,7 @@ mod tests {
         assert_eq!(
             processor.descriptor().requirements[0].capabilities,
             leani_primitives::CapabilitySet::of(leani_primitives::Capability::Header)
+                .with(leani_primitives::Capability::Body)
         );
         assert_eq!(
             components

@@ -7,7 +7,7 @@
     },
     {
       "id": "block-summary",
-      "description": "Header-only Ethereum block summaries for low-latency chain following"
+      "description": "Verified Ethereum block summaries with transaction counts"
     },
     {
       "id": "erc20-balances",

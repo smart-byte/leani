@@ -7402,7 +7402,7 @@ mod tests {
             base_fee_per_gas: Some(Quantity::new([7; 32])),
             blob_gas_used: Some(262_144),
             excess_blob_gas: Some(393_216),
-            transaction_count: None,
+            transaction_count: Some(123),
             size_bytes: None,
             finality: Finality::Optimistic,
         })
@@ -7954,6 +7954,7 @@ mod tests {
         assert_eq!(body["data"]["blockNumber"], block.number.0);
         assert_eq!(body["data"]["blockHash"], block.hash.to_string());
         assert_eq!(body["data"]["gasUsed"], 31_000_000);
+        assert_eq!(body["data"]["transactionCount"], 123);
         assert_eq!(body["data"]["finality"], "optimistic");
     }
 

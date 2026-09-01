@@ -533,7 +533,7 @@ async fn subscribe_embedded(
 
     match options.protocol {
         SubscribeProtocol::Blocks => eprintln!(
-            "leani: embedded block-summary processor active; bootstrapping verified Ethereum headers..."
+            "leani: embedded block-summary processor active; bootstrapping verified Ethereum blocks..."
         ),
         SubscribeProtocol::UniswapV3 => eprintln!(
             "leani: embedded Uniswap V3 processor active for {}; bootstrapping verified Ethereum data...",
@@ -961,7 +961,7 @@ fn subscription_data_dir_for(
     let root = local_state::runtime_data_dir(config_path, working_directory)?.join("subscriptions");
     let mut hasher = blake3::Hasher::new();
     hasher.update(match protocol {
-        SubscribeProtocol::Blocks => b"block-summary/1.0.0",
+        SubscribeProtocol::Blocks => b"block-summary/1.1.0",
         SubscribeProtocol::UniswapV3 => b"uniswap-observations/2.1.0",
     });
     let mut pools = markets.iter().map(|market| market.pool).collect::<Vec<_>>();
@@ -1832,10 +1832,14 @@ fn render_block_summary(format: SubscribeFormat, output: &RenderedBlockSummary) 
                     }
                 },
             );
+            let transactions = output
+                .transaction_count
+                .map_or_else(|| "unknown".to_owned(), |count| count.to_string());
             println!(
-                "{}  block={}  gas={}  base_fee={}  blobs={}  {}{}",
+                "{}  block={}  txs={}  gas={}  base_fee={}  blobs={}  {}{}",
                 timestamp,
                 output.block_number,
+                transactions,
                 gas,
                 base_fee,
                 blobs,
@@ -2696,7 +2700,7 @@ mod tests {
             base_fee_per_gas: None,
             blob_gas_used: Some(262_144),
             excess_blob_gas: Some(393_216),
-            transaction_count: None,
+            transaction_count: Some(123),
             size_bytes: None,
             finality: Finality::Optimistic,
         };
@@ -3195,7 +3199,7 @@ mod tests {
     }
 
     #[test]
-    fn embedded_block_processor_has_no_body_requirement() {
+    fn embedded_block_processor_requires_bodies_but_not_receipts() {
         let processor = subscription_processor(
             SubscribeProtocol::Blocks,
             &[],
@@ -3207,6 +3211,7 @@ mod tests {
         assert_eq!(
             processor.descriptor().requirements[0].capabilities,
             leani_primitives::CapabilitySet::of(leani_primitives::Capability::Header)
+                .with(leani_primitives::Capability::Body)
         );
     }
 }

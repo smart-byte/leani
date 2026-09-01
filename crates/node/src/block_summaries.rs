@@ -10,7 +10,7 @@ pub(crate) fn processor_config(instance: &str, finalized_only: bool) -> Result<P
         r#"
 id = "block-summary"
 instance = "block-summary"
-version = "1.0.0"
+version = "1.1.0"
 history_control = "node_owned"
 history_mode = "on_demand"
 start_block = 0
@@ -59,11 +59,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn built_in_contract_is_header_only_and_on_demand() {
+    fn built_in_contract_is_receipt_free_and_on_demand() {
         let configured = processor_config("demo-blocks", false).expect("processor config");
         assert_eq!(configured.id, "block-summary");
         assert_eq!(configured.instance, "demo-blocks");
-        assert_eq!(configured.version, "1.0.0");
+        assert_eq!(configured.version, "1.1.0");
         assert_eq!(configured.history_mode, ProcessorHistoryMode::OnDemand);
         assert!(configured.settings.is_empty());
     }

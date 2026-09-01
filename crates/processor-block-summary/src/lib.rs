@@ -1,4 +1,4 @@
-//! Header-only Ethereum block summaries for low-latency chain following.
+//! Ethereum block summaries from verified headers and bodies.
 
 use async_trait::async_trait;
 use leani_primitives::{
@@ -24,7 +24,7 @@ pub struct BlockSummaryConfig {
     pub start_block: BlockNumber,
 }
 
-/// Stable, source-neutral fields available from a verified execution header.
+/// Stable, source-neutral fields available from a verified execution block.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BlockSummaryEntity {
@@ -49,7 +49,7 @@ pub struct BlockSummaryProcessor {
 }
 
 impl BlockSummaryProcessor {
-    /// Build a header-only block summary processor.
+    /// Build a block summary processor that avoids receipt acquisition.
     ///
     /// # Errors
     ///
@@ -59,17 +59,17 @@ impl BlockSummaryProcessor {
             .map_err(|error| ProcessorError::Input(error.to_string()))?;
         let id = ProcessorId::new("block-summary")
             .map_err(|error| ProcessorError::Input(error.to_string()))?;
-        let version = Version::new(1, 0, 0);
+        let version = Version::new(1, 1, 0);
         let config_hash = BlockHash::new(*blake3::hash(&encoded).as_bytes());
         let descriptor = ProcessorDescriptor {
             instance: ProcessorInstanceId::legacy(&id, &version, config_hash),
             id,
             version,
-            code_hash: BlockHash::new(*blake3::hash(b"leani/block-summary/1.0.0").as_bytes()),
+            code_hash: BlockHash::new(*blake3::hash(b"leani/block-summary/1.1.0").as_bytes()),
             config_hash,
             start: StartPoint::Block(config.start_block),
             requirements: vec![DataRequirement {
-                capabilities: CapabilitySet::of(Capability::Header),
+                capabilities: CapabilitySet::of(Capability::Header).with(Capability::Body),
                 log_fields: leani_primitives::LogFieldSet::NONE,
                 allow_filtered: false,
                 filter: FilterScope::default(),
@@ -143,7 +143,17 @@ impl Processor for BlockSummaryProcessor {
             base_fee_per_gas: header.base_fee_per_gas,
             blob_gas_used: header.blob_gas_used,
             excess_blob_gas: header.excess_blob_gas,
-            transaction_count: header.transaction_count,
+            transaction_count: Some(
+                block
+                    .transactions
+                    .as_complete()
+                    .and_then(|transactions| u32::try_from(transactions.len()).ok())
+                    .ok_or_else(|| {
+                        ProcessorError::Input(
+                            "complete execution body transaction count is unavailable".to_owned(),
+                        )
+                    })?,
+            ),
             size_bytes: header.size_bytes,
             finality: block.finality,
         };
@@ -287,7 +297,7 @@ fn validate_cursor(
 
 #[cfg(test)]
 mod tests {
-    use leani_primitives::{BlockRef, HeaderEnvelope};
+    use leani_primitives::{BlockRef, HeaderEnvelope, TransactionEnvelope, TransactionHash};
     use leani_testkit::{MemoryReducer, fixture_frame};
 
     use super::*;
@@ -302,6 +312,27 @@ mod tests {
     fn frame() -> BlockFrame {
         let mut frame = fixture_frame(42, BlockHash::new([41; 32]));
         frame.finality = Finality::Optimistic;
+        frame.transactions = Material::Complete(
+            (0..2_u32)
+                .map(|index| TransactionEnvelope {
+                    hash: TransactionHash::new([u8::try_from(index).expect("small index"); 32]),
+                    transaction_type: 2,
+                    index,
+                    encoded: Some(vec![u8::try_from(index).expect("small index")]),
+                    from: None,
+                    to: None,
+                    nonce: None,
+                    gas_limit: None,
+                    value: None,
+                    input: None,
+                    max_fee_per_gas: None,
+                    max_priority_fee_per_gas: None,
+                    max_fee_per_blob_gas: None,
+                    blob_versioned_hashes: Vec::new(),
+                    size_bytes: Some(1),
+                })
+                .collect(),
+        );
         frame.header = Material::Complete(HeaderEnvelope {
             rlp: None,
             transactions_root: Some(BlockHash::new([2; 32])),
@@ -313,7 +344,7 @@ mod tests {
             blob_gas_used: Some(393_216),
             excess_blob_gas: Some(786_432),
             size_bytes: None,
-            transaction_count: None,
+            transaction_count: Some(2),
             consensus_size_bytes: None,
         });
         frame
@@ -332,7 +363,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn maps_and_emits_one_summary_from_header_material() {
+    async fn maps_and_emits_one_summary_from_verified_block_material() {
         let processor = processor();
         let frame = frame();
         let delta = processor.map(&frame).await.expect("map");
@@ -340,7 +371,7 @@ mod tests {
             postcard::from_bytes(&delta.payload).expect("summary payload");
         assert_eq!(entity.block_number, BlockNumber(42));
         assert_eq!(entity.gas_used, Some(30_000_000));
-        assert_eq!(entity.transaction_count, None);
+        assert_eq!(entity.transaction_count, Some(2));
 
         let mut reducer = MemoryReducer::default();
         let changes = processor

@@ -3137,7 +3137,7 @@ markets = ["LINK/ETH"]
         let config = starter.expand().expect("expand blocks config");
         assert_eq!(config.processors.len(), 1);
         assert_eq!(config.processors[0].id, "block-summary");
-        assert_eq!(config.processors[0].version, "1.0.0");
+        assert_eq!(config.processors[0].version, "1.1.0");
         assert!(config.processors[0].settings.is_empty());
     }
 

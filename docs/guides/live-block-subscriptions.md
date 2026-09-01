@@ -1,6 +1,6 @@
 ---
 title: Follow Ethereum blocks from the CLI
-description: Print one verified, header-only summary for every new Ethereum block from an embedded runtime or a prepared Leani node.
+description: Print one verified summary for every new Ethereum block from an embedded runtime or a prepared Leani node.
 section: guides
 order: 12
 audience:
@@ -10,8 +10,9 @@ status: preview
 ---
 
 The built-in `block-summary` processor is the smallest continuous Leani demo.
-It requests verified execution headers only, so it does not wait for a
-particular contract event or download block bodies and receipts.
+It requests verified execution headers and bodies, so it can report the exact
+transaction count without waiting for a particular contract event. It does not
+download receipts.
 
 Run it without configuring or starting a node:
 
@@ -23,19 +24,19 @@ The optimistic head is printed as soon as it is available, followed by one
 line per new block:
 
 ```text
-2026-09-01T09:14:35Z  block=25881412  gas=32.47M / 60.00M (54.1%)  base_fee=0.143592817 gwei  blobs=6  optimistic
+2026-09-01T09:14:35Z  block=25881412  txs=187  gas=32.47M / 60.00M (54.1%)  base_fee=0.143592817 gwei  blobs=6  optimistic
 ```
 
-The summary contains the block number, hash and parent, timestamp, gas limit
-and usage, base fee, blob gas, excess blob gas, and finality. Transaction count
-and encoded block size are optional fields: header-only P2P following leaves
-them empty instead of delaying the feed to fetch a block body.
+The summary contains the block number, hash and parent, timestamp, transaction
+count, encoded block size, gas limit and usage, base fee, blob gas, excess blob
+gas, and finality. Leani verifies the transaction and withdrawals roots from
+the body while keeping receipt acquisition out of this latency-sensitive path.
 
 Use newline-delimited JSON for scripts:
 
 ```bash
 leani subscribe blocks --format json |
-  jq '{block: .blockNumber, gas: .gasUsed, baseFee: .baseFeePerGasWei}'
+  jq '{block: .blockNumber, transactions: .transactionCount, gas: .gasUsed, baseFee: .baseFeePerGasWei}'
 ```
 
 `--once` exits after the first summary, which is useful for startup timing:
