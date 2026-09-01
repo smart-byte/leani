@@ -566,8 +566,11 @@ async fn subscribe_embedded(
     let mut announced_ready = false;
     let mut snapshot_pending =
         options.finality == SubscribeFinality::Optimistic && options.format != SubscribeFormat::Raw;
+    // An optimistic preview can outrun the durable runtime's anchored overlap.
+    // Retain both its identities and ordered block context through readiness so
+    // later overlap commits confirm the preview instead of regressing stdout.
     let mut previewed = HashSet::<ObservationKey>::new();
-    let mut preview_blocks = BTreeMap::<u64, (BlockHash, Vec<SubscriptionItem>)>::new();
+    let mut preview_blocks = BTreeMap::<u64, (BlockRef, Vec<SubscriptionItem>)>::new();
     let mut preview_stream = None::<ChainEventStream>;
     loop {
         if runtime.is_finished() {
@@ -638,10 +641,16 @@ async fn subscribe_embedded(
                     eprintln!("leani: live execution and verified finality are ready");
                 }
                 for (item, record) in startup_items {
-                    if previewed.contains(&observation_key(&item))
-                        || preview_is_at_or_after(&preview_blocks, &item)
-                    {
-                        continue;
+                    match reconcile_preview_handoff(
+                        &mut preview_blocks,
+                        &mut previewed,
+                        &item,
+                        record.direction,
+                    ) {
+                        PreviewHandoffAction::Suppress => continue,
+                        PreviewHandoffAction::Render { reverted } => {
+                            render_preview_reverts(options.format, &reverted)?;
+                        }
                     }
                     render_local_item(options.format, &item, &record)?;
                     if options.once {
@@ -650,7 +659,6 @@ async fn subscribe_embedded(
                         return Ok(Exit::Success);
                     }
                 }
-                preview_blocks.clear();
             }
         }
         if !announced_ready {
@@ -749,9 +757,9 @@ async fn subscribe_embedded(
                         }
                         Ok(ChainEvent::Reorg { reverted, applied }) => {
                             for block in reverted {
-                                if let Some((hash, items)) =
+                                if let Some((retained, items)) =
                                     preview_blocks.remove(&block.number.0)
-                                    && hash == block.hash
+                                    && retained.hash == block.hash
                                 {
                                     let reverted = render_optimistic_items(
                                         options.format,
@@ -831,8 +839,16 @@ async fn subscribe_embedded(
                 continue;
             }
             if let Some(item) = local_item(options.protocol, markets, &record)? {
-                if previewed.remove(&observation_key(&item)) {
-                    continue;
+                match reconcile_preview_handoff(
+                    &mut preview_blocks,
+                    &mut previewed,
+                    &item,
+                    record.direction,
+                ) {
+                    PreviewHandoffAction::Suppress => continue,
+                    PreviewHandoffAction::Render { reverted } => {
+                        render_preview_reverts(options.format, &reverted)?;
+                    }
                 }
                 render_local_item(options.format, &item, &record)?;
                 if options.once {
@@ -1837,12 +1853,12 @@ async fn next_preview_event(
 }
 
 fn retain_preview_block(
-    blocks: &mut BTreeMap<u64, (BlockHash, Vec<SubscriptionItem>)>,
+    blocks: &mut BTreeMap<u64, (BlockRef, Vec<SubscriptionItem>)>,
     previewed: &mut HashSet<ObservationKey>,
     block: BlockRef,
     items: Vec<SubscriptionItem>,
 ) {
-    if let Some((_, replaced)) = blocks.insert(block.number.0, (block.hash, items)) {
+    if let Some((_, replaced)) = blocks.insert(block.number.0, (block, items)) {
         for item in replaced {
             previewed.remove(&observation_key(&item));
         }
@@ -1867,18 +1883,104 @@ const fn observation_key(item: &SubscriptionItem) -> ObservationKey {
 }
 
 fn preview_is_at_or_after(
-    blocks: &BTreeMap<u64, (BlockHash, Vec<SubscriptionItem>)>,
+    blocks: &BTreeMap<u64, (BlockRef, Vec<SubscriptionItem>)>,
     candidate: &SubscriptionItem,
 ) -> bool {
-    blocks.values().any(|(_, items)| {
+    blocks.values().any(|(block, items)| {
         items.iter().any(|preview| {
             preview.same_scope(candidate)
                 && (preview.block_number() > candidate.block_number()
                     || (preview.block_number() == candidate.block_number()
-                        && preview.block_hash() == candidate.block_hash()
+                        && block.hash == candidate.block_hash()
                         && preview.item_index() >= candidate.item_index()))
         })
     })
+}
+
+#[derive(Debug)]
+enum PreviewHandoffAction {
+    Suppress,
+    Render {
+        reverted: Vec<(BlockRef, SubscriptionItem)>,
+    },
+}
+
+fn reconcile_preview_handoff(
+    blocks: &mut BTreeMap<u64, (BlockRef, Vec<SubscriptionItem>)>,
+    previewed: &mut HashSet<ObservationKey>,
+    candidate: &SubscriptionItem,
+    direction: ChangeDirection,
+) -> PreviewHandoffAction {
+    // An exact durable apply confirms an already-rendered preview. An undo of
+    // that identity must remain visible because the user saw the apply.
+    let key = observation_key(candidate);
+    if previewed.remove(&key) {
+        remove_preview_item(blocks, key);
+        return if direction == ChangeDirection::Undo {
+            PreviewHandoffAction::Render {
+                reverted: Vec::new(),
+            }
+        } else {
+            PreviewHandoffAction::Suppress
+        };
+    }
+    if preview_is_at_or_after(blocks, candidate) {
+        return PreviewHandoffAction::Suppress;
+    }
+
+    // Crossing a still-unconfirmed preview means the durable chain selected a
+    // replacement. Revert those speculative observations newest-first before
+    // releasing the durable candidate.
+    let candidate_number = candidate.block_number();
+    let candidate_hash = candidate.block_hash();
+    let candidate_index = candidate.item_index();
+    let mut reverted = Vec::new();
+    for (block, items) in blocks.values_mut() {
+        items.retain(|preview| {
+            if !preview.same_scope(candidate) {
+                return true;
+            }
+            let crossed = block.number < candidate_number
+                || (block.number == candidate_number
+                    && (block.hash != candidate_hash || preview.item_index() < candidate_index));
+            if !crossed {
+                return true;
+            }
+            let key = observation_key(preview);
+            if previewed.remove(&key) {
+                reverted.push((*block, preview.clone()));
+            }
+            false
+        });
+    }
+    blocks.retain(|_, (_, items)| !items.is_empty());
+    reverted.sort_by_key(|(block, item)| {
+        (
+            std::cmp::Reverse(block.number),
+            std::cmp::Reverse(item.item_index()),
+        )
+    });
+    PreviewHandoffAction::Render { reverted }
+}
+
+fn remove_preview_item(
+    blocks: &mut BTreeMap<u64, (BlockRef, Vec<SubscriptionItem>)>,
+    key: ObservationKey,
+) {
+    for (_, items) in blocks.values_mut() {
+        items.retain(|item| observation_key(item) != key);
+    }
+    blocks.retain(|_, (_, items)| !items.is_empty());
+}
+
+fn render_preview_reverts(
+    format: SubscribeFormat,
+    reverted: &[(BlockRef, SubscriptionItem)],
+) -> Result<()> {
+    for (block, item) in reverted {
+        render_item(format, item, *block, Finality::Optimistic, "revert", None)?;
+    }
+    Ok(())
 }
 
 fn render_local_item(
@@ -3122,11 +3224,21 @@ mod tests {
             .expect("preview market");
         let mut preview_blocks = BTreeMap::from([(
             preview.block_number().0,
-            (preview.block_hash(), vec![preview.clone()]),
+            (preview_record.block, vec![preview.clone()]),
         )]);
+        let mut previewed = HashSet::from([observation_key(&preview)]);
 
         assert!(preview_is_at_or_after(&preview_blocks, &older));
         assert!(preview_is_at_or_after(&preview_blocks, &preview));
+        assert!(matches!(
+            reconcile_preview_handoff(
+                &mut preview_blocks,
+                &mut previewed,
+                &older,
+                ChangeDirection::Apply,
+            ),
+            PreviewHandoffAction::Suppress
+        ));
 
         let newer_record = price_record(market, 89, 10_036);
         let newer = local_item(SubscribeProtocol::UniswapV3, &[market], &newer_record)
@@ -3134,15 +3246,115 @@ mod tests {
             .expect("newer market");
         assert!(!preview_is_at_or_after(&preview_blocks, &newer));
 
-        let mut replacement = preview;
-        let SubscriptionItem::Uniswap { entity, .. } = &mut replacement else {
-            panic!("expected Uniswap item");
+        assert!(matches!(
+            reconcile_preview_handoff(
+                &mut preview_blocks,
+                &mut previewed,
+                &preview,
+                ChangeDirection::Apply,
+            ),
+            PreviewHandoffAction::Suppress
+        ));
+        assert!(previewed.is_empty());
+        assert!(preview_blocks.is_empty());
+        assert!(matches!(
+            reconcile_preview_handoff(
+                &mut preview_blocks,
+                &mut previewed,
+                &newer,
+                ChangeDirection::Apply,
+            ),
+            PreviewHandoffAction::Render { reverted } if reverted.is_empty()
+        ));
+    }
+
+    #[test]
+    fn delayed_durable_block_overlap_stays_behind_the_preview_barrier() {
+        let preview_record = block_record(65, 10_024);
+        let preview = local_item(SubscribeProtocol::Blocks, &[], &preview_record)
+            .expect("decode preview block")
+            .expect("preview block");
+        let mut preview_blocks = BTreeMap::from([(
+            preview.block_number().0,
+            (preview_record.block, vec![preview.clone()]),
+        )]);
+        let mut previewed = HashSet::from([observation_key(&preview)]);
+
+        for number in 58..65 {
+            let record = block_record(number, 9_900 + number);
+            let delayed = local_item(SubscribeProtocol::Blocks, &[], &record)
+                .expect("decode delayed block")
+                .expect("delayed block");
+            assert!(matches!(
+                reconcile_preview_handoff(
+                    &mut preview_blocks,
+                    &mut previewed,
+                    &delayed,
+                    record.direction,
+                ),
+                PreviewHandoffAction::Suppress
+            ));
+        }
+        assert!(previewed.contains(&observation_key(&preview)));
+
+        assert!(matches!(
+            reconcile_preview_handoff(
+                &mut preview_blocks,
+                &mut previewed,
+                &preview,
+                preview_record.direction,
+            ),
+            PreviewHandoffAction::Suppress
+        ));
+        assert!(previewed.is_empty());
+        assert!(preview_blocks.is_empty());
+
+        let next_record = block_record(66, 10_036);
+        let next = local_item(SubscribeProtocol::Blocks, &[], &next_record)
+            .expect("decode next block")
+            .expect("next block");
+        assert!(matches!(
+            reconcile_preview_handoff(
+                &mut preview_blocks,
+                &mut previewed,
+                &next,
+                next_record.direction,
+            ),
+            PreviewHandoffAction::Render { reverted } if reverted.is_empty()
+        ));
+    }
+
+    #[test]
+    fn replacement_at_preview_height_reverts_the_preview_first() {
+        let preview_record = block_record(65, 10_024);
+        let preview = local_item(SubscribeProtocol::Blocks, &[], &preview_record)
+            .expect("decode preview block")
+            .expect("preview block");
+        let mut replacement = preview.clone();
+        let SubscriptionItem::Block(entity) = &mut replacement else {
+            panic!("expected block summary");
         };
         entity.block_hash = BlockHash::new([99; 32]);
-        assert!(!preview_is_at_or_after(&preview_blocks, &replacement));
+        let mut preview_blocks = BTreeMap::from([(
+            preview.block_number().0,
+            (preview_record.block, vec![preview.clone()]),
+        )]);
+        let mut previewed = HashSet::from([observation_key(&preview)]);
 
-        preview_blocks.clear();
-        assert!(!preview_is_at_or_after(&preview_blocks, &older));
+        let action = reconcile_preview_handoff(
+            &mut preview_blocks,
+            &mut previewed,
+            &replacement,
+            ChangeDirection::Apply,
+        );
+        let PreviewHandoffAction::Render { reverted } = action else {
+            panic!("replacement must be rendered");
+        };
+        assert_eq!(reverted.len(), 1);
+        assert_eq!(reverted[0].0, preview_record.block);
+        assert_eq!(observation_key(&reverted[0].1), observation_key(&preview));
+        assert!(previewed.is_empty());
+        assert!(preview_blocks.is_empty());
     }
 
     #[test]
