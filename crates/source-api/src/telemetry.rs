@@ -154,6 +154,18 @@ struct SupervisorRecord {
     updated: Instant,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct PeerOriginRecord {
+    candidates_admitted: u64,
+    sessions_established: u64,
+    body_serving: u64,
+    headers_only: u64,
+    lagging: u64,
+    rejected: u64,
+    timed_out: u64,
+    qualification_elapsed_milliseconds: u64,
+}
+
 #[derive(Debug)]
 struct NetworkTelemetryInner {
     next_id: AtomicU64,
@@ -171,6 +183,7 @@ struct NetworkTelemetryInner {
     max_outbound_peer_slots: AtomicU64,
     max_concurrent_dials: AtomicU64,
     disconnect_reasons: RwLock<BTreeMap<NetworkDisconnectReason, u64>>,
+    peer_origins: RwLock<BTreeMap<NetworkPeerOrigin, PeerOriginRecord>>,
     sessions: RwLock<BTreeMap<u64, SessionRecord>>,
     inactive_order: RwLock<VecDeque<u64>>,
     supervisor: RwLock<SupervisorRecord>,
@@ -201,6 +214,7 @@ impl Default for NetworkTelemetry {
                 max_outbound_peer_slots: AtomicU64::new(0),
                 max_concurrent_dials: AtomicU64::new(0),
                 disconnect_reasons: RwLock::new(BTreeMap::new()),
+                peer_origins: RwLock::new(BTreeMap::new()),
                 sessions: RwLock::new(BTreeMap::new()),
                 inactive_order: RwLock::new(VecDeque::new()),
                 supervisor: RwLock::new(SupervisorRecord {
@@ -348,6 +362,54 @@ impl NetworkTelemetry {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Record one unique peer candidate admitted to the network manager.
+    pub fn peer_candidate_admitted(&self, origin: NetworkPeerOrigin) {
+        let mut origins = write_lock(&self.inner.peer_origins);
+        let record = origins.entry(origin).or_default();
+        record.candidates_admitted = record.candidates_admitted.saturating_add(1);
+    }
+
+    /// Attribute an active peer session to its first known candidate origin.
+    pub fn peer_session_established_from(&self, origin: NetworkPeerOrigin) {
+        self.peer_session_established();
+        let mut origins = write_lock(&self.inner.peer_origins);
+        let record = origins.entry(origin).or_default();
+        record.sessions_established = record.sessions_established.saturating_add(1);
+    }
+
+    /// Record the material-serving qualification reached by one peer.
+    pub fn peer_qualified(
+        &self,
+        origin: NetworkPeerOrigin,
+        outcome: NetworkPeerQualification,
+        elapsed: Option<Duration>,
+    ) {
+        let mut origins = write_lock(&self.inner.peer_origins);
+        let record = origins.entry(origin).or_default();
+        match outcome {
+            NetworkPeerQualification::BodyServing => {
+                record.body_serving = record.body_serving.saturating_add(1);
+            }
+            NetworkPeerQualification::HeadersOnly => {
+                record.headers_only = record.headers_only.saturating_add(1);
+            }
+            NetworkPeerQualification::Lagging => {
+                record.lagging = record.lagging.saturating_add(1);
+            }
+            NetworkPeerQualification::Rejected => {
+                record.rejected = record.rejected.saturating_add(1);
+            }
+            NetworkPeerQualification::TimedOut => {
+                record.timed_out = record.timed_out.saturating_add(1);
+            }
+        }
+        if let Some(elapsed) = elapsed {
+            record.qualification_elapsed_milliseconds = record
+                .qualification_elapsed_milliseconds
+                .saturating_add(u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX));
+        }
+    }
+
     /// Record a closed execution peer session by its protocol-level reason.
     pub fn peer_session_closed(&self, reason: NetworkDisconnectReason) {
         self.inner
@@ -400,6 +462,22 @@ impl NetworkTelemetry {
                 count: *count,
             })
             .collect();
+        let peer_origins = read_lock(&self.inner.peer_origins)
+            .iter()
+            .map(|(origin, record)| NetworkPeerOriginSnapshot {
+                origin: *origin,
+                candidates_admitted: record.candidates_admitted,
+                sessions_established: record.sessions_established,
+                qualifications: NetworkPeerQualificationSnapshot {
+                    body_serving: record.body_serving,
+                    headers_only: record.headers_only,
+                    lagging: record.lagging,
+                    rejected: record.rejected,
+                    timed_out: record.timed_out,
+                    elapsed_milliseconds: record.qualification_elapsed_milliseconds,
+                },
+            })
+            .collect();
         let retry_in_seconds = supervisor.retry_at.map(|retry_at| {
             let remaining = retry_at.saturating_duration_since(Instant::now());
             remaining
@@ -433,6 +511,7 @@ impl NetworkTelemetry {
                 disconnected: self.inner.peer_sessions_closed.load(Ordering::Relaxed),
                 disconnect_reasons,
             },
+            peer_origins,
             supervisor: NetworkSupervisorSnapshot {
                 state: supervisor.state,
                 failures: supervisor.failures,
@@ -568,8 +647,84 @@ pub struct NetworkTelemetrySnapshot {
     pub peer_targets: NetworkPeerTargetsSnapshot,
     pub requests: NetworkRequestSnapshot,
     pub peer_lifecycle: NetworkPeerLifecycleSnapshot,
+    /// Candidate, session, and capability outcomes grouped by startup origin.
+    pub peer_origins: Vec<NetworkPeerOriginSnapshot>,
     pub supervisor: NetworkSupervisorSnapshot,
     pub sessions: Vec<NetworkSessionSnapshot>,
+}
+
+/// How a peer candidate first entered this process's network manager.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NetworkPeerOrigin {
+    CachedHot,
+    CachedBroad,
+    DnsTree,
+    Discv4Crawler,
+    Trusted,
+    /// Reth's built-in Discv4 or Discv5 service discovered the peer without it
+    /// first passing through Leani's explicit candidate admission path.
+    Discv4Or5,
+}
+
+impl NetworkPeerOrigin {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::CachedHot => "cached_hot",
+            Self::CachedBroad => "cached_broad",
+            Self::DnsTree => "dns_tree",
+            Self::Discv4Crawler => "discv4_crawler",
+            Self::Trusted => "trusted",
+            Self::Discv4Or5 => "discv4_or_5",
+        }
+    }
+}
+
+/// Result of testing a connected execution peer against verified material.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NetworkPeerQualification {
+    BodyServing,
+    HeadersOnly,
+    Lagging,
+    Rejected,
+    TimedOut,
+}
+
+impl NetworkPeerQualification {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::BodyServing => "body_serving",
+            Self::HeadersOnly => "headers_only",
+            Self::Lagging => "lagging",
+            Self::Rejected => "rejected",
+            Self::TimedOut => "timed_out",
+        }
+    }
+}
+
+/// Identity-free startup and qualification counters for one peer origin.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NetworkPeerOriginSnapshot {
+    pub origin: NetworkPeerOrigin,
+    pub candidates_admitted: u64,
+    pub sessions_established: u64,
+    pub qualifications: NetworkPeerQualificationSnapshot,
+}
+
+/// Cumulative qualification outcomes and their total admission-to-result time.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NetworkPeerQualificationSnapshot {
+    pub body_serving: u64,
+    pub headers_only: u64,
+    pub lagging: u64,
+    pub rejected: u64,
+    pub timed_out: u64,
+    pub elapsed_milliseconds: u64,
 }
 
 /// Configured execution peer-pool thresholds.
@@ -675,6 +830,13 @@ mod tests {
         telemetry.request_timed_out();
         telemetry.peer_session_established();
         telemetry.peer_session_established();
+        telemetry.peer_candidate_admitted(NetworkPeerOrigin::CachedHot);
+        telemetry.peer_session_established_from(NetworkPeerOrigin::CachedHot);
+        telemetry.peer_qualified(
+            NetworkPeerOrigin::CachedHot,
+            NetworkPeerQualification::BodyServing,
+            Some(Duration::from_millis(12)),
+        );
         telemetry.peer_session_closed(NetworkDisconnectReason::TooManyPeers);
         telemetry.peer_session_closed(NetworkDisconnectReason::ConnectionClosed);
         let session = telemetry.register(NetworkLane::History);
@@ -713,7 +875,7 @@ mod tests {
                 max_concurrent_dials: 30,
             }
         );
-        assert_eq!(active.peer_lifecycle.established, 2);
+        assert_eq!(active.peer_lifecycle.established, 3);
         assert_eq!(active.peer_lifecycle.disconnected, 2);
         assert_eq!(
             active.peer_lifecycle.disconnect_reasons,
@@ -729,6 +891,22 @@ mod tests {
             ]
         );
         assert_eq!(active.sessions[0].phase, NetworkPhase::FetchingReceipts);
+        assert_eq!(
+            active.peer_origins,
+            vec![NetworkPeerOriginSnapshot {
+                origin: NetworkPeerOrigin::CachedHot,
+                candidates_admitted: 1,
+                sessions_established: 1,
+                qualifications: NetworkPeerQualificationSnapshot {
+                    body_serving: 1,
+                    headers_only: 0,
+                    lagging: 0,
+                    rejected: 0,
+                    timed_out: 0,
+                    elapsed_milliseconds: 12,
+                },
+            }]
+        );
         assert_eq!(active.sessions[0].observed_head_block, Some(19));
         assert_eq!(active.sessions[0].from_block, Some(10));
 

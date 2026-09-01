@@ -515,8 +515,14 @@ Leani consumes isolated networking crates from Reth 2.4.1 rather than
 forking SHiNode or running a complete execution client. One manager persists
 for the process lifetime, uses a stable key in the data directory, shares a
 bounded peer cache across live/history work, enables Discv4, Discv5, and DNS
-discovery, and multiplexes at most four bounded material requests per connected
-peer under one global, live-priority admission gate. Body and receipt requests
+discovery, and hedges warm startup across cached and newly discovered peers.
+Only the most recent capability-proven, currently viable body servers are
+dialed immediately; the broader cache is admitted in refill-paced batches so
+stale records cannot monopolize the first dial window. Cache refreshes merge
+the current Reth view into that bounded discovery set, so a short failed run
+cannot erase the next run's alternatives. Leani multiplexes at most four
+bounded material requests per connected peer under one global, live-priority
+admission gate. Body and receipt requests
 start at an evidence-backed eight-block ceiling, shrink independently after a
 partial/failed response, and grow again only after sustained success. Finalized
 P2P history is a protocol-verified, operator-bounded fallback after retained

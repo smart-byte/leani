@@ -19,6 +19,8 @@ pub use contract::{
 pub use planner::{PlanError, SelectionPolicy, coverage_gaps, select_source};
 pub use telemetry::{
     NetworkDisconnectReason, NetworkDisconnectSnapshot, NetworkLane, NetworkPeerLifecycleSnapshot,
-    NetworkPeerTargetsSnapshot, NetworkPhase, NetworkSessionSnapshot, NetworkSessionTelemetry,
-    NetworkSupervisorSnapshot, NetworkSupervisorState, NetworkTelemetry, NetworkTelemetrySnapshot,
+    NetworkPeerOrigin, NetworkPeerOriginSnapshot, NetworkPeerQualification,
+    NetworkPeerQualificationSnapshot, NetworkPeerTargetsSnapshot, NetworkPhase,
+    NetworkSessionSnapshot, NetworkSessionTelemetry, NetworkSupervisorSnapshot,
+    NetworkSupervisorState, NetworkTelemetry, NetworkTelemetrySnapshot,
 };

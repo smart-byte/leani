@@ -12,7 +12,7 @@ use std::{
     fs::OpenOptions,
     future::Future,
     io::Write as _,
-    net::{Ipv4Addr, SocketAddr, SocketAddrV4},
+    net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4},
     num::NonZeroUsize,
     path::{Path, PathBuf},
     sync::{
@@ -42,9 +42,10 @@ use leani_primitives::{
 };
 use leani_source_api::{
     BlockFrameStream, ChainEvent, ChainEventStream, DataRequest, FinalityModel, HistorySource,
-    LiveSource, LiveStart, NetworkDisconnectReason, NetworkLane, NetworkPhase,
-    NetworkSessionTelemetry, NetworkTelemetry, NetworkTelemetrySnapshot, Partitioning,
-    SourceAcquisitionMetrics, SourceBudget, SourceChunk, SourceDescriptor, SourceError, SourcePlan,
+    LiveSource, LiveStart, NetworkDisconnectReason, NetworkLane, NetworkPeerOrigin,
+    NetworkPeerQualification, NetworkPhase, NetworkSessionTelemetry, NetworkTelemetry,
+    NetworkTelemetrySnapshot, Partitioning, SourceAcquisitionMetrics, SourceBudget, SourceChunk,
+    SourceDescriptor, SourceError, SourcePlan,
 };
 use reth_chainspec::MAINNET;
 use reth_discv4::{DiscoveryUpdate, Discv4, Discv4Config};
@@ -254,8 +255,9 @@ pub struct RethP2pConfig {
     /// Stable secp256k1 node identity. When omitted while a peer cache is
     /// configured, a sibling `execution-p2p-secret` file is used.
     pub secret_key_path: Option<PathBuf>,
-    /// Maximum retained peer records after every authoritative Reth cache
-    /// refresh. This prevents stale discovery results from growing forever.
+    /// Maximum retained peer records after merging Reth's current view with
+    /// the broader discovery cache. This bounds growth without letting one
+    /// short or failed run erase candidates needed by the next startup.
     pub peer_cache_max_entries: usize,
     pub peer_cache_flush_interval: Duration,
     pub poll_interval: Duration,
@@ -879,6 +881,65 @@ enum PeerQualification {
     TimedOut,
 }
 
+impl From<PeerQualification> for NetworkPeerQualification {
+    fn from(value: PeerQualification) -> Self {
+        match value {
+            PeerQualification::BodyServing => Self::BodyServing,
+            PeerQualification::HeadersOnly => Self::HeadersOnly,
+            PeerQualification::Lagging => Self::Lagging,
+            PeerQualification::Rejected => Self::Rejected,
+            PeerQualification::TimedOut => Self::TimedOut,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PeerCandidateAdmission {
+    origin: NetworkPeerOrigin,
+    admitted_at: Instant,
+}
+
+#[derive(Debug, Default)]
+struct PeerCandidateRegistry {
+    admissions: Mutex<HashMap<B512, PeerCandidateAdmission>>,
+}
+
+impl PeerCandidateRegistry {
+    fn admit(&self, peer_id: B512, origin: NetworkPeerOrigin) -> bool {
+        let mut admissions = self
+            .admissions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if admissions.contains_key(&peer_id) {
+            return false;
+        }
+        admissions.insert(
+            peer_id,
+            PeerCandidateAdmission {
+                origin,
+                admitted_at: Instant::now(),
+            },
+        );
+        true
+    }
+
+    fn origin(&self, peer_id: B512) -> NetworkPeerOrigin {
+        self.admissions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&peer_id)
+            .map_or(NetworkPeerOrigin::Discv4Or5, |admission| admission.origin)
+    }
+
+    fn qualification_elapsed(&self, peer_id: B512) -> Option<Duration> {
+        self.admissions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&peer_id)
+            .map(|admission| admission.admitted_at.elapsed())
+    }
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct PeerQualityEvidence {
@@ -1022,6 +1083,22 @@ impl PeerQualityStore {
             .map_or_else(PeerQualityRank::default, PeerQualityRank::from)
     }
 
+    fn is_available_body_server(&self, peer_id: B512) -> bool {
+        let document = self
+            .document
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(evidence) = document.peers.get(&peer_quality_key(peer_id)) else {
+            return false;
+        };
+        let Some(body_success) = evidence.last_body_success_unix_ms else {
+            return false;
+        };
+        evidence
+            .last_failure_unix_ms
+            .is_none_or(|failure| failure < body_success)
+    }
+
     fn persist(&self, maximum_entries: usize) -> Result<(), String> {
         let Some(path) = self.path.as_deref() else {
             return Ok(());
@@ -1073,11 +1150,12 @@ impl PeerQualityStore {
 #[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
 struct PeerQualityRank {
     body_serving: bool,
+    available_after_last_failure: bool,
+    last_body_success_unix_ms: u64,
     receipt_serving: bool,
-    highest_served_block: u64,
     last_material_success_unix_ms: u64,
+    highest_served_block: u64,
     inverse_latency_ms: std::cmp::Reverse<u64>,
-    no_recent_failure: bool,
 }
 
 impl From<&PeerQualityEvidence> for PeerQualityRank {
@@ -1091,13 +1169,14 @@ impl From<&PeerQualityEvidence> for PeerQualityRank {
             .unwrap_or_default();
         Self {
             body_serving: evidence.last_body_success_unix_ms.is_some(),
-            receipt_serving: evidence.last_receipt_success_unix_ms.is_some(),
-            highest_served_block: evidence.highest_served_block.unwrap_or_default(),
-            last_material_success_unix_ms,
-            inverse_latency_ms: std::cmp::Reverse(evidence.response_latency_ms.unwrap_or(u64::MAX)),
-            no_recent_failure: evidence
+            available_after_last_failure: evidence
                 .last_failure_unix_ms
                 .is_none_or(|failure| failure < last_material_success_unix_ms),
+            last_body_success_unix_ms: evidence.last_body_success_unix_ms.unwrap_or_default(),
+            receipt_serving: evidence.last_receipt_success_unix_ms.is_some(),
+            last_material_success_unix_ms,
+            highest_served_block: evidence.highest_served_block.unwrap_or_default(),
+            inverse_latency_ms: std::cmp::Reverse(evidence.response_latency_ms.unwrap_or(u64::MAX)),
         }
     }
 }
@@ -2261,6 +2340,7 @@ fn spawn_peer_qualification_worker(
     direct_peers: Arc<DirectPeerPool>,
     qualifications: Arc<PeerQualificationPool>,
     quality: Arc<PeerQualityStore>,
+    peer_candidates: Arc<PeerCandidateRegistry>,
     handle: NetworkHandle<EthNetworkPrimitives>,
     network_telemetry: NetworkTelemetry,
     mut target_updates: tokio::sync::watch::Receiver<BlockRef>,
@@ -2372,6 +2452,11 @@ fn spawn_peer_qualification_worker(
                         result.peer_id,
                         result.outcome,
                         result.detail.as_deref(),
+                    );
+                    network_telemetry.peer_qualified(
+                        peer_candidates.origin(result.peer_id),
+                        result.outcome.into(),
+                        peer_candidates.qualification_elapsed(result.peer_id),
                     );
                     qualifications.record(target, result.peer_id, result.outcome);
                     direct_peers.set_qualification(result.peer_id, result.outcome);
@@ -2494,6 +2579,43 @@ struct DnsPeerSeederRuntime {
     dns_head: Head,
     bootstrap_dns_tree: Option<String>,
     bootstrap_records: Vec<NodeRecord>,
+    peer_candidates: Arc<PeerCandidateRegistry>,
+    network_telemetry: NetworkTelemetry,
+}
+
+fn spawn_cached_peer_admitter(
+    handle: NetworkHandle<EthNetworkPrimitives>,
+    records: Vec<NodeRecord>,
+    batch_size: usize,
+    interval: Duration,
+    peer_candidates: Arc<PeerCandidateRegistry>,
+    network_telemetry: NetworkTelemetry,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut records = records.into_iter();
+        let mut admission_tick =
+            tokio::time::interval_at(tokio::time::Instant::now() + interval, interval);
+        admission_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            admission_tick.tick().await;
+            let mut admitted = 0_usize;
+            for _ in 0..batch_size {
+                let Some(record) = records.next() else {
+                    debug!("finished staged admission of broad cached execution peers");
+                    return;
+                };
+                admit_node_record_to_network(
+                    &handle,
+                    record,
+                    NetworkPeerOrigin::CachedBroad,
+                    &peer_candidates,
+                    &network_telemetry,
+                );
+                admitted = admitted.saturating_add(1);
+            }
+            trace!(admitted, "admitted a broad cached execution-peer batch");
+        }
+    })
 }
 
 #[expect(
@@ -2509,19 +2631,14 @@ fn spawn_mainnet_dns_peer_seeder(
             dns_head,
             bootstrap_dns_tree,
             bootstrap_records,
+            peer_candidates,
+            network_telemetry,
         } = runtime;
         // Reth owns the single bounded dial queue. It receives terminal TCP and
         // handshake failures directly, immediately refills freed slots with
         // fresh candidates, and applies its per-peer backoff policy. Keeping a
         // second Leani-side pending/cooldown queue here delays that feedback
         // and can submit duplicate attempts.
-        for record in &bootstrap_records {
-            add_node_record_to_network(&handle, *record);
-        }
-        debug!(
-            cached_candidates = bootstrap_records.len(),
-            "submitted quality-ranked cached execution peers to Reth's dialer"
-        );
         let resolver = match SegmentJoiningDnsResolver::from_system_conf() {
             Ok(resolver) => resolver,
             Err(error) => {
@@ -2631,7 +2748,13 @@ fn spawn_mainnet_dns_peer_seeder(
                         continue;
                     }
                     let record = update.node_record;
-                    add_node_record_to_network(&handle, record);
+                    admit_node_record_to_network(
+                        &handle,
+                        record,
+                        NetworkPeerOrigin::DnsTree,
+                        &peer_candidates,
+                        &network_telemetry,
+                    );
                     if crawler_seed_count < MAINNET_DNS_DISCV4_BOOTSTRAP_PEERS {
                         crawler.add_boot_node(record);
                         crawler_seed_count = crawler_seed_count.saturating_add(1);
@@ -2658,7 +2781,13 @@ fn spawn_mainnet_dns_peer_seeder(
                                 if fork_filter.validate(fork_id).is_err() {
                                     continue;
                                 }
-                                add_node_record_to_network(&handle, record);
+                                admit_node_record_to_network(
+                                    &handle,
+                                    record,
+                                    NetworkPeerOrigin::Discv4Crawler,
+                                    &peer_candidates,
+                                    &network_telemetry,
+                                );
                                 if crawler_discovered.insert(record.id) {
                                     let discovered_peers = crawler_discovered.len();
                                     if discovered_peers == 1 || discovered_peers.is_multiple_of(25) {
@@ -2685,6 +2814,21 @@ fn add_node_record_to_network(handle: &NetworkHandle<EthNetworkPrimitives>, reco
     let tcp_addr = SocketAddr::new(record.address, record.tcp_port);
     let udp_addr = SocketAddr::new(record.address, record.udp_port);
     handle.add_peer_kind(record.id, None, tcp_addr, Some(udp_addr));
+}
+
+fn admit_node_record_to_network(
+    handle: &NetworkHandle<EthNetworkPrimitives>,
+    record: NodeRecord,
+    origin: NetworkPeerOrigin,
+    peer_candidates: &PeerCandidateRegistry,
+    network_telemetry: &NetworkTelemetry,
+) {
+    if peer_candidates.admit(record.id, origin) {
+        network_telemetry.peer_candidate_admitted(origin);
+    }
+    // Re-submit rediscovered identities as their advertised address may have
+    // changed since the first admission.
+    add_node_record_to_network(handle, record);
 }
 
 fn connect_node_record(handle: &NetworkHandle<EthNetworkPrimitives>, record: NodeRecord) {
@@ -2752,9 +2896,10 @@ where
             peer_recovery_timeout,
             dns_head,
             direct_peers,
-            max_concurrent_dials,
+            trusted_peer_ids,
+            peer_refill_interval,
             bootstrap_dns_tree,
-            bootstrap_records,
+            cached_records,
             peer_quality,
             qualifications,
             qualification_target,
@@ -2767,27 +2912,53 @@ where
             shutdown,
         } = runtime;
         let mut manager = Box::pin(manager);
-        let warm_start_records = bootstrap_records
-            .iter()
-            .take(max_concurrent_dials)
-            .copied()
-            .collect::<Vec<_>>();
-        for record in &warm_start_records {
-            add_node_record_to_network(manager.as_ref().get_ref().handle(), *record);
+        let peer_candidates = Arc::new(PeerCandidateRegistry::default());
+        for peer_id in trusted_peer_ids {
+            if peer_candidates.admit(peer_id, NetworkPeerOrigin::Trusted) {
+                network_telemetry.peer_candidate_admitted(NetworkPeerOrigin::Trusted);
+            }
+        }
+        let CachedPeerRecords { hot, broad } = cached_records;
+        let mut crawler_bootstrap_records = hot.clone();
+        crawler_bootstrap_records.extend(broad.iter().copied());
+        for record in &hot {
+            admit_node_record_to_network(
+                manager.as_ref().get_ref().handle(),
+                *record,
+                NetworkPeerOrigin::CachedHot,
+                &peer_candidates,
+                &network_telemetry,
+            );
             connect_node_record(manager.as_ref().get_ref().handle(), *record);
         }
+        debug!(
+            hot_candidates = hot.len(),
+            broad_candidates = broad.len(),
+            "started hedged execution-peer cache admission"
+        );
+        let cached_peer_admitter = spawn_cached_peer_admitter(
+            manager.as_ref().get_ref().handle().clone(),
+            broad,
+            body_serving_peer_target,
+            peer_refill_interval,
+            peer_candidates.clone(),
+            network_telemetry.clone(),
+        );
         let dns_peer_seeder = spawn_mainnet_dns_peer_seeder(
             manager.as_ref().get_ref().handle().clone(),
             DnsPeerSeederRuntime {
                 dns_head,
                 bootstrap_dns_tree,
-                bootstrap_records,
+                bootstrap_records: crawler_bootstrap_records,
+                peer_candidates: peer_candidates.clone(),
+                network_telemetry: network_telemetry.clone(),
             },
         );
         let qualification_worker = spawn_peer_qualification_worker(
             direct_peers.clone(),
             qualifications.clone(),
             peer_quality.clone(),
+            peer_candidates.clone(),
             manager.as_ref().get_ref().handle().clone(),
             network_telemetry.clone(),
             qualification_target,
@@ -2848,7 +3019,9 @@ where
                 event = network_events.next(), if network_events_open => {
                     match event {
                         Some(NetworkEvent::ActivePeerSession { info, messages }) => {
-                            network_telemetry.peer_session_established();
+                            network_telemetry.peer_session_established_from(
+                                peer_candidates.origin(info.peer_id),
+                            );
                             direct_peers.insert(DirectPeer {
                                 peer_id: info.peer_id,
                                 eth_version: info.version,
@@ -2936,6 +3109,8 @@ where
         }
         dns_peer_seeder.abort();
         let _ = dns_peer_seeder.await;
+        cached_peer_admitter.abort();
+        let _ = cached_peer_admitter.await;
         qualification_worker.abort();
         let _ = qualification_worker.await;
         direct_peers.clear();
@@ -2966,9 +3141,10 @@ struct NetworkManagerRuntime {
     peer_recovery_timeout: Duration,
     dns_head: Head,
     direct_peers: Arc<DirectPeerPool>,
-    max_concurrent_dials: usize,
+    trusted_peer_ids: Vec<B512>,
+    peer_refill_interval: Duration,
     bootstrap_dns_tree: Option<String>,
-    bootstrap_records: Vec<NodeRecord>,
+    cached_records: CachedPeerRecords,
     peer_quality: Arc<PeerQualityStore>,
     qualifications: Arc<PeerQualificationPool>,
     qualification_target: tokio::sync::watch::Receiver<BlockRef>,
@@ -3027,7 +3203,9 @@ fn write_peer_cache_atomically(
         let _ = std::fs::remove_file(&temporary);
         return Err(error.to_string());
     }
-    if let Err(error) = compact_peer_cache_file(&temporary, maximum_entries, quality) {
+    if let Err(error) =
+        merge_and_compact_peer_cache_file(&temporary, path, maximum_entries, quality)
+    {
         let _ = std::fs::remove_file(&temporary);
         return Err(error);
     }
@@ -3063,16 +3241,24 @@ fn compact_existing_peer_cache(
     std::fs::rename(&temporary, path).map_err(|error| error.to_string())
 }
 
-fn compact_peer_cache_file(
-    path: &Path,
+fn merge_and_compact_peer_cache_file(
+    current_path: &Path,
+    previous_path: &Path,
     maximum_entries: usize,
     quality: &PeerQualityStore,
 ) -> Result<(), String> {
-    let encoded = std::fs::read(path).map_err(|error| error.to_string())?;
-    let entries = parse_peer_cache_entries(&encoded)?;
+    let encoded = std::fs::read(current_path).map_err(|error| error.to_string())?;
+    let mut entries = match std::fs::read(previous_path) {
+        Ok(previous) => parse_peer_cache_entries(&previous).unwrap_or_default(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(_) => Vec::new(),
+    };
+    // Current Reth metadata wins for identities present in both sets. Peers
+    // absent from a short or failed session remain available to later runs.
+    entries.extend(parse_peer_cache_entries(&encoded)?);
     let compacted = compact_peer_cache_entries(entries, maximum_entries, quality);
     let encoded = serde_json::to_vec_pretty(&compacted).map_err(|error| error.to_string())?;
-    std::fs::write(path, encoded).map_err(|error| error.to_string())
+    std::fs::write(current_path, encoded).map_err(|error| error.to_string())
 }
 
 fn compact_peer_cache_entries(
@@ -3102,10 +3288,7 @@ fn peer_cache_priority(
         .get("fork_id")
         .or_else(|| entry.get("forkId"))
         .is_some_and(|value| !value.is_null());
-    let reputation = entry
-        .get("reputation")
-        .and_then(serde_json::Value::as_i64)
-        .unwrap_or_default();
+    let reputation = peer_cache_reputation(entry);
     let quality = entry
         .get("record")
         .and_then(serde_json::Value::as_str)
@@ -3120,30 +3303,108 @@ fn peer_cache_priority(
     )
 }
 
+fn peer_cache_reputation(entry: &serde_json::Value) -> i64 {
+    entry
+        .get("reputation")
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or_default()
+}
+
+#[derive(Debug, Default)]
+struct CachedPeerRecords {
+    hot: Vec<NodeRecord>,
+    broad: Vec<NodeRecord>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum PeerSubnet {
+    Ipv4([u8; 2]),
+    Ipv6([u8; 4]),
+}
+
+fn peer_subnet(address: IpAddr) -> PeerSubnet {
+    match address {
+        IpAddr::V4(address) => {
+            let octets = address.octets();
+            PeerSubnet::Ipv4([octets[0], octets[1]])
+        }
+        IpAddr::V6(address) => {
+            let octets = address.octets();
+            PeerSubnet::Ipv6([octets[0], octets[1], octets[2], octets[3]])
+        }
+    }
+}
+
 fn prioritized_peer_cache_records(
     path: Option<&Path>,
     quality: &PeerQualityStore,
     maximum_entries: usize,
-) -> Vec<NodeRecord> {
+    hot_limit: usize,
+) -> CachedPeerRecords {
     let Some(path) = path else {
-        return Vec::new();
+        return CachedPeerRecords::default();
     };
     let Ok(encoded) = std::fs::read(path) else {
-        return Vec::new();
+        return CachedPeerRecords::default();
     };
     let Ok(mut entries) = parse_peer_cache_entries(&encoded) else {
-        return Vec::new();
+        return CachedPeerRecords::default();
     };
     entries.sort_by(|(left_record, left), (right_record, right)| {
         peer_cache_priority(right, quality)
             .cmp(&peer_cache_priority(left, quality))
             .then_with(|| left_record.cmp(right_record))
     });
-    entries
+    let mut seen = HashSet::new();
+    let records = entries
         .into_iter()
         .take(maximum_entries)
-        .filter_map(|(record, _)| record.parse::<NodeRecord>().ok())
-        .collect()
+        .filter_map(|(record, entry)| {
+            record
+                .parse::<NodeRecord>()
+                .ok()
+                .map(|record| (record, peer_cache_reputation(&entry)))
+        })
+        .filter(|(record, _)| seen.insert(record.id))
+        .collect::<Vec<_>>();
+
+    // The immediate-dial tier contains only peers that served a verified body
+    // after their most recent recorded failure. Select distinct /16 (IPv4) or
+    // /32 (IPv6) networks first so one operator cannot occupy the whole hedge.
+    let eligible = records
+        .iter()
+        .copied()
+        .filter(|(record, reputation)| {
+            *reputation >= 0 && quality.is_available_body_server(record.id)
+        })
+        .map(|(record, _)| record)
+        .collect::<Vec<_>>();
+    let mut hot = Vec::with_capacity(hot_limit.min(eligible.len()));
+    let mut hot_ids = HashSet::new();
+    let mut subnets = HashSet::new();
+    for record in &eligible {
+        if hot.len() >= hot_limit {
+            break;
+        }
+        if subnets.insert(peer_subnet(record.address)) {
+            hot.push(*record);
+            hot_ids.insert(record.id);
+        }
+    }
+    for record in eligible {
+        if hot.len() >= hot_limit {
+            break;
+        }
+        if hot_ids.insert(record.id) {
+            hot.push(record);
+        }
+    }
+    let broad = records
+        .into_iter()
+        .map(|(record, _)| record)
+        .filter(|record| !hot_ids.contains(&record.id))
+        .collect();
+    CachedPeerRecords { hot, broad }
 }
 
 fn parse_peer_cache_entries(encoded: &[u8]) -> Result<Vec<(String, serde_json::Value)>, String> {
@@ -3856,29 +4117,15 @@ impl RethP2pSource {
                 "ignoring peer-cache compaction failure before network startup"
             );
         }
-        let peers = PeersConfig::default()
+        // Cached peers are admitted through the two-tier startup policy after
+        // the manager is built. Loading this file through Reth as well would
+        // enqueue the entire broad cache immediately and defeat the fresh-peer
+        // hedge.
+        PeersConfig::default()
             .with_max_outbound(self.config.max_outbound_peers)
             .with_max_concurrent_dials(self.config.max_concurrent_dials)
             .with_refill_slots_interval(self.config.peer_refill_interval)
-            .with_trusted_nodes(self.config.trusted_peers.clone());
-        match peers
-            .clone()
-            .with_basic_nodes_from_file(self.config.peer_cache_path.as_deref())
-        {
-            Ok(peers) => peers,
-            Err(error) => {
-                warn!(
-                    path = %self
-                        .config
-                        .peer_cache_path
-                        .as_deref()
-                        .map_or_else(|| "<disabled>".to_owned(), |path| path.display().to_string()),
-                    %error,
-                    "ignoring unreadable execution peer cache"
-                );
-                peers
-            }
-        }
+            .with_trusted_nodes(self.config.trusted_peers.clone())
     }
 
     async fn connect(
@@ -4021,10 +4268,13 @@ impl RethP2pSource {
         self.network.qualifications.set_target(advertised);
         let (qualification_target, qualification_updates) = tokio::sync::watch::channel(advertised);
         let (cache_flush, cache_flush_requests) = tokio::sync::mpsc::channel(1);
-        let bootstrap_records = prioritized_peer_cache_records(
+        let cached_records = prioritized_peer_cache_records(
             self.config.peer_cache_path.as_deref(),
             &self.network.peer_quality,
             self.config.peer_cache_max_entries,
+            self.config
+                .body_serving_peer_target
+                .min(self.config.max_concurrent_dials),
         );
         let network_task = spawn_network_manager(
             manager,
@@ -4038,9 +4288,15 @@ impl RethP2pSource {
                 peer_recovery_timeout: self.config.peer_recovery_timeout,
                 dns_head: advertised_head,
                 direct_peers: self.network.direct_peers.clone(),
-                max_concurrent_dials: self.config.max_concurrent_dials,
+                trusted_peer_ids: self
+                    .config
+                    .trusted_peers
+                    .iter()
+                    .map(|peer| peer.id)
+                    .collect(),
+                peer_refill_interval: self.config.peer_refill_interval,
                 bootstrap_dns_tree: self.config.bootstrap_dns_tree.clone(),
-                bootstrap_records,
+                cached_records,
                 peer_quality: self.network.peer_quality.clone(),
                 qualifications: self.network.qualifications.clone(),
                 qualification_target: qualification_updates,
@@ -9628,12 +9884,13 @@ mod tests {
     }
 
     fn node_record(marker: u8) -> NodeRecord {
+        node_record_at(marker, Ipv4Addr::LOCALHOST)
+    }
+
+    fn node_record_at(marker: u8, address: Ipv4Addr) -> NodeRecord {
         let secret = SecretKey::from_slice(&[marker; 32]).expect("valid test secret");
         NodeRecord::from_secret_key(
-            SocketAddr::V4(SocketAddrV4::new(
-                Ipv4Addr::LOCALHOST,
-                30_300 + u16::from(marker),
-            )),
+            SocketAddr::V4(SocketAddrV4::new(address, 30_300 + u16::from(marker))),
             &secret,
         )
     }
@@ -10829,6 +11086,101 @@ mod tests {
             compacted
                 .iter()
                 .all(|entry| entry["record"] != "enode://stale")
+        );
+    }
+
+    #[test]
+    fn peer_cache_hot_tier_requires_current_body_service_and_subnet_diversity() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("execution-peers.json");
+        let first = node_record_at(1, Ipv4Addr::new(10, 1, 1, 1));
+        let same_subnet = node_record_at(2, Ipv4Addr::new(10, 1, 2, 2));
+        let diverse = node_record_at(3, Ipv4Addr::new(10, 2, 1, 1));
+        let failed = node_record_at(4, Ipv4Addr::new(10, 3, 1, 1));
+        let negative_reputation = node_record_at(5, Ipv4Addr::new(10, 4, 1, 1));
+        let entries = [
+            &first,
+            &same_subnet,
+            &diverse,
+            &failed,
+            &negative_reputation,
+        ]
+        .into_iter()
+        .map(|record| {
+            serde_json::json!({
+                "record": record.to_string(),
+                "kind": "basic",
+                "reputation": if record.id == negative_reputation.id { -1 } else { 0 },
+            })
+        })
+        .collect::<Vec<_>>();
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&entries).expect("encode peer cache"),
+        )
+        .expect("write peer cache");
+
+        let quality = PeerQualityStore::load(None);
+        for record in [
+            &first,
+            &same_subnet,
+            &diverse,
+            &failed,
+            &negative_reputation,
+        ] {
+            quality.record_success(
+                record.id,
+                PeerMaterialKind::Body,
+                1,
+                Duration::from_millis(10),
+            );
+        }
+        quality.record_failure(failed.id, "session closed");
+
+        let cached = prioritized_peer_cache_records(Some(&path), &quality, 16, 2);
+        assert_eq!(cached.hot.len(), 2);
+        assert_ne!(
+            peer_subnet(cached.hot[0].address),
+            peer_subnet(cached.hot[1].address)
+        );
+        assert!(cached.hot.iter().all(|record| record.id != failed.id));
+        assert!(cached.broad.iter().any(|record| record.id == failed.id));
+        assert!(
+            cached
+                .broad
+                .iter()
+                .any(|record| record.id == negative_reputation.id)
+        );
+        assert_eq!(cached.hot.len() + cached.broad.len(), 5);
+    }
+
+    #[test]
+    fn peer_cache_refresh_retains_broad_records_absent_from_current_session() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let previous = directory.path().join("execution-peers.json");
+        let current = directory.path().join("execution-peers.tmp");
+        std::fs::write(
+            &previous,
+            br#"[{"record":"enode://broad","kind":"basic","reputation":0}]"#,
+        )
+        .expect("write previous peer cache");
+        std::fs::write(
+            &current,
+            br#"[{"record":"enode://current","kind":"basic","reputation":1}]"#,
+        )
+        .expect("write current peer cache");
+
+        merge_and_compact_peer_cache_file(&current, &previous, 16, &PeerQualityStore::load(None))
+            .expect("merge peer caches");
+        let merged = parse_peer_cache_entries(&std::fs::read(current).expect("read merged cache"))
+            .expect("parse merged cache");
+        let records = merged
+            .into_iter()
+            .map(|(record, _)| record)
+            .collect::<HashSet<_>>();
+        assert_eq!(
+            records,
+            HashSet::from(["enode://broad".to_owned(), "enode://current".to_owned()])
         );
     }
 

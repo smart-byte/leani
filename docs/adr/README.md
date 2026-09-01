@@ -31,3 +31,4 @@ Accepted records:
 - [0009 — Native consensus P2P finality](0009-native-consensus-p2p-finality.md)
 - [0010 — Persistent execution P2P and late archive reconciliation](0010-persistent-p2p-and-late-archive-reconciliation.md)
 - [0011 — Process-wide execution P2P manager](0011-process-wide-execution-p2p-manager.md)
+- [0012 — Two-tier execution peer startup](0012-two-tier-execution-peer-startup.md)

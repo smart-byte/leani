@@ -48,6 +48,8 @@ use leani_processor_blobs::{
 };
 use leani_processor_erc20::{BALANCE_CHANGE_KIND, TokenBalanceEntity};
 use leani_processor_uniswap::PoolPriceEntity;
+#[cfg(test)]
+use leani_source_api::{NetworkPeerOrigin, NetworkPeerQualification};
 use leani_source_api::{NetworkTelemetry, NetworkTelemetrySnapshot, coverage_gaps};
 use leani_store_history::{
     RawHistoryIndexPolicy, RawHistoryJob, RawHistoryJobDeletion, RawHistoryMaterialProfile,
@@ -3173,6 +3175,65 @@ fn append_network_peer_lifecycle_metrics(
             "leani_p2p_peer_disconnects_total{{reason=\"{}\"}} {}",
             reason.reason.as_str(),
             reason.count
+        )?;
+    }
+    writeln!(
+        output,
+        "# TYPE leani_p2p_peer_candidates_admitted_total counter"
+    )?;
+    writeln!(
+        output,
+        "# TYPE leani_p2p_peer_sessions_by_origin_total counter"
+    )?;
+    writeln!(output, "# TYPE leani_p2p_peer_qualifications_total counter")?;
+    writeln!(
+        output,
+        "# TYPE leani_p2p_peer_qualification_elapsed_milliseconds_total counter"
+    )?;
+    for origin in &network.peer_origins {
+        let label = origin.origin.as_str();
+        writeln!(
+            output,
+            "leani_p2p_peer_candidates_admitted_total{{origin=\"{label}\"}} {}",
+            origin.candidates_admitted
+        )?;
+        writeln!(
+            output,
+            "leani_p2p_peer_sessions_by_origin_total{{origin=\"{label}\"}} {}",
+            origin.sessions_established
+        )?;
+        for (outcome, count) in [
+            (
+                leani_source_api::NetworkPeerQualification::BodyServing,
+                origin.qualifications.body_serving,
+            ),
+            (
+                leani_source_api::NetworkPeerQualification::HeadersOnly,
+                origin.qualifications.headers_only,
+            ),
+            (
+                leani_source_api::NetworkPeerQualification::Lagging,
+                origin.qualifications.lagging,
+            ),
+            (
+                leani_source_api::NetworkPeerQualification::Rejected,
+                origin.qualifications.rejected,
+            ),
+            (
+                leani_source_api::NetworkPeerQualification::TimedOut,
+                origin.qualifications.timed_out,
+            ),
+        ] {
+            writeln!(
+                output,
+                "leani_p2p_peer_qualifications_total{{origin=\"{label}\",outcome=\"{}\"}} {count}",
+                outcome.as_str()
+            )?;
+        }
+        writeln!(
+            output,
+            "leani_p2p_peer_qualification_elapsed_milliseconds_total{{origin=\"{label}\"}} {}",
+            origin.qualifications.elapsed_milliseconds
         )?;
     }
     Ok(())
@@ -9768,6 +9829,12 @@ mod tests {
         telemetry.request_timed_out();
         telemetry.peer_session_established();
         telemetry.peer_session_established();
+        telemetry.peer_candidate_admitted(NetworkPeerOrigin::CachedHot);
+        telemetry.peer_qualified(
+            NetworkPeerOrigin::CachedHot,
+            NetworkPeerQualification::BodyServing,
+            Some(Duration::from_millis(15)),
+        );
         telemetry.peer_session_closed(NetworkDisconnectReason::TooManyPeers);
         telemetry.supervisor_backoff(
             "hot/cold handoff retained pending deltas",
@@ -9811,6 +9878,11 @@ mod tests {
         assert_eq!(body["network"]["requests"]["queueWaitMilliseconds"], 20);
         assert_eq!(body["network"]["peerLifecycle"]["established"], 2);
         assert_eq!(body["network"]["peerLifecycle"]["disconnected"], 1);
+        assert_eq!(body["network"]["peerOrigins"][0]["origin"], "cached_hot");
+        assert_eq!(
+            body["network"]["peerOrigins"][0]["qualifications"]["bodyServing"],
+            1
+        );
         assert_eq!(
             body["network"]["peerLifecycle"]["disconnectReasons"][0]["reason"],
             "too_many_peers"
@@ -9940,6 +10012,12 @@ mod tests {
         assert!(metrics.contains("leani_p2p_peer_sessions_established_total 2"));
         assert!(metrics.contains("leani_p2p_peer_sessions_disconnected_total 1"));
         assert!(metrics.contains("leani_p2p_peer_disconnects_total{reason=\"too_many_peers\"} 1"));
+        assert!(
+            metrics.contains("leani_p2p_peer_candidates_admitted_total{origin=\"cached_hot\"} 1")
+        );
+        assert!(metrics.contains(
+            "leani_p2p_peer_qualifications_total{origin=\"cached_hot\",outcome=\"body_serving\"} 1"
+        ));
         assert!(metrics.contains(
             "leani_p2p_session_connected_peers{session=\"1\",lane=\"live\",phase=\"fetching_receipts\"} 1"
         ));

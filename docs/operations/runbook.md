@@ -70,9 +70,11 @@ the same state under the `leani_p2p_*` metric prefix.
 
 The execution identity is stored as `execution-p2p-secret` in `data_dir`.
 Treat it as node identity material: keep it across restarts, restrict its
-permissions, and never publish it. `execution-peers.json` is authoritative
-Reth output capped by `sources.live.peer_cache_max_entries`; the first startup
-after upgrading preserves an oversized old cache as
+permissions, and never publish it. `execution-peers.json` is a bounded broad
+discovery cache capped by `sources.live.peer_cache_max_entries`. Refreshes
+merge Reth's current view without dropping candidates absent from one short or
+failed run; quality ordering decides which records survive the bound. The
+first startup after upgrading preserves an oversized old cache as
 `execution-peers.json.pre-compact`.
 
 `execution-peer-quality.json` stores Leani's independently observed service
@@ -82,6 +84,22 @@ compatibility, and latest anchor qualification. Keep it with the peer cache.
 Standalone feeds merge this evidence across sibling local Mainnet contexts,
 so a body- or receipt-serving peer learned by one processor is preferred by
 another without sharing processor data or the local P2P identity secret.
+
+Warm startup uses two cache tiers. A small hot tier contains recent body-serving
+peers whose last verified body success is newer than their last recorded
+failure, with IPv4 `/16` and IPv6 `/32` diversity preferred. Those peers are
+dialed immediately. All other records stay in the broad tier and enter Reth's
+dialer in `body_serving_peer_target`-sized batches at the configured peer refill
+interval. DNS trees, the supplemental Discv4 crawler, and Reth's native
+Discv4/Discv5 discovery run concurrently from the beginning.
+
+`/v1/network/status` groups candidate admissions, established sessions, and
+qualification outcomes by `cached_hot`, `cached_broad`, `dns_tree`,
+`discv4_crawler`, `trusted`, or `discv4_or_5`. Prometheus exports the same origin labels
+through `leani_p2p_peer_candidates_admitted_total`,
+`leani_p2p_peer_sessions_by_origin_total`, and
+`leani_p2p_peer_qualifications_total`. Use these counters when comparing cold
+and warm startup instead of treating cache size as evidence of usefulness.
 
 Every new ETH session is immediately tested against the current independently
 verified execution anchor. Only a peer that returns both the exact header and

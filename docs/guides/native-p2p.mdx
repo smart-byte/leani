@@ -18,7 +18,9 @@ healthy execution peer set cannot assert finalized Ethereum ancestry by itself.
 1. Start from `config/example.toml` and replace the weak-subjectivity checkpoint
    and finalized beacon slot with a recent value obtained independently.
 2. Give the node a durable data directory. Its execution node key and bounded
-   peer cache survive restarts.
+   peer cache survive restarts. Warm startup immediately hedges a small set of
+   recently proven body servers against fresh DNS and Discv discovery, then
+   progressively admits the broader cache.
 3. Expose the configured discovery/listener ports and allow outbound execution
    and consensus traffic.
 4. Run `doctor --json` before `serve`.
