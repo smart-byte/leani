@@ -301,6 +301,11 @@
           "type": "array",
           "items": { "type": "string" }
         },
+        "bootstrap_dns_tree": {
+          "type": "string",
+          "pattern": "^enrtree://",
+          "description": "Optional authenticated EIP-1459 execution peer-hint tree. It affects discovery only; execution material remains protocol-verified locally."
+        },
         "peer_refill_interval_ms": { "$ref": "#/$defs/positiveInteger" },
         "peer_recovery_timeout_seconds": { "$ref": "#/$defs/positiveInteger" },
         "material_request_concurrency": { "$ref": "#/$defs/positiveInteger" },

@@ -528,6 +528,11 @@ pub struct LiveSourceConfig {
     /// are not an allowlist.
     #[serde(default)]
     pub trusted_peers: Vec<String>,
+    /// Optional authenticated EIP-1459 tree of execution peers prepared for
+    /// Leani traffic. This affects discovery only; all material remains
+    /// protocol-verified locally.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bootstrap_dns_tree: Option<String>,
     #[serde(default = "default_execution_peer_refill_interval_ms")]
     pub peer_refill_interval_ms: u64,
     /// Recreate the execution network manager after this long with zero
@@ -1489,6 +1494,14 @@ impl Config {
                         "must be a valid enode trusted peer",
                     ));
                 }
+            }
+            if let Some(tree) = self.sources.live.bootstrap_dns_tree.as_deref()
+                && leani_source_p2p::validate_bootstrap_dns_tree(tree).is_err()
+            {
+                errors.push(ValidationError::new(
+                    "sources.live.bootstrap_dns_tree",
+                    "must be a valid authenticated enrtree:// URL",
+                ));
             }
         }
         if matches!(self.sources.live.kind, LiveSourceKind::P2p)
@@ -2998,6 +3011,7 @@ verification_segment_blocks = 8192"#,
         config.sources.live.archive_reconciliation_blocks = 4_097;
         config.sources.live.discovery_port = 30_303;
         config.sources.live.discv5_port = 30_303;
+        config.sources.live.bootstrap_dns_tree = Some("https://example.com/peers".to_owned());
         let errors = config.validate().expect_err("p2p bounds rejected").0;
         for field in [
             "sources.live.preferred_peers",
@@ -3012,6 +3026,7 @@ verification_segment_blocks = 8192"#,
             "sources.live.history_header_request_blocks",
             "sources.live.archive_reconciliation_blocks",
             "sources.live.discv5_port",
+            "sources.live.bootstrap_dns_tree",
         ] {
             assert!(
                 errors.iter().any(|error| error.field == field),

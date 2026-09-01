@@ -17,7 +17,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -50,6 +50,7 @@ use reth_chainspec::MAINNET;
 use reth_discv4::{DiscoveryUpdate, Discv4, Discv4Config};
 use reth_dns_discovery::{
     DnsDiscoveryConfig, DnsDiscoveryService, Resolver as DnsDiscoveryResolver,
+    tree::LinkEntry as DnsDiscoveryLink,
 };
 use reth_ethereum_primitives::{BlockBody, Receipt};
 use reth_network::types::{
@@ -100,6 +101,8 @@ const MAINNET_DNS_DISCOVERY_TREE: &str =
     "enrtree://AKA3AM6LPBYEUDMVNU3BSVQJ5AD45Y7YPOHJLEF6W26QOE4VTUDPE@all.mainnet.ethdisco.net";
 const MAINNET_DNS_DISCV4_BOOTSTRAP_PEERS: usize = 32;
 const MAINNET_DNS_RETRY_INTERVAL: Duration = Duration::from_secs(15);
+const PEER_QUALIFICATION_RETRY_INTERVAL: Duration = Duration::from_secs(5);
+const PEER_QUALITY_SCHEMA_VERSION: u32 = 1;
 static PEER_CACHE_WRITE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 static PEER_CACHE_WRITE_LOCK: Mutex<()> = Mutex::new(());
 // Mainnet ETH responses have a 2 MiB soft limit. Start from the fastest
@@ -167,6 +170,23 @@ pub fn parse_trusted_peer(value: &str) -> Result<TrustedPeer, P2pError> {
     })
 }
 
+/// Validate an authenticated EIP-1459 execution-peer tree URL.
+///
+/// The tree's public key authenticates peer hints only. It does not confer
+/// trust on execution headers, bodies, or receipts returned by those peers.
+///
+/// # Errors
+///
+/// Returns an invalid-configuration error when `value` is not a valid
+/// `enrtree://` link containing a DNS domain and secp256k1 public key.
+pub fn validate_bootstrap_dns_tree(value: &str) -> Result<(), P2pError> {
+    value.parse::<DnsDiscoveryLink>().map(|_| ()).map_err(|_| {
+        P2pError::InvalidConfig(
+            "bootstrap DNS tree must be a valid authenticated enrtree:// URL".to_owned(),
+        )
+    })
+}
+
 #[derive(Clone, Debug)]
 pub struct RethP2pConfig {
     /// Hard availability floor required before requests may start.
@@ -193,6 +213,10 @@ pub struct RethP2pConfig {
     pub nat: Option<NatResolver>,
     /// Optional operator-supplied peers that Reth will keep reconnecting to.
     pub trusted_peers: Vec<TrustedPeer>,
+    /// Optional EIP-1459 tree containing execution peers operated for Leani
+    /// traffic. The public key embedded in the `enrtree://` URL authenticates
+    /// the records; returned chain material remains independently verified.
+    pub bootstrap_dns_tree: Option<String>,
     /// How quickly Reth fills newly available outbound slots.
     pub peer_refill_interval: Duration,
     /// Rebuild the complete network and discovery stack after this long
@@ -250,6 +274,7 @@ impl Default for RethP2pConfig {
             enable_discv5: true,
             nat: None,
             trusted_peers: Vec::new(),
+            bootstrap_dns_tree: None,
             peer_refill_interval: Duration::from_secs(5),
             peer_recovery_timeout: Duration::from_mins(5),
             peer_wait_timeout: Duration::from_mins(5),
@@ -303,6 +328,13 @@ impl RethP2pConfig {
         {
             return Err(P2pError::InvalidConfig(
                 "fixed Discv4 and Discv5 UDP ports must differ".to_owned(),
+            ));
+        }
+        if let Some(tree) = self.bootstrap_dns_tree.as_deref()
+            && validate_bootstrap_dns_tree(tree).is_err()
+        {
+            return Err(P2pError::InvalidConfig(
+                "bootstrap DNS tree must be a valid authenticated enrtree:// URL".to_owned(),
             ));
         }
         if !(1..=64).contains(&self.material_request_concurrency) {
@@ -817,12 +849,509 @@ impl P2pSession {
     }
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum PeerMaterialKind {
+    Header,
+    Body,
+    Receipts,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum PeerQualification {
+    BodyServing,
+    HeadersOnly,
+    Lagging,
+    Rejected,
+    TimedOut,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct PeerQualityEvidence {
+    fork_compatible: bool,
+    highest_served_block: Option<u64>,
+    last_header_success_unix_ms: Option<u64>,
+    last_body_success_unix_ms: Option<u64>,
+    last_receipt_success_unix_ms: Option<u64>,
+    response_latency_ms: Option<u64>,
+    last_failure_reason: Option<String>,
+    last_failure_unix_ms: Option<u64>,
+    qualification: Option<PeerQualification>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct PeerQualityDocument {
+    schema_version: u32,
+    peers: BTreeMap<String, PeerQualityEvidence>,
+}
+
+impl Default for PeerQualityDocument {
+    fn default() -> Self {
+        Self {
+            schema_version: PEER_QUALITY_SCHEMA_VERSION,
+            peers: BTreeMap::new(),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct PeerQualityStore {
+    path: Option<PathBuf>,
+    document: Mutex<PeerQualityDocument>,
+    dirty: AtomicBool,
+}
+
+impl PeerQualityStore {
+    fn load(peer_cache_path: Option<&Path>) -> Self {
+        let path = peer_cache_path.map(peer_quality_path);
+        let document = path.as_deref().map_or_else(PeerQualityDocument::default, |path| {
+            match std::fs::read(path) {
+                Ok(encoded) => match serde_json::from_slice::<PeerQualityDocument>(&encoded) {
+                    Ok(document)
+                        if document.schema_version == PEER_QUALITY_SCHEMA_VERSION => document,
+                    Ok(document) => {
+                        warn!(
+                            path = %path.display(),
+                            schema_version = document.schema_version,
+                            "ignoring execution peer-quality cache with an unsupported schema"
+                        );
+                        PeerQualityDocument::default()
+                    }
+                    Err(error) => {
+                        warn!(path = %path.display(), %error, "ignoring unreadable execution peer-quality cache");
+                        PeerQualityDocument::default()
+                    }
+                },
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    PeerQualityDocument::default()
+                }
+                Err(error) => {
+                    warn!(path = %path.display(), %error, "ignoring unreadable execution peer-quality cache");
+                    PeerQualityDocument::default()
+                }
+            }
+        });
+        Self {
+            path,
+            document: Mutex::new(document),
+            dirty: AtomicBool::new(false),
+        }
+    }
+
+    fn record_success(&self, peer_id: B512, kind: PeerMaterialKind, block: u64, elapsed: Duration) {
+        let now = observed_at_unix_ms();
+        let latency = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
+        let mut document = self
+            .document
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let evidence = document.peers.entry(peer_quality_key(peer_id)).or_default();
+        evidence.fork_compatible = true;
+        evidence.highest_served_block =
+            Some(evidence.highest_served_block.unwrap_or_default().max(block));
+        match kind {
+            PeerMaterialKind::Header => evidence.last_header_success_unix_ms = Some(now),
+            PeerMaterialKind::Body => evidence.last_body_success_unix_ms = Some(now),
+            PeerMaterialKind::Receipts => evidence.last_receipt_success_unix_ms = Some(now),
+        }
+        evidence.response_latency_ms = Some(evidence.response_latency_ms.map_or(latency, |old| {
+            old.saturating_mul(3).saturating_add(latency) / 4
+        }));
+        if matches!(kind, PeerMaterialKind::Body) {
+            evidence.qualification = Some(PeerQualification::BodyServing);
+        }
+        drop(document);
+        self.dirty.store(true, Ordering::Release);
+    }
+
+    fn record_qualification(
+        &self,
+        peer_id: B512,
+        qualification: PeerQualification,
+        detail: Option<&str>,
+    ) {
+        let now = observed_at_unix_ms();
+        let mut document = self
+            .document
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let evidence = document.peers.entry(peer_quality_key(peer_id)).or_default();
+        evidence.qualification = Some(qualification);
+        evidence.fork_compatible |= !matches!(qualification, PeerQualification::Rejected);
+        if !matches!(qualification, PeerQualification::BodyServing) {
+            evidence.last_failure_reason = detail.map(bounded_quality_detail);
+            evidence.last_failure_unix_ms = Some(now);
+        }
+        drop(document);
+        self.dirty.store(true, Ordering::Release);
+    }
+
+    fn record_failure(&self, peer_id: B512, detail: &str) {
+        let mut document = self
+            .document
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let evidence = document.peers.entry(peer_quality_key(peer_id)).or_default();
+        evidence.last_failure_reason = Some(bounded_quality_detail(detail));
+        evidence.last_failure_unix_ms = Some(observed_at_unix_ms());
+        drop(document);
+        self.dirty.store(true, Ordering::Release);
+    }
+
+    fn rank(&self, peer_id: B512) -> PeerQualityRank {
+        self.document
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .peers
+            .get(&peer_quality_key(peer_id))
+            .map_or_else(PeerQualityRank::default, PeerQualityRank::from)
+    }
+
+    fn persist(&self, maximum_entries: usize) -> Result<(), String> {
+        let Some(path) = self.path.as_deref() else {
+            return Ok(());
+        };
+        if !self.dirty.swap(false, Ordering::AcqRel) && path.exists() {
+            return Ok(());
+        }
+        let mut document = self
+            .document
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if document.peers.len() > maximum_entries {
+            let mut entries = document.peers.into_iter().collect::<Vec<_>>();
+            entries.sort_by(|(_, left), (_, right)| {
+                PeerQualityRank::from(right).cmp(&PeerQualityRank::from(left))
+            });
+            entries.truncate(maximum_entries);
+            document.peers = entries.into_iter().collect();
+        }
+        let parent = path
+            .parent()
+            .ok_or_else(|| "execution peer-quality path has no parent directory".to_owned())?;
+        std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+        let encoded = serde_json::to_vec_pretty(&document).map_err(|error| error.to_string())?;
+        let sequence = PEER_CACHE_WRITE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let temporary =
+            path.with_extension(format!("json.{}.{}.tmp", std::process::id(), sequence));
+        let result = (|| {
+            let mut file = OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&temporary)
+                .map_err(|error| error.to_string())?;
+            file.write_all(&encoded)
+                .map_err(|error| error.to_string())?;
+            file.write_all(b"\n").map_err(|error| error.to_string())?;
+            file.sync_all().map_err(|error| error.to_string())?;
+            std::fs::rename(&temporary, path).map_err(|error| error.to_string())
+        })();
+        if result.is_err() {
+            self.dirty.store(true, Ordering::Release);
+            let _ = std::fs::remove_file(&temporary);
+        }
+        result
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
+struct PeerQualityRank {
+    body_serving: bool,
+    receipt_serving: bool,
+    highest_served_block: u64,
+    last_material_success_unix_ms: u64,
+    inverse_latency_ms: std::cmp::Reverse<u64>,
+    no_recent_failure: bool,
+}
+
+impl From<&PeerQualityEvidence> for PeerQualityRank {
+    fn from(evidence: &PeerQualityEvidence) -> Self {
+        let last_material_success_unix_ms = evidence
+            .last_header_success_unix_ms
+            .into_iter()
+            .chain(evidence.last_body_success_unix_ms)
+            .chain(evidence.last_receipt_success_unix_ms)
+            .max()
+            .unwrap_or_default();
+        Self {
+            body_serving: evidence.last_body_success_unix_ms.is_some(),
+            receipt_serving: evidence.last_receipt_success_unix_ms.is_some(),
+            highest_served_block: evidence.highest_served_block.unwrap_or_default(),
+            last_material_success_unix_ms,
+            inverse_latency_ms: std::cmp::Reverse(evidence.response_latency_ms.unwrap_or(u64::MAX)),
+            no_recent_failure: evidence
+                .last_failure_unix_ms
+                .is_none_or(|failure| failure < last_material_success_unix_ms),
+        }
+    }
+}
+
+fn peer_quality_key(peer_id: B512) -> String {
+    hex::encode(peer_id.as_slice())
+}
+
+fn bounded_quality_detail(detail: &str) -> String {
+    detail.chars().take(256).collect()
+}
+
+fn peer_quality_path(peer_cache_path: &Path) -> PathBuf {
+    peer_cache_path.with_file_name("execution-peer-quality.json")
+}
+
+/// Identity-free summary of a peer-quality cache merge.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PeerQualityCacheMerge {
+    pub total: usize,
+    pub imported: usize,
+}
+
+/// Merge sibling execution peer-quality caches into one destination.
+///
+/// Evidence is monotonic per material kind: the highest served block and most
+/// recent verified successes win, while the newest failure classification is
+/// retained independently. This lets isolated subscription feeds reuse useful
+/// service history without sharing their database or P2P identity.
+///
+/// # Errors
+///
+/// Returns an error when an existing quality document cannot be read or the
+/// merged document cannot be persisted atomically.
+pub fn merge_peer_quality_caches(
+    destination: &Path,
+    sources: &[PathBuf],
+    maximum_entries: usize,
+) -> Result<Option<PeerQualityCacheMerge>, String> {
+    let destination_document = read_peer_quality_document(destination)?;
+    let destination_peers = destination_document
+        .peers
+        .keys()
+        .cloned()
+        .collect::<HashSet<_>>();
+    let mut merged = destination_document.peers;
+    for source in sources
+        .iter()
+        .filter(|source| source.as_path() != destination)
+    {
+        let document = match read_peer_quality_document(source) {
+            Ok(document) => document,
+            Err(error) => {
+                warn!(path = %source.display(), %error, "ignoring unreadable sibling execution peer-quality cache");
+                continue;
+            }
+        };
+        for (peer_id, evidence) in document.peers {
+            match merged.entry(peer_id) {
+                std::collections::btree_map::Entry::Vacant(slot) => {
+                    slot.insert(evidence);
+                }
+                std::collections::btree_map::Entry::Occupied(mut slot) => {
+                    merge_peer_quality_evidence(slot.get_mut(), evidence);
+                }
+            }
+        }
+    }
+    if merged.is_empty() {
+        return Ok(None);
+    }
+    let mut entries = merged.into_iter().collect::<Vec<_>>();
+    entries.sort_by(|(left_id, left), (right_id, right)| {
+        PeerQualityRank::from(right)
+            .cmp(&PeerQualityRank::from(left))
+            .then_with(|| left_id.cmp(right_id))
+    });
+    entries.truncate(maximum_entries);
+    let imported = entries
+        .iter()
+        .filter(|(peer_id, _)| !destination_peers.contains(peer_id))
+        .count();
+    let document = PeerQualityDocument {
+        schema_version: PEER_QUALITY_SCHEMA_VERSION,
+        peers: entries.into_iter().collect(),
+    };
+    write_peer_quality_document(destination, &document)?;
+    Ok(Some(PeerQualityCacheMerge {
+        total: document.peers.len(),
+        imported,
+    }))
+}
+
+fn read_peer_quality_document(path: &Path) -> Result<PeerQualityDocument, String> {
+    let encoded = match std::fs::read(path) {
+        Ok(encoded) => encoded,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(PeerQualityDocument::default());
+        }
+        Err(error) => return Err(error.to_string()),
+    };
+    let document = serde_json::from_slice::<PeerQualityDocument>(&encoded)
+        .map_err(|error| error.to_string())?;
+    if document.schema_version != PEER_QUALITY_SCHEMA_VERSION {
+        return Err(format!(
+            "unsupported peer-quality schema {}",
+            document.schema_version
+        ));
+    }
+    Ok(document)
+}
+
+fn write_peer_quality_document(path: &Path, document: &PeerQualityDocument) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| "execution peer-quality path has no parent directory".to_owned())?;
+    std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    let encoded = serde_json::to_vec_pretty(document).map_err(|error| error.to_string())?;
+    let sequence = PEER_CACHE_WRITE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let temporary =
+        path.with_extension(format!("json.{}.{}.merging", std::process::id(), sequence));
+    let result = (|| {
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&temporary)
+            .map_err(|error| error.to_string())?;
+        file.write_all(&encoded)
+            .map_err(|error| error.to_string())?;
+        file.write_all(b"\n").map_err(|error| error.to_string())?;
+        file.sync_all().map_err(|error| error.to_string())?;
+        std::fs::rename(&temporary, path).map_err(|error| error.to_string())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    result
+}
+
+fn merge_peer_quality_evidence(retained: &mut PeerQualityEvidence, incoming: PeerQualityEvidence) {
+    let retained_success = PeerQualityRank::from(&*retained).last_material_success_unix_ms;
+    let incoming_success = PeerQualityRank::from(&incoming).last_material_success_unix_ms;
+    retained.fork_compatible |= incoming.fork_compatible;
+    retained.highest_served_block = retained
+        .highest_served_block
+        .into_iter()
+        .chain(incoming.highest_served_block)
+        .max();
+    retained.last_header_success_unix_ms = retained
+        .last_header_success_unix_ms
+        .into_iter()
+        .chain(incoming.last_header_success_unix_ms)
+        .max();
+    retained.last_body_success_unix_ms = retained
+        .last_body_success_unix_ms
+        .into_iter()
+        .chain(incoming.last_body_success_unix_ms)
+        .max();
+    retained.last_receipt_success_unix_ms = retained
+        .last_receipt_success_unix_ms
+        .into_iter()
+        .chain(incoming.last_receipt_success_unix_ms)
+        .max();
+    if incoming_success >= retained_success {
+        retained.response_latency_ms = incoming.response_latency_ms;
+        retained.qualification = incoming.qualification;
+    }
+    if incoming.last_failure_unix_ms >= retained.last_failure_unix_ms {
+        retained.last_failure_unix_ms = incoming.last_failure_unix_ms;
+        retained.last_failure_reason = incoming.last_failure_reason;
+    }
+}
+
+#[derive(Debug)]
+struct PeerQualificationState {
+    target: BlockRef,
+    outcomes: HashMap<B512, PeerQualification>,
+}
+
+#[derive(Debug)]
+struct PeerQualificationPool {
+    state: Mutex<PeerQualificationState>,
+    changed: tokio::sync::Notify,
+}
+
+impl PeerQualificationPool {
+    fn new(target: BlockRef) -> Self {
+        Self {
+            state: Mutex::new(PeerQualificationState {
+                target,
+                outcomes: HashMap::new(),
+            }),
+            changed: tokio::sync::Notify::new(),
+        }
+    }
+
+    fn set_target(&self, target: BlockRef) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.target != target {
+            state.target = target;
+            state.outcomes.clear();
+            drop(state);
+            self.changed.notify_waiters();
+        }
+    }
+
+    fn record(&self, target: BlockRef, peer_id: B512, outcome: PeerQualification) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.target == target {
+            state.outcomes.insert(peer_id, outcome);
+            drop(state);
+            self.changed.notify_waiters();
+        }
+    }
+
+    fn remove(&self, peer_id: B512) {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .outcomes
+            .remove(&peer_id);
+        self.changed.notify_waiters();
+    }
+
+    fn ready(&self, target: BlockRef) -> usize {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.target != target {
+            return 0;
+        }
+        state
+            .outcomes
+            .values()
+            .filter(|outcome| matches!(outcome, PeerQualification::BodyServing))
+            .count()
+    }
+
+    fn peer_is_ready(&self, target: BlockRef, peer_id: B512) -> bool {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.target == target
+            && state
+                .outcomes
+                .get(&peer_id)
+                .is_some_and(|outcome| matches!(outcome, PeerQualification::BodyServing))
+    }
+}
+
 #[derive(Debug)]
 struct PersistentNetwork {
     state: tokio::sync::Mutex<Option<PersistentNetworkState>>,
     next_generation: AtomicU64,
     request_gate: Arc<MaterialRequestGate>,
     direct_peers: Arc<DirectPeerPool>,
+    peer_quality: Arc<PeerQualityStore>,
+    qualifications: Arc<PeerQualificationPool>,
 }
 
 #[derive(Debug)]
@@ -834,6 +1363,7 @@ struct PersistentNetworkState {
     network_task: tokio::task::JoinHandle<()>,
     shutdown: CancellationToken,
     telemetry: NetworkSessionTelemetry,
+    qualification_target: tokio::sync::watch::Sender<BlockRef>,
 }
 
 #[derive(Clone, Debug)]
@@ -841,24 +1371,36 @@ struct DirectPeer {
     peer_id: B512,
     eth_version: EthVersion,
     messages: PeerRequestSender<PeerRequest<EthNetworkPrimitives>>,
+    advertised_head: Option<u64>,
 }
 
 #[derive(Debug)]
 struct DirectPeerState {
     peer: DirectPeer,
+    qualified: bool,
     in_flight: usize,
     failures: u32,
     retry_at: Instant,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct DirectPeerPool {
     peers: Mutex<Vec<DirectPeerState>>,
     cursor: AtomicUsize,
     changed: tokio::sync::Notify,
+    quality: Arc<PeerQualityStore>,
 }
 
 impl DirectPeerPool {
+    fn new(quality: Arc<PeerQualityStore>) -> Self {
+        Self {
+            peers: Mutex::new(Vec::new()),
+            cursor: AtomicUsize::new(0),
+            changed: tokio::sync::Notify::new(),
+            quality,
+        }
+    }
+
     fn insert(&self, peer: DirectPeer) {
         let mut peers = self
             .peers
@@ -869,11 +1411,13 @@ impl DirectPeerPool {
             .find(|existing| existing.peer.peer_id == peer.peer_id)
         {
             existing.peer = peer;
+            existing.qualified = false;
             existing.in_flight = 0;
             existing.retry_at = Instant::now();
         } else {
             peers.push(DirectPeerState {
                 peer,
+                qualified: false,
                 in_flight: 0,
                 failures: 0,
                 retry_at: Instant::now(),
@@ -896,6 +1440,30 @@ impl DirectPeerPool {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clear();
+        self.changed.notify_waiters();
+    }
+
+    fn set_qualified(&self, peer_id: B512, qualified: bool) {
+        let mut peers = self
+            .peers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(peer) = peers.iter_mut().find(|peer| peer.peer.peer_id == peer_id) {
+            peer.qualified = qualified;
+        }
+        drop(peers);
+        self.changed.notify_waiters();
+    }
+
+    fn clear_qualifications(&self) {
+        let mut peers = self
+            .peers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for peer in &mut *peers {
+            peer.qualified = false;
+        }
+        drop(peers);
         self.changed.notify_waiters();
     }
 
@@ -926,12 +1494,14 @@ impl DirectPeerPool {
             .map(|offset| (start.wrapping_add(offset)) % len)
             .filter(|index| {
                 !excluded.contains(&peers[*index].peer.peer_id)
+                    && peers[*index].qualified
                     && peers[*index].in_flight < per_peer_limit
                     && peers[*index].retry_at <= now
             })
             .min_by_key(|index| {
                 (
                     Some(peers[*index].peer.peer_id) != preferred,
+                    std::cmp::Reverse(self.quality.rank(peers[*index].peer.peer_id)),
                     peers[*index].failures,
                     peers[*index].in_flight,
                 )
@@ -988,12 +1558,14 @@ impl DirectPeerPool {
                     .map(|offset| (start.wrapping_add(offset)) % len)
                     .filter(|index| {
                         !excluded.contains(&peers[*index].peer.peer_id)
+                            && peers[*index].qualified
                             && peers[*index].in_flight < per_peer_limit
                             && peers[*index].retry_at <= now
                     })
                     .min_by_key(|index| {
                         (
                             Some(peers[*index].peer.peer_id) != preferred,
+                            std::cmp::Reverse(self.quality.rank(peers[*index].peer.peer_id)),
                             peers[*index].failures,
                             peers[*index].in_flight,
                         )
@@ -1011,14 +1583,15 @@ impl DirectPeerPool {
                         .iter()
                         .filter(|peer| {
                             !excluded.contains(&peer.peer.peer_id)
+                                && peer.qualified
                                 && peer.in_flight < per_peer_limit
                         })
                         .map(|peer| peer.retry_at.saturating_duration_since(now))
                         .min(),
-                    !peers.is_empty(),
+                    peers.iter().any(|peer| peer.qualified),
                     peers
                         .iter()
-                        .any(|peer| !excluded.contains(&peer.peer.peer_id)),
+                        .any(|peer| peer.qualified && !excluded.contains(&peer.peer.peer_id)),
                 )
             };
             if has_peers && !has_untried_peers {
@@ -1048,6 +1621,15 @@ impl DirectPeerPool {
                 () = tokio::time::sleep(delay.max(Duration::from_millis(10))) => {}
             }
         }
+    }
+
+    fn snapshot(&self) -> Vec<DirectPeer> {
+        self.peers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .map(|state| state.peer.clone())
+            .collect()
     }
 }
 
@@ -1097,6 +1679,9 @@ impl Drop for DirectPeerLease {
                     let exponent = peer.failures.saturating_sub(1).min(7);
                     let backoff_ms = 250_u64.saturating_mul(1_u64 << exponent).min(30_000);
                     peer.retry_at = Instant::now() + Duration::from_millis(backoff_ms);
+                    self.pool
+                        .quality
+                        .record_failure(self.peer.peer_id, "material request failed");
                 }
                 DirectPeerOutcome::Neutral => {}
             }
@@ -1391,6 +1976,367 @@ fn block_status_head(block: BlockRef) -> Head {
     }
 }
 
+#[derive(Debug)]
+struct PeerQualificationResult {
+    target: BlockRef,
+    peer_id: B512,
+    outcome: PeerQualification,
+    detail: Option<String>,
+    header_elapsed: Option<Duration>,
+    body_elapsed: Option<Duration>,
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "one bounded probe classifies the header and body stages together"
+)]
+async fn qualify_execution_peer(
+    peer: DirectPeer,
+    target: BlockRef,
+    timeout: Duration,
+    request_gate: Arc<MaterialRequestGate>,
+    request_limit: usize,
+    priority: Priority,
+    cancellation: CancellationToken,
+) -> PeerQualificationResult {
+    let result = async {
+        if peer
+            .advertised_head
+            .is_some_and(|head| head < target.number.0)
+        {
+            return PeerQualificationResult {
+                target,
+                peer_id: peer.peer_id,
+                outcome: PeerQualification::Lagging,
+                detail: Some(format!(
+                    "advertised head is below verified block {}",
+                    target.number.0
+                )),
+                header_elapsed: None,
+                body_elapsed: None,
+            };
+        }
+        let permit = match request_gate
+            .acquire(request_limit, priority, &cancellation)
+            .await
+        {
+            Ok(permit) => permit,
+            Err(error) => {
+                return PeerQualificationResult {
+                    target,
+                    peer_id: peer.peer_id,
+                    outcome: PeerQualification::TimedOut,
+                    detail: Some(error.to_string()),
+                    header_elapsed: None,
+                    body_elapsed: None,
+                };
+            }
+        };
+        let header_started = Instant::now();
+        let header_response = request_direct_header(
+            &peer,
+            B256::from(*target.hash.as_array()),
+            timeout,
+            &cancellation,
+        )
+        .await;
+        drop(permit);
+        let header_elapsed = header_started.elapsed();
+        let mut headers = match header_response {
+            Ok(headers) => headers,
+            Err(error) => {
+                let outcome = if matches!(error, P2pError::Timeout { .. }) {
+                    PeerQualification::TimedOut
+                } else {
+                    PeerQualification::Lagging
+                };
+                return PeerQualificationResult {
+                    target,
+                    peer_id: peer.peer_id,
+                    outcome,
+                    detail: Some(error.to_string()),
+                    header_elapsed: Some(header_elapsed),
+                    body_elapsed: None,
+                };
+            }
+        };
+        let Some(header) = headers.pop() else {
+            return PeerQualificationResult {
+                target,
+                peer_id: peer.peer_id,
+                outcome: PeerQualification::Lagging,
+                detail: Some("verified anchor header was not served".to_owned()),
+                header_elapsed: Some(header_elapsed),
+                body_elapsed: None,
+            };
+        };
+        if !headers.is_empty()
+            || header.number != target.number.0
+            || header.hash_slow() != B256::from(*target.hash.as_array())
+        {
+            return PeerQualificationResult {
+                target,
+                peer_id: peer.peer_id,
+                outcome: PeerQualification::Rejected,
+                detail: Some("peer returned a mismatched verified anchor header".to_owned()),
+                header_elapsed: Some(header_elapsed),
+                body_elapsed: None,
+            };
+        }
+        let permit = match request_gate
+            .acquire(request_limit, priority, &cancellation)
+            .await
+        {
+            Ok(permit) => permit,
+            Err(error) => {
+                return PeerQualificationResult {
+                    target,
+                    peer_id: peer.peer_id,
+                    outcome: PeerQualification::TimedOut,
+                    detail: Some(error.to_string()),
+                    header_elapsed: Some(header_elapsed),
+                    body_elapsed: None,
+                };
+            }
+        };
+        let body_started = Instant::now();
+        let body_response = request_direct_bodies(
+            &peer,
+            std::slice::from_ref(&B256::from(*target.hash.as_array())),
+            timeout,
+            &cancellation,
+        )
+        .await;
+        drop(permit);
+        let body_elapsed = body_started.elapsed();
+        match body_response {
+            Ok((bodies, _)) => match validate_bodies(std::slice::from_ref(&header), &bodies) {
+                Ok(()) => PeerQualificationResult {
+                    target,
+                    peer_id: peer.peer_id,
+                    outcome: PeerQualification::BodyServing,
+                    detail: None,
+                    header_elapsed: Some(header_elapsed),
+                    body_elapsed: Some(body_elapsed),
+                },
+                Err(P2pError::IncompleteResponse { .. }) => PeerQualificationResult {
+                    target,
+                    peer_id: peer.peer_id,
+                    outcome: PeerQualification::HeadersOnly,
+                    detail: Some("verified anchor body was not served".to_owned()),
+                    header_elapsed: Some(header_elapsed),
+                    body_elapsed: Some(body_elapsed),
+                },
+                Err(error) => PeerQualificationResult {
+                    target,
+                    peer_id: peer.peer_id,
+                    outcome: PeerQualification::Rejected,
+                    detail: Some(error.to_string()),
+                    header_elapsed: Some(header_elapsed),
+                    body_elapsed: Some(body_elapsed),
+                },
+            },
+            Err(error) => PeerQualificationResult {
+                target,
+                peer_id: peer.peer_id,
+                outcome: if matches!(error, P2pError::Timeout { .. }) {
+                    PeerQualification::TimedOut
+                } else {
+                    PeerQualification::HeadersOnly
+                },
+                detail: Some(error.to_string()),
+                header_elapsed: Some(header_elapsed),
+                body_elapsed: Some(body_elapsed),
+            },
+        }
+    };
+    result.await
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "qualification owns the shared peer, target, quality, request, and shutdown state"
+)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one event loop owns qualification dispatch, target changes, retry state, and results"
+)]
+fn spawn_peer_qualification_worker(
+    direct_peers: Arc<DirectPeerPool>,
+    qualifications: Arc<PeerQualificationPool>,
+    quality: Arc<PeerQualityStore>,
+    handle: NetworkHandle<EthNetworkPrimitives>,
+    mut target_updates: tokio::sync::watch::Receiver<BlockRef>,
+    request_gate: Arc<MaterialRequestGate>,
+    request_timeout: Duration,
+    concurrency: usize,
+    shutdown: CancellationToken,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut target = *target_updates.borrow_and_update();
+        qualifications.set_target(target);
+        let mut pending = HashSet::<B512>::new();
+        let mut failures = HashMap::<B512, u32>::new();
+        let mut retry_at = HashMap::<B512, Instant>::new();
+        let mut tasks = FuturesUnordered::new();
+        let mut retry_tick = tokio::time::interval(Duration::from_millis(250));
+        retry_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            let now = Instant::now();
+            let ready = qualifications.ready(target);
+            let qualification_concurrency = if ready == 0 { concurrency } else { 1 };
+            let priority = if ready == 0 {
+                Priority::High
+            } else {
+                Priority::Normal
+            };
+            if tasks.len() < qualification_concurrency {
+                let mut candidates = direct_peers.snapshot();
+                candidates.sort_by_key(|peer| std::cmp::Reverse(quality.rank(peer.peer_id)));
+                for peer in candidates {
+                    if tasks.len() >= qualification_concurrency {
+                        break;
+                    }
+                    if pending.contains(&peer.peer_id)
+                        || qualifications.peer_is_ready(target, peer.peer_id)
+                        || retry_at
+                            .get(&peer.peer_id)
+                            .is_some_and(|retry_at| *retry_at > now)
+                    {
+                        continue;
+                    }
+                    pending.insert(peer.peer_id);
+                    tasks.push(tokio::spawn(qualify_execution_peer(
+                        peer,
+                        target,
+                        request_timeout,
+                        request_gate.clone(),
+                        concurrency,
+                        priority,
+                        shutdown.clone(),
+                    )));
+                }
+            }
+            tokio::select! {
+                () = shutdown.cancelled() => break,
+                changed = target_updates.changed() => {
+                    if changed.is_err() {
+                        break;
+                    }
+                    target = *target_updates.borrow_and_update();
+                    qualifications.set_target(target);
+                    direct_peers.clear_qualifications();
+                    for task in &tasks {
+                        task.abort();
+                    }
+                    tasks.clear();
+                    pending.clear();
+                    failures.clear();
+                    retry_at.clear();
+                }
+                () = direct_peers.changed.notified() => {}
+                _ = retry_tick.tick() => {}
+                completed = tasks.next(), if !tasks.is_empty() => {
+                    let Ok(result) = completed.expect("qualification task exists") else {
+                        continue;
+                    };
+                    pending.remove(&result.peer_id);
+                    if result.target != target {
+                        continue;
+                    }
+                    if let Some(elapsed) = result.header_elapsed {
+                        quality.record_success(
+                            result.peer_id,
+                            PeerMaterialKind::Header,
+                            target.number.0,
+                            elapsed,
+                        );
+                    }
+                    if let Some(elapsed) = result.body_elapsed
+                        && matches!(result.outcome, PeerQualification::BodyServing)
+                    {
+                        quality.record_success(
+                            result.peer_id,
+                            PeerMaterialKind::Body,
+                            target.number.0,
+                            elapsed,
+                        );
+                    }
+                    let first_ready = qualifications.ready(target) == 0
+                        && matches!(result.outcome, PeerQualification::BodyServing);
+                    quality.record_qualification(
+                        result.peer_id,
+                        result.outcome,
+                        result.detail.as_deref(),
+                    );
+                    qualifications.record(target, result.peer_id, result.outcome);
+                    if matches!(result.outcome, PeerQualification::BodyServing) {
+                        direct_peers.set_qualified(result.peer_id, true);
+                        failures.remove(&result.peer_id);
+                        retry_at.remove(&result.peer_id);
+                        handle.reputation_change(
+                            result.peer_id,
+                            ReputationChangeKind::Other(
+                                VERIFIED_MATERIAL_RESPONSE_REPUTATION_REWARD,
+                            ),
+                        );
+                        if first_ready {
+                            for task in &tasks {
+                                task.abort();
+                            }
+                            tasks.clear();
+                            pending.clear();
+                        }
+                    } else {
+                        direct_peers.set_qualified(result.peer_id, false);
+                        let failures = failures.entry(result.peer_id).or_default();
+                        *failures = failures.saturating_add(1);
+                        let exponent = failures.saturating_sub(1).min(4);
+                        let delay = PEER_QUALIFICATION_RETRY_INTERVAL
+                            .saturating_mul(1_u32 << exponent);
+                        retry_at.insert(result.peer_id, Instant::now() + delay);
+                        if matches!(result.outcome, PeerQualification::Rejected) {
+                            handle.ban_peer(result.peer_id);
+                            direct_peers.remove(result.peer_id);
+                            qualifications.remove(result.peer_id);
+                        }
+                    }
+                }
+            }
+        }
+    })
+}
+
+async fn wait_for_qualified_peers(
+    session: &P2pSession,
+    qualifications: &PeerQualificationPool,
+    target: BlockRef,
+    minimum: usize,
+    timeout: Duration,
+    cancellation: &CancellationToken,
+) -> Result<usize, P2pError> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if !session.manager_is_current().await {
+            return Err(P2pError::Network(
+                "execution P2P manager restarted during peer qualification".to_owned(),
+            ));
+        }
+        let ready = qualifications.ready(target);
+        if ready >= minimum {
+            return Ok(ready);
+        }
+        tokio::select! {
+            () = cancellation.cancelled() => return Err(P2pError::Cancelled),
+            () = qualifications.changed.notified() => {}
+            () = tokio::time::sleep(Duration::from_millis(100)) => {}
+            () = tokio::time::sleep_until(deadline) => {
+                return Err(P2pError::PeerTimeout { minimum, connected: ready });
+            }
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 struct SegmentJoiningDnsResolver(hickory_resolver::TokioResolver);
 
@@ -1437,19 +2383,232 @@ fn join_dns_txt_segments<'a>(segments: impl IntoIterator<Item = &'a [u8]>) -> Op
     String::from_utf8(joined).ok()
 }
 
+#[derive(Clone, Copy, Debug)]
+enum DialEvent {
+    Established(B512),
+    Unavailable(B512),
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PendingDial {
+    record: NodeRecord,
+    expires_at: tokio::time::Instant,
+}
+
+#[derive(Debug)]
+struct EventDrivenDialQueue {
+    records: HashMap<B512, NodeRecord>,
+    fresh: VecDeque<B512>,
+    fresh_ids: HashSet<B512>,
+    pending: HashMap<B512, PendingDial>,
+    cooldowns: HashMap<B512, tokio::time::Instant>,
+    connected: HashSet<B512>,
+    attempt_timeout: Duration,
+    redial_interval: Duration,
+}
+
+impl EventDrivenDialQueue {
+    fn new(attempt_timeout: Duration, redial_interval: Duration) -> Self {
+        Self {
+            records: HashMap::new(),
+            fresh: VecDeque::new(),
+            fresh_ids: HashSet::new(),
+            pending: HashMap::new(),
+            cooldowns: HashMap::new(),
+            connected: HashSet::new(),
+            attempt_timeout,
+            redial_interval,
+        }
+    }
+
+    fn add(&mut self, record: NodeRecord) -> bool {
+        let peer_id = record.id;
+        let first_seen = self.records.insert(peer_id, record).is_none();
+        if first_seen
+            && !self.pending.contains_key(&peer_id)
+            && !self.connected.contains(&peer_id)
+            && self.fresh_ids.insert(peer_id)
+        {
+            self.fresh.push_back(peer_id);
+        }
+        first_seen
+    }
+
+    fn on_event(&mut self, event: DialEvent, now: tokio::time::Instant) {
+        match event {
+            DialEvent::Established(peer_id) => {
+                self.pending.remove(&peer_id);
+                self.cooldowns.remove(&peer_id);
+                self.fresh_ids.remove(&peer_id);
+                self.connected.insert(peer_id);
+            }
+            DialEvent::Unavailable(peer_id) => {
+                self.connected.remove(&peer_id);
+                self.pending.remove(&peer_id);
+                if self.records.contains_key(&peer_id) {
+                    self.cooldowns.insert(peer_id, now + self.redial_interval);
+                }
+            }
+        }
+    }
+
+    fn expire_pending(&mut self, now: tokio::time::Instant) {
+        let expired = self
+            .pending
+            .iter()
+            .filter_map(|(peer_id, pending)| (pending.expires_at <= now).then_some(*peer_id))
+            .collect::<Vec<_>>();
+        for peer_id in expired {
+            if let Some(pending) = self.pending.remove(&peer_id) {
+                self.records.insert(peer_id, pending.record);
+                self.cooldowns.insert(peer_id, now + self.redial_interval);
+            }
+        }
+    }
+
+    fn dispatch(
+        &mut self,
+        handle: &NetworkHandle<EthNetworkPrimitives>,
+        preferred_peers: usize,
+        maximum_dials: usize,
+    ) -> (usize, usize) {
+        let now = tokio::time::Instant::now();
+        self.expire_pending(now);
+        let connected = handle.num_connected_peers();
+        let desired = if connected == 0 {
+            maximum_dials
+        } else {
+            preferred_peers.saturating_sub(connected).min(maximum_dials)
+        };
+        let capacity = desired.saturating_sub(self.pending.len());
+        let mut fresh_attempts = 0_usize;
+        let mut retry_attempts = 0_usize;
+        for _ in 0..capacity {
+            let candidate = self
+                .next_fresh()
+                .map(|record| (record, true))
+                .or_else(|| self.next_cooled(now).map(|record| (record, false)));
+            let Some((record, fresh)) = candidate else {
+                break;
+            };
+            connect_node_record(handle, record);
+            self.pending.insert(
+                record.id,
+                PendingDial {
+                    record,
+                    expires_at: now + self.attempt_timeout,
+                },
+            );
+            if fresh {
+                fresh_attempts = fresh_attempts.saturating_add(1);
+            } else {
+                retry_attempts = retry_attempts.saturating_add(1);
+            }
+        }
+        (fresh_attempts, retry_attempts)
+    }
+
+    fn next_fresh(&mut self) -> Option<NodeRecord> {
+        while let Some(peer_id) = self.fresh.pop_front() {
+            self.fresh_ids.remove(&peer_id);
+            if self.connected.contains(&peer_id)
+                || self.pending.contains_key(&peer_id)
+                || self.cooldowns.contains_key(&peer_id)
+            {
+                continue;
+            }
+            if let Some(record) = self.records.get(&peer_id).copied() {
+                return Some(record);
+            }
+        }
+        None
+    }
+
+    fn next_cooled(&mut self, now: tokio::time::Instant) -> Option<NodeRecord> {
+        let peer_id = self
+            .cooldowns
+            .iter()
+            .filter(|(peer_id, retry_at)| {
+                **retry_at <= now
+                    && !self.connected.contains(*peer_id)
+                    && !self.pending.contains_key(*peer_id)
+            })
+            .min_by_key(|(_, retry_at)| **retry_at)
+            .map(|(peer_id, _)| *peer_id)?;
+        self.cooldowns.remove(&peer_id);
+        self.records.get(&peer_id).copied()
+    }
+
+    fn next_wake(&self) -> tokio::time::Instant {
+        self.pending
+            .values()
+            .map(|pending| pending.expires_at)
+            .chain(self.cooldowns.values().copied())
+            .min()
+            .unwrap_or_else(|| tokio::time::Instant::now() + Duration::from_hours(1))
+    }
+}
+
+#[derive(Debug)]
+struct DnsPeerSeederRuntime {
+    dns_head: Head,
+    preferred_peers: usize,
+    max_concurrent_dials: usize,
+    dial_attempt_timeout: Duration,
+    redial_interval: Duration,
+    bootstrap_dns_tree: Option<String>,
+    bootstrap_records: Vec<NodeRecord>,
+    initial_pending_records: Vec<NodeRecord>,
+}
+
 #[expect(
     clippy::too_many_lines,
     reason = "one select loop joins verified DNS records with the bootstrap crawler"
 )]
 fn spawn_mainnet_dns_peer_seeder(
     handle: NetworkHandle<EthNetworkPrimitives>,
-    dns_head: Head,
-    preferred_peers: usize,
-    max_concurrent_dials: usize,
-    refill_interval: Duration,
-    redial_interval: Duration,
+    runtime: DnsPeerSeederRuntime,
+    mut dial_events: tokio::sync::mpsc::UnboundedReceiver<DialEvent>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
+        let DnsPeerSeederRuntime {
+            dns_head,
+            preferred_peers,
+            max_concurrent_dials,
+            dial_attempt_timeout,
+            redial_interval,
+            bootstrap_dns_tree,
+            bootstrap_records,
+            initial_pending_records,
+        } = runtime;
+        // Reused, quality-ranked peers are actionable without DNS or Discv
+        // setup. Submit them first so a warm start does not lose its best
+        // candidates behind public discovery initialization.
+        let mut dial_queue = EventDrivenDialQueue::new(dial_attempt_timeout, redial_interval);
+        for record in &bootstrap_records {
+            add_node_record_to_network(&handle, *record);
+            dial_queue.add(*record);
+        }
+        let now = tokio::time::Instant::now();
+        for record in initial_pending_records {
+            dial_queue.fresh_ids.remove(&record.id);
+            dial_queue.fresh.retain(|peer_id| *peer_id != record.id);
+            dial_queue.pending.insert(
+                record.id,
+                PendingDial {
+                    record,
+                    expires_at: now + dial_attempt_timeout,
+                },
+            );
+        }
+        let (fresh_attempts, retry_attempts) =
+            dial_queue.dispatch(&handle, preferred_peers, max_concurrent_dials);
+        debug!(
+            pending_dials = dial_queue.pending.len(),
+            fresh_attempts,
+            retry_attempts,
+            "submitted quality-ranked cached execution peers before public discovery"
+        );
         let resolver = match SegmentJoiningDnsResolver::from_system_conf() {
             Ok(resolver) => resolver,
             Err(error) => {
@@ -1467,9 +2626,15 @@ fn spawn_mainnet_dns_peer_seeder(
                 return;
             }
         };
-        if let Err(error) = control.sync_tree(MAINNET_DNS_DISCOVERY_TREE) {
-            warn!(%error, "could not configure mainnet execution peer DNS seeder");
-            return;
+        let mut dns_trees = vec![MAINNET_DNS_DISCOVERY_TREE.to_owned()];
+        if let Some(tree) = bootstrap_dns_tree {
+            dns_trees.push(tree);
+        }
+        for tree in &dns_trees {
+            if let Err(error) = control.sync_tree(tree) {
+                warn!(%error, %tree, "could not configure authenticated execution peer DNS tree");
+                return;
+            }
         }
         let mut dns_retry = tokio::time::interval_at(
             tokio::time::Instant::now() + MAINNET_DNS_RETRY_INTERVAL,
@@ -1512,12 +2677,29 @@ fn spawn_mainnet_dns_peer_seeder(
         // configured retry ceiling. Fresh records always go first so a
         // long-lived zero-peer process neither exhausts discovery permanently
         // nor hammers one peer.
-        let mut dial_records = VecDeque::new();
-        let mut redial_records = VecDeque::new();
-        let mut dial_record_ids = HashSet::new();
-        let mut eager_refill = tokio::time::interval(refill_interval);
-        eager_refill.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        for record in bootstrap_records {
+            if crawler_seed_count < MAINNET_DNS_DISCV4_BOOTSTRAP_PEERS {
+                crawler.add_boot_node(record);
+                crawler_seed_count = crawler_seed_count.saturating_add(1);
+            }
+        }
         loop {
+            let connected = handle.num_connected_peers();
+            let (fresh_attempts, retry_attempts) =
+                dial_queue.dispatch(&handle, preferred_peers, max_concurrent_dials);
+            let attempts = fresh_attempts.saturating_add(retry_attempts);
+            if attempts > 0 {
+                debug!(
+                    connected_peers = connected,
+                    preferred_peers,
+                    pending_dials = dial_queue.pending.len(),
+                    attempts,
+                    fresh_attempts,
+                    retry_attempts,
+                    "filled execution dial slots from the event-driven peer queue"
+                );
+            }
+            let next_dial_wake = dial_queue.next_wake();
             tokio::select! {
                 _ = &mut service_task.0 => {
                     warn!("mainnet execution peer DNS seeder stopped unexpectedly");
@@ -1532,53 +2714,19 @@ fn spawn_mainnet_dns_peer_seeder(
                     // resolved, but an initial root lookup failure leaves no
                     // tree to refresh. Resubmit the root independently of the
                     // slower whole-network recovery watchdog.
-                    if let Err(error) = control.sync_tree(MAINNET_DNS_DISCOVERY_TREE) {
-                        warn!(%error, "could not retry mainnet execution peer DNS tree");
+                    for tree in &dns_trees {
+                        if let Err(error) = control.sync_tree(tree) {
+                            warn!(%error, %tree, "could not retry authenticated execution peer DNS tree");
+                        }
                     }
                 }
-                _ = eager_refill.tick(), if !dial_records.is_empty() || !redial_records.is_empty() => {
-                    let connected = handle.num_connected_peers();
-                    let capacity = eager_refill_attempts(
-                        connected,
-                        preferred_peers,
-                        max_concurrent_dials,
-                        usize::MAX,
-                    );
-                    let now = tokio::time::Instant::now();
-                    let fresh_attempts = capacity.min(dial_records.len());
-                    for _ in 0..fresh_attempts {
-                        let Some(record) = dial_records.pop_front() else {
-                            break;
-                        };
-                        connect_node_record(&handle, record);
-                        redial_records.push_back((now + redial_interval, record));
-                    }
-                    let mut retry_attempts = 0_usize;
-                    while retry_attempts < capacity.saturating_sub(fresh_attempts) {
-                        let Some((retry_at, _)) = redial_records.front() else {
-                            break;
-                        };
-                        if *retry_at > now {
-                            break;
-                        }
-                        let (_, record) = redial_records
-                            .pop_front()
-                            .expect("eligible redial record is present");
-                        connect_node_record(&handle, record);
-                        redial_records.push_back((now + redial_interval, record));
-                        retry_attempts = retry_attempts.saturating_add(1);
-                    }
-                    let attempts = fresh_attempts.saturating_add(retry_attempts);
-                    if attempts > 0 {
-                        debug!(
-                            connected_peers = connected,
-                            preferred_peers,
-                            attempts,
-                            fresh_attempts,
-                            retry_attempts,
-                            "eagerly refilling execution peer sessions from verified discovery records"
-                        );
-                    }
+                () = tokio::time::sleep_until(next_dial_wake) => {}
+                event = dial_events.recv() => {
+                    let Some(event) = event else {
+                        warn!("execution dial event channel closed unexpectedly");
+                        return;
+                    };
+                    dial_queue.on_event(event, tokio::time::Instant::now());
                 }
                 update = records.next() => {
                     let Some(update) = update else {
@@ -1595,9 +2743,7 @@ fn spawn_mainnet_dns_peer_seeder(
                     }
                     let record = update.node_record;
                     add_node_record_to_network(&handle, record);
-                    if dial_record_ids.insert(record.id) {
-                        dial_records.push_back(record);
-                    }
+                    dial_queue.add(record);
                     if crawler_seed_count < MAINNET_DNS_DISCV4_BOOTSTRAP_PEERS {
                         crawler.add_boot_node(record);
                         crawler_seed_count = crawler_seed_count.saturating_add(1);
@@ -1625,9 +2771,7 @@ fn spawn_mainnet_dns_peer_seeder(
                                     continue;
                                 }
                                 add_node_record_to_network(&handle, record);
-                                if dial_record_ids.insert(record.id) {
-                                    dial_records.push_back(record);
-                                }
+                                dial_queue.add(record);
                                 if crawler_discovered.insert(record.id) {
                                     let discovered_peers = crawler_discovered.len();
                                     if discovered_peers == 1 || discovered_peers.is_multiple_of(25) {
@@ -1674,24 +2818,6 @@ async fn reward_verified_material_peer(
     // an ordering barrier so a short-lived `subscribe --once` process cannot
     // shut down before the serving-peer reward reaches the persisted cache.
     let _ = handle.reputation_by_id(peer_id).await;
-}
-
-fn eager_refill_attempts(
-    connected: usize,
-    preferred: usize,
-    maximum_dials: usize,
-    records: usize,
-) -> usize {
-    // With no serving session there is no useful work to protect, so consume
-    // the operator's explicit simultaneous-dial budget. Once any peer is
-    // connected, refill only the soft preferred-pool deficit.
-    if connected == 0 {
-        return maximum_dials.min(records);
-    }
-    preferred
-        .saturating_sub(connected)
-        .min(maximum_dials)
-        .min(records)
 }
 
 struct AbortTaskOnDrop(tokio::task::JoinHandle<()>);
@@ -1741,19 +2867,54 @@ where
             direct_peers,
             preferred_peers,
             max_concurrent_dials,
-            peer_refill_interval,
             redial_interval,
+            dial_attempt_timeout,
+            bootstrap_dns_tree,
+            bootstrap_records,
+            peer_quality,
+            qualifications,
+            qualification_target,
+            request_gate,
+            request_timeout,
+            material_request_concurrency,
             mut cache_flush_requests,
             shutdown,
         } = runtime;
         let mut manager = Box::pin(manager);
+        let initial_pending_records = bootstrap_records
+            .iter()
+            .take(max_concurrent_dials)
+            .copied()
+            .collect::<Vec<_>>();
+        for record in &initial_pending_records {
+            add_node_record_to_network(manager.as_ref().get_ref().handle(), *record);
+            connect_node_record(manager.as_ref().get_ref().handle(), *record);
+        }
+        let (dial_event_tx, dial_event_rx) = tokio::sync::mpsc::unbounded_channel();
         let dns_peer_seeder = spawn_mainnet_dns_peer_seeder(
             manager.as_ref().get_ref().handle().clone(),
-            dns_head,
-            preferred_peers,
-            max_concurrent_dials,
-            peer_refill_interval,
-            redial_interval,
+            DnsPeerSeederRuntime {
+                dns_head,
+                preferred_peers,
+                max_concurrent_dials,
+                dial_attempt_timeout,
+                redial_interval,
+                bootstrap_dns_tree,
+                bootstrap_records,
+                initial_pending_records,
+            },
+            dial_event_rx,
+        );
+        let qualification_worker = spawn_peer_qualification_worker(
+            direct_peers.clone(),
+            qualifications.clone(),
+            peer_quality.clone(),
+            manager.as_ref().get_ref().handle().clone(),
+            qualification_target,
+            request_gate,
+            request_timeout,
+            material_request_concurrency,
+            shutdown.clone(),
         );
         let mut network_events_open = true;
         let mut zero_peers_since = Some(tokio::time::Instant::now());
@@ -1789,6 +2950,7 @@ where
                                 manager.as_ref().get_ref(),
                                 path,
                                 peer_cache_max_entries,
+                                &peer_quality,
                             )
                         {
                             warn!(path = %path.display(), %error, "failed to persist execution peers before recovery");
@@ -1805,25 +2967,33 @@ where
                     match event {
                         Some(NetworkEvent::ActivePeerSession { info, messages }) => {
                             network_telemetry.peer_session_established();
+                            let _ = dial_event_tx.send(DialEvent::Established(info.peer_id));
                             direct_peers.insert(DirectPeer {
                                 peer_id: info.peer_id,
                                 eth_version: info.version,
                                 messages,
+                                advertised_head: info.status.latest_block,
                             });
                         }
-                        Some(NetworkEvent::Peer(PeerEvent::SessionEstablished(_))) => {
-                            network_telemetry.peer_session_established();
+                        Some(NetworkEvent::Peer(PeerEvent::SessionEstablished(info))) => {
+                            let _ = dial_event_tx.send(DialEvent::Established(info.peer_id));
                         }
                         Some(NetworkEvent::Peer(PeerEvent::SessionClosed { peer_id, reason })) => {
+                            let _ = dial_event_tx.send(DialEvent::Unavailable(peer_id));
                             direct_peers.remove(peer_id);
-                            let reason = classify_disconnect_reason(reason);
-                            network_telemetry.peer_session_closed(reason);
+                            qualifications.remove(peer_id);
+                            let classified = classify_disconnect_reason(reason);
+                            peer_quality.record_failure(peer_id, classified.as_str());
+                            network_telemetry.peer_session_closed(classified);
                             debug!(
-                                reason = reason.as_str(),
+                                reason = classified.as_str(),
                                 "execution peer session closed"
                             );
                         }
-                        Some(NetworkEvent::Peer(PeerEvent::PeerAdded(_) | PeerEvent::PeerRemoved(_))) => {}
+                        Some(NetworkEvent::Peer(PeerEvent::PeerRemoved(peer_id))) => {
+                            let _ = dial_event_tx.send(DialEvent::Unavailable(peer_id));
+                        }
+                        Some(NetworkEvent::Peer(PeerEvent::PeerAdded(_))) => {}
                         None => network_events_open = false,
                     }
                 }
@@ -1840,9 +3010,11 @@ where
                                 manager.as_ref().get_ref(),
                                 path,
                                 peer_cache_max_entries,
+                                &peer_quality,
                             )
                         }
                     });
+                    let result = result.and(peer_quality.persist(peer_cache_max_entries));
                     cache_flushed_before_shutdown = result.is_ok();
                     let _ = response.send(result);
                 }
@@ -1856,11 +3028,15 @@ where
                             manager.as_ref().get_ref(),
                             path,
                             peer_cache_max_entries,
+                            &peer_quality,
                         )
                     {
                         warn!(path = %path.display(), %error, "failed to refresh execution peer cache");
                     } else {
                         debug!(path = %path.display(), "refreshed execution peer cache");
+                    }
+                    if let Err(error) = peer_quality.persist(peer_cache_max_entries) {
+                        warn!(%error, "failed to refresh execution peer-quality cache");
                     }
                 }
             }
@@ -1872,12 +3048,18 @@ where
                 manager.as_ref().get_ref(),
                 path,
                 peer_cache_max_entries,
+                &peer_quality,
             )
         {
             warn!(path = %path.display(), %error, "failed to persist final execution peer state");
         }
+        if let Err(error) = peer_quality.persist(peer_cache_max_entries) {
+            warn!(%error, "failed to persist final execution peer-quality state");
+        }
         dns_peer_seeder.abort();
         let _ = dns_peer_seeder.await;
+        qualification_worker.abort();
+        let _ = qualification_worker.await;
         direct_peers.clear();
     })
 }
@@ -1908,8 +3090,16 @@ struct NetworkManagerRuntime {
     direct_peers: Arc<DirectPeerPool>,
     preferred_peers: usize,
     max_concurrent_dials: usize,
-    peer_refill_interval: Duration,
     redial_interval: Duration,
+    dial_attempt_timeout: Duration,
+    bootstrap_dns_tree: Option<String>,
+    bootstrap_records: Vec<NodeRecord>,
+    peer_quality: Arc<PeerQualityStore>,
+    qualifications: Arc<PeerQualificationPool>,
+    qualification_target: tokio::sync::watch::Receiver<BlockRef>,
+    request_gate: Arc<MaterialRequestGate>,
+    request_timeout: Duration,
+    material_request_concurrency: usize,
     cache_flush_requests:
         tokio::sync::mpsc::Receiver<tokio::sync::oneshot::Sender<Result<(), String>>>,
     shutdown: CancellationToken,
@@ -1942,6 +3132,7 @@ fn write_peer_cache_atomically(
     manager: &NetworkManager<EthNetworkPrimitives>,
     path: &Path,
     maximum_entries: usize,
+    quality: &PeerQualityStore,
 ) -> Result<(), String> {
     let _write_guard = PEER_CACHE_WRITE_LOCK
         .lock()
@@ -1959,7 +3150,7 @@ fn write_peer_cache_atomically(
         let _ = std::fs::remove_file(&temporary);
         return Err(error.to_string());
     }
-    if let Err(error) = compact_peer_cache_file(&temporary, maximum_entries) {
+    if let Err(error) = compact_peer_cache_file(&temporary, maximum_entries, quality) {
         let _ = std::fs::remove_file(&temporary);
         return Err(error);
     }
@@ -1970,7 +3161,11 @@ fn write_peer_cache_atomically(
     Ok(())
 }
 
-fn compact_existing_peer_cache(path: &Path, maximum_entries: usize) -> Result<(), String> {
+fn compact_existing_peer_cache(
+    path: &Path,
+    maximum_entries: usize,
+    quality: &PeerQualityStore,
+) -> Result<(), String> {
     let encoded = match std::fs::read(path) {
         Ok(encoded) => encoded,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -1984,17 +3179,21 @@ fn compact_existing_peer_cache(path: &Path, maximum_entries: usize) -> Result<()
     if !backup.exists() {
         std::fs::copy(path, &backup).map_err(|error| error.to_string())?;
     }
-    let compacted = compact_peer_cache_entries(entries, maximum_entries);
+    let compacted = compact_peer_cache_entries(entries, maximum_entries, quality);
     let rewritten = serde_json::to_vec_pretty(&compacted).map_err(|error| error.to_string())?;
     let temporary = path.with_extension("json.compacting");
     std::fs::write(&temporary, rewritten).map_err(|error| error.to_string())?;
     std::fs::rename(&temporary, path).map_err(|error| error.to_string())
 }
 
-fn compact_peer_cache_file(path: &Path, maximum_entries: usize) -> Result<(), String> {
+fn compact_peer_cache_file(
+    path: &Path,
+    maximum_entries: usize,
+    quality: &PeerQualityStore,
+) -> Result<(), String> {
     let encoded = std::fs::read(path).map_err(|error| error.to_string())?;
     let entries = parse_peer_cache_entries(&encoded)?;
-    let compacted = compact_peer_cache_entries(entries, maximum_entries);
+    let compacted = compact_peer_cache_entries(entries, maximum_entries, quality);
     let encoded = serde_json::to_vec_pretty(&compacted).map_err(|error| error.to_string())?;
     std::fs::write(path, encoded).map_err(|error| error.to_string())
 }
@@ -2002,6 +3201,7 @@ fn compact_peer_cache_file(path: &Path, maximum_entries: usize) -> Result<(), St
 fn compact_peer_cache_entries(
     entries: Vec<(String, serde_json::Value)>,
     maximum_entries: usize,
+    quality: &PeerQualityStore,
 ) -> Vec<serde_json::Value> {
     let mut unique = BTreeMap::new();
     for (record, entry) in entries {
@@ -2009,15 +3209,18 @@ fn compact_peer_cache_entries(
     }
     let mut entries = unique.into_iter().collect::<Vec<_>>();
     entries.sort_by(|(left_record, left), (right_record, right)| {
-        peer_cache_priority(right)
-            .cmp(&peer_cache_priority(left))
+        peer_cache_priority(right, quality)
+            .cmp(&peer_cache_priority(left, quality))
             .then_with(|| left_record.cmp(right_record))
     });
     entries.truncate(maximum_entries);
     entries.into_iter().map(|(_, entry)| entry).collect()
 }
 
-fn peer_cache_priority(entry: &serde_json::Value) -> (bool, bool, bool, i64) {
+fn peer_cache_priority(
+    entry: &serde_json::Value,
+    quality: &PeerQualityStore,
+) -> (PeerQualityRank, bool, bool, bool, i64) {
     let has_fork = entry
         .get("fork_id")
         .or_else(|| entry.get("forkId"))
@@ -2026,7 +3229,44 @@ fn peer_cache_priority(entry: &serde_json::Value) -> (bool, bool, bool, i64) {
         .get("reputation")
         .and_then(serde_json::Value::as_i64)
         .unwrap_or_default();
-    (reputation >= 0, reputation > 0, has_fork, reputation)
+    let quality = entry
+        .get("record")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|record| record.parse::<NodeRecord>().ok())
+        .map_or_else(PeerQualityRank::default, |record| quality.rank(record.id));
+    (
+        quality,
+        reputation >= 0,
+        reputation > 0,
+        has_fork,
+        reputation,
+    )
+}
+
+fn prioritized_peer_cache_records(
+    path: Option<&Path>,
+    quality: &PeerQualityStore,
+    maximum_entries: usize,
+) -> Vec<NodeRecord> {
+    let Some(path) = path else {
+        return Vec::new();
+    };
+    let Ok(encoded) = std::fs::read(path) else {
+        return Vec::new();
+    };
+    let Ok(mut entries) = parse_peer_cache_entries(&encoded) else {
+        return Vec::new();
+    };
+    entries.sort_by(|(left_record, left), (right_record, right)| {
+        peer_cache_priority(right, quality)
+            .cmp(&peer_cache_priority(left, quality))
+            .then_with(|| left_record.cmp(right_record))
+    });
+    entries
+        .into_iter()
+        .take(maximum_entries)
+        .filter_map(|(record, _)| record.parse::<NodeRecord>().ok())
+        .collect()
 }
 
 fn parse_peer_cache_entries(encoded: &[u8]) -> Result<Vec<(String, serde_json::Value)>, String> {
@@ -2179,8 +3419,10 @@ impl RethP2pSource {
             config.preferred_peers,
             config.max_outbound_peers,
         );
+        let peer_quality = Arc::new(PeerQualityStore::load(config.peer_cache_path.as_deref()));
         if let Some(path) = config.peer_cache_path.as_deref()
-            && let Err(error) = compact_existing_peer_cache(path, config.peer_cache_max_entries)
+            && let Err(error) =
+                compact_existing_peer_cache(path, config.peer_cache_max_entries, &peer_quality)
         {
             warn!(
                 path = %path.display(),
@@ -2188,11 +3430,14 @@ impl RethP2pSource {
                 "could not compact the existing execution peer cache before startup"
             );
         }
+        let initial_target = Self::mainnet_genesis_block();
         let network = Arc::new(PersistentNetwork {
             state: tokio::sync::Mutex::new(None),
             next_generation: AtomicU64::new(1),
             request_gate: Arc::new(MaterialRequestGate::default()),
-            direct_peers: Arc::new(DirectPeerPool::default()),
+            direct_peers: Arc::new(DirectPeerPool::new(peer_quality.clone())),
+            peer_quality,
+            qualifications: Arc::new(PeerQualificationPool::new(initial_target)),
         });
         Ok(Self {
             descriptor: SourceDescriptor {
@@ -2243,6 +3488,7 @@ impl RethP2pSource {
         let state = self.network.state.lock().await;
         if let Some(running) = state.as_ref() {
             running.handle.update_status(block_status_head(head));
+            let _ = running.qualification_target.send(head);
         }
     }
 
@@ -2534,6 +3780,12 @@ impl RethP2pSource {
                     match validate_receipts_against_headers(headers, &response.receipts) {
                         Ok(()) => {
                             lease.succeeded();
+                            self.network.peer_quality.record_success(
+                                peer,
+                                PeerMaterialKind::Receipts,
+                                headers.last().map_or(0, |header| header.number),
+                                request_started_at.elapsed(),
+                            );
                             reward_verified_material_peer(&session.handle, peer).await;
                             self.config.network_telemetry.request_succeeded();
                             self.request_metrics.record_batch(
@@ -2710,8 +3962,11 @@ impl RethP2pSource {
 
     fn peers_config(&self) -> PeersConfig {
         if let Some(path) = self.config.peer_cache_path.as_deref()
-            && let Err(error) =
-                compact_existing_peer_cache(path, self.config.peer_cache_max_entries)
+            && let Err(error) = compact_existing_peer_cache(
+                path,
+                self.config.peer_cache_max_entries,
+                &self.network.peer_quality,
+            )
         {
             warn!(
                 path = %path.display(),
@@ -2754,15 +4009,17 @@ impl RethP2pSource {
         session
             .telemetry
             .set_range(Some(BlockRange::single(advertised.number)));
-        let already_connected = session.fetch.num_connected_peers();
-        if !newly_started && already_connected >= self.config.minimum_peers {
+        let already_qualified = self.network.qualifications.ready(advertised);
+        if !newly_started && already_qualified >= self.config.minimum_peers {
             session.set_phase(NetworkPhase::Ready);
             session.clear_error();
-            return Ok((session, already_connected));
+            return Ok((session, already_qualified));
         }
         session.set_phase(NetworkPhase::WaitingForPeers);
-        let connected = match wait_for_peers(
+        let connected = match wait_for_qualified_peers(
             &session,
+            &self.network.qualifications,
+            advertised,
             self.config.minimum_peers,
             self.config.peer_wait_timeout,
             cancellation,
@@ -2803,6 +4060,7 @@ impl RethP2pSource {
         }
         if let Some(running) = state.as_ref() {
             running.handle.update_status(block_status_head(advertised));
+            let _ = running.qualification_target.send(advertised);
             return Ok((
                 P2pSession {
                     network: self.network.clone(),
@@ -2873,7 +4131,14 @@ impl RethP2pSource {
         self.network.direct_peers.clear();
         let generation = self.network.next_generation.fetch_add(1, Ordering::Relaxed);
         let shutdown = CancellationToken::new();
+        self.network.qualifications.set_target(advertised);
+        let (qualification_target, qualification_updates) = tokio::sync::watch::channel(advertised);
         let (cache_flush, cache_flush_requests) = tokio::sync::mpsc::channel(1);
+        let bootstrap_records = prioritized_peer_cache_records(
+            self.config.peer_cache_path.as_deref(),
+            &self.network.peer_quality,
+            self.config.peer_cache_max_entries,
+        );
         let network_task = spawn_network_manager(
             manager,
             network_events,
@@ -2888,8 +4153,16 @@ impl RethP2pSource {
                 direct_peers: self.network.direct_peers.clone(),
                 preferred_peers: self.config.preferred_peers,
                 max_concurrent_dials: self.config.max_concurrent_dials,
-                peer_refill_interval: self.config.peer_refill_interval,
                 redial_interval: self.config.retry_backoff_max,
+                dial_attempt_timeout: self.config.request_timeout,
+                bootstrap_dns_tree: self.config.bootstrap_dns_tree.clone(),
+                bootstrap_records,
+                peer_quality: self.network.peer_quality.clone(),
+                qualifications: self.network.qualifications.clone(),
+                qualification_target: qualification_updates,
+                request_gate: self.network.request_gate.clone(),
+                request_timeout: self.config.request_timeout,
+                material_request_concurrency: self.config.material_request_concurrency,
                 cache_flush_requests,
                 shutdown: shutdown.clone(),
             },
@@ -2902,6 +4175,7 @@ impl RethP2pSource {
             network_task,
             shutdown,
             telemetry: telemetry.clone(),
+            qualification_target,
         };
         *state = Some(running);
         Ok((
@@ -4107,6 +5381,12 @@ impl RethP2pSource {
                     match validate_headers(range, &headers, expected_tip) {
                         Ok(()) => {
                             lease.succeeded();
+                            self.network.peer_quality.record_success(
+                                peer_id,
+                                PeerMaterialKind::Header,
+                                range.end().0,
+                                elapsed,
+                            );
                             reward_verified_material_peer(&session.handle, peer_id).await;
                             self.config.network_telemetry.request_succeeded();
                             self.request_metrics.record_header(
@@ -4317,6 +5597,12 @@ impl RethP2pSource {
                         match validate_bodies(std::slice::from_ref(header), &bodies) {
                             Ok(()) => {
                                 lease.succeeded();
+                                self.network.peer_quality.record_success(
+                                    peer_id,
+                                    PeerMaterialKind::Body,
+                                    header.number,
+                                    elapsed,
+                                );
                                 reward_verified_material_peer(&session.handle, peer_id).await;
                                 self.config.network_telemetry.request_succeeded();
                                 self.request_metrics.record(
@@ -4483,6 +5769,12 @@ impl RethP2pSource {
                         ) {
                             Ok(()) => {
                                 lease.succeeded();
+                                self.network.peer_quality.record_success(
+                                    peer_id,
+                                    PeerMaterialKind::Receipts,
+                                    material.header.number,
+                                    request_started_at.elapsed(),
+                                );
                                 reward_verified_material_peer(&session.handle, peer_id).await;
                                 self.config.network_telemetry.request_succeeded();
                                 self.request_metrics.record_batch(
@@ -5668,6 +6960,12 @@ impl RethP2pHistorySource {
                     match validate_receipts_against_headers(headers, &response.receipts) {
                         Ok(()) => {
                             lease.succeeded();
+                            self.source.network.peer_quality.record_success(
+                                peer_id,
+                                PeerMaterialKind::Receipts,
+                                headers.last().map_or(0, |header| header.number),
+                                request_started_at.elapsed(),
+                            );
                             reward_verified_material_peer(&session.handle, peer_id).await;
                             self.source.config.network_telemetry.request_succeeded();
                             self.source.request_metrics.record_batch(
@@ -7226,51 +8524,6 @@ async fn request_direct_receipts70(
     })
 }
 
-async fn wait_for_peers(
-    session: &P2pSession,
-    minimum: usize,
-    timeout: Duration,
-    cancellation: &CancellationToken,
-) -> Result<usize, P2pError> {
-    let deadline = Instant::now() + timeout;
-    let mut last_reported = None;
-    let mut next_periodic_report = Instant::now();
-    loop {
-        if !session.manager_is_current().await {
-            return Err(P2pError::Network(
-                "execution P2P manager restarted after peer discovery stalled".to_owned(),
-            ));
-        }
-        let connected = session.fetch.num_connected_peers();
-        if connected >= minimum {
-            debug!(
-                connected_peers = connected,
-                required_peers = minimum,
-                "execution peer threshold reached"
-            );
-            return Ok(connected);
-        }
-        let now = Instant::now();
-        if last_reported != Some(connected) || now >= next_periodic_report {
-            debug!(
-                connected_peers = connected,
-                required_peers = minimum,
-                remaining_seconds = deadline.saturating_duration_since(now).as_secs(),
-                "waiting for execution peers"
-            );
-            last_reported = Some(connected);
-            next_periodic_report = now + Duration::from_secs(10);
-        }
-        if now >= deadline {
-            return Err(P2pError::PeerTimeout { minimum, connected });
-        }
-        tokio::select! {
-            () = cancellation.cancelled() => return Err(P2pError::Cancelled),
-            () = tokio::time::sleep(Duration::from_millis(100)) => {}
-        }
-    }
-}
-
 fn validate_headers(
     range: BlockRange,
     headers: &[Header],
@@ -8505,6 +9758,21 @@ mod tests {
 
     use super::*;
 
+    fn direct_peer_pool() -> Arc<DirectPeerPool> {
+        Arc::new(DirectPeerPool::new(Arc::new(PeerQualityStore::load(None))))
+    }
+
+    fn node_record(marker: u8) -> NodeRecord {
+        let secret = SecretKey::from_slice(&[marker; 32]).expect("valid test secret");
+        NodeRecord::from_secret_key(
+            SocketAddr::V4(SocketAddrV4::new(
+                Ipv4Addr::LOCALHOST,
+                30_300 + u16::from(marker),
+            )),
+            &secret,
+        )
+    }
+
     fn empty_fixture() -> (BlockRange, Vec<Header>, Vec<BlockBody>, Vec<Vec<Receipt>>) {
         let range = BlockRange::new(BlockNumber(10), BlockNumber(11)).expect("range");
         let body = BlockBody::default();
@@ -9223,13 +10491,6 @@ mod tests {
                 Err(P2pError::InvalidConfig(_))
             ));
         }
-
-        assert_eq!(eager_refill_attempts(1, 16, 30, 100), 15);
-        assert_eq!(eager_refill_attempts(15, 16, 30, 100), 1);
-        assert_eq!(eager_refill_attempts(16, 16, 30, 100), 0);
-        assert_eq!(eager_refill_attempts(0, 16, 30, 100), 30);
-        assert_eq!(eager_refill_attempts(0, 64, 8, 100), 8);
-        assert_eq!(eager_refill_attempts(0, 64, 30, 4), 4);
     }
 
     #[test]
@@ -9246,6 +10507,154 @@ mod tests {
                     .to_owned()
             )
         );
+    }
+
+    #[test]
+    fn event_driven_dials_try_fresh_peers_before_cooled_retries() {
+        let first = node_record(1);
+        let second = node_record(2);
+        let mut queue = EventDrivenDialQueue::new(Duration::from_secs(2), Duration::from_secs(10));
+        assert!(queue.add(first));
+        assert!(queue.add(second));
+        assert!(!queue.add(first));
+        assert_eq!(queue.next_fresh().map(|record| record.id), Some(first.id));
+        let now = tokio::time::Instant::now();
+        queue.pending.insert(
+            first.id,
+            PendingDial {
+                record: first,
+                expires_at: now + Duration::from_secs(2),
+            },
+        );
+        assert_eq!(queue.next_fresh().map(|record| record.id), Some(second.id));
+        queue.expire_pending(now + Duration::from_secs(1));
+        assert!(queue.next_cooled(now + Duration::from_secs(20)).is_none());
+        queue.expire_pending(now + Duration::from_secs(2));
+        assert!(queue.next_cooled(now + Duration::from_secs(11)).is_none());
+        assert_eq!(
+            queue
+                .next_cooled(now + Duration::from_secs(12))
+                .map(|record| record.id),
+            Some(first.id)
+        );
+    }
+
+    #[test]
+    fn authenticated_bootstrap_tree_configuration_is_strict() {
+        assert!(validate_bootstrap_dns_tree(MAINNET_DNS_DISCOVERY_TREE).is_ok());
+        assert!(validate_bootstrap_dns_tree("https://example.com/peers.json").is_err());
+        assert!(validate_bootstrap_dns_tree("enrtree://missing-key.example.com").is_err());
+    }
+
+    #[test]
+    fn peer_quality_merge_preserves_verified_material_evidence() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let destination = directory.path().join("execution-peer-quality.json");
+        let sibling = directory.path().join("sibling-peer-quality.json");
+        let destination_store = PeerQualityStore {
+            path: Some(destination.clone()),
+            document: Mutex::new(PeerQualityDocument::default()),
+            dirty: AtomicBool::new(false),
+        };
+        let sibling_store = PeerQualityStore {
+            path: Some(sibling.clone()),
+            document: Mutex::new(PeerQualityDocument::default()),
+            dirty: AtomicBool::new(false),
+        };
+        let body_peer = node_record(3).id;
+        let receipt_peer = node_record(4).id;
+        destination_store.record_success(
+            body_peer,
+            PeerMaterialKind::Body,
+            25_000_000,
+            Duration::from_millis(30),
+        );
+        sibling_store.record_success(
+            receipt_peer,
+            PeerMaterialKind::Receipts,
+            25_000_100,
+            Duration::from_millis(20),
+        );
+        destination_store.persist(10).expect("persist destination");
+        sibling_store.persist(10).expect("persist sibling");
+
+        let merged = merge_peer_quality_caches(&destination, std::slice::from_ref(&sibling), 10)
+            .expect("merge quality caches")
+            .expect("quality evidence exists");
+        assert_eq!(
+            merged,
+            PeerQualityCacheMerge {
+                total: 2,
+                imported: 1
+            }
+        );
+        let document = read_peer_quality_document(&destination).expect("merged document");
+        assert!(
+            document.peers[&peer_quality_key(body_peer)]
+                .last_body_success_unix_ms
+                .is_some()
+        );
+        assert!(
+            document.peers[&peer_quality_key(receipt_peer)]
+                .last_receipt_success_unix_ms
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn verified_anchor_body_qualification_requires_both_material_responses() {
+        let body = BlockBody::default();
+        let header = Header {
+            number: 25_000_000,
+            timestamp: 1_788_000_000,
+            transactions_root: calculate_transaction_root(&body.transactions),
+            ommers_hash: EMPTY_OMMER_ROOT_HASH,
+            ..Header::default()
+        };
+        let hash = header.hash_slow();
+        let target = BlockRef {
+            number: BlockNumber(header.number),
+            hash: BlockHash::new(hash.0),
+            parent_hash: BlockHash::new(header.parent_hash.0),
+            timestamp: header.timestamp,
+        };
+        let peer_id = B512::from([0x42; 64]);
+        let (sender, mut receiver) =
+            tokio::sync::mpsc::channel::<PeerRequest<EthNetworkPrimitives>>(2);
+        let peer = DirectPeer {
+            peer_id,
+            eth_version: EthVersion::Eth68,
+            messages: PeerRequestSender::new(peer_id, sender),
+            advertised_head: Some(header.number),
+        };
+        let responder = tokio::spawn(async move {
+            let PeerRequest::GetBlockHeaders { response, .. } =
+                receiver.recv().await.expect("header request")
+            else {
+                panic!("expected header request");
+            };
+            response
+                .send(Ok(vec![header].into()))
+                .expect("header response");
+            let PeerRequest::GetBlockBodies { response, .. } =
+                receiver.recv().await.expect("body request")
+            else {
+                panic!("expected body request");
+            };
+            response.send(Ok(vec![body].into())).expect("body response");
+        });
+        let result = qualify_execution_peer(
+            peer,
+            target,
+            Duration::from_secs(1),
+            Arc::new(MaterialRequestGate::default()),
+            1,
+            Priority::High,
+            CancellationToken::new(),
+        )
+        .await;
+        assert_eq!(result.outcome, PeerQualification::BodyServing);
+        responder.await.expect("qualification responder");
     }
 
     #[test]
@@ -9564,7 +10973,8 @@ mod tests {
         )
         .expect("peer entries");
 
-        let compacted = compact_peer_cache_entries(entries, 2);
+        let quality = PeerQualityStore::load(None);
+        let compacted = compact_peer_cache_entries(entries, 2, &quality);
         assert_eq!(compacted.len(), 2);
         assert_eq!(compacted[0]["record"], "enode://plain");
         assert_eq!(compacted[0]["reputation"], 100);
@@ -9613,7 +11023,7 @@ mod tests {
 
     #[tokio::test]
     async fn empty_direct_peer_pool_has_a_distinct_availability_timeout() {
-        let pool = Arc::new(DirectPeerPool::default());
+        let pool = direct_peer_pool();
         let error = pool
             .acquire(4, Duration::from_millis(10), &CancellationToken::new())
             .await
@@ -9628,7 +11038,7 @@ mod tests {
 
     #[tokio::test]
     async fn direct_peer_wave_selects_each_connected_peer_at_most_once() {
-        let pool = Arc::new(DirectPeerPool::default());
+        let pool = direct_peer_pool();
         let mut receivers = Vec::new();
         for marker in 1_u8..=3 {
             let peer_id = B512::from([marker; 64]);
@@ -9638,7 +11048,9 @@ mod tests {
                 peer_id,
                 eth_version: EthVersion::Eth68,
                 messages: PeerRequestSender::new(peer_id, sender),
+                advertised_head: None,
             });
+            pool.set_qualified(peer_id, true);
         }
 
         let cancellation = CancellationToken::new();
@@ -9704,7 +11116,7 @@ mod tests {
 
     #[tokio::test]
     async fn local_cooldown_prioritizes_a_new_unasked_peer() {
-        let pool = Arc::new(DirectPeerPool::default());
+        let pool = direct_peer_pool();
         let mut receivers = Vec::new();
         for marker in 1_u8..=2 {
             let peer_id = B512::from([marker; 64]);
@@ -9714,7 +11126,9 @@ mod tests {
                 peer_id,
                 eth_version: EthVersion::Eth68,
                 messages: PeerRequestSender::new(peer_id, sender),
+                advertised_head: None,
             });
+            pool.set_qualified(peer_id, true);
         }
 
         let cancellation = CancellationToken::new();
@@ -9741,7 +11155,9 @@ mod tests {
             peer_id: fresh_peer,
             eth_version: EthVersion::Eth68,
             messages: PeerRequestSender::new(fresh_peer, sender),
+            advertised_head: None,
         });
+        pool.set_qualified(fresh_peer, true);
         let lease = pool
             .acquire_excluding(
                 1,
@@ -9767,6 +11183,7 @@ mod tests {
             peer_id,
             eth_version: EthVersion::Eth68,
             messages: PeerRequestSender::new(peer_id, sender),
+            advertised_head: None,
         };
         let hash = B256::from([0x55; 32]);
         let responder = tokio::spawn(async move {
@@ -9801,6 +11218,7 @@ mod tests {
             peer_id,
             eth_version: EthVersion::Eth68,
             messages: PeerRequestSender::new(peer_id, sender),
+            advertised_head: None,
         };
         let hash = B256::from([0x77; 32]);
         let responder = tokio::spawn(async move {

@@ -1063,7 +1063,9 @@ fn reset_subscription_directory(data_dir: &Path, confirmed: bool) -> Result<bool
 
     eprintln!("leani: embedded subscription cold-start reset");
     eprintln!("  directory: {}", data_dir.display());
-    eprintln!("  removes:   checkpoint, feed-local peer cache, P2P identity, and SQLite state");
+    eprintln!(
+        "  removes:   checkpoint, feed-local peer/quality caches, P2P identity, and SQLite state"
+    );
     eprintln!(
         "  note:      other local Mainnet contexts remain reusable; `leani reset all` removes every peer cache"
     );
@@ -1186,10 +1188,36 @@ fn merge_local_execution_peer_caches(
         return Ok(None);
     }
     write_peer_cache(&destination, &entries)?;
+    merge_local_execution_peer_quality(&sources, data_dir, maximum_entries)?;
     Ok(Some(PeerCacheMerge {
         total: entries.len(),
         imported,
     }))
+}
+
+fn merge_local_execution_peer_quality(
+    peer_cache_sources: &[PathBuf],
+    data_dir: &Path,
+    maximum_entries: usize,
+) -> Result<()> {
+    let quality_destination = data_dir.join("execution-peer-quality.json");
+    let quality_sources = peer_cache_sources
+        .iter()
+        .map(|source| source.with_file_name("execution-peer-quality.json"))
+        .collect::<Vec<_>>();
+    leani_source_p2p::merge_peer_quality_caches(
+        &quality_destination,
+        &quality_sources,
+        maximum_entries,
+    )
+    .map_err(anyhow::Error::msg)
+    .with_context(|| {
+        format!(
+            "merge execution peer-quality caches into {}",
+            quality_destination.display()
+        )
+    })?;
+    Ok(())
 }
 
 fn read_peer_cache_entries(path: &Path) -> Result<Vec<Value>> {
@@ -3310,6 +3338,48 @@ mod tests {
             ],
         )
         .expect("sibling cache");
+        fs::write(
+            target.join("execution-peer-quality.json"),
+            serde_json::to_vec_pretty(&json!({
+                "schema_version": 1,
+                "peers": {
+                    "local-peer": {
+                        "fork_compatible": true,
+                        "highest_served_block": 10,
+                        "last_header_success_unix_ms": 1,
+                        "last_body_success_unix_ms": 1,
+                        "last_receipt_success_unix_ms": null,
+                        "response_latency_ms": 30,
+                        "last_failure_reason": null,
+                        "last_failure_unix_ms": null,
+                        "qualification": "body_serving"
+                    }
+                }
+            }))
+            .expect("target quality JSON"),
+        )
+        .expect("target quality cache");
+        fs::write(
+            sibling.join("execution-peer-quality.json"),
+            serde_json::to_vec_pretty(&json!({
+                "schema_version": 1,
+                "peers": {
+                    "imported-peer": {
+                        "fork_compatible": true,
+                        "highest_served_block": 12,
+                        "last_header_success_unix_ms": 2,
+                        "last_body_success_unix_ms": null,
+                        "last_receipt_success_unix_ms": 2,
+                        "response_latency_ms": 20,
+                        "last_failure_reason": null,
+                        "last_failure_unix_ms": null,
+                        "qualification": null
+                    }
+                }
+            }))
+            .expect("sibling quality JSON"),
+        )
+        .expect("sibling quality cache");
 
         let merged = merge_local_execution_peer_caches(None, &target, 3)
             .expect("merge caches")
@@ -3333,6 +3403,12 @@ mod tests {
                 .iter()
                 .any(|entry| { peer_cache_record(entry).as_deref() == Some("enode://imported") })
         );
+        let quality: Value = serde_json::from_slice(
+            &fs::read(target.join("execution-peer-quality.json")).expect("merged quality cache"),
+        )
+        .expect("parse merged quality cache");
+        assert!(quality["peers"]["local-peer"].is_object());
+        assert!(quality["peers"]["imported-peer"].is_object());
     }
 
     #[test]

@@ -105,6 +105,12 @@ enable_discv5 = true
 nat = "any"
 # Optional stable enode seeds supplement discovery; they are not an allowlist.
 trusted_peers = []
+# An optional Leani/community EIP-1459 tree can advertise peers prepared for
+# indexing traffic. The public key in its enrtree:// URL authenticates hints,
+# never execution data. No operator is configured by default.
+# bootstrap_dns_tree = "enrtree://<public-key>@peers.example.org"
+# This is Reth's safety-net polling interval. Leani dispatches newly discovered
+# candidates and refills freed dial slots immediately within the ceiling above.
 peer_refill_interval_ms = 5000
 # Rebuild discovery after a sustained zero-peer state (including host sleep or
 # an initially failed DNS/Discv bootstrap).

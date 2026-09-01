@@ -177,6 +177,20 @@ production ports normally use `listener_port = 30303`,
 require distinct fixed UDP ports; zero selects an isolated ephemeral port for
 that protocol.
 
+Discovery is event-driven above Reth's bounded dialer: a newly authenticated
+DNS/Discv candidate is tried as soon as a dial slot is available, failed
+attempts enter a cooldown, and a closed session immediately exposes its slot
+to an unseen candidate. `max_concurrent_dials` remains the hard simultaneous
+dial ceiling; `peer_refill_interval_ms` is only Reth's internal safety-net
+poll.
+
+`bootstrap_dns_tree` may point at an optional EIP-1459 `enrtree://` peer-hint
+tree. The public key embedded in that URL authenticates its ENRs. It does not
+make those peers trusted sources: Leani still commitment-checks every header,
+body, and receipt. This is the deployment hook for a future Leani/community
+pool of execution nodes prepared to accept indexing traffic; compact and
+advanced configurations leave it unset by default.
+
 Finality checkpoints are bootstrap trust anchors, not evergreen config
 defaults. `consensus_p2p` requires a recent 32-byte checkpoint root and its
 non-zero finalized beacon slot. `beacon_api` requires one or more endpoints

@@ -75,10 +75,20 @@ Reth output capped by `sources.live.peer_cache_max_entries`; the first startup
 after upgrading preserves an oversized old cache as
 `execution-peers.json.pre-compact`.
 
-Leani adds a small positive reputation only after a historical response passes
-its header/body/receipt commitments, then flushes that state during graceful
-shutdown. Proven serving peers are tried before untested discovery records on
-the next start.
+`execution-peer-quality.json` stores Leani's independently observed service
+evidence: verified header/body/receipt success times, highest served block,
+smoothed response latency, last failure classification/time, fork
+compatibility, and latest anchor qualification. Keep it with the peer cache.
+Standalone feeds merge this evidence across sibling local Mainnet contexts,
+so a body- or receipt-serving peer learned by one processor is preferred by
+another without sharing processor data or the local P2P identity secret.
+
+Every new ETH session is immediately tested against the current independently
+verified execution anchor. Only a peer that returns both the exact header and
+a body matching its commitments enters the live material pool. Leani races
+qualifications until the first serving peer is ready, then qualifies remaining
+sessions one at a time at normal priority so live requests win. Proven serving
+peers are tried before untested discovery records on the next start.
 
 `sources.live.material_request_concurrency` bounds simultaneous physical
 requests together with the global source budget and connected-peer capacity.

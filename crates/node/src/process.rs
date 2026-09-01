@@ -4239,6 +4239,7 @@ fn p2p_probe_source(
         enable_discv5: config.sources.live.enable_discv5,
         nat: leani_source_p2p::parse_nat_resolver(&config.sources.live.nat)?,
         trusted_peers,
+        bootstrap_dns_tree: config.sources.live.bootstrap_dns_tree.clone(),
         peer_refill_interval: Duration::from_millis(config.sources.live.peer_refill_interval_ms),
         peer_recovery_timeout: Duration::from_secs(
             config.sources.live.peer_recovery_timeout_seconds,
@@ -5633,6 +5634,7 @@ pub(crate) fn execution_p2p_source(
         enable_discv5: config.sources.live.enable_discv5,
         nat,
         trusted_peers,
+        bootstrap_dns_tree: config.sources.live.bootstrap_dns_tree.clone(),
         peer_refill_interval: std::time::Duration::from_millis(
             config.sources.live.peer_refill_interval_ms,
         ),
