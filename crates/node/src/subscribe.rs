@@ -467,7 +467,6 @@ async fn subscribe_embedded(
         if !announced_ready && runtime.readiness.is_ready() {
             snapshot_pending = false;
             preview_stream = None;
-            preview_blocks.clear();
             // The live runtime validates and catches up a finalized overlap
             // before readiness. Preserve only the newest fresh observation
             // per requested market from that work: replaying the whole overlap
@@ -500,7 +499,9 @@ async fn subscribe_embedded(
                 eprintln!("leani: live execution and verified finality are ready");
             }
             for (market, entity, record) in startup_prices {
-                if previewed.contains(&observation_key(&entity)) {
+                if previewed.contains(&observation_key(&entity))
+                    || preview_is_at_or_after(&preview_blocks, &entity)
+                {
                     continue;
                 }
                 render_local(options.format, &market, &entity, &record)?;
@@ -510,6 +511,7 @@ async fn subscribe_embedded(
                     return Ok(Exit::Success);
                 }
             }
+            preview_blocks.clear();
         }
         if !announced_ready {
             tokio::select! {
@@ -1457,6 +1459,21 @@ const fn observation_key(entity: &PoolPriceEntity) -> ObservationKey {
     (entity.pool, entity.block_hash, entity.log_index)
 }
 
+fn preview_is_at_or_after(
+    blocks: &BTreeMap<u64, (BlockHash, Vec<PoolPriceEntity>)>,
+    candidate: &PoolPriceEntity,
+) -> bool {
+    blocks.values().any(|(_, observations)| {
+        observations.iter().any(|preview| {
+            preview.pool == candidate.pool
+                && (preview.block_number.0 > candidate.block_number.0
+                    || (preview.block_number == candidate.block_number
+                        && preview.block_hash == candidate.block_hash
+                        && preview.log_index >= candidate.log_index))
+        })
+    })
+}
+
 fn render_local(
     format: SubscribeFormat,
     market: &Market,
@@ -2292,6 +2309,39 @@ mod tests {
         assert_eq!(prices[0].2.cursor.sequence, 4);
         assert_eq!(prices[1].0.symbol, "WBTC/ETH");
         assert_eq!(prices[1].2.cursor.sequence, 3);
+    }
+
+    #[test]
+    fn readiness_snapshot_cannot_follow_a_newer_optimistic_preview() {
+        let market = resolve_markets(&["ETH/USDC".to_owned()]).expect("market")[0];
+        let older_record = price_record(market, 86, 10_000);
+        let preview_record = price_record(market, 88, 10_024);
+        let (_, older) = local_price(&[market], &older_record)
+            .expect("decode older price")
+            .expect("older market");
+        let (_, preview) = local_price(&[market], &preview_record)
+            .expect("decode preview price")
+            .expect("preview market");
+        let mut preview_blocks = BTreeMap::from([(
+            preview.block_number.0,
+            (preview.block_hash, vec![preview.clone()]),
+        )]);
+
+        assert!(preview_is_at_or_after(&preview_blocks, &older));
+        assert!(preview_is_at_or_after(&preview_blocks, &preview));
+
+        let newer_record = price_record(market, 89, 10_036);
+        let (_, newer) = local_price(&[market], &newer_record)
+            .expect("decode newer price")
+            .expect("newer market");
+        assert!(!preview_is_at_or_after(&preview_blocks, &newer));
+
+        let mut replacement = preview;
+        replacement.block_hash = BlockHash::new([99; 32]);
+        assert!(!preview_is_at_or_after(&preview_blocks, &replacement));
+
+        preview_blocks.clear();
+        assert!(!preview_is_at_or_after(&preview_blocks, &older));
     }
 
     #[test]
