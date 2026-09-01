@@ -20,7 +20,7 @@ use leani_processor_block_summary::{BLOCK_SUMMARY_KIND, BlockSummaryEntity};
 use leani_processor_uniswap::{PoolPriceEntity, UniswapPriceDelta};
 use leani_source_api::{
     ChainEvent, ChainEventStream, DataRequest, FieldProjection, FilterSet, LiveSource as _,
-    LiveStart, SourceBudget, SourceError, VerificationPolicy,
+    LiveStart, NetworkTelemetrySnapshot, SourceBudget, SourceError, VerificationPolicy,
 };
 use leani_store_sqlite::{ChangeDirection, ChangeRecord, SqliteStore};
 use serde::{Deserialize, Serialize};
@@ -495,10 +495,24 @@ async fn subscribe_embedded(
     let data_dir = subscription_data_dir(options, markets, config_path)?;
     fs::create_dir_all(&data_dir)
         .with_context(|| format!("create subscription data directory {}", data_dir.display()))?;
-    if seed_configured_peer_cache(config_path, &data_dir)? {
-        eprintln!("leani: reusing cached execution peers from the configured node context");
-    }
     let config = embedded_config(options, markets, config_path, &data_dir).await?;
+    if let Some(peer_cache) = merge_local_execution_peer_caches(
+        config_path,
+        &data_dir,
+        config.sources.live.peer_cache_max_entries,
+    )? {
+        if peer_cache.imported == 0 {
+            eprintln!(
+                "leani: loaded {} cached execution peer candidates",
+                peer_cache.total,
+            );
+        } else {
+            eprintln!(
+                "leani: loaded {} cached execution peer candidates ({} imported from other local Mainnet contexts)",
+                peer_cache.total, peer_cache.imported,
+            );
+        }
+    }
     let processors = registry.instantiate_all(&config)?;
     let processor = processors
         .first()
@@ -567,8 +581,8 @@ async fn subscribe_embedded(
                 );
             } else if status.connected_peer_slots == 0 {
                 eprintln!(
-                    "leani: still searching for a usable Ethereum peer ({} known, {} sessions accepted); Ctrl-C stops immediately",
-                    status.known_peer_records, status.peer_lifecycle.established,
+                    "leani: still searching for a usable Ethereum peer ({}); Ctrl-C stops immediately",
+                    format_peer_search_status(&status),
                 );
             } else {
                 eprintln!(
@@ -579,8 +593,6 @@ async fn subscribe_embedded(
             next_startup_status = next_startup_status.saturating_add(Duration::from_secs(30));
         }
         if !announced_ready && runtime.readiness.is_ready() {
-            snapshot_pending = false;
-            preview_stream = None;
             // The live runtime validates and catches up a finalized overlap
             // before readiness. Preserve only the newest fresh observation
             // per requested market from that work: replaying the whole overlap
@@ -608,29 +620,38 @@ async fn subscribe_embedded(
                 options.finality,
                 unix_seconds(),
             )?;
-            after = ready_after;
-            announced_ready = true;
-            if startup_items.is_empty() {
-                eprintln!(
-                    "leani: execution peers and verified finality are connected; waiting for the next matching update..."
-                );
-            } else {
-                eprintln!("leani: live execution and verified finality are ready");
-            }
-            for (item, record) in startup_items {
-                if previewed.contains(&observation_key(&item))
-                    || preview_is_at_or_after(&preview_blocks, &item)
-                {
-                    continue;
+            // Readiness means the anchored lane is operational, not that it
+            // has already committed a displayable update. Keep racing the
+            // current-head snapshot until either it resolves or anchored work
+            // produces the first fresh item. Cancelling it here made a ready
+            // but still-empty store wait through the finalized overlap.
+            if !startup_items.is_empty() || !snapshot_pending {
+                snapshot_pending = false;
+                preview_stream = None;
+                after = ready_after;
+                announced_ready = true;
+                if startup_items.is_empty() {
+                    eprintln!(
+                        "leani: execution peers and verified finality are connected; waiting for the next matching update..."
+                    );
+                } else {
+                    eprintln!("leani: live execution and verified finality are ready");
                 }
-                render_local_item(options.format, &item, &record)?;
-                if options.once {
-                    persist_current_verified_anchor(&runtime, &data_dir, &config)?;
-                    runtime.shutdown().await;
-                    return Ok(Exit::Success);
+                for (item, record) in startup_items {
+                    if previewed.contains(&observation_key(&item))
+                        || preview_is_at_or_after(&preview_blocks, &item)
+                    {
+                        continue;
+                    }
+                    render_local_item(options.format, &item, &record)?;
+                    if options.once {
+                        persist_current_verified_anchor(&runtime, &data_dir, &config)?;
+                        runtime.shutdown().await;
+                        return Ok(Exit::Success);
+                    }
                 }
+                preview_blocks.clear();
             }
-            preview_blocks.clear();
         }
         if !announced_ready {
             tokio::select! {
@@ -838,6 +859,38 @@ async fn subscribe_embedded(
     }
 }
 
+fn format_peer_search_status(status: &NetworkTelemetrySnapshot) -> String {
+    let mut reasons = status
+        .peer_lifecycle
+        .disconnect_reasons
+        .iter()
+        .collect::<Vec<_>>();
+    reasons.sort_by(|left, right| {
+        right
+            .count
+            .cmp(&left.count)
+            .then_with(|| left.reason.cmp(&right.reason))
+    });
+    let reasons = reasons
+        .into_iter()
+        .take(2)
+        .map(|reason| format!("{}={}", reason.reason.as_str(), reason.count))
+        .collect::<Vec<_>>();
+    let reasons = if reasons.is_empty() {
+        String::new()
+    } else {
+        format!("; {}", reasons.join(", "))
+    };
+    format!(
+        "{} connected, {} candidates known; {} sessions opened, {} closed{}",
+        status.connected_peer_slots,
+        status.known_peer_records,
+        status.peer_lifecycle.established,
+        status.peer_lifecycle.disconnected,
+        reasons,
+    )
+}
+
 async fn embedded_config(
     options: &SubscribeOptions,
     markets: &[Market],
@@ -1010,7 +1063,10 @@ fn reset_subscription_directory(data_dir: &Path, confirmed: bool) -> Result<bool
 
     eprintln!("leani: embedded subscription cold-start reset");
     eprintln!("  directory: {}", data_dir.display());
-    eprintln!("  removes:   checkpoint, peer cache, P2P identity, and SQLite state");
+    eprintln!("  removes:   checkpoint, feed-local peer cache, P2P identity, and SQLite state");
+    eprintln!(
+        "  note:      other local Mainnet contexts remain reusable; `leani reset all` removes every peer cache"
+    );
     eprintln!("Stop any embedded subscriber using this feed before continuing.");
     if !confirmed {
         if !io::stdin().is_terminal() {
@@ -1030,37 +1086,158 @@ fn reset_subscription_directory(data_dir: &Path, confirmed: bool) -> Result<bool
     Ok(true)
 }
 
-fn seed_configured_peer_cache(config_path: Option<&Path>, data_dir: &Path) -> Result<bool> {
-    let Some(config_path) = config_path else {
-        return Ok(false);
-    };
-    let source = Config::load(config_path)?
-        .data_dir
-        .join("execution-peers.json");
-    seed_peer_cache(&source, &data_dir.join("execution-peers.json"))
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PeerCacheMerge {
+    total: usize,
+    imported: usize,
 }
 
-fn seed_peer_cache(source: &Path, destination: &Path) -> Result<bool> {
-    if source == destination || !source.is_file() || destination.exists() {
-        return Ok(false);
+fn merge_local_execution_peer_caches(
+    config_path: Option<&Path>,
+    data_dir: &Path,
+    maximum_entries: usize,
+) -> Result<Option<PeerCacheMerge>> {
+    let destination = data_dir.join("execution-peers.json");
+    let mut sources = Vec::new();
+    if destination.is_file() {
+        sources.push(destination.clone());
     }
-    let parent = destination
+    if let Some(config_path) = config_path {
+        sources.push(
+            Config::load(config_path)?
+                .data_dir
+                .join("execution-peers.json"),
+        );
+    }
+    if data_dir
+        .parent()
+        .and_then(Path::file_name)
+        .is_some_and(|name| name == "subscriptions")
+        && let Some(subscriptions) = data_dir.parent()
+    {
+        for entry in fs::read_dir(subscriptions)
+            .with_context(|| format!("read subscription state root {}", subscriptions.display()))?
+        {
+            let path = entry
+                .with_context(|| format!("read entry in {}", subscriptions.display()))?
+                .path()
+                .join("execution-peers.json");
+            sources.push(path);
+        }
+    }
+    sources.sort_unstable();
+    sources.dedup();
+
+    let destination_entries = read_peer_cache_entries(&destination)?;
+    let destination_records = destination_entries
+        .iter()
+        .filter_map(peer_cache_record)
+        .collect::<HashSet<_>>();
+    let mut merged = BTreeMap::<String, Value>::new();
+    for entry in destination_entries {
+        if let Some(record) = peer_cache_record(&entry) {
+            merged.insert(record, entry);
+        }
+    }
+    for source in sources.iter().filter(|source| **source != destination) {
+        let entries = match read_peer_cache_entries(source) {
+            Ok(entries) => entries,
+            Err(error) => {
+                eprintln!(
+                    "leani: ignoring unreadable peer cache {}: {error:#}",
+                    source.display()
+                );
+                continue;
+            }
+        };
+        for entry in entries {
+            let Some(record) = peer_cache_record(&entry) else {
+                continue;
+            };
+            match merged.entry(record) {
+                std::collections::btree_map::Entry::Vacant(slot) => {
+                    slot.insert(entry);
+                }
+                std::collections::btree_map::Entry::Occupied(mut slot)
+                    if peer_cache_priority(&entry) > peer_cache_priority(slot.get()) =>
+                {
+                    slot.insert(entry);
+                }
+                std::collections::btree_map::Entry::Occupied(_) => {}
+            }
+        }
+    }
+    let mut entries = merged.into_iter().collect::<Vec<_>>();
+    entries.sort_by(|(left_record, left), (right_record, right)| {
+        peer_cache_priority(right)
+            .cmp(&peer_cache_priority(left))
+            .then_with(|| left_record.cmp(right_record))
+    });
+    entries.truncate(maximum_entries);
+    let imported = entries
+        .iter()
+        .filter(|(record, _)| !destination_records.contains(record))
+        .count();
+    let entries = entries
+        .into_iter()
+        .map(|(_, entry)| entry)
+        .collect::<Vec<_>>();
+    if entries.is_empty() {
+        return Ok(None);
+    }
+    write_peer_cache(&destination, &entries)?;
+    Ok(Some(PeerCacheMerge {
+        total: entries.len(),
+        imported,
+    }))
+}
+
+fn read_peer_cache_entries(path: &Path) -> Result<Vec<Value>> {
+    let encoded = match fs::read(path) {
+        Ok(encoded) => encoded,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => {
+            return Err(error).with_context(|| format!("read peer cache {}", path.display()));
+        }
+    };
+    serde_json::from_slice(&encoded).with_context(|| format!("parse peer cache {}", path.display()))
+}
+
+fn peer_cache_record(entry: &Value) -> Option<String> {
+    entry
+        .get("record")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+}
+
+fn peer_cache_priority(entry: &Value) -> (bool, bool, bool, i64) {
+    let reputation = entry
+        .get("reputation")
+        .and_then(Value::as_i64)
+        .unwrap_or_default();
+    let has_fork = entry
+        .get("fork_id")
+        .or_else(|| entry.get("forkId"))
+        .is_some_and(|fork| !fork.is_null());
+    (reputation >= 0, reputation > 0, has_fork, reputation)
+}
+
+fn write_peer_cache(path: &Path, entries: &[Value]) -> Result<()> {
+    let parent = path
         .parent()
         .context("execution peer cache path has no parent directory")?;
     fs::create_dir_all(parent)
         .with_context(|| format!("create peer cache directory {}", parent.display()))?;
-    let mut input = fs::File::open(source)
-        .with_context(|| format!("open configured peer cache {}", source.display()))?;
     let mut temporary = tempfile::NamedTempFile::new_in(parent)
         .with_context(|| format!("create peer cache in {}", parent.display()))?;
-    io::copy(&mut input, temporary.as_file_mut())?;
+    serde_json::to_writer_pretty(temporary.as_file_mut(), entries)?;
+    temporary.as_file_mut().write_all(b"\n")?;
     temporary.as_file_mut().sync_all()?;
-    match temporary.persist_noclobber(destination) {
-        Ok(_) => Ok(true),
-        Err(error) if error.error.kind() == io::ErrorKind::AlreadyExists => Ok(false),
-        Err(error) => Err(error.error)
-            .with_context(|| format!("seed peer cache at {}", destination.display())),
-    }
+    temporary
+        .persist(path)
+        .map_err(|error| error.error)
+        .with_context(|| format!("write merged peer cache at {}", path.display()))?;
+    Ok(())
 }
 
 async fn trusted_checkpoint(
@@ -1489,6 +1666,8 @@ async fn optimistic_head_snapshot(
     budget: SourceBudget,
     cancellation: tokio_util::sync::CancellationToken,
 ) -> Result<BlockFrame> {
+    const MAX_SNAPSHOT_ATTEMPTS: usize = 3;
+
     let advertised = loop {
         if let Some(anchor) = *anchors.borrow() {
             break anchor.block;
@@ -1503,10 +1682,40 @@ async fn optimistic_head_snapshot(
         }
     };
     request.range = BlockRange::single(advertised.number);
-    source
-        .optimistic_head_snapshot(advertised, &request, budget, &cancellation)
-        .await
-        .context("fetch optimistic execution-head preview")
+    for attempt in 1..=MAX_SNAPSHOT_ATTEMPTS {
+        match source
+            .optimistic_head_snapshot(advertised, &request, budget, &cancellation)
+            .await
+        {
+            Ok(frame) => return Ok(frame),
+            Err(error)
+                if attempt < MAX_SNAPSHOT_ATTEMPTS
+                    && !matches!(
+                        &error,
+                        leani_source_p2p::P2pError::InvalidConfig(_)
+                            | leani_source_p2p::P2pError::RangeTooLarge { .. }
+                            | leani_source_p2p::P2pError::ReorgTooDeep { .. }
+                            | leani_source_p2p::P2pError::Cancelled
+                            | leani_source_p2p::P2pError::Source(_)
+                    ) =>
+            {
+                tracing::debug!(
+                    attempt,
+                    maximum_attempts = MAX_SNAPSHOT_ATTEMPTS,
+                    %error,
+                    "optimistic execution-head preview is temporarily unavailable; retrying the active peer pool"
+                );
+                tokio::select! {
+                    () = cancellation.cancelled() => {
+                        bail!("embedded runtime stopped before optimistic preview");
+                    }
+                    () = tokio::time::sleep(Duration::from_secs(1)) => {}
+                }
+            }
+            Err(error) => return Err(error).context("fetch optimistic execution-head preview"),
+        }
+    }
+    unreachable!("bounded optimistic snapshot attempts always return")
 }
 
 fn processor_data_request(
@@ -3078,23 +3287,66 @@ mod tests {
     }
 
     #[test]
-    fn peer_cache_seed_is_atomic_and_never_replaces_local_state() {
+    fn peer_cache_merge_reuses_sibling_candidates_and_keeps_best_metadata() {
         let directory = tempfile::tempdir().expect("temporary directory");
-        let source = directory.path().join("configured-peers.json");
-        let destination = directory.path().join("embedded/execution-peers.json");
-        fs::write(&source, b"configured").expect("write configured cache");
+        let subscriptions = directory.path().join("subscriptions");
+        let target = subscriptions.join("0123456789abcdef");
+        let sibling = subscriptions.join("fedcba9876543210");
+        fs::create_dir_all(&target).expect("target state");
+        fs::create_dir_all(&sibling).expect("sibling state");
+        write_peer_cache(
+            &target.join("execution-peers.json"),
+            &[
+                json!({"record": "enode://shared", "reputation": 0}),
+                json!({"record": "enode://local", "reputation": 1}),
+            ],
+        )
+        .expect("target cache");
+        write_peer_cache(
+            &sibling.join("execution-peers.json"),
+            &[
+                json!({"record": "enode://shared", "reputation": 12}),
+                json!({"record": "enode://imported", "reputation": 0, "fork_id": {}}),
+            ],
+        )
+        .expect("sibling cache");
 
-        assert!(seed_peer_cache(&source, &destination).expect("seed cache"));
+        let merged = merge_local_execution_peer_caches(None, &target, 3)
+            .expect("merge caches")
+            .expect("peer cache exists");
         assert_eq!(
-            fs::read(&destination).expect("read seeded cache"),
-            b"configured"
+            merged,
+            PeerCacheMerge {
+                total: 3,
+                imported: 1,
+            }
         );
+        let entries =
+            read_peer_cache_entries(&target.join("execution-peers.json")).expect("merged entries");
+        assert_eq!(entries.len(), 3);
+        assert!(entries.iter().any(|entry| {
+            peer_cache_record(entry).as_deref() == Some("enode://shared")
+                && entry["reputation"] == 12
+        }));
+        assert!(
+            entries
+                .iter()
+                .any(|entry| { peer_cache_record(entry).as_deref() == Some("enode://imported") })
+        );
+    }
 
-        fs::write(&source, b"new configured state").expect("update configured cache");
-        assert!(!seed_peer_cache(&source, &destination).expect("preserve cache"));
+    #[test]
+    fn peer_search_status_reports_current_connections_and_churn() {
+        let telemetry = leani_source_api::NetworkTelemetry::default();
+        telemetry.peer_session_established();
+        telemetry.peer_session_established();
+        telemetry.peer_session_closed(leani_source_api::NetworkDisconnectReason::TooManyPeers);
+        telemetry.peer_session_closed(leani_source_api::NetworkDisconnectReason::ConnectionClosed);
+
+        let status = format_peer_search_status(&telemetry.snapshot());
         assert_eq!(
-            fs::read(&destination).expect("read local cache"),
-            b"configured"
+            status,
+            "0 connected, 0 candidates known; 2 sessions opened, 2 closed; connection_closed=1, too_many_peers=1"
         );
     }
 
