@@ -7,8 +7,8 @@ pub use extension::{
     QueryContext, QueryExtension, QueryExtensionRegistration, QueryExtensionSummary,
 };
 pub use extensions::{
-    BlobsQueryExtension, Erc20QueryExtension, UniswapObservationsQueryExtension,
-    UniswapQueryExtension,
+    BlobsQueryExtension, BlockSummaryQueryExtension, Erc20QueryExtension,
+    UniswapObservationsQueryExtension, UniswapQueryExtension,
 };
 
 use std::{
@@ -7377,6 +7377,62 @@ mod tests {
         block
     }
 
+    async fn seed_block_summary(
+        store: &SqliteStore,
+        processor: &leani_processor_block_summary::BlockSummaryProcessor,
+    ) -> leani_primitives::BlockRef {
+        let block = leani_primitives::BlockRef {
+            number: BlockNumber(43),
+            hash: BlockHash::new([0x43; 32]),
+            parent_hash: BlockHash::new([0x42; 32]),
+            timestamp: 1_800_000_012,
+        };
+        store
+            .store_canonical_anchor(ChainId(1), block, Finality::Optimistic)
+            .await
+            .expect("canonical block-summary block");
+        let payload = postcard::to_allocvec(&leani_processor_block_summary::BlockSummaryEntity {
+            chain_id: ChainId(1),
+            block_number: block.number,
+            block_hash: block.hash,
+            parent_hash: block.parent_hash,
+            timestamp: block.timestamp,
+            gas_limit: Some(60_000_000),
+            gas_used: Some(31_000_000),
+            base_fee_per_gas: Some(Quantity::new([7; 32])),
+            blob_gas_used: Some(262_144),
+            excess_blob_gas: Some(393_216),
+            transaction_count: None,
+            size_bytes: None,
+            finality: Finality::Optimistic,
+        })
+        .expect("block-summary delta");
+        let delta = leani_processor_api::EncodedDelta::new(
+            processor.descriptor(),
+            ChainId(1),
+            block,
+            payload,
+        );
+        store
+            .apply(
+                processor,
+                ProcessorCursor {
+                    processor_id: processor.descriptor().id.to_string(),
+                    processor_version: processor.descriptor().version.to_string(),
+                    chain_id: ChainId(1),
+                    block_number: block.number,
+                    block_hash: block.hash,
+                    finality: Finality::Optimistic,
+                    sequence: 1,
+                },
+                &delta,
+                &[],
+            )
+            .await
+            .expect("apply block summary");
+        block
+    }
+
     #[test]
     fn stream_batching_overrides_can_only_tighten_durable_limits() {
         let persisted = DeliveryBatchLimits::history_default();
@@ -7851,6 +7907,54 @@ mod tests {
             format!("/v1/processors/{instance}/query")
         );
         assert_eq!(body["queryExtensions"][0]["aliasPath"], "/v1/q/orders");
+    }
+
+    #[tokio::test]
+    async fn block_summary_extension_exposes_the_latest_processed_header() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = SqliteStore::open(leani_store_sqlite::StoreConfig::new(
+            directory.path().join("node.sqlite"),
+        ))
+        .await
+        .expect("store");
+        let processor = Arc::new(
+            leani_processor_block_summary::BlockSummaryProcessor::new(
+                leani_processor_block_summary::BlockSummaryConfig {
+                    start_block: BlockNumber(0),
+                },
+            )
+            .expect("processor"),
+        );
+        let instance = processor.descriptor().instance.to_string();
+        let block = seed_block_summary(&store, processor.as_ref()).await;
+        let processor: Arc<dyn Processor> = processor;
+        let registration = QueryExtensionRegistration::new(
+            processor.clone(),
+            Arc::new(BlockSummaryQueryExtension),
+        );
+        let app = router_with_processors(
+            store,
+            vec![processor],
+            vec![registration],
+            ApiConfig::default(),
+        )
+        .expect("router");
+
+        let response = app
+            .oneshot(
+                Request::get(format!("/v1/processors/{instance}/query/latest"))
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 4096).await.expect("body");
+        let body: Value = serde_json::from_slice(&body).expect("JSON");
+        assert_eq!(body["data"]["blockNumber"], block.number.0);
+        assert_eq!(body["data"]["blockHash"], block.hash.to_string());
+        assert_eq!(body["data"]["gasUsed"], 31_000_000);
+        assert_eq!(body["data"]["finality"], "optimistic");
     }
 
     #[tokio::test]

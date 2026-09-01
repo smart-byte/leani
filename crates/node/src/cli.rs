@@ -44,9 +44,9 @@ pub enum Command {
         /// Processor preset to configure.
         #[arg(value_enum)]
         protocol: SubscribeProtocol,
-        /// One or more built-in markets, for example `ETH/USDC`.
-        #[arg(required = true, num_args = 1..)]
-        markets: Vec<String>,
+        /// Optional protocol targets; Uniswap requires one or more markets such as `ETH/USDC`.
+        #[arg(num_args = 0.., value_name = "TARGET")]
+        targets: Vec<String>,
         /// Data directory written to the generated configuration.
         #[arg(long, default_value = "./data")]
         data_dir: PathBuf,
@@ -69,14 +69,14 @@ pub enum Command {
         #[arg(long)]
         yes: bool,
     },
-    /// Stream live market prices from an embedded processor or a running node.
+    /// Stream live processor output from an embedded runtime or a running node.
     Subscribe {
-        /// Embedded market-data processor to activate.
+        /// Built-in subscription feed to activate.
         #[arg(value_enum)]
         protocol: SubscribeProtocol,
-        /// One or more built-in markets, for example `ETH/USDC`.
-        #[arg(required = true, num_args = 1..)]
-        markets: Vec<String>,
+        /// Optional feed targets; Uniswap requires one or more markets such as `ETH/USDC`.
+        #[arg(num_args = 0.., value_name = "TARGET")]
+        targets: Vec<String>,
         /// Rendering contract for stdout.
         #[arg(long, value_enum, default_value_t = SubscribeFormat::Pretty)]
         format: SubscribeFormat,
@@ -87,12 +87,12 @@ pub enum Command {
         #[arg(long)]
         endpoint: Option<url::Url>,
         /// Processor instance or unambiguous processor kind on a running node.
-        #[arg(long, default_value = "uniswap-observations")]
-        processor: String,
+        #[arg(long)]
+        processor: Option<String>,
         /// Optional bearer token for a running node.
         #[arg(long, env = "LEANI_API_TOKEN")]
         token: Option<String>,
-        /// Price publication finality.
+        /// Publication finality.
         #[arg(long, value_enum, default_value_t = SubscribeFinality::Optimistic)]
         finality: SubscribeFinality,
         /// Finality transport for the embedded runtime.
@@ -119,7 +119,7 @@ pub enum Command {
         /// Persistent directory for the lightweight embedded runtime.
         #[arg(long)]
         data_dir: Option<PathBuf>,
-        /// Exit after the first matching price update.
+        /// Exit after the first matching update.
         #[arg(long)]
         once: bool,
     },
@@ -282,6 +282,7 @@ pub enum Command {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 pub enum SubscribeProtocol {
+    Blocks,
     UniswapV3,
 }
 
@@ -328,12 +329,12 @@ pub enum ResetCommand {
     },
     /// Delete reconstructible state for one embedded market subscription.
     Subscription {
-        /// Embedded market-data processor whose state should be reset.
+        /// Built-in subscription feed whose embedded state should be reset.
         #[arg(value_enum)]
         protocol: SubscribeProtocol,
-        /// The exact market set used by `leani subscribe`.
-        #[arg(required = true, num_args = 1..)]
-        markets: Vec<String>,
+        /// The exact targets used by `leani subscribe`; empty for `blocks`.
+        #[arg(num_args = 0.., value_name = "TARGET")]
+        targets: Vec<String>,
         /// Price finality used by the subscription state being reset.
         #[arg(long, value_enum, default_value_t = SubscribeFinality::Optimistic)]
         finality: SubscribeFinality,
@@ -839,7 +840,7 @@ mod tests {
         .expect("CLI parses");
         let Command::Init {
             protocol,
-            markets,
+            targets,
             yes,
             ..
         } = cli.command
@@ -847,8 +848,39 @@ mod tests {
             panic!("expected init command");
         };
         assert_eq!(protocol, SubscribeProtocol::UniswapV3);
-        assert_eq!(markets, ["ETH/USDC", "ETH/USDT"]);
+        assert_eq!(targets, ["ETH/USDC", "ETH/USDT"]);
         assert!(yes);
+    }
+
+    #[test]
+    fn blocks_feed_and_init_need_no_positional_targets() {
+        let subscribe = Cli::try_parse_from(["leani", "subscribe", "blocks", "--once"])
+            .expect("blocks subscription parses");
+        let Command::Subscribe {
+            protocol,
+            targets,
+            processor,
+            once,
+            ..
+        } = subscribe.command
+        else {
+            panic!("expected subscribe command");
+        };
+        assert_eq!(protocol, SubscribeProtocol::Blocks);
+        assert!(targets.is_empty());
+        assert!(processor.is_none());
+        assert!(once);
+
+        let init =
+            Cli::try_parse_from(["leani", "init", "blocks", "--yes"]).expect("blocks init parses");
+        let Command::Init {
+            protocol, targets, ..
+        } = init.command
+        else {
+            panic!("expected init command");
+        };
+        assert_eq!(protocol, SubscribeProtocol::Blocks);
+        assert!(targets.is_empty());
     }
 
     #[test]
@@ -868,7 +900,7 @@ mod tests {
             command:
                 ResetCommand::Subscription {
                     protocol,
-                    markets,
+                    targets,
                     finality,
                     yes,
                 },
@@ -877,7 +909,7 @@ mod tests {
             panic!("expected subscription reset command");
         };
         assert_eq!(protocol, SubscribeProtocol::UniswapV3);
-        assert_eq!(markets, ["ETH/USDC"]);
+        assert_eq!(targets, ["ETH/USDC"]);
         assert_eq!(finality, SubscribeFinality::Finalized);
         assert!(yes);
 

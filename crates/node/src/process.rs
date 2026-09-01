@@ -21,7 +21,7 @@ use crate::{
     benchmark::{BenchmarkOptions, RealSourceBenchmarkOptions},
     cli::{
         BenchmarkCommand, Cli, Command, ConformanceCommand, DbCommand, E2eCommand, LogFormat,
-        ProbeSource, ResetCommand, SourceCommand,
+        ProbeSource, ResetCommand, SourceCommand, SubscribeProtocol,
     },
     config::{
         ArtifactStorageBackend, Config, HistoryMaterialCoordinatorMode, ProcessorConfig,
@@ -2595,7 +2595,7 @@ pub async fn run_cli_with_registry(cli: Cli, registry: &ProcessorRegistry) -> Re
         Command::Serve => serve(&config_path, registry).await,
         Command::Init {
             protocol,
-            markets,
+            targets,
             data_dir,
             checkpoint_url,
             checkpoint_quorum,
@@ -2603,7 +2603,7 @@ pub async fn run_cli_with_registry(cli: Cli, registry: &ProcessorRegistry) -> Re
         } => {
             crate::init::init(crate::init::InitOptions {
                 protocol,
-                markets,
+                targets,
                 data_dir,
                 checkpoint_urls: checkpoint_url,
                 checkpoint_quorum,
@@ -2615,7 +2615,7 @@ pub async fn run_cli_with_registry(cli: Cli, registry: &ProcessorRegistry) -> Re
         }
         Command::Subscribe {
             protocol,
-            markets,
+            targets,
             format,
             mode,
             endpoint,
@@ -2629,10 +2629,14 @@ pub async fn run_cli_with_registry(cli: Cli, registry: &ProcessorRegistry) -> Re
             data_dir,
             once,
         } => {
+            let processor = processor.unwrap_or_else(|| match protocol {
+                SubscribeProtocol::Blocks => "block-summary".to_owned(),
+                SubscribeProtocol::UniswapV3 => "uniswap-observations".to_owned(),
+            });
             Box::pin(crate::subscribe::subscribe(
                 crate::subscribe::SubscribeOptions {
                     protocol,
-                    markets,
+                    targets,
                     format,
                     mode,
                     endpoint,
@@ -2664,13 +2668,13 @@ pub async fn run_cli_with_registry(cli: Cli, registry: &ProcessorRegistry) -> Re
             }
             ResetCommand::Subscription {
                 protocol,
-                markets,
+                targets,
                 finality,
                 yes,
             } => {
                 crate::subscribe::reset_subscription(&crate::subscribe::ResetSubscriptionOptions {
                     protocol,
-                    markets,
+                    targets,
                     finality,
                     confirmed: yes,
                     requested_config,

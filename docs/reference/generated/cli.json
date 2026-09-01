@@ -212,7 +212,7 @@
       {
         "name": "init",
         "about": "Create a compact configuration for a built-in processor",
-        "usage": "Usage: leani init [OPTIONS] <PROTOCOL> <MARKETS>...",
+        "usage": "Usage: leani init [OPTIONS] <PROTOCOL> [TARGET]...",
         "arguments": [
           {
             "id": "protocol",
@@ -223,15 +223,16 @@
             "action": "Set",
             "defaultValues": [],
             "possibleValues": [
+              "blocks",
               "uniswap-v3"
             ]
           },
           {
-            "id": "markets",
+            "id": "targets",
             "long": null,
             "short": null,
-            "help": "One or more built-in markets, for example `ETH/USDC`",
-            "required": true,
+            "help": "Optional protocol targets; Uniswap requires one or more markets such as `ETH/USDC`",
+            "required": false,
             "action": "Append",
             "defaultValues": [],
             "possibleValues": []
@@ -351,27 +352,28 @@
       },
       {
         "name": "subscribe",
-        "about": "Stream live market prices from an embedded processor or a running node",
-        "usage": "Usage: leani subscribe [OPTIONS] <PROTOCOL> <MARKETS>...",
+        "about": "Stream live processor output from an embedded runtime or a running node",
+        "usage": "Usage: leani subscribe [OPTIONS] <PROTOCOL> [TARGET]...",
         "arguments": [
           {
             "id": "protocol",
             "long": null,
             "short": null,
-            "help": "Embedded market-data processor to activate",
+            "help": "Built-in subscription feed to activate",
             "required": true,
             "action": "Set",
             "defaultValues": [],
             "possibleValues": [
+              "blocks",
               "uniswap-v3"
             ]
           },
           {
-            "id": "markets",
+            "id": "targets",
             "long": null,
             "short": null,
-            "help": "One or more built-in markets, for example `ETH/USDC`",
-            "required": true,
+            "help": "Optional feed targets; Uniswap requires one or more markets such as `ETH/USDC`",
+            "required": false,
             "action": "Append",
             "defaultValues": [],
             "possibleValues": []
@@ -425,9 +427,7 @@
             "help": "Processor instance or unambiguous processor kind on a running node",
             "required": false,
             "action": "Set",
-            "defaultValues": [
-              "uniswap-observations"
-            ],
+            "defaultValues": [],
             "possibleValues": []
           },
           {
@@ -444,7 +444,7 @@
             "id": "finality",
             "long": "finality",
             "short": null,
-            "help": "Price publication finality",
+            "help": "Publication finality",
             "required": false,
             "action": "Set",
             "defaultValues": [
@@ -526,7 +526,7 @@
             "id": "once",
             "long": "once",
             "short": null,
-            "help": "Exit after the first matching price update",
+            "help": "Exit after the first matching update",
             "required": false,
             "action": "SetTrue",
             "defaultValues": [
@@ -596,6 +596,299 @@
           }
         ],
         "subcommands": []
+      },
+      {
+        "name": "reset",
+        "about": "Reset reconstructible local runtime state for cold-start testing",
+        "usage": "Usage: leani reset [OPTIONS] <COMMAND>",
+        "arguments": [
+          {
+            "id": "config",
+            "long": "config",
+            "short": null,
+            "help": "Path to the versioned TOML configuration",
+            "required": false,
+            "action": "Set",
+            "defaultValues": [],
+            "possibleValues": []
+          },
+          {
+            "id": "log_format",
+            "long": "log-format",
+            "short": null,
+            "help": "Log rendering format",
+            "required": false,
+            "action": "Set",
+            "defaultValues": [
+              "pretty"
+            ],
+            "possibleValues": [
+              "pretty",
+              "json"
+            ]
+          },
+          {
+            "id": "log_filter",
+            "long": "log-filter",
+            "short": null,
+            "help": "Tracing filter, e.g. `info,leani=debug`",
+            "required": false,
+            "action": "Set",
+            "defaultValues": [
+              "info"
+            ],
+            "possibleValues": []
+          },
+          {
+            "id": "help",
+            "long": "help",
+            "short": "h",
+            "help": "Print help (see more with '--help')",
+            "required": false,
+            "action": "Help",
+            "defaultValues": [],
+            "possibleValues": []
+          },
+          {
+            "id": "version",
+            "long": "version",
+            "short": "V",
+            "help": "Print version",
+            "required": false,
+            "action": "Version",
+            "defaultValues": [],
+            "possibleValues": []
+          }
+        ],
+        "subcommands": [
+          {
+            "name": "all",
+            "about": "Delete all node and embedded-subscription state in the resolved data directory",
+            "usage": "Usage: leani reset all [OPTIONS]",
+            "arguments": [
+              {
+                "id": "yes",
+                "long": "yes",
+                "short": null,
+                "help": "Reset without interactive confirmation",
+                "required": false,
+                "action": "SetTrue",
+                "defaultValues": [
+                  "false"
+                ],
+                "possibleValues": [
+                  "true",
+                  "false"
+                ]
+              },
+              {
+                "id": "config",
+                "long": "config",
+                "short": null,
+                "help": "Path to the versioned TOML configuration",
+                "required": false,
+                "action": "Set",
+                "defaultValues": [],
+                "possibleValues": []
+              },
+              {
+                "id": "log_format",
+                "long": "log-format",
+                "short": null,
+                "help": "Log rendering format",
+                "required": false,
+                "action": "Set",
+                "defaultValues": [
+                  "pretty"
+                ],
+                "possibleValues": [
+                  "pretty",
+                  "json"
+                ]
+              },
+              {
+                "id": "log_filter",
+                "long": "log-filter",
+                "short": null,
+                "help": "Tracing filter, e.g. `info,leani=debug`",
+                "required": false,
+                "action": "Set",
+                "defaultValues": [
+                  "info"
+                ],
+                "possibleValues": []
+              },
+              {
+                "id": "help",
+                "long": "help",
+                "short": "h",
+                "help": "Print help (see more with '--help')",
+                "required": false,
+                "action": "Help",
+                "defaultValues": [],
+                "possibleValues": []
+              },
+              {
+                "id": "version",
+                "long": "version",
+                "short": "V",
+                "help": "Print version",
+                "required": false,
+                "action": "Version",
+                "defaultValues": [],
+                "possibleValues": []
+              }
+            ],
+            "subcommands": []
+          },
+          {
+            "name": "subscription",
+            "about": "Delete reconstructible state for one embedded market subscription",
+            "usage": "Usage: leani reset subscription [OPTIONS] <PROTOCOL> [TARGET]...",
+            "arguments": [
+              {
+                "id": "protocol",
+                "long": null,
+                "short": null,
+                "help": "Built-in subscription feed whose embedded state should be reset",
+                "required": true,
+                "action": "Set",
+                "defaultValues": [],
+                "possibleValues": [
+                  "blocks",
+                  "uniswap-v3"
+                ]
+              },
+              {
+                "id": "targets",
+                "long": null,
+                "short": null,
+                "help": "The exact targets used by `leani subscribe`; empty for `blocks`",
+                "required": false,
+                "action": "Append",
+                "defaultValues": [],
+                "possibleValues": []
+              },
+              {
+                "id": "finality",
+                "long": "finality",
+                "short": null,
+                "help": "Price finality used by the subscription state being reset",
+                "required": false,
+                "action": "Set",
+                "defaultValues": [
+                  "optimistic"
+                ],
+                "possibleValues": [
+                  "optimistic",
+                  "finalized"
+                ]
+              },
+              {
+                "id": "yes",
+                "long": "yes",
+                "short": null,
+                "help": "Reset without interactive confirmation",
+                "required": false,
+                "action": "SetTrue",
+                "defaultValues": [
+                  "false"
+                ],
+                "possibleValues": [
+                  "true",
+                  "false"
+                ]
+              },
+              {
+                "id": "config",
+                "long": "config",
+                "short": null,
+                "help": "Path to the versioned TOML configuration",
+                "required": false,
+                "action": "Set",
+                "defaultValues": [],
+                "possibleValues": []
+              },
+              {
+                "id": "log_format",
+                "long": "log-format",
+                "short": null,
+                "help": "Log rendering format",
+                "required": false,
+                "action": "Set",
+                "defaultValues": [
+                  "pretty"
+                ],
+                "possibleValues": [
+                  "pretty",
+                  "json"
+                ]
+              },
+              {
+                "id": "log_filter",
+                "long": "log-filter",
+                "short": null,
+                "help": "Tracing filter, e.g. `info,leani=debug`",
+                "required": false,
+                "action": "Set",
+                "defaultValues": [
+                  "info"
+                ],
+                "possibleValues": []
+              },
+              {
+                "id": "help",
+                "long": "help",
+                "short": "h",
+                "help": "Print help (see more with '--help')",
+                "required": false,
+                "action": "Help",
+                "defaultValues": [],
+                "possibleValues": []
+              },
+              {
+                "id": "version",
+                "long": "version",
+                "short": "V",
+                "help": "Print version",
+                "required": false,
+                "action": "Version",
+                "defaultValues": [],
+                "possibleValues": []
+              }
+            ],
+            "subcommands": []
+          },
+          {
+            "name": "help",
+            "about": "Print this message or the help of the given subcommand(s)",
+            "usage": "Usage: leani reset help [COMMAND]",
+            "arguments": [],
+            "subcommands": [
+              {
+                "name": "all",
+                "about": "Delete all node and embedded-subscription state in the resolved data directory",
+                "usage": "Usage: leani reset help all",
+                "arguments": [],
+                "subcommands": []
+              },
+              {
+                "name": "subscription",
+                "about": "Delete reconstructible state for one embedded market subscription",
+                "usage": "Usage: leani reset help subscription",
+                "arguments": [],
+                "subcommands": []
+              },
+              {
+                "name": "help",
+                "about": "Print this message or the help of the given subcommand(s)",
+                "usage": "Usage: leani reset help help",
+                "arguments": [],
+                "subcommands": []
+              }
+            ]
+          }
+        ]
       },
       {
         "name": "backfill",
@@ -3774,10 +4067,32 @@
           },
           {
             "name": "subscribe",
-            "about": "Stream live market prices from an embedded processor or a running node",
+            "about": "Stream live processor output from an embedded runtime or a running node",
             "usage": "Usage: leani help subscribe",
             "arguments": [],
             "subcommands": []
+          },
+          {
+            "name": "reset",
+            "about": "Reset reconstructible local runtime state for cold-start testing",
+            "usage": "Usage: leani help reset [COMMAND]",
+            "arguments": [],
+            "subcommands": [
+              {
+                "name": "all",
+                "about": "Delete all node and embedded-subscription state in the resolved data directory",
+                "usage": "Usage: leani help reset all",
+                "arguments": [],
+                "subcommands": []
+              },
+              {
+                "name": "subscription",
+                "about": "Delete reconstructible state for one embedded market subscription",
+                "usage": "Usage: leani help reset subscription",
+                "arguments": [],
+                "subcommands": []
+              }
+            ]
           },
           {
             "name": "backfill",

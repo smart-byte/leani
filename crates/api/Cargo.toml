@@ -19,6 +19,7 @@ flate2.workspace = true
 hex.workspace = true
 leani-primitives = { path = "../primitives" }
 leani-processor-api = { path = "../processor-api" }
+leani-processor-block-summary = { path = "../processor-block-summary" }
 leani-processor-blobs = { path = "../processor-blobs" }
 leani-processor-erc20 = { path = "../processor-erc20" }
 leani-processor-uniswap = { path = "../processor-uniswap" }

@@ -52,7 +52,10 @@ pub(crate) struct StarterConfig {
     #[serde(default = "default_starter_data_dir")]
     pub data_dir: PathBuf,
     pub finality: StarterFinalityConfig,
-    pub uniswap: StarterUniswapConfig,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocks: Option<StarterBlocksConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uniswap: Option<StarterUniswapConfig>,
     #[serde(default)]
     pub api: StarterApiConfig,
 }
@@ -76,6 +79,10 @@ pub(crate) struct StarterFinalityConfig {
 pub(crate) struct StarterUniswapConfig {
     pub markets: Vec<String>,
 }
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct StarterBlocksConfig {}
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -119,21 +126,52 @@ impl StarterConfig {
                 checkpoint_slot,
                 endpoints,
             },
-            uniswap: StarterUniswapConfig { markets },
+            blocks: None,
+            uniswap: Some(StarterUniswapConfig { markets }),
+            api: StarterApiConfig::default(),
+        }
+    }
+
+    pub(crate) fn blocks(
+        data_dir: PathBuf,
+        checkpoint: String,
+        checkpoint_slot: u64,
+        endpoints: Vec<Url>,
+    ) -> Self {
+        Self {
+            config_version: CONFIG_VERSION,
+            network: StarterNetwork::EthereumMainnet,
+            data_dir,
+            finality: StarterFinalityConfig {
+                checkpoint,
+                checkpoint_slot,
+                endpoints,
+            },
+            blocks: Some(StarterBlocksConfig::default()),
+            uniswap: None,
             api: StarterApiConfig::default(),
         }
     }
 
     fn expand(self) -> Result<Config, String> {
         let mut config: Config = toml::from_str(include_str!(
-            "../../../config/defaults/ethereum-mainnet-uniswap.toml"
+            "../../../config/defaults/ethereum-mainnet.toml"
         ))
         .map_err(|error| format!("built-in Ethereum Mainnet defaults are invalid: {error}"))?;
-        let markets = crate::uniswap_markets::resolve_markets(&self.uniswap.markets)
-            .map_err(|error| error.to_string())?;
-        let processor =
-            crate::uniswap_markets::processor_config(&markets, "uniswap-observations", false)
-                .map_err(|error| error.to_string())?;
+        let processor = match (self.blocks, self.uniswap) {
+            (Some(_), None) => crate::block_summaries::processor_config("block-summary", false),
+            (None, Some(uniswap)) => {
+                let markets = crate::uniswap_markets::resolve_markets(&uniswap.markets)
+                    .map_err(|error| error.to_string())?;
+                crate::uniswap_markets::processor_config(&markets, "uniswap-observations", false)
+            }
+            _ => {
+                return Err(
+                    "compact config must define exactly one of [blocks] or [uniswap]".to_owned(),
+                );
+            }
+        }
+        .map_err(|error| error.to_string())?;
 
         config.config_version = self.config_version;
         config.data_dir = self.data_dir;
@@ -3082,6 +3120,25 @@ markets = ["LINK/ETH"]
         assert!(!encoded.contains("[budgets]"));
         assert!(!encoded.contains("[sources.live]"));
         assert!(!encoded.contains("[[processors.settings.pools]]"));
+    }
+
+    #[test]
+    fn compact_blocks_configuration_expands_to_header_summary_processor() {
+        let starter = StarterConfig::blocks(
+            PathBuf::from("./data"),
+            format!("0x{}", "11".repeat(32)),
+            15_000_000,
+            vec![Url::parse("https://beacon.example/").expect("URL")],
+        );
+        let encoded = toml::to_string_pretty(&starter).expect("serialize blocks config");
+        assert!(encoded.contains("[blocks]"));
+        assert!(!encoded.contains("[uniswap]"));
+
+        let config = starter.expand().expect("expand blocks config");
+        assert_eq!(config.processors.len(), 1);
+        assert_eq!(config.processors[0].id, "block-summary");
+        assert_eq!(config.processors[0].version, "1.0.0");
+        assert!(config.processors[0].settings.is_empty());
     }
 
     #[test]

@@ -1,6 +1,7 @@
 //! Process configuration, command line interface, diagnostics, and lifecycle.
 
 mod benchmark;
+mod block_summaries;
 pub mod cli;
 pub mod config;
 mod init;

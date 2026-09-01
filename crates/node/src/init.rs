@@ -16,7 +16,7 @@ use crate::{
 
 pub(crate) struct InitOptions {
     pub protocol: SubscribeProtocol,
-    pub markets: Vec<String>,
+    pub targets: Vec<String>,
     pub data_dir: PathBuf,
     pub checkpoint_urls: Vec<Url>,
     pub checkpoint_quorum: usize,
@@ -26,9 +26,6 @@ pub(crate) struct InitOptions {
 }
 
 pub(crate) async fn init(options: InitOptions) -> Result<Exit> {
-    if options.protocol != SubscribeProtocol::UniswapV3 {
-        bail!("unsupported processor preset");
-    }
     let config_path = absolute_path(&options.working_directory, &options.config_path);
     if config_path.exists() {
         bail!(
@@ -36,11 +33,23 @@ pub(crate) async fn init(options: InitOptions) -> Result<Exit> {
             config_path.display()
         );
     }
-    let markets = resolve_markets(&options.markets)?;
-    let market_names = markets
-        .iter()
-        .map(|market| market.symbol.to_owned())
-        .collect::<Vec<_>>();
+    let market_names = match options.protocol {
+        SubscribeProtocol::Blocks => {
+            if !options.targets.is_empty() {
+                bail!("the blocks preset does not take market arguments");
+            }
+            Vec::new()
+        }
+        SubscribeProtocol::UniswapV3 => {
+            if options.targets.is_empty() {
+                bail!("the uniswap-v3 preset requires at least one market");
+            }
+            resolve_markets(&options.targets)?
+                .iter()
+                .map(|market| market.symbol.to_owned())
+                .collect::<Vec<_>>()
+        }
+    };
     let runtime_data_dir = absolute_path(&options.working_directory, &options.data_dir);
     let checkpoint = initialize_checkpoint(
         options.checkpoint_urls,
@@ -49,23 +58,41 @@ pub(crate) async fn init(options: InitOptions) -> Result<Exit> {
         &runtime_data_dir,
     )
     .await?;
-    let config = StarterConfig::uniswap(
-        options.data_dir,
-        market_names.clone(),
-        checkpoint.root,
-        checkpoint.slot,
-        checkpoint.beacon_api_endpoints,
-    );
+    let config = match options.protocol {
+        SubscribeProtocol::Blocks => StarterConfig::blocks(
+            options.data_dir,
+            checkpoint.root,
+            checkpoint.slot,
+            checkpoint.beacon_api_endpoints,
+        ),
+        SubscribeProtocol::UniswapV3 => StarterConfig::uniswap(
+            options.data_dir,
+            market_names.clone(),
+            checkpoint.root,
+            checkpoint.slot,
+            checkpoint.beacon_api_endpoints,
+        ),
+    };
     let encoded = toml::to_string_pretty(&config).context("render compact configuration")?;
     write_new_config(&config_path, &encoded)?;
 
     println!("Created {}", config_path.display());
-    println!("Processor: uniswap-observations");
-    println!("Markets: {}", market_names.join(", "));
+    match options.protocol {
+        SubscribeProtocol::Blocks => println!("Processor: block-summary"),
+        SubscribeProtocol::UniswapV3 => {
+            println!("Processor: uniswap-observations");
+            println!("Markets: {}", market_names.join(", "));
+        }
+    }
     println!();
     println!("Next:");
     println!("  leani serve");
-    println!("  leani subscribe uniswap-v3 {}", market_names.join(" "));
+    match options.protocol {
+        SubscribeProtocol::Blocks => println!("  leani subscribe blocks"),
+        SubscribeProtocol::UniswapV3 => {
+            println!("  leani subscribe uniswap-v3 {}", market_names.join(" "));
+        }
+    }
     Ok(Exit::Success)
 }
 

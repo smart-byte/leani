@@ -16,6 +16,7 @@ use futures::{StreamExt as _, future::join_all};
 use leani_primitives::{
     Address, BlockFrame, BlockHash, BlockNumber, BlockRange, BlockRef, ChainId, Finality,
 };
+use leani_processor_block_summary::{BLOCK_SUMMARY_KIND, BlockSummaryEntity};
 use leani_processor_uniswap::{PoolPriceEntity, UniswapPriceDelta};
 use leani_source_api::{
     ChainEvent, ChainEventStream, DataRequest, FieldProjection, FilterSet, LiveSource as _,
@@ -38,20 +39,74 @@ use crate::{
     uniswap_markets::{MARKET_CATALOG, Market, Token, processor_config, resolve_markets},
 };
 
-const PROCESSOR_INSTANCE: &str = "cli-uniswap-v3-prices";
+const BLOCK_PROCESSOR_INSTANCE: &str = "cli-ethereum-blocks";
+const UNISWAP_PROCESSOR_INSTANCE: &str = "cli-uniswap-v3-prices";
 const CHECKPOINT_CACHE_MAX_AGE: Duration = Duration::from_hours(12);
 const LOCALLY_VERIFIED_CHECKPOINT_MAX_AGE: Duration = Duration::from_hours(13 * 24);
 const MAINNET_SLOT_SECONDS: u64 = 12;
-const OPTIMISTIC_PRICE_MAX_AGE: Duration = Duration::from_secs(90);
-const FINALIZED_PRICE_MAX_AGE: Duration = Duration::from_mins(30);
+const OPTIMISTIC_UPDATE_MAX_AGE: Duration = Duration::from_secs(90);
+const FINALIZED_UPDATE_MAX_AGE: Duration = Duration::from_mins(30);
 const PRICE_PRECISION: usize = 8;
-const STARTUP_PRICE_SCAN_LIMIT: usize = 10_000;
+const STARTUP_UPDATE_SCAN_LIMIT: usize = 10_000;
 
-type ObservationKey = (Address, BlockHash, u32);
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum ObservationKey {
+    Block(BlockHash),
+    Uniswap(Address, BlockHash, u32),
+}
+
+#[derive(Clone, Debug)]
+enum SubscriptionItem {
+    Block(BlockSummaryEntity),
+    Uniswap {
+        market: Market,
+        entity: PoolPriceEntity,
+    },
+}
+
+impl SubscriptionItem {
+    fn scope_key(&self) -> String {
+        match self {
+            Self::Block(_) => "blocks".to_owned(),
+            Self::Uniswap { entity, .. } => entity.pool.to_string(),
+        }
+    }
+
+    fn same_scope(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Block(_), Self::Block(_)) => true,
+            (Self::Uniswap { entity: left, .. }, Self::Uniswap { entity: right, .. }) => {
+                left.pool == right.pool
+            }
+            _ => false,
+        }
+    }
+
+    const fn block_number(&self) -> BlockNumber {
+        match self {
+            Self::Block(entity) => entity.block_number,
+            Self::Uniswap { entity, .. } => entity.block_number,
+        }
+    }
+
+    const fn block_hash(&self) -> BlockHash {
+        match self {
+            Self::Block(entity) => entity.block_hash,
+            Self::Uniswap { entity, .. } => entity.block_hash,
+        }
+    }
+
+    const fn item_index(&self) -> u32 {
+        match self {
+            Self::Block(_) => 0,
+            Self::Uniswap { entity, .. } => entity.log_index,
+        }
+    }
+}
 
 pub(crate) struct SubscribeOptions {
     pub protocol: SubscribeProtocol,
-    pub markets: Vec<String>,
+    pub targets: Vec<String>,
     pub format: SubscribeFormat,
     pub mode: SubscribeMode,
     pub endpoint: Option<Url>,
@@ -70,7 +125,7 @@ pub(crate) struct SubscribeOptions {
 
 pub(crate) struct ResetSubscriptionOptions {
     pub protocol: SubscribeProtocol,
-    pub markets: Vec<String>,
+    pub targets: Vec<String>,
     pub finality: SubscribeFinality,
     pub confirmed: bool,
     pub requested_config: Option<PathBuf>,
@@ -175,9 +230,32 @@ struct AttachedPoolPrice {
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct AttachedBlockSummary {
+    chain_id: u64,
+    block_number: u64,
+    block_hash: String,
+    parent_hash: String,
+    timestamp: u64,
+    gas_limit: Option<u64>,
+    gas_used: Option<u64>,
+    base_fee_per_gas: Option<String>,
+    blob_gas_used: Option<u64>,
+    excess_blob_gas: Option<u64>,
+    transaction_count: Option<u32>,
+    size_bytes: Option<u64>,
+    finality: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct AttachedLatestObservation {
     data: AttachedPoolPrice,
     timestamp: u64,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct AttachedLatestBlock {
+    data: AttachedBlockSummary,
 }
 
 #[derive(Debug)]
@@ -197,6 +275,25 @@ struct RenderedPrice<'a> {
     sequence: Option<String>,
 }
 
+#[derive(Debug)]
+struct RenderedBlockSummary {
+    chain_id: u64,
+    block_number: u64,
+    block_hash: String,
+    parent_hash: String,
+    timestamp: u64,
+    gas_limit: Option<u64>,
+    gas_used: Option<u64>,
+    base_fee_wei: Option<String>,
+    blob_gas_used: Option<u64>,
+    excess_blob_gas: Option<u64>,
+    transaction_count: Option<u32>,
+    size_bytes: Option<u64>,
+    finality: String,
+    operation: String,
+    sequence: Option<String>,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct AttachedEnvelope {
@@ -206,7 +303,7 @@ struct AttachedEnvelope {
     block: Value,
     finality: String,
     kind: String,
-    data: Option<AttachedPoolPrice>,
+    data: Option<Value>,
     #[serde(flatten)]
     extra: BTreeMap<String, Value>,
 }
@@ -231,10 +328,7 @@ pub(crate) async fn subscribe(
     options: SubscribeOptions,
     registry: &ProcessorRegistry,
 ) -> Result<Exit> {
-    if options.protocol != SubscribeProtocol::UniswapV3 {
-        bail!("unsupported subscription protocol");
-    }
-    let markets = resolve_markets(&options.markets)?;
+    let markets = subscription_markets(options.protocol, &options.targets)?;
     let configured_path = local_state::configured_path(
         options.requested_config.as_deref(),
         &options.working_directory,
@@ -277,16 +371,14 @@ pub(crate) async fn subscribe(
 }
 
 pub(crate) fn reset_subscription(options: &ResetSubscriptionOptions) -> Result<Exit> {
-    if options.protocol != SubscribeProtocol::UniswapV3 {
-        bail!("unsupported subscription protocol");
-    }
-    let markets = resolve_markets(&options.markets)?;
+    let markets = subscription_markets(options.protocol, &options.targets)?;
     let configured_path = local_state::configured_path(
         options.requested_config.as_deref(),
         &options.working_directory,
     );
     let data_dir = subscription_data_dir_for(
         None,
+        options.protocol,
         &markets,
         configured_path.as_deref(),
         options.finality,
@@ -294,6 +386,23 @@ pub(crate) fn reset_subscription(options: &ResetSubscriptionOptions) -> Result<E
     )?;
     reset_subscription_directory(&data_dir, options.confirmed)?;
     Ok(Exit::Success)
+}
+
+fn subscription_markets(protocol: SubscribeProtocol, targets: &[String]) -> Result<Vec<Market>> {
+    match protocol {
+        SubscribeProtocol::Blocks => {
+            if !targets.is_empty() {
+                bail!("the blocks feed does not take market arguments");
+            }
+            Ok(Vec::new())
+        }
+        SubscribeProtocol::UniswapV3 => {
+            if targets.is_empty() {
+                bail!("the uniswap-v3 feed requires at least one market");
+            }
+            resolve_markets(targets)
+        }
+    }
 }
 
 pub(crate) async fn initialize_checkpoint(
@@ -307,7 +416,7 @@ pub(crate) async fn initialize_checkpoint(
     let checkpoint = trusted_checkpoint(
         &SubscribeOptions {
             protocol: SubscribeProtocol::UniswapV3,
-            markets: Vec::new(),
+            targets: Vec::new(),
             format: SubscribeFormat::Pretty,
             mode: SubscribeMode::Embedded,
             endpoint: None,
@@ -422,14 +531,19 @@ async fn subscribe_embedded(
     );
     tokio::pin!(optimistic_snapshot);
 
-    eprintln!(
-        "leani: embedded Uniswap V3 processor active for {}; bootstrapping verified Ethereum data...",
-        markets
-            .iter()
-            .map(|market| market.symbol)
-            .collect::<Vec<_>>()
-            .join(", ")
-    );
+    match options.protocol {
+        SubscribeProtocol::Blocks => eprintln!(
+            "leani: embedded block-summary processor active; bootstrapping verified Ethereum headers..."
+        ),
+        SubscribeProtocol::UniswapV3 => eprintln!(
+            "leani: embedded Uniswap V3 processor active for {}; bootstrapping verified Ethereum data...",
+            markets
+                .iter()
+                .map(|market| market.symbol)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
     eprintln!(
         "leani: a cold start verifies consensus, then discovers execution peers; reusable state is cached for later runs"
     );
@@ -439,7 +553,7 @@ async fn subscribe_embedded(
     let mut snapshot_pending =
         options.finality == SubscribeFinality::Optimistic && options.format != SubscribeFormat::Raw;
     let mut previewed = HashSet::<ObservationKey>::new();
-    let mut preview_blocks = BTreeMap::<u64, (BlockHash, Vec<PoolPriceEntity>)>::new();
+    let mut preview_blocks = BTreeMap::<u64, (BlockHash, Vec<SubscriptionItem>)>::new();
     let mut preview_stream = None::<ChainEventStream>;
     loop {
         if runtime.is_finished() {
@@ -481,30 +595,35 @@ async fn subscribe_embedded(
                     processor.descriptor(),
                     ChainId(config.chain.chain_id),
                     ready_after.saturating_sub(
-                        u64::try_from(STARTUP_PRICE_SCAN_LIMIT)
+                        u64::try_from(STARTUP_UPDATE_SCAN_LIMIT)
                             .expect("startup scan limit fits u64"),
                     ),
-                    STARTUP_PRICE_SCAN_LIMIT,
+                    STARTUP_UPDATE_SCAN_LIMIT,
                 )
                 .await?;
-            let startup_prices =
-                latest_fresh_prices(markets, startup_records, options.finality, unix_seconds())?;
+            let startup_items = latest_fresh_items(
+                options.protocol,
+                markets,
+                startup_records,
+                options.finality,
+                unix_seconds(),
+            )?;
             after = ready_after;
             announced_ready = true;
-            if startup_prices.is_empty() {
+            if startup_items.is_empty() {
                 eprintln!(
-                    "leani: execution peers and verified finality are connected; waiting for a fresh matching swap..."
+                    "leani: execution peers and verified finality are connected; waiting for the next matching update..."
                 );
             } else {
                 eprintln!("leani: live execution and verified finality are ready");
             }
-            for (market, entity, record) in startup_prices {
-                if previewed.contains(&observation_key(&entity))
-                    || preview_is_at_or_after(&preview_blocks, &entity)
+            for (item, record) in startup_items {
+                if previewed.contains(&observation_key(&item))
+                    || preview_is_at_or_after(&preview_blocks, &item)
                 {
                     continue;
                 }
-                render_local(options.format, &market, &entity, &record)?;
+                render_local_item(options.format, &item, &record)?;
                 if options.once {
                     persist_current_verified_anchor(&runtime, &data_dir, &config)?;
                     runtime.shutdown().await;
@@ -529,15 +648,16 @@ async fn subscribe_embedded(
                     snapshot_pending = false;
                     match snapshot {
                         Ok(frame) => {
-                            let observations = optimistic_observations(
+                            let items = optimistic_items(
+                                options.protocol,
+                                markets,
                                 processor.as_ref(),
                                 &frame,
                             )
                             .await?;
-                            let rendered = render_optimistic_observations(
+                            let rendered = render_optimistic_items(
                                 options.format,
-                                markets,
-                                &observations,
+                                &items,
                                 frame.block,
                                 "apply",
                             )?;
@@ -546,7 +666,7 @@ async fn subscribe_embedded(
                                 &mut preview_blocks,
                                 &mut previewed,
                                 frame.block,
-                                observations,
+                                items,
                             );
                             if options.once && !rendered.is_empty() {
                                 persist_current_verified_anchor(&runtime, &data_dir, &config)?;
@@ -585,14 +705,15 @@ async fn subscribe_embedded(
                     let mut rendered_any = false;
                     match event {
                         Ok(ChainEvent::Block(frame)) => {
-                            let observations = optimistic_observations(
+                            let items = optimistic_items(
+                                options.protocol,
+                                markets,
                                 processor.as_ref(),
                                 &frame,
                             ).await?;
-                            let rendered = render_optimistic_observations(
+                            let rendered = render_optimistic_items(
                                 options.format,
-                                markets,
-                                &observations,
+                                &items,
                                 frame.block,
                                 "apply",
                             )?;
@@ -602,19 +723,18 @@ async fn subscribe_embedded(
                                 &mut preview_blocks,
                                 &mut previewed,
                                 frame.block,
-                                observations,
+                                items,
                             );
                         }
                         Ok(ChainEvent::Reorg { reverted, applied }) => {
                             for block in reverted {
-                                if let Some((hash, observations)) =
+                                if let Some((hash, items)) =
                                     preview_blocks.remove(&block.number.0)
                                     && hash == block.hash
                                 {
-                                    let reverted = render_optimistic_observations(
+                                    let reverted = render_optimistic_items(
                                         options.format,
-                                        markets,
-                                        &observations,
+                                        &items,
                                         block,
                                         "revert",
                                     )?;
@@ -624,14 +744,15 @@ async fn subscribe_embedded(
                                 }
                             }
                             for frame in applied {
-                                let observations = optimistic_observations(
+                                let items = optimistic_items(
+                                    options.protocol,
+                                    markets,
                                     processor.as_ref(),
                                     &frame,
                                 ).await?;
-                                let rendered = render_optimistic_observations(
+                                let rendered = render_optimistic_items(
                                     options.format,
-                                    markets,
-                                    &observations,
+                                    &items,
                                     frame.block,
                                     "apply",
                                 )?;
@@ -641,7 +762,7 @@ async fn subscribe_embedded(
                                     &mut preview_blocks,
                                     &mut previewed,
                                     frame.block,
-                                    observations,
+                                    items,
                                 );
                             }
                         }
@@ -685,14 +806,14 @@ async fn subscribe_embedded(
             .await?;
         for record in records {
             after = record.cursor.sequence;
-            if !price_is_fresh(options.finality, record.block.timestamp, unix_seconds()) {
+            if !update_is_fresh(options.finality, record.block.timestamp, unix_seconds()) {
                 continue;
             }
-            if let Some((market, entity)) = local_price(markets, &record)? {
-                if previewed.remove(&observation_key(&entity)) {
+            if let Some(item) = local_item(options.protocol, markets, &record)? {
+                if previewed.remove(&observation_key(&item)) {
                     continue;
                 }
-                render_local(options.format, market, &entity, &record)?;
+                render_local_item(options.format, &item, &record)?;
                 if options.once {
                     persist_current_verified_anchor(&runtime, &data_dir, &config)?;
                     runtime.shutdown().await;
@@ -730,7 +851,7 @@ async fn embedded_config(
             .context("parse built-in node configuration")?
     };
     if config.chain.chain_id != 1 {
-        bail!("the built-in Uniswap V3 market catalog currently supports Ethereum mainnet only");
+        bail!("built-in subscriptions currently support Ethereum mainnet only");
     }
 
     config.data_dir = data_dir.to_path_buf();
@@ -785,19 +906,30 @@ async fn embedded_config(
         }
         FinalitySourceKind::Disabled => unreachable!("subscription finality is always enabled"),
     }
-    config.processors = vec![subscription_processor(markets, options.finality)?];
+    config.processors = vec![subscription_processor(
+        options.protocol,
+        markets,
+        options.finality,
+    )?];
     Ok(config.validate()?.into_inner())
 }
 
 fn subscription_processor(
+    protocol: SubscribeProtocol,
     markets: &[Market],
     finality: SubscribeFinality,
 ) -> Result<crate::config::ProcessorConfig> {
-    processor_config(
-        markets,
-        PROCESSOR_INSTANCE,
-        finality == SubscribeFinality::Finalized,
-    )
+    match protocol {
+        SubscribeProtocol::Blocks => crate::block_summaries::processor_config(
+            BLOCK_PROCESSOR_INSTANCE,
+            finality == SubscribeFinality::Finalized,
+        ),
+        SubscribeProtocol::UniswapV3 => processor_config(
+            markets,
+            UNISWAP_PROCESSOR_INSTANCE,
+            finality == SubscribeFinality::Finalized,
+        ),
+    }
 }
 
 fn subscription_data_dir(
@@ -807,6 +939,7 @@ fn subscription_data_dir(
 ) -> Result<PathBuf> {
     subscription_data_dir_for(
         options.data_dir.as_deref(),
+        options.protocol,
         markets,
         config_path,
         options.finality,
@@ -816,6 +949,7 @@ fn subscription_data_dir(
 
 fn subscription_data_dir_for(
     explicit_data_dir: Option<&Path>,
+    protocol: SubscribeProtocol,
     markets: &[Market],
     config_path: Option<&Path>,
     finality: SubscribeFinality,
@@ -826,7 +960,10 @@ fn subscription_data_dir_for(
     }
     let root = local_state::runtime_data_dir(config_path, working_directory)?.join("subscriptions");
     let mut hasher = blake3::Hasher::new();
-    hasher.update(b"uniswap-observations/2.1.0");
+    hasher.update(match protocol {
+        SubscribeProtocol::Blocks => b"block-summary/1.0.0",
+        SubscribeProtocol::UniswapV3 => b"uniswap-observations/2.1.0",
+    });
     let mut pools = markets.iter().map(|market| market.pool).collect::<Vec<_>>();
     pools.sort_unstable();
     for pool in pools {
@@ -874,7 +1011,7 @@ fn reset_subscription_directory(data_dir: &Path, confirmed: bool) -> Result<bool
     eprintln!("leani: embedded subscription cold-start reset");
     eprintln!("  directory: {}", data_dir.display());
     eprintln!("  removes:   checkpoint, peer cache, P2P identity, and SQLite state");
-    eprintln!("Stop any embedded subscriber using this market set before continuing.");
+    eprintln!("Stop any embedded subscriber using this feed before continuing.");
     if !confirmed {
         if !io::stdin().is_terminal() {
             bail!("subscription reset requires an interactive terminal or --yes");
@@ -1278,34 +1415,51 @@ fn persist_current_verified_anchor(
     Ok(())
 }
 
-fn local_price<'a>(
-    markets: &'a [Market],
+fn local_item(
+    protocol: SubscribeProtocol,
+    markets: &[Market],
     record: &ChangeRecord,
-) -> Result<Option<(&'a Market, PoolPriceEntity)>> {
-    if record.change.kind != "uniswap.price.observation" {
-        return Ok(None);
+) -> Result<Option<SubscriptionItem>> {
+    match protocol {
+        SubscribeProtocol::Blocks => {
+            if record.change.kind != BLOCK_SUMMARY_KIND {
+                return Ok(None);
+            }
+            let entity = postcard::from_bytes(&record.change.payload)
+                .context("decode embedded Ethereum block summary")?;
+            Ok(Some(SubscriptionItem::Block(entity)))
+        }
+        SubscribeProtocol::UniswapV3 => {
+            if record.change.kind != "uniswap.price.observation" {
+                return Ok(None);
+            }
+            let entity: PoolPriceEntity = postcard::from_bytes(&record.change.payload)
+                .context("decode embedded Uniswap observation")?;
+            let market = markets
+                .iter()
+                .find(|market| address_matches(entity.pool, market.pool));
+            Ok(market.map(|market| SubscriptionItem::Uniswap {
+                market: *market,
+                entity,
+            }))
+        }
     }
-    let entity: PoolPriceEntity = postcard::from_bytes(&record.change.payload)
-        .context("decode embedded Uniswap observation")?;
-    let market = markets
-        .iter()
-        .find(|market| address_matches(entity.pool, market.pool));
-    Ok(market.map(|market| (market, entity)))
 }
 
-fn latest_fresh_prices(
+fn latest_fresh_items(
+    protocol: SubscribeProtocol,
     markets: &[Market],
     records: Vec<ChangeRecord>,
     finality: SubscribeFinality,
     now: u64,
-) -> Result<Vec<(Market, PoolPriceEntity, ChangeRecord)>> {
+) -> Result<Vec<(SubscriptionItem, ChangeRecord)>> {
     let mut latest = BTreeMap::new();
     for record in records {
-        if !price_is_fresh(finality, record.block.timestamp, now) {
+        if !update_is_fresh(finality, record.block.timestamp, now) {
             continue;
         }
-        if let Some((market, entity)) = local_price(markets, &record)? {
-            latest.insert(market.symbol, (*market, entity, record));
+        if let Some(item) = local_item(protocol, markets, &record)? {
+            latest.insert(item.scope_key(), (item, record));
         }
     }
     Ok(latest.into_values().collect())
@@ -1376,11 +1530,13 @@ fn processor_data_request(
     }
 }
 
-async fn optimistic_observations(
+async fn optimistic_items(
+    protocol: SubscribeProtocol,
+    markets: &[Market],
     processor: &dyn leani_processor_api::Processor,
     frame: &BlockFrame,
-) -> Result<Vec<PoolPriceEntity>> {
-    if !price_is_fresh(
+) -> Result<Vec<SubscriptionItem>> {
+    if !update_is_fresh(
         SubscribeFinality::Optimistic,
         frame.block.timestamp,
         unix_seconds(),
@@ -1390,37 +1546,43 @@ async fn optimistic_observations(
     let delta = processor
         .map(frame)
         .await
-        .context("map optimistic Uniswap head preview")?;
-    let delta: UniswapPriceDelta =
-        postcard::from_bytes(&delta.payload).context("decode optimistic Uniswap head preview")?;
-    Ok(delta.observations)
+        .context("map optimistic subscription head preview")?;
+    match protocol {
+        SubscribeProtocol::Blocks => {
+            let entity = postcard::from_bytes(&delta.payload)
+                .context("decode optimistic Ethereum block summary")?;
+            Ok(vec![SubscriptionItem::Block(entity)])
+        }
+        SubscribeProtocol::UniswapV3 => {
+            let delta: UniswapPriceDelta = postcard::from_bytes(&delta.payload)
+                .context("decode optimistic Uniswap head preview")?;
+            Ok(delta
+                .observations
+                .into_iter()
+                .filter_map(|entity| {
+                    markets
+                        .iter()
+                        .find(|market| address_matches(entity.pool, market.pool))
+                        .map(|market| SubscriptionItem::Uniswap {
+                            market: *market,
+                            entity,
+                        })
+                })
+                .collect())
+        }
+    }
 }
 
-fn render_optimistic_observations(
+fn render_optimistic_items(
     format: SubscribeFormat,
-    markets: &[Market],
-    observations: &[PoolPriceEntity],
+    items: &[SubscriptionItem],
     block: BlockRef,
     operation: &str,
 ) -> Result<Vec<ObservationKey>> {
     let mut rendered = Vec::new();
-    for entity in observations {
-        let Some(market) = markets
-            .iter()
-            .find(|market| address_matches(entity.pool, market.pool))
-        else {
-            continue;
-        };
-        render_entity(
-            format,
-            market,
-            entity,
-            block,
-            Finality::Optimistic,
-            operation,
-            None,
-        )?;
-        rendered.push(observation_key(entity));
+    for item in items {
+        render_item(format, item, block, Finality::Optimistic, operation, None)?;
+        rendered.push(observation_key(item));
     }
     Ok(rendered)
 }
@@ -1435,49 +1597,53 @@ async fn next_preview_event(
 }
 
 fn retain_preview_block(
-    blocks: &mut BTreeMap<u64, (BlockHash, Vec<PoolPriceEntity>)>,
+    blocks: &mut BTreeMap<u64, (BlockHash, Vec<SubscriptionItem>)>,
     previewed: &mut HashSet<ObservationKey>,
     block: BlockRef,
-    observations: Vec<PoolPriceEntity>,
+    items: Vec<SubscriptionItem>,
 ) {
-    if let Some((_, replaced)) = blocks.insert(block.number.0, (block.hash, observations)) {
-        for entity in replaced {
-            previewed.remove(&observation_key(&entity));
+    if let Some((_, replaced)) = blocks.insert(block.number.0, (block.hash, items)) {
+        for item in replaced {
+            previewed.remove(&observation_key(&item));
         }
     }
     while blocks.len() > 64 {
         let Some((_, (_, expired))) = blocks.pop_first() else {
             break;
         };
-        for entity in expired {
-            previewed.remove(&observation_key(&entity));
+        for item in expired {
+            previewed.remove(&observation_key(&item));
         }
     }
 }
 
-const fn observation_key(entity: &PoolPriceEntity) -> ObservationKey {
-    (entity.pool, entity.block_hash, entity.log_index)
+const fn observation_key(item: &SubscriptionItem) -> ObservationKey {
+    match item {
+        SubscriptionItem::Block(entity) => ObservationKey::Block(entity.block_hash),
+        SubscriptionItem::Uniswap { entity, .. } => {
+            ObservationKey::Uniswap(entity.pool, entity.block_hash, entity.log_index)
+        }
+    }
 }
 
 fn preview_is_at_or_after(
-    blocks: &BTreeMap<u64, (BlockHash, Vec<PoolPriceEntity>)>,
-    candidate: &PoolPriceEntity,
+    blocks: &BTreeMap<u64, (BlockHash, Vec<SubscriptionItem>)>,
+    candidate: &SubscriptionItem,
 ) -> bool {
-    blocks.values().any(|(_, observations)| {
-        observations.iter().any(|preview| {
-            preview.pool == candidate.pool
-                && (preview.block_number.0 > candidate.block_number.0
-                    || (preview.block_number == candidate.block_number
-                        && preview.block_hash == candidate.block_hash
-                        && preview.log_index >= candidate.log_index))
+    blocks.values().any(|(_, items)| {
+        items.iter().any(|preview| {
+            preview.same_scope(candidate)
+                && (preview.block_number() > candidate.block_number()
+                    || (preview.block_number() == candidate.block_number()
+                        && preview.block_hash() == candidate.block_hash()
+                        && preview.item_index() >= candidate.item_index()))
         })
     })
 }
 
-fn render_local(
+fn render_local_item(
     format: SubscribeFormat,
-    market: &Market,
-    entity: &PoolPriceEntity,
+    item: &SubscriptionItem,
     record: &ChangeRecord,
 ) -> Result<()> {
     if format == SubscribeFormat::Raw {
@@ -1485,15 +1651,51 @@ fn render_local(
         io::stdout().flush()?;
         return Ok(());
     }
-    render_entity(
+    render_item(
         format,
-        market,
-        entity,
+        item,
         record.block,
         record.finality,
         direction_name(record.direction),
         Some(record.cursor.sequence.to_string()),
     )
+}
+
+fn render_item(
+    format: SubscribeFormat,
+    item: &SubscriptionItem,
+    block: BlockRef,
+    finality: Finality,
+    operation: &str,
+    sequence: Option<String>,
+) -> Result<()> {
+    match item {
+        SubscriptionItem::Block(entity) => render_block_summary(
+            format,
+            &RenderedBlockSummary {
+                chain_id: entity.chain_id.0,
+                block_number: entity.block_number.0,
+                block_hash: entity.block_hash.to_string(),
+                parent_hash: entity.parent_hash.to_string(),
+                timestamp: entity.timestamp,
+                gas_limit: entity.gas_limit,
+                gas_used: entity.gas_used,
+                base_fee_wei: entity
+                    .base_fee_per_gas
+                    .map(|value| U256::from_be_bytes(value.0).to_string()),
+                blob_gas_used: entity.blob_gas_used,
+                excess_blob_gas: entity.excess_blob_gas,
+                transaction_count: entity.transaction_count,
+                size_bytes: entity.size_bytes,
+                finality: finality_name(finality).to_owned(),
+                operation: operation.to_owned(),
+                sequence,
+            },
+        ),
+        SubscriptionItem::Uniswap { market, entity } => {
+            render_entity(format, market, entity, block, finality, operation, sequence)
+        }
+    }
 }
 
 fn render_entity(
@@ -1597,6 +1799,108 @@ fn render_price(format: SubscribeFormat, output: &RenderedPrice<'_>) -> Result<(
     Ok(())
 }
 
+fn render_block_summary(format: SubscribeFormat, output: &RenderedBlockSummary) -> Result<()> {
+    match format {
+        SubscribeFormat::Pretty => {
+            let timestamp = readable_timestamp(output.timestamp)?;
+            let gas = match (output.gas_used, output.gas_limit) {
+                (Some(used), Some(limit)) if limit > 0 => format!(
+                    "{} / {} ({})",
+                    compact_count(used),
+                    compact_count(limit),
+                    tenths_percent(used, limit),
+                ),
+                (Some(used), _) => compact_count(used),
+                _ => "unknown".to_owned(),
+            };
+            let base_fee = output.base_fee_wei.as_deref().map_or_else(
+                || "unknown".to_owned(),
+                |value| {
+                    value.parse::<U256>().map_or_else(
+                        |_| "unknown".to_owned(),
+                        |value| format!("{} gwei", decimal_token_amount(value, 9)),
+                    )
+                },
+            );
+            let blobs = output.blob_gas_used.map_or_else(
+                || "unknown".to_owned(),
+                |gas| {
+                    if gas % 131_072 == 0 {
+                        (gas / 131_072).to_string()
+                    } else {
+                        format!("gas:{gas}")
+                    }
+                },
+            );
+            println!(
+                "{}  block={}  gas={}  base_fee={}  blobs={}  {}{}",
+                timestamp,
+                output.block_number,
+                gas,
+                base_fee,
+                blobs,
+                output.finality,
+                if output.operation == "apply" {
+                    String::new()
+                } else {
+                    format!("  {}", output.operation)
+                }
+            );
+        }
+        SubscribeFormat::Json => println!(
+            "{}",
+            serde_json::to_string(&json!({
+                "schema": "leani.block-summary.v1",
+                "chainId": output.chain_id,
+                "blockNumber": output.block_number,
+                "blockHash": output.block_hash,
+                "parentHash": output.parent_hash,
+                "timestamp": output.timestamp,
+                "gasLimit": output.gas_limit,
+                "gasUsed": output.gas_used,
+                "baseFeePerGasWei": output.base_fee_wei,
+                "blobGasUsed": output.blob_gas_used,
+                "excessBlobGas": output.excess_blob_gas,
+                "transactionCount": output.transaction_count,
+                "sizeBytes": output.size_bytes,
+                "finality": output.finality,
+                "operation": output.operation,
+                "sequence": output.sequence,
+            }))?
+        ),
+        SubscribeFormat::Raw => {
+            unreachable!("raw records are rendered before block-summary conversion")
+        }
+    }
+    io::stdout().flush()?;
+    Ok(())
+}
+
+fn compact_count(value: u64) -> String {
+    if value >= 1_000_000 {
+        let hundredths = (u128::from(value) * 100 + 500_000) / 1_000_000;
+        format!("{}.{:02}M", hundredths / 100, hundredths % 100)
+    } else if value >= 1_000 {
+        let tenths = (u128::from(value) * 10 + 500) / 1_000;
+        format!("{}.{:01}k", tenths / 10, tenths % 10)
+    } else {
+        value.to_string()
+    }
+}
+
+fn tenths_percent(value: u64, total: u64) -> String {
+    let tenths = (u128::from(value) * 1_000 + u128::from(total) / 2) / u128::from(total);
+    format!("{}.{:01}%", tenths / 10, tenths % 10)
+}
+
+fn parse_quantity(value: &str) -> Result<U256> {
+    if let Some(hex) = value.strip_prefix("0x") {
+        U256::from_str_radix(hex, 16).context("invalid hexadecimal quantity from node API")
+    } else {
+        U256::from_str(value).context("invalid decimal quantity from node API")
+    }
+}
+
 fn readable_timestamp(timestamp: u64) -> Result<String> {
     let timestamp = i64::try_from(timestamp).context("block timestamp exceeds the Unix range")?;
     let timestamp = chrono::DateTime::from_timestamp(timestamp, 0)
@@ -1604,10 +1908,10 @@ fn readable_timestamp(timestamp: u64) -> Result<String> {
     Ok(timestamp.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
 }
 
-fn price_is_fresh(finality: SubscribeFinality, timestamp: u64, now: u64) -> bool {
+fn update_is_fresh(finality: SubscribeFinality, timestamp: u64, now: u64) -> bool {
     let maximum_age = match finality {
-        SubscribeFinality::Optimistic => OPTIMISTIC_PRICE_MAX_AGE,
-        SubscribeFinality::Finalized => FINALIZED_PRICE_MAX_AGE,
+        SubscribeFinality::Optimistic => OPTIMISTIC_UPDATE_MAX_AGE,
+        SubscribeFinality::Finalized => FINALIZED_UPDATE_MAX_AGE,
     };
     now.saturating_sub(timestamp) <= maximum_age.as_secs()
 }
@@ -1728,38 +2032,15 @@ async fn subscribe_attached(
     endpoint: Url,
 ) -> Result<Exit> {
     let client = reqwest::Client::new();
-    validate_attached_markets(&client, options, markets, &endpoint).await?;
-    let use_latest =
-        options.finality == SubscribeFinality::Optimistic && options.format != SubscribeFormat::Raw;
-    let (mut cursor, latest) = if use_latest {
-        attached_latest_snapshot(&client, options, markets, &endpoint).await?
-    } else {
-        (
-            attached_change_head(&client, options, &endpoint)
-                .await?
-                .cursor,
-            Vec::new(),
-        )
-    };
-    if use_latest {
-        for (market, latest) in latest {
-            if !price_is_fresh(options.finality, latest.timestamp, unix_seconds()) {
-                continue;
-            }
-            render_attached_price(
-                options.format,
-                &market,
-                &latest.data,
-                latest.timestamp,
-                "apply",
-                None,
-            )?;
-            if options.once {
-                return Ok(Exit::Success);
-            }
-        }
+    if options.protocol == SubscribeProtocol::UniswapV3 {
+        validate_attached_markets(&client, options, markets, &endpoint).await?;
     }
-    announce_attached(&endpoint, markets);
+    let (mut cursor, rendered_snapshot) =
+        attached_start_cursor(&client, options, markets, &endpoint).await?;
+    if rendered_snapshot && options.once {
+        return Ok(Exit::Success);
+    }
+    announce_attached(options.protocol, &endpoint, markets);
     let mut backoff = Duration::from_secs(1);
     loop {
         let mut stream_url = processor_url(&endpoint, &options.processor, "stream")?;
@@ -1821,16 +2102,77 @@ async fn subscribe_attached(
     }
 }
 
-fn announce_attached(endpoint: &Url, markets: &[Market]) {
-    eprintln!(
-        "leani: attached to {} for {}; waiting for fresh prices...",
-        endpoint,
-        markets
-            .iter()
-            .map(|market| market.symbol)
-            .collect::<Vec<_>>()
-            .join(", ")
-    );
+async fn attached_start_cursor(
+    client: &reqwest::Client,
+    options: &SubscribeOptions,
+    markets: &[Market],
+    endpoint: &Url,
+) -> Result<(Option<String>, bool)> {
+    let use_latest =
+        options.finality == SubscribeFinality::Optimistic && options.format != SubscribeFormat::Raw;
+    if use_latest {
+        match options.protocol {
+            SubscribeProtocol::Blocks => {
+                let (cursor, latest) =
+                    attached_latest_block_snapshot(client, options, endpoint).await?;
+                let mut rendered = false;
+                if let Some(latest) = latest
+                    && update_is_fresh(options.finality, latest.timestamp, unix_seconds())
+                {
+                    render_attached_block_summary(options.format, latest, "apply", None)?;
+                    rendered = true;
+                }
+                Ok((cursor, rendered))
+            }
+            SubscribeProtocol::UniswapV3 => {
+                let (cursor, latest) =
+                    attached_latest_snapshot(client, options, markets, endpoint).await?;
+                let mut rendered = false;
+                for (market, latest) in latest {
+                    if !update_is_fresh(options.finality, latest.timestamp, unix_seconds()) {
+                        continue;
+                    }
+                    render_attached_price(
+                        options.format,
+                        &market,
+                        &latest.data,
+                        latest.timestamp,
+                        "apply",
+                        None,
+                    )?;
+                    rendered = true;
+                    if options.once {
+                        break;
+                    }
+                }
+                Ok((cursor, rendered))
+            }
+        }
+    } else {
+        Ok((
+            attached_change_head(client, options, endpoint)
+                .await?
+                .cursor,
+            false,
+        ))
+    }
+}
+
+fn announce_attached(protocol: SubscribeProtocol, endpoint: &Url, markets: &[Market]) {
+    match protocol {
+        SubscribeProtocol::Blocks => {
+            eprintln!("leani: attached to {endpoint}; waiting for the next Ethereum block...");
+        }
+        SubscribeProtocol::UniswapV3 => eprintln!(
+            "leani: attached to {} for {}; waiting for fresh prices...",
+            endpoint,
+            markets
+                .iter()
+                .map(|market| market.symbol)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
 }
 
 fn render_attached_sse_events(
@@ -1851,8 +2193,14 @@ fn render_attached_sse_events(
             continue;
         };
         *cursor = Some(envelope.cursor.clone());
-        if render_attached(options.format, options.finality, markets, envelope, &value)?
-            && options.once
+        if render_attached(
+            options.protocol,
+            options.format,
+            options.finality,
+            markets,
+            envelope,
+            &value,
+        )? && options.once
         {
             return Ok(true);
         }
@@ -1900,6 +2248,54 @@ async fn attached_latest_snapshot(
         "Uniswap changes remained busy during latest-price bootstrap; continuing directly from the live cursor"
     );
     Ok((head.cursor, Vec::new()))
+}
+
+async fn attached_latest_block_snapshot(
+    client: &reqwest::Client,
+    options: &SubscribeOptions,
+    endpoint: &Url,
+) -> Result<(Option<String>, Option<AttachedBlockSummary>)> {
+    const MAX_STABILITY_ATTEMPTS: usize = 8;
+
+    for attempt in 1..=MAX_STABILITY_ATTEMPTS {
+        let before = attached_change_head(client, options, endpoint).await?;
+        let latest = attached_latest_block(client, options, endpoint).await?;
+        let after = attached_change_head(client, options, endpoint).await?;
+        if before.cursor == after.cursor {
+            return Ok((after.cursor, latest));
+        }
+        tracing::debug!(
+            attempt,
+            "block summaries advanced during latest-block bootstrap; retrying a stable snapshot"
+        );
+    }
+
+    let head = attached_change_head(client, options, endpoint).await?;
+    tracing::debug!(
+        "block summaries remained busy during latest-block bootstrap; continuing directly from the live cursor"
+    );
+    Ok((head.cursor, None))
+}
+
+async fn attached_latest_block(
+    client: &reqwest::Client,
+    options: &SubscribeOptions,
+    endpoint: &Url,
+) -> Result<Option<AttachedBlockSummary>> {
+    let url = processor_url(endpoint, &options.processor, "query/latest")?;
+    let response = authorized(client.get(url), options.token.as_deref())
+        .send()
+        .await?;
+    if response.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
+    Ok(Some(
+        response
+            .error_for_status()?
+            .json::<AttachedLatestBlock>()
+            .await?
+            .data,
+    ))
 }
 
 async fn attached_latest_observations(
@@ -1992,18 +2388,24 @@ async fn wait_for_reconnect(delay: Duration) -> Result<bool> {
 }
 
 fn render_attached(
+    protocol: SubscribeProtocol,
     format: SubscribeFormat,
     finality: SubscribeFinality,
     markets: &[Market],
     envelope: AttachedEnvelope,
     raw: &Value,
 ) -> Result<bool> {
+    if protocol == SubscribeProtocol::Blocks {
+        return render_attached_block(format, finality, envelope, raw);
+    }
     if !envelope.kind.starts_with("uniswap.price.observation.") {
         return Ok(false);
     }
     let Some(entity) = envelope.data else {
         return Ok(false);
     };
+    let entity: AttachedPoolPrice =
+        serde_json::from_value(entity).context("decode attached Uniswap price observation")?;
     if finality == SubscribeFinality::Finalized && entity.finality != "finalized" {
         return Ok(false);
     }
@@ -2018,7 +2420,7 @@ fn render_attached(
         .get("timestamp")
         .and_then(Value::as_u64)
         .unwrap_or_default();
-    if !price_is_fresh(finality, timestamp, unix_seconds()) {
+    if !update_is_fresh(finality, timestamp, unix_seconds()) {
         return Ok(false);
     }
     if format == SubscribeFormat::Raw {
@@ -2035,6 +2437,69 @@ fn render_attached(
         Some(envelope.sequence),
     )?;
     Ok(true)
+}
+
+fn render_attached_block(
+    format: SubscribeFormat,
+    finality: SubscribeFinality,
+    envelope: AttachedEnvelope,
+    raw: &Value,
+) -> Result<bool> {
+    if !envelope.kind.starts_with(BLOCK_SUMMARY_KIND) {
+        return Ok(false);
+    }
+    let Some(entity) = envelope.data else {
+        return Ok(false);
+    };
+    let entity: AttachedBlockSummary =
+        serde_json::from_value(entity).context("decode attached block summary")?;
+    if finality == SubscribeFinality::Finalized && entity.finality != "finalized" {
+        return Ok(false);
+    }
+    if !update_is_fresh(finality, entity.timestamp, unix_seconds()) {
+        return Ok(false);
+    }
+    if format == SubscribeFormat::Raw {
+        println!("{}", serde_json::to_string(raw)?);
+        io::stdout().flush()?;
+        return Ok(true);
+    }
+    render_attached_block_summary(format, entity, &envelope.operation, Some(envelope.sequence))?;
+    Ok(true)
+}
+
+fn render_attached_block_summary(
+    format: SubscribeFormat,
+    entity: AttachedBlockSummary,
+    operation: &str,
+    sequence: Option<String>,
+) -> Result<()> {
+    let base_fee_wei = entity
+        .base_fee_per_gas
+        .as_deref()
+        .map(parse_quantity)
+        .transpose()?
+        .map(|value| value.to_string());
+    render_block_summary(
+        format,
+        &RenderedBlockSummary {
+            chain_id: entity.chain_id,
+            block_number: entity.block_number,
+            block_hash: entity.block_hash,
+            parent_hash: entity.parent_hash,
+            timestamp: entity.timestamp,
+            gas_limit: entity.gas_limit,
+            gas_used: entity.gas_used,
+            base_fee_wei,
+            blob_gas_used: entity.blob_gas_used,
+            excess_blob_gas: entity.excess_blob_gas,
+            transaction_count: entity.transaction_count,
+            size_bytes: entity.size_bytes,
+            finality: entity.finality,
+            operation: operation.to_owned(),
+            sequence,
+        },
+    )
 }
 
 fn render_attached_price(
@@ -2150,7 +2615,7 @@ mod tests {
     fn subscribe_options(checkpoint_urls: Vec<Url>) -> SubscribeOptions {
         SubscribeOptions {
             protocol: SubscribeProtocol::UniswapV3,
-            markets: vec!["ETH/USDC".to_owned()],
+            targets: vec!["ETH/USDC".to_owned()],
             format: SubscribeFormat::Pretty,
             mode: SubscribeMode::Embedded,
             endpoint: None,
@@ -2218,6 +2683,53 @@ mod tests {
         }
     }
 
+    fn block_record(sequence: u64, timestamp: u64) -> ChangeRecord {
+        let block_hash = BlockHash::new([u8::try_from(sequence).unwrap_or(u8::MAX); 32]);
+        let entity = BlockSummaryEntity {
+            chain_id: ChainId(1),
+            block_number: BlockNumber(sequence),
+            block_hash,
+            parent_hash: BlockHash::new([0; 32]),
+            timestamp,
+            gas_limit: Some(60_000_000),
+            gas_used: Some(30_000_000),
+            base_fee_per_gas: None,
+            blob_gas_used: Some(262_144),
+            excess_blob_gas: Some(393_216),
+            transaction_count: None,
+            size_bytes: None,
+            finality: Finality::Optimistic,
+        };
+        ChangeRecord {
+            delivery_encoding_version: 1,
+            cursor: ChangeCursor {
+                chain_id: ChainId(1),
+                processor_id: "block-summary".to_owned(),
+                sequence,
+            },
+            origin: DeliveryOrigin {
+                kind: DeliveryOriginKind::Live,
+                id: "test".to_owned(),
+                publication_revision: 0,
+            },
+            block: BlockRef {
+                number: BlockNumber(sequence),
+                hash: block_hash,
+                parent_hash: BlockHash::new([0; 32]),
+                timestamp,
+            },
+            finality: Finality::Optimistic,
+            direction: ChangeDirection::Apply,
+            change: DomainChange {
+                kind: BLOCK_SUMMARY_KIND.to_owned(),
+                key: block_hash.0.to_vec(),
+                operation: ChangeOperation::Upsert,
+                payload: postcard::to_allocvec(&entity).expect("encode block summary"),
+            },
+            emitted_at_unix_ms: timestamp.saturating_mul(1_000),
+        }
+    }
+
     #[test]
     fn resolves_multiple_markets_and_weth_spelling() {
         let markets =
@@ -2231,6 +2743,13 @@ mod tests {
         let error = resolve_markets(&["ETH/USDC".to_owned(), "WETH/USDC".to_owned()])
             .expect_err("duplicate");
         assert!(error.to_string().contains("more than once"));
+    }
+
+    #[test]
+    fn subscription_targets_are_protocol_specific() {
+        assert!(subscription_markets(SubscribeProtocol::Blocks, &[]).is_ok());
+        assert!(subscription_markets(SubscribeProtocol::Blocks, &["ETH/USDC".to_owned()]).is_err());
+        assert!(subscription_markets(SubscribeProtocol::UniswapV3, &[]).is_err());
     }
 
     #[test]
@@ -2268,19 +2787,27 @@ mod tests {
     }
 
     #[test]
-    fn catch_up_prices_stay_silent_until_the_stream_is_current() {
+    fn pretty_block_counts_and_gas_percentage_use_exact_integer_rounding() {
+        assert_eq!(compact_count(52_481_000), "52.48M");
+        assert_eq!(compact_count(12_349), "12.3k");
+        assert_eq!(compact_count(999), "999");
+        assert_eq!(tenths_percent(52_481_000, 60_000_000), "87.5%");
+    }
+
+    #[test]
+    fn catch_up_updates_stay_silent_until_the_stream_is_current() {
         let now = 10_000;
-        assert!(price_is_fresh(
+        assert!(update_is_fresh(
             SubscribeFinality::Optimistic,
-            now - OPTIMISTIC_PRICE_MAX_AGE.as_secs(),
+            now - OPTIMISTIC_UPDATE_MAX_AGE.as_secs(),
             now
         ));
-        assert!(!price_is_fresh(
+        assert!(!update_is_fresh(
             SubscribeFinality::Optimistic,
-            now - OPTIMISTIC_PRICE_MAX_AGE.as_secs() - 1,
+            now - OPTIMISTIC_UPDATE_MAX_AGE.as_secs() - 1,
             now
         ));
-        assert!(price_is_fresh(
+        assert!(update_is_fresh(
             SubscribeFinality::Finalized,
             now - 15 * 60,
             now
@@ -2291,7 +2818,8 @@ mod tests {
     fn readiness_keeps_only_the_newest_fresh_price_per_market() {
         let eth = resolve_markets(&["ETH/USDC".to_owned()]).expect("ETH market")[0];
         let wbtc = resolve_markets(&["WBTC/ETH".to_owned()]).expect("WBTC market")[0];
-        let prices = latest_fresh_prices(
+        let prices = latest_fresh_items(
+            SubscribeProtocol::UniswapV3,
             &[eth, wbtc],
             vec![
                 price_record(eth, 1, 9_000),
@@ -2305,10 +2833,36 @@ mod tests {
         .expect("select startup prices");
 
         assert_eq!(prices.len(), 2);
-        assert_eq!(prices[0].0.symbol, "ETH/USDC");
-        assert_eq!(prices[0].2.cursor.sequence, 4);
-        assert_eq!(prices[1].0.symbol, "WBTC/ETH");
-        assert_eq!(prices[1].2.cursor.sequence, 3);
+        assert!(matches!(
+            &prices[0].0,
+            SubscriptionItem::Uniswap { market, .. } if market.symbol == "ETH/USDC"
+        ));
+        assert_eq!(prices[0].1.cursor.sequence, 4);
+        assert!(matches!(
+            &prices[1].0,
+            SubscriptionItem::Uniswap { market, .. } if market.symbol == "WBTC/ETH"
+        ));
+        assert_eq!(prices[1].1.cursor.sequence, 3);
+    }
+
+    #[test]
+    fn readiness_keeps_only_the_newest_fresh_block() {
+        let items = latest_fresh_items(
+            SubscribeProtocol::Blocks,
+            &[],
+            vec![
+                block_record(40, 9_900),
+                block_record(41, 9_912),
+                block_record(42, 9_924),
+            ],
+            SubscribeFinality::Optimistic,
+            10_000,
+        )
+        .expect("select startup block");
+
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].0.block_number(), BlockNumber(42));
+        assert_eq!(items[0].1.cursor.sequence, 42);
     }
 
     #[test]
@@ -2316,28 +2870,31 @@ mod tests {
         let market = resolve_markets(&["ETH/USDC".to_owned()]).expect("market")[0];
         let older_record = price_record(market, 86, 10_000);
         let preview_record = price_record(market, 88, 10_024);
-        let (_, older) = local_price(&[market], &older_record)
+        let older = local_item(SubscribeProtocol::UniswapV3, &[market], &older_record)
             .expect("decode older price")
             .expect("older market");
-        let (_, preview) = local_price(&[market], &preview_record)
+        let preview = local_item(SubscribeProtocol::UniswapV3, &[market], &preview_record)
             .expect("decode preview price")
             .expect("preview market");
         let mut preview_blocks = BTreeMap::from([(
-            preview.block_number.0,
-            (preview.block_hash, vec![preview.clone()]),
+            preview.block_number().0,
+            (preview.block_hash(), vec![preview.clone()]),
         )]);
 
         assert!(preview_is_at_or_after(&preview_blocks, &older));
         assert!(preview_is_at_or_after(&preview_blocks, &preview));
 
         let newer_record = price_record(market, 89, 10_036);
-        let (_, newer) = local_price(&[market], &newer_record)
+        let newer = local_item(SubscribeProtocol::UniswapV3, &[market], &newer_record)
             .expect("decode newer price")
             .expect("newer market");
         assert!(!preview_is_at_or_after(&preview_blocks, &newer));
 
         let mut replacement = preview;
-        replacement.block_hash = BlockHash::new([99; 32]);
+        let SubscriptionItem::Uniswap { entity, .. } = &mut replacement else {
+            panic!("expected Uniswap item");
+        };
+        entity.block_hash = BlockHash::new([99; 32]);
         assert!(!preview_is_at_or_after(&preview_blocks, &replacement));
 
         preview_blocks.clear();
@@ -2353,28 +2910,32 @@ mod tests {
             operation: "apply".to_owned(),
             block: json!({
                 "timestamp": unix_seconds()
-                    .saturating_sub(OPTIMISTIC_PRICE_MAX_AGE.as_secs() + 1),
+                    .saturating_sub(OPTIMISTIC_UPDATE_MAX_AGE.as_secs() + 1),
             }),
             finality: "optimistic".to_owned(),
             kind: "uniswap.price.observation.apply".to_owned(),
-            data: Some(AttachedPoolPrice {
-                pool: market.pool.to_owned(),
-                kind: "v3".to_owned(),
-                reserve0: None,
-                reserve1: None,
-                amount0: None,
-                amount1: None,
-                sqrt_price_x96: None,
-                block_number: 1,
-                block_hash: format!("0x{}", hex::encode([1; 32])),
-                log_index: 0,
-                finality: "optimistic".to_owned(),
-            }),
+            data: Some(
+                serde_json::to_value(AttachedPoolPrice {
+                    pool: market.pool.to_owned(),
+                    kind: "v3".to_owned(),
+                    reserve0: None,
+                    reserve1: None,
+                    amount0: None,
+                    amount1: None,
+                    sqrt_price_x96: None,
+                    block_number: 1,
+                    block_hash: format!("0x{}", hex::encode([1; 32])),
+                    log_index: 0,
+                    finality: "optimistic".to_owned(),
+                })
+                .expect("price JSON"),
+            ),
             extra: BTreeMap::new(),
         };
 
         assert!(
             !render_attached(
+                SubscribeProtocol::UniswapV3,
                 SubscribeFormat::Raw,
                 SubscribeFinality::Optimistic,
                 &[market],
@@ -2541,6 +3102,7 @@ mod tests {
             .expect("right markets");
         let left = subscription_data_dir_for(
             None,
+            SubscribeProtocol::UniswapV3,
             &left,
             None,
             SubscribeFinality::Optimistic,
@@ -2549,6 +3111,7 @@ mod tests {
         .expect("left identity");
         let right = subscription_data_dir_for(
             None,
+            SubscribeProtocol::UniswapV3,
             &right,
             None,
             SubscribeFinality::Optimistic,
@@ -2556,6 +3119,30 @@ mod tests {
         )
         .expect("right identity");
         assert_eq!(left.file_name(), right.file_name());
+    }
+
+    #[test]
+    fn block_and_uniswap_subscriptions_have_distinct_state() {
+        let market = resolve_markets(&["ETH/USDC".to_owned()]).expect("market");
+        let blocks = subscription_data_dir_for(
+            None,
+            SubscribeProtocol::Blocks,
+            &[],
+            None,
+            SubscribeFinality::Optimistic,
+            Path::new("."),
+        )
+        .expect("blocks identity");
+        let uniswap = subscription_data_dir_for(
+            None,
+            SubscribeProtocol::UniswapV3,
+            &market,
+            None,
+            SubscribeFinality::Optimistic,
+            Path::new("."),
+        )
+        .expect("Uniswap identity");
+        assert_ne!(blocks.file_name(), uniswap.file_name());
     }
 
     #[test]
@@ -2592,8 +3179,12 @@ mod tests {
     fn embedded_processor_contains_every_requested_pool() {
         let markets =
             resolve_markets(&["ETH/USDC".to_owned(), "ETH/USDT".to_owned()]).expect("markets");
-        let processor =
-            subscription_processor(&markets, SubscribeFinality::Optimistic).expect("processor");
+        let processor = subscription_processor(
+            SubscribeProtocol::UniswapV3,
+            &markets,
+            SubscribeFinality::Optimistic,
+        )
+        .expect("processor");
         let pools = processor.settings["pools"].as_array().expect("pools");
         assert_eq!(pools.len(), 2);
         assert_eq!(processor.history_mode, ProcessorHistoryMode::OnDemand);
@@ -2601,5 +3192,21 @@ mod tests {
             processor.publish,
             PublishMode::OptimisticAndFinalized
         ));
+    }
+
+    #[test]
+    fn embedded_block_processor_has_no_body_requirement() {
+        let processor = subscription_processor(
+            SubscribeProtocol::Blocks,
+            &[],
+            SubscribeFinality::Optimistic,
+        )
+        .expect("processor");
+        let registry = ProcessorRegistry::standard();
+        let processor = registry.instantiate(&processor, 1).expect("instantiate");
+        assert_eq!(
+            processor.descriptor().requirements[0].capabilities,
+            leani_primitives::CapabilitySet::of(leani_primitives::Capability::Header)
+        );
     }
 }

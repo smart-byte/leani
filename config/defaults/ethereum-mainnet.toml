@@ -1,4 +1,4 @@
-# Internal expansion defaults for the compact Ethereum Mainnet Uniswap config.
+# Internal expansion defaults for compact Ethereum Mainnet processor configs.
 # Operators can copy any of these fields into the advanced config schema when
 # they need complete control; compact configs intentionally expose only choices.
 config_version = 1

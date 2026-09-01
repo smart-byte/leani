@@ -2966,10 +2966,11 @@ impl RethP2pSource {
         budget: SourceBudget,
         cancellation: &CancellationToken,
     ) -> Result<(Vec<BlockFrame>, usize), P2pError> {
-        if sparse_log_scope(request).is_none()
-            || request
-                .log_fields
-                .contains(leani_primitives::LogField::TransactionHash)
+        if !header_only_request(request)
+            && (sparse_log_scope(request).is_none()
+                || request
+                    .log_fields
+                    .contains(leani_primitives::LogField::TransactionHash))
         {
             return self
                 .fetch_verified_range(session, range, expected_tip, budget, cancellation)
@@ -2994,10 +2995,13 @@ impl RethP2pSource {
             range,
             ..request.clone()
         };
-        let frames = self
-            .fetch_sparse_live_frames(session, &headers, &request, budget, cancellation)
-            .await
-            .inspect_err(|error| session.record_error(error))?;
+        let frames = if header_only_request(&request) {
+            normalize_verified_headers(&headers, budget)?
+        } else {
+            self.fetch_sparse_live_frames(session, &headers, &request, budget, cancellation)
+                .await
+                .inspect_err(|error| session.record_error(error))?
+        };
         session.clear_error();
         Ok((frames, 1))
     }
@@ -3123,6 +3127,13 @@ impl RethP2pSource {
         let header = headers
             .pop()
             .expect("one validated live header was returned");
+        if header_only_request(request) {
+            let mut frames = normalize_verified_headers(&[header], budget)?;
+            session.clear_error();
+            session.observe_head(next);
+            session.set_phase(NetworkPhase::FollowingHead);
+            return Ok(frames.pop());
+        }
         let hash = header.hash_slow();
         if sparse_log_scope(request).is_some()
             && !request
@@ -5109,7 +5120,9 @@ impl RethP2pHistorySource {
                 max_input_bytes: remaining,
                 ..budget
             };
-            let mut frames = if sparse_log_scope(request).is_some() {
+            let mut frames = if header_only_request(request) {
+                normalize_verified_headers(header_chunk, window_budget)?
+            } else if sparse_log_scope(request).is_some() {
                 self.fetch_sparse_log_frames(
                     session,
                     header_chunk,
@@ -7508,6 +7521,81 @@ fn normalize_sparse_log_block(
     })
 }
 
+fn normalize_verified_headers(
+    headers: &[Header],
+    budget: SourceBudget,
+) -> Result<Vec<BlockFrame>, P2pError> {
+    let observed_at_unix_ms = u64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis(),
+    )
+    .unwrap_or(u64::MAX);
+    let mut total_bytes = 0_u64;
+    let mut output = Vec::with_capacity(headers.len());
+    for header in headers {
+        let hash = header.hash_slow();
+        let frame = BlockFrame {
+            chain_id: ChainId(1),
+            block: BlockRef {
+                number: BlockNumber(header.number),
+                hash: block_hash(hash),
+                parent_hash: block_hash(header.parent_hash),
+                timestamp: header.timestamp,
+            },
+            finality: Finality::Optimistic,
+            header: Material::Complete(HeaderEnvelope {
+                rlp: Some(alloy_rlp::encode(header)),
+                transactions_root: Some(block_hash(header.transactions_root)),
+                receipts_root: Some(block_hash(header.receipts_root)),
+                withdrawals_root: header.withdrawals_root.map(block_hash),
+                gas_limit: Some(header.gas_limit),
+                gas_used: Some(header.gas_used),
+                base_fee_per_gas: header.base_fee_per_gas.map(U256::from).map(quantity),
+                blob_gas_used: header.blob_gas_used,
+                excess_blob_gas: header.excess_blob_gas,
+                size_bytes: None,
+                transaction_count: None,
+                consensus_size_bytes: None,
+            }),
+            transactions: Material::Missing(MissingReason::NotRequested),
+            receipts: Material::Missing(MissingReason::NotRequested),
+            logs: Material::Missing(MissingReason::NotRequested),
+            withdrawals: Material::Missing(MissingReason::NotRequested),
+            blob_sidecars: Material::Missing(MissingReason::NotRequested),
+            traces: Material::Missing(MissingReason::Unsupported),
+            state_diffs: Material::Missing(MissingReason::Unsupported),
+            provenance: vec![Provenance {
+                source_id: SourceId::new("reth-p2p-mainnet")
+                    .map_err(|error| P2pError::InvalidConfig(error.to_string()))?,
+                source_kind: SourceKind::ExecutionP2p,
+                trust: TrustModel::ProtocolVerified,
+                range: Some(BlockRange::single(BlockNumber(header.number))),
+                object: Some(ObjectIdentity {
+                    locator: format!("devp2p://mainnet/block/{hash:#x}"),
+                    version: Some(format!("reth/{RETH_VERSION}@{RETH_REVISION}")),
+                    checksum: Some(hash.0),
+                    schema: Some("eth/68-70/header".to_owned()),
+                }),
+                observed_at_unix_ms,
+                projection: vec!["header".to_owned()],
+            }],
+            verification: VerificationReport {
+                header_hash: VerificationCheck::VERIFIED,
+                parent_continuity: VerificationCheck::VERIFIED,
+                transactions_root: VerificationCheck::NOT_CHECKED,
+                receipts_root: VerificationCheck::NOT_CHECKED,
+                withdrawals_root: VerificationCheck::NOT_CHECKED,
+                dataset_checksum: VerificationCheck::NOT_CHECKED,
+                consensus_anchor: None,
+            },
+        };
+        push_normalized_frame(&mut output, frame, &mut total_bytes, budget)?;
+    }
+    Ok(output)
+}
+
 fn normalize_verified(
     headers: &[Header],
     bodies: &[BlockBody],
@@ -7594,6 +7682,10 @@ fn requested_material(request: Option<&DataRequest>, capability: Capability) -> 
         }
         _ => request.required.contains(capability),
     })
+}
+
+fn header_only_request(request: &DataRequest) -> bool {
+    request.required == CapabilitySet::of(Capability::Header)
 }
 
 fn effective_filter_scope(request: Option<&DataRequest>) -> Option<FilterScope> {
@@ -8112,6 +8204,49 @@ mod tests {
         assert_eq!(frames.len(), 2);
         assert_eq!(frames[1].block.parent_hash, frames[0].block.hash);
         assert!(frames.iter().all(|frame| frame.validate_shape().is_ok()));
+    }
+
+    #[test]
+    fn header_only_requests_normalize_without_bodies_or_receipts() {
+        let (range, headers, _, _) = empty_fixture();
+        let request = DataRequest {
+            chain_id: ChainId(1),
+            range,
+            required: CapabilitySet::of(Capability::Header),
+            allow_filtered: false,
+            projection: leani_source_api::FieldProjection::default(),
+            log_fields: leani_primitives::LogFieldSet::NONE,
+            filters: leani_source_api::FilterSet::default(),
+            minimum_finality: Finality::Optimistic,
+            verification_policy: leani_source_api::VerificationPolicy::CompleteCryptographic,
+        };
+        assert!(header_only_request(&request));
+        let frames = normalize_verified_headers(
+            &headers,
+            SourceBudget {
+                max_input_bytes: 1_000_000,
+                max_frame_bytes: 1_000_000,
+                max_frames: 2,
+                max_buffered_frames: 2,
+                max_in_flight_requests: 1,
+                temporary_disk_bytes: 0,
+            },
+        )
+        .expect("header frames");
+
+        assert_eq!(frames.len(), 2);
+        assert!(frames.iter().all(|frame| {
+            matches!(frame.header, Material::Complete(_))
+                && matches!(
+                    frame.transactions,
+                    Material::Missing(MissingReason::NotRequested)
+                )
+                && matches!(
+                    frame.receipts,
+                    Material::Missing(MissingReason::NotRequested)
+                )
+                && frame.capabilities().complete.contains(Capability::Header)
+        }));
     }
 
     #[test]

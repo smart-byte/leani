@@ -4247,6 +4247,7 @@ dependencies = [
  "leani-primitives",
  "leani-processor-api",
  "leani-processor-blobs",
+ "leani-processor-block-summary",
  "leani-processor-erc20",
  "leani-processor-evm-events",
  "leani-processor-transaction-stats",
@@ -4291,6 +4292,7 @@ dependencies = [
  "leani-primitives",
  "leani-processor-api",
  "leani-processor-blobs",
+ "leani-processor-block-summary",
  "leani-processor-erc20",
  "leani-processor-uniswap",
  "leani-source-api",
@@ -4411,6 +4413,22 @@ name = "leani-processor-blobs"
 version = "0.1.0"
 dependencies = [
  "alloy-primitives",
+ "async-trait",
+ "blake3",
+ "leani-primitives",
+ "leani-processor-api",
+ "leani-testkit",
+ "postcard",
+ "semver 1.0.28",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "leani-processor-block-summary"
+version = "0.1.0"
+dependencies = [
  "async-trait",
  "blake3",
  "leani-primitives",

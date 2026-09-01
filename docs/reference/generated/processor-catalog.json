@@ -6,6 +6,10 @@
       "description": "Mainnet blob blocks, transactions, fees, burn, capacity, and fork-aware schedule"
     },
     {
+      "id": "block-summary",
+      "description": "Header-only Ethereum block summaries for low-latency chain following"
+    },
+    {
       "id": "erc20-balances",
       "description": "Watchlist ERC-20 transfer ledger with current balances"
     },

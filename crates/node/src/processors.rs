@@ -12,8 +12,8 @@
 use std::{collections::BTreeMap, fmt, sync::Arc};
 
 use leani_api::{
-    BlobsQueryExtension, Erc20QueryExtension, QueryExtension, QueryExtensionRegistration,
-    UniswapObservationsQueryExtension, UniswapQueryExtension,
+    BlobsQueryExtension, BlockSummaryQueryExtension, Erc20QueryExtension, QueryExtension,
+    QueryExtensionRegistration, UniswapObservationsQueryExtension, UniswapQueryExtension,
 };
 use leani_primitives::{Address, BlockNumber};
 use leani_processor_api::{
@@ -168,6 +168,7 @@ impl ProcessorRegistry {
     pub fn standard() -> Self {
         let mut factories: BTreeMap<String, Arc<dyn ProcessorFactory>> = BTreeMap::new();
         for factory in [
+            Arc::new(BlockSummaryProcessorFactory) as Arc<dyn ProcessorFactory>,
             Arc::new(BlobsProcessorFactory) as Arc<dyn ProcessorFactory>,
             Arc::new(Erc20ProcessorFactory),
             Arc::new(EvmEventsProcessorFactory),
@@ -428,6 +429,44 @@ fn configured_contract(
         .lifecycle_policies()
         .map_err(ProcessorFactoryError::configuration)?;
     Ok((instance, configured.publication_policy(), lifecycle))
+}
+
+#[derive(Clone, Copy, Debug)]
+struct BlockSummaryProcessorFactory;
+
+impl ProcessorFactory for BlockSummaryProcessorFactory {
+    fn id(&self) -> &str {
+        "block-summary"
+    }
+
+    fn description(&self) -> &str {
+        "Header-only Ethereum block summaries for low-latency chain following"
+    }
+
+    fn create(
+        &self,
+        configured: &ProcessorConfig,
+        _context: ProcessorFactoryContext,
+    ) -> Result<ProcessorComponents, ProcessorFactoryError> {
+        if !configured.settings.is_empty() {
+            return Err(ProcessorFactoryError::configuration(
+                "the block-summary processor takes no settings",
+            ));
+        }
+        let processor = leani_processor_block_summary::BlockSummaryProcessor::new(
+            leani_processor_block_summary::BlockSummaryConfig {
+                start_block: BlockNumber(configured.start_block),
+            },
+        )
+        .map_err(|error| ProcessorFactoryError::configuration(error.to_string()))?;
+        let (instance, publication, lifecycle) = configured_contract(configured)?;
+        Ok(ProcessorComponents::new(Arc::new(processor.with_contract(
+            instance,
+            publication,
+            lifecycle,
+        )))
+        .with_query_extension(Arc::new(BlockSummaryQueryExtension)))
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -797,6 +836,30 @@ mod tests {
         assert_eq!(
             registry.register(DuplicateBlobs),
             Err(ProcessorRegistryError::Duplicate("blobs-money".to_owned()))
+        );
+    }
+
+    #[test]
+    fn standard_registry_contains_block_summary() {
+        let registry = ProcessorRegistry::standard();
+        assert!(registry.contains("block-summary"));
+        let configured =
+            crate::block_summaries::processor_config("demo-blocks", false).expect("block config");
+        let components = registry
+            .instantiate_components(&configured, 1)
+            .expect("block processor");
+        let processor = &components.processor;
+        assert_eq!(processor.descriptor().id.as_str(), "block-summary");
+        assert_eq!(
+            processor.descriptor().requirements[0].capabilities,
+            leani_primitives::CapabilitySet::of(leani_primitives::Capability::Header)
+        );
+        assert_eq!(
+            components
+                .query_extension
+                .as_ref()
+                .map(|extension| extension.id()),
+            Some("block-summary-v1")
         );
     }
 

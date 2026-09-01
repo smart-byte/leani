@@ -10,12 +10,17 @@
     "starterConfig": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["config_version", "network", "finality", "uniswap"],
+      "required": ["config_version", "network", "finality"],
+      "oneOf": [
+        { "required": ["blocks"], "not": { "required": ["uniswap"] } },
+        { "required": ["uniswap"], "not": { "required": ["blocks"] } }
+      ],
       "properties": {
         "config_version": { "const": 1 },
         "network": { "const": "ethereum-mainnet" },
         "data_dir": { "type": "string", "minLength": 1, "default": "./data" },
         "finality": { "$ref": "#/$defs/starterFinality" },
+        "blocks": { "$ref": "#/$defs/starterBlocks" },
         "uniswap": { "$ref": "#/$defs/starterUniswap" },
         "api": { "$ref": "#/$defs/starterApi" }
       }
@@ -33,6 +38,10 @@
           "items": { "type": "string", "format": "uri" }
         }
       }
+    },
+    "starterBlocks": {
+      "type": "object",
+      "additionalProperties": false
     },
     "starterUniswap": {
       "type": "object",

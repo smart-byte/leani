@@ -92,6 +92,30 @@ fallback.
 
 Token balances and Uniswap prices are the next generality tests. Both can be derived from receipt logs without an EVM, subject to the semantic limits documented in [RPC compatibility](docs/reference/ethereum-json-rpc.md).
 
+## Follow Ethereum one block at a time
+
+The smallest continuous Leani demo needs no configuration and does not wait for
+a particular contract event:
+
+```bash
+leani subscribe blocks
+```
+
+The built-in `block-summary` processor requests verified execution headers
+only. It prints every fresh optimistic block with its timestamp, block number,
+gas usage, base fee, blob count, and finality:
+
+```text
+2026-09-01T09:14:35Z  block=25881412  gas=32.47M / 60.00M (54.1%)  base_fee=0.143592817 gwei  blobs=6  optimistic
+```
+
+Use `--format json` for NDJSON or `--once` to measure time to first data. To
+prepare a reusable node, run `leani init blocks` once and `leani serve` in one
+terminal; the same `leani subscribe blocks` command in another terminal detects
+the local API, prints a stable latest snapshot immediately, and follows live
+changes. See the [live block subscription guide](docs/guides/live-block-subscriptions.md)
+for the compact configuration and recording workflow.
+
 ## Stream a live Uniswap price
 
 The CLI can activate the embedded Uniswap V3 observation processor without a
