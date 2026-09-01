@@ -89,6 +89,9 @@ endpoint = "https://data.ethpandaops.io/erae/mainnet/"
 [sources.live]
 kind = "p2p"
 minimum_peers = 1
+# Start as soon as one verified body-serving peer is ready, then continue
+# qualifying peers concurrently until four independent fallbacks are ready.
+body_serving_peer_target = 4
 # Non-blocking operational target for a healthy pool. Requests start with one
 # peer while background dialing continues beyond this target.
 preferred_peers = 16
@@ -109,9 +112,10 @@ trusted_peers = []
 # indexing traffic. The public key in its enrtree:// URL authenticates hints,
 # never execution data. No operator is configured by default.
 # bootstrap_dns_tree = "enrtree://<public-key>@peers.example.org"
-# This is Reth's safety-net polling interval. Leani dispatches newly discovered
-# candidates and refills freed dial slots immediately within the ceiling above.
-peer_refill_interval_ms = 5000
+# Reth refills a failed dial immediately. This safety-net interval makes newly
+# discovered candidates actionable promptly without adding network traffic;
+# max_concurrent_dials remains the hard bound on simultaneous attempts.
+peer_refill_interval_ms = 1000
 # Rebuild discovery after a sustained zero-peer state (including host sleep or
 # an initially failed DNS/Discv bootstrap).
 peer_recovery_timeout_seconds = 300

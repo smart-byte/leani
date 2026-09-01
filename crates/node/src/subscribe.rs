@@ -586,8 +586,8 @@ async fn subscribe_embedded(
                 );
             } else {
                 eprintln!(
-                    "leani: connected to {} Ethereum peer(s); validating a current serving head...",
-                    status.connected_peer_slots,
+                    "leani: {}; validating a current serving head...",
+                    format_peer_search_status(&status),
                 );
             }
             next_startup_status = next_startup_status.saturating_add(Duration::from_secs(30));
@@ -882,11 +882,14 @@ fn format_peer_search_status(status: &NetworkTelemetrySnapshot) -> String {
         format!("; {}", reasons.join(", "))
     };
     format!(
-        "{} connected, {} candidates known; {} sessions opened, {} closed{}",
+        "{} connected, {}/{} body-serving, {} candidates known; {} active sessions established, {} closed; up to {} concurrent dials{}",
         status.connected_peer_slots,
+        status.body_serving_peer_slots,
+        status.peer_targets.body_serving,
         status.known_peer_records,
         status.peer_lifecycle.established,
         status.peer_lifecycle.disconnected,
+        status.peer_targets.max_concurrent_dials,
         reasons,
     )
 }
@@ -3422,7 +3425,7 @@ mod tests {
         let status = format_peer_search_status(&telemetry.snapshot());
         assert_eq!(
             status,
-            "0 connected, 0 candidates known; 2 sessions opened, 2 closed; connection_closed=1, too_many_peers=1"
+            "0 connected, 0/0 body-serving, 0 candidates known; 2 active sessions established, 2 closed; up to 0 concurrent dials; connection_closed=1, too_many_peers=1"
         );
     }
 

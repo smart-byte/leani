@@ -188,14 +188,16 @@
       <div class="label-row">
         <span class="label">Peers</span>
         <button class="info-badge" id="peers-info" type="button" aria-label="What do the peer counts mean?" aria-describedby="peers-help">?</button>
-        <span class="info-tooltip" id="peers-help" role="tooltip">Connected slots are current physical RLPx sessions. One peer is the normal hard floor for starting work; preferred is a non-blocking healthy-pool target, and background dialing continues beyond it up to the maximum outbound limit. Known records are persisted discovery candidates, not active connections. Established and closed are cumulative since process start; closures are grouped by protocol-level reason without exposing peer identities.</span>
+        <span class="info-tooltip" id="peers-help" role="tooltip">Connected slots are current physical RLPx sessions. Body-serving peers have additionally returned a commitment-valid body at the current verified target. One such peer is the normal hard floor for starting work; qualification continues toward its independent fallback target. Preferred is a non-blocking connection-pool target, and background dialing continues beyond it up to the maximum outbound limit. Known records are persisted discovery candidates, not active connections. Established and closed are cumulative since process start; closures are grouped by protocol-level reason without exposing peer identities.</span>
       </div>
       <strong class="value" id="connected">—</strong>
       <span class="subvalue" id="peer-connected-detail">connected peer slots</span>
       <div class="request-breakdown">
+        <span><strong class="good" id="peer-body-serving">—</strong>body-serving</span>
         <span><strong id="known">—</strong>known records</span>
         <span><strong id="peer-preferred">—</strong>preferred</span>
         <span><strong id="peer-maximum">—</strong>maximum outbound</span>
+        <span><strong id="peer-dials">—</strong>concurrent dial ceiling</span>
         <span><strong class="good" id="peer-established">—</strong>established</span>
         <span><strong class="bad" id="peer-closed">—</strong>closed</span>
       </div>
@@ -484,8 +486,10 @@
     el("peer-connected-detail").textContent = peerTargets.minimum
       ? `connected peer slots · ${fmt(peerTargets.minimum)} required to start`
       : "connected peer slots";
+    el("peer-body-serving").textContent = `${fmt(data.network.bodyServingPeerSlots)}/${fmt(peerTargets.bodyServing)}`;
     el("peer-preferred").textContent = fmt(peerTargets.preferred);
     el("peer-maximum").textContent = fmt(peerTargets.maxOutbound);
+    el("peer-dials").textContent = fmt(peerTargets.maxConcurrentDials);
     const peerLifecycle = data.network.peerLifecycle || {};
     el("peer-established").textContent = fmt(peerLifecycle.established);
     el("peer-closed").textContent = fmt(peerLifecycle.disconnected);

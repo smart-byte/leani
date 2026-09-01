@@ -277,6 +277,7 @@
       "properties": {
         "kind": { "enum": ["p2p", "disabled"] },
         "minimum_peers": { "$ref": "#/$defs/nonNegativeInteger" },
+        "body_serving_peer_target": { "$ref": "#/$defs/nonNegativeInteger" },
         "preferred_peers": { "$ref": "#/$defs/nonNegativeInteger" },
         "max_outbound_peers": { "$ref": "#/$defs/nonNegativeInteger" },
         "max_concurrent_dials": { "$ref": "#/$defs/nonNegativeInteger" },

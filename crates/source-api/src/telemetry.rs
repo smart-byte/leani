@@ -164,9 +164,12 @@ struct NetworkTelemetryInner {
     request_queue_wait_milliseconds: AtomicU64,
     peer_sessions_established: AtomicU64,
     peer_sessions_closed: AtomicU64,
+    body_serving_peer_slots: AtomicU64,
     minimum_peer_slots: AtomicU64,
+    body_serving_peer_target: AtomicU64,
     preferred_peer_slots: AtomicU64,
     max_outbound_peer_slots: AtomicU64,
+    max_concurrent_dials: AtomicU64,
     disconnect_reasons: RwLock<BTreeMap<NetworkDisconnectReason, u64>>,
     sessions: RwLock<BTreeMap<u64, SessionRecord>>,
     inactive_order: RwLock<VecDeque<u64>>,
@@ -191,9 +194,12 @@ impl Default for NetworkTelemetry {
                 request_queue_wait_milliseconds: AtomicU64::new(0),
                 peer_sessions_established: AtomicU64::new(0),
                 peer_sessions_closed: AtomicU64::new(0),
+                body_serving_peer_slots: AtomicU64::new(0),
                 minimum_peer_slots: AtomicU64::new(0),
+                body_serving_peer_target: AtomicU64::new(0),
                 preferred_peer_slots: AtomicU64::new(0),
                 max_outbound_peer_slots: AtomicU64::new(0),
+                max_concurrent_dials: AtomicU64::new(0),
                 disconnect_reasons: RwLock::new(BTreeMap::new()),
                 sessions: RwLock::new(BTreeMap::new()),
                 inactive_order: RwLock::new(VecDeque::new()),
@@ -210,10 +216,21 @@ impl Default for NetworkTelemetry {
 }
 
 impl NetworkTelemetry {
-    /// Publish the hard, preferred, and maximum execution peer-pool targets.
-    pub fn set_peer_targets(&self, minimum: usize, preferred: usize, max_outbound: usize) {
+    /// Publish execution peer availability and pool targets.
+    pub fn set_peer_targets(
+        &self,
+        minimum: usize,
+        body_serving: usize,
+        preferred: usize,
+        max_outbound: usize,
+        max_concurrent_dials: usize,
+    ) {
         self.inner.minimum_peer_slots.store(
             u64::try_from(minimum).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+        self.inner.body_serving_peer_target.store(
+            u64::try_from(body_serving).unwrap_or(u64::MAX),
             Ordering::Relaxed,
         );
         self.inner.preferred_peer_slots.store(
@@ -224,6 +241,18 @@ impl NetworkTelemetry {
             u64::try_from(max_outbound).unwrap_or(u64::MAX),
             Ordering::Relaxed,
         );
+        self.inner.max_concurrent_dials.store(
+            u64::try_from(max_concurrent_dials).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+    }
+
+    /// Publish the number of peers proven to serve commitment-valid bodies at
+    /// the current verified execution target.
+    pub fn set_body_serving_peers(&self, peers: usize) {
+        self.inner
+            .body_serving_peer_slots
+            .store(u64::try_from(peers).unwrap_or(u64::MAX), Ordering::Relaxed);
     }
 
     /// Register a persistent network manager.
@@ -381,10 +410,13 @@ impl NetworkTelemetry {
             active_sessions,
             connected_peer_slots,
             known_peer_records,
+            body_serving_peer_slots: self.inner.body_serving_peer_slots.load(Ordering::Relaxed),
             peer_targets: NetworkPeerTargetsSnapshot {
                 minimum: self.inner.minimum_peer_slots.load(Ordering::Relaxed),
+                body_serving: self.inner.body_serving_peer_target.load(Ordering::Relaxed),
                 preferred: self.inner.preferred_peer_slots.load(Ordering::Relaxed),
                 max_outbound: self.inner.max_outbound_peer_slots.load(Ordering::Relaxed),
+                max_concurrent_dials: self.inner.max_concurrent_dials.load(Ordering::Relaxed),
             },
             requests: NetworkRequestSnapshot {
                 started: self.inner.requests_started.load(Ordering::Relaxed),
@@ -531,6 +563,8 @@ pub struct NetworkTelemetrySnapshot {
     pub connected_peer_slots: usize,
     /// Known-peer records across active physical network managers.
     pub known_peer_records: usize,
+    /// Peers proven to serve commitment-valid bodies at the current target.
+    pub body_serving_peer_slots: u64,
     pub peer_targets: NetworkPeerTargetsSnapshot,
     pub requests: NetworkRequestSnapshot,
     pub peer_lifecycle: NetworkPeerLifecycleSnapshot,
@@ -544,10 +578,14 @@ pub struct NetworkTelemetrySnapshot {
 pub struct NetworkPeerTargetsSnapshot {
     /// Hard availability floor required before requests may start.
     pub minimum: u64,
+    /// Desired number of independently verified body-serving peers.
+    pub body_serving: u64,
     /// Non-blocking healthy-pool target; background dialing continues beyond it.
     pub preferred: u64,
     /// Maximum outbound connections maintained by the peer manager.
     pub max_outbound: u64,
+    /// Hard ceiling on simultaneous outbound connection attempts.
+    pub max_concurrent_dials: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -629,7 +667,8 @@ mod tests {
     #[test]
     fn sessions_remain_visible_after_close_without_peer_identities() {
         let telemetry = NetworkTelemetry::default();
-        telemetry.set_peer_targets(1, 16, 100);
+        telemetry.set_peer_targets(1, 4, 16, 100, 30);
+        telemetry.set_body_serving_peers(3);
         telemetry.request_started(Duration::from_millis(7));
         telemetry.request_succeeded();
         telemetry.request_started(Duration::from_millis(3));
@@ -663,12 +702,15 @@ mod tests {
         );
         assert_eq!(active.active_sessions, 1);
         assert_eq!(active.connected_peer_slots, 2);
+        assert_eq!(active.body_serving_peer_slots, 3);
         assert_eq!(
             active.peer_targets,
             NetworkPeerTargetsSnapshot {
                 minimum: 1,
+                body_serving: 4,
                 preferred: 16,
                 max_outbound: 100,
+                max_concurrent_dials: 30,
             }
         );
         assert_eq!(active.peer_lifecycle.established, 2);

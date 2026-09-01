@@ -125,10 +125,16 @@ verification.
 seeds that supplement public discovery without turning the pool into an
 allowlist.
 `sources.live.minimum_peers` is the hard availability floor before execution
-requests may start and should normally remain `1`. `preferred_peers` is a soft
-operational target and never blocks ingestion. The Reth manager continues
-filling connections beyond that target in the background up to
-`max_outbound_peers`.
+requests may start and should normally remain `1`.
+`body_serving_peer_target` controls how many peers Leani concurrently proves
+can serve commitment-valid bodies; reaching it does not delay startup after
+the minimum is available. `preferred_peers` is a soft operational target and
+never blocks ingestion. The Reth manager continues filling connections beyond
+that target in the background up to `max_outbound_peers`.
+Header, body, and receipt failures are isolated to their material lane. A
+transient miss therefore cools that lane without disconnecting a session that
+may still be useful to another processor; cryptographically invalid material
+continues to ban the peer globally.
 If the pool remains at zero connected peers for
 `sources.live.peer_recovery_timeout_seconds`, the node rebuilds the complete
 execution network manager and restarts Discv4, Discv5, and DNS bootstrap. This

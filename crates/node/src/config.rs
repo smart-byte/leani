@@ -499,6 +499,10 @@ pub struct LiveSourceConfig {
     pub kind: LiveSourceKind,
     /// Hard availability floor required before execution requests may start.
     pub minimum_peers: usize,
+    /// Independently verified body-serving peers kept ready for fast request
+    /// failover. Startup still proceeds once `minimum_peers` is satisfied.
+    #[serde(default = "default_execution_body_serving_peer_target")]
+    pub body_serving_peer_target: usize,
     /// Non-blocking operational target for a healthy peer pool. The manager
     /// continues dialing beyond this value up to `max_outbound_peers`.
     #[serde(default = "default_execution_preferred_peers")]
@@ -1393,6 +1397,15 @@ impl Config {
             ));
         }
         if matches!(self.sources.live.kind, LiveSourceKind::P2p)
+            && (self.sources.live.body_serving_peer_target < self.sources.live.minimum_peers
+                || self.sources.live.body_serving_peer_target > self.sources.live.preferred_peers)
+        {
+            errors.push(ValidationError::new(
+                "sources.live.body_serving_peer_target",
+                "must be between minimum_peers and preferred_peers for p2p",
+            ));
+        }
+        if matches!(self.sources.live.kind, LiveSourceKind::P2p)
             && (self.sources.live.max_concurrent_dials == 0
                 || self.sources.live.max_concurrent_dials > self.sources.live.max_outbound_peers)
         {
@@ -2216,12 +2229,16 @@ const fn default_execution_preferred_peers() -> usize {
     16
 }
 
+const fn default_execution_body_serving_peer_target() -> usize {
+    4
+}
+
 const fn default_execution_max_concurrent_dials() -> usize {
     30
 }
 
 const fn default_execution_peer_refill_interval_ms() -> u64 {
-    5_000
+    1_000
 }
 
 const fn default_execution_peer_recovery_timeout_seconds() -> u64 {
@@ -3015,6 +3032,7 @@ verification_segment_blocks = 8192"#,
         let errors = config.validate().expect_err("p2p bounds rejected").0;
         for field in [
             "sources.live.preferred_peers",
+            "sources.live.body_serving_peer_target",
             "sources.live.max_concurrent_dials",
             "sources.live.material_request_concurrency",
             "sources.live.material_request_blocks",
@@ -3078,6 +3096,7 @@ bind = "127.0.0.1:18080"
             .expect("expanded configuration validates");
         assert_eq!(config.chain.chain_id, 1);
         assert_eq!(config.sources.live.minimum_peers, 1);
+        assert_eq!(config.sources.live.body_serving_peer_target, 4);
         assert_eq!(config.sources.live.preferred_peers, 16);
         assert_eq!(config.finality.endpoints.len(), 2);
         assert!(

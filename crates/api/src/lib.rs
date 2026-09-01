@@ -3070,11 +3070,23 @@ fn append_network_request_metrics(
         "leani_p2p_connected_peer_slots {}",
         network.connected_peer_slots
     )?;
+    writeln!(output, "# TYPE leani_p2p_body_serving_peer_slots gauge")?;
+    writeln!(
+        output,
+        "leani_p2p_body_serving_peer_slots {}",
+        network.body_serving_peer_slots
+    )?;
     writeln!(output, "# TYPE leani_p2p_minimum_peer_slots gauge")?;
     writeln!(
         output,
         "leani_p2p_minimum_peer_slots {}",
         network.peer_targets.minimum
+    )?;
+    writeln!(output, "# TYPE leani_p2p_body_serving_peer_target gauge")?;
+    writeln!(
+        output,
+        "leani_p2p_body_serving_peer_target {}",
+        network.peer_targets.body_serving
     )?;
     writeln!(output, "# TYPE leani_p2p_preferred_peer_slots gauge")?;
     writeln!(
@@ -3087,6 +3099,12 @@ fn append_network_request_metrics(
         output,
         "leani_p2p_max_outbound_peer_slots {}",
         network.peer_targets.max_outbound
+    )?;
+    writeln!(output, "# TYPE leani_p2p_max_concurrent_dials gauge")?;
+    writeln!(
+        output,
+        "leani_p2p_max_concurrent_dials {}",
+        network.peer_targets.max_concurrent_dials
     )?;
     writeln!(output, "# TYPE leani_p2p_requests_started_total counter")?;
     writeln!(
@@ -9734,7 +9752,8 @@ mod tests {
         .await
         .expect("store");
         let telemetry = NetworkTelemetry::default();
-        telemetry.set_peer_targets(1, 16, 100);
+        telemetry.set_peer_targets(1, 4, 16, 100, 30);
+        telemetry.set_body_serving_peers(3);
         let session = telemetry.register(NetworkLane::Live);
         session.set_phase(NetworkPhase::FetchingReceipts);
         session.set_peers(1, 42);
@@ -9780,9 +9799,12 @@ mod tests {
         let body: Value = serde_json::from_slice(&body).expect("JSON");
         assert_eq!(body["network"]["activeSessions"], 1);
         assert_eq!(body["network"]["connectedPeerSlots"], 1);
+        assert_eq!(body["network"]["bodyServingPeerSlots"], 3);
         assert_eq!(body["network"]["peerTargets"]["minimum"], 1);
+        assert_eq!(body["network"]["peerTargets"]["bodyServing"], 4);
         assert_eq!(body["network"]["peerTargets"]["preferred"], 16);
         assert_eq!(body["network"]["peerTargets"]["maxOutbound"], 100);
+        assert_eq!(body["network"]["peerTargets"]["maxConcurrentDials"], 30);
         assert_eq!(body["network"]["requests"]["started"], 2);
         assert_eq!(body["network"]["requests"]["succeeded"], 1);
         assert_eq!(body["network"]["requests"]["timedOut"], 1);
@@ -9883,9 +9905,11 @@ mod tests {
         assert!(dashboard.contains("Average local queue wait"));
         assert!(dashboard.contains("<span class=\"label\">Peers</span>"));
         assert!(dashboard.contains("connected peer slots"));
+        assert!(dashboard.contains("body-serving"));
         assert!(dashboard.contains("known records"));
         assert!(dashboard.contains("preferred"));
         assert!(dashboard.contains("maximum outbound"));
+        assert!(dashboard.contains("concurrent dial ceiling"));
         assert!(dashboard.contains("Known records are persisted discovery candidates"));
         assert!(dashboard.contains("protocol-level reason"));
         assert!(!dashboard.contains("Coverage state"));
@@ -9903,9 +9927,12 @@ mod tests {
             .expect("metrics");
         let metrics = String::from_utf8(metrics.to_vec()).expect("UTF-8");
         assert!(metrics.contains("leani_p2p_active_sessions 1"));
+        assert!(metrics.contains("leani_p2p_body_serving_peer_slots 3"));
         assert!(metrics.contains("leani_p2p_minimum_peer_slots 1"));
+        assert!(metrics.contains("leani_p2p_body_serving_peer_target 4"));
         assert!(metrics.contains("leani_p2p_preferred_peer_slots 16"));
         assert!(metrics.contains("leani_p2p_max_outbound_peer_slots 100"));
+        assert!(metrics.contains("leani_p2p_max_concurrent_dials 30"));
         assert!(metrics.contains("leani_network_supervisor_info{state=\"backing_off\"} 1"));
         assert!(metrics.contains("leani_network_supervisor_failures_total 1"));
         assert!(metrics.contains("leani_p2p_requests_started_total 2"));

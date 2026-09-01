@@ -177,12 +177,20 @@ production ports normally use `listener_port = 30303`,
 require distinct fixed UDP ports; zero selects an isolated ephemeral port for
 that protocol.
 
-Discovery is event-driven above Reth's bounded dialer: a newly authenticated
-DNS/Discv candidate is tried as soon as a dial slot is available, failed
-attempts enter a cooldown, and a closed session immediately exposes its slot
-to an unseen candidate. `max_concurrent_dials` remains the hard simultaneous
-dial ceiling; `peer_refill_interval_ms` is only Reth's internal safety-net
-poll.
+Reth owns the bounded dial queue and receives TCP/RLPx failures directly. A
+terminal failure immediately releases its slot to another eligible peer, while
+Reth's per-peer backoff prevents rapid redials. Newly authenticated DNS/Discv
+candidates are added to that same queue. `max_concurrent_dials` remains the
+hard simultaneous dial ceiling; `peer_refill_interval_ms` is only a short
+safety-net poll for newly added candidates, not a network request rate.
+`minimum_peers` remains the startup gate. After that first verified peer is
+available, qualification continues concurrently until
+`body_serving_peer_target` distinct peers have served a
+commitment-valid body at the current target; the default target is four.
+Request health is tracked independently for headers, bodies, and receipts. A
+timeout or incomplete response cools only that material lane, so a peer that
+cannot serve one processor's body request remains available to processors that
+can use its headers or receipts. Commitment-invalid data still bans the peer.
 
 `bootstrap_dns_tree` may point at an optional EIP-1459 `enrtree://` peer-hint
 tree. The public key embedded in that URL authenticates its ENRs. It does not
