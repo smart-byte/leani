@@ -90,7 +90,7 @@ endpoint = "https://data.ethpandaops.io/erae/mainnet/"
 kind = "p2p"
 minimum_peers = 1
 # Start as soon as one verified body-serving peer is ready, then continue
-# qualifying peers concurrently until four independent fallbacks are ready.
+# qualifying peers concurrently until four body-serving peers are ready.
 body_serving_peer_target = 4
 # Non-blocking operational target for a healthy pool. Requests start with one
 # peer while background dialing continues beyond this target.

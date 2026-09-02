@@ -593,7 +593,7 @@ impl BackfillJob {
         let bounding_range = BlockRange::new(first_range.start(), last_range.end())
             .map_err(|error| RuntimeError::InvalidConfig(error.to_string()))?;
         let requirements = &processor.descriptor().requirements;
-        let first = requirements.first().ok_or_else(|| {
+        requirements.first().ok_or_else(|| {
             RuntimeError::InvalidConfig("processor has no data requirements".to_owned())
         })?;
         let required = requirements
@@ -611,6 +611,22 @@ impl BackfillJob {
             .fold(LogFieldSet::NONE, |all, requirement| {
                 all.union(requirement.log_fields)
             });
+        let allow_filtered = requirements
+            .iter()
+            .all(|requirement| requirement.allow_filtered);
+        let filters = if allow_filtered {
+            let mut scope = leani_primitives::FilterScope::default();
+            for requirement in requirements {
+                union_filter_scope(&mut scope, &requirement.filter);
+            }
+            leani_source_api::FilterSet {
+                senders: scope.senders.clone(),
+                recipients: scope.recipients.clone(),
+                scope,
+            }
+        } else {
+            leani_source_api::FilterSet::default()
+        };
         Ok(Self {
             id: id.into(),
             owner: HistoricalJobOwner::Materialization,
@@ -623,15 +639,9 @@ impl BackfillJob {
                 range: bounding_range,
                 required,
                 log_fields,
-                allow_filtered: requirements
-                    .iter()
-                    .all(|requirement| requirement.allow_filtered),
+                allow_filtered,
                 projection: leani_source_api::FieldProjection::default(),
-                filters: leani_source_api::FilterSet {
-                    scope: first.filter.clone(),
-                    senders: first.filter.senders.clone(),
-                    recipients: first.filter.recipients.clone(),
-                },
+                filters,
                 minimum_finality,
                 verification_policy,
             },
@@ -3400,10 +3410,33 @@ impl SharedLiveRuntime {
                     .insert(processor.descriptor().instance.to_string());
             }
         }
+        let mut available_processors = {
+            let unavailable = self
+                .unavailable_processors
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            self.processors
+                .iter()
+                .filter(|processor| !unavailable.contains(processor.descriptor().instance.as_str()))
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        if available_processors.is_empty() {
+            // A parked lane can still be restored by a shallow reorg. Keep
+            // enough source material flowing to observe and apply that
+            // replacement even when every configured processor is currently
+            // paused; ordinary frames remain unmapped while the lane is
+            // unavailable.
+            available_processors.clone_from(&self.processors);
+        }
         let events = self
             .source
             .subscribe(
-                compile_live_request(&self.processors, self.source.descriptor().chain_id, &start)?,
+                compile_live_request(
+                    &available_processors,
+                    self.source.descriptor().chain_id,
+                    &start,
+                )?,
                 start,
                 budget,
                 cancellation.clone(),
@@ -4659,7 +4692,7 @@ fn compile_live_request(
         .iter()
         .flat_map(|processor| &processor.descriptor().requirements)
         .collect::<Vec<_>>();
-    let first = requirements.first().copied().ok_or_else(|| {
+    requirements.first().copied().ok_or_else(|| {
         RuntimeError::InvalidConfig("live processors require at least one data requirement".into())
     })?;
     let required = requirements
@@ -4679,12 +4712,16 @@ fn compile_live_request(
         });
     let allow_filtered = requirements
         .iter()
-        .all(|requirement| requirement.allow_filtered && requirement.filter == first.filter);
+        .all(|requirement| requirement.allow_filtered);
     let filters = if allow_filtered {
+        let mut scope = leani_primitives::FilterScope::default();
+        for requirement in requirements {
+            union_filter_scope(&mut scope, &requirement.filter);
+        }
         leani_source_api::FilterSet {
-            scope: first.filter.clone(),
-            senders: first.filter.senders.clone(),
-            recipients: first.filter.recipients.clone(),
+            senders: scope.senders.clone(),
+            recipients: scope.recipients.clone(),
+            scope,
         }
     } else {
         leani_source_api::FilterSet::default()
@@ -4700,6 +4737,39 @@ fn compile_live_request(
         minimum_finality,
         verification_policy: VerificationPolicy::CompleteCryptographic,
     })
+}
+
+fn union_filter_scope(
+    retained: &mut leani_primitives::FilterScope,
+    incoming: &leani_primitives::FilterScope,
+) {
+    fn extend_unique<T: Clone + Eq>(retained: &mut Vec<T>, incoming: &[T]) {
+        for value in incoming {
+            if !retained.contains(value) {
+                retained.push(value.clone());
+            }
+        }
+    }
+
+    extend_unique(&mut retained.addresses, &incoming.addresses);
+    extend_unique(
+        &mut retained.transaction_hashes,
+        &incoming.transaction_hashes,
+    );
+    extend_unique(&mut retained.transaction_types, &incoming.transaction_types);
+    extend_unique(&mut retained.senders, &incoming.senders);
+    extend_unique(&mut retained.recipients, &incoming.recipients);
+    for topic in &incoming.topics {
+        if let Some(existing) = retained
+            .topics
+            .iter_mut()
+            .find(|existing| existing.position == topic.position)
+        {
+            extend_unique(&mut existing.alternatives, &topic.alternatives);
+        } else {
+            retained.topics.push(topic.clone());
+        }
+    }
 }
 
 fn signal_readiness(readiness: Option<&tokio::sync::watch::Sender<bool>>, ready: bool) {
@@ -6178,6 +6248,35 @@ mod tests {
         .expect("both physical chunks should open while the first is delayed");
         let report = run.await.expect("runtime task").expect("backfill");
         assert_eq!(report.frames_committed, 4);
+    }
+
+    #[test]
+    fn filtered_processor_scopes_are_unionable_without_disabling_pushdown() {
+        let first = leani_primitives::Address::new([0x11; 20]);
+        let second = leani_primitives::Address::new([0x22; 20]);
+        let mut retained = leani_primitives::FilterScope {
+            addresses: vec![first],
+            topics: vec![leani_primitives::TopicFilter {
+                position: 0,
+                alternatives: vec![[0x33; 32]],
+            }],
+            ..leani_primitives::FilterScope::default()
+        };
+        union_filter_scope(
+            &mut retained,
+            &leani_primitives::FilterScope {
+                addresses: vec![second],
+                topics: vec![leani_primitives::TopicFilter {
+                    position: 0,
+                    alternatives: vec![[0x44; 32]],
+                }],
+                ..leani_primitives::FilterScope::default()
+            },
+        );
+
+        assert_eq!(retained.addresses, [first, second]);
+        assert_eq!(retained.topics.len(), 1);
+        assert_eq!(retained.topics[0].alternatives, [[0x33; 32], [0x44; 32]]);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

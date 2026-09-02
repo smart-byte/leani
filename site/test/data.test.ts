@@ -97,6 +97,7 @@ describe('canned data', () => {
   test('tracked standard processor catalog includes every built-in factory', () => {
     expect(processorCatalog.processors.map((processor) => processor.id)).toEqual([
       'blobs-money',
+      'block-summary',
       'erc20-balances',
       'evm-events',
       'transaction-stats',

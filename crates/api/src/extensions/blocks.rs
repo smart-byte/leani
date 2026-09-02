@@ -1,8 +1,13 @@
 //! Typed query surface for the latest processed Ethereum block summary.
 
-use axum::{Json, Router, extract::State, routing::get};
+use alloy_primitives::U256;
+use axum::{
+    Json, Router,
+    extract::{Path, State},
+    routing::get,
+};
 use leani_processor_block_summary::{
-    BLOCK_LATEST_COLLECTION, BLOCK_LATEST_KEY, BlockSummaryEntity, BlockSummaryProcessor,
+    BLOCK_COLLECTION, BLOCK_NUMBER_INDEX_COLLECTION, BlockSummaryEntity, BlockSummaryProcessor,
 };
 use serde::Serialize;
 
@@ -17,7 +22,9 @@ impl QueryExtension for BlockSummaryQueryExtension {
     }
 
     fn routes(&self) -> Router<QueryContext> {
-        Router::new().route("/latest", get(latest))
+        Router::new()
+            .route("/latest", get(latest))
+            .route("/blocks/{number}", get(by_number))
     }
 }
 
@@ -55,7 +62,9 @@ impl From<BlockSummaryEntity> for PublicBlockSummary {
             timestamp: entity.timestamp,
             gas_limit: entity.gas_limit,
             gas_used: entity.gas_used,
-            base_fee_per_gas: entity.base_fee_per_gas.map(|value| value.to_string()),
+            base_fee_per_gas: entity
+                .base_fee_per_gas
+                .map(|value| U256::from_be_bytes(value.0).to_string()),
             blob_gas_used: entity.blob_gas_used,
             excess_blob_gas: entity.excess_blob_gas,
             transaction_count: entity.transaction_count,
@@ -77,10 +86,45 @@ async fn latest(
                 "block-summary query extension is mounted on an incompatible processor",
             )
         })?;
-    let value = context
-        .entity(BLOCK_LATEST_COLLECTION, BLOCK_LATEST_KEY)
+    let cursor = context
+        .processor_cursor()
         .await?
         .ok_or_else(|| ApiError::not_found("no Ethereum block summary has been indexed"))?;
+    let value = context
+        .entity(BLOCK_COLLECTION, &cursor.block_hash.0)
+        .await?
+        .ok_or_else(|| ApiError::not_found("no Ethereum block summary has been indexed"))?;
+    let entity: BlockSummaryEntity = postcard::from_bytes(&value).map_err(|error| {
+        ApiError::internal(&format!(
+            "stored Ethereum block summary is invalid: {error}"
+        ))
+    })?;
+    Ok(Json(LatestBlockSummaryResponse {
+        data: entity.into(),
+    }))
+}
+
+async fn by_number(
+    State(context): State<QueryContext>,
+    Path(number): Path<u64>,
+) -> Result<Json<LatestBlockSummaryResponse>, ApiError> {
+    context
+        .processor()
+        .as_any()
+        .downcast_ref::<BlockSummaryProcessor>()
+        .ok_or_else(|| {
+            ApiError::internal(
+                "block-summary query extension is mounted on an incompatible processor",
+            )
+        })?;
+    let hash = context
+        .entity(BLOCK_NUMBER_INDEX_COLLECTION, &number.to_be_bytes())
+        .await?
+        .ok_or_else(|| ApiError::not_found("Ethereum block summary is not indexed"))?;
+    let value = context
+        .entity(BLOCK_COLLECTION, &hash)
+        .await?
+        .ok_or_else(|| ApiError::internal("block summary number index is inconsistent"))?;
     let entity: BlockSummaryEntity = postcard::from_bytes(&value).map_err(|error| {
         ApiError::internal(&format!(
             "stored Ethereum block summary is invalid: {error}"

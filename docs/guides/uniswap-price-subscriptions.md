@@ -205,7 +205,7 @@ rendering:
 ```ts
 import { createLeaniClient } from "@leani/sdk";
 
-const leani = createLeaniClient({ baseUrl: "http://127.0.0.1:8080" });
+const leani = createLeaniClient({ baseUrl: "http://127.0.0.1:18080" });
 const Q192 = 1n << 192n;
 
 function decimalRatio(numerator: bigint, denominator: bigint, places = 8) {

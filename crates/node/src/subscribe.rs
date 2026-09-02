@@ -16,8 +16,10 @@ use futures::{StreamExt as _, future::join_all};
 use leani_primitives::{
     Address, BlockFrame, BlockHash, BlockNumber, BlockRange, BlockRef, ChainId, Finality,
 };
-use leani_processor_block_summary::{BLOCK_SUMMARY_KIND, BlockSummaryEntity};
-use leani_processor_uniswap::{PoolPriceEntity, UniswapPriceDelta};
+use leani_processor_block_summary::{
+    BLOCK_SUMMARY_KIND, BLOCK_SUMMARY_VERSION, BlockSummaryEntity,
+};
+use leani_processor_uniswap::{PoolPriceEntity, UNISWAP_OBSERVATIONS_VERSION, UniswapPriceDelta};
 use leani_source_api::{
     ChainEvent, ChainEventStream, DataRequest, FieldProjection, FilterSet, LiveSource as _,
     LiveStart, NetworkTelemetrySnapshot, SourceBudget, SourceError, VerificationPolicy,
@@ -127,6 +129,7 @@ pub(crate) struct ResetSubscriptionOptions {
     pub protocol: SubscribeProtocol,
     pub targets: Vec<String>,
     pub finality: SubscribeFinality,
+    pub data_dir: Option<PathBuf>,
     pub confirmed: bool,
     pub requested_config: Option<PathBuf>,
     pub working_directory: PathBuf,
@@ -262,7 +265,7 @@ struct AttachedLatestBlock {
 struct RenderedPrice<'a> {
     market: &'a Market,
     price: String,
-    base_volume: String,
+    base_volume: Option<String>,
     block_number: u64,
     block_hash: String,
     timestamp: u64,
@@ -270,8 +273,8 @@ struct RenderedPrice<'a> {
     finality: String,
     operation: String,
     sqrt_price_x96: String,
-    amount0: String,
-    amount1: String,
+    amount0: Option<String>,
+    amount1: Option<String>,
     sequence: Option<String>,
 }
 
@@ -306,6 +309,18 @@ struct AttachedEnvelope {
     data: Option<Value>,
     #[serde(flatten)]
     extra: BTreeMap<String, Value>,
+}
+
+#[derive(Debug)]
+struct ParsedSseEvent {
+    event: Option<String>,
+    data: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct SseRenderOutcome {
+    stop: bool,
+    observed_change: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -377,7 +392,7 @@ pub(crate) fn reset_subscription(options: &ResetSubscriptionOptions) -> Result<E
         &options.working_directory,
     );
     let data_dir = subscription_data_dir_for(
-        None,
+        options.data_dir.as_deref(),
         options.protocol,
         &markets,
         configured_path.as_deref(),
@@ -411,8 +426,6 @@ pub(crate) async fn initialize_checkpoint(
     accept_checkpoint: bool,
     data_dir: &Path,
 ) -> Result<InitializedCheckpoint> {
-    fs::create_dir_all(data_dir)
-        .with_context(|| format!("create data directory {}", data_dir.display()))?;
     let checkpoint = trusted_checkpoint(
         &SubscribeOptions {
             protocol: SubscribeProtocol::UniswapV3,
@@ -434,6 +447,7 @@ pub(crate) async fn initialize_checkpoint(
         },
         data_dir,
         true,
+        false,
     )
     .await?;
     let beacon_api_endpoints = checkpoint
@@ -453,15 +467,16 @@ fn infer_endpoint(path: Option<&Path>) -> Result<Option<Url>> {
         return Ok(None);
     };
     let config = Config::load(path)?;
-    let SocketAddr::V4(bind) = config.api.bind else {
-        return Ok(None);
-    };
+    let bind = config.api.bind;
     let ip = if bind.ip().is_unspecified() {
-        Ipv4Addr::LOCALHOST
+        match bind {
+            SocketAddr::V4(_) => std::net::IpAddr::V4(Ipv4Addr::LOCALHOST),
+            SocketAddr::V6(_) => std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
+        }
     } else {
-        *bind.ip()
+        bind.ip()
     };
-    Url::parse(&format!("http://{ip}:{}/", bind.port()))
+    Url::parse(&format!("http://{}/", SocketAddr::new(ip, bind.port())))
         .map(Some)
         .context("construct local API endpoint")
 }
@@ -495,6 +510,7 @@ async fn subscribe_embedded(
     let data_dir = subscription_data_dir(options, markets, config_path)?;
     fs::create_dir_all(&data_dir)
         .with_context(|| format!("create subscription data directory {}", data_dir.display()))?;
+    let data_dir_lock = local_state::lock_runtime_directory(&data_dir)?;
     let config = embedded_config(options, markets, config_path, &data_dir).await?;
     if let Some(peer_cache) = merge_local_execution_peer_caches(
         config_path,
@@ -528,7 +544,8 @@ async fn subscribe_embedded(
         .change_bounds(processor.descriptor())
         .await?
         .map_or(0, |bounds| bounds.latest);
-    let mut runtime = spawn_embedded_network_runtime(config.clone(), store.clone(), processors)?;
+    let mut runtime =
+        spawn_embedded_network_runtime(config.clone(), store.clone(), processors, data_dir_lock)?;
     let preview_requirement = processor
         .descriptor()
         .requirements
@@ -572,6 +589,7 @@ async fn subscribe_embedded(
     let mut previewed = HashSet::<ObservationKey>::new();
     let mut preview_blocks = BTreeMap::<u64, (BlockRef, Vec<SubscriptionItem>)>::new();
     let mut preview_stream = None::<ChainEventStream>;
+    let outcome = async {
     loop {
         if runtime.is_finished() {
             bail!("embedded network runtime stopped before the subscription completed");
@@ -652,10 +670,14 @@ async fn subscribe_embedded(
                             render_preview_reverts(options.format, &reverted)?;
                         }
                     }
-                    render_local_item(options.format, &item, &record)?;
+                    render_local_item(
+                        options.format,
+                        &item,
+                        &record,
+                        processor.as_ref(),
+                        store.epoch(),
+                    )?;
                     if options.once {
-                        persist_current_verified_anchor(&runtime, &data_dir, &config)?;
-                        runtime.shutdown().await;
                         return Ok(Exit::Success);
                     }
                 }
@@ -665,8 +687,6 @@ async fn subscribe_embedded(
             tokio::select! {
                 result = tokio::signal::ctrl_c() => {
                     result.context("install Ctrl-C handler")?;
-                    persist_current_verified_anchor(&runtime, &data_dir, &config)?;
-                    runtime.shutdown().await;
                     return Ok(Exit::Success);
                 }
                 changed = runtime.verified_anchor.changed() => {
@@ -698,8 +718,6 @@ async fn subscribe_embedded(
                                 items,
                             );
                             if options.once && !rendered.is_empty() {
-                                persist_current_verified_anchor(&runtime, &data_dir, &config)?;
-                                runtime.shutdown().await;
                                 return Ok(Exit::Success);
                             }
                             match runtime.execution_source.subscribe(
@@ -757,19 +775,20 @@ async fn subscribe_embedded(
                         }
                         Ok(ChainEvent::Reorg { reverted, applied }) => {
                             for block in reverted {
-                                if let Some((retained, items)) =
-                                    preview_blocks.remove(&block.number.0)
-                                    && retained.hash == block.hash
-                                {
+                                if let Some(items) = revert_preview_block(
+                                    &mut preview_blocks,
+                                    &mut previewed,
+                                    block,
+                                ) {
                                     let reverted = render_optimistic_items(
                                         options.format,
                                         &items,
                                         block,
                                         "revert",
                                     )?;
-                                    for key in reverted {
-                                        previewed.remove(&key);
-                                    }
+                                    debug_assert!(reverted
+                                        .iter()
+                                        .all(|key| !previewed.contains(key)));
                                 }
                             }
                             for frame in applied {
@@ -815,8 +834,6 @@ async fn subscribe_embedded(
                         }
                     }
                     if options.once && rendered_any {
-                        persist_current_verified_anchor(&runtime, &data_dir, &config)?;
-                        runtime.shutdown().await;
                         return Ok(Exit::Success);
                     }
                 }
@@ -833,6 +850,7 @@ async fn subscribe_embedded(
                 256,
             )
             .await?;
+        let full_batch = records.len() == 256;
         for record in records {
             after = record.cursor.sequence;
             if !update_is_fresh(options.finality, record.block.timestamp, unix_seconds()) {
@@ -850,19 +868,24 @@ async fn subscribe_embedded(
                         render_preview_reverts(options.format, &reverted)?;
                     }
                 }
-                render_local_item(options.format, &item, &record)?;
+                render_local_item(
+                    options.format,
+                    &item,
+                    &record,
+                    processor.as_ref(),
+                    store.epoch(),
+                )?;
                 if options.once {
-                    persist_current_verified_anchor(&runtime, &data_dir, &config)?;
-                    runtime.shutdown().await;
                     return Ok(Exit::Success);
                 }
             }
         }
+        if full_batch {
+            continue;
+        }
         tokio::select! {
             result = tokio::signal::ctrl_c() => {
                 result.context("install Ctrl-C handler")?;
-                persist_current_verified_anchor(&runtime, &data_dir, &config)?;
-                runtime.shutdown().await;
                 return Ok(Exit::Success);
             }
             changed = runtime.verified_anchor.changed() => {
@@ -873,6 +896,12 @@ async fn subscribe_embedded(
             () = tokio::time::sleep(Duration::from_secs(1)) => {}
         }
     }
+    }
+    .await;
+    let anchor_result = persist_current_verified_anchor(&runtime, &data_dir, &config);
+    runtime.shutdown().await;
+    anchor_result?;
+    outcome
 }
 
 fn format_peer_search_status(status: &NetworkTelemetrySnapshot) -> String {
@@ -955,6 +984,7 @@ async fn embedded_config(
             options,
             data_dir,
             matches!(finality_kind, FinalitySourceKind::BeaconApi),
+            true,
         )
         .await?;
         config.finality.checkpoint = checkpoint.root;
@@ -992,10 +1022,10 @@ fn subscription_processor(
     finality: SubscribeFinality,
 ) -> Result<crate::config::ProcessorConfig> {
     match protocol {
-        SubscribeProtocol::Blocks => crate::block_summaries::processor_config(
+        SubscribeProtocol::Blocks => Ok(crate::block_summaries::processor_config(
             BLOCK_PROCESSOR_INSTANCE,
             finality == SubscribeFinality::Finalized,
-        ),
+        )),
         SubscribeProtocol::UniswapV3 => processor_config(
             markets,
             UNISWAP_PROCESSOR_INSTANCE,
@@ -1032,10 +1062,16 @@ fn subscription_data_dir_for(
     }
     let root = local_state::runtime_data_dir(config_path, working_directory)?.join("subscriptions");
     let mut hasher = blake3::Hasher::new();
-    hasher.update(match protocol {
-        SubscribeProtocol::Blocks => b"block-summary/1.1.0",
-        SubscribeProtocol::UniswapV3 => b"uniswap-observations/2.1.0",
-    });
+    match protocol {
+        SubscribeProtocol::Blocks => {
+            hasher.update(b"block-summary/");
+            hasher.update(BLOCK_SUMMARY_VERSION.as_bytes());
+        }
+        SubscribeProtocol::UniswapV3 => {
+            hasher.update(b"uniswap-observations/");
+            hasher.update(UNISWAP_OBSERVATIONS_VERSION.as_bytes());
+        }
+    }
     let mut pools = markets.iter().map(|market| market.pool).collect::<Vec<_>>();
     pools.sort_unstable();
     for pool in pools {
@@ -1057,12 +1093,12 @@ fn reset_subscription_directory(data_dir: &Path, confirmed: bool) -> Result<bool
         .parent()
         .and_then(Path::file_name)
         .and_then(std::ffi::OsStr::to_str);
-    if parent != Some("subscriptions")
-        || name.len() != 16
-        || !name.bytes().all(|byte| byte.is_ascii_hexdigit())
-    {
+    let derived = parent == Some("subscriptions")
+        && name.len() == 16
+        && name.bytes().all(|byte| byte.is_ascii_hexdigit());
+    if !derived && !local_state::is_runtime_directory(data_dir) {
         bail!(
-            "refusing to reset non-derived subscription directory {}",
+            "refusing to reset directory without Leani runtime identity {}",
             data_dir.display()
         );
     }
@@ -1101,8 +1137,11 @@ fn reset_subscription_directory(data_dir: &Path, confirmed: bool) -> Result<bool
             bail!("subscription reset was not confirmed");
         }
     }
-    fs::remove_dir_all(data_dir)
-        .with_context(|| format!("reset subscription state at {}", data_dir.display()))?;
+    let _lock = local_state::lock_runtime_directory(data_dir)?;
+    let unknown = local_state::remove_known_runtime_state(data_dir)?;
+    for path in unknown {
+        eprintln!("leani: preserved unknown entry {}", path.display());
+    }
     eprintln!("leani: subscription state reset; the next embedded run is cold");
     Ok(true)
 }
@@ -1291,6 +1330,7 @@ async fn trusted_checkpoint(
     options: &SubscribeOptions,
     data_dir: &Path,
     require_beacon_api: bool,
+    persist: bool,
 ) -> Result<CachedCheckpoint> {
     let cache_path = data_dir.join("checkpoint.json");
     let now = unix_seconds();
@@ -1342,7 +1382,9 @@ async fn trusted_checkpoint(
             .collect(),
         updated_at_unix_seconds: now,
     };
-    write_checkpoint_cache(&cache_path, &checkpoint)?;
+    if persist {
+        write_checkpoint_cache(&cache_path, &checkpoint)?;
+    }
     Ok(checkpoint)
 }
 
@@ -1683,7 +1725,18 @@ fn latest_fresh_items(
             continue;
         }
         if let Some(item) = local_item(protocol, markets, &record)? {
-            latest.insert(item.scope_key(), (item, record));
+            let scope = item.scope_key();
+            match record.direction {
+                ChangeDirection::Apply | ChangeDirection::Finalized => {
+                    latest.insert(scope, (item, record));
+                }
+                ChangeDirection::Undo => {
+                    latest.remove(&scope);
+                }
+                ChangeDirection::ResetRequired => {
+                    bail!("embedded subscription history requires a fresh snapshot");
+                }
+            }
         }
     }
     Ok(latest.into_values().collect())
@@ -1873,6 +1926,22 @@ fn retain_preview_block(
     }
 }
 
+fn revert_preview_block(
+    blocks: &mut BTreeMap<u64, (BlockRef, Vec<SubscriptionItem>)>,
+    previewed: &mut HashSet<ObservationKey>,
+    block: BlockRef,
+) -> Option<Vec<SubscriptionItem>> {
+    let (retained, items) = blocks.remove(&block.number.0)?;
+    if retained.hash != block.hash {
+        blocks.insert(block.number.0, (retained, items));
+        return None;
+    }
+    for item in &items {
+        previewed.remove(&observation_key(item));
+    }
+    Some(items)
+}
+
 const fn observation_key(item: &SubscriptionItem) -> ObservationKey {
     match item {
         SubscriptionItem::Block(entity) => ObservationKey::Block(entity.block_hash),
@@ -1987,9 +2056,12 @@ fn render_local_item(
     format: SubscribeFormat,
     item: &SubscriptionItem,
     record: &ChangeRecord,
+    processor: &dyn leani_processor_api::Processor,
+    store_epoch: [u8; 16],
 ) -> Result<()> {
     if format == SubscribeFormat::Raw {
-        println!("{}", serde_json::to_string(record)?);
+        let envelope = leani_api::change_envelope_json(store_epoch, processor, record.clone())?;
+        println!("{}", serde_json::to_string(&envelope)?);
         io::stdout().flush()?;
         return Ok(());
     }
@@ -2052,21 +2124,15 @@ fn render_entity(
     let sqrt = entity
         .sqrt_price_x96
         .context("Uniswap V3 observation omitted sqrtPriceX96")?;
-    let amount0 = signed_amount(
-        entity
-            .amount0
-            .context("Uniswap V3 observation omitted Swap amount0")?,
-    );
-    let amount1 = signed_amount(
-        entity
-            .amount1
-            .context("Uniswap V3 observation omitted Swap amount1")?,
-    );
+    let amount0 = entity.amount0.map(signed_amount);
+    let amount1 = entity.amount1.map(signed_amount);
     let price = v3_price(market, U256::from_be_bytes(sqrt.0), PRICE_PRECISION)?;
     let output = RenderedPrice {
         market,
         price,
-        base_volume: base_volume(market, amount0, amount1),
+        base_volume: amount0
+            .zip(amount1)
+            .map(|(amount0, amount1)| base_volume(market, amount0, amount1)),
         block_number: block.number.0,
         block_hash: format!("0x{}", hex::encode(block.hash.0)),
         timestamp: block.timestamp,
@@ -2074,8 +2140,8 @@ fn render_entity(
         finality: finality_name(finality).to_owned(),
         operation: operation.to_owned(),
         sqrt_price_x96: U256::from_be_bytes(sqrt.0).to_string(),
-        amount0: amount0.to_string(),
-        amount1: amount1.to_string(),
+        amount0: amount0.map(|amount| amount.to_string()),
+        amount1: amount1.map(|amount| amount.to_string()),
         sequence,
     };
     render_price(format, &output)
@@ -2085,13 +2151,16 @@ fn render_price(format: SubscribeFormat, output: &RenderedPrice<'_>) -> Result<(
     match format {
         SubscribeFormat::Pretty => {
             let timestamp = readable_timestamp(output.timestamp)?;
+            let volume = output.base_volume.as_ref().map_or_else(
+                || "volume=n/a".to_owned(),
+                |volume| format!("volume={} {}", volume, base_token(output.market).symbol),
+            );
             println!(
-                "{}  {} {}  volume={} {}  block={}  {}{}",
+                "{}  {} {}  {}  block={}  {}{}",
                 timestamp,
                 output.market.symbol,
                 output.price,
-                output.base_volume,
-                base_token(output.market).symbol,
+                volume,
                 output.block_number,
                 output.finality,
                 if output.operation == "apply" {
@@ -2204,7 +2273,7 @@ fn render_block_summary(format: SubscribeFormat, output: &RenderedBlockSummary) 
                 "timestamp": output.timestamp,
                 "gasLimit": output.gas_limit,
                 "gasUsed": output.gas_used,
-                "baseFeePerGasWei": output.base_fee_wei,
+                "baseFeePerGas": output.base_fee_wei,
                 "blobGasUsed": output.blob_gas_used,
                 "excessBlobGas": output.excess_blob_gas,
                 "transactionCount": output.transaction_count,
@@ -2372,6 +2441,48 @@ const fn direction_name(direction: ChangeDirection) -> &'static str {
     }
 }
 
+enum AttachedStreamConnection {
+    Connected(reqwest::Response),
+    Retry,
+    Interrupted,
+}
+
+async fn connect_attached_stream(
+    client: &reqwest::Client,
+    options: &SubscribeOptions,
+    stream_url: Url,
+    backoff: Duration,
+) -> Result<AttachedStreamConnection> {
+    let response = authorized(client.get(stream_url), options.token.as_deref())
+        .send()
+        .await;
+    let error = match response {
+        Ok(response)
+            if response.status().is_client_error()
+                && response.status() != reqwest::StatusCode::REQUEST_TIMEOUT
+                && response.status() != reqwest::StatusCode::TOO_MANY_REQUESTS =>
+        {
+            bail!(
+                "node rejected the subscription request with {}; check the endpoint, processor, and token",
+                response.status()
+            );
+        }
+        Ok(response) => match response.error_for_status() {
+            Ok(response) => return Ok(AttachedStreamConnection::Connected(response)),
+            Err(error) => error,
+        },
+        Err(error) => error,
+    };
+    eprintln!(
+        "leani: stream connection failed ({error}); reconnecting in {}s",
+        backoff.as_secs()
+    );
+    if wait_for_reconnect(backoff).await? {
+        return Ok(AttachedStreamConnection::Interrupted);
+    }
+    Ok(AttachedStreamConnection::Retry)
+}
+
 async fn subscribe_attached(
     options: &SubscribeOptions,
     markets: &[Market],
@@ -2388,30 +2499,20 @@ async fn subscribe_attached(
     }
     announce_attached(options.protocol, &endpoint, markets);
     let mut backoff = Duration::from_secs(1);
+    let mut last_sequence = None;
     loop {
         let mut stream_url = processor_url(&endpoint, &options.processor, "stream")?;
         if let Some(cursor) = &cursor {
             stream_url.query_pairs_mut().append_pair("after", cursor);
         }
-        let response = authorized(client.get(stream_url), options.token.as_deref())
-            .send()
-            .await
-            .and_then(reqwest::Response::error_for_status);
-        let response = match response {
-            Ok(response) => response,
-            Err(error) => {
-                eprintln!(
-                    "leani: stream connection failed ({error}); reconnecting in {}s",
-                    backoff.as_secs()
-                );
-                if wait_for_reconnect(backoff).await? {
-                    return Ok(Exit::Success);
-                }
+        let response = match connect_attached_stream(&client, options, stream_url, backoff).await? {
+            AttachedStreamConnection::Connected(response) => response,
+            AttachedStreamConnection::Retry => {
                 backoff = backoff.saturating_mul(2).min(Duration::from_secs(30));
                 continue;
             }
+            AttachedStreamConnection::Interrupted => return Ok(Exit::Success),
         };
-        backoff = Duration::from_secs(1);
         let mut bytes = response.bytes_stream();
         let mut buffer = Vec::new();
         loop {
@@ -2433,7 +2534,17 @@ async fn subscribe_attached(
                 }
             };
             buffer.extend_from_slice(&chunk);
-            if render_attached_sse_events(&mut buffer, &mut cursor, options, markets)? {
+            let outcome = render_attached_sse_events(
+                &mut buffer,
+                &mut cursor,
+                &mut last_sequence,
+                options,
+                markets,
+            )?;
+            if outcome.observed_change {
+                backoff = Duration::from_secs(1);
+            }
+            if outcome.stop {
                 return Ok(Exit::Success);
             }
         }
@@ -2524,20 +2635,59 @@ fn announce_attached(protocol: SubscribeProtocol, endpoint: &Url, markets: &[Mar
 fn render_attached_sse_events(
     buffer: &mut Vec<u8>,
     cursor: &mut Option<String>,
+    last_sequence: &mut Option<u64>,
     options: &SubscribeOptions,
     markets: &[Market],
-) -> Result<bool> {
+) -> Result<SseRenderOutcome> {
+    let mut outcome = SseRenderOutcome::default();
     while let Some(end) = sse_event_end(buffer) {
         let event = buffer.drain(..end).collect::<Vec<_>>();
         let delimiter = if event.ends_with(b"\r\n\r\n") { 4 } else { 2 };
         let event = &event[..event.len().saturating_sub(delimiter)];
-        let Some(data) = sse_data(event)? else {
+        let parsed = match parse_sse_event(event) {
+            Ok(parsed) => parsed,
+            Err(error) => {
+                eprintln!("leani: ignored malformed SSE frame: {error}");
+                continue;
+            }
+        };
+        if parsed.event.as_deref() == Some("hello") {
+            continue;
+        }
+        let Some(data) = parsed.data else {
             continue;
         };
-        let value: Value = serde_json::from_str(&data)?;
-        let Ok(envelope) = serde_json::from_value::<AttachedEnvelope>(value.clone()) else {
-            continue;
+        if parsed.event.as_deref() == Some("error") {
+            bail!("node subscription stream reported an error: {data}");
+        }
+        let value: Value = match serde_json::from_str(&data) {
+            Ok(value) => value,
+            Err(error) => {
+                eprintln!("leani: ignored malformed SSE JSON: {error}");
+                continue;
+            }
         };
+        let envelope = match serde_json::from_value::<AttachedEnvelope>(value.clone()) {
+            Ok(envelope) => envelope,
+            Err(error) => {
+                eprintln!("leani: ignored unrecognized SSE event: {error}");
+                continue;
+            }
+        };
+        outcome.observed_change = true;
+        if envelope.operation == "reset_required" {
+            bail!(
+                "subscription cursor is no longer retained; query a fresh snapshot and restart without the old cursor"
+            );
+        }
+        let sequence = envelope
+            .sequence
+            .parse::<u64>()
+            .context("node SSE event sequence is not an unsigned integer")?;
+        if last_sequence.is_some_and(|last| sequence <= last) {
+            continue;
+        }
+        *last_sequence = Some(sequence);
         *cursor = Some(envelope.cursor.clone());
         if render_attached(
             options.protocol,
@@ -2548,10 +2698,11 @@ fn render_attached_sse_events(
             &value,
         )? && options.once
         {
-            return Ok(true);
+            outcome.stop = true;
+            return Ok(outcome);
         }
     }
-    Ok(false)
+    Ok(outcome)
 }
 
 async fn attached_change_head(
@@ -2750,8 +2901,9 @@ fn render_attached(
     let Some(entity) = envelope.data else {
         return Ok(false);
     };
-    let entity: AttachedPoolPrice =
+    let mut entity: AttachedPoolPrice =
         serde_json::from_value(entity).context("decode attached Uniswap price observation")?;
+    entity.finality.clone_from(&envelope.finality);
     if finality == SubscribeFinality::Finalized && entity.finality != "finalized" {
         return Ok(false);
     }
@@ -2765,7 +2917,7 @@ fn render_attached(
         .block
         .get("timestamp")
         .and_then(Value::as_u64)
-        .unwrap_or_default();
+        .context("attached Uniswap event omitted block.timestamp")?;
     if !update_is_fresh(finality, timestamp, unix_seconds()) {
         return Ok(false);
     }
@@ -2797,8 +2949,9 @@ fn render_attached_block(
     let Some(entity) = envelope.data else {
         return Ok(false);
     };
-    let entity: AttachedBlockSummary =
+    let mut entity: AttachedBlockSummary =
         serde_json::from_value(entity).context("decode attached block summary")?;
+    entity.finality.clone_from(&envelope.finality);
     if finality == SubscribeFinality::Finalized && entity.finality != "finalized" {
         return Ok(false);
     }
@@ -2863,21 +3016,29 @@ fn render_attached_price(
     let amount0 = entity
         .amount0
         .as_deref()
-        .context("Uniswap V3 observation omitted Swap amount0")?
-        .parse::<I256>()
-        .context("invalid signed amount0 from node API")?;
+        .map(|amount| {
+            amount
+                .parse::<I256>()
+                .context("invalid signed amount0 from node API")
+        })
+        .transpose()?;
     let amount1 = entity
         .amount1
         .as_deref()
-        .context("Uniswap V3 observation omitted Swap amount1")?
-        .parse::<I256>()
-        .context("invalid signed amount1 from node API")?;
+        .map(|amount| {
+            amount
+                .parse::<I256>()
+                .context("invalid signed amount1 from node API")
+        })
+        .transpose()?;
     let sqrt_value = U256::from_str(sqrt).context("invalid sqrtPriceX96 from node API")?;
     let price = v3_price(market, sqrt_value, PRICE_PRECISION)?;
     let output = RenderedPrice {
         market,
         price,
-        base_volume: base_volume(market, amount0, amount1),
+        base_volume: amount0
+            .zip(amount1)
+            .map(|(amount0, amount1)| base_volume(market, amount0, amount1)),
         block_number: entity.block_number,
         block_hash: entity.block_hash.clone(),
         timestamp,
@@ -2885,8 +3046,8 @@ fn render_attached_price(
         finality: entity.finality.clone(),
         operation: operation.to_owned(),
         sqrt_price_x96: sqrt.to_owned(),
-        amount0: amount0.to_string(),
-        amount1: amount1.to_string(),
+        amount0: amount0.map(|amount| amount.to_string()),
+        amount1: amount1.map(|amount| amount.to_string()),
         sequence,
     };
     render_price(format, &output)?;
@@ -2911,26 +3072,36 @@ fn authorized(request: reqwest::RequestBuilder, token: Option<&str>) -> reqwest:
 }
 
 fn sse_event_end(buffer: &[u8]) -> Option<usize> {
-    buffer
+    let crlf = buffer
         .windows(4)
         .position(|window| window == b"\r\n\r\n")
-        .map(|position| position + 4)
-        .or_else(|| {
-            buffer
-                .windows(2)
-                .position(|window| window == b"\n\n")
-                .map(|position| position + 2)
-        })
+        .map(|position| (position, position + 4));
+    let lf = buffer
+        .windows(2)
+        .position(|window| window == b"\n\n")
+        .map(|position| (position, position + 2));
+    match (crlf, lf) {
+        (Some(left), Some(right)) => Some(if left.0 <= right.0 { left.1 } else { right.1 }),
+        (Some((_, end)), None) | (None, Some((_, end))) => Some(end),
+        (None, None) => None,
+    }
 }
 
-fn sse_data(event: &[u8]) -> Result<Option<String>> {
+fn parse_sse_event(event: &[u8]) -> Result<ParsedSseEvent> {
     let event = std::str::from_utf8(event).context("node SSE stream is not UTF-8")?;
+    let event_name = event
+        .lines()
+        .find_map(|line| line.strip_prefix("event:"))
+        .map(|value| value.trim_start().to_owned());
     let data = event
         .lines()
         .filter_map(|line| line.strip_prefix("data:"))
         .map(str::trim_start)
         .collect::<Vec<_>>();
-    Ok((!data.is_empty()).then(|| data.join("\n")))
+    Ok(ParsedSseEvent {
+        event: event_name,
+        data: (!data.is_empty()).then(|| data.join("\n")),
+    })
 }
 
 fn unix_seconds() -> u64 {
@@ -3358,6 +3529,56 @@ mod tests {
     }
 
     #[test]
+    fn mismatched_reorg_revert_preserves_the_preview_barrier() {
+        let preview_record = block_record(65, 10_024);
+        let preview = local_item(SubscribeProtocol::Blocks, &[], &preview_record)
+            .expect("decode preview block")
+            .expect("preview block");
+        let preview_key = observation_key(&preview);
+        let mut preview_blocks = BTreeMap::from([(
+            preview.block_number().0,
+            (preview_record.block, vec![preview]),
+        )]);
+        let mut previewed = HashSet::from([preview_key]);
+        let unrelated_revert = BlockRef {
+            hash: BlockHash::new([99; 32]),
+            ..preview_record.block
+        };
+
+        assert!(
+            revert_preview_block(&mut preview_blocks, &mut previewed, unrelated_revert).is_none()
+        );
+        assert!(preview_blocks.contains_key(&65));
+        assert!(previewed.contains(&preview_key));
+
+        let reverted =
+            revert_preview_block(&mut preview_blocks, &mut previewed, preview_record.block)
+                .expect("matching preview reverts");
+        assert_eq!(reverted.len(), 1);
+        assert!(preview_blocks.is_empty());
+        assert!(previewed.is_empty());
+    }
+
+    #[test]
+    fn readiness_does_not_emit_a_lone_undo() {
+        let market = resolve_markets(&["ETH/USDC".to_owned()]).expect("market")[0];
+        let apply = price_record(market, 1, 9_990);
+        let mut undo = apply.clone();
+        undo.cursor.sequence = 2;
+        undo.direction = ChangeDirection::Undo;
+
+        let items = latest_fresh_items(
+            SubscribeProtocol::UniswapV3,
+            &[market],
+            vec![apply, undo],
+            SubscribeFinality::Optimistic,
+            10_000,
+        )
+        .expect("startup state");
+        assert!(items.is_empty());
+    }
+
+    #[test]
     fn attached_subscription_hides_stale_node_catch_up_observations() {
         let market = resolve_markets(&["ETH/USDC".to_owned()]).expect("market")[0];
         let envelope = AttachedEnvelope {
@@ -3704,7 +3925,8 @@ mod tests {
         fs::write(sibling.join("checkpoint.json"), b"sibling").expect("sibling state");
 
         assert!(reset_subscription_directory(&target, true).expect("reset target"));
-        assert!(!target.exists());
+        assert!(local_state::is_runtime_directory(&target));
+        assert!(!target.join("checkpoint.json").exists());
         assert!(sibling.join("checkpoint.json").is_file());
         assert!(reset_subscription_directory(&target, true).is_ok());
         assert!(reset_subscription_directory(root.path(), true).is_err());
@@ -3714,10 +3936,9 @@ mod tests {
     fn parses_sse_across_standard_line_endings() {
         let unix = b"event: apply\ndata: {\"sequence\":\"1\"}\n\nrest";
         assert_eq!(sse_event_end(unix), Some(37));
-        assert_eq!(
-            sse_data(&unix[..35]).expect("data").as_deref(),
-            Some("{\"sequence\":\"1\"}")
-        );
+        let parsed = parse_sse_event(&unix[..35]).expect("data");
+        assert_eq!(parsed.event.as_deref(), Some("apply"));
+        assert_eq!(parsed.data.as_deref(), Some("{\"sequence\":\"1\"}"));
         let windows = b"data: {}\r\n\r\n";
         assert_eq!(sse_event_end(windows), Some(windows.len()));
     }

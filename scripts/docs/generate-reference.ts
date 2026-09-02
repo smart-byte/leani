@@ -55,9 +55,12 @@ async function httpReference(repositoryRoot: string): Promise<JsonObject> {
     )) {
       const body = implementation[1] ?? '';
       const alias = body.match(/fn alias\(&self\)[\s\S]*?Some\("([a-z0-9-]+)"\)/)?.[1];
-      if (!alias) continue;
       for (const match of body.matchAll(/\.route\(\s*"([^"]+)"/g)) {
-        routedPaths.add(`/v1/q/${alias}${match[1]}`);
+        routedPaths.add(
+          alias
+            ? `/v1/q/${alias}${match[1]}`
+            : `/v1/processors/{processor}/query${match[1]}`,
+        );
       }
     }
   }

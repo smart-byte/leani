@@ -62,8 +62,9 @@ execution blocks or Uniswap data. Leani queries the pool concurrently, verifies
 every response locally from the pinned checkpoint, and accepts the first set
 that satisfies `minimum_agreement`. With the compact profile's default
 agreement of one, the first valid response wins, so a stalled transport does
-not hold up node startup. Any endpoints listed in the compact document join
-this managed pool. Compact Ethereum Mainnet configurations expand to:
+not hold up node startup. Listing endpoints in the compact document replaces
+the managed defaults, which lets operators use only self-hosted transports.
+Compact Ethereum Mainnet configurations expand to:
 
 | Concern | Default |
 |---|---|
@@ -85,10 +86,9 @@ cp config/modes/windowed.toml leani.toml
 leani doctor --json
 ```
 
-Without `--config`, Leani looks for `./leani.toml` and then
-`./config/example.toml` (the source-workspace fallback). Set `LEANI_CONFIG` when a
-service or shell should consistently use a configuration elsewhere. An
-explicit `--config` remains the highest-precedence override. Compact documents
+Without `--config`, Leani uses `./leani.toml`. Set `LEANI_CONFIG` when a service
+or shell should consistently use a configuration elsewhere. An explicit
+`--config` remains the highest-precedence override. Compact documents
 default operational tuning but never the chain identity, checkpoint trust
 root, or selected processor targets. Advanced documents keep every choice explicit.
 

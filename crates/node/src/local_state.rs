@@ -1,7 +1,7 @@
 //! Resolution and explicit deletion of Leani-owned local runtime state.
 
 use std::{
-    fs,
+    fs::{self, File, OpenOptions},
     io::{self, IsTerminal, Write},
     path::{Path, PathBuf},
 };
@@ -13,7 +13,47 @@ use crate::{config::Config, process::Exit};
 pub(crate) struct ResetAllOptions {
     pub confirmed: bool,
     pub config_path: Option<PathBuf>,
+    pub data_dir: Option<PathBuf>,
     pub working_directory: PathBuf,
+}
+
+const RUNTIME_LOCK_FILE: &str = ".leani.lock";
+const RUNTIME_STATE_ENTRIES: &[&str] = &[
+    "leani.sqlite",
+    "leani.sqlite-shm",
+    "leani.sqlite-wal",
+    "raw-history",
+    "processor-artifacts",
+    "execution-peers.json",
+    "execution-peer-quality.json",
+    "execution-p2p-secret",
+    "checkpoint.json",
+    "subscriptions",
+];
+
+#[derive(Debug)]
+pub(crate) struct RuntimeDirectoryLock {
+    _file: File,
+}
+
+pub(crate) fn lock_runtime_directory(data_dir: &Path) -> Result<RuntimeDirectoryLock> {
+    fs::create_dir_all(data_dir)
+        .with_context(|| format!("create runtime data directory {}", data_dir.display()))?;
+    let path = data_dir.join(RUNTIME_LOCK_FILE);
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&path)
+        .with_context(|| format!("open runtime lock {}", path.display()))?;
+    file.try_lock().with_context(|| {
+        format!(
+            "runtime data directory {} is already in use by another Leani process",
+            data_dir.display()
+        )
+    })?;
+    Ok(RuntimeDirectoryLock { _file: file })
 }
 
 pub(crate) fn configured_path(
@@ -43,7 +83,10 @@ pub(crate) fn runtime_data_dir(
 }
 
 pub(crate) fn reset_all(options: &ResetAllOptions) -> Result<Exit> {
-    let data_dir = runtime_data_dir(options.config_path.as_deref(), &options.working_directory)?;
+    let data_dir = options.data_dir.clone().map_or_else(
+        || runtime_data_dir(options.config_path.as_deref(), &options.working_directory),
+        Ok,
+    )?;
     reset_runtime_directory(
         &data_dir,
         options.config_path.as_deref(),
@@ -138,10 +181,48 @@ fn reset_runtime_directory(
             bail!("full state reset was not confirmed");
         }
     }
-    fs::remove_dir_all(&target)
-        .with_context(|| format!("reset all runtime state at {}", target.display()))?;
+    let _lock = lock_runtime_directory(&target)?;
+    let unknown = remove_known_runtime_state(&target)?;
+    for path in unknown {
+        eprintln!("leani: preserved unknown entry {}", path.display());
+    }
     eprintln!("leani: all local runtime state reset; the next run is cold");
     Ok(true)
+}
+
+pub(crate) fn is_runtime_directory(target: &Path) -> bool {
+    target.join(RUNTIME_LOCK_FILE).is_file()
+}
+
+pub(crate) fn remove_known_runtime_state(target: &Path) -> Result<Vec<PathBuf>> {
+    let mut unknown = Vec::new();
+    for entry in fs::read_dir(target)
+        .with_context(|| format!("read runtime data directory {}", target.display()))?
+    {
+        let entry = entry?;
+        let name = entry.file_name();
+        if name == RUNTIME_LOCK_FILE {
+            continue;
+        }
+        let Some(name_str) = name.to_str() else {
+            unknown.push(entry.path());
+            continue;
+        };
+        if !RUNTIME_STATE_ENTRIES.contains(&name_str) {
+            unknown.push(entry.path());
+            continue;
+        }
+        let path = entry.path();
+        let metadata = fs::symlink_metadata(&path)?;
+        if metadata.is_dir() && !metadata.file_type().is_symlink() {
+            fs::remove_dir_all(&path)
+                .with_context(|| format!("remove runtime directory {}", path.display()))?;
+        } else {
+            fs::remove_file(&path)
+                .with_context(|| format!("remove runtime file {}", path.display()))?;
+        }
+    }
+    Ok(unknown)
 }
 
 #[cfg(test)]
@@ -163,7 +244,9 @@ mod tests {
             reset_runtime_directory(&data_dir, Some(&config_path), &working_directory, true)
                 .expect("reset all state")
         );
-        assert!(!data_dir.exists());
+        assert!(data_dir.join(RUNTIME_LOCK_FILE).is_file());
+        assert!(!data_dir.join("leani.sqlite").exists());
+        assert!(!data_dir.join("subscriptions").exists());
         assert!(config_path.is_file());
         assert!(working_directory.is_dir());
     }
@@ -183,5 +266,15 @@ mod tests {
             reset_runtime_directory(root.path(), Some(&config_path), &working_directory, true)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn runtime_directory_lock_excludes_other_process_contexts() {
+        let root = tempfile::tempdir().expect("temporary directory");
+        let first = lock_runtime_directory(root.path()).expect("first lock");
+        let error = lock_runtime_directory(root.path()).expect_err("second lock is refused");
+        assert!(error.to_string().contains("already in use"));
+        drop(first);
+        lock_runtime_directory(root.path()).expect("lock can be reacquired");
     }
 }

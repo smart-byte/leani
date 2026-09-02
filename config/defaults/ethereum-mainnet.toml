@@ -43,45 +43,6 @@ endpoints = [
   "https://lodestar-mainnet.chainsafe.io/",
 ]
 minimum_agreement = 1
-discovery_port = 0
-
-[[processors]]
-id = "uniswap-observations"
-instance = "uniswap-observations"
-version = "2.1.0"
-history_control = "node_owned"
-history_mode = "on_demand"
-start_block = 12376729
-publish = "optimistic_and_finalized"
-
-[processors.state]
-mode = "checkpointed"
-
-[processors.artifacts]
-mode = "none"
-
-[processors.output]
-mode = "full"
-
-[processors.delivery]
-mode = "window"
-max_bytes = "64MiB"
-max_age = "24h"
-on_limit = "pause"
-
-[processors.checkpoint]
-mode = "automatic"
-keep = 3
-
-[processors.undo]
-mode = "unfinalized"
-safety_blocks = 256
-
-[processors.settings]
-
-[[processors.settings.pools]]
-address = "0x88e6A0c2dDD26FEEb64F039a2c41296FcB3f5640"
-kind = "v3"
 
 [rpc]
 http_bind = "127.0.0.1:18545"

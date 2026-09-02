@@ -2557,14 +2557,13 @@ pub async fn run() -> Result<Exit> {
 /// selected operation fails.
 pub async fn run_with_registry(registry: ProcessorRegistry) -> Result<Exit> {
     let cli = Cli::parse();
-    let log_filter = if matches!(cli.command, Command::Subscribe { .. })
-        && cli.log_filter == "info"
-        && std::env::var_os("LEANI_LOG").is_none()
-    {
-        "error,leani=warn"
-    } else {
-        &cli.log_filter
-    };
+    let log_filter = cli.log_filter.as_deref().unwrap_or({
+        if matches!(cli.command, Command::Subscribe { .. }) {
+            "error,leani=warn"
+        } else {
+            "info"
+        }
+    });
     init_logging(cli.log_format, log_filter)?;
     Box::pin(run_cli_with_registry(cli, &registry)).await
 }
@@ -2657,12 +2656,13 @@ pub async fn run_cli_with_registry(cli: Cli, registry: &ProcessorRegistry) -> Re
             .await
         }
         Command::Reset { command } => match command {
-            ResetCommand::All { yes } => {
+            ResetCommand::All { data_dir, yes } => {
                 let reset_config =
                     (requested_config.is_some() || config_path.is_file()).then_some(config_path);
                 crate::local_state::reset_all(&crate::local_state::ResetAllOptions {
                     confirmed: yes,
                     config_path: reset_config,
+                    data_dir,
                     working_directory,
                 })
             }
@@ -2670,12 +2670,14 @@ pub async fn run_cli_with_registry(cli: Cli, registry: &ProcessorRegistry) -> Re
                 protocol,
                 targets,
                 finality,
+                data_dir,
                 yes,
             } => {
                 crate::subscribe::reset_subscription(&crate::subscribe::ResetSubscriptionOptions {
                     protocol,
                     targets,
                     finality,
+                    data_dir,
                     confirmed: yes,
                     requested_config,
                     working_directory,
@@ -2829,16 +2831,8 @@ pub async fn run_cli_with_registry(cli: Cli, registry: &ProcessorRegistry) -> Re
 }
 
 fn resolve_config_path(explicit: Option<&Path>, working_directory: &Path) -> PathBuf {
-    if let Some(path) = explicit {
-        return path.to_owned();
-    }
-    for candidate in ["leani.toml", "config/example.toml"] {
-        let path = working_directory.join(candidate);
-        if path.is_file() {
-            return path;
-        }
-    }
-    working_directory.join("leani.toml")
+    crate::local_state::configured_path(explicit, working_directory)
+        .unwrap_or_else(|| working_directory.join("leani.toml"))
 }
 
 #[derive(Debug, Serialize)]
@@ -4729,6 +4723,7 @@ async fn serve(path: &Path, registry: &ProcessorRegistry) -> Result<Exit> {
     use leani_store_sqlite::SqliteStore;
 
     let config = Config::load(path)?.validate()?;
+    let _data_dir_lock = crate::local_state::lock_runtime_directory(&config.get().data_dir)?;
     let assembly = registry.instantiate_all_with_extensions(config.get())?;
     let processors = assembly.processors;
     let query_extensions = assembly.query_extensions;
@@ -5552,6 +5547,7 @@ pub(crate) struct EmbeddedNetworkRuntime {
     pub(crate) execution_source: std::sync::Arc<leani_source_p2p::RethP2pSource>,
     cancellation: CancellationToken,
     task: tokio::task::JoinHandle<()>,
+    _data_dir_lock: crate::local_state::RuntimeDirectoryLock,
 }
 
 impl EmbeddedNetworkRuntime {
@@ -5567,6 +5563,8 @@ impl EmbeddedNetworkRuntime {
 
     pub(crate) async fn shutdown(mut self) {
         self.cancellation.cancel();
+        let _ =
+            tokio::time::timeout(Duration::from_secs(5), self.execution_source.shutdown()).await;
         if tokio::time::timeout(Duration::from_secs(1), &mut self.task)
             .await
             .is_err()
@@ -5576,8 +5574,15 @@ impl EmbeddedNetworkRuntime {
             // honor Ctrl-C promptly; aborting the supervisor after cancellation
             // is safe because SQLite commits and peer-cache writes are atomic.
             self.task.abort();
-            let _ = self.task.await;
+            let _ = (&mut self.task).await;
         }
+    }
+}
+
+impl Drop for EmbeddedNetworkRuntime {
+    fn drop(&mut self) {
+        self.cancellation.cancel();
+        self.task.abort();
     }
 }
 
@@ -5585,6 +5590,7 @@ pub(crate) fn spawn_embedded_network_runtime(
     config: Config,
     store: leani_store_sqlite::SqliteStore,
     processors: Vec<std::sync::Arc<dyn leani_processor_api::Processor>>,
+    data_dir_lock: crate::local_state::RuntimeDirectoryLock,
 ) -> Result<EmbeddedNetworkRuntime> {
     let readiness = leani_api::ReadinessHandle::new(true, true);
     let cancellation = CancellationToken::new();
@@ -5614,6 +5620,7 @@ pub(crate) fn spawn_embedded_network_runtime(
         execution_source,
         cancellation,
         task,
+        _data_dir_lock: data_dir_lock,
     })
 }
 
@@ -5631,7 +5638,12 @@ pub(crate) fn execution_p2p_source(
         .collect::<Result<Vec<_>, _>>()?;
     let p2p_config = leani_source_p2p::RethP2pConfig {
         minimum_peers: config.sources.live.minimum_peers,
-        body_serving_peer_target: config.sources.live.body_serving_peer_target,
+        body_serving_peer_target: config
+            .sources
+            .live
+            .body_serving_peer_target
+            .max(config.sources.live.minimum_peers)
+            .min(config.sources.live.preferred_peers),
         preferred_peers: config.sources.live.preferred_peers,
         max_outbound_peers: config.sources.live.max_outbound_peers,
         max_concurrent_dials: config.sources.live.max_concurrent_dials,
@@ -5934,12 +5946,11 @@ async fn run_network_lanes_once(
         timestamp: now,
     };
     // A cold store has no trustworthy execution head to advertise until the
-    // independently verified finality probe completes. Starting a peer manager
-    // at genesis can make current peers reject our obsolete ETH status and then
-    // hold startup behind the full peer timeout. Retained stores still overlap
-    // discovery with finality, but refresh their advertised head immediately.
-    live_source.update_advertised_head(live_anchor).await;
+    // independently verified finality probe completes. A warm store already
+    // advertised its newer retained canonical tip, so do not downgrade it to
+    // the older finalized anchor.
     if retained_warmup_head.is_none() {
+        live_source.update_advertised_head(live_anchor).await;
         spawn_execution_peer_warmup(
             live_source.clone(),
             live_anchor,
@@ -6059,6 +6070,12 @@ async fn run_network_lanes_once(
             }
         }
     };
+    let require_anchor_overlap = config.processors.iter().any(|configured| {
+        !matches!(
+            configured.history_mode,
+            crate::config::ProcessorHistoryMode::OnDemand
+        ) && configured.start_block <= selected.execution_block_number
+    });
     let backfills = spawn_cold_backfills(
         config,
         &store,
@@ -6101,7 +6118,7 @@ async fn run_network_lanes_once(
         live_anchor,
         overlap_blocks,
         64,
-        !backfills.is_empty(),
+        require_anchor_overlap,
     )
     .await?;
     let live = live_runtime.run_with_readiness(
@@ -6555,12 +6572,12 @@ async fn spawn_cold_backfills(
             match configured_history_sources(config, processor.as_ref(), None) {
                 Ok(source) => source,
                 Err(error) => {
-                    warn!(
-                        processor = %processor.descriptor().id,
-                        %error,
-                        "no cold source can satisfy configured live processor"
-                    );
-                    continue;
+                    return Err(error).with_context(|| {
+                        format!(
+                            "no cold source can satisfy configured live processor {}",
+                            processor.descriptor().id
+                        )
+                    });
                 }
             };
         let bridge_start = config
@@ -6576,14 +6593,8 @@ async fn spawn_cold_backfills(
             )
             .with_context(|| format!("construct P2P history bridge for {}", configured.id))?,
         ));
-        let range = match BlockRange::new(BlockNumber(configured.start_block), BlockNumber(through))
-        {
-            Ok(range) => range,
-            Err(error) => {
-                warn!(%error, "invalid automatic backfill range");
-                continue;
-            }
-        };
+        let range = BlockRange::new(BlockNumber(configured.start_block), BlockNumber(through))
+            .with_context(|| format!("invalid automatic backfill range for {}", configured.id))?;
         let overlap = BlockRange::new(
             BlockNumber(overlap_from.max(configured.start_block)),
             BlockNumber(through),
@@ -6634,8 +6645,9 @@ async fn spawn_cold_backfills(
                 }
             }
             Err(error) => {
-                warn!(%error, "failed to construct automatic backfill");
-                continue;
+                return Err(error).with_context(|| {
+                    format!("construct automatic backfill for {}", configured.id)
+                });
             }
         };
         let runtime = if let Some(startup_permit) = startup_permit {
@@ -6655,8 +6667,8 @@ async fn spawn_cold_backfills(
         ) {
             Ok(job) => job,
             Err(error) => {
-                warn!(%error, "failed to plan automatic backfill");
-                continue;
+                return Err(error)
+                    .with_context(|| format!("plan automatic backfill for {}", configured.id));
             }
         };
         let budget = SourceBudget {
@@ -7064,7 +7076,7 @@ mod tests {
     }
 
     #[test]
-    fn configuration_discovery_prefers_explicit_then_project_local_then_workspace() {
+    fn configuration_discovery_uses_only_explicit_or_project_local_paths() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let workspace_config = directory.path().join("config/example.toml");
         std::fs::create_dir_all(workspace_config.parent().expect("config parent"))
@@ -7072,7 +7084,7 @@ mod tests {
         std::fs::write(&workspace_config, "workspace").expect("write workspace config");
         assert_eq!(
             resolve_config_path(None, directory.path()),
-            workspace_config
+            directory.path().join("leani.toml")
         );
 
         let local_config = directory.path().join("leani.toml");
@@ -7102,6 +7114,7 @@ mod tests {
 
     #[tokio::test]
     async fn embedded_runtime_shutdown_aborts_an_uncooperative_network_task() {
+        let directory = tempfile::tempdir().expect("temporary directory");
         let cancellation = CancellationToken::new();
         let (_, verified_anchor) = tokio::sync::watch::channel(None);
         let execution_source = std::sync::Arc::new(
@@ -7114,6 +7127,8 @@ mod tests {
             execution_source,
             cancellation,
             task: tokio::spawn(std::future::pending()),
+            _data_dir_lock: crate::local_state::lock_runtime_directory(directory.path())
+                .expect("runtime directory lock"),
         };
 
         tokio::time::timeout(Duration::from_millis(1_500), runtime.shutdown())

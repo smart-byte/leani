@@ -4429,6 +4429,7 @@ dependencies = [
 name = "leani-processor-block-summary"
 version = "0.1.0"
 dependencies = [
+ "alloy-primitives",
  "async-trait",
  "blake3",
  "leani-primitives",

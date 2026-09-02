@@ -1,5 +1,6 @@
 //! Ethereum block summaries from verified headers and bodies.
 
+use alloy_primitives::U256;
 use async_trait::async_trait;
 use leani_primitives::{
     BlockFrame, BlockHash, BlockNumber, Capability, CapabilitySet, ChainId, FilterScope, Finality,
@@ -15,9 +16,9 @@ use semver::Version;
 use serde::{Deserialize, Serialize};
 
 pub const BLOCK_COLLECTION: &str = "ethereum.blocks";
-pub const BLOCK_LATEST_COLLECTION: &str = "ethereum.blocks.latest";
+pub const BLOCK_NUMBER_INDEX_COLLECTION: &str = "ethereum.blocks.by-number";
 pub const BLOCK_SUMMARY_KIND: &str = "ethereum.block.summary";
-pub const BLOCK_LATEST_KEY: &[u8] = b"latest";
+pub const BLOCK_SUMMARY_VERSION: &str = "1.1.0";
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct BlockSummaryConfig {
@@ -65,7 +66,10 @@ impl BlockSummaryProcessor {
             instance: ProcessorInstanceId::legacy(&id, &version, config_hash),
             id,
             version,
-            code_hash: BlockHash::new(*blake3::hash(b"leani/block-summary/1.1.0").as_bytes()),
+            code_hash: BlockHash::new(
+                *blake3::hash(format!("leani/block-summary/{BLOCK_SUMMARY_VERSION}").as_bytes())
+                    .as_bytes(),
+            ),
             config_hash,
             start: StartPoint::Block(config.start_block),
             requirements: vec![DataRequirement {
@@ -132,6 +136,22 @@ impl Processor for BlockSummaryProcessor {
                 )));
             }
         };
+        let transaction_count = block
+            .transactions
+            .as_complete()
+            .and_then(|transactions| u32::try_from(transactions.len()).ok())
+            .ok_or_else(|| {
+                ProcessorError::Input(
+                    "complete execution body transaction count is unavailable".to_owned(),
+                )
+            })?;
+        if let Some(header_count) = header.transaction_count
+            && header_count != transaction_count
+        {
+            return Err(ProcessorError::Input(format!(
+                "execution header transaction count {header_count} differs from decoded body count {transaction_count}"
+            )));
+        }
         let entity = BlockSummaryEntity {
             chain_id: block.chain_id,
             block_number: block.block.number,
@@ -143,17 +163,7 @@ impl Processor for BlockSummaryProcessor {
             base_fee_per_gas: header.base_fee_per_gas,
             blob_gas_used: header.blob_gas_used,
             excess_blob_gas: header.excess_blob_gas,
-            transaction_count: Some(
-                block
-                    .transactions
-                    .as_complete()
-                    .and_then(|transactions| u32::try_from(transactions.len()).ok())
-                    .ok_or_else(|| {
-                        ProcessorError::Input(
-                            "complete execution body transaction count is unavailable".to_owned(),
-                        )
-                    })?,
-            ),
+            transaction_count: Some(transaction_count),
             size_bytes: header.size_bytes,
             finality: block.finality,
         };
@@ -204,25 +214,13 @@ impl Processor for BlockSummaryProcessor {
         transaction
             .put(BLOCK_COLLECTION, key.clone(), payload.clone())
             .await?;
-        let replace_latest = transaction
-            .get(BLOCK_LATEST_COLLECTION, BLOCK_LATEST_KEY)
-            .await?
-            .map(|current| {
-                postcard::from_bytes::<BlockSummaryEntity>(&current)
-                    .map(|current| entity.block_number >= current.block_number)
-                    .map_err(|error| ProcessorError::State(error.to_string()))
-            })
-            .transpose()?
-            .unwrap_or(true);
-        if replace_latest {
-            transaction
-                .put(
-                    BLOCK_LATEST_COLLECTION,
-                    BLOCK_LATEST_KEY.to_vec(),
-                    payload.clone(),
-                )
-                .await?;
-        }
+        transaction
+            .put(
+                BLOCK_NUMBER_INDEX_COLLECTION,
+                entity.block_number.0.to_be_bytes().to_vec(),
+                entity.block_hash.0.to_vec(),
+            )
+            .await?;
         let change = DomainChange {
             kind: BLOCK_SUMMARY_KIND.to_owned(),
             key,
@@ -251,7 +249,7 @@ impl Processor for BlockSummaryProcessor {
         _key: &[u8],
         value: &[u8],
     ) -> Result<Option<serde_json::Value>, ProcessorError> {
-        if collection != BLOCK_COLLECTION && collection != BLOCK_LATEST_COLLECTION {
+        if collection != BLOCK_COLLECTION {
             return Ok(None);
         }
         entity_json(value).map(Some)
@@ -269,7 +267,9 @@ fn entity_json(payload: &[u8]) -> Result<serde_json::Value, ProcessorError> {
         "timestamp": entity.timestamp,
         "gasLimit": entity.gas_limit,
         "gasUsed": entity.gas_used,
-        "baseFeePerGas": entity.base_fee_per_gas.map(|value| value.to_string()),
+        "baseFeePerGas": entity
+            .base_fee_per_gas
+            .map(|value| U256::from_be_bytes(value.0).to_string()),
         "blobGasUsed": entity.blob_gas_used,
         "excessBlobGas": entity.excess_blob_gas,
         "transactionCount": entity.transaction_count,
@@ -392,10 +392,14 @@ mod tests {
                 .entity(BLOCK_COLLECTION, &frame.block.hash.0)
                 .is_some()
         );
-        assert!(
+        assert_eq!(
             reducer
-                .entity(BLOCK_LATEST_COLLECTION, BLOCK_LATEST_KEY)
-                .is_some()
+                .entity(
+                    BLOCK_NUMBER_INDEX_COLLECTION,
+                    &frame.block.number.0.to_be_bytes(),
+                )
+                .expect("number index"),
+            frame.block.hash.0
         );
     }
 
@@ -422,7 +426,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn latest_summary_never_regresses_to_an_older_finality_update() {
+    async fn block_summaries_are_retained_by_hash_without_a_hot_latest_key() {
         let processor = processor();
         let newest = frame();
         let mut older = frame();
@@ -441,12 +445,15 @@ mod tests {
             .await
             .expect("older reduce");
 
-        let latest: BlockSummaryEntity = postcard::from_bytes(
+        assert!(
             reducer
-                .entity(BLOCK_LATEST_COLLECTION, BLOCK_LATEST_KEY)
-                .expect("latest entity"),
-        )
-        .expect("decode latest");
-        assert_eq!(latest.block_number, BlockNumber(42));
+                .entity(BLOCK_COLLECTION, &newest.block.hash.0)
+                .is_some()
+        );
+        assert!(
+            reducer
+                .entity(BLOCK_COLLECTION, &older.block.hash.0)
+                .is_some()
+        );
     }
 }

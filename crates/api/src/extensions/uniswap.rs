@@ -77,7 +77,25 @@ async fn latest_observation(
     State(context): State<QueryContext>,
     Path(address): Path<String>,
 ) -> Result<Json<LatestObservationResponse>, ApiError> {
+    let configured = context.processor();
+    let processor = configured
+        .as_any()
+        .downcast_ref::<UniswapObservationsProcessor>()
+        .ok_or_else(|| {
+            ApiError::internal(
+                "Uniswap observations query extension is mounted on an incompatible processor",
+            )
+        })?;
     let address = parse_address(&address)?;
+    if !processor
+        .configured_pools()
+        .iter()
+        .any(|pool| pool.address == address)
+    {
+        return Err(ApiError::not_found(
+            "Uniswap pool is not configured for this processor",
+        ));
+    }
     let value = context
         .entity(OBSERVATION_LATEST_COLLECTION, &address.0)
         .await?
@@ -88,7 +106,7 @@ async fn latest_observation(
     let block = context
         .canonical_block_by_hash(entity.block_hash)
         .await?
-        .ok_or_else(|| ApiError::internal("latest Uniswap observation block is not canonical"))?;
+        .ok_or_else(|| ApiError::not_found("latest Uniswap observation is no longer canonical"))?;
     Ok(Json(LatestObservationResponse {
         data: UniswapPoolPrice::from(&entity),
         timestamp: block.timestamp,

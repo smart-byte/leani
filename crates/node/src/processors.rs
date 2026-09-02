@@ -843,8 +843,7 @@ mod tests {
     fn standard_registry_contains_block_summary() {
         let registry = ProcessorRegistry::standard();
         assert!(registry.contains("block-summary"));
-        let configured =
-            crate::block_summaries::processor_config("demo-blocks", false).expect("block config");
+        let configured = crate::block_summaries::processor_config("demo-blocks", false);
         let components = registry
             .instantiate_components(&configured, 1)
             .expect("block processor");

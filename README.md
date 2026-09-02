@@ -217,6 +217,7 @@ Those methods can eventually use an optional forwarding or stateless-execution e
 Start at [leani.dev/docs](https://leani.dev/docs/) for the task-oriented
 documentation, including the [Mainnet quickstart](https://leani.dev/docs/getting-started/),
 [configuration reference](https://leani.dev/docs/reference/configuration/),
+[live block subscriptions](https://leani.dev/docs/guides/live-block-subscriptions/),
 [live Uniswap price subscriptions](https://leani.dev/docs/guides/uniswap-price-subscriptions/),
 [operations guidance](https://leani.dev/docs/operations/preview-limitations/),
 and [processor-author guide](https://leani.dev/docs/guides/custom-processor/).

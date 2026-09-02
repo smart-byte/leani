@@ -185,6 +185,20 @@ tokens = ["0x2222222222222222222222222222222222222222"]
 complete_from_start = true
 ```
 
+## block-summary 1.1.0
+
+A receipt-free, block-local view of every verified Ethereum execution block.
+It requests headers and bodies, then publishes timestamp, parent/hash identity,
+gas limit and usage, decimal base fee, blob gas fields, transaction count, exact
+execution-block size when available, and finality. Summaries are retained by
+block hash with a canonical block-number index; the query extension exposes
+`/latest` and `/blocks/{number}`. It never executes the EVM and does not request
+receipts.
+
+The compact `[blocks]` preset supplies the standard checkpointed lifecycle,
+full query output, 64 MiB/24 hour delivery window, and 256-block optimistic undo
+window. Advanced configurations can override those policies explicitly.
+
 ## uniswap-observations 2.1.0 / uniswap-latest 2.0.0
 
 Two configured-pool contracts share the same exact event decoder:

@@ -6614,6 +6614,44 @@ fn change_envelope_with_stream(
     stream_id: Option<&str>,
     record: ChangeRecord,
 ) -> Result<ChangeEnvelope, ApiError> {
+    let cursor = if let Some(stream_id) = stream_id {
+        encode_stream_cursor(state, processor, stream_id, record.cursor.sequence)?
+    } else {
+        encode_change_cursor(state, processor, &record.cursor)?
+    };
+    render_change_envelope(processor, cursor, record)
+}
+
+/// Render one stored change with the same stable envelope used by the HTTP
+/// changes and SSE APIs. Embedded clients use this to keep `--format raw`
+/// independent of whether they attached to a running node.
+///
+/// # Errors
+///
+/// Returns an API rendering error when the stored payload or cursor identity
+/// is invalid for the owning processor.
+pub fn change_envelope_json(
+    store_epoch: [u8; 16],
+    processor: &dyn Processor,
+    record: ChangeRecord,
+) -> Result<Value, ApiError> {
+    let cursor = encode_cursor(&ApiCursor {
+        version: 2,
+        epoch: store_epoch,
+        chain_id: record.cursor.chain_id.0,
+        processor_id: processor.descriptor().instance.to_string(),
+        processor_version: processor.descriptor().version.to_string(),
+        sequence: record.cursor.sequence,
+    })?;
+    serde_json::to_value(render_change_envelope(processor, cursor, record)?).map_err(ApiError::from)
+}
+
+#[allow(clippy::too_many_lines)]
+fn render_change_envelope(
+    processor: &dyn Processor,
+    cursor: String,
+    record: ChangeRecord,
+) -> Result<ChangeEnvelope, ApiError> {
     let data = match record.change.operation {
         ChangeOperation::Delete => None,
         ChangeOperation::Upsert if record.change.kind == "system.finality" => {
@@ -6683,11 +6721,6 @@ fn change_envelope_with_stream(
                     "value": hex::encode(&record.change.payload)
                 }))
             }),
-    };
-    let cursor = if let Some(stream_id) = stream_id {
-        encode_stream_cursor(state, processor, stream_id, record.cursor.sequence)?
-    } else {
-        encode_change_cursor(state, processor, &record.cursor)?
     };
     let suffix = match record.change.operation {
         ChangeOperation::Upsert => "put",

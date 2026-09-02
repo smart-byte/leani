@@ -3,9 +3,9 @@
 use std::collections::HashSet;
 
 use anyhow::{Context as _, Result, bail};
-use leani_processor_api::UndoPolicyMode;
+use leani_processor_uniswap::UNISWAP_OBSERVATIONS_VERSION;
 
-use crate::config::{ProcessorConfig, ProcessorHistoryMode, PublishMode};
+use crate::{builtin_processors::processor_contract, config::ProcessorConfig};
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Token {
@@ -109,56 +109,18 @@ pub(crate) fn processor_config(
     instance: &str,
     finalized_only: bool,
 ) -> Result<ProcessorConfig> {
-    let mut processor: ProcessorConfig = toml::from_str(
-        r#"
-id = "uniswap-observations"
-instance = "uniswap-observations"
-version = "2.1.0"
-history_control = "node_owned"
-history_mode = "on_demand"
-start_block = 12376729
-publish = "optimistic_and_finalized"
-
-[state]
-mode = "checkpointed"
-
-[artifacts]
-mode = "none"
-
-[output]
-mode = "full"
-
-[delivery]
-mode = "window"
-max_bytes = "64MiB"
-max_age = "24h"
-on_limit = "pause"
-
-[checkpoint]
-mode = "automatic"
-keep = 3
-
-[undo]
-mode = "unfinalized"
-safety_blocks = 256
-
-[settings]
-"#,
-    )
-    .context("parse built-in Uniswap processor contract")?;
-    instance.clone_into(&mut processor.instance);
-    processor.history_mode = ProcessorHistoryMode::OnDemand;
-    processor.start_block = markets
+    let start_block = markets
         .iter()
         .map(|market| market.start_block)
         .min()
         .context("at least one market is required")?;
-    if finalized_only {
-        processor.publish = PublishMode::FinalizedOnly;
-        processor.output.finalized_only = true;
-        processor.undo.mode = UndoPolicyMode::None;
-        processor.undo.safety_blocks = 0;
-    }
+    let mut processor = processor_contract(
+        "uniswap-observations",
+        instance,
+        UNISWAP_OBSERVATIONS_VERSION,
+        start_block,
+        finalized_only,
+    );
     let pools = markets
         .iter()
         .map(|market| {
@@ -175,4 +137,38 @@ safety_blocks = 256
         .settings
         .insert("pools".to_owned(), toml::Value::Array(pools));
     Ok(processor)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn market_catalog_is_unique_and_matches_the_compact_schema() {
+        let symbols = MARKET_CATALOG
+            .iter()
+            .map(|market| market.symbol)
+            .collect::<Vec<_>>();
+        let pools = MARKET_CATALOG
+            .iter()
+            .map(|market| market.pool.to_ascii_lowercase())
+            .collect::<HashSet<_>>();
+        assert_eq!(
+            symbols.iter().copied().collect::<HashSet<_>>().len(),
+            symbols.len()
+        );
+        assert_eq!(pools.len(), symbols.len());
+
+        let schema: serde_json::Value =
+            serde_json::from_str(include_str!("../../../config/schema-v1.json"))
+                .expect("configuration schema");
+        let schema_symbols =
+            schema["$defs"]["starterUniswap"]["properties"]["markets"]["items"]["enum"]
+                .as_array()
+                .expect("starter market enum")
+                .iter()
+                .map(|value| value.as_str().expect("market symbol"))
+                .collect::<Vec<_>>();
+        assert_eq!(schema_symbols, symbols);
+    }
 }

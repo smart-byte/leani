@@ -102,10 +102,11 @@ through `leani_p2p_peer_candidates_admitted_total`,
 and warm startup instead of treating cache size as evidence of usefulness.
 
 Every new ETH session is immediately tested against the current independently
-verified execution anchor. Only a peer that returns both the exact header and
-a body matching its commitments enters the live material pool. Leani races
-qualifications until the first serving peer is ready, then qualifies remaining
-sessions one at a time at normal priority so live requests win. Proven serving
+verified execution anchor. Leani races qualifications until the configured
+body-serving target is ready, then continues one qualification at a time at
+normal priority. Qualification ranks proven serving peers first but does not
+exclude a newly connected peer: each material response is independently
+verified before use, so fresh peers remain immediate fallbacks. Proven serving
 peers are tried before untested discovery records on the next start.
 
 `sources.live.material_request_concurrency` bounds simultaneous physical

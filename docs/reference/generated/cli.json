@@ -37,9 +37,7 @@
         "help": "Tracing filter, e.g. `info,leani=debug`",
         "required": false,
         "action": "Set",
-        "defaultValues": [
-          "info"
-        ],
+        "defaultValues": [],
         "possibleValues": []
       },
       {
@@ -116,9 +114,7 @@
             "help": "Tracing filter, e.g. `info,leani=debug`",
             "required": false,
             "action": "Set",
-            "defaultValues": [
-              "info"
-            ],
+            "defaultValues": [],
             "possibleValues": []
           },
           {
@@ -181,9 +177,7 @@
             "help": "Tracing filter, e.g. `info,leani=debug`",
             "required": false,
             "action": "Set",
-            "defaultValues": [
-              "info"
-            ],
+            "defaultValues": [],
             "possibleValues": []
           },
           {
@@ -322,9 +316,7 @@
             "help": "Tracing filter, e.g. `info,leani=debug`",
             "required": false,
             "action": "Set",
-            "defaultValues": [
-              "info"
-            ],
+            "defaultValues": [],
             "possibleValues": []
           },
           {
@@ -569,9 +561,7 @@
             "help": "Tracing filter, e.g. `info,leani=debug`",
             "required": false,
             "action": "Set",
-            "defaultValues": [
-              "info"
-            ],
+            "defaultValues": [],
             "possibleValues": []
           },
           {
@@ -634,9 +624,7 @@
             "help": "Tracing filter, e.g. `info,leani=debug`",
             "required": false,
             "action": "Set",
-            "defaultValues": [
-              "info"
-            ],
+            "defaultValues": [],
             "possibleValues": []
           },
           {
@@ -666,6 +654,16 @@
             "about": "Delete all node and embedded-subscription state in the resolved data directory",
             "usage": "Usage: leani reset all [OPTIONS]",
             "arguments": [
+              {
+                "id": "data_dir",
+                "long": "data-dir",
+                "short": null,
+                "help": "Runtime data directory to reset instead of the configured/default directory",
+                "required": false,
+                "action": "Set",
+                "defaultValues": [],
+                "possibleValues": []
+              },
               {
                 "id": "yes",
                 "long": "yes",
@@ -713,9 +711,7 @@
                 "help": "Tracing filter, e.g. `info,leani=debug`",
                 "required": false,
                 "action": "Set",
-                "defaultValues": [
-                  "info"
-                ],
+                "defaultValues": [],
                 "possibleValues": []
               },
               {
@@ -785,6 +781,16 @@
                 ]
               },
               {
+                "id": "data_dir",
+                "long": "data-dir",
+                "short": null,
+                "help": "Exact embedded subscription directory to reset",
+                "required": false,
+                "action": "Set",
+                "defaultValues": [],
+                "possibleValues": []
+              },
+              {
                 "id": "yes",
                 "long": "yes",
                 "short": null,
@@ -831,9 +837,7 @@
                 "help": "Tracing filter, e.g. `info,leani=debug`",
                 "required": false,
                 "action": "Set",
-                "defaultValues": [
-                  "info"
-                ],
+                "defaultValues": [],
                 "possibleValues": []
               },
               {
@@ -959,9 +963,7 @@
             "help": "Tracing filter, e.g. `info,leani=debug`",
             "required": false,
             "action": "Set",
-            "defaultValues": [
-              "info"
-            ],
+            "defaultValues": [],
             "possibleValues": []
           },
           {
@@ -1024,9 +1026,7 @@
             "help": "Tracing filter, e.g. `info,leani=debug`",
             "required": false,
             "action": "Set",
-            "defaultValues": [
-              "info"
-            ],
+            "defaultValues": [],
             "possibleValues": []
           },
           {
@@ -1088,9 +1088,7 @@
                 "help": "Tracing filter, e.g. `info,leani=debug`",
                 "required": false,
                 "action": "Set",
-                "defaultValues": [
-                  "info"
-                ],
+                "defaultValues": [],
                 "possibleValues": []
               },
               {
@@ -1282,9 +1280,7 @@
                     "help": "Tracing filter, e.g. `info,leani=debug`",
                     "required": false,
                     "action": "Set",
-                    "defaultValues": [
-                      "info"
-                    ],
+                    "defaultValues": [],
                     "possibleValues": []
                   },
                   {
@@ -1469,9 +1465,7 @@
                     "help": "Tracing filter, e.g. `info,leani=debug`",
                     "required": false,
                     "action": "Set",
-                    "defaultValues": [
-                      "info"
-                    ],
+                    "defaultValues": [],
                     "possibleValues": []
                   },
                   {
@@ -1596,9 +1590,7 @@
                     "help": "Tracing filter, e.g. `info,leani=debug`",
                     "required": false,
                     "action": "Set",
-                    "defaultValues": [
-                      "info"
-                    ],
+                    "defaultValues": [],
                     "possibleValues": []
                   },
                   {
@@ -1711,9 +1703,7 @@
                     "help": "Tracing filter, e.g. `info,leani=debug`",
                     "required": false,
                     "action": "Set",
-                    "defaultValues": [
-                      "info"
-                    ],
+                    "defaultValues": [],
                     "possibleValues": []
                   },
                   {
@@ -1874,9 +1864,7 @@
             "help": "Tracing filter, e.g. `info,leani=debug`",
             "required": false,
             "action": "Set",
-            "defaultValues": [
-              "info"
-            ],
+            "defaultValues": [],
             "possibleValues": []
           },
           {
@@ -2010,9 +1998,7 @@
                 "help": "Tracing filter, e.g. `info,leani=debug`",
                 "required": false,
                 "action": "Set",
-                "defaultValues": [
-                  "info"
-                ],
+                "defaultValues": [],
                 "possibleValues": []
               },
               {
@@ -2137,9 +2123,7 @@
                 "help": "Tracing filter, e.g. `info,leani=debug`",
                 "required": false,
                 "action": "Set",
-                "defaultValues": [
-                  "info"
-                ],
+                "defaultValues": [],
                 "possibleValues": []
               },
               {
@@ -2242,9 +2226,7 @@
                 "help": "Tracing filter, e.g. `info,leani=debug`",
                 "required": false,
                 "action": "Set",
-                "defaultValues": [
-                  "info"
-                ],
+                "defaultValues": [],
                 "possibleValues": []
               },
               {
@@ -2835,9 +2817,7 @@
             "help": "Tracing filter, e.g. `info,leani=debug`",
             "required": false,
             "action": "Set",
-            "defaultValues": [
-              "info"
-            ],
+            "defaultValues": [],
             "possibleValues": []
           },
           {
@@ -2919,9 +2899,7 @@
                 "help": "Tracing filter, e.g. `info,leani=debug`",
                 "required": false,
                 "action": "Set",
-                "defaultValues": [
-                  "info"
-                ],
+                "defaultValues": [],
                 "possibleValues": []
               },
               {
@@ -3144,9 +3122,7 @@
                 "help": "Tracing filter, e.g. `info,leani=debug`",
                 "required": false,
                 "action": "Set",
-                "defaultValues": [
-                  "info"
-                ],
+                "defaultValues": [],
                 "possibleValues": []
               },
               {
@@ -3240,9 +3216,7 @@
             "help": "Tracing filter, e.g. `info,leani=debug`",
             "required": false,
             "action": "Set",
-            "defaultValues": [
-              "info"
-            ],
+            "defaultValues": [],
             "possibleValues": []
           },
           {
@@ -3336,9 +3310,7 @@
                 "help": "Tracing filter, e.g. `info,leani=debug`",
                 "required": false,
                 "action": "Set",
-                "defaultValues": [
-                  "info"
-                ],
+                "defaultValues": [],
                 "possibleValues": []
               },
               {
@@ -3508,9 +3480,7 @@
                 "help": "Tracing filter, e.g. `info,leani=debug`",
                 "required": false,
                 "action": "Set",
-                "defaultValues": [
-                  "info"
-                ],
+                "defaultValues": [],
                 "possibleValues": []
               },
               {
@@ -3604,9 +3574,7 @@
             "help": "Tracing filter, e.g. `info,leani=debug`",
             "required": false,
             "action": "Set",
-            "defaultValues": [
-              "info"
-            ],
+            "defaultValues": [],
             "possibleValues": []
           },
           {
@@ -3668,9 +3636,7 @@
                 "help": "Tracing filter, e.g. `info,leani=debug`",
                 "required": false,
                 "action": "Set",
-                "defaultValues": [
-                  "info"
-                ],
+                "defaultValues": [],
                 "possibleValues": []
               },
               {
@@ -3733,9 +3699,7 @@
                 "help": "Tracing filter, e.g. `info,leani=debug`",
                 "required": false,
                 "action": "Set",
-                "defaultValues": [
-                  "info"
-                ],
+                "defaultValues": [],
                 "possibleValues": []
               },
               {
@@ -3808,9 +3772,7 @@
                 "help": "Tracing filter, e.g. `info,leani=debug`",
                 "required": false,
                 "action": "Set",
-                "defaultValues": [
-                  "info"
-                ],
+                "defaultValues": [],
                 "possibleValues": []
               },
               {
@@ -3873,9 +3835,7 @@
                 "help": "Tracing filter, e.g. `info,leani=debug`",
                 "required": false,
                 "action": "Set",
-                "defaultValues": [
-                  "info"
-                ],
+                "defaultValues": [],
                 "possibleValues": []
               },
               {
@@ -3958,9 +3918,7 @@
                 "help": "Tracing filter, e.g. `info,leani=debug`",
                 "required": false,
                 "action": "Set",
-                "defaultValues": [
-                  "info"
-                ],
+                "defaultValues": [],
                 "possibleValues": []
               },
               {

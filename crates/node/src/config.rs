@@ -36,6 +36,7 @@ pub struct Config {
     pub budgets: BudgetConfig,
     pub sources: SourcesConfig,
     pub finality: FinalityConfig,
+    #[serde(default)]
     pub processors: Vec<ProcessorConfig>,
     pub rpc: RpcConfig,
     pub api: ApiConfig,
@@ -159,7 +160,10 @@ impl StarterConfig {
         ))
         .map_err(|error| format!("built-in Ethereum Mainnet defaults are invalid: {error}"))?;
         let processor = match (self.blocks, self.uniswap) {
-            (Some(_), None) => crate::block_summaries::processor_config("block-summary", false),
+            (Some(_), None) => Ok(crate::block_summaries::processor_config(
+                "block-summary",
+                false,
+            )),
             (None, Some(uniswap)) => {
                 let markets = crate::uniswap_markets::resolve_markets(&uniswap.markets)
                     .map_err(|error| error.to_string())?;
@@ -177,11 +181,7 @@ impl StarterConfig {
         config.data_dir = self.data_dir;
         config.finality.checkpoint = self.finality.checkpoint;
         config.finality.checkpoint_slot = self.finality.checkpoint_slot;
-        for endpoint in self.finality.endpoints {
-            if !config.finality.endpoints.contains(&endpoint) {
-                config.finality.endpoints.push(endpoint);
-            }
-        }
+        config.finality.endpoints = self.finality.endpoints;
         config.processors = vec![processor];
         config.api.bind = self.api.bind;
         Ok(config)
@@ -1397,12 +1397,11 @@ impl Config {
             ));
         }
         if matches!(self.sources.live.kind, LiveSourceKind::P2p)
-            && (self.sources.live.body_serving_peer_target < self.sources.live.minimum_peers
-                || self.sources.live.body_serving_peer_target > self.sources.live.preferred_peers)
+            && self.sources.live.body_serving_peer_target > self.sources.live.preferred_peers
         {
             errors.push(ValidationError::new(
                 "sources.live.body_serving_peer_target",
-                "must be between minimum_peers and preferred_peers for p2p",
+                "must not exceed preferred_peers for p2p; values below minimum_peers use the availability floor",
             ));
         }
         if matches!(self.sources.live.kind, LiveSourceKind::P2p)
@@ -3098,13 +3097,10 @@ bind = "127.0.0.1:18080"
         assert_eq!(config.sources.live.minimum_peers, 1);
         assert_eq!(config.sources.live.body_serving_peer_target, 4);
         assert_eq!(config.sources.live.preferred_peers, 16);
-        assert_eq!(config.finality.endpoints.len(), 2);
-        assert!(
-            config
-                .finality
-                .endpoints
-                .iter()
-                .any(|endpoint| endpoint.as_str() == "https://lodestar-mainnet.chainsafe.io/")
+        assert_eq!(config.finality.endpoints.len(), 1);
+        assert_eq!(
+            config.finality.endpoints[0].as_str(),
+            "https://ethereum-beacon-api.publicnode.com/"
         );
         assert_eq!(config.rpc.http_bind.port(), 18_545);
         assert_eq!(config.api.bind.port(), 18_080);

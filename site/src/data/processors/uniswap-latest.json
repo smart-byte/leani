@@ -66,7 +66,7 @@
       "reserve1": null,
       "amount0": "1000000000",
       "amount1": "-533333333333333333",
-      "sqrtPriceX96": "1829233563324955304354064818",
+      "sqrtPriceX96": "1829233563324955304354064818000000",
       "blockNumber": 25696396,
       "blockHash": "0xc86f87600c81fb635325cca051fef40b875ca405d1b2f57881437963321e88ff",
       "logIndex": 158,

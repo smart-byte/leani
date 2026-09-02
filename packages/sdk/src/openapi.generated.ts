@@ -1195,6 +1195,45 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/processors/{processor}/query/latest": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                processor: components["parameters"]["Processor"];
+            };
+            cookie?: never;
+        };
+        /** Read the latest indexed Ethereum block summary */
+        get: operations["getLatestBlockSummary"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/processors/{processor}/query/blocks/{number}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                processor: components["parameters"]["Processor"];
+                number: components["schemas"]["SafeInteger"];
+            };
+            cookie?: never;
+        };
+        /** Read an indexed Ethereum block summary by block number */
+        get: operations["getBlockSummaryByNumber"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
 }
 export type webhooks = Record<string, never>;
 export interface components {
@@ -1501,6 +1540,24 @@ export interface components {
         LatestUniswapObservation: {
             data: components["schemas"]["UniswapPoolPrice"];
             timestamp: components["schemas"]["SafeInteger"];
+        };
+        BlockSummary: {
+            chainId: components["schemas"]["SafeInteger"];
+            blockNumber: components["schemas"]["SafeInteger"];
+            blockHash: components["schemas"]["Hash32"];
+            parentHash: components["schemas"]["Hash32"];
+            timestamp: components["schemas"]["SafeInteger"];
+            gasLimit: components["schemas"]["SafeInteger"] | null;
+            gasUsed: components["schemas"]["SafeInteger"] | null;
+            baseFeePerGas: components["schemas"]["DecimalQuantity"] | null;
+            blobGasUsed: components["schemas"]["SafeInteger"] | null;
+            excessBlobGas: components["schemas"]["SafeInteger"] | null;
+            transactionCount: components["schemas"]["SafeInteger"] | null;
+            sizeBytes: components["schemas"]["SafeInteger"] | null;
+            finality: components["schemas"]["Finality"];
+        };
+        LatestBlockSummary: {
+            data: components["schemas"]["BlockSummary"];
         };
         ChangeBlock: {
             number: components["schemas"]["SafeInteger"];
@@ -3347,6 +3404,53 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["LatestUniswapObservation"];
+                };
+            };
+            default: components["responses"]["Error"];
+        };
+    };
+    getLatestBlockSummary: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                processor: components["parameters"]["Processor"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Latest block summary produced by the selected processor instance. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["LatestBlockSummary"];
+                };
+            };
+            default: components["responses"]["Error"];
+        };
+    };
+    getBlockSummaryByNumber: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                processor: components["parameters"]["Processor"];
+                number: components["schemas"]["SafeInteger"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Canonical block summary at the selected height. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["LatestBlockSummary"];
                 };
             };
             default: components["responses"]["Error"];

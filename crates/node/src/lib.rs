@@ -2,6 +2,7 @@
 
 mod benchmark;
 mod block_summaries;
+mod builtin_processors;
 pub mod cli;
 pub mod config;
 mod init;

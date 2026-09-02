@@ -9,6 +9,7 @@ homepage.workspace = true
 publish = false
 
 [dependencies]
+alloy-primitives.workspace = true
 async-trait.workspace = true
 blake3.workspace = true
 leani-primitives = { path = "../primitives" }

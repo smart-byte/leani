@@ -1127,6 +1127,41 @@ paths:
                 $ref: "#/components/schemas/LatestUniswapObservation"
         default:
           $ref: "#/components/responses/Error"
+  /v1/processors/{processor}/query/latest:
+    parameters:
+      - $ref: "#/components/parameters/Processor"
+    get:
+      summary: Read the latest indexed Ethereum block summary
+      operationId: getLatestBlockSummary
+      responses:
+        "200":
+          description: Latest block summary produced by the selected processor instance.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LatestBlockSummary"
+        default:
+          $ref: "#/components/responses/Error"
+  /v1/processors/{processor}/query/blocks/{number}:
+    parameters:
+      - $ref: "#/components/parameters/Processor"
+      - name: number
+        in: path
+        required: true
+        schema:
+          $ref: "#/components/schemas/SafeInteger"
+    get:
+      summary: Read an indexed Ethereum block summary by block number
+      operationId: getBlockSummaryByNumber
+      responses:
+        "200":
+          description: Canonical block summary at the selected height.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LatestBlockSummary"
+        default:
+          $ref: "#/components/responses/Error"
 components:
   securitySchemes:
     bearerAuth:
@@ -1940,6 +1975,58 @@ components:
           $ref: "#/components/schemas/UniswapPoolPrice"
         timestamp:
           $ref: "#/components/schemas/SafeInteger"
+    BlockSummary:
+      type: object
+      additionalProperties: false
+      required: [chainId, blockNumber, blockHash, parentHash, timestamp, gasLimit, gasUsed, baseFeePerGas, blobGasUsed, excessBlobGas, transactionCount, sizeBytes, finality]
+      properties:
+        chainId:
+          $ref: "#/components/schemas/SafeInteger"
+        blockNumber:
+          $ref: "#/components/schemas/SafeInteger"
+        blockHash:
+          $ref: "#/components/schemas/Hash32"
+        parentHash:
+          $ref: "#/components/schemas/Hash32"
+        timestamp:
+          $ref: "#/components/schemas/SafeInteger"
+        gasLimit:
+          oneOf:
+            - $ref: "#/components/schemas/SafeInteger"
+            - type: "null"
+        gasUsed:
+          oneOf:
+            - $ref: "#/components/schemas/SafeInteger"
+            - type: "null"
+        baseFeePerGas:
+          oneOf:
+            - $ref: "#/components/schemas/DecimalQuantity"
+            - type: "null"
+        blobGasUsed:
+          oneOf:
+            - $ref: "#/components/schemas/SafeInteger"
+            - type: "null"
+        excessBlobGas:
+          oneOf:
+            - $ref: "#/components/schemas/SafeInteger"
+            - type: "null"
+        transactionCount:
+          oneOf:
+            - $ref: "#/components/schemas/SafeInteger"
+            - type: "null"
+        sizeBytes:
+          oneOf:
+            - $ref: "#/components/schemas/SafeInteger"
+            - type: "null"
+        finality:
+          $ref: "#/components/schemas/Finality"
+    LatestBlockSummary:
+      type: object
+      additionalProperties: false
+      required: [data]
+      properties:
+        data:
+          $ref: "#/components/schemas/BlockSummary"
     ChangeBlock:
       type: object
       additionalProperties: false

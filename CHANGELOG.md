@@ -8,6 +8,12 @@ record, and documented RPC contracts.
 
 ### Changed
 
+- `LiveSource::subscribe` now receives the compiled `DataRequest`, allowing
+  sources to acquire only the material required by the active processor set.
+- Uniswap 2.1 public entity/change JSON now uses camelCase fields, `0x` address
+  and hash strings, decimal quantities, and signed decimal swap amounts.
+- Compact finality endpoint lists replace the managed defaults when supplied,
+  and runtime data directories are exclusively locked across processes.
 - The CLI now discovers `./leani.toml` by default; `LEANI_CONFIG` and
   `--config` remain explicit overrides.
 - `ProcessorFactory::id` accepts an ordinary borrowed string again, and
@@ -42,6 +48,11 @@ record, and documented RPC contracts.
 
 ### Added
 
+- `leani subscribe blocks` and the built-in `block-summary` 1.1.0 processor,
+  including latest/by-number native queries and typed SDK helpers.
+- `leani subscribe uniswap-v3 MARKET...`, embedded/attached auto-detection,
+  exact V3 price and base-token volume output, stable JSON/raw formats, and
+  scoped cold-start reset commands.
 - Processor-owned native query extensions with canonical instance-scoped
   routes, collision-safe optional aliases, bounded read-only contexts,
   capability discovery, a safe same-origin SDK request primitive, and a

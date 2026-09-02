@@ -336,6 +336,35 @@ export interface LatestUniswapObservation {
   timestamp: number;
 }
 
+export interface ConfiguredUniswapPool {
+  address: Hex;
+  kind: "v2" | "v3";
+}
+
+export interface ConfiguredUniswapPools {
+  data: ConfiguredUniswapPool[];
+}
+
+export interface BlockSummary {
+  chainId: number;
+  blockNumber: number;
+  blockHash: Hex;
+  parentHash: Hex;
+  timestamp: number;
+  gasLimit: number | null;
+  gasUsed: number | null;
+  baseFeePerGas: string | null;
+  blobGasUsed: number | null;
+  excessBlobGas: number | null;
+  transactionCount: number | null;
+  sizeBytes: number | null;
+  finality: Finality;
+}
+
+export interface LatestBlockSummary {
+  data: BlockSummary;
+}
+
 export interface ChangeEnvelope<T = unknown> {
   apiVersion: "1";
   sequence: string;
@@ -616,9 +645,26 @@ export interface LeaniClient {
       address: Hex,
       options?: { processor?: string; signal?: AbortSignal },
     ): Promise<LatestUniswapObservation>;
+    listConfiguredPools(options?: {
+      processor?: string;
+      signal?: AbortSignal;
+    }): Promise<ConfiguredUniswapPools>;
     subscribe(
       options?: SubscribeOptions,
     ): AsyncGenerator<ChangeEnvelope<UniswapPoolPrice>>;
+  };
+  blocks: {
+    getLatest(options?: {
+      processor?: string;
+      signal?: AbortSignal;
+    }): Promise<LatestBlockSummary>;
+    getByNumber(
+      number: number,
+      options?: { processor?: string; signal?: AbortSignal },
+    ): Promise<LatestBlockSummary>;
+    subscribe(
+      options?: SubscribeOptions,
+    ): AsyncGenerator<ChangeEnvelope<BlockSummary>>;
   };
 }
 
@@ -1026,8 +1072,37 @@ export function createLeaniClient(
           undefined,
           { signal: options.signal },
         ),
+      listConfiguredPools: (
+        options: { processor?: string; signal?: AbortSignal } = {},
+      ) =>
+        request<ConfiguredUniswapPools>(
+          `v1/processors/${encodeURIComponent(options.processor ?? "uniswap-observations")}/query/pools`,
+          undefined,
+          { signal: options.signal },
+        ),
       subscribe: (subscribeOptions: SubscribeOptions = {}) =>
         subscribe<UniswapPoolPrice>("uniswap-observations", subscribeOptions),
+    }),
+    blocks: Object.freeze({
+      getLatest: (
+        options: { processor?: string; signal?: AbortSignal } = {},
+      ) =>
+        request<LatestBlockSummary>(
+          `v1/processors/${encodeURIComponent(options.processor ?? "block-summary")}/query/latest`,
+          undefined,
+          { signal: options.signal },
+        ),
+      getByNumber: (
+        number: number,
+        options: { processor?: string; signal?: AbortSignal } = {},
+      ) =>
+        request<LatestBlockSummary>(
+          `v1/processors/${encodeURIComponent(options.processor ?? "block-summary")}/query/blocks/${assertSafeInteger(number, "block number")}`,
+          undefined,
+          { signal: options.signal },
+        ),
+      subscribe: (subscribeOptions: SubscribeOptions = {}) =>
+        subscribe<BlockSummary>("block-summary", subscribeOptions),
     }),
   });
 }

@@ -10,10 +10,9 @@ use clap::{Parser, Subcommand, ValueEnum};
 pub struct Cli {
     /// Path to the versioned TOML configuration.
     ///
-    /// When omitted, Leani discovers `./leani.toml`, then the source-workspace
-    /// fallback `./config/example.toml`. `LEANI_CONFIG` provides a persistent
-    /// override without repeating this flag. For `init`, this selects the new
-    /// file instead and defaults to `./leani.toml`.
+    /// When omitted, Leani uses `./leani.toml`. `LEANI_CONFIG` provides a
+    /// persistent override without repeating this flag. For `init`, this
+    /// selects the new file instead.
     #[arg(long, global = true, env = "LEANI_CONFIG")]
     pub config: Option<PathBuf>,
 
@@ -22,8 +21,8 @@ pub struct Cli {
     pub log_format: LogFormat,
 
     /// Tracing filter, e.g. `info,leani=debug`.
-    #[arg(long, global = true, env = "LEANI_LOG", default_value = "info")]
-    pub log_filter: String,
+    #[arg(long, global = true, env = "LEANI_LOG")]
+    pub log_filter: Option<String>,
 
     #[command(subcommand)]
     pub command: Command,
@@ -323,6 +322,9 @@ pub enum SubscribeFinalitySource {
 pub enum ResetCommand {
     /// Delete all node and embedded-subscription state in the resolved data directory.
     All {
+        /// Runtime data directory to reset instead of the configured/default directory.
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
         /// Reset without interactive confirmation.
         #[arg(long)]
         yes: bool,
@@ -338,6 +340,9 @@ pub enum ResetCommand {
         /// Price finality used by the subscription state being reset.
         #[arg(long, value_enum, default_value_t = SubscribeFinality::Optimistic)]
         finality: SubscribeFinality,
+        /// Exact embedded subscription directory to reset.
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
         /// Reset without interactive confirmation.
         #[arg(long)]
         yes: bool,
@@ -903,6 +908,7 @@ mod tests {
                     targets,
                     finality,
                     yes,
+                    ..
                 },
         } = cli.command
         else {
@@ -915,7 +921,7 @@ mod tests {
 
         let cli = Cli::try_parse_from(["leani", "reset", "all", "--yes"]).expect("CLI parses");
         let Command::Reset {
-            command: ResetCommand::All { yes },
+            command: ResetCommand::All { yes, .. },
         } = cli.command
         else {
             panic!("expected full reset command");

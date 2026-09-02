@@ -31,6 +31,6 @@ describe('generated contract reference', () => {
   test('consumes the tracked Rust-owned fixtures', () => {
     expect(cli.command.name).toBe('leani');
     expect(cli.command.subcommands.some((command) => command.name === 'doctor')).toBe(true);
-    expect(processors.processors).toHaveLength(6);
+    expect(processors.processors).toHaveLength(7);
   });
 });

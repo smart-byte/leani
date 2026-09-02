@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 
-use alloy_primitives::keccak256;
+use alloy_primitives::{I256, U256, keccak256};
 use async_trait::async_trait;
 use leani_primitives::{
     Address, BlockFrame, BlockHash, BlockNumber, Capability, CapabilitySet, Completeness,
@@ -18,6 +18,7 @@ use semver::Version;
 use serde::{Deserialize, Serialize};
 
 pub const CURRENT_COLLECTION: &str = "uniswap.pools.current";
+pub const UNISWAP_OBSERVATIONS_VERSION: &str = "2.1.0";
 pub const HISTORY_COLLECTION: &str = "uniswap.pools.history";
 pub const OBSERVATION_LATEST_COLLECTION: &str = "uniswap.observations.latest";
 
@@ -192,7 +193,10 @@ impl UniswapObservationsProcessor {
             id,
             version,
             code_hash: BlockHash::new(
-                *blake3::hash(b"leani/uniswap-observations/2.1.0").as_bytes(),
+                *blake3::hash(
+                    format!("leani/uniswap-observations/{UNISWAP_OBSERVATIONS_VERSION}").as_bytes(),
+                )
+                .as_bytes(),
             ),
             config_hash,
             start: StartPoint::Block(config.start_block),
@@ -297,9 +301,19 @@ impl Processor for UniswapLatestProcessor {
         }
         let entity: PoolPriceEntity = postcard::from_bytes(value)
             .map_err(|error| ProcessorError::State(error.to_string()))?;
-        serde_json::to_value(entity)
-            .map(Some)
-            .map_err(|error| ProcessorError::State(error.to_string()))
+        Ok(Some(serde_json::json!({
+            "pool": entity.pool.to_string(),
+            "kind": entity.kind,
+            "reserve0": entity.reserve0.map(|value| U256::from_be_bytes(value.0).to_string()),
+            "reserve1": entity.reserve1.map(|value| U256::from_be_bytes(value.0).to_string()),
+            "amount0": entity.amount0.map(|value| I256::from_raw(U256::from_be_bytes(value.0)).to_string()),
+            "amount1": entity.amount1.map(|value| I256::from_raw(U256::from_be_bytes(value.0)).to_string()),
+            "sqrtPriceX96": entity.sqrt_price_x96.map(|value| U256::from_be_bytes(value.0).to_string()),
+            "blockNumber": entity.block_number.0,
+            "blockHash": entity.block_hash.to_string(),
+            "logIndex": entity.log_index,
+            "finality": entity.finality.name(),
+        })))
     }
 }
 
