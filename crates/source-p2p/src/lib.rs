@@ -195,7 +195,11 @@ pub fn validate_bootstrap_dns_tree(value: &str) -> Result<(), P2pError> {
 
 #[derive(Clone, Debug)]
 pub struct RethP2pConfig {
-    /// Hard availability floor required before requests may start.
+    /// Hard connected-peer floor required before requests may start.
+    ///
+    /// Peers do not need to complete capability qualification before they
+    /// count toward this floor. Qualification remains a background ranking
+    /// signal, while every response is independently commitment-checked.
     pub minimum_peers: usize,
     /// Number of independently verified body-serving peers kept ready before
     /// qualification falls back to low-rate background probing.
@@ -325,12 +329,11 @@ impl RethP2pConfig {
                     .to_owned(),
             ));
         }
-        if self.body_serving_peer_target < self.minimum_peers
+        if self.body_serving_peer_target == 0
             || self.body_serving_peer_target > self.preferred_peers
         {
             return Err(P2pError::InvalidConfig(
-                "body-serving peer target must be between minimum peers and preferred peers"
-                    .to_owned(),
+                "body-serving peer target must be between one and preferred peers".to_owned(),
             ));
         }
         if self.max_outbound_peers < self.minimum_peers || self.max_outbound_peers > 400 {
@@ -886,12 +889,6 @@ enum PeerQualification {
     TimedOut,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum RequiredPeerService {
-    Header,
-    Body,
-}
-
 const fn qualification_served_header(outcome: PeerQualification) -> bool {
     matches!(
         outcome,
@@ -1043,10 +1040,6 @@ impl PeerQualificationPool {
     }
 
     fn ready(&self, target: BlockRef) -> usize {
-        self.ready_for(target, RequiredPeerService::Body)
-    }
-
-    fn ready_for(&self, target: BlockRef, required: RequiredPeerService) -> usize {
         let state = self
             .state
             .lock()
@@ -1057,15 +1050,7 @@ impl PeerQualificationPool {
         state
             .outcomes
             .values()
-            .filter(|outcome| match required {
-                RequiredPeerService::Header => matches!(
-                    outcome,
-                    PeerQualification::BodyServing | PeerQualification::HeadersOnly
-                ),
-                RequiredPeerService::Body => {
-                    matches!(outcome, PeerQualification::BodyServing)
-                }
-            })
+            .filter(|outcome| matches!(outcome, PeerQualification::BodyServing))
             .count()
     }
 
@@ -1230,6 +1215,13 @@ impl DirectPeerPool {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clear();
         self.changed.notify_waiters();
+    }
+
+    fn len(&self) -> usize {
+        self.peers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
     }
 
     fn set_qualification(&self, peer_id: B512, qualification: PeerQualification) {
@@ -1975,7 +1967,6 @@ fn spawn_peer_qualification_worker(
     request_gate: Arc<MaterialRequestGate>,
     request_timeout: Duration,
     concurrency: usize,
-    minimum_ready: usize,
     body_serving_peer_target: usize,
     shutdown: CancellationToken,
 ) -> tokio::task::JoinHandle<()> {
@@ -1997,7 +1988,7 @@ fn spawn_peer_qualification_worker(
             } else {
                 1
             };
-            let priority = if ready < minimum_ready {
+            let priority = if ready == 0 {
                 Priority::High
             } else {
                 Priority::Normal
@@ -2130,11 +2121,9 @@ fn spawn_peer_qualification_worker(
     })
 }
 
-async fn wait_for_qualified_peers(
+async fn wait_for_connected_peers(
     session: &P2pSession,
-    qualifications: &PeerQualificationPool,
-    target: BlockRef,
-    required: RequiredPeerService,
+    direct_peers: &DirectPeerPool,
     minimum: usize,
     timeout: Duration,
     cancellation: &CancellationToken,
@@ -2143,19 +2132,19 @@ async fn wait_for_qualified_peers(
     loop {
         if !session.manager_is_current().await {
             return Err(P2pError::Network(
-                "execution P2P manager restarted during peer qualification".to_owned(),
+                "execution P2P manager restarted while waiting for a connected peer".to_owned(),
             ));
         }
-        let ready = qualifications.ready_for(target, required);
-        if ready >= minimum {
-            return Ok(ready);
+        let connected = direct_peers.len();
+        if connected >= minimum {
+            return Ok(connected);
         }
         tokio::select! {
             () = cancellation.cancelled() => return Err(P2pError::Cancelled),
-            () = qualifications.changed.notified() => {}
+            () = direct_peers.changed.notified() => {}
             () = tokio::time::sleep(Duration::from_millis(100)) => {}
             () = tokio::time::sleep_until(deadline) => {
-                return Err(P2pError::PeerTimeout { minimum, connected: ready });
+                return Err(P2pError::PeerTimeout { minimum, connected });
             }
         }
     }
@@ -2574,7 +2563,6 @@ where
             request_gate,
             request_timeout,
             material_request_concurrency,
-            minimum_peers,
             body_serving_peer_target,
             mut peer_store_flush_requests,
             shutdown,
@@ -2633,7 +2621,6 @@ where
             request_gate,
             request_timeout,
             material_request_concurrency,
-            minimum_peers,
             body_serving_peer_target,
             shutdown.clone(),
         );
@@ -2794,7 +2781,6 @@ struct NetworkManagerRuntime {
     request_gate: Arc<MaterialRequestGate>,
     request_timeout: Duration,
     material_request_concurrency: usize,
-    minimum_peers: usize,
     body_serving_peer_target: usize,
     peer_store_flush_requests:
         tokio::sync::mpsc::Receiver<tokio::sync::oneshot::Sender<Result<(), String>>>,
@@ -3158,14 +3144,9 @@ impl RethP2pSource {
         advertised: BlockRef,
         cancellation: &CancellationToken,
     ) -> Result<usize, P2pError> {
-        self.connect(
-            advertised,
-            NetworkLane::Live,
-            RequiredPeerService::Body,
-            cancellation,
-        )
-        .await
-        .map(|(_, connected)| connected)
+        self.connect(advertised, NetworkLane::Live, cancellation)
+            .await
+            .map(|(_, connected)| connected)
     }
 
     /// Fetch the newest self-consistent execution block advertised by the
@@ -3213,12 +3194,7 @@ impl RethP2pSource {
             ));
         }
         let (session, _) = self
-            .connect(
-                advertised,
-                NetworkLane::Live,
-                RequiredPeerService::Body,
-                cancellation,
-            )
+            .connect(advertised, NetworkLane::Live, cancellation)
             .await?;
         let (head_number, head_hash) = self
             .wait_for_peer_head(
@@ -3606,25 +3582,22 @@ impl RethP2pSource {
         &self,
         advertised: BlockRef,
         lane: NetworkLane,
-        required: RequiredPeerService,
         cancellation: &CancellationToken,
     ) -> Result<(P2pSession, usize), P2pError> {
         let (session, newly_started) = self.network_session(advertised, lane).await?;
         session
             .telemetry
             .set_range(Some(BlockRange::single(advertised.number)));
-        let already_qualified = self.network.qualifications.ready_for(advertised, required);
-        if !newly_started && already_qualified >= self.config.minimum_peers {
+        let already_connected = self.network.direct_peers.len();
+        if !newly_started && already_connected >= self.config.minimum_peers {
             session.set_phase(NetworkPhase::Ready);
             session.clear_error();
-            return Ok((session, already_qualified));
+            return Ok((session, already_connected));
         }
         session.set_phase(NetworkPhase::WaitingForPeers);
-        let connected = match wait_for_qualified_peers(
+        let connected = match wait_for_connected_peers(
             &session,
-            &self.network.qualifications,
-            advertised,
-            required,
+            &self.network.direct_peers,
             self.config.minimum_peers,
             self.config.peer_wait_timeout,
             cancellation,
@@ -3788,7 +3761,6 @@ impl RethP2pSource {
                 request_gate: self.network.request_gate.clone(),
                 request_timeout: self.config.request_timeout,
                 material_request_concurrency: self.config.material_request_concurrency,
-                minimum_peers: self.config.minimum_peers,
                 body_serving_peer_target: self.config.body_serving_peer_target,
                 peer_store_flush_requests,
                 shutdown: shutdown.clone(),
@@ -4239,16 +4211,7 @@ impl RethP2pSource {
         loop {
             attempts = attempts.saturating_add(1);
             let session = match self
-                .connect(
-                    advertised,
-                    NetworkLane::Live,
-                    if header_only_request(request) {
-                        RequiredPeerService::Header
-                    } else {
-                        RequiredPeerService::Body
-                    },
-                    cancellation,
-                )
+                .connect(advertised, NetworkLane::Live, cancellation)
                 .await
             {
                 Ok((session, _)) => session,
@@ -4679,12 +4642,7 @@ impl RethP2pSource {
                 .as_secs(),
         };
         let (session, connected_peers) = self
-            .connect(
-                advertised,
-                NetworkLane::Probe,
-                RequiredPeerService::Body,
-                &cancellation,
-            )
+            .connect(advertised, NetworkLane::Probe, &cancellation)
             .await?;
         let telemetry = session.telemetry.clone();
         telemetry.set_range(Some(range));
@@ -6037,12 +5995,7 @@ impl RethP2pHistorySource {
             shared
         } else {
             self.source
-                .connect(
-                    self.anchor.block,
-                    NetworkLane::History,
-                    RequiredPeerService::Body,
-                    cancellation,
-                )
+                .connect(self.anchor.block, NetworkLane::History, cancellation)
                 .await?
                 .0
         };
@@ -7427,32 +7380,14 @@ impl LiveSource for RethP2pSource {
         };
         let (session, last, queued, recent) = if let Some(recent) = retained {
             let (session, _) = self
-                .connect(
-                    anchor,
-                    NetworkLane::Live,
-                    if header_only_request(&request) {
-                        RequiredPeerService::Header
-                    } else {
-                        RequiredPeerService::Body
-                    },
-                    &cancellation,
-                )
+                .connect(anchor, NetworkLane::Live, &cancellation)
                 .await?;
             self.wait_for_peer_head(&session, required_peer_head, &cancellation)
                 .await?;
             (session, anchor, VecDeque::new(), recent)
         } else if overlap_blocks == 0 {
             let (session, _) = self
-                .connect(
-                    anchor,
-                    NetworkLane::Live,
-                    if header_only_request(&request) {
-                        RequiredPeerService::Header
-                    } else {
-                        RequiredPeerService::Body
-                    },
-                    &cancellation,
-                )
+                .connect(anchor, NetworkLane::Live, &cancellation)
                 .await?;
             self.wait_for_peer_head(&session, required_peer_head, &cancellation)
                 .await?;
@@ -7774,16 +7709,7 @@ async fn reconnect_live_session(
         attempts = attempts.saturating_add(1);
         match state
             .source
-            .connect(
-                state.last,
-                NetworkLane::Live,
-                if header_only_request(&state.request) {
-                    RequiredPeerService::Header
-                } else {
-                    RequiredPeerService::Body
-                },
-                &state.cancellation,
-            )
+            .connect(state.last, NetworkLane::Live, &state.cancellation)
             .await
         {
             Ok((session, _)) => {
@@ -10189,6 +10115,16 @@ mod tests {
                 Err(P2pError::InvalidConfig(_))
             ));
         }
+
+        let independent_targets = RethP2pConfig {
+            minimum_peers: 8,
+            body_serving_peer_target: 4,
+            ..RethP2pConfig::default()
+        };
+        assert!(
+            RethP2pSource::mainnet(independent_targets).is_ok(),
+            "the connected-peer floor must not become a qualification floor"
+        );
     }
 
     #[test]
@@ -10338,17 +10274,13 @@ mod tests {
         let qualifications = PeerQualificationPool::new(target);
         qualifications.record(target, peer, PeerQualification::BodyServing);
         assert_eq!(qualifications.ready(target), 1);
-        assert_eq!(
-            qualifications.ready_for(target, RequiredPeerService::Header),
-            1
-        );
 
         qualifications.reset(target);
         assert_eq!(qualifications.ready(target), 0);
     }
 
     #[test]
-    fn header_only_readiness_accepts_headers_only_peers() {
+    fn header_only_qualification_does_not_count_as_body_serving() {
         let target = BlockRef {
             number: BlockNumber(25_000_000),
             hash: BlockHash::new([0x11; 32]),
@@ -10362,9 +10294,25 @@ mod tests {
             PeerQualification::HeadersOnly,
         );
         assert_eq!(qualifications.ready(target), 0);
-        assert_eq!(
-            qualifications.ready_for(target, RequiredPeerService::Header),
-            1
+    }
+
+    #[test]
+    fn connected_unqualified_peer_is_immediately_available_for_verified_requests() {
+        let pool = direct_peer_pool();
+        let peer_id = B512::from([0x51; 64]);
+        let (sender, _receiver) = tokio::sync::mpsc::channel(1);
+        pool.insert(DirectPeer {
+            peer_id,
+            eth_version: EthVersion::Eth68,
+            messages: PeerRequestSender::new(peer_id, sender),
+            advertised_head: None,
+        });
+
+        assert_eq!(pool.len(), 1, "the physical session satisfies the floor");
+        assert!(
+            pool.try_acquire_excluding(PeerMaterialKind::Body, 1, &HashSet::new(), None,)
+                .is_some(),
+            "background qualification must rank, not exclude, the session"
         );
     }
 

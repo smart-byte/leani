@@ -145,8 +145,10 @@ verification.
 `sources.live.trusted_peers` may contain stable operator/community `enode://`
 seeds that supplement public discovery without turning the pool into an
 allowlist.
-`sources.live.minimum_peers` is the hard availability floor before execution
-requests may start and should normally remain `1`.
+`sources.live.minimum_peers` is the hard connected-session floor before
+execution requests may start and should normally remain `1`. Capability
+qualification does not gate startup: it ranks proven peers first while
+commitment validation remains mandatory for every response.
 `body_serving_peer_target` controls how many peers Leani concurrently proves
 can serve commitment-valid bodies; reaching it does not delay startup after
 the minimum is available. `preferred_peers` is a soft operational target and

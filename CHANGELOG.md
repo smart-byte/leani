@@ -19,6 +19,9 @@ record, and documented RPC contracts.
 - Execution peer candidates and verified service evidence now use the bounded
   `execution-network.sqlite` WAL store with background incremental persistence;
   the pre-launch JSON peer-state formats are intentionally not migrated.
+- Execution peer qualification is now a background ranking signal rather than
+  a startup gate. Requests begin at the configured connected-peer floor and
+  continue to commitment-check every response.
 - `ProcessorFactory::id` accepts an ordinary borrowed string again, and
   `description` has a backwards-compatible default for downstream factories.
 - Public documentation and the Astro landing page now live in this monorepo,

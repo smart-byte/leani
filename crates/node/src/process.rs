@@ -4218,8 +4218,8 @@ fn p2p_probe_source(
             .sources
             .live
             .body_serving_peer_target
-            .max(options.minimum_peers)
-            .min(max_outbound_peers),
+            .min(max_outbound_peers)
+            .max(1),
         preferred_peers: config
             .sources
             .live
@@ -5638,12 +5638,7 @@ pub(crate) fn execution_p2p_source(
         .collect::<Result<Vec<_>, _>>()?;
     let p2p_config = leani_source_p2p::RethP2pConfig {
         minimum_peers: config.sources.live.minimum_peers,
-        body_serving_peer_target: config
-            .sources
-            .live
-            .body_serving_peer_target
-            .max(config.sources.live.minimum_peers)
-            .min(config.sources.live.preferred_peers),
+        body_serving_peer_target: config.sources.live.body_serving_peer_target,
         preferred_peers: config.sources.live.preferred_peers,
         max_outbound_peers: config.sources.live.max_outbound_peers,
         max_concurrent_dials: config.sources.live.max_concurrent_dials,

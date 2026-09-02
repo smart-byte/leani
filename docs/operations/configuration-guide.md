@@ -183,8 +183,10 @@ Reth's per-peer backoff prevents rapid redials. Newly authenticated DNS/Discv
 candidates are added to that same queue. `max_concurrent_dials` remains the
 hard simultaneous dial ceiling; `peer_refill_interval_ms` is only a short
 safety-net poll for newly added candidates, not a network request rate.
-`minimum_peers` remains the startup gate. After that first verified peer is
-available, qualification continues concurrently until
+`minimum_peers` is the connected-session startup gate. A peer need not finish
+capability qualification before requests may use it: every response is still
+commitment-checked, and qualification ranks proven peers first. Background
+qualification continues concurrently until
 `body_serving_peer_target` distinct peers have served a
 commitment-valid body at the current target; the default target is four.
 Request health is tracked independently for headers, bodies, and receipts. A

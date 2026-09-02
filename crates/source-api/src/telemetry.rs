@@ -731,7 +731,7 @@ pub struct NetworkPeerQualificationSnapshot {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NetworkPeerTargetsSnapshot {
-    /// Hard availability floor required before requests may start.
+    /// Hard connected-peer floor required before requests may start.
     pub minimum: u64,
     /// Desired number of independently verified body-serving peers.
     pub body_serving: u64,

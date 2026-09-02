@@ -33,3 +33,4 @@ Accepted records:
 - [0011 — Process-wide execution P2P manager](0011-process-wide-execution-p2p-manager.md)
 - [0012 — Two-tier execution peer startup](0012-two-tier-execution-peer-startup.md)
 - [0013 — SQLite execution peer store](0013-sqlite-execution-peer-store.md)
+- [0014 — Opportunistic execution peer qualification](0014-opportunistic-execution-peer-qualification.md)

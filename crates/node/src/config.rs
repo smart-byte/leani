@@ -497,7 +497,8 @@ pub enum HistoryTrust {
 #[serde(deny_unknown_fields)]
 pub struct LiveSourceConfig {
     pub kind: LiveSourceKind,
-    /// Hard availability floor required before execution requests may start.
+    /// Hard connected-peer floor required before execution requests may start.
+    /// Capability qualification ranks peers but does not gate this floor.
     pub minimum_peers: usize,
     /// Independently verified body-serving peers kept ready for fast request
     /// failover. Startup still proceeds once `minimum_peers` is satisfied.
@@ -1397,11 +1398,12 @@ impl Config {
             ));
         }
         if matches!(self.sources.live.kind, LiveSourceKind::P2p)
-            && self.sources.live.body_serving_peer_target > self.sources.live.preferred_peers
+            && (self.sources.live.body_serving_peer_target == 0
+                || self.sources.live.body_serving_peer_target > self.sources.live.preferred_peers)
         {
             errors.push(ValidationError::new(
                 "sources.live.body_serving_peer_target",
-                "must not exceed preferred_peers for p2p; values below minimum_peers use the availability floor",
+                "must be in 1..=preferred_peers for p2p",
             ));
         }
         if matches!(self.sources.live.kind, LiveSourceKind::P2p)
@@ -3050,6 +3052,16 @@ verification_segment_blocks = 8192"#,
                 "missing validation error for {field}"
             );
         }
+    }
+
+    #[test]
+    fn connected_and_body_serving_peer_targets_are_independent() {
+        let mut config = config();
+        config.sources.live.minimum_peers = 8;
+        config.sources.live.body_serving_peer_target = 4;
+        config
+            .validate()
+            .expect("qualification target may be below the connected-session floor");
     }
 
     #[test]

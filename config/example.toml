@@ -89,8 +89,8 @@ endpoint = "https://data.ethpandaops.io/erae/mainnet/"
 [sources.live]
 kind = "p2p"
 minimum_peers = 1
-# Start as soon as one verified body-serving peer is ready, then continue
-# qualifying peers concurrently until four body-serving peers are ready.
+# Start as soon as one execution peer is connected. Qualification runs in the
+# background and ranks proven peers first without blocking verified requests.
 body_serving_peer_target = 4
 # Non-blocking operational target for a healthy pool. Requests start with one
 # peer while background dialing continues beyond this target.
