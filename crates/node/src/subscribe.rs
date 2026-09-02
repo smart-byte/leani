@@ -512,20 +512,22 @@ async fn subscribe_embedded(
         .with_context(|| format!("create subscription data directory {}", data_dir.display()))?;
     let data_dir_lock = local_state::lock_runtime_directory(&data_dir)?;
     let config = embedded_config(options, markets, config_path, &data_dir).await?;
-    if let Some(peer_cache) = merge_local_execution_peer_caches(
+    if let Some(peer_store) = merge_local_execution_peer_stores(
         config_path,
         &data_dir,
-        config.sources.live.peer_cache_max_entries,
-    )? {
-        if peer_cache.imported == 0 {
+        config.sources.live.peer_store_max_entries,
+    )
+    .await?
+    {
+        if peer_store.imported == 0 {
             eprintln!(
                 "leani: loaded {} cached execution peer candidates",
-                peer_cache.total,
+                peer_store.total,
             );
         } else {
             eprintln!(
                 "leani: loaded {} cached execution peer candidates ({} imported from other local Mainnet contexts)",
-                peer_cache.total, peer_cache.imported,
+                peer_store.total, peer_store.imported,
             );
         }
     }
@@ -1119,10 +1121,10 @@ fn reset_subscription_directory(data_dir: &Path, confirmed: bool) -> Result<bool
     eprintln!("leani: embedded subscription cold-start reset");
     eprintln!("  directory: {}", data_dir.display());
     eprintln!(
-        "  removes:   checkpoint, feed-local peer/quality caches, P2P identity, and SQLite state"
+        "  removes:   checkpoint, feed-local peer store, P2P identity, and processor SQLite state"
     );
     eprintln!(
-        "  note:      other local Mainnet contexts remain reusable; `leani reset all` removes every peer cache"
+        "  note:      other local Mainnet contexts remain reusable; `leani reset all` removes every peer store"
     );
     eprintln!("Stop any embedded subscriber using this feed before continuing.");
     if !confirmed {
@@ -1147,26 +1149,44 @@ fn reset_subscription_directory(data_dir: &Path, confirmed: bool) -> Result<bool
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct PeerCacheMerge {
+struct PeerStoreMerge {
     total: usize,
     imported: usize,
 }
 
-fn merge_local_execution_peer_caches(
+async fn merge_local_execution_peer_stores(
     config_path: Option<&Path>,
     data_dir: &Path,
     maximum_entries: usize,
-) -> Result<Option<PeerCacheMerge>> {
-    let destination = data_dir.join("execution-peers.json");
+) -> Result<Option<PeerStoreMerge>> {
+    let destination = data_dir.join("execution-network.sqlite");
+    let sources = local_execution_peer_store_sources(config_path, data_dir)?;
+    leani_source_p2p::merge_execution_peer_stores(&destination, &sources, maximum_entries)
+        .await
+        .with_context(|| {
+            format!(
+                "merge local execution peer stores into {}",
+                destination.display()
+            )
+        })
+        .map(|merged| {
+            merged.map(|merged| PeerStoreMerge {
+                total: merged.total,
+                imported: merged.imported,
+            })
+        })
+}
+
+fn local_execution_peer_store_sources(
+    config_path: Option<&Path>,
+    data_dir: &Path,
+) -> Result<Vec<PathBuf>> {
     let mut sources = Vec::new();
-    if destination.is_file() {
-        sources.push(destination.clone());
-    }
     if let Some(config_path) = config_path {
         sources.push(
             Config::load(config_path)?
                 .data_dir
-                .join("execution-peers.json"),
+                .join("execution-network.sqlite"),
         );
     }
     if data_dir
@@ -1181,149 +1201,13 @@ fn merge_local_execution_peer_caches(
             let path = entry
                 .with_context(|| format!("read entry in {}", subscriptions.display()))?
                 .path()
-                .join("execution-peers.json");
+                .join("execution-network.sqlite");
             sources.push(path);
         }
     }
     sources.sort_unstable();
     sources.dedup();
-
-    let destination_entries = read_peer_cache_entries(&destination)?;
-    let destination_records = destination_entries
-        .iter()
-        .filter_map(peer_cache_record)
-        .collect::<HashSet<_>>();
-    let mut merged = BTreeMap::<String, Value>::new();
-    for entry in destination_entries {
-        if let Some(record) = peer_cache_record(&entry) {
-            merged.insert(record, entry);
-        }
-    }
-    for source in sources.iter().filter(|source| **source != destination) {
-        let entries = match read_peer_cache_entries(source) {
-            Ok(entries) => entries,
-            Err(error) => {
-                eprintln!(
-                    "leani: ignoring unreadable peer cache {}: {error:#}",
-                    source.display()
-                );
-                continue;
-            }
-        };
-        for entry in entries {
-            let Some(record) = peer_cache_record(&entry) else {
-                continue;
-            };
-            match merged.entry(record) {
-                std::collections::btree_map::Entry::Vacant(slot) => {
-                    slot.insert(entry);
-                }
-                std::collections::btree_map::Entry::Occupied(mut slot)
-                    if peer_cache_priority(&entry) > peer_cache_priority(slot.get()) =>
-                {
-                    slot.insert(entry);
-                }
-                std::collections::btree_map::Entry::Occupied(_) => {}
-            }
-        }
-    }
-    let mut entries = merged.into_iter().collect::<Vec<_>>();
-    entries.sort_by(|(left_record, left), (right_record, right)| {
-        peer_cache_priority(right)
-            .cmp(&peer_cache_priority(left))
-            .then_with(|| left_record.cmp(right_record))
-    });
-    entries.truncate(maximum_entries);
-    let imported = entries
-        .iter()
-        .filter(|(record, _)| !destination_records.contains(record))
-        .count();
-    let entries = entries
-        .into_iter()
-        .map(|(_, entry)| entry)
-        .collect::<Vec<_>>();
-    if entries.is_empty() {
-        return Ok(None);
-    }
-    write_peer_cache(&destination, &entries)?;
-    merge_local_execution_peer_quality(&sources, data_dir, maximum_entries)?;
-    Ok(Some(PeerCacheMerge {
-        total: entries.len(),
-        imported,
-    }))
-}
-
-fn merge_local_execution_peer_quality(
-    peer_cache_sources: &[PathBuf],
-    data_dir: &Path,
-    maximum_entries: usize,
-) -> Result<()> {
-    let quality_destination = data_dir.join("execution-peer-quality.json");
-    let quality_sources = peer_cache_sources
-        .iter()
-        .map(|source| source.with_file_name("execution-peer-quality.json"))
-        .collect::<Vec<_>>();
-    leani_source_p2p::merge_peer_quality_caches(
-        &quality_destination,
-        &quality_sources,
-        maximum_entries,
-    )
-    .map_err(anyhow::Error::msg)
-    .with_context(|| {
-        format!(
-            "merge execution peer-quality caches into {}",
-            quality_destination.display()
-        )
-    })?;
-    Ok(())
-}
-
-fn read_peer_cache_entries(path: &Path) -> Result<Vec<Value>> {
-    let encoded = match fs::read(path) {
-        Ok(encoded) => encoded,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(error) => {
-            return Err(error).with_context(|| format!("read peer cache {}", path.display()));
-        }
-    };
-    serde_json::from_slice(&encoded).with_context(|| format!("parse peer cache {}", path.display()))
-}
-
-fn peer_cache_record(entry: &Value) -> Option<String> {
-    entry
-        .get("record")
-        .and_then(Value::as_str)
-        .map(str::to_owned)
-}
-
-fn peer_cache_priority(entry: &Value) -> (bool, bool, bool, i64) {
-    let reputation = entry
-        .get("reputation")
-        .and_then(Value::as_i64)
-        .unwrap_or_default();
-    let has_fork = entry
-        .get("fork_id")
-        .or_else(|| entry.get("forkId"))
-        .is_some_and(|fork| !fork.is_null());
-    (reputation >= 0, reputation > 0, has_fork, reputation)
-}
-
-fn write_peer_cache(path: &Path, entries: &[Value]) -> Result<()> {
-    let parent = path
-        .parent()
-        .context("execution peer cache path has no parent directory")?;
-    fs::create_dir_all(parent)
-        .with_context(|| format!("create peer cache directory {}", parent.display()))?;
-    let mut temporary = tempfile::NamedTempFile::new_in(parent)
-        .with_context(|| format!("create peer cache in {}", parent.display()))?;
-    serde_json::to_writer_pretty(temporary.as_file_mut(), entries)?;
-    temporary.as_file_mut().write_all(b"\n")?;
-    temporary.as_file_mut().sync_all()?;
-    temporary
-        .persist(path)
-        .map_err(|error| error.error)
-        .with_context(|| format!("write merged peer cache at {}", path.display()))?;
-    Ok(())
+    Ok(sources)
 }
 
 async fn trusted_checkpoint(
@@ -3751,100 +3635,17 @@ mod tests {
     }
 
     #[test]
-    fn peer_cache_merge_reuses_sibling_candidates_and_keeps_best_metadata() {
+    fn peer_store_discovery_includes_sibling_subscription_contexts() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let subscriptions = directory.path().join("subscriptions");
         let target = subscriptions.join("0123456789abcdef");
         let sibling = subscriptions.join("fedcba9876543210");
         fs::create_dir_all(&target).expect("target state");
         fs::create_dir_all(&sibling).expect("sibling state");
-        write_peer_cache(
-            &target.join("execution-peers.json"),
-            &[
-                json!({"record": "enode://shared", "reputation": 0}),
-                json!({"record": "enode://local", "reputation": 1}),
-            ],
-        )
-        .expect("target cache");
-        write_peer_cache(
-            &sibling.join("execution-peers.json"),
-            &[
-                json!({"record": "enode://shared", "reputation": 12}),
-                json!({"record": "enode://imported", "reputation": 0, "fork_id": {}}),
-            ],
-        )
-        .expect("sibling cache");
-        fs::write(
-            target.join("execution-peer-quality.json"),
-            serde_json::to_vec_pretty(&json!({
-                "schema_version": 1,
-                "peers": {
-                    "local-peer": {
-                        "fork_compatible": true,
-                        "highest_served_block": 10,
-                        "last_header_success_unix_ms": 1,
-                        "last_body_success_unix_ms": 1,
-                        "last_receipt_success_unix_ms": null,
-                        "response_latency_ms": 30,
-                        "last_failure_reason": null,
-                        "last_failure_unix_ms": null,
-                        "qualification": "body_serving"
-                    }
-                }
-            }))
-            .expect("target quality JSON"),
-        )
-        .expect("target quality cache");
-        fs::write(
-            sibling.join("execution-peer-quality.json"),
-            serde_json::to_vec_pretty(&json!({
-                "schema_version": 1,
-                "peers": {
-                    "imported-peer": {
-                        "fork_compatible": true,
-                        "highest_served_block": 12,
-                        "last_header_success_unix_ms": 2,
-                        "last_body_success_unix_ms": null,
-                        "last_receipt_success_unix_ms": 2,
-                        "response_latency_ms": 20,
-                        "last_failure_reason": null,
-                        "last_failure_unix_ms": null,
-                        "qualification": null
-                    }
-                }
-            }))
-            .expect("sibling quality JSON"),
-        )
-        .expect("sibling quality cache");
-
-        let merged = merge_local_execution_peer_caches(None, &target, 3)
-            .expect("merge caches")
-            .expect("peer cache exists");
-        assert_eq!(
-            merged,
-            PeerCacheMerge {
-                total: 3,
-                imported: 1,
-            }
-        );
-        let entries =
-            read_peer_cache_entries(&target.join("execution-peers.json")).expect("merged entries");
-        assert_eq!(entries.len(), 3);
-        assert!(entries.iter().any(|entry| {
-            peer_cache_record(entry).as_deref() == Some("enode://shared")
-                && entry["reputation"] == 12
-        }));
-        assert!(
-            entries
-                .iter()
-                .any(|entry| { peer_cache_record(entry).as_deref() == Some("enode://imported") })
-        );
-        let quality: Value = serde_json::from_slice(
-            &fs::read(target.join("execution-peer-quality.json")).expect("merged quality cache"),
-        )
-        .expect("parse merged quality cache");
-        assert!(quality["peers"]["local-peer"].is_object());
-        assert!(quality["peers"]["imported-peer"].is_object());
+        let sources =
+            local_execution_peer_store_sources(None, &target).expect("discover peer stores");
+        assert!(sources.contains(&sibling.join("execution-network.sqlite")));
+        assert!(sources.contains(&target.join("execution-network.sqlite")));
     }
 
     #[test]

@@ -498,8 +498,8 @@ processor start block. If `sources.live.history_fallback_blocks` is configured,
 the range must fit that explicit cost bound.
 
 P2P results are highly sensitive to public-peer availability and block
-payload size. Record cold and persisted-peer-cache runs separately, preserve
-`execution-p2p-secret` plus `execution-peers.json` for the latter, and never
+payload size. Record cold and persisted-peer-store runs separately, preserve
+`execution-p2p-secret` plus `execution-network.sqlite` for the latter, and never
 compare a recent receipt-complete run directly with a header-only or
 state-snapshot sync headline. `material_request_blocks` is intentionally
 tunable: the evidence-backed default is eight; partial/failed responses shrink

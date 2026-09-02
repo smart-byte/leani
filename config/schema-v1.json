@@ -322,8 +322,8 @@
         "history_header_request_blocks": { "$ref": "#/$defs/positiveInteger" },
         "persistent_retries": { "type": "boolean" },
         "retry_backoff_max_seconds": { "$ref": "#/$defs/positiveInteger" },
-        "peer_cache_flush_seconds": { "$ref": "#/$defs/positiveInteger" },
-        "peer_cache_max_entries": { "$ref": "#/$defs/positiveInteger" },
+        "peer_store_flush_seconds": { "$ref": "#/$defs/positiveInteger" },
+        "peer_store_max_entries": { "$ref": "#/$defs/positiveInteger" },
         "archive_reconciliation_blocks": { "$ref": "#/$defs/positiveInteger" },
         "archive_reconciliation_interval_seconds": {
           "$ref": "#/$defs/positiveInteger"

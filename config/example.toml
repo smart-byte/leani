@@ -134,8 +134,8 @@ history_header_request_concurrency = 16
 history_header_request_blocks = 1024
 persistent_retries = true
 retry_backoff_max_seconds = 60
-peer_cache_flush_seconds = 60
-peer_cache_max_entries = 4096
+peer_store_flush_seconds = 60
+peer_store_max_entries = 4096
 # As each interchangeable archive catches up, re-map sequential finalized
 # ranges and compare the output with the compact delta checksums produced live.
 archive_reconciliation_blocks = 64

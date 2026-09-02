@@ -4256,11 +4256,11 @@ fn p2p_probe_source(
         material_request_blocks: config.sources.live.material_request_blocks,
         history_header_request_concurrency: config.sources.live.history_header_request_concurrency,
         history_header_request_blocks: config.sources.live.history_header_request_blocks,
-        peer_cache_path: Some(config.data_dir.join("execution-peers.json")),
+        peer_store_path: Some(config.data_dir.join("execution-network.sqlite")),
         secret_key_path: Some(config.data_dir.join("execution-p2p-secret")),
-        peer_cache_max_entries: config.sources.live.peer_cache_max_entries,
-        peer_cache_flush_interval: Duration::from_secs(
-            config.sources.live.peer_cache_flush_seconds,
+        peer_store_max_entries: config.sources.live.peer_store_max_entries,
+        peer_store_flush_interval: Duration::from_secs(
+            config.sources.live.peer_store_flush_seconds,
         ),
         poll_interval: Duration::from_secs(2),
         max_reorg_depth: 64,
@@ -5569,10 +5569,10 @@ impl EmbeddedNetworkRuntime {
             .await
             .is_err()
         {
-            // Some networking internals finish their own cache flush and socket
+            // Some networking internals finish their own peer-store flush and socket
             // teardown on a fixed timer. A CLI subscription must nevertheless
             // honor Ctrl-C promptly; aborting the supervisor after cancellation
-            // is safe because SQLite commits and peer-cache writes are atomic.
+            // is safe because both SQLite stores commit atomically.
             self.task.abort();
             let _ = (&mut self.task).await;
         }
@@ -5675,11 +5675,11 @@ pub(crate) fn execution_p2p_source(
         ),
         history_header_request_concurrency: config.sources.live.history_header_request_concurrency,
         history_header_request_blocks: config.sources.live.history_header_request_blocks,
-        peer_cache_path: Some(config.data_dir.join("execution-peers.json")),
+        peer_store_path: Some(config.data_dir.join("execution-network.sqlite")),
         secret_key_path: Some(config.data_dir.join("execution-p2p-secret")),
-        peer_cache_max_entries: config.sources.live.peer_cache_max_entries,
-        peer_cache_flush_interval: std::time::Duration::from_secs(
-            config.sources.live.peer_cache_flush_seconds,
+        peer_store_max_entries: config.sources.live.peer_store_max_entries,
+        peer_store_flush_interval: std::time::Duration::from_secs(
+            config.sources.live.peer_store_flush_seconds,
         ),
         network_telemetry,
         ..leani_source_p2p::RethP2pConfig::default()

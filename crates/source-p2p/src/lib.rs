@@ -5,6 +5,8 @@
 //! requests a bounded fixed range, verifies all response commitments, and
 //! converts the result into source-neutral [`BlockFrame`] values.
 
+mod peer_store;
+
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt as _;
 use std::{
@@ -17,7 +19,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -81,6 +83,11 @@ use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, trace, warn};
 
+use peer_store::ExecutionPeerStore;
+pub use peer_store::{
+    ExecutionPeerStoreError, ExecutionPeerStoreMerge, merge_execution_peer_stores,
+};
+
 /// Immutable Reth release used by this adapter.
 pub const RETH_VERSION: &str = "2.4.1";
 /// Immutable Reth commit used by this adapter.
@@ -103,9 +110,7 @@ const MAINNET_DNS_DISCOVERY_TREE: &str =
 const MAINNET_DNS_DISCV4_BOOTSTRAP_PEERS: usize = 32;
 const MAINNET_DNS_RETRY_INTERVAL: Duration = Duration::from_secs(15);
 const PEER_QUALIFICATION_RETRY_INTERVAL: Duration = Duration::from_secs(5);
-const PEER_QUALITY_SCHEMA_VERSION: u32 = 1;
-static PEER_CACHE_WRITE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
-static PEER_CACHE_WRITE_LOCK: Mutex<()> = Mutex::new(());
+static SECRET_KEY_WRITE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 // Mainnet ETH responses have a 2 MiB soft limit. Start from the fastest
 // evidence-backed width, then shrink body and receipt requests independently
 // when a peer truncates or rejects an oversized response.
@@ -116,7 +121,7 @@ const MATERIAL_BATCH_GROW_SUCCESS_WINDOWS: usize = 8;
 // consume the entire global history budget.
 const MAX_MATERIAL_REQUESTS_PER_PEER: usize = 4;
 const DEFAULT_MATERIAL_REQUEST_CONCURRENCY: usize = 32;
-const DEFAULT_PEER_CACHE_MAX_ENTRIES: usize = 4_096;
+const DEFAULT_PEER_STORE_MAX_ENTRIES: usize = 4_096;
 // Cryptographically verified execution material is stronger evidence than a
 // successful handshake. Persist a small positive signal so later runs try
 // proven serving peers before arbitrary discovered records.
@@ -249,17 +254,17 @@ pub struct RethP2pConfig {
     pub history_header_request_concurrency: usize,
     /// Maximum headers requested in one historical proof response.
     pub history_header_request_blocks: u64,
-    /// Optional Reth peer metadata cache loaded on startup and refreshed while
-    /// the network session is running.
-    pub peer_cache_path: Option<PathBuf>,
-    /// Stable secp256k1 node identity. When omitted while a peer cache is
+    /// Optional disposable `SQLite` store containing bounded peer candidates and
+    /// independently observed service evidence.
+    pub peer_store_path: Option<PathBuf>,
+    /// Stable secp256k1 node identity. When omitted while a peer store is
     /// configured, a sibling `execution-p2p-secret` file is used.
     pub secret_key_path: Option<PathBuf>,
     /// Maximum retained peer records after merging Reth's current view with
-    /// the broader discovery cache. This bounds growth without letting one
+    /// broader discovered candidates. This bounds growth without letting one
     /// short or failed run erase candidates needed by the next startup.
-    pub peer_cache_max_entries: usize,
-    pub peer_cache_flush_interval: Duration,
+    pub peer_store_max_entries: usize,
+    pub peer_store_flush_interval: Duration,
     pub poll_interval: Duration,
     pub max_reorg_depth: usize,
     /// Shared operational status for the persistent P2P manager.
@@ -294,10 +299,10 @@ impl Default for RethP2pConfig {
             material_request_blocks: DEFAULT_MATERIAL_REQUEST_BLOCKS,
             history_header_request_concurrency: 16,
             history_header_request_blocks: MAX_HISTORY_HEADER_REQUEST_BLOCKS,
-            peer_cache_path: None,
+            peer_store_path: None,
             secret_key_path: None,
-            peer_cache_max_entries: DEFAULT_PEER_CACHE_MAX_ENTRIES,
-            peer_cache_flush_interval: Duration::from_mins(1),
+            peer_store_max_entries: DEFAULT_PEER_STORE_MAX_ENTRIES,
+            peer_store_flush_interval: Duration::from_mins(1),
             poll_interval: Duration::from_secs(2),
             max_reorg_depth: 64,
             network_telemetry: NetworkTelemetry::default(),
@@ -371,9 +376,9 @@ impl RethP2pConfig {
                 "history header request blocks must be in 1..={MAX_HISTORY_HEADER_REQUEST_BLOCKS}"
             )));
         }
-        if !(1..=65_536).contains(&self.peer_cache_max_entries) {
+        if !(1..=65_536).contains(&self.peer_store_max_entries) {
             return Err(P2pError::InvalidConfig(
-                "peer cache maximum entries must be in 1..=65536".to_owned(),
+                "peer store maximum entries must be in 1..=65536".to_owned(),
             ));
         }
         if self.peer_wait_timeout.is_zero()
@@ -382,7 +387,7 @@ impl RethP2pConfig {
             || self.retry_backoff_max.is_zero()
             || self.peer_refill_interval.is_zero()
             || self.peer_recovery_timeout.is_zero()
-            || self.peer_cache_flush_interval.is_zero()
+            || self.peer_store_flush_interval.is_zero()
             || self.poll_interval.is_zero()
         {
             return Err(P2pError::InvalidConfig(
@@ -912,12 +917,20 @@ struct PeerCandidateAdmission {
     admitted_at: Instant,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct PeerCandidateRegistry {
+    maximum_entries: usize,
     admissions: Mutex<HashMap<B512, PeerCandidateAdmission>>,
 }
 
 impl PeerCandidateRegistry {
+    fn new(maximum_entries: usize) -> Self {
+        Self {
+            maximum_entries,
+            admissions: Mutex::new(HashMap::new()),
+        }
+    }
+
     fn admit(&self, peer_id: B512, origin: NetworkPeerOrigin) -> bool {
         let mut admissions = self
             .admissions
@@ -925,6 +938,14 @@ impl PeerCandidateRegistry {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if admissions.contains_key(&peer_id) {
             return false;
+        }
+        if admissions.len() >= self.maximum_entries
+            && let Some(oldest) = admissions
+                .iter()
+                .min_by_key(|(_, admission)| admission.admitted_at)
+                .map(|(peer_id, _)| *peer_id)
+        {
+            admissions.remove(&oldest);
         }
         admissions.insert(
             peer_id,
@@ -950,419 +971,6 @@ impl PeerCandidateRegistry {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(&peer_id)
             .map(|admission| admission.admitted_at.elapsed())
-    }
-}
-
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-struct PeerQualityEvidence {
-    fork_compatible: bool,
-    highest_served_block: Option<u64>,
-    last_header_success_unix_ms: Option<u64>,
-    last_body_success_unix_ms: Option<u64>,
-    last_receipt_success_unix_ms: Option<u64>,
-    response_latency_ms: Option<u64>,
-    last_failure_reason: Option<String>,
-    last_failure_unix_ms: Option<u64>,
-    qualification: Option<PeerQualification>,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-struct PeerQualityDocument {
-    schema_version: u32,
-    peers: BTreeMap<String, PeerQualityEvidence>,
-}
-
-impl Default for PeerQualityDocument {
-    fn default() -> Self {
-        Self {
-            schema_version: PEER_QUALITY_SCHEMA_VERSION,
-            peers: BTreeMap::new(),
-        }
-    }
-}
-
-#[derive(Debug)]
-struct PeerQualityStore {
-    path: Option<PathBuf>,
-    document: Mutex<PeerQualityDocument>,
-    dirty: AtomicBool,
-}
-
-impl PeerQualityStore {
-    fn load(peer_cache_path: Option<&Path>) -> Self {
-        let path = peer_cache_path.map(peer_quality_path);
-        let document = path.as_deref().map_or_else(PeerQualityDocument::default, |path| {
-            match std::fs::read(path) {
-                Ok(encoded) => match serde_json::from_slice::<PeerQualityDocument>(&encoded) {
-                    Ok(document)
-                        if document.schema_version == PEER_QUALITY_SCHEMA_VERSION => document,
-                    Ok(document) => {
-                        warn!(
-                            path = %path.display(),
-                            schema_version = document.schema_version,
-                            "ignoring execution peer-quality cache with an unsupported schema"
-                        );
-                        PeerQualityDocument::default()
-                    }
-                    Err(error) => {
-                        warn!(path = %path.display(), %error, "ignoring unreadable execution peer-quality cache");
-                        PeerQualityDocument::default()
-                    }
-                },
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    PeerQualityDocument::default()
-                }
-                Err(error) => {
-                    warn!(path = %path.display(), %error, "ignoring unreadable execution peer-quality cache");
-                    PeerQualityDocument::default()
-                }
-            }
-        });
-        Self {
-            path,
-            document: Mutex::new(document),
-            dirty: AtomicBool::new(false),
-        }
-    }
-
-    fn record_success(&self, peer_id: B512, kind: PeerMaterialKind, block: u64, elapsed: Duration) {
-        let now = observed_at_unix_ms();
-        let latency = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
-        let mut document = self
-            .document
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let evidence = document.peers.entry(peer_quality_key(peer_id)).or_default();
-        evidence.fork_compatible = true;
-        evidence.highest_served_block =
-            Some(evidence.highest_served_block.unwrap_or_default().max(block));
-        match kind {
-            PeerMaterialKind::Header => evidence.last_header_success_unix_ms = Some(now),
-            PeerMaterialKind::Body => evidence.last_body_success_unix_ms = Some(now),
-            PeerMaterialKind::Receipts => evidence.last_receipt_success_unix_ms = Some(now),
-        }
-        evidence.response_latency_ms = Some(evidence.response_latency_ms.map_or(latency, |old| {
-            old.saturating_mul(3).saturating_add(latency) / 4
-        }));
-        if matches!(kind, PeerMaterialKind::Body) {
-            evidence.qualification = Some(PeerQualification::BodyServing);
-        }
-        drop(document);
-        self.dirty.store(true, Ordering::Release);
-    }
-
-    fn record_qualification(
-        &self,
-        peer_id: B512,
-        qualification: PeerQualification,
-        detail: Option<&str>,
-    ) {
-        let now = observed_at_unix_ms();
-        let mut document = self
-            .document
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let evidence = document.peers.entry(peer_quality_key(peer_id)).or_default();
-        evidence.qualification = Some(qualification);
-        evidence.fork_compatible |= !matches!(qualification, PeerQualification::Rejected);
-        if !matches!(qualification, PeerQualification::BodyServing) {
-            evidence.last_failure_reason = detail.map(bounded_quality_detail);
-            evidence.last_failure_unix_ms = Some(now);
-        }
-        drop(document);
-        self.dirty.store(true, Ordering::Release);
-    }
-
-    fn record_failure(&self, peer_id: B512, detail: &str) {
-        let mut document = self
-            .document
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let evidence = document.peers.entry(peer_quality_key(peer_id)).or_default();
-        evidence.last_failure_reason = Some(bounded_quality_detail(detail));
-        evidence.last_failure_unix_ms = Some(observed_at_unix_ms());
-        drop(document);
-        self.dirty.store(true, Ordering::Release);
-    }
-
-    fn rank(&self, peer_id: B512) -> PeerQualityRank {
-        self.document
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .peers
-            .get(&peer_quality_key(peer_id))
-            .map_or_else(PeerQualityRank::default, PeerQualityRank::from)
-    }
-
-    fn is_available_body_server(&self, peer_id: B512) -> bool {
-        let document = self
-            .document
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let Some(evidence) = document.peers.get(&peer_quality_key(peer_id)) else {
-            return false;
-        };
-        let Some(body_success) = evidence.last_body_success_unix_ms else {
-            return false;
-        };
-        evidence
-            .last_failure_unix_ms
-            .is_none_or(|failure| failure < body_success)
-    }
-
-    fn persist(&self, maximum_entries: usize) -> Result<(), String> {
-        let Some(path) = self.path.as_deref() else {
-            return Ok(());
-        };
-        if !self.dirty.swap(false, Ordering::AcqRel) && path.exists() {
-            return Ok(());
-        }
-        let mut retained = self
-            .document
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if retained.peers.len() > maximum_entries {
-            let mut entries = std::mem::take(&mut retained.peers)
-                .into_iter()
-                .collect::<Vec<_>>();
-            entries.sort_by(|(_, left), (_, right)| {
-                PeerQualityRank::from(right).cmp(&PeerQualityRank::from(left))
-            });
-            entries.truncate(maximum_entries);
-            retained.peers = entries.into_iter().collect();
-        }
-        let document = retained.clone();
-        drop(retained);
-        let parent = path
-            .parent()
-            .ok_or_else(|| "execution peer-quality path has no parent directory".to_owned())?;
-        std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
-        let encoded = serde_json::to_vec_pretty(&document).map_err(|error| error.to_string())?;
-        let sequence = PEER_CACHE_WRITE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let temporary =
-            path.with_extension(format!("json.{}.{}.tmp", std::process::id(), sequence));
-        let result = (|| {
-            let mut file = OpenOptions::new()
-                .create_new(true)
-                .write(true)
-                .open(&temporary)
-                .map_err(|error| error.to_string())?;
-            file.write_all(&encoded)
-                .map_err(|error| error.to_string())?;
-            file.write_all(b"\n").map_err(|error| error.to_string())?;
-            file.sync_all().map_err(|error| error.to_string())?;
-            std::fs::rename(&temporary, path).map_err(|error| error.to_string())
-        })();
-        if result.is_err() {
-            self.dirty.store(true, Ordering::Release);
-            let _ = std::fs::remove_file(&temporary);
-        }
-        result
-    }
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
-struct PeerQualityRank {
-    body_serving: bool,
-    available_after_last_failure: bool,
-    last_body_success_unix_ms: u64,
-    receipt_serving: bool,
-    last_material_success_unix_ms: u64,
-    highest_served_block: u64,
-    inverse_latency_ms: std::cmp::Reverse<u64>,
-}
-
-impl From<&PeerQualityEvidence> for PeerQualityRank {
-    fn from(evidence: &PeerQualityEvidence) -> Self {
-        let last_material_success_unix_ms = evidence
-            .last_header_success_unix_ms
-            .into_iter()
-            .chain(evidence.last_body_success_unix_ms)
-            .chain(evidence.last_receipt_success_unix_ms)
-            .max()
-            .unwrap_or_default();
-        Self {
-            body_serving: evidence.last_body_success_unix_ms.is_some(),
-            available_after_last_failure: evidence
-                .last_failure_unix_ms
-                .is_none_or(|failure| failure < last_material_success_unix_ms),
-            last_body_success_unix_ms: evidence.last_body_success_unix_ms.unwrap_or_default(),
-            receipt_serving: evidence.last_receipt_success_unix_ms.is_some(),
-            last_material_success_unix_ms,
-            highest_served_block: evidence.highest_served_block.unwrap_or_default(),
-            inverse_latency_ms: std::cmp::Reverse(evidence.response_latency_ms.unwrap_or(u64::MAX)),
-        }
-    }
-}
-
-fn peer_quality_key(peer_id: B512) -> String {
-    hex::encode(peer_id.as_slice())
-}
-
-fn bounded_quality_detail(detail: &str) -> String {
-    detail.chars().take(256).collect()
-}
-
-fn peer_quality_path(peer_cache_path: &Path) -> PathBuf {
-    peer_cache_path.with_file_name("execution-peer-quality.json")
-}
-
-/// Identity-free summary of a peer-quality cache merge.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct PeerQualityCacheMerge {
-    pub total: usize,
-    pub imported: usize,
-}
-
-/// Merge sibling execution peer-quality caches into one destination.
-///
-/// Evidence is monotonic per material kind: the highest served block and most
-/// recent verified successes win, while the newest failure classification is
-/// retained independently. This lets isolated subscription feeds reuse useful
-/// service history without sharing their database or P2P identity.
-///
-/// # Errors
-///
-/// Returns an error when an existing quality document cannot be read or the
-/// merged document cannot be persisted atomically.
-pub fn merge_peer_quality_caches(
-    destination: &Path,
-    sources: &[PathBuf],
-    maximum_entries: usize,
-) -> Result<Option<PeerQualityCacheMerge>, String> {
-    let destination_document = read_peer_quality_document(destination)?;
-    let destination_peers = destination_document
-        .peers
-        .keys()
-        .cloned()
-        .collect::<HashSet<_>>();
-    let mut merged = destination_document.peers;
-    for source in sources
-        .iter()
-        .filter(|source| source.as_path() != destination)
-    {
-        let document = match read_peer_quality_document(source) {
-            Ok(document) => document,
-            Err(error) => {
-                warn!(path = %source.display(), %error, "ignoring unreadable sibling execution peer-quality cache");
-                continue;
-            }
-        };
-        for (peer_id, evidence) in document.peers {
-            match merged.entry(peer_id) {
-                std::collections::btree_map::Entry::Vacant(slot) => {
-                    slot.insert(evidence);
-                }
-                std::collections::btree_map::Entry::Occupied(mut slot) => {
-                    merge_peer_quality_evidence(slot.get_mut(), evidence);
-                }
-            }
-        }
-    }
-    if merged.is_empty() {
-        return Ok(None);
-    }
-    let mut entries = merged.into_iter().collect::<Vec<_>>();
-    entries.sort_by(|(left_id, left), (right_id, right)| {
-        PeerQualityRank::from(right)
-            .cmp(&PeerQualityRank::from(left))
-            .then_with(|| left_id.cmp(right_id))
-    });
-    entries.truncate(maximum_entries);
-    let imported = entries
-        .iter()
-        .filter(|(peer_id, _)| !destination_peers.contains(peer_id))
-        .count();
-    let document = PeerQualityDocument {
-        schema_version: PEER_QUALITY_SCHEMA_VERSION,
-        peers: entries.into_iter().collect(),
-    };
-    write_peer_quality_document(destination, &document)?;
-    Ok(Some(PeerQualityCacheMerge {
-        total: document.peers.len(),
-        imported,
-    }))
-}
-
-fn read_peer_quality_document(path: &Path) -> Result<PeerQualityDocument, String> {
-    let encoded = match std::fs::read(path) {
-        Ok(encoded) => encoded,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(PeerQualityDocument::default());
-        }
-        Err(error) => return Err(error.to_string()),
-    };
-    let document = serde_json::from_slice::<PeerQualityDocument>(&encoded)
-        .map_err(|error| error.to_string())?;
-    if document.schema_version != PEER_QUALITY_SCHEMA_VERSION {
-        return Err(format!(
-            "unsupported peer-quality schema {}",
-            document.schema_version
-        ));
-    }
-    Ok(document)
-}
-
-fn write_peer_quality_document(path: &Path, document: &PeerQualityDocument) -> Result<(), String> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| "execution peer-quality path has no parent directory".to_owned())?;
-    std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
-    let encoded = serde_json::to_vec_pretty(document).map_err(|error| error.to_string())?;
-    let sequence = PEER_CACHE_WRITE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-    let temporary =
-        path.with_extension(format!("json.{}.{}.merging", std::process::id(), sequence));
-    let result = (|| {
-        let mut file = OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&temporary)
-            .map_err(|error| error.to_string())?;
-        file.write_all(&encoded)
-            .map_err(|error| error.to_string())?;
-        file.write_all(b"\n").map_err(|error| error.to_string())?;
-        file.sync_all().map_err(|error| error.to_string())?;
-        std::fs::rename(&temporary, path).map_err(|error| error.to_string())
-    })();
-    if result.is_err() {
-        let _ = std::fs::remove_file(&temporary);
-    }
-    result
-}
-
-fn merge_peer_quality_evidence(retained: &mut PeerQualityEvidence, incoming: PeerQualityEvidence) {
-    let retained_success = PeerQualityRank::from(&*retained).last_material_success_unix_ms;
-    let incoming_success = PeerQualityRank::from(&incoming).last_material_success_unix_ms;
-    retained.fork_compatible |= incoming.fork_compatible;
-    retained.highest_served_block = retained
-        .highest_served_block
-        .into_iter()
-        .chain(incoming.highest_served_block)
-        .max();
-    retained.last_header_success_unix_ms = retained
-        .last_header_success_unix_ms
-        .into_iter()
-        .chain(incoming.last_header_success_unix_ms)
-        .max();
-    retained.last_body_success_unix_ms = retained
-        .last_body_success_unix_ms
-        .into_iter()
-        .chain(incoming.last_body_success_unix_ms)
-        .max();
-    retained.last_receipt_success_unix_ms = retained
-        .last_receipt_success_unix_ms
-        .into_iter()
-        .chain(incoming.last_receipt_success_unix_ms)
-        .max();
-    if incoming_success >= retained_success {
-        retained.response_latency_ms = incoming.response_latency_ms;
-        retained.qualification = incoming.qualification;
-    }
-    if incoming.last_failure_unix_ms >= retained.last_failure_unix_ms {
-        retained.last_failure_unix_ms = incoming.last_failure_unix_ms;
-        retained.last_failure_reason = incoming.last_failure_reason;
     }
 }
 
@@ -1480,7 +1088,7 @@ struct PersistentNetwork {
     next_generation: AtomicU64,
     request_gate: Arc<MaterialRequestGate>,
     direct_peers: Arc<DirectPeerPool>,
-    peer_quality: Arc<PeerQualityStore>,
+    peer_store: Arc<ExecutionPeerStore>,
     qualifications: Arc<PeerQualificationPool>,
 }
 
@@ -1496,7 +1104,7 @@ struct PersistentNetworkState {
     generation: u64,
     handle: NetworkHandle<EthNetworkPrimitives>,
     fetch: FetchClient<EthNetworkPrimitives>,
-    cache_flush: tokio::sync::mpsc::Sender<tokio::sync::oneshot::Sender<Result<(), String>>>,
+    peer_store_flush: tokio::sync::mpsc::Sender<tokio::sync::oneshot::Sender<Result<(), String>>>,
     network_task: tokio::task::JoinHandle<()>,
     shutdown: CancellationToken,
     telemetry: NetworkSessionTelemetry,
@@ -1568,11 +1176,11 @@ struct DirectPeerPool {
     peers: Mutex<Vec<DirectPeerState>>,
     cursor: AtomicUsize,
     changed: tokio::sync::Notify,
-    quality: Arc<PeerQualityStore>,
+    quality: Arc<ExecutionPeerStore>,
 }
 
 impl DirectPeerPool {
-    fn new(quality: Arc<PeerQualityStore>) -> Self {
+    fn new(quality: Arc<ExecutionPeerStore>) -> Self {
         Self {
             peers: Mutex::new(Vec::new()),
             cursor: AtomicUsize::new(0),
@@ -2130,17 +1738,17 @@ impl PersistentNetwork {
             return;
         };
         let (flush_result, flushed) = tokio::sync::oneshot::channel();
-        if running.cache_flush.send(flush_result).await.is_ok() {
+        if running.peer_store_flush.send(flush_result).await.is_ok() {
             match tokio::time::timeout(NETWORK_SHUTDOWN_TIMEOUT, flushed).await {
                 Ok(Ok(Ok(()))) => {}
                 Ok(Ok(Err(error))) => {
-                    warn!(%error, "failed to flush execution peer cache before shutdown");
+                    warn!(%error, "failed to flush execution peer store before shutdown");
                 }
                 Ok(Err(_)) => {
-                    warn!("execution peer-cache flush channel closed before shutdown");
+                    warn!("execution peer-store flush channel closed before shutdown");
                 }
                 Err(_) => {
-                    warn!("timed out flushing execution peer cache before shutdown");
+                    warn!("timed out flushing execution peer store before shutdown");
                 }
             }
         }
@@ -2359,7 +1967,7 @@ async fn qualify_execution_peer(
 fn spawn_peer_qualification_worker(
     direct_peers: Arc<DirectPeerPool>,
     qualifications: Arc<PeerQualificationPool>,
-    quality: Arc<PeerQualityStore>,
+    quality: Arc<ExecutionPeerStore>,
     peer_candidates: Arc<PeerCandidateRegistry>,
     handle: NetworkHandle<EthNetworkPrimitives>,
     network_telemetry: NetworkTelemetry,
@@ -2723,9 +2331,9 @@ fn spawn_mainnet_dns_peer_seeder(
         let mut crawler_updates = crawler_service.update_stream();
         let mut crawler_task = AbortTaskOnDrop(crawler_service.spawn());
         let fork_filter = MAINNET.fork_filter(dns_head);
-        let mut seeded = HashSet::new();
+        let mut seeded_peers = 0_usize;
         let mut crawler_seed_count = 0_usize;
-        let mut crawler_discovered = HashSet::new();
+        let mut crawler_discovered_peers = 0_usize;
         // Queue every newly verified discovery record for the next bounded
         // refill wave. Reth owns the simultaneous-dial ceiling, and this
         // supplemental queue never revisits a record more frequently than the
@@ -2773,7 +2381,7 @@ fn spawn_mainnet_dns_peer_seeder(
                         continue;
                     }
                     let record = update.node_record;
-                    admit_node_record_to_network(
+                    let admitted = admit_node_record_to_network(
                         &handle,
                         record,
                         NetworkPeerOrigin::DnsTree,
@@ -2784,8 +2392,8 @@ fn spawn_mainnet_dns_peer_seeder(
                         crawler.add_boot_node(record);
                         crawler_seed_count = crawler_seed_count.saturating_add(1);
                     }
-                    if seeded.insert(record.id) {
-                        let seeded_peers = seeded.len();
+                    if admitted {
+                        seeded_peers = seeded_peers.saturating_add(1);
                         if seeded_peers == 1 || seeded_peers.is_multiple_of(100) {
                             debug!(
                                 seeded_peers,
@@ -2806,18 +2414,18 @@ fn spawn_mainnet_dns_peer_seeder(
                                 if fork_filter.validate(fork_id).is_err() {
                                     continue;
                                 }
-                                admit_node_record_to_network(
+                                let admitted = admit_node_record_to_network(
                                     &handle,
                                     record,
                                     NetworkPeerOrigin::Discv4Crawler,
                                     &peer_candidates,
                                     &network_telemetry,
                                 );
-                                if crawler_discovered.insert(record.id) {
-                                    let discovered_peers = crawler_discovered.len();
-                                    if discovered_peers == 1 || discovered_peers.is_multiple_of(25) {
+                                if admitted {
+                                    crawler_discovered_peers = crawler_discovered_peers.saturating_add(1);
+                                    if crawler_discovered_peers == 1 || crawler_discovered_peers.is_multiple_of(25) {
                                         debug!(
-                                            discovered_peers,
+                                            discovered_peers = crawler_discovered_peers,
                                             "seeded compatible execution peers from the Discv4 bootstrap crawler"
                                         );
                                     }
@@ -2847,13 +2455,15 @@ fn admit_node_record_to_network(
     origin: NetworkPeerOrigin,
     peer_candidates: &PeerCandidateRegistry,
     network_telemetry: &NetworkTelemetry,
-) {
-    if peer_candidates.admit(record.id, origin) {
+) -> bool {
+    let admitted = peer_candidates.admit(record.id, origin);
+    if admitted {
         network_telemetry.peer_candidate_admitted(origin);
     }
     // Re-submit rediscovered identities as their advertised address may have
     // changed since the first admission.
     add_node_record_to_network(handle, record);
+    admitted
 }
 
 fn connect_node_record(handle: &NetworkHandle<EthNetworkPrimitives>, record: NodeRecord) {
@@ -2872,7 +2482,7 @@ async fn reward_verified_material_peer(
     );
     // Network-handle commands are queued. Awaiting the following query creates
     // an ordering barrier so a short-lived `subscribe --once` process cannot
-    // shut down before the serving-peer reward reaches the persisted cache.
+    // shut down before the serving-peer reward reaches the persistent store.
     let _ = handle.reputation_by_id(peer_id).await;
 }
 
@@ -2896,9 +2506,43 @@ fn mainnet_dns_discovery_config() -> DnsDiscoveryConfig {
     }
 }
 
+struct PeerPersistenceRequest {
+    records: Vec<NodeRecord>,
+    response: Option<tokio::sync::oneshot::Sender<Result<(), String>>>,
+}
+
+fn spawn_peer_persistence_worker(
+    store: Arc<ExecutionPeerStore>,
+    mut requests: tokio::sync::mpsc::Receiver<PeerPersistenceRequest>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        while let Some(request) = requests.recv().await {
+            let candidate_count = request.records.len();
+            let started = Instant::now();
+            let result = store
+                .persist(request.records)
+                .await
+                .map_err(|error| error.to_string());
+            if result.is_ok() {
+                debug!(
+                    candidate_count,
+                    elapsed_milliseconds =
+                        u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                    "persisted execution peer store"
+                );
+            }
+            if let Some(response) = request.response {
+                let _ = response.send(result);
+            } else if let Err(error) = result {
+                warn!(%error, "failed to refresh execution peer store");
+            }
+        }
+    })
+}
+
 #[expect(
     clippy::too_many_lines,
-    reason = "one select loop synchronizes manager, cache, telemetry, recovery, and peer events"
+    reason = "one select loop synchronizes manager, persistence, telemetry, recovery, and peer events"
 )]
 fn spawn_network_manager<S>(
     manager: NetworkManager<EthNetworkPrimitives>,
@@ -2913,9 +2557,8 @@ where
 {
     tokio::spawn(async move {
         let NetworkManagerRuntime {
-            peer_cache_path,
-            peer_cache_max_entries,
-            peer_cache_flush_interval,
+            peer_store_flush_interval,
+            peer_store_max_entries,
             telemetry,
             network_telemetry,
             peer_recovery_timeout,
@@ -2925,7 +2568,7 @@ where
             peer_refill_interval,
             bootstrap_dns_tree,
             cached_records,
-            peer_quality,
+            peer_store,
             qualifications,
             qualification_target,
             request_gate,
@@ -2933,11 +2576,11 @@ where
             material_request_concurrency,
             minimum_peers,
             body_serving_peer_target,
-            mut cache_flush_requests,
+            mut peer_store_flush_requests,
             shutdown,
         } = runtime;
         let mut manager = Box::pin(manager);
-        let peer_candidates = Arc::new(PeerCandidateRegistry::default());
+        let peer_candidates = Arc::new(PeerCandidateRegistry::new(peer_store_max_entries));
         for peer_id in trusted_peer_ids {
             if peer_candidates.admit(peer_id, NetworkPeerOrigin::Trusted) {
                 network_telemetry.peer_candidate_admitted(NetworkPeerOrigin::Trusted);
@@ -2959,7 +2602,7 @@ where
         debug!(
             hot_candidates = hot.len(),
             broad_candidates = broad.len(),
-            "started hedged execution-peer cache admission"
+            "started hedged execution-peer store admission"
         );
         let cached_peer_admitter = spawn_cached_peer_admitter(
             manager.as_ref().get_ref().handle().clone(),
@@ -2982,7 +2625,7 @@ where
         let qualification_worker = spawn_peer_qualification_worker(
             direct_peers.clone(),
             qualifications.clone(),
-            peer_quality.clone(),
+            peer_store.clone(),
             peer_candidates.clone(),
             manager.as_ref().get_ref().handle().clone(),
             network_telemetry.clone(),
@@ -2996,15 +2639,17 @@ where
         );
         let mut network_events_open = true;
         let mut zero_peers_since = Some(tokio::time::Instant::now());
-        let mut cache_flush = tokio::time::interval_at(
-            tokio::time::Instant::now() + peer_cache_flush_interval,
-            peer_cache_flush_interval,
+        let mut peer_store_flush = tokio::time::interval_at(
+            tokio::time::Instant::now() + peer_store_flush_interval,
+            peer_store_flush_interval,
         );
-        cache_flush.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        peer_store_flush.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let (persistence_requests, persistence_receiver) = tokio::sync::mpsc::channel(1);
+        let persistence_worker =
+            spawn_peer_persistence_worker(peer_store.clone(), persistence_receiver);
         let mut telemetry_refresh = tokio::time::interval(Duration::from_secs(1));
         telemetry_refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        let mut cache_flush_requests_open = true;
-        let mut cache_flushed_before_shutdown = false;
+        let mut peer_store_flush_requests_open = true;
         loop {
             tokio::select! {
                 () = shutdown.cancelled() => break,
@@ -3022,17 +2667,6 @@ where
                         now,
                         peer_recovery_timeout,
                     ) {
-                        if let Some(path) = peer_cache_path.as_deref()
-                            && known_peers > 0
-                            && let Err(error) = write_peer_cache_atomically(
-                                manager.as_ref().get_ref(),
-                                path,
-                                peer_cache_max_entries,
-                                &peer_quality,
-                            )
-                        {
-                            warn!(path = %path.display(), %error, "failed to persist execution peers before recovery");
-                        }
                         warn!(
                             known_peers,
                             ?peer_recovery_timeout,
@@ -3059,7 +2693,7 @@ where
                             qualifications.remove(peer_id);
                             let classified = classify_disconnect_reason(reason);
                             if disconnect_invalidates_service_evidence(classified) {
-                                peer_quality.record_failure(peer_id, classified.as_str());
+                                peer_store.record_failure(peer_id, classified.as_str());
                             }
                             network_telemetry.peer_session_closed(classified);
                             debug!(
@@ -3075,64 +2709,31 @@ where
                         None => network_events_open = false,
                     }
                 }
-                request = cache_flush_requests.recv(), if cache_flush_requests_open => {
+                request = peer_store_flush_requests.recv(), if peer_store_flush_requests_open => {
                     let Some(response) = request else {
-                        cache_flush_requests_open = false;
+                        peer_store_flush_requests_open = false;
                         continue;
                     };
-                    let result = peer_cache_path.as_deref().map_or(Ok(()), |path| {
-                        if manager.as_ref().get_ref().num_known_peers() == 0 {
-                            Ok(())
-                        } else {
-                            write_peer_cache_atomically(
-                                manager.as_ref().get_ref(),
-                                path,
-                                peer_cache_max_entries,
-                                &peer_quality,
-                            )
-                        }
-                    });
-                    let result = result.and(peer_quality.persist(peer_cache_max_entries));
-                    cache_flushed_before_shutdown = result.is_ok();
-                    let _ = response.send(result);
-                }
-                _ = cache_flush.tick(), if peer_cache_path.is_some() => {
-                    let path = peer_cache_path.as_deref().expect("guarded by peer cache path");
-                    if manager.as_ref().get_ref().num_known_peers() == 0 {
-                        continue;
-                    }
-                    if let Err(error) =
-                        write_peer_cache_atomically(
-                            manager.as_ref().get_ref(),
-                            path,
-                            peer_cache_max_entries,
-                            &peer_quality,
-                        )
+                    let records = manager.as_ref().get_ref().all_peers().collect();
+                    let persistence = PeerPersistenceRequest {
+                        records,
+                        response: Some(response),
+                    };
+                    if let Err(error) = persistence_requests.send(persistence).await
+                        && let Some(response) = error.0.response
                     {
-                        warn!(path = %path.display(), %error, "failed to refresh execution peer cache");
-                    } else {
-                        debug!(path = %path.display(), "refreshed execution peer cache");
+                        let _ = response.send(Err(
+                            "execution peer persistence worker stopped unexpectedly".to_owned(),
+                        ));
                     }
-                    if let Err(error) = peer_quality.persist(peer_cache_max_entries) {
-                        warn!(%error, "failed to refresh execution peer-quality cache");
-                    }
+                }
+                _ = peer_store_flush.tick() => {
+                    let _ = persistence_requests.try_send(PeerPersistenceRequest {
+                        records: manager.as_ref().get_ref().all_peers().collect(),
+                        response: None,
+                    });
                 }
             }
-        }
-        if !cache_flushed_before_shutdown
-            && let Some(path) = peer_cache_path.as_deref()
-            && manager.as_ref().get_ref().num_known_peers() > 0
-            && let Err(error) = write_peer_cache_atomically(
-                manager.as_ref().get_ref(),
-                path,
-                peer_cache_max_entries,
-                &peer_quality,
-            )
-        {
-            warn!(path = %path.display(), %error, "failed to persist final execution peer state");
-        }
-        if let Err(error) = peer_quality.persist(peer_cache_max_entries) {
-            warn!(%error, "failed to persist final execution peer-quality state");
         }
         dns_peer_seeder.abort();
         let _ = dns_peer_seeder.await;
@@ -3140,6 +2741,22 @@ where
         let _ = cached_peer_admitter.await;
         qualification_worker.abort();
         let _ = qualification_worker.await;
+        let (response, persisted) = tokio::sync::oneshot::channel();
+        let final_request = PeerPersistenceRequest {
+            records: manager.as_ref().get_ref().all_peers().collect(),
+            response: Some(response),
+        };
+        if persistence_requests.send(final_request).await.is_ok() {
+            match persisted.await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => warn!(%error, "failed to persist final execution peer state"),
+                Err(error) => {
+                    warn!(%error, "execution peer persistence worker stopped before final flush");
+                }
+            }
+        }
+        drop(persistence_requests);
+        let _ = persistence_worker.await;
         direct_peers.clear();
     })
 }
@@ -3160,9 +2777,8 @@ fn peer_recovery_due(
 
 #[derive(Debug)]
 struct NetworkManagerRuntime {
-    peer_cache_path: Option<PathBuf>,
-    peer_cache_max_entries: usize,
-    peer_cache_flush_interval: Duration,
+    peer_store_flush_interval: Duration,
+    peer_store_max_entries: usize,
     telemetry: NetworkSessionTelemetry,
     network_telemetry: NetworkTelemetry,
     peer_recovery_timeout: Duration,
@@ -3172,7 +2788,7 @@ struct NetworkManagerRuntime {
     peer_refill_interval: Duration,
     bootstrap_dns_tree: Option<String>,
     cached_records: CachedPeerRecords,
-    peer_quality: Arc<PeerQualityStore>,
+    peer_store: Arc<ExecutionPeerStore>,
     qualifications: Arc<PeerQualificationPool>,
     qualification_target: tokio::sync::watch::Receiver<BlockRef>,
     request_gate: Arc<MaterialRequestGate>,
@@ -3180,7 +2796,7 @@ struct NetworkManagerRuntime {
     material_request_concurrency: usize,
     minimum_peers: usize,
     body_serving_peer_target: usize,
-    cache_flush_requests:
+    peer_store_flush_requests:
         tokio::sync::mpsc::Receiver<tokio::sync::oneshot::Sender<Result<(), String>>>,
     shutdown: CancellationToken,
 }
@@ -3218,153 +2834,6 @@ const fn disconnect_invalidates_service_evidence(reason: NetworkDisconnectReason
     )
 }
 
-fn write_peer_cache_atomically(
-    manager: &NetworkManager<EthNetworkPrimitives>,
-    path: &Path,
-    maximum_entries: usize,
-    quality: &PeerQualityStore,
-) -> Result<(), String> {
-    let _write_guard = PEER_CACHE_WRITE_LOCK
-        .lock()
-        .map_err(|_| "execution peer cache write lock is poisoned".to_owned())?;
-    let sequence = PEER_CACHE_WRITE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-    let file_name = path
-        .file_name()
-        .map_or_else(|| "execution-peers".into(), |name| name.to_string_lossy());
-    let temporary = path.with_file_name(format!(
-        ".{file_name}.{}.{}.tmp",
-        std::process::id(),
-        sequence
-    ));
-    if let Err(error) = manager.write_peers_to_file(&temporary) {
-        let _ = std::fs::remove_file(&temporary);
-        return Err(error.to_string());
-    }
-    if let Err(error) =
-        merge_and_compact_peer_cache_file(&temporary, path, maximum_entries, quality)
-    {
-        let _ = std::fs::remove_file(&temporary);
-        return Err(error);
-    }
-    if let Err(error) = std::fs::rename(&temporary, path) {
-        let _ = std::fs::remove_file(&temporary);
-        return Err(error.to_string());
-    }
-    Ok(())
-}
-
-fn compact_existing_peer_cache(
-    path: &Path,
-    maximum_entries: usize,
-    quality: &PeerQualityStore,
-) -> Result<(), String> {
-    let encoded = match std::fs::read(path) {
-        Ok(encoded) => encoded,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(error.to_string()),
-    };
-    let entries = parse_peer_cache_entries(&encoded)?;
-    if entries.len() <= maximum_entries {
-        return Ok(());
-    }
-    let backup = path.with_extension("json.pre-compact");
-    if !backup.exists() {
-        std::fs::copy(path, &backup).map_err(|error| error.to_string())?;
-    }
-    let compacted = compact_peer_cache_entries(entries, maximum_entries, quality);
-    let rewritten = serde_json::to_vec_pretty(&compacted).map_err(|error| error.to_string())?;
-    let sequence = PEER_CACHE_WRITE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-    let temporary = path.with_extension(format!(
-        "json.{}.{}.compacting",
-        std::process::id(),
-        sequence
-    ));
-    let result = (|| {
-        let mut file = OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&temporary)
-            .map_err(|error| error.to_string())?;
-        file.write_all(&rewritten)
-            .map_err(|error| error.to_string())?;
-        file.sync_all().map_err(|error| error.to_string())?;
-        std::fs::rename(&temporary, path).map_err(|error| error.to_string())
-    })();
-    if result.is_err() {
-        let _ = std::fs::remove_file(&temporary);
-    }
-    result
-}
-
-fn merge_and_compact_peer_cache_file(
-    current_path: &Path,
-    previous_path: &Path,
-    maximum_entries: usize,
-    quality: &PeerQualityStore,
-) -> Result<(), String> {
-    let encoded = std::fs::read(current_path).map_err(|error| error.to_string())?;
-    let mut entries = match std::fs::read(previous_path) {
-        Ok(previous) => parse_peer_cache_entries(&previous).unwrap_or_default(),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
-        Err(_) => Vec::new(),
-    };
-    // Current Reth metadata wins for identities present in both sets. Peers
-    // absent from a short or failed session remain available to later runs.
-    entries.extend(parse_peer_cache_entries(&encoded)?);
-    let compacted = compact_peer_cache_entries(entries, maximum_entries, quality);
-    let encoded = serde_json::to_vec_pretty(&compacted).map_err(|error| error.to_string())?;
-    std::fs::write(current_path, encoded).map_err(|error| error.to_string())
-}
-
-fn compact_peer_cache_entries(
-    entries: Vec<(String, serde_json::Value)>,
-    maximum_entries: usize,
-    quality: &PeerQualityStore,
-) -> Vec<serde_json::Value> {
-    let mut unique = BTreeMap::new();
-    for (record, entry) in entries {
-        unique.insert(record, entry);
-    }
-    let mut entries = unique.into_iter().collect::<Vec<_>>();
-    entries.sort_by(|(left_record, left), (right_record, right)| {
-        peer_cache_priority(right, quality)
-            .cmp(&peer_cache_priority(left, quality))
-            .then_with(|| left_record.cmp(right_record))
-    });
-    entries.truncate(maximum_entries);
-    entries.into_iter().map(|(_, entry)| entry).collect()
-}
-
-fn peer_cache_priority(
-    entry: &serde_json::Value,
-    quality: &PeerQualityStore,
-) -> (PeerQualityRank, bool, bool, bool, i64) {
-    let has_fork = entry
-        .get("fork_id")
-        .or_else(|| entry.get("forkId"))
-        .is_some_and(|value| !value.is_null());
-    let reputation = peer_cache_reputation(entry);
-    let quality = entry
-        .get("record")
-        .and_then(serde_json::Value::as_str)
-        .and_then(|record| record.parse::<NodeRecord>().ok())
-        .map_or_else(PeerQualityRank::default, |record| quality.rank(record.id));
-    (
-        quality,
-        reputation >= 0,
-        reputation > 0,
-        has_fork,
-        reputation,
-    )
-}
-
-fn peer_cache_reputation(entry: &serde_json::Value) -> i64 {
-    entry
-        .get("reputation")
-        .and_then(serde_json::Value::as_i64)
-        .unwrap_or_default()
-}
-
 #[derive(Debug, Default)]
 struct CachedPeerRecords {
     hot: Vec<NodeRecord>,
@@ -3391,37 +2860,10 @@ fn peer_subnet(address: IpAddr) -> PeerSubnet {
 }
 
 fn prioritized_peer_cache_records(
-    path: Option<&Path>,
-    quality: &PeerQualityStore,
-    maximum_entries: usize,
+    store: &ExecutionPeerStore,
     hot_limit: usize,
 ) -> CachedPeerRecords {
-    let Some(path) = path else {
-        return CachedPeerRecords::default();
-    };
-    let Ok(encoded) = std::fs::read(path) else {
-        return CachedPeerRecords::default();
-    };
-    let Ok(mut entries) = parse_peer_cache_entries(&encoded) else {
-        return CachedPeerRecords::default();
-    };
-    entries.sort_by(|(left_record, left), (right_record, right)| {
-        peer_cache_priority(right, quality)
-            .cmp(&peer_cache_priority(left, quality))
-            .then_with(|| left_record.cmp(right_record))
-    });
-    let mut seen = HashSet::new();
-    let records = entries
-        .into_iter()
-        .take(maximum_entries)
-        .filter_map(|(record, entry)| {
-            record
-                .parse::<NodeRecord>()
-                .ok()
-                .map(|record| (record, peer_cache_reputation(&entry)))
-        })
-        .filter(|(record, _)| seen.insert(record.id))
-        .collect::<Vec<_>>();
+    let records = store.candidates();
 
     // The immediate-dial tier contains only peers that served a verified body
     // after their most recent recorded failure. Select distinct /16 (IPv4) or
@@ -3429,10 +2871,7 @@ fn prioritized_peer_cache_records(
     let eligible = records
         .iter()
         .copied()
-        .filter(|(record, reputation)| {
-            *reputation >= 0 && quality.is_available_body_server(record.id)
-        })
-        .map(|(record, _)| record)
+        .filter(|record| store.is_available_body_server(record.id))
         .collect::<Vec<_>>();
     let mut hot = Vec::with_capacity(hot_limit.min(eligible.len()));
     let mut hot_ids = HashSet::new();
@@ -3456,32 +2895,15 @@ fn prioritized_peer_cache_records(
     }
     let broad = records
         .into_iter()
-        .map(|(record, _)| record)
         .filter(|record| !hot_ids.contains(&record.id))
         .collect();
     CachedPeerRecords { hot, broad }
 }
 
-fn parse_peer_cache_entries(encoded: &[u8]) -> Result<Vec<(String, serde_json::Value)>, String> {
-    let entries = serde_json::from_slice::<Vec<serde_json::Value>>(encoded)
-        .map_err(|error| error.to_string())?;
-    entries
-        .into_iter()
-        .map(|entry| {
-            let record = entry
-                .get("record")
-                .and_then(serde_json::Value::as_str)
-                .ok_or_else(|| "execution peer cache entry has no string record".to_owned())?
-                .to_owned();
-            Ok((record, entry))
-        })
-        .collect()
-}
-
 fn configured_secret_key_path(config: &RethP2pConfig) -> Option<PathBuf> {
     config.secret_key_path.clone().or_else(|| {
         config
-            .peer_cache_path
+            .peer_store_path
             .as_ref()
             .map(|path| path.with_file_name("execution-p2p-secret"))
     })
@@ -3511,7 +2933,7 @@ fn load_or_create_secret_key(path: Option<&Path>) -> Result<SecretKey, P2pError>
     }
     let secret = rng_secret_key();
     let encoded = hex::encode(secret.secret_bytes());
-    let sequence = PEER_CACHE_WRITE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let sequence = SECRET_KEY_WRITE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     let temporary = path.with_extension(format!("secret.{}.{}.tmp", std::process::id(), sequence));
     let mut options = OpenOptions::new();
     options.create_new(true).write(true);
@@ -3614,24 +3036,17 @@ impl RethP2pSource {
             config.max_outbound_peers,
             config.max_concurrent_dials,
         );
-        let peer_quality = Arc::new(PeerQualityStore::load(config.peer_cache_path.as_deref()));
-        if let Some(path) = config.peer_cache_path.as_deref()
-            && let Err(error) =
-                compact_existing_peer_cache(path, config.peer_cache_max_entries, &peer_quality)
-        {
-            warn!(
-                path = %path.display(),
-                %error,
-                "could not compact the existing execution peer cache before startup"
-            );
-        }
+        let peer_store = Arc::new(ExecutionPeerStore::new(
+            config.peer_store_path.clone(),
+            config.peer_store_max_entries,
+        ));
         let initial_target = Self::mainnet_genesis_block();
         let network = Arc::new(PersistentNetwork {
             state: tokio::sync::Mutex::new(None),
             next_generation: AtomicU64::new(1),
             request_gate: Arc::new(MaterialRequestGate::default()),
-            direct_peers: Arc::new(DirectPeerPool::new(peer_quality.clone())),
-            peer_quality,
+            direct_peers: Arc::new(DirectPeerPool::new(peer_store.clone())),
+            peer_store,
             qualifications: Arc::new(PeerQualificationPool::new(initial_target)),
         });
         Ok(Self {
@@ -3709,7 +3124,7 @@ impl RethP2pSource {
         snapshot
     }
 
-    /// Gracefully stop the shared execution network and flush its peer cache.
+    /// Gracefully stop the shared execution network and flush its peer store.
     pub async fn shutdown(&self) {
         self.network.shutdown().await;
     }
@@ -3997,7 +3412,7 @@ impl RethP2pSource {
                     match validate_receipts_against_headers(headers, &response.receipts) {
                         Ok(()) => {
                             lease.succeeded();
-                            self.network.peer_quality.record_success(
+                            self.network.peer_store.record_success(
                                 peer,
                                 PeerMaterialKind::Receipts,
                                 headers.last().map_or(0, |header| header.number),
@@ -4176,21 +3591,8 @@ impl RethP2pSource {
     }
 
     fn peers_config(&self) -> PeersConfig {
-        if let Some(path) = self.config.peer_cache_path.as_deref()
-            && let Err(error) = compact_existing_peer_cache(
-                path,
-                self.config.peer_cache_max_entries,
-                &self.network.peer_quality,
-            )
-        {
-            warn!(
-                path = %path.display(),
-                %error,
-                "ignoring peer-cache compaction failure before network startup"
-            );
-        }
         // Cached peers are admitted through the two-tier startup policy after
-        // the manager is built. Loading this file through Reth as well would
+        // the manager is built. Loading the whole store through Reth as well would
         // enqueue the entire broad cache immediately and defeat the fresh-peer
         // hedge.
         PeersConfig::default()
@@ -4254,6 +3656,11 @@ impl RethP2pSource {
         advertised: BlockRef,
         lane: NetworkLane,
     ) -> Result<(P2pSession, bool), P2pError> {
+        self.network
+            .peer_store
+            .initialize()
+            .await
+            .map_err(|error| P2pError::InvalidConfig(error.to_string()))?;
         let mut state = self.network.state.lock().await;
         if state
             .as_ref()
@@ -4348,11 +3755,9 @@ impl RethP2pSource {
         let shutdown = CancellationToken::new();
         self.network.qualifications.reset(advertised);
         let (qualification_target, qualification_updates) = tokio::sync::watch::channel(advertised);
-        let (cache_flush, cache_flush_requests) = tokio::sync::mpsc::channel(1);
+        let (peer_store_flush, peer_store_flush_requests) = tokio::sync::mpsc::channel(1);
         let cached_records = prioritized_peer_cache_records(
-            self.config.peer_cache_path.as_deref(),
-            &self.network.peer_quality,
-            self.config.peer_cache_max_entries,
+            &self.network.peer_store,
             self.config
                 .body_serving_peer_target
                 .min(self.config.max_concurrent_dials),
@@ -4361,9 +3766,8 @@ impl RethP2pSource {
             manager,
             network_events,
             NetworkManagerRuntime {
-                peer_cache_path: self.config.peer_cache_path.clone(),
-                peer_cache_max_entries: self.config.peer_cache_max_entries,
-                peer_cache_flush_interval: self.config.peer_cache_flush_interval,
+                peer_store_flush_interval: self.config.peer_store_flush_interval,
+                peer_store_max_entries: self.config.peer_store_max_entries,
                 telemetry: telemetry.clone(),
                 network_telemetry: self.config.network_telemetry.clone(),
                 peer_recovery_timeout: self.config.peer_recovery_timeout,
@@ -4378,7 +3782,7 @@ impl RethP2pSource {
                 peer_refill_interval: self.config.peer_refill_interval,
                 bootstrap_dns_tree: self.config.bootstrap_dns_tree.clone(),
                 cached_records,
-                peer_quality: self.network.peer_quality.clone(),
+                peer_store: self.network.peer_store.clone(),
                 qualifications: self.network.qualifications.clone(),
                 qualification_target: qualification_updates,
                 request_gate: self.network.request_gate.clone(),
@@ -4386,7 +3790,7 @@ impl RethP2pSource {
                 material_request_concurrency: self.config.material_request_concurrency,
                 minimum_peers: self.config.minimum_peers,
                 body_serving_peer_target: self.config.body_serving_peer_target,
-                cache_flush_requests,
+                peer_store_flush_requests,
                 shutdown: shutdown.clone(),
             },
         );
@@ -4394,7 +3798,7 @@ impl RethP2pSource {
             generation,
             handle: handle.clone(),
             fetch: fetch.clone(),
-            cache_flush,
+            peer_store_flush,
             network_task,
             shutdown,
             telemetry: telemetry.clone(),
@@ -5620,7 +5024,7 @@ impl RethP2pSource {
                     match validate_headers(range, &headers, expected_tip) {
                         Ok(()) => {
                             lease.succeeded();
-                            self.network.peer_quality.record_success(
+                            self.network.peer_store.record_success(
                                 peer_id,
                                 PeerMaterialKind::Header,
                                 range.end().0,
@@ -5835,7 +5239,7 @@ impl RethP2pSource {
                         match validate_bodies(std::slice::from_ref(header), &bodies) {
                             Ok(()) => {
                                 lease.succeeded();
-                                self.network.peer_quality.record_success(
+                                self.network.peer_store.record_success(
                                     peer_id,
                                     PeerMaterialKind::Body,
                                     header.number,
@@ -6002,7 +5406,7 @@ impl RethP2pSource {
                         ) {
                             Ok(()) => {
                                 lease.succeeded();
-                                self.network.peer_quality.record_success(
+                                self.network.peer_store.record_success(
                                     peer_id,
                                     PeerMaterialKind::Receipts,
                                     material.header.number,
@@ -7191,7 +6595,7 @@ impl RethP2pHistorySource {
                     match validate_receipts_against_headers(headers, &response.receipts) {
                         Ok(()) => {
                             lease.succeeded();
-                            self.source.network.peer_quality.record_success(
+                            self.source.network.peer_store.record_success(
                                 peer_id,
                                 PeerMaterialKind::Receipts,
                                 headers.last().map_or(0, |header| header.number),
@@ -10009,11 +9413,43 @@ mod tests {
     use super::*;
 
     fn direct_peer_pool() -> Arc<DirectPeerPool> {
-        Arc::new(DirectPeerPool::new(Arc::new(PeerQualityStore::load(None))))
+        Arc::new(DirectPeerPool::new(Arc::new(ExecutionPeerStore::new(
+            None,
+            DEFAULT_PEER_STORE_MAX_ENTRIES,
+        ))))
     }
 
     fn node_record(marker: u8) -> NodeRecord {
         node_record_at(marker, Ipv4Addr::LOCALHOST)
+    }
+
+    #[test]
+    fn peer_candidate_registry_evicts_oldest_admissions_at_its_bound() {
+        let registry = PeerCandidateRegistry::new(2);
+        let first = node_record(1).id;
+        let second = node_record(2).id;
+        let third = node_record(3).id;
+        assert!(registry.admit(first, NetworkPeerOrigin::CachedBroad));
+        registry
+            .admissions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get_mut(&first)
+            .expect("first admission")
+            .admitted_at = Instant::now()
+            .checked_sub(Duration::from_secs(1))
+            .expect("one second before now is representable");
+        assert!(registry.admit(second, NetworkPeerOrigin::DnsTree));
+        assert!(registry.admit(third, NetworkPeerOrigin::Discv4Crawler));
+
+        let admissions = registry
+            .admissions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(admissions.len(), 2);
+        assert!(!admissions.contains_key(&first));
+        assert!(admissions.contains_key(&second));
+        assert!(admissions.contains_key(&third));
     }
 
     fn node_record_at(marker: u8, address: Ipv4Addr) -> NodeRecord {
@@ -10778,59 +10214,51 @@ mod tests {
         assert!(validate_bootstrap_dns_tree("enrtree://missing-key.example.com").is_err());
     }
 
-    #[test]
-    fn peer_quality_merge_preserves_verified_material_evidence() {
+    #[tokio::test]
+    async fn peer_store_merge_preserves_verified_material_evidence() {
         let directory = tempfile::tempdir().expect("temporary directory");
-        let destination = directory.path().join("execution-peer-quality.json");
-        let sibling = directory.path().join("sibling-peer-quality.json");
-        let destination_store = PeerQualityStore {
-            path: Some(destination.clone()),
-            document: Mutex::new(PeerQualityDocument::default()),
-            dirty: AtomicBool::new(false),
-        };
-        let sibling_store = PeerQualityStore {
-            path: Some(sibling.clone()),
-            document: Mutex::new(PeerQualityDocument::default()),
-            dirty: AtomicBool::new(false),
-        };
-        let body_peer = node_record(3).id;
-        let receipt_peer = node_record(4).id;
+        let destination = directory.path().join("execution-network.sqlite");
+        let sibling = directory.path().join("sibling-network.sqlite");
+        let destination_store = ExecutionPeerStore::new(Some(destination.clone()), 10);
+        let sibling_store = ExecutionPeerStore::new(Some(sibling.clone()), 10);
+        let body_record = node_record(3);
+        let receipt_record = node_record(4);
         destination_store.record_success(
-            body_peer,
+            body_record.id,
             PeerMaterialKind::Body,
             25_000_000,
             Duration::from_millis(30),
         );
         sibling_store.record_success(
-            receipt_peer,
+            receipt_record.id,
             PeerMaterialKind::Receipts,
             25_000_100,
             Duration::from_millis(20),
         );
-        destination_store.persist(10).expect("persist destination");
-        sibling_store.persist(10).expect("persist sibling");
+        destination_store
+            .persist(vec![body_record])
+            .await
+            .expect("persist destination");
+        sibling_store
+            .persist(vec![receipt_record])
+            .await
+            .expect("persist sibling");
 
-        let merged = merge_peer_quality_caches(&destination, std::slice::from_ref(&sibling), 10)
-            .expect("merge quality caches")
+        let merged = merge_execution_peer_stores(&destination, std::slice::from_ref(&sibling), 10)
+            .await
+            .expect("merge peer stores")
             .expect("quality evidence exists");
         assert_eq!(
             merged,
-            PeerQualityCacheMerge {
+            ExecutionPeerStoreMerge {
                 total: 2,
                 imported: 1
             }
         );
-        let document = read_peer_quality_document(&destination).expect("merged document");
-        assert!(
-            document.peers[&peer_quality_key(body_peer)]
-                .last_body_success_unix_ms
-                .is_some()
-        );
-        assert!(
-            document.peers[&peer_quality_key(receipt_peer)]
-                .last_receipt_success_unix_ms
-                .is_some()
-        );
+        let reopened = ExecutionPeerStore::new(Some(destination), 10);
+        reopened.initialize().await.expect("reopen merged store");
+        assert!(reopened.has_material_success(body_record.id, PeerMaterialKind::Body));
+        assert!(reopened.has_material_success(receipt_record.id, PeerMaterialKind::Receipts));
     }
 
     #[tokio::test]
@@ -11246,78 +10674,50 @@ mod tests {
         assert_eq!(builder.pending.back().copied(), Some(first_wave[1]));
     }
 
-    #[test]
-    fn peer_cache_compaction_prefers_serving_reputation_then_fork_metadata() {
-        let entries = parse_peer_cache_entries(
-            br#"[{"record":"enode://stale","kind":"basic","reputation":-25600},
-                  {"record":"enode://plain","kind":"basic","reputation":50},
-                  {"record":"enode://fork","kind":"basic","reputation":0,"fork_id":{"hash":"x"}},
-                  {"record":"enode://plain","kind":"basic","reputation":100}]"#,
-        )
-        .expect("peer entries");
-
-        let quality = PeerQualityStore::load(None);
-        let compacted = compact_peer_cache_entries(entries, 2, &quality);
-        assert_eq!(compacted.len(), 2);
-        assert_eq!(compacted[0]["record"], "enode://plain");
-        assert_eq!(compacted[0]["reputation"], 100);
-        assert_eq!(compacted[1]["record"], "enode://fork");
-        assert!(
-            compacted
-                .iter()
-                .all(|entry| entry["record"] != "enode://stale")
+    #[tokio::test]
+    async fn peer_store_pruning_prefers_verified_body_service() {
+        let store = ExecutionPeerStore::new(None, 2);
+        let proven = node_record(1);
+        let recent = node_record(2);
+        let excess = node_record(3);
+        store.record_success(
+            proven.id,
+            PeerMaterialKind::Body,
+            25_000_000,
+            Duration::from_millis(10),
         );
+        store
+            .persist(vec![proven, recent, excess])
+            .await
+            .expect("prune in-memory peer store");
+        let retained = store.candidate_ids();
+        assert_eq!(retained.len(), 2);
+        assert!(retained.contains(&proven.id));
     }
 
-    #[test]
-    fn peer_cache_hot_tier_requires_current_body_service_and_subnet_diversity() {
-        let directory = tempfile::tempdir().expect("temporary directory");
-        let path = directory.path().join("execution-peers.json");
+    #[tokio::test]
+    async fn peer_cache_hot_tier_requires_current_body_service_and_subnet_diversity() {
         let first = node_record_at(1, Ipv4Addr::new(10, 1, 1, 1));
         let same_subnet = node_record_at(2, Ipv4Addr::new(10, 1, 2, 2));
         let diverse = node_record_at(3, Ipv4Addr::new(10, 2, 1, 1));
         let failed = node_record_at(4, Ipv4Addr::new(10, 3, 1, 1));
-        let negative_reputation = node_record_at(5, Ipv4Addr::new(10, 4, 1, 1));
-        let entries = [
-            &first,
-            &same_subnet,
-            &diverse,
-            &failed,
-            &negative_reputation,
-        ]
-        .into_iter()
-        .map(|record| {
-            serde_json::json!({
-                "record": record.to_string(),
-                "kind": "basic",
-                "reputation": if record.id == negative_reputation.id { -1 } else { 0 },
-            })
-        })
-        .collect::<Vec<_>>();
-        std::fs::write(
-            &path,
-            serde_json::to_vec(&entries).expect("encode peer cache"),
-        )
-        .expect("write peer cache");
-
-        let quality = PeerQualityStore::load(None);
-        for record in [
-            &first,
-            &same_subnet,
-            &diverse,
-            &failed,
-            &negative_reputation,
-        ] {
-            quality.record_success(
+        let unproven = node_record_at(5, Ipv4Addr::new(10, 4, 1, 1));
+        let store = ExecutionPeerStore::new(None, 16);
+        for record in [&first, &same_subnet, &diverse, &failed] {
+            store.record_success(
                 record.id,
                 PeerMaterialKind::Body,
                 1,
                 Duration::from_millis(10),
             );
         }
-        quality.record_failure(failed.id, "session closed");
+        store.record_failure(failed.id, "session closed");
+        store
+            .persist(vec![first, same_subnet, diverse, failed, unproven])
+            .await
+            .expect("persist candidates");
 
-        let cached = prioritized_peer_cache_records(Some(&path), &quality, 16, 2);
+        let cached = prioritized_peer_cache_records(&store, 2);
         assert_eq!(cached.hot.len(), 2);
         assert_ne!(
             peer_subnet(cached.hot[0].address),
@@ -11325,42 +10725,31 @@ mod tests {
         );
         assert!(cached.hot.iter().all(|record| record.id != failed.id));
         assert!(cached.broad.iter().any(|record| record.id == failed.id));
-        assert!(
-            cached
-                .broad
-                .iter()
-                .any(|record| record.id == negative_reputation.id)
-        );
+        assert!(cached.broad.iter().any(|record| record.id == unproven.id));
         assert_eq!(cached.hot.len() + cached.broad.len(), 5);
     }
 
-    #[test]
-    fn peer_cache_refresh_retains_broad_records_absent_from_current_session() {
+    #[tokio::test]
+    async fn peer_store_refresh_retains_broad_records_absent_from_current_session() {
         let directory = tempfile::tempdir().expect("temporary directory");
-        let previous = directory.path().join("execution-peers.json");
-        let current = directory.path().join("execution-peers.tmp");
-        std::fs::write(
-            &previous,
-            br#"[{"record":"enode://broad","kind":"basic","reputation":0}]"#,
-        )
-        .expect("write previous peer cache");
-        std::fs::write(
-            &current,
-            br#"[{"record":"enode://current","kind":"basic","reputation":1}]"#,
-        )
-        .expect("write current peer cache");
+        let path = directory.path().join("execution-network.sqlite");
+        let broad = node_record(1);
+        let current = node_record(2);
+        let store = ExecutionPeerStore::new(Some(path.clone()), 16);
+        store
+            .persist(vec![broad])
+            .await
+            .expect("persist broad peer");
+        store
+            .persist(vec![current])
+            .await
+            .expect("persist current peer");
 
-        merge_and_compact_peer_cache_file(&current, &previous, 16, &PeerQualityStore::load(None))
-            .expect("merge peer caches");
-        let merged = parse_peer_cache_entries(&std::fs::read(current).expect("read merged cache"))
-            .expect("parse merged cache");
-        let records = merged
-            .into_iter()
-            .map(|(record, _)| record)
-            .collect::<HashSet<_>>();
+        let reopened = ExecutionPeerStore::new(Some(path), 16);
+        reopened.initialize().await.expect("reopen peer store");
         assert_eq!(
-            records,
-            HashSet::from(["enode://broad".to_owned(), "enode://current".to_owned()])
+            reopened.candidate_ids(),
+            HashSet::from([broad.id, current.id])
         );
     }
 

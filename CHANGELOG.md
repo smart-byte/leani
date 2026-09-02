@@ -16,6 +16,9 @@ record, and documented RPC contracts.
   and runtime data directories are exclusively locked across processes.
 - The CLI now discovers `./leani.toml` by default; `LEANI_CONFIG` and
   `--config` remain explicit overrides.
+- Execution peer candidates and verified service evidence now use the bounded
+  `execution-network.sqlite` WAL store with background incremental persistence;
+  the pre-launch JSON peer-state formats are intentionally not migrated.
 - `ProcessorFactory::id` accepts an ordinary borrowed string again, and
   `description` has a backwards-compatible default for downstream factories.
 - Public documentation and the Astro landing page now live in this monorepo,

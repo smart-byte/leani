@@ -70,20 +70,22 @@ the same state under the `leani_p2p_*` metric prefix.
 
 The execution identity is stored as `execution-p2p-secret` in `data_dir`.
 Treat it as node identity material: keep it across restarts, restrict its
-permissions, and never publish it. `execution-peers.json` is a bounded broad
-discovery cache capped by `sources.live.peer_cache_max_entries`. Refreshes
-merge Reth's current view without dropping candidates absent from one short or
-failed run; quality ordering decides which records survive the bound. The
-first startup after upgrading preserves an oversized old cache as
-`execution-peers.json.pre-compact`.
+permissions, and never publish it. `execution-network.sqlite` is a disposable,
+bounded operational store capped by `sources.live.peer_store_max_entries`. It
+contains both broad discovery candidates and Leani's independently observed
+service evidence: verified header/body/receipt success times, highest served
+block, smoothed response latency, last failure classification/time, fork
+compatibility, and latest anchor qualification.
 
-`execution-peer-quality.json` stores Leani's independently observed service
-evidence: verified header/body/receipt success times, highest served block,
-smoothed response latency, last failure classification/time, fork
-compatibility, and latest anchor qualification. Keep it with the peer cache.
-Standalone feeds merge this evidence across sibling local Mainnet contexts,
-so a body- or receipt-serving peer learned by one processor is preferred by
-another without sharing processor data or the local P2P identity secret.
+Reth's known-peer snapshots and new service observations are committed by a
+dedicated background writer, so SQLite I/O never stops the network-manager
+event loop. Incremental upserts retain candidates absent from one short or
+failed run; indexed quality ordering decides which records survive the bound.
+Standalone feeds merge the SQLite evidence across sibling local Mainnet
+contexts, so a body- or receipt-serving peer learned by one processor is
+preferred by another without sharing processor data or the local P2P identity
+secret. The peer store is reconstructible and intentionally separate from the
+authoritative processor database and its backups.
 
 Warm startup uses two cache tiers. A small hot tier contains recent body-serving
 peers whose last verified body success is newer than their last recorded

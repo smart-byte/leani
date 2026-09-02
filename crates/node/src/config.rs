@@ -568,10 +568,10 @@ pub struct LiveSourceConfig {
     pub persistent_retries: bool,
     #[serde(default = "default_execution_retry_backoff_max_seconds")]
     pub retry_backoff_max_seconds: u64,
-    #[serde(default = "default_execution_peer_cache_flush_seconds")]
-    pub peer_cache_flush_seconds: u64,
-    #[serde(default = "default_execution_peer_cache_max_entries")]
-    pub peer_cache_max_entries: usize,
+    #[serde(default = "default_execution_peer_store_flush_seconds")]
+    pub peer_store_flush_seconds: u64,
+    #[serde(default = "default_execution_peer_store_max_entries")]
+    pub peer_store_max_entries: usize,
     /// Finalized processor-delta checksums compared per archive catch-up
     /// batch. Raw live frames need not be retained for this audit.
     #[serde(default = "default_archive_reconciliation_blocks")]
@@ -1474,7 +1474,7 @@ impl Config {
         }
         if matches!(self.sources.live.kind, LiveSourceKind::P2p)
             && (self.sources.live.retry_backoff_max_seconds == 0
-                || self.sources.live.peer_cache_flush_seconds == 0
+                || self.sources.live.peer_store_flush_seconds == 0
                 || self.sources.live.archive_reconciliation_interval_seconds == 0)
         {
             errors.push(ValidationError::new(
@@ -1483,10 +1483,10 @@ impl Config {
             ));
         }
         if matches!(self.sources.live.kind, LiveSourceKind::P2p)
-            && !(1..=65_536).contains(&self.sources.live.peer_cache_max_entries)
+            && !(1..=65_536).contains(&self.sources.live.peer_store_max_entries)
         {
             errors.push(ValidationError::new(
-                "sources.live.peer_cache_max_entries",
+                "sources.live.peer_store_max_entries",
                 "must be in 1..=65536 for p2p",
             ));
         }
@@ -2280,11 +2280,11 @@ const fn default_execution_retry_backoff_max_seconds() -> u64 {
     60
 }
 
-const fn default_execution_peer_cache_flush_seconds() -> u64 {
+const fn default_execution_peer_store_flush_seconds() -> u64 {
     60
 }
 
-const fn default_execution_peer_cache_max_entries() -> usize {
+const fn default_execution_peer_store_max_entries() -> usize {
     4_096
 }
 

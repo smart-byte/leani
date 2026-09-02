@@ -4648,6 +4648,7 @@ dependencies = [
  "secp256k1 0.30.0",
  "serde",
  "serde_json",
+ "sqlx",
  "tempfile",
  "thiserror 2.0.19",
  "tokio",
