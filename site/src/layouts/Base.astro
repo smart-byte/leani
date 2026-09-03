@@ -7,6 +7,7 @@ import '../styles/global.css';
 interface Props { title: string; description: string }
 const { title, description } = Astro.props;
 const canonical = new URL(Astro.url.pathname, Astro.site);
+const socialImage = new URL('/leani-social-avatar.png', Astro.site);
 ---
 <!doctype html>
 <html lang="en">
@@ -16,12 +17,16 @@ const canonical = new URL(Astro.url.pathname, Astro.site);
     <title>{title}</title>
     <meta name="description" content={description} />
     <meta name="theme-color" content="#0b0f0d" />
+    <link rel="icon" href="/favicon.ico" sizes="any" />
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
     <link rel="canonical" href={canonical} />
     <meta property="og:title" content={title} />
     <meta property="og:description" content={description} />
     <meta property="og:url" content={canonical} />
     <meta property="og:type" content="website" />
+    <meta property="og:image" content={socialImage} />
+    <meta property="og:image:alt" content="Leani logo" />
     <meta name="twitter:card" content="summary" />
   </head>
   <body>

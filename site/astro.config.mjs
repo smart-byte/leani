@@ -36,6 +36,10 @@ export default defineConfig({
       title: 'Leani',
       description: 'Run the Ethereum data processors your application needs, and keep only their durable results.',
       favicon: '/favicon.svg',
+      logo: {
+        src: './src/assets/leani-mark.svg',
+        alt: 'Leani',
+      },
       pagefind: true,
       social: [
         {

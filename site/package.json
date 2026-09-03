@@ -3,6 +3,7 @@
   "private": true,
   "type": "module",
   "scripts": {
+    "brand:update": "bun scripts/generate-brand-assets.ts",
     "dev": "bun run docs:prepare && astro dev",
     "build": "bun run docs:prepare && astro build",
     "preview": "astro preview",

@@ -16,6 +16,10 @@ manifest into ignored render inputs under `src/generated`. Run
 changes; that command requires the repository Rust toolchain. Normal site builds
 require Bun only and make no network requests.
 
+Brand exports come from `src/assets/leani-mark.svg`. Run `bun run brand:update`
+after changing it to regenerate the SVG favicon, ICO, Apple touch icon, and
+social-media avatar under `public`.
+
 Use `bun run check`, `bun run examples:check`, and `bun run build` before review.
 `LEANI_SITE_MODE` and `LEANI_DOCS_REF` override automatically derived preview or
 release metadata when reproducing CI locally.

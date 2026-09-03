@@ -30,7 +30,10 @@ const examples = heroExamples.map((example) => {
 ---
 <section class="hero wrap section">
   <a class="eyebrow mono" href={LIMITATIONS_URL}>Public preview</a>
-  <p class="mono brand"><span class="accent">leani</span>_ <span class="say">(LEE-nee)</span></p>
+  <p class="mono brand">
+    <img src="/leani-mark.svg" width="32" height="32" alt="" />
+    <span><span class="accent">leani</span>_ <span class="say">(LEE-nee)</span></span>
+  </p>
   <h1>Ethereum data, shaped for your&nbsp;application.</h1>
   <p class="sub">
     Backfill from public datasets, follow the head over Ethereum P2P, and
@@ -94,7 +97,8 @@ const examples = heroExamples.map((example) => {
 
 <style>
   .hero { padding-top: 7rem; }
-  .brand { font-size: 1.1rem; margin-top: 1rem; }
+  .brand { display: flex; align-items: center; gap: 0.65rem; font-size: 1.1rem; margin-top: 1rem; }
+  .brand img { width: 2rem; height: 2rem; }
   .say { color: var(--ink-dim); font-size: 0.85rem; }
   h1 { font-size: clamp(2.4rem, 6vw, 4.2rem); max-width: 18ch; margin-top: 0.75rem; }
   .sub { color: var(--ink-dim); font-size: 1.15rem; max-width: 52ch; margin-top: 1.25rem; }
