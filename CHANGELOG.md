@@ -8,6 +8,9 @@ record, and documented RPC contracts.
 
 ### Changed
 
+- Execution peer discovery now has one Discv4 owner: Reth's network manager.
+  Leani continues to feed independently decoded EIP-1459 DNS records into the
+  same bounded peer manager without running a second Discv4 crawler.
 - `LiveSource::subscribe` now receives the compiled `DataRequest`, allowing
   sources to acquire only the material required by the active processor set.
 - Uniswap 2.1 public entity/change JSON now uses camelCase fields, `0x` address

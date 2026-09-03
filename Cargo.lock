@@ -4636,7 +4636,6 @@ dependencies = [
  "leani-source-api",
  "postcard",
  "reth-chainspec",
- "reth-discv4",
  "reth-discv5",
  "reth-dns-discovery",
  "reth-ethereum-primitives",

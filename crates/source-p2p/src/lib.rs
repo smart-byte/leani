@@ -50,7 +50,6 @@ use leani_source_api::{
     SourceDescriptor, SourceError, SourcePlan,
 };
 use reth_chainspec::MAINNET;
-use reth_discv4::{DiscoveryUpdate, Discv4, Discv4Config};
 use reth_dns_discovery::{
     DnsDiscoveryConfig, DnsDiscoveryService, Resolver as DnsDiscoveryResolver,
     tree::LinkEntry as DnsDiscoveryLink,
@@ -107,7 +106,6 @@ const MAX_HISTORY_MATERIAL_WINDOW_BLOCKS: usize = 32;
 const NETWORK_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 const MAINNET_DNS_DISCOVERY_TREE: &str =
     "enrtree://AKA3AM6LPBYEUDMVNU3BSVQJ5AD45Y7YPOHJLEF6W26QOE4VTUDPE@all.mainnet.ethdisco.net";
-const MAINNET_DNS_DISCV4_BOOTSTRAP_PEERS: usize = 32;
 const MAINNET_DNS_RETRY_INTERVAL: Duration = Duration::from_secs(15);
 const PEER_QUALIFICATION_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 static SECRET_KEY_WRITE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -2200,7 +2198,6 @@ fn join_dns_txt_segments<'a>(segments: impl IntoIterator<Item = &'a [u8]>) -> Op
 struct DnsPeerSeederRuntime {
     dns_head: Head,
     bootstrap_dns_tree: Option<String>,
-    bootstrap_records: Vec<NodeRecord>,
     peer_candidates: Arc<PeerCandidateRegistry>,
     network_telemetry: NetworkTelemetry,
 }
@@ -2240,10 +2237,6 @@ fn spawn_cached_peer_admitter(
     })
 }
 
-#[expect(
-    clippy::too_many_lines,
-    reason = "one select loop joins verified DNS records with the bootstrap crawler"
-)]
 fn spawn_mainnet_dns_peer_seeder(
     handle: NetworkHandle<EthNetworkPrimitives>,
     runtime: DnsPeerSeederRuntime,
@@ -2252,7 +2245,6 @@ fn spawn_mainnet_dns_peer_seeder(
         let DnsPeerSeederRuntime {
             dns_head,
             bootstrap_dns_tree,
-            bootstrap_records,
             peer_candidates,
             network_telemetry,
         } = runtime;
@@ -2294,55 +2286,12 @@ fn spawn_mainnet_dns_peer_seeder(
         );
         dns_retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-        let crawler_secret = rng_secret_key();
-        let crawler_addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0));
-        let crawler_record =
-            NodeRecord::from_secret_key(crawler_addr, &crawler_secret).with_tcp_port(0);
-        let crawler_config = Discv4Config {
-            external_ip_resolver: None,
-            resolve_external_ip_interval: None,
-            ..Discv4Config::default()
-        };
-        let (crawler, mut crawler_service) = match Discv4::bind(
-            crawler_addr,
-            crawler_record,
-            crawler_secret,
-            crawler_config,
-        )
-        .await
-        {
-            Ok(crawler) => crawler,
-            Err(error) => {
-                warn!(%error, "could not start execution peer Discv4 bootstrap crawler");
-                return;
-            }
-        };
-        let mut crawler_updates = crawler_service.update_stream();
-        let mut crawler_task = AbortTaskOnDrop(crawler_service.spawn());
         let fork_filter = MAINNET.fork_filter(dns_head);
         let mut seeded_peers = 0_usize;
-        let mut crawler_seed_count = 0_usize;
-        let mut crawler_discovered_peers = 0_usize;
-        // Queue every newly verified discovery record for the next bounded
-        // refill wave. Reth owns the simultaneous-dial ceiling, and this
-        // supplemental queue never revisits a record more frequently than the
-        // configured retry ceiling. Fresh records always go first so a
-        // long-lived zero-peer process neither exhausts discovery permanently
-        // nor hammers one peer.
-        for record in bootstrap_records {
-            if crawler_seed_count < MAINNET_DNS_DISCV4_BOOTSTRAP_PEERS {
-                crawler.add_boot_node(record);
-                crawler_seed_count = crawler_seed_count.saturating_add(1);
-            }
-        }
         loop {
             tokio::select! {
                 _ = &mut service_task.0 => {
                     warn!("mainnet execution peer DNS seeder stopped unexpectedly");
-                    return;
-                }
-                _ = &mut crawler_task.0 => {
-                    warn!("execution peer Discv4 bootstrap crawler stopped unexpectedly");
                     return;
                 }
                 _ = dns_retry.tick() => {
@@ -2377,10 +2326,6 @@ fn spawn_mainnet_dns_peer_seeder(
                         &peer_candidates,
                         &network_telemetry,
                     );
-                    if crawler_seed_count < MAINNET_DNS_DISCV4_BOOTSTRAP_PEERS {
-                        crawler.add_boot_node(record);
-                        crawler_seed_count = crawler_seed_count.saturating_add(1);
-                    }
                     if admitted {
                         seeded_peers = seeded_peers.saturating_add(1);
                         if seeded_peers == 1 || seeded_peers.is_multiple_of(100) {
@@ -2388,42 +2333,6 @@ fn spawn_mainnet_dns_peer_seeder(
                                 seeded_peers,
                                 "seeded compatible execution peers from the mainnet DNS tree"
                             );
-                        }
-                    }
-                }
-                update = crawler_updates.next() => {
-                    let Some(update) = update else {
-                        warn!("execution peer Discv4 bootstrap crawler stream closed unexpectedly");
-                        return;
-                    };
-                    let mut pending = vec![update];
-                    while let Some(update) = pending.pop() {
-                        match update {
-                            DiscoveryUpdate::EnrForkId(record, fork_id) => {
-                                if fork_filter.validate(fork_id).is_err() {
-                                    continue;
-                                }
-                                let admitted = admit_node_record_to_network(
-                                    &handle,
-                                    record,
-                                    NetworkPeerOrigin::Discv4Crawler,
-                                    &peer_candidates,
-                                    &network_telemetry,
-                                );
-                                if admitted {
-                                    crawler_discovered_peers = crawler_discovered_peers.saturating_add(1);
-                                    if crawler_discovered_peers == 1 || crawler_discovered_peers.is_multiple_of(25) {
-                                        debug!(
-                                            discovered_peers = crawler_discovered_peers,
-                                            "seeded compatible execution peers from the Discv4 bootstrap crawler"
-                                        );
-                                    }
-                                }
-                            }
-                            DiscoveryUpdate::Batch(updates) => pending.extend(updates),
-                            DiscoveryUpdate::Added(_)
-                            | DiscoveryUpdate::DiscoveredAtCapacity(_)
-                            | DiscoveryUpdate::Removed(_) => {}
                         }
                     }
                 }
@@ -2575,8 +2484,6 @@ where
             }
         }
         let CachedPeerRecords { hot, broad } = cached_records;
-        let mut crawler_bootstrap_records = hot.clone();
-        crawler_bootstrap_records.extend(broad.iter().copied());
         for record in &hot {
             admit_node_record_to_network(
                 manager.as_ref().get_ref().handle(),
@@ -2605,7 +2512,6 @@ where
             DnsPeerSeederRuntime {
                 dns_head,
                 bootstrap_dns_tree,
-                bootstrap_records: crawler_bootstrap_records,
                 peer_candidates: peer_candidates.clone(),
                 network_telemetry: network_telemetry.clone(),
             },
@@ -9366,7 +9272,7 @@ mod tests {
             .checked_sub(Duration::from_secs(1))
             .expect("one second before now is representable");
         assert!(registry.admit(second, NetworkPeerOrigin::DnsTree));
-        assert!(registry.admit(third, NetworkPeerOrigin::Discv4Crawler));
+        assert!(registry.admit(third, NetworkPeerOrigin::Trusted));
 
         let admissions = registry
             .admissions

@@ -34,3 +34,4 @@ Accepted records:
 - [0012 — Two-tier execution peer startup](0012-two-tier-execution-peer-startup.md)
 - [0013 — SQLite execution peer store](0013-sqlite-execution-peer-store.md)
 - [0014 — Opportunistic execution peer qualification](0014-opportunistic-execution-peer-qualification.md)
+- [0015 — Single-owner execution Discv4 discovery](0015-single-owner-execution-discv4.md)

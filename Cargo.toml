@@ -82,7 +82,6 @@ parquet = { version = "59.2.0", default-features = false, features = [
 ] }
 postcard = { version = "1.1", features = ["alloc"] }
 reth-chainspec = { git = "https://github.com/paradigmxyz/reth", rev = "8eb210175687c9f0c889a3b6795c16781d830e3a" }
-reth-discv4 = { git = "https://github.com/paradigmxyz/reth", rev = "8eb210175687c9f0c889a3b6795c16781d830e3a" }
 reth-discv5 = { git = "https://github.com/paradigmxyz/reth", rev = "8eb210175687c9f0c889a3b6795c16781d830e3a" }
 reth-dns-discovery = { git = "https://github.com/paradigmxyz/reth", rev = "8eb210175687c9f0c889a3b6795c16781d830e3a" }
 reth-era = { git = "https://github.com/paradigmxyz/reth", rev = "8eb210175687c9f0c889a3b6795c16781d830e3a" }

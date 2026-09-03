@@ -660,7 +660,6 @@ pub enum NetworkPeerOrigin {
     CachedHot,
     CachedBroad,
     DnsTree,
-    Discv4Crawler,
     Trusted,
     /// Reth's built-in Discv4 or Discv5 service discovered the peer without it
     /// first passing through Leani's explicit candidate admission path.
@@ -674,7 +673,6 @@ impl NetworkPeerOrigin {
             Self::CachedHot => "cached_hot",
             Self::CachedBroad => "cached_broad",
             Self::DnsTree => "dns_tree",
-            Self::Discv4Crawler => "discv4_crawler",
             Self::Trusted => "trusted",
             Self::Discv4Or5 => "discv4_or_5",
         }

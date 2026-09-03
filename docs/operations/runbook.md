@@ -92,13 +92,14 @@ peers whose last verified body success is newer than their last recorded
 failure, with IPv4 `/16` and IPv6 `/32` diversity preferred. Those peers are
 dialed immediately. All other records stay in the broad tier and enter Reth's
 dialer in `body_serving_peer_target`-sized batches at the configured peer refill
-interval. DNS trees, the supplemental Discv4 crawler, and Reth's native
-Discv4/Discv5 discovery run concurrently from the beginning.
+interval. The segment-correct EIP-1459 DNS seeder and Reth's native
+Discv4/Discv5 discovery run concurrently from the beginning. Reth owns the only
+Discv4 service and the bounded dial scheduler.
 
 `/v1/network/status` groups candidate admissions, established sessions, and
-qualification outcomes by `cached_hot`, `cached_broad`, `dns_tree`,
-`discv4_crawler`, `trusted`, or `discv4_or_5`. Prometheus exports the same origin labels
-through `leani_p2p_peer_candidates_admitted_total`,
+qualification outcomes by `cached_hot`, `cached_broad`, `dns_tree`, `trusted`,
+or `discv4_or_5`. Prometheus exports the same origin labels through
+`leani_p2p_peer_candidates_admitted_total`,
 `leani_p2p_peer_sessions_by_origin_total`, and
 `leani_p2p_peer_qualifications_total`. Use these counters when comparing cold
 and warm startup instead of treating cache size as evidence of usefulness.
