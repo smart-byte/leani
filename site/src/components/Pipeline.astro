@@ -1,3 +1,6 @@
+---
+import PipelineSteps from './PipelineSteps.astro';
+---
 <section id="pipeline" class="section" aria-labelledby="pipeline-h">
   <div id="pipeline-stage" class="wrap">
     <h2 id="pipeline-h"><span class="mono"># </span>Two lanes in. One processor contract.</h2>
@@ -6,6 +9,8 @@
       envelope. Each source declares its capabilities and trust model; raw input
       can disappear after commit or remain under an explicit retention policy.
     </p>
+    <div class="steps-row"><PipelineSteps links="landing" /></div>
+    <div class="diagram">
     <svg
       viewBox="0 0 1200 760"
       role="img"
@@ -69,13 +74,17 @@
         <text x="600" y="676" class="eq eq-dim" text-anchor="middle">state · output · delivery · artifacts · checkpoints · undo · raw</text>
       </g>
     </svg>
+    </div>
   </div>
 </section>
 
 <style>
   #pipeline { background: color-mix(in srgb, var(--panel) 55%, var(--bg)); border-block: 1px solid var(--panel-edge); }
   .lede { color: var(--ink-dim); max-width: 52ch; margin-top: 1rem; }
-  svg { width: 100%; height: auto; margin-top: 3rem; display: block; }
+  .steps-row { margin-top: 1rem; }
+  /* Narrow screens scroll the diagram sideways instead of shrinking its labels. */
+  .diagram { overflow-x: auto; margin-top: 3rem; }
+  svg { width: 100%; min-width: 56rem; height: auto; display: block; }
   .lane-label { fill: var(--ink-dim); font-size: 13px; letter-spacing: 0.15em; }
   .chip rect, .stage rect { fill: var(--panel); stroke: var(--panel-edge); }
   .chip text, .stage text { fill: var(--ink); font-size: 15px; text-anchor: middle; }

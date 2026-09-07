@@ -31,6 +31,7 @@ const socialImage = new URL('/leani-social-avatar.png', Astro.site);
   </head>
   <body>
     <a class="skip-link" href="#main">Skip to content</a>
+    <slot name="before-main" />
     <main id="main">
       <slot />
     </main>

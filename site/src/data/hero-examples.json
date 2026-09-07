@@ -2,56 +2,109 @@
   {
     "id": "quickstart",
     "label": "quickstart",
-    "title": "leani — index public Mainnet data",
-    "note": "1,000 real blocks from public Xatu; no API key and no EVM execution",
+    "title": "leani \u2014 follow Ethereum blocks",
+    "note": "Build the current alpha from source, then follow checkpoint setup on first use.",
     "lang": "shell",
     "lines": [
-      { "text": "$ brew install leani-dev/tap/leani", "charMs": 8 },
-      { "text": "$ mkdir leani-quickstart && cd leani-quickstart", "delayMs": 80, "charMs": 6 },
-      { "text": "$ curl -fsSLo leani.toml \\", "delayMs": 80, "charMs": 8 },
-      { "text": "    https://raw.githubusercontent.com/smart-byte/leani/v0.1.0/config/modes/windowed.toml", "charMs": 3 },
-      { "text": "$ leani backfill --processor uniswap-v2-sync-30d \\", "delayMs": 80, "charMs": 6 },
-      { "text": "    --from 10000835 --to 10001834", "charMs": 6 },
-      { "text": "", "delayMs": 80 },
-      { "text": "source    xatu · public Ethereum Mainnet history", "className": "t-dim", "delayMs": 150, "charMs": 2 },
-      { "text": "processor uniswap-v2-sync-30d · 1,000 frames committed", "delayMs": 120, "charMs": 2 },
-      { "text": "coverage  10000835..10001834 · continuous · finalized", "className": "t-accent", "delayMs": 120, "charMs": 2 },
-      { "text": "", "delayMs": 100 },
-      { "text": "$ █", "charMs": 0, "delayMs": 200 }
-    ]
+      {
+        "text": "$ leani subscribe blocks --once"
+      },
+      {
+        "text": ""
+      },
+      {
+        "text": "# On first use, review and accept the checkpoint."
+      },
+      {
+        "text": "# --once may return a labelled unanchored peer preview."
+      },
+      {
+        "text": "# Wait for finalized ancestry instead:"
+      },
+      {
+        "text": "$ leani subscribe blocks --finality finalized --once"
+      }
+    ],
+    "noteHref": "/docs/getting-started/install/",
+    "noteLabel": "Install Leani \u2192"
   },
   {
     "id": "rpc",
     "label": "rpc subset",
-    "title": "watch.ts — existing clients, advertised methods",
-    "note": "exact when the configured source or retained material satisfies the request",
+    "title": "watch.ts \u2014 query your prepared node",
+    "note": "Use the RPC port of the node created by leani init blocks.",
     "lang": "ts",
     "lines": [
-      { "text": "// use leani for the block/receipt/log methods it advertises", "className": "t-dim", "charMs": 3 },
-      { "text": "import { createPublicClient, http, webSocket } from \"viem\";", "delayMs": 80, "charMs": 3 },
-      { "text": "", "delayMs": 60 },
-      { "text": "const eth = createPublicClient({", "charMs": 3 },
-      { "text": "  transport: http(\"http://localhost:8545\"),", "charMs": 3 },
-      { "text": "});", "charMs": 3 },
-      { "text": "", "delayMs": 60 },
-      { "text": "const receipts = await eth.getBlockReceipts({ blockNumber: 19426589n });", "charMs": 3 },
-      { "text": "// exact post-Merge response from capable historical material", "className": "t-accent", "delayMs": 150, "charMs": 3 },
-      { "text": "", "delayMs": 60 },
-      { "text": "const live = createPublicClient({ transport: webSocket(\"ws://localhost:8546\") });", "charMs": 3 },
-      { "text": "live.watchBlocks({ onBlock: (block) => update(block) });", "charMs": 3 },
-      { "text": "// reorg-correct newHeads — replacement heads after branch commit", "className": "t-accent", "delayMs": 150, "charMs": 3 },
-      { "text": "", "delayMs": 60 },
-      { "text": "// not served: eth_call · eth_getBalance · state methods — no EVM, no pretending", "className": "t-dim", "delayMs": 100, "charMs": 3 }
+      {
+        "text": "import { createPublicClient, http } from \"viem\";"
+      },
+      {
+        "text": ""
+      },
+      {
+        "text": "const eth = createPublicClient({"
+      },
+      {
+        "text": "  transport: http(\"http://127.0.0.1:18545\"),"
+      },
+      {
+        "text": "});"
+      },
+      {
+        "text": ""
+      },
+      {
+        "text": "const chainId = await eth.getChainId();"
+      },
+      {
+        "text": "console.log(chainId); // 1 \u2014 Ethereum Mainnet"
+      }
     ],
-    "noteHref": "#rpc",
-    "noteLabel": "served vs refused, in full →"
+    "noteHref": "/docs/guides/json-rpc/",
+    "noteLabel": "Run the RPC example \u2192"
   },
   {
     "id": "sdk",
     "label": "typescript sdk",
-    "title": "follow.ts — query once, follow without a race",
-    "note": "exact snapshot boundary; resumable SSE with explicit apply, undo, and finality",
+    "title": "watch.ts \u2014 follow block summaries",
+    "note": "Start a block-summary node with leani init blocks and leani serve.",
     "lang": "ts",
-    "example": "query-then-follow"
+    "lines": [
+      {
+        "text": "import { createLeaniClient } from \"@leani/sdk\";"
+      },
+      {
+        "text": ""
+      },
+      {
+        "text": "const leani = createLeaniClient({"
+      },
+      {
+        "text": "  baseUrl: \"http://127.0.0.1:18080\","
+      },
+      {
+        "text": "});"
+      },
+      {
+        "text": ""
+      },
+      {
+        "text": "for await (const change of leani.blocks.subscribe()) {"
+      },
+      {
+        "text": "  if (change.operation === \"apply\" && change.data) {"
+      },
+      {
+        "text": "    console.log(change.data.blockNumber);"
+      },
+      {
+        "text": "  }"
+      },
+      {
+        "text": "}"
+      }
+    ],
+    "noteHref": "/docs/guides/query-then-follow/",
+    "noteLabel": "Seed state and handle reorgs \u2192"
   }
 ]

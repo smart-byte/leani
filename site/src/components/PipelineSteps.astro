@@ -1,0 +1,41 @@
+---
+// The four-stage mental model, shared by the landing hero and the docs.
+// Landing links jump to page sections where one exists, otherwise to the concept page.
+interface Props { links?: 'landing' | 'docs' }
+const { links = 'docs' } = Astro.props;
+
+const steps = [
+  ['01', 'acquire', 'history and live head, one exact handoff', '/docs/concepts/data-sources/', '/docs/concepts/data-sources/'],
+  ['02', 'validate', 'commitments, canonicality, provenance', '/docs/concepts/coverage-finality-and-reorgs/', '/docs/concepts/coverage-finality-and-reorgs/'],
+  ['03', 'reduce', 'deterministic processors, ordered state', '#processors', '/docs/reference/processor-contracts/'],
+  ['04', 'deliver', 'query, stream, acknowledge, prune', '#delivery', '/docs/concepts/durable-delivery/'],
+] as const;
+---
+<ol class="steps not-content" aria-label="How leani works">
+  {steps.map(([num, name, desc, landing, docs]) => (
+    <li>
+      <a href={links === 'landing' ? landing : docs}>
+        <span class="num">{num}</span> {name}
+        <span class="desc">{desc}</span>
+      </a>
+    </li>
+  ))}
+</ol>
+
+<style>
+  /* Tokens fall back to Starlight's so the strip works on docs pages in both themes. */
+  .steps {
+    list-style: none; margin: 1.5rem 0 0; padding: 1.25rem 0 0;
+    border-top: 1px solid var(--panel-edge, var(--sl-color-hairline-light));
+    display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 1.25rem;
+    font-family: var(--font-mono, var(--__sl-font-mono));
+    font-size: 0.82rem; line-height: 1.6;
+  }
+  @media (max-width: 760px) { .steps { grid-template-columns: 1fr 1fr; } }
+  @media (max-width: 460px) { .steps { grid-template-columns: 1fr; } }
+  .steps li { margin: 0; padding: 0; }
+  .steps a { color: var(--ink, var(--sl-color-white)); text-decoration: none; display: block; }
+  .steps a:hover .desc { color: var(--ink, var(--sl-color-white)); }
+  .num { color: var(--accent, var(--sl-color-accent)); font-weight: 700; margin-right: 0.3rem; }
+  .desc { display: block; color: var(--ink-dim, var(--sl-color-gray-3)); font-size: 0.76rem; margin-top: 0.15rem; }
+</style>

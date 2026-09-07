@@ -40,7 +40,7 @@ h1, h2, h3 { line-height: 1.15; font-weight: 650; letter-spacing: -0.01em; text-
 h2 { font-size: clamp(1.6rem, 3.5vw, 2.4rem); }
 h2 .mono { color: var(--accent); font-size: 0.85em; }
 
-[id] { scroll-margin-top: 1.5rem; }
+[id] { scroll-margin-top: 4.5rem; }
 
 button, summary, a { touch-action: manipulation; }
 

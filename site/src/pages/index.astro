@@ -1,5 +1,6 @@
 ---
 import Base from '../layouts/Base.astro';
+import Header from '../components/Header.astro';
 import Hero from '../components/Hero.astro';
 import Story from '../components/Story.astro';
 import Pipeline from '../components/Pipeline.astro';
@@ -16,6 +17,7 @@ import SideNav from '../components/SideNav.astro';
   title="leani — the lean Ethereum indexing node"
   description="Leani backfills Ethereum history, follows the live chain, and deterministically reduces blocks into the state, outputs, and durable streams your application chooses to retain."
 >
+  <Header slot="before-main" />
   <SideNav />
   <Hero />
   <Story />

@@ -1,0 +1,39 @@
+---
+import { DOCS_URL, GITHUB_URL, QUICKSTART_URL } from '../config';
+---
+<header class="site-head mono">
+  <div class="wrap row">
+    <a class="brand" href="/">
+      <img src="/leani-mark.svg" width="22" height="22" alt="" />
+      <span><span class="accent">leani</span>_</span>
+      <span class="say">(LEE-nee)</span>
+    </a>
+    <nav aria-label="Site">
+      <a href={DOCS_URL}>docs</a>
+      <a class="qs" href={QUICKSTART_URL}>quickstart</a>
+      <a class="gh" href={GITHUB_URL}>github ↗</a>
+    </nav>
+  </div>
+</header>
+
+<style>
+  .site-head {
+    position: sticky; top: 0; z-index: 8;
+    border-bottom: 1px solid var(--panel-edge);
+    background: color-mix(in srgb, var(--bg) 85%, transparent);
+    backdrop-filter: blur(8px);
+    -webkit-backdrop-filter: blur(8px);
+    font-size: 0.82rem;
+  }
+  .row { display: flex; align-items: center; justify-content: space-between; gap: 1rem; min-height: 3.5rem; }
+  .brand { display: flex; align-items: center; gap: 0.55rem; color: var(--ink); text-decoration: none; font-size: 0.95rem; }
+  .say { color: var(--ink-dim); font-size: 0.75rem; }
+  @media (max-width: 720px) { .say { display: none; } }
+  nav { display: flex; gap: 1.5rem; }
+  nav a { color: var(--ink-dim); text-decoration: none; white-space: nowrap; }
+  @media (max-width: 480px) { nav a.qs { display: none; } }
+  nav a:hover, nav .gh { color: var(--ink); }
+  nav a:hover { color: var(--accent); }
+  /* Leave room for the fixed section menu button (SideNav) on narrow screens. */
+  @media (max-width: 1399px) { nav { padding-right: 3.2rem; gap: 1.1rem; } }
+</style>

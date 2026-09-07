@@ -1,18 +1,24 @@
 ---
 import TerminalFrame from './TerminalFrame.astro';
-import { GITHUB_URL, LIMITATIONS_URL } from '../config';
+import { GITHUB_URL, LIMITATIONS_URL, QUICKSTART_URL } from '../config';
 import heroExamples from '../data/hero-examples.json';
-import buildMetadata from '../generated/build-metadata.json';
-import { exampleSource } from '../lib/examples';
+import processorReference from '../generated/processors-reference.json';
 
 import { esc, hlShell, hlTs } from '../lib/highlight';
+
+// Measured or catalog-backed facts; the storage figure is the externalized
+// profile's evidence row in data/costs.json, footnoted there as workload-specific.
+const stats = [
+  ['1M blocks → 9.5 MB', 'externalized policy, real Mainnet run'],
+  ['0 API keys', 'public Xatu datasets + Ethereum P2P'],
+  [`${processorReference.processors.length} processors`, 'built in, or your own native Rust'],
+  ['MIT-licensed', 'Rust library + standalone node'],
+];
 
 // Lines with a className keep their whole-line styling (dim context, accent
 // payoffs); everything else gets language tokens.
 const examples = heroExamples.map((example) => {
-  const lines = 'example' in example
-    ? exampleSource('query-then-follow').code.split('\n').map((text) => ({ text }))
-    : example.lines;
+  const lines = example.lines;
   return {
   ...example,
   lines: lines.map((line) => ({
@@ -29,90 +35,94 @@ const examples = heroExamples.map((example) => {
 });
 ---
 <section class="hero wrap section">
-  <a class="eyebrow mono" href={LIMITATIONS_URL}>Public preview</a>
-  <p class="mono brand">
-    <img src="/leani-mark.svg" width="32" height="32" alt="" />
-    <span><span class="accent">leani</span>_ <span class="say">(LEE-nee)</span></span>
-  </p>
-  <h1>Ethereum data, shaped for your&nbsp;application.</h1>
-  <p class="sub">
-    Backfill from public datasets, follow the head over Ethereum P2P, and
-    deterministically reduce blocks into only the state, outputs, and durable
-    streams you choose to retain. Coverage and source trust stay explicit.
-  </p>
-  <div class="cta">
-    <a class="btn btn-primary" href={GITHUB_URL}>GitHub</a>
-    <a class="btn btn-ghost" href="/docs/getting-started/">Quickstart →</a>
-  </div>
-  <ol class="steps mono">
-    <li><a href="#pipeline"><span class="num">01</span> acquire — history and live head, one exact handoff</a></li>
-    <li><a href="#pipeline"><span class="num">02</span> validate — commitments, canonicality, provenance</a></li>
-    <li><a href="#processors"><span class="num">03</span> reduce — deterministic processors, ordered state</a></li>
-    <li><a href="#delivery"><span class="num">04</span> deliver — query, stream, acknowledge, prune</a></li>
-  </ol>
-
-  <div class="hero-term">
-    <div class="hero-tabs mono" role="tablist" aria-label="Hero examples">
-      {examples.map((example, i) => (
-        <button
-          role="tab"
-          id={`hero-tab-${example.id}`}
-          aria-controls={`hero-panel-${example.id}`}
-          aria-selected={i === 0 ? 'true' : 'false'}
-          tabindex={i === 0 ? 0 : -1}
-        >{example.label}</button>
-      ))}
+  <div class="hero-grid">
+    <div class="hero-copy">
+      <a class="eyebrow mono" href={LIMITATIONS_URL}>Public preview</a>
+      <h1>Ethereum data, shaped for your application.</h1>
+      <p class="sub">
+        An Ethereum indexing node you run inside your own infra. Backfill from
+        public datasets, follow the head over Ethereum P2P, and deterministically
+        reduce blocks into only the state, outputs, and durable streams you
+        choose to retain. Point viem or any JSON-RPC client at it, or stream
+        changes over the SDK.
+      </p>
+      <div class="cta">
+        <a class="btn btn-primary" href={QUICKSTART_URL}>Quickstart →</a>
+        <a class="btn btn-ghost" href={GITHUB_URL}>GitHub ↗</a>
+      </div>
     </div>
-    {examples.map((example) => (
-      <div
-        class="hero-panel"
-        role="tabpanel"
-        id={`hero-panel-${example.id}`}
-        aria-labelledby={`hero-tab-${example.id}`}
-      >
-        <TerminalFrame title={example.title}>
-          <div class="hero-typer" data-lines={JSON.stringify(example.lines)}>
-            <noscript>
+
+    <div class="hero-term">
+      <div class="hero-tabs mono" role="tablist" aria-label="Hero examples">
+        {examples.map((example, i) => (
+          <button
+            role="tab"
+            id={`hero-tab-${example.id}`}
+            aria-controls={`hero-panel-${example.id}`}
+            aria-selected={i === 0 ? 'true' : 'false'}
+            tabindex={i === 0 ? 0 : -1}
+          >{example.label}</button>
+        ))}
+      </div>
+      {examples.map((example) => (
+        <div
+          class="hero-panel"
+          role="tabpanel"
+          id={`hero-panel-${example.id}`}
+          aria-labelledby={`hero-tab-${example.id}`}
+        >
+          <TerminalFrame title={example.title}>
+            <div class="hero-transcript">
               {example.lines.map((l) => (
                 <span class={`t-line ${l.className ?? ''}`} set:html={l.html ?? esc(l.text)} />
               ))}
-            </noscript>
-          </div>
-        </TerminalFrame>
-        <p class="mono note">
-          {example.note}
-          {buildMetadata.mode === 'preview' && example.id === 'quickstart' && (
-            <span> · release commands resolve after v0.1.0 is published</span>
-          )}
-          {'noteHref' in example && (
-            <a href={(example as { noteHref: string }).noteHref}>
-              {(example as { noteLabel: string }).noteLabel}
-            </a>
-          )}
-        </p>
-      </div>
-    ))}
+            </div>
+          </TerminalFrame>
+          <p class="mono note">
+            {example.note}
+            {'noteHref' in example && (
+              <a href={(example as { noteHref: string }).noteHref}>
+                {(example as { noteLabel: string }).noteLabel}
+              </a>
+            )}
+          </p>
+        </div>
+      ))}
+    </div>
   </div>
+
+  <ul class="stats mono" aria-label="Measured facts">
+    {stats.map(([value, label]) => (
+      <li><b>{value}</b><span>{label}</span></li>
+    ))}
+  </ul>
 </section>
 
 <style>
-  .hero { padding-top: 7rem; }
-  .brand { display: flex; align-items: center; gap: 0.65rem; font-size: 1.1rem; margin-top: 1rem; }
-  .brand img { width: 2rem; height: 2rem; }
-  .say { color: var(--ink-dim); font-size: 0.85rem; }
-  h1 { font-size: clamp(2.4rem, 6vw, 4.2rem); max-width: 18ch; margin-top: 0.75rem; }
-  .sub { color: var(--ink-dim); font-size: 1.15rem; max-width: 52ch; margin-top: 1.25rem; }
-  .cta { display: flex; gap: 0.9rem; margin-top: 2rem; flex-wrap: wrap; }
-  .steps {
-    list-style: none; padding: 0; margin-top: 2.5rem;
-    display: flex; gap: 1.5rem; flex-wrap: wrap;
-    font-size: 0.85rem;
+  .hero { padding-top: 3.5rem; }
+  .hero-grid { display: grid; gap: 2.5rem; align-items: center; }
+  .hero-copy, .hero-term, .hero-panel { min-width: 0; }
+  h1 { font-size: clamp(2.4rem, 6vw, 4.2rem); max-width: 18ch; margin-top: 0.9rem; }
+  .sub { color: var(--ink-dim); font-size: 1.15rem; max-width: 52ch; margin-top: 1.1rem; }
+  .cta { display: flex; gap: 0.9rem; margin-top: 1.7rem; flex-wrap: wrap; }
+  .hero-term { max-width: 54rem; }
+  /* Wide screens: copy left, terminal right, so the product runs above the fold. */
+  @media (min-width: 1000px) {
+    .hero-grid { grid-template-columns: minmax(0, 11fr) minmax(0, 12fr); gap: 3rem; }
+    h1 { font-size: clamp(2.3rem, 3.1vw, 2.9rem); max-width: 14ch; }
+    .sub { font-size: 1.02rem; max-width: 42ch; }
+    .hero-term { max-width: none; }
+    .hero-term :global(.term-body) { font-size: 0.78rem; }
   }
-  .steps a { color: var(--ink-dim); text-decoration: none; }
-  .steps a:hover { color: var(--ink); }
-  .num { color: var(--accent); font-weight: 700; margin-right: 0.35rem; }
-  .hero-term { margin-top: 2.5rem; max-width: 54rem; }
-  .hero-term, .hero-panel { min-width: 0; }
+  .stats {
+    list-style: none; padding: 1.25rem 0 0; margin-top: 3rem;
+    border-top: 1px solid var(--panel-edge);
+    display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 1.25rem;
+  }
+  @media (max-width: 760px) { .stats { grid-template-columns: 1fr 1fr; } }
+  @media (max-width: 460px) { .stats { grid-template-columns: 1fr; } }
+  .stats b { display: block; color: var(--accent); font-size: 0.95rem; }
+  .stats span { display: block; color: var(--ink-dim); font-size: 0.76rem; margin-top: 0.15rem; }
   .hero-tabs { display: flex; gap: 0.4rem; flex-wrap: wrap; margin-bottom: 0.75rem; }
   .hero-tabs [role='tab'] {
     background: none; border: 1px solid var(--panel-edge); border-radius: 6px;
@@ -129,40 +139,21 @@ const examples = heroExamples.map((example) => {
 </style>
 
 <script>
-  import { playTyper, onVisible, type TyperLine } from '../lib/typer';
 
   const tablist = document.querySelector<HTMLElement>('.hero-tabs');
   const tabs = [...document.querySelectorAll<HTMLButtonElement>('.hero-tabs [role="tab"]')];
   const panels = [...document.querySelectorAll<HTMLElement>('.hero-panel')];
-  let cancelTyper: (() => void) | null = null;
-
-  function play(panel: HTMLElement, instant = false) {
-    cancelTyper?.();
-    cancelTyper = null;
-    const host = panel.querySelector<HTMLElement>('.hero-typer');
-    if (!host) return;
-    host.replaceChildren();
-    const lines = JSON.parse(host.dataset.lines!) as TyperLine[];
-    const cancel = playTyper(host, lines, { loop: !instant, loopPauseMs: 5000 });
-    // Switching tabs should never make the reader wait: cancelling right
-    // away renders the full highlighted transcript instantly.
-    if (instant) cancel();
-    else cancelTyper = cancel;
-  }
-
-  function select(index: number, opts: { focus?: boolean; replay?: boolean } = {}) {
+  function select(index: number, opts: { focus?: boolean } = {}) {
     tabs.forEach((tab, i) => {
       tab.setAttribute('aria-selected', String(i === index));
       tab.tabIndex = i === index ? 0 : -1;
       panels[i]!.hidden = i !== index;
     });
     if (opts.focus !== false) tabs[index]!.focus();
-    if (opts.replay !== false) play(panels[index]!, true);
   }
 
   // Panels render visible for JS-off readers; JS collapses to tab view.
-  select(0, { focus: false, replay: false });
-  if (panels[0]) onVisible(panels[0], () => play(panels[0]!));
+  select(0, { focus: false });
 
   tabs.forEach((tab, i) => tab.addEventListener('click', () => select(i)));
   tablist?.addEventListener('keydown', (e) => {
