@@ -299,6 +299,20 @@ mod tests {
         let error = lock_runtime_directory(root.path()).expect_err("second lock is refused");
         assert!(error.to_string().contains("already in use"));
         drop(first);
-        lock_runtime_directory(root.path()).expect("lock can be reacquired");
+        // The lock is a flock, which travels with the open file description.
+        // A child process another test spawns concurrently (benchmark helpers
+        // run `git` and `ps`) inherits that description until its exec
+        // completes, so an immediate reacquire can briefly still see the lock
+        // held. Measured window: a few milliseconds.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            match lock_runtime_directory(root.path()) {
+                Ok(_) => break,
+                Err(_) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Err(error) => panic!("lock can be reacquired: {error:#}"),
+            }
+        }
     }
 }
