@@ -88,9 +88,9 @@ pub use peer_store::{
 };
 
 /// Immutable Reth release used by this adapter.
-pub const RETH_VERSION: &str = "2.4.1";
+pub const RETH_VERSION: &str = "2.5.2";
 /// Immutable Reth commit used by this adapter.
-pub const RETH_REVISION: &str = "8eb210175687c9f0c889a3b6795c16781d830e3a";
+pub const RETH_REVISION: &str = "5a6940e351fed80458fe6c9da8581cbe4b8bd036";
 const MAX_FIXED_RANGE_BLOCKS: u64 = 64;
 // ETH peers may serve at most 1,024 headers per response. Header-only proof
 // acquisition is small enough to use that protocol limit; body and receipt
@@ -827,6 +827,8 @@ impl AnchoredHeaderProofBuilder {
     }
 }
 
+/// Logical lane over the process-wide network manager. Dropping or retrying a
+/// lane must not disconnect healthy peers shared by other lanes.
 #[derive(Debug)]
 struct P2pSession {
     network: Arc<PersistentNetwork>,
@@ -1080,6 +1082,11 @@ impl PersistentNetwork {
         self.direct_peers.remove(peer_id);
         self.qualifications.remove(peer_id);
     }
+
+    fn invalidate_peer(&self, peer_id: B512, detail: &str) {
+        self.peer_store.record_failure(peer_id, detail);
+        self.drop_peer(peer_id);
+    }
 }
 
 #[derive(Debug)]
@@ -1122,6 +1129,7 @@ impl PeerServiceState {
 #[derive(Debug)]
 struct DirectPeerState {
     peer: DirectPeer,
+    connection_id: u64,
     in_flight: usize,
     header: PeerServiceState,
     body: PeerServiceState,
@@ -1158,6 +1166,7 @@ fn cool_peer_service(peer: &mut DirectPeerState, kind: PeerMaterialKind) {
 struct DirectPeerPool {
     peers: Mutex<Vec<DirectPeerState>>,
     cursor: AtomicUsize,
+    next_connection_id: AtomicU64,
     changed: tokio::sync::Notify,
     quality: Arc<ExecutionPeerStore>,
 }
@@ -1167,12 +1176,14 @@ impl DirectPeerPool {
         Self {
             peers: Mutex::new(Vec::new()),
             cursor: AtomicUsize::new(0),
+            next_connection_id: AtomicU64::new(1),
             changed: tokio::sync::Notify::new(),
             quality,
         }
     }
 
     fn insert(&self, peer: DirectPeer) {
+        let connection_id = self.next_connection_id.fetch_add(1, Ordering::Relaxed);
         let mut peers = self
             .peers
             .lock()
@@ -1182,6 +1193,7 @@ impl DirectPeerPool {
             .find(|existing| existing.peer.peer_id == peer.peer_id)
         {
             existing.peer = peer;
+            existing.connection_id = connection_id;
             existing.in_flight = 0;
             existing.header = PeerServiceState::new();
             existing.body = PeerServiceState::new();
@@ -1189,6 +1201,7 @@ impl DirectPeerPool {
         } else {
             peers.push(DirectPeerState {
                 peer,
+                connection_id,
                 in_flight: 0,
                 header: PeerServiceState::new(),
                 body: PeerServiceState::new(),
@@ -1302,6 +1315,7 @@ impl DirectPeerPool {
         Some(DirectPeerLease {
             pool: self.clone(),
             peer: peers[selected].peer.clone(),
+            connection_id: peers[selected].connection_id,
             kind,
             outcome: DirectPeerOutcome::Neutral,
         })
@@ -1371,6 +1385,7 @@ impl DirectPeerPool {
                     return Ok(Some(DirectPeerLease {
                         pool: self.clone(),
                         peer: peers[index].peer.clone(),
+                        connection_id: peers[index].connection_id,
                         kind,
                         outcome: DirectPeerOutcome::Neutral,
                     }));
@@ -1440,6 +1455,7 @@ enum DirectPeerOutcome {
 struct DirectPeerLease {
     pool: Arc<DirectPeerPool>,
     peer: DirectPeer,
+    connection_id: u64,
     kind: PeerMaterialKind,
     outcome: DirectPeerOutcome,
 }
@@ -1461,10 +1477,9 @@ impl Drop for DirectPeerLease {
             .peers
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(peer) = peers
-            .iter_mut()
-            .find(|peer| peer.peer.peer_id == self.peer.peer_id)
-        {
+        if let Some(peer) = peers.iter_mut().find(|peer| {
+            peer.peer.peer_id == self.peer.peer_id && peer.connection_id == self.connection_id
+        }) {
             peer.in_flight = peer.in_flight.saturating_sub(1);
             match self.outcome {
                 DirectPeerOutcome::Success => {
@@ -2963,7 +2978,7 @@ impl RethP2pSource {
                     .with(Capability::Logs)
                     .with(Capability::Withdrawals),
                 trust: TrustModel::ProtocolVerified,
-                finality: FinalityModel::Optimistic,
+                finality: FinalityModel::Included,
                 partitioning: Partitioning::FixedBlockSpan(MAX_FIXED_RANGE_BLOCKS),
                 expected_lag: Duration::from_secs(12),
                 schema_version: format!("reth-p2p.v1+{RETH_VERSION}.{RETH_REVISION}"),
@@ -3081,13 +3096,13 @@ impl RethP2pSource {
         let sparse_scope = sparse_log_scope(request);
         if sparse_scope.is_none() && !header_and_body_only_request(request) {
             return Err(P2pError::InvalidConfig(
-                "optimistic head preview requires a block-summary or compatible filtered-log request"
+                "peer preview requires a block-summary or compatible filtered-log request"
                     .to_owned(),
             ));
         }
         if request.chain_id != self.descriptor.chain_id {
             return Err(P2pError::InvalidConfig(
-                "optimistic head preview request belongs to another chain".to_owned(),
+                "peer preview request belongs to another chain".to_owned(),
             ));
         }
         if sparse_scope.is_some()
@@ -3096,7 +3111,7 @@ impl RethP2pSource {
                 .contains(leani_primitives::LogField::TransactionHash)
         {
             return Err(P2pError::InvalidConfig(
-                "receipt-only optimistic preview cannot supply transaction hashes".to_owned(),
+                "receipt-only peer preview cannot supply transaction hashes".to_owned(),
             ));
         }
         let (session, _) = self
@@ -3137,7 +3152,7 @@ impl RethP2pSource {
                 .await;
         }
         let scope = sparse_scope.ok_or_else(|| {
-            P2pError::InvalidConfig("optimistic filtered-log scope disappeared".to_owned())
+            P2pError::InvalidConfig("peer preview filtered-log scope disappeared".to_owned())
         })?;
         self.finish_optimistic_sparse_snapshot(
             &session,
@@ -3160,7 +3175,7 @@ impl RethP2pSource {
         cancellation: &CancellationToken,
     ) -> Result<BlockFrame, P2pError> {
         let header = headers.first().ok_or_else(|| {
-            P2pError::InvalidResponse("optimistic head request returned no header".to_owned())
+            P2pError::InvalidResponse("peer preview request returned no header".to_owned())
         })?;
         let hashes = [header.hash_slow()];
         let bloom_positive = header_bloom_matches(scope, header);
@@ -3202,9 +3217,9 @@ impl RethP2pSource {
             &[],
         )?;
         let mut frame = frames.pop().ok_or_else(|| {
-            P2pError::InvalidResponse("optimistic head request returned no frame".to_owned())
+            P2pError::InvalidResponse("peer preview request returned no frame".to_owned())
         })?;
-        frame.finality = Finality::Optimistic;
+        frame.finality = Finality::Included;
         session.clear_error();
         session.set_range(None);
         session.set_phase(NetworkPhase::FollowingHead);
@@ -3223,9 +3238,9 @@ impl RethP2pSource {
             .fetch_live_body_frames(session, headers, preferred_peer, budget, cancellation)
             .await?;
         let mut frame = frames.pop().ok_or_else(|| {
-            P2pError::InvalidResponse("optimistic head request returned no frame".to_owned())
+            P2pError::InvalidResponse("peer preview request returned no frame".to_owned())
         })?;
-        frame.finality = Finality::Optimistic;
+        frame.finality = Finality::Included;
         session.clear_error();
         session.set_range(None);
         session.set_phase(NetworkPhase::FollowingHead);
@@ -3325,7 +3340,7 @@ impl RethP2pSource {
                             );
                             if matches!(error, P2pError::InvalidResponse(_)) {
                                 session.handle.ban_peer(peer);
-                                self.network.drop_peer(peer);
+                                self.network.invalidate_peer(peer, &error.to_string());
                             } else if matches!(error, P2pError::IncompleteResponse { .. })
                                 && repeated_incomplete_response(
                                     &mut incomplete_responses,
@@ -3597,7 +3612,7 @@ impl RethP2pSource {
                 .discovery_addr(discovery_addr)
                 .disable_tx_gossip(true)
                 .mainnet_boot_nodes()
-                // Reth 2.4.1 reads only the first byte segment of a DNS TXT
+                // The pinned Reth DNS decoder reads only the first byte segment of a DNS TXT
                 // record. Mainnet's EIP-1459 tree contains multi-segment
                 // records, so use the segment-joining seeder below instead.
                 .disable_dns_discovery()
@@ -4142,7 +4157,6 @@ impl RethP2pSource {
                 .await
             {
                 if matches!(error, P2pError::Cancelled) {
-                    shutdown_session(&session);
                     return Err(P2pError::Cancelled);
                 }
                 if should_retry_session_error(&self.config, attempts, &error) {
@@ -4167,14 +4181,10 @@ impl RethP2pSource {
                     session.set_phase(NetworkPhase::FollowingHead);
                     return Ok((session, frames, response_peers));
                 }
-                Err(P2pError::Cancelled) => {
-                    shutdown_session(&session);
-                    return Err(P2pError::Cancelled);
-                }
+                Err(P2pError::Cancelled) => return Err(P2pError::Cancelled),
                 Err(error) => {
                     session.record_attempt();
                     session.record_error(&error);
-                    shutdown_session(&session);
                     if should_retry_session_error(&self.config, attempts, &error) {
                         let delay = session_retry_delay(&self.config, attempts);
                         debug!(
@@ -4323,7 +4333,8 @@ impl RethP2pSource {
             };
             if header.hash_slow() != hash {
                 session.handle.ban_peer(peer_id);
-                self.network.drop_peer(peer_id);
+                self.network
+                    .invalidate_peer(peer_id, "peer did not serve its advertised execution head");
             } else if header.number >= minimum.0 {
                 let head = (BlockNumber(header.number), BlockHash::new(hash.0));
                 session.observe_head(head.0);
@@ -4919,7 +4930,7 @@ impl RethP2pSource {
                             );
                             if !matches!(error, P2pError::IncompleteResponse { .. }) {
                                 session.handle.ban_peer(peer_id);
-                                self.network.drop_peer(peer_id);
+                                self.network.invalidate_peer(peer_id, &error.to_string());
                             }
                             last_error = Some(error);
                         }
@@ -5157,7 +5168,7 @@ impl RethP2pSource {
                                 } else {
                                     lease.failed();
                                     session.handle.ban_peer(peer_id);
-                                    self.network.drop_peer(peer_id);
+                                    self.network.invalidate_peer(peer_id, &error.to_string());
                                     last_error = Some(error);
                                 }
                             }
@@ -5324,7 +5335,7 @@ impl RethP2pSource {
                                 } else {
                                     lease.failed();
                                     session.handle.ban_peer(peer_id);
-                                    self.network.drop_peer(peer_id);
+                                    self.network.invalidate_peer(peer_id, &error.to_string());
                                     last_error = Some(error);
                                 }
                             }
@@ -6485,7 +6496,9 @@ impl RethP2pHistorySource {
                             );
                             if matches!(error, P2pError::InvalidResponse(_)) {
                                 session.handle.ban_peer(peer_id);
-                                self.source.network.drop_peer(peer_id);
+                                self.source
+                                    .network
+                                    .invalidate_peer(peer_id, &error.to_string());
                             }
                             last_error = Some(error);
                         }
@@ -6777,14 +6790,10 @@ impl RethP2pHistorySource {
                     session.clear_error();
                     return Ok((session, headers));
                 }
-                Err(P2pError::Cancelled) => {
-                    shutdown_session(&session);
-                    return Err(P2pError::Cancelled);
-                }
+                Err(P2pError::Cancelled) => return Err(P2pError::Cancelled),
                 Err(error) => {
                     session.record_attempt();
                     session.record_error(&error);
-                    shutdown_session(&session);
                     if should_retry_session_error(&self.source.config, attempts, &error) {
                         let delay = session_retry_delay(&self.source.config, attempts);
                         debug!(
@@ -7315,14 +7324,12 @@ impl LiveSource for RethP2pSource {
                 Err(error) => return Err(error.into()),
             };
             let Some(first) = frames.first() else {
-                shutdown_session(&session);
                 return Err(SourceError::Protocol(
                     "anchored overlap returned no frames".to_owned(),
                 ));
             };
             let fetched_anchor = frames.last().expect("non-empty overlap").block;
             if fetched_anchor.number != anchor.number || fetched_anchor.hash != anchor.hash {
-                shutdown_session(&session);
                 return Err(SourceError::Protocol(
                     "anchored overlap did not end at the verified execution anchor".to_owned(),
                 ));
@@ -7369,7 +7376,6 @@ async fn next_live_event(
 ) -> Option<(Result<ChainEvent, SourceError>, P2pLiveState)> {
     loop {
         if state.terminal || state.cancellation.is_cancelled() {
-            shutdown_session(&state.session);
             return None;
         }
         if let Some(request_error) = state.reconnect_error.take() {
@@ -7404,10 +7410,7 @@ async fn next_live_event(
                 state.disconnect_reported = false;
                 head
             }
-            Err(P2pError::Cancelled) => {
-                shutdown_session(&state.session);
-                return None;
-            }
+            Err(P2pError::Cancelled) => return None,
             Err(error) => {
                 let grace = state
                     .source
@@ -7427,7 +7430,6 @@ async fn next_live_event(
                     .await
                     .is_err()
                 {
-                    shutdown_session(&state.session);
                     return None;
                 }
                 if head_unavailable_for(&mut state.head_unavailable_since, Instant::now()) < grace {
@@ -7475,14 +7477,10 @@ async fn next_live_event(
                         .await
                         .is_err()
                     {
-                        shutdown_session(&state.session);
                         return None;
                     }
                 }
-                Err(P2pError::Cancelled) => {
-                    shutdown_session(&state.session);
-                    return None;
-                }
+                Err(P2pError::Cancelled) => return None,
                 Err(error) => {
                     if let Some(delay) = pending_live_material_delay(
                         &state.source.config,
@@ -7496,7 +7494,6 @@ async fn next_live_event(
                             "latest execution material is not available yet; retrying on the active peer pool"
                         );
                         if retry_pause(delay, &state.cancellation).await.is_err() {
-                            shutdown_session(&state.session);
                             return None;
                         }
                         continue;
@@ -7543,10 +7540,7 @@ async fn next_live_event(
                 state.pending_material_attempts = 0;
                 result
             }
-            Err(P2pError::Cancelled) => {
-                shutdown_session(&state.session);
-                return None;
-            }
+            Err(P2pError::Cancelled) => return None,
             Err(error) => {
                 if let Some(delay) = pending_live_material_delay(
                     &state.source.config,
@@ -7560,7 +7554,6 @@ async fn next_live_event(
                         "latest execution material is not available yet; retrying on the active peer pool"
                     );
                     if retry_pause(delay, &state.cancellation).await.is_err() {
-                        shutdown_session(&state.session);
                         return None;
                     }
                     continue;
@@ -7609,7 +7602,6 @@ async fn reconnect_live_session(
 ) -> Result<(), P2pError> {
     state.session.record_attempt();
     state.session.record_error(request_error);
-    shutdown_session(&state.session);
     let mut attempts = 0_usize;
     loop {
         attempts = attempts.saturating_add(1);
@@ -7677,11 +7669,6 @@ async fn retry_pause(duration: Duration, cancellation: &CancellationToken) -> Re
         () = cancellation.cancelled() => Err(P2pError::Cancelled),
         () = tokio::time::sleep(duration) => Ok(()),
     }
-}
-
-fn shutdown_session(_session: &P2pSession) {
-    // Logical live/history/probe sessions share one process-wide network
-    // manager. Dropping or retrying one lane must not disconnect healthy peers.
 }
 
 fn should_retry_session(config: &RethP2pConfig, attempts: usize) -> bool {
@@ -8427,7 +8414,7 @@ fn normalize_sparse_log_block(
             parent_hash: block_hash(header.parent_hash),
             timestamp: header.timestamp,
         },
-        finality: Finality::Optimistic,
+        finality: Finality::Included,
         header: if header_requested {
             Material::Complete(HeaderEnvelope {
                 rlp: Some(alloy_rlp::encode(header)),
@@ -8515,7 +8502,7 @@ fn normalize_verified_headers(
                 parent_hash: block_hash(header.parent_hash),
                 timestamp: header.timestamp,
             },
-            finality: Finality::Optimistic,
+            finality: Finality::Included,
             header: Material::Complete(HeaderEnvelope {
                 rlp: Some(alloy_rlp::encode(header)),
                 transactions_root: Some(block_hash(header.transactions_root)),
@@ -8598,7 +8585,7 @@ fn normalize_verified_bodies(
                 parent_hash: block_hash(header.parent_hash),
                 timestamp: header.timestamp,
             },
-            finality: Finality::Optimistic,
+            finality: Finality::Included,
             header: Material::Complete(HeaderEnvelope {
                 rlp: Some(alloy_rlp::encode(header)),
                 transactions_root: Some(block_hash(header.transactions_root)),
@@ -9086,7 +9073,7 @@ fn normalize_block(
             parent_hash: block_hash(header.parent_hash),
             timestamp: header.timestamp,
         },
-        finality: Finality::Optimistic,
+        finality: Finality::Included,
         header: if header_requested {
             Material::Complete(HeaderEnvelope {
                 rlp: header_rlp,
@@ -9366,7 +9353,7 @@ mod tests {
             projection: leani_source_api::FieldProjection::default(),
             log_fields: leani_primitives::LogFieldSet::NONE,
             filters: leani_source_api::FilterSet::default(),
-            minimum_finality: Finality::Optimistic,
+            minimum_finality: Finality::Included,
             verification_policy: leani_source_api::VerificationPolicy::CompleteCryptographic,
         };
         assert!(header_only_request(&request));
@@ -9409,7 +9396,7 @@ mod tests {
             projection: leani_source_api::FieldProjection::default(),
             log_fields: leani_primitives::LogFieldSet::NONE,
             filters: leani_source_api::FilterSet::default(),
-            minimum_finality: Finality::Optimistic,
+            minimum_finality: Finality::Included,
             verification_policy: leani_source_api::VerificationPolicy::CompleteCryptographic,
         };
         assert!(header_and_body_only_request(&request));
@@ -10863,6 +10850,96 @@ mod tests {
         );
     }
 
+    #[test]
+    fn stale_lease_cannot_mutate_a_reconnected_peer_session() {
+        let pool = direct_peer_pool();
+        let peer_id = B512::from([0x34; 64]);
+        let (first_sender, _first_receiver) = tokio::sync::mpsc::channel(1);
+        pool.insert(DirectPeer {
+            peer_id,
+            eth_version: EthVersion::Eth68,
+            messages: PeerRequestSender::new(peer_id, first_sender),
+            advertised_head: None,
+        });
+        let mut stale_lease = pool
+            .try_acquire_excluding(PeerMaterialKind::Body, 1, &HashSet::new(), None)
+            .expect("first session lease");
+        stale_lease.failed();
+
+        pool.remove(peer_id);
+        let (second_sender, _second_receiver) = tokio::sync::mpsc::channel(1);
+        pool.insert(DirectPeer {
+            peer_id,
+            eth_version: EthVersion::Eth68,
+            messages: PeerRequestSender::new(peer_id, second_sender),
+            advertised_head: None,
+        });
+        let current = pool
+            .try_acquire_excluding(PeerMaterialKind::Body, 1, &HashSet::new(), None)
+            .expect("reconnected session lease");
+
+        drop(stale_lease);
+        let peers = pool
+            .peers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let reconnected = peers.first().expect("reconnected peer state");
+        assert_eq!(
+            reconnected.in_flight, 1,
+            "stale lease changed current accounting"
+        );
+        assert_eq!(
+            reconnected.body.failures, 0,
+            "stale lease cooled current session"
+        );
+        drop(peers);
+        assert!(
+            pool.try_acquire_excluding(PeerMaterialKind::Body, 1, &HashSet::new(), None)
+                .is_none(),
+            "current session remains at its per-peer limit"
+        );
+        drop(current);
+    }
+
+    #[test]
+    fn invalid_peer_removal_also_invalidates_persistent_service_evidence() {
+        let peer_store = Arc::new(ExecutionPeerStore::new(
+            None,
+            DEFAULT_PEER_STORE_MAX_ENTRIES,
+        ));
+        let direct_peers = Arc::new(DirectPeerPool::new(peer_store.clone()));
+        let network = PersistentNetwork {
+            state: tokio::sync::Mutex::new(None),
+            next_generation: AtomicU64::new(1),
+            request_gate: Arc::new(MaterialRequestGate::default()),
+            direct_peers: direct_peers.clone(),
+            peer_store: peer_store.clone(),
+            qualifications: Arc::new(PeerQualificationPool::new(
+                RethP2pSource::mainnet_genesis_block(),
+            )),
+        };
+        let peer_id = B512::from([0x35; 64]);
+        let (sender, _receiver) = tokio::sync::mpsc::channel(1);
+        direct_peers.insert(DirectPeer {
+            peer_id,
+            eth_version: EthVersion::Eth68,
+            messages: PeerRequestSender::new(peer_id, sender),
+            advertised_head: None,
+        });
+        peer_store.record_success(
+            peer_id,
+            PeerMaterialKind::Body,
+            25_000_000,
+            Duration::from_millis(1),
+        );
+        assert!(peer_store.is_available_body_server(peer_id));
+
+        network.invalidate_peer(peer_id, "invalid execution material");
+
+        assert!(!peer_store.is_available_body_server(peer_id));
+        assert_eq!(direct_peers.len(), 0);
+    }
+
     #[tokio::test]
     async fn direct_body_request_uses_the_selected_peer_session() {
         let peer_id = B512::from([0x44; 64]);
@@ -11179,7 +11256,7 @@ mod tests {
             allow_filtered: false,
             projection: leani_source_api::FieldProjection::default(),
             filters: leani_source_api::FilterSet::default(),
-            minimum_finality: Finality::Optimistic,
+            minimum_finality: Finality::Included,
             verification_policy: leani_source_api::VerificationPolicy::CompleteCryptographic,
         }
     }

@@ -1248,8 +1248,20 @@ export interface components {
         Address: string;
         /** @description Store-, chain-, and processor-bound opaque value. */
         Cursor: string;
-        /** @enum {string} */
-        Finality: "optimistic" | "safe" | "finalized";
+        /**
+         * @description Chain-confidence status of the block a record belongs to.
+         *     `included`: the block is on the currently followed chain; a reorg can
+         *     still remove it. `finalized`: Ethereum consensus has finalized the
+         *     block, as verified by this node's configured finality source. When a
+         *     source serves finalized material under dataset trust (Xatu, EraE), the
+         *     label reflects that source's trust model, not an independent proof.
+         *     `preview`: a peer supplied the block and its connection to the chain is
+         *     still being checked; only the embedded CLI emits `preview`, the HTTP
+         *     API never does. A record's `data.finality`, when present, always equals
+         *     the envelope `finality`.
+         * @enum {string}
+         */
+        Finality: "preview" | "included" | "finalized";
         ProcessorSummary: {
             id: string;
             instance: string;
@@ -1378,16 +1390,24 @@ export interface components {
             data: components["schemas"]["GenericOutputEntity"][];
             nextCursor: components["schemas"]["Cursor"] | null;
             snapshotId: string;
-            boundaryCursor: components["schemas"]["Cursor"];
+            /** @description Null when the processor has delivery disabled. */
+            boundaryCursor: components["schemas"]["Cursor"] | null;
             rowCount: components["schemas"]["DecimalQuantity"];
+            /** @description Snapshot accounting bytes, including entity keys and row overhead. */
             valueBytes: components["schemas"]["DecimalQuantity"];
             expiresAtUnixMs: components["schemas"]["DecimalQuantity"];
             retainedBounds: components["schemas"]["OutputBounds"] | null;
             coverage: components["schemas"]["ProcessorCoverage"];
             recovery: {
-                follow: string;
+                follow: string | null;
                 /** @constant */
                 outsideRetention: "create_processor_instance_or_source_scan";
+            };
+        };
+        FollowSnapshotPage: components["schemas"]["GenericSnapshotPage"] & {
+            boundaryCursor: components["schemas"]["Cursor"];
+            recovery: {
+                follow: string;
             };
         };
         CreateConsumer: {
@@ -1998,6 +2018,15 @@ export interface operations {
                     "application/json": components["schemas"]["GenericSnapshotPage"];
                 };
             };
+            /** @description Aggregate query snapshot capacity is full; release snapshots or retry after expiry. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
             default: components["responses"]["Error"];
         };
     };
@@ -2051,7 +2080,25 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["GenericSnapshotPage"];
+                    "application/json": components["schemas"]["FollowSnapshotPage"];
+                };
+            };
+            /** @description This processor has delivery disabled; query retained entities without following, or enable delivery. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Aggregate query snapshot capacity is full; release snapshots or retry after expiry. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
                 };
             };
             default: components["responses"]["Error"];

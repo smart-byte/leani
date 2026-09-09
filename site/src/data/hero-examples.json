@@ -16,10 +16,10 @@
         "text": "# On first use, review and accept the checkpoint."
       },
       {
-        "text": "# --once may return a labelled unanchored peer preview."
+        "text": "# --once may print an early peer preview."
       },
       {
-        "text": "# Wait for finalized ancestry instead:"
+        "text": "# Print only blocks Ethereum has finalized:"
       },
       {
         "text": "$ leani subscribe blocks --finality finalized --once"

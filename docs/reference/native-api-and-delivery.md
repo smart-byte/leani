@@ -195,7 +195,7 @@ export interface ProcessorCoverage {
   available: Array<{
     fromBlock: number;
     toBlock: number;
-    finality: "optimistic" | "safe" | "finalized";
+    finality: "preview" | "included" | "finalized";
   }>;
   configuredStartBlock: number;
   historicalTargetBlock: number | null;
@@ -328,6 +328,15 @@ Entity queries accept `fromBlock`, `toBlock`, `fromTimestamp`, `toTimestamp`,
 contains the processor schema, decoded JSON data, block/timestamp/finality
 metadata, stable snapshot ID, change boundary, retained bounds, and coverage.
 
+Explicit block bounds require complete processor coverage. Missing blocks return
+HTTP 409 `range_incomplete`, including the requested interval and coverage.
+The resolved block range is kept with the snapshot across pagination and node
+restart. A block-count window uses its retention policy boundary, rather than
+the first matching entity, so covered blocks without events remain queryable.
+`retainedBounds` describes the entities present, not the limits of processor
+coverage. Timestamp filters select retained rows; include block bounds when
+you need a completeness check for a specific interval.
+
 `output = "none"` or a range outside the retained window returns
 `output_not_retained` with a rebuild/source-scan action. It never returns a
 successful empty page for unavailable local history.
@@ -336,6 +345,11 @@ The TypeScript SDK's
 `client.processors.queryAndFollow(processor, collection, query)` returns this
 snapshot and its `boundaryCursor` in one operation. Continue with
 `client.processors.subscribe(processor, { after: page.boundaryCursor })`.
+
+With delivery disabled, ordinary entity queries still work, but return
+`boundaryCursor: null` and `recovery.follow: null`. Query-and-follow, change-head,
+change-page, and stream requests return non-retryable HTTP 409
+`delivery_disabled`; enable a delivery policy before subscribing.
 
 Release a no-longer-needed snapshot early:
 
@@ -394,7 +408,7 @@ select `processor_job` or `operator_pin` ownership. Delivery acknowledgement,
 output pruning, raw-history deletion, and checkpoint pruning never delete
 artifacts.
 
-`[budgets.artifacts]` caps retained finalized bytes and pending optimistic
+`[budgets.artifacts]` caps retained finalized bytes and pending included-block
 candidates across all processors. Admission is atomic: exceeding either limit
 rolls back artifacts, processor mutations, coverage, and cursor advancement.
 The metrics endpoint reports current and maximum artifact bytes separately;
@@ -444,10 +458,11 @@ export interface ChangeEnvelope<T = unknown> {
     parentHash: `0x${string}`;
     timestamp: number;
   } | null;
-  finality: "optimistic" | "safe" | "finalized";
+  finality: "preview" | "included" | "finalized";
   kind: string;
   schema: string;
   key: string | null;
+  /** When the payload carries its own finality field, it equals the envelope finality. */
   data: T | null;
   /** Present only on reset_required, as the current coverage hint. */
   coverage?: ProcessorCoverage;
@@ -485,7 +500,7 @@ from another store, chain, processor version, or expired epoch is rejected.
 
 - introduces or updates the keyed domain value;
 - is emitted only after the state transaction commits;
-- may be optimistic.
+- may be included but not yet finalized.
 
 `undo`
 
@@ -708,7 +723,7 @@ export interface BlobsBlock {
   targetBlobsPerBlock: number;
   maxBlobsPerBlock: number;
   transformVersion: number;
-  finality: "optimistic" | "safe" | "finalized";
+  finality: "preview" | "included" | "finalized";
 }
 
 export interface BlobTransaction {
@@ -899,10 +914,12 @@ SDK non-responsibilities:
 The SDK exports pure helpers:
 
 ```ts
-applyEntityChange(...)
-isResetRequired(...)
-compareSequences(...)
-createInMemoryCursorStore() // tests/development only
+import {
+  applyEntityChange,
+  compareSequences,
+  createInMemoryCursorStore, // Tests and development only.
+  isResetRequired,
+} from "@leani/sdk";
 ```
 
 Application database integration remains explicit because domain changes must

@@ -96,11 +96,11 @@ impl BlobsProcessor {
                     transaction_types: vec![3],
                     ..FilterScope::default()
                 },
-                minimum_finality: Finality::Optimistic,
+                minimum_finality: Finality::Included,
             }],
             mode: ReductionMode::BlockLocal,
             delivery_ordering: DeliveryOrdering::BlockVersionedIdempotent,
-            publication: PublicationPolicy::OptimisticAndFinalized,
+            publication: PublicationPolicy::IncludedAndFinalized,
             lifecycle: LifecyclePolicies::from_legacy(RetentionPolicy::FullOutputHistory),
             schemas: ProcessorSchemas {
                 delta_version: 2,
@@ -288,8 +288,8 @@ impl Processor for BlobsProcessor {
         delta.validate(&self.descriptor)?;
         let decoded: BlobsDelta = postcard::from_bytes(&delta.payload)
             .map_err(|error| ProcessorError::DeltaPayload(error.to_string()))?;
-        let mut checksums = Vec::with_capacity(3);
-        for finality in [Finality::Optimistic, Finality::Safe, Finality::Finalized] {
+        let mut checksums = Vec::with_capacity(2);
+        for finality in [Finality::Included, Finality::Finalized] {
             let mut variant = decoded.clone();
             variant.block.finality = finality;
             let payload = postcard::to_allocvec(&variant)
@@ -621,7 +621,7 @@ mod tests {
         let variants = processor
             .finality_variant_checksums(&encoded)
             .expect("finality variants");
-        assert_eq!(variants.len(), 3);
+        assert_eq!(variants.len(), 2);
         assert!(variants.contains(&encoded.checksum));
         let decoded: BlobsDelta = postcard::from_bytes(&encoded.payload).expect("decode");
         assert_eq!(quantity_to_u256(decoded.block.blob_base_fee), U256::from(1));

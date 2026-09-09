@@ -1,0 +1,436 @@
+---
+import { pipelineStages, pipelineProcessors } from '../data/pipeline';
+const lanes = ['history', 'live', 'output'];
+const sharedLayers = [
+  { name: 'Validation', level: 116, id: 'validate', number: '02' },
+  { name: 'Block envelope', level: 168, id: 'normalize', number: '01' },
+];
+const processorLayers = [
+  { name: 'reduce()', level: 26, id: 'reduce' },
+  { name: 'map()', level: 66, id: 'map' },
+];
+const initialStage = pipelineStages[2];
+---
+<pipeline-scene class="engine" data-running="false">
+  <div class="engine-bar mono">
+    <span><span class="status-dot"></span> THE BLOCK ENGINE</span>
+    <button class="motion-toggle" type="button" aria-label="Pause pipeline animation" aria-pressed="false" hidden>
+      <svg viewBox="0 0 12 12" width="12" height="12" aria-hidden="true"><path class="pause-icon" d="M4 2v8M8 2v8"/><path class="play-icon" d="m4 2 5 4-5 4Z"/></svg>
+      <span class="motion-label">Pause</span>
+    </button>
+  </div>
+
+  <div class="viewport" role="group" aria-label="Historical blocks and live Ethereum blocks travel along two separate rails into capability-aware source adapters and the same BlockEnvelope. A floating stack validates canonicality and provenance, then shares material with configured processors. Each has its own parallel map and ordered reduce to produce policy-shaped SQLite state and durable delivery. Raw bytes are optional after commit.">
+    <div class="annotation history-label mono" aria-hidden="true"><span class="annotation-kicker">HISTORICAL LANE</span><strong>Backfill the past.</strong><span>Xatu · EraE · retained raw</span></div>
+    <div class="annotation live-label mono" aria-hidden="true"><span class="annotation-kicker"><i></i> LIVE LANE</span><strong>Follow the head.</strong><span>Ethereum P2P · CL finality</span></div>
+    <div class="annotation core-label mono" aria-hidden="true"><span class="annotation-kicker">ONE SHARED CONTRACT</span><strong>One input. Your processors.</strong></div>
+    <div class="annotation output-label mono" aria-hidden="true"><span class="annotation-kicker">YOUR APPLICATION</span><strong>Keep what matters.</strong><span>State + durable delivery</span></div>
+
+    <div class="camera" aria-hidden="true">
+      <div class="world">
+        <div class="floor"></div>
+        <div class="floor-cross cross-a"></div><div class="floor-cross cross-b"></div><div class="floor-cross cross-c"></div><div class="floor-cross cross-d"></div>
+        <svg class="rails" viewBox="0 0 860 480" fill="none">
+          <defs><linearGradient id="pipeline-rail-gradient"><stop stop-color="#466b58"/><stop offset="1" stop-color="#3ee07f"/></linearGradient></defs>
+          <g class="rail-bed"><path d="M110 100H218Q250 100 250 132V208Q250 240 282 240H430"/><path d="M110 380H288Q320 380 320 348V272Q320 240 352 240H430"/><path d="M430 240H755"/></g>
+          <g class="rail-line"><path d="M110 100H218Q250 100 250 132V208Q250 240 282 240H430"/><path d="M110 380H288Q320 380 320 348V272Q320 240 352 240H430"/><path d="M430 240H755"/></g>
+          <g class="rail-ticks"><path d="M110 100H218Q250 100 250 132V208Q250 240 282 240H430"/><path d="M110 380H288Q320 380 320 348V272Q320 240 352 240H430"/><path d="M430 240H755"/></g>
+        </svg>
+        <div class="source archive">
+          {[0, 1, 2, 3].map((level) => <div class="archive-slab" style={`--level: ${level}`}><span></span><span></span><span></span></div>)}
+          <div class="source-caption mono">HISTORY</div>
+        </div>
+        <div class="source live-source">
+          <div class="emitter-base"><div class="emitter-rings"></div></div>
+          <div class="emitter-signal signal-one"></div><div class="emitter-signal signal-two"></div>
+          <div class="live-gem"><div class="gem-top"></div><div class="gem-bottom"></div></div>
+          <div class="source-caption mono">LIVE HEAD</div>
+        </div>
+        {lanes.map((lane) => [0, 1, 2].map((index) => (
+          <div class={`packet packet-${lane}`} style={`--delay: ${-index * 2 - (lane === 'live' ? 1 : 0)}s; --position: ${18 + index * 28}%`}>
+            <div class="cube"></div>
+          </div>
+        )))}
+        <div class="processor">
+          <div class="processor-foundation"><span class="mono">leani_</span><div class="pins pins-left"></div><div class="pins pins-right"></div></div>
+          {processorLayers.map(({ name, level, id }) => (
+            <div class={`processor-layer split-layer ${id}`} data-stage-target={id} style={`--height: ${level}px; --layer: ${id === 'map' ? 1 : 0}`}>
+              {pipelineProcessors.map((processor, index) => (
+                <div class="processor-module" data-processor-target={processor.id} style={`--col: ${index % 2}; --row: ${Math.floor(index / 2)}; --processor-color: ${processor.color}; --module: ${index}`}>
+                  <div class="module-edge"></div>
+                  <div class="module-surface">
+                    <span class="module-title mono">{processor.short}</span>
+                    <span class="module-method mono">{name}</span>
+                    <i class="module-led"></i>
+                  </div>
+                </div>
+              ))}
+            </div>
+          ))}
+          {sharedLayers.map(({ name, level, id, number }, index) => (
+            <div class={`processor-layer ${id}`} data-stage-target={id} style={`--height: ${level}px; --layer: ${index + 2}`}>
+              <div class="plate-edge edge-front"></div><div class="plate-edge edge-right"></div>
+              <div class="plate-surface">
+                <span class="plate-number mono">{number}</span>
+                <div class="plate-circuit"><span></span><span></span><span></span><span></span></div>
+                <span class="plate-name mono">{name}</span><i class="plate-led"></i>
+              </div>
+            </div>
+          ))}
+          <div class="intake-ring"></div>
+        </div>
+        <div class="state-bank" data-stage-target="store">
+          <div class="state-base"><span class="mono">COMMITTED STATE</span></div>
+          {Array.from({ length: 9 }, (_, index) => (
+            <div class="state-cell" style={`--col: ${index % 3}; --row: ${Math.floor(index / 3)}; --cell: ${index}`}>
+              <div class="cube"></div>
+            </div>
+          ))}
+        </div>
+        <div class="raw-path mono"><span>raw bytes</span><span>optional after commit</span></div>
+        {[0, 1, 2, 3].map((index) => <div class="raw-fragment" style={`--fragment: ${index}`}></div>)}
+      </div>
+    </div>
+    <div class="scene-note mono" aria-hidden="true"><span>Shared input</span><span class="note-line"></span><span>Independent processors</span></div>
+  </div>
+  <div class="pipeline-explorer">
+    <div class="explorer-heading"><span class="mono">INSIDE THE PIPELINE</span><span class="explore-hint" hidden>Hover a layer or select a stage to explore</span></div>
+    <div class="stage-controls" role="group" aria-label="Explore pipeline stages" hidden>
+      {pipelineStages.map((stage, index) => (
+        <button type="button" data-select-stage={stage.id} aria-pressed={stage.id === initialStage.id ? 'true' : 'false'} aria-controls="pipeline-stage-detail"><span class="mono">0{index + 1}</span>{stage.label}</button>
+      ))}
+    </div>
+    <div class="inspector">
+      <div id="pipeline-stage-detail" class="stage-detail" aria-live="polite" aria-atomic="true">
+        <p class="detail-key mono" data-stage-label>{initialStage.label}</p>
+        <h3 data-stage-title>{initialStage.title}</h3>
+        <p data-stage-description>{initialStage.description}</p>
+      </div>
+      <div class="processor-detail">
+        <div class="processor-choices" role="group" aria-label="Explore example processors" hidden>
+          {pipelineProcessors.map((processor) => (
+            <button type="button" data-select-processor={processor.id} style={`--processor-color: ${processor.color}`} aria-pressed="false" aria-controls="pipeline-processor-detail"><i></i>{processor.label}</button>
+          ))}
+        </div>
+        <div id="pipeline-processor-detail" aria-live="polite" aria-atomic="true">
+          <p class="processor-summary" data-processor-summary>Built-in or your own Rust. Each processor owns both steps.</p>
+          <dl><div><dt class="mono">map()</dt><dd data-processor-map>Block material → compact delta</dd></div><div><dt class="mono">reduce()</dt><dd data-processor-reduce>Ordered delta → state + changes</dd></div></dl>
+          <a data-processor-link href="/docs/guides/custom-processor/">Build your processor →</a>
+        </div>
+      </div>
+    </div>
+    <p class="engine-footnote">Xatu is trusted; EraE commitments are checked. Live P2P provenance and CL finality stay explicit. Raw bytes are optional after commit.</p>
+  </div>
+</pipeline-scene>
+
+<script>
+  import { pipelineStages, pipelineProcessors } from '../data/pipeline';
+
+  class PipelineScene extends HTMLElement {
+    connectedCallback() {
+      const viewport = this.querySelector<HTMLElement>('.viewport')!;
+      const camera = this.querySelector<HTMLElement>('.camera')!;
+      const button = this.querySelector<HTMLButtonElement>('.motion-toggle')!;
+      const label = this.querySelector<HTMLElement>('.motion-label')!;
+      const stageControls = this.querySelector<HTMLElement>('.stage-controls')!;
+      const processorChoices = this.querySelector<HTMLElement>('.processor-choices')!;
+      const hint = this.querySelector<HTMLElement>('.explore-hint')!;
+      const stageLabel = this.querySelector<HTMLElement>('[data-stage-label]')!;
+      const stageTitle = this.querySelector<HTMLElement>('[data-stage-title]')!;
+      const stageDescription = this.querySelector<HTMLElement>('[data-stage-description]')!;
+      const processorSummary = this.querySelector<HTMLElement>('[data-processor-summary]')!;
+      const processorMap = this.querySelector<HTMLElement>('[data-processor-map]')!;
+      const processorReduce = this.querySelector<HTMLElement>('[data-processor-reduce]')!;
+      const processorLink = this.querySelector<HTMLAnchorElement>('[data-processor-link]')!;
+      let activeStage = 'map';
+      let activeProcessor: string | null = null;
+      const inspect = (stageId: string, processorId = activeProcessor) => {
+        const stage = pipelineStages.find(item => item.id === stageId);
+        if (!stage) return;
+        const processor = ['map', 'reduce'].includes(stage.id) ? pipelineProcessors.find(item => item.id === processorId) : undefined;
+        activeStage = stage.id;
+        activeProcessor = processor?.id ?? null;
+        this.dataset.stage = activeStage;
+        this.dataset.processor = activeProcessor ?? '';
+        stageLabel.textContent = stage.label;
+        stageTitle.textContent = stage.title;
+        stageDescription.textContent = stage.description;
+        processorSummary.textContent = processor ? `${processor.label} → ${processor.output}` : 'Built-in or your own Rust. Each processor owns both steps.';
+        processorMap.textContent = processor?.map ?? 'Block material → compact delta';
+        processorReduce.textContent = processor?.reduce ?? 'Ordered delta → state + changes';
+        processorLink.href = processor?.href ?? '/docs/guides/custom-processor/';
+        processorLink.textContent = processor ? (processor.id === 'custom' ? 'Build your processor →' : 'Processor contract →') : 'Build your processor →';
+        this.querySelectorAll<HTMLElement>('[data-stage-target]').forEach(element => element.classList.toggle('is-active', element.dataset.stageTarget === activeStage));
+        this.querySelectorAll<HTMLElement>('[data-processor-target]').forEach(element => element.classList.toggle('is-selected', element.dataset.processorTarget === activeProcessor));
+        this.querySelectorAll<HTMLButtonElement>('[data-select-stage]').forEach(element => element.setAttribute('aria-pressed', String(element.dataset.selectStage === activeStage)));
+        this.querySelectorAll<HTMLButtonElement>('[data-select-processor]').forEach(element => element.setAttribute('aria-pressed', String(element.dataset.selectProcessor === activeProcessor)));
+      };
+      const reducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)');
+      const finePointer = window.matchMedia('(hover: hover) and (pointer: fine)');
+      const events = new AbortController();
+      let paused = false;
+      let visible = false;
+      let pointerFrame = 0;
+      const resetTilt = () => {
+        cancelAnimationFrame(pointerFrame);
+        pointerFrame = 0;
+        camera.style.setProperty('--tilt-x', '0deg');
+        camera.style.setProperty('--tilt-z', '0deg');
+      };
+      const update = () => {
+        const running = !paused && !reducedMotion.matches && visible && !document.hidden;
+        this.dataset.running = String(running);
+        button.hidden = reducedMotion.matches;
+        button.setAttribute('aria-pressed', String(paused));
+        button.setAttribute('aria-label', paused ? 'Play pipeline animation' : 'Pause pipeline animation');
+        label.textContent = paused ? 'Play' : 'Pause';
+        if (!running) resetTilt();
+      };
+      const resize = new ResizeObserver(([entry]) => {
+        camera.style.setProperty('--scene-scale', String(Math.min(1, entry.contentRect.width / 1060)));
+      });
+      const intersection = new IntersectionObserver(([entry]) => {
+        visible = entry.isIntersecting;
+        update();
+      }, { threshold: 0.08 });
+      button.addEventListener('click', () => { paused = !paused; update(); }, { signal: events.signal });
+      reducedMotion.addEventListener('change', update, { signal: events.signal });
+      document.addEventListener('visibilitychange', update, { signal: events.signal });
+      viewport.addEventListener('pointermove', (event) => {
+        if (this.dataset.running !== 'true' || !finePointer.matches || pointerFrame) return;
+        pointerFrame = requestAnimationFrame(() => {
+          const bounds = viewport.getBoundingClientRect();
+          camera.style.setProperty('--tilt-x', `${((event.clientY - bounds.top) / bounds.height - 0.5) * -5}deg`);
+          camera.style.setProperty('--tilt-z', `${((event.clientX - bounds.left) / bounds.width - 0.5) * 5}deg`);
+          pointerFrame = 0;
+        });
+      }, { signal: events.signal });
+      viewport.addEventListener('pointerleave', resetTilt, { signal: events.signal });
+      this.addEventListener('click', (event) => {
+        const target = event.target instanceof Element ? event.target.closest<HTMLElement>('[data-select-stage], [data-select-processor]') : null;
+        if (target?.dataset.selectStage) inspect(target.dataset.selectStage);
+        if (target?.dataset.selectProcessor) inspect(['map', 'reduce'].includes(activeStage) ? activeStage : 'map', target.dataset.selectProcessor);
+      }, { signal: events.signal });
+      this.addEventListener('focusin', (event) => {
+        const target = event.target as HTMLElement;
+        if (target.dataset.selectStage) inspect(target.dataset.selectStage);
+        if (target.dataset.selectProcessor) inspect(['map', 'reduce'].includes(activeStage) ? activeStage : 'map', target.dataset.selectProcessor);
+      }, { signal: events.signal });
+      viewport.addEventListener('pointerover', (event) => {
+        if (!finePointer.matches || !(event.target instanceof Element)) return;
+        const stage = event.target.closest<HTMLElement>('[data-stage-target]');
+        const processor = event.target.closest<HTMLElement>('[data-processor-target]');
+        if (stage) {
+          if (stage.dataset.stageTarget !== activeStage || (processor?.dataset.processorTarget ?? null) !== activeProcessor) inspect(stage.dataset.stageTarget!, processor?.dataset.processorTarget ?? null);
+        }
+      }, { signal: events.signal });
+      document.addEventListener('keydown', (event) => {
+        if (event.key === 'Escape' && this.contains(document.activeElement)) inspect('map', null);
+      }, { signal: events.signal });
+      stageControls.hidden = false;
+      processorChoices.hidden = false;
+      hint.hidden = false;
+      inspect('map');
+      resize.observe(viewport);
+      intersection.observe(viewport);
+      update();
+      this.cleanup = () => { events.abort(); resize.disconnect(); intersection.disconnect(); resetTilt(); };
+    }
+    cleanup?: () => void;
+    disconnectedCallback() { this.cleanup?.(); }
+  }
+  if (!customElements.get('pipeline-scene')) customElements.define('pipeline-scene', PipelineScene);
+</script>
+
+<style>
+  .engine { display: block; margin-top: 2.8rem; border: 1px solid var(--panel-edge); border-radius: 12px; background: #0b110e; overflow: hidden; }
+  .engine-bar { display: flex; justify-content: space-between; align-items: center; min-height: 3.4rem; margin-inline: 1.5rem; border-bottom: 1px solid #1c2b23; font-size: 0.65rem; letter-spacing: 0.13em; color: var(--ink-dim); }
+  .engine-bar > span { display: flex; align-items: center; gap: 0.65rem; }
+  .status-dot { width: 6px; height: 6px; background: var(--accent); border-radius: 50%; box-shadow: 0 0 10px #3ee07f55; }
+  .motion-toggle { display: inline-flex; align-items: center; justify-content: center; gap: 0.55rem; min-width: 5rem; min-height: 2.75rem; margin-right: -0.6rem; border: 0; background: transparent; color: var(--ink-dim); font: inherit; letter-spacing: 0; cursor: pointer; }
+  .motion-toggle[hidden] { display: none; }
+  .motion-toggle:hover { color: var(--accent); }
+  .motion-toggle svg { fill: none; stroke: currentColor; stroke-width: 1.5; }
+  .play-icon, [aria-pressed='true'] .pause-icon { display: none; }
+  [aria-pressed='true'] .play-icon { display: block; }
+  .viewport { height: 660px; position: relative; isolation: isolate; background: radial-gradient(ellipse at 54% 48%, #14362255, transparent 57%); overflow: hidden; }
+  .camera { --scene-scale: 1; position: absolute; width: 860px; height: 480px; left: 50%; top: 57%; margin: -240px 0 0 -430px; transform: scale(var(--scene-scale)); perspective: 1800px; }
+  .world { width: 100%; height: 100%; position: relative; transform-style: preserve-3d; transform: rotateX(calc(55deg + var(--tilt-x, 0deg))) rotateZ(calc(-30deg + var(--tilt-z, 0deg))); transition: transform 600ms cubic-bezier(0.2, 0.65, 0.3, 1); }
+  /* Only 3D groups preserve depth. SVG rails and plate artwork stay flat
+     within their own plane so their children paint consistently across engines. */
+  .source, .packet, .cube, .processor, .processor-layer, .processor-module, .state-bank, .state-cell { transform-style: preserve-3d; }
+  .floor, .floor-cross, .rails, .packet, .emitter-signal, .intake-ring, .raw-fragment { pointer-events: none; }
+  .floor { position: absolute; inset: -65px -40px; background-image: linear-gradient(#35533f26 1px, transparent 1px), linear-gradient(90deg, #35533f26 1px, transparent 1px); background-size: 32px 32px; border: 1px solid #35533f26; mask-image: radial-gradient(ellipse, black 30%, transparent 72%); }
+  .floor-cross { position: absolute; width: 12px; height: 12px; }
+  .floor-cross::before, .floor-cross::after { content: ''; position: absolute; background: #52765c66; }
+  .floor-cross::before { width: 12px; height: 1px; top: 6px; }
+  .floor-cross::after { width: 1px; height: 12px; left: 6px; }
+  .cross-a { left: 15px; top: 20px; }.cross-b { right: 15px; top: 20px; }.cross-c { left: 15px; bottom: 10px; }.cross-d { right: 15px; bottom: 10px; }
+  .rails { position: absolute; inset: 0; width: 860px; height: 480px; overflow: visible; transform: translateZ(2px); }
+  .rail-bed { stroke: #142c1e; stroke-width: 28px; }
+  .rail-line { stroke: url(#pipeline-rail-gradient); stroke-width: 1px; }
+  .rail-ticks { stroke: #74c28e; stroke-width: 16px; stroke-dasharray: 1 15; opacity: 0.3; }
+  .source { position: absolute; width: 112px; height: 112px; left: 54px; }
+  .archive { top: 44px; }
+  .archive-slab { position: absolute; inset: 0; border: 1px solid #69987b; border-radius: 5px; background: linear-gradient(135deg, #294435, #17271e); transform: translateZ(calc(8px + var(--level) * 16px)); box-shadow: 0 5px 0 #102218, 0 6px 0 #3e614b; display: flex; flex-direction: column; justify-content: center; gap: 9px; padding: 22px; }
+  .archive-slab span { height: 4px; background: repeating-linear-gradient(90deg, #7c9d88 0 14px, transparent 14px 19px); opacity: 0.7; }
+  .archive-slab span:nth-child(2) { width: 75%; }
+  .source-caption { position: absolute; top: 124px; width: 100%; text-align: center; font-size: 14px; letter-spacing: 0.07em; color: #c1d9c9; }
+  .live-source { top: 324px; }
+  .emitter-base { position: absolute; inset: 0; border: 1px solid #409761; background: #102d1c; border-radius: 8px; transform: translateZ(8px); box-shadow: 0 6px 0 #112519, 0 7px 0 #315e41; }
+  .emitter-rings { position: absolute; inset: 15px; border: 1px solid #3ee07f55; border-radius: 50%; background: repeating-radial-gradient(circle, transparent 0 11px, #3ee07f44 12px 13px, transparent 14px 24px); }
+  .emitter-signal { position: absolute; inset: 20px; border: 1px solid #3ee07f88; border-radius: 50%; transform: translateZ(20px); animation: broadcast 4s ease-out infinite; }
+  .signal-two { animation-delay: -2s; }
+  .live-gem { position: absolute; width: 28px; height: 40px; left: 42px; top: 36px; transform: translateZ(42px) rotateZ(30deg) rotateX(-55deg); }
+  .gem-top { width: 28px; height: 27px; background: linear-gradient(90deg, #91ffb9 50%, #3d9c63 50%); clip-path: polygon(50% 0, 100% 76%, 50% 100%, 0 76%); }
+  .gem-bottom { width: 28px; height: 14px; margin-top: -2px; background: linear-gradient(90deg, #59c883 50%, #246b40 50%); clip-path: polygon(0 0, 50% 35%, 100% 0, 50% 100%); }
+  /* Opacity animation on a 3D parent flattens its faces, even at opacity: 1.
+     Keep packets solid; their paths start and end inside the source/core/state. */
+  .packet { position: absolute; left: 0; top: 0; width: 18px; height: 18px; offset-rotate: 0deg; offset-distance: var(--position); transform: translateZ(18px); animation: travel 6s linear infinite; animation-delay: var(--delay); }
+  .packet-history { --cube-top: #b4d4bf; --cube-front: #537660; --cube-side: #385842; offset-path: path('M110 100H218Q250 100 250 132V208Q250 240 282 240H430'); }
+  .packet-live { --cube-top: #91ffb9; --cube-front: #37b86b; --cube-side: #22763e; offset-path: path('M110 380H288Q320 380 320 348V272Q320 240 352 240H430'); }
+  .packet-output { --cube-top: #b6ffce; --cube-front: #3ee07f; --cube-side: #248f4c; offset-path: path('M475 240H755'); }
+  /* Three visible faces, with sides generated in CSS to keep the diagram lean. */
+  .cube { --size: 18px; width: var(--size); height: var(--size); position: relative; background: var(--cube-top); border: 1px solid #bcffd35e; transform: translateZ(calc(var(--size) / 2)); }
+  .cube::before, .cube::after { content: ''; position: absolute; inset: -1px; border: 1px solid #bcffd35e; backface-visibility: hidden; }
+  .cube::before { background: var(--cube-front); transform: translateY(calc(var(--size) / 2)) translateZ(calc(var(--size) / -2)) rotateX(-90deg); }
+  .cube::after { background: var(--cube-side); transform: translateX(calc(var(--size) / -2)) translateZ(calc(var(--size) / -2)) rotateY(-90deg); }
+  .processor { position: absolute; left: 308px; top: 148px; width: 244px; height: 184px; }
+  .processor-foundation { position: absolute; inset: -14px -26px -46px; background: #13291b; border: 1px solid #3e7752; border-radius: 8px; box-shadow: 0 8px 0 #0d1c12, 0 9px 0 #31543d, 0 24px 45px #0009; }
+  .processor-foundation, .processor-layer, .intake-ring { scale: 0.96; }
+  .processor-foundation > span { position: absolute; bottom: 8px; right: 10px; color: #daf5e4; font-size: 17px; font-weight: 700; line-height: 1; }
+  .pins { position: absolute; top: 22px; bottom: 22px; width: 10px; background: repeating-linear-gradient(0deg, #6b9578 0 3px, transparent 3px 10px); }
+  .pins-left { left: -10px; }.pins-right { right: -10px; }
+  .processor-layer { position: absolute; inset: 0; transform: translateZ(var(--height)); animation: layer-breathe 6s ease-in-out infinite; }
+  .plate-surface { position: absolute; inset: 0; border: 1px solid #6aaa80; border-radius: 5px; background: linear-gradient(145deg, #243f2edb, #102219f2); }
+  .normalize .plate-surface { border-color: #85e9a6; background: linear-gradient(145deg, #33543fdc, #193723ed); box-shadow: 0 0 30px #3ee07f14, inset 0 0 25px #3ee07f10; }
+  .plate-edge { position: absolute; background: #142c1d; border: 1px solid #416e50; }
+  .edge-front { width: 244px; height: 8px; top: 184px; transform-origin: top; transform: rotateX(-90deg); }
+  .edge-right { width: 8px; height: 184px; left: 244px; transform-origin: left; transform: rotateY(90deg); }
+  .plate-number { position: absolute; left: 12px; top: 8px; color: #c0dcca; font-size: 13px; }
+  .plate-name { position: absolute; bottom: 14px; left: 16px; color: #effff4; font-size: 18px; font-weight: 700; }
+  .plate-led { position: absolute; top: 13px; right: 13px; width: 4px; height: 4px; border-radius: 50%; background: #8dffb5; box-shadow: 0 0 8px #3ee07f; }
+  .plate-circuit { position: absolute; inset: 35px 76px 52px; display: grid; grid-template-columns: 1fr 1fr; gap: 6px; border: 1px solid #69a37c77; padding: 7px; }
+  .plate-circuit::before, .plate-circuit::after { content: ''; position: absolute; width: 19px; height: 38px; top: 20px; background: repeating-linear-gradient(0deg, #7ac28e77 0 1px, transparent 1px 7px); }
+  .plate-circuit::before { right: 100%; }.plate-circuit::after { left: 100%; }
+  .plate-circuit span { border: 1px solid #a2e7b975; background: #3ee07f18; animation: compute 3s ease-in-out infinite; animation-delay: calc(var(--layer) * -0.65s); }
+  .plate-circuit span:nth-child(2n) { animation-delay: calc(var(--layer) * -0.65s - 1.5s); }
+  .intake-ring { position: absolute; inset: -6px; border: 1px solid #8bffb677; border-radius: 6px; transform: translateZ(178px); animation: intake 6s ease-out infinite; }
+  .state-bank { position: absolute; left: 686px; top: 173px; width: 138px; height: 138px; }
+  .state-base { position: absolute; inset: -8px; border: 1px solid #4ca66a; border-radius: 6px; background: #142e1e; transform: translateZ(5px); box-shadow: 0 6px 0 #102319, 0 7px 0 #365c43; }
+  .state-base > span { position: absolute; bottom: -28px; width: 100%; text-align: center; color: #b9dcc4; font-size: 13px; letter-spacing: 0.07em; }
+  .state-cell { --cube-top: #78e99c; --cube-front: #36a55d; --cube-side: #206a3b; position: absolute; left: calc(8px + var(--col) * 43px); top: calc(8px + var(--row) * 43px); transform: translateZ(27px); animation: commit 6s ease-in-out infinite; animation-delay: calc(var(--cell) * -0.65s); }
+  .state-cell .cube { --size: 35px; }
+  .raw-path { position: absolute; left: 505px; top: 375px; border-left: 1px dashed #53705d; padding: 12px; transform: translateZ(1px); font-size: 13px; color: #a7c0af; }
+  .raw-path span { display: block; }
+  .raw-fragment { position: absolute; left: calc(480px + var(--fragment) * 20px); top: calc(310px + var(--fragment) * 13px); width: 7px; height: 7px; background: #73907d; transform: translateZ(25px); animation: discard 4s ease-out infinite; animation-delay: calc(var(--fragment) * -1s); }
+  .annotation { position: absolute; z-index: 1; display: flex; flex-direction: column; gap: 0.3rem; font-size: 0.78rem; line-height: 1.5; color: #bad0c2; pointer-events: none; }
+  .annotation strong { font-family: var(--font-sans); color: #d5e9dc; font-size: 1.05rem; font-weight: 550; letter-spacing: -0.01em; }
+  .annotation-kicker { color: #a2c3ae; letter-spacing: 0.06em; font-size: 0.72rem; }
+  .history-label { left: 5%; top: 21%; }
+  .live-label { left: 4%; bottom: 10%; }
+  .live-label .annotation-kicker { color: #76d795; }
+  .annotation i { display: inline-block; width: 5px; height: 5px; margin-bottom: 1px; background: var(--accent); border-radius: 50%; }
+  .core-label { top: 5%; left: 43%; }
+  .core-label::after { content: ''; display: block; height: 35px; width: 1px; margin-top: 8px; background: linear-gradient(#65977477, transparent); }
+  .output-label { right: 3%; top: 27%; }
+  .scene-note { position: absolute; bottom: 22px; right: 24px; display: flex; align-items: center; justify-content: center; gap: 12px; color: #aec6b7; font-size: 0.75rem; letter-spacing: 0.03em; }
+  .note-line { width: 42px; height: 1px; background: #3e7050; }
+  .processor-module { position: absolute; left: calc(var(--col) * 154px - 12px); top: calc(var(--row) * 100px + 30px); width: 114px; height: 84px; }
+  .module-surface { position: absolute; inset: 0; border: 1px solid color-mix(in srgb, var(--processor-color) 60%, #1b3021); border-radius: 5px; background: #17271e; transition: border-color 180ms, background 180ms, box-shadow 180ms; }
+  .module-edge { position: absolute; width: 114px; height: 7px; top: 84px; transform-origin: top; transform: rotateX(-90deg); background: #183224; border: 1px solid color-mix(in srgb, var(--processor-color) 50%, #1b3021); }
+  .module-title { display: block; position: absolute; left: 10px; top: 8px; font-size: 17px; font-weight: 700; color: var(--processor-color); }
+  .module-method { position: absolute; left: 10px; bottom: 9px; font-size: 14px; color: #e8f9ee; }
+  .module-led { position: absolute; right: 10px; bottom: 16px; width: 5px; height: 5px; background: var(--processor-color); box-shadow: 0 0 9px var(--processor-color); animation: compute 3s ease-in-out infinite; animation-delay: calc(var(--module) * -0.7s); }
+  .map .processor-module::after { content: ''; position: absolute; left: 56px; top: 42px; width: 1px; height: 40px; transform-origin: top; transform: rotateX(-90deg); background: color-mix(in srgb, var(--processor-color) 50%, transparent); pointer-events: none; }
+  .map .processor-module::before { content: ''; position: absolute; left: 53px; top: 39px; width: 7px; height: 7px; background: var(--processor-color); transform: translateZ(-20px); animation: delta-pass 3.2s linear infinite; animation-delay: calc(var(--module) * -0.8s); pointer-events: none; }
+  .plate-surface { transition: border-color 180ms, box-shadow 180ms; }
+  .is-active > .plate-surface { border-color: #c0ffd7; box-shadow: 0 0 26px #3ee07f45, inset 0 0 32px #3ee07f18; }
+  .is-active .module-surface { border-color: var(--processor-color); background: color-mix(in srgb, var(--processor-color) 12%, #14221a); box-shadow: 0 0 20px color-mix(in srgb, var(--processor-color) 12%, transparent); }
+  .processor-module.is-selected .module-surface { border: 2px solid var(--processor-color); background: color-mix(in srgb, var(--processor-color) 23%, #14221a); box-shadow: 0 0 23px color-mix(in srgb, var(--processor-color) 30%, transparent); }
+  .state-bank.is-active .state-base { border-color: #baffd2; box-shadow: 0 0 32px #3ee07f55; }
+  [data-stage-target] { cursor: pointer; }
+  .pipeline-explorer { padding: 1.5rem; border-top: 1px solid #2e4637; background: #0e1812; }
+  .explorer-heading { display: flex; justify-content: space-between; gap: 1rem; align-items: center; margin-bottom: 1rem; }
+  .explorer-heading .mono { color: #b0cbb9; font-size: 0.73rem; letter-spacing: 0.06em; }
+  .explore-hint { color: #94b29f; font-size: 0.8rem; }
+  .stage-controls { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 0.5rem; }
+  .stage-controls[hidden], .processor-choices[hidden], .explore-hint[hidden] { display: none; }
+  .stage-controls button { display: flex; align-items: center; justify-content: center; gap: 0.5rem; padding: 0.7rem 0.4rem; min-height: 44px; border: 1px solid #304939; border-radius: 5px; background: #121f17; color: #c5ddce; font: 500 0.85rem var(--font-sans); cursor: pointer; }
+  .stage-controls button span { color: #85aa92; font-size: 0.7rem; }
+  .stage-controls button[aria-pressed='true'] { color: #e8fff0; border-color: #7cdb9d; background: #203c2b; }
+  .stage-controls button[aria-pressed='true'] span { color: #9af0b8; }
+  .stage-controls button:hover, .processor-choices button:hover { border-color: #9dceb0; }
+  .inspector { display: grid; grid-template-columns: 1fr 1.35fr; gap: 2rem; margin-top: 1.5rem; }
+  .detail-key { margin-bottom: 0.6rem; color: #9befb6; font-size: 0.78rem; }
+  .stage-detail h3 { color: #eef9f2; font-size: 1.25rem; line-height: 1.3; text-wrap: initial; margin-bottom: 0.65rem; }
+  .stage-detail > p:last-child { color: #aec8b8; font-size: 0.9rem; line-height: 1.7; }
+  .processor-detail { border-left: 1px solid #304939; padding-left: 2rem; }
+  .processor-choices { display: grid; grid-template-columns: 1fr 1fr; gap: 0.45rem; margin-bottom: 1rem; }
+  .processor-choices button { display: flex; gap: 0.55rem; align-items: center; min-height: 42px; padding: 0.55rem 0.7rem; border: 1px solid #304939; border-radius: 5px; background: #111e16; color: #d3e7da; font: 0.82rem var(--font-sans); text-align: left; cursor: pointer; }
+  .processor-choices button i { width: 6px; height: 6px; flex-shrink: 0; background: var(--processor-color); border-radius: 2px; }
+  .processor-choices button[aria-pressed='true'] { border-color: var(--processor-color); color: var(--processor-color); background: color-mix(in srgb, var(--processor-color) 9%, #111e16); }
+  .processor-summary { font-size: 0.85rem; color: #e3f4e9; margin-bottom: 0.7rem; min-height: 2.7em; }
+  .processor-detail dl { display: grid; gap: 0.55rem; font-size: 0.83rem; line-height: 1.55; }
+  .processor-detail dl div { display: grid; grid-template-columns: 5.4rem 1fr; gap: 0.5rem; }
+  .processor-detail dt { color: #b7e5c7; }
+  .processor-detail dd { color: #abc7b6; }
+  .processor-detail a { display: inline-block; margin-top: 1rem; font-size: 0.85rem; }
+  .engine-footnote { border-top: 1px solid #253b2d; margin-top: 1.4rem; padding-top: 1rem; font-size: 0.78rem; line-height: 1.65; color: #9bb9a7; }
+  .engine[data-running='false'] *, .engine[data-running='false'] *::before, .engine[data-running='false'] *::after { animation-play-state: paused !important; }
+  @keyframes travel { from { offset-distance: 0%; } to { offset-distance: 100%; } }
+  @keyframes layer-breathe { 0%, 100% { transform: translateZ(var(--height)); } 50% { transform: translateZ(calc(var(--height) + var(--layer) * 4px + 3px)); } }
+  @keyframes compute { 0%, 100% { opacity: 0.45; } 50% { opacity: 1; } }
+  @keyframes delta-pass { 0% { transform: translateZ(-5px); opacity: 0; } 15%, 85% { opacity: 1; } 100% { transform: translateZ(-36px); opacity: 0; } }
+  @keyframes intake { 0%, 100% { opacity: 0; transform: translateZ(178px) scale(1); } 20% { opacity: 0.8; } 65% { opacity: 0; transform: translateZ(200px) scale(1.15); } }
+  @keyframes broadcast { 0% { transform: translateZ(12px) scale(0.65); opacity: 0; } 15% { opacity: 0.8; } 100% { transform: translateZ(80px) scale(1.4); opacity: 0; } }
+  @keyframes commit { 0%, 65%, 100% { transform: translateZ(27px); } 78% { transform: translateZ(42px); } 88% { transform: translateZ(25px); } }
+  @keyframes discard { 0% { transform: translate3d(0, 0, 28px); opacity: 0; } 15% { opacity: 0.65; } 100% { transform: translate3d(45px, 65px, 1px) scale(0.2); opacity: 0; } }
+  @media (max-width: 1000px) {
+    .viewport { height: 570px; }
+    .camera { --scene-scale: 0.75; top: 59%; }
+    .history-label { top: 18%; left: 4%; }
+    .core-label { left: 39%; }
+    .output-label { right: 3%; top: 29%; }
+    .live-label { left: 4%; bottom: 12%; }
+    .annotation strong { font-size: 0.95rem; }
+    .annotation { font-size: 0.7rem; }
+    .annotation-kicker { font-size: 0.64rem; }
+    .stage-controls { grid-template-columns: repeat(3, 1fr); }
+    .inspector { gap: 1.25rem; }
+    .processor-detail { padding-left: 1.25rem; }
+    .explore-hint { display: none; }
+  }
+  /* Conservative scales keep the full static scene visible without JavaScript. */
+  @media (max-width: 760px) { .camera { --scene-scale: 0.53; } }
+  @media (max-width: 600px) {
+    .engine { margin-top: 2rem; }
+    .engine-bar { margin-inline: 1rem; font-size: 0.7rem; }
+    .viewport { height: 400px; }
+    .camera { --scene-scale: 0.26; top: 57%; }
+    .annotation { font-size: 0.7rem; gap: 0.2rem; }
+    .annotation strong { font-size: 0.84rem; }
+    .annotation-kicker { font-size: 0.62rem; }
+    .core-label { left: 0; right: 0; top: 5%; text-align: center; }
+    .core-label::after { height: 18px; margin: 3px auto 0; }
+    .history-label { top: 29%; left: 5%; }
+    .history-label > span:last-child, .live-label > span:last-child, .output-label > span:last-child { display: none; }
+    .live-label { left: 6%; bottom: 13%; }
+    .output-label { right: 5%; top: 73%; text-align: right; }
+    .scene-note { bottom: 14px; left: 0; right: 0; font-size: 0.65rem; gap: 8px; }
+    .note-line { width: 20px; }
+    .pipeline-explorer { padding: 1rem; }
+    .stage-controls { grid-template-columns: 1fr 1fr; }
+    .stage-controls button:last-child { grid-column: 1 / -1; }
+    .stage-controls button { justify-content: flex-start; padding-inline: 0.7rem; font-size: 0.82rem; }
+    .inspector { grid-template-columns: 1fr; gap: 1.25rem; }
+    .stage-detail { min-height: 12.5rem; }
+    .processor-detail { border-left: 0; border-top: 1px solid #304939; padding: 1.25rem 0 0; }
+    .processor-choices button { font-size: 0.8rem; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .world, .plate-surface, .module-surface { transition: none; }
+    .world * { animation: none !important; }
+    .emitter-signal, .intake-ring, .raw-fragment { display: none; }
+  }
+</style>

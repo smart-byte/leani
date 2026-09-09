@@ -122,11 +122,11 @@ impl UniswapLatestProcessor {
                     }],
                     ..FilterScope::default()
                 },
-                minimum_finality: Finality::Optimistic,
+                minimum_finality: Finality::Included,
             }],
             mode: ReductionMode::OrderedState,
             delivery_ordering: DeliveryOrdering::Canonical,
-            publication: PublicationPolicy::OptimisticAndFinalized,
+            publication: PublicationPolicy::IncludedAndFinalized,
             lifecycle: LifecyclePolicies::from_legacy(RetentionPolicy::LatestState),
             schemas: ProcessorSchemas {
                 delta_version: 2,
@@ -203,7 +203,7 @@ impl UniswapObservationsProcessor {
             requirements: vec![uniswap_requirement(&config)],
             mode: ReductionMode::BlockLocal,
             delivery_ordering: DeliveryOrdering::BlockVersionedIdempotent,
-            publication: PublicationPolicy::OptimisticAndFinalized,
+            publication: PublicationPolicy::IncludedAndFinalized,
             lifecycle: LifecyclePolicies::from_legacy(RetentionPolicy::FullOutputHistory),
             schemas: ProcessorSchemas {
                 delta_version: 2,
@@ -420,7 +420,7 @@ fn uniswap_requirement(config: &UniswapConfig) -> DataRequirement {
             }],
             ..FilterScope::default()
         },
-        minimum_finality: Finality::Optimistic,
+        minimum_finality: Finality::Included,
     }
 }
 
@@ -491,8 +491,8 @@ fn finality_variant_checksums(
     delta.validate(descriptor)?;
     let decoded: UniswapPriceDelta = postcard::from_bytes(&delta.payload)
         .map_err(|error| ProcessorError::DeltaPayload(error.to_string()))?;
-    let mut checksums = Vec::with_capacity(3);
-    for finality in [Finality::Optimistic, Finality::Safe, Finality::Finalized] {
+    let mut checksums = Vec::with_capacity(2);
+    for finality in [Finality::Included, Finality::Finalized] {
         let mut variant = decoded.clone();
         for observation in &mut variant.observations {
             observation.finality = finality;
@@ -674,7 +674,7 @@ mod tests {
         let variants = processor
             .finality_variant_checksums(&delta)
             .expect("finality variants");
-        assert_eq!(variants.len(), 3);
+        assert_eq!(variants.len(), 2);
         assert!(variants.contains(&delta.checksum));
         let mut reducer = MemoryReducer::default();
         let changes = processor

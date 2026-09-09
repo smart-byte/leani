@@ -11,20 +11,14 @@ status: preview
 ---
 
 import { Aside, Card, CardGrid } from '@astrojs/starlight/components';
+import PipelineSteps from '@docs/components/PipelineSteps.astro';
 
 Leani is an application-specific Ethereum indexing node. It does not synchronize
 Ethereum's execution state and then ask what your application needs. It declares
 the processor's material requirements first, obtains only sources capable of
 satisfying them, and retains only the products selected by lifecycle policy.
 
-```text
-history sources ─┐
-                 ├─> normalized blocks ─> validate ─> map in parallel
-live P2P ────────┘                                  └─> reduce in order
-                                                            │
-                         query API <─ output/state/artifacts ┤
-                         your app  <─ durable change log ────┘
-```
+<PipelineSteps />
 
 <CardGrid>
   <Card title="Acquire by capability" icon="magnifier">

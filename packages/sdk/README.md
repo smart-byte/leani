@@ -57,3 +57,23 @@ replay a change.
 The browser build assumes a same-origin deployment or a reverse proxy that
 adds the application's CORS policy. Leani does not enable cross-origin access
 on its native API by default.
+
+Typed subscriptions accept a configured `processor` instance when a kind is
+ambiguous. `blobs.subscribe()` yields a `{ block, transactions }` payload on
+apply. Check `operation` before reading processor data: a finalized event has
+`{ throughBlock }` instead. Pass an `AbortSignal` to stop an idle stream;
+leaving the loop cancels its response body.
+
+`queryAndFollow()` returns the first snapshot page and an atomic stream boundary.
+Read every `nextCursor` with `queryEntities()`, release the snapshot in `finally`,
+and then subscribe from `boundaryCursor`. See the executable
+[query/follow example](../../examples/sdk-stream/index.ts) and its
+[setup guide](https://leani.dev/docs/guides/query-then-follow/).
+
+When delivery is disabled, `queryEntities()` still returns retained output,
+with `boundaryCursor` and `recovery.follow` set to `null`. `queryAndFollow()`
+requires delivery and otherwise returns HTTP 409 `delivery_disabled`.
+
+Both package entry points use `LeaniError` for HTTP failures, including status,
+code, retryability, and request ID. ResetRequiredError is a LeaniError with
+`code: "cursor_expired"`; rebuild application state from a fresh snapshot.

@@ -113,11 +113,11 @@ impl Erc20BalanceProcessor {
                     }],
                     ..FilterScope::default()
                 },
-                minimum_finality: Finality::Optimistic,
+                minimum_finality: Finality::Included,
             }],
             mode: ReductionMode::OrderedState,
             delivery_ordering: DeliveryOrdering::Canonical,
-            publication: PublicationPolicy::OptimisticAndFinalized,
+            publication: PublicationPolicy::IncludedAndFinalized,
             lifecycle: LifecyclePolicies::from_legacy(RetentionPolicy::LatestState),
             schemas: ProcessorSchemas {
                 delta_version: 1,

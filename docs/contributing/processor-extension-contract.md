@@ -89,7 +89,7 @@ Common configuration remains strict:
 id = "my-protocol"
 version = "1.0.0"
 start_block = 18000000
-publish = "optimistic_and_finalized"
+publish = "included_and_finalized"
 retention = "full_output_history"
 
 [processors.settings]
@@ -141,7 +141,7 @@ pub trait Processor: Send + Sync {
 source material into a compact, versioned delta.
 
 `finality_variant_checksums` defaults to the exact delta checksum. A processor
-whose mapped payload embeds optimistic/safe/finalized state must override it by
+whose mapped payload embeds included/finalized state must override it by
 decoding the validated delta and returning only the checksums produced by
 changing that finality field. This lets restart recovery prove archive/live
 equivalence even after the raw frame has been pruned; it must not treat any

@@ -1,78 +1,82 @@
 {
-  "id": "evm-events",
-  "label": "evm-events",
-  "caption": "Declarative static-ABI decoding—no EVM or contract code, just logs. Dynamic values, tuples, arrays, and anonymous events are rejected by doctor.",
-  "docsUrl": "/docs/reference/processor-contracts/#evm-events-100",
+  "caption": "Declarative static-ABI decoding—no EVM or contract code, just logs. Dynamic values, tuples, arrays, and anonymous events are rejected by doctor. Illustrative response; hashes, cursors, and values vary by run.",
+  "config": "[[processors]]\nid = \"evm-events\"\ninstance = \"weth-transfers\"\nversion = \"1.0.0\"\nhistory_mode = \"on_demand\"\nstart_block = 12965000\npublish = \"finalized_only\"\n\n[processors.state]\nmode = \"durable\"\n\n[processors.artifacts]\nmode = \"none\"\n\n[processors.output]\nmode = \"window\"\nfinalized_only = true\n\n[processors.output.window]\nmax_blocks = 216000\n\n[processors.delivery]\nmode = \"window\"\n\n[processors.checkpoint]\nmode = \"automatic\"\nkeep = 3\n\n[processors.undo]\nmode = \"none\"\nsafety_blocks = 0\n\n[processors.settings]\naddresses = [\"0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2\"]\n\n[[processors.settings.events]]\nabi = \"event Transfer(address indexed from, address indexed to, uint256 value)\"\n\n[processors.settings.events.output]\ncollection = \"weth.transfers\"\nkind = \"weth.transfer\"\nkey_fields = []",
   "configLang": "toml",
-  "config": "[[processors]]\nid = \"evm-events\"\ninstance = \"weth-transfers\"\nversion = \"1.0.0\"\nhistory_mode = \"on_demand\"\nstart_block = 12965000\npublish = \"finalized_only\"\n\n[processors.state]\nmode = \"durable\"\n\n[processors.artifacts]\nmode = \"none\"\n\n[processors.output]\nmode = \"window\"\nfinalized_only = true\n\n[processors.output.window]\nmax_blocks = 216000\n\n[processors.delivery]\nmode = \"none\"\n\n[processors.checkpoint]\nmode = \"automatic\"\nkeep = 3\n\n[processors.undo]\nmode = \"none\"\nsafety_blocks = 0\n\n[processors.settings]\naddresses = [\"0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2\"]\n\n[[processors.settings.events]]\nabi = \"event Transfer(address indexed from, address indexed to, uint256 value)\"\n\n[processors.settings.events.output]\ncollection = \"weth.transfers\"\nkind = \"weth.transfer\"\nkey_fields = []",
-  "dataType": "{\n  schemaVersion: number;\n  contract: Hex;\n  event: string;\n  signature: string;\n  blockNumber: number;\n  blockHash: Hex;\n  blockTimestamp: number;\n  bucketStartTimestamp?: number;\n  transactionHash: Hex;\n  transactionIndex: number;\n  logIndex: number;\n  finality: \"optimistic\" | \"safe\" | \"finalized\";\n  values: Record<string, string>;\n}",
-  "sseId": "opaque-resume-cursor",
+  "dataType": "{\n  schemaVersion: number;\n  contract: Hex;\n  event: string;\n  signature: string;\n  blockNumber: number;\n  blockHash: Hex;\n  blockTimestamp: number;\n  bucketStartTimestamp?: number;\n  transactionHash: Hex;\n  transactionIndex: number;\n  logIndex: number;\n  finality: \"preview\" | \"included\" | \"finalized\";\n  values: Record<string, string>;\n}",
+  "docsUrl": "/docs/reference/processor-contracts/#evm-events-100",
   "helloJson": {
     "apiVersion": "1",
     "chainId": 1,
+    "coverage": {
+      "available": [
+        {
+          "finality": "finalized",
+          "fromBlock": 19430000,
+          "toBlock": 19430000
+        }
+      ],
+      "chainId": 1,
+      "complete": false,
+      "configuredStartBlock": 12965000,
+      "finalizedThrough": 19430000,
+      "processedThrough": 19430000,
+      "requested": null,
+      "state": "live"
+    },
     "processor": {
+      "artifactRetention": "none",
+      "changeSchema": "evm.event.change.v1",
+      "codeHash": "0x6bf652372a5750664c8b0597faefb4317c4d8ec0a2fb59c8173453726985aed1",
+      "configHash": "0x38b6203c8ca408c1a00aa1fb528d2bc33ae3c59559d6259007a4aa75c06eedbd",
+      "deliveryOrdering": "block_versioned_idempotent",
+      "genericApi": "processor-v1",
       "id": "evm-events",
       "instance": "weth-transfers",
-      "version": "1.0.0",
-      "codeHash": "0x7c1de60b2f4a45b7bb0c9c6f1e8a52d94033f8b1a2c7e05d6889a4be13907c44",
-      "configHash": "0x3f92ab7e0d6c41f8a55b17c2ee94083db761c50a9f24e8d3ba07615c284df9e1",
-      "genericApi": "processor-v1",
-      "changeSchema": "evm.event.change.v1",
       "queryExtensions": [],
       "subscriptions": true,
-      "artifactRetention": "none",
-      "deliveryOrdering": "block_versioned_idempotent"
-    },
-    "coverage": {
-      "chainId": 1,
-      "requested": null,
-      "available": [
-        { "fromBlock": 12965000, "toBlock": 25696313, "finality": "finalized" }
-      ],
-      "configuredStartBlock": 12965000,
-      "processedThrough": 25696313,
-      "finalizedThrough": 25696313,
-      "complete": true,
-      "state": "live"
+      "version": "1.0.0"
     }
   },
+  "id": "evm-events",
+  "label": "evm-events",
   "outputJson": {
     "apiVersion": "1",
-    "sequence": "84121",
-    "cursor": "opaque-resume-cursor",
-    "operation": "apply",
-    "originKind": "historical_backfill",
-    "originId": "weth-transfers",
-    "publicationRevision": "0",
-    "chainId": 1,
     "block": {
-      "hash": "0x7d31c4b8e2a90f6d5c11ae08b4b32799d4c6f1502e83ba7dd06945218c3ea7b2",
-      "number": 25696313,
-      "parentHash": "0x59e8d20cc41b73361fa8b4c05b90ea1745c2d9803f617ba2ce90d4a1f8b06c33",
-      "timestamp": 1786024151
+      "hash": "0x8a707419475207771c1004663d7510f330100ca73e206cc3c9bf51e0cef7c0b7",
+      "number": 19430000,
+      "parentHash": "0x5c68562e249e87eee7f656b04177dd585413adf9d3e1cb09f67420223e928e41",
+      "timestamp": 1710500000
     },
-    "finality": "finalized",
-    "kind": "weth.transfer.put",
-    "schema": "evm.event.change.v1",
-    "key": "0x6f2ab84cd07e3d51988c40b1e2f6a09375d14ec8ab90277f13d6c05e849b1fa2000000d2",
+    "chainId": 1,
+    "cursor": "0200000000000000000000000000000000010e776574682d7472616e736665727305312e302e30017961ec9fa579b8d10bbb5738b6b701d1",
     "data": {
-      "schemaVersion": 1,
+      "blockHash": "0x8a707419475207771c1004663d7510f330100ca73e206cc3c9bf51e0cef7c0b7",
+      "blockNumber": 19430000,
+      "blockTimestamp": 1710500000,
       "contract": "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2",
       "event": "Transfer",
-      "signature": "Transfer(address,address,uint256)",
-      "blockNumber": 25696313,
-      "blockHash": "0x7d31c4b8e2a90f6d5c11ae08b4b32799d4c6f1502e83ba7dd06945218c3ea7b2",
-      "blockTimestamp": 1786024151,
-      "transactionHash": "0x6f2ab84cd07e3d51988c40b1e2f6a09375d14ec8ab90277f13d6c05e849b1fa2",
-      "transactionIndex": 84,
-      "logIndex": 210,
       "finality": "finalized",
+      "logIndex": 0,
+      "schemaVersion": 1,
+      "signature": "Transfer(address,address,uint256)",
+      "transactionHash": "0x3333333333333333333333333333333333333333333333333333333333333333",
+      "transactionIndex": 0,
       "values": {
-        "from": "0x28c6c06298d514db089934071355e5743bf21d60",
-        "to": "0x2f2d854c1d6d5bb8936bb85bc07c28ebb42c9b10",
-        "value": "1250000000000000000"
+        "from": "0x0000000000000000000000000000000000000000",
+        "to": "0x1111111111111111111111111111111111111111",
+        "value": "42"
       }
     },
-    "emittedAt": "2026-08-06T13:49:23.082Z"
-  }
+    "emittedAt": "2024-03-15T10:53:20.000Z",
+    "finality": "finalized",
+    "key": "0x333333333333333333333333333333333333333333333333333333333333333300000000",
+    "kind": "weth.transfer.put",
+    "operation": "apply",
+    "originId": "illustrative-fixture",
+    "originKind": "historical_backfill",
+    "publicationRevision": "0",
+    "schema": "evm.event.change.v1",
+    "sequence": "1"
+  },
+  "sseId": "0200000000000000000000000000000000010e776574682d7472616e736665727305312e302e30017961ec9fa579b8d10bbb5738b6b701d1"
 }

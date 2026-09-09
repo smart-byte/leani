@@ -1,6 +1,6 @@
 ---
-title: Offline proof to Mainnet
-description: Prove a Leani release without network access, then move to a bounded Mainnet range and durable consumer.
+title: Offline and container diagnostics
+description: Diagnose an installation offline and exercise the local container image.
 section: getting-started
 order: 60
 audience:
@@ -9,37 +9,16 @@ audience:
 status: preview
 ---
 
-The optional offline diagnostic is deterministic and network-free. It exercises the distributed
-binary, historical runtime, processor reduction, schema migrations, delivery
-spool, checkpoints, coverage, and SQLite integrity.
+Use this page when you need to distinguish an installation problem from an
+upstream network problem. For your first run, start with
+[Install Leani](/docs/getting-started/install/) and
+[follow a block](/docs/getting-started/).
 
 ## Native
 
-Requirements: the pinned Rust toolchain and a writable temporary directory.
-
-```bash
-git clone https://github.com/smart-byte/leani.git leani
-cd leani
-cargo build --locked -p leani
-mkdir -p /tmp/leani-quickstart
-./target/debug/leani e2e fixture \
-  --data-dir /tmp/leani-quickstart \
-  --blocks 128 \
-  --report /tmp/leani-quickstart/report.json
-```
-
-Success prints a JSON report with `"status": "passed"`,
-`"databaseVerified": true`, one continuous `1..128` coverage interval, and
-128 changes. The command refuses an existing database so an accidental rerun
-cannot overwrite evidence; choose another directory for a second run.
-
-Validate a real lifecycle profile without opening a database or network:
-
-```bash
-./target/debug/leani \
-  --config config/modes/windowed.toml \
-  doctor --json
-```
+The [offline fixture](/docs/getting-started/offline-proof/) uses deterministic
+blocks with the production runtime and SQLite store. It reports 128 changes,
+continuous coverage, and database integrity without requiring a network.
 
 ## Docker
 
@@ -72,45 +51,14 @@ docker run --rm leani:local \
 
 ## Bounded public event example
 
-This step uses the public Xatu dataset and therefore requires outbound HTTPS.
-It retains an hourly-bucketed window of Uniswap V2 `Sync` events without
-running an EVM:
-
-```bash
-cp config/modes/windowed.toml leani.toml
-cargo run --locked --release -p leani -- \
-  backfill --processor uniswap-v2-sync-30d --from 10000835 --to 10001834
-```
-
-Start the historical-only API over the committed database:
-
-```bash
-cargo run --locked --release -p leani -- serve
-```
-
-In another terminal:
-
-```bash
-curl -s http://127.0.0.1:8080/v1/processors/uniswap-v2-sync-30d/collections
-curl -s \
-  'http://127.0.0.1:8080/v1/processors/uniswap-v2-sync-30d/collections/uniswap_v2.sync_hourly/entities?limit=10'
-```
-
-The collection route returns retained-window metadata and the entity route
-returns a stable snapshot cursor, query/follow boundary, actual row/byte cost,
-coverage, and decoded JSON entities. A range outside the retained window
-returns `output_not_retained` with an explicit rebuild/source-scan action; it
-never masquerades as an empty result.
-
-The profile intentionally disables head following. To continue at verified
-head, copy the execution-P2P and independently sourced finality settings from
-`config/example.toml`, use a fresh `data_dir`, run `doctor`, and then `serve`.
+After the offline check passes, follow
+[Index a bounded Mainnet range](/docs/getting-started/bounded-mainnet/).
+It includes a matching source configuration, decoded event queries, and
+coverage checks.
 
 ## Durable external consumer
 
-For the externalized profile, register the configured required consumer before
-backfill using `earliest_retained`. Store the returned consumer credential
-outside TOML. Read changes with that credential, commit each destination
-transaction and cursor atomically, then acknowledge the cursor. See
-[native API and delivery protocol](https://leani.dev/docs/reference/native-api-and-delivery/) for
-exact semantics and the commit-then-ack helper.
+For a complete destination setup, use
+[Consume changes into PostgreSQL](/docs/guides/postgres-consumer/).
+The guide specifies its node profile, database, registration secret, and
+restart check.

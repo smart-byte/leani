@@ -436,14 +436,14 @@
             "id": "finality",
             "long": "finality",
             "short": null,
-            "help": "Publication finality",
+            "help": "Lowest status to print: `included` (default) or `finalized`",
             "required": false,
             "action": "Set",
             "defaultValues": [
-              "optimistic"
+              "included"
             ],
             "possibleValues": [
-              "optimistic",
+              "included",
               "finalized"
             ]
           },
@@ -769,14 +769,14 @@
                 "id": "finality",
                 "long": "finality",
                 "short": null,
-                "help": "Price finality used by the subscription state being reset",
+                "help": "Finality of the subscription state being reset (`included` or `finalized`)",
                 "required": false,
                 "action": "Set",
                 "defaultValues": [
-                  "optimistic"
+                  "included"
                 ],
                 "possibleValues": [
-                  "optimistic",
+                  "included",
                   "finalized"
                 ]
               },

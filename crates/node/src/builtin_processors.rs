@@ -30,7 +30,7 @@ pub(crate) fn processor_contract(
         publish: if finalized_only {
             PublishMode::FinalizedOnly
         } else {
-            PublishMode::OptimisticAndFinalized
+            PublishMode::IncludedAndFinalized
         },
         state: StatePolicyConfig {
             mode: StatePolicyMode::Checkpointed,

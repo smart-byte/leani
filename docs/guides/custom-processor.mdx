@@ -1,6 +1,6 @@
 ---
-title: Build a custom processor
-description: Register a native Rust processor and expose a capability-discovered typed query extension.
+title: Build a custom node in Rust
+description: Use the Leani Rust library to register a processor, index three Mainnet blocks, and query your own output.
 section: guides
 order: 10
 audience:
@@ -8,39 +8,170 @@ audience:
 status: preview
 ---
 
-import { Aside, Steps } from '@astrojs/starlight/components';
+import { Aside } from '@astrojs/starlight/components';
 import CodeExample from '@docs/components/docs/CodeExample.astro';
+import SourceLink from '@docs/components/docs/SourceLink.astro';
 
-A downstream binary can register a processor without forking Leani. The public
-factory contract returns processor components: the state transform is required;
-query extensions are optional and owned by that processor.
+Use Leani as a Rust library when your application needs a transformation beyond
+its built-in processors. You supply a `Processor` and register its factory;
+Leani supplies acquisition, the CLI, storage, checkpoints, and delivery.
+The result is your own executable with the usual `doctor`, `backfill`, and
+`serve` commands.
 
-<Steps>
-1. Implement deterministic `map` and `reduce` behavior against the declared data
-   requirements.
-2. Register a factory under a stable processor ID.
-3. Attach a query extension when the processor needs a typed read model beyond
-   the generic collection API.
-4. Declare every state, output, delivery, checkpoint, undo, and publication
-   policy in the instance configuration.
-5. Discover the mounted extension from capabilities instead of constructing its
-   URL from an assumption.
-</Steps>
+This example stores each block's number and timestamp. It requests headers
+only and indexes three Mainnet blocks from public EraE archives. No API key or
+live peer connection is needed. Start with the
+[source installation](/docs/getting-started/install/) and keep `LEANI_SOURCE`
+pointing to the checkout.
 
-## Processor-owned query route
+## Run the complete example
 
-<CodeExample example="custom-processor-extension" />
+From the checkout, build the custom binary and test its processor:
 
-## Complete lifecycle configuration
+```bash
+cargo build --locked -p leani-custom-example
+cargo test --locked -p leani-custom-example
+```
+
+Use a fresh working directory so the example owns its own database:
+
+```bash
+export LEANI_CUSTOM_BIN="$LEANI_SOURCE/target/debug/leani-custom-example"
+LEANI_CUSTOM_DIR="$(mktemp -d)"
+cp "$LEANI_SOURCE/examples/custom-node/node.toml" "$LEANI_CUSTOM_DIR/leani.toml"
+cd "$LEANI_CUSTOM_DIR"
+"$LEANI_CUSTOM_BIN" doctor --json
+"$LEANI_CUSTOM_BIN" backfill \
+  --processor example-block-summary-local --from 19426589 --to 19426591
+"$LEANI_CUSTOM_BIN" serve
+```
+
+Expect `valid: true` from `doctor` and continuous coverage of
+`19426589..19426591` after backfill. `serve` stays in the foreground. In a
+second terminal, query the custom route:
+
+```bash
+curl -s http://127.0.0.1:9080/v1/processors/example-block-summary-local/query/19426589
+```
+
+The response has the shape `{ "blockNumber": 19426589, "timestamp": 1710338159 }`.
+The timestamp comes from the block header. Query an unindexed block and the
+extension returns HTTP 404. Discover the extension through `/v1/capabilities`
+when your application does not know the configured instance name.
+
+<Aside type="note" title="Source trust">
+  EraE checks execution commitments against the archive material. This
+  historical example relies on the public archive catalog; it does not claim
+  independent consensus anchoring or follow the live head.
+</Aside>
+
+## Use the Rust library
+
+The package `leani` exports the node runtime and processor registry. The
+example's Cargo dependency is a local path during the alpha:
+
+```toml
+[dependencies]
+leani = { path = "../../crates/node" }
+leani-primitives = { path = "../../crates/primitives" }
+leani-processor-api = { path = "../../crates/processor-api" }
+```
+
+Those paths are relative to `examples/custom-node/Cargo.toml`. Use paths to the
+same checkout in your own project; the alpha's crates are not yet published.
+The complete manifest also includes the serialization, Tokio, and Axum
+dependencies used below.
+
+The entry point registers the factory and hands command-line execution to
+`leani::run_with_registry`:
+
+<CodeExample example="custom-node-main" />
+
+`ProcessorRegistry::new()` starts empty: this binary contains the custom
+processor registered here. The stock `leani` executable will not recognize
+`example-block-summary`. Run the custom binary for this configuration.
+
+## Transform a block
+
+The complete implementation is in `examples/custom-node/src/main.rs`.
+Its descriptor declares `Capability::Header`, the processor's ID/version,
+its starting block, and its entity/change schemas.
+
+These methods implement the transformation:
+
+<CodeExample example="custom-processor-transform" />
+
+`map` validates its input and encodes a deterministic block summary. It must
+not depend on wall-clock time or external requests. `reduce` stores that summary
+under the block number and emits its change in the same transaction. Leani
+manages checkpoints and publication around that transaction.
+
+The example implements `change_json` and `entity_json` to expose typed JSON
+through delivery and the generic collection API.
+For your own transformation, change the summary type, mapping, and rendering
+together. Change the schema/version when the durable representation changes.
+
+## Configure the processor
+
+The full `node.toml` supplies the archive source, budgets, and listeners.
+Its processor section is:
 
 <CodeExample example="custom-processor-config" />
 
-## Capability-driven client
+`history_mode = "on_demand"` lets the explicit bounded `backfill` command own
+this run. `output.mode = "full"` retains all three summaries, and
+`delivery.mode = "window"` makes their changes available to subscribers.
+For a new experiment, use a new data directory.
+
+## Add a typed query route
+
+The example's optional query extension mounts `/{number}` underneath its
+instance's query path. Its factory connects both the processor and extension:
+
+<CodeExample example="custom-processor-extension" />
+
+With the example node still running, prepare the SDK using the install page,
+then run this from the checkout:
+
+```bash
+bun examples/custom-node/client.ts
+```
 
 <CodeExample example="custom-query-client" />
 
-<Aside type="caution" title="Native processors are trusted code">
-  A custom processor runs in the node process. Treat it like any other part of
-  your production binary: pin dependencies, review code, and test migrations and
-  reorg behavior before deployment.
-</Aside>
+## Move it into your application
+
+The example includes a standalone manifest with explicit dependencies. With your
+source checkout named `leani`, create a sibling application:
+
+```bash
+cd "$LEANI_SOURCE/.."
+cargo new --bin my-leani-node
+cp "$LEANI_SOURCE/examples/custom-node/standalone.toml" my-leani-node/Cargo.toml
+cp "$LEANI_SOURCE/examples/custom-node/src/main.rs" my-leani-node/src/main.rs
+cp "$LEANI_SOURCE/examples/custom-node/node.toml" my-leani-node/node.toml
+cp "$LEANI_SOURCE/rust-toolchain.toml" my-leani-node/rust-toolchain.toml
+cd my-leani-node
+cargo build
+cargo test --locked
+./target/debug/my-leani-node --config node.toml doctor --json
+```
+
+This application is outside Leani's workspace. Its dependencies point to
+`../leani/crates/...`; adjust those paths if your checkout has another name.
+The compatibility patch in the standalone manifest matches the workspace's
+upstream dependency patch. Commit the generated `Cargo.lock`, then use
+`cargo build --locked` for subsequent builds. Use your new binary with the same
+bounded `backfill` and `serve` commands from the beginning of this guide.
+
+Complete files: <SourceLink path="examples/custom-node/standalone.toml" label="standalone Cargo manifest" />,
+<SourceLink path="examples/custom-node/src/main.rs" label="Rust implementation and tests" />,
+and <SourceLink path="examples/custom-node/node.toml" label="node configuration" />.
+
+The implementation is compiled into your binary. For contract events expressible
+with a static ABI, the [event decoder](/docs/getting-started/bounded-mainnet/)
+may be sufficient without Rust code. For custom aggregation or additional
+queries, continue with the [processor contract](/docs/contributing/processor-extension-contract/).
+
+Native processors run in the node process. Review their code and test their
+restart and reorg behavior before using them with production data.

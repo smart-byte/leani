@@ -43,7 +43,7 @@ id = "blobs-money"
 instance = "blobs-container"
 version = "1.4.0"
 start_block = 19426589
-publish = "optimistic_and_finalized"
+publish = "included_and_finalized"
 
 [processors.state]
 mode = "checkpointed"

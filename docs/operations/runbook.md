@@ -243,6 +243,12 @@ the node exports its database/recent-cache byte counts but not host capacity.
 
 Create a consistent backup without stopping the server:
 
+Stop the node and any embedded subscription or standalone backfill using this
+data directory before running `leani db` commands (including `inspect`, `verify`,
+and `backup`). They open the store with migrations enabled and therefore take
+the same `.leani.lock` as other writers. Use the API and `/metrics` for inspection
+while the node is running.
+
 ```bash
 leani db backup /backups/leani-$(date +%s).sqlite \
   --config /etc/leani/node.toml
@@ -280,7 +286,7 @@ Never mark failed chunks complete.
 Readiness must become false when the live session is unavailable. Open
 `/debug/network` or inspect `/v1/network/status` before treating every
 zero-peer message as a live outage. Preserve the recent and undo windows, stop
-optimistic publication before a hard storage limit, and compare local queue
+included publication before a hard storage limit, and compare local queue
 wait with peer timeouts. The production source keeps one persistent broad peer
 pool, penalizes invalid material through Reth, retries without discarding
 healthy connections, and caps recovery backoff. Invalid commitments are
@@ -294,7 +300,7 @@ processor version/configuration and block identity before resuming.
 
 ### Finality outage or disagreement
 
-Continue only explicitly optimistic publication. Do not advance or prune the
+Continue only explicitly included publication. Do not advance or prune the
 finalized cursor. A disagreement or contradiction is fail-closed and requires
 operator review of checkpoint provenance and independent endpoints.
 
@@ -303,7 +309,7 @@ operator review of checkpoint provenance and independent endpoints.
 Inspect per-processor attribution with `db inspect` and `/metrics`. Prune
 change history only through `db prune-changes`, respecting active leases.
 Never evict rollback data required by unfinalized blocks. Add capacity or stop
-optimistic advancement before the hard limit.
+included advancement before the hard limit.
 
 ### SQLite failure
 

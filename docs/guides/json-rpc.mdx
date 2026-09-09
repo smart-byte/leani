@@ -1,0 +1,51 @@
+---
+title: Query a node with JSON-RPC
+description: Use curl or viem with the RPC endpoint of a prepared block node.
+section: guides
+order: 17
+audience:
+  - app-developer
+status: preview
+---
+
+First prepare a node with `leani init blocks` and `leani serve` as described in
+[Getting started](/docs/getting-started/). Its JSON-RPC endpoint is
+`http://127.0.0.1:18545`; its separate native SDK API is on port 18080.
+
+## Check the chain
+
+```bash
+curl -s http://127.0.0.1:18545 \
+  -H 'Content-Type: application/json' \
+  --data '{"jsonrpc":"2.0","id":1,"method":"eth_chainId","params":[]}'
+```
+
+Expect `{"jsonrpc":"2.0","id":1,"result":"0x1"}` for Ethereum Mainnet.
+
+In a Bun application, install viem with `bun add viem`, save the following as
+`watch.ts`, and run `bun watch.ts`:
+
+```ts
+import { createPublicClient, http } from "viem";
+
+const eth = createPublicClient({
+  transport: http("http://127.0.0.1:18545"),
+});
+console.log(await eth.getChainId()); // 1
+```
+
+## Requesting blocks, receipts, or state
+
+Available data depends on the node's configured sources and retained material.
+The block-summary feed requests headers and bodies without receipts. A
+historical receipts request needs a source that supplies complete receipts;
+the filtered Xatu event quickstart alone cannot satisfy it and returns
+`no_viable_historical_source`.
+
+The full historical configuration examples use RPC port 8545. Use the
+`rpc_http` listener shown by `leani doctor --json` for your selected profile.
+Do not infer the port or supported data from a different tutorial.
+
+See the [RPC method matrix](/docs/reference/ethereum-json-rpc/) before moving an
+existing application. Arbitrary `eth_call`, account-state queries, and execution
+simulation are outside the EVM-free core.

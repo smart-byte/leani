@@ -1254,7 +1254,7 @@ mod tests {
         let directory = tempdir().expect("temporary directory");
         let expected = frames(10, 12);
         let mut optimistic = expected[0].clone();
-        optimistic.finality = Finality::Optimistic;
+        optimistic.finality = Finality::Included;
         let mut writer = SegmentWriter::create(
             directory.path().join("finality.partial"),
             directory.path().join("finality.idxpartial"),

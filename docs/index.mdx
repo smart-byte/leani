@@ -14,53 +14,35 @@ sidebar:
 
 import { Card, CardGrid } from '@astrojs/starlight/components';
 
-Leani is an application-specific Ethereum indexing node. It follows the chain,
-runs only the processors you configure, and stores the durable products your
-application actually consumes.
-
-It is deliberately not a general-purpose archive node, SQL mirror of Ethereum,
-or promise that every JSON-RPC method is available. The node publishes its real
-capabilities, coverage, and retention so applications can make explicit choices.
+Leani is an Ethereum indexing node you run in your own infrastructure. It
+backfills public history, follows the chain, and stores the results your
+application needs. Start with one small example:
 
 <CardGrid>
-  <Card title="Run the node" icon="rocket">
-    [Install Leani, prove the binary offline, then index a bounded Mainnet range.](/docs/getting-started/)
+  <Card title="Run Leani" icon="rocket">
+    [Install the alpha](/docs/getting-started/install/), then
+    [follow an Ethereum block](/docs/getting-started/) or
+    [index contract events](/docs/getting-started/bounded-mainnet/).
   </Card>
-  <Card title="Consume durable changes" icon="database">
-    [Query a consistent snapshot, follow changes, and acknowledge an opaque cursor
-    only after your own transaction commits.](/docs/concepts/durable-delivery/)
+  <Card title="Connect an application" icon="database">
+    [Query and subscribe with TypeScript](/docs/guides/query-then-follow/),
+    then [persist changes to PostgreSQL](/docs/guides/postgres-consumer/).
   </Card>
-  <Card title="Write a processor" icon="puzzle">
-    [Turn blocks into typed deltas, materialized entities, artifacts, or a
-    processor-owned query API.](/docs/guides/custom-processor/)
-  </Card>
-  <Card title="Operate honestly" icon="approve-check-circle">
-    [Inspect exact coverage, data-source health, peer state, finality, and storage
-    lifecycle from native status endpoints.](/docs/operations/runbook/)
+  <Card title="Build with the Rust library" icon="puzzle">
+    [Register your own processor, build a custom node, and query its output.](/docs/guides/custom-processor/)
   </Card>
 </CardGrid>
 
-## The shortest useful mental model
+Each tutorial includes a matching configuration, commands, and expected output.
+The current alpha uses a source checkout; release packages become available
+when published.
 
-```text
-Ethereum sources → canonical blocks → processor map/reduce → durable products
-                                      ↘ change log → your application
-```
+Leani does not maintain EVM state. Arbitrary `eth_call`, native account balances,
+and transaction simulation need an execution provider. Read
+[alpha limitations](/docs/operations/preview-limitations/) before connecting a
+production application.
 
-Historical and live work are separate lanes. Leani can fill a history gap from
-available P2P or archive sources while the live lane continues following the
-head. A configured history limit is a policy boundary; when no limit is
-configured, the node attempts to fill the entire requested gap.
-
-## Choose your path
-
-- If you are evaluating Leani, start with [Getting started](/docs/getting-started/).
-- If you are integrating an application, learn the snapshot-and-follow and
-  durable-consumer protocol in `@leani/sdk` before persisting cursors.
-- If you are operating a node, treat `/v1/capabilities` and processor coverage as
-  runtime authorities rather than assuming a feature exists.
-- If you are extending Leani, processor factories can attach typed query routes
-  without expanding the generic API contract.
-
-The documentation on `main` is a preview. Production documentation is deployed
-only from a commit carrying the matching published release tag.
+The expandable sidebar groups hold detailed concepts, API and configuration
+reference, operations, and contributor material. Start with
+[how Leani works](/docs/concepts/how-leani-works/) when you want to understand
+what happens between a source block and your application output.

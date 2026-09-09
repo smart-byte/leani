@@ -1,0 +1,4 @@
+{
+  "extends": "../sdk-subscription/tsconfig.json",
+  "include": ["client.ts"]
+}

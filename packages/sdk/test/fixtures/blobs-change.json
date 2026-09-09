@@ -1,0 +1,65 @@
+{
+  "apiVersion": "1",
+  "block": {
+    "hash": "0x460f4c111c4a3634fa3c26d429e51fe9a9326e12a138788e5226038ce5334f47",
+    "number": 19430000,
+    "parentHash": "0x40a4b2e74ae938e20245ac697051f964b2308191ff0e1d65fb8f40803a084ab0",
+    "timestamp": 1710500000
+  },
+  "chainId": 1,
+  "cursor": "02000000000000000000000000000000000110626c6f62732d70726f64756374696f6e05312e342e3001743f67ce7c929c7babc790a657015f2c",
+  "data": {
+    "block": {
+      "blobBaseFee": "1",
+      "blobCount": 3,
+      "blobEthBurnedWei": "393216",
+      "blobGasUsed": "393216",
+      "blockHash": "0x460f4c111c4a3634fa3c26d429e51fe9a9326e12a138788e5226038ce5334f47",
+      "blockNumber": 19430000,
+      "excessBlobGas": "0",
+      "executionBaseFee": "10000000000",
+      "executionEthBurnedWei": "210000000000000",
+      "finality": "finalized",
+      "gasLimit": "30000000",
+      "gasUsed": "21000",
+      "maxBlobsPerBlock": 6,
+      "network": "mainnet",
+      "parentHash": "0x40a4b2e74ae938e20245ac697051f964b2308191ff0e1d65fb8f40803a084ab0",
+      "reserveFeeWei": null,
+      "size": "1024",
+      "targetBlobsPerBlock": 3,
+      "timestamp": 1710500000,
+      "transactionCount": 1,
+      "transformVersion": 3
+    },
+    "transactions": [
+      {
+        "blobBurnedWei": "393216",
+        "blobCount": 3,
+        "blobVersionedHashes": [
+          "0xa89b09021100e6907075c37e14644d808b64e574b20380c31478533d616640d3",
+          "0x7467efe5108e92e2b5965492adb8ca767497c2db4ee1ca6d7f68fbfe29bd17da",
+          "0x75c3af1ba7c574c1fd68fb4a020f8752ab8b65c819bb830dc8a5d32fc257feb3"
+        ],
+        "blockHash": "0x460f4c111c4a3634fa3c26d429e51fe9a9326e12a138788e5226038ce5334f47",
+        "blockNumber": 19430000,
+        "executionBurnedWei": "210000000000000",
+        "network": "mainnet",
+        "senderAddress": "0x1111111111111111111111111111111111111111",
+        "totalBurnedWei": "210000000393216",
+        "transactionIndex": 0,
+        "txHash": "0x3bbf7db04ef26a674e8e95b3186b58905153f80b22fbd9ed92eaeda6012e7369"
+      }
+    ]
+  },
+  "emittedAt": "2024-03-15T10:53:20.000Z",
+  "finality": "finalized",
+  "key": "0x0000000001287a70",
+  "kind": "blobs.block.put",
+  "operation": "apply",
+  "originId": "illustrative-fixture",
+  "originKind": "historical_backfill",
+  "publicationRevision": "0",
+  "schema": "blobs.block-bundle.v1",
+  "sequence": "1"
+}

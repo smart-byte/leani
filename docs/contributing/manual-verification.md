@@ -60,7 +60,7 @@ data_dir = "./data/manual-mainnet"
 [finality]
 kind = "consensus_p2p"
 checkpoint = "<RECENT_FINALIZED_BEACON_BLOCK_ROOT>"
-checkpoint_slot = <ITS_FINALIZED_BEACON_SLOT>
+checkpoint_slot = 0 # Replace 0 with ITS_FINALIZED_BEACON_SLOT.
 minimum_peers = 2
 discovery_port = 0
 ```
@@ -113,8 +113,8 @@ Set the configured processor start to the numeric value printed as `FROM`:
 [[processors]]
 id = "blobs-money"
 version = "1.4.0"
-start_block = <FROM>
-publish = "optimistic_and_finalized"
+start_block = 0 # Replace 0 with the numeric FROM value printed above.
+publish = "included_and_finalized"
 retention = "full_output_history"
 ```
 
@@ -214,7 +214,7 @@ typical envelope contains:
   "sequence": "12345",
   "cursor": "<opaque cursor>",
   "operation": "apply",
-  "finality": "optimistic",
+  "finality": "included",
   "kind": "blobs.block.put",
   "block": {
     "number": 123,
@@ -247,7 +247,7 @@ change and save its opaque cursor in the same database transaction.
 
 The current API and SDK do not accept a `finality` subscription query option.
 Inspect or filter `event.finality` in the consumer. Do not append
-`?finality=optimistic`; unknown change-stream query fields are rejected.
+`?finality=included`; unknown change-stream query fields are rejected.
 
 ## Exercise the TypeScript SDK
 
@@ -383,8 +383,8 @@ minimum_agreement = 1
 [[processors]]
 id = "blobs-money"
 version = "1.4.0"
-start_block = <FROM>
-publish = "optimistic_and_finalized"
+start_block = 0 # Replace 0 with the numeric FROM value printed above.
+publish = "included_and_finalized"
 retention = "full_output_history"
 
 [rpc]
@@ -650,3 +650,31 @@ A successful application rehearsal demonstrates:
 - no pending ordered deltas after handoff;
 - bounded recent raw storage; and
 - a successful SQLite integrity check.
+
+## Public quickstart proof
+
+To compare Xatu transport strategies without changing processor state, run:
+
+```bash
+cargo test -p leani-source-xatu compare_public_xatu_range_strategies --locked -- \
+  --ignored --nocapture
+```
+
+This manual diagnostic compares the production coalescing reader with a
+256 KiB split strategy on identical Parquet columns, reverses their order for
+the second pair, and checks that completed reads return identical bytes. Each
+attempt has a 20-second deadline and prints its outcome; inspect those outcomes
+even if the test completes successfully. Repeated reads do not establish a cold
+CDN baseline. Record the host, time, and all attempts when comparing performance.
+
+After building the current binary, run `scripts/verify-mainnet-quickstart.sh`.
+This manual check requests the documented Xatu range `17000000..17000999`,
+reopens the node, checks finalized coverage and decoded non-zero Sync reserves
+through the API, releases its query snapshot, and verifies SQLite integrity.
+It uses an isolated temporary directory and local ports 18180, 18545, and 18546.
+`LEANI_BIN` selects a built binary; `LEANI_VERIFY_DIR` reuses a prior verification
+directory to exercise restart/idempotence. The directory contains the binary
+SHA-256, dated report, responses, and logs. Backfill has a ten-minute deadline;
+`LEANI_VERIFY_TIMEOUT_SECONDS` overrides it for diagnostics. A timeout or unavailable source is
+not a passing result. Installation and release artifact checks follow this
+code/API/example hardening phase.

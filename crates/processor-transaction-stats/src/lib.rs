@@ -87,11 +87,11 @@ impl TransactionStatsProcessor {
                     recipients: vec![config.to],
                     ..FilterScope::default()
                 },
-                minimum_finality: Finality::Optimistic,
+                minimum_finality: Finality::Included,
             }],
             mode: ReductionMode::OrderedState,
             delivery_ordering: DeliveryOrdering::Canonical,
-            publication: PublicationPolicy::OptimisticAndFinalized,
+            publication: PublicationPolicy::IncludedAndFinalized,
             lifecycle: LifecyclePolicies::from_legacy(RetentionPolicy::LatestState),
             schemas: ProcessorSchemas {
                 delta_version: 1,
@@ -394,7 +394,7 @@ mod tests {
                 ),
                 timestamp: number,
             },
-            finality: Finality::Optimistic,
+            finality: Finality::Included,
             header: Material::Missing(leani_primitives::MissingReason::NotRequested),
             transactions: Material::Complete(transactions),
             receipts: Material::Missing(leani_primitives::MissingReason::NotRequested),

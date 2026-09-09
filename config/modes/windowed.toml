@@ -45,7 +45,7 @@ instance = "uniswap-v2-sync-30d"
 version = "1.0.0"
 history_control = "node_owned"
 history_mode = "on_demand"
-start_block = 10000835
+start_block = 17000000
 publish = "finalized_only"
 
 [processors.state]

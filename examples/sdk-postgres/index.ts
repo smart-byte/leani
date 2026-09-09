@@ -86,12 +86,13 @@ class PostgresDestination implements Destination<unknown> {
 }
 // docs:end postgres-destination
 
-const processor = process.env.LEANI_PROCESSOR?.trim() || "blobs-money";
+const processor = process.env.LEANI_PROCESSOR?.trim() || "usdc-weth-latest";
 const network = process.env.LEANI_NETWORK?.trim() || "mainnet";
 const sql = new SQL(required("DATABASE_URL"));
 const destination = new PostgresDestination(sql, processor, network);
 
 await destination.migrate();
+console.log(`Consuming ${processor} into PostgreSQL; press Ctrl-C to stop.`);
 await consumeDurably(destination, {
   baseUrl: process.env.LEANI_URL?.trim() || "http://127.0.0.1:8080",
   processor,

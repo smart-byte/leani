@@ -682,3 +682,23 @@ describe("backfill subscriptions", () => {
     ).toBe("10");
   });
 });
+
+test("backfill HTTP errors share the main client's error contract", async () => {
+  const { LeaniError } = await import("../src/index.ts");
+  const { LeaniError: BackfillError } = await import("../src/backfill.ts");
+  expect(BackfillError).toBe(LeaniError);
+  for (const payload of [{}, { error: { code: "busy", message: "try later", retryable: true, requestId: "r-1" } }]) {
+    const client = createBackfillSubscriptionClient({
+      baseUrl: "http://node.test",
+      fetch: async () => Response.json(payload, { status: 503 }),
+    });
+    try {
+      await client.list();
+      throw new Error("expected failure");
+    } catch (error) {
+      expect(error).toBeInstanceOf(LeaniError);
+      expect((error as InstanceType<typeof LeaniError>).status).toBe(503);
+      expect((error as InstanceType<typeof LeaniError>).retryable).toBe(true);
+    }
+  }
+});

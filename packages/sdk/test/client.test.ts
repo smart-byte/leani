@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import type { Finality, OpenApiComponents } from "../src/index.ts";
 
 import {
   LeaniError,
@@ -20,7 +21,7 @@ function jsonResponse(value: unknown, status = 200): Response {
   });
 }
 
-function change(sequence: string, cursor = `cursor-${sequence}`): ChangeEnvelope {
+function change(sequence: string, cursor = `cursor-${sequence}`): ChangeEnvelope & { operation: "apply" } {
   return {
     apiVersion: "1",
     sequence,
@@ -490,4 +491,169 @@ describe("helpers", () => {
     ).rejects.toThrow("destination failed");
     expect(acknowledged).toBe(false);
   });
+});
+
+describe("stream recovery and resource ownership", () => {
+  const frame = (value: unknown) => new TextEncoder().encode(`event: apply\ndata: ${JSON.stringify(value)}\n\n`);
+
+  test("reconnects from the last complete event when EOF truncates a frame", async () => {
+    const urls: string[] = [];
+    const client = createLeaniClient({
+      baseUrl: "http://node.test",
+      reconnect: { initialDelayMs: 0, maxDelayMs: 0, jitter: 0 },
+      fetch: async (url) => {
+        urls.push(String(url));
+        return new Response(urls.length === 1
+          ? `data: ${JSON.stringify(change("1"))}\n\ndata: {"sequence":"2"`
+          : frame(change("2")));
+      },
+    });
+    const events = client.blocks.subscribe();
+    expect((await events.next()).value?.sequence).toBe("1");
+    expect((await events.next()).value?.sequence).toBe("2");
+    expect(urls[1]).toContain("after=cursor-1");
+    await events.return(undefined);
+  });
+
+  test("does not dispatch unterminated data even when its JSON is complete", async () => {
+    for (const ending of ["", "\n", "\r", "\r\n"]) {
+      const messages = [];
+      for await (const message of parseSse(new Response(`data: {}${ending}`).body!)) {
+        messages.push(message);
+      }
+      expect(messages).toEqual([]);
+    }
+  });
+
+  test("reconnects after a socket reset during the response body", async () => {
+    let calls = 0;
+    let first!: ReadableStreamDefaultController<Uint8Array>;
+    const urls: string[] = [];
+    const client = createLeaniClient({
+      baseUrl: "http://node.test",
+      reconnect: { initialDelayMs: 0, maxDelayMs: 0, jitter: 0 },
+      fetch: async (url) => {
+        urls.push(String(url));
+        calls++;
+        return new Response(new ReadableStream({
+          start(controller) {
+            if (calls === 1) first = controller;
+            controller.enqueue(frame(change(String(calls))));
+          },
+        }));
+      },
+    });
+    const events = client.processors.subscribe("pool-a");
+    expect((await events.next()).value?.sequence).toBe("1");
+    first.error(new TypeError("connection reset"));
+    expect((await events.next()).value?.sequence).toBe("2");
+    expect(urls[1]).toContain("after=cursor-1");
+    await events.return(undefined);
+  });
+
+  test("cancels the response when a consumer exits early", async () => {
+    let cancelled = false;
+    const client = createLeaniClient({
+      baseUrl: "http://node.test",
+      fetch: async () => new Response(new ReadableStream({
+        start(controller) { controller.enqueue(frame(change("1"))); },
+        cancel() { cancelled = true; },
+      })),
+    });
+    const events = client.blobs.subscribe();
+    await events.next();
+    await events.return(undefined);
+    expect(cancelled).toBe(true);
+  });
+
+  test("abort interrupts a read even with a custom fetch implementation", async () => {
+    const stop = new AbortController();
+    const client = createLeaniClient({
+      baseUrl: "http://node.test",
+      fetch: async () => new Response(new ReadableStream()),
+    });
+    const events = client.blocks.subscribe({ signal: stop.signal });
+    const next = events.next();
+    stop.abort();
+    expect((await next).done).toBe(true);
+  });
+
+  test("malformed protocol data does not reconnect indefinitely", async () => {
+    let calls = 0;
+    const client = createLeaniClient({
+      baseUrl: "http://node.test",
+      fetch: async () => { calls++; return new Response("data: {}\n\n"); },
+    });
+    await expect(client.blocks.subscribe().next()).rejects.toBeInstanceOf(LeaniError);
+    expect(calls).toBe(1);
+  });
+
+  test("retries transient HTTP responses and respects terminal errors", async () => {
+    for (const status of [408, 429, 503]) {
+      let calls = 0;
+      const client = createLeaniClient({
+        baseUrl: "http://node.test",
+        reconnect: { initialDelayMs: 0, maxDelayMs: 0, jitter: 0 },
+        fetch: async () => ++calls === 1
+          ? new Response("upstream busy", { status })
+          : new Response(frame(change("1"))),
+      });
+      const events = client.blocks.subscribe();
+      expect((await events.next()).value?.sequence).toBe("1");
+      expect(calls).toBe(2);
+      await events.return(undefined);
+    }
+    const terminal = createLeaniClient({
+      baseUrl: "http://node.test",
+      fetch: async () => jsonResponse({
+        error: { code: "failed", message: "operator action required", retryable: false },
+      }, 503),
+    });
+    await expect(terminal.blocks.subscribe().next()).rejects.toMatchObject({ code: "failed" });
+  });
+
+  test("typed subscriptions select an instance and preserve the blobs bundle", async () => {
+    const urls: string[] = [];
+    const client = createLeaniClient({
+      baseUrl: "http://node.test",
+      fetch: async (url) => {
+        urls.push(String(url));
+        return new Response(frame({ ...change("1"), data: { block: { blockNumber: 42 }, transactions: [] } }));
+      },
+    });
+    const events = client.blobs.subscribe({ processor: "blobs-secondary" });
+    const event = (await events.next()).value!;
+    expect(event.data?.block.blockNumber).toBe(42);
+    expect(urls[0]).toContain("/processors/blobs-secondary/stream");
+    await events.return(undefined);
+  });
+
+  test("unstructured JSON errors keep their HTTP status", async () => {
+    const client = createLeaniClient({
+      baseUrl: "http://node.test",
+      fetch: async () => jsonResponse({}, 502),
+    });
+    await expect(client.status()).rejects.toMatchObject({ name: "LeaniError", status: 502, retryable: true });
+  });
+});
+
+test("typed blobs subscription consumes the production serializer fixture", async () => {
+  const fixture = (await import("./fixtures/blobs-change.json")).default;
+  const client = createLeaniClient({
+    baseUrl: "http://node.test",
+    fetch: async () => new Response(`event: apply\ndata: ${JSON.stringify(fixture)}\n\n`),
+  });
+  for await (const event of client.blobs.subscribe()) {
+    if (event.operation !== "apply" || !event.data) throw new Error("expected block apply");
+    expect(event.data.block.blockNumber).toBe(19_430_000);
+    expect(event.data.transactions.length).toBeGreaterThan(0);
+    expect(event.data.transactions[0]?.blockHash).toBe(event.data.block.blockHash);
+    break;
+  }
+});
+
+test("finality vocabulary matches the OpenAPI enum", () => {
+  const values: Finality[] = ["preview", "included", "finalized"];
+  const wire: OpenApiComponents["schemas"]["Finality"][] = values;
+  expect(wire).toEqual(["preview", "included", "finalized"]);
 });

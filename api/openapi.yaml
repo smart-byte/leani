@@ -235,6 +235,12 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/GenericSnapshotPage"
+        "503":
+          description: Aggregate query snapshot capacity is full; release snapshots or retry after expiry.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorBody"
         default:
           $ref: "#/components/responses/Error"
   /v1/processors/{processor}/collections/{collection}/entities/{key}:
@@ -280,7 +286,19 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/GenericSnapshotPage"
+                $ref: "#/components/schemas/FollowSnapshotPage"
+        "409":
+          description: This processor has delivery disabled; query retained entities without following, or enable delivery.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorBody"
+        "503":
+          description: Aggregate query snapshot capacity is full; release snapshots or retry after expiry.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorBody"
         default:
           $ref: "#/components/responses/Error"
   /v1/processors/{processor}/query-snapshots/{snapshot}:
@@ -1295,7 +1313,18 @@ components:
       description: Store-, chain-, and processor-bound opaque value.
     Finality:
       type: string
-      enum: [optimistic, safe, finalized]
+      enum: [preview, included, finalized]
+      description: |
+        Chain-confidence status of the block a record belongs to.
+        `included`: the block is on the currently followed chain; a reorg can
+        still remove it. `finalized`: Ethereum consensus has finalized the
+        block, as verified by this node's configured finality source. When a
+        source serves finalized material under dataset trust (Xatu, EraE), the
+        label reflects that source's trust model, not an independent proof.
+        `preview`: a peer supplied the block and its connection to the chain is
+        still being checked; only the embedded CLI emits `preview`, the HTTP
+        API never does. A record's `data.finality`, when present, always equals
+        the envelope `finality`.
     ProcessorSummary:
       type: object
       additionalProperties: false
@@ -1595,10 +1624,14 @@ components:
           type: string
           pattern: "^[0-9a-f]{32}$"
         boundaryCursor:
-          $ref: "#/components/schemas/Cursor"
+          description: Null when the processor has delivery disabled.
+          oneOf:
+            - $ref: "#/components/schemas/Cursor"
+            - type: "null"
         rowCount:
           $ref: "#/components/schemas/DecimalQuantity"
         valueBytes:
+          description: Snapshot accounting bytes, including entity keys and row overhead.
           $ref: "#/components/schemas/DecimalQuantity"
         expiresAtUnixMs:
           $ref: "#/components/schemas/DecimalQuantity"
@@ -1614,9 +1647,23 @@ components:
           required: [follow, outsideRetention]
           properties:
             follow:
-              type: string
+              type: [string, "null"]
             outsideRetention:
               const: create_processor_instance_or_source_scan
+    FollowSnapshotPage:
+      allOf:
+        - $ref: "#/components/schemas/GenericSnapshotPage"
+        - type: object
+          required: [boundaryCursor, recovery]
+          properties:
+            boundaryCursor:
+              $ref: "#/components/schemas/Cursor"
+            recovery:
+              type: object
+              required: [follow]
+              properties:
+                follow:
+                  type: string
     CreateConsumer:
       type: object
       additionalProperties: false

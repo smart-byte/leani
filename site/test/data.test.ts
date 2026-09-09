@@ -17,8 +17,6 @@ describe('canned data', () => {
       if (example.lines) {
         expect(example.lines.length).toBeGreaterThan(3);
         for (const line of example.lines) expect(typeof line.text).toBe('string');
-      } else {
-        expect(example.example).toBe('query-then-follow');
       }
     }
   });
@@ -80,10 +78,10 @@ describe('canned data', () => {
       Bun.file(new URL('../src/components/Showcase.astro', import.meta.url)).text(),
       Bun.file(new URL('../src/components/Quickstart.astro', import.meta.url)).text(),
     ]);
-    expect(showcaseSource).toContain("exampleSource('custom-processor-extension')");
+    expect(showcaseSource).toContain("exampleSource('custom-node-main')");
     expect(showcaseSource).toContain("exampleSource('custom-query-client')");
-    expect(quickstartSource).toContain("exampleSource('bounded-mainnet-quickstart')");
-    expect(quickstartSource).toContain("exampleSource('bounded-mainnet-query')");
+    expect(quickstartSource).toContain("exampleSource('live-block-first-run')");
+    expect(quickstartSource).toContain("exampleSource('live-block-node')");
   });
 
   test('storage table has 4 lifecycle profiles and evidence notes', () => {

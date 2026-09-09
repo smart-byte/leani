@@ -152,11 +152,8 @@ pub enum ReductionMode {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PublicationPolicy {
-    #[serde(alias = "OptimisticAndFinalized")]
-    OptimisticAndFinalized,
-    #[serde(alias = "FinalizedOnly")]
+    IncludedAndFinalized,
     FinalizedOnly,
-    #[serde(alias = "TerminalOnly")]
     TerminalOnly,
 }
 
@@ -539,10 +536,10 @@ impl LifecyclePolicies {
         {
             return Err("until_acknowledged delivery requires a required durable consumer");
         }
-        if matches!(publication, PublicationPolicy::OptimisticAndFinalized)
+        if matches!(publication, PublicationPolicy::IncludedAndFinalized)
             && matches!(self.undo.mode, UndoPolicyMode::None)
         {
-            return Err("optimistic publication requires an unfinalized undo policy");
+            return Err("included publication requires an unfinalized undo policy");
         }
         if matches!(self.checkpoint.mode, CheckpointPolicyMode::Automatic)
             && self.checkpoint.keep == 0
@@ -550,9 +547,9 @@ impl LifecyclePolicies {
             return Err("automatic checkpoints must retain at least one checkpoint");
         }
         if matches!(self.state.mode, StatePolicyMode::Ephemeral)
-            && matches!(publication, PublicationPolicy::OptimisticAndFinalized)
+            && matches!(publication, PublicationPolicy::IncludedAndFinalized)
         {
-            return Err("optimistic publication requires durable processor state");
+            return Err("included publication requires durable processor state");
         }
         Ok(())
     }
@@ -764,7 +761,7 @@ mod tests {
             log_fields: LogFieldSet::NONE,
             allow_filtered: false,
             filter: FilterScope::default(),
-            minimum_finality: Finality::Optimistic,
+            minimum_finality: Finality::Included,
         };
         assert_eq!(
             requirement.validate_frame(&frame),
@@ -869,11 +866,11 @@ mod tests {
                 "log_fields": LogFieldSet::NONE,
                 "allow_filtered": false,
                 "filter": FilterScope::default(),
-                "minimum_finality": "Optimistic"
+                "minimum_finality": "Included"
             }],
             "mode": "BlockLocal",
             "delivery_ordering": "block_versioned_idempotent",
-            "publication": "FinalizedOnly",
+            "publication": "finalized_only",
             "retention": "LatestState",
             "schemas": {
                 "delta_version": 1,

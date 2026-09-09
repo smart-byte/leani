@@ -20,11 +20,12 @@ Run it without configuring or starting a node:
 leani subscribe blocks
 ```
 
-The optimistic head is printed as soon as it is available, followed by one
-line per new block:
+First output can take several minutes while Leani finds serving peers and
+validates a current block. The included head is printed when it is available,
+followed by one line per new block:
 
 ```text
-2026-09-01T09:14:35Z  block=25881412  txs=187  gas=32.47M / 60.00M (54.1%)  base_fee=0.143592817 gwei  blobs=6  optimistic
+2026-09-01T09:14:35Z  block=25881412  txs=187  gas=32.47M / 60.00M (54.1%)  base_fee=0.143592817 gwei  blobs=6  included
 ```
 
 The summary contains the block number, hash and parent, timestamp, transaction
@@ -36,10 +37,21 @@ Use newline-delimited JSON for scripts:
 
 ```bash
 leani subscribe blocks --format json |
-  jq '{block: .blockNumber, transactions: .transactionCount, gas: .gasUsed, baseFee: .baseFeePerGasWei}'
+  jq '{block: .blockNumber, transactions: .transactionCount, gas: .gasUsed, baseFee: .baseFeePerGas}'
 ```
 
-`--once` exits after the first summary, which is useful for startup timing:
+Embedded startup can print a header-commitment-checked peer preview before the
+verified processor lane is ready. Those rows say `preview`; JSON reports
+`finality: "preview"`. Rows from the verified lane say `included` or
+`finalized`. In embedded mode, use `--finality finalized` when the first result
+must be a block Ethereum consensus has finalized. Attached output follows the
+node's configured source trust; a dataset's finality label does not become a
+cryptographic proof simply by subscribing to it. Against a node that publishes
+included blocks, an attached `--finality finalized` subscription prints each
+block once the node's finality marker covers it.
+
+`--once` exits after the first summary, including a labelled preview,
+which is useful for startup timing:
 
 ```bash
 time leani subscribe blocks --once

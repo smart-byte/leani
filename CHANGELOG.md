@@ -8,6 +8,14 @@ record, and documented RPC contracts.
 
 ### Changed
 
+- Chain-confidence vocabulary is now `preview`, `included`, and `finalized` on
+  every `finality` field: CLI output, HTTP API, SSE, SDK types, and
+  configuration. `optimistic` becomes `included`; `safe` is removed because no
+  source produced it. `publish = "optimistic_and_finalized"` is now
+  `included_and_finalized`, and `leani subscribe --finality` accepts `included`
+  (default) or `finalized`. Rendered `data.finality` always equals the envelope
+  `finality`. Node stores (schema 21) and embedded subscription directories
+  created before this change are refused and must be deleted.
 - Execution peer discovery now has one Discv4 owner: Reth's network manager.
   Leani continues to feed independently decoded EIP-1459 DNS records into the
   same bounded peer manager without running a second Discv4 crawler.
@@ -104,6 +112,19 @@ record, and documented RPC contracts.
 
 ### Fixed
 
+- `publish = "finalized_only"` is now enforced. Included-block changes are held
+  in the store until verified finality promotes them, their bytes count against
+  the delivery budget from admission, undo records are never published, and the
+  change stream carries only finalized `apply` records and `system.finality`
+  markers. `leani subscribe --finality finalized` now honors that promise in
+  both embedded and attached mode; attached subscriptions against an
+  `included_and_finalized` node print each block once a finality marker covers
+  it. Previously every finalized-only processor published included apply and
+  undo records, and the attached CLI never printed anything under
+  `--finality finalized`. `query-and-follow` now rejects finalized-only
+  processors with `finalized_only_snapshot`, because retained state includes
+  blocks whose changes are still unpublished and the stream never emits an
+  undo for them.
 - Correct processor schema OpenAPI string types, reject unsafe processor
   instance route segments, range-scope blob block cursors, and paginate blob
   transaction lists without silent truncation.

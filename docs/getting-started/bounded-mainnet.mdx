@@ -9,41 +9,85 @@ audience:
 status: preview
 ---
 
-import { Aside, Steps } from '@astrojs/starlight/components';
+import { Aside } from '@astrojs/starlight/components';
 import CodeExample from '@docs/components/docs/CodeExample.astro';
 
-Start with a finite range and a checked lifecycle profile. That keeps source
-cost, temporary storage, output retention, and the correctness claim explicit.
+Index 1,000 Ethereum Mainnet blocks and query the last Uniswap V2 pool-reserve
+observation in each hour. This uses public Xatu data, needs no API key, and
+stops after a finite range.
 
-<Aside type="caution" title="Release commands become live with the first published tag">
-  The Homebrew formula and pinned `v0.1.0` configuration URL below are the
-  release path. Before that tag and formula are published, build the workspace
-  from a local checkout and use its `config/modes/windowed.toml` instead.
-</Aside>
+First [install from source](/docs/getting-started/install/) so `leani` and
+`LEANI_SOURCE` are available in your terminal. The commands below copy a complete
+configuration into a fresh temporary directory:
 
 <CodeExample example="bounded-mainnet-quickstart" />
 
-Once `serve` starts, query the decoded events and their exact coverage from a
-second terminal:
+`doctor` should report `valid: true`. The backfill report should show continuous
+coverage from `17000000` through `17000999`. Leave `serve` running and query it
+from another terminal:
 
 <CodeExample example="bounded-mainnet-query" />
 
-<Steps>
-1. Copy a checked profile into a new file and give it a fresh `data_dir`.
-2. Run `doctor --json`; resolve every error before starting network access.
-3. Request an explicit `--from` and `--to` range.
-4. Query `/v1/processors/<id>/status` and verify the returned coverage
-   interval, finality, and source provenance.
-5. Query a value inside the covered interval and deliberately query outside it
-   once. An uncovered range must be reported as unavailable, never as empty.
-</Steps>
+Expect five hourly entities for this range; `limit=3` returns only the first
+page. Follow `nextCursor` to read the rest. Entities are ordered by their keys,
+so sort by `bucketStartTimestamp` when drawing a time series.
 
-<Aside type="tip" title="An omitted P2P fallback limit means the whole gap">
-  When `sources.live.history_fallback_blocks` is absent, every gap at or after a
-  processor's start block is eligible for P2P recovery. Set the option only
-  when you intentionally want a bounded finalized suffix. Retained and archive
-  sources remain preferred when they can satisfy the request.
+Each entity contains `values.reserve0` (USDC, six decimals) and
+`values.reserve1` (WETH, eighteen decimals). These are exact integer strings.
+The processor retains the last `Sync` observation per hourly bucket; it does
+not return every swap or an hourly average price.
+
+## Check coverage
+
+The status response's `available` intervals should cover the entire requested
+range. A high `processedThrough` alone does not prove that earlier blocks were
+indexed. Xatu's `finalized` label is a dataset assertion; this profile has
+independent finality verification disabled.
+
+Try an explicit range query, then one outside your indexed interval:
+
+```bash
+curl -s 'http://127.0.0.1:8080/v1/processors/uniswap-v2-sync-30d/collections/uniswap_v2.sync_hourly/entities?fromBlock=17000000&toBlock=17000999'
+curl -s 'http://127.0.0.1:8080/v1/processors/uniswap-v2-sync-30d/collections/uniswap_v2.sync_hourly/entities?fromBlock=17001000&toBlock=17001999'
+```
+
+The first should return retained entities with complete requested coverage.
+The second should return `range_incomplete`, rather than an empty success.
+An indexed range whose output was subsequently pruned returns `output_not_retained`.
+
+## Decode a different contract event
+
+The configuration's `processors.settings` selects the contract address and
+Solidity event ABI. For a small WETH transfer example, use the complete config
+at `examples/weth-transfers/node.toml`:
+
+```bash
+LEANI_EVENTS_DIR="$(mktemp -d)"
+cp "$LEANI_SOURCE/examples/weth-transfers/node.toml" "$LEANI_EVENTS_DIR/leani.toml"
+cd "$LEANI_EVENTS_DIR"
+leani doctor --json
+leani backfill --processor weth-transfers --from 17000000 --to 17000009
+leani serve
+```
+
+This example uses API port 8081 so it can run beside the Uniswap node. Query:
+
+```bash
+curl -s 'http://127.0.0.1:8081/v1/processors/weth-transfers/collections/weth.transfers/entities?limit=100'
+```
+
+Expect 205 transfers across three pages. Each entity's `values` contains `from`,
+`to`, and `value`; WETH uses 18 decimals. Change the address, ABI, collection,
+instance name, and block range for your contract. Keep
+`history_mode = "on_demand"` for explicit backfills, and use a fresh data
+directory when changing processor identity or schema.
+
+<Aside type="note" title="Queries and subscriptions need different policies">
+  These examples retain query output with delivery disabled. To follow changes,
+  use the matching node configuration in the
+  [TypeScript guide](/docs/guides/query-then-follow/) or
+  [PostgreSQL guide](/docs/guides/postgres-consumer/).
 </Aside>
 
-Next, [consume the processor durably](/docs/getting-started/first-consumer/)
-instead of polling and inventing your own handoff.
+For a transformation beyond static event decoding,
+[build your own processor with the Rust library](/docs/guides/custom-processor/).

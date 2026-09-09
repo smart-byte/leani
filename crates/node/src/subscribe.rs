@@ -1,5 +1,7 @@
 //! Lightweight live market subscriptions backed by native processors.
 
+mod sse;
+
 use std::{
     collections::{BTreeMap, HashSet},
     fs,
@@ -29,6 +31,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use url::Url;
 
+use self::sse::EventBuffer;
+
 use crate::{
     cli::{
         SubscribeFinality, SubscribeFinalitySource, SubscribeFormat, SubscribeMode,
@@ -46,10 +50,13 @@ const UNISWAP_PROCESSOR_INSTANCE: &str = "cli-uniswap-v3-prices";
 const CHECKPOINT_CACHE_MAX_AGE: Duration = Duration::from_hours(12);
 const LOCALLY_VERIFIED_CHECKPOINT_MAX_AGE: Duration = Duration::from_hours(13 * 24);
 const MAINNET_SLOT_SECONDS: u64 = 12;
-const OPTIMISTIC_UPDATE_MAX_AGE: Duration = Duration::from_secs(90);
+const INCLUDED_UPDATE_MAX_AGE: Duration = Duration::from_secs(90);
 const FINALIZED_UPDATE_MAX_AGE: Duration = Duration::from_mins(30);
 const PRICE_PRECISION: usize = 8;
 const STARTUP_UPDATE_SCAN_LIMIT: usize = 10_000;
+const ATTACHED_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const ATTACHED_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const ATTACHED_STREAM_STALL_TIMEOUT: Duration = Duration::from_secs(90);
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 enum ObservationKey {
@@ -311,10 +318,62 @@ struct AttachedEnvelope {
     extra: BTreeMap<String, Value>,
 }
 
-#[derive(Debug)]
-struct ParsedSseEvent {
-    event: Option<String>,
-    data: Option<String>,
+/// Included envelopes an attached `--finality finalized` subscription holds
+/// until a `system.finality` marker covers their block.
+#[derive(Debug, Default)]
+struct FinalizedGate {
+    pending: BTreeMap<u64, Vec<(AttachedEnvelope, Value)>>,
+}
+
+/// Blocks retained while waiting for finality. Two epochs is roughly 64
+/// blocks; this bound only matters if a node stops emitting markers.
+const FINALIZED_GATE_MAX_BLOCKS: usize = 1_024;
+
+impl FinalizedGate {
+    #[cfg(test)]
+    fn pending_blocks(&self) -> usize {
+        self.pending.len()
+    }
+
+    fn hold(&mut self, block: u64, envelope: AttachedEnvelope, raw: Value) {
+        self.pending.entry(block).or_default().push((envelope, raw));
+        while self.pending.len() > FINALIZED_GATE_MAX_BLOCKS {
+            let Some((dropped, _)) = self.pending.pop_first() else {
+                break;
+            };
+            eprintln!(
+                "leani: dropping unfinalized block {dropped} from the finality gate; the node stopped reporting finality markers"
+            );
+        }
+    }
+
+    fn undo(&mut self, block: u64) {
+        self.pending.remove(&block);
+    }
+
+    /// Everything at or below `through`, promoted to `finalized`, in block order.
+    fn release(&mut self, through: u64) -> Vec<(AttachedEnvelope, Value)> {
+        let keep = self.pending.split_off(&through.saturating_add(1));
+        let released = std::mem::replace(&mut self.pending, keep);
+        released
+            .into_values()
+            .flatten()
+            .map(|(mut envelope, mut raw)| {
+                "finalized".clone_into(&mut envelope.finality);
+                raw["finality"] = Value::String("finalized".to_owned());
+                if let Some(data) = raw.get_mut("data").and_then(Value::as_object_mut)
+                    && data.contains_key("finality")
+                {
+                    data.insert("finality".to_owned(), Value::String("finalized".to_owned()));
+                }
+                (envelope, raw)
+            })
+            .collect()
+    }
+}
+
+fn envelope_block_number(envelope: &AttachedEnvelope) -> Option<u64> {
+    envelope.block.get("number").and_then(Value::as_u64)
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -399,7 +458,12 @@ pub(crate) fn reset_subscription(options: &ResetSubscriptionOptions) -> Result<E
         options.finality,
         &options.working_directory,
     )?;
-    reset_subscription_directory(&data_dir, options.confirmed)?;
+    reset_subscription_directory(
+        &data_dir,
+        configured_path.as_deref(),
+        &options.working_directory,
+        options.confirmed,
+    )?;
     Ok(Exit::Success)
 }
 
@@ -435,7 +499,7 @@ pub(crate) async fn initialize_checkpoint(
             endpoint: None,
             processor: "uniswap-observations".to_owned(),
             token: None,
-            finality: SubscribeFinality::Optimistic,
+            finality: SubscribeFinality::Included,
             finality_source: SubscribeFinalitySource::BeaconApi,
             checkpoint_urls,
             checkpoint_quorum,
@@ -555,14 +619,14 @@ async fn subscribe_embedded(
         .context("subscription processor omitted its data requirement")?;
     let preview_request =
         processor_data_request(preview_requirement, BlockRange::single(BlockNumber(0)));
-    let optimistic_snapshot = optimistic_head_snapshot(
+    let preview_snapshot = preview_head_snapshot(
         runtime.verified_anchor.clone(),
         runtime.execution_source.clone(),
         preview_request.clone(),
         embedded_snapshot_budget(&config),
         runtime.cancellation_token(),
     );
-    tokio::pin!(optimistic_snapshot);
+    tokio::pin!(preview_snapshot);
 
     match options.protocol {
         SubscribeProtocol::Blocks => eprintln!(
@@ -584,8 +648,8 @@ async fn subscribe_embedded(
     let mut next_startup_status = Duration::from_secs(15);
     let mut announced_ready = false;
     let mut snapshot_pending =
-        options.finality == SubscribeFinality::Optimistic && options.format != SubscribeFormat::Raw;
-    // An optimistic preview can outrun the durable runtime's anchored overlap.
+        options.finality == SubscribeFinality::Included && options.format != SubscribeFormat::Raw;
+    // A peer preview can outrun the durable runtime's anchored overlap.
     // Retain both its identities and ordered block context through readiness so
     // later overlap commits confirm the preview instead of regressing stdout.
     let mut previewed = HashSet::<ObservationKey>::new();
@@ -695,18 +759,18 @@ async fn subscribe_embedded(
                     changed.context("verified anchor channel closed")?;
                     persist_current_verified_anchor(&runtime, &data_dir, &config)?;
                 }
-                snapshot = &mut optimistic_snapshot, if snapshot_pending => {
+                snapshot = &mut preview_snapshot, if snapshot_pending => {
                     snapshot_pending = false;
                     match snapshot {
                         Ok(frame) => {
-                            let items = optimistic_items(
+                            let items = preview_items(
                                 options.protocol,
                                 markets,
                                 processor.as_ref(),
                                 &frame,
                             )
                             .await?;
-                            let rendered = render_optimistic_items(
+                            let rendered = render_preview_items(
                                 options.format,
                                 &items,
                                 frame.block,
@@ -736,13 +800,13 @@ async fn subscribe_embedded(
                                 Ok(stream) => preview_stream = Some(stream),
                                 Err(error) => tracing::debug!(
                                     %error,
-                                    "optimistic head preview could not follow the live tail; anchored startup continues"
+                                    "peer preview could not follow the live tail; anchored startup continues"
                                 ),
                             }
                         }
                         Err(error) => tracing::debug!(
                             %error,
-                            "optimistic head preview was unavailable; anchored startup continues"
+                            "peer preview was unavailable; anchored startup continues"
                         ),
                     }
                 }
@@ -754,13 +818,13 @@ async fn subscribe_embedded(
                     let mut rendered_any = false;
                     match event {
                         Ok(ChainEvent::Block(frame)) => {
-                            let items = optimistic_items(
+                            let items = preview_items(
                                 options.protocol,
                                 markets,
                                 processor.as_ref(),
                                 &frame,
                             ).await?;
-                            let rendered = render_optimistic_items(
+                            let rendered = render_preview_items(
                                 options.format,
                                 &items,
                                 frame.block,
@@ -782,7 +846,7 @@ async fn subscribe_embedded(
                                     &mut previewed,
                                     block,
                                 ) {
-                                    let reverted = render_optimistic_items(
+                                    let reverted = render_preview_items(
                                         options.format,
                                         &items,
                                         block,
@@ -794,13 +858,13 @@ async fn subscribe_embedded(
                                 }
                             }
                             for frame in applied {
-                                let items = optimistic_items(
+                                let items = preview_items(
                                     options.protocol,
                                     markets,
                                     processor.as_ref(),
                                     &frame,
                                 ).await?;
-                                let rendered = render_optimistic_items(
+                                let rendered = render_preview_items(
                                     options.format,
                                     &items,
                                     frame.block,
@@ -818,19 +882,19 @@ async fn subscribe_embedded(
                         }
                         Ok(ChainEvent::Disconnected { reason }) => tracing::debug!(
                             %reason,
-                            "optimistic preview tail transiently disconnected"
+                            "peer preview tail transiently disconnected"
                         ),
                         Ok(ChainEvent::Reset { reason, .. }) => {
                             tracing::debug!(
                                 %reason,
-                                "optimistic preview tail reset; anchored startup continues"
+                                "peer preview tail reset; anchored startup continues"
                             );
                             preview_stream = None;
                         }
                         Err(error) => {
                             tracing::debug!(
                                 %error,
-                                "optimistic preview tail stopped; anchored startup continues"
+                                "peer preview tail stopped; anchored startup continues"
                             );
                             preview_stream = None;
                         }
@@ -856,6 +920,11 @@ async fn subscribe_embedded(
         for record in records {
             after = record.cursor.sequence;
             if !update_is_fresh(options.finality, record.block.timestamp, unix_seconds()) {
+                continue;
+            }
+            if options.finality == SubscribeFinality::Finalized
+                && record.finality != Finality::Finalized
+            {
                 continue;
             }
             if let Some(item) = local_item(options.protocol, markets, &record)? {
@@ -1080,30 +1149,23 @@ fn subscription_data_dir_for(
         hasher.update(pool.as_bytes());
     }
     hasher.update(match finality {
-        SubscribeFinality::Optimistic => b"optimistic",
+        SubscribeFinality::Included => b"included",
         SubscribeFinality::Finalized => b"finalized",
     });
     Ok(root.join(&hasher.finalize().to_hex()[..16]))
 }
 
-fn reset_subscription_directory(data_dir: &Path, confirmed: bool) -> Result<bool> {
-    let name = data_dir
-        .file_name()
-        .and_then(std::ffi::OsStr::to_str)
-        .context("subscription state directory has no UTF-8 identity")?;
-    let parent = data_dir
-        .parent()
-        .and_then(Path::file_name)
-        .and_then(std::ffi::OsStr::to_str);
-    let derived = parent == Some("subscriptions")
-        && name.len() == 16
-        && name.bytes().all(|byte| byte.is_ascii_hexdigit());
-    if !derived && !local_state::is_runtime_directory(data_dir) {
-        bail!(
-            "refusing to reset directory without Leani runtime identity {}",
-            data_dir.display()
-        );
-    }
+fn reset_subscription_directory(
+    data_dir: &Path,
+    config_path: Option<&Path>,
+    working_directory: &Path,
+    confirmed: bool,
+) -> Result<bool> {
+    let data_dir = if data_dir.is_absolute() {
+        data_dir.to_path_buf()
+    } else {
+        working_directory.join(data_dir)
+    };
     if !data_dir.exists() {
         eprintln!(
             "leani: no embedded subscription state exists at {}",
@@ -1111,12 +1173,13 @@ fn reset_subscription_directory(data_dir: &Path, confirmed: bool) -> Result<bool
         );
         return Ok(false);
     }
-    if !data_dir.is_dir() {
-        bail!(
-            "subscription state path is not a directory: {}",
-            data_dir.display()
-        );
-    }
+    let data_dir = local_state::validated_reset_target(
+        &data_dir,
+        config_path,
+        working_directory,
+        "subscription state",
+        true,
+    )?;
 
     eprintln!("leani: embedded subscription cold-start reset");
     eprintln!("  directory: {}", data_dir.display());
@@ -1139,8 +1202,8 @@ fn reset_subscription_directory(data_dir: &Path, confirmed: bool) -> Result<bool
             bail!("subscription reset was not confirmed");
         }
     }
-    let _lock = local_state::lock_runtime_directory(data_dir)?;
-    let unknown = local_state::remove_known_runtime_state(data_dir)?;
+    let _lock = local_state::lock_runtime_directory(&data_dir)?;
+    let unknown = local_state::remove_known_runtime_state(&data_dir)?;
     for path in unknown {
         eprintln!("leani: preserved unknown entry {}", path.display());
     }
@@ -1516,17 +1579,42 @@ fn persist_current_verified_anchor(
     let Some(anchor) = *runtime.verified_anchor.borrow() else {
         return Ok(());
     };
+    persist_verified_anchor(anchor, data_dir, config)
+}
+
+fn persist_verified_anchor(
+    anchor: leani_runtime::AppliedFinalityAnchor,
+    data_dir: &Path,
+    config: &Config,
+) -> Result<()> {
     let cache_path = data_dir.join("checkpoint.json");
     let previous = read_checkpoint_cache(&cache_path);
     let root = format!("0x{}", hex::encode(anchor.beacon_block_root));
     let execution_block_hash = anchor.block.hash.to_string();
-    if previous.as_ref().is_some_and(|checkpoint| {
-        checkpoint.trust == CheckpointTrust::LocallyVerified
-            && checkpoint.slot == anchor.beacon_slot
-            && checkpoint.root == root
-            && checkpoint.execution_block_hash.as_deref() == Some(execution_block_hash.as_str())
-    }) {
-        return Ok(());
+    if let Some(checkpoint) = &previous
+        && checkpoint.trust == CheckpointTrust::LocallyVerified
+    {
+        // A supervisor restart can bootstrap an older valid anchor. Keep the
+        // newest verified checkpoint already persisted by an earlier runtime.
+        if checkpoint.slot > anchor.beacon_slot {
+            return Ok(());
+        }
+        if checkpoint.slot == anchor.beacon_slot {
+            if checkpoint.root != root
+                || checkpoint
+                    .execution_block_hash
+                    .as_ref()
+                    .is_some_and(|hash| hash != &execution_block_hash)
+            {
+                bail!(
+                    "verified finality anchor contradicts cached checkpoint at Beacon slot {}",
+                    checkpoint.slot
+                );
+            }
+            if checkpoint.execution_block_hash.is_some() {
+                return Ok(());
+            }
+        }
     }
     let accepted_providers = previous
         .as_ref()
@@ -1608,6 +1696,11 @@ fn latest_fresh_items(
         if !update_is_fresh(finality, record.block.timestamp, now) {
             continue;
         }
+        // Store deferral already withholds included records for finalized_only
+        // processors; this keeps the flag honest if that ever regresses.
+        if finality == SubscribeFinality::Finalized && record.finality != Finality::Finalized {
+            continue;
+        }
         if let Some(item) = local_item(protocol, markets, &record)? {
             let scope = item.scope_key();
             match record.direction {
@@ -1643,7 +1736,7 @@ fn embedded_snapshot_budget(config: &Config) -> SourceBudget {
     }
 }
 
-async fn optimistic_head_snapshot(
+async fn preview_head_snapshot(
     mut anchors: tokio::sync::watch::Receiver<Option<leani_runtime::AppliedFinalityAnchor>>,
     source: std::sync::Arc<leani_source_p2p::RethP2pSource>,
     mut request: DataRequest,
@@ -1658,10 +1751,10 @@ async fn optimistic_head_snapshot(
         }
         tokio::select! {
             changed = anchors.changed() => {
-                changed.context("verified anchor channel closed before optimistic preview")?;
+                changed.context("verified anchor channel closed before the peer preview")?;
             }
             () = cancellation.cancelled() => {
-                bail!("embedded runtime stopped before optimistic preview");
+                bail!("embedded runtime stopped before the peer preview");
             }
         }
     };
@@ -1687,19 +1780,19 @@ async fn optimistic_head_snapshot(
                     attempt,
                     maximum_attempts = MAX_SNAPSHOT_ATTEMPTS,
                     %error,
-                    "optimistic execution-head preview is temporarily unavailable; retrying the active peer pool"
+                    "peer preview is temporarily unavailable; retrying the active peer pool"
                 );
                 tokio::select! {
                     () = cancellation.cancelled() => {
-                        bail!("embedded runtime stopped before optimistic preview");
+                        bail!("embedded runtime stopped before the peer preview");
                     }
                     () = tokio::time::sleep(Duration::from_secs(1)) => {}
                 }
             }
-            Err(error) => return Err(error).context("fetch optimistic execution-head preview"),
+            Err(error) => return Err(error).context("fetch peer preview"),
         }
     }
-    unreachable!("bounded optimistic snapshot attempts always return")
+    unreachable!("bounded peer preview snapshot attempts always return")
 }
 
 fn processor_data_request(
@@ -1723,32 +1816,29 @@ fn processor_data_request(
     }
 }
 
-async fn optimistic_items(
+async fn preview_items(
     protocol: SubscribeProtocol,
     markets: &[Market],
     processor: &dyn leani_processor_api::Processor,
     frame: &BlockFrame,
 ) -> Result<Vec<SubscriptionItem>> {
     if !update_is_fresh(
-        SubscribeFinality::Optimistic,
+        SubscribeFinality::Included,
         frame.block.timestamp,
         unix_seconds(),
     ) {
         return Ok(Vec::new());
     }
-    let delta = processor
-        .map(frame)
-        .await
-        .context("map optimistic subscription head preview")?;
+    let delta = processor.map(frame).await.context("map peer preview")?;
     match protocol {
         SubscribeProtocol::Blocks => {
             let entity = postcard::from_bytes(&delta.payload)
-                .context("decode optimistic Ethereum block summary")?;
+                .context("decode peer preview block summary")?;
             Ok(vec![SubscriptionItem::Block(entity)])
         }
         SubscribeProtocol::UniswapV3 => {
             let delta: UniswapPriceDelta = postcard::from_bytes(&delta.payload)
-                .context("decode optimistic Uniswap head preview")?;
+                .context("decode peer preview Uniswap update")?;
             Ok(delta
                 .observations
                 .into_iter()
@@ -1766,7 +1856,7 @@ async fn optimistic_items(
     }
 }
 
-fn render_optimistic_items(
+fn render_preview_items(
     format: SubscribeFormat,
     items: &[SubscriptionItem],
     block: BlockRef,
@@ -1774,7 +1864,7 @@ fn render_optimistic_items(
 ) -> Result<Vec<ObservationKey>> {
     let mut rendered = Vec::new();
     for item in items {
-        render_item(format, item, block, Finality::Optimistic, operation, None)?;
+        render_item(format, item, block, Finality::Preview, operation, None)?;
         rendered.push(observation_key(item));
     }
     Ok(rendered)
@@ -1931,7 +2021,7 @@ fn render_preview_reverts(
     reverted: &[(BlockRef, SubscriptionItem)],
 ) -> Result<()> {
     for (block, item) in reverted {
-        render_item(format, item, *block, Finality::Optimistic, "revert", None)?;
+        render_item(format, item, *block, Finality::Preview, "revert", None)?;
     }
     Ok(())
 }
@@ -1959,6 +2049,33 @@ fn render_local_item(
     )
 }
 
+fn rendered_block_summary(
+    entity: &BlockSummaryEntity,
+    finality: Finality,
+    operation: &str,
+    sequence: Option<String>,
+) -> RenderedBlockSummary {
+    RenderedBlockSummary {
+        chain_id: entity.chain_id.0,
+        block_number: entity.block_number.0,
+        block_hash: entity.block_hash.to_string(),
+        parent_hash: entity.parent_hash.to_string(),
+        timestamp: entity.timestamp,
+        gas_limit: entity.gas_limit,
+        gas_used: entity.gas_used,
+        base_fee_wei: entity
+            .base_fee_per_gas
+            .map(|value| U256::from_be_bytes(value.0).to_string()),
+        blob_gas_used: entity.blob_gas_used,
+        excess_blob_gas: entity.excess_blob_gas,
+        transaction_count: entity.transaction_count,
+        size_bytes: entity.size_bytes,
+        finality: finality.name().to_owned(),
+        operation: operation.to_owned(),
+        sequence,
+    }
+}
+
 fn render_item(
     format: SubscribeFormat,
     item: &SubscriptionItem,
@@ -1970,25 +2087,7 @@ fn render_item(
     match item {
         SubscriptionItem::Block(entity) => render_block_summary(
             format,
-            &RenderedBlockSummary {
-                chain_id: entity.chain_id.0,
-                block_number: entity.block_number.0,
-                block_hash: entity.block_hash.to_string(),
-                parent_hash: entity.parent_hash.to_string(),
-                timestamp: entity.timestamp,
-                gas_limit: entity.gas_limit,
-                gas_used: entity.gas_used,
-                base_fee_wei: entity
-                    .base_fee_per_gas
-                    .map(|value| U256::from_be_bytes(value.0).to_string()),
-                blob_gas_used: entity.blob_gas_used,
-                excess_blob_gas: entity.excess_blob_gas,
-                transaction_count: entity.transaction_count,
-                size_bytes: entity.size_bytes,
-                finality: finality_name(finality).to_owned(),
-                operation: operation.to_owned(),
-                sequence,
-            },
+            &rendered_block_summary(entity, finality, operation, sequence),
         ),
         SubscriptionItem::Uniswap { market, entity } => {
             render_entity(format, market, entity, block, finality, operation, sequence)
@@ -2021,7 +2120,7 @@ fn render_entity(
         block_hash: format!("0x{}", hex::encode(block.hash.0)),
         timestamp: block.timestamp,
         log_index: entity.log_index,
-        finality: finality_name(finality).to_owned(),
+        finality: finality.name().to_owned(),
         operation: operation.to_owned(),
         sqrt_price_x96: U256::from_be_bytes(sqrt.0).to_string(),
         amount0: amount0.map(|amount| amount.to_string()),
@@ -2209,7 +2308,7 @@ fn readable_timestamp(timestamp: u64) -> Result<String> {
 
 fn update_is_fresh(finality: SubscribeFinality, timestamp: u64, now: u64) -> bool {
     let maximum_age = match finality {
-        SubscribeFinality::Optimistic => OPTIMISTIC_UPDATE_MAX_AGE,
+        SubscribeFinality::Included => INCLUDED_UPDATE_MAX_AGE,
         SubscribeFinality::Finalized => FINALIZED_UPDATE_MAX_AGE,
     };
     now.saturating_sub(timestamp) <= maximum_age.as_secs()
@@ -2308,14 +2407,6 @@ fn quote_token(market: &Market) -> Token {
     }
 }
 
-const fn finality_name(finality: Finality) -> &'static str {
-    match finality {
-        Finality::Optimistic => "optimistic",
-        Finality::Safe => "safe",
-        Finality::Finalized => "finalized",
-    }
-}
-
 const fn direction_name(direction: ChangeDirection) -> &'static str {
     match direction {
         ChangeDirection::Apply => "apply",
@@ -2337,9 +2428,27 @@ async fn connect_attached_stream(
     stream_url: Url,
     backoff: Duration,
 ) -> Result<AttachedStreamConnection> {
-    let response = authorized(client.get(stream_url), options.token.as_deref())
-        .send()
-        .await;
+    let response = tokio::select! {
+        result = tokio::signal::ctrl_c() => {
+            result.context("install Ctrl-C handler")?;
+            return Ok(AttachedStreamConnection::Interrupted);
+        }
+        response = tokio::time::timeout(
+            ATTACHED_CONNECT_TIMEOUT,
+            authorized(client.get(stream_url), options.token.as_deref()).send(),
+        ) => response,
+    };
+    let Ok(response) = response else {
+        eprintln!(
+            "leani: stream connection timed out after {}s; reconnecting in {}s",
+            ATTACHED_CONNECT_TIMEOUT.as_secs(),
+            backoff.as_secs()
+        );
+        if wait_for_reconnect(backoff).await? {
+            return Ok(AttachedStreamConnection::Interrupted);
+        }
+        return Ok(AttachedStreamConnection::Retry);
+    };
     let error = match response {
         Ok(response)
             if response.status().is_client_error()
@@ -2372,18 +2481,30 @@ async fn subscribe_attached(
     markets: &[Market],
     endpoint: Url,
 ) -> Result<Exit> {
-    let client = reqwest::Client::new();
-    if options.protocol == SubscribeProtocol::UniswapV3 {
-        validate_attached_markets(&client, options, markets, &endpoint).await?;
-    }
-    let (mut cursor, rendered_snapshot) =
-        attached_start_cursor(&client, options, markets, &endpoint).await?;
+    let client = reqwest::Client::builder()
+        .connect_timeout(ATTACHED_CONNECT_TIMEOUT)
+        .build()
+        .context("build attached subscription HTTP client")?;
+    let startup = async {
+        if options.protocol == SubscribeProtocol::UniswapV3 {
+            validate_attached_markets(&client, options, markets, &endpoint).await?;
+        }
+        attached_start_cursor(&client, options, markets, &endpoint).await
+    };
+    let (mut cursor, rendered_snapshot) = tokio::select! {
+        result = tokio::signal::ctrl_c() => {
+            result.context("install Ctrl-C handler")?;
+            return Ok(Exit::Success);
+        }
+        result = startup => result?,
+    };
     if rendered_snapshot && options.once {
         return Ok(Exit::Success);
     }
     announce_attached(options.protocol, &endpoint, markets);
     let mut backoff = Duration::from_secs(1);
     let mut last_sequence = None;
+    let mut gate = FinalizedGate::default();
     loop {
         let mut stream_url = processor_url(&endpoint, &options.processor, "stream")?;
         if let Some(cursor) = &cursor {
@@ -2398,14 +2519,24 @@ async fn subscribe_attached(
             AttachedStreamConnection::Interrupted => return Ok(Exit::Success),
         };
         let mut bytes = response.bytes_stream();
-        let mut buffer = Vec::new();
+        let mut buffer = EventBuffer::default();
         loop {
             let chunk = tokio::select! {
                 result = tokio::signal::ctrl_c() => {
                     result.context("install Ctrl-C handler")?;
                     return Ok(Exit::Success);
                 }
-                chunk = bytes.next() => chunk,
+                chunk = tokio::time::timeout(ATTACHED_STREAM_STALL_TIMEOUT, bytes.next()) => {
+                    if let Ok(chunk) = chunk {
+                        chunk
+                    } else {
+                        eprintln!(
+                            "leani: subscription stream received no data for {}s; reconnecting",
+                            ATTACHED_STREAM_STALL_TIMEOUT.as_secs()
+                        );
+                        break;
+                    }
+                },
             };
             let Some(chunk) = chunk else {
                 break;
@@ -2417,13 +2548,14 @@ async fn subscribe_attached(
                     break;
                 }
             };
-            buffer.extend_from_slice(&chunk);
+            buffer.push(&chunk);
             let outcome = render_attached_sse_events(
                 &mut buffer,
                 &mut cursor,
                 &mut last_sequence,
                 options,
                 markets,
+                &mut gate,
             )?;
             if outcome.observed_change {
                 backoff = Duration::from_secs(1);
@@ -2450,7 +2582,7 @@ async fn attached_start_cursor(
     endpoint: &Url,
 ) -> Result<(Option<String>, bool)> {
     let use_latest =
-        options.finality == SubscribeFinality::Optimistic && options.format != SubscribeFormat::Raw;
+        options.finality == SubscribeFinality::Included && options.format != SubscribeFormat::Raw;
     if use_latest {
         match options.protocol {
             SubscribeProtocol::Blocks => {
@@ -2517,47 +2649,36 @@ fn announce_attached(protocol: SubscribeProtocol, endpoint: &Url, markets: &[Mar
 }
 
 fn render_attached_sse_events(
-    buffer: &mut Vec<u8>,
+    buffer: &mut EventBuffer,
     cursor: &mut Option<String>,
     last_sequence: &mut Option<u64>,
     options: &SubscribeOptions,
     markets: &[Market],
+    gate: &mut FinalizedGate,
 ) -> Result<SseRenderOutcome> {
     let mut outcome = SseRenderOutcome::default();
-    while let Some(end) = sse_event_end(buffer) {
-        let event = buffer.drain(..end).collect::<Vec<_>>();
-        let delimiter = if event.ends_with(b"\r\n\r\n") { 4 } else { 2 };
-        let event = &event[..event.len().saturating_sub(delimiter)];
-        let parsed = match parse_sse_event(event) {
-            Ok(parsed) => parsed,
-            Err(error) => {
-                eprintln!("leani: ignored malformed SSE frame: {error}");
-                continue;
-            }
-        };
-        if parsed.event.as_deref() == Some("hello") {
+    while let Some(event) = buffer.next_frame()? {
+        let parsed = sse::parse(&event).context("node sent a malformed SSE frame")?;
+        if parsed.name.as_deref() == Some("hello") {
             continue;
         }
         let Some(data) = parsed.data else {
             continue;
         };
-        if parsed.event.as_deref() == Some("error") {
+        if parsed.name.as_deref() == Some("error") {
             bail!("node subscription stream reported an error: {data}");
         }
-        let value: Value = match serde_json::from_str(&data) {
-            Ok(value) => value,
-            Err(error) => {
-                eprintln!("leani: ignored malformed SSE JSON: {error}");
-                continue;
-            }
-        };
-        let envelope = match serde_json::from_value::<AttachedEnvelope>(value.clone()) {
-            Ok(envelope) => envelope,
-            Err(error) => {
-                eprintln!("leani: ignored unrecognized SSE event: {error}");
-                continue;
-            }
-        };
+        let value: Value = serde_json::from_str(&data).context("node sent malformed SSE JSON")?;
+        let envelope: AttachedEnvelope = serde_json::from_value(value.clone())
+            .context("node sent an invalid SSE change envelope")?;
+        if envelope.cursor.is_empty()
+            || !matches!(
+                envelope.operation.as_str(),
+                "apply" | "undo" | "finalized" | "reset_required"
+            )
+        {
+            bail!("node sent an invalid SSE change envelope");
+        }
         outcome.observed_change = true;
         if envelope.operation == "reset_required" {
             bail!(
@@ -2573,17 +2694,43 @@ fn render_attached_sse_events(
         }
         *last_sequence = Some(sequence);
         *cursor = Some(envelope.cursor.clone());
-        if render_attached(
-            options.protocol,
-            options.format,
-            options.finality,
-            markets,
-            envelope,
-            &value,
-        )? && options.once
+        if options.finality == SubscribeFinality::Finalized && envelope.finality != "finalized" {
+            match (
+                envelope.operation.as_str(),
+                envelope_block_number(&envelope),
+            ) {
+                ("apply", Some(block)) if !envelope.kind.starts_with("system.") => {
+                    gate.hold(block, envelope, value);
+                }
+                ("undo", Some(block)) => gate.undo(block),
+                _ => {}
+            }
+            continue;
+        }
+        let mut to_render = Vec::new();
+        if envelope.kind.starts_with("system.finality")
+            && let Some(through) = envelope
+                .data
+                .as_ref()
+                .and_then(|data| data.get("throughBlock"))
+                .and_then(Value::as_u64)
         {
-            outcome.stop = true;
-            return Ok(outcome);
+            to_render = gate.release(through);
+        }
+        to_render.push((envelope, value));
+        for (envelope, value) in to_render {
+            if render_attached(
+                options.protocol,
+                options.format,
+                options.finality,
+                markets,
+                envelope,
+                &value,
+            )? && options.once
+            {
+                outcome.stop = true;
+                return Ok(outcome);
+            }
         }
     }
     Ok(outcome)
@@ -2595,12 +2742,14 @@ async fn attached_change_head(
     endpoint: &Url,
 ) -> Result<ChangeHead> {
     let head_url = processor_url(endpoint, &options.processor, "changes/head")?;
-    Ok(authorized(client.get(head_url), options.token.as_deref())
-        .send()
-        .await?
-        .error_for_status()?
-        .json::<ChangeHead>()
-        .await?)
+    Ok(
+        attached_rest_request(client.get(head_url), options.token.as_deref())
+            .send()
+            .await?
+            .error_for_status()?
+            .json::<ChangeHead>()
+            .await?,
+    )
 }
 
 async fn attached_latest_snapshot(
@@ -2664,7 +2813,7 @@ async fn attached_latest_block(
     endpoint: &Url,
 ) -> Result<Option<AttachedBlockSummary>> {
     let url = processor_url(endpoint, &options.processor, "query/latest")?;
-    let response = authorized(client.get(url), options.token.as_deref())
+    let response = attached_rest_request(client.get(url), options.token.as_deref())
         .send()
         .await?;
     if response.status() == reqwest::StatusCode::NOT_FOUND {
@@ -2691,7 +2840,7 @@ async fn attached_latest_observations(
             &options.processor,
             &format!("query/pools/{}/latest", market.pool),
         )?;
-        let response = authorized(client.get(url), options.token.as_deref())
+        let response = attached_rest_request(client.get(url), options.token.as_deref())
             .send()
             .await?;
         if response.status() == reqwest::StatusCode::NOT_FOUND {
@@ -2717,7 +2866,7 @@ async fn validate_attached_markets(
     endpoint: &Url,
 ) -> Result<()> {
     let pools_url = processor_url(endpoint, &options.processor, "query/pools")?;
-    let configured = authorized(client.get(pools_url), options.token.as_deref())
+    let configured = attached_rest_request(client.get(pools_url), options.token.as_deref())
         .send()
         .await?
         .error_for_status()?
@@ -2955,37 +3104,11 @@ fn authorized(request: reqwest::RequestBuilder, token: Option<&str>) -> reqwest:
     }
 }
 
-fn sse_event_end(buffer: &[u8]) -> Option<usize> {
-    let crlf = buffer
-        .windows(4)
-        .position(|window| window == b"\r\n\r\n")
-        .map(|position| (position, position + 4));
-    let lf = buffer
-        .windows(2)
-        .position(|window| window == b"\n\n")
-        .map(|position| (position, position + 2));
-    match (crlf, lf) {
-        (Some(left), Some(right)) => Some(if left.0 <= right.0 { left.1 } else { right.1 }),
-        (Some((_, end)), None) | (None, Some((_, end))) => Some(end),
-        (None, None) => None,
-    }
-}
-
-fn parse_sse_event(event: &[u8]) -> Result<ParsedSseEvent> {
-    let event = std::str::from_utf8(event).context("node SSE stream is not UTF-8")?;
-    let event_name = event
-        .lines()
-        .find_map(|line| line.strip_prefix("event:"))
-        .map(|value| value.trim_start().to_owned());
-    let data = event
-        .lines()
-        .filter_map(|line| line.strip_prefix("data:"))
-        .map(str::trim_start)
-        .collect::<Vec<_>>();
-    Ok(ParsedSseEvent {
-        event: event_name,
-        data: (!data.is_empty()).then(|| data.join("\n")),
-    })
+fn attached_rest_request(
+    request: reqwest::RequestBuilder,
+    token: Option<&str>,
+) -> reqwest::RequestBuilder {
+    authorized(request, token).timeout(ATTACHED_REQUEST_TIMEOUT)
 }
 
 fn unix_seconds() -> u64 {
@@ -3022,7 +3145,7 @@ mod tests {
             endpoint: None,
             processor: "uniswap-observations".to_owned(),
             token: None,
-            finality: SubscribeFinality::Optimistic,
+            finality: SubscribeFinality::Included,
             finality_source: SubscribeFinalitySource::Auto,
             checkpoint_urls,
             checkpoint_quorum: 2,
@@ -3031,6 +3154,211 @@ mod tests {
             once: true,
             requested_config: None,
             working_directory: PathBuf::from("."),
+        }
+    }
+
+    #[test]
+    fn finalized_subscriptions_never_select_included_records() {
+        let items = latest_fresh_items(
+            SubscribeProtocol::Blocks,
+            &[],
+            vec![block_record(40, 9_900)],
+            SubscribeFinality::Finalized,
+            10_000,
+        )
+        .expect("select");
+        assert!(items.is_empty());
+
+        let mut finalized = block_record(41, 9_912);
+        finalized.finality = Finality::Finalized;
+        let items = latest_fresh_items(
+            SubscribeProtocol::Blocks,
+            &[],
+            vec![finalized],
+            SubscribeFinality::Finalized,
+            10_000,
+        )
+        .expect("select");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].0.block_number(), BlockNumber(41));
+    }
+
+    #[test]
+    fn preview_rows_carry_the_preview_status() {
+        let record = block_record(42, 9_924);
+        let item = local_item(SubscribeProtocol::Blocks, &[], &record)
+            .expect("decode")
+            .expect("block item");
+        let SubscriptionItem::Block(entity) = &item else {
+            panic!("expected a block item");
+        };
+        let rendered = rendered_block_summary(entity, Finality::Preview, "apply", None);
+        assert_eq!(rendered.finality, "preview");
+        assert_eq!(rendered.operation, "apply");
+    }
+
+    fn attached_block_event(sequence: u64, block: u64, finality: &str, now: u64) -> Vec<u8> {
+        let hash = format!(
+            "0x{}",
+            hex::encode([u8::try_from(block).unwrap_or(u8::MAX); 32])
+        );
+        let zero = hex::encode([0; 32]);
+        format!(
+            "data: {{\"sequence\":\"{sequence}\",\"cursor\":\"cursor-{sequence}\",\"operation\":\"apply\",\
+             \"block\":{{\"number\":{block},\"hash\":\"{hash}\",\"parentHash\":\"0x{zero}\",\"timestamp\":{now}}},\
+             \"finality\":\"{finality}\",\"kind\":\"{BLOCK_SUMMARY_KIND}.put\",\
+             \"data\":{{\"chainId\":1,\"blockNumber\":{block},\"blockHash\":\"{hash}\",\"parentHash\":\"0x{zero}\",\
+             \"timestamp\":{now},\"gasLimit\":60000000,\"gasUsed\":30000000,\"baseFeePerGas\":null,\
+             \"blobGasUsed\":null,\"excessBlobGas\":null,\"transactionCount\":3,\"sizeBytes\":null,\
+             \"finality\":\"{finality}\"}}}}\n\n"
+        )
+        .into_bytes()
+    }
+
+    fn attached_marker_event(sequence: u64, block: u64, kind: &str, through: u64) -> Vec<u8> {
+        let zero = hex::encode([0; 32]);
+        let (operation, finality) = if kind.starts_with("system.finality") {
+            ("finalized", "finalized")
+        } else {
+            ("undo", "included")
+        };
+        format!(
+            "data: {{\"sequence\":\"{sequence}\",\"cursor\":\"cursor-{sequence}\",\"operation\":\"{operation}\",\
+             \"block\":{{\"number\":{block},\"hash\":\"0x{zero}\",\"parentHash\":\"0x{zero}\",\"timestamp\":1}},\
+             \"finality\":\"{finality}\",\"kind\":\"{kind}\",\"data\":{{\"throughBlock\":{through}}}}}\n\n"
+        )
+        .into_bytes()
+    }
+
+    fn attached_finalized_options() -> SubscribeOptions {
+        let mut options = subscribe_options(Vec::new());
+        options.protocol = SubscribeProtocol::Blocks;
+        options.mode = SubscribeMode::Client;
+        options.format = SubscribeFormat::Json;
+        options.finality = SubscribeFinality::Finalized;
+        options.once = true;
+        options
+    }
+
+    #[test]
+    fn attached_finalized_subscriptions_print_included_blocks_once_finality_covers_them() {
+        let now = unix_seconds();
+        let options = attached_finalized_options();
+        let mut gate = FinalizedGate::default();
+        let mut buffer = EventBuffer::default();
+        let mut cursor = None;
+        let mut sequence = None;
+
+        buffer.push(&attached_block_event(1, 100, "included", now));
+        let outcome = render_attached_sse_events(
+            &mut buffer,
+            &mut cursor,
+            &mut sequence,
+            &options,
+            &[],
+            &mut gate,
+        )
+        .expect("included apply is buffered");
+        assert!(
+            !outcome.stop,
+            "included block must not print under --finality finalized"
+        );
+        assert_eq!(gate.pending_blocks(), 1);
+
+        buffer.push(&attached_marker_event(2, 100, "system.finality.put", 100));
+        let outcome = render_attached_sse_events(
+            &mut buffer,
+            &mut cursor,
+            &mut sequence,
+            &options,
+            &[],
+            &mut gate,
+        )
+        .expect("finality marker flushes");
+        assert!(
+            outcome.stop,
+            "the covered block prints once finality reaches it"
+        );
+        assert_eq!(gate.pending_blocks(), 0);
+    }
+
+    #[test]
+    fn attached_finalized_subscriptions_drop_undone_blocks_before_finality() {
+        let now = unix_seconds();
+        let options = attached_finalized_options();
+        let mut gate = FinalizedGate::default();
+        let mut buffer = EventBuffer::default();
+        let mut cursor = None;
+        let mut sequence = None;
+
+        buffer.push(&attached_block_event(1, 100, "included", now));
+        buffer.push(&attached_marker_event(
+            2,
+            100,
+            "ethereum.block.summary.delete",
+            0,
+        ));
+        buffer.push(&attached_marker_event(3, 100, "system.finality.put", 100));
+        let outcome = render_attached_sse_events(
+            &mut buffer,
+            &mut cursor,
+            &mut sequence,
+            &options,
+            &[],
+            &mut gate,
+        )
+        .expect("undo then marker");
+        assert!(!outcome.stop, "an undone block must never print");
+        assert_eq!(gate.pending_blocks(), 0);
+    }
+
+    #[test]
+    fn attached_finalized_subscriptions_print_already_finalized_records_directly() {
+        let now = unix_seconds();
+        let options = attached_finalized_options();
+        let mut gate = FinalizedGate::default();
+        let mut buffer = EventBuffer::default();
+        let mut cursor = None;
+        let mut sequence = None;
+
+        buffer.push(&attached_block_event(1, 100, "finalized", now));
+        let outcome = render_attached_sse_events(
+            &mut buffer,
+            &mut cursor,
+            &mut sequence,
+            &options,
+            &[],
+            &mut gate,
+        )
+        .expect("finalized apply prints");
+        assert!(outcome.stop);
+        assert_eq!(gate.pending_blocks(), 0);
+    }
+
+    #[test]
+    fn attached_stream_rejects_malformed_events_without_advancing_its_cursor() {
+        for malformed in [
+            b"data: \xff\n\n".as_slice(),
+            b"data: {\n\n".as_slice(),
+            b"data: {}\n\n".as_slice(),
+            b"data: {\"sequence\":\"2\",\"cursor\":\"cursor-2\",\"operation\":\"unknown\",\"block\":null,\"finality\":\"finalized\",\"kind\":\"system\"}\n\n".as_slice(),
+        ] {
+            let mut buffer = EventBuffer::default();
+            buffer.push(malformed);
+            buffer.push(b"data: {\"sequence\":\"3\",\"cursor\":\"cursor-3\",\"operation\":\"finalized\",\"block\":null,\"finality\":\"finalized\",\"kind\":\"system\"}\n\n");
+            let mut cursor = Some("cursor-1".to_owned());
+            let mut sequence = Some(1);
+            let result = render_attached_sse_events(
+                &mut buffer,
+                &mut cursor,
+                &mut sequence,
+                &subscribe_options(Vec::new()),
+                &[],
+                &mut FinalizedGate::default(),
+            );
+            assert!(result.is_err(), "malformed event must stop the stream");
+            assert_eq!(cursor.as_deref(), Some("cursor-1"));
+            assert_eq!(sequence, Some(1));
         }
     }
 
@@ -3052,7 +3380,7 @@ mod tests {
             block_number: BlockNumber(sequence),
             block_hash,
             log_index: 0,
-            finality: Finality::Optimistic,
+            finality: Finality::Included,
         };
         ChangeRecord {
             delivery_encoding_version: 1,
@@ -3072,7 +3400,7 @@ mod tests {
                 parent_hash: BlockHash::new([0; 32]),
                 timestamp,
             },
-            finality: Finality::Optimistic,
+            finality: Finality::Included,
             direction: ChangeDirection::Apply,
             change: DomainChange {
                 kind: "uniswap.price.observation".to_owned(),
@@ -3099,7 +3427,7 @@ mod tests {
             excess_blob_gas: Some(393_216),
             transaction_count: Some(123),
             size_bytes: None,
-            finality: Finality::Optimistic,
+            finality: Finality::Included,
         };
         ChangeRecord {
             delivery_encoding_version: 1,
@@ -3119,7 +3447,7 @@ mod tests {
                 parent_hash: BlockHash::new([0; 32]),
                 timestamp,
             },
-            finality: Finality::Optimistic,
+            finality: Finality::Included,
             direction: ChangeDirection::Apply,
             change: DomainChange {
                 kind: BLOCK_SUMMARY_KIND.to_owned(),
@@ -3199,13 +3527,13 @@ mod tests {
     fn catch_up_updates_stay_silent_until_the_stream_is_current() {
         let now = 10_000;
         assert!(update_is_fresh(
-            SubscribeFinality::Optimistic,
-            now - OPTIMISTIC_UPDATE_MAX_AGE.as_secs(),
+            SubscribeFinality::Included,
+            now - INCLUDED_UPDATE_MAX_AGE.as_secs(),
             now
         ));
         assert!(!update_is_fresh(
-            SubscribeFinality::Optimistic,
-            now - OPTIMISTIC_UPDATE_MAX_AGE.as_secs() - 1,
+            SubscribeFinality::Included,
+            now - INCLUDED_UPDATE_MAX_AGE.as_secs() - 1,
             now
         ));
         assert!(update_is_fresh(
@@ -3228,7 +3556,7 @@ mod tests {
                 price_record(wbtc, 3, 9_960),
                 price_record(eth, 4, 9_990),
             ],
-            SubscribeFinality::Optimistic,
+            SubscribeFinality::Included,
             10_000,
         )
         .expect("select startup prices");
@@ -3256,7 +3584,7 @@ mod tests {
                 block_record(41, 9_912),
                 block_record(42, 9_924),
             ],
-            SubscribeFinality::Optimistic,
+            SubscribeFinality::Included,
             10_000,
         )
         .expect("select startup block");
@@ -3267,7 +3595,7 @@ mod tests {
     }
 
     #[test]
-    fn readiness_snapshot_cannot_follow_a_newer_optimistic_preview() {
+    fn readiness_snapshot_cannot_follow_a_newer_peer_preview() {
         let market = resolve_markets(&["ETH/USDC".to_owned()]).expect("market")[0];
         let older_record = price_record(market, 86, 10_000);
         let preview_record = price_record(market, 88, 10_024);
@@ -3455,7 +3783,7 @@ mod tests {
             SubscribeProtocol::UniswapV3,
             &[market],
             vec![apply, undo],
-            SubscribeFinality::Optimistic,
+            SubscribeFinality::Included,
             10_000,
         )
         .expect("startup state");
@@ -3471,9 +3799,9 @@ mod tests {
             operation: "apply".to_owned(),
             block: json!({
                 "timestamp": unix_seconds()
-                    .saturating_sub(OPTIMISTIC_UPDATE_MAX_AGE.as_secs() + 1),
+                    .saturating_sub(INCLUDED_UPDATE_MAX_AGE.as_secs() + 1),
             }),
-            finality: "optimistic".to_owned(),
+            finality: "included".to_owned(),
             kind: "uniswap.price.observation.apply".to_owned(),
             data: Some(
                 serde_json::to_value(AttachedPoolPrice {
@@ -3487,7 +3815,7 @@ mod tests {
                     block_number: 1,
                     block_hash: format!("0x{}", hex::encode([1; 32])),
                     log_index: 0,
-                    finality: "optimistic".to_owned(),
+                    finality: "included".to_owned(),
                 })
                 .expect("price JSON"),
             ),
@@ -3498,7 +3826,7 @@ mod tests {
             !render_attached(
                 SubscribeProtocol::UniswapV3,
                 SubscribeFormat::Raw,
-                SubscribeFinality::Optimistic,
+                SubscribeFinality::Included,
                 &[market],
                 envelope,
                 &Value::Null,
@@ -3607,6 +3935,55 @@ mod tests {
     }
 
     #[test]
+    fn verified_checkpoint_cache_keeps_the_newest_anchor_across_runtime_restarts() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("checkpoint.json");
+        let config: Config = toml::from_str(crate::config::VALID_CONFIG_TOML).expect("config");
+        let first = leani_runtime::AppliedFinalityAnchor {
+            block: leani_testkit::fixture_frame(1, BlockHash::ZERO).block,
+            beacon_slot: 100,
+            beacon_block_root: [1; 32],
+        };
+        let quorum = CachedCheckpoint {
+            schema: "leani.verified-checkpoint.v1".to_owned(),
+            root: format!("0x{}", hex::encode(first.beacon_block_root)),
+            slot: first.beacon_slot,
+            execution_block_hash: None,
+            trust: CheckpointTrust::ProviderQuorum,
+            accepted_providers: vec!["https://a.example/".to_owned()],
+            beacon_api_endpoints: vec!["https://a.example/".to_owned()],
+            updated_at_unix_seconds: 1,
+        };
+        write_checkpoint_cache(&path, &quorum).expect("provider checkpoint");
+        persist_verified_anchor(first, directory.path(), &config).expect("verified upgrade");
+        let upgraded = read_checkpoint_cache(&path).expect("upgraded cache");
+        assert_eq!(upgraded.trust, CheckpointTrust::LocallyVerified);
+        assert_eq!(
+            upgraded.execution_block_hash,
+            Some(first.block.hash.to_string())
+        );
+        assert_eq!(upgraded.accepted_providers, quorum.accepted_providers);
+
+        let next = leani_runtime::AppliedFinalityAnchor {
+            block: leani_testkit::fixture_frame(2, first.block.hash).block,
+            beacon_slot: 132,
+            beacon_block_root: [2; 32],
+        };
+        persist_verified_anchor(next, directory.path(), &config).expect("newer anchor");
+        let persisted = fs::read(&path).expect("persisted bytes");
+        persist_verified_anchor(first, directory.path(), &config).expect("stale restarted runtime");
+        persist_verified_anchor(next, directory.path(), &config).expect("duplicate anchor");
+        assert_eq!(fs::read(&path).expect("unchanged cache"), persisted);
+
+        let conflict = leani_runtime::AppliedFinalityAnchor {
+            beacon_block_root: [3; 32],
+            ..next
+        };
+        assert!(persist_verified_anchor(conflict, directory.path(), &config).is_err());
+        assert_eq!(fs::read(&path).expect("cache survives conflict"), persisted);
+    }
+
+    #[test]
     fn checkpoint_cache_round_trips_and_replaces_atomically() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let path = directory.path().join("checkpoint.json");
@@ -3674,7 +4051,7 @@ mod tests {
             SubscribeProtocol::UniswapV3,
             &left,
             None,
-            SubscribeFinality::Optimistic,
+            SubscribeFinality::Included,
             Path::new("."),
         )
         .expect("left identity");
@@ -3683,7 +4060,7 @@ mod tests {
             SubscribeProtocol::UniswapV3,
             &right,
             None,
-            SubscribeFinality::Optimistic,
+            SubscribeFinality::Included,
             Path::new("."),
         )
         .expect("right identity");
@@ -3698,7 +4075,7 @@ mod tests {
             SubscribeProtocol::Blocks,
             &[],
             None,
-            SubscribeFinality::Optimistic,
+            SubscribeFinality::Included,
             Path::new("."),
         )
         .expect("blocks identity");
@@ -3707,7 +4084,7 @@ mod tests {
             SubscribeProtocol::UniswapV3,
             &market,
             None,
-            SubscribeFinality::Optimistic,
+            SubscribeFinality::Included,
             Path::new("."),
         )
         .expect("Uniswap identity");
@@ -3724,24 +4101,55 @@ mod tests {
         fs::create_dir_all(&sibling).expect("sibling directory");
         fs::write(target.join("checkpoint.json"), b"fixture").expect("target state");
         fs::write(sibling.join("checkpoint.json"), b"sibling").expect("sibling state");
+        drop(
+            local_state::lock_runtime_directory(&target)
+                .expect("mark target as Leani runtime state"),
+        );
 
-        assert!(reset_subscription_directory(&target, true).expect("reset target"));
+        assert!(
+            reset_subscription_directory(&target, None, root.path(), true).expect("reset target")
+        );
         assert!(local_state::is_runtime_directory(&target));
         assert!(!target.join("checkpoint.json").exists());
         assert!(sibling.join("checkpoint.json").is_file());
-        assert!(reset_subscription_directory(&target, true).is_ok());
-        assert!(reset_subscription_directory(root.path(), true).is_err());
+        assert!(reset_subscription_directory(&target, None, root.path(), true).is_ok());
+        assert!(reset_subscription_directory(root.path(), None, root.path(), true).is_err());
     }
 
     #[test]
-    fn parses_sse_across_standard_line_endings() {
-        let unix = b"event: apply\ndata: {\"sequence\":\"1\"}\n\nrest";
-        assert_eq!(sse_event_end(unix), Some(37));
-        let parsed = parse_sse_event(&unix[..35]).expect("data");
-        assert_eq!(parsed.event.as_deref(), Some("apply"));
-        assert_eq!(parsed.data.as_deref(), Some("{\"sequence\":\"1\"}"));
-        let windows = b"data: {}\r\n\r\n";
-        assert_eq!(sse_event_end(windows), Some(windows.len()));
+    fn reset_rejects_unowned_derived_subscription_directory() {
+        let root = tempfile::tempdir().expect("temporary directory");
+        let target = root.path().join("subscriptions/0123456789abcdef");
+        fs::create_dir_all(&target).expect("target directory");
+        fs::write(target.join("checkpoint.json"), b"not Leani state").expect("target fixture");
+
+        let error = reset_subscription_directory(&target, None, root.path(), true)
+            .expect_err("unowned directory must be refused");
+        assert!(error.to_string().contains("without Leani runtime identity"));
+        assert!(target.join("checkpoint.json").is_file());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reset_rejects_symlinked_subscription_directory() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().expect("temporary directory");
+        let victim = root.path().join("victim");
+        let target = root.path().join("subscriptions/0123456789abcdef");
+        fs::create_dir_all(target.parent().expect("subscription root")).expect("subscription root");
+        fs::create_dir_all(&victim).expect("victim directory");
+        fs::write(victim.join("checkpoint.json"), b"victim state").expect("victim fixture");
+        drop(
+            local_state::lock_runtime_directory(&victim)
+                .expect("make the symlink destination look owned"),
+        );
+        symlink(&victim, &target).expect("subscription symlink");
+
+        let error = reset_subscription_directory(&target, None, root.path(), true)
+            .expect_err("symlinked directory must be refused");
+        assert!(error.to_string().contains("symlinked subscription state"));
+        assert!(victim.join("checkpoint.json").is_file());
     }
 
     #[test]
@@ -3751,7 +4159,7 @@ mod tests {
         let processor = subscription_processor(
             SubscribeProtocol::UniswapV3,
             &markets,
-            SubscribeFinality::Optimistic,
+            SubscribeFinality::Included,
         )
         .expect("processor");
         let pools = processor.settings["pools"].as_array().expect("pools");
@@ -3759,18 +4167,15 @@ mod tests {
         assert_eq!(processor.history_mode, ProcessorHistoryMode::OnDemand);
         assert!(matches!(
             processor.publish,
-            PublishMode::OptimisticAndFinalized
+            PublishMode::IncludedAndFinalized
         ));
     }
 
     #[test]
     fn embedded_block_processor_requires_bodies_but_not_receipts() {
-        let processor = subscription_processor(
-            SubscribeProtocol::Blocks,
-            &[],
-            SubscribeFinality::Optimistic,
-        )
-        .expect("processor");
+        let processor =
+            subscription_processor(SubscribeProtocol::Blocks, &[], SubscribeFinality::Included)
+                .expect("processor");
         let registry = ProcessorRegistry::standard();
         let processor = registry.instantiate(&processor, 1).expect("instantiate");
         assert_eq!(

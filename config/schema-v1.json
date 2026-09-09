@@ -497,7 +497,7 @@
         "start_block": { "$ref": "#/$defs/nonNegativeInteger" },
         "publish": {
           "enum": [
-            "optimistic_and_finalized",
+            "included_and_finalized",
             "finalized_only",
             "terminal_only"
           ]

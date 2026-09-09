@@ -224,13 +224,13 @@ impl ExecutionPeerStore {
         block: u64,
         elapsed: Duration,
     ) {
-        let now = observed_at_unix_ms();
         let latency = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
         let mut quality = self
             .quality
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let evidence = quality.entry(peer_id).or_default();
+        let now = next_quality_timestamp(evidence);
         evidence.fork_compatible = true;
         evidence.highest_served_block =
             Some(evidence.highest_served_block.unwrap_or_default().max(block));
@@ -263,7 +263,7 @@ impl ExecutionPeerStore {
         evidence.fork_compatible |= !matches!(qualification, PeerQualification::Rejected);
         if !matches!(qualification, PeerQualification::BodyServing) {
             evidence.last_failure_reason = detail.map(bounded_quality_detail);
-            evidence.last_failure_unix_ms = Some(observed_at_unix_ms());
+            evidence.last_failure_unix_ms = Some(next_quality_timestamp(evidence));
         }
         self.finish_quality_update(&mut quality, peer_id);
     }
@@ -275,7 +275,7 @@ impl ExecutionPeerStore {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let evidence = quality.entry(peer_id).or_default();
         evidence.last_failure_reason = Some(bounded_quality_detail(detail));
-        evidence.last_failure_unix_ms = Some(observed_at_unix_ms());
+        evidence.last_failure_unix_ms = Some(next_quality_timestamp(evidence));
         self.finish_quality_update(&mut quality, peer_id);
     }
 
@@ -1045,6 +1045,18 @@ fn observed_at_unix_ms() -> u64 {
     .unwrap_or(u64::MAX)
 }
 
+fn next_quality_timestamp(evidence: &PeerQualityEvidence) -> u64 {
+    let previous = evidence
+        .last_header_success_unix_ms
+        .into_iter()
+        .chain(evidence.last_body_success_unix_ms)
+        .chain(evidence.last_receipt_success_unix_ms)
+        .chain(evidence.last_failure_unix_ms)
+        .max()
+        .unwrap_or_default();
+    observed_at_unix_ms().max(previous.saturating_add(1))
+}
+
 fn bounded_quality_detail(detail: &str) -> String {
     detail.chars().take(256).collect()
 }
@@ -1139,6 +1151,37 @@ mod tests {
                 .len(),
             2
         );
+    }
+
+    #[test]
+    fn quality_updates_preserve_order_when_wall_clock_milliseconds_collide() {
+        let store = ExecutionPeerStore::new(None, 2);
+        let peer_id = node_record(1).id;
+        let same_millisecond = observed_at_unix_ms().saturating_add(60_000);
+        store
+            .quality
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(
+                peer_id,
+                PeerQualityEvidence {
+                    last_body_success_unix_ms: Some(same_millisecond),
+                    last_failure_unix_ms: Some(same_millisecond),
+                    ..PeerQualityEvidence::default()
+                },
+            );
+        assert!(!store.is_available_body_server(peer_id));
+
+        store.record_success(
+            peer_id,
+            PeerMaterialKind::Body,
+            25_000_000,
+            Duration::from_millis(1),
+        );
+        assert!(store.is_available_body_server(peer_id));
+
+        store.record_failure(peer_id, "later failure");
+        assert!(!store.is_available_body_server(peer_id));
     }
 
     #[tokio::test]

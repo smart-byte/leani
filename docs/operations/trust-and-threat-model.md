@@ -48,7 +48,9 @@ runtime exists.
 - optional bearer authentication with redacted debug output;
 - random per-consumer bearer credentials stored only as one-way hashes and
   scoped to that processor instance and consumer identity;
-- no CORS layer and no remote admin endpoint;
+- no CORS layer; administrative routes share the native API listener and its
+  optional bearer authentication, so binding it beyond localhost exposes those
+  routes as well;
 - non-root, read-only container profile with all capabilities dropped;
 - fail-closed unsupported RPC responses instead of synthesized partial state.
 

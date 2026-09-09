@@ -603,7 +603,7 @@ impl BackfillJob {
             });
         let minimum_finality = requirements
             .iter()
-            .fold(Finality::Optimistic, |required, requirement| {
+            .fold(Finality::Included, |required, requirement| {
                 required.max(requirement.minimum_finality)
             });
         let log_fields = requirements
@@ -1034,7 +1034,7 @@ async fn map_with_finality_variants(
             "finality variants must include the exact delta checksum".to_owned(),
         ));
     }
-    for finality in [Finality::Optimistic, Finality::Safe, Finality::Finalized] {
+    for finality in [Finality::Included, Finality::Finalized] {
         if finality == frame.finality {
             continue;
         }
@@ -4358,7 +4358,7 @@ impl SharedLiveRuntime {
                 });
                 if let Some(delta) = candidate {
                     let outcome = match self
-                        .apply_delta(processor.as_ref(), &delta, Finality::Optimistic)
+                        .apply_delta(processor.as_ref(), &delta, Finality::Included)
                         .await
                     {
                         Ok(outcome) => outcome,
@@ -4467,7 +4467,7 @@ impl SharedLiveRuntime {
             return Ok(false);
         };
         let outcome = if stored_checksum == delta.checksum {
-            self.apply_delta(processor, delta, Finality::Optimistic)
+            self.apply_delta(processor, delta, Finality::Included)
                 .await?
         } else {
             let mut equivalent_checksums = processor.finality_variant_checksums(delta)?;
@@ -4707,7 +4707,7 @@ fn compile_live_request(
         });
     let minimum_finality = requirements
         .iter()
-        .fold(Finality::Optimistic, |all, requirement| {
+        .fold(Finality::Included, |all, requirement| {
             all.max(requirement.minimum_finality)
         });
     let allow_filtered = requirements
@@ -5737,6 +5737,7 @@ mod tests {
     use tower::ServiceExt;
 
     use super::*;
+    use leani_store_sqlite::ChangeDirection;
 
     #[test]
     fn adaptive_history_commits_shrink_immediately_above_writer_target() {
@@ -5908,8 +5909,8 @@ mod tests {
             delta: &EncodedDelta,
         ) -> Result<Vec<BlockHash>, ProcessorError> {
             delta.validate(self.descriptor())?;
-            let mut checksums = Vec::with_capacity(3);
-            for finality in [Finality::Optimistic, Finality::Safe, Finality::Finalized] {
+            let mut checksums = Vec::with_capacity(2);
+            for finality in [Finality::Included, Finality::Finalized] {
                 let mut payload = delta.payload.clone();
                 let encoded_finality = payload
                     .last_mut()
@@ -6902,9 +6903,9 @@ mod tests {
             .collect()
     }
 
-    fn optimistic_frame(number: u64, parent: BlockHash) -> leani_primitives::BlockFrame {
+    fn included_frame(number: u64, parent: BlockHash) -> leani_primitives::BlockFrame {
         let mut frame = fixture_frame(number, parent);
-        frame.finality = Finality::Optimistic;
+        frame.finality = Finality::Included;
         frame
     }
 
@@ -6917,7 +6918,7 @@ mod tests {
             projection: FieldProjection::default(),
             log_fields: leani_primitives::LogFieldSet::NONE,
             filters: FilterSet::default(),
-            minimum_finality: Finality::Optimistic,
+            minimum_finality: Finality::Included,
             verification_policy: VerificationPolicy::CompleteCryptographic,
         }
     }
@@ -6954,7 +6955,7 @@ mod tests {
                 let mut frame = fixture_frame(number, parent);
                 frame.block.hash = e2e_hash(number);
                 frame.block.parent_hash = parent;
-                frame.finality = Finality::Optimistic;
+                frame.finality = Finality::Included;
                 frame.header = Material::Complete(HeaderEnvelope {
                     rlp: None,
                     transactions_root: None,
@@ -10255,10 +10256,10 @@ mod tests {
     #[tokio::test]
     async fn live_runtime_applies_and_reverses_a_shallow_fork() {
         let range = BlockRange::new(BlockNumber(1), BlockNumber(3)).expect("range");
-        let first = optimistic_frame(1, BlockHash::ZERO);
-        let second = optimistic_frame(2, first.block.hash);
-        let third = optimistic_frame(3, second.block.hash);
-        let mut replacement = optimistic_frame(3, second.block.hash);
+        let first = included_frame(1, BlockHash::ZERO);
+        let second = included_frame(2, first.block.hash);
+        let third = included_frame(3, second.block.hash);
+        let mut replacement = included_frame(3, second.block.hash);
         replacement.block.hash = BlockHash::new([0x33; 32]);
         let source = Arc::new(ScriptedLiveSource::new(
             fixture_source_descriptor("live", range),
@@ -11234,7 +11235,7 @@ mod tests {
                     &MappedFrame {
                         delta,
                         equivalent_checksums,
-                        finality: Finality::Optimistic,
+                        finality: Finality::Included,
                         estimated_bytes: 0,
                         material: None,
                         _mapped_byte_permit: None,
@@ -11532,7 +11533,7 @@ mod tests {
     }
 
     fn live_fixture(number: u64, parent: BlockHash) -> leani_primitives::BlockFrame {
-        let mut frame = optimistic_frame(number, parent);
+        let mut frame = included_frame(number, parent);
         frame.header = leani_primitives::Material::Complete(leani_primitives::HeaderEnvelope {
             rlp: None,
             transactions_root: None,
@@ -11553,8 +11554,8 @@ mod tests {
     #[tokio::test]
     async fn live_runtime_rejects_a_parent_gap_before_mapping() {
         let range = BlockRange::new(BlockNumber(1), BlockNumber(3)).expect("range");
-        let first = optimistic_frame(1, BlockHash::ZERO);
-        let third = optimistic_frame(3, first.block.hash);
+        let first = included_frame(1, BlockHash::ZERO);
+        let third = included_frame(3, first.block.hash);
         let source = Arc::new(ScriptedLiveSource::new(
             fixture_source_descriptor("live-gap", range),
             vec![
@@ -11582,11 +11583,91 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn finalized_only_processors_publish_nothing_before_verified_finality() {
+        let range = BlockRange::new(BlockNumber(1), BlockNumber(3)).expect("range");
+        let first = included_frame(1, BlockHash::ZERO);
+        let second = included_frame(2, first.block.hash);
+        let third = included_frame(3, second.block.hash);
+        let live_source = Arc::new(ScriptedLiveSource::new(
+            fixture_source_descriptor("live-finalized-only", range),
+            vec![
+                LiveStep::Event(ChainEvent::Block(Box::new(first))),
+                LiveStep::Event(ChainEvent::Block(Box::new(second.clone()))),
+                LiveStep::Event(ChainEvent::Block(Box::new(third))),
+            ],
+        ));
+        let processor = Arc::new(
+            BlockLocalCounter::default().with_publication(PublicationPolicy::FinalizedOnly),
+        );
+        let (_directory, store) = store().await;
+        LiveRuntime::new(
+            store.clone(),
+            live_source,
+            processor.clone(),
+            LiveRuntimeConfig::default(),
+        )
+        .expect("live runtime")
+        .run(
+            LiveStart::Head,
+            default_source_budget(),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("live run");
+        assert!(
+            store
+                .changes(processor.descriptor(), ChainId(1), 0, 100)
+                .await
+                .expect("changes before finality")
+                .is_empty(),
+            "included blocks must not be published by a finalized_only processor"
+        );
+
+        let checkpoint = ConsensusCheckpoint {
+            beacon_slot: 1,
+            beacon_block_root: [1; 32],
+            execution_block_hash: first_hash_for_checkpoint(),
+            obtained_at_unix_seconds: 1,
+            source: "fixture".to_owned(),
+        };
+        let finality_source = Arc::new(ScriptedFinalitySource::new(
+            fixture_source_descriptor("finality", range),
+            checkpoint.clone(),
+            vec![FinalityStep::Event(FinalityEvent::Finalized {
+                block_hash: second.block.hash,
+                beacon_slot: 2,
+                beacon_block_root: [2; 32],
+            })],
+        ));
+        FinalityRuntime::new(store.clone(), finality_source, processor.clone())
+            .run(checkpoint, CancellationToken::new())
+            .await
+            .expect("finality");
+
+        let changes = store
+            .changes(processor.descriptor(), ChainId(1), 0, 100)
+            .await
+            .expect("changes after finality");
+        let summary: Vec<_> = changes
+            .iter()
+            .map(|change| (change.block.number.0, change.finality, change.direction))
+            .collect();
+        assert_eq!(
+            summary,
+            vec![
+                (1, Finality::Finalized, ChangeDirection::Apply),
+                (2, Finality::Finalized, ChangeDirection::Apply),
+                (2, Finality::Finalized, ChangeDirection::Finalized),
+            ]
+        );
+    }
+
+    #[tokio::test]
     async fn verified_finality_makes_the_anchored_prefix_irreversible() {
         let range = BlockRange::new(BlockNumber(1), BlockNumber(3)).expect("range");
-        let first = optimistic_frame(1, BlockHash::ZERO);
-        let second = optimistic_frame(2, first.block.hash);
-        let third = optimistic_frame(3, second.block.hash);
+        let first = included_frame(1, BlockHash::ZERO);
+        let second = included_frame(2, first.block.hash);
+        let third = included_frame(3, second.block.hash);
         let live_source = Arc::new(ScriptedLiveSource::new(
             fixture_source_descriptor("live-finality", range),
             vec![

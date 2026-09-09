@@ -9,6 +9,8 @@ Usage:
   scripts/run-controlled-benchmarks.sh SUITE [OUTPUT_DIRECTORY]
 
 Suites:
+  subscription-startup
+                     Alternating cold/warm block-subscription startup comparison.
   smoke              Small, resumable two-candidate sweep.
   synthetic-million  Full synthetic processor/delivery matrix (sequential).
   delivery-faults    SDK/PostgreSQL reconnect and lost-ACK matrix.
@@ -19,13 +21,17 @@ Outputs default to an ignored timestamped directory under
 LEANI_BENCHMARK_OUTPUT_DIRECTORY, to resume a controlled run in place.
 
 Useful environment overrides:
+  LEANI_BENCHMARK_BASELINE_BINARY
+                               Baseline binary for subscription-startup (required).
   LEANI_BENCHMARK_BINARY       Existing binary; otherwise build target/release/leani.
   LEANI_BENCHMARK_CASES        Space-separated synthetic case filter.
   LEANI_BENCHMARK_CORPORA      Space-separated corpus filter.
   LEANI_BENCHMARK_BLOCKS       Synthetic block count (default: 1000000).
   LEANI_BENCHMARK_CHUNK_BLOCKS Source chunk size (default: min(blocks, 8192)).
   LEANI_BENCHMARK_WARMUPS      Synthetic warm-up count (default: 1).
-  LEANI_BENCHMARK_RUNS         Synthetic measured runs (default: 3).
+  LEANI_BENCHMARK_RUNS         Startup pairs (default: 10) or synthetic runs (default: 3).
+  LEANI_BENCHMARK_CUTOFF_SECONDS
+                               Subscription startup cutoff (default: 90).
   LEANI_BENCHMARK_FAULT_BLOCKS Delivery-fault block count (default: 10000).
 
 SDK/PostgreSQL cases require LEANI_BENCHMARK_POSTGRES_URL pointing to a
@@ -47,7 +53,7 @@ case "${1:-}" in
     usage
     exit 0
     ;;
-  smoke|synthetic-million|delivery-faults|all)
+  subscription-startup|smoke|synthetic-million|delivery-faults|all)
     suite=$1
     ;;
   '')
@@ -156,6 +162,29 @@ run_smoke() {
   "$benchmark_binary" benchmark sweep \
     --manifest config/benchmark-sweep.smoke.json \
     --output-directory "$directory"
+}
+
+run_subscription_startup() {
+  local directory=$1
+  local baseline_binary=${LEANI_BENCHMARK_BASELINE_BINARY:-}
+  local runs=${LEANI_BENCHMARK_RUNS:-10}
+  local cutoff_seconds=${LEANI_BENCHMARK_CUTOFF_SECONDS:-90}
+
+  [ -n "$baseline_binary" ] || fail \
+    "subscription-startup requires LEANI_BENCHMARK_BASELINE_BINARY"
+  case "$baseline_binary" in
+    /*) ;;
+    *) baseline_binary="$repository_root/$baseline_binary" ;;
+  esac
+  [ -x "$baseline_binary" ] || fail "baseline binary is not executable: $baseline_binary"
+
+  prepare_output_directory "$directory"
+  python3 benchmarks/subscription-startup/benchmark.py \
+    --baseline-binary "$baseline_binary" \
+    --candidate-binary "$benchmark_binary" \
+    --output-directory "$directory" \
+    --runs "$runs" \
+    --cutoff-seconds "$cutoff_seconds"
 }
 
 run_synthetic_million() {
@@ -273,6 +302,7 @@ run_delivery_faults() {
 }
 
 case "$suite" in
+  subscription-startup) run_subscription_startup "$output_directory" ;;
   smoke) run_smoke "$output_directory" ;;
   synthetic-million) run_synthetic_million "$output_directory" ;;
   delivery-faults) run_delivery_faults "$output_directory" ;;

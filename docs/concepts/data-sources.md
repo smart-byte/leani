@@ -66,6 +66,17 @@ projections:
 3. logs with address and all four topic positions; and
 4. the existing blob/type-3 projection.
 
+The current Xatu projections require Beacon execution payloads for parent
+hashes, so Mainnet requests must begin at block **15,537,394** (the Merge) or
+later. Earlier ranges fail during planning. A processor deployment/start block
+before the Merge does not make that range available from this adapter; use a
+source that explicitly advertises the required historical range.
+
+Parquet reads fetch only the requested byte ranges in at most 256 KiB requests,
+with up to four range reads in flight per reader. This avoids large downloads
+of gaps between projected columns. Public hosting can still retry or stall;
+source availability and throughput need dated operational evidence.
+
 Every immutable chunk encodes its projection kind and exact filters. `open`
 therefore cannot execute a different physical projection from the one that
 was planned. The source plan reports logical reader, table, selected columns,

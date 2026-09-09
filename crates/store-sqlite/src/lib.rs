@@ -22,7 +22,8 @@ use leani_primitives::{
 use leani_processor_api::{
     ArtifactPolicyMode, ChangeOperation, CheckpointPolicyMode, DeliveryLimitAction,
     DeliveryOrdering, DeliveryPolicyMode, DomainChange, EncodedDelta, OutputPolicyMode, Processor,
-    ProcessorDescriptor, ProcessorError, ReducerTransaction, ReductionMode, StartPoint,
+    ProcessorDescriptor, ProcessorError, PublicationPolicy, ReducerTransaction, ReductionMode,
+    StartPoint,
 };
 use leani_store_artifacts::{
     ArtifactBatchReceipt, ArtifactBatchSink, ArtifactCompression, ArtifactSegmentLimits,
@@ -57,10 +58,14 @@ const SCHEMA_V16: &str = include_str!("../migrations/0016_tiered_processor_artif
 const SCHEMA_V17: &str = include_str!("../migrations/0017_artifact_segment_owners.sql");
 const SCHEMA_V18: &str = include_str!("../migrations/0018_processor_artifact_totals.sql");
 const SCHEMA_V19: &str = include_str!("../migrations/0019_bulk_artifact_accounting.sql");
+const SCHEMA_V20: &str = include_str!("../migrations/0020_query_snapshot_filters.sql");
+const SCHEMA_V21: &str = include_str!("../migrations/0021_deferred_changes.sql");
 /// Current on-disk `SQLite` schema version written by this crate.
-pub const CURRENT_SCHEMA_VERSION: u32 = 19;
+pub const CURRENT_SCHEMA_VERSION: u32 = 21;
 /// Stable encoding version attached to durable delivery records.
 pub const DELIVERY_ENCODING_VERSION: u16 = 1;
+/// Deferred rows promoted per SQL round trip inside `mark_finalized`.
+const DEFERRED_FLUSH_BATCH: usize = 256;
 
 /// `SQLite` fsync policy.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -147,7 +152,7 @@ impl Default for DeliveryStorageBudget {
     }
 }
 
-/// Independent logical byte limits for finalized artifacts and optimistic
+/// Independent logical byte limits for finalized artifacts and included-block
 /// candidates awaiting finality.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ArtifactStorageBudget {
@@ -930,7 +935,7 @@ pub struct PortableSavepoint {
 
 /// Optional retained-output constraints applied while creating one stable
 /// query snapshot.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
 pub struct OutputQuery {
     pub from_block: Option<BlockNumber>,
     pub to_block: Option<BlockNumber>,
@@ -966,12 +971,35 @@ pub struct OutputBounds {
     pub latest_timestamp: u64,
 }
 
+/// Admission limits for immutable query snapshots, shared across all processors.
+#[derive(Clone, Copy, Debug)]
+pub struct QuerySnapshotLimits {
+    pub ttl: Duration,
+    pub max_rows: u64,
+    pub max_bytes: u64,
+    pub max_total_snapshots: u64,
+    pub max_total_bytes: u64,
+}
+
+impl Default for QuerySnapshotLimits {
+    fn default() -> Self {
+        Self {
+            ttl: Duration::from_mins(5),
+            max_rows: 100_000,
+            max_bytes: 64 * 1024 * 1024,
+            max_total_snapshots: 32,
+            max_total_bytes: 128 * 1024 * 1024,
+        }
+    }
+}
+
 /// Metadata for an immutable, short-lived query snapshot.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct QuerySnapshot {
     pub snapshot_id: [u8; 16],
     pub processor_instance: String,
     pub collection: String,
+    pub query: OutputQuery,
     pub boundary_sequence: u64,
     pub row_count: u64,
     pub value_bytes: u64,
@@ -1747,7 +1775,7 @@ pub trait ProcessorArtifactStore: Send + Sync {
     ) -> Result<ProcessorArtifactExport, StoreError>;
 }
 
-async fn migrate(pool: &SqlitePool) -> Result<(), StoreError> {
+async fn migrate(pool: &SqlitePool, new_store: bool) -> Result<(), StoreError> {
     let encoded: Vec<u8> =
         sqlx::query_scalar("SELECT value FROM node_meta WHERE key = 'schema_version'")
             .fetch_one(pool)
@@ -1769,6 +1797,16 @@ async fn migrate(pool: &SqlitePool) -> Result<(), StoreError> {
             "database schema 0 cannot be upgraded by this binary".to_owned(),
         ));
     }
+    // Older stores encode finality 0 = optimistic inside postcard cursors and
+    // undo records; that value now means Preview and cannot be rewritten by
+    // SQL. Only the schema-1 bootstrap of a store created by this call may
+    // continue through the migration chain.
+    if !new_store && version < CURRENT_SCHEMA_VERSION {
+        return Err(StoreError::InvalidConfig(format!(
+            "database schema {version} predates the included/finalized vocabulary; \
+             delete the data directory and re-initialize"
+        )));
+    }
 
     let migrations = [
         (2, SCHEMA_V2),
@@ -1789,6 +1827,8 @@ async fn migrate(pool: &SqlitePool) -> Result<(), StoreError> {
         (17, SCHEMA_V17),
         (18, SCHEMA_V18),
         (19, SCHEMA_V19),
+        (20, SCHEMA_V20),
+        (21, SCHEMA_V21),
     ];
     let mut transaction = pool.begin().await?;
     for (target, migration) in migrations {
@@ -1891,7 +1931,7 @@ impl SqliteStore {
                 .await?;
         }
         sqlx::raw_sql(SCHEMA_V1).execute(&pool).await?;
-        migrate(&pool).await?;
+        migrate(&pool, new_store).await?;
         let now = now_i64()?;
         let mut hasher = blake3::Hasher::new();
         hasher.update(config.path.to_string_lossy().as_bytes());
@@ -2555,15 +2595,28 @@ impl SqliteStore {
             ));
         }
         let batch = overlay.into_batch();
-        let published_changes = if delivery_enabled && publish_changes {
+        // finalized_only processors park included-block changes until
+        // mark_finalized promotes them. Their bytes are still admitted against
+        // the delivery budget here so backpressure behaves like any other
+        // processor; the flush never re-checks capacity.
+        let defer_publication = matches!(descriptor.publication, PublicationPolicy::FinalizedOnly)
+            && delivery_enabled
+            && publish_changes
+            && cursor.finality != Finality::Finalized;
+        let admitted_changes = if delivery_enabled && publish_changes {
             batch.changes.as_slice()
         } else {
             &[]
         };
+        let published_changes = if defer_publication {
+            &[]
+        } else {
+            admitted_changes
+        };
         let publish_progress =
             delivery_enabled && delivery_stream_is_backfill(&self.inner.pool, stream_id).await?;
         let mut incoming_change_bytes =
-            published_changes.iter().try_fold(0_u64, |total, change| {
+            admitted_changes.iter().try_fold(0_u64, |total, change| {
                 let bytes = change
                     .key
                     .len()
@@ -2590,7 +2643,7 @@ impl SqliteStore {
             )
             .await?;
         }
-        let inverse_changes = if delivery_enabled && publish_changes {
+        let inverse_changes = if delivery_enabled && publish_changes && !defer_publication {
             build_inverse_changes(&batch)?
         } else {
             Vec::new()
@@ -2732,6 +2785,34 @@ impl SqliteStore {
                 &cursor,
                 encoded_cursor.expose(),
             )
+            .await?;
+        }
+        if defer_publication {
+            let block_bytes = postcard::to_allocvec(&delta.block)
+                .map_err(|error| StoreError::Encoding(error.to_string()))?;
+            let origin_bytes = postcard::to_allocvec(&delivery_origin)
+                .map_err(|error| StoreError::Encoding(error.to_string()))?;
+            let changes_bytes = postcard::to_allocvec(&batch.changes)
+                .map_err(|error| StoreError::Encoding(error.to_string()))?;
+            let sink_bytes = postcard::to_allocvec(sink_ids)
+                .map_err(|error| StoreError::Encoding(error.to_string()))?;
+            sqlx::query(
+                "INSERT INTO deferred_changes(
+                    instance, stream_id, chain_id, block_number, block_hash,
+                    block, origin, changes, sink_ids, bytes
+                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&instance)
+            .bind(stream_id)
+            .bind(u64_i64(cursor.chain_id.0, "chain_id")?)
+            .bind(u64_i64(cursor.block_number.0, "block_number")?)
+            .bind(cursor.block_hash.0.as_slice())
+            .bind(block_bytes)
+            .bind(origin_bytes)
+            .bind(changes_bytes)
+            .bind(sink_bytes)
+            .bind(u64_i64(incoming_change_bytes, "deferred delivery bytes")?)
+            .execute(&mut *transaction)
             .await?;
         }
         let (mut first, mut last) = if delivery_enabled {
@@ -4031,6 +4112,19 @@ impl SqliteStore {
         }
         let (first, last) = if descriptor.lifecycle.delivery.mode == DeliveryPolicyMode::None {
             (None, None)
+        } else if matches!(descriptor.publication, PublicationPolicy::FinalizedOnly) {
+            // Nothing was published for this block, so nothing is undone
+            // downstream; only the parked changes go away.
+            sqlx::query(
+                "DELETE FROM deferred_changes
+                 WHERE instance = ? AND block_number = ? AND block_hash = ?",
+            )
+            .bind(&instance)
+            .bind(u64_i64(block_number.0, "block_number")?)
+            .bind(block_hash.0.as_slice())
+            .execute(&mut *transaction)
+            .await?;
+            (None, None)
         } else {
             append_changes(
                 &mut transaction,
@@ -4120,6 +4214,71 @@ impl SqliteStore {
         .bind(finality_i64(Finality::Finalized))
         .execute(&mut *transaction)
         .await?;
+        let mut flushed_deferred = false;
+        if matches!(descriptor.publication, PublicationPolicy::FinalizedOnly)
+            && descriptor.lifecycle.delivery.mode != DeliveryPolicyMode::None
+        {
+            // Bytes were admitted at apply time, so no capacity check here:
+            // finality advancement must never fail on delivery pressure.
+            loop {
+                let rows = sqlx::query(
+                    "SELECT id, stream_id, chain_id, block, origin, changes, sink_ids
+                     FROM deferred_changes
+                     WHERE instance = ? AND block_number <= ?
+                     ORDER BY block_number, id
+                     LIMIT ?",
+                )
+                .bind(&instance)
+                .bind(u64_i64(through.0, "block_number")?)
+                .bind(i64::try_from(DEFERRED_FLUSH_BATCH).unwrap_or(i64::MAX))
+                .fetch_all(&mut *transaction)
+                .await?;
+                if rows.is_empty() {
+                    break;
+                }
+                for row in &rows {
+                    let id: i64 = row.try_get("id")?;
+                    let stream_id: String = row.try_get("stream_id")?;
+                    let chain_id = ChainId(i64_u64(row.try_get("chain_id")?, "deferred chain id")?);
+                    let block: BlockRef =
+                        postcard::from_bytes(&row.try_get::<Vec<u8>, _>("block")?)
+                            .map_err(|error| StoreError::Encoding(error.to_string()))?;
+                    let origin: DeliveryOrigin =
+                        postcard::from_bytes(&row.try_get::<Vec<u8>, _>("origin")?)
+                            .map_err(|error| StoreError::Encoding(error.to_string()))?;
+                    let changes: Vec<DomainChange> =
+                        postcard::from_bytes(&row.try_get::<Vec<u8>, _>("changes")?)
+                            .map_err(|error| StoreError::Encoding(error.to_string()))?;
+                    let sink_ids: Vec<String> =
+                        postcard::from_bytes(&row.try_get::<Vec<u8>, _>("sink_ids")?)
+                            .map_err(|error| StoreError::Encoding(error.to_string()))?;
+                    append_changes(
+                        &mut transaction,
+                        &instance,
+                        &stream_id,
+                        &origin,
+                        chain_id,
+                        block,
+                        Finality::Finalized,
+                        ChangeDirection::Apply,
+                        &changes,
+                        &sink_ids,
+                    )
+                    .await?;
+                    // Rows are ordered by block, not by insertion id, so a
+                    // block admitted early can carry a low id: delete exactly
+                    // what was published, never a cutoff.
+                    sqlx::query("DELETE FROM deferred_changes WHERE id = ?")
+                        .bind(id)
+                        .execute(&mut *transaction)
+                        .await?;
+                }
+                flushed_deferred = true;
+                if rows.len() < DEFERRED_FLUSH_BATCH {
+                    break;
+                }
+            }
+        }
         let mut checkpoint_cursor = cursor.clone();
         if let Some(finalized_cursor) = checkpoint_cursor.as_mut()
             && finalized_cursor.block_number <= through
@@ -4181,7 +4340,7 @@ impl SqliteStore {
             enforce_artifact_storage_capacity(&mut transaction, self.inner.artifact_budget).await?;
         }
         transaction.commit().await?;
-        if result.rows_affected() > 0 {
+        if result.rows_affected() > 0 || flushed_deferred {
             self.inner.delivery_changes_available.notify_waiters();
         }
         Ok(result.rows_affected())
@@ -5791,6 +5950,7 @@ impl SqliteStore {
         finality: Finality,
     ) -> Result<(), StoreError> {
         let _guard = self.inner.writer.lock().await;
+        let mut transaction = self.inner.pool.begin().await?;
         sqlx::query(
             "INSERT INTO canonical_blocks(
                 chain_id, block_number, block_hash, parent_hash, timestamp, finality
@@ -5804,7 +5964,7 @@ impl SqliteStore {
         .bind(block.parent_hash.0.as_slice())
         .bind(u64_i64(block.timestamp, "block timestamp")?)
         .bind(finality_i64(finality))
-        .execute(&self.inner.pool)
+        .execute(&mut *transaction)
         .await?;
         let stored: Vec<u8> = sqlx::query_scalar(
             "SELECT block_hash FROM canonical_blocks
@@ -5812,7 +5972,7 @@ impl SqliteStore {
         )
         .bind(u64_i64(chain_id.0, "chain_id")?)
         .bind(u64_i64(block.number.0, "block_number")?)
-        .fetch_one(&self.inner.pool)
+        .fetch_one(&mut *transaction)
         .await?;
         let stored = decode_hash(stored)?;
         if stored != block.hash {
@@ -5822,6 +5982,7 @@ impl SqliteStore {
                 incoming: block.hash,
             });
         }
+        transaction.commit().await?;
         Ok(())
     }
 
@@ -8518,12 +8679,53 @@ impl SqliteStore {
         descriptor: &ProcessorDescriptor,
         collection: &str,
         query: OutputQuery,
-        ttl: Duration,
-        max_rows: u64,
-        max_bytes: u64,
+        limits: QuerySnapshotLimits,
     ) -> Result<QuerySnapshot, StoreError> {
+        self.create_query_snapshot_inner(descriptor, collection, query, limits, false)
+            .await
+    }
+
+    /// Create a snapshot only if its explicit block range remains covered and
+    /// retained while holding the store writer lock.
+    ///
+    /// # Errors
+    /// Returns an error for an uncovered or pruned range, invalid admission
+    /// limits, or a failed database operation.
+    pub async fn create_covered_query_snapshot(
+        &self,
+        descriptor: &ProcessorDescriptor,
+        collection: &str,
+        query: OutputQuery,
+        limits: QuerySnapshotLimits,
+    ) -> Result<QuerySnapshot, StoreError> {
+        self.create_query_snapshot_inner(descriptor, collection, query, limits, true)
+            .await
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn create_query_snapshot_inner(
+        &self,
+        descriptor: &ProcessorDescriptor,
+        collection: &str,
+        query: OutputQuery,
+        limits: QuerySnapshotLimits,
+        require_coverage: bool,
+    ) -> Result<QuerySnapshot, StoreError> {
+        let QuerySnapshotLimits {
+            ttl,
+            max_rows,
+            max_bytes,
+            max_total_snapshots,
+            max_total_bytes,
+        } = limits;
         let query = query.validate()?;
-        if collection.is_empty() || ttl.is_zero() || max_rows == 0 || max_bytes == 0 {
+        if collection.is_empty()
+            || ttl.is_zero()
+            || max_rows == 0
+            || max_bytes == 0
+            || max_total_snapshots == 0
+            || max_total_bytes == 0
+        {
             return Err(StoreError::InvalidConfig(
                 "query snapshots require a collection and non-zero TTL/row/byte budgets".to_owned(),
             ));
@@ -8547,15 +8749,46 @@ impl SqliteStore {
             .map(|value| u64_i64(value, "query to timestamp"))
             .transpose()?;
         let _guard = self.inner.writer.lock().await;
-        let mut transaction = self.inner.pool.begin().await?;
+        if require_coverage && let Some((from, to)) = query.from_block.zip(query.to_block) {
+            let requested = BlockRange::new(from, to)
+                .map_err(|error| StoreError::InvalidConfig(error.to_string()))?;
+            if self.coverage(descriptor, requested).await? != [requested] {
+                return Err(StoreError::OutputRangeIncomplete { from, to });
+            }
+            if descriptor.lifecycle.output.mode == OutputPolicyMode::Window {
+                let block_floor = descriptor
+                    .lifecycle
+                    .output
+                    .window
+                    .and_then(|window| window.max_blocks);
+                let floor = if let Some(blocks) = block_floor {
+                    self.processor_cursor(descriptor).await?.map(|cursor| {
+                        BlockNumber(
+                            cursor
+                                .block_number
+                                .0
+                                .saturating_add(1)
+                                .saturating_sub(blocks),
+                        )
+                    })
+                } else {
+                    self.output_bounds(descriptor, collection)
+                        .await?
+                        .map(|bounds| bounds.earliest_block)
+                };
+                if floor.is_some_and(|floor| from < floor) {
+                    return Err(StoreError::OutputRangePruned);
+                }
+            }
+        }
         let now = now_i64()?;
         sqlx::query("DELETE FROM query_snapshots WHERE expires_at_unix_ms <= ?")
             .bind(now)
-            .execute(&mut *transaction)
+            .execute(&self.inner.pool)
             .await?;
         let row = sqlx::query(
             "SELECT COUNT(*) AS row_count,
-                    COALESCE(SUM(length(entity.value)), 0) AS value_bytes
+                    COALESCE(SUM(length(entity.value) + length(entity.entity_key) + 128), 0) AS value_bytes
              FROM entities AS entity
              JOIN output_entity_meta AS meta
                ON meta.instance = entity.instance
@@ -8577,7 +8810,7 @@ impl SqliteStore {
         .bind(from_timestamp)
         .bind(to_timestamp)
         .bind(to_timestamp)
-        .fetch_one(&mut *transaction)
+        .fetch_one(&self.inner.pool)
         .await?;
         let row_count = i64_u64(row.try_get("row_count")?, "query snapshot rows")?;
         let value_bytes = i64_u64(row.try_get("value_bytes")?, "query snapshot bytes")?;
@@ -8589,12 +8822,35 @@ impl SqliteStore {
                 max_bytes,
             });
         }
+        let totals = sqlx::query(
+            "SELECT COUNT(*) AS count, COALESCE(SUM(value_bytes), 0) AS bytes FROM query_snapshots",
+        )
+        .fetch_one(&self.inner.pool)
+        .await?;
+        let count = i64_u64(totals.try_get("count")?, "active query snapshots")?;
+        let bytes = i64_u64(totals.try_get("bytes")?, "active query snapshot bytes")?;
+        if count >= max_total_snapshots || bytes.saturating_add(value_bytes) > max_total_bytes {
+            return Err(StoreError::QuerySnapshotCapacity {
+                max_snapshots: max_total_snapshots,
+                max_bytes: max_total_bytes,
+            });
+        }
+        // Allow for B-tree pages, indexes and WAL copies before entering a write
+        // transaction; admission may checkpoint/vacuum under physical pressure.
+        enforce_physical_store_capacity(
+            &self.inner,
+            value_bytes.saturating_mul(4).saturating_add(16_384),
+        )
+        .await?;
+        let mut transaction = self.inner.pool.begin().await?;
         let pruned: i64 = sqlx::query_scalar(
             "SELECT pruned_through_sequence FROM delivery_streams WHERE stream_id = ?",
         )
         .bind(&stream_id)
-        .fetch_one(&mut *transaction)
-        .await?;
+        .fetch_optional(&mut *transaction)
+        .await?
+        // Output-only processors deliberately have no delivery stream.
+        .unwrap_or(0);
         let boundary: i64 = sqlx::query_scalar(
             "SELECT COALESCE(MAX(stream_sequence), ?) FROM change_log WHERE stream_id = ?",
         )
@@ -8612,8 +8868,9 @@ impl SqliteStore {
         sqlx::query(
             "INSERT INTO query_snapshots(
                 snapshot_id, instance, collection, boundary_sequence,
-                row_count, value_bytes, created_at_unix_ms, expires_at_unix_ms
-             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                row_count, value_bytes, created_at_unix_ms, expires_at_unix_ms,
+                from_block, to_block, from_timestamp, to_timestamp
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(snapshot_id.as_slice())
         .bind(&instance)
@@ -8623,6 +8880,10 @@ impl SqliteStore {
         .bind(u64_i64(value_bytes, "query snapshot bytes")?)
         .bind(now)
         .bind(expires)
+        .bind(from_block)
+        .bind(to_block)
+        .bind(from_timestamp)
+        .bind(to_timestamp)
         .execute(&mut *transaction)
         .await?;
         sqlx::query(
@@ -8663,12 +8924,28 @@ impl SqliteStore {
             snapshot_id,
             processor_instance: instance,
             collection: collection.to_owned(),
+            query,
             boundary_sequence: boundary,
             row_count,
             value_bytes,
             created_at_unix_ms: i64_u64(now, "query snapshot creation time")?,
             expires_at_unix_ms: i64_u64(expires, "query snapshot expiry")?,
         })
+    }
+
+    /// Remove expired snapshots and their copied entities independently of reads.
+    ///
+    /// # Errors
+    /// Returns an error if the clock or database operation fails.
+    pub async fn prune_expired_query_snapshots(&self) -> Result<u64, StoreError> {
+        let _guard = self.inner.writer.lock().await;
+        Ok(
+            sqlx::query("DELETE FROM query_snapshots WHERE expires_at_unix_ms <= ?")
+                .bind(now_i64()?)
+                .execute(&self.inner.pool)
+                .await?
+                .rows_affected(),
+        )
     }
 
     /// Read one page from an immutable query snapshot.
@@ -8695,7 +8972,8 @@ impl SqliteStore {
         let instance = processor_instance(descriptor);
         let row = sqlx::query(
             "SELECT instance, collection, boundary_sequence, row_count,
-                    value_bytes, created_at_unix_ms, expires_at_unix_ms
+                    value_bytes, created_at_unix_ms, expires_at_unix_ms,
+                    from_block, to_block, from_timestamp, to_timestamp
              FROM query_snapshots WHERE snapshot_id = ?",
         )
         .bind(snapshot_id.as_slice())
@@ -8716,6 +8994,24 @@ impl SqliteStore {
             snapshot_id,
             processor_instance: stored_instance,
             collection: stored_collection,
+            query: OutputQuery {
+                from_block: row
+                    .try_get::<Option<i64>, _>("from_block")?
+                    .map(|value| i64_u64(value, "snapshot from block").map(BlockNumber))
+                    .transpose()?,
+                to_block: row
+                    .try_get::<Option<i64>, _>("to_block")?
+                    .map(|value| i64_u64(value, "snapshot to block").map(BlockNumber))
+                    .transpose()?,
+                from_timestamp: row
+                    .try_get::<Option<i64>, _>("from_timestamp")?
+                    .map(|value| i64_u64(value, "snapshot from timestamp"))
+                    .transpose()?,
+                to_timestamp: row
+                    .try_get::<Option<i64>, _>("to_timestamp")?
+                    .map(|value| i64_u64(value, "snapshot to timestamp"))
+                    .transpose()?,
+            },
             boundary_sequence: i64_u64(
                 row.try_get("boundary_sequence")?,
                 "query snapshot boundary",
@@ -8975,6 +9271,33 @@ impl SqliteStore {
         .await
     }
 
+    /// Read a resumable default-stream page from one consistent database snapshot.
+    ///
+    /// An omitted cursor starts at the earliest retained record. An explicit
+    /// cursor, including zero, must still be covered by retention.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ChangeCursorExpired` when pruning has overtaken the cursor,
+    /// or an error for invalid limits, stream identity, or stored data.
+    pub async fn resumable_changes(
+        &self,
+        descriptor: &ProcessorDescriptor,
+        chain_id: ChainId,
+        after: Option<u64>,
+        limit: usize,
+    ) -> Result<Vec<ChangeRecord>, StoreError> {
+        self.read_changes_in_stream(
+            descriptor,
+            &default_delivery_stream_id(descriptor),
+            chain_id,
+            after,
+            limit,
+            true,
+        )
+        .await
+    }
+
     /// Read committed changes from one explicit delivery stream.
     ///
     /// # Errors
@@ -8989,6 +9312,27 @@ impl SqliteStore {
         after_sequence: u64,
         limit: usize,
     ) -> Result<Vec<ChangeRecord>, StoreError> {
+        self.read_changes_in_stream(
+            descriptor,
+            stream_id,
+            chain_id,
+            Some(after_sequence),
+            limit,
+            false,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    async fn read_changes_in_stream(
+        &self,
+        descriptor: &ProcessorDescriptor,
+        stream_id: &str,
+        chain_id: ChainId,
+        after: Option<u64>,
+        limit: usize,
+        check_retention: bool,
+    ) -> Result<Vec<ChangeRecord>, StoreError> {
         if limit == 0 || limit > 10_000 {
             return Err(StoreError::InvalidConfig(
                 "change limit must be in 1..=10000".to_owned(),
@@ -8996,6 +9340,39 @@ impl SqliteStore {
         }
         self.validate_delivery_stream(&processor_instance(descriptor), stream_id)
             .await?;
+        // The watermark and page must share a read transaction: a separate
+        // check followed by a read would race the delivery pruner.
+        let mut transaction = self.inner.pool.begin().await?;
+        let after_sequence = if check_retention {
+            let pruned: i64 = sqlx::query_scalar(
+                "SELECT pruned_through_sequence FROM delivery_streams WHERE stream_id = ?",
+            )
+            .bind(stream_id)
+            .fetch_one(&mut *transaction)
+            .await?;
+            let pruned = i64_u64(pruned, "pruned delivery sequence")?;
+            if after.is_some_and(|sequence| sequence < pruned) {
+                let (earliest, latest): (Option<i64>, Option<i64>) = sqlx::query_as(
+                    "SELECT MIN(stream_sequence), MAX(stream_sequence) FROM change_log WHERE stream_id = ?",
+                )
+                .bind(stream_id)
+                .fetch_one(&mut *transaction)
+                .await?;
+                return Err(StoreError::ChangeCursorExpired(ChangeBounds {
+                    earliest: earliest
+                        .map(|value| i64_u64(value, "earliest change"))
+                        .transpose()?
+                        .unwrap_or(pruned.saturating_add(1)),
+                    latest: latest
+                        .map(|value| i64_u64(value, "latest change"))
+                        .transpose()?
+                        .unwrap_or(pruned),
+                }));
+            }
+            after.unwrap_or(pruned)
+        } else {
+            after.unwrap_or(0)
+        };
         let rows = sqlx::query(
             "SELECT stream_sequence, encoding_version, chain_id,
                     origin_kind, origin_id, publication_revision,
@@ -9009,8 +9386,9 @@ impl SqliteStore {
         .bind(stream_id)
         .bind(u64_i64(after_sequence, "sequence")?)
         .bind(usize_i64(limit, "limit")?)
-        .fetch_all(&self.inner.pool)
+        .fetch_all(&mut *transaction)
         .await?;
+        transaction.commit().await?;
         rows.into_iter()
             .map(|row| {
                 let sequence = i64_u64(row.try_get("stream_sequence")?, "sequence")?;
@@ -14574,6 +14952,15 @@ async fn enforce_delivery_capacity(
             .fetch_one(pool)
             .await?;
     let current = i64_u64(current, "delivery stream bytes")?;
+    let deferred_stream: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(SUM(bytes), 0) FROM deferred_changes WHERE stream_id = ?",
+    )
+    .bind(stream_id)
+    .fetch_one(pool)
+    .await?;
+    let current = current
+        .checked_add(i64_u64(deferred_stream, "deferred delivery bytes")?)
+        .ok_or(StoreError::Numeric("retained delivery bytes"))?;
     let limit = backfill_limits
         .as_ref()
         .map_or(descriptor.lifecycle.delivery.max_bytes, |limits| {
@@ -14622,6 +15009,13 @@ async fn enforce_delivery_capacity(
     .fetch_one(pool)
     .await?;
     let total_retained = i64_u64(total_retained, "total retained delivery bytes")?;
+    let deferred_total: i64 =
+        sqlx::query_scalar("SELECT COALESCE(SUM(bytes), 0) FROM deferred_changes")
+            .fetch_one(pool)
+            .await?;
+    let total_retained = total_retained
+        .checked_add(i64_u64(deferred_total, "deferred delivery bytes")?)
+        .ok_or(StoreError::Numeric("total retained delivery bytes"))?;
     let history_retained = i64_u64(history_retained, "history retained delivery bytes")?;
     let projected_total_retained =
         total_retained
@@ -15172,16 +15566,16 @@ fn decode_operation(value: i64) -> Result<ChangeOperation, StoreError> {
 
 fn finality_i64(finality: Finality) -> i64 {
     match finality {
-        Finality::Optimistic => 0,
-        Finality::Safe => 1,
+        Finality::Preview => 0,
+        Finality::Included => 1,
         Finality::Finalized => 2,
     }
 }
 
 fn decode_finality(value: i64) -> Result<Finality, StoreError> {
     match value {
-        0 => Ok(Finality::Optimistic),
-        1 => Ok(Finality::Safe),
+        0 => Ok(Finality::Preview),
+        1 => Ok(Finality::Included),
         2 => Ok(Finality::Finalized),
         _ => Err(StoreError::Invariant(format!(
             "invalid finality value {value}"
@@ -15589,6 +15983,14 @@ fn state_error(error: impl std::fmt::Display) -> ProcessorError {
 
 #[derive(Debug, Error)]
 pub enum StoreError {
+    #[error("requested output range {from:?}..{to:?} has unindexed gaps")]
+    OutputRangeIncomplete { from: BlockNumber, to: BlockNumber },
+    #[error("requested output range is outside the retained window")]
+    OutputRangePruned,
+
+    #[error("change cursor predates retained delivery bounds {0:?}")]
+    ChangeCursorExpired(ChangeBounds),
+
     #[error("invalid store configuration: {0}")]
     InvalidConfig(String),
     #[error("SQLite operation failed: {0}")]
@@ -15741,6 +16143,10 @@ pub enum StoreError {
         max_rows: u64,
         max_bytes: u64,
     },
+    #[error(
+        "aggregate query snapshot capacity reached ({max_snapshots} snapshots/{max_bytes} bytes); release snapshots or retry after expiry"
+    )]
+    QuerySnapshotCapacity { max_snapshots: u64, max_bytes: u64 },
     #[error("query snapshot is absent or expired; create a new snapshot")]
     QuerySnapshotExpired,
     #[error("query snapshot belongs to another processor instance or collection")]
@@ -15865,11 +16271,11 @@ mod tests {
                         log_fields: leani_primitives::LogFieldSet::NONE,
                         allow_filtered: false,
                         filter: FilterScope::default(),
-                        minimum_finality: Finality::Optimistic,
+                        minimum_finality: Finality::Included,
                     }],
                     mode: ReductionMode::OrderedState,
                     delivery_ordering: DeliveryOrdering::Canonical,
-                    publication: PublicationPolicy::OptimisticAndFinalized,
+                    publication: PublicationPolicy::IncludedAndFinalized,
                     lifecycle: LifecyclePolicies::from_legacy(RetentionPolicy::LatestState),
                     schemas: ProcessorSchemas {
                         delta_version: 1,
@@ -15976,7 +16382,7 @@ mod tests {
                 parent_hash: parent,
                 timestamp: number,
             },
-            finality: Finality::Optimistic,
+            finality: Finality::Included,
             header: leani_primitives::Material::Complete(leani_primitives::HeaderEnvelope {
                 rlp: None,
                 transactions_root: None,
@@ -16087,7 +16493,7 @@ mod tests {
 
         assert!(matches!(
             store
-                .retain_finalized_artifact(&processor.descriptor, &first, Finality::Optimistic)
+                .retain_finalized_artifact(&processor.descriptor, &first, Finality::Included)
                 .await,
             Err(StoreError::InvalidConfig(_))
         ));
@@ -16914,8 +17320,404 @@ mod tests {
         }
     }
 
+    fn finalized_only_processor() -> FixtureProcessor {
+        let mut processor = FixtureProcessor::new();
+        processor.descriptor.publication = PublicationPolicy::FinalizedOnly;
+        processor
+    }
+
+    fn healthy_sibling_processor() -> FixtureProcessor {
+        let mut processor = FixtureProcessor::new();
+        processor.descriptor.id = ProcessorId::new("healthy").expect("id");
+        processor.descriptor.instance = ProcessorInstanceId::legacy(
+            &processor.descriptor.id,
+            &processor.descriptor.version,
+            processor.descriptor.config_hash,
+        );
+        processor
+    }
+
+    async fn deferred_rows(store: &SqliteStore, processor: &FixtureProcessor) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM deferred_changes WHERE instance = ?")
+            .bind(processor_instance(&processor.descriptor))
+            .fetch_one(&store.inner.pool)
+            .await
+            .expect("count deferred rows")
+    }
+
     #[tokio::test]
-    async fn upgrades_a_v1_change_log_in_place() {
+    async fn finalized_only_defers_included_changes_and_drops_them_on_undo() {
+        let (_directory, store) = store().await;
+        let processor = finalized_only_processor();
+        let block = frame(1, BlockHash::ZERO);
+        assert_eq!(block.finality, Finality::Included);
+        let delta = processor.map(&block).await.expect("map");
+        store
+            .apply(&processor, cursor(&processor, &block, 1), &delta, &[])
+            .await
+            .expect("apply included block");
+
+        assert!(
+            store
+                .changes(&processor.descriptor, ChainId(1), 0, 100)
+                .await
+                .expect("changes")
+                .is_empty()
+        );
+        assert_eq!(deferred_rows(&store, &processor).await, 1);
+
+        store
+            .undo(
+                &processor.descriptor,
+                block.chain_id,
+                block.block.number,
+                block.block.hash,
+                &[],
+            )
+            .await
+            .expect("undo included block");
+        assert!(
+            store
+                .changes(&processor.descriptor, ChainId(1), 0, 100)
+                .await
+                .expect("changes after undo")
+                .is_empty()
+        );
+        assert_eq!(deferred_rows(&store, &processor).await, 0);
+    }
+
+    #[tokio::test]
+    async fn finalized_only_publishes_finalized_blocks_immediately() {
+        let (_directory, store) = store().await;
+        let processor = finalized_only_processor();
+        let mut block = frame(1, BlockHash::ZERO);
+        block.finality = Finality::Finalized;
+        let delta = processor.map(&block).await.expect("map");
+        store
+            .apply(&processor, cursor(&processor, &block, 1), &delta, &[])
+            .await
+            .expect("apply finalized block");
+
+        let changes = store
+            .changes(&processor.descriptor, ChainId(1), 0, 100)
+            .await
+            .expect("changes");
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].finality, Finality::Finalized);
+        assert_eq!(changes[0].direction, ChangeDirection::Apply);
+        assert_eq!(deferred_rows(&store, &processor).await, 0);
+    }
+
+    #[tokio::test]
+    async fn deferred_bytes_count_toward_the_delivery_limit_without_stalling_siblings() {
+        let (_directory, store) = store().await;
+        let mut slow = finalized_only_processor();
+        slow.descriptor.lifecycle.delivery.max_bytes = 30;
+        let healthy = healthy_sibling_processor();
+
+        let mut parent = BlockHash::ZERO;
+        for number in 1..=2 {
+            let current = frame(number, parent);
+            parent = current.block.hash;
+            let delta = slow.map(&current).await.expect("map");
+            store
+                .apply(&slow, cursor(&slow, &current, number), &delta, &[])
+                .await
+                .expect("apply below hard limit");
+        }
+        assert_eq!(deferred_rows(&store, &slow).await, 2);
+        assert!(
+            store
+                .changes(&slow.descriptor, ChainId(1), 0, 100)
+                .await
+                .expect("changes")
+                .is_empty()
+        );
+
+        let third = frame(3, parent);
+        let third_delta = slow.map(&third).await.expect("map third");
+        assert!(matches!(
+            store
+                .apply(&slow, cursor(&slow, &third, 3), &third_delta, &[])
+                .await,
+            Err(StoreError::DeliveryLimit {
+                action: DeliveryLimitAction::Pause,
+                ..
+            })
+        ));
+        assert_eq!(
+            store
+                .processor_runtime_state(&slow.descriptor)
+                .await
+                .expect("paused state")
+                .state,
+            ProcessorRunState::Paused
+        );
+
+        // A sibling processor on the same store keeps publishing.
+        let block = frame(1, BlockHash::ZERO);
+        let delta = healthy.map(&block).await.expect("map healthy");
+        store
+            .apply(&healthy, cursor(&healthy, &block, 1), &delta, &[])
+            .await
+            .expect("healthy sibling applies");
+        assert_eq!(
+            store
+                .changes(&healthy.descriptor, ChainId(1), 0, 100)
+                .await
+                .expect("healthy changes")
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn finalized_only_publishes_deferred_changes_when_finality_advances() {
+        let (_directory, store) = store().await;
+        let processor = finalized_only_processor();
+        let first = frame(1, BlockHash::ZERO);
+        let second = frame(2, first.block.hash);
+        let third = frame(3, second.block.hash);
+        for (sequence, block) in [(1, &first), (2, &second), (3, &third)] {
+            let delta = processor.map(block).await.expect("map");
+            store
+                .apply(&processor, cursor(&processor, block, sequence), &delta, &[])
+                .await
+                .expect("apply included block");
+        }
+        assert!(
+            store
+                .changes(&processor.descriptor, ChainId(1), 0, 100)
+                .await
+                .expect("changes before finality")
+                .is_empty()
+        );
+
+        store
+            .mark_finalized(&processor.descriptor, BlockNumber(2))
+            .await
+            .expect("finalize through block 2");
+
+        let changes = store
+            .changes(&processor.descriptor, ChainId(1), 0, 100)
+            .await
+            .expect("changes after finality");
+        let summary: Vec<_> = changes
+            .iter()
+            .map(|change| {
+                (
+                    change.block.number.0,
+                    change.finality,
+                    change.direction,
+                    change.change.kind.as_str(),
+                    change.origin.kind,
+                )
+            })
+            .collect();
+        assert_eq!(
+            summary,
+            vec![
+                (
+                    1,
+                    Finality::Finalized,
+                    ChangeDirection::Apply,
+                    "fixture.counter",
+                    DeliveryOriginKind::Live
+                ),
+                (
+                    2,
+                    Finality::Finalized,
+                    ChangeDirection::Apply,
+                    "fixture.counter",
+                    DeliveryOriginKind::Live
+                ),
+                (
+                    2,
+                    Finality::Finalized,
+                    ChangeDirection::Finalized,
+                    "system.finality",
+                    DeliveryOriginKind::Live
+                ),
+            ]
+        );
+        assert_eq!(deferred_rows(&store, &processor).await, 1);
+        let sequences: Vec<u64> = changes
+            .iter()
+            .map(|change| change.cursor.sequence)
+            .collect();
+        let mut sorted = sequences.clone();
+        sorted.sort_unstable();
+        assert_eq!(
+            sequences, sorted,
+            "flushed records must be appended in block order"
+        );
+    }
+
+    /// `frame` truncates the block number to one byte for its hash; wide
+    /// ranges need distinct hashes per block.
+    fn wide_frame(number: u64, parent: BlockHash) -> BlockFrame {
+        let mut current = frame(number, parent);
+        let mut hash = [0_u8; 32];
+        hash[..8].copy_from_slice(&number.to_be_bytes());
+        hash[8] = 0xa5;
+        current.block.hash = BlockHash::new(hash);
+        current
+    }
+
+    #[tokio::test]
+    async fn deferred_flush_crosses_batch_boundaries_in_order() {
+        let (_directory, store) = store().await;
+        let processor = finalized_only_processor();
+        let total = u64::try_from(DEFERRED_FLUSH_BATCH).expect("batch fits u64") + 4;
+        let mut parent = BlockHash::ZERO;
+        for number in 1..=total {
+            let current = wide_frame(number, parent);
+            parent = current.block.hash;
+            let delta = processor.map(&current).await.expect("map");
+            store
+                .apply(
+                    &processor,
+                    cursor(&processor, &current, number),
+                    &delta,
+                    &[],
+                )
+                .await
+                .expect("apply included block");
+        }
+        assert_eq!(
+            deferred_rows(&store, &processor).await,
+            i64::try_from(total).expect("fits")
+        );
+
+        store
+            .mark_finalized(&processor.descriptor, BlockNumber(total))
+            .await
+            .expect("finalize everything");
+
+        let changes = store
+            .changes(
+                &processor.descriptor,
+                ChainId(1),
+                0,
+                usize::try_from(total).expect("fits") + 8,
+            )
+            .await
+            .expect("changes after finality");
+        let applies: Vec<u64> = changes
+            .iter()
+            .filter(|change| change.direction == ChangeDirection::Apply)
+            .map(|change| change.block.number.0)
+            .collect();
+        assert_eq!(applies, (1..=total).collect::<Vec<_>>());
+        assert_eq!(deferred_rows(&store, &processor).await, 0);
+    }
+
+    #[tokio::test]
+    async fn deferred_flush_deletes_only_the_rows_it_published() {
+        // Block-local processors can apply out of order, so insertion ids do
+        // not follow block numbers. A later block admitted first must survive a
+        // flush that publishes the earlier blocks around it.
+        let (_directory, store) = store().await;
+        let mut processor = FixtureProcessor::block_output();
+        processor.descriptor.publication = PublicationPolicy::FinalizedOnly;
+        let batch = u64::try_from(DEFERRED_FLUSH_BATCH).expect("batch fits u64");
+        let last = batch + 4;
+        let mut order = vec![last];
+        order.extend(1..last);
+        for (sequence, number) in order.iter().copied().enumerate() {
+            let current = wide_frame(number, BlockHash::ZERO);
+            let delta = processor.map(&current).await.expect("map");
+            store
+                .apply(
+                    &processor,
+                    cursor(
+                        &processor,
+                        &current,
+                        u64::try_from(sequence).expect("fits") + 1,
+                    ),
+                    &delta,
+                    &[],
+                )
+                .await
+                .expect("apply included block");
+        }
+
+        store
+            .mark_finalized(&processor.descriptor, BlockNumber(last))
+            .await
+            .expect("finalize everything");
+
+        let changes = store
+            .changes(
+                &processor.descriptor,
+                ChainId(1),
+                0,
+                usize::try_from(last).expect("fits") + 8,
+            )
+            .await
+            .expect("changes after finality");
+        let mut applies: Vec<u64> = changes
+            .iter()
+            .filter(|change| change.direction == ChangeDirection::Apply)
+            .map(|change| change.block.number.0)
+            .collect();
+        applies.sort_unstable();
+        assert_eq!(applies, (1..=last).collect::<Vec<_>>());
+        assert_eq!(deferred_rows(&store, &processor).await, 0);
+    }
+
+    #[tokio::test]
+    async fn stores_from_before_the_included_vocabulary_are_refused() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("node.sqlite");
+        let store = SqliteStore::open(StoreConfig::new(&path))
+            .await
+            .expect("open fresh store");
+        sqlx::query("UPDATE node_meta SET value = X'00000014' WHERE key = 'schema_version'")
+            .execute(&store.inner.pool)
+            .await
+            .expect("rewind schema to 20");
+        store.inner.pool.close().await;
+
+        let error = SqliteStore::open(StoreConfig::new(&path))
+            .await
+            .expect_err("schema 20 must be refused");
+        assert!(error.to_string().contains("re-initialize"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn fresh_stores_have_the_deferred_changes_table() {
+        let (_directory, store) = store().await;
+        let columns: Vec<String> = sqlx::query_scalar(
+            "SELECT name FROM pragma_table_info('deferred_changes') ORDER BY cid",
+        )
+        .fetch_all(&store.inner.pool)
+        .await
+        .expect("columns");
+        assert_eq!(
+            columns,
+            [
+                "id",
+                "instance",
+                "stream_id",
+                "chain_id",
+                "block_number",
+                "block_hash",
+                "block",
+                "origin",
+                "changes",
+                "sink_ids",
+                "bytes",
+            ]
+        );
+        assert_eq!(
+            store.stats().await.expect("stats").schema_version,
+            CURRENT_SCHEMA_VERSION
+        );
+    }
+
+    #[tokio::test]
+    async fn pre_existing_v1_stores_are_refused() {
         let directory = tempfile::tempdir().expect("tempdir");
         let path = directory.path().join("legacy.sqlite");
         let options =
@@ -16933,26 +17735,15 @@ mod tests {
             .expect("v1 schema");
         pool.close().await;
 
-        let store = SqliteStore::open(StoreConfig::new(&path))
+        let error = SqliteStore::open(StoreConfig::new(&path))
             .await
-            .expect("migrate");
-        assert_eq!(
-            store.stats().await.expect("stats").schema_version,
-            CURRENT_SCHEMA_VERSION
-        );
-        let columns: Vec<String> =
-            sqlx::query_scalar("SELECT name FROM pragma_table_info('change_log') ORDER BY cid")
-                .fetch_all(&store.inner.pool)
-                .await
-                .expect("columns");
-        assert!(columns.iter().any(|column| column == "parent_hash"));
-        assert!(columns.iter().any(|column| column == "block_timestamp"));
-        assert!(columns.iter().any(|column| column == "finality"));
+            .expect_err("pre-existing schema 1 store must be refused");
+        assert!(error.to_string().contains("re-initialize"), "{error}");
     }
 
     #[tokio::test]
     #[allow(clippy::too_many_lines)]
-    async fn unacknowledged_changes_survive_a_v7_to_v8_upgrade() {
+    async fn pre_existing_v7_stores_are_refused() {
         let directory = tempfile::tempdir().expect("tempdir");
         let path = directory.path().join("v6-delivery.sqlite");
         let store = SqliteStore::open(StoreConfig::new(&path))
@@ -16997,7 +17788,6 @@ mod tests {
                 .acknowledged_sequence,
             0
         );
-        let epoch = store.epoch();
         store.inner.pool.close().await;
         drop(store);
 
@@ -17011,6 +17801,10 @@ mod tests {
             .expect("downgrade fixture pool");
         sqlx::raw_sql(
             "
+            ALTER TABLE query_snapshots DROP COLUMN from_block;
+            ALTER TABLE query_snapshots DROP COLUMN to_block;
+            ALTER TABLE query_snapshots DROP COLUMN from_timestamp;
+            ALTER TABLE query_snapshots DROP COLUMN to_timestamp;
             DROP TRIGGER processor_artifact_totals_processor_insert;
             DROP TRIGGER processor_artifact_totals_artifact_insert;
             DROP TRIGGER processor_artifact_totals_artifact_delete;
@@ -17102,29 +17896,10 @@ mod tests {
         .expect("represent the pre-v8 binary schema");
         pool.close().await;
 
-        let upgraded = SqliteStore::open(StoreConfig::new(&path))
+        let error = SqliteStore::open(StoreConfig::new(&path))
             .await
-            .expect("upgrade to v8");
-        assert_eq!(upgraded.epoch(), epoch);
-        assert_eq!(
-            upgraded.stats().await.expect("stats").schema_version,
-            CURRENT_SCHEMA_VERSION
-        );
-        let replayed = upgraded
-            .consumer_changes(&processor.descriptor, ChainId(1), "upgrade-replay", 100)
-            .await
-            .expect("replay unacknowledged changes");
-        assert_eq!(replayed, delivered);
-        assert!(
-            replayed
-                .iter()
-                .all(|change| change.delivery_encoding_version == 1)
-        );
-        let acknowledged = upgraded
-            .acknowledge_consumer(&processor.descriptor, "upgrade-replay", 2)
-            .await
-            .expect("acknowledge after upgrade");
-        assert_eq!(acknowledged.acknowledged_sequence, 2);
+            .expect_err("pre-existing schema 7 store must be refused");
+        assert!(error.to_string().contains("re-initialize"), "{error}");
     }
 
     #[tokio::test]
@@ -18055,9 +18830,12 @@ mod tests {
                 &processor.descriptor,
                 "state",
                 OutputQuery::default(),
-                Duration::from_mins(1),
-                100,
-                1 << 20,
+                QuerySnapshotLimits {
+                    ttl: Duration::from_mins(1),
+                    max_rows: 100,
+                    max_bytes: 1 << 20,
+                    ..QuerySnapshotLimits::default()
+                },
             )
             .await
             .expect("snapshot");
@@ -18094,6 +18872,131 @@ mod tests {
                 .expect("current entity"),
             Some(2_u64.to_be_bytes().to_vec())
         );
+    }
+
+    #[tokio::test]
+    async fn query_snapshot_admission_is_aggregate_and_expiry_reclaims_rows() {
+        let (_directory, store) = store().await;
+        let processor = FixtureProcessor::new();
+        let block = frame(1, BlockHash::ZERO);
+        let delta = processor.map(&block).await.expect("map");
+        store
+            .apply(&processor, cursor(&processor, &block, 1), &delta, &[])
+            .await
+            .expect("apply");
+        let limits = QuerySnapshotLimits {
+            max_total_snapshots: 1,
+            ..QuerySnapshotLimits::default()
+        };
+        let snapshot = store
+            .create_query_snapshot(
+                &processor.descriptor,
+                "state",
+                OutputQuery::default(),
+                limits,
+            )
+            .await
+            .expect("first");
+        assert!(matches!(
+            store
+                .create_query_snapshot(
+                    &processor.descriptor,
+                    "state",
+                    OutputQuery::default(),
+                    limits
+                )
+                .await,
+            Err(StoreError::QuerySnapshotCapacity { .. })
+        ));
+        let byte_limits = QuerySnapshotLimits {
+            max_total_snapshots: 10,
+            max_total_bytes: snapshot.value_bytes,
+            ..limits
+        };
+        assert!(matches!(
+            store
+                .create_query_snapshot(
+                    &processor.descriptor,
+                    "state",
+                    OutputQuery::default(),
+                    byte_limits
+                )
+                .await,
+            Err(StoreError::QuerySnapshotCapacity { .. })
+        ));
+        store
+            .release_query_snapshot(&processor.descriptor, snapshot.snapshot_id)
+            .await
+            .expect("release");
+        let replacement = store
+            .create_query_snapshot(
+                &processor.descriptor,
+                "state",
+                OutputQuery::default(),
+                limits,
+            )
+            .await
+            .expect("released capacity");
+        // Advance the persisted deadline without a wall-clock sleep or another query.
+        sqlx::query("UPDATE query_snapshots SET expires_at_unix_ms = 0")
+            .execute(&store.inner.pool)
+            .await
+            .expect("expire fixture");
+        assert_eq!(
+            store
+                .prune_expired_query_snapshots()
+                .await
+                .expect("periodic cleanup"),
+            1
+        );
+        let copied_rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM query_snapshot_entities")
+            .fetch_one(&store.inner.pool)
+            .await
+            .expect("copied rows");
+        assert_eq!(copied_rows, 0);
+        assert!(matches!(
+            store
+                .query_snapshot_page(
+                    &processor.descriptor,
+                    "state",
+                    replacement.snapshot_id,
+                    None,
+                    10
+                )
+                .await,
+            Err(StoreError::QuerySnapshotExpired)
+        ));
+    }
+
+    #[tokio::test]
+    async fn query_snapshot_respects_physical_store_capacity() {
+        let directory = tempfile::tempdir().expect("directory");
+        let store = SqliteStore::open(
+            StoreConfig::new(directory.path().join("node.sqlite")).with_storage_budget(
+                StoreStorageBudget {
+                    maximum_physical_bytes: 1,
+                },
+            ),
+        )
+        .await
+        .expect("open");
+        let processor = FixtureProcessor::new();
+        assert!(matches!(
+            store
+                .create_query_snapshot(
+                    &processor.descriptor,
+                    "state",
+                    OutputQuery::default(),
+                    QuerySnapshotLimits::default()
+                )
+                .await,
+            Err(StoreError::PhysicalStorageLimit { .. })
+        ));
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM query_snapshots")
+            .fetch_one(&store.inner.pool)
+            .await
+            .expect("snapshots");
+        assert_eq!(count, 0);
     }
 
     #[tokio::test]
@@ -19840,6 +20743,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rejected_canonical_anchor_does_not_finalize_the_conflicting_stored_block() {
+        let (_directory, store) = store().await;
+        let block = frame(1, BlockHash::ZERO).block;
+        store
+            .store_canonical_anchor(ChainId(1), block, Finality::Included)
+            .await
+            .expect("optimistic block");
+        let conflicting = BlockRef {
+            hash: BlockHash::new([0xff; 32]),
+            ..block
+        };
+        let error = store
+            .store_canonical_anchor(ChainId(1), conflicting, Finality::Finalized)
+            .await
+            .expect_err("conflicting hash");
+        assert!(matches!(error, StoreError::CanonicalConflict { .. }));
+        assert_eq!(
+            store
+                .finalized_canonical_head(ChainId(1))
+                .await
+                .expect("finalized head"),
+            None
+        );
+        store
+            .store_canonical_anchor(ChainId(1), block, Finality::Finalized)
+            .await
+            .expect("matching finalized anchor");
+        assert_eq!(
+            store
+                .finalized_canonical_head(ChainId(1))
+                .await
+                .expect("finalized head"),
+            Some(block)
+        );
+    }
+
+    #[tokio::test]
     async fn finalized_canonical_head_is_chain_scoped_and_monotonic() {
         let (_directory, store) = store().await;
         let first = frame(1, BlockHash::ZERO);
@@ -19849,7 +20789,7 @@ mod tests {
             .await
             .expect("finalized anchor");
         store
-            .store_canonical_anchor(ChainId(1), second.block, Finality::Optimistic)
+            .store_canonical_anchor(ChainId(1), second.block, Finality::Included)
             .await
             .expect("optimistic head");
         assert_eq!(

@@ -223,12 +223,16 @@ impl CanonicalKey {
     }
 }
 
-/// Execution-chain confidence. Ordering is intentional.
+/// Chain-confidence status of a block. Ordering is intentional.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[repr(u8)]
 pub enum Finality {
-    Optimistic = 0,
-    Safe = 1,
+    /// A peer supplied the block; its connection to the chain is still being
+    /// checked. Only the embedded CLI emits this; it is never persisted.
+    Preview = 0,
+    /// The block is on the currently followed chain. A reorg can remove it.
+    Included = 1,
+    /// Ethereum consensus has finalized the block.
     Finalized = 2,
 }
 
@@ -242,8 +246,8 @@ impl Finality {
     #[must_use]
     pub const fn name(self) -> &'static str {
         match self {
-            Self::Optimistic => "optimistic",
-            Self::Safe => "safe",
+            Self::Preview => "preview",
+            Self::Included => "included",
             Self::Finalized => "finalized",
         }
     }
@@ -273,10 +277,14 @@ mod tests {
     }
 
     #[test]
-    fn finality_is_monotonic() {
-        assert!(Finality::Finalized.satisfies(Finality::Optimistic));
-        assert!(Finality::Safe.satisfies(Finality::Safe));
-        assert!(!Finality::Optimistic.satisfies(Finality::Safe));
+    fn finality_is_monotonic_and_named() {
+        assert!(Finality::Finalized.satisfies(Finality::Included));
+        assert!(Finality::Included.satisfies(Finality::Preview));
+        assert!(!Finality::Preview.satisfies(Finality::Included));
+        assert!(!Finality::Included.satisfies(Finality::Finalized));
+        assert_eq!(Finality::Preview.name(), "preview");
+        assert_eq!(Finality::Included.name(), "included");
+        assert_eq!(Finality::Finalized.name(), "finalized");
     }
 
     #[test]

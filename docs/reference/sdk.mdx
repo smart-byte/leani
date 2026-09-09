@@ -1,6 +1,6 @@
 ---
 title: TypeScript SDK
-description: Generated member inventory for the exported LeaniClient TypeScript contract.
+description: Typed queries, snapshot lifecycle, resumable streams, and generated public SDK contracts.
 section: reference
 order: 30
 audience:
@@ -11,8 +11,61 @@ generated: true
 
 import ReferenceTable from '@docs/components/docs/ReferenceTable.astro';
 
-Install the public package as `@leani/sdk`. This inventory is generated from the
-exported `LeaniClient` interface in `packages/sdk/src/index.ts`; it is not a
-separate handwritten API list.
+The public package is `@leani/sdk`, for Node 20+ and Bun 1.2+. In a source
+checkout, run `bun install --cwd packages/sdk` and `bun run --cwd packages/sdk build`.
+The [query/follow guide](/docs/guides/query-then-follow/) includes an executable
+client, a matching node config, and pagination/reset handling.
+
+For a node started with `leani init blocks` and `leani serve`:
+
+```ts
+import { createLeaniClient } from "@leani/sdk";
+
+const leani = createLeaniClient({ baseUrl: "http://127.0.0.1:18080" });
+const stop = new AbortController();
+for await (const change of leani.blocks.subscribe({ signal: stop.signal })) {
+  if (change.operation === "apply" && change.data) {
+    console.log(change.data.blockNumber);
+  }
+}
+```
+
+Pass an `AbortSignal` to cancel an idle subscription; breaking out of the loop
+also cancels its response body. Transport disconnects reconnect from the last
+yielded cursor. Protocol errors and expired history require application action.
+An incomplete final event is discarded before reconnecting. Retryable HTTP
+errors, including rate limiting, use the configured reconnect backoff.
+This print-only example does not maintain state; stateful consumers must apply
+undo mutations too.
+
+Typed subscriptions accept `processor` to select a configured instance, for
+example `leani.blobs.subscribe({ processor: "blobs-production" })`. The blobs
+apply payload is `{ block, transactions }`. Narrow `operation` before reading
+processor data: `finalized` carries `{ throughBlock }` instead. Discover canonical
+query paths with `capabilities()` and pass `queryBasePaths` when aliases are
+ambiguous.
+
+`queryAndFollow()` returns the **first page** of an immutable snapshot and its
+stream boundary. Follow every `nextCursor` with `queryEntities()`, release the
+snapshot in `finally`, then subscribe from `boundaryCursor`. SSE resets throw
+`ResetRequiredError`; HTTP expiry throws `LeaniError` with `code: "cursor_expired"`
+or `"query_snapshot_expired"`. Rebuild the seed for either case.
+
+`queryEntities()` also works when delivery is disabled; its `boundaryCursor`
+and `recovery.follow` are then `null`. `queryAndFollow()` requires delivery and
+returns a `FollowSnapshotPage` with a non-null boundary, or HTTP 409
+`delivery_disabled`. The stream and change endpoints return the same error
+when delivery is disabled.
+
+Durable live/history sessions live in `@leani/sdk/backfill`. Construct them with
+`createBackfillSubscriptionClient({ baseUrl, token, fetch, timeoutMs })`; both
+entry points use the same `LeaniError` class and HTTP error fields (`status`,
+`code`, `retryable`, `requestId`). The deadline applies to JSON requests, not to
+established streams. Always close delivery sessions in `finally`. Commit
+idempotent destination writes before acknowledging a batch. See
+[durable delivery](/docs/concepts/durable-delivery/) for lease and reset semantics.
+
+The inventory below is generated from both public entry points and shared error
+types. The `backfill.*` members belong to the backfill client.
 
 <ReferenceTable kind="sdk" />

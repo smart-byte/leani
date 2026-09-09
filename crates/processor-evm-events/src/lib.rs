@@ -176,11 +176,11 @@ impl EvmEventsProcessor {
                     }],
                     ..FilterScope::default()
                 },
-                minimum_finality: Finality::Optimistic,
+                minimum_finality: Finality::Included,
             }],
             mode: ReductionMode::BlockLocal,
             delivery_ordering: DeliveryOrdering::BlockVersionedIdempotent,
-            publication: PublicationPolicy::OptimisticAndFinalized,
+            publication: PublicationPolicy::IncludedAndFinalized,
             lifecycle: LifecyclePolicies::from_legacy(RetentionPolicy::FullOutputHistory),
             schemas: ProcessorSchemas {
                 delta_version: 1,
@@ -759,7 +759,7 @@ mod tests {
                 parent_hash: BlockHash::ZERO,
                 timestamp: 125,
             },
-            finality: Finality::Optimistic,
+            finality: Finality::Included,
             header: Material::Missing(leani_primitives::MissingReason::NotRequested),
             transactions: Material::Missing(leani_primitives::MissingReason::NotRequested),
             receipts: Material::Missing(leani_primitives::MissingReason::NotRequested),

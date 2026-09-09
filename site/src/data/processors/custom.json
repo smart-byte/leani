@@ -31,7 +31,7 @@
       "chainId": 1,
       "requested": null,
       "available": [
-        { "fromBlock": 25650000, "toBlock": 25696396, "finality": "optimistic" }
+        { "fromBlock": 25650000, "toBlock": 25696396, "finality": "included" }
       ],
       "configuredStartBlock": 25650000,
       "processedThrough": 25696396,
@@ -55,7 +55,7 @@
       "parentHash": "0x0141a01b6e38f75cd3606834c3780f581d5772460e440e7c5758b69589929168",
       "timestamp": 1786025147
     },
-    "finality": "optimistic",
+    "finality": "included",
     "kind": "example.block_summary.put",
     "schema": "example.block-summary.change.v1",
     "key": "0x000000000188188c",

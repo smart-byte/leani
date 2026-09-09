@@ -54,7 +54,7 @@ use url::Url;
 const BLOCKS_PER_FILE: u64 = 8_192;
 const MAX_CATALOG_BYTES: u64 = 16 * 1_024 * 1_024;
 const MAX_CATALOG_OBJECTS: usize = 16_384;
-const RETH_REVISION: &str = "8eb210175687c9f0c889a3b6795c16781d830e3a";
+const RETH_REVISION: &str = "5a6940e351fed80458fe6c9da8581cbe4b8bd036";
 
 /// Construction settings for one archive mirror.
 #[derive(Clone, Debug)]

@@ -57,6 +57,7 @@ export default defineConfig({
       components: {
         Banner: './src/components/docs/PreviewBanner.astro',
         EditLink: './src/components/docs/EditLink.astro',
+        MobileMenuToggle: './src/components/docs/MobileMenuToggle.astro',
         Pagination: './src/components/docs/Pagination.astro',
         Sidebar: './src/components/docs/Sidebar.astro',
       },

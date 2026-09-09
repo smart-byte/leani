@@ -173,37 +173,43 @@ async function configReference(repositoryRoot: string): Promise<JsonObject> {
 }
 
 async function sdkReference(repositoryRoot: string): Promise<JsonObject> {
-  const require = siteRequire(repositoryRoot);
-  const ts = require('typescript') as any;
-  const path = resolve(repositoryRoot, 'packages/sdk/src/index.ts');
-  const source = await readFile(path, 'utf8');
-  const sourceFile = ts.createSourceFile(path, source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
-  const declaration = sourceFile.statements.find(
-    (statement: any) => ts.isInterfaceDeclaration(statement) && statement.name.text === 'LeaniClient',
-  );
-  if (!declaration) throw new Error('packages/sdk/src/index.ts: missing exported LeaniClient interface');
-
+  const ts = siteRequire(repositoryRoot)('typescript') as any;
   const methods: JsonObject[] = [];
-  const memberName = (member: any): string => member.name?.getText(sourceFile).replace(/^['"]|['"]$/g, '') ?? '';
-  const visit = (members: readonly any[], prefix = ''): void => {
-    for (const member of members) {
-      const name = memberName(member);
-      if (!name) continue;
-      const qualified = prefix ? `${prefix}.${name}` : name;
-      if (ts.isPropertySignature(member) && member.type && ts.isTypeLiteralNode(member.type)) {
-        visit(member.type.members, qualified);
-        continue;
+  const types: JsonObject[] = [];
+  for (const module of ['index', 'backfill', 'errors']) {
+    const path = `packages/sdk/src/${module}.ts`;
+    const source = await readFile(resolve(repositoryRoot, path), 'utf8');
+    const file = ts.createSourceFile(path, source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+    const visit = (members: readonly any[], prefix = ''): void => {
+      for (const member of members) {
+        const name = member.name?.getText(file).replace(/^['"]|['"]$/g, '') ?? '';
+        if (!name) continue;
+        const qualified = prefix ? `${prefix}.${name}` : name;
+        if (ts.isPropertySignature(member) && member.type && ts.isTypeLiteralNode(member.type)) {
+          visit(member.type.members, qualified);
+          continue;
+        }
+        methods.push({ name: qualified, kind: ts.isMethodSignature(member) ? 'method' : 'property',
+          signature: member.getText(file).replace(/\s+/g, ' ').replace(/;$/, '') });
       }
-      methods.push({
-        name: qualified,
-        kind: ts.isMethodSignature(member) ? 'method' : 'property',
-        signature: member.getText(sourceFile).replace(/\s+/g, ' ').replace(/;$/, ''),
-      });
+    };
+    for (const statement of file.statements) {
+      if (!statement.modifiers?.some((modifier: any) => modifier.kind === ts.SyntaxKind.ExportKeyword)) continue;
+      const name = statement.name?.text;
+      if (!name) continue;
+      if (ts.isInterfaceDeclaration(statement) && ['LeaniClient', 'BackfillSubscriptionClient'].includes(name)) {
+        visit(statement.members, module === 'backfill' ? 'backfill' : '');
+      }
+      if (ts.isInterfaceDeclaration(statement) || ts.isTypeAliasDeclaration(statement)) {
+        types.push({ name, module: module === 'backfill' ? '@leani/sdk/backfill' : '@leani/sdk', signature: statement.getText(file) });
+      } else if (ts.isFunctionDeclaration(statement) && module !== 'errors') {
+        types.push({ name, module: module === 'backfill' ? '@leani/sdk/backfill' : '@leani/sdk',
+          signature: source.slice(statement.getStart(file), statement.body?.pos ?? statement.end).trim() + ';' });
+      }
     }
-  };
-  visit(declaration.members);
+  }
   if (methods.length < 25) throw new Error(`SDK extraction found only ${methods.length} members`);
-  return { schemaVersion: 1, source: 'packages/sdk/src/index.ts', methods };
+  return { schemaVersion: 1, source: 'packages/sdk/src/{index,backfill,errors}.ts', methods, types };
 }
 
 export async function generateReference(repositoryRoot: string): Promise<void> {

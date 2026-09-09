@@ -1,0 +1,29 @@
+---
+import DefaultMobileMenuToggle from '@astrojs/starlight/components/MobileMenuToggle.astro';
+---
+
+<DefaultMobileMenuToggle />
+
+<script>
+  const marker = 'data-leani-expanded-sync';
+
+  function syncDisclosureState() {
+    document.querySelectorAll<HTMLElement>('starlight-menu-button').forEach((menu) => {
+      if (menu.hasAttribute(marker)) return;
+      const button = menu.querySelector<HTMLButtonElement>('button');
+      if (!button) return;
+
+      const sync = () =>
+        button.setAttribute('aria-expanded', String(menu.getAttribute('aria-expanded') === 'true'));
+      new MutationObserver(sync).observe(menu, {
+        attributes: true,
+        attributeFilter: ['aria-expanded'],
+      });
+      menu.setAttribute(marker, '');
+      sync();
+    });
+  }
+
+  syncDisclosureState();
+  document.addEventListener('astro:page-load', syncDisclosureState);
+</script>

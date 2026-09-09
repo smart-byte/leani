@@ -63,8 +63,7 @@ pub struct DataRequest {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum FinalityModel {
     None,
-    Optimistic,
-    Safe,
+    Included,
     Finalized,
 }
 
@@ -73,8 +72,7 @@ impl FinalityModel {
     pub const fn supports(self, required: Finality) -> bool {
         match self {
             Self::None => false,
-            Self::Optimistic => matches!(required, Finality::Optimistic),
-            Self::Safe => !matches!(required, Finality::Finalized),
+            Self::Included => !matches!(required, Finality::Finalized),
             Self::Finalized => true,
         }
     }

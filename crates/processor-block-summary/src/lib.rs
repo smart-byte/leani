@@ -77,11 +77,11 @@ impl BlockSummaryProcessor {
                 log_fields: leani_primitives::LogFieldSet::NONE,
                 allow_filtered: false,
                 filter: FilterScope::default(),
-                minimum_finality: Finality::Optimistic,
+                minimum_finality: Finality::Included,
             }],
             mode: ReductionMode::BlockLocal,
             delivery_ordering: DeliveryOrdering::BlockVersionedIdempotent,
-            publication: PublicationPolicy::OptimisticAndFinalized,
+            publication: PublicationPolicy::IncludedAndFinalized,
             lifecycle: LifecyclePolicies::from_legacy(RetentionPolicy::FullOutputHistory),
             schemas: ProcessorSchemas {
                 delta_version: 1,
@@ -184,8 +184,8 @@ impl Processor for BlockSummaryProcessor {
         delta.validate(&self.descriptor)?;
         let decoded: BlockSummaryEntity = postcard::from_bytes(&delta.payload)
             .map_err(|error| ProcessorError::DeltaPayload(error.to_string()))?;
-        let mut checksums = Vec::with_capacity(3);
-        for finality in [Finality::Optimistic, Finality::Safe, Finality::Finalized] {
+        let mut checksums = Vec::with_capacity(2);
+        for finality in [Finality::Included, Finality::Finalized] {
             let mut entity = decoded.clone();
             entity.finality = finality;
             let payload = postcard::to_allocvec(&entity)
@@ -311,7 +311,7 @@ mod tests {
 
     fn frame() -> BlockFrame {
         let mut frame = fixture_frame(42, BlockHash::new([41; 32]));
-        frame.finality = Finality::Optimistic;
+        frame.finality = Finality::Included;
         frame.transactions = Material::Complete(
             (0..2_u32)
                 .map(|index| TransactionEnvelope {
@@ -385,7 +385,7 @@ mod tests {
             .expect("change JSON")
             .expect("owned JSON");
         assert_eq!(json["blockNumber"], 42);
-        assert_eq!(json["finality"], "optimistic");
+        assert_eq!(json["finality"], "included");
         assert_eq!(json["blockHash"], frame.block.hash.to_string());
         assert!(
             reducer
@@ -411,7 +411,7 @@ mod tests {
         let checksums = processor
             .finality_variant_checksums(&delta)
             .expect("variants");
-        assert_eq!(checksums.len(), 3);
+        assert_eq!(checksums.len(), 2);
 
         let unrelated = EncodedDelta::new(
             processor.descriptor(),

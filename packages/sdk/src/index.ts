@@ -1,3 +1,6 @@
+import { LeaniError, responseError, errorFromBody } from "./errors.ts";
+export { LeaniError, type LeaniErrorBody } from "./errors.ts";
+
 export const SDK_VERSION = "0.1.0" as const;
 
 export type {
@@ -7,7 +10,7 @@ export type {
 } from "./openapi.generated.ts";
 
 export type Hex = `0x${string}`;
-export type Finality = "optimistic" | "safe" | "finalized";
+export type Finality = "preview" | "included" | "finalized";
 export type ChangeOperation =
   | "apply"
   | "undo"
@@ -205,16 +208,21 @@ export interface GenericSnapshotPage<T = unknown> {
   data: GenericOutputEntity<T>[];
   nextCursor: string | null;
   snapshotId: string;
-  boundaryCursor: string;
+  boundaryCursor: string | null;
   rowCount: string;
   valueBytes: string;
   expiresAtUnixMs: string;
   retainedBounds: OutputBounds | null;
   coverage: ProcessorCoverage;
   recovery: {
-    follow: string;
+    follow: string | null;
     outsideRetention: "create_processor_instance_or_source_scan";
   };
+}
+
+export interface FollowSnapshotPage<T = unknown> extends GenericSnapshotPage<T> {
+  boundaryCursor: string;
+  recovery: GenericSnapshotPage<T>["recovery"] & { follow: string };
 }
 
 export interface OutputQueryOptions {
@@ -365,11 +373,10 @@ export interface LatestBlockSummary {
   data: BlockSummary;
 }
 
-export interface ChangeEnvelope<T = unknown> {
+export interface ChangeMetadata {
   apiVersion: "1";
   sequence: string;
   cursor: string;
-  operation: ChangeOperation;
   originKind:
     | "live"
     | "live_recovery"
@@ -388,12 +395,22 @@ export interface ChangeEnvelope<T = unknown> {
   kind: string;
   schema: string;
   key: string | null;
-  data: T | null;
   /** Present only on `reset_required` events, as the current coverage hint. */
   coverage?: ProcessorCoverage;
   /** RFC 3339 UTC emission time with millisecond precision. */
   emittedAt: string;
 }
+
+/** System transitions never pretend to contain a processor entity payload. */
+export type ChangeEnvelope<T = unknown> = ChangeMetadata & (
+  | { operation: "apply" | "undo"; data: T | null }
+  | { operation: "finalized"; data: { throughBlock: number } }
+  | { operation: "reset_required"; data: {
+      earliestAvailableSequence: string;
+      latestAvailableSequence: string;
+      action: "query_snapshot_then_resume";
+    } }
+);
 
 export interface LiveLaneReset {
   processor: string;
@@ -414,43 +431,6 @@ export interface StreamHello {
   chainId: number;
   processor: ProcessorSummary;
   coverage: ProcessorCoverage;
-}
-
-export interface LeaniErrorBody {
-  error: {
-    code: string;
-    message: string;
-    retryable: boolean;
-    details?: Record<string, unknown> | null;
-    requestId: string;
-  };
-}
-
-export class LeaniError extends Error {
-  readonly status: number;
-  readonly code: string;
-  readonly retryable: boolean;
-  readonly details?: Record<string, unknown> | null;
-  readonly requestId?: string;
-
-  constructor(
-    message: string,
-    options: {
-      status: number;
-      code: string;
-      retryable: boolean;
-      details?: Record<string, unknown> | null;
-      requestId?: string;
-    },
-  ) {
-    super(message);
-    this.name = "LeaniError";
-    this.status = options.status;
-    this.code = options.code;
-    this.retryable = options.retryable;
-    this.details = options.details;
-    this.requestId = options.requestId;
-  }
 }
 
 export class ResetRequiredError extends LeaniError {
@@ -495,6 +475,11 @@ export interface SubscribeOptions {
   signal?: AbortSignal;
   /** Receives the connection handshake frame; called once per (re)connect. */
   onHello?: (hello: StreamHello) => void;
+}
+
+/** Select a configured instance when more than one processor has this kind. */
+export interface ProcessorSubscribeOptions extends SubscribeOptions {
+  processor?: string;
 }
 
 export interface LeaniClient {
@@ -542,11 +527,12 @@ export interface LeaniClient {
       collection: string,
       options?: OutputQueryOptions,
     ): Promise<GenericSnapshotPage<T>>;
+    /** First snapshot page plus an atomic stream boundary. Read all nextCursor pages and releaseSnapshot before following. */
     queryAndFollow<T = unknown>(
       id: string,
       collection: string,
       options?: Omit<OutputQueryOptions, "cursor">,
-    ): Promise<GenericSnapshotPage<T>>;
+    ): Promise<FollowSnapshotPage<T>>;
     getEntity<T = unknown>(
       id: string,
       collection: string,
@@ -623,8 +609,8 @@ export interface LeaniClient {
       signal?: AbortSignal;
     }): Promise<BlobSchedule>;
     subscribe(
-      options?: SubscribeOptions,
-    ): AsyncGenerator<ChangeEnvelope<BlobsBlock | BlobTransaction>>;
+      options?: ProcessorSubscribeOptions,
+    ): AsyncGenerator<ChangeEnvelope<BlobsSnapshotEntry>>;
   };
   erc20: {
     getBalance(
@@ -633,7 +619,7 @@ export interface LeaniClient {
       options?: { signal?: AbortSignal },
     ): Promise<Erc20Balance>;
     subscribe(
-      options?: SubscribeOptions,
+      options?: ProcessorSubscribeOptions,
     ): AsyncGenerator<ChangeEnvelope<Erc20Balance>>;
   };
   uniswap: {
@@ -650,7 +636,7 @@ export interface LeaniClient {
       signal?: AbortSignal;
     }): Promise<ConfiguredUniswapPools>;
     subscribe(
-      options?: SubscribeOptions,
+      options?: ProcessorSubscribeOptions,
     ): AsyncGenerator<ChangeEnvelope<UniswapPoolPrice>>;
   };
   blocks: {
@@ -663,7 +649,7 @@ export interface LeaniClient {
       options?: { processor?: string; signal?: AbortSignal },
     ): Promise<LatestBlockSummary>;
     subscribe(
-      options?: SubscribeOptions,
+      options?: ProcessorSubscribeOptions,
     ): AsyncGenerator<ChangeEnvelope<BlockSummary>>;
   };
 }
@@ -844,7 +830,7 @@ export function createLeaniClient(
         collection: string,
         queryOptions: Omit<OutputQueryOptions, "cursor"> = {},
       ) =>
-        post<GenericSnapshotPage<T>>(
+        post<FollowSnapshotPage<T>>(
           `v1/processors/${encodeURIComponent(id)}/collections/${encodeURIComponent(collection)}/query-and-follow`,
           outputQueryBody(queryOptions),
           queryOptions.signal,
@@ -1033,9 +1019,9 @@ export function createLeaniClient(
           },
           { signal: scheduleOptions.signal },
         ),
-      subscribe: (subscribeOptions: SubscribeOptions = {}) =>
-        subscribe<BlobsBlock | BlobTransaction>(
-          "blobs-money",
+      subscribe: (subscribeOptions: ProcessorSubscribeOptions = {}) =>
+        subscribe<BlobsSnapshotEntry>(
+          subscribeOptions.processor ?? "blobs-money",
           subscribeOptions,
         ),
     }),
@@ -1050,8 +1036,8 @@ export function createLeaniClient(
           undefined,
           options,
         ),
-      subscribe: (subscribeOptions: SubscribeOptions = {}) =>
-        subscribe<Erc20Balance>("erc20-balances", subscribeOptions),
+      subscribe: (subscribeOptions: ProcessorSubscribeOptions = {}) =>
+        subscribe<Erc20Balance>(subscribeOptions.processor ?? "erc20-balances", subscribeOptions),
     }),
     uniswap: Object.freeze({
       getPool: (
@@ -1080,8 +1066,8 @@ export function createLeaniClient(
           undefined,
           { signal: options.signal },
         ),
-      subscribe: (subscribeOptions: SubscribeOptions = {}) =>
-        subscribe<UniswapPoolPrice>("uniswap-observations", subscribeOptions),
+      subscribe: (subscribeOptions: ProcessorSubscribeOptions = {}) =>
+        subscribe<UniswapPoolPrice>(subscribeOptions.processor ?? "uniswap-observations", subscribeOptions),
     }),
     blocks: Object.freeze({
       getLatest: (
@@ -1101,8 +1087,8 @@ export function createLeaniClient(
           undefined,
           { signal: options.signal },
         ),
-      subscribe: (subscribeOptions: SubscribeOptions = {}) =>
-        subscribe<BlockSummary>("block-summary", subscribeOptions),
+      subscribe: (subscribeOptions: ProcessorSubscribeOptions = {}) =>
+        subscribe<BlockSummary>(subscribeOptions.processor ?? "block-summary", subscribeOptions),
     }),
   });
 }
@@ -1272,7 +1258,7 @@ async function* subscribeProcessor<T>(
     }
     if (!response.ok) {
       const error = await responseError(response);
-      if (!error.retryable || response.status < 500) {
+      if (!error.retryable) {
         throw error;
       }
       await abortableDelay(jitter(delayMs, options.reconnect.jitter), subscribeOptions.signal);
@@ -1287,28 +1273,39 @@ async function* subscribeProcessor<T>(
       });
     }
     delayMs = options.reconnect.initialDelayMs;
-    for await (const message of parseSse(response.body)) {
-      if (!message.data) {
-        continue;
+    try {
+      for await (const message of parseSse(response.body, subscribeOptions.signal)) {
+        if (!message.data) {
+          continue;
+        }
+        if (message.event === "hello") {
+          subscribeOptions.onHello?.(JSON.parse(message.data) as StreamHello);
+          continue;
+        }
+        if (message.event === "error") {
+          throw errorFromBody(200, JSON.parse(message.data));
+        }
+        const change = JSON.parse(message.data) as ChangeEnvelope<T>;
+        validateChangeEnvelope(change);
+        if (change.operation === "reset_required") {
+          throw new ResetRequiredError(change as ChangeEnvelope);
+        }
+
+        if (
+          lastSequence !== undefined &&
+          compareSequences(change.sequence, lastSequence) <= 0
+        ) {
+          continue;
+        }
+        lastSequence = change.sequence;
+        after = change.cursor;
+        yield change;
       }
-      if (message.event === "hello") {
-        subscribeOptions.onHello?.(JSON.parse(message.data) as StreamHello);
-        continue;
-      }
-      const change = JSON.parse(message.data) as ChangeEnvelope<T>;
-      validateChangeEnvelope(change);
-      if (
-        lastSequence !== undefined &&
-        compareSequences(change.sequence, lastSequence) <= 0
-      ) {
-        continue;
-      }
-      if (change.operation === "reset_required") {
-        throw new ResetRequiredError(change as ChangeEnvelope);
-      }
-      lastSequence = change.sequence;
-      after = change.cursor;
-      yield change;
+    } catch (error) {
+      if (subscribeOptions.signal?.aborted) return;
+      if (!(error instanceof StreamReadError)) throw error;
+      // Resume only transport failures; malformed events and user callbacks
+      // must fail visibly instead of entering an endless reconnect loop.
     }
     if (subscribeOptions.signal?.aborted) {
       break;
@@ -1327,18 +1324,27 @@ interface SseMessage {
   data?: string;
 }
 
+class StreamReadError extends Error {}
+
 export async function* parseSse(
   body: ReadableStream<Uint8Array>,
+  signal?: AbortSignal,
 ): AsyncGenerator<SseMessage> {
   const reader = body.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
+  const cancel = () => { void reader.cancel().catch(() => undefined); };
+  signal?.addEventListener("abort", cancel, { once: true });
+  if (signal?.aborted) cancel();
   try {
     while (true) {
-      const { done, value } = await reader.read();
+      const { done, value } = await reader.read().catch((cause: unknown) => {
+        throw new StreamReadError("SSE connection interrupted", { cause });
+      });
       buffer += decoder.decode(value, { stream: !done });
       let boundary = findSseFrameBoundary(buffer, done);
       while (boundary) {
+        if (signal?.aborted) return;
         const frame = buffer.slice(0, boundary.index);
         buffer = buffer.slice(boundary.index + boundary.length);
         const parsed = parseSseFrame(frame);
@@ -1348,14 +1354,14 @@ export async function* parseSse(
         boundary = findSseFrameBoundary(buffer, done);
       }
       if (done) {
-        const parsed = parseSseFrame(buffer);
-        if (parsed) {
-          yield parsed;
-        }
+        // Only a blank line completes an SSE event. Discard a partial final
+        // frame so reconnect resumes from the last fully delivered cursor.
         break;
       }
     }
   } finally {
+    signal?.removeEventListener("abort", cancel);
+    await reader.cancel().catch(() => undefined);
     reader.releaseLock();
   }
 }
@@ -1442,31 +1448,14 @@ function headers(
   return result;
 }
 
-async function responseError(response: Response): Promise<LeaniError> {
-  let body: LeaniErrorBody | undefined;
-  try {
-    body = (await response.json()) as LeaniErrorBody;
-  } catch {
-    // Fall through to the status-derived error without exposing response text.
-  }
-  return new LeaniError(
-    body?.error.message ?? `Leani returned HTTP ${response.status}`,
-    {
-      status: response.status,
-      code: body?.error.code ?? "internal",
-      retryable: body?.error.retryable ?? response.status >= 500,
-      details: body?.error.details,
-      requestId: body?.error.requestId,
-    },
-  );
-}
-
 function validateChangeEnvelope(value: ChangeEnvelope): void {
   if (
+    !value ||
     value.apiVersion !== "1" ||
     !/^\d+$/.test(value.sequence) ||
     typeof value.cursor !== "string" ||
     value.cursor.length === 0 ||
+    !["apply", "undo", "finalized", "reset_required"].includes(value.operation) ||
     typeof value.schema !== "string" ||
     value.schema.length === 0
   ) {
@@ -1501,7 +1490,7 @@ export async function applyEntityChange<T>(
   target: EntityChangeTarget<T>,
   change: ChangeEnvelope<T>,
 ): Promise<void> {
-  if (!change.key) {
+  if ((change.operation !== "apply" && change.operation !== "undo") || !change.key) {
     return;
   }
   if (change.data === null || change.kind.endsWith(".delete")) {

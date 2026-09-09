@@ -70,7 +70,7 @@ Compact Ethereum Mainnet configurations expand to:
 |---|---|
 | execution | native P2P, one-peer availability floor, 16-peer healthy target, 100-peer cap |
 | history | public Xatu source, on-demand processor scheduling |
-| processor | selected built-in feed, optimistic and finalized output, checkpointed state, 256-block undo safety |
+| processor | selected built-in feed, included and finalized output, checkpointed state, 256-block undo safety |
 | resources | 512 MiB memory, 2 GiB temporary disk, four source and mapper tasks |
 | retention | full query output; 64 MiB or 24 hours of change delivery |
 | listeners | ephemeral P2P ports, RPC `127.0.0.1:18545`/`18546`, API `127.0.0.1:18080` |
@@ -129,7 +129,7 @@ It is deliberately not nested under delivery: artifacts, materialized views,
 correctness metadata, and delivery share the same physical capacity.
 
 `[budgets.artifacts]` independently caps immutable finalized artifact bytes and
-optimistic candidate bytes awaiting finality. A transaction that would exceed
+included-block candidate bytes awaiting finality. A transaction that would exceed
 either logical limit rolls back without advancing processor coverage. A
 processor's `window` policy may prune its own instance below a tighter bound;
 the node-wide artifact budget still protects against the aggregate of many
@@ -217,7 +217,7 @@ id = "evm-events"              # registered processor kind
 instance = "weth-transfer-v1"  # stable operator-selected identity
 version = "1.0.0"
 start_block = 12965000
-publish = "optimistic_and_finalized"
+publish = "included_and_finalized"
 ```
 
 Changing processor code, semantic version, settings, start point, or source
@@ -226,9 +226,10 @@ existing cursor namespace.
 
 Publication values are:
 
-- `finalized_only`: publish only finalized results; no normal reorg undo is
-  exposed.
-- `optimistic_and_finalized`: publish apply/undo/finality transitions and keep
+- `finalized_only`: publish only finalized `apply` records. Included-block
+  changes wait in the store for verified finality, count against the delivery
+  budget meanwhile, and undo is never published.
+- `included_and_finalized`: publish apply/undo/finality transitions and keep
   an unfinalized undo window.
 - `terminal_only`: a bounded backfill publishes its terminal aggregate and
   then becomes complete/reclaimable. Deletion remains explicit.
@@ -246,7 +247,7 @@ checkpoint, and undo semantics cannot be inferred from one overloaded setting.
 ### State
 
 `[processors.state] mode` is `ephemeral`, `durable`, or `checkpointed`.
-Optimistic publication cannot use ephemeral state.
+Included publication cannot use ephemeral state.
 
 ### Artifacts
 
@@ -311,7 +312,7 @@ explicitly through the API and are not covered by automatic checkpoint
 pruning.
 
 `[processors.undo] mode` is `none` or `unfinalized`.
-`optimistic_and_finalized` requires `unfinalized`; `safety_blocks` extends the
+`included_and_finalized` requires `unfinalized`; `safety_blocks` extends the
 bounded correctness window.
 
 ## API and credentials

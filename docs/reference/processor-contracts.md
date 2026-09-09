@@ -44,6 +44,12 @@ Supported ABI values are `address`, `bool`, fixed `bytes1..bytes32`, and
 anonymous events, duplicate signatures, malformed keys, and more than three
 indexed fields fail deterministically during `doctor`.
 
+
+`publish = "finalized_only"` holds included-block changes in the store until
+verified finality promotes them. The stream then contains only finalized
+`apply` records and `system.finality` markers; no `undo` is ever published.
+Held bytes count against `[processors.delivery] max_bytes` from admission.
+
 ```toml
 [[processors]]
 id = "evm-events"
@@ -157,7 +163,7 @@ id = "erc20-balances"
 instance = "erc20-watchlist"
 version = "1.0.0"
 start_block = 1234567
-publish = "optimistic_and_finalized"
+publish = "included_and_finalized"
 
 [processors.state]
 mode = "durable"
@@ -196,7 +202,7 @@ block hash with a canonical block-number index; the query extension exposes
 receipts.
 
 The compact `[blocks]` preset supplies the standard checkpointed lifecycle,
-full query output, 64 MiB/24 hour delivery window, and 256-block optimistic undo
+full query output, 64 MiB/24 hour delivery window, and 256-block included-block undo
 window. Advanced configurations can override those policies explicitly.
 
 ## uniswap-observations 2.1.0 / uniswap-latest 2.0.0
@@ -228,7 +234,7 @@ id = "uniswap-observations" # or "uniswap-latest"
 instance = "usdc-weth-observations"
 version = "2.1.0" # use 2.0.0 with uniswap-latest
 start_block = 12369621
-publish = "optimistic_and_finalized"
+publish = "included_and_finalized"
 history_control = "node_owned"
 history_mode = "on_demand"
 

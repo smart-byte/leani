@@ -25,6 +25,8 @@ describe('generated contract reference', () => {
     expect(config.fields.some((field) => field.path === 'processors[].coverage.verification_segment_blocks')).toBe(true);
     const members = new Set(sdk.methods.map((member) => member.name));
     expect(members.has('processors.queryAndFollow')).toBe(true);
+    expect(members.has('backfill.subscribe')).toBe(true);
+    expect(sdk.types.some((type) => type.name === 'ChangeEnvelope')).toBe(true);
     expect(members.has('processors.consumers.acknowledge')).toBe(true);
   });
 

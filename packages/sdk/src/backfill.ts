@@ -1,3 +1,5 @@
+import { LeaniError, responseError } from "./errors.ts";
+export { LeaniError } from "./errors.ts";
 import type {
   ChangeEnvelope,
   DurableConsumer,
@@ -352,6 +354,8 @@ export interface BackfillSubscriptionClientOptions {
   baseUrl: string | URL;
   token?: string;
   fetch?: FetchLike;
+  /** Deadline for JSON requests; established delivery streams stay open. */
+  timeoutMs?: number;
 }
 
 export class BackfillStreamError extends Error {
@@ -428,6 +432,8 @@ export function createBackfillSubscriptionClient(
     throw new TypeError("a fetch implementation is required");
   }
 
+  const timeoutMs = options.timeoutMs ?? 30_000;
+  assertPositiveInteger(timeoutMs, "timeoutMs");
   const requestJson = async <T>(
     method: "GET" | "POST" | "DELETE",
     path: string,
@@ -445,7 +451,9 @@ export function createBackfillSubscriptionClient(
         sessionToken,
       ),
       body: body === undefined ? undefined : JSON.stringify(body),
-      signal,
+      signal: signal
+        ? AbortSignal.any([signal, AbortSignal.timeout(timeoutMs)])
+        : AbortSignal.timeout(timeoutMs),
     });
     if (!response.ok) {
       throw await responseError(response);
@@ -1047,6 +1055,10 @@ function validateReplacementHello<
 
 function isRetryableDeliveryDisconnect(error: unknown): boolean {
   if (isAbortError(error) || error instanceof BackfillStreamError) return false;
+  if (error instanceof LeaniError) {
+    return error.retryable || error.code === "consumer_session_active" ||
+      error.code === "consumer_session_lost";
+  }
   if (!(error instanceof Error)) return false;
   if (
     error.name === "consumer_session_active" ||
@@ -1482,6 +1494,9 @@ export async function* parseNdjson(
   signal?: AbortSignal,
 ): AsyncGenerator<unknown> {
   const reader = body.getReader();
+  const cancel = () => { void reader.cancel().catch(() => {}); };
+  signal?.addEventListener("abort", cancel, { once: true });
+  if (signal?.aborted) cancel();
   const decoder = new TextDecoder();
   let buffer = "";
   try {
@@ -1509,6 +1524,8 @@ export async function* parseNdjson(
       }
     }
   } finally {
+    signal?.removeEventListener("abort", cancel);
+    await reader.cancel().catch(() => {});
     reader.releaseLock();
   }
 }
@@ -1591,23 +1608,6 @@ function liveConsumerPath(
     `v1/processors/${encodeURIComponent(assertIdentity(processor, "processor"))}` +
     `/streams/live/consumers/${encodeURIComponent(assertIdentity(consumer, "consumer"))}/${operation}`
   );
-}
-
-async function responseError(response: Response): Promise<Error> {
-  let message = `Leani request failed with HTTP ${response.status}`;
-  let code = "http_error";
-  try {
-    const body = (await response.json()) as {
-      error?: { code?: string; message?: string };
-    };
-    code = body.error?.code ?? code;
-    message = body.error?.message ?? message;
-  } catch {
-    // Preserve the stable HTTP fallback when the peer did not send JSON.
-  }
-  const error = new Error(message);
-  error.name = code;
-  return error;
 }
 
 function assertBlock(value: number, field: string): number {

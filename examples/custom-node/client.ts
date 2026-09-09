@@ -1,3 +1,4 @@
+// docs:start custom-query-client
 import { createLeaniClient } from "@leani/sdk";
 
 interface BlockSummary {
@@ -7,7 +8,6 @@ interface BlockSummary {
 
 const leani = createLeaniClient({ baseUrl: "http://127.0.0.1:9080" });
 
-// docs:start custom-query-client
 const capabilities = await leani.capabilities();
 const extension = capabilities.queryExtensions.find(
   (candidate) => candidate.processor === "example-block-summary-local",

@@ -234,7 +234,7 @@ fn comparison_frame(
             ..VerificationReport::default()
         };
     } else {
-        normalized.finality = Finality::Optimistic;
+        normalized.finality = Finality::Included;
         normalized.verification = VerificationReport::default();
     }
     Ok(normalized)
@@ -276,7 +276,7 @@ mod tests {
     fn transport_evidence_is_excluded_from_material_comparison() {
         let left = fixture_frame(1, leani_primitives::BlockHash::ZERO);
         let mut right = left.clone();
-        right.finality = Finality::Safe;
+        right.finality = Finality::Finalized;
         right.provenance.push(leani_primitives::Provenance {
             source_id: SourceId::new("other-source").expect("source ID"),
             source_kind: SourceKind::PublicDataset,

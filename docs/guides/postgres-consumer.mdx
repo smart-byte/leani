@@ -1,6 +1,6 @@
 ---
 title: Consume changes into PostgreSQL
-description: Apply Leani changes idempotently and persist the destination cursor in the same PostgreSQL transaction before acknowledgement.
+description: Run a complete TypeScript consumer, inspect committed rows, and verify cursor resume after restart.
 section: guides
 order: 25
 audience:
@@ -8,40 +8,105 @@ audience:
 status: preview
 ---
 
-import { Aside, Steps } from '@astrojs/starlight/components';
+import { Aside } from '@astrojs/starlight/components';
 import CodeExample from '@docs/components/docs/CodeExample.astro';
 
-The complete example uses Bun's PostgreSQL client and the same compile-checked
-durable-consumer loop shown elsewhere. Adapt the event table to your application
-schema; keep the cursor transaction invariant intact.
+This example copies USDC/WETH processor changes into PostgreSQL. It commits each
+change and its cursor in one database transaction, then acknowledges Leani.
+Restarting the consumer resumes from its acknowledgement without duplicating
+committed rows.
 
-<CodeExample example="postgres-destination" />
+## Start the matching Leani node
 
-<Steps>
-1. Create one stable `(processor, network)` cursor row per destination.
-2. Give every applied change an idempotency key. The example uses the Leani
-   sequence scoped by processor and network.
-3. Apply the domain mutation and upsert the opaque cursor in one transaction.
-4. Return from the transaction only after PostgreSQL commits.
-5. Let the consumer acknowledge Leani. A lost response may cause redelivery,
-   which the idempotency key makes harmless.
-</Steps>
+Follow [query once, then follow](/docs/guides/query-then-follow/) through the
+backfill and `serve` commands. Keep that node running at `http://127.0.0.1:8080`.
+It must contain the `usdc-weth-latest` instance with delivery enabled.
+The earlier `windowed.toml` event example has delivery disabled and cannot be
+used for this consumer.
 
-Run the complete example with:
+You also need Bun and the local SDK setup from
+[Install Leani](/docs/getting-started/install/).
+
+## Prepare PostgreSQL
+
+If you have PostgreSQL running, create an empty `leani_example` database and set
+`DATABASE_URL` to its connection string. Alternatively, with Docker running:
 
 ```bash
-DATABASE_URL=postgres://localhost/leani_example \
-LEANI_CONSUMER_CREDENTIAL='<credential returned at registration>' \
-LEANI_PROCESSOR=blobs-money \
+docker run --name leani-example-postgres \
+  -e POSTGRES_PASSWORD=leani-example \
+  -e POSTGRES_DB=leani_example \
+  -p 127.0.0.1:54329:5432 -d postgres:17-alpine
+docker exec leani-example-postgres pg_isready -U postgres -d leani_example
+export DATABASE_URL='postgres://postgres:leani-example@127.0.0.1:54329/leani_example'
+```
+
+Wait until `pg_isready` reports that it is accepting connections. The container
+is an isolated example database; use your own credentials for other deployments.
+
+## Run the consumer
+
+In the terminal with `DATABASE_URL`, run:
+
+```bash
+cd "$LEANI_SOURCE"
+export LEANI_URL=http://127.0.0.1:8080
+export LEANI_PROCESSOR=usdc-weth-latest
+export LEANI_CONSUMER=postgres-example
+export LEANI_CONSUMER_CREDENTIAL="$(openssl rand -hex 32)"
 bun examples/sdk-postgres/index.ts
 ```
 
-<Aside type="caution" title="Do not generate timestamps for cursor correctness">
-  Store Leani's opaque cursor and sequence. An `updated_at` column is useful for
-  operations, but wall-clock time cannot establish delivery order or resume a
-  consumer.
+The application creates its tables and registers the named consumer with the
+secret you supplied. Registration does not generate this secret. Preserve it
+when restarting or moving to another terminal; do not generate a different
+secret for the same consumer identity.
+
+Expect `Consuming usdc-weth-latest into PostgreSQL; press Ctrl-C to stop.`
+The historical example then drains the retained changes and waits for new ones.
+The runnable application consists of `examples/sdk-postgres/index.ts` and its
+imported helper, `examples/sdk-subscription/index.ts`.
+
+## Inspect the result and restart
+
+Using `psql` with your connection string:
+
+```bash
+psql "$DATABASE_URL" -c 'select count(*), max(sequence) from leani_applied_changes'
+psql "$DATABASE_URL" -c 'select processor, network, sequence from leani_cursors'
+curl -s http://127.0.0.1:8080/v1/processors/usdc-weth-latest/consumers/postgres-example
+```
+
+For the 1,000-block example, the checked run committed 491 changes. PostgreSQL's
+highest sequence should match Leani's `acknowledgedSequence`, with `lagChanges`
+zero after draining. A change is a processor mutation or finality transition;
+it is not necessarily one row per Ethereum block.
+
+Press Ctrl-C in the consumer terminal. Run `bun examples/sdk-postgres/index.ts`
+again in that same terminal, keeping the exported identity and credential.
+The row count and cursor should stay unchanged until new changes arrive.
+
+## Keep the transaction boundary
+
+The destination implementation is:
+
+<CodeExample example="postgres-destination" />
+
+The `(processor, network, sequence)` key makes replay idempotent. The cursor is
+stored in the same transaction as the event. A failed acknowledgement after
+commit can cause redelivery; a committed event must remain safe to apply again.
+This example stores a change log. When building domain tables, apply both
+forward and inverse mutations to keep those tables correct through reorgs.
+
+<Aside type="note" title="Retention remains a node policy">
+  The query/follow example uses a bounded change window. A consumer that falls
+  behind that window must rebuild. For a destination that must prevent pruning
+  until it acknowledges, use `delivery.mode = "until_acknowledged"` with a
+  configured required consumer; see
+  [operating profiles](/docs/guides/choose-operating-profile/) and
+  [durable delivery](/docs/concepts/durable-delivery/).
 </Aside>
 
-If application state is lost, rebuild from a consistent retained snapshot and
-its query/follow boundary. If Leani emits `reset_required`, do not advance the
-cursor; reconcile the missing interval first.
+The reusable [consumer loop](/docs/guides/durable-consumer/) explains leases,
+reset handling, and commit-before-ack in detail. Stop this example's Docker
+database when finished with `docker stop leani-example-postgres`.

@@ -1,0 +1,31 @@
+[package]
+name = "my-leani-node"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97"
+publish = false
+
+# Place this application beside the leani source checkout.
+[dependencies]
+leani = { path = "../leani/crates/node" }
+leani-primitives = { path = "../leani/crates/primitives" }
+leani-processor-api = { path = "../leani/crates/processor-api" }
+async-trait = "0.1"
+axum = "0.8"
+blake3 = "1.8"
+semver = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.48", features = ["macros", "rt-multi-thread"] }
+
+[dev-dependencies]
+leani-api = { path = "../leani/crates/api" }
+leani-store-sqlite = { path = "../leani/crates/store-sqlite" }
+leani-testkit = { path = "../leani/crates/testkit" }
+tempfile = "3.23"
+toml = "0.9"
+tower = { version = "0.5", features = ["util"] }
+
+# Keep the same upstream compatibility patch as the Leani workspace.
+[patch.crates-io]
+proc-macro-error2 = { git = "https://github.com/fgardt/proc-macro-error-2", rev = "53ff94b61c678593158db1a3d50269c6f0de0db7" }

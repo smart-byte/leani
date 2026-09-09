@@ -25,6 +25,8 @@ use crate::{
 
 const SCHEMA_VERSION: &str = "xatu.history.v3";
 const PHYSICAL_PARTITION_BLOCKS: u64 = 1_000;
+// Execution parent hashes are supplied by Beacon execution payloads.
+const MAINNET_MERGE_BLOCK: u64 = 15_537_394;
 
 /// Planner and chunking settings for public Xatu history.
 #[derive(Clone, Debug)]
@@ -86,6 +88,17 @@ impl XatuHistorySource {
         {
             return Err(XatuError::BlockRange);
         }
+        let supported = BlockRange::new(BlockNumber(MAINNET_MERGE_BLOCK), BlockNumber(u64::MAX))
+            .map_err(|_| XatuError::BlockRange)?;
+        let range = if let Some(requested) = config.range {
+            if requested.end() < supported.start() {
+                return Err(XatuError::BlockRange);
+            }
+            BlockRange::new(requested.start().max(supported.start()), requested.end())
+                .map_err(|_| XatuError::BlockRange)?
+        } else {
+            supported
+        };
         let id = SourceId::new(format!("xatu-{}", config.catalog.network))
             .map_err(|error| XatuError::Data(error.to_string()))?;
         let catalog = XatuCatalog::new(config.catalog)?;
@@ -100,7 +113,7 @@ impl XatuHistorySource {
                 id,
                 kind: SourceKind::PublicDataset,
                 chain_id: ChainId(1),
-                range: config.range,
+                range: Some(range),
                 capabilities,
                 complete_capabilities: CapabilitySet::NONE,
                 trust: TrustModel::TrustedDataset,
@@ -174,6 +187,11 @@ impl HistorySource for XatuHistorySource {
             return Err(SourceError::InvalidPlan(
                 "Xatu history currently supports Ethereum mainnet only".to_owned(),
             ));
+        }
+        if request.range.start().0 < MAINNET_MERGE_BLOCK {
+            return Err(SourceError::InvalidPlan(format!(
+                "Xatu execution projections require Beacon parent hashes; request blocks from {MAINNET_MERGE_BLOCK} (the Merge) onward, or select a source supporting pre-Merge history"
+            )));
         }
         if let Some(available) = self.descriptor.range
             && (available.start().0 > request.range.start().0
@@ -702,6 +720,28 @@ mod tests {
             minimum_finality: Finality::Finalized,
             verification_policy: VerificationPolicy::TrustedDataset,
         }
+    }
+
+    #[tokio::test]
+    async fn planner_rejects_pre_merge_history_before_acquisition() {
+        let source = XatuHistorySource::new(XatuHistoryConfig::public("mainnet").expect("config"))
+            .expect("source");
+        let range =
+            BlockRange::new(BlockNumber(10_000_835), BlockNumber(10_001_834)).expect("range");
+        let error = source
+            .plan(&request(range))
+            .await
+            .expect_err("unsupported range");
+        assert!(error.to_string().contains("Beacon parent hashes"));
+        assert_eq!(
+            source
+                .descriptor()
+                .range
+                .expect("advertised range")
+                .start()
+                .0,
+            MAINNET_MERGE_BLOCK
+        );
     }
 
     #[tokio::test]

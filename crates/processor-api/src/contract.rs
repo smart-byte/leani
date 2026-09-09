@@ -347,7 +347,7 @@ mod tests {
                 log_fields: leani_primitives::LogFieldSet::NONE,
                 allow_filtered: false,
                 filter: FilterScope::default(),
-                minimum_finality: Finality::Optimistic,
+                minimum_finality: Finality::Included,
             }],
             mode: ReductionMode::BlockLocal,
             delivery_ordering: DeliveryOrdering::BlockVersionedIdempotent,

@@ -58,7 +58,7 @@ durable locator and therefore remains recent-only by default.
 | `web3_clientVersion` | Exact | Local | — |
 | `net_version` | Exact | Local | — |
 | `eth_chainId` | Exact | Local | — |
-| `eth_blockNumber` | Exact | Live source | Defines optimistic head |
+| `eth_blockNumber` | Exact | Live source | Defines the included head |
 | `eth_syncing` | Exact for this node | Local progress | Report both cold reducer and hot source |
 | `eth_getBlockByNumber` | Exact with body source | Recent/on-demand | Historical latency depends on backend |
 | `eth_getBlockByHash` | Exact with locator | Recent; optional index | Hash-to-chunk lookup otherwise expensive |

@@ -102,7 +102,7 @@ For each new execution block:
 3. verify header hash, transaction root, receipt root, and parent;
 4. map type-3 transactions;
 5. apply the blobs output transaction atomically;
-6. publish an optimistic update;
+6. publish an included update;
 7. retain raw material and undo through the reorg window;
 8. mark output finalized when the consensus source finalizes it;
 9. prune raw material/undo according to policy.
@@ -189,7 +189,7 @@ Use these cutover stages:
 - Full Dencun-to-head backfill without paid RPC.
 - Exact parity with the current formulas and schema over the agreed range.
 - No permanent raw block/receipt storage.
-- Live optimistic lag normally within two blocks.
+- Live included-block lag normally within two blocks.
 - Finalized cursor exposed separately.
 - Restart, source outage, and shallow reorg tested.
 - Native API, SDK, JSON-RPC, and blobs.money integration fixtures pass.

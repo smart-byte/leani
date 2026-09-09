@@ -1,6 +1,6 @@
 ---
-title: Getting started
-description: Choose a first-run path and prove Leani before connecting it to production data or consumers.
+title: Follow your first Ethereum block
+description: Install the alpha, read a real Ethereum block, and prepare a node for your application.
 section: getting-started
 order: 10
 audience:
@@ -9,67 +9,71 @@ audience:
 status: preview
 ---
 
-import { Aside, Card, CardGrid, Steps } from '@astrojs/starlight/components';
+import { Aside } from '@astrojs/starlight/components';
 import CodeExample from '@docs/components/docs/CodeExample.astro';
 
-The primary first run indexes a bounded Ethereum Mainnet range from the public
-Xatu dataset. It needs no provider credentials, produces decoded application
-data you can query, and keeps the requested work and storage boundary explicit.
+[Install the current alpha](/docs/getting-started/install/) first. This example
+prints a real Ethereum Mainnet block with no API key and no configuration file.
+Run it from a fresh directory:
 
-<Aside type="caution" title="Previewing before v0.1.0 is published">
-  The release commands below become runnable when the matching GitHub tag,
-  Homebrew formula, container, and crate are published. Until then, use a local
-  source checkout and its `config/modes/windowed.toml`; do not replace the
-  pinned version with an arbitrary remote `main` build.
+```bash
+cd "$(mktemp -d)"
+```
+
+<CodeExample example="live-block-first-run" />
+
+On first use, Leani asks independent public providers for a recent finalized
+checkpoint. At least two must agree before you can accept it. This is the
+starting trust anchor for subsequent verification.
+
+Peer discovery can take several minutes, even on a later run with cached state.
+Leani prints progress to stderr. Success is a line shaped like:
+
+```text
+2026-09-07T12:11:59Z  block=25925396  txs=381  gas=43.17M / 60.00M (72.0%)  base_fee=0.069459109 gwei  blobs=3  included
+```
+
+Your block number and values will differ. `--once` exits after that first result.
+Remove it to keep following blocks, or add `--format json` for scripts.
+
+<Aside type="note" title="Read the finality label">
+  The first result may say `preview`: a peer supplied the block and Leani is
+  still checking its place in Ethereum's chain. JSON reports
+  `finality: "preview"`. Later rows say `included` (on the followed chain, a
+  reorg can still remove them) or `finalized`. Use
+  `leani subscribe blocks --finality finalized --once` when you need a result
+  Ethereum consensus has finalized.
 </Aside>
 
-<Steps>
-1. Install a release binary for your platform, use Homebrew from the `leani-dev`
-   tap, or build the workspace with Cargo.
-2. Save the selected profile as `./leani.toml` and run `leani doctor`.
-3. Index one bounded public-data range and inspect its decoded output and exact
-   coverage.
-4. Query `/v1/capabilities` and `/v1/processors` instead of assuming the node was
-   compiled and configured with a particular processor.
-5. Use the offline fixture only when you need to isolate packaging/runtime
-   health from network-source behavior, then attach a consumer.
-</Steps>
+## Prepare a node for your application
 
-<Aside type="caution" title="The data directory is part of the configuration">
-  Processor identity, schema compatibility, retained change history, and
-  checkpoints are durable state. Do not point two independent nodes at the same
-  writable directory or casually reuse a production directory for experiments.
-</Aside>
+When you want an HTTP API and SDK subscriptions, initialize a reusable node:
 
-## What you can install
+<CodeExample example="live-block-node" />
 
-<CardGrid>
-  <Card title="Release binary">
-    Best for a pinned, auditable deployment. Verify the published checksum before
-    starting the binary.
-  </Card>
-  <Card title="Homebrew">
-    Convenient on macOS and Linux through the `leani-dev` namespace once the
-    release formula for your version is published.
-  </Card>
-  <Card title="Cargo">
-    Useful for contributors and processor authors working against the workspace.
-    A source build is not the same artifact as a signed release binary.
-  </Card>
-</CardGrid>
+Leave `serve` running. In another terminal, set up `leani` as described on the
+install page and change into the same `leani-blocks` directory. Then run:
 
-Choose the smallest path that proves the boundary you care about:
+```bash
+leani subscribe blocks --format json
+```
 
-- [Install a pinned release](/docs/getting-started/install/) and verify its identity.
-- [Index a bounded Mainnet range](/docs/getting-started/bounded-mainnet/) and inspect exact coverage.
-- [Prove it offline](/docs/getting-started/offline-proof/) when diagnosing an installation without network access.
-- [Attach a durable consumer](/docs/getting-started/first-consumer/) with commit-then-ack semantics.
-- Use the [complete quickstart](/docs/getting-started/offline-to-mainnet/) when you want the native and Docker flows on one page.
+It attaches to the running node. The API is at `http://127.0.0.1:18080` and
+JSON-RPC is at `http://127.0.0.1:18545`. Discover the configured processor with:
 
-## Request a bounded Mainnet range
+```bash
+curl -s http://127.0.0.1:18080/v1/capabilities
+```
 
-<CodeExample example="bounded-mainnet-quickstart" />
+Expect a `block-summary` processor with `subscriptions: true`. Keep each node's
+data directory separate; do not start two nodes against the same writable data.
 
-## Optional offline installation proof
+## Choose your next example
 
-<CodeExample example="offline-quickstart" />
+- [Index a small historical range](/docs/getting-started/bounded-mainnet/) to query decoded contract events.
+- [Query and follow with TypeScript](/docs/guides/query-then-follow/) to seed application state.
+- [Build a custom processor in Rust](/docs/guides/custom-processor/) to run your own transformation using the Leani library.
+
+For startup diagnostics and all CLI fields, see
+[block subscriptions](/docs/guides/live-block-subscriptions/). Read
+[alpha limitations](/docs/operations/preview-limitations/) before connecting production applications.

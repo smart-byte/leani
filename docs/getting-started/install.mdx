@@ -1,6 +1,6 @@
 ---
 title: Install Leani
-description: Install a pinned Leani release with Homebrew, a release archive, Docker, or Cargo and verify what you received.
+description: Build the current alpha, check the binary, and prepare the TypeScript SDK if you need it.
 section: getting-started
 order: 20
 audience:
@@ -9,42 +9,63 @@ audience:
 status: preview
 ---
 
-import { Aside, Card, CardGrid, Steps } from '@astrojs/starlight/components';
+import { Aside } from '@astrojs/starlight/components';
+import CodeExample from '@docs/components/docs/CodeExample.astro';
 
-Choose a release version first. The binary, container, crate, SDK, Homebrew
-formula, and production docs should all identify the same release tag.
+## Build the current alpha
 
-<CardGrid>
-  <Card title="Homebrew" icon="seti:homebrew">
-    `brew install leani-dev/tap/leani`
-  </Card>
-  <Card title="Release archive" icon="download">
-    Download the archive and checksum for your platform from the matching
-    `smart-byte/leani` GitHub release.
-  </Card>
-  <Card title="Container" icon="seti:docker">
-    Pull the immutable `ghcr.io/smart-byte/leani:<version>` image produced by
-    the same release workflow.
-  </Card>
-  <Card title="Cargo" icon="seti:rust">
-    `cargo install leani --version <version> --locked`
-  </Card>
-</CardGrid>
+Use a source checkout while the first release packages are being prepared.
+You need Git, Rust installed through rustup, and your platform's C/C++ build
+tools. The repository's `rust-toolchain.toml` selects Rust 1.97.0 automatically.
+The first build downloads dependencies and can take several minutes.
 
-<Steps>
-1. Verify the release archive checksum or pin the container digest.
-2. Run `leani --version` and record it with your deployment configuration.
-3. Save the selected profile as `./leani.toml` and run `leani doctor --json`
-   before allowing network or database access. Use `LEANI_CONFIG` or
-   `--config` when the file intentionally lives elsewhere.
-4. Continue with a [bounded Mainnet range](/docs/getting-started/bounded-mainnet/).
-   Use the deterministic [offline proof](/docs/getting-started/offline-proof/)
-   when you need to isolate packaging or runtime health from network behavior.
-</Steps>
+<CodeExample example="source-install" />
 
-<Aside type="caution" title="Pre-release package names are prepared, not assumed">
-  Before the first release exists, install commands can resolve only after the
-  corresponding GitHub, crates.io, Homebrew, npm, and container artifacts have
-  been published. Do not substitute an unpinned `main` build in a release
-  rehearsal.
+Expect `leani 0.1.0`. If you already have the checkout, start at
+`cargo build --locked -p leani` in its root directory.
+
+`LEANI_SOURCE` points to the checkout; later tutorials use it to find example
+configs. The `PATH` setting makes `leani` available in this terminal. In each
+additional terminal, return to the checkout and run:
+
+```bash
+export LEANI_SOURCE="$PWD"
+export PATH="$LEANI_SOURCE/target/debug:$PATH"
+```
+
+Continue with [your first Ethereum block](/docs/getting-started/).
+For a check without network access, run the
+[offline fixture](/docs/getting-started/offline-proof/).
+
+## Prepare the TypeScript SDK
+
+The examples use Bun 1.2 or later. From the checkout:
+
+```bash
+bun install --cwd packages/sdk --frozen-lockfile
+bun run --cwd packages/sdk build
+```
+
+Repository examples resolve `@leani/sdk` to the local source. To use the built
+package in your own application, run this from that application's directory:
+
+```bash
+bun add "$LEANI_SOURCE/packages/sdk"
+```
+
+Then follow the [query and subscription example](/docs/guides/query-then-follow/).
+For Rust applications, see [build a custom node](/docs/guides/custom-processor/).
+
+## Published releases
+
+<Aside type="note" title="Available after publication">
+  The commands in this section require the corresponding public release
+  artifacts. Use the source instructions above for the current alpha.
 </Aside>
+
+Once published, install with `brew install leani-dev/tap/leani`, or choose a
+matching archive from the [GitHub releases](https://github.com/smart-byte/leani/releases).
+Verify the archive's published checksum before running it. Containers use
+`ghcr.io/smart-byte/leani:<version>`; pin the release's digest for deployment.
+The SDK package is `@leani/sdk` on npm. Keep binary, SDK, and configuration
+versions aligned with the release you selected.

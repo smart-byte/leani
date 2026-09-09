@@ -784,7 +784,7 @@ impl From<ArtifactPolicyConfig> for ArtifactPolicy {
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PublishMode {
-    OptimisticAndFinalized,
+    IncludedAndFinalized,
     FinalizedOnly,
     TerminalOnly,
 }
@@ -792,7 +792,7 @@ pub enum PublishMode {
 impl From<PublishMode> for PublicationPolicy {
     fn from(value: PublishMode) -> Self {
         match value {
-            PublishMode::OptimisticAndFinalized => Self::OptimisticAndFinalized,
+            PublishMode::IncludedAndFinalized => Self::IncludedAndFinalized,
             PublishMode::FinalizedOnly => Self::FinalizedOnly,
             PublishMode::TerminalOnly => Self::TerminalOnly,
         }
@@ -2410,7 +2410,7 @@ id = "fixture"
 instance = "fixture-main"
 version = "0.1.0"
 start_block = 1
-publish = "optimistic_and_finalized"
+publish = "included_and_finalized"
 
 [processors.state]
 mode = "durable"
@@ -2450,7 +2450,7 @@ mod tests {
     const BASE_PROCESSOR_CONTRACT: &str = r#"instance = "fixture-main"
 version = "0.1.0"
 start_block = 1
-publish = "optimistic_and_finalized"
+publish = "included_and_finalized"
 
 [processors.state]
 mode = "durable"
@@ -2709,7 +2709,7 @@ maximum_overfetch_ratio = 1.5"#,
             r#"instance = "fixture-production"
 version = "0.1.0"
 start_block = 1
-publish = "optimistic_and_finalized"
+publish = "included_and_finalized"
 
 [processors.state]
 mode = "checkpointed"
@@ -2781,7 +2781,7 @@ version = "0.1.0"
 history_control = "node_owned"
 history_mode = "on_demand"
 start_block = 1
-publish = "optimistic_and_finalized"
+publish = "included_and_finalized"
 
 [processors.state]
 mode = "durable"
@@ -2829,7 +2829,7 @@ verification_segment_blocks = 8192"#,
 version = "0.1.0"
 history_control = "application_subscriptions"
 start_block = 1
-publish = "optimistic_and_finalized"
+publish = "included_and_finalized"
 
 [processors.state]
 mode = "durable"
@@ -2869,7 +2869,7 @@ verification_segment_blocks = 8192"#,
             r#"instance = "fixture-analysis"
 version = "0.1.0"
 start_block = 1
-publish = "optimistic_and_finalized"
+publish = "included_and_finalized"
 
 [processors.state]
 mode = "durable"
@@ -2899,8 +2899,8 @@ verification_segment_blocks = 8192"#,
     #[test]
     fn rejects_removed_legacy_retention() {
         let stale = VALID_CONFIG_TOML.replace(
-            "publish = \"optimistic_and_finalized\"",
-            "publish = \"optimistic_and_finalized\"\nretention = \"full_output_history\"",
+            "publish = \"included_and_finalized\"",
+            "publish = \"included_and_finalized\"\nretention = \"full_output_history\"",
         );
         let error = toml::from_str::<Config>(&stale).expect_err("legacy retention is rejected");
         assert!(error.to_string().contains("retention"));

@@ -102,12 +102,12 @@ leani subscribe blocks
 ```
 
 The built-in `block-summary` processor requests verified execution headers and
-bodies, but no receipts. It prints every fresh optimistic block with its
+bodies, but no receipts. It prints every fresh included block with its
 timestamp, block number, transaction count, gas usage, base fee, blob count,
 and finality:
 
 ```text
-2026-09-01T09:14:35Z  block=25881412  txs=187  gas=32.47M / 60.00M (54.1%)  base_fee=0.143592817 gwei  blobs=6  optimistic
+2026-09-01T09:14:35Z  block=25881412  txs=187  gas=32.47M / 60.00M (54.1%)  base_fee=0.143592817 gwei  blobs=6  included
 ```
 
 Use `--format json` for NDJSON or `--once` to measure time to first data. To
@@ -512,7 +512,7 @@ and SQLite integrity while writing a pass/fail evidence report. See
 
 ## Current networking architecture
 
-Leani consumes isolated networking crates from Reth 2.4.1 rather than
+Leani consumes isolated networking crates from Reth 2.5.2 rather than
 forking SHiNode or running a complete execution client. One manager persists
 for the process lifetime, uses a stable key in the data directory, shares a
 bounded peer cache across live/history work, enables Discv4, Discv5, and DNS

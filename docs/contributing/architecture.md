@@ -27,7 +27,7 @@ status: preview
 2. Missing capabilities cause an error, never silently empty fields.
 3. Raw historical material is transient unless retention is explicitly enabled.
 4. State transitions are applied in canonical block order.
-5. Every optimistic state transition is reversible until finalized.
+5. Every included state transition is reversible until finalized.
 6. Historical and live lanes overlap and verify before handoff.
 7. Outputs carry provenance, processor version, and a canonical cursor.
 8. Source trust and cryptographic verification are different dimensions.
@@ -145,7 +145,7 @@ BlockEnvelope
     parent_hash
     timestamp
   finality
-    optimistic | safe | finalized
+    included | finalized
   header?
   body?
   transactions?
@@ -167,7 +167,7 @@ header_hash       verified | failed | not_checked
 parent_continuity verified | failed | not_checked
 transactions_root verified | failed | unavailable
 receipts_root     verified | failed | unavailable
-consensus_anchor  finalized | safe | optimistic | unavailable
+consensus_anchor  finalized | included | unavailable
 dataset_checksum  verified | failed | unavailable
 ```
 
@@ -313,7 +313,7 @@ Processor descriptors include:
 - address/topic filters;
 - output schema;
 - current-only, bucketed, or full-history retention;
-- optimistic/finalized publication policy;
+- included/finalized publication policy;
 - whether deltas are commutative or strictly ordered.
 
 The concrete first-release modes are:
@@ -365,14 +365,14 @@ Default pruning rules:
 
 Post-Merge canonicality is anchored to consensus safe/finalized execution payloads. A future pre-Merge/genesis profile must additionally validate canonical total difficulty or an appropriate history accumulator/checkpoint; parent and trie-root validity alone is insufficient to select the canonical proof-of-work branch.
 
-Every optimistic block application is one atomic transaction:
+Every included block application is one atomic transaction:
 
 ```text
 validate parent
 persist delta
 apply output changes
 persist undo
-advance optimistic cursor
+advance included cursor
 commit
 publish apply event
 ```
@@ -464,7 +464,7 @@ id = "blobs-money"
 version = "0.1.0"
 requires = ["HEADER", "TRANSACTIONS", "RECEIPTS"]
 retention = "full-output-history"
-publish = "optimistic-and-finalized"
+publish = "included_and_finalized"
 
 [processors.sink]
 kind = "embedded"

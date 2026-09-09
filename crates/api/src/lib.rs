@@ -201,6 +201,8 @@ pub struct ApiConfig {
     pub query_snapshot_ttl: Duration,
     pub query_snapshot_max_rows: u64,
     pub query_snapshot_max_bytes: u64,
+    pub query_snapshot_max_total_snapshots: u64,
+    pub query_snapshot_max_total_bytes: u64,
     /// Optional bearer token. Debug output always redacts this value.
     pub bearer_token: Option<Arc<str>>,
     pub readiness: ReadinessHandle,
@@ -232,6 +234,8 @@ impl Default for ApiConfig {
             query_snapshot_ttl: Duration::from_mins(5),
             query_snapshot_max_rows: 100_000,
             query_snapshot_max_bytes: 64 * 1024 * 1024,
+            query_snapshot_max_total_snapshots: 32,
+            query_snapshot_max_total_bytes: 128 * 1024 * 1024,
             bearer_token: None,
             readiness: ReadinessHandle::default(),
             network_telemetry: NetworkTelemetry::default(),
@@ -258,6 +262,14 @@ impl std::fmt::Debug for ApiConfig {
             .field("query_snapshot_ttl", &self.query_snapshot_ttl)
             .field("query_snapshot_max_rows", &self.query_snapshot_max_rows)
             .field("query_snapshot_max_bytes", &self.query_snapshot_max_bytes)
+            .field(
+                "query_snapshot_max_total_snapshots",
+                &self.query_snapshot_max_total_snapshots,
+            )
+            .field(
+                "query_snapshot_max_total_bytes",
+                &self.query_snapshot_max_total_bytes,
+            )
             .field(
                 "bearer_token",
                 &self.bearer_token.as_ref().map(|_| "[REDACTED]"),
@@ -297,6 +309,8 @@ impl ApiConfig {
             || self.query_snapshot_max_rows == 0
             || self.query_snapshot_max_rows > 1_000_000
             || self.query_snapshot_max_bytes == 0
+            || self.query_snapshot_max_total_snapshots == 0
+            || self.query_snapshot_max_total_bytes == 0
         {
             return Err(ApiError::invalid(
                 "API limits, chain ID, and intervals must be bounded and non-zero",
@@ -2241,7 +2255,7 @@ pub struct RequestedRange {
 /// Split covered ranges at finality boundaries so each interval carries the
 /// exact finality of every block inside it. Both inputs must be normalized
 /// (ascending, non-overlapping); `finalized` labels its intersection with
-/// `coverage` and everything else stays optimistic.
+/// `coverage` and everything else stays included.
 fn labeled_coverage_intervals(
     coverage: &[BlockRange],
     finalized: &[BlockRange],
@@ -2255,8 +2269,8 @@ fn labeled_coverage_intervals(
             while remaining.next_if(|range| range.end().0 < cursor).is_some() {}
             let (to_block, finality) = match remaining.peek() {
                 Some(range) if range.start().0 <= cursor => (range.end().0.min(end), "finalized"),
-                Some(range) if range.start().0 <= end => (range.start().0 - 1, "optimistic"),
-                _ => (end, "optimistic"),
+                Some(range) if range.start().0 <= end => (range.start().0 - 1, "included"),
+                _ => (end, "included"),
             };
             intervals.push(CoverageInterval {
                 from_block: cursor,
@@ -3541,6 +3555,7 @@ async fn change_head(
     Path(processor): Path<String>,
 ) -> Result<Json<ChangeHead>, ApiError> {
     let processor = configured_processor(&state, &processor)?;
+    ensure_delivery_enabled(processor.as_ref())?;
     let bounds = state.store.change_bounds(processor.descriptor()).await?;
     let cursor = bounds
         .as_ref()
@@ -5998,7 +6013,7 @@ struct GenericSnapshotPage {
     data: Vec<GenericOutputEntity>,
     next_cursor: Option<String>,
     snapshot_id: String,
-    boundary_cursor: String,
+    boundary_cursor: Option<String>,
     row_count: String,
     value_bytes: String,
     expires_at_unix_ms: String,
@@ -6046,6 +6061,8 @@ async fn query_and_follow(
 ) -> Result<Json<GenericSnapshotPage>, ApiError> {
     let processor = configured_processor(&state, &processor)?;
     ensure_output_retained(processor.as_ref())?;
+    ensure_delivery_enabled(processor.as_ref())?;
+    ensure_snapshot_follow_supported(processor.as_ref())?;
     let limit = page_limit(&state, query.limit)?;
     Ok(Json(
         create_generic_snapshot_page(&state, processor, &collection, query.into(), limit).await?,
@@ -6092,23 +6109,54 @@ async fn create_generic_snapshot_page(
     state: &ApiState,
     processor: Arc<dyn Processor>,
     collection: &str,
-    query: OutputQuery,
+    mut query: OutputQuery,
     limit: usize,
 ) -> Result<GenericSnapshotPage, ApiError> {
+    let cursor = state.store.processor_cursor(processor.descriptor()).await?;
+    // Resolve open block bounds once. Pagination must continue reporting the
+    // same request even when ingestion advances the processor cursor.
+    if query.from_block.is_some() || query.to_block.is_some() {
+        let from = query.from_block.unwrap_or_else(|| {
+            BlockNumber(processor_start_block(processor.descriptor()))
+                .min(query.to_block.unwrap_or(BlockNumber(u64::MAX)))
+        });
+        let to = query.to_block.unwrap_or_else(|| {
+            cursor
+                .as_ref()
+                .map_or(from, |cursor| cursor.block_number.max(from))
+        });
+        let requested =
+            BlockRange::new(from, to).map_err(|error| ApiError::invalid(&error.to_string()))?;
+        let requested_coverage = coverage(state, processor.as_ref(), Some(requested)).await?;
+        if !requested_coverage.is_complete() {
+            return Err(ApiError::range_incomplete(requested_coverage));
+        }
+        query.from_block = Some(from);
+        query.to_block = Some(to);
+    }
     let bounds = state
         .store
         .output_bounds(processor.descriptor(), collection)
         .await?;
-    reject_unretained_range(processor.as_ref(), query, bounds)?;
+    reject_unretained_range(
+        processor.as_ref(),
+        query,
+        bounds,
+        cursor.as_ref().map(|cursor| cursor.block_number),
+    )?;
     let snapshot = state
         .store
-        .create_query_snapshot(
+        .create_covered_query_snapshot(
             processor.descriptor(),
             collection,
             query,
-            state.config.query_snapshot_ttl,
-            state.config.query_snapshot_max_rows,
-            state.config.query_snapshot_max_bytes,
+            leani_store_sqlite::QuerySnapshotLimits {
+                ttl: state.config.query_snapshot_ttl,
+                max_rows: state.config.query_snapshot_max_rows,
+                max_bytes: state.config.query_snapshot_max_bytes,
+                max_total_snapshots: state.config.query_snapshot_max_total_snapshots,
+                max_total_bytes: state.config.query_snapshot_max_total_bytes,
+            },
         )
         .await?;
     read_generic_snapshot_page(
@@ -6166,8 +6214,26 @@ async fn read_generic_snapshot_page(
         .output_bounds(processor.descriptor(), collection)
         .await?
         .map(OutputBoundsResponse::from);
-    let boundary_cursor =
-        encode_consumer_cursor(state, processor.as_ref(), snapshot.boundary_sequence)?;
+    let boundary_cursor = (processor.descriptor().lifecycle.delivery.mode
+        != leani_processor_api::DeliveryPolicyMode::None)
+        .then(|| encode_consumer_cursor(state, processor.as_ref(), snapshot.boundary_sequence))
+        .transpose()?;
+    let requested = snapshot
+        .query
+        .from_block
+        .zip(snapshot.query.to_block)
+        .map(|(from, to)| BlockRange::new(from, to))
+        .transpose()
+        .map_err(|error| ApiError::invalid(&error.to_string()))?;
+    let snapshot_coverage = coverage(state, processor.as_ref(), requested).await?;
+    if requested.is_some() && !snapshot_coverage.is_complete() {
+        // A reorg may have removed coverage between admission and copying.
+        state
+            .store
+            .release_query_snapshot(processor.descriptor(), snapshot_id)
+            .await?;
+        return Err(ApiError::range_incomplete(snapshot_coverage));
+    }
     Ok(GenericSnapshotPage {
         data,
         next_cursor,
@@ -6177,12 +6243,12 @@ async fn read_generic_snapshot_page(
         value_bytes: snapshot.value_bytes.to_string(),
         expires_at_unix_ms: snapshot.expires_at_unix_ms.to_string(),
         retained_bounds,
-        coverage: coverage(state, processor.as_ref(), None).await?,
+        coverage: snapshot_coverage,
         recovery: json!({
-            "follow": format!(
-                "/v1/processors/{}/stream?after={boundary_cursor}",
+            "follow": boundary_cursor.map(|cursor| format!(
+                "/v1/processors/{}/stream?after={cursor}",
                 processor.descriptor().instance
-            ),
+            )),
             "outsideRetention": "create_processor_instance_or_source_scan"
         }),
     })
@@ -6207,6 +6273,8 @@ fn render_output_entity(
                 "value": hex::encode(&entity.value)
             })
         });
+    let mut data = data;
+    stamp_finality(&mut data, entity.finality);
     Ok(GenericOutputEntity {
         ordinal: entity.ordinal.to_string(),
         key: format!("0x{}", hex::encode(entity.key)),
@@ -6231,10 +6299,42 @@ fn ensure_output_retained(processor: &dyn Processor) -> Result<(), ApiError> {
     }
 }
 
+/// Snapshots read retained state, which for a `finalized_only` processor
+/// already contains included blocks whose changes are still unpublished. The
+/// stream never emits an undo for those blocks, so a consumer that seeded from
+/// such a snapshot could keep reorged rows forever.
+fn ensure_snapshot_follow_supported(processor: &dyn Processor) -> Result<(), ApiError> {
+    if matches!(
+        processor.descriptor().publication,
+        leani_processor_api::PublicationPolicy::FinalizedOnly
+    ) {
+        Err(ApiError::conflict(
+            "finalized_only_snapshot",
+            "query-and-follow is unavailable for finalized_only processors: retained state includes unpublished blocks; follow the change stream from its head instead",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn ensure_delivery_enabled(processor: &dyn Processor) -> Result<(), ApiError> {
+    if processor.descriptor().lifecycle.delivery.mode
+        == leani_processor_api::DeliveryPolicyMode::None
+    {
+        Err(ApiError::conflict(
+            "delivery_disabled",
+            "this processor retains output without a change stream; enable delivery to follow changes",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
 fn reject_unretained_range(
     processor: &dyn Processor,
     query: OutputQuery,
     bounds: Option<OutputBounds>,
+    processed_through: Option<BlockNumber>,
 ) -> Result<(), ApiError> {
     if !matches!(
         processor.descriptor().lifecycle.output.mode,
@@ -6242,14 +6342,29 @@ fn reject_unretained_range(
     ) {
         return Ok(());
     }
-    if let Some(bounds) = bounds
-        && (query
-            .from_block
-            .is_some_and(|from| from < bounds.earliest_block)
-            || query
-                .from_timestamp
-                .is_some_and(|from| from < bounds.earliest_timestamp))
-    {
+    let block_floor = processor
+        .descriptor()
+        .lifecycle
+        .output
+        .window
+        .and_then(|window| window.max_blocks)
+        .and_then(|max_blocks| {
+            processed_through
+                .map(|tip| BlockNumber(tip.0.saturating_add(1).saturating_sub(max_blocks)))
+        });
+    // For a block window, availability starts at the policy boundary, not at
+    // the first matching event. A covered block with no event is still known.
+    // Other window kinds retain the conservative entity-bound check.
+    let block_floor = block_floor.or_else(|| bounds.map(|bounds| bounds.earliest_block));
+    let before_block_window = query
+        .from_block
+        .zip(block_floor)
+        .is_some_and(|(from, floor)| from < floor);
+    let before_time_window = query
+        .from_timestamp
+        .zip(bounds)
+        .is_some_and(|(from, bounds)| from < bounds.earliest_timestamp);
+    if before_block_window || before_time_window {
         return Err(ApiError::output_not_retained(
             "requested range starts before retained output; create a source-scan job or processor instance",
         ));
@@ -6385,19 +6500,17 @@ async fn changes(
     Query(query): Query<ChangesQuery>,
 ) -> Result<Json<Page<ChangeEnvelope>>, ApiError> {
     let processor = configured_processor(&state, &processor)?;
+    ensure_delivery_enabled(processor.as_ref())?;
     let after = query
         .after
         .as_deref()
         .map(|cursor| decode_change_cursor(&state, processor.as_ref(), cursor))
         .transpose()?
-        .map_or(0, |cursor| cursor.sequence);
-    if let Some(bounds) = expired_resume(&state, processor.as_ref(), after).await? {
-        return Err(ApiError::cursor_expired(bounds));
-    }
+        .map(|cursor| cursor.sequence);
     let limit = page_limit(&state, query.limit)?;
     let records = state
         .store
-        .changes(processor.descriptor(), state.config.chain_id, after, limit)
+        .resumable_changes(processor.descriptor(), state.config.chain_id, after, limit)
         .await?;
     let coverage = coverage(&state, processor.as_ref(), None).await?;
     let data = records
@@ -6418,37 +6531,35 @@ async fn change_stream(
     Query(query): Query<ChangesQuery>,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, ApiError> {
     let processor = configured_processor(&state, &processor)?;
+    ensure_delivery_enabled(processor.as_ref())?;
     let after = query
         .after
         .as_deref()
         .map(|cursor| decode_change_cursor(&state, processor.as_ref(), cursor))
         .transpose()?
-        .map_or(0, |cursor| cursor.sequence);
+        .map(|cursor| cursor.sequence);
+    // Capture an omitted starting position now. Even an initially empty
+    // connection must detect pruning before its first data event.
+    let after = Some(match after {
+        Some(sequence) => sequence,
+        None => state
+            .store
+            .change_bounds(processor.descriptor())
+            .await?
+            .map_or(0, |bounds| bounds.earliest.saturating_sub(1)),
+    });
     let hello = StreamHello {
         api_version: API_VERSION,
         chain_id: state.config.chain_id.0,
         processor: processor_summary(&state, processor.as_ref()),
         coverage: coverage(&state, processor.as_ref(), None).await?,
     };
-    let expired = expired_resume(&state, processor.as_ref(), after).await?;
-    let mut queued = VecDeque::new();
-    let terminal = if let Some(bounds) = expired {
-        queued.push_back(reset_envelope(
-            &state,
-            processor.as_ref(),
-            bounds,
-            hello.coverage.clone(),
-        )?);
-        true
-    } else {
-        false
-    };
     let stream_state = ChangeStreamState {
         state: state.clone(),
         processor,
         after,
-        queued,
-        terminal,
+        queued: VecDeque::new(),
+        terminal: false,
     };
     // Connection handshake: synthesized fresh per connection, deliberately
     // without an SSE id so it can never become a resume cursor.
@@ -6468,7 +6579,7 @@ async fn change_stream(
 struct ChangeStreamState {
     state: ApiState,
     processor: Arc<dyn Processor>,
-    after: u64,
+    after: Option<u64>,
     queued: VecDeque<ChangeEnvelope>,
     terminal: bool,
 }
@@ -6478,7 +6589,7 @@ async fn poll_change(
 ) -> Option<(Result<Event, Infallible>, ChangeStreamState)> {
     loop {
         if let Some(envelope) = stream_state.queued.pop_front() {
-            stream_state.after = envelope.sequence.parse().unwrap_or(stream_state.after);
+            stream_state.after = envelope.sequence.parse().ok().or(stream_state.after);
             let event = Event::default()
                 .id(envelope.cursor.clone())
                 .event(envelope.operation)
@@ -6492,7 +6603,7 @@ async fn poll_change(
         let records = stream_state
             .state
             .store
-            .changes(
+            .resumable_changes(
                 stream_state.processor.descriptor(),
                 stream_state.state.config.chain_id,
                 stream_state.after,
@@ -6522,27 +6633,34 @@ async fn poll_change(
                     }
                 }
             }
+            Err(StoreError::ChangeCursorExpired(bounds)) => {
+                stream_state.terminal = true;
+                let reset = match coverage(
+                    &stream_state.state,
+                    stream_state.processor.as_ref(),
+                    None,
+                )
+                .await
+                {
+                    Ok(coverage) => reset_envelope(
+                        &stream_state.state,
+                        stream_state.processor.as_ref(),
+                        bounds,
+                        coverage,
+                    ),
+                    Err(error) => Err(error),
+                };
+                match reset {
+                    Ok(envelope) => stream_state.queued.push_back(envelope),
+                    Err(error) => return Some((Ok(error.sse_event()), stream_state)),
+                }
+            }
             Err(error) => {
                 stream_state.terminal = true;
                 return Some((Ok(ApiError::from(error).sse_event()), stream_state));
             }
         }
     }
-}
-
-async fn expired_resume(
-    state: &ApiState,
-    processor: &dyn Processor,
-    after: u64,
-) -> Result<Option<ChangeBounds>, ApiError> {
-    if after == 0 {
-        return Ok(None);
-    }
-    Ok(state
-        .store
-        .change_bounds(processor.descriptor())
-        .await?
-        .filter(|bounds| after.saturating_add(1) < bounds.earliest))
 }
 
 fn reset_envelope(
@@ -6722,6 +6840,10 @@ fn render_change_envelope(
                 }))
             }),
     };
+    let data = data.map(|mut data| {
+        stamp_finality(&mut data, record.finality);
+        data
+    });
     let suffix = match record.change.operation {
         ChangeOperation::Upsert => "put",
         ChangeOperation::Delete => "delete",
@@ -7052,10 +7174,20 @@ fn signed_quantity_decimal(value: Quantity) -> String {
 }
 
 const fn finality_name(finality: Finality) -> &'static str {
-    match finality {
-        Finality::Optimistic => "optimistic",
-        Finality::Safe => "safe",
-        Finality::Finalized => "finalized",
+    finality.name()
+}
+
+/// Publication-time finality overrides any finality a processor embedded in
+/// its payload: a deferred flush promotes the envelope without rewriting the
+/// stored bytes, and the two must never disagree in rendered JSON.
+fn stamp_finality(data: &mut Value, finality: Finality) {
+    if let Some(object) = data.as_object_mut()
+        && object.contains_key("finality")
+    {
+        object.insert(
+            "finality".to_owned(),
+            Value::String(finality.name().to_owned()),
+        );
     }
 }
 
@@ -7145,6 +7277,20 @@ impl ApiError {
         error
     }
 
+    fn output_range_incomplete(from: BlockNumber, to: BlockNumber) -> Self {
+        let mut error = Self::new(
+            StatusCode::CONFLICT,
+            "range_incomplete",
+            "requested block range has unindexed gaps",
+            true,
+        );
+        error.details = Some(json!({
+            "requested": { "fromBlock": from.0, "toBlock": to.0 },
+            "complete": false
+        }));
+        error
+    }
+
     fn cursor_expired(bounds: ChangeBounds) -> Self {
         let mut error = Self::new(
             StatusCode::GONE,
@@ -7199,6 +7345,19 @@ impl ApiError {
 impl From<StoreError> for ApiError {
     fn from(error: StoreError) -> Self {
         match error {
+            StoreError::OutputRangePruned => Self::output_not_retained(
+                "requested output was pruned before the snapshot; rebuild or select a retained range",
+            ),
+            StoreError::OutputRangeIncomplete { from, to } => {
+                Self::output_range_incomplete(from, to)
+            }
+            matched @ StoreError::QuerySnapshotCapacity { .. } => Self::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "query_snapshot_capacity",
+                &matched.to_string(),
+                true,
+            ),
+            StoreError::ChangeCursorExpired(bounds) => Self::cursor_expired(bounds),
             StoreError::InvalidConfig(message) => Self::invalid(&message),
             matched @ StoreError::ConsumerExists { .. } => {
                 Self::conflict("consumer_exists", &matched.to_string())
@@ -7444,7 +7603,7 @@ mod tests {
             timestamp: 1_800_000_000,
         };
         store
-            .store_canonical_anchor(ChainId(1), block, Finality::Optimistic)
+            .store_canonical_anchor(ChainId(1), block, Finality::Included)
             .await
             .expect("canonical observation block");
         let payload = postcard::to_allocvec(&leani_processor_uniswap::UniswapPriceDelta {
@@ -7459,7 +7618,7 @@ mod tests {
                 block_number: block.number,
                 block_hash: block.hash,
                 log_index: 7,
-                finality: Finality::Optimistic,
+                finality: Finality::Included,
             }],
         })
         .expect("observation delta");
@@ -7478,7 +7637,7 @@ mod tests {
                     chain_id: ChainId(1),
                     block_number: block.number,
                     block_hash: block.hash,
-                    finality: Finality::Optimistic,
+                    finality: Finality::Included,
                     sequence: 1,
                 },
                 &delta,
@@ -7500,7 +7659,7 @@ mod tests {
             timestamp: 1_800_000_012,
         };
         store
-            .store_canonical_anchor(ChainId(1), block, Finality::Optimistic)
+            .store_canonical_anchor(ChainId(1), block, Finality::Included)
             .await
             .expect("canonical block-summary block");
         let payload = postcard::to_allocvec(&leani_processor_block_summary::BlockSummaryEntity {
@@ -7516,7 +7675,7 @@ mod tests {
             excess_blob_gas: Some(393_216),
             transaction_count: Some(123),
             size_bytes: None,
-            finality: Finality::Optimistic,
+            finality: Finality::Included,
         })
         .expect("block-summary delta");
         let delta = leani_processor_api::EncodedDelta::new(
@@ -7534,7 +7693,7 @@ mod tests {
                     chain_id: ChainId(1),
                     block_number: block.number,
                     block_hash: block.hash,
-                    finality: Finality::Optimistic,
+                    finality: Finality::Included,
                     sequence: 1,
                 },
                 &delta,
@@ -8067,7 +8226,7 @@ mod tests {
         assert_eq!(body["data"]["blockHash"], block.hash.to_string());
         assert_eq!(body["data"]["gasUsed"], 31_000_000);
         assert_eq!(body["data"]["transactionCount"], 123);
-        assert_eq!(body["data"]["finality"], "optimistic");
+        assert_eq!(body["data"]["finality"], "included");
     }
 
     #[tokio::test]
@@ -9117,6 +9276,44 @@ mod tests {
         assert_eq!(body["data"][0]["id"], "blobs-api");
         assert_eq!(body["data"][0]["acknowledgedSequence"], "0");
         assert_eq!(body["data"][0]["deliveredSequence"], "0");
+    }
+
+    #[tokio::test]
+    async fn query_and_follow_rejects_finalized_only_processors() {
+        use leani_processor_api::PublicationPolicy;
+        use leani_testkit::BlockLocalCounter;
+
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = SqliteStore::open(leani_store_sqlite::StoreConfig::new(
+            directory.path().join("finalized-only-follow.sqlite"),
+        ))
+        .await
+        .expect("store");
+        let processor: Arc<dyn Processor> = Arc::new(
+            BlockLocalCounter::default().with_publication(PublicationPolicy::FinalizedOnly),
+        );
+        let router =
+            router_with_processors(store, vec![processor], Vec::new(), ApiConfig::default())
+                .expect("router");
+        let response = router
+            .oneshot(
+                Request::post(
+                    "/v1/processors/synthetic-counter/collections/counter.blocks/query-and-follow",
+                )
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"limit":1}"#))
+                .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body: Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body"),
+        )
+        .expect("JSON");
+        assert_eq!(body["error"]["code"], "finalized_only_snapshot");
     }
 
     #[tokio::test]
@@ -10196,7 +10393,7 @@ mod tests {
             CoverageInterval {
                 from_block: 25,
                 to_block: 40,
-                finality: "optimistic",
+                finality: "included",
             },
         ];
         assert_eq!(missing_coverage_blocks(10, 30, &available), 4);
@@ -10258,16 +10455,16 @@ mod tests {
             labels(&labeled_coverage_intervals(&coverage, &finalized)),
             vec![
                 (5, 8, "finalized"),
-                (9, 11, "optimistic"),
+                (9, 11, "included"),
                 (12, 14, "finalized"),
-                (15, 20, "optimistic"),
-                (30, 32, "optimistic"),
+                (15, 20, "included"),
+                (30, 32, "included"),
                 (33, 35, "finalized"),
             ],
         );
         assert_eq!(
             labels(&labeled_coverage_intervals(&coverage, &[])),
-            vec![(5, 20, "optimistic"), (30, 35, "optimistic")],
+            vec![(5, 20, "included"), (30, 35, "included")],
         );
         assert_eq!(
             labels(&labeled_coverage_intervals(
@@ -10304,7 +10501,7 @@ mod tests {
                 CoverageInterval {
                     from_block: 90,
                     to_block: 100,
-                    finality: "optimistic",
+                    finality: "included",
                 },
             ],
             configured_start_block: 0,
@@ -10501,7 +10698,7 @@ mod tests {
         let mut parent = BlockHash::ZERO;
         for number in 0..=4 {
             let mut frame = fixture_frame(number, parent);
-            frame.finality = Finality::Optimistic;
+            frame.finality = Finality::Included;
             let delta = processor.map(&frame).await.expect("map");
             let descriptor = processor.descriptor();
             store
@@ -10549,9 +10746,74 @@ mod tests {
             body["available"],
             json!([
                 { "fromBlock": 0, "toBlock": 2, "finality": "finalized" },
-                { "fromBlock": 3, "toBlock": 4, "finality": "optimistic" }
+                { "fromBlock": 3, "toBlock": 4, "finality": "included" }
             ]),
         );
         assert_eq!(body["finalizedThrough"], 2);
+    }
+
+    #[test]
+    fn promoted_change_envelopes_stamp_finalized_onto_embedded_payload_finality() {
+        use leani_primitives::{BlockHash, BlockNumber, BlockRef, ChangeCursor, Finality};
+        use leani_processor_block_summary::{
+            BLOCK_SUMMARY_KIND, BlockSummaryConfig, BlockSummaryEntity, BlockSummaryProcessor,
+        };
+        use leani_store_sqlite::{
+            ChangeDirection, ChangeRecord, DeliveryOrigin, DeliveryOriginKind,
+        };
+
+        let processor = BlockSummaryProcessor::new(BlockSummaryConfig {
+            start_block: BlockNumber(0),
+        })
+        .expect("processor");
+        let block_hash = BlockHash::new([7; 32]);
+        let entity = BlockSummaryEntity {
+            chain_id: ChainId(1),
+            block_number: BlockNumber(42),
+            block_hash,
+            parent_hash: BlockHash::ZERO,
+            timestamp: 1_700_000_000,
+            gas_limit: Some(60_000_000),
+            gas_used: Some(30_000_000),
+            base_fee_per_gas: None,
+            blob_gas_used: None,
+            excess_blob_gas: None,
+            transaction_count: Some(3),
+            size_bytes: None,
+            finality: Finality::Included,
+        };
+        let record = ChangeRecord {
+            delivery_encoding_version: 1,
+            cursor: ChangeCursor {
+                chain_id: ChainId(1),
+                processor_id: processor.descriptor().id.to_string(),
+                sequence: 9,
+            },
+            origin: DeliveryOrigin {
+                kind: DeliveryOriginKind::Live,
+                id: processor.descriptor().instance.to_string(),
+                publication_revision: 0,
+            },
+            block: BlockRef {
+                number: BlockNumber(42),
+                hash: block_hash,
+                parent_hash: BlockHash::ZERO,
+                timestamp: 1_700_000_000,
+            },
+            finality: Finality::Finalized,
+            direction: ChangeDirection::Apply,
+            change: leani_processor_api::DomainChange {
+                kind: BLOCK_SUMMARY_KIND.to_owned(),
+                key: block_hash.0.to_vec(),
+                operation: ChangeOperation::Upsert,
+                payload: postcard::to_allocvec(&entity).expect("encode entity"),
+            },
+            emitted_at_unix_ms: 1,
+        };
+
+        let envelope = change_envelope_json([0; 16], &processor, record).expect("envelope");
+        assert_eq!(envelope["finality"], "finalized");
+        assert_eq!(envelope["data"]["finality"], "finalized");
+        assert_eq!(envelope["data"]["blockNumber"], 42);
     }
 }

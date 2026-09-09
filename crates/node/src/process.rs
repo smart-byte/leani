@@ -3113,6 +3113,7 @@ async fn backfill(
         source_ids = ?source_ids,
         "starting processor historical backfill"
     );
+    let _data_dir_lock = crate::local_state::lock_runtime_directory(&config.data_dir)?;
     let store = SqliteStore::open(configured_store_config(
         &config,
         config.data_dir.join("leani.sqlite"),
@@ -3246,6 +3247,7 @@ async fn fixture_e2e(data_dir: &Path, blocks: u64, report: Option<&Path>) -> Res
     if !(1..=10_000).contains(&blocks) {
         bail!("fixture block count must be within 1..=10000");
     }
+    let _data_dir_lock = crate::local_state::lock_runtime_directory(data_dir)?;
     let database = data_dir.join("leani.sqlite");
     if database.exists() {
         bail!(
@@ -3961,6 +3963,7 @@ async fn db(command: DbCommand, config_path: &Path, registry: &ProcessorRegistry
         .validate()
         .map_err(|errors| anyhow::anyhow!(errors))?
         .into_inner();
+    let _data_dir_lock = crate::local_state::lock_runtime_directory(&config.data_dir)?;
     let database_path = config.data_dir.join("leani.sqlite");
     let store = SqliteStore::open(configured_store_config(&config, &database_path))
         .await
@@ -5244,6 +5247,21 @@ async fn serve(path: &Path, registry: &ProcessorRegistry) -> Result<Exit> {
     } else {
         None
     };
+    let snapshot_store = store.clone();
+    let snapshot_cancellation = cancellation.clone();
+    let snapshot_maintenance = tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(30));
+        loop {
+            tokio::select! {
+                () = snapshot_cancellation.cancelled() => break,
+                _ = ticker.tick() => {
+                    if let Err(error) = snapshot_store.prune_expired_query_snapshots().await {
+                        warn!(%error, "query snapshot cleanup failed");
+                    }
+                }
+            }
+        }
+    });
     let processor_maintenance = processors
         .iter()
         .zip(&config.get().processors)
@@ -5297,6 +5315,7 @@ async fn serve(path: &Path, registry: &ProcessorRegistry) -> Result<Exit> {
     if let Some(artifact_compaction_supervisor) = artifact_compaction_supervisor {
         let _ = artifact_compaction_supervisor.await;
     }
+    let _ = snapshot_maintenance.await;
     for maintenance in processor_maintenance {
         let _ = maintenance.await;
     }
@@ -5536,6 +5555,42 @@ struct NetworkLaneHandles {
     backfill_control: Option<Arc<NativeBackfillControl>>,
     verified_anchor:
         Option<tokio::sync::watch::Sender<Option<leani_runtime::AppliedFinalityAnchor>>>,
+}
+
+fn publish_verified_anchor(
+    sender: &tokio::sync::watch::Sender<Option<leani_runtime::AppliedFinalityAnchor>>,
+    anchor: leani_runtime::AppliedFinalityAnchor,
+) -> Result<bool> {
+    let mut conflict = false;
+    let changed = sender.send_if_modified(|current| {
+        if let Some(previous) = current {
+            if anchor.beacon_slot < previous.beacon_slot {
+                return false;
+            }
+            if anchor.beacon_slot == previous.beacon_slot {
+                conflict = anchor.beacon_block_root != previous.beacon_block_root
+                    || anchor.block.hash != previous.block.hash
+                    || anchor.block.number != previous.block.number;
+                return false;
+            }
+            if anchor.block.number < previous.block.number
+                || (anchor.block.number == previous.block.number
+                    && anchor.block.hash != previous.block.hash)
+            {
+                conflict = true;
+                return false;
+            }
+        }
+        *current = Some(anchor);
+        true
+    });
+    if conflict {
+        bail!(
+            "verified finality anchor at Beacon slot {} contradicts the current anchor",
+            anchor.beacon_slot
+        );
+    }
+    Ok(changed)
 }
 
 /// Minimal network runtime used by commands that need live processing without
@@ -5957,11 +6012,14 @@ async fn run_network_lanes_once(
         .store_canonical_anchor(chain_id, live_anchor, Finality::Finalized)
         .await?;
     if let Some(verified_anchor) = &verified_anchor {
-        verified_anchor.send_replace(Some(leani_runtime::AppliedFinalityAnchor {
-            block: live_anchor,
-            beacon_slot: selected.beacon_slot,
-            beacon_block_root: selected.beacon_block_root,
-        }));
+        publish_verified_anchor(
+            verified_anchor,
+            leani_runtime::AppliedFinalityAnchor {
+                block: live_anchor,
+                beacon_slot: selected.beacon_slot,
+                beacon_block_root: selected.beacon_block_root,
+            },
+        )?;
     }
     let checkpoint = ConsensusCheckpoint {
         beacon_slot: bootstrap.beacon_slot,
@@ -6044,7 +6102,7 @@ async fn run_network_lanes_once(
                     }
                 };
                 if let Some(verified_anchor) = &verified_anchor {
-                    verified_anchor.send_replace(Some(applied));
+                    publish_verified_anchor(verified_anchor, applied)?;
                 }
                 if let Some(control) = &control {
                     control
@@ -6788,6 +6846,58 @@ mod tests {
     use leani_testkit::{BlockLocalCounter, fixture_frame};
 
     use super::*;
+
+    #[test]
+    fn verified_anchor_notifications_never_rewind_or_replace_a_conflicting_identity() {
+        use leani_primitives::BlockHash;
+        use leani_runtime::AppliedFinalityAnchor;
+
+        let first = AppliedFinalityAnchor {
+            block: fixture_frame(1, BlockHash::ZERO).block,
+            beacon_slot: 100,
+            beacon_block_root: [1; 32],
+        };
+        let next = AppliedFinalityAnchor {
+            block: fixture_frame(2, first.block.hash).block,
+            beacon_slot: 132,
+            beacon_block_root: [2; 32],
+        };
+        let (sender, mut receiver) = tokio::sync::watch::channel(None);
+        assert!(publish_verified_anchor(&sender, first).expect("initial anchor"));
+        assert!(publish_verified_anchor(&sender, next).expect("newer anchor"));
+        assert_eq!(*receiver.borrow_and_update(), Some(next));
+        assert!(!publish_verified_anchor(&sender.clone(), first).expect("stale bootstrap"));
+        assert!(!publish_verified_anchor(&sender, next).expect("duplicate anchor"));
+        assert!(!receiver.has_changed().expect("no redundant notifications"));
+
+        for conflict in [
+            AppliedFinalityAnchor {
+                beacon_block_root: [3; 32],
+                ..next
+            },
+            AppliedFinalityAnchor {
+                block: first.block,
+                ..next
+            },
+            AppliedFinalityAnchor {
+                beacon_slot: 164,
+                block: first.block,
+                ..next
+            },
+            AppliedFinalityAnchor {
+                beacon_slot: 164,
+                block: leani_primitives::BlockRef {
+                    hash: first.block.hash,
+                    ..next.block
+                },
+                ..next
+            },
+        ] {
+            assert!(publish_verified_anchor(&sender, conflict).is_err());
+            assert_eq!(*receiver.borrow(), Some(next));
+            assert!(!receiver.has_changed().expect("conflict not published"));
+        }
+    }
 
     #[tokio::test]
     async fn failed_backfill_updates_the_primary_scheduler_record() {

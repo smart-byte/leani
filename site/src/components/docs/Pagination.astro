@@ -1,15 +1,20 @@
 ---
 import { getCollection } from 'astro:content';
-import { DOC_SECTIONS, docHref } from '../../lib/docs';
+import { DOC_SECTIONS, DOC_STARTER_PAGES, docHref } from '../../lib/docs';
 
 const currentId = Astro.locals.starlightRoute.entry.id;
 const entries = (await getCollection('docs', ({ data }) => !data.draft)).sort((left, right) => {
   const sectionOrder = DOC_SECTIONS.indexOf(left.data.section) - DOC_SECTIONS.indexOf(right.data.section);
   return sectionOrder || left.data.order - right.data.order || left.data.title.localeCompare(right.data.title);
 });
-const currentIndex = entries.findIndex((entry) => entry.id === currentId);
-const previous = currentIndex > 0 ? entries[currentIndex - 1] : undefined;
-const next = currentIndex >= 0 ? entries[currentIndex + 1] : undefined;
+const starterIds = new Set<string>(DOC_STARTER_PAGES.map((page) => page.id));
+const current = entries.find((entry) => entry.id === currentId);
+const path = starterIds.has(currentId)
+  ? DOC_STARTER_PAGES.map((page) => entries.find((entry) => entry.id === page.id)!)
+  : entries.filter((entry) => !starterIds.has(entry.id) && entry.data.section === current?.data.section);
+const currentIndex = path.findIndex((entry) => entry.id === currentId);
+const previous = currentIndex > 0 ? path[currentIndex - 1] : undefined;
+const next = currentIndex >= 0 ? path[currentIndex + 1] : undefined;
 ---
 
 <nav class="pagination-links print:hidden" aria-label="Documentation pages">

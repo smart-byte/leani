@@ -9,8 +9,6 @@ audience:
 status: preview
 ---
 
-# Live Uniswap prices from the CLI and SDK
-
 Leani's `subscribe` command turns the built-in Uniswap V3 observation
 processor into a small live-price utility. It follows Ethereum directly and
 prints only matching pool updates to stdout; lifecycle and peer messages go to
@@ -83,7 +81,7 @@ Beacon API. Override the provider set with repeatable `--checkpoint-url` flags
 The default pretty stream looks like this:
 
 ```text
-2026-08-28T19:22:11Z  ETH/USDC 2439.03084279  volume=0.601207569812525017 ETH  block=25855798  optimistic
+2026-08-28T19:22:11Z  ETH/USDC 2439.03084279  volume=0.601207569812525017 ETH  block=25855798  included
 ```
 
 Volume is the absolute swap amount in the first, or base, token of the market.
@@ -106,14 +104,20 @@ leani subscribe uniswap-v3 ETH/USDC --format json |
 
 `--format raw` exposes the underlying change envelope, and `--once` exits after
 one matching update. `--finality finalized` builds an embedded finalized-only
-processor. The default `optimistic` mode emits head updates and marks undo
+processor that prints a price only after Ethereum consensus has finalized its
+block. The default `included` mode emits head updates and marks undo
 records during a reorg.
 
 Embedded mode does not bind API or RPC ports, activate unrelated processors, or
 start a historical backfill. It starts from an independently verified finalized
-execution anchor and connects native execution P2P. For an optimistic
+execution anchor and connects native execution P2P. For an included
 subscription it also fetches one root-checked current head block and can print
-matching swaps while the durable anchored lane catches up; finalized output
+matching swaps while the durable anchored lane catches up. Such output says
+`preview` in the terminal and `finality: "preview"` in JSON: commitment checks
+alone do not prove canonical ancestry. Output from the configured processor
+lane says `included` or `finalized`. `--once` may exit on a preview; use
+`--finality finalized` to wait for a block Ethereum consensus has finalized.
+Finalized output
 still waits for the fully joined path. Its small SQLite store, locally verified
 checkpoint, and peer cache live under the platform data directory; use
 `--data-dir PATH` to select an explicit location. The durable lane of a
@@ -146,7 +150,7 @@ Auto mode discovers the reachable `api.bind` in `./leani.toml` and attaches;
 otherwise it starts the embedded runtime. Use `--mode client --endpoint URL`
 when attaching to a remote node should be mandatory rather than automatic. The
 client takes a head cursor, reads the node's query-only latest observation for
-an immediate still-fresh optimistic price, then opens SSE and applies the same timestamp
+an immediate still-fresh included price, then opens SSE and applies the same timestamp
 freshness gate as embedded mode, so retained history and in-progress node
 catch-up are not presented as live prices. Before opening the stream, it reads
 the processor's immutable pool catalog and rejects any requested market that
@@ -184,7 +188,7 @@ includes the ordinary PublicNode
 (`https://ethereum-beacon-api.publicnode.com/`) and Lodestar
 (`https://lodestar-mainnet.chainsafe.io/`) Beacon API endpoints, Xatu history
 fallback, bounded 512 MiB memory and 2 GiB temporary-disk budgets, on-demand
-Uniswap history, optimistic/finalized publication, a 256 block undo window,
+Uniswap history, included/finalized publication, a 256 block undo window,
 64 MiB/24 hour delivery retention, ephemeral P2P listener ports, RPC on
 `18545`/`18546`, and the native API on `18080`. Pool addresses, fee tiers, and
 the earliest processor block come from the same built-in market catalog as

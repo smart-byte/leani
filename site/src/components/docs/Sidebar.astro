@@ -2,23 +2,36 @@
 import { getCollection } from 'astro:content';
 import { Badge } from '@astrojs/starlight/components';
 import MobileMenuFooter from '@astrojs/starlight/components/MobileMenuFooter.astro';
-import { DOC_SECTIONS, DOC_SECTION_LABELS, docHref } from '../../lib/docs';
+import { DOC_SECTIONS, DOC_SECTION_LABELS, DOC_STARTER_PAGES, docHref } from '../../lib/docs';
 
 const currentId = Astro.locals.starlightRoute.entry.id;
 const entries = (await getCollection('docs', ({ data }) => !data.draft)).sort((left, right) => {
   const sectionOrder = DOC_SECTIONS.indexOf(left.data.section) - DOC_SECTIONS.indexOf(right.data.section);
   return sectionOrder || left.data.order - right.data.order || left.data.title.localeCompare(right.data.title);
 });
+const starterIds = new Set<string>(DOC_STARTER_PAGES.map((page) => page.id));
 ---
 
 <nav class="docs-nav" aria-label="Documentation">
+  <section aria-labelledby="starter-heading">
+    <h2 id="starter-heading">Start building</h2>
+    <ul>
+      {DOC_STARTER_PAGES.map((page) => (
+        <li>
+          <a href={docHref(page.id)} aria-current={page.id === currentId ? 'page' : undefined}>
+            <span>{page.label}</span>
+          </a>
+        </li>
+      ))}
+    </ul>
+  </section>
   {
     DOC_SECTIONS.map((section) => {
-      const sectionEntries = entries.filter((entry) => entry.data.section === section);
+      const sectionEntries = entries.filter((entry) => entry.data.section === section && !starterIds.has(entry.id));
       if (sectionEntries.length === 0) return null;
       return (
-        <section>
-          <h2>{DOC_SECTION_LABELS[section]}</h2>
+        <details open={sectionEntries.some((entry) => entry.id === currentId)}>
+          <summary>{section === 'getting-started' ? 'More first-run help' : DOC_SECTION_LABELS[section]}</summary>
           <ul>
             {sectionEntries.map((entry) => (
               <li>
@@ -35,7 +48,7 @@ const entries = (await getCollection('docs', ({ data }) => !data.draft)).sort((l
               </li>
             ))}
           </ul>
-        </section>
+        </details>
       );
     })
   }
@@ -53,7 +66,7 @@ const entries = (await getCollection('docs', ({ data }) => !data.draft)).sort((l
       padding-block: 0.5rem 1.5rem;
     }
 
-    h2 {
+    h2, summary {
       color: var(--sl-color-gray-2);
       font-size: var(--sl-text-xs);
       font-weight: 700;
@@ -61,6 +74,9 @@ const entries = (await getCollection('docs', ({ data }) => !data.draft)).sort((l
       margin: 0 0 0.4rem;
       text-transform: uppercase;
     }
+
+    summary { cursor: pointer; padding-block: 0.35rem; }
+    details[open] summary { margin-bottom: 0.4rem; }
 
     ul {
       display: grid;

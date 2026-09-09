@@ -96,6 +96,20 @@ function cliCommands(command: CliCommand, parents: string[] = []): Array<{ path:
 }
 
 {
+  kind === 'sdk' && (
+    <section class="reference-group">
+      <h2>Exported types and helpers</h2>
+      {sdkReference.types.map((type) => (
+        <details class="command">
+          <summary><code>{type.name}</code><span>{type.module}</span></summary>
+          <pre><code>{type.signature}</code></pre>
+        </details>
+      ))}
+    </section>
+  )
+}
+
+{
   kind === 'cli' && cliCommands(cliReference.command).map(({ path, command }) => (
     <details class="command" open={path === 'leani'}>
       <summary><code>{path}</code><span>{command.about}</span></summary>

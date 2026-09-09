@@ -46,7 +46,7 @@ version = "1.0.0"
 history_control = "node_owned"
 history_mode = "automatic"
 start_block = 12965000
-publish = "optimistic_and_finalized"
+publish = "included_and_finalized"
 
 [processors.state]
 mode = "durable"

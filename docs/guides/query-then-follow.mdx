@@ -16,16 +16,56 @@ can commit after the query but before the stream starts. `queryAndFollow()`
 returns the snapshot and its opaque change boundary atomically. Passing that
 boundary to `subscribe({ after })` closes the gap.
 
+<Aside type="caution" title="Included-and-finalized processors only">
+  `query-and-follow` answers `409 finalized_only_snapshot` for a processor
+  with `publish = "finalized_only"`. Its retained state already holds included
+  blocks whose changes are unpublished, and the stream never emits an undo for
+  them, so a snapshot could seed rows no later event corrects. Follow such a
+  processor's change stream from its head instead.
+</Aside>
+
+First follow the [source installation](/docs/getting-started/install/), including
+the SDK setup. Stop any other node using API port 8080 before this example.
+The supplied profile retains the latest USDC/WETH pool state and a bounded
+change stream; its public Xatu history needs no provider key:
+
+```bash
+LEANI_SDK_DIR="$(mktemp -d)"
+cp "$LEANI_SOURCE/examples/sdk-stream/node.toml" "$LEANI_SDK_DIR/leani.toml"
+cd "$LEANI_SDK_DIR"
+leani doctor --json
+leani backfill --processor usdc-weth-latest --from 17000000 --to 17000999
+leani serve
+```
+
+In another terminal, from the repository root:
+
+```bash
+cd "$LEANI_SOURCE"
+bun examples/sdk-stream/index.ts
+```
+
+Expect `Loaded 1 pools`. The process then waits for more changes; this
+historical-only profile has no live source, so silence after the seed is expected.
+Press Ctrl-C to stop. The example keeps the price map in memory; for a durable
+destination, continue with [PostgreSQL](/docs/guides/postgres-consumer/).
+
+This historical-only profile lets you inspect the seed and resume boundary.
+For ongoing P2P updates, enable live execution and verified finality as described
+in the [Uniswap subscription guide](/docs/guides/uniswap-price-subscriptions/).
+
 <CodeExample example="query-then-follow" />
 
 <Steps>
-1. Materialize every entity returned by the stable snapshot.
+1. Follow every `nextCursor` to materialize the complete stable snapshot.
 2. Release the snapshot when the local seed is committed.
 3. Start the resumable stream at `boundaryCursor`.
 4. Apply both `apply` and `undo`; an undo envelope carries the inverse entity
    mutation.
 5. Treat `finalized` as an explicit transition and `reset_required` as a
-   rebuild instruction. Never infer either from elapsed time.
+   rebuild instruction. The SDK throws `ResetRequiredError` on an SSE reset;
+   expired HTTP cursors throw `LeaniError` with `code: "cursor_expired"`.
+   Never infer either transition from elapsed time.
 </Steps>
 
 <Aside type="note" title="SSE resume is not a durable acknowledgement">
@@ -33,3 +73,12 @@ boundary to `subscribe({ after })` closes the gap.
   live feed. For a destination that must fence Leani's retention across process
   restarts, use a named [durable consumer](/docs/guides/durable-consumer/).
 </Aside>
+
+The page `limit` only controls transport size. Creating the first page copies
+the entire matching collection under the store writer lock. Defaults cap each
+snapshot at 100,000 rows / 64 MiB and all outstanding snapshots together at 32
+snapshots / 128 MiB (including key and row overhead). Physical store admission
+also applies. Release snapshots promptly; the node expires them after five
+minutes and cleans expired rows every 30 seconds. `query_snapshot_capacity`
+returns retryable HTTP 503 when aggregate admission is full. Very slow readers
+can outlive the retained stream and must rebuild, as the example does.

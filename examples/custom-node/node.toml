@@ -41,8 +41,9 @@ checkpoint = ""
 id = "example-block-summary"
 instance = "example-block-summary-local"
 version = "1.0.0"
+history_mode = "on_demand"
 start_block = 19426589
-publish = "optimistic_and_finalized"
+publish = "included_and_finalized"
 
 [processors.state]
 mode = "durable"

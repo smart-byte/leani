@@ -91,8 +91,8 @@ pub enum Command {
         /// Optional bearer token for a running node.
         #[arg(long, env = "LEANI_API_TOKEN")]
         token: Option<String>,
-        /// Publication finality.
-        #[arg(long, value_enum, default_value_t = SubscribeFinality::Optimistic)]
+        /// Lowest status to print: `included` (default) or `finalized`.
+        #[arg(long, value_enum, default_value_t = SubscribeFinality::Included)]
         finality: SubscribeFinality,
         /// Finality transport for the embedded runtime.
         #[arg(long, value_enum, default_value_t = SubscribeFinalitySource::Auto)]
@@ -302,9 +302,13 @@ pub enum SubscribeMode {
     Embedded,
 }
 
+/// Lowest chain-confidence status a subscription prints.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 pub enum SubscribeFinality {
-    Optimistic,
+    /// Print blocks as soon as they are on the followed chain; a reorg can
+    /// still remove them. Embedded startup may print a peer preview first.
+    Included,
+    /// Print blocks only after Ethereum consensus has finalized them.
     Finalized,
 }
 
@@ -337,8 +341,8 @@ pub enum ResetCommand {
         /// The exact targets used by `leani subscribe`; empty for `blocks`.
         #[arg(num_args = 0.., value_name = "TARGET")]
         targets: Vec<String>,
-        /// Price finality used by the subscription state being reset.
-        #[arg(long, value_enum, default_value_t = SubscribeFinality::Optimistic)]
+        /// Finality of the subscription state being reset (`included` or `finalized`).
+        #[arg(long, value_enum, default_value_t = SubscribeFinality::Included)]
         finality: SubscribeFinality,
         /// Exact embedded subscription directory to reset.
         #[arg(long)]

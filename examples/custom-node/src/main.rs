@@ -85,7 +85,7 @@ impl BlockSummaryProcessor {
                     log_fields: leani_primitives::LogFieldSet::NONE,
                     allow_filtered: false,
                     filter: FilterScope::default(),
-                    minimum_finality: Finality::Optimistic,
+                    minimum_finality: Finality::Included,
                 }],
                 mode: ReductionMode::BlockLocal,
                 delivery_ordering: DeliveryOrdering::BlockVersionedIdempotent,
@@ -114,6 +114,7 @@ impl Processor for BlockSummaryProcessor {
         &self.descriptor
     }
 
+    // docs:start custom-processor-transform
     async fn map(&self, block: &BlockFrame) -> Result<EncodedDelta, ProcessorError> {
         self.descriptor.requirements[0]
             .validate_frame(block)
@@ -154,6 +155,7 @@ impl Processor for BlockSummaryProcessor {
             changes: vec![change],
         })
     }
+    // docs:end custom-processor-transform
 
     fn change_json(
         &self,
@@ -163,6 +165,24 @@ impl Processor for BlockSummaryProcessor {
             return Ok(None);
         }
         serde_json::from_slice::<BlockSummary>(&change.payload)
+            .map_err(|error| ProcessorError::State(error.to_string()))
+            .and_then(|summary| {
+                serde_json::to_value(summary)
+                    .map(Some)
+                    .map_err(|error| ProcessorError::State(error.to_string()))
+            })
+    }
+
+    fn entity_json(
+        &self,
+        collection: &str,
+        _key: &[u8],
+        value: &[u8],
+    ) -> Result<Option<serde_json::Value>, ProcessorError> {
+        if collection != COLLECTION {
+            return Ok(None);
+        }
+        serde_json::from_slice::<BlockSummary>(value)
             .map_err(|error| ProcessorError::State(error.to_string()))
             .and_then(|summary| {
                 serde_json::to_value(summary)
@@ -246,6 +266,7 @@ impl ProcessorFactory for BlockSummaryFactory {
 }
 // docs:end custom-processor-extension
 
+// docs:start custom-node-main
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
     let mut registry = ProcessorRegistry::new();
@@ -261,6 +282,7 @@ async fn main() -> std::process::ExitCode {
         }
     }
 }
+// docs:end custom-node-main
 
 #[cfg(test)]
 mod tests {
@@ -367,6 +389,7 @@ mod tests {
         .expect("router");
 
         let response = app
+            .clone()
             .oneshot(
                 Request::get(format!("/v1/processors/{instance}/query/42"))
                     .body(Body::empty())
@@ -381,6 +404,24 @@ mod tests {
         let body: serde_json::Value = serde_json::from_slice(&body).expect("JSON response");
         assert_eq!(body["blockNumber"], 42);
         assert_eq!(body["timestamp"], 1_700_000_042_u64);
+
+        let generic = app
+            .oneshot(
+                Request::get(format!(
+                    "/v1/processors/{instance}/collections/{COLLECTION}/entities"
+                ))
+                .body(Body::empty())
+                .expect("generic query"),
+            )
+            .await
+            .expect("generic response");
+        assert_eq!(generic.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(generic.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let body: serde_json::Value = serde_json::from_slice(&body).expect("generic JSON");
+        assert_eq!(body["data"][0]["data"]["blockNumber"], 42);
+        assert_eq!(body["data"][0]["data"]["timestamp"], 1_700_000_042_u64);
     }
 
     #[test]
@@ -393,7 +434,7 @@ mod tests {
             history_control: leani::config::ProcessorHistoryControl::NodeOwned,
             require_retained_input: false,
             start_block: 1,
-            publish: leani::config::PublishMode::OptimisticAndFinalized,
+            publish: leani::config::PublishMode::IncludedAndFinalized,
             state: leani::config::StatePolicyConfig {
                 mode: leani_processor_api::StatePolicyMode::Durable,
             },

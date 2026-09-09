@@ -1,3 +1,4 @@
+// docs:start durable-consumer
 import {
   LeaniError,
   createLeaniClient,
@@ -25,7 +26,6 @@ export interface ConsumerOptions {
   signal?: AbortSignal;
 }
 
-// docs:start durable-consumer
 export async function consumeDurably<T>(
   destination: Destination<T>,
   options: ConsumerOptions,

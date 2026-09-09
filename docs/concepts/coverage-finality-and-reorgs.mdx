@@ -12,20 +12,33 @@ status: preview
 import { Aside } from '@astrojs/starlight/components';
 
 Coverage answers “which block intervals did this processor commit?” Finality
-answers “what canonicality confidence does each committed interval have?” They
+answers “what chain-confidence status does each committed interval have?” They
 are related but deliberately not collapsed into one boolean.
+
+Every record carries one of three statuses:
+
+| Status | Meaning |
+|---|---|
+| `preview` | A peer supplied the block; its connection to the chain is still being checked. Only the embedded CLI prints this during startup. |
+| `included` | The block is on the currently followed chain. A reorg can still remove it. |
+| `finalized` | Ethereum consensus has finalized the block. |
+
+`finalized` reflects the node's configured finality source. Embedded and
+native-P2P runs verify it locally through light-client proofs. Sources that
+serve finalized material under dataset trust (Xatu, EraE) carry the label
+under that source's trust model; subscribing to them does not turn the label
+into an independent proof.
 
 ```text
 requested       100 ─────────────────────────────── 140
 coverage        100 ───── 112     120 ───────────── 140
 finalized       100 ───────────────── 128
-safe                                      129 ── 134
-optimistic                                        135 ── 140
+included                                  129 ───── 140
 ```
 
 In that example, `complete` is false because `113..119` is absent. A high
 `processedThrough` value does not hide the internal gap, and finalized coverage
-does not imply the optimistic tail is absent.
+does not imply the included tail is absent.
 
 ## Filling history gaps
 
@@ -47,10 +60,19 @@ default.
 
 ## Reorgs are delivery events
 
-For optimistic publication, downstream consumers can see `apply`, `undo`, and
+For included publication (`publish = "included_and_finalized"`), downstream
+consumers can see `apply`, `undo`, and
 later `finalized` changes. Processor state, undo records, and published changes
 commit together. A consumer must implement these operations idempotently and
 must not infer finality from age alone.
+
+With `publish = "finalized_only"` the change stream carries only finalized
+`apply` records and `system.finality` markers. Included blocks are applied to
+processor state and journaled for undo, but their changes stay in the store
+until verified finality promotes them. Their bytes count against the delivery
+budget from the moment they are applied, so a slow consumer pauses the
+processor exactly as it would with included publication. A reorg of an
+unpublished block emits nothing downstream.
 
 Use processor status for exact intervals and `/v1/network/status` for the
 independent live/finality lane state. Readiness can be healthy while an older

@@ -1,75 +1,81 @@
 {
-  "id": "erc20-balances",
-  "label": "erc20-balances",
   "caption": "Event-derived watchlist balances with declared coverage. Exact for conventional Transfer semantics when indexing begins before the relevant initial mint; rebasing, reflection, and non-standard tokens need a different model.",
-  "docsUrl": "/docs/reference/processor-contracts/#erc20-balances-100",
+  "config": "[[processors]]\nid = \"erc20-balances\"\ninstance = \"erc20-watchlist\"\nversion = \"1.0.0\"\nhistory_mode = \"on_demand\"\nstart_block = 1234567\npublish = \"included_and_finalized\"\n\n[processors.state]\nmode = \"durable\"\n\n[processors.artifacts]\nmode = \"none\"\n\n[processors.output]\nmode = \"latest\"\n\n[processors.delivery]\nmode = \"window\"\n\n[processors.checkpoint]\nmode = \"automatic\"\nkeep = 3\n\n[processors.undo]\nmode = \"unfinalized\"\nsafety_blocks = 256\n\n[processors.settings]\naddresses = [\"0x1111111111111111111111111111111111111111\"]\ntokens = [\"0x2222222222222222222222222222222222222222\"]\ncomplete_from_start = true",
   "configLang": "toml",
-  "config": "[[processors]]\nid = \"erc20-balances\"\ninstance = \"erc20-watchlist\"\nversion = \"1.0.0\"\nhistory_mode = \"on_demand\"\nstart_block = 1234567\npublish = \"optimistic_and_finalized\"\n\n[processors.state]\nmode = \"durable\"\n\n[processors.artifacts]\nmode = \"none\"\n\n[processors.output]\nmode = \"latest\"\n\n[processors.delivery]\nmode = \"window\"\n\n[processors.checkpoint]\nmode = \"automatic\"\nkeep = 3\n\n[processors.undo]\nmode = \"unfinalized\"\nsafety_blocks = 256\n\n[processors.settings]\naddresses = [\"0x1111111111111111111111111111111111111111\"]\ntokens = [\"0x2222222222222222222222222222222222222222\"]\ncomplete_from_start = true",
-  "dataType": "{\n  token: Hex;\n  address: Hex;\n  balance: string;\n  asOfBlock: number;\n  blockHash: Hex;\n  finality: \"optimistic\" | \"safe\" | \"finalized\";\n  coverageFrom: number;\n  complete: boolean;\n  method: \"erc20_transfer_ledger\";\n}",
-  "sseId": "opaque-resume-cursor",
+  "dataType": "{\n  token: Hex;\n  address: Hex;\n  balance: string;\n  asOfBlock: number;\n  blockHash: Hex;\n  finality: \"preview\" | \"included\" | \"finalized\";\n  coverageFrom: number;\n  complete: boolean;\n  method: \"erc20_transfer_ledger\";\n}",
+  "docsUrl": "/docs/reference/processor-contracts/#erc20-balances-100",
   "helloJson": {
     "apiVersion": "1",
     "chainId": 1,
+    "coverage": {
+      "available": [
+        {
+          "finality": "finalized",
+          "fromBlock": 19430000,
+          "toBlock": 19430000
+        }
+      ],
+      "chainId": 1,
+      "complete": false,
+      "configuredStartBlock": 1234567,
+      "finalizedThrough": 19430000,
+      "processedThrough": 19430000,
+      "requested": null,
+      "state": "live"
+    },
     "processor": {
+      "artifactRetention": "none",
+      "changeSchema": "erc20.balance.change.v1",
+      "codeHash": "0xacb6d26482e17309a53171a6524dbf27fae7020927facb647cad98fee2bc8ddd",
+      "configHash": "0x286fc393037f30bc3360400281755f19a6741292e7585e781a4294c02facb8ac",
+      "deliveryOrdering": "canonical",
+      "genericApi": "processor-v1",
       "id": "erc20-balances",
       "instance": "erc20-watchlist",
-      "version": "1.0.0",
-      "codeHash": "0x3ff8089f652ea47348210759a3ea27d5f88186c84828268c41ad364cb55bc561",
-      "configHash": "0x2027103520614c5fe4f48a3f1d0237b447f9045130d323acd0e1164613a88c44",
-      "genericApi": "processor-v1",
-      "changeSchema": "erc20.balance.change.v1",
-      "queryExtensions": [{
-        "id": "erc20-v1",
-        "basePath": "/v1/processors/erc20-watchlist/query",
-        "aliasPath": "/v1/q/erc20"
-      }],
-      "subscriptions": true,
-      "artifactRetention": "none",
-      "deliveryOrdering": "canonical"
-    },
-    "coverage": {
-      "chainId": 1,
-      "requested": null,
-      "available": [
-        { "fromBlock": 1234567, "toBlock": 25696396, "finality": "optimistic" }
+      "queryExtensions": [
+        {
+          "aliasPath": "/v1/q/erc20",
+          "basePath": "/v1/processors/erc20-watchlist/query",
+          "id": "erc20-v1"
+        }
       ],
-      "configuredStartBlock": 1234567,
-      "processedThrough": 25696396,
-      "finalizedThrough": 25696313,
-      "complete": true,
-      "state": "live"
+      "subscriptions": true,
+      "version": "1.0.0"
     }
   },
+  "id": "erc20-balances",
+  "label": "erc20-balances",
   "outputJson": {
     "apiVersion": "1",
-    "sequence": "18842",
-    "cursor": "opaque-resume-cursor",
-    "operation": "apply",
-    "originKind": "live",
-    "originId": "erc20-watchlist",
-    "publicationRevision": "0",
-    "chainId": 1,
     "block": {
-      "hash": "0xc86f87600c81fb635325cca051fef40b875ca405d1b2f57881437963321e88ff",
-      "number": 25696396,
-      "parentHash": "0x0141a01b6e38f75cd3606834c3780f581d5772460e440e7c5758b69589929168",
-      "timestamp": 1786025147
+      "hash": "0x8a707419475207771c1004663d7510f330100ca73e206cc3c9bf51e0cef7c0b7",
+      "number": 19430000,
+      "parentHash": "0x5c68562e249e87eee7f656b04177dd585413adf9d3e1cb09f67420223e928e41",
+      "timestamp": 1710500000
     },
-    "finality": "optimistic",
-    "kind": "erc20.balance.put",
-    "schema": "erc20.balance.change.v1",
-    "key": "0x22222222222222222222222222222222222222221111111111111111111111111111111111111111",
+    "chainId": 1,
+    "cursor": "0200000000000000000000000000000000010f65726332302d77617463686c69737405312e302e30011ead1cd8d6ca2b8f409b07f68687fe5f",
     "data": {
-      "token": "0x2222222222222222222222222222222222222222",
       "address": "0x1111111111111111111111111111111111111111",
-      "balance": "1250000000000000000",
-      "asOfBlock": 25696396,
-      "blockHash": "0xc86f87600c81fb635325cca051fef40b875ca405d1b2f57881437963321e88ff",
-      "finality": "optimistic",
-      "coverageFrom": 1234567,
+      "asOfBlock": 19430000,
+      "balance": "42",
+      "blockHash": "0x8a707419475207771c1004663d7510f330100ca73e206cc3c9bf51e0cef7c0b7",
       "complete": true,
-      "method": "erc20_transfer_ledger"
+      "coverageFrom": 1234567,
+      "finality": "finalized",
+      "method": "erc20_transfer_ledger",
+      "token": "0x2222222222222222222222222222222222222222"
     },
-    "emittedAt": "2026-08-06T14:05:51.426Z"
-  }
+    "emittedAt": "2024-03-15T10:53:20.000Z",
+    "finality": "finalized",
+    "key": "0x22222222222222222222222222222222222222221111111111111111111111111111111111111111",
+    "kind": "erc20.balance.put",
+    "operation": "apply",
+    "originId": "illustrative-fixture",
+    "originKind": "historical_backfill",
+    "publicationRevision": "0",
+    "schema": "erc20.balance.change.v1",
+    "sequence": "1"
+  },
+  "sseId": "0200000000000000000000000000000000010f65726332302d77617463686c69737405312e302e30011ead1cd8d6ca2b8f409b07f68687fe5f"
 }

@@ -115,49 +115,13 @@ fn reset_runtime_directory(
         );
         return Ok(false);
     }
-    let metadata = fs::symlink_metadata(&target)
-        .with_context(|| format!("inspect runtime data directory {}", target.display()))?;
-    if metadata.file_type().is_symlink() {
-        bail!(
-            "refusing to reset symlinked runtime data directory {}",
-            target.display()
-        );
-    }
-    if !metadata.is_dir() {
-        bail!("runtime data path is not a directory: {}", target.display());
-    }
-
-    let target = target
-        .canonicalize()
-        .with_context(|| format!("resolve runtime data directory {}", target.display()))?;
-    let working_directory = working_directory
-        .canonicalize()
-        .context("resolve working directory before resetting state")?;
-    if target.parent().is_none() || working_directory.starts_with(&target) {
-        bail!(
-            "refusing to reset broad runtime data directory {}",
-            target.display()
-        );
-    }
-    if let Some(home) = std::env::var_os("HOME")
-        && let Ok(home) = PathBuf::from(home).canonicalize()
-        && target == home
-    {
-        bail!(
-            "refusing to reset home directory configured as runtime data: {}",
-            target.display()
-        );
-    }
-    if let Some(config_path) = config_path
-        && let Ok(config_path) = config_path.canonicalize()
-        && config_path.starts_with(&target)
-    {
-        bail!(
-            "refusing to reset runtime data directory {} because it contains configuration {}",
-            target.display(),
-            config_path.display()
-        );
-    }
+    let target = validated_reset_target(
+        &target,
+        config_path,
+        working_directory,
+        "runtime data",
+        false,
+    )?;
 
     eprintln!("leani: full local-state cold-start reset");
     eprintln!("  directory: {}", target.display());
@@ -189,6 +153,65 @@ fn reset_runtime_directory(
     }
     eprintln!("leani: all local runtime state reset; the next run is cold");
     Ok(true)
+}
+
+pub(crate) fn validated_reset_target(
+    target: &Path,
+    config_path: Option<&Path>,
+    working_directory: &Path,
+    subject: &str,
+    require_runtime_identity: bool,
+) -> Result<PathBuf> {
+    let metadata = fs::symlink_metadata(target)
+        .with_context(|| format!("inspect {subject} directory {}", target.display()))?;
+    if metadata.file_type().is_symlink() {
+        bail!(
+            "refusing to reset symlinked {subject} directory {}",
+            target.display()
+        );
+    }
+    if !metadata.is_dir() {
+        bail!("{subject} path is not a directory: {}", target.display());
+    }
+
+    let target = target
+        .canonicalize()
+        .with_context(|| format!("resolve {subject} directory {}", target.display()))?;
+    let working_directory = working_directory
+        .canonicalize()
+        .with_context(|| format!("resolve working directory before resetting {subject}"))?;
+    if target.parent().is_none() || working_directory.starts_with(&target) {
+        bail!(
+            "refusing to reset broad {subject} directory {}",
+            target.display()
+        );
+    }
+    if let Some(home) = std::env::var_os("HOME")
+        && let Ok(home) = PathBuf::from(home).canonicalize()
+        && target == home
+    {
+        bail!(
+            "refusing to reset home directory configured as {subject}: {}",
+            target.display()
+        );
+    }
+    if let Some(config_path) = config_path
+        && let Ok(config_path) = config_path.canonicalize()
+        && config_path.starts_with(&target)
+    {
+        bail!(
+            "refusing to reset {subject} directory {} because it contains configuration {}",
+            target.display(),
+            config_path.display()
+        );
+    }
+    if require_runtime_identity && !is_runtime_directory(&target) {
+        bail!(
+            "refusing to reset directory without Leani runtime identity {}",
+            target.display()
+        );
+    }
+    Ok(target)
 }
 
 pub(crate) fn is_runtime_directory(target: &Path) -> bool {
