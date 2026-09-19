@@ -9,6 +9,13 @@ on:
 permissions:
   contents: read
 
+# Fresh hosted runners do not benefit from incremental caches. Full debug
+# symbols for the workspace and its dependencies exceed Linux runner storage.
+env:
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
+
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
@@ -70,8 +77,7 @@ jobs:
         run: ruby scripts/test-release-ci.rb
       - name: Validate historical-only deployment config
         run: cargo run --locked -- doctor --json --config deploy/container.toml
-      - name: Build container
-        run: docker build --tag leani:ci .
+      # container.yml builds and scans the image on the same pushes and PRs.
 
   dependencies:
     name: Dependency policy

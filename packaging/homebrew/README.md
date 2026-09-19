@@ -5,7 +5,7 @@ the four release archives. It does not update a tap automatically.
 
 Before the first preview release:
 
-1. create the public `leani-dev/homebrew-tap` repository;
+1. create the public `smart-byte/homebrew-tap` repository;
 2. dispatch `Prepare release` with `publish=false` from the intended tag and
    inspect the release-candidate artifact;
 3. run `brew style`, `brew audit --strict --online`, and `brew install --build-from-source`
