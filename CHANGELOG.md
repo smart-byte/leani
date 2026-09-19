@@ -8,6 +8,12 @@ record, and documented RPC contracts.
 
 ### Changed
 
+- Release publication now requires passing CI for the exact release commit.
+  Native binary releases reuse an inspected candidate, exercise the offline
+  fixture on all four target architectures, and distinguish prereleases from
+  stable releases. SDK package checks cover both public entry points.
+- Updated `h2` to 0.4.16 and `rustls` to 0.23.45 for security fixes, and
+  replaced the yanked `chacha20` 0.10.1 dependency with 0.10.2.
 - Chain-confidence vocabulary is now `preview`, `included`, and `finalized` on
   every `finality` field: CLI output, HTTP API, SSE, SDK types, and
   configuration. `optimistic` becomes `included`; `safe` is removed because no

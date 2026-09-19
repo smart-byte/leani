@@ -24,4 +24,6 @@ npm_config_cache="$npm_cache" npm_config_dry_run=false npm init --yes >/dev/null
 npm_config_cache="$npm_cache" npm_config_dry_run=false \
   npm install --ignore-scripts "$tarball" >/dev/null
 node --input-type=module -e 'import("@leani/sdk").then((sdk) => { if (typeof sdk.createLeaniClient !== "function") process.exit(1); })'
+node --input-type=module -e 'import("@leani/sdk/backfill").then((sdk) => { if (typeof sdk.createBackfillSubscriptionClient !== "function") process.exit(1); })'
 bun --eval 'import { createLeaniClient } from "@leani/sdk"; if (typeof createLeaniClient !== "function") process.exit(1);'
+bun --eval 'import { createBackfillSubscriptionClient } from "@leani/sdk/backfill"; if (typeof createBackfillSubscriptionClient !== "function") process.exit(1);'

@@ -66,6 +66,8 @@ jobs:
         run: scripts/check-doc-links.rb
       - name: Validate release and Homebrew packaging
         run: scripts/test-release-packaging.sh
+      - name: Validate release CI requirements
+        run: ruby scripts/test-release-ci.rb
       - name: Validate historical-only deployment config
         run: cargo run --locked -- doctor --json --config deploy/container.toml
       - name: Build container

@@ -8,13 +8,18 @@ on:
         required: true
         type: string
       publish:
-        description: Create the GitHub release after every preparation gate passes
+        description: Publish an already prepared candidate without rebuilding it
         required: true
         default: false
         type: boolean
+      candidate_run_id:
+        description: Successful preparation run ID (required when publishing)
+        required: false
+        type: string
 
 permissions:
   contents: read
+  actions: read
 
 env:
   RELEASE_VERSION: ${{ inputs.version }}
@@ -25,9 +30,14 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          fetch-depth: 0
+      - name: Verify publication history
+        run: scripts/check-publication.rb HEAD
       - name: Validate version and publish ref
         env:
           PUBLISH: ${{ inputs.publish }}
+          CANDIDATE_RUN_ID: ${{ inputs.candidate_run_id }}
         run: |
           case "$RELEASE_VERSION" in
             v[0-9]*.[0-9]*.[0-9]*) ;;
@@ -37,15 +47,26 @@ jobs:
             echo "publishing requires dispatching this workflow from refs/tags/$RELEASE_VERSION" >&2
             exit 1
           fi
+          if [ "$PUBLISH" = "true" ] && [ -z "$CANDIDATE_RUN_ID" ]; then
+            echo "publishing requires a verified candidate_run_id" >&2
+            exit 1
+          fi
           package_version=$(cargo metadata --locked --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "leani") | .version')
           if [ "$RELEASE_VERSION" != "v$package_version" ]; then
             echo "release version $RELEASE_VERSION does not match leani package version v$package_version" >&2
             exit 1
           fi
+      - name: Require passing CI and matching candidate
+        if: ${{ inputs.publish }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CANDIDATE_RUN_ID: ${{ inputs.candidate_run_id }}
+        run: ruby scripts/check-release-ci.rb
 
   archive:
     name: ${{ matrix.target }} archive
     needs: validate
+    if: ${{ !inputs.publish }}
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -53,32 +74,26 @@ jobs:
         include:
           - runner: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
-            cross: false
-          - runner: ubuntu-24.04
+          - runner: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
-            cross: true
           - runner: macos-15-intel
             target: x86_64-apple-darwin
-            cross: false
           - runner: macos-15
             target: aarch64-apple-darwin
-            cross: false
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
-      - name: Install Linux cross linker
-        if: matrix.cross
-        run: sudo apt-get update && sudo apt-get install --yes gcc-aarch64-linux-gnu
       - run: rustup target add ${{ matrix.target }}
       - name: Build release binary
         env:
           CARGO_INCREMENTAL: "0"
           LEANI_GIT_COMMIT: ${{ github.sha }}
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
-          CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
         run: cargo build --locked --release --target ${{ matrix.target }} -p leani
       - name: Smoke release binary
-        if: ${{ !matrix.cross }}
-        run: target/${{ matrix.target }}/release/leani --version
+        run: |
+          target/${{ matrix.target }}/release/leani --version
+          target/${{ matrix.target }}/release/leani e2e fixture \
+            --blocks 128 --data-dir "$RUNNER_TEMP/leani-release-fixture" \
+            --report "$RUNNER_TEMP/leani-release-fixture.json"
       - name: Package and checksum
         run: |
           install -d dist
@@ -99,6 +114,7 @@ jobs:
   sbom:
     name: Software bill of materials
     needs: validate
+    if: ${{ !inputs.publish }}
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
@@ -144,22 +160,35 @@ jobs:
   publish:
     name: Publish GitHub release
     if: ${{ inputs.publish }}
-    needs: assemble
+    needs: validate
     runs-on: ubuntu-24.04
     permissions:
       contents: write
+      actions: read
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
       - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
         with:
           name: leani-release-candidate-${{ inputs.version }}
           path: release-assets
-      - name: Create immutable release
+          run-id: ${{ inputs.candidate_run_id }}
+          github-token: ${{ github.token }}
+      - name: Verify candidate checksums
+        working-directory: release-assets
+        run: sha256sum --check SHA256SUMS
+      - name: Publish complete release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release create "$RELEASE_VERSION" release-assets/* \
             --repo "$GITHUB_REPOSITORY" \
             --verify-tag \
+            --draft \
             --generate-notes \
             --title "Leani $RELEASE_VERSION"
+          case "${RELEASE_VERSION%%+*}" in
+            *-*) prerelease=true; latest=false ;;
+            *) prerelease=false; latest=true ;;
+          esac
+          gh release edit "$RELEASE_VERSION" --repo "$GITHUB_REPOSITORY" \
+            --draft=false --prerelease="$prerelease" --latest="$latest"
