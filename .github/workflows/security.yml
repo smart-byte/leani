@@ -2,7 +2,8 @@ name: Secret history scan
 
 on:
   push:
-    branches: [main, site-production]
+    branches: ['**']
+    tags: ['**']
   pull_request:
   workflow_dispatch:
 
@@ -22,18 +23,19 @@ jobs:
         with:
           fetch-depth: 0
       - run: scripts/check-publication.rb HEAD
+      - name: Test publication guards
+        run: ruby scripts/test-publication.rb
 
-  trufflehog:
-    name: Verified secrets
+  secrets:
+    name: Credential history scan
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           fetch-depth: 0
-      - name: Scan complete Git history
-        uses: trufflesecurity/trufflehog@6f3c981e7b77f235fd2702dd74af25fc4b72bf11 # v3.96.0
-        with:
-          path: ./
-          base: ""
-          head: ""
-          extra_args: --only-verified
+      - name: Install pinned credential scanner
+        run: scripts/install-gitleaks.sh .private/tools/bin
+      - name: Scan complete reachable history with redacted diagnostics
+        run: scripts/check-secrets.sh HEAD
+      - name: Test credential detection and fixture exception
+        run: ruby scripts/test-secret-scan.rb

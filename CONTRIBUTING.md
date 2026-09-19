@@ -13,6 +13,23 @@ without updating `docs/reference/ethereum-json-rpc.md` and adding differential t
 
 ## Local checks
 
+Install the local publication guards once per clone before committing or
+pushing:
+
+```bash
+scripts/install-gitleaks.sh .private/tools/bin
+git config core.hooksPath "$PWD/scripts/git-hooks"
+```
+
+The hooks check staged files and commit messages, and inspect the complete
+history of every pushed branch or tag. Private plans, agent instructions,
+design explorations, raw reports, credentials, and local user paths belong
+under ignored `.private/`. Deleting a file in a later commit does not remove
+it from history. Never push archive, backup, or private refs; keep recovery
+bundles under `.private/archives/`. Hooks can be bypassed, so release and CI
+checks enforce the same policy independently. Pushes also run the pinned
+credential scanner with redacted diagnostics; missing tooling fails closed.
+
 ```bash
 cargo fmt --all --check
 cargo test --workspace --locked

@@ -1,0 +1,14 @@
+title = "Leani credential detection"
+
+[extend]
+useDefault = true
+
+[[rules]]
+id = "generic-api-key"
+
+[[rules.allowlists]]
+description = "Public Ethereum USDC/WETH pool address in the illustrative Uniswap entity key"
+condition = "AND"
+paths = ['''^site/src/data/processors/uniswap-latest\.json$''']
+regexTarget = "secret"
+regexes = ['''^0x88e6a0c2ddd26feeb64f039a2c41296fcb3f5640$''']

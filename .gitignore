@@ -19,7 +19,31 @@
 # Local product planning, pre-release records, raw evidence, and repository
 # archives live under one explicitly private tree. This is not a backup.
 /.private/
-/AGENTS.md
+**/AGENTS.md
+**/CLAUDE.md
+**/.agents/
+**/.codex/
+**/.claude/
+**/.planning/
+**/.specify/
+**/plans/
+**/plan/
+**/planning/
+**/superpowers/
+/design-explorations/
+/reports/
+/PLAN.md
+/BACKLOG.md
+/ROADMAP.md
+/docs/*-PLAN.md
+/docs/*-READINESS.md
+/docs/*-CHECKLIST.md
+/docs/IMPLEMENTATION-DESIGN.md
+/docs/IMPLEMENTATION-STATUS.md
+/docs/XATU-OPTIMIZATIONS.md
+/docs/evidence/
+**/.env
+**/.env.*
 
 # Benchmark and validation output. Benchmark implementations and reproducible
 # input manifests remain versioned; generated measurements stay local.

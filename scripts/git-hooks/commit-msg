@@ -1,0 +1,4 @@
+#!/bin/sh
+set -eu
+hook_directory=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+exec ruby "$hook_directory/../check-publication.rb" --message "$1"

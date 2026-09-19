@@ -1,0 +1,13 @@
+#!/bin/sh
+set -eu
+hook_directory=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+input=$(mktemp)
+trap 'rm -f "$input"' EXIT HUP INT TERM
+cat > "$input"
+ruby "$hook_directory/../check-publication.rb" --pre-push < "$input"
+while read -r _local_ref local_oid _remote_ref _remote_oid; do
+  case "$local_oid" in
+    0000000000000000000000000000000000000000|0000000000000000000000000000000000000000000000000000000000000000) continue ;;
+  esac
+  "$hook_directory/../check-secrets.sh" "$local_oid"
+done < "$input"
