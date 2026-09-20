@@ -26,9 +26,12 @@ class Leani < Formula
 
   def install
     bin.install "leani"
+    pkgshare.install "THIRD_PARTY_LICENSES.txt"
   end
 
   test do
     assert_match version.to_s, shell_output("#{bin}/leani --version")
+    system bin/"leani", "e2e", "fixture", "--blocks", "16",
+           "--data-dir", testpath/"data", "--report", testpath/"fixture.json"
   end
 end
