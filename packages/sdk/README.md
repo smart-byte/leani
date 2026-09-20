@@ -77,3 +77,7 @@ requires delivery and otherwise returns HTTP 409 `delivery_disabled`.
 Both package entry points use `LeaniError` for HTTP failures, including status,
 code, retryability, and request ID. ResetRequiredError is a LeaniError with
 `code: "cursor_expired"`; rebuild application state from a fresh snapshot.
+
+## License
+
+[MIT](LICENSE).

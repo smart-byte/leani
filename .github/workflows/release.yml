@@ -98,7 +98,7 @@ jobs:
         run: |
           install -d dist
           cp target/${{ matrix.target }}/release/leani dist/
-          cp LICENSE-APACHE LICENSE-MIT README.md dist/
+          cp LICENSE README.md dist/
           archive="leani-${RELEASE_VERSION}-${{ matrix.target }}.tar.gz"
           tar -C dist -czf "$archive" .
           shasum -a 256 "$archive" > "$archive.sha256"

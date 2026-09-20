@@ -32,7 +32,7 @@ default-members = ["crates/node"]
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.97"
-license = "MIT OR Apache-2.0"
+license = "MIT"
 repository = "https://github.com/smart-byte/leani"
 homepage = "https://leani.dev"
 

@@ -2,6 +2,9 @@
 
 Status: pre-release preview.
 
+Leani's code is licensed under the [MIT License](LICENSE). Dependencies and
+third-party data retain their respective licenses.
+
 Leani is a lean, state-minimized Ethereum indexing node. Its Rust workspace
 and Bun-compatible SDK compile and test. Historical Xatu,
 checksummed normalized archives, and a native sparse EraE reader feed a durable

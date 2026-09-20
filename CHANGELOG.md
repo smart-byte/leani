@@ -8,6 +8,8 @@ record, and documented RPC contracts.
 
 ### Changed
 
+- Standardized Leani's code, packages, and release metadata on the MIT license.
+  Dependencies and third-party data retain their respective licenses.
 - Release publication now requires passing CI for the exact release commit.
   Native binary releases reuse an inspected candidate, exercise the offline
   fixture on all four target architectures, and distinguish prereleases from
@@ -81,7 +83,7 @@ record, and documented RPC contracts.
   capability discovery, a safe same-origin SDK request primitive, and a
   complete downstream custom-processor example.
 - Independent Rust workspace and Bun-compatible TypeScript SDK with strict
-  configuration, diagnostics, lifecycle, CI, dual licensing, release
+  configuration, diagnostics, lifecycle, CI, MIT licensing, release
   artifacts, container/Compose/systemd deployment, and operations contracts.
 - Source-neutral chain frames with explicit material completeness,
   capabilities, provenance, trust, verification, finality, checksummed

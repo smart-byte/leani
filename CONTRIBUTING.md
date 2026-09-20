@@ -4,6 +4,12 @@ The project is built as a sequence of independently runnable vertical
 checkpoints. Keep `main` buildable and make commits small enough that a
 correctness or storage regression can be bisected.
 
+## Contribution license
+
+By submitting a contribution, you agree to license it under the
+[MIT License](LICENSE). Third-party material must retain its applicable
+license and attribution notices.
+
 ## Before changing a contract
 
 Public source, processor, store, API, SDK, cursor, or durable encoding changes

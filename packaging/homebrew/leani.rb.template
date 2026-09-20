@@ -2,7 +2,7 @@ class Leani < Formula
   desc "Lean, state-minimized Ethereum indexing node"
   homepage "https://github.com/@REPOSITORY@"
   version "@VERSION@"
-  license any_of: ["MIT", "Apache-2.0"]
+  license "MIT"
 
   on_macos do
     if Hardware::CPU.arm?

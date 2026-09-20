@@ -4,6 +4,10 @@ Status: accepted
 
 Date: 2026-08-01
 
+The licensing decision below is superseded by
+[0017 — MIT license](0017-mit-license.md). The contract-versioning decision
+remains in effect.
+
 ## Context
 
 The project is a Rust infrastructure component intended to integrate with
