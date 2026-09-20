@@ -6,10 +6,10 @@ record, and documented RPC contracts.
 
 ## [Unreleased]
 
-## [0.1.0-rc.1] - Unreleased
+## [0.1.0-rc.1] - 2026-09-20
 
-The first public release is a preview. Publication remains gated on release
-candidate verification and the documented preview limitations.
+The first public release is a preview. Review the documented preview
+limitations before deploying it.
 
 ### Changed
 

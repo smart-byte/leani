@@ -37,7 +37,6 @@ macos_x86="leani-${version}-x86_64-apple-darwin.tar.gz"
 macos_arm="leani-${version}-aarch64-apple-darwin.tar.gz"
 
 sed \
-  -e "s|@VERSION@|${version#v}|g" \
   -e "s|@TAG@|$version|g" \
   -e "s|@REPOSITORY@|$repository|g" \
   -e "s|@LINUX_X86_SHA@|$(checksum "$linux_x86")|g" \
