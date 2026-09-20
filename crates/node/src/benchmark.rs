@@ -7451,7 +7451,10 @@ mod tests {
             );
             assert_eq!(delivery.completion_records, 1);
             assert!(delivery.acknowledgements > 0);
-            assert!(delivery.consumer_complete_milliseconds.is_some());
+            let consumer_complete = delivery
+                .consumer_complete_milliseconds
+                .expect("consumer completion measurement");
+            assert!(consumer_complete <= run.elapsed_milliseconds);
             assert!(
                 delivery
                     .consumer_blocks_per_second_milli
@@ -7479,16 +7482,21 @@ mod tests {
                     assert!(delivery.post_producer_drain_milliseconds.is_none());
                 }
                 BenchmarkMode::EndToEnd => {
-                    assert!(delivery.producer_complete_milliseconds.is_some());
+                    let producer_complete = delivery
+                        .producer_complete_milliseconds
+                        .expect("producer completion measurement");
+                    assert!(producer_complete <= run.elapsed_milliseconds);
                     assert!(
                         delivery
                             .producer_blocks_per_second_milli
                             .is_some_and(|rate| rate > 0)
                     );
-                    assert!(delivery.post_producer_drain_milliseconds.is_some());
-                    assert!(
-                        delivery.consumer_complete_milliseconds
-                            >= delivery.producer_complete_milliseconds
+                    // Completion is visible to the consumer before the producer
+                    // finishes saving its checkpoint, so either future can
+                    // finish first. Drain is zero if the consumer finishes first.
+                    assert_eq!(
+                        delivery.post_producer_drain_milliseconds,
+                        Some(consumer_complete.saturating_sub(producer_complete))
                     );
                 }
                 BenchmarkMode::Acquire | BenchmarkMode::Process => unreachable!(),
