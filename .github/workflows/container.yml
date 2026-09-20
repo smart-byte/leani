@@ -12,13 +12,18 @@ on:
         default: candidate
         type: string
       publish:
-        description: Push the scanned image to GHCR
+        description: Publish the two images from a successful candidate run
         required: true
         default: false
         type: boolean
+      candidate_run_id:
+        description: Successful preparation run ID (required when publishing)
+        required: false
+        type: string
 
 permissions:
   contents: read
+  actions: read
 
 concurrency:
   group: container-${{ github.ref }}
@@ -26,25 +31,44 @@ concurrency:
 
 jobs:
   build-and-scan:
-    name: Build and vulnerability scan
-    runs-on: ubuntu-24.04
+    name: Build and scan (${{ matrix.arch }})
+    if: ${{ !inputs.publish }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           fetch-depth: 0
       - name: Verify publication history
         run: scripts/check-publication.rb HEAD
-      - uses: docker/setup-qemu-action@06116385d9baf250c9f4dcb4858b16962ea869c3 # v4.2.0
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
       - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: .
           load: true
+          platforms: linux/${{ matrix.arch }}
           tags: leani:scan
           build-args: |
             LEANI_GIT_COMMIT=${{ github.sha }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: type=gha,scope=container-${{ matrix.arch }}
+          cache-to: type=gha,scope=container-${{ matrix.arch }},mode=max
+      - name: Verify the native image
+        run: |
+          docker run --rm leani:scan --version
+          docker run --rm leani:scan e2e fixture --blocks 128 \
+            --data-dir /tmp/leani/fixture --report /tmp/leani/fixture.json
+          container=$(docker create leani:scan)
+          docker cp "$container:/usr/local/bin/leani" "$RUNNER_TEMP/leani"
+          docker cp "$container:/usr/share/licenses/leani" "$RUNNER_TEMP/licenses"
+          docker rm "$container"
+          ruby scripts/check-artifact-privacy.rb "$RUNNER_TEMP/leani" "$RUNNER_TEMP/licenses"
       - name: Report all high and critical image findings
         uses: aquasecurity/trivy-action@a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8 # v0.36.0
         with:
@@ -63,11 +87,34 @@ jobs:
           severity: HIGH,CRITICAL
           ignore-unfixed: true
           exit-code: "1"
+      - name: Record the verified image dependency inventory
+        uses: aquasecurity/trivy-action@a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8 # v0.36.0
+        with:
+          image-ref: leani:scan
+          format: cyclonedx
+          output: leani-container-${{ matrix.arch }}.cdx.json
+      - name: Save the verified image
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: |
+          docker image inspect leani:scan --format '{{.Id}}' > image.id
+          ruby scripts/check-artifact-privacy.rb "leani-container-$ARCH.cdx.json"
+          docker save leani:scan | gzip > "leani-container-$ARCH.tar.gz"
+          sha256sum "leani-container-$ARCH.tar.gz" "leani-container-$ARCH.cdx.json" image.id > SHA256SUMS
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: leani-container-${{ matrix.arch }}
+          path: |
+            leani-container-*.tar.gz
+            leani-container-*.cdx.json
+            image.id
+            SHA256SUMS
+          if-no-files-found: error
+          retention-days: 14
 
   publish:
     name: Publish immutable GHCR image
     if: ${{ inputs.publish == true }}
-    needs: build-and-scan
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -75,14 +122,16 @@ jobs:
       actions: read
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
-      - name: Require passing release CI
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: ruby scripts/check-release-ci.rb --container
+        with:
+          fetch-depth: 0
+      - name: Verify publication history
+        run: scripts/check-publication.rb HEAD
       - name: Require a matching release tag
         env:
           IMAGE_TAG: ${{ inputs.image_tag }}
+          CANDIDATE_RUN_ID: ${{ inputs.candidate_run_id }}
         run: |
+          test -n "$CANDIDATE_RUN_ID" || { echo "candidate_run_id is required" >&2; exit 1; }
           case "$IMAGE_TAG" in
             v[0-9]*.[0-9]*.[0-9]*) ;;
             *) echo "image_tag must be a v-prefixed SemVer" >&2; exit 1 ;;
@@ -96,22 +145,38 @@ jobs:
             echo "image tag $IMAGE_TAG does not match leani package version v$package_version" >&2
             exit 1
           fi
-      - uses: docker/setup-qemu-action@06116385d9baf250c9f4dcb4858b16962ea869c3 # v4.2.0
+      - name: Require passing CI and matching container candidate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CANDIDATE_RUN_ID: ${{ inputs.candidate_run_id }}
+        run: ruby scripts/check-release-ci.rb --container
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          pattern: leani-container-*
+          path: images
+          run-id: ${{ inputs.candidate_run_id }}
+          github-token: ${{ github.token }}
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
       - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
-        with:
-          context: .
-          push: true
-          platforms: linux/amd64,linux/arm64
-          tags: ghcr.io/${{ github.repository }}:${{ inputs.image_tag }}
-          build-args: |
-            LEANI_GIT_COMMIT=${{ github.sha }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-          provenance: mode=max
-          sbom: true
+      - name: Push verified images and assemble the multiarchitecture tag
+        env:
+          IMAGE_TAG: ${{ inputs.image_tag }}
+        run: |
+          image="ghcr.io/${GITHUB_REPOSITORY,,}"
+          for arch in amd64 arm64; do
+            directory="images/leani-container-$arch"
+            (cd "$directory" && sha256sum --check SHA256SUMS)
+            docker load --input "$directory/leani-container-$arch.tar.gz"
+            test "$(docker image inspect leani:scan --format '{{.Id}}')" = "$(cat "$directory/image.id")"
+            test "$(docker image inspect leani:scan --format '{{.Architecture}}')" = "$arch"
+            docker tag leani:scan "$image:$IMAGE_TAG-$arch"
+            docker push "$image:$IMAGE_TAG-$arch"
+            docker image inspect "$image:$IMAGE_TAG-$arch" --format '{{index .RepoDigests 0}}' > "$arch.digest"
+          done
+          docker buildx imagetools create --tag "$image:$IMAGE_TAG" \
+            "$(cat amd64.digest)" "$(cat arm64.digest)"
+          docker buildx imagetools inspect "$image:$IMAGE_TAG"

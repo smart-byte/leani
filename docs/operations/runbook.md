@@ -241,13 +241,13 @@ the node exports its database/recent-cache byte counts but not host capacity.
 
 ## Backup, restore, and compact
 
-Create a consistent backup without stopping the server:
-
 Stop the node and any embedded subscription or standalone backfill using this
 data directory before running `leani db` commands (including `inspect`, `verify`,
 and `backup`). They open the store with migrations enabled and therefore take
 the same `.leani.lock` as other writers. Use the API and `/metrics` for inspection
 while the node is running.
+
+Create a consistent backup after stopping those writers:
 
 ```bash
 leani db backup /backups/leani-$(date +%s).sqlite \

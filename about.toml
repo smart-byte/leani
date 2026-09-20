@@ -1,0 +1,34 @@
+# Preserve dependency notices in native and container distributions.
+# Dependency admission is enforced separately by deny.toml.
+accepted = [
+  "MIT", "Apache-2.0", "Apache-2.0 WITH LLVM-exception",
+  "BSD-2-Clause", "BSD-3-Clause", "ISC", "Unicode-3.0", "Zlib",
+]
+ignore-dev-dependencies = true
+
+[aurora-engine-modexp]
+accepted = ["CC0-1.0"]
+[secp256k1]
+accepted = ["CC0-1.0"]
+[secp256k1-sys]
+accepted = ["CC0-1.0"]
+[tiny-keccak]
+accepted = ["CC0-1.0"]
+[webpki-root-certs]
+accepted = ["CDLA-Permissive-2.0"]
+[webpki-roots]
+accepted = ["CDLA-Permissive-2.0"]
+[bitmaps]
+accepted = ["MPL-2.0"]
+[imbl]
+accepted = ["MPL-2.0"]
+[imbl-sized-chunks]
+accepted = ["MPL-2.0"]
+
+# The pinned Helios crate inherits the repository license without declaring it
+# in its package manifest. Fail if that upstream license changes.
+[helios-consensus-core.clarify]
+license = "MIT"
+[[helios-consensus-core.clarify.files]]
+path = "../../LICENSE"
+checksum = "a6dcee4c8f9d8c83ddb9226e7ab201e7263404c2870f299db46ed7b8767aafb9"

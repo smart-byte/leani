@@ -75,6 +75,10 @@ jobs:
         run: scripts/test-release-packaging.sh
       - name: Validate release CI requirements
         run: ruby scripts/test-release-ci.rb
+      - name: Validate artifact privacy checks
+        run: ruby scripts/test-artifact-privacy.rb
+      - name: Validate Rust package inspection
+        run: python3 scripts/test-crate-packages.py
       - name: Validate historical-only deployment config
         run: cargo run --locked -- doctor --json --config deploy/container.toml
       # container.yml builds and scans the image on the same pushes and PRs.

@@ -65,7 +65,7 @@ jobs:
 
   archive:
     name: ${{ matrix.target }} archive
-    needs: validate
+    needs: [validate, sbom]
     if: ${{ !inputs.publish }}
     runs-on: ${{ matrix.runner }}
     strategy:
@@ -82,26 +82,36 @@ jobs:
             target: aarch64-apple-darwin
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          name: leani-sbom
+          path: notices
       - run: rustup target add ${{ matrix.target }}
       - name: Build release binary
         env:
           CARGO_INCREMENTAL: "0"
           LEANI_GIT_COMMIT: ${{ github.sha }}
-        run: cargo build --locked --release --target ${{ matrix.target }} -p leani
-      - name: Smoke release binary
         run: |
-          target/${{ matrix.target }}/release/leani --version
-          target/${{ matrix.target }}/release/leani e2e fixture \
-            --blocks 128 --data-dir "$RUNNER_TEMP/leani-release-fixture" \
-            --report "$RUNNER_TEMP/leani-release-fixture.json"
+          export RUSTFLAGS="--remap-path-prefix=$HOME=/build --remap-path-prefix=$GITHUB_WORKSPACE=/source"
+          export CFLAGS="-ffile-prefix-map=$HOME=/build -ffile-prefix-map=$GITHUB_WORKSPACE=/source"
+          export CXXFLAGS="$CFLAGS"
+          cargo build --locked --release --target ${{ matrix.target }} -p leani
+          ruby scripts/check-artifact-privacy.rb target/${{ matrix.target }}/release/leani
       - name: Package and checksum
         run: |
           install -d dist
           cp target/${{ matrix.target }}/release/leani dist/
           cp LICENSE README.md dist/
+          cp notices/THIRD_PARTY_LICENSES.txt dist/
           archive="leani-${RELEASE_VERSION}-${{ matrix.target }}.tar.gz"
           tar -C dist -czf "$archive" .
           shasum -a 256 "$archive" > "$archive.sha256"
+          install -d unpacked
+          tar -xzf "$archive" -C unpacked
+          unpacked/leani --version
+          unpacked/leani e2e fixture \
+            --blocks 128 --data-dir "$RUNNER_TEMP/leani-archive-fixture" \
+            --report "$RUNNER_TEMP/leani-archive-fixture.json"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: leani-${{ matrix.target }}
@@ -120,10 +130,21 @@ jobs:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
       - run: cargo install cargo-cyclonedx --version 0.5.9 --locked
       - run: cargo cyclonedx --format json --all
+      - name: Prepare portable SBOM assets
+        run: |
+          ruby scripts/prepare-sbom.rb sbom-assets "$GITHUB_WORKSPACE" \
+            crates/*/*.cdx.json examples/*/*.cdx.json
+      - name: Include dependency license notices
+        run: |
+          sh scripts/install-cargo-about.sh "$RUNNER_TEMP/license-tools"
+          "$RUNNER_TEMP/license-tools/cargo-about" generate --locked --fail \
+            --manifest-path crates/node/Cargo.toml --config about.toml \
+            about.hbs --output-file sbom-assets/THIRD_PARTY_LICENSES.txt
+          ruby scripts/check-artifact-privacy.rb sbom-assets
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: leani-sbom
-          path: "**/*.cdx.json"
+          path: sbom-assets/
           if-no-files-found: error
           retention-days: 14
 
@@ -150,6 +171,11 @@ jobs:
             "${{ github.repository }}" \
             release-assets/SHA256SUMS \
             release-assets/leani.rb
+      - name: Inspect public metadata
+        run: |
+          ruby scripts/check-artifact-privacy.rb \
+            release-assets/*.cdx.json release-assets/THIRD_PARTY_LICENSES.txt \
+            release-assets/leani.rb release-assets/SHA256SUMS
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: leani-release-candidate-${{ inputs.version }}
@@ -176,6 +202,12 @@ jobs:
       - name: Verify candidate checksums
         working-directory: release-assets
         run: sha256sum --check SHA256SUMS
+      - name: Require flat release assets
+        run: |
+          if find release-assets -mindepth 1 -type d | grep -q .; then
+            echo "release assets must be files, without nested directories" >&2
+            exit 1
+          fi
       - name: Publish complete release
         env:
           GH_TOKEN: ${{ github.token }}

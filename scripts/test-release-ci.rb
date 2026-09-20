@@ -19,6 +19,11 @@ cases = [
   ["pull-request results cannot authorize publication", { "workflow_runs" => [passed.merge("event" => "pull_request")] }, candidate, false],
   ["candidate from another commit is rejected", { "workflow_runs" => [passed] }, candidate.merge("head_sha" => "b" * 40), false],
   ["candidate from another workflow is rejected", { "workflow_runs" => [passed] }, candidate.merge("path" => ".github/workflows/ci.yml"), false],
+  ["container preparation from push is accepted", { "workflow_runs" => [passed] }, passed.merge("path" => ".github/workflows/container.yml"), true, ["--container"]],
+  ["container preparation from dispatch is accepted", { "workflow_runs" => [passed] }, candidate.merge("path" => ".github/workflows/container.yml"), true, ["--container"]],
+  ["container preparation from a pull request is rejected", { "workflow_runs" => [passed] }, passed.merge("path" => ".github/workflows/container.yml", "event" => "pull_request"), false, ["--container"]],
+  ["binary candidate cannot authorize a container", { "workflow_runs" => [passed] }, candidate, false, ["--container"]],
+  ["older container candidate is rejected", { "workflow_runs" => [passed] }, passed.merge("path" => ".github/workflows/container.yml", "head_sha" => "b" * 40), false, ["--container"]],
 ]
 
 Dir.mktmpdir("leani-release-ci-test-") do |directory|
@@ -39,9 +44,9 @@ Dir.mktmpdir("leani-release-ci-test-") do |directory|
     "CANDIDATE_RUN_ID" => "123",
     "RELEASE_TEST_FIXTURE" => fixture,
   }
-  cases.each do |name, checks, candidate_run, success|
+  cases.each do |name, checks, candidate_run, success, arguments|
     File.write(fixture, JSON.generate("checks" => checks, "candidate" => candidate_run))
-    output, status = Open3.capture2e(environment, RbConfig.ruby, checker)
+    output, status = Open3.capture2e(environment, RbConfig.ruby, checker, *Array(arguments))
     raise "#{name}: unexpected result: #{output}" unless status.success? == success
     puts "PASS #{name}"
   end

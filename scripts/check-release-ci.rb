@@ -17,8 +17,8 @@ end
 
 abort "usage: check-release-ci.rb [--container]" unless ARGV.empty? || ARGV == ["--container"]
 workflows = %w[ci.yml security.yml site.yml]
-# The container publisher already depends on its current build-and-scan job.
-# Requiring its own workflow to have completed here would deadlock publication.
+# Container publication verifies a separate successful preparation run below;
+# requiring its own in-progress publication run to finish would deadlock.
 workflows << "container.yml" unless ARGV == ["--container"]
 workflows.each do |workflow|
   response = api("repos/#{repository}/actions/workflows/#{workflow}/runs?head_sha=#{commit}&per_page=100")
@@ -36,10 +36,13 @@ candidate_id = ENV.fetch("CANDIDATE_RUN_ID", "")
 unless candidate_id.empty?
   abort "invalid candidate run ID" unless candidate_id.match?(/\A[1-9][0-9]*\z/)
   run = api("repos/#{repository}/actions/runs/#{candidate_id}")
-  unless run["head_sha"] == commit && run["event"] == "workflow_dispatch" &&
+  container = ARGV == ["--container"]
+  workflow = container ? "container.yml" : "release.yml"
+  events = container ? %w[push workflow_dispatch] : %w[workflow_dispatch]
+  unless run["head_sha"] == commit && events.include?(run["event"]) &&
          run["status"] == "completed" && run["conclusion"] == "success" &&
-         run["path"] == ".github/workflows/release.yml"
-    abort "candidate must be a successful Prepare release run from the exact release commit"
+         run["path"] == ".github/workflows/#{workflow}"
+    abort "candidate must be a successful #{workflow} run from the exact release commit"
   end
   puts "candidate #{candidate_id}: passed on #{commit}"
 end

@@ -8,13 +8,13 @@ audience:
 status: preview
 ---
 
-1. Complete the release-readiness checklist and attach the local evidence report.
-2. Run the full Rust, SDK, dependency-policy, migration, backup/restore, and
-   reproducibility suites from a clean checkout.
+1. Keep release verification results in ignored local storage.
+2. Run the Rust, SDK, dependency-policy, and publication checks from a clean
+   checkout. Test restart, replay, and backup/restore with the packaged binary.
 3. Update `CHANGELOG.md`, OpenAPI/SDK compatibility tables, durable schema
    versions, and processor version declarations.
-4. Build Linux `x86_64` and `aarch64` artifacts and the OCI image from the same
-   signed commit.
+4. Build Linux and macOS `x86_64` and `aarch64` artifacts and both Linux container
+   architectures from the same reviewed commit.
 5. Verify checksums and a clean-host smoke test.
 6. Create an annotated semantic-version tag. Release candidates use
    `-rc.N`; a stable release requires every artifact listed above.
@@ -39,7 +39,9 @@ must stay in ignored local storage. Do not push recovery or archive refs.
 Run `Prepare release` with the version matching the workspace manifest and
 `publish=false`. It executes the offline fixture on native Linux and macOS
 runners for both architectures, then uploads a release candidate containing
-the archives, checksums, SBOM, and Homebrew formula.
+the archives, checksums, portable SBOM files, dependency license notices, and
+Homebrew formula. Build paths are remapped and the extracted binaries are
+checked for private content before their fixture tests run.
 
 Inspect and test that candidate. Once the exact commit is tagged and its CI,
 publication/security, site, and container checks have passed, run the workflow
@@ -61,12 +63,26 @@ protection is required; the workflow name alone does not enable it.
 
 The SDK workflow requires `sdk-v<package-version>` for publication and passing
 CI for the same commit. Prerelease SDK versions use npm's `next` tag; stable
-versions use `latest`. The first package publication and npm trusted-publisher
-configuration must be completed by a maintainer with access to the scope.
+versions use `latest`. The workflow tests and scans a local npm archive, then
+publishes that archive. A dry run uploads it for manual inspection.
 
-The container publisher requires the matching node release tag, its current
-successful image scan, and passing Rust, security, and site workflows. Verify
-both published architectures on clean hosts before announcing the release.
+For the first publication, a maintainer with access to the `@leani` scope must
+configure a short-lived granular `NPM_TOKEN` repository secret with publication
+access and permission to bypass 2FA. Dispatch `sdk-release.yml` from the SDK tag
+with `publish=true` and `bootstrap=true`. The GitHub repository must be public
+for npm provenance. Once the package exists, configure its npm trusted publisher:
+GitHub owner `smart-byte`, repository `leani`, workflow `sdk-release.yml`, and
+permission to publish directly with `npm publish`. Subsequent publications use
+`bootstrap=false` and need no npm secret. Revoke the bootstrap token and delete
+the GitHub secret after switching. See [npm trusted publishing](https://docs.npmjs.com/trusted-publishers/).
+
+The container workflow builds, runs, scans, and saves both architectures on
+native runners. Publication requires the matching node release tag, that
+successful preparation run's `candidate_run_id`, and passing Rust, security,
+and site workflows. It loads and verifies the saved images before publishing
+them, then assembles the multiarchitecture tag from their registry digests.
+GitHub's automatic `GITHUB_TOKEN` supplies GHCR authentication. Verify anonymous
+pulls for both architectures before announcing the release.
 
 Copy the candidate's `leani.rb` into the Homebrew tap only after its public
 archive URLs exist. Run the tap's installation and formula tests. The site
@@ -97,13 +113,22 @@ and source contents. Run the publication/privacy checks and credential scanner
 on the exact release commit and scan the extracted archives too. Validate a
 standalone consumer against the packages, then against crates.io after upload.
 
+Run `crates-release.yml` with `publish=false` to test, package, and inspect all
+four libraries in CI. It checks their clean commit provenance, MIT license,
+archive paths, and contents before uploading the dry-run packages.
+
 The first publication requires a crates.io account with a verified email and
-an API token configured locally through `cargo login`. Publish from the clean,
-reviewed release commit using the same explicit package selection without
-`--dry-run`. Dependency order is primitives, the processor/source APIs, then
-testkit. Add the intended maintainers or GitHub team as owners afterward.
-Configure [trusted publishing](https://crates.io/docs/trusted-publishing) for
-subsequent releases once the crates exist.
+an API token with permission to create the four crates. Store it as the
+`CARGO_REGISTRY_TOKEN` repository secret, then dispatch `crates-release.yml`
+from the node release tag with `publish=true` and `bootstrap=true`. Cargo
+publishes the explicit package selection in dependency order. Add the intended
+maintainers or GitHub team as owners afterward.
+
+Configure [trusted publishing](https://crates.io/docs/trusted-publishing) on
+each crate with GitHub owner `smart-byte`, repository `leani`, and workflow
+`crates-release.yml`. Subsequent publications use `bootstrap=false`; the
+official crates.io authentication action supplies a short-lived token. Revoke
+the bootstrap token and remove its GitHub secret after switching.
 
 The full `leani` node is distributed through native archives, Homebrew, and
 containers. Its Git-only networking and consensus dependencies prevent

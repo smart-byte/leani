@@ -456,6 +456,8 @@ overwriting an interrupted measurement.
 
 The `delivery-faults` and `all` suites require
 `LEANI_BENCHMARK_POSTGRES_URL` to reference a dedicated disposable database.
+When running an installed binary outside the repository root, set `LEANI_SOURCE`
+to the Leani checkout containing the SDK fixture.
 Start the checked local service with:
 
 ```bash

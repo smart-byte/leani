@@ -4824,14 +4824,14 @@ async fn consume_subscription_sdk_postgres(
             "sdk-postgres requires LEANI_BENCHMARK_POSTGRES_URL pointing to a dedicated benchmark database"
         );
     }
-    let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
+    let repository = std::env::var_os("LEANI_SOURCE")
+        .map_or_else(std::env::current_dir, |path| Ok(PathBuf::from(path)))?
         .canonicalize()
         .context("resolve benchmark repository root")?;
     let script = repository.join("packages/sdk/benchmark/postgres-destination.ts");
     if !script.is_file() {
         bail!(
-            "SDK PostgreSQL benchmark fixture is missing: {}",
+            "SDK PostgreSQL benchmark fixture is missing: {}; set LEANI_SOURCE to the Leani checkout",
             script.display()
         );
     }

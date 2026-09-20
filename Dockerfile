@@ -7,7 +7,14 @@ COPY . .
 ENV CARGO_INCREMENTAL=0
 ENV CARGO_PROFILE_RELEASE_STRIP=symbols
 ENV LEANI_GIT_COMMIT=${LEANI_GIT_COMMIT}
+ENV RUSTFLAGS="--remap-path-prefix=/usr/local/cargo=/cargo"
+ENV CFLAGS="-ffile-prefix-map=/usr/local/cargo=/cargo"
+ENV CXXFLAGS="-ffile-prefix-map=/usr/local/cargo=/cargo"
 RUN cargo build --locked --release -p leani
+RUN sh scripts/install-cargo-about.sh /tmp/license-tools \
+    && /tmp/license-tools/cargo-about generate --locked --fail \
+       --manifest-path crates/node/Cargo.toml --config about.toml \
+       about.hbs --output-file /source/THIRD_PARTY_LICENSES.txt
 
 FROM debian:bookworm-slim
 
@@ -19,6 +26,8 @@ RUN apt-get update \
     && install --directory --owner leani --group leani /var/lib/leani /tmp/leani
 
 COPY --from=builder /source/target/release/leani /usr/local/bin/leani
+COPY LICENSE /usr/share/licenses/leani/LICENSE
+COPY --from=builder /source/THIRD_PARTY_LICENSES.txt /usr/share/licenses/leani/THIRD_PARTY_LICENSES.txt
 COPY deploy/container.toml /etc/leani/node.toml
 COPY config/modes /etc/leani/examples
 
