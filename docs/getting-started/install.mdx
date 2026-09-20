@@ -1,6 +1,6 @@
 ---
 title: Install Leani
-description: Build the current alpha, check the binary, and prepare the TypeScript SDK if you need it.
+description: Build the release candidate, check the binary, and prepare the TypeScript SDK if you need it.
 section: getting-started
 order: 20
 audience:
@@ -12,7 +12,7 @@ status: preview
 import { Aside } from '@astrojs/starlight/components';
 import CodeExample from '@docs/components/docs/CodeExample.astro';
 
-## Build the current alpha
+## Build the release candidate
 
 Use a source checkout while the first release packages are being prepared.
 You need Git, Rust installed through rustup, and your platform's C/C++ build
@@ -21,7 +21,7 @@ The first build downloads dependencies and can take several minutes.
 
 <CodeExample example="source-install" />
 
-Expect `leani 0.1.0`. If you already have the checkout, start at
+Expect `leani 0.1.0-rc.1`. If you already have the checkout, start at
 `cargo build --locked -p leani` in its root directory.
 
 `LEANI_SOURCE` points to the checkout; later tutorials use it to find example
@@ -60,12 +60,13 @@ For Rust applications, see [build a custom node](/docs/guides/custom-processor/)
 
 <Aside type="note" title="Available after publication">
   The commands in this section require the corresponding public release
-  artifacts. Use the source instructions above for the current alpha.
+  artifacts. Use the source instructions above for the current release candidate.
 </Aside>
 
 Once published, install with `brew install smart-byte/tap/leani`, or choose a
 matching archive from the [GitHub releases](https://github.com/smart-byte/leani/releases).
 Verify the archive's published checksum before running it. Containers use
 `ghcr.io/smart-byte/leani:<version>`; pin the release's digest for deployment.
-The SDK package is `@leani/sdk` on npm. Keep binary, SDK, and configuration
-versions aligned with the release you selected.
+For this preview, select the `v0.1.0-rc.1` binary release and install the matching
+SDK with `bun add @leani/sdk@0.1.0-rc.1`. Prerelease SDKs use npm's `next` tag.
+Keep binary, SDK, and configuration versions aligned with the release you selected.

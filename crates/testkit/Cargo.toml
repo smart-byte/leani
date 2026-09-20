@@ -1,12 +1,18 @@
 [package]
 name = "leani-testkit"
+description = "Deterministic fixtures and conformance helpers for Leani processors and sources"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
-publish = false
+publish = ["crates-io"]
+readme = "README.md"
+documentation = "https://docs.rs/leani-testkit"
+keywords = ["ethereum", "indexing", "leani", "testing"]
+categories = ["cryptography::cryptocurrencies", "development-tools::testing"]
+include = ["src/**/*.rs", "README.md", "LICENSE"]
 
 [dependencies]
 alloy-primitives.workspace = true
@@ -14,9 +20,9 @@ async-trait.workspace = true
 blake3.workspace = true
 futures.workspace = true
 hex.workspace = true
-leani-primitives = { path = "../primitives" }
-leani-processor-api = { path = "../processor-api" }
-leani-source-api = { path = "../source-api" }
+leani-primitives = { version = "=0.1.0-rc.1", path = "../primitives" }
+leani-processor-api = { version = "=0.1.0-rc.1", path = "../processor-api" }
+leani-source-api = { version = "=0.1.0-rc.1", path = "../source-api" }
 semver.workspace = true
 serde.workspace = true
 sha2.workspace = true

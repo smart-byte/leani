@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: SemVer tag to package (for example v0.1.0-alpha.1)
+        description: SemVer tag to package (for example v0.1.0-rc.1)
         required: true
         type: string
       publish:

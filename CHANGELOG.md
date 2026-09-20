@@ -6,8 +6,16 @@ record, and documented RPC contracts.
 
 ## [Unreleased]
 
+## [0.1.0-rc.1] - Unreleased
+
+The first public release is a preview. Publication remains gated on release
+candidate verification and the documented preview limitations.
+
 ### Changed
 
+- Prepared the processor-authoring Rust libraries for crates.io with explicit
+  package contents, MIT notices, READMEs, and matching prerelease dependency
+  versions. Other workspace crates remain private packages.
 - Standardized Leani's code, packages, and release metadata on the MIT license.
   Dependencies and third-party data retain their respective licenses.
 - Release publication now requires passing CI for the exact release commit.
@@ -146,8 +154,3 @@ record, and documented RPC contracts.
   block `23,975,778` and BPO2 block `24,179,383`.
 - Omit the obsolete `totalDifficulty` extension from canonical post-Merge RPC
   blocks.
-
-## [0.1.0] - Unreleased
-
-The first tag remains gated on the release candidate checks and current
-preview limitations.

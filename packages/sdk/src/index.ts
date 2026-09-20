@@ -1,7 +1,7 @@
 import { LeaniError, responseError, errorFromBody } from "./errors.ts";
 export { LeaniError, type LeaniErrorBody } from "./errors.ts";
 
-export const SDK_VERSION = "0.1.0" as const;
+export const SDK_VERSION = "0.1.0-rc.1" as const;
 
 export type {
   components as OpenApiComponents,

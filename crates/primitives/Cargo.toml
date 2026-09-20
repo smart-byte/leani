@@ -1,12 +1,18 @@
 [package]
 name = "leani-primitives"
+description = "Shared chain, frame, cursor, and provenance types for Leani"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
-publish = false
+publish = ["crates-io"]
+readme = "README.md"
+documentation = "https://docs.rs/leani-primitives"
+keywords = ["ethereum", "indexing", "leani"]
+categories = ["cryptography::cryptocurrencies"]
+include = ["src/**/*.rs", "tests/**/*.rs", "tests/fixtures/*.hex", "README.md", "LICENSE"]
 
 [dependencies]
 alloy-primitives.workspace = true

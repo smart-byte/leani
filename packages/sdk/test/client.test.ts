@@ -49,7 +49,7 @@ describe("createLeaniClient", () => {
     });
 
     expect(client.baseUrl.href).toBe("http://127.0.0.1:8080/prefix/");
-    expect(SDK_VERSION).toBe("0.1.0");
+    expect(SDK_VERSION).toBe("0.1.0-rc.1");
   });
 
   test("extension requests preserve base paths without leaking credentials", async () => {

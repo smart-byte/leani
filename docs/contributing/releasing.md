@@ -73,9 +73,42 @@ archive URLs exist. Run the tap's installation and formula tests. The site
 promotion workflow requires a published GitHub release before advancing
 `site-production` to the exact tagged commit.
 
-Publishing native binaries does not publish Rust libraries. The workspace
-crates remain unpublished until their registry dependency graph, package
-contents, and downstream builds are verified separately.
+## Rust libraries
+
+The crates.io release surface is `leani-primitives`, `leani-processor-api`,
+`leani-source-api`, and `leani-testkit`. Other workspace crates have publication
+disabled. Keep these libraries on the workspace release version; their internal
+prerelease dependencies use exact version requirements.
+
+Use the repository's pinned Cargo version to rehearse all four packages together:
+
+```bash
+cargo publish --dry-run --locked \
+  -p leani-primitives \
+  -p leani-processor-api \
+  -p leani-source-api \
+  -p leani-testkit
+```
+
+Cargo verifies the packaged sources against a temporary registry containing
+the selected local packages. This allows verification before the first upload.
+Inspect each archive and its normalized manifest, license, README, lockfile,
+and source contents. Run the publication/privacy checks and credential scanner
+on the exact release commit and scan the extracted archives too. Validate a
+standalone consumer against the packages, then against crates.io after upload.
+
+The first publication requires a crates.io account with a verified email and
+an API token configured locally through `cargo login`. Publish from the clean,
+reviewed release commit using the same explicit package selection without
+`--dry-run`. Dependency order is primitives, the processor/source APIs, then
+testkit. Add the intended maintainers or GitHub team as owners afterward.
+Configure [trusted publishing](https://crates.io/docs/trusted-publishing) for
+subsequent releases once the crates exist.
+
+The full `leani` node is distributed through native archives, Homebrew, and
+containers. Its Git-only networking and consensus dependencies prevent
+publication on crates.io. Publishing the authoring libraries does not enable
+dynamic processor loading; custom native processors are compiled into a node.
 
 Rollback means deploying the previous binary with a store format it supports
 or restoring the pre-migration backup. Every irreversible migration must be

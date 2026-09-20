@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       release_tag:
-        description: Published Leani release tag to promote (for example v0.1.0)
+        description: Published Leani release tag to promote (for example v0.1.0-rc.1)
         required: true
         type: string
 

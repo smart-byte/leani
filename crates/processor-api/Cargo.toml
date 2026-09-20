@@ -1,18 +1,24 @@
 [package]
 name = "leani-processor-api"
+description = "Contracts for deterministic Leani processors and reducers"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
-publish = false
+publish = ["crates-io"]
+readme = "README.md"
+documentation = "https://docs.rs/leani-processor-api"
+keywords = ["ethereum", "indexing", "leani", "processor"]
+categories = ["cryptography::cryptocurrencies"]
+include = ["src/**/*.rs", "README.md", "LICENSE"]
 
 [dependencies]
 async-trait.workspace = true
 blake3.workspace = true
 hex.workspace = true
-leani-primitives = { path = "../primitives" }
+leani-primitives = { version = "=0.1.0-rc.1", path = "../primitives" }
 semver.workspace = true
 serde.workspace = true
 serde_json.workspace = true

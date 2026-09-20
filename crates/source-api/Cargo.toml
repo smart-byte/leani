@@ -1,18 +1,24 @@
 [package]
 name = "leani-source-api"
+description = "Contracts for Leani historical, live, and finality sources"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
-publish = false
+publish = ["crates-io"]
+readme = "README.md"
+documentation = "https://docs.rs/leani-source-api"
+keywords = ["ethereum", "indexing", "leani"]
+categories = ["cryptography::cryptocurrencies"]
+include = ["src/**/*.rs", "README.md", "LICENSE"]
 
 [dependencies]
 async-trait.workspace = true
 blake3.workspace = true
 futures.workspace = true
-leani-primitives = { path = "../primitives" }
+leani-primitives = { version = "=0.1.0-rc.1", path = "../primitives" }
 postcard.workspace = true
 serde.workspace = true
 thiserror.workspace = true
