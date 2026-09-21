@@ -201,9 +201,9 @@ async function sdkReference(repositoryRoot: string): Promise<JsonObject> {
         visit(statement.members, module === 'backfill' ? 'backfill' : '');
       }
       if (ts.isInterfaceDeclaration(statement) || ts.isTypeAliasDeclaration(statement)) {
-        types.push({ name, module: module === 'backfill' ? '@leani/sdk/backfill' : '@leani/sdk', signature: statement.getText(file) });
+        types.push({ name, module: module === 'backfill' ? '@smart-byte/leani-sdk/backfill' : '@smart-byte/leani-sdk', signature: statement.getText(file) });
       } else if (ts.isFunctionDeclaration(statement) && module !== 'errors') {
-        types.push({ name, module: module === 'backfill' ? '@leani/sdk/backfill' : '@leani/sdk',
+        types.push({ name, module: module === 'backfill' ? '@smart-byte/leani-sdk/backfill' : '@smart-byte/leani-sdk',
           signature: source.slice(statement.getStart(file), statement.body?.pos ?? statement.end).trim() + ';' });
       }
     }

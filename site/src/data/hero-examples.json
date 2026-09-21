@@ -71,7 +71,7 @@
     "lang": "ts",
     "lines": [
       {
-        "text": "import { createLeaniClient } from \"@leani/sdk\";"
+        "text": "import { createLeaniClient } from \"@smart-byte/leani-sdk\";"
       },
       {
         "text": ""

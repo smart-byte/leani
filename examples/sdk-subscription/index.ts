@@ -4,7 +4,7 @@ import {
   createLeaniClient,
   isResetRequired,
   type ChangeEnvelope,
-} from "@leani/sdk";
+} from "@smart-byte/leani-sdk";
 
 export interface DestinationTransaction<T> {
   /** Must be idempotent because a committed change can be redelivered. */

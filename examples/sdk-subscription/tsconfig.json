@@ -3,7 +3,7 @@
   "compilerOptions": {
     "baseUrl": ".",
     "paths": {
-      "@leani/sdk": ["../../packages/sdk/src/index.ts"]
+      "@smart-byte/leani-sdk": ["../../packages/sdk/src/index.ts"]
     },
     "typeRoots": [
       "../../packages/sdk/node_modules/@types",

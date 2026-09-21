@@ -11,7 +11,7 @@ generated: true
 
 import ReferenceTable from '@docs/components/docs/ReferenceTable.astro';
 
-The public package is `@leani/sdk`, for Node 20+ and Bun 1.2+. In a source
+The public package is `@smart-byte/leani-sdk`, for Node 20+ and Bun 1.2+. In a source
 checkout, run `bun install --cwd packages/sdk` and `bun run --cwd packages/sdk build`.
 The [query/follow guide](/docs/guides/query-then-follow/) includes an executable
 client, a matching node config, and pagination/reset handling.
@@ -19,7 +19,7 @@ client, a matching node config, and pagination/reset handling.
 For a node started with `leani init blocks` and `leani serve`:
 
 ```ts
-import { createLeaniClient } from "@leani/sdk";
+import { createLeaniClient } from "@smart-byte/leani-sdk";
 
 const leani = createLeaniClient({ baseUrl: "http://127.0.0.1:18080" });
 const stop = new AbortController();
@@ -57,7 +57,7 @@ returns a `FollowSnapshotPage` with a non-null boundary, or HTTP 409
 `delivery_disabled`. The stream and change endpoints return the same error
 when delivery is disabled.
 
-Durable live/history sessions live in `@leani/sdk/backfill`. Construct them with
+Durable live/history sessions live in `@smart-byte/leani-sdk/backfill`. Construct them with
 `createBackfillSubscriptionClient({ baseUrl, token, fetch, timeoutMs })`; both
 entry points use the same `LeaniError` class and HTTP error fields (`status`,
 `code`, `retryable`, `requestId`). The deadline applies to JSON requests, not to

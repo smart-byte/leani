@@ -207,7 +207,7 @@ USDC per ETH with `bigint`, preserving the V3 ratio until the final decimal
 rendering:
 
 ```ts
-import { createLeaniClient } from "@leani/sdk";
+import { createLeaniClient } from "@smart-byte/leani-sdk";
 
 const leani = createLeaniClient({ baseUrl: "http://127.0.0.1:18080" });
 const Q192 = 1n << 192n;

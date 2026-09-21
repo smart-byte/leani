@@ -2,7 +2,7 @@
 import {
   applyEntityChange, createLeaniClient, LeaniError,
   type GenericSnapshotPage, type LeaniClient, type UniswapPoolPrice,
-} from "@leani/sdk";
+} from "@smart-byte/leani-sdk";
 
 // Run examples/sdk-stream/node.toml first (see the guide).
 export async function followPrices(
