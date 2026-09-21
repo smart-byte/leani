@@ -136,11 +136,11 @@ answering wrongly. See the [method matrix](docs/reference/ethereum-json-rpc.md).
 ## TypeScript SDK
 
 ```bash
-bun add @leani/sdk
+bun add @smart-byte/leani-sdk
 ```
 
 ```ts
-import { createLeaniClient } from "@leani/sdk";
+import { createLeaniClient } from "@smart-byte/leani-sdk";
 
 const leani = createLeaniClient({ baseUrl: "http://127.0.0.1:18080" });
 
