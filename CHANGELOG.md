@@ -6,6 +6,12 @@ record, and documented RPC contracts.
 
 ## [Unreleased]
 
+### Security
+
+- Updated Reth's transitive `imbl` dependency to 7.0.2 and
+  `imbl-sized-chunks` to 0.2.0 to address RUSTSEC-2026-0292. This also removes
+  the unmaintained `bitmaps` dependency and its policy exceptions.
+
 ## [0.1.0-rc.1] - 2026-09-20
 
 The first public release is a preview. Review the documented preview
