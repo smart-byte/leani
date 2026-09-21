@@ -144,7 +144,7 @@ There are two integration paths:
 The second path is implemented and is the intended primary integration. The
 first remains a compatibility, development, and emergency-fallback path until
 production evidence supports a cutover. blobs.money currently carries a local
-client; adopting the published `@leani/sdk` should happen once that package is
+client; adopting the published `@smart-byte/leani-sdk` should happen once that package is
 released and its contract is identical.
 
 ## 6. `eth_config`

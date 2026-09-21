@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { createLeaniClient, LeaniError, type UniswapPoolPrice } from "@leani/sdk";
+import { createLeaniClient, LeaniError, type UniswapPoolPrice } from "@smart-byte/leani-sdk";
 import { followPrices } from "./index.ts";
 
 const entity = (index: number) => ({

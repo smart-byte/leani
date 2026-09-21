@@ -1,9 +1,9 @@
-# `@leani/sdk`
+# `@smart-byte/leani-sdk`
 
 Typed queries and resumable live/history delivery for [Leani](https://github.com/smart-byte/leani).
 
 ```ts
-import { createLeaniClient } from "@leani/sdk";
+import { createLeaniClient } from "@smart-byte/leani-sdk";
 
 const leani = createLeaniClient({ baseUrl: "http://127.0.0.1:8080" });
 const status = await leani.status();
@@ -49,7 +49,7 @@ const scoped = createLeaniClient({
 ```
 
 Historical subscription orchestration and unified live/history iterators are
-available from `@leani/sdk/backfill`. Required consumers should commit the
+available from `@smart-byte/leani-sdk/backfill`. Required consumers should commit the
 application transaction before acknowledging the Leani-owned durable cursor.
 Destination writes must be idempotent because a crash between those steps can
 replay a change.

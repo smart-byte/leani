@@ -33,7 +33,7 @@ const html = (
   )
 ).join('\n');
 
-for (const term of ['configuration', '@leani/sdk', 'JSON-RPC', 'processor']) {
+for (const term of ['configuration', '@smart-byte/leani-sdk', 'JSON-RPC', 'processor']) {
   if (!html.toLocaleLowerCase('en-US').includes(term.toLocaleLowerCase('en-US'))) {
     throw new Error(`representative search term is absent from built documentation: ${term}`);
   }

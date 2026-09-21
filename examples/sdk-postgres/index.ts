@@ -1,5 +1,5 @@
 import { SQL } from "bun";
-import type { ChangeEnvelope } from "@leani/sdk";
+import type { ChangeEnvelope } from "@smart-byte/leani-sdk";
 import {
   consumeDurably,
   type Destination,

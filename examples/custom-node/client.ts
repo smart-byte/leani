@@ -1,5 +1,5 @@
 // docs:start custom-query-client
-import { createLeaniClient } from "@leani/sdk";
+import { createLeaniClient } from "@smart-byte/leani-sdk";
 
 interface BlockSummary {
   blockNumber: number;

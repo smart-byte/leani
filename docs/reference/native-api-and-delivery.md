@@ -809,12 +809,12 @@ arrives as ordinary `apply` changes.
 Package:
 
 ```text
-@leani/sdk
+@smart-byte/leani-sdk
 ```
 
-The public package name is reserved but not published yet. The pre-release
-workspace package remains private until its JavaScript/type build and packed
-Node/Bun smoke tests are part of the release workflow.
+The SDK release workflow builds the JavaScript and type declarations and runs
+packed-package smoke tests in Node and Bun before publication. Prerelease
+versions use npm's `next` tag.
 
 Runtime support:
 
@@ -826,7 +826,7 @@ Runtime support:
 Public shape:
 
 ```ts
-import { createLeaniClient } from "@leani/sdk";
+import { createLeaniClient } from "@smart-byte/leani-sdk";
 
 const node = createLeaniClient({
   baseUrl: "http://127.0.0.1:8080",
@@ -919,7 +919,7 @@ import {
   compareSequences,
   createInMemoryCursorStore, // Tests and development only.
   isResetRequired,
-} from "@leani/sdk";
+} from "@smart-byte/leani-sdk";
 ```
 
 Application database integration remains explicit because domain changes must
@@ -1036,7 +1036,7 @@ blobs.money continues to own:
 
 ### Cutover sequence
 
-1. Publish the shared `@leani/sdk` package and replace the application-local
+1. Publish the shared `@smart-byte/leani-sdk` package and replace the application-local
    client once their contracts match.
 2. Start Leani from application-requested ranges derived from PostgreSQL state.
 3. Compare Leani output with existing `blocks` and `blob_transactions`.

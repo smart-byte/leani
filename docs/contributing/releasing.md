@@ -61,15 +61,18 @@ protection is required; the workflow name alone does not enable it.
 
 ## SDK, container, Homebrew, and site
 
-The SDK workflow requires `sdk-v<package-version>` for publication and passing
-CI for the same commit. Prerelease SDK versions use npm's `next` tag; stable
-versions use `latest`. The workflow tests and scans a local npm archive, then
-publishes that archive. A dry run uploads it for manual inspection.
+The SDK is published as `@smart-byte/leani-sdk`. Its workflow requires
+`sdk-v<package-version>` for publication and passing CI for the same commit.
+Prerelease SDK versions use npm's `next` tag; stable versions use `latest`.
+The workflow tests and scans a local npm archive, then publishes that archive.
+A dry run uploads it for manual inspection.
 
-For the first publication, a maintainer with access to the `@leani` scope must
-configure a short-lived granular `NPM_TOKEN` repository secret with publication
-access and permission to bypass 2FA. Dispatch `sdk-release.yml` from the SDK tag
-with `publish=true` and `bootstrap=true`. The GitHub repository must be public
+For the first publication, a maintainer with access to the `@smart-byte` scope
+must configure a short-lived granular `NPM_TOKEN` repository secret. Grant
+the token read/write publication access to `@smart-byte` under packages and
+scopes, and permission to bypass 2FA. Organization-management access alone
+does not grant package publication rights. Dispatch `sdk-release.yml` from the
+SDK tag with `publish=true` and `bootstrap=true`. The GitHub repository must be public
 for npm provenance. Once the package exists, configure its npm trusted publisher:
 GitHub owner `smart-byte`, repository `leani`, workflow `sdk-release.yml`, and
 permission to publish directly with `npm publish`. Subsequent publications use
@@ -84,10 +87,20 @@ them, then assembles the multiarchitecture tag from their registry digests.
 GitHub's automatic `GITHUB_TOKEN` supplies GHCR authentication. Verify anonymous
 pulls for both architectures before announcing the release.
 
-Copy the candidate's `leani.rb` into the Homebrew tap only after its public
-archive URLs exist. Run the tap's installation and formula tests. The site
-promotion workflow requires a published GitHub release before advancing
-`site-production` to the exact tagged commit.
+Copy the candidate's `leani.rb` to `Formula/leani.rb` in the shared
+`smart-byte/homebrew-tap` repository only after its public archive URLs exist.
+Run the tap's installation and formula tests. Keep `v0.1.0-rc.1` available
+through this formula for initial testing. When the first stable release ships,
+switch the formula to stable releases by default; publishing a later prerelease
+through it requires an explicit decision.
+
+Before promoting the site, set the Cloudflare Pages project's production
+`LEANI_DOCS_REF` build variable to the node release tag being promoted. This
+keeps documentation links pinned to that release even when an SDK tag points
+to the same commit. The site promotion workflow requires a published GitHub
+release before advancing `site-production` to the exact tagged commit.
+Cloudflare's Git integration then builds production from `site-production`;
+`main` builds previews.
 
 ## Rust libraries
 

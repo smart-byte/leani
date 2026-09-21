@@ -7,7 +7,6 @@ ignore = [
   # unmaintained notices, not known vulnerabilities; revisit on every Reth bump.
   { id = "RUSTSEC-2023-0089", reason = "atomic-polyfill is inherited through Reth-era dependencies" },
   { id = "RUSTSEC-2024-0436", reason = "paste is inherited through the pinned Reth networking graph" },
-  { id = "RUSTSEC-2026-0247", reason = "bitmaps is inherited through Reth's imbl transaction-pool dependency" },
   # object_store 0.13 is the newest version compatible with Parquet 59. Leani's
   # read-only Xatu adapter invokes only HEAD/range GET; it never invokes the
   # WebDAV/cloud XML list and credential parsers that reach these code paths.
@@ -34,7 +33,6 @@ exceptions = [
   { allow = ["CC0-1.0"], crate = "tiny-keccak" },
   { allow = ["CDLA-Permissive-2.0"], crate = "webpki-root-certs" },
   { allow = ["CDLA-Permissive-2.0"], crate = "webpki-roots" },
-  { allow = ["MPL-2.0"], crate = "bitmaps" },
   { allow = ["MPL-2.0"], crate = "imbl" },
   { allow = ["MPL-2.0"], crate = "imbl-sized-chunks" },
 ]
