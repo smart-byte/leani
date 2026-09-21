@@ -82,10 +82,6 @@ jobs:
             target: aarch64-apple-darwin
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
-      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
-        with:
-          name: leani-sbom
-          path: notices
       - run: rustup target add ${{ matrix.target }}
       - name: Build release binary
         env:
@@ -101,8 +97,7 @@ jobs:
         run: |
           install -d dist
           cp target/${{ matrix.target }}/release/leani dist/
-          cp LICENSE README.md dist/
-          cp notices/THIRD_PARTY_LICENSES.txt dist/
+          cp LICENSE README.md THIRD_PARTY_LICENSES.txt dist/
           archive="leani-${RELEASE_VERSION}-${{ matrix.target }}.tar.gz"
           tar -C dist -czf "$archive" .
           shasum -a 256 "$archive" > "$archive.sha256"
@@ -134,12 +129,12 @@ jobs:
         run: |
           ruby scripts/prepare-sbom.rb sbom-assets "$GITHUB_WORKSPACE" \
             crates/*/*.cdx.json examples/*/*.cdx.json
-      - name: Include dependency license notices
+      - name: Verify and include dependency license notices
         run: |
           sh scripts/install-cargo-about.sh "$RUNNER_TEMP/license-tools"
-          "$RUNNER_TEMP/license-tools/cargo-about" generate --locked --fail \
-            --manifest-path crates/node/Cargo.toml --config about.toml \
-            about.hbs --output-file sbom-assets/THIRD_PARTY_LICENSES.txt
+          python3 scripts/generate-third-party-licenses.py --check \
+            --cargo-about "$RUNNER_TEMP/license-tools/cargo-about"
+          cp THIRD_PARTY_LICENSES.txt sbom-assets/
           ruby scripts/check-artifact-privacy.rb sbom-assets
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:

@@ -11,12 +11,12 @@ ENV RUSTFLAGS="--remap-path-prefix=/usr/local/cargo=/cargo"
 ENV CFLAGS="-ffile-prefix-map=/usr/local/cargo=/cargo"
 ENV CXXFLAGS="-ffile-prefix-map=/usr/local/cargo=/cargo"
 RUN cargo build --locked --release -p leani
-RUN sh scripts/install-cargo-about.sh /tmp/license-tools \
-    && /tmp/license-tools/cargo-about generate --locked --fail \
-       --manifest-path crates/node/Cargo.toml --config about.toml \
-       about.hbs --output-file /source/THIRD_PARTY_LICENSES.txt
 
 FROM debian:bookworm-slim
+
+LABEL org.opencontainers.image.title="leani" \
+      org.opencontainers.image.source="https://github.com/smart-byte/leani" \
+      org.opencontainers.image.licenses="MIT"
 
 RUN apt-get update \
     && apt-get install --yes --no-install-recommends ca-certificates curl \
@@ -26,8 +26,8 @@ RUN apt-get update \
     && install --directory --owner leani --group leani /var/lib/leani /tmp/leani
 
 COPY --from=builder /source/target/release/leani /usr/local/bin/leani
-COPY LICENSE /usr/share/licenses/leani/LICENSE
-COPY --from=builder /source/THIRD_PARTY_LICENSES.txt /usr/share/licenses/leani/THIRD_PARTY_LICENSES.txt
+# THIRD_PARTY_LICENSES.txt is committed and verified against Cargo.lock in CI.
+COPY LICENSE THIRD_PARTY_LICENSES.txt /usr/share/licenses/leani/
 COPY deploy/container.toml /etc/leani/node.toml
 COPY config/modes /etc/leani/examples
 

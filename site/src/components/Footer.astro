@@ -1,5 +1,5 @@
 ---
-import { GITHUB_URL, BLOBS_MONEY_URL } from '../config';
+import { GITHUB_URL, BLOBS_MONEY_URL, sourceUrl } from '../config';
 ---
 <footer class="wrap">
   <p class="mono"><span class="accent">leani</span>_ — the lean Ethereum indexing node</p>
@@ -11,7 +11,9 @@ import { GITHUB_URL, BLOBS_MONEY_URL } from '../config';
     <a href={BLOBS_MONEY_URL}>blobs.money</a>
   </nav>
   <p class="fine">
-    MIT-licensed · built by the blobs.money team · historical demo data:
+    <a href={sourceUrl('LICENSE')}>MIT-licensed</a> ·
+    <a href={sourceUrl('THIRD_PARTY_LICENSES.txt')}>third-party notices</a> ·
+    built by the blobs.money team · historical demo data:
     <a href="https://github.com/ethpandaops/xatu-data">Xatu by ethPandaOps</a> (CC BY 4.0)
   </p>
 </footer>

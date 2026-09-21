@@ -4,6 +4,11 @@ Status: pre-release preview.
 
 Leani's code is licensed under the [MIT License](LICENSE). Dependencies and
 third-party data retain their respective licenses.
+[THIRD_PARTY_LICENSES.txt](THIRD_PARTY_LICENSES.txt) lists the license text
+and notices of every dependency compiled into the node; release archives, the
+container image, and the Homebrew package ship the same file. Historical
+demonstration data and benchmark evidence derive from
+[Xatu](https://github.com/ethpandaops/xatu-data) by ethPandaOps (CC BY 4.0).
 
 Leani is a lean, state-minimized Ethereum indexing node. Its Rust workspace
 and Bun-compatible SDK compile and test. Historical Xatu,
