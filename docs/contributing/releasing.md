@@ -39,9 +39,12 @@ must stay in ignored local storage. Do not push recovery or archive refs.
 Run `Prepare release` with the version matching the workspace manifest and
 `publish=false`. It executes the offline fixture on native Linux and macOS
 runners for both architectures, then uploads a release candidate containing
-the archives, checksums, portable SBOM files, dependency license notices, and
-Homebrew formula. Build paths are remapped and the extracted binaries are
-checked for private content before their fixture tests run.
+the archives, checksums, portable SBOM files, the committed
+`THIRD_PARTY_LICENSES.txt` dependency notices, and Homebrew formula. The
+notices file is regenerated from `Cargo.lock` and must match the commit, so
+an outdated copy fails the candidate. Build paths are remapped and the
+extracted binaries are checked for private content before their fixture tests
+run.
 
 Inspect and test that candidate. Once the exact commit is tagged and its CI,
 publication/security, site, and container checks have passed, run the workflow

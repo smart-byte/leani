@@ -25,7 +25,7 @@ class Leani < Formula
 
   def install
     bin.install "leani"
-    pkgshare.install "THIRD_PARTY_LICENSES.txt"
+    pkgshare.install "LICENSE", "THIRD_PARTY_LICENSES.txt"
   end
 
   test do

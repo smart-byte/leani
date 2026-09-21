@@ -479,3 +479,29 @@ recent_window_blocks = 128
 historical_mode = "on-demand"
 transaction_locator_index = false
 ```
+
+## 13. Execution networking
+
+Leani consumes isolated networking crates from Reth 2.5.2 rather than
+forking SHiNode or running a complete execution client. One manager persists
+for the process lifetime, uses a stable key in the data directory, shares a
+bounded peer cache across live/history work, enables Discv4, Discv5, and DNS
+discovery, and hedges warm startup across cached and newly discovered peers.
+Only the most recent capability-proven, currently viable body servers are
+dialed immediately; the broader cache is admitted in refill-paced batches so
+stale records cannot monopolize the first dial window. Cache refreshes merge
+the current Reth view into that bounded discovery set, so a short failed run
+cannot erase the next run's alternatives. Leani multiplexes at most four
+bounded material requests per connected peer under one global, live-priority
+admission gate. Body and receipt requests start at an evidence-backed
+eight-block ceiling, shrink independently after a partial/failed response, and
+grow again only after sustained success. Finalized P2P history is a
+protocol-verified, operator-bounded fallback after retained and archive
+sources: Leani proves ancestry to a beacon-derived execution anchor before
+emitting commitment-checked material. Filtered log-only processors use
+verified header blooms to avoid negative-block receipts and can omit bodies
+when transaction hash is not part of their declared output identity; generic
+RPC and broad processors retain the full-material path. Durable processor
+coverage and retained parent-linked canonical material remain the restart
+authorities. The decisions behind this design are recorded in ADRs 0011
+through 0015; see [decisions](/docs/contributing/decisions/).

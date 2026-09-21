@@ -79,6 +79,8 @@ jobs:
         run: ruby scripts/test-artifact-privacy.rb
       - name: Validate Rust package inspection
         run: python3 scripts/test-crate-packages.py
+      - name: Validate dependency notice collection
+        run: python3 scripts/test-third-party-licenses.py
       - name: Validate historical-only deployment config
         run: cargo run --locked -- doctor --json --config deploy/container.toml
       # container.yml builds and scans the image on the same pushes and PRs.
@@ -91,3 +93,8 @@ jobs:
       - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
         with:
           command: check
+      - name: Verify committed dependency license notices
+        run: |
+          sh scripts/install-cargo-about.sh "$RUNNER_TEMP/license-tools"
+          python3 scripts/generate-third-party-licenses.py --check \
+            --cargo-about "$RUNNER_TEMP/license-tools/cargo-about"

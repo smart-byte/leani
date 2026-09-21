@@ -41,6 +41,7 @@ cargo fmt --all --check
 cargo test --workspace --locked
 cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo deny check
+python3 scripts/generate-third-party-licenses.py --check
 
 cd packages/sdk
 bun install --frozen-lockfile
@@ -53,6 +54,12 @@ bun run check
 bun run examples:check
 bun run build
 ```
+
+`THIRD_PARTY_LICENSES.txt` is generated from `Cargo.lock` and shipped with
+every binary distribution, so CI rejects a stale copy. After any dependency
+change, install the pinned generator once with
+`sh scripts/install-cargo-about.sh ~/.local/bin`, run
+`scripts/generate-third-party-licenses.py`, and commit the result.
 
 Public documentation lives in `docs/`; the Astro frontend lives in `site/`.
 Site preparation consumes tracked Rust-generated fixtures and requires only Bun.

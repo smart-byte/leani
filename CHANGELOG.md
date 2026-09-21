@@ -12,6 +12,14 @@ record, and documented RPC contracts.
   `imbl-sized-chunks` to 0.2.0 to address RUSTSEC-2026-0292. This also removes
   the unmaintained `bitmaps` dependency and its policy exceptions.
 
+### Changed
+
+- `THIRD_PARTY_LICENSES.txt` is now committed, verified against `Cargo.lock`
+  in CI, and linked from the README and site. It adds the Apache-2.0 NOTICE
+  files of the Arrow, Parquet, object_store, and Moka dependencies, which the
+  generated listing previously omitted. The Homebrew package now also installs
+  Leani's own `LICENSE`, and the container image declares OCI license metadata.
+
 ## [0.1.0-rc.1] - 2026-09-20
 
 The first public release is a preview. Review the documented preview
