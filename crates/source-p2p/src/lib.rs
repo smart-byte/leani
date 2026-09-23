@@ -25,7 +25,7 @@ use std::{
 };
 
 use alloy_consensus::{
-    Block, Header, Transaction as _, TxReceipt as _,
+    Block, EMPTY_ROOT_HASH, Header, Transaction as _, TxReceipt as _,
     proofs::{calculate_receipt_root, calculate_transaction_root},
     transaction::SignerRecoverable,
 };
@@ -33,7 +33,7 @@ use alloy_eips::{BlockHashOrNumber, Encodable2718, eip2124::Head};
 use alloy_primitives::{Address as AlloyAddress, B256, B512, BloomInput, Sealable, U256};
 use alloy_rlp::Encodable as _;
 use async_trait::async_trait;
-use futures::{StreamExt, stream, stream::FuturesUnordered};
+use futures::{FutureExt as _, StreamExt, stream, stream::FuturesUnordered};
 use hickory_resolver::proto::rr::RData;
 use leani_primitives::{
     Address, BlockFrame, BlockHash, BlockNumber, BlockRange, BlockRef, Capability, CapabilitySet,
@@ -126,6 +126,23 @@ const RESERVED_LIVE_MATERIAL_REQUESTS: usize = 4;
 // Peers one poll for a block at the head asks. It usually does not exist yet,
 // so racing every eligible peer only multiplies "not yet" replies.
 const AT_HEAD_HEADER_PEERS: usize = 2;
+// A "not yet" this close before another peer served the block came from the
+// poll that served it: polls for one block are at least the first retry pause
+// apart, so a peer asked by an earlier poll may have been asked before the
+// block existed. A shorter configured pause shortens it.
+const HEAD_POLL_NOT_YET_TOLERANCE: Duration = Duration::from_millis(250);
+// Peers head discovery races for the minimum live head. The block exists, so
+// a few peers answer it; discovery runs on every live-loop iteration.
+const MINIMUM_LIVE_HEAD_PEERS: usize = 3;
+// A live body or receipt request asks every eligible peer once per wave. After
+// this many waves, or this long, nobody serves the material of that header.
+const MAX_LIVE_MATERIAL_WAVES: usize = 8;
+const LIVE_MATERIAL_TIMEOUT: Duration = Duration::from_mins(1);
+// Continuation rounds, and response bytes across them, one eth/70 receipt
+// request may take. Peers answer about 2 MiB per round, so a block's receipts
+// fit, while a batch that does not fit is split into single blocks.
+const MAX_RECEIPTS70_ROUNDS: usize = 8;
+const MAX_RECEIPTS70_BYTES: usize = 64 * 1024 * 1024;
 // Session events reach the direct-peer pool over a lossy broadcast, so the
 // pool is reconciled with Reth's active sessions this often.
 const DIRECT_PEER_RECONCILE_INTERVAL: Duration = Duration::from_secs(10);
@@ -727,26 +744,46 @@ struct HeaderProofSegment {
     hashes: Vec<BlockHash>,
 }
 
+/// Assembles the hashes of a finalized header range from segments fetched in
+/// any order. Segments are validated top-down from the anchor: each must end
+/// at the hash that its validated child names as parent, so every validated
+/// segment is proven, and one that does not is fetched again while the
+/// validated ones stay.
 #[derive(Debug)]
 struct AnchoredHeaderProofBuilder {
     proof: BlockRange,
     retained: BlockRange,
+    /// Ranges to fetch, the anchor's first.
     pending: VecDeque<BlockRange>,
-    segments: BTreeMap<BlockNumber, HeaderProofSegment>,
-    next: Option<BlockNumber>,
-    prior_hash: Option<BlockHash>,
+    /// Fetched segments not validated yet, by last block, with the peer that
+    /// served each.
+    segments: BTreeMap<BlockNumber, (B512, HeaderProofSegment)>,
+    /// The last block of the next segment to validate.
+    next_end: Option<BlockNumber>,
+    /// The hash that segment must end at: the anchor, then the parent that
+    /// the lowest validated segment names.
+    expected_hash: BlockHash,
+    /// Retained hashes validated so far, newest first.
     retained_hashes: Vec<BlockHash>,
 }
 
 impl AnchoredHeaderProofBuilder {
-    fn new(proof: BlockRange, retained: BlockRange, request_blocks: u64) -> Self {
+    fn new(
+        proof: BlockRange,
+        retained: BlockRange,
+        request_blocks: u64,
+        anchor: BlockHash,
+    ) -> Self {
         Self {
             proof,
             retained,
-            pending: VecDeque::from(anchored_header_ranges(proof, request_blocks)),
+            pending: anchored_header_ranges(proof, request_blocks)
+                .into_iter()
+                .rev()
+                .collect(),
             segments: BTreeMap::new(),
-            next: Some(proof.start()),
-            prior_hash: None,
+            next_end: Some(proof.end()),
+            expected_hash: anchor,
             retained_hashes: Vec::with_capacity(
                 usize::try_from(retained.len()).unwrap_or_default(),
             ),
@@ -759,39 +796,44 @@ impl AnchoredHeaderProofBuilder {
             .collect()
     }
 
+    /// Record one fetched range and validate the segments it completes.
+    /// Returns each peer whose segment contradicts the anchored chain, with
+    /// the error. Such a range, like a failed one, is fetched again first.
     fn record(
         &mut self,
         range: BlockRange,
-        result: Result<HeaderProofSegment, P2pError>,
-    ) -> Result<(), P2pError> {
+        result: Result<(B512, HeaderProofSegment), P2pError>,
+    ) -> Vec<(B512, P2pError)> {
         match result {
-            Ok(segment) => {
-                self.segments.insert(segment.range.start(), segment);
+            Ok((peer, segment)) => {
+                self.segments.insert(segment.range.end(), (peer, segment));
             }
-            Err(_) => self.pending.push_back(range),
+            Err(_) => self.pending.push_front(range),
         }
         self.advance()
     }
 
-    fn advance(&mut self) -> Result<(), P2pError> {
-        while let Some(next) = self.next {
-            let Some(segment) = self.segments.remove(&next) else {
+    fn advance(&mut self) -> Vec<(B512, P2pError)> {
+        let mut rejected = Vec::new();
+        while let Some(next_end) = self.next_end {
+            let Some((peer, segment)) = self.segments.remove(&next_end) else {
                 break;
             };
-            if segment.range.start() != next || segment.range.end() > self.proof.end() {
-                return Err(P2pError::InvalidResponse(
-                    "anchored header proof segments are not an exact ordered cover".to_owned(),
-                ));
-            }
-            if let Some(expected_parent) = self.prior_hash
-                && segment.first_parent != expected_parent
+            if segment.range.start() < self.proof.start()
+                || segment.hashes.last() != Some(&self.expected_hash)
             {
-                return Err(P2pError::InvalidResponse(format!(
-                    "anchored header proof boundary failed at block {}",
-                    segment.range.start().0
-                )));
+                rejected.push((
+                    peer,
+                    P2pError::ExpectationMismatch(format!(
+                        "anchored header proof segment ending at block {} is not the parent of \
+                         the proven chain above it",
+                        next_end.0
+                    )),
+                ));
+                self.pending.push_front(segment.range);
+                break;
             }
-            for (offset, hash) in segment.hashes.iter().copied().enumerate() {
+            for (offset, hash) in segment.hashes.iter().copied().enumerate().rev() {
                 let number = segment
                     .range
                     .start()
@@ -801,25 +843,18 @@ impl AnchoredHeaderProofBuilder {
                     self.retained_hashes.push(hash);
                 }
             }
-            self.prior_hash = segment.hashes.last().copied();
-            self.next = (segment.range.end() < self.proof.end())
-                .then(|| BlockNumber(segment.range.end().0.saturating_add(1)));
+            self.expected_hash = segment.first_parent;
+            self.next_end = (segment.range.start() > self.proof.start())
+                .then(|| BlockNumber(segment.range.start().0.saturating_sub(1)));
         }
-        Ok(())
+        rejected
     }
 
-    fn finish(&mut self, anchor: BlockHash) -> Result<AnchoredHeaderProof, P2pError> {
-        self.advance()?;
-        if !self.pending.is_empty() || self.next.is_some() || !self.segments.is_empty() {
+    fn finish(&mut self) -> Result<AnchoredHeaderProof, P2pError> {
+        if self.next_end.is_some() {
             return Err(P2pError::InvalidResponse(
                 "anchored header proof still has pending ranges".to_owned(),
             ));
-        }
-        if self.prior_hash != Some(anchor) {
-            return Err(P2pError::InvalidResponse(format!(
-                "anchored header proof tip {:?}, expected {anchor}",
-                self.prior_hash
-            )));
         }
         let expected = usize::try_from(self.retained.len()).map_err(|_| {
             P2pError::InvalidConfig("retained history proof range is too large".to_owned())
@@ -829,10 +864,12 @@ impl AnchoredHeaderProofBuilder {
                 "anchored header proof omitted retained material hashes".to_owned(),
             ));
         }
+        let mut hashes = std::mem::take(&mut self.retained_hashes);
+        hashes.reverse();
         Ok(AnchoredHeaderProof {
             proof: self.proof,
             retained: self.retained,
-            hashes: std::mem::take(&mut self.retained_hashes),
+            hashes,
         })
     }
 }
@@ -1097,14 +1134,36 @@ struct PersistentNetwork {
 }
 
 impl PersistentNetwork {
-    fn drop_peer(&self, peer_id: B512) {
-        self.direct_peers.invalidate(peer_id);
-        self.qualifications.remove(peer_id);
+    fn drop_peer(&self, peer_id: B512, connection_id: u64) {
+        if self.direct_peers.invalidate(peer_id, connection_id) {
+            self.qualifications.remove(peer_id);
+        }
     }
 
-    fn invalidate_peer(&self, peer_id: B512, detail: &str) {
+    fn invalidate_peer(&self, peer_id: B512, connection_id: u64, detail: &str) {
         self.peer_store.record_failure(peer_id, detail);
-        self.drop_peer(peer_id);
+        self.drop_peer(peer_id, connection_id);
+    }
+
+    /// The one penalty rule for a failed response from the session behind
+    /// `lease`, checked against an expectation of `expectation`'s trust. A
+    /// response `classify_response_failure` finds invalid bans the peer
+    /// through `ban_peer` and stores the failure. Any other failure, such as
+    /// an empty reply or a timeout, only cools the leased lane.
+    fn penalize_response(
+        &self,
+        lease: &mut DirectPeerLease,
+        error: &P2pError,
+        expectation: ExpectationTrust,
+        ban_peer: impl FnOnce(B512),
+    ) -> ResponseFault {
+        lease.failed();
+        let fault = classify_response_failure(error, expectation);
+        if fault == ResponseFault::Invalid {
+            ban_peer(lease.peer.peer_id);
+            self.invalidate_peer(lease.peer.peer_id, lease.connection_id, &error.to_string());
+        }
+        fault
     }
 }
 
@@ -1152,6 +1211,11 @@ struct DirectPeerState {
     header: PeerServiceState,
     body: PeerServiceState,
     receipts: PeerServiceState,
+    /// Headers the peer served whose body or receipts no peer served, since
+    /// a frame on one of its headers last completed.
+    withheld_strikes: u32,
+    /// When the peer may serve headers again after its last strike.
+    withheld_until: Instant,
 }
 
 impl DirectPeerState {
@@ -1163,6 +1227,8 @@ impl DirectPeerState {
             header: PeerServiceState::new(),
             body: PeerServiceState::new(),
             receipts: PeerServiceState::new(),
+            withheld_strikes: 0,
+            withheld_until: Instant::now(),
         }
     }
 
@@ -1181,14 +1247,34 @@ impl DirectPeerState {
             PeerMaterialKind::Receipts => &mut self.receipts,
         }
     }
+
+    /// When the peer's `kind` lane may be asked next. Headers also wait out
+    /// the peer's last withheld-header strike.
+    fn available_at(&self, kind: PeerMaterialKind) -> Instant {
+        match kind {
+            PeerMaterialKind::Header => self.header.retry_at.max(self.withheld_until),
+            PeerMaterialKind::Body | PeerMaterialKind::Receipts => self.service(kind).retry_at,
+        }
+    }
+
+    /// Whether the peer ranks after the others for `kind`: headers from a
+    /// peer with a withheld-header strike.
+    fn struck(&self, kind: PeerMaterialKind) -> bool {
+        kind == PeerMaterialKind::Header && self.withheld_strikes > 0
+    }
 }
 
 fn cool_peer_service(peer: &mut DirectPeerState, kind: PeerMaterialKind) {
     let service = peer.service_mut(kind);
     service.failures = service.failures.saturating_add(1);
-    let exponent = service.failures.saturating_sub(1).min(7);
-    let backoff_ms = 250_u64.saturating_mul(1_u64 << exponent).min(30_000);
-    service.retry_at = Instant::now() + Duration::from_millis(backoff_ms);
+    service.retry_at = Instant::now() + peer_cooldown(service.failures);
+}
+
+/// The cooldown after `failures` consecutive failures of a lane, or strikes:
+/// 250 ms, doubling with each, up to 30 s.
+fn peer_cooldown(failures: u32) -> Duration {
+    let exponent = failures.saturating_sub(1).min(7);
+    Duration::from_millis(250_u64.saturating_mul(1_u64 << exponent).min(30_000))
 }
 
 #[derive(Debug)]
@@ -1220,10 +1306,11 @@ impl DirectPeerPool {
         let connection_id = self.next_connection_id.fetch_add(1, Ordering::Relaxed);
         // A new session starts over, even for a peer whose previous session
         // was dropped for invalid material.
-        self.invalidated
+        let mut invalidated = self
+            .invalidated
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(&peer.peer_id);
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        invalidated.remove(&peer.peer_id);
         let mut peers = self
             .peers
             .lock()
@@ -1238,6 +1325,7 @@ impl DirectPeerPool {
             peers.push(state);
         }
         drop(peers);
+        drop(invalidated);
         self.changed.notify_waiters();
     }
 
@@ -1249,14 +1337,32 @@ impl DirectPeerPool {
         self.changed.notify_waiters();
     }
 
-    /// Drop a peer for invalid material and keep it out until its session
-    /// closes.
-    fn invalidate(&self, peer_id: B512) {
-        self.invalidated
+    /// Drop the session `connection_id` for invalid material and keep its peer
+    /// out until that session closes. A session the peer opened since keeps
+    /// its place: returns whether the session was still pooled.
+    fn invalidate(&self, peer_id: B512, connection_id: u64) -> bool {
+        // Lock order as in `insert`, so a new session cannot slip between the
+        // removal and the mark.
+        let mut invalidated = self
+            .invalidated
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(peer_id);
-        self.remove(peer_id);
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut peers = self
+            .peers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let pooled = peers.len();
+        peers.retain(|state| state.peer.peer_id != peer_id || state.connection_id != connection_id);
+        let removed = peers.len() != pooled;
+        drop(peers);
+        if removed {
+            invalidated.insert(peer_id);
+        }
+        drop(invalidated);
+        if removed {
+            self.changed.notify_waiters();
+        }
+        removed
     }
 
     /// Drop a peer whose session closed; a later session may join again.
@@ -1320,13 +1426,13 @@ impl DirectPeerPool {
         self.changed.notify_waiters();
     }
 
-    fn get(&self, peer_id: B512) -> Option<DirectPeer> {
+    fn get(&self, peer_id: B512) -> Option<(DirectPeer, u64)> {
         self.peers
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .iter()
             .find(|peer| peer.peer.peer_id == peer_id)
-            .map(|peer| peer.peer.clone())
+            .map(|peer| (peer.peer.clone(), peer.connection_id))
     }
 
     /// Lease a header peer for a poll for the next block at the head: the
@@ -1368,6 +1474,46 @@ impl DirectPeerPool {
         self.changed.notify_waiters();
     }
 
+    /// Strike a peer whose header no peer served the body or receipts of: it
+    /// may have made the block up. Each strike keeps the peer out of header
+    /// requests for the next step of the lane cooldown, up to 30 s, and ranks
+    /// it after other header peers. Unlike a lane cooldown, a header the peer
+    /// serves lifts neither; only a completed frame on one of its headers
+    /// does. Nothing is persisted and nobody is banned.
+    fn strike_withheld_header(&self, peer_id: B512) {
+        let mut peers = self
+            .peers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(peer) = peers.iter_mut().find(|peer| peer.peer.peer_id == peer_id) {
+            peer.withheld_strikes = peer.withheld_strikes.saturating_add(1);
+            peer.withheld_until = Instant::now() + peer_cooldown(peer.withheld_strikes);
+        }
+        drop(peers);
+        self.changed.notify_waiters();
+    }
+
+    /// A frame on a header the peer served completed: that block exists, so
+    /// its withheld-header strikes clear.
+    fn clear_withheld_header(&self, peer_id: B512) {
+        let mut peers = self
+            .peers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let cleared = peers
+            .iter_mut()
+            .find(|peer| peer.peer.peer_id == peer_id && peer.withheld_strikes > 0)
+            .map(|peer| {
+                peer.withheld_strikes = 0;
+                peer.withheld_until = Instant::now();
+            })
+            .is_some();
+        drop(peers);
+        if cleared {
+            self.changed.notify_waiters();
+        }
+    }
+
     fn try_acquire_excluding(
         self: &Arc<Self>,
         kind: PeerMaterialKind,
@@ -1388,11 +1534,12 @@ impl DirectPeerPool {
             .filter(|index| {
                 !excluded.contains(&peers[*index].peer.peer_id)
                     && peers[*index].in_flight < per_peer_limit
-                    && peers[*index].service(kind).retry_at <= now
+                    && peers[*index].available_at(kind) <= now
             })
             .min_by_key(|index| {
                 (
                     Some(peers[*index].peer.peer_id) != preferred,
+                    peers[*index].struck(kind),
                     !peers[*index].service(kind).verified,
                     std::cmp::Reverse(self.quality.rank(peers[*index].peer.peer_id)),
                     peers[*index].service(kind).failures,
@@ -1457,11 +1604,12 @@ impl DirectPeerPool {
                     .filter(|index| {
                         !excluded.contains(&peers[*index].peer.peer_id)
                             && peers[*index].in_flight < per_peer_limit
-                            && peers[*index].service(kind).retry_at <= now
+                            && peers[*index].available_at(kind) <= now
                     })
                     .min_by_key(|index| {
                         (
                             Some(peers[*index].peer.peer_id) != preferred,
+                            peers[*index].struck(kind),
                             !peers[*index].service(kind).verified,
                             std::cmp::Reverse(self.quality.rank(peers[*index].peer.peer_id)),
                             peers[*index].service(kind).failures,
@@ -1485,7 +1633,7 @@ impl DirectPeerPool {
                             !excluded.contains(&peer.peer.peer_id)
                                 && peer.in_flight < per_peer_limit
                         })
-                        .map(|peer| peer.service(kind).retry_at.saturating_duration_since(now))
+                        .map(|peer| peer.available_at(kind).saturating_duration_since(now))
                         .min(),
                     !peers.is_empty(),
                     peers
@@ -1522,12 +1670,12 @@ impl DirectPeerPool {
         }
     }
 
-    fn snapshot(&self) -> Vec<DirectPeer> {
+    fn snapshot(&self) -> Vec<(DirectPeer, u64)> {
         self.peers
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .iter()
-            .map(|state| state.peer.clone())
+            .map(|state| (state.peer.clone(), state.connection_id))
             .collect()
     }
 
@@ -1564,12 +1712,11 @@ impl DirectPeerPool {
     /// Add a session the pool missed, unless its open event arrived meanwhile
     /// or the peer was dropped for invalid material since.
     fn insert_missing(&self, peer: DirectPeer) -> bool {
-        if self
+        let invalidated = self
             .invalidated
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .contains(&peer.peer_id)
-        {
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if invalidated.contains(&peer.peer_id) {
             return false;
         }
         let connection_id = self.next_connection_id.fetch_add(1, Ordering::Relaxed);
@@ -1582,6 +1729,7 @@ impl DirectPeerPool {
         }
         peers.push(DirectPeerState::new(peer, connection_id));
         drop(peers);
+        drop(invalidated);
         self.changed.notify_waiters();
         true
     }
@@ -1768,11 +1916,23 @@ struct MaterialRequestPolicy {
     priority: Priority,
 }
 
+/// A peer's validated reply to a live header request. Its reward waits for
+/// the frames built on the headers: a header whose body or receipts no peer
+/// serves earns nothing.
+#[derive(Clone, Copy, Debug)]
+struct HeaderServe {
+    peer_id: B512,
+    block: u64,
+    elapsed: Duration,
+}
+
 #[derive(Clone, Copy, Debug)]
 struct LiveReceiptMaterial<'a> {
     header: &'a Header,
     body: &'a BlockBody,
     hash: B256,
+    /// The peer that served the header.
+    header_peer: B512,
     preferred_peer: B512,
 }
 
@@ -1878,6 +2038,15 @@ fn direct_peer_request_limit(total_concurrency: usize, connected_peers: usize) -
         .clamp(1, MAX_MATERIAL_REQUESTS_PER_PEER)
 }
 
+/// The policy of the request for the minimum live head, a block that exists:
+/// a race of `MINIMUM_LIVE_HEAD_PEERS` peers at a time, at live priority.
+const fn minimum_live_head_policy() -> MaterialRequestPolicy {
+    MaterialRequestPolicy {
+        concurrency: MINIMUM_LIVE_HEAD_PEERS,
+        priority: Priority::High,
+    }
+}
+
 /// Parallel and total peers one live header request asks. Polling at the head
 /// asks a cohort of one or two peers per poll, because the next block is
 /// usually not produced yet; catching up races every eligible peer.
@@ -1928,35 +2097,64 @@ const fn live_header_reply_cost(
 /// Each poll asks peers the rotation has not asked for that block yet, and it
 /// starts over once every eligible peer has been asked, so two peers that
 /// answer "not yet" cannot hold the lane: the next poll asks others. Once the
-/// lane has moved past the block, another peer has served it, and the peers
-/// that answered "not yet" for it earn the normal header-lane cooldown.
-#[derive(Debug, Default)]
+/// lane has moved on with a block a poll served, a peer that answered "not
+/// yet" for it after that serve, or within the tolerance before it, earns the
+/// normal header-lane cooldown. Peers asked before the block existed cost
+/// nothing.
+#[derive(Debug)]
 struct HeadPollRotation {
     block: Option<BlockNumber>,
     /// Peers asked for `block` since the rotation last started over.
     asked: HashSet<B512>,
     /// Peers the current poll asked.
     polling: HashSet<B512>,
-    /// Peers that answered "not yet" for `block`.
-    not_yet: HashSet<B512>,
+    /// Peers that answered "not yet" for `block`, and when they last did.
+    not_yet: HashMap<B512, Instant>,
+    /// When a poll last served `block`, unless the lane could not go on with
+    /// that serve.
+    served_at: Option<Instant>,
+    /// How long before a serve a "not yet" still counts against its peer.
+    not_yet_tolerance: Duration,
 }
 
 impl HeadPollRotation {
-    /// Begin a poll for `block`. Once the lane has moved past the block polled
-    /// before, returns the peers that answered "not yet" for it, to cool.
+    /// A rotation for a lane whose first retry pause is `retry_backoff`: a
+    /// "not yet" counts within `HEAD_POLL_NOT_YET_TOLERANCE`, or within the
+    /// pause if it is shorter, before a serve.
+    fn new(retry_backoff: Duration) -> Self {
+        Self {
+            block: None,
+            asked: HashSet::new(),
+            polling: HashSet::new(),
+            not_yet: HashMap::new(),
+            served_at: None,
+            not_yet_tolerance: HEAD_POLL_NOT_YET_TOLERANCE.min(retry_backoff),
+        }
+    }
+
+    /// Begin a poll for `block`. Once the lane has moved on with the block a
+    /// poll served before, returns the peers that withheld it, to cool.
     fn begin_poll(&mut self, block: BlockNumber) -> Vec<B512> {
         self.polling.clear();
         if self.block == Some(block) {
             return Vec::new();
         }
-        let served = self.block.is_some_and(|polled| block.0 > polled.0);
+        let moved_on = self.block.is_some_and(|polled| block.0 > polled.0);
         self.block = Some(block);
         self.asked.clear();
         let not_yet = std::mem::take(&mut self.not_yet);
-        if !served {
+        // A block the lane caught up past, which no poll served, blames no
+        // peer: they may have been asked before it existed.
+        let Some(served_at) = self.served_at.take().filter(|_| moved_on) else {
             return Vec::new();
-        }
-        let mut withheld = not_yet.into_iter().collect::<Vec<_>>();
+        };
+        let mut withheld = not_yet
+            .into_iter()
+            .filter(|(_, answered_at)| {
+                served_at.saturating_duration_since(*answered_at) <= self.not_yet_tolerance
+            })
+            .map(|(peer_id, _)| peer_id)
+            .collect::<Vec<_>>();
         withheld.sort_unstable();
         withheld
     }
@@ -1981,14 +2179,21 @@ impl HeadPollRotation {
         true
     }
 
-    fn record_not_yet(&mut self, peer_id: B512) {
-        self.not_yet.insert(peer_id);
+    fn record_not_yet(&mut self, peer_id: B512, at: Instant) {
+        self.not_yet.insert(peer_id, at);
     }
 
-    /// A peer that served the block withheld nothing, even if it answered
-    /// "not yet" before.
-    fn record_served(&mut self, peer_id: B512) {
+    /// A peer served the block's header at `at`. It withheld nothing, even if
+    /// it answered "not yet" before.
+    fn record_served(&mut self, peer_id: B512, at: Instant) {
         self.not_yet.remove(&peer_id);
+        self.served_at = Some(at);
+    }
+
+    /// The poll failed, after its header was served or not: no serve so far
+    /// moved the lane on, such as a header whose body no peer served.
+    const fn serve_failed(&mut self) {
+        self.served_at = None;
     }
 }
 
@@ -2052,20 +2257,33 @@ impl PersistentNetwork {
                 }
             }
         }
-        if tokio::time::timeout(NETWORK_SHUTDOWN_TIMEOUT, running.handle.shutdown())
+        let graceful = tokio::time::timeout(NETWORK_SHUTDOWN_TIMEOUT, running.handle.shutdown())
             .await
-            .is_err()
-        {
-            warn!("timed out while shutting down execution P2P network manager");
-            running.shutdown.cancel();
-        }
-        if tokio::time::timeout(NETWORK_SHUTDOWN_TIMEOUT, &mut running.network_task)
-            .await
-            .is_err()
-        {
-            running.network_task.abort();
-            let _ = running.network_task.await;
-        }
+            .is_ok();
+        stop_network_task(graceful, &running.shutdown, &mut running.network_task).await;
+    }
+}
+
+/// Stop a network manager task once its network has shut down, gracefully or
+/// not, and wait for the task's teardown. The manager future keeps running
+/// after a graceful network shutdown, so the task's own token ends its loop;
+/// the task then persists the final peer state, unless that overruns the
+/// timeout.
+async fn stop_network_task(
+    graceful: bool,
+    shutdown: &CancellationToken,
+    task: &mut tokio::task::JoinHandle<()>,
+) {
+    if !graceful {
+        warn!("timed out while shutting down execution P2P network manager");
+    }
+    shutdown.cancel();
+    if tokio::time::timeout(NETWORK_SHUTDOWN_TIMEOUT, &mut *task)
+        .await
+        .is_err()
+    {
+        task.abort();
+        let _ = task.await;
     }
 }
 
@@ -2284,8 +2502,8 @@ fn spawn_peer_qualification_worker(
             };
             if tasks.len() < qualification_concurrency {
                 let mut candidates = direct_peers.snapshot();
-                candidates.sort_by_key(|peer| std::cmp::Reverse(quality.rank(peer.peer_id)));
-                for peer in candidates {
+                candidates.sort_by_key(|(peer, _)| std::cmp::Reverse(quality.rank(peer.peer_id)));
+                for (peer, connection_id) in candidates {
                     if tasks.len() >= qualification_concurrency {
                         break;
                     }
@@ -2298,13 +2516,19 @@ fn spawn_peer_qualification_worker(
                         continue;
                     }
                     pending.insert(peer.peer_id);
-                    tasks.push(tokio::spawn(qualify_execution_peer(
-                        peer,
-                        target,
-                        request_timeout,
-                        request_gate.clone(),
-                        shutdown.clone(),
-                    )));
+                    // A rejected probe drops only the session it ran on, not a
+                    // later session of the peer. Its other outcomes, and the
+                    // qualification pool, are still kept per peer.
+                    tasks.push(tokio::spawn(
+                        qualify_execution_peer(
+                            peer,
+                            target,
+                            request_timeout,
+                            request_gate.clone(),
+                            shutdown.clone(),
+                        )
+                        .map(move |result| (connection_id, result)),
+                    ));
                 }
             }
             tokio::select! {
@@ -2330,7 +2554,8 @@ fn spawn_peer_qualification_worker(
                 () = direct_peers.changed.notified() => {}
                 _ = retry_tick.tick() => {}
                 completed = tasks.next(), if !tasks.is_empty() => {
-                    let Ok(result) = completed.expect("qualification task exists") else {
+                    let Ok((connection_id, result)) = completed.expect("qualification task exists")
+                    else {
                         continue;
                     };
                     pending.remove(&result.peer_id);
@@ -2397,7 +2622,7 @@ fn spawn_peer_qualification_worker(
                         retry_at.insert(result.peer_id, Instant::now() + delay);
                         if matches!(result.outcome, PeerQualification::Rejected) {
                             handle.ban_peer(result.peer_id);
-                            direct_peers.invalidate(result.peer_id);
+                            direct_peers.invalidate(result.peer_id, connection_id);
                             qualifications.remove(result.peer_id);
                         }
                     }
@@ -3415,7 +3640,11 @@ struct P2pLiveState {
     pending_material_attempts: usize,
     head_poll: HeadPollRotation,
     head_unavailable_since: Option<Instant>,
+    /// Since when every head poll's cohort has stayed silent.
+    head_poll_silent_since: Option<Instant>,
     reconnect_error: Option<String>,
+    /// Whether the lane has reported itself disconnected since it last
+    /// emitted a block or reorg, or reconnected.
     disconnect_reported: bool,
     terminal: bool,
 }
@@ -3434,6 +3663,7 @@ impl std::fmt::Debug for P2pLiveState {
             .field("required_peer_head", &self.required_peer_head)
             .field("pending_material_attempts", &self.pending_material_attempts)
             .field("head_unavailable_since", &self.head_unavailable_since)
+            .field("head_poll_silent_since", &self.head_poll_silent_since)
             .field("reconnect_error", &self.reconnect_error)
             .field("disconnect_reported", &self.disconnect_reported)
             .field("terminal", &self.terminal)
@@ -3818,7 +4048,9 @@ impl RethP2pSource {
             let request_started_at = Instant::now();
             let response = request_direct_receipts(
                 &lease.peer,
+                headers,
                 hashes,
+                None,
                 self.config.request_timeout,
                 cancellation,
             )
@@ -3852,7 +4084,6 @@ impl RethP2pSource {
                             return Ok(response.receipts);
                         }
                         Err(error) => {
-                            lease.failed();
                             self.config.network_telemetry.request_failed();
                             self.request_metrics.record_batch(
                                 P2pRequestKind::Receipts,
@@ -3864,12 +4095,14 @@ impl RethP2pSource {
                             );
                             // Receipts requested by hash answer to their
                             // header's commitments, a verified expectation.
-                            if classify_response_failure(&error, ExpectationTrust::Verified)
-                                == ResponseFault::Invalid
-                            {
-                                session.handle.ban_peer(peer);
-                                self.network.invalidate_peer(peer, &error.to_string());
-                            } else if matches!(error, P2pError::IncompleteResponse { .. })
+                            let fault = self.network.penalize_response(
+                                &mut lease,
+                                &error,
+                                ExpectationTrust::Verified,
+                                |peer_id| session.handle.ban_peer(peer_id),
+                            );
+                            if fault == ResponseFault::Disagreement
+                                && matches!(error, P2pError::IncompleteResponse { .. })
                                 && repeated_incomplete_response(
                                     &mut incomplete_responses,
                                     peer,
@@ -3888,7 +4121,14 @@ impl RethP2pSource {
                 }
                 Err(P2pError::Cancelled) => return Err(P2pError::Cancelled),
                 Err(error) => {
-                    lease.failed();
+                    // An eth/70 reply is checked against its headers while it is
+                    // assembled, so its invalid receipts fail the request itself.
+                    self.network.penalize_response(
+                        &mut lease,
+                        &error,
+                        ExpectationTrust::Verified,
+                        |peer_id| session.handle.ban_peer(peer_id),
+                    );
                     record_request_error(&self.config.network_telemetry, &error);
                     self.request_metrics.record(
                         P2pRequestKind::Receipts,
@@ -4238,6 +4478,7 @@ impl RethP2pSource {
         ))
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn fetch_verified_range(
         &self,
         session: &P2pSession,
@@ -4248,7 +4489,7 @@ impl RethP2pSource {
     ) -> Result<(Vec<BlockFrame>, usize), P2pError> {
         session.set_range(Some(range));
         session.set_phase(NetworkPhase::FetchingHeaders);
-        let (header_peer, headers) = match self
+        let (header_serve, headers) = match self
             .fetch_live_headers_from_untried_peers(
                 session,
                 range,
@@ -4268,6 +4509,7 @@ impl RethP2pSource {
                 return Err(error);
             }
         };
+        let header_peer = header_serve.peer_id;
         let hashes = headers.iter().map(Sealable::hash_slow).collect::<Vec<_>>();
         session.set_phase(NetworkPhase::FetchingBodies);
         // Live material, like the rest of the live lane, may use the request
@@ -4315,13 +4557,14 @@ impl RethP2pSource {
                     header,
                     body,
                     hash: *hash,
+                    header_peer,
                     preferred_peer: preferred_receipt_peer.expect("one live body response peer"),
                 },
                 material_policy,
                 cancellation,
             )
             .await
-            .map(|(peer, block_receipts)| (HashSet::from([peer]), vec![block_receipts]))
+            .map(|(peer, block_receipts)| (peer.into_iter().collect(), vec![block_receipts]))
         } else {
             self.fetch_receipts_batched(
                 &session.fetch,
@@ -4341,6 +4584,7 @@ impl RethP2pSource {
             }
         };
         let frames = normalize_verified(&headers, &bodies, &receipts, budget)?;
+        self.complete_header_serve(session, header_serve).await;
         session.clear_error();
         let mut response_peers = HashSet::from([header_peer]);
         response_peers.extend(body_peers);
@@ -4370,7 +4614,7 @@ impl RethP2pSource {
         }
         session.set_range(Some(range));
         session.set_phase(NetworkPhase::FetchingHeaders);
-        let (header_peer, headers) = self
+        let (header_serve, headers) = self
             .fetch_live_headers_from_untried_peers(
                 session,
                 range,
@@ -4384,6 +4628,7 @@ impl RethP2pSource {
             )
             .await
             .inspect_err(|error| session.record_error(error))?;
+        let header_peer = header_serve.peer_id;
         let request = DataRequest {
             range,
             ..request.clone()
@@ -4399,12 +4644,20 @@ impl RethP2pSource {
                 .inspect_err(|error| session.record_error(error))?
         } else {
             (
-                self.fetch_sparse_live_frames(session, &headers, &request, budget, cancellation)
-                    .await
-                    .inspect_err(|error| session.record_error(error))?,
+                self.fetch_sparse_live_frames(
+                    session,
+                    &headers,
+                    header_peer,
+                    &request,
+                    budget,
+                    cancellation,
+                )
+                .await
+                .inspect_err(|error| session.record_error(error))?,
                 HashSet::new(),
             )
         };
+        self.complete_header_serve(session, header_serve).await;
         response_peers.insert(header_peer);
         session.clear_error();
         Ok((frames, response_peers.len()))
@@ -4447,6 +4700,7 @@ impl RethP2pSource {
         &self,
         session: &P2pSession,
         headers: &[Header],
+        header_peer: B512,
         request: &DataRequest,
         budget: SourceBudget,
         cancellation: &CancellationToken,
@@ -4468,21 +4722,28 @@ impl RethP2pSource {
             .iter()
             .map(|index| hashes[*index])
             .collect::<Vec<_>>();
-        let positive_receipts = if positive_headers.is_empty() {
-            Vec::new()
-        } else {
+        let positive_receipts = if let Some(first) = positive_headers.first() {
             session.set_phase(NetworkPhase::FetchingReceipts);
-            self.fetch_sparse_receipts_batched(
+            // Like the live body and receipt requests, the lane's filtered-log
+            // receipt request gives its header up once no peer has served the
+            // receipts within the live material bound.
+            let mut bound = LiveMaterialBound::new("receipts", first.number, Some(header_peer));
+            let deadline = bound.deadline();
+            let waves = self.live_sparse_receipt_waves(
                 session,
                 &positive_headers,
                 &positive_hashes,
+                &mut bound,
                 MaterialRequestPolicy {
                     concurrency: budget.max_in_flight_requests,
                     priority: Priority::High,
                 },
                 cancellation,
-            )
-            .await?
+            );
+            let outcome = tokio::time::timeout_at(deadline, waves).await;
+            outcome.unwrap_or_else(|_| Err(self.live_material_deadline_passed(&bound)))?
+        } else {
+            Vec::new()
         };
         let exact_match_positions = positive_receipts
             .iter()
@@ -4513,21 +4774,54 @@ impl RethP2pSource {
         Ok(frames)
     }
 
+    /// Ask for the receipts of the lane's filtered-log blocks in waves, each a
+    /// batched request with its own retries, until one serves them.
+    async fn live_sparse_receipt_waves(
+        &self,
+        session: &P2pSession,
+        headers: &[Header],
+        hashes: &[B256],
+        bound: &mut LiveMaterialBound,
+        policy: MaterialRequestPolicy,
+        cancellation: &CancellationToken,
+    ) -> Result<Vec<Vec<Receipt>>, P2pError> {
+        loop {
+            match self
+                .fetch_sparse_receipts_batched(session, headers, hashes, policy, cancellation)
+                .await
+            {
+                Ok(receipts) => return Ok(receipts),
+                Err(error) => {
+                    self.end_live_material_wave(bound, error, cancellation)
+                        .await?;
+                }
+            }
+        }
+    }
+
     async fn normalize_polled_sparse_live_frame(
         &self,
         session: &P2pSession,
-        next: BlockNumber,
         header: Header,
+        header_peer: B512,
         request: &DataRequest,
         budget: SourceBudget,
         cancellation: &CancellationToken,
     ) -> Result<Option<BlockFrame>, P2pError> {
+        let next = BlockNumber(header.number);
         let request = DataRequest {
             range: BlockRange::single(next),
             ..request.clone()
         };
         let mut frames = self
-            .fetch_sparse_live_frames(session, &[header], &request, budget, cancellation)
+            .fetch_sparse_live_frames(
+                session,
+                &[header],
+                header_peer,
+                &request,
+                budget,
+                cancellation,
+            )
             .await
             .inspect_err(|error| session.record_error(error))?;
         session.clear_error();
@@ -4549,7 +4843,7 @@ impl RethP2pSource {
         session.set_range(Some(BlockRange::single(next)));
         session.set_phase(NetworkPhase::FetchingHeaders);
         let range = BlockRange::single(next);
-        let (header_peer, mut headers) = self
+        let (header_serve, mut headers) = self
             .fetch_live_headers_from_untried_peers(
                 session,
                 range,
@@ -4563,11 +4857,13 @@ impl RethP2pSource {
             )
             .await
             .inspect_err(|error| session.record_error(error))?;
+        let header_peer = header_serve.peer_id;
         let header = headers
             .pop()
             .expect("one validated live header was returned");
         if header_only_request(request) {
             let mut frames = normalize_verified_headers(&[header], budget)?;
+            self.complete_header_serve(session, header_serve).await;
             session.clear_error();
             session.observe_head(next);
             session.set_phase(NetworkPhase::FollowingHead);
@@ -4578,6 +4874,7 @@ impl RethP2pSource {
                 .fetch_live_body_frames(session, &[header], Some(header_peer), budget, cancellation)
                 .await
                 .inspect_err(|error| session.record_error(error))?;
+            self.complete_header_serve(session, header_serve).await;
             session.clear_error();
             session.observe_head(next);
             session.set_phase(NetworkPhase::FollowingHead);
@@ -4589,16 +4886,18 @@ impl RethP2pSource {
                 .log_fields
                 .contains(leani_primitives::LogField::TransactionHash)
         {
-            return self
+            let frame = self
                 .normalize_polled_sparse_live_frame(
                     session,
-                    next,
                     header,
+                    header_peer,
                     request,
                     budget,
                     cancellation,
                 )
-                .await;
+                .await?;
+            self.complete_header_serve(session, header_serve).await;
+            return Ok(frame);
         }
         session.set_phase(NetworkPhase::FetchingBodies);
         let material_policy = MaterialRequestPolicy {
@@ -4630,6 +4929,7 @@ impl RethP2pSource {
                     header: &header,
                     body: &body,
                     hash,
+                    header_peer,
                     preferred_peer: body_peer,
                 },
                 material_policy,
@@ -4647,6 +4947,7 @@ impl RethP2pSource {
         let bodies = [body];
         let receipts = [block_receipts];
         let mut frames = normalize_verified(&headers, &bodies, &receipts, budget)?;
+        self.complete_header_serve(session, header_serve).await;
         session.clear_error();
         session.observe_head(next);
         session.set_phase(NetworkPhase::FollowingHead);
@@ -4829,7 +5130,7 @@ impl RethP2pSource {
                 self.network
                     .direct_peers
                     .get(peer_id)
-                    .map(|peer| (peer_id, hash, peer))
+                    .map(|(peer, connection_id)| (peer_id, connection_id, hash, peer))
             })
             .collect::<Vec<_>>();
         let concurrency = candidates.len();
@@ -4838,16 +5139,17 @@ impl RethP2pSource {
         }
         let timeout = self.config.request_timeout;
         let mut pending = stream::iter(candidates.into_iter().map(
-            |(peer_id, hash, peer)| async move {
+            |(peer_id, connection_id, hash, peer)| async move {
                 (
                     peer_id,
+                    connection_id,
                     hash,
                     request_direct_header(&peer, hash, timeout, cancellation).await,
                 )
             },
         ))
         .buffer_unordered(concurrency);
-        while let Some((peer_id, hash, result)) = pending.next().await {
+        while let Some((peer_id, connection_id, hash, result)) = pending.next().await {
             let headers = match result {
                 Ok(headers) => headers,
                 Err(P2pError::Cancelled) => return Err(P2pError::Cancelled),
@@ -4867,9 +5169,18 @@ impl RethP2pSource {
                 continue;
             };
             if header.hash_slow() != hash {
-                session.handle.ban_peer(peer_id);
-                self.network
-                    .invalidate_peer(peer_id, "peer did not serve its advertised execution head");
+                let error = P2pError::InvalidResponse(
+                    "peer did not serve its advertised execution head".to_owned(),
+                );
+                // A header requested by hash answers to that hash, a verified
+                // expectation.
+                if classify_response_failure(&error, ExpectationTrust::Verified)
+                    == ResponseFault::Invalid
+                {
+                    session.handle.ban_peer(peer_id);
+                    self.network
+                        .invalidate_peer(peer_id, connection_id, &error.to_string());
+                }
             } else if header.number >= minimum.0 {
                 // The peer's own header proves only its claim: it steers the
                 // next request but is not observed as a verified head.
@@ -4896,7 +5207,7 @@ impl RethP2pSource {
         // the consensus-required minimum is enough to start the anchored live
         // lane; subsequent polling advances it without trusting peer status.
         let range = BlockRange::single(minimum);
-        let (serving_peer, mut headers) = match self
+        let (serve, mut headers) = match self
             .fetch_live_headers_from_untried_peers(
                 session,
                 range,
@@ -4905,10 +5216,7 @@ impl RethP2pSource {
                 // finalized anchor: it exists, so this is no head poll, and an
                 // empty reply is a lagging peer.
                 None,
-                MaterialRequestPolicy {
-                    concurrency: self.config.material_request_concurrency,
-                    priority: Priority::High,
-                },
+                minimum_live_head_policy(),
                 cancellation,
             )
             .await
@@ -4917,12 +5225,15 @@ impl RethP2pSource {
             Err(P2pError::Cancelled) => return Err(P2pError::Cancelled),
             Err(_) => return Ok(None),
         };
+        // The header is the whole reply. No frame follows it, so it clears no
+        // withheld-header strike.
+        self.reward_header_serve(session, serve).await;
         let header = headers
             .pop()
             .expect("one validated minimum live header was returned");
         Ok(Some((
             (minimum, BlockHash::new(header.hash_slow().0)),
-            serving_peer,
+            serve.peer_id,
         )))
     }
 
@@ -4948,6 +5259,14 @@ impl RethP2pSource {
                         "waiting for an execution peer at or above the verified live anchor"
                     );
                     retry_pause(self.config.poll_interval, cancellation).await?;
+                    // A session whose manager the zero-peer watchdog stopped
+                    // never finds a head: the caller connects again.
+                    if !session.manager_is_current().await {
+                        return Err(P2pError::Network(
+                            "execution P2P manager restarted while waiting for a peer head"
+                                .to_owned(),
+                        ));
+                    }
                 }
                 Err(error) => return Err(error),
             }
@@ -5328,11 +5647,35 @@ impl RethP2pSource {
         (lease, request_started_at.elapsed(), response)
     }
 
+    /// Reward a peer for a live header reply: persisted service evidence and
+    /// Reth reputation.
+    async fn reward_header_serve(&self, session: &P2pSession, serve: HeaderServe) {
+        self.network.peer_store.record_success(
+            serve.peer_id,
+            PeerMaterialKind::Header,
+            serve.block,
+            serve.elapsed,
+        );
+        reward_verified_material_peer(&session.handle, serve.peer_id).await;
+    }
+
+    /// The frames on `serve`'s headers completed, with their bodies and
+    /// receipts: the blocks exist. The peer's withheld-header strikes clear,
+    /// and it earns the reward held back for its headers.
+    async fn complete_header_serve(&self, session: &P2pSession, serve: HeaderServe) {
+        self.network
+            .direct_peers
+            .clear_withheld_header(serve.peer_id);
+        self.reward_header_serve(session, serve).await;
+    }
+
     /// Fetch a live header range from the first peer that serves it validly.
     /// With the lane's `head_poll` rotation, the range is the next block at
     /// the head, polled from a small cohort of peers not yet asked for it; a
     /// "not yet" reply then costs a peer nothing until another serves the
-    /// block. Without it, the blocks exist and eligible peers race.
+    /// block. Without it, the blocks exist and eligible peers race. The
+    /// serving peer is rewarded by the caller, once the frames on these
+    /// headers complete.
     #[allow(clippy::too_many_lines)]
     async fn fetch_live_headers_from_untried_peers(
         &self,
@@ -5342,7 +5685,7 @@ impl RethP2pSource {
         mut head_poll: Option<&mut HeadPollRotation>,
         policy: MaterialRequestPolicy,
         cancellation: &CancellationToken,
-    ) -> Result<(B512, Vec<Header>), P2pError> {
+    ) -> Result<(HeaderServe, Vec<Header>), P2pError> {
         let mut tried = HashSet::new();
         let mut last_error = None;
         let expectation = expected_tip.map_or(ExpectationTrust::Unverified, |tip| tip.trust);
@@ -5484,15 +5827,8 @@ impl RethP2pSource {
                         Ok(()) => {
                             lease.succeeded();
                             if let Some(rotation) = head_poll.as_deref_mut() {
-                                rotation.record_served(peer_id);
+                                rotation.record_served(peer_id, Instant::now());
                             }
-                            self.network.peer_store.record_success(
-                                peer_id,
-                                PeerMaterialKind::Header,
-                                range.end().0,
-                                elapsed,
-                            );
-                            reward_verified_material_peer(&session.handle, peer_id).await;
                             self.config.network_telemetry.request_succeeded();
                             self.request_metrics.record_header(
                                 false,
@@ -5502,7 +5838,12 @@ impl RethP2pSource {
                                 elapsed,
                                 P2pRequestOutcome::Succeeded,
                             );
-                            return Ok((peer_id, headers));
+                            let serve = HeaderServe {
+                                peer_id,
+                                block: range.end().0,
+                                elapsed,
+                            };
+                            return Ok((serve, headers));
                         }
                         Err(error) => {
                             self.config.network_telemetry.request_failed();
@@ -5515,15 +5856,17 @@ impl RethP2pSource {
                                 P2pRequestOutcome::Failed,
                             );
                             match live_header_reply_cost(&error, expectation, head_poll.is_some()) {
-                                HeaderReplyCost::Ban => {
-                                    lease.failed();
-                                    session.handle.ban_peer(peer_id);
-                                    self.network.invalidate_peer(peer_id, &error.to_string());
+                                HeaderReplyCost::Ban | HeaderReplyCost::Cooldown => {
+                                    self.network.penalize_response(
+                                        &mut lease,
+                                        &error,
+                                        expectation,
+                                        |peer_id| session.handle.ban_peer(peer_id),
+                                    );
                                 }
-                                HeaderReplyCost::Cooldown => lease.failed(),
                                 HeaderReplyCost::NotYet => {
                                     if let Some(rotation) = head_poll.as_deref_mut() {
-                                        rotation.record_not_yet(peer_id);
+                                        rotation.record_not_yet(peer_id, Instant::now());
                                     }
                                 }
                             }
@@ -5587,17 +5930,90 @@ impl RethP2pSource {
         (lease, request_started_at.elapsed(), response)
     }
 
-    #[allow(clippy::too_many_lines)]
+    /// End a wave of a live material request: pause before the next wave, or
+    /// give the header up. Returns the error that ends the request otherwise.
+    async fn end_live_material_wave(
+        &self,
+        bound: &mut LiveMaterialBound,
+        error: P2pError,
+        cancellation: &CancellationToken,
+    ) -> Result<(), P2pError> {
+        match live_material_wave_end(
+            &self.config,
+            &mut bound.waves,
+            bound.started.elapsed(),
+            &error,
+        ) {
+            LiveWaveEnd::NextWave(delay) => {
+                debug!(
+                    component = bound.component,
+                    block = bound.block,
+                    wave = bound.waves,
+                    %error,
+                    "latest execution material is not available; asking the peer pool again"
+                );
+                retry_pause(delay, cancellation).await
+            }
+            LiveWaveEnd::Withheld => Err(self.give_up_live_material(bound)),
+            LiveWaveEnd::Fail => Err(error),
+        }
+    }
+
+    /// Give up the header of a live material request that no peer served
+    /// within its bound: its peer may have made the block up, so it takes a
+    /// withheld-header strike, without a ban.
+    fn give_up_live_material(&self, bound: &LiveMaterialBound) -> P2pError {
+        if let Some(peer_id) = bound.header_peer {
+            self.network.direct_peers.strike_withheld_header(peer_id);
+        }
+        withheld_live_material(bound.component, bound.block, bound.waves)
+    }
+
+    /// End a live material request whose deadline passed inside a wave: give
+    /// the header up once an earlier wave found no peer serving the material,
+    /// and time out otherwise.
+    fn live_material_deadline_passed(&self, bound: &LiveMaterialBound) -> P2pError {
+        if bound.waves > 0 {
+            self.give_up_live_material(bound)
+        } else {
+            P2pError::Timeout {
+                component: bound.component,
+            }
+        }
+    }
+
+    /// Fetch the body of a validated live header, asking `header_peer`, the
+    /// peer that served the header, first. Waves ask every eligible peer until
+    /// one serves the body, within `MAX_LIVE_MATERIAL_WAVES` waves and
+    /// `LIVE_MATERIAL_TIMEOUT`, which also ends a wave in progress. Past that
+    /// bound the header is given up, and its peer struck.
     async fn fetch_live_body_from_untried_peers(
         &self,
         session: &P2pSession,
         header: &Header,
         hash: B256,
-        preferred_peer: Option<B512>,
+        header_peer: Option<B512>,
         policy: MaterialRequestPolicy,
         cancellation: &CancellationToken,
     ) -> Result<(B512, BlockBody), P2pError> {
-        let mut wave_attempts = 0_usize;
+        let mut bound = LiveMaterialBound::new("bodies", header.number, header_peer);
+        let deadline = bound.deadline();
+        let waves = self.live_body_waves(session, header, hash, &mut bound, policy, cancellation);
+        let outcome = tokio::time::timeout_at(deadline, waves).await;
+        outcome.unwrap_or_else(|_| Err(self.live_material_deadline_passed(&bound)))
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn live_body_waves(
+        &self,
+        session: &P2pSession,
+        header: &Header,
+        hash: B256,
+        bound: &mut LiveMaterialBound,
+        policy: MaterialRequestPolicy,
+        cancellation: &CancellationToken,
+    ) -> Result<(B512, BlockBody), P2pError> {
+        let header_peer = bound.header_peer;
         let mut incomplete_responses = HashMap::new();
         loop {
             let mut tried = HashSet::new();
@@ -5617,7 +6033,7 @@ impl RethP2pSource {
                         PeerMaterialKind::Body,
                         per_peer_limit,
                         &tried,
-                        preferred_peer,
+                        header_peer,
                     ) else {
                         break;
                     };
@@ -5638,7 +6054,7 @@ impl RethP2pSource {
                             per_peer_limit,
                             self.config.request_timeout,
                             &tried,
-                            preferred_peer,
+                            header_peer,
                             cancellation,
                         )
                         .await
@@ -5663,26 +6079,17 @@ impl RethP2pSource {
                                             "all connected peers were tried for the latest block"
                                                 .to_owned(),
                                     });
-                            let Some(delay) = pending_live_material_delay(
-                                &self.config,
-                                &mut wave_attempts,
-                                &error,
-                            ) else {
-                                return Err(error);
-                            };
-                            debug!(
-                                wave = wave_attempts,
-                                peers_tried = tried.len(),
-                                %error,
-                                "latest execution body is not available; cooling tried peers while discovery continues"
-                            );
-                            retry_pause(delay, cancellation).await?;
+                            self.end_live_material_wave(bound, error, cancellation)
+                                .await?;
                             break;
                         }
-                        Err(P2pError::Cancelled) => return Err(P2pError::Cancelled),
+                        // Waiting for a peer failed, as it does after the
+                        // request timeout in a pool without any peer: the
+                        // request ends, and the lane reconnects.
                         Err(error) => {
-                            last_error = Some(error);
-                            continue;
+                            self.end_live_material_wave(bound, error, cancellation)
+                                .await?;
+                            break;
                         }
                     }
                 }
@@ -5736,19 +6143,22 @@ impl RethP2pSource {
                                     P2pRequestOutcome::Failed,
                                 );
                                 // Material requested by hash answers to its
-                                // header's commitments, a verified expectation.
-                                if classify_response_failure(&error, ExpectationTrust::Verified)
-                                    == ResponseFault::Disagreement
+                                // header's commitments, a verified
+                                // expectation. An empty latest-material
+                                // response is not malicious, but immediately
+                                // selecting the same peer again can spam a
+                                // lagging or non-serving session and starve
+                                // new peers: it costs the pool-local
+                                // exponential cooldown of the body lane only,
+                                // without changing Reth reputation or
+                                // disconnecting the session.
+                                if self.network.penalize_response(
+                                    &mut lease,
+                                    &error,
+                                    ExpectationTrust::Verified,
+                                    |peer_id| session.handle.ban_peer(peer_id),
+                                ) == ResponseFault::Disagreement
                                 {
-                                    // An empty latest-material response is not
-                                    // malicious, but immediately selecting the
-                                    // same peer again can spam a lagging or
-                                    // non-serving session and starve new peers.
-                                    // Apply the pool-local exponential
-                                    // cooldown without changing Reth
-                                    // reputation, disconnecting the session,
-                                    // or affecting its header/receipt lanes.
-                                    lease.failed();
                                     if repeated_incomplete_response(
                                         &mut incomplete_responses,
                                         peer_id,
@@ -5762,9 +6172,6 @@ impl RethP2pSource {
                                     }
                                     pending_error = Some(error);
                                 } else {
-                                    lease.failed();
-                                    session.handle.ban_peer(peer_id);
-                                    self.network.invalidate_peer(peer_id, &error.to_string());
                                     last_error = Some(error);
                                 }
                             }
@@ -5788,15 +6195,52 @@ impl RethP2pSource {
         }
     }
 
-    #[allow(clippy::too_many_lines)]
+    /// Fetch the receipts of a validated live block, asking the peer that
+    /// served its body first, in waves bounded like the live body's. Returns
+    /// the peer that served them, or `None` for a block without transactions,
+    /// whose receipts no peer is asked for.
     async fn fetch_live_receipts_from_untried_peers(
         &self,
         session: &P2pSession,
         material: LiveReceiptMaterial<'_>,
         policy: MaterialRequestPolicy,
         cancellation: &CancellationToken,
+    ) -> Result<(Option<B512>, Vec<Receipt>), P2pError> {
+        // A block without transactions commits to the empty receipts root:
+        // its receipts are known without asking a peer, once the header and
+        // body agree with them.
+        if !has_receipts(material.header)
+            && validate_receipts(
+                std::slice::from_ref(material.header),
+                std::slice::from_ref(material.body),
+                &[Vec::new()],
+            )
+            .is_ok()
+        {
+            return Ok((None, Vec::new()));
+        }
+        let mut bound = LiveMaterialBound::new(
+            "receipts",
+            material.header.number,
+            Some(material.header_peer),
+        );
+        let deadline = bound.deadline();
+        let waves = self.live_receipt_waves(session, material, &mut bound, policy, cancellation);
+        let outcome = tokio::time::timeout_at(deadline, waves).await;
+        outcome
+            .unwrap_or_else(|_| Err(self.live_material_deadline_passed(&bound)))
+            .map(|(peer_id, receipts)| (Some(peer_id), receipts))
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn live_receipt_waves(
+        &self,
+        session: &P2pSession,
+        material: LiveReceiptMaterial<'_>,
+        bound: &mut LiveMaterialBound,
+        policy: MaterialRequestPolicy,
+        cancellation: &CancellationToken,
     ) -> Result<(B512, Vec<Receipt>), P2pError> {
-        let mut wave_attempts = 0_usize;
         let mut incomplete_responses = HashMap::new();
         loop {
             let mut tried = HashSet::new();
@@ -5831,18 +6275,8 @@ impl RethP2pSource {
                             detail: "all connected peers were tried for the latest block"
                                 .to_owned(),
                         });
-                    let Some(delay) =
-                        pending_live_material_delay(&self.config, &mut wave_attempts, &error)
-                    else {
-                        return Err(error);
-                    };
-                    debug!(
-                        wave = wave_attempts,
-                        peers_tried = tried.len(),
-                        %error,
-                        "latest execution receipts are not available; cooling tried peers while discovery continues"
-                    );
-                    retry_pause(delay, cancellation).await?;
+                    self.end_live_material_wave(bound, error, cancellation)
+                        .await?;
                     break;
                 };
                 let peer_id = lease.peer.peer_id;
@@ -5858,7 +6292,9 @@ impl RethP2pSource {
                 let request_started_at = Instant::now();
                 let response = request_direct_receipts(
                     &lease.peer,
+                    std::slice::from_ref(material.header),
                     std::slice::from_ref(&material.hash),
+                    Some(std::slice::from_ref(material.body)),
                     self.config.request_timeout,
                     cancellation,
                 )
@@ -5911,13 +6347,16 @@ impl RethP2pSource {
                                     request_started_at.elapsed(),
                                     P2pRequestOutcome::Failed,
                                 );
-                                if classify_response_failure(&error, ExpectationTrust::Verified)
-                                    == ResponseFault::Disagreement
+                                // See the matching live-body path: prefer
+                                // fresh peers and retry only this material
+                                // lane after its local cooldown.
+                                if self.network.penalize_response(
+                                    &mut lease,
+                                    &error,
+                                    ExpectationTrust::Verified,
+                                    |peer_id| session.handle.ban_peer(peer_id),
+                                ) == ResponseFault::Disagreement
                                 {
-                                    // See the matching live-body path: prefer
-                                    // fresh peers and retry only this material
-                                    // lane after its local cooldown.
-                                    lease.failed();
                                     if repeated_incomplete_response(
                                         &mut incomplete_responses,
                                         peer_id,
@@ -5931,9 +6370,6 @@ impl RethP2pSource {
                                     }
                                     pending_error = Some(error);
                                 } else {
-                                    lease.failed();
-                                    session.handle.ban_peer(peer_id);
-                                    self.network.invalidate_peer(peer_id, &error.to_string());
                                     last_error = Some(error);
                                 }
                             }
@@ -5950,8 +6386,15 @@ impl RethP2pSource {
                             request_started_at.elapsed(),
                             request_outcome(&error),
                         );
+                        // An eth/70 reply is checked against its headers while it is
+                        // assembled, so its invalid receipts fail the request itself.
+                        self.network.penalize_response(
+                            &mut lease,
+                            &error,
+                            ExpectationTrust::Verified,
+                            |peer_id| session.handle.ban_peer(peer_id),
+                        );
                         if incomplete {
-                            lease.failed();
                             if repeated_incomplete_response(
                                 &mut incomplete_responses,
                                 peer_id,
@@ -5965,7 +6408,6 @@ impl RethP2pSource {
                             }
                             pending_error = Some(error);
                         } else {
-                            lease.failed();
                             last_error = Some(error);
                         }
                     }
@@ -6584,9 +7026,14 @@ impl RethP2pHistorySource {
 
         // Hold the cache lock across construction. Historical material streams
         // are opened concurrently; without this single-flight section each
-        // stream could independently download the same proof suffix.
+        // stream could independently download the same proof suffix. A bad
+        // segment no longer wedges that download, and a stream waiting for it
+        // stops waiting once cancelled.
         let (proof_session, expected_tip) = {
-            let mut cached = self.anchored_headers.lock().await;
+            let mut cached = tokio::select! {
+                () = cancellation.cancelled() => return Err(P2pError::Cancelled),
+                cached = self.anchored_headers.lock() => cached,
+            };
             if cached
                 .as_ref()
                 .is_none_or(|cached| !cached.covers(proof, retained))
@@ -7051,7 +7498,9 @@ impl RethP2pHistorySource {
             let request_started_at = Instant::now();
             let response = request_direct_receipts(
                 &lease.peer,
+                headers,
                 hashes,
+                None,
                 self.source.config.request_timeout,
                 cancellation,
             )
@@ -7085,7 +7534,6 @@ impl RethP2pHistorySource {
                             return Ok((peer_id, response.receipts));
                         }
                         Err(error) => {
-                            lease.failed();
                             self.source.config.network_telemetry.request_failed();
                             self.source.request_metrics.record_batch(
                                 P2pRequestKind::Receipts,
@@ -7097,21 +7545,26 @@ impl RethP2pHistorySource {
                             );
                             // Receipts requested by hash answer to their
                             // header's commitments, a verified expectation.
-                            if classify_response_failure(&error, ExpectationTrust::Verified)
-                                == ResponseFault::Invalid
-                            {
-                                session.handle.ban_peer(peer_id);
-                                self.source
-                                    .network
-                                    .invalidate_peer(peer_id, &error.to_string());
-                            }
+                            self.source.network.penalize_response(
+                                &mut lease,
+                                &error,
+                                ExpectationTrust::Verified,
+                                |peer_id| session.handle.ban_peer(peer_id),
+                            );
                             last_error = Some(error);
                         }
                     }
                 }
                 Err(P2pError::Cancelled) => return Err(P2pError::Cancelled),
                 Err(error) => {
-                    lease.failed();
+                    // An eth/70 reply is checked against its headers while it is
+                    // assembled, so its invalid receipts fail the request itself.
+                    self.source.network.penalize_response(
+                        &mut lease,
+                        &error,
+                        ExpectationTrust::Verified,
+                        |peer_id| session.handle.ban_peer(peer_id),
+                    );
                     record_request_error(&self.source.config.network_telemetry, &error);
                     self.source.request_metrics.record(
                         P2pRequestKind::Receipts,
@@ -7146,10 +7599,18 @@ impl RethP2pHistorySource {
                 "receipt batch material length mismatch".to_owned(),
             ));
         }
+        // A block without transactions commits to the empty receipts root, so
+        // no peer is asked for its receipts.
+        let (requested_headers, requested_hashes): (Vec<_>, Vec<_>) = headers
+            .iter()
+            .zip(hashes)
+            .filter(|(header, _)| has_receipts(header))
+            .map(|(header, hash)| (header.clone(), *hash))
+            .unzip();
         let batch_blocks = self.source.material_tuning.receipt_blocks();
-        let requests = headers
+        let requests = requested_headers
             .chunks(batch_blocks)
-            .zip(hashes.chunks(batch_blocks))
+            .zip(requested_hashes.chunks(batch_blocks))
             .map(|(header_chunk, hash_chunk)| (header_chunk.to_vec(), hash_chunk.to_vec()))
             .collect::<Vec<_>>();
         let concurrency = effective_material_concurrency(
@@ -7225,10 +7686,11 @@ impl RethP2pHistorySource {
             self.source.material_tuning.receipts_succeeded();
         }
         completed.sort_by_key(|(number, _, _)| *number);
-        let mut receipts = Vec::with_capacity(headers.len());
+        let mut fetched = Vec::with_capacity(requested_headers.len());
         for (_, _, mut batch) in completed {
-            receipts.append(&mut batch);
+            fetched.append(&mut batch);
         }
+        let receipts = with_known_empty_receipts(headers, fetched);
         validate_receipts_against_headers(headers, &receipts)?;
         Ok(receipts)
     }
@@ -7359,6 +7821,7 @@ impl RethP2pHistorySource {
             proof,
             retained,
             self.source.config.history_header_request_blocks,
+            self.anchor.block.hash,
         );
         loop {
             attempts = attempts.saturating_add(1);
@@ -7474,13 +7937,16 @@ impl RethP2pHistorySource {
                             cancellation,
                         )
                         .await
-                        .and_then(|(_, headers)| header_proof_segment(range, &headers));
+                        .and_then(|(peer, headers)| {
+                            header_proof_segment(range, &headers).map(|segment| (peer, segment))
+                        });
                     (range, result)
                 })
                 .buffer_unordered(concurrency)
                 .collect::<Vec<_>>()
                 .await;
             let mut last_error = None;
+            // Every outcome is recorded, so no range of the wave is lost.
             for (range, result) in outcomes {
                 if let Err(error) = &result {
                     if matches!(error, P2pError::Cancelled) {
@@ -7488,7 +7954,16 @@ impl RethP2pHistorySource {
                     }
                     last_error = Some(error.to_string());
                 }
-                builder.record(range, result)?;
+                for (peer, error) in builder.record(range, result) {
+                    // The segment contradicts the header chain proven to the
+                    // finalized anchor, a verified expectation.
+                    if classify_response_failure(&error, ExpectationTrust::Verified)
+                        == ResponseFault::Invalid
+                    {
+                        fetch.report_bad_message(peer);
+                    }
+                    last_error = Some(error.to_string());
+                }
             }
             if let Some(error) = last_error {
                 return Err(P2pError::Request {
@@ -7497,7 +7972,7 @@ impl RethP2pHistorySource {
                 });
             }
         }
-        builder.finish(self.anchor.block.hash)
+        builder.finish()
     }
 }
 
@@ -7743,13 +8218,19 @@ fn assemble_anchored_header_proof(
     anchor: BlockHash,
     segments: Vec<HeaderProofSegment>,
 ) -> Result<AnchoredHeaderProof, P2pError> {
-    let mut builder = AnchoredHeaderProofBuilder::new(proof, proof, proof.len());
+    let mut builder = AnchoredHeaderProofBuilder::new(proof, proof, proof.len(), anchor);
     builder.pending.clear();
     for segment in segments {
         let range = segment.range;
-        builder.record(range, Ok(segment))?;
+        if let Some((_, error)) = builder
+            .record(range, Ok((B512::ZERO, segment)))
+            .into_iter()
+            .next()
+        {
+            return Err(error);
+        }
     }
-    builder.finish(anchor)
+    builder.finish()
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -7970,8 +8451,9 @@ impl LiveSource for RethP2pSource {
             recent,
             required_peer_head,
             pending_material_attempts: 0,
-            head_poll: HeadPollRotation::default(),
+            head_poll: HeadPollRotation::new(self.config.retry_backoff),
             head_unavailable_since: None,
+            head_poll_silent_since: None,
             reconnect_error: None,
             disconnect_reported: false,
             terminal: false,
@@ -8004,6 +8486,9 @@ async fn next_live_event(
             while state.recent.len() > state.source.config.max_reorg_depth.saturating_add(1) {
                 state.recent.pop_front();
             }
+            // Progress: the lane reports itself disconnected again, once,
+            // after its next failure.
+            state.disconnect_reported = false;
             return Some((Ok(ChainEvent::Block(Box::new(frame))), state));
         }
         let (head_number, head_hash) = match state
@@ -8017,7 +8502,6 @@ async fn next_live_event(
         {
             Ok(head) => {
                 state.head_unavailable_since = None;
-                state.disconnect_reported = false;
                 head
             }
             Err(P2pError::Cancelled) => return None,
@@ -8042,8 +8526,16 @@ async fn next_live_event(
                 {
                     return None;
                 }
-                if head_unavailable_for(&mut state.head_unavailable_since, Instant::now()) < grace {
+                let action = head_unavailable(
+                    state.session.manager_is_current().await,
+                    head_unavailable_for(&mut state.head_unavailable_since, Instant::now()),
+                    grace,
+                );
+                if action == HeadUnavailable::Retry {
                     continue;
+                }
+                if action == HeadUnavailable::Reconnect {
+                    state.reconnect_error = Some(error.to_string());
                 }
                 if state.disconnect_reported {
                     continue;
@@ -8082,17 +8574,24 @@ async fn next_live_event(
             {
                 Ok(Some(frame)) => {
                     state.pending_material_attempts = 0;
+                    state.head_poll_silent_since = None;
                     if frame.block.parent_hash != state.last.hash {
-                        let block = frame.block;
-                        let event =
-                            reconstruct_reorg_event(&mut state, block.number, block.hash).await;
-                        return Some((Ok(event), state));
+                        // The lane does not go on with this serve: after a
+                        // reorg the block is polled again, and the peers that
+                        // answered "not yet" are judged against that serve.
+                        state.head_poll.serve_failed();
+                        if let Some(event) = reconstruct_reorg_event(&mut state, frame.block).await
+                        {
+                            return Some((Ok(event), state));
+                        }
+                        continue;
                     }
                     state.queued.push_back(frame);
                     continue;
                 }
                 Ok(None) => {
                     state.pending_material_attempts = 0;
+                    state.head_poll_silent_since = None;
                     if retry_pause(state.source.config.poll_interval, &state.cancellation)
                         .await
                         .is_err()
@@ -8102,25 +8601,49 @@ async fn next_live_event(
                 }
                 Err(P2pError::Cancelled) => return None,
                 Err(error) => {
-                    if let Some(delay) = pending_live_material_delay(
+                    state.head_poll.serve_failed();
+                    let manager_current = state.session.manager_is_current().await;
+                    let grace = state
+                        .source
+                        .descriptor
+                        .expected_lag
+                        .max(state.source.config.poll_interval);
+                    let (delay, report) = match head_poll_failure(
                         &state.source.config,
                         &mut state.pending_material_attempts,
+                        &mut state.head_poll_silent_since,
+                        Instant::now(),
+                        grace,
                         &error,
+                        manager_current,
                     ) {
-                        debug!(
-                            attempt = state.pending_material_attempts,
-                            ?delay,
-                            %error,
-                            "latest execution material is not available yet; retrying on the active peer pool"
-                        );
-                        if retry_pause(delay, &state.cancellation).await.is_err() {
-                            return None;
+                        HeadPollFailure::Retry(delay) => (delay, false),
+                        HeadPollFailure::Report(delay) => (delay, true),
+                        HeadPollFailure::Reconnect => {
+                            let reason = error.to_string();
+                            state.reconnect_error = Some(reason.clone());
+                            return Some((Ok(ChainEvent::Disconnected { reason }), state));
                         }
-                        continue;
+                    };
+                    debug!(
+                        attempt = state.pending_material_attempts,
+                        ?delay,
+                        %error,
+                        "latest execution material is not available yet; retrying on the active peer pool"
+                    );
+                    if retry_pause(delay, &state.cancellation).await.is_err() {
+                        return None;
                     }
-                    let reason = error.to_string();
-                    state.reconnect_error = Some(reason.clone());
-                    return Some((Ok(ChainEvent::Disconnected { reason }), state));
+                    if report && !state.disconnect_reported {
+                        state.disconnect_reported = true;
+                        return Some((
+                            Ok(ChainEvent::Disconnected {
+                                reason: error.to_string(),
+                            }),
+                            state,
+                        ));
+                    }
+                    continue;
                 }
             }
             continue;
@@ -8167,10 +8690,13 @@ async fn next_live_event(
             }
             Err(P2pError::Cancelled) => return None,
             Err(error) => {
+                let manager_current = state.session.manager_is_current().await;
                 if let Some(delay) = pending_live_material_delay(
                     &state.source.config,
                     &mut state.pending_material_attempts,
                     &error,
+                    false,
+                    manager_current,
                 ) {
                     debug!(
                         attempt = state.pending_material_attempts,
@@ -8188,12 +8714,15 @@ async fn next_live_event(
                 return Some((Ok(ChainEvent::Disconnected { reason }), state));
             }
         };
-        if frames
-            .first()
-            .is_none_or(|frame| frame.block.parent_hash != state.last.hash)
+        // A branch that does not extend the tip is reconstructed from where it
+        // forks, not from the head discovered far ahead.
+        if let Some(first) = frames.first()
+            && first.block.parent_hash != state.last.hash
         {
-            let event = reconstruct_reorg_event(&mut state, head_number, head_hash).await;
-            return Some((Ok(event), state));
+            if let Some(event) = reconstruct_reorg_event(&mut state, first.block).await {
+                return Some((Ok(event), state));
+            }
+            continue;
         }
         // Validated headers linked to the verified tip are the heads the
         // session observes; the claimed head above them is not.
@@ -8277,22 +8806,200 @@ fn head_unavailable_for(since: &mut Option<Instant>, now: Instant) -> Duration {
     now.saturating_duration_since(*since.get_or_insert(now))
 }
 
+/// What the live lane does while head discovery fails.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HeadUnavailable {
+    /// Look for the head again on the same session.
+    Retry,
+    /// Report the lane disconnected, once, and keep looking.
+    Report,
+    /// Report the lane disconnected and reconnect.
+    Reconnect,
+}
+
+/// What the live lane does once head discovery has failed for
+/// `unavailable_for`. A session whose manager has stopped, as the zero-peer
+/// watchdog stops it, never serves the head again: only `connect` builds a
+/// new manager, so the lane reconnects. With a running manager, peers may
+/// still serve the head, and the lane reports itself disconnected once the
+/// grace has passed.
+fn head_unavailable(
+    manager_current: bool,
+    unavailable_for: Duration,
+    grace: Duration,
+) -> HeadUnavailable {
+    if !manager_current {
+        HeadUnavailable::Reconnect
+    } else if unavailable_for < grace {
+        HeadUnavailable::Retry
+    } else {
+        HeadUnavailable::Report
+    }
+}
+
+/// The pause before the live lane asks again, on its session, after a head
+/// poll or catch-up request failed, or `None` to report the lane disconnected
+/// and reconnect. The lane waits while its manager runs and the failure is
+/// material not served yet, or, for a head poll, a cohort whose last peer
+/// timed out or could not take the request: the next poll asks other peers.
 fn pending_live_material_delay(
     config: &RethP2pConfig,
     attempts: &mut usize,
     error: &P2pError,
+    head_poll: bool,
+    manager_current: bool,
 ) -> Option<Duration> {
-    if !matches!(
+    let waits = matches!(
         error,
         P2pError::IncompleteResponse {
             component: "headers" | "bodies" | "receipts",
             ..
         }
-    ) {
+    ) || (head_poll && silent_head_poll(error));
+    if !waits || !manager_current {
         return None;
     }
     *attempts = (*attempts).saturating_add(1);
     Some(session_retry_delay(config, *attempts).min(config.poll_interval))
+}
+
+/// Whether a failed head poll heard from no peer: its cohort's last peer
+/// timed out, or its session could not take the request.
+fn silent_head_poll(error: &P2pError) -> bool {
+    matches!(
+        error,
+        P2pError::Timeout {
+            component: "headers"
+        } | P2pError::Request {
+            component: "headers",
+            ..
+        }
+    )
+}
+
+/// What the live lane does after its head poll failed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HeadPollFailure {
+    /// Poll again after the pause.
+    Retry(Duration),
+    /// Report the lane disconnected, once, and poll again after the pause.
+    Report(Duration),
+    /// Report the lane disconnected and reconnect.
+    Reconnect,
+}
+
+/// What the live lane does after its head poll failed with `error`. A silent
+/// cohort is waited out like a block not produced yet, until no polled peer
+/// has answered for `grace` since `silent_since`: the lane then reports
+/// itself disconnected, which clears readiness, and keeps polling. Any
+/// answer ends the silence, and a stopped manager reconnects.
+fn head_poll_failure(
+    config: &RethP2pConfig,
+    attempts: &mut usize,
+    silent_since: &mut Option<Instant>,
+    now: Instant,
+    grace: Duration,
+    error: &P2pError,
+    manager_current: bool,
+) -> HeadPollFailure {
+    let Some(delay) = pending_live_material_delay(config, attempts, error, true, manager_current)
+    else {
+        return HeadPollFailure::Reconnect;
+    };
+    if !silent_head_poll(error) {
+        *silent_since = None;
+        return HeadPollFailure::Retry(delay);
+    }
+    if head_unavailable_for(silent_since, now) < grace {
+        HeadPollFailure::Retry(delay)
+    } else {
+        HeadPollFailure::Report(delay)
+    }
+}
+
+/// The pause before another wave of a live body or receipt request whose last
+/// wave found no peer serving the material, or `None` once the request has
+/// run `MAX_LIVE_MATERIAL_WAVES` waves or `LIVE_MATERIAL_TIMEOUT`: no peer
+/// serves the material of that header.
+fn next_live_material_wave(
+    config: &RethP2pConfig,
+    waves: &mut usize,
+    elapsed: Duration,
+) -> Option<Duration> {
+    *waves = (*waves).saturating_add(1);
+    if *waves >= MAX_LIVE_MATERIAL_WAVES || elapsed >= LIVE_MATERIAL_TIMEOUT {
+        return None;
+    }
+    Some(session_retry_delay(config, *waves).min(config.poll_interval))
+}
+
+/// What ends a wave of a live body or receipt request.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LiveWaveEnd {
+    /// Ask the eligible peers again after the pause.
+    NextWave(Duration),
+    /// No peer served the material within the bound: give the header up.
+    Withheld,
+    /// End the request with the error.
+    Fail,
+}
+
+/// What a live material request does after `error` ended a wave, or the wait
+/// for a peer to ask. While peers answer that they lack the material, it asks
+/// them again within `next_live_material_wave`'s bound, and gives the header
+/// up past it. Any other error ends the request, and the lane decides: a pool
+/// without any peer, for one, reconnects.
+fn live_material_wave_end(
+    config: &RethP2pConfig,
+    waves: &mut usize,
+    elapsed: Duration,
+    error: &P2pError,
+) -> LiveWaveEnd {
+    if !matches!(error, P2pError::IncompleteResponse { .. }) {
+        return LiveWaveEnd::Fail;
+    }
+    next_live_material_wave(config, waves, elapsed)
+        .map_or(LiveWaveEnd::Withheld, LiveWaveEnd::NextWave)
+}
+
+/// One live body or receipt request for the block of a validated header, and
+/// its bound: `MAX_LIVE_MATERIAL_WAVES` waves and `LIVE_MATERIAL_TIMEOUT`.
+#[derive(Debug)]
+struct LiveMaterialBound {
+    component: &'static str,
+    block: u64,
+    /// The peer that served the header.
+    header_peer: Option<B512>,
+    started: Instant,
+    waves: usize,
+}
+
+impl LiveMaterialBound {
+    fn new(component: &'static str, block: u64, header_peer: Option<B512>) -> Self {
+        Self {
+            component,
+            block,
+            header_peer,
+            started: Instant::now(),
+            waves: 0,
+        }
+    }
+
+    /// The instant the request ends, even inside a wave.
+    fn deadline(&self) -> tokio::time::Instant {
+        tokio::time::Instant::from_std(self.started + LIVE_MATERIAL_TIMEOUT)
+    }
+}
+
+/// The error for the material of a validated header that no peer served
+/// within the live wave bound. It is no incomplete reply the lane waits out:
+/// the lane reports itself disconnected, drops the header, and asks for it
+/// again.
+fn withheld_live_material(component: &'static str, block: u64, waves: usize) -> P2pError {
+    P2pError::Request {
+        component,
+        detail: format!("no peer served block {block} within {waves} waves"),
+    }
 }
 
 async fn reconnect_live_session(
@@ -8335,13 +9042,15 @@ async fn reconnect_live_session(
     }
 }
 
+/// Reconstruct the reorg that `mismatching` reveals. Returns the event to
+/// emit, or `None` when the lane only retries.
 async fn reconstruct_reorg_event(
     state: &mut P2pLiveState,
-    head_number: BlockNumber,
-    head_hash: BlockHash,
-) -> ChainEvent {
+    mismatching: BlockRef,
+) -> Option<ChainEvent> {
     let source = state.source.clone();
-    match source
+    let (head_number, head_hash) = reorg_reconstruction_tip(state.last, mismatching);
+    let error = match source
         .reconstruct_reorg(state, head_number, head_hash)
         .await
     {
@@ -8351,15 +9060,70 @@ async fn reconstruct_reorg_event(
             }
             state.recent.extend(applied.iter().map(|frame| frame.block));
             state.last = new_tip;
-            ChainEvent::Reorg { reverted, applied }
+            state.disconnect_reported = false;
+            return Some(ChainEvent::Reorg { reverted, applied });
         }
-        Err(error) => {
+        Err(error) => error,
+    };
+    match reorg_failure(&error, &mut state.disconnect_reported) {
+        ReorgFailure::Reset => {
             state.terminal = true;
-            ChainEvent::Reset {
+            Some(ChainEvent::Reset {
                 last_valid: state.recent.front().copied(),
                 reason: error.to_string(),
-            }
+            })
         }
+        // The lane keeps its tip and looks for the branch again, after a
+        // pause. Cancellation ends the lane on the next poll.
+        ReorgFailure::Report => {
+            let _ = retry_pause(source.config.poll_interval, &state.cancellation).await;
+            Some(ChainEvent::Disconnected {
+                reason: error.to_string(),
+            })
+        }
+        ReorgFailure::Retry => {
+            let _ = retry_pause(source.config.poll_interval, &state.cancellation).await;
+            None
+        }
+    }
+}
+
+/// The block reorg reconstruction descends from once `mismatching`, fetched
+/// past the lane's tip `last`, does not extend it: `last`'s replacement, the
+/// parent `mismatching` names. Its descending headers cover the retained
+/// window and nothing above the tip, so a shallow reorg is reconstructed
+/// however far the discovered head is ahead.
+const fn reorg_reconstruction_tip(
+    last: BlockRef,
+    mismatching: BlockRef,
+) -> (BlockNumber, BlockHash) {
+    (last.number, mismatching.parent_hash)
+}
+
+/// What the live lane does after a reorg reconstruction failed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReorgFailure {
+    /// The branch is proven to fork below the retained window: reset.
+    Reset,
+    /// Report the lane disconnected, and look for the branch again.
+    Report,
+    /// Look for the branch again.
+    Retry,
+}
+
+/// What the live lane does after a reorg reconstruction failed with `error`:
+/// a reset only for a replacement branch proven to fork below the retained
+/// window, and a retry otherwise, such as for a peer without the branch or a
+/// timeout. The lane reports itself disconnected once, unless it has already
+/// since its last progress.
+const fn reorg_failure(error: &P2pError, disconnect_reported: &mut bool) -> ReorgFailure {
+    if matches!(error, P2pError::ReorgTooDeep { .. }) {
+        ReorgFailure::Reset
+    } else if *disconnect_reported {
+        ReorgFailure::Retry
+    } else {
+        *disconnect_reported = true;
+        ReorgFailure::Report
     }
 }
 
@@ -8536,9 +9300,14 @@ struct DirectReceiptsResponse {
     response_payload_bytes: usize,
 }
 
+/// Request the receipts of `headers`, whose block hashes are `hashes`, from
+/// one peer. `bodies`, once known, bound each block's receipts by its
+/// transaction count.
 async fn request_direct_receipts(
     peer: &DirectPeer,
+    headers: &[Header],
     hashes: &[B256],
+    bodies: Option<&[BlockBody]>,
     timeout: Duration,
     cancellation: &CancellationToken,
 ) -> Result<DirectReceiptsResponse, P2pError> {
@@ -8551,7 +9320,9 @@ async fn request_direct_receipts(
         });
     }
     match peer.eth_version {
-        EthVersion::Eth70 => request_direct_receipts70(peer, hashes, timeout, cancellation).await,
+        EthVersion::Eth70 => {
+            request_direct_receipts70(peer, headers, hashes, bodies, timeout, cancellation).await
+        }
         EthVersion::Eth69 => {
             let (sender, receiver) = tokio::sync::oneshot::channel();
             peer.messages
@@ -8608,32 +9379,31 @@ async fn request_direct_receipts(
 
 async fn request_direct_receipts70(
     peer: &DirectPeer,
+    headers: &[Header],
     hashes: &[B256],
+    bodies: Option<&[BlockBody]>,
     timeout: Duration,
     cancellation: &CancellationToken,
 ) -> Result<DirectReceiptsResponse, P2pError> {
-    const MAX_CONTINUATION_ROUNDS: usize = 64;
-    let mut blocks = Vec::<Vec<Receipt>>::new();
-    let mut block_index = 0_usize;
-    let mut receipt_index = 0_usize;
+    let mut assembled = Receipts70Accumulator::default();
     let mut requested_block_hashes = 0_usize;
-    let mut response_payload_bytes = 0_usize;
     let deadline = Instant::now() + timeout;
-    for round in 0..MAX_CONTINUATION_ROUNDS {
+    loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             return Err(P2pError::Timeout {
                 component: "receipts",
             });
         }
-        requested_block_hashes =
-            requested_block_hashes.saturating_add(hashes.len().saturating_sub(block_index));
+        let (block_index, receipt_index) = assembled.cursor();
+        let block_hashes = hashes.get(block_index..).unwrap_or_default();
+        requested_block_hashes = requested_block_hashes.saturating_add(block_hashes.len());
         let (sender, receiver) = tokio::sync::oneshot::channel();
         peer.messages
             .try_send(PeerRequest::GetReceipts70 {
                 request: GetReceipts70 {
                     first_block_receipt_index: u64::try_from(receipt_index).unwrap_or(u64::MAX),
-                    block_hashes: hashes[block_index..].to_vec(),
+                    block_hashes: block_hashes.to_vec(),
                 },
                 response: sender,
             })
@@ -8643,58 +9413,143 @@ async fn request_direct_receipts70(
             })?;
         let response =
             await_direct_peer_response(receiver, remaining, cancellation, "receipts").await?;
-        response_payload_bytes = response_payload_bytes.saturating_add(response.length());
-        if response.receipts.is_empty()
-            || response.receipts.len() > hashes.len().saturating_sub(block_index)
-        {
+        let response_payload_bytes = response.length();
+        if assembled.merge(
+            headers,
+            bodies,
+            response.last_block_incomplete,
+            response.receipts,
+            response_payload_bytes,
+        )? {
+            return Ok(DirectReceiptsResponse {
+                physical_requests: u64::try_from(assembled.rounds).unwrap_or(u64::MAX),
+                requested_block_hashes,
+                response_payload_bytes: assembled.response_bytes,
+                receipts: assembled.blocks,
+            });
+        }
+    }
+}
+
+/// Receipts an eth/70 request assembles across continuation rounds: every
+/// completed block, then possibly one partial block the next round continues.
+#[derive(Debug, Default)]
+struct Receipts70Accumulator {
+    blocks: Vec<Vec<Receipt>>,
+    /// Whether the last block awaits more receipts.
+    partial: bool,
+    rounds: usize,
+    response_bytes: usize,
+}
+
+impl Receipts70Accumulator {
+    /// The first block the next round asks for, and its first receipt.
+    fn cursor(&self) -> (usize, usize) {
+        match self.blocks.last() {
+            Some(last) if self.partial => (self.blocks.len().saturating_sub(1), last.len()),
+            _ => (self.blocks.len(), 0),
+        }
+    }
+
+    fn completed(&self) -> usize {
+        self.blocks.len().saturating_sub(usize::from(self.partial))
+    }
+
+    fn partial_receipts(&self) -> usize {
+        self.blocks
+            .last()
+            .filter(|_| self.partial)
+            .map_or(0, Vec::len)
+    }
+
+    /// Merge one round's response to a request for the receipts of
+    /// `headers`, and return whether the request is complete. The request
+    /// takes at most `MAX_RECEIPTS70_ROUNDS` rounds and
+    /// `MAX_RECEIPTS70_BYTES` of responses. A block never holds more receipts
+    /// than its known transactions, and each block is checked against its
+    /// header as it completes. A round must complete a block, even one
+    /// without receipts, or add receipts to the partial one.
+    fn merge(
+        &mut self,
+        headers: &[Header],
+        bodies: Option<&[BlockBody]>,
+        last_block_incomplete: bool,
+        receipts: Vec<Vec<Receipt>>,
+        response_bytes: usize,
+    ) -> Result<bool, P2pError> {
+        self.rounds = self.rounds.saturating_add(1);
+        self.response_bytes = self.response_bytes.saturating_add(response_bytes);
+        if self.response_bytes > MAX_RECEIPTS70_BYTES {
+            return Err(P2pError::Request {
+                component: "receipts",
+                detail: format!(
+                    "eth/70 continuation exceeded {MAX_RECEIPTS70_BYTES} response bytes"
+                ),
+            });
+        }
+        let (block_index, _) = self.cursor();
+        let remaining = headers.len().saturating_sub(block_index);
+        if receipts.is_empty() || receipts.len() > remaining {
             return Err(P2pError::IncompleteResponse {
                 component: "receipts",
-                returned: response.receipts.len(),
-                expected: hashes.len().saturating_sub(block_index),
+                returned: receipts.len(),
+                expected: remaining,
             });
         }
-        let before = blocks.iter().map(Vec::len).sum::<usize>();
-        let response_blocks = response.receipts.len();
-        for (offset, mut receipts) in response.receipts.into_iter().enumerate() {
+        let completed = self.completed();
+        let partial_receipts = self.partial_receipts();
+        for (offset, mut block) in receipts.into_iter().enumerate() {
             let index = block_index.saturating_add(offset);
-            match index.cmp(&blocks.len()) {
-                std::cmp::Ordering::Less => {
-                    if offset != 0 || receipt_index == 0 {
-                        return Err(P2pError::InvalidResponse(
-                            "eth/70 receipt continuation overlapped a completed block".to_owned(),
-                        ));
-                    }
-                    blocks[index].append(&mut receipts);
-                }
-                std::cmp::Ordering::Equal => blocks.push(receipts),
-                std::cmp::Ordering::Greater => {
-                    return Err(P2pError::InvalidResponse(
-                        "eth/70 receipt continuation skipped a block".to_owned(),
-                    ));
-                }
+            if offset == 0
+                && self.partial
+                && let Some(partial) = self.blocks.last_mut()
+            {
+                partial.append(&mut block);
+            } else {
+                self.blocks.push(block);
+            }
+            if let (Some(body), Some(block)) = (
+                bodies.and_then(|bodies| bodies.get(index)),
+                self.blocks.get(index),
+            ) && block.len() > body.transactions.len()
+            {
+                return Err(P2pError::InvalidResponse(format!(
+                    "{} receipts for {} transactions at block {}",
+                    block.len(),
+                    body.transactions.len(),
+                    headers.get(index).map_or(0, |header| header.number)
+                )));
             }
         }
-        let after = blocks.iter().map(Vec::len).sum::<usize>();
-        if after == before {
-            return Err(P2pError::InvalidResponse(
-                "eth/70 receipt continuation made no progress".to_owned(),
-            ));
+        self.partial = last_block_incomplete;
+        for index in completed..self.completed() {
+            if let (Some(header), Some(block)) = (headers.get(index), self.blocks.get(index)) {
+                validate_receipts_against_headers(
+                    std::slice::from_ref(header),
+                    std::slice::from_ref(block),
+                )?;
+            }
         }
-        if !response.last_block_incomplete {
-            return Ok(DirectReceiptsResponse {
-                receipts: blocks,
-                physical_requests: u64::try_from(round.saturating_add(1)).unwrap_or(u64::MAX),
-                requested_block_hashes,
-                response_payload_bytes,
+        if self.completed() == completed && self.partial_receipts() <= partial_receipts {
+            // A reply that repeats the partial block serves nothing new; the
+            // peer may be unable to fit its next receipt in one response.
+            return Err(P2pError::IncompleteResponse {
+                component: "receipts",
+                returned: 0,
+                expected: remaining,
             });
         }
-        block_index = block_index.saturating_add(response_blocks.saturating_sub(1));
-        receipt_index = blocks.get(block_index).map_or(0, Vec::len);
+        if !self.partial {
+            return Ok(true);
+        }
+        if self.rounds >= MAX_RECEIPTS70_ROUNDS {
+            return Err(P2pError::Request {
+                component: "receipts",
+                detail: "eth/70 continuation round limit exceeded".to_owned(),
+            });
+        }
+        Ok(false)
     }
-    Err(P2pError::Request {
-        component: "receipts",
-        detail: "eth/70 continuation round limit exceeded".to_owned(),
-    })
 }
 
 /// Whether the expectation a peer response is checked against was verified
@@ -8837,10 +9692,13 @@ fn validate_descending_headers(
     head_hash: BlockHash,
     headers: &[Header],
 ) -> Result<(), P2pError> {
+    // A peer that does not have the requested block answers with none.
     let Some(first) = headers.first() else {
-        return Err(P2pError::InvalidResponse(
-            "empty descending header response".to_owned(),
-        ));
+        return Err(P2pError::IncompleteResponse {
+            component: "reorg headers",
+            returned: 0,
+            expected: 1,
+        });
     };
     // The request is by hash: another block breaks the protocol, while the
     // requested block at another height only contradicts the claimed number.
@@ -8882,6 +9740,22 @@ fn plan_reorg(
             .copied()
     });
     let Some(ancestor) = ancestor else {
+        // Only a branch that reaches the oldest retained block without
+        // joining the retained chain proves a fork below the window; a
+        // shorter reply proves nothing yet.
+        let reached = descending.last().map(|header| header.number);
+        let oldest = recent.front().map(|block| block.number.0);
+        if let (Some(reached), Some(oldest)) = (reached, oldest)
+            && reached > oldest
+        {
+            return Err(P2pError::IncompleteResponse {
+                component: "reorg headers",
+                returned: descending.len(),
+                expected: descending.len().saturating_add(
+                    usize::try_from(reached.saturating_sub(oldest)).unwrap_or(usize::MAX),
+                ),
+            });
+        }
         return Err(P2pError::ReorgTooDeep {
             maximum: recent.len().saturating_sub(1),
         });
@@ -9041,6 +9915,32 @@ fn validate_receipts_against_headers(
         }
     }
     Ok(())
+}
+
+/// Whether a peer must be asked for a block's receipts. A block without
+/// transactions commits to the empty receipts root: its receipts are known.
+fn has_receipts(header: &Header) -> bool {
+    header.receipts_root != EMPTY_ROOT_HASH
+}
+
+/// Receipts for `headers` from those fetched, in order, for the blocks that
+/// have receipts, with the empty receipts of the others. Fetched receipts
+/// that run out end the list early, and any left over follow it, so
+/// validating the list against `headers` still reports the mismatch.
+fn with_known_empty_receipts(headers: &[Header], fetched: Vec<Vec<Receipt>>) -> Vec<Vec<Receipt>> {
+    let mut fetched = fetched.into_iter();
+    let mut receipts = Vec::with_capacity(headers.len());
+    for header in headers {
+        if !has_receipts(header) {
+            receipts.push(Vec::new());
+        } else if let Some(block) = fetched.next() {
+            receipts.push(block);
+        } else {
+            break;
+        }
+    }
+    receipts.extend(fetched);
+    receipts
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -10468,30 +11368,30 @@ mod tests {
         };
 
         assert_eq!(
-            pending_live_material_delay(&config, &mut attempts, &missing_body),
+            pending_live_material_delay(&config, &mut attempts, &missing_body, false, true),
             Some(Duration::from_millis(250))
         );
         assert_eq!(
-            pending_live_material_delay(&config, &mut attempts, &missing_receipts),
+            pending_live_material_delay(&config, &mut attempts, &missing_receipts, false, true),
             Some(Duration::from_millis(500))
         );
         assert_eq!(
-            pending_live_material_delay(&config, &mut attempts, &missing_body),
+            pending_live_material_delay(&config, &mut attempts, &missing_body, false, true),
             Some(Duration::from_secs(1))
         );
         assert_eq!(
-            pending_live_material_delay(&config, &mut attempts, &missing_receipts),
+            pending_live_material_delay(&config, &mut attempts, &missing_receipts, false, true),
             Some(Duration::from_secs(2))
         );
         assert_eq!(
-            pending_live_material_delay(&config, &mut attempts, &missing_body),
+            pending_live_material_delay(&config, &mut attempts, &missing_body, false, true),
             Some(Duration::from_secs(2))
         );
         assert_eq!(attempts, 5);
 
         let actual_disconnect = P2pError::Network("peer pool stopped".to_owned());
         assert_eq!(
-            pending_live_material_delay(&config, &mut attempts, &actual_disconnect),
+            pending_live_material_delay(&config, &mut attempts, &actual_disconnect, false, true),
             None
         );
         assert_eq!(attempts, 5);
@@ -11260,39 +12160,36 @@ mod tests {
 
     #[test]
     fn header_proof_builder_retains_successful_ranges_across_retry() {
-        let proof = BlockRange::new(BlockNumber(100), BlockNumber(2_199)).expect("proof range");
-        let retained = BlockRange::new(BlockNumber(100), BlockNumber(199)).expect("retained");
-        let mut builder = AnchoredHeaderProofBuilder::new(proof, retained, 1_024);
+        let (headers, proof, [first, second, third]) = anchored_header_chain();
+        let anchor = block_hash(headers.last().expect("anchor").hash_slow());
+        let retained = BlockRange::new(BlockNumber(2_100), BlockNumber(2_199)).expect("retained");
+        let mut builder = AnchoredHeaderProofBuilder::new(proof, retained, 1_024, anchor);
+        // Ranges are fetched from the anchor down, so each validates on
+        // arrival.
         let first_wave = builder.take_wave(2);
-        assert_eq!(first_wave.len(), 2);
-        let first = first_wave[0];
-        builder
-            .record(
-                first,
-                Ok(HeaderProofSegment {
-                    range: first,
-                    first_parent: BlockHash::ZERO,
-                    hashes: vec![BlockHash::new([1; 32]); 1_024],
-                }),
-            )
-            .expect("record first proof segment");
-        builder
-            .record(
-                first_wave[1],
-                Err(P2pError::Request {
-                    component: "headers",
-                    detail: "temporary peer failure".to_owned(),
-                }),
-            )
-            .expect("retain failed proof range");
+        assert_eq!(first_wave, [third, second]);
+        assert!(
+            builder
+                .record(third, Ok((B512::ZERO, proof_segment(&headers, third))))
+                .is_empty()
+        );
+        assert!(
+            builder
+                .record(
+                    second,
+                    Err(P2pError::Request {
+                        component: "headers",
+                        detail: "temporary peer failure".to_owned(),
+                    }),
+                )
+                .is_empty()
+        );
 
         assert!(builder.segments.is_empty());
-        assert_eq!(
-            builder.retained_hashes.len(),
-            usize::try_from(retained.len()).expect("retained range fits in memory")
-        );
-        assert_eq!(builder.pending.len(), 2);
-        assert_eq!(builder.pending.back().copied(), Some(first_wave[1]));
+        // Blocks 2,148..=2,199 are proven: 52 of the 100 retained hashes.
+        assert_eq!(builder.retained_hashes.len(), 52);
+        // The failed range is fetched again first.
+        assert_eq!(builder.pending, VecDeque::from([second, first]));
     }
 
     #[tokio::test]
@@ -11709,7 +12606,10 @@ mod tests {
         );
         assert!(peer_store.is_available_body_server(peer_id));
 
-        network.invalidate_peer(peer_id, "invalid execution material");
+        let [session] = direct_peers.sessions()[..] else {
+            panic!("one pooled session");
+        };
+        network.invalidate_peer(peer_id, session.connection_id, "invalid execution material");
 
         assert!(!peer_store.is_available_body_server(peer_id));
         assert_eq!(direct_peers.len(), 0);
@@ -12596,27 +13496,32 @@ mod tests {
 
     type PeerReceiver = tokio::sync::mpsc::Receiver<PeerRequest<EthNetworkPrimitives>>;
 
-    /// A header lane's failure count and remaining cooldown.
-    fn header_lane(pool: &DirectPeerPool, peer_id: B512) -> (u32, Duration) {
+    /// A header lane's failure count and the end of its cooldown.
+    fn header_lane(pool: &DirectPeerPool, peer_id: B512) -> (u32, Instant) {
         pool.peers
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .iter()
             .find(|state| state.peer.peer_id == peer_id)
-            .map(|state| {
-                (
-                    state.header.failures,
-                    state
-                        .header
-                        .retry_at
-                        .saturating_duration_since(Instant::now()),
-                )
-            })
+            .map(|state| (state.header.failures, state.header.retry_at))
             .expect("pooled peer")
     }
 
-    /// Move every header-lane cooldown `by` into the past, as if that much
-    /// time had passed: the pool reads the real clock.
+    /// Whether a cooldown applied between `before` and `after` is the first
+    /// step, 250 ms from when it was applied: a check of bounds the test
+    /// captured, however long the test itself runs.
+    fn first_cooldown_step(retry_at: Instant, before: Instant, after: Instant) -> bool {
+        cooldown_step(Duration::from_millis(250), retry_at, before, after)
+    }
+
+    /// Whether a cooldown applied between `before` and `after` lasts `step`.
+    fn cooldown_step(step: Duration, retry_at: Instant, before: Instant, after: Instant) -> bool {
+        retry_at >= before + step && retry_at <= after + step
+    }
+
+    /// Move every header-lane cooldown, and every withheld-header strike,
+    /// `by` into the past, as if that much time had passed: the pool reads
+    /// the real clock.
     fn age_header_lanes(pool: &DirectPeerPool, by: Duration) {
         for state in pool
             .peers
@@ -12627,7 +13532,21 @@ mod tests {
             if let Some(earlier) = state.header.retry_at.checked_sub(by) {
                 state.header.retry_at = earlier;
             }
+            if let Some(earlier) = state.withheld_until.checked_sub(by) {
+                state.withheld_until = earlier;
+            }
         }
+    }
+
+    /// A peer's withheld-header strikes and the end of its last strike.
+    fn withheld_strike(pool: &DirectPeerPool, peer_id: B512) -> (u32, Instant) {
+        pool.peers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .find(|state| state.peer.peer_id == peer_id)
+            .map(|state| (state.withheld_strikes, state.withheld_until))
+            .expect("pooled peer")
     }
 
     #[test]
@@ -12654,7 +13573,7 @@ mod tests {
             expected: 1,
         };
         let block = BlockNumber(25_000_001);
-        let mut rotation = HeadPollRotation::default();
+        let mut rotation = HeadPollRotation::new(RethP2pConfig::default().retry_backoff);
         let mut cohorts = Vec::new();
         for _ in 0..3 {
             assert!(rotation.begin_poll(block).is_empty());
@@ -12675,7 +13594,7 @@ mod tests {
                     live_header_reply_cost(&not_yet, ExpectationTrust::Unverified, true),
                     HeaderReplyCost::NotYet
                 );
-                rotation.record_not_yet(lease.peer.peer_id);
+                rotation.record_not_yet(lease.peer.peer_id, Instant::now());
             }
             // The next poll starts at least one production poll interval,
             // plus the first retry pause, later.
@@ -12695,7 +13614,7 @@ mod tests {
     fn head_polls_cool_peers_that_withheld_a_served_block() {
         let (pool, _, receivers) = header_peer_pool(&[0x91, 0x92, 0x93]);
         let block = BlockNumber(25_000_001);
-        let mut rotation = HeadPollRotation::default();
+        let mut rotation = HeadPollRotation::new(RethP2pConfig::default().retry_backoff);
         assert!(rotation.begin_poll(block).is_empty());
         let withholder = pool
             .lease_for_head_poll(&mut rotation, 1)
@@ -12705,10 +13624,11 @@ mod tests {
             .expect("a second peer to poll");
         let (withholder_id, server_id) = (withholder.peer.peer_id, server.peer.peer_id);
         // One peer answers "not yet", which costs it nothing yet, while the
-        // other serves the block.
-        rotation.record_not_yet(withholder_id);
+        // other, asked with it, serves the block.
+        let answered_at = Instant::now();
+        rotation.record_not_yet(withholder_id, answered_at);
         drop(withholder);
-        rotation.record_served(server_id);
+        rotation.record_served(server_id, answered_at);
         drop(server);
         assert_eq!(header_lane(&pool, withholder_id).0, 0);
 
@@ -12717,15 +13637,14 @@ mod tests {
         // first. Nothing is persisted, and it stays pooled.
         let withheld = rotation.begin_poll(BlockNumber(block.0 + 1));
         assert_eq!(withheld, vec![withholder_id]);
+        let before = Instant::now();
         for peer_id in withheld {
             pool.record_material_failure(peer_id, PeerMaterialKind::Header);
         }
-        let (failures, cooling_for) = header_lane(&pool, withholder_id);
+        let after = Instant::now();
+        let (failures, retry_at) = header_lane(&pool, withholder_id);
         assert_eq!(failures, 1);
-        assert!(
-            cooling_for > Duration::from_millis(100) && cooling_for <= Duration::from_millis(250),
-            "{cooling_for:?}"
-        );
+        assert!(first_cooldown_step(retry_at, before, after));
         assert_eq!(pool.len(), 3);
         // The next poll asks the other peers while it cools.
         let polled = (0..2)
@@ -12764,13 +13683,12 @@ mod tests {
             .try_acquire_excluding(PeerMaterialKind::Header, 1, &HashSet::new(), None)
             .expect("the peer");
         lease.failed();
+        let before = Instant::now();
         drop(lease);
-        let (failures, cooling_for) = header_lane(&pool, peers[0]);
+        let after = Instant::now();
+        let (failures, retry_at) = header_lane(&pool, peers[0]);
         assert_eq!(failures, 1);
-        assert!(
-            cooling_for > Duration::from_millis(100) && cooling_for <= Duration::from_millis(250),
-            "{cooling_for:?}"
-        );
+        assert!(first_cooldown_step(retry_at, before, after));
         drop(receivers);
     }
 
@@ -12811,7 +13729,13 @@ mod tests {
                 receiver,
             )
         };
-        pool.invalidate(peer_id);
+        let connection_id = |pool: &DirectPeerPool| {
+            let [session] = pool.sessions()[..] else {
+                panic!("one pooled session");
+            };
+            session.connection_id
+        };
+        assert!(pool.invalidate(peer_id, connection_id(&pool)));
         assert_eq!(pool.len(), 0);
         assert_eq!(pool.invalidated(), HashSet::from([peer_id]));
         // The reconciler cannot adopt the peer while its session lasts...
@@ -12823,7 +13747,7 @@ mod tests {
         let (adopted, _adopted_receiver) = session();
         assert!(pool.insert_missing(adopted));
         // A new session announced by Reth starts over as well.
-        pool.invalidate(peer_id);
+        assert!(pool.invalidate(peer_id, connection_id(&pool)));
         let (announced, _announced_receiver) = session();
         pool.insert(announced);
         assert!(pool.invalidated().is_empty());
@@ -12859,6 +13783,1033 @@ mod tests {
         assert!(
             acquired.is_ok(),
             "the release went to a waiter that registered later"
+        );
+    }
+
+    #[test]
+    fn live_lane_reconnects_once_the_watchdog_recycles_its_manager() {
+        let config = RethP2pConfig::default();
+        let source = RethP2pSource::mainnet(config.clone()).expect("source");
+        let grace = source.descriptor.expected_lag.max(config.poll_interval);
+        // Five minutes without peers end the manager task, and only
+        // `connect` builds another: the lane's session is then dead.
+        let started = tokio::time::Instant::now();
+        let mut zero_peers_since = Some(started);
+        assert_eq!(config.peer_recovery_timeout, Duration::from_mins(5));
+        assert!(peer_recovery_due(
+            0,
+            &mut zero_peers_since,
+            started + config.peer_recovery_timeout,
+            config.peer_recovery_timeout,
+        ));
+        assert_eq!(
+            head_unavailable(false, config.poll_interval, grace),
+            HeadUnavailable::Reconnect,
+            "the lane kept the session of a recycled manager"
+        );
+        assert_eq!(
+            head_unavailable(false, config.peer_recovery_timeout, grace),
+            HeadUnavailable::Reconnect
+        );
+        // While the manager runs, its peers may still serve the head: the
+        // lane keeps the session and reports itself disconnected once the
+        // grace has passed.
+        assert_eq!(
+            head_unavailable(true, config.poll_interval, grace),
+            HeadUnavailable::Retry
+        );
+        assert_eq!(
+            head_unavailable(true, grace, grace),
+            HeadUnavailable::Report
+        );
+    }
+
+    #[test]
+    fn a_silent_head_poll_peer_does_not_disconnect_the_lane() {
+        let config = RethP2pConfig::default();
+        let mut attempts = 0;
+        // The last peer of a head poll's cohort timed out, or its session
+        // could not take the request: the next poll asks other peers.
+        let silent = P2pError::Timeout {
+            component: "headers",
+        };
+        assert_eq!(
+            pending_live_material_delay(&config, &mut attempts, &silent, true, true),
+            Some(Duration::from_millis(250)),
+            "a silent head-poll peer disconnected the lane"
+        );
+        let unqueued = P2pError::Request {
+            component: "headers",
+            detail: "could not queue direct request: Full(..)".to_owned(),
+        };
+        assert_eq!(
+            pending_live_material_delay(&config, &mut attempts, &unqueued, true, true),
+            Some(Duration::from_millis(500))
+        );
+        // Once the manager has stopped, every failure reconnects.
+        let not_yet = P2pError::IncompleteResponse {
+            component: "headers",
+            returned: 0,
+            expected: 1,
+        };
+        assert_eq!(
+            pending_live_material_delay(&config, &mut attempts, &not_yet, true, false),
+            None
+        );
+        assert_eq!(
+            pending_live_material_delay(&config, &mut attempts, &silent, true, false),
+            None
+        );
+        // So do the same failures while catching up, and a pool without any
+        // peer, whose reconnection waits for one.
+        assert_eq!(
+            pending_live_material_delay(&config, &mut attempts, &silent, false, true),
+            None
+        );
+        let no_peer = P2pError::Timeout {
+            component: "direct peer availability",
+        };
+        assert_eq!(
+            pending_live_material_delay(&config, &mut attempts, &no_peer, true, true),
+            None
+        );
+    }
+
+    #[test]
+    fn live_material_waves_end_after_eight_waves_or_a_minute() {
+        let config = RethP2pConfig::default();
+        // A wave in which no peer serves the material pauses, as in
+        // production, before the next one...
+        let mut waves = 0;
+        let mut elapsed = Duration::ZERO;
+        let mut pauses = Vec::new();
+        while let Some(pause) = next_live_material_wave(&config, &mut waves, elapsed) {
+            assert!(waves < 64, "live material waves never end");
+            pauses.push(pause);
+            elapsed += pause;
+        }
+        // ...until eight waves have asked every eligible peer.
+        assert_eq!(waves, 8);
+        assert_eq!(
+            pauses,
+            [
+                Duration::from_millis(250),
+                Duration::from_millis(500),
+                Duration::from_secs(1),
+                Duration::from_secs(2),
+                Duration::from_secs(2),
+                Duration::from_secs(2),
+                Duration::from_secs(2),
+            ]
+        );
+        // Slow waves end once a minute has passed.
+        let mut waves = 0;
+        assert_eq!(
+            next_live_material_wave(&config, &mut waves, Duration::from_mins(1)),
+            None,
+            "live material waves have no time bound"
+        );
+        // The lane then reports itself disconnected, which clears readiness,
+        // and asks for the header again.
+        let withheld = withheld_live_material("bodies", 25_000_001, 8);
+        let mut attempts = 0;
+        assert_eq!(
+            pending_live_material_delay(&config, &mut attempts, &withheld, true, true),
+            None
+        );
+    }
+
+    /// Headers for blocks `numbers`, the first child of `parent`. The
+    /// timestamp tells branches apart.
+    fn header_chain(
+        parent: B256,
+        numbers: std::ops::RangeInclusive<u64>,
+        timestamp: u64,
+    ) -> Vec<Header> {
+        let mut parent = parent;
+        numbers
+            .map(|number| {
+                let header = Header {
+                    number,
+                    parent_hash: parent,
+                    timestamp,
+                    ..Default::default()
+                };
+                parent = header.hash_slow();
+                header
+            })
+            .collect()
+    }
+
+    /// A header chain for blocks 100..=2199, whose tip is the anchor, and the
+    /// three ranges that prove it.
+    fn anchored_header_chain() -> (Vec<Header>, BlockRange, [BlockRange; 3]) {
+        let range = |start, end| {
+            BlockRange::new(BlockNumber(start), BlockNumber(end)).expect("proof range")
+        };
+        (
+            header_chain(B256::ZERO, 100..=2_199, 0),
+            range(100, 2_199),
+            [range(100, 1_123), range(1_124, 2_147), range(2_148, 2_199)],
+        )
+    }
+
+    fn proof_segment(headers: &[Header], range: BlockRange) -> HeaderProofSegment {
+        let offset = usize::try_from(range.start().0 - 100).expect("offset");
+        let len = usize::try_from(range.len()).expect("length");
+        header_proof_segment(range, &headers[offset..offset + len]).expect("proof segment")
+    }
+
+    fn rejected_peers(rejected: &[(B512, P2pError)]) -> Vec<B512> {
+        assert!(rejected.iter().all(|(_, error)| {
+            classify_response_failure(error, ExpectationTrust::Verified) == ResponseFault::Invalid
+        }));
+        rejected.iter().map(|(peer, _)| *peer).collect()
+    }
+
+    #[test]
+    fn anchored_header_proof_recovers_from_a_bad_segment() {
+        let (headers, proof, [first, second, third]) = anchored_header_chain();
+        let anchor = block_hash(headers.last().expect("anchor").hash_slow());
+        let (honest, liar) = (B512::from([0x71; 64]), B512::from([0x72; 64]));
+        // A peer serves a chain of its own for the middle range: it joins the
+        // segment below, but not the one above.
+        let forged = header_proof_segment(
+            second,
+            &header_chain(headers[1_023].hash_slow(), 1_124..=2_147, 1),
+        )
+        .expect("forged segment");
+        let mut builder = AnchoredHeaderProofBuilder::new(proof, proof, 1_024, anchor);
+        assert_eq!(builder.take_wave(3).len(), 3);
+        let segment = |range| Ok((honest, proof_segment(&headers, range)));
+        assert!(builder.record(third, segment(third)).is_empty());
+        // Checked against the proven segment above it, the forged one fails,
+        // and its peer is reported...
+        assert_eq!(
+            rejected_peers(&builder.record(second, Ok((liar, forged)))),
+            [liar]
+        );
+        assert!(builder.record(first, segment(first)).is_empty());
+        // ...while its range is fetched again...
+        assert_eq!(
+            builder.pending,
+            VecDeque::from([second]),
+            "a bad segment wedged the proof"
+        );
+        // ...and the proof completes once another peer serves it.
+        assert_eq!(builder.take_wave(3), [second]);
+        assert!(builder.record(second, segment(second)).is_empty());
+        let assembled = builder
+            .finish()
+            .expect("the proof recovers from a bad segment");
+        assert_eq!(assembled.hashes.len(), 2_100);
+        assert_eq!(
+            assembled.expected_hash(BlockNumber(1_500)),
+            Some(block_hash(headers[1_400].hash_slow()))
+        );
+    }
+
+    #[test]
+    fn anchored_header_proof_recovers_from_a_wrong_tip() {
+        let (headers, proof, [first, second, third]) = anchored_header_chain();
+        let anchor = block_hash(headers.last().expect("anchor").hash_slow());
+        // The top segment joins the chain below it but ends at another block
+        // than the finalized anchor.
+        let forged = header_proof_segment(
+            third,
+            &header_chain(headers[2_047].hash_slow(), 2_148..=2_199, 1),
+        )
+        .expect("forged segment");
+        let (honest, liar) = (B512::from([0x73; 64]), B512::from([0x74; 64]));
+        let mut builder = AnchoredHeaderProofBuilder::new(proof, proof, 1_024, anchor);
+        assert_eq!(builder.take_wave(3).len(), 3);
+        let segment = |range| Ok((honest, proof_segment(&headers, range)));
+        assert!(builder.record(first, segment(first)).is_empty());
+        assert!(builder.record(second, segment(second)).is_empty());
+        assert_eq!(
+            rejected_peers(&builder.record(third, Ok((liar, forged)))),
+            [liar]
+        );
+        assert!(builder.finish().is_err());
+        assert_eq!(
+            builder.pending,
+            VecDeque::from([third]),
+            "a wrong tip wedged the proof"
+        );
+        assert_eq!(builder.take_wave(3), [third]);
+        assert!(builder.record(third, segment(third)).is_empty());
+        let assembled = builder
+            .finish()
+            .expect("the proof recovers from a wrong tip");
+        assert_eq!(assembled.expected_hash(BlockNumber(2_199)), Some(anchor));
+    }
+
+    /// The lane's retained window, blocks 1,036..=1,100, and a branch that
+    /// replaces its last three blocks and leads a hundred blocks further.
+    fn reorged_live_window() -> (VecDeque<BlockRef>, Vec<Header>) {
+        let canonical = header_chain(B256::ZERO, 1_000..=1_100, 0);
+        let recent = canonical[36..].iter().map(block_ref).collect();
+        let replacement = header_chain(canonical[97].hash_slow(), 1_098..=1_200, 1);
+        (recent, [&canonical[..=97], &replacement[..]].concat())
+    }
+
+    #[test]
+    fn shallow_reorgs_while_behind_are_reconstructed_from_the_replaced_tip() {
+        let max_reorg_depth = RethP2pConfig::default().max_reorg_depth;
+        let (recent, branch) = reorged_live_window();
+        assert_eq!(recent.len(), max_reorg_depth + 1);
+        let last = *recent.back().expect("the lane's tip");
+        let at = |number: u64| &branch[usize::try_from(number - 1_000).expect("offset")];
+        // Catching up to the head discovered at block 1,200, the lane fetched
+        // block 1,101 of the branch, which does not extend its tip.
+        let head = branch.last().expect("the branch's head");
+        assert_eq!(head.number, 1_200);
+        let mismatching = block_ref(at(1_101));
+        // The full reply a peer gives from a block: the headers below it,
+        // as many as the window holds.
+        let descending_from = |number: u64| {
+            branch
+                .iter()
+                .rev()
+                .skip_while(|header| header.number > number)
+                .take(max_reorg_depth + 1)
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        // From the far head, even a full reply stays above the retained
+        // window, so it can never find the fork.
+        assert!(
+            plan_reorg(&recent, &descending_from(head.number)).is_err(),
+            "a reply from the far head reached the retained window"
+        );
+        // From the block that replaced the tip, it covers the window, so the
+        // three replaced blocks are reverted.
+        let (number, hash) = reorg_reconstruction_tip(last, mismatching);
+        let descending = descending_from(number.0);
+        validate_descending_headers(number, hash, &descending).expect("descending branch");
+        let (ancestor, reverted) = plan_reorg(&recent, &descending).expect("a shallow reorg");
+        assert_eq!(ancestor.number, BlockNumber(1_097));
+        assert_eq!(reverted.len(), 3);
+    }
+
+    #[test]
+    fn empty_or_short_reorg_replies_are_retryable_not_invalid() {
+        let (recent, branch) = reorged_live_window();
+        let tip = &branch[100];
+        let (number, hash) = (BlockNumber(tip.number), block_hash(tip.hash_slow()));
+        // A peer that does not have the block answers with no headers.
+        let empty = validate_descending_headers(number, hash, &[]).expect_err("no headers");
+        assert!(
+            matches!(empty, P2pError::IncompleteResponse { .. }),
+            "an empty reply is {empty}"
+        );
+        assert_eq!(
+            classify_response_failure(&empty, ExpectationTrust::Unverified),
+            ResponseFault::Disagreement
+        );
+        // A consistent reply that ends above the fork proves no deep reorg.
+        let short = branch[99..=100].iter().rev().cloned().collect::<Vec<_>>();
+        validate_descending_headers(number, hash, &short).expect("a short branch");
+        let incomplete = plan_reorg(&recent, &short).expect_err("no ancestor yet");
+        assert!(
+            matches!(incomplete, P2pError::IncompleteResponse { .. }),
+            "a short reply is {incomplete}"
+        );
+        for retryable in [
+            incomplete,
+            P2pError::Timeout {
+                component: "reorg headers",
+            },
+        ] {
+            assert_ne!(
+                reorg_failure(&retryable, &mut false),
+                ReorgFailure::Reset,
+                "{retryable}"
+            );
+        }
+        // Only a branch that passes the whole window without joining it
+        // proves a reorg too deep to follow.
+        let unrelated = header_chain(B256::repeat_byte(0x42), 1_000..=1_100, 2);
+        let descending = unrelated.iter().rev().take(65).cloned().collect::<Vec<_>>();
+        let too_deep = plan_reorg(&recent, &descending).expect_err("no common block");
+        assert!(matches!(too_deep, P2pError::ReorgTooDeep { .. }));
+        assert_eq!(reorg_failure(&too_deep, &mut false), ReorgFailure::Reset);
+    }
+
+    fn receipt(cumulative_gas_used: u64) -> Receipt {
+        EthereumReceipt {
+            tx_type: TxType::Legacy,
+            success: true,
+            cumulative_gas_used,
+            logs: Vec::new(),
+        }
+    }
+
+    /// A header whose commitments hold exactly `receipts`.
+    fn header_committing(number: u64, receipts: &[Receipt]) -> Header {
+        let with_bloom = receipts
+            .iter()
+            .map(alloy_consensus::TxReceipt::with_bloom_ref)
+            .collect::<Vec<_>>();
+        Header {
+            number,
+            receipts_root: calculate_receipt_root(&with_bloom),
+            gas_used: receipts
+                .last()
+                .map_or(0, |receipt| receipt.cumulative_gas_used),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn eth70_receipt_continuation_is_bounded_and_validated_as_blocks_complete() {
+        let large = header_committing(10, &vec![receipt(21_000); 16]);
+        // A peer that keeps a block incomplete gets eight rounds...
+        let mut assembled = Receipts70Accumulator::default();
+        for round in 1..=8 {
+            let merged = assembled.merge(
+                std::slice::from_ref(&large),
+                None,
+                true,
+                vec![vec![receipt(21_000)]],
+                1_024,
+            );
+            if round < 8 {
+                assert!(matches!(merged, Ok(false)), "round {round}: {merged:?}");
+            } else {
+                assert!(
+                    matches!(merged, Err(P2pError::Request { .. })),
+                    "eth/70 continuation took a ninth round: {merged:?}"
+                );
+            }
+        }
+        // ...and 64 MiB of responses across them.
+        let mut assembled = Receipts70Accumulator::default();
+        let ten_mib = 10 * 1024 * 1024;
+        for round in 1..=7 {
+            let merged = assembled.merge(
+                std::slice::from_ref(&large),
+                None,
+                true,
+                vec![vec![receipt(21_000)]],
+                ten_mib,
+            );
+            if round < 7 {
+                assert!(matches!(merged, Ok(false)), "round {round}: {merged:?}");
+            } else {
+                assert!(
+                    matches!(merged, Err(P2pError::Request { .. })),
+                    "eth/70 continuation kept 70 MiB: {merged:?}"
+                );
+            }
+        }
+        // A block never holds more receipts than its transactions...
+        let transaction =
+            alloy_consensus::EthereumTxEnvelope::Legacy(alloy_consensus::Signed::new_unhashed(
+                alloy_consensus::TxLegacy::default(),
+                alloy_primitives::Signature::test_signature(),
+            ));
+        let body = BlockBody {
+            transactions: vec![transaction],
+            ..BlockBody::default()
+        };
+        let single = header_committing(11, &[receipt(21_000)]);
+        let mut assembled = Receipts70Accumulator::default();
+        let merged = assembled.merge(
+            std::slice::from_ref(&single),
+            Some(std::slice::from_ref(&body)),
+            true,
+            vec![vec![receipt(21_000), receipt(42_000)]],
+            1_024,
+        );
+        assert!(
+            matches!(merged, Err(P2pError::InvalidResponse(_))),
+            "a block kept more receipts than transactions: {merged:?}"
+        );
+        // ...and each completed block is checked against its header before
+        // the next round.
+        let headers = [single.clone(), header_committing(12, &[receipt(21_000)])];
+        let mut assembled = Receipts70Accumulator::default();
+        let merged = assembled.merge(
+            &headers,
+            None,
+            true,
+            vec![vec![receipt(5)], vec![receipt(21_000)]],
+            1_024,
+        );
+        assert!(
+            matches!(merged, Err(P2pError::InvalidResponse(_))),
+            "a completed block was not validated: {merged:?}"
+        );
+    }
+
+    #[test]
+    fn eth70_accepts_responses_of_empty_blocks() {
+        let (_, headers, _, _) = empty_fixture();
+        let mut assembled = Receipts70Accumulator::default();
+        let merged = assembled.merge(&headers, None, false, vec![Vec::new(), Vec::new()], 3);
+        assert!(
+            matches!(merged, Ok(true)),
+            "a reply of empty blocks was rejected: {merged:?}"
+        );
+        assert_eq!(assembled.blocks, [Vec::<Receipt>::new(), Vec::new()]);
+    }
+
+    #[test]
+    fn blocks_without_transactions_are_not_asked_for_receipts() {
+        let (_, empty, _, _) = empty_fixture();
+        let full = header_committing(12, &[receipt(21_000)]);
+        assert!(
+            !has_receipts(&empty[0]),
+            "an empty block was asked for receipts"
+        );
+        assert!(has_receipts(&full));
+        let headers = [empty[0].clone(), full, empty[1].clone()];
+        let receipts = with_known_empty_receipts(&headers, vec![vec![receipt(21_000)]]);
+        assert_eq!(receipts, [Vec::new(), vec![receipt(21_000)], Vec::new()]);
+        validate_receipts_against_headers(&headers, &receipts).expect("committed receipts");
+    }
+
+    #[tokio::test]
+    async fn shutdown_stops_the_manager_task_after_a_graceful_network_shutdown() {
+        use std::sync::atomic::AtomicBool;
+
+        // The manager future keeps running after Reth's graceful network
+        // shutdown: the task ends, and persists the final peer state, only
+        // once its token is cancelled.
+        let shutdown = CancellationToken::new();
+        let torn_down = Arc::new(AtomicBool::new(false));
+        let mut task = tokio::spawn({
+            let shutdown = shutdown.clone();
+            let torn_down = torn_down.clone();
+            async move {
+                shutdown.cancelled().await;
+                tokio::task::yield_now().await;
+                torn_down.store(true, Ordering::Release);
+            }
+        });
+        stop_network_task(true, &shutdown, &mut task).await;
+        assert!(
+            torn_down.load(Ordering::Acquire),
+            "shutdown waited out its timeout and aborted the manager's teardown"
+        );
+    }
+
+    #[test]
+    fn head_polls_cool_only_peers_that_withheld_a_block_already_served() {
+        let config = RethP2pConfig::default();
+        let peer = |marker: u8| B512::from([marker; 64]);
+        let block = BlockNumber(25_000_001);
+        let slot = Duration::from_secs(12);
+        let previous = Instant::now();
+        let served_at = previous + slot;
+        let mut rotation = HeadPollRotation::new(RethP2pConfig::default().retry_backoff);
+        assert!(rotation.begin_poll(block).is_empty());
+        // Polls start after the previous block and run about nine times per
+        // slot: peers asked before the block exists answer "not yet"...
+        rotation.record_not_yet(peer(1), previous + config.retry_backoff);
+        rotation.record_not_yet(
+            peer(2),
+            previous + slot.saturating_sub(config.poll_interval),
+        );
+        // ...as does a peer asked together with the one that serves it.
+        rotation.record_not_yet(
+            peer(3),
+            previous + slot.saturating_sub(Duration::from_millis(100)),
+        );
+        rotation.record_served(peer(4), served_at);
+        assert_eq!(
+            rotation.begin_poll(BlockNumber(block.0 + 1)),
+            vec![peer(3)],
+            "peers asked before the block existed were cooled"
+        );
+
+        // A header the lane did not move on with, such as one whose body no
+        // peer served, is no serve: the lane later caught up past the block.
+        let mut rotation = HeadPollRotation::new(RethP2pConfig::default().retry_backoff);
+        assert!(rotation.begin_poll(block).is_empty());
+        rotation.record_served(peer(5), previous + Duration::from_secs(1));
+        rotation.serve_failed();
+        rotation.record_not_yet(peer(1), previous + Duration::from_secs(3));
+        assert!(
+            rotation.begin_poll(BlockNumber(block.0 + 2)).is_empty(),
+            "a failed serve cooled the peers asked after it"
+        );
+    }
+
+    #[test]
+    fn minimum_live_head_races_a_small_cohort() {
+        let config = RethP2pConfig::default();
+        // Discovery asks for a block that exists on every live-loop
+        // iteration, with the policy `minimum_live_head` passes: a few peers
+        // answer it at a time, however many are connected, at live priority.
+        let policy = minimum_live_head_policy();
+        assert!(policy.priority.is_high());
+        for connected in [2, 40, 400] {
+            let request_limit = effective_material_concurrency(
+                connected,
+                config.material_request_concurrency,
+                policy.concurrency,
+            );
+            let (width, _) = live_header_fanout(false, request_limit);
+            assert!(
+                (2..=4).contains(&width),
+                "head discovery races {width} of {connected} peers"
+            );
+        }
+        // It is no head poll: an empty reply cools the peer.
+        let empty = P2pError::IncompleteResponse {
+            component: "headers",
+            returned: 0,
+            expected: 1,
+        };
+        assert_eq!(
+            live_header_reply_cost(&empty, ExpectationTrust::Unverified, false),
+            HeaderReplyCost::Cooldown
+        );
+    }
+
+    #[test]
+    fn invalidation_only_drops_the_session_that_served_invalid_material() {
+        let (pool, peers, receivers) = header_peer_pool(&[0xc1]);
+        let peer_id = peers[0];
+        let [old] = pool.sessions()[..] else {
+            panic!("one pooled session");
+        };
+        // The peer reconnects before a request on its old session fails with
+        // invalid material.
+        let (sender, _receiver) = tokio::sync::mpsc::channel(1);
+        pool.insert(DirectPeer {
+            peer_id,
+            eth_version: EthVersion::Eth68,
+            messages: PeerRequestSender::new(peer_id, sender),
+        });
+        let [current] = pool.sessions()[..] else {
+            panic!("one pooled session");
+        };
+        assert!(
+            !pool.invalidate(peer_id, old.connection_id),
+            "an old session's invalid material dropped the new session"
+        );
+        assert_eq!(pool.len(), 1);
+        assert!(pool.invalidated().is_empty());
+        // The session that served it is dropped, and kept out.
+        assert!(pool.invalidate(peer_id, current.connection_id));
+        assert_eq!(pool.len(), 0);
+        assert_eq!(pool.invalidated(), HashSet::from([peer_id]));
+        drop(receivers);
+    }
+
+    #[test]
+    fn failed_material_bans_invalid_peers_and_cools_the_rest() {
+        let peer_store = Arc::new(ExecutionPeerStore::new(
+            None,
+            DEFAULT_PEER_STORE_MAX_ENTRIES,
+        ));
+        let direct_peers = Arc::new(DirectPeerPool::new(peer_store.clone()));
+        let network = PersistentNetwork {
+            state: tokio::sync::Mutex::new(None),
+            next_generation: AtomicU64::new(1),
+            request_gate: Arc::new(MaterialRequestGate::new(
+                DEFAULT_MATERIAL_REQUEST_CONCURRENCY,
+            )),
+            direct_peers: direct_peers.clone(),
+            peer_store: peer_store.clone(),
+            qualifications: Arc::new(PeerQualificationPool::new(
+                RethP2pSource::mainnet_genesis_block(),
+            )),
+        };
+        let (liar, silent) = (B512::from([0xe1; 64]), B512::from([0xe2; 64]));
+        let mut receivers = Vec::new();
+        for peer_id in [liar, silent] {
+            let (sender, receiver) = tokio::sync::mpsc::channel(1);
+            receivers.push(receiver);
+            direct_peers.insert(DirectPeer {
+                peer_id,
+                eth_version: EthVersion::Eth70,
+                messages: PeerRequestSender::new(peer_id, sender),
+            });
+            peer_store.record_success(
+                peer_id,
+                PeerMaterialKind::Body,
+                25_000_000,
+                Duration::from_millis(1),
+            );
+        }
+        let receipts_lease = |peer_id: B512| {
+            let others = [liar, silent]
+                .into_iter()
+                .filter(|other| *other != peer_id)
+                .collect::<HashSet<_>>();
+            direct_peers
+                .try_acquire_excluding(PeerMaterialKind::Receipts, 1, &others, None)
+                .expect("the peer's receipt lane")
+        };
+
+        // An eth/70 peer completes a block with receipts its header does not
+        // commit to: the reply fails while it is assembled, before any caller
+        // validates it.
+        let header = header_committing(12, &[receipt(21_000)]);
+        let invalid = Receipts70Accumulator::default()
+            .merge(
+                std::slice::from_ref(&header),
+                None,
+                false,
+                vec![vec![receipt(5)]],
+                1,
+            )
+            .expect_err("receipts the header does not commit to");
+        let mut banned = Vec::new();
+        let mut lease = receipts_lease(liar);
+        let fault = network.penalize_response(
+            &mut lease,
+            &invalid,
+            ExpectationTrust::Verified,
+            |peer_id| banned.push(peer_id),
+        );
+        drop(lease);
+        assert_eq!(
+            banned,
+            [liar],
+            "an eth/70 peer that served invalid receipts was not banned"
+        );
+        assert_eq!(fault, ResponseFault::Invalid);
+        assert!(direct_peers.get(liar).is_none());
+        assert!(!peer_store.is_available_body_server(liar));
+
+        // A transport failure costs the peer a cooldown on that lane only.
+        let timeout = P2pError::Timeout {
+            component: "receipts",
+        };
+        let mut lease = receipts_lease(silent);
+        let fault = network.penalize_response(
+            &mut lease,
+            &timeout,
+            ExpectationTrust::Verified,
+            |peer_id| banned.push(peer_id),
+        );
+        drop(lease);
+        assert_eq!(fault, ResponseFault::Disagreement);
+        assert_eq!(banned, [liar]);
+        assert!(peer_store.is_available_body_server(silent));
+        let receipt_failures = direct_peers
+            .peers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .find(|state| state.peer.peer_id == silent)
+            .map(|state| state.receipts.failures);
+        assert_eq!(receipt_failures, Some(1));
+        drop(receivers);
+    }
+
+    #[test]
+    fn an_empty_pool_ends_a_live_material_request() {
+        // Without a pooled peer, waiting for one fails after the request
+        // timeout. The request ends, so the lane reports itself disconnected
+        // and reconnects: that waits for peers, and rebuilds a manager the
+        // zero-peer watchdog stopped.
+        let no_peer = P2pError::Timeout {
+            component: "direct peer availability",
+        };
+        let config = RethP2pConfig::default();
+        assert_eq!(
+            live_material_wave_end(&config, &mut 0, Duration::ZERO, &no_peer),
+            LiveWaveEnd::Fail,
+            "an empty pool kept the live body request waiting"
+        );
+        assert_eq!(
+            pending_live_material_delay(&config, &mut 0, &no_peer, true, true),
+            None
+        );
+    }
+
+    #[test]
+    fn filtered_log_receipts_are_bounded_like_other_live_material() {
+        let config = RethP2pConfig::default();
+        // No peer serves the receipts of a validated header's block that the
+        // lane's filtered-log request needs.
+        let missing = P2pError::IncompleteResponse {
+            component: "receipts",
+            returned: 0,
+            expected: 1,
+        };
+        let mut waves = 0;
+        let mut elapsed = Duration::ZERO;
+        let mut ends = Vec::new();
+        while ends.len() < 64 {
+            let end = live_material_wave_end(&config, &mut waves, elapsed, &missing);
+            ends.push(end);
+            let LiveWaveEnd::NextWave(pause) = end else {
+                break;
+            };
+            elapsed += pause;
+        }
+        assert_eq!(
+            ends.last(),
+            Some(&LiveWaveEnd::Withheld),
+            "filtered-log receipts are not bounded like other live material: {ends:?}"
+        );
+        assert_eq!(waves, 8);
+        assert_eq!(
+            live_material_wave_end(&config, &mut 0, Duration::from_mins(1), &missing),
+            LiveWaveEnd::Withheld
+        );
+        // The header is then given up, which the lane reports.
+        assert_eq!(
+            pending_live_material_delay(
+                &config,
+                &mut 0,
+                &withheld_live_material("receipts", 25_000_001, 8),
+                true,
+                true
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn withheld_header_strikes_outlast_header_successes_until_a_frame_completes() {
+        let (pool, peers, receivers) = header_peer_pool(&[0xd1, 0xd2]);
+        let (fabricator, honest) = (peers[0], peers[1]);
+        // The fabricator has served verified bodies before, so it ranks
+        // first for headers.
+        pool.quality.record_success(
+            fabricator,
+            PeerMaterialKind::Body,
+            25_000_000,
+            Duration::from_millis(10),
+        );
+        let header_race = |excluded: &[B512]| {
+            pool.try_acquire_excluding(
+                PeerMaterialKind::Header,
+                1,
+                &excluded.iter().copied().collect(),
+                None,
+            )
+            .map(|lease| lease.peer.peer_id)
+        };
+        let serve_header = |excluded: &[B512]| {
+            let mut lease = pool
+                .try_acquire_excluding(
+                    PeerMaterialKind::Header,
+                    1,
+                    &excluded.iter().copied().collect(),
+                    None,
+                )
+                .expect("a header peer");
+            lease.succeeded();
+            lease.peer.peer_id
+        };
+        assert_eq!(serve_header(&[]), fabricator);
+
+        // No peer serves the body of the header it served within the bound:
+        // the lane gives the header up and strikes its peer.
+        let before = Instant::now();
+        pool.strike_withheld_header(fabricator);
+        let after = Instant::now();
+        let first_strike = withheld_strike(&pool, fabricator);
+        // While the strike lasts, header races ask other peers.
+        assert_eq!(header_race(&[]), Some(honest));
+        assert_eq!(header_race(&[honest]), None, "a struck peer was asked");
+        // Once it has cooled, the peer serves a header again...
+        age_header_lanes(&pool, Duration::from_millis(250));
+        assert_eq!(serve_header(&[honest]), fabricator);
+        // ...which lifts a lane cooldown, but not the strike: the next header
+        // race still asks the honest peer first.
+        assert_eq!(
+            header_race(&[]),
+            Some(honest),
+            "a header success cleared the withheld-material strike"
+        );
+        assert_eq!(first_strike.0, 1);
+        assert!(first_cooldown_step(first_strike.1, before, after));
+
+        // The strike escalates like a lane cooldown, up to 30 s.
+        let before = Instant::now();
+        pool.strike_withheld_header(fabricator);
+        let after = Instant::now();
+        let (strikes, until) = withheld_strike(&pool, fabricator);
+        assert_eq!(strikes, 2);
+        assert!(cooldown_step(
+            Duration::from_millis(500),
+            until,
+            before,
+            after
+        ));
+        for _ in 0..8 {
+            pool.strike_withheld_header(fabricator);
+        }
+        let before = Instant::now();
+        pool.strike_withheld_header(fabricator);
+        let after = Instant::now();
+        let (strikes, until) = withheld_strike(&pool, fabricator);
+        assert_eq!(strikes, 11);
+        assert!(cooldown_step(Duration::from_secs(30), until, before, after));
+
+        // A frame on one of its headers completes: its header was real, the
+        // strike clears, and it ranks first again.
+        pool.clear_withheld_header(fabricator);
+        assert_eq!(withheld_strike(&pool, fabricator).0, 0);
+        assert_eq!(header_race(&[]), Some(fabricator));
+        drop(receivers);
+    }
+
+    #[test]
+    fn a_silent_head_poll_cohort_is_reported_once_its_silence_outlasts_the_grace() {
+        let config = RethP2pConfig::default();
+        let source = RethP2pSource::mainnet(config.clone()).expect("source");
+        let grace = source.descriptor.expected_lag.max(config.poll_interval);
+        assert_eq!(grace, Duration::from_secs(12));
+        let silent = P2pError::Timeout {
+            component: "headers",
+        };
+        let not_yet = P2pError::IncompleteResponse {
+            component: "headers",
+            returned: 0,
+            expected: 1,
+        };
+        let started = Instant::now();
+        let mut attempts = 0;
+        let mut silent_since = None;
+        let mut poll_failed = |at: Instant, error: &P2pError, manager_current: bool| {
+            head_poll_failure(
+                &config,
+                &mut attempts,
+                &mut silent_since,
+                at,
+                grace,
+                error,
+                manager_current,
+            )
+        };
+        // The cohort's peers time out: the lane polls others, within the
+        // grace...
+        assert!(matches!(
+            poll_failed(started, &silent, true),
+            HeadPollFailure::Retry(_)
+        ));
+        assert!(matches!(
+            poll_failed(
+                started + grace.saturating_sub(Duration::from_millis(1)),
+                &silent,
+                true
+            ),
+            HeadPollFailure::Retry(_)
+        ));
+        // ...until no polled peer has answered for the grace: the lane then
+        // reports itself disconnected, and keeps polling.
+        assert!(
+            matches!(
+                poll_failed(started + grace, &silent, true),
+                HeadPollFailure::Report(_)
+            ),
+            "a silent head-poll cohort never cleared readiness"
+        );
+        // A peer that answers, even "not yet", ends the silence.
+        assert!(matches!(
+            poll_failed(started + grace + config.poll_interval, &not_yet, true),
+            HeadPollFailure::Retry(_)
+        ));
+        assert!(matches!(
+            poll_failed(started + grace + config.poll_interval * 2, &silent, true),
+            HeadPollFailure::Retry(_)
+        ));
+        // A stopped manager reconnects.
+        assert_eq!(
+            poll_failed(started + grace * 3, &silent, false),
+            HeadPollFailure::Reconnect
+        );
+    }
+
+    #[test]
+    fn head_poll_tolerance_never_exceeds_the_first_retry_pause() {
+        let peer = |marker: u8| B512::from([marker; 64]);
+        let block = BlockNumber(25_000_001);
+        let slot = Duration::from_secs(12);
+        let previous = Instant::now();
+        // With a first retry pause of 100 ms, polls for one block can be
+        // 150 ms apart: a peer asked by the poll before the serving one may
+        // have been asked before the block existed.
+        let mut rotation = HeadPollRotation::new(Duration::from_millis(100));
+        assert!(rotation.begin_poll(block).is_empty());
+        rotation.record_not_yet(
+            peer(1),
+            previous + slot.saturating_sub(Duration::from_millis(150)),
+        );
+        rotation.record_not_yet(
+            peer(2),
+            previous + slot.saturating_sub(Duration::from_millis(50)),
+        );
+        rotation.record_served(peer(3), previous + slot);
+        assert_eq!(
+            rotation.begin_poll(BlockNumber(block.0 + 1)),
+            vec![peer(2)],
+            "a peer asked by an earlier poll was cooled"
+        );
+    }
+
+    #[test]
+    fn reorg_retries_report_the_lane_disconnected_once() {
+        let timeout = P2pError::Timeout {
+            component: "reorg headers",
+        };
+        let mut reported = false;
+        assert_eq!(reorg_failure(&timeout, &mut reported), ReorgFailure::Report);
+        assert_eq!(
+            reorg_failure(&timeout, &mut reported),
+            ReorgFailure::Retry,
+            "every reorg retry reported the lane disconnected again"
+        );
+        assert!(reported);
+        // A reorg proven deeper than the window still resets.
+        assert_eq!(
+            reorg_failure(&P2pError::ReorgTooDeep { maximum: 64 }, &mut reported),
+            ReorgFailure::Reset
+        );
+    }
+
+    #[test]
+    fn a_live_material_request_ends_at_its_deadline() {
+        let source = RethP2pSource::mainnet(RethP2pConfig::default()).expect("source");
+        let header_peer = B512::from([0xf1; 64]);
+        let (sender, _receiver) = tokio::sync::mpsc::channel(1);
+        source.network.direct_peers.insert(DirectPeer {
+            peer_id: header_peer,
+            eth_version: EthVersion::Eth68,
+            messages: PeerRequestSender::new(header_peer, sender),
+        });
+        let strikes = || withheld_strike(&source.network.direct_peers, header_peer).0;
+        let mut bound = LiveMaterialBound::new("bodies", 25_000_001, Some(header_peer));
+        // A minute after the request started, its deadline ends even a wave
+        // in progress. In the first wave, no peer has answered that it lacks
+        // the body yet: the request times out, and nobody is struck.
+        assert!(matches!(
+            source.live_material_deadline_passed(&bound),
+            P2pError::Timeout {
+                component: "bodies"
+            }
+        ));
+        assert_eq!(strikes(), 0);
+        // After a wave in which no peer served the body, the header is given
+        // up, and its peer struck.
+        bound.waves = 1;
+        let withheld = source.live_material_deadline_passed(&bound);
+        assert!(
+            matches!(
+                withheld,
+                P2pError::Request {
+                    component: "bodies",
+                    ..
+                }
+            ),
+            "{withheld}"
+        );
+        assert_eq!(strikes(), 1);
+        // The lane does not wait that out: it reports itself disconnected.
+        assert_eq!(
+            pending_live_material_delay(&source.config, &mut 0, &withheld, true, true),
+            None
         );
     }
 }

@@ -42,9 +42,36 @@ record, and documented RPC contracts.
   proven to it), still bans the peer and stores the failure. A mismatch with
   an unverified expectation, and an empty or short reply, costs at most a
   short local cooldown. The same rule applies to the peer preview of
-  `leani subscribe`, to the replacement branch fetched for a reorg, and to
-  `leani source probe p2p --expected-tip`. Reorg reconstruction still reports
-  a peer to Reth when it returns no headers for the claimed head's hash.
+  `leani subscribe`, to reorg reconstruction, which no longer reports a peer
+  to Reth for returning no headers, and to
+  `leani source probe p2p --expected-tip`.
+- An execution peer that serves the live lane the next block's header and
+  withholds its body or receipts no longer stalls the lane. A live body or
+  receipt request, including the receipts of filtered-log subscriptions, now
+  gives up after eight waves across the peer pool or a minute, even inside a
+  wave. The lane then reports itself disconnected, which clears readiness,
+  and asks another peer for the header. The peer that served the header
+  takes a strike: it is not asked for headers for a cooldown that grows with
+  each strike, up to 30 seconds, and ranks after other peers until a block
+  whose header it served completes. A header it serves in the meantime lifts
+  neither, and nothing is banned or stored. A live header also earns its
+  peer's stored service evidence and Reth reputation only once its body and
+  receipts arrive. The lane used to retry forever while still reporting itself
+  ready, and to reward the header first.
+- One execution peer serving a forged segment of the history bridge's header
+  proof no longer blocks the bridge. The proof is checked from the finalized
+  anchor down, each segment against the parent that the proven segment above
+  it names. A segment that does not match is reported to Reth and fetched
+  again, and the segments already proven are kept. A bad segment, or a wrong
+  last block, used to wedge the proof, and every history stream waiting for
+  it, until restart. A stream waiting for the proof now also stops once it is
+  cancelled.
+- eth/70 receipt requests take at most eight continuation rounds and 64 MiB of
+  responses, instead of up to 64 rounds of up to 10 MiB each before any check.
+  A block never takes more receipts than its known transactions, and each
+  block is checked against its header as it completes. A peer whose receipts
+  fail that check is banned, and the failure stored, like any peer serving
+  invalid receipts.
 - An existing execution P2P identity (`execution-p2p-secret`) that group or
   other users can access is restricted to mode 0600 on load, with a warning.
   Creating the identity removes its temporary file on every failure and syncs
@@ -186,7 +213,7 @@ record, and documented RPC contracts.
   peer claimed in its status. One status claiming block 18446744073709551615
   set that value for the session's lifetime. While the node catches up, these
   fields now follow its validated progress instead of the claimed network
-  head.
+  head. The network dashboard calls it the verified head throughout.
 - Execution P2P schedules every material request under one process-wide
   limit, the larger of `material_request_concurrency` and
   `history_header_request_concurrency`, instead of comparing each caller's
@@ -577,12 +604,39 @@ record, and documented RPC contracts.
   not been asked for that block yet, until every eligible peer has been asked
   and the rotation starts over. An empty reply for a block that is not
   produced yet no longer counts as a failure with an exponential cooldown.
-  Once another peer has served the block, the peers that answered "not yet"
-  for it get the normal lane cooldown, so peers that withhold new blocks drop
-  out of later polls; nothing is stored against them and they are not
-  banned. The request for the minimum live head, the verified tip or the
-  block after the finalized anchor, still races every eligible peer, and an
-  empty reply there cools the peer's header lane.
+  Once the lane moves on with a block that a poll served, a peer that answered
+  "not yet" for it after that serve, or up to 250 ms before it (at most the
+  first retry pause), as a peer asked in the same poll does, gets the normal
+  lane cooldown, so peers that withhold new blocks drop out of later polls;
+  nothing is stored against them and they are not banned. Peers asked before
+  the block existed are not cooled, so the polls of each slot no longer push
+  honest peers toward the 30-second cooldown cap. The request for the minimum
+  live head, the verified tip or the block after the finalized anchor, races
+  three eligible peers at a time instead of up to 32, and an empty reply there
+  cools the peer's header lane.
+- A head poll whose last peer times out, or cannot take the request, no longer
+  reports the live lane disconnected: the next poll asks other peers. Once no
+  polled peer has answered for the head grace, 12 seconds by default, the lane
+  reports itself disconnected, once, and keeps polling.
+- The live execution P2P lane reconnects after the zero-peer watchdog stops
+  the network manager (`sources.live.peer_recovery_timeout_seconds`, five
+  minutes by default): its reconnection rebuilds the manager. The lane kept
+  the stopped manager's session and never followed the head again, and a
+  live body request kept waiting for a peer in the emptied pool. A live
+  subscription still waiting for its first peer head now connects again too,
+  instead of waiting forever.
+- A shallow reorg while the live lane catches up is reconstructed from where
+  the branch forks, not from the head discovered far ahead. That made the
+  reorg look deeper than the retained window, reset every lane, and repeated
+  after the restart. Reorg reconstruction retries a peer without the branch,
+  a short reply, or a timeout, and reports the lane disconnected once until
+  the lane moves again; only a branch proven to fork below the retained window
+  resets the lane.
+- eth/70 peers are no longer rejected for the receipts of blocks without
+  transactions, and those receipts are no longer requested: the block's empty
+  receipts root proves them.
+- Stopping the node no longer waits five seconds for the execution network
+  manager and then aborts it before it stores the final peer state.
 - Execution peer qualification no longer marks a peer `lagging` from its
   handshake head, which is fixed when the session opens, but asks the peer.
   Lagging and timed-out probes are no longer stored as service failures and no
@@ -597,7 +651,9 @@ record, and documented RPC contracts.
   active sessions every 10 seconds. A lost session event no longer leaves a
   closed session's request sender in the pool or hides a connected peer. A
   peer dropped for invalid material is not taken back while its session
-  lasts, which Reth keeps open for trusted peers.
+  lasts, which Reth keeps open for trusted peers. Only the session that
+  served the invalid material is dropped: a session the peer opened since
+  stays in the pool.
 - `leani source probe p2p` uses a throwaway identity, an in-memory peer store,
   and ephemeral ports, so it can run beside a live node without the
   data-directory lock and never changes the node's peer store or identity. It

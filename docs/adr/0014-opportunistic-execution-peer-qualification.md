@@ -48,11 +48,21 @@ commitments, and receipts are checked against both the receipt root and body.
   Honest peers on another branch, or behind a claimed head, answer this way;
 - polling for the next block asks one or two peers per poll, taken from those
   not yet asked for that block; once every eligible peer has been asked, the
-  rotation starts over. An empty reply there is not a failure, but once
-  another peer has served the block, the peers that answered "not yet" get
-  the normal lane cooldown. Requests for blocks that exist, such as a
-  catch-up range or the minimum live head, race the eligible peers, and an
-  empty reply to them cools the peer's lane;
+  rotation starts over. An empty reply there is not a failure. Once the lane
+  moves on with a block that a poll served, a peer that answered "not yet"
+  after that serve, or up to 250 ms (at most the first retry pause) before it,
+  as a peer asked in the same poll does, gets the normal lane cooldown; peers
+  asked before the block existed do not. Requests for blocks that exist race
+  the eligible peers: all of them for a catch-up range, three at a time for
+  the minimum live head. An empty reply to them cools the peer's lane;
+- when no peer serves the body or receipts of a validated live header within
+  eight waves across the pool, or a minute, the header is given up and asked
+  of another peer. The peer that served it takes a withheld-header strike: it
+  is not asked for headers for a cooldown that grows with each strike, up to
+  30 seconds, and ranks after other header peers until a frame on one of its
+  headers completes. Its header successes lift neither, and nothing is banned
+  or persisted. A live header earns its peer's service evidence and
+  reputation only once the frame completes;
 - qualification probes each peer with real requests at the current target,
   never from its handshake head, and compares targets by block number and
   hash. Lagging and timed-out probes are not persisted as failures and never
@@ -83,8 +93,17 @@ match, and a verified expectation still bans a peer that contradicts it.
 
 Peers that withhold the next block cannot stall the live lane either: each
 poll asks peers not yet asked for the block, and a peer that answered "not
-yet" for a block another peer served cools like any lagging peer. A slightly
-late but honest peer pays the same short cooldown, and a success resets it.
+yet" after another peer served the block, or together with it, cools like any
+lagging peer. A peer asked before the block existed pays nothing, so the
+roughly nine polls of each slot do not push honest peers toward the 30-second
+cooldown cap. An honest peer asked with the serving peer that has not received
+the block yet pays the first short cooldown, and a success resets it. A peer
+that serves a header whose body or receipts no other peer has stalls the lane
+for at most eight waves or a minute. It then takes a strike that its next
+header successes do not lift, so while other peers serve headers it does not
+win the next races and stall the lane again; each further strike doubles its
+cooldown, up to 30 seconds. An honest peer's strike clears with its next
+completed frame.
 
 ## Evidence
 

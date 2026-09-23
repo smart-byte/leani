@@ -31,8 +31,9 @@ stacks.
 - a global material gate starts request timeouts only after connected-peer
   capacity is available across all lanes, and queued live-head work takes the
   next available slot before normal catch-up work;
-- body and receipt batches start at one block, grow to two and four after
-  success, and reset independently after failure;
+- body and receipt batches start at `material_request_blocks`, eight blocks by
+  default, halve independently after a failed batch, and double again after
+  eight successful ones, up to that size;
 - history emits verified material in at most four-block units and retains
   successful bodies while receipts retry;
 - a retained parent-linked canonical suffix may seed live reorg context and

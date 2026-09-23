@@ -231,7 +231,7 @@
     <h2>Active and recent P2P sessions</h2>
     <div class="table-wrap">
       <table>
-        <thead><tr><th>ID</th><th>Lane</th><th>Phase</th><th>Peers</th><th>Known</th><th>Observed head</th><th>Work range</th><th>Attempts</th><th>Age</th><th>Last error</th></tr></thead>
+        <thead><tr><th>ID</th><th>Lane</th><th>Phase</th><th>Peers</th><th>Known</th><th>Verified head</th><th>Work range</th><th>Attempts</th><th>Age</th><th>Last error</th></tr></thead>
         <tbody id="sessions"></tbody>
       </table>
     </div>
@@ -286,7 +286,7 @@
     el("blocks-detail").textContent = maximumRemaining == null
       ? "Waiting for a catch-up target"
       : maximumRemaining === 0
-        ? "Observed catch-up range is fully covered"
+        ? "Catch-up range is fully covered through the verified head"
         : `${fmt(rangeCount)} missing range${rangeCount === 1 ? "" : "s"} across ${fmt(processors.length)} processor${processors.length === 1 ? "" : "s"}`;
 
     const storage = data.storage || {};
@@ -373,18 +373,18 @@
       syncState = "finality wait";
     } else if (maximumRemaining != null && maximumRemaining > 0) {
       const target = processors.find(processor => processor.syncTargetBlock != null)?.syncTargetBlock;
-      title = `${fmt(maximumRemaining)} block${maximumRemaining === 1 ? "" : "s"} missing through the observed peer head`;
-      detail = `Stored data is contiguous so far, but coverage has not reached observed peer head ${fmt(target)}.`
+      title = `${fmt(maximumRemaining)} block${maximumRemaining === 1 ? "" : "s"} missing through the verified head`;
+      detail = `Stored data is contiguous so far, but coverage has not reached verified head ${fmt(target)}.`
         + (activeLive ? ` The live session is ${words(activeLive.phase)}.` : "");
       syncState = `${fmt(maximumRemaining)} behind`;
     } else if (data.readiness.ready) {
       tone = "good";
       title = "Live-ready";
-      detail = "Stored processor data is contiguous through the latest observed peer head and the verified live subscription is usable.";
+      detail = "Stored processor data is contiguous through the latest verified head and the verified live subscription is usable.";
       syncState = "live";
     } else if (activeLive) {
       title = "Completing the live handoff";
-      detail = `Stored data is contiguous through the latest observed peer head. The live session is still ${words(activeLive.phase)}, so readiness remains false.`;
+      detail = `Stored data is contiguous through the latest verified head. The live session is still ${words(activeLive.phase)}, so readiness remains false.`;
       syncState = "handoff";
     } else if (supervisor.state === "running") {
       title = "Starting the required network lane";
@@ -537,11 +537,11 @@
           ? onDemand
             ? "active requested history covered"
             : c.state === "live"
-              ? "observed peer head covered"
+              ? "verified head covered"
               : processor.storedRangeContiguous
-                ? "observed peer head covered; live handoff pending"
-                : "observed peer head covered; stored gaps remain"
-          : `${fmt(processor.blocksRemaining)} blocks missing through ${onDemand ? "requested history" : "observed head"}`;
+                ? "verified head covered; live handoff pending"
+                : "verified head covered; stored gaps remain"
+          : `${fmt(processor.blocksRemaining)} blocks missing through ${onDemand ? "requested history" : "verified head"}`;
       const pending = processor.pendingDeltas
         ? `${fmt(processor.pendingDeltas)} pending delta${processor.pendingDeltas === 1 ? "" : "s"}`
         : "";
