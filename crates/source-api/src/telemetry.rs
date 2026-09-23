@@ -309,10 +309,7 @@ impl NetworkTelemetry {
 
     /// Record a fail-closed network-lane exit and its bounded retry delay.
     pub fn supervisor_backoff(&self, error: impl fmt::Display, retry: Duration) {
-        let mut error = error.to_string();
-        if error.len() > MAX_ERROR_LENGTH {
-            error.truncate(MAX_ERROR_LENGTH);
-        }
+        let error = bounded_error(error);
         let now = Instant::now();
         let mut supervisor = write_lock(&self.inner.supervisor);
         supervisor.state = NetworkSupervisorState::BackingOff;
@@ -580,10 +577,7 @@ impl NetworkSessionTelemetry {
     }
 
     pub fn record_error(&self, error: impl fmt::Display) {
-        let mut error = error.to_string();
-        if error.len() > MAX_ERROR_LENGTH {
-            error.truncate(MAX_ERROR_LENGTH);
-        }
+        let error = bounded_error(error);
         self.update(|record| record.last_error = Some(error));
     }
 
@@ -801,6 +795,14 @@ pub struct NetworkSessionSnapshot {
     pub update_age_seconds: u64,
 }
 
+/// Render `error` in at most [`MAX_ERROR_LENGTH`] bytes, cut at a character
+/// boundary: the text can come from a remote endpoint and need not be ASCII.
+fn bounded_error(error: impl fmt::Display) -> String {
+    let mut error = error.to_string();
+    error.truncate(error.floor_char_boundary(MAX_ERROR_LENGTH));
+    error
+}
+
 fn read_lock<T>(lock: &RwLock<T>) -> std::sync::RwLockReadGuard<'_, T> {
     lock.read()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -943,5 +945,25 @@ mod tests {
         assert_eq!(stopped.state, NetworkSupervisorState::Stopped);
         assert_eq!(stopped.failures, 1);
         assert!(stopped.retry_in_seconds.is_none());
+    }
+
+    #[test]
+    fn long_non_ascii_errors_are_cut_at_a_character_boundary() {
+        // A two-byte character straddles the byte limit, as remote error text can.
+        let message = "a".repeat(MAX_ERROR_LENGTH - 1) + "é";
+        let assert_bounded = |error: Option<String>| {
+            let error = error.expect("error recorded");
+            assert!(error.len() <= MAX_ERROR_LENGTH);
+            assert!(std::str::from_utf8(error.as_bytes()).is_ok());
+            assert_eq!(error, "a".repeat(MAX_ERROR_LENGTH - 1));
+        };
+
+        let telemetry = NetworkTelemetry::default();
+        telemetry.supervisor_backoff(&message, Duration::from_secs(1));
+        assert_bounded(telemetry.snapshot().supervisor.last_error);
+
+        let session = telemetry.register(NetworkLane::Live);
+        session.record_error(&message);
+        assert_bounded(telemetry.snapshot().sessions[0].last_error.clone());
     }
 }

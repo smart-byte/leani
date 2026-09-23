@@ -150,17 +150,117 @@ record, and documented RPC contracts.
 - A paused processor lane that resumes no longer replays retained frames
   filtered for the processors that stayed live meanwhile. Live-gap replay
   treats such a frame as missing: it recovers a finalized block from the
-  configured history source, and at an unfinalized block it fails only that
-  processor's lane (`unfinalized_gap_unrecoverable`), as for a block that was
-  never retained. A mapping failure during block-local gap replay now also
-  fails only that processor's lane (`processor_live_mapping_failed`), as
-  ordered replay already did, instead of stopping shared live ingestion.
+  configured history source. At an unfinalized block, as for a block that was
+  never retained, only that processor's lane pauses
+  (`unfinalized_gap_waiting_for_finality`); the first drain after finality
+  reaches the block recovers it from history, with no operator reset. A
+  mapping failure during block-local gap replay now also fails only that
+  processor's lane (`processor_live_mapping_failed`), as ordered replay already
+  did, instead of stopping shared live ingestion. The replay-miss log is now
+  at debug level, since a waiting lane retries on every drain.
 - A source request compiled for several filtering requirements no longer
   narrows a field that one requirement leaves unfiltered. Previously an
   unfiltered field such as `addresses` took another requirement's list, so the
   source could omit material the unfiltered requirement needed.
 - `coverage_gaps` in `leani-source-api` no longer reports a range covered
   through block `u64::MAX` as missing.
+- A processor whose reducer rejects a block no longer stops live ingestion for
+  every processor, and a restart no longer loops on the same block. Reducer
+  errors, and the store's per-apply invariant errors, fail only that
+  processor's live lane (`processor_live_reduce_failed`) while the others keep
+  following. This holds for every processor mode and delivery ordering,
+  including block-local processors with the default canonical ordering, which
+  used to stop the whole lane. A delta that conflicts with the one already
+  applied for its block (`processor_live_delta_conflict`), and a mapping or
+  finality-variant failure while replaying (`processor_live_mapping_failed`),
+  likewise fail only that lane. Live commits and every live-gap replay path
+  apply this one isolation policy, so a replay after a restart or an operator
+  reset parks the lane again instead of failing the live lane. A failed lane
+  keeps its first failure: it is mapped only to move its first unapplied block
+  across a reorg, a later failure does not change its reason, and a later park
+  does not move its first unapplied block. Only a finality contradiction
+  (`processor_finality_conflict`) replaces the reason. The store applies this
+  rule atomically, so a park that races another component failing the lane,
+  such as finality, cannot unfail it; the store still records the first
+  unapplied block of a lane it fails itself for a delivery limit. The live-lane
+  reset route (`POST /admin/v1/processors/{processor}/lanes/live/reset`) now
+  accepts processors with canonical delivery ordering, which include every
+  ordered processor, instead of answering
+  `409 processor_has_no_split_live_stream`.
+- A failed automatic cold backfill, or a failed hot/cold overlap verification,
+  no longer ends the network lanes for every processor. That processor's
+  handoff is recorded as failed and its live lane pauses at the live tip
+  (`hot_cold_handoff_failed`); the other handoffs and live lanes continue. A
+  block-local lane replays and resumes at once. An ordered lane resumes once a
+  later backfill passes its gap: ordered replay now moves past a parked block
+  that history has already applied, instead of waiting for it forever.
+- A lane whose gap crosses the finalized anchor the node seeds at startup no
+  longer fails the whole live lane on every restart. The seeded canonical row
+  has no parent hash until the block's frame arrives; retaining that frame now
+  fills in its parent and timestamp, and a gap check treats a missing parent as
+  unknown instead of as a broken chain. A gap whose next canonical block truly
+  does not descend from it fails only that lane
+  (`live_gap_canonical_identity_changed`).
+- The live source request now covers every configured processor, including
+  lanes that are paused when the live lane subscribes. Frames retained while a
+  lane is paused carry its material, so it resumes by replaying them. A reorg no
+  longer fails a paused lane that cannot map the replacement block: the lane
+  stays paused, its gap moves to the replacement, and its own replay maps it.
+  A reorg that replaces blocks at or below a parked lane's gap moves the gap
+  down to the first replacement block. Before, an ordered lane stalled and a
+  block-local lane skipped the replacement blocks below its gap, or, after a
+  reorg to a shorter branch, resumed with a hole. A reorg without a
+  replacement branch no longer leaves a parked lane's gap on a block the chain
+  no longer has: the gap moves onto the new tip, which the lane has applied,
+  so a paused lane resumes at once, and a failed lane's gap moves onto the
+  tip's successor once that block arrives, where a reset replays it. Before,
+  a block-local lane skipped the next block or failed
+  (`live_gap_canonical_identity_changed`), and an ordered lane stalled. A gap
+  found off the canonical chain, as earlier versions could leave one, moves
+  back to the last canonical block the lane applied, instead of being
+  completed past blocks the lane never applied or failing the lane.
+- The shared live lane checks continuity before any processor maps a block. A
+  block must extend the canonical tip or repeat a block already retained, and a
+  reorg must first revert the canonical tip. A source that breaks this fails
+  the lane with `LiveGap` or `InvalidReorg`, and the supervisor reconnects,
+  instead of the block being applied.
+- The recent-frame hard limit, `budgets.recent_raw_hard_bytes`, now applies
+  when live ingestion retains a frame, not only when finality prunes. At the
+  limit live ingestion waits with readiness down (`recent_storage_full` in the
+  log) and resumes once finality prunes; no unfinalized frame is dropped. After
+  15 minutes at the limit the live lane fails, so the supervisor restarts it
+  from a fresh finalized anchor that finality can prune through. Finality no
+  longer fails its lane when pruning leaves frames above the hard limit; it
+  logs a warning.
+- One processor's failed finality update no longer stops finality for the
+  others or recent-frame pruning. It is logged, reported under
+  `failed_processors` in the shared finality report, and retried at the next
+  finalized anchor. A processor whose coverage holds the finalized hash at
+  another height contradicts the canonical chain: its lane fails
+  (`processor_finality_conflict`), and that reason replaces any earlier failure
+  reason. The reset route refuses that lane with
+  `409 live_lane_requires_rebuild`, since only rebuilding the processor as a
+  replacement instance repairs it. Finality skips any failed lane until it is
+  reset, so no later anchor finalizes a contradicted lane through the
+  contradicted height. A gap replay that finds its lane failed meanwhile, for
+  example by finality, leaves the lane failed instead of failing the whole
+  live lane.
+- Backfills that reuse retained recent frames read them in bounded batches, one
+  query each: at most `budgets.history_pipeline.commit.maximum_blocks` blocks
+  and `maximum_mapped_bytes` encoded bytes, each holding an active-chunk slot.
+  A long gap no longer loads the whole recent window into memory with one
+  query per block.
+- The live lane's gap drains, live commits, and the hot/cold handoff's
+  reconciliation no longer race each other over one lane's gap. Two drains of
+  the same gap could fail the live lane with "live gap marker changed".
+- A processor's retained raw-history source now uses the filter its own
+  backfill requests carry, which covers every requirement, instead of the first
+  requirement's filter. With several differently filtered requirements, the
+  source's material shape never matched those requests, and its filter could
+  omit material another requirement needed.
+- Network telemetry no longer panics when it shortens a long error message that
+  contains non-ASCII text, such as one from a Beacon API endpoint. The panic
+  stopped the network supervisor. Messages are now cut at a character boundary.
 
 ## [0.1.0-rc.1] - 2026-09-20
 

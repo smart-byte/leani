@@ -6192,6 +6192,24 @@ impl SqliteStore {
     /// Rejects invalid/corrupt material, canonical conflicts, oversized
     /// numeric fields, durable encoding failures, and database failures.
     pub async fn store_recent_frame(&self, frame: &BlockFrame) -> Result<(), StoreError> {
+        self.store_recent_frame_within(frame, u64::MAX).await
+    }
+
+    /// Persist one recent frame unless retaining it would take the chain's
+    /// retained recent frames above `hard_bytes` encoded bytes.
+    ///
+    /// Retaining an already retained frame again adds nothing and is always
+    /// accepted. The limit check and the insert share one writer turn.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::RecentStorageLimit`] when the frame does not fit,
+    /// and otherwise the same errors as [`Self::store_recent_frame`].
+    pub async fn store_recent_frame_within(
+        &self,
+        frame: &BlockFrame,
+        hard_bytes: u64,
+    ) -> Result<(), StoreError> {
         frame
             .validate_shape()
             .map_err(|error| StoreError::Invariant(error.to_owned()))?;
@@ -6220,13 +6238,23 @@ impl SqliteStore {
                 });
             }
         }
+        if hard_bytes != u64::MAX {
+            self.admit_recent_frame(frame, encoded.len(), hard_bytes)
+                .await?;
+        }
         let mut transaction = self.inner.pool.begin().await?;
+        // A row seeded from a finality anchor has no parent hash (zero) and
+        // its seeding time as timestamp; the retained frame supplies both.
         sqlx::query(
             "INSERT INTO canonical_blocks(
                 chain_id, block_number, block_hash, parent_hash, timestamp, finality
              ) VALUES (?, ?, ?, ?, ?, ?)
              ON CONFLICT(chain_id, block_number) DO UPDATE SET
-                finality = MAX(canonical_blocks.finality, excluded.finality)",
+                finality = MAX(canonical_blocks.finality, excluded.finality),
+                parent_hash = CASE WHEN canonical_blocks.parent_hash = zeroblob(32)
+                    THEN excluded.parent_hash ELSE canonical_blocks.parent_hash END,
+                timestamp = CASE WHEN canonical_blocks.parent_hash = zeroblob(32)
+                    THEN excluded.timestamp ELSE canonical_blocks.timestamp END",
         )
         .bind(u64_i64(frame.chain_id.0, "chain_id")?)
         .bind(u64_i64(frame.block.number.0, "block_number")?)
@@ -6274,6 +6302,46 @@ impl SqliteStore {
         }
         upsert_recent_transaction_locators(&mut transaction, frame).await?;
         transaction.commit().await?;
+        Ok(())
+    }
+
+    /// Refuse a new recent frame of `encoded_bytes` that would take the
+    /// chain's retained frames above `hard_bytes`. The caller holds the writer.
+    async fn admit_recent_frame(
+        &self,
+        frame: &BlockFrame,
+        encoded_bytes: usize,
+        hard_bytes: u64,
+    ) -> Result<(), StoreError> {
+        let retained_already: Option<i64> = sqlx::query_scalar(
+            "SELECT 1 FROM recent_blocks
+             WHERE chain_id = ? AND block_number = ? AND block_hash = ?",
+        )
+        .bind(u64_i64(frame.chain_id.0, "chain_id")?)
+        .bind(u64_i64(frame.block.number.0, "block_number")?)
+        .bind(frame.block.hash.0.as_slice())
+        .fetch_optional(&self.inner.pool)
+        .await?;
+        if retained_already.is_some() {
+            return Ok(());
+        }
+        // `length` of a blob reads only the row header, not the frame
+        // payload, unlike the `bytes` column stored after it.
+        let retained: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(SUM(length(encoded_frame)), 0)
+             FROM recent_blocks WHERE chain_id = ?",
+        )
+        .bind(u64_i64(frame.chain_id.0, "chain_id")?)
+        .fetch_one(&self.inner.pool)
+        .await?;
+        let projected_bytes = i64_u64(retained, "retained recent bytes")?
+            .saturating_add(u64::try_from(encoded_bytes).unwrap_or(u64::MAX));
+        if projected_bytes > hard_bytes {
+            return Err(StoreError::RecentStorageLimit {
+                limit_bytes: hard_bytes,
+                projected_bytes,
+            });
+        }
         Ok(())
     }
 
@@ -6541,6 +6609,61 @@ impl SqliteStore {
         .transpose()
     }
 
+    /// Read retained canonical frames upward from `range.start()`, in block
+    /// order, with one query.
+    ///
+    /// Reading stops at the end of `range`, at the first block without a
+    /// retained canonical frame, or before the frame that would take the
+    /// encoded frames read past `max_bytes`; the first frame is returned
+    /// whatever its size. Each frame reports its canonical block's current
+    /// finality, as [`Self::recent_frame`] does.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for corrupt durable material or a database failure.
+    pub async fn recent_frames(
+        &self,
+        chain_id: ChainId,
+        range: BlockRange,
+        max_bytes: u64,
+    ) -> Result<Vec<BlockFrame>, StoreError> {
+        let mut rows = sqlx::query(
+            "SELECT canonical.block_number, recent.encoded_frame,
+                    canonical.block_hash, canonical.finality
+             FROM canonical_blocks AS canonical
+             JOIN recent_blocks AS recent
+               ON recent.chain_id = canonical.chain_id
+              AND recent.block_number = canonical.block_number
+              AND recent.block_hash = canonical.block_hash
+             WHERE canonical.chain_id = ? AND canonical.block_number BETWEEN ? AND ?
+             ORDER BY canonical.block_number",
+        )
+        .bind(u64_i64(chain_id.0, "chain_id")?)
+        .bind(u64_i64(range.start().0, "block_number")?)
+        .bind(u64_i64(range.end().0, "block_number")?)
+        .fetch(&self.inner.pool);
+        let mut frames = Vec::new();
+        let mut bytes = 0_u64;
+        let mut expected = range.start().0;
+        while let Some(row) = rows.try_next().await? {
+            if i64_u64(row.try_get("block_number")?, "recent block number")? != expected {
+                break;
+            }
+            let encoded: Vec<u8> = row.try_get("encoded_frame")?;
+            let encoded_bytes = u64::try_from(encoded.len()).unwrap_or(u64::MAX);
+            if !frames.is_empty() && bytes.saturating_add(encoded_bytes) > max_bytes {
+                break;
+            }
+            frames.push(decode_recent_frame(
+                &encoded,
+                Some((row.try_get("block_hash")?, row.try_get("finality")?)),
+            )?);
+            bytes = bytes.saturating_add(encoded_bytes);
+            expected = expected.saturating_add(1);
+        }
+        Ok(frames)
+    }
+
     /// Read one retained frame by its exact block hash, including a bounded
     /// non-canonical fork candidate.
     ///
@@ -6668,6 +6791,34 @@ impl SqliteStore {
                 },
                 decode_finality(finality)?,
             ))
+        })
+        .transpose()
+    }
+
+    /// Return the highest canonical block retained for a chain, including a
+    /// seeded anchor or a block whose recent frame was pruned.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for corrupt canonical metadata or a failed read.
+    pub async fn canonical_tip(&self, chain_id: ChainId) -> Result<Option<BlockRef>, StoreError> {
+        let row: Option<(i64, Vec<u8>, Vec<u8>, i64)> = sqlx::query_as(
+            "SELECT block_number, block_hash, parent_hash, timestamp
+             FROM canonical_blocks
+             WHERE chain_id = ?
+             ORDER BY block_number DESC
+             LIMIT 1",
+        )
+        .bind(u64_i64(chain_id.0, "chain_id")?)
+        .fetch_optional(&self.inner.pool)
+        .await?;
+        row.map(|(number, hash, parent_hash, timestamp)| {
+            Ok(BlockRef {
+                number: BlockNumber(i64_u64(number, "canonical tip block number")?),
+                hash: decode_hash(hash)?,
+                parent_hash: decode_hash(parent_hash)?,
+                timestamp: i64_u64(timestamp, "canonical tip timestamp")?,
+            })
         })
         .transpose()
     }
@@ -7682,6 +7833,35 @@ impl SqliteStore {
         descriptor: &ProcessorDescriptor,
     ) -> Result<Option<HotColdHandoffRecord>, StoreError> {
         load_handoff(&self.inner.pool, id, descriptor).await
+    }
+
+    /// Record that a running hot/cold handoff failed before verification,
+    /// for example because its cold backfill failed. A handoff that already
+    /// has a verdict keeps it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for numeric overflow or a database failure.
+    pub async fn fail_hot_cold_handoff(
+        &self,
+        id: &str,
+        descriptor: &ProcessorDescriptor,
+        failure: &str,
+    ) -> Result<(), StoreError> {
+        let updated_at_unix_ms = now_milliseconds()?;
+        let _guard = self.inner.writer.lock().await;
+        sqlx::query(
+            "UPDATE hot_cold_handoffs
+             SET state = 'failed', failure = ?, updated_at_unix_ms = ?
+             WHERE handoff_id = ? AND processor_instance = ? AND state = 'running'",
+        )
+        .bind(failure)
+        .bind(u64_i64(updated_at_unix_ms, "updated_at_unix_ms")?)
+        .bind(id)
+        .bind(processor_instance(descriptor))
+        .execute(&self.inner.pool)
+        .await?;
+        Ok(())
     }
 
     /// Read the newest durable handoff for one processor instance.
@@ -12081,6 +12261,16 @@ impl SqliteStore {
     /// Atomically persist the first unapplied delta, its gap marker, and the
     /// processor-local paused/failed state.
     ///
+    /// A lane that is already failed keeps its first failure and is left
+    /// unchanged, so a park racing another component, such as finality, can
+    /// neither unfail it nor move its replay point. The one exception is the
+    /// failure the store records itself when an apply exceeds a delivery limit
+    /// under the `fail` action: while that lane has no marker yet, the marker
+    /// and delta are recorded, keeping the failed state and its reason, so an
+    /// operator reset can replay the block.
+    ///
+    /// Returns whether anything was recorded.
+    ///
     /// # Errors
     ///
     /// Returns an error for an invalid delta/reason, an identity conflict, or
@@ -12093,7 +12283,7 @@ impl SqliteStore {
         required_delivery_bytes: u64,
         failed: bool,
         persist_delta: bool,
-    ) -> Result<(), StoreError> {
+    ) -> Result<bool, StoreError> {
         if reason.trim().is_empty() {
             return Err(StoreError::InvalidConfig(
                 "processor live-lane park reason must not be empty".to_owned(),
@@ -12105,6 +12295,22 @@ impl SqliteStore {
         let now = now_i64()?;
         let _guard = self.inner.writer.lock().await;
         let mut transaction = self.inner.pool.begin().await?;
+        let (already_failed, store_recorded): (bool, bool) = sqlx::query_as(
+            "SELECT state = 'failed',
+                    IFNULL(reason, '') IN (
+                        'single_block_exceeds_delivery_limit', 'delivery_spool_hard_limit'
+                    ) AND NOT EXISTS(SELECT 1 FROM live_lane_gaps WHERE instance = ?)
+             FROM processor_runtime_state WHERE instance = ?",
+        )
+        .bind(&instance)
+        .bind(&instance)
+        .fetch_optional(&mut *transaction)
+        .await?
+        .unwrap_or_default();
+        if already_failed && !store_recorded {
+            transaction.rollback().await?;
+            return Ok(false);
+        }
         if persist_delta {
             sqlx::query(
                 "INSERT INTO pending_deltas(
@@ -12154,19 +12360,21 @@ impl SqliteStore {
         .bind(now)
         .execute(&mut *transaction)
         .await?;
-        sqlx::query(
-            "UPDATE processor_runtime_state
-             SET state = ?, reason = ?, updated_at_unix_ms = ?
-             WHERE instance = ?",
-        )
-        .bind(if failed { "failed" } else { "paused" })
-        .bind(reason)
-        .bind(now)
-        .bind(&instance)
-        .execute(&mut *transaction)
-        .await?;
+        if !already_failed {
+            sqlx::query(
+                "UPDATE processor_runtime_state
+                 SET state = ?, reason = ?, updated_at_unix_ms = ?
+                 WHERE instance = ?",
+            )
+            .bind(if failed { "failed" } else { "paused" })
+            .bind(reason)
+            .bind(now)
+            .bind(&instance)
+            .execute(&mut *transaction)
+            .await?;
+        }
         transaction.commit().await?;
-        Ok(())
+        Ok(true)
     }
 
     /// Atomically persist a first-unapplied marker and failed/paused lane state
@@ -12174,6 +12382,10 @@ impl SqliteStore {
     ///
     /// The canonical recent frame remains the replay input. This keeps a
     /// processor-local failure from terminating shared live/RPC ingestion.
+    ///
+    /// A lane that is already failed keeps its first failure: neither its
+    /// reason nor its marker changes, and no marker is planted where it has
+    /// none, so a later park can neither move its replay point nor unfail it.
     ///
     /// # Errors
     ///
@@ -12193,6 +12405,14 @@ impl SqliteStore {
         let instance = self.register_processor(descriptor).await?;
         let now = now_i64()?;
         let _guard = self.inner.writer.lock().await;
+        let state: Option<String> =
+            sqlx::query_scalar("SELECT state FROM processor_runtime_state WHERE instance = ?")
+                .bind(&instance)
+                .fetch_optional(&self.inner.pool)
+                .await?;
+        if state.as_deref() == Some(ProcessorRunState::Failed.as_str()) {
+            return Ok(());
+        }
         let mut transaction = self.inner.pool.begin().await?;
         sqlx::query(
             "INSERT INTO live_lane_gaps(
@@ -12387,16 +12607,30 @@ impl SqliteStore {
     /// indivisible item fits the processor's current delivery limit.
     ///
     /// The durable gap is retained and the lane moves to `paused`; the shared
-    /// live runtime then replays it before accepting new direct commits.
+    /// live runtime then replays it before accepting new direct commits. A lane
+    /// failed with `processor_finality_conflict` is refused, marker or not,
+    /// with [`StoreError::LiveLaneRequiresRebuild`]: its coverage contradicts
+    /// the canonical chain, and only a rebuild repairs it.
     ///
     /// # Errors
     ///
-    /// Returns an error when the lane is not failed, has no recovery marker,
-    /// still cannot fit, or the update fails.
+    /// Returns an error when the lane is not failed, needs a rebuild, has no
+    /// recovery marker, still cannot fit, or the update fails.
     pub async fn reset_failed_live_lane(
         &self,
         descriptor: &ProcessorDescriptor,
     ) -> Result<LiveLaneGap, StoreError> {
+        let instance = processor_instance(descriptor);
+        let _guard = self.inner.writer.lock().await;
+        let reason: Option<String> =
+            sqlx::query_scalar("SELECT reason FROM processor_runtime_state WHERE instance = ?")
+                .bind(&instance)
+                .fetch_optional(&self.inner.pool)
+                .await?
+                .flatten();
+        if reason.as_deref() == Some("processor_finality_conflict") {
+            return Err(StoreError::LiveLaneRequiresRebuild { instance });
+        }
         let gap = self.live_lane_gap(descriptor).await?.ok_or_else(|| {
             StoreError::InvalidConfig(format!(
                 "processor {} has no durable live gap to reset",
@@ -12412,7 +12646,6 @@ impl SqliteStore {
                 maximum_work_blocks: None,
             });
         }
-        let _guard = self.inner.writer.lock().await;
         let updated = sqlx::query(
             "UPDATE processor_runtime_state
              SET state = 'paused', reason = 'operator_reset_pending_replay',
@@ -12436,6 +12669,10 @@ impl SqliteStore {
     /// Fail one processor commit lane without affecting shared ingestion or
     /// unrelated processors.
     ///
+    /// A lane that is already failed keeps its first failure reason, except
+    /// that `processor_finality_conflict` overrides it: coverage contradicting
+    /// the canonical chain needs a rebuild whatever failed first.
+    ///
     /// # Errors
     ///
     /// Returns an error when the processor is absent or the state write fails.
@@ -12451,7 +12688,20 @@ impl SqliteStore {
         }
         let instance = processor_instance(descriptor);
         let _guard = self.inner.writer.lock().await;
-        let updated = sqlx::query(
+        let state: Option<String> =
+            sqlx::query_scalar("SELECT state FROM processor_runtime_state WHERE instance = ?")
+                .bind(&instance)
+                .fetch_optional(&self.inner.pool)
+                .await?;
+        let Some(state) = state else {
+            return Err(StoreError::Invariant(format!(
+                "processor runtime state is missing for {instance}"
+            )));
+        };
+        if state == ProcessorRunState::Failed.as_str() && reason != "processor_finality_conflict" {
+            return Ok(());
+        }
+        sqlx::query(
             "UPDATE processor_runtime_state
              SET state = 'failed', reason = ?, updated_at_unix_ms = ?
              WHERE instance = ?",
@@ -12461,11 +12711,6 @@ impl SqliteStore {
         .bind(&instance)
         .execute(&self.inner.pool)
         .await?;
-        if updated.rows_affected() != 1 {
-            return Err(StoreError::Invariant(format!(
-                "processor runtime state is missing for {instance}"
-            )));
-        }
         Ok(())
     }
 
@@ -17487,6 +17732,13 @@ pub enum StoreError {
         projected_bytes: u64,
     },
     #[error(
+        "recent frame storage limit: retaining the frame projects {projected_bytes} bytes; the hard limit is {limit_bytes}"
+    )]
+    RecentStorageLimit {
+        limit_bytes: u64,
+        projected_bytes: u64,
+    },
+    #[error(
         "SQLite-only backup would omit {segments} processor artifact segments; prune them or use a segment-aware data-directory backup"
     )]
     ArtifactSegmentBackupUnsupported { segments: u64 },
@@ -17518,6 +17770,10 @@ pub enum StoreError {
     },
     #[error("processor instance {0} has failed and requires operator recovery")]
     ProcessorFailed(String),
+    #[error(
+        "processor instance {instance} coverage contradicts the canonical chain; resetting its live lane cannot repair it, so rebuild it as a replacement processor instance"
+    )]
+    LiveLaneRequiresRebuild { instance: String },
     #[error("processor instance {0} has no committed cursor to checkpoint")]
     NoProcessorCursor(String),
     #[error("recovery checkpoint {checkpoint_id} does not exist for processor instance {instance}")]
@@ -22528,6 +22784,265 @@ mod tests {
                 .expect("retained transaction location")
                 .is_some()
         );
+    }
+
+    #[tokio::test]
+    async fn a_failed_lane_keeps_its_first_failure_unless_finality_contradicts_it() {
+        let (_directory, store) = store().await;
+        let processor = FixtureProcessor::new();
+        let descriptor = &processor.descriptor;
+        store
+            .register_processor(descriptor)
+            .await
+            .expect("register");
+        let first = frame(1, BlockHash::ZERO);
+        let second = frame(2, first.block.hash);
+        let lane = || async {
+            let state = store
+                .processor_runtime_state(descriptor)
+                .await
+                .expect("state");
+            let marker = store
+                .live_lane_gap(descriptor)
+                .await
+                .expect("gap")
+                .map(|gap| gap.first_unapplied);
+            let pending = store
+                .pending_deltas(descriptor, BlockNumber(0), 10)
+                .await
+                .expect("pending")
+                .len();
+            (state.state, state.reason, marker, pending)
+        };
+        let recorded = || {
+            (
+                ProcessorRunState::Failed,
+                Some("single_block_exceeds_delivery_limit".to_owned()),
+                Some(first.block),
+                1,
+            )
+        };
+
+        // The store fails a lane itself when one block exceeds the delivery
+        // limit. The park that follows records that failure's marker and
+        // pending delta.
+        store
+            .fail_processor_live_lane(descriptor, "single_block_exceeds_delivery_limit")
+            .await
+            .expect("store-recorded failure");
+        store
+            .park_processor_live_lane(
+                descriptor,
+                &EncodedDelta::new(descriptor, ChainId(1), first.block, vec![1]),
+                "single_block_exceeds_delivery_limit",
+                8,
+                true,
+                true,
+            )
+            .await
+            .expect("park");
+        assert_eq!(lane().await, recorded());
+
+        // Later failures change neither its reason nor its marker.
+        store
+            .park_processor_live_lane(
+                descriptor,
+                &EncodedDelta::new(descriptor, ChainId(1), second.block, vec![2]),
+                "processor_live_reduce_failed",
+                0,
+                true,
+                true,
+            )
+            .await
+            .expect("park");
+        store
+            .park_processor_live_lane_at(
+                descriptor,
+                second.block,
+                "processor_live_mapping_failed",
+                true,
+            )
+            .await
+            .expect("park");
+        store
+            .fail_processor_live_lane(descriptor, "finalized_gap_recovery_failed")
+            .await
+            .expect("fail");
+        assert_eq!(lane().await, recorded());
+
+        // A finality contradiction overrides it, and the lane then refuses a
+        // reset.
+        store
+            .fail_processor_live_lane(descriptor, "processor_finality_conflict")
+            .await
+            .expect("conflict");
+        assert_eq!(
+            lane().await.1.as_deref(),
+            Some("processor_finality_conflict")
+        );
+        assert!(matches!(
+            store.reset_failed_live_lane(descriptor).await,
+            Err(StoreError::LiveLaneRequiresRebuild { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_park_racing_a_finality_failure_leaves_the_failed_lane_alone() {
+        let (_directory, store) = store().await;
+        let processor = FixtureProcessor::new();
+        let descriptor = &processor.descriptor;
+        store
+            .register_processor(descriptor)
+            .await
+            .expect("register");
+        let first = frame(1, BlockHash::ZERO);
+        // An apply over the delivery limit under the pause action paused the
+        // lane; finality failed it before the runtime parked it.
+        store
+            .pause_processor_live_lane(descriptor, "delivery_spool_hard_limit")
+            .await
+            .expect("store-recorded pause");
+        store
+            .fail_processor_live_lane(descriptor, "processor_finality_conflict")
+            .await
+            .expect("conflict");
+
+        let recorded = store
+            .park_processor_live_lane(
+                descriptor,
+                &EncodedDelta::new(descriptor, ChainId(1), first.block, vec![1]),
+                "delivery_spool_hard_limit",
+                0,
+                false,
+                true,
+            )
+            .await
+            .expect("park");
+
+        assert!(!recorded);
+        let state = store
+            .processor_runtime_state(descriptor)
+            .await
+            .expect("state");
+        assert_eq!(
+            (state.state, state.reason.as_deref()),
+            (
+                ProcessorRunState::Failed,
+                Some("processor_finality_conflict")
+            )
+        );
+        assert!(
+            store
+                .live_lane_gap(descriptor)
+                .await
+                .expect("gap")
+                .is_none()
+        );
+        assert!(
+            store
+                .pending_deltas(descriptor, BlockNumber(0), 10)
+                .await
+                .expect("pending")
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_retained_frame_gives_its_seeded_anchor_row_the_real_parent() {
+        let (_directory, store) = store().await;
+        let first = frame(1, BlockHash::ZERO);
+        let second = frame(2, first.block.hash);
+        // A finality anchor is seeded before its frame arrives, with no known
+        // parent and the seeding time as its timestamp.
+        let seeded = |timestamp| BlockRef {
+            parent_hash: BlockHash::ZERO,
+            timestamp,
+            ..second.block
+        };
+        store
+            .store_canonical_anchor(ChainId(1), seeded(99), Finality::Finalized)
+            .await
+            .expect("seed anchor");
+        store.store_recent_frame(&first).await.expect("store first");
+        store
+            .store_recent_frame(&second)
+            .await
+            .expect("store second");
+
+        let (anchor, finality) = store
+            .canonical_block(ChainId(1), BlockNumber(2))
+            .await
+            .expect("canonical lookup")
+            .expect("anchor row");
+        assert_eq!(anchor, second.block);
+        assert_eq!(finality, Finality::Finalized);
+
+        // Seeding the anchor again keeps the real parent.
+        store
+            .store_canonical_anchor(ChainId(1), seeded(100), Finality::Finalized)
+            .await
+            .expect("seed anchor again");
+        assert_eq!(
+            store
+                .canonical_block(ChainId(1), BlockNumber(2))
+                .await
+                .expect("canonical lookup")
+                .expect("anchor row")
+                .0,
+            second.block
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_recent_insert_refuses_growth_past_the_hard_limit() {
+        let (_directory, store) = store().await;
+        let first = frame(1, BlockHash::ZERO);
+        let second = frame(2, first.block.hash);
+        let third = frame(3, second.block.hash);
+        store.store_recent_frame(&first).await.expect("store first");
+        let one_frame = store
+            .recent_stats(ChainId(1))
+            .await
+            .expect("recent stats")
+            .encoded_bytes;
+        let limit = one_frame * 2;
+        store
+            .store_recent_frame_within(&second, limit)
+            .await
+            .expect("the second frame fits");
+
+        assert!(matches!(
+            store.store_recent_frame_within(&third, limit).await,
+            Err(StoreError::RecentStorageLimit {
+                limit_bytes,
+                projected_bytes,
+            }) if limit_bytes == limit && projected_bytes == one_frame * 3
+        ));
+        assert!(
+            store
+                .canonical_block(ChainId(1), BlockNumber(3))
+                .await
+                .expect("canonical lookup")
+                .is_none(),
+            "a refused frame leaves no canonical pointer"
+        );
+        store
+            .store_recent_frame_within(&second, limit)
+            .await
+            .expect("retaining an already retained frame adds nothing");
+
+        store
+            .mark_recent_finalized(ChainId(1), BlockNumber(1), first.block.hash)
+            .await
+            .expect("finalize");
+        store
+            .prune_recent_frames(ChainId(1), BlockNumber(1), 1, 1, limit)
+            .await
+            .expect("prune");
+        store
+            .store_recent_frame_within(&third, limit)
+            .await
+            .expect("pruning makes room again");
     }
 
     #[tokio::test]

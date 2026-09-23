@@ -47,7 +47,12 @@ limits.
 A historical-only node may be ready while a requested range is incomplete;
 the range query still fails with `range_incomplete` unless the caller opts
 into partial data. A live profile remains not ready until its independently
-anchored live and finality actors report ready.
+anchored live and finality actors report ready. Live readiness also drops
+while retained recent frames sit at `budgets.recent_raw_hard_bytes`: live
+ingestion waits there, logging `recent_storage_full`, until finality prunes
+older frames (see [Storage pressure](#storage-pressure)). A parked processor
+lane does not affect readiness (see
+[Parked processor live lane](#parked-processor-live-lane)).
 
 With `sources.live.kind = "p2p"` and either supported finality backend, `serve`
 verifies the configured weak-subjectivity checkpoint, seeds the finalized
@@ -323,6 +328,60 @@ Never evict rollback data required by unfinalized blocks. Add capacity or stop
 included advancement before the hard limit. If the database file stays at its
 high-water mark after pruning, check the startup log for the auto-vacuum
 warning and run `db compact` once.
+
+Retained recent frames are the reorg and replay input, so the node never drops
+an unfinalized one to make room. When they reach
+`budgets.recent_raw_hard_bytes`, live ingestion stops before the next block,
+live readiness drops, and the log reports `recent_storage_full`. Ingestion
+resumes once a finality advance prunes older frames. After 15 minutes at the
+limit the live lane fails, and the supervisor restarts the network lanes from
+a fresh finalized anchor, which lets finality prune again. A node that keeps
+reaching the limit needs working finality, or a hard limit above the
+`rpc.minimum_recent_blocks` window plus the unfinalized tail.
+
+### Parked processor live lane
+
+A failure that belongs to one processor parks only that processor's live
+lane; shared ingestion, finality, and every other processor continue. This
+holds for every processor mode and delivery ordering.
+`/v1/processors/{id}/status` reports the lane as `paused` or `failed`.
+`/v1/network/status` adds its `runState`, `pauseReason`, and `liveGap` (the
+first unapplied block), and `leani_processor_run_state` carries the state. A
+paused lane resumes by itself. A failed lane is frozen: it commits no live
+block, and finality does not advance it. It is still mapped for a reorg's
+replacement blocks, only to move its first unapplied block onto the new
+branch. Its first failure stands: a later failure does not change its reason,
+and a later park does not move its first unapplied block. Only
+`processor_finality_conflict` replaces the reason. A failed lane waits for an
+operator: fix the cause, then call
+`POST /admin/v1/processors/{id}/lanes/live/reset`, which works for every
+delivery ordering and pauses the lane so that it replays from its first
+unapplied block. A lane that fails again on the same block parks again; it
+does not stop the node.
+
+A reorg never leaves a parked lane's first unapplied block on a block the
+chain no longer has. A reorg that replaces blocks at or below it moves it down
+to the first replacement block, so the lane replays the whole new branch. A
+reorg without a replacement branch moves it onto the new tip, which the lane
+has applied: a paused lane resumes at once, and a failed lane's first
+unapplied block moves onto the new tip's successor once that block arrives. A
+first unapplied block found off the canonical chain, as an earlier version
+could leave one, moves back to the last canonical block the lane applied; the
+lane then replays from there instead of skipping blocks or failing.
+
+| Reason | State | Resumes when |
+|---|---|---|
+| `delivery_spool_hard_limit`, `physical_store_hard_limit`, `artifact_store_hard_limit`, `pending_delta_hard_limit` | paused | Consumers acknowledge or storage frees up. |
+| `unfinalized_gap_waiting_for_finality` | paused | Finality reaches the first unapplied block, which then comes from the history source. No retained frame can serve that block, for example because it was retained without this processor's material. |
+| `finalized_gap_waiting_for_history_source`, `finalized_gap_recovery_unavailable`, `finalized_gap_recovery_incomplete` | paused | A history source can serve the finalized gap. |
+| `operator_reset_pending_replay` | paused | The replay after an operator reset reaches the live tip. |
+| `hot_cold_handoff_failed` | paused | The processor's automatic cold backfill or its overlap verification failed; the handoff is recorded as failed. A block-local lane replays and resumes at once. An ordered lane resumes once a later backfill, such as the one at the next start, passes its gap. |
+| `processor_live_reduce_failed` | failed | Reset after fixing the processor or its input. Its reducer, or the store's check of what the reducer wrote, rejected the block. |
+| `processor_live_mapping_failed` | failed | Reset after fixing the processor or its input. Mapping the block, or checking a pending delta's finality variants, failed. |
+| `processor_live_delta_conflict` | failed | Investigate before resetting: a pending delta for an applied block carries different content, so the processor's transform is not deterministic or its inputs differed. |
+| `single_block_exceeds_delivery_limit`, `single_delta_exceeds_pending_delta_limit`, `live_gap_marker_exceeds_pending_delta_budget` | failed | Reset after raising the limit. |
+| `live_gap_canonical_identity_changed` and the other `finalized_gap_recovery_*` reasons | failed | Reset after checking the history source against the canonical chain. |
+| `processor_finality_conflict` | failed | Rebuild the processor as a replacement instance; the reset route refuses this lane with `409 live_lane_requires_rebuild`. The same instance cannot be rebuilt in place today: configure a replacement instance, with a new processor version or configuration, and move to it as in [Processor rebuild or rollback](#processor-rebuild-or-rollback). Its coverage holds a finalized block hash at another height, so it contradicts the canonical chain, and finality stops advancing it. This reason replaces any earlier failure reason. |
 
 ### SQLite failure
 

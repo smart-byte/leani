@@ -720,6 +720,17 @@ paths:
       responses:
         "200":
           description: Paused live-lane reset state.
+        "409":
+          description: |
+            The lane cannot be reset. `single_block_exceeds_delivery_limit`:
+            its first unapplied block still exceeds the delivery limit; raise
+            the limit first. `live_lane_requires_rebuild`: the lane failed with
+            `processor_finality_conflict`, so its coverage contradicts the
+            canonical chain; rebuild the processor as a replacement instance.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorBody"
         default:
           $ref: "#/components/responses/Error"
   /admin/v1/processors/{processor}/artifacts:

@@ -109,7 +109,10 @@ root, or selected processor targets. Advanced documents keep every choice explic
 
 `budgets.recent_raw_soft_bytes` must not exceed
 `budgets.recent_raw_hard_bytes`. All byte budgets and concurrency values are
-positive.
+positive. Each finality advance prunes finalized recent frames toward the soft
+limit. Live ingestion enforces the hard limit as it retains each frame: at the
+limit it waits, with live readiness down, until finality prunes (see the
+operations runbook's storage pressure section).
 
 `[budgets.history_material]` is the sole budget for shared immutable source
 frames and acquisition reorder buffers. `[budgets.history_pipeline]` is
@@ -121,7 +124,10 @@ limit. `target_writer_hold` controls the adaptive block limit: the runtime
 halves the current limit when observed p95 historical writer hold time exceeds
 the target and cautiously grows it again below half the target. A single
 mapped delta or single-block commit that exceeds its byte limit fails
-immediately because waiting cannot make that item fit.
+immediately because waiting cannot make that item fit. A backfill that reuses
+retained recent frames reads them in batches of at most `commit.maximum_blocks`
+blocks and `maximum_mapped_bytes` encoded bytes, each holding one active-chunk
+slot like a physical history read.
 
 `[budgets.store].maximum_physical_bytes` is the emergency node-store admission
 bound shared by SQLite, its WAL, and configured processor-artifact segments.

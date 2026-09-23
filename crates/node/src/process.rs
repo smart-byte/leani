@@ -2526,6 +2526,93 @@ mod raw_history_control_tests {
             source.descriptor().kind == leani_primitives::SourceKind::RetainedHistory
         }));
     }
+
+    /// Only its descriptor matters: the raw-history profile is derived from it.
+    #[derive(Debug)]
+    struct RequirementsOnly {
+        descriptor: leani_processor_api::ProcessorDescriptor,
+    }
+
+    #[async_trait::async_trait]
+    impl leani_processor_api::Processor for RequirementsOnly {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
+        fn descriptor(&self) -> &leani_processor_api::ProcessorDescriptor {
+            &self.descriptor
+        }
+
+        async fn map(
+            &self,
+            _block: &leani_primitives::BlockFrame,
+        ) -> Result<leani_processor_api::EncodedDelta, leani_processor_api::ProcessorError>
+        {
+            Err(leani_processor_api::ProcessorError::Input(
+                "not mapped in this test".to_owned(),
+            ))
+        }
+
+        async fn reduce(
+            &self,
+            _transaction: &mut dyn leani_processor_api::ReducerTransaction,
+            _cursor: &leani_primitives::ProcessorCursor,
+            _delta: &leani_processor_api::EncodedDelta,
+        ) -> Result<leani_processor_api::DomainChanges, leani_processor_api::ProcessorError>
+        {
+            Err(leani_processor_api::ProcessorError::Input(
+                "not reduced in this test".to_owned(),
+            ))
+        }
+    }
+
+    #[test]
+    fn raw_history_profile_covers_every_requirement_like_the_backfill_request() {
+        use leani_processor_api::Processor as _;
+
+        let requirement = |filter| leani_processor_api::DataRequirement {
+            capabilities: CapabilitySet::of(Capability::Transactions),
+            log_fields: leani_primitives::LogFieldSet::NONE,
+            allow_filtered: true,
+            filter,
+            minimum_finality: leani_primitives::Finality::Included,
+        };
+        let mut descriptor = leani_testkit::BlockLocalCounter::named("raw-profile")
+            .descriptor()
+            .clone();
+        descriptor.requirements = vec![
+            requirement(leani_primitives::FilterScope {
+                senders: vec![leani_primitives::Address::new([0x55; 20])],
+                ..leani_primitives::FilterScope::default()
+            }),
+            requirement(leani_primitives::FilterScope::default()),
+        ];
+        let processor = RequirementsOnly { descriptor };
+
+        let profile = super::processor_raw_material_profile(&processor);
+
+        for requirement in &processor.descriptor().requirements {
+            assert!(
+                profile.filters.scope.covers(&requirement.filter),
+                "the profile narrows a requirement's filter: {:?}",
+                profile.filters
+            );
+        }
+        let request = leani_runtime::BackfillJob::for_processor(
+            "raw-profile",
+            &processor,
+            ChainId(1),
+            BlockRange::single(BlockNumber(0)),
+            leani_source_api::VerificationPolicy::TrustedDataset,
+        )
+        .expect("backfill job")
+        .request;
+        assert_eq!(
+            profile.shape_id(),
+            RawHistoryMaterialProfile::from_request(&request).shape_id(),
+            "the retained source must serve the processor's own backfill requests"
+        );
+    }
 }
 
 impl From<Exit> for ExitCode {
@@ -3734,6 +3821,41 @@ async fn collect_mainnet_e2e_processors(
     Ok(reports)
 }
 
+/// The raw-history material shape of a processor's own backfill requests, so
+/// its retained source serves exactly those requests: the filter covering
+/// every requirement when all accept filtered material, as
+/// `BackfillJob::for_processor` builds it, otherwise none.
+fn processor_raw_material_profile(
+    processor: &dyn leani_processor_api::Processor,
+) -> leani_store_history::RawHistoryMaterialProfile {
+    let requirements = &processor.descriptor().requirements;
+    let allow_filtered = requirements
+        .iter()
+        .all(|requirement| requirement.allow_filtered);
+    let filters = if allow_filtered {
+        let scope = leani_runtime::covering_filter_scope(
+            requirements.iter().map(|requirement| &requirement.filter),
+        );
+        leani_source_api::FilterSet {
+            senders: scope.senders.clone(),
+            recipients: scope.recipients.clone(),
+            scope,
+        }
+    } else {
+        leani_source_api::FilterSet::default()
+    };
+    leani_store_history::RawHistoryMaterialProfile {
+        allow_filtered,
+        projection: leani_source_api::FieldProjection::default(),
+        log_fields: requirements
+            .iter()
+            .fold(leani_primitives::LogFieldSet::NONE, |all, requirement| {
+                all.union(requirement.log_fields)
+            }),
+        filters,
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 pub(crate) fn configured_history_sources(
     config: &Config,
@@ -3837,19 +3959,10 @@ pub(crate) fn configured_history_sources(
         }
     }
     if let Some(store) = raw_history_store {
-        let first = requirements
+        requirements
             .first()
             .context("processor has no material requirements")?;
-        let material = leani_store_history::RawHistoryMaterialProfile {
-            allow_filtered,
-            projection: leani_source_api::FieldProjection::default(),
-            log_fields,
-            filters: leani_source_api::FilterSet {
-                scope: first.filter.clone(),
-                senders: first.filter.senders.clone(),
-                recipients: first.filter.recipients.clone(),
-            },
-        };
+        let material = processor_raw_material_profile(processor);
         let retained: std::sync::Arc<dyn HistorySource> = std::sync::Arc::new(
             leani_store_history::RetainedHistorySource::new(
                 store.clone(),
@@ -6038,6 +6151,8 @@ async fn run_network_lanes_once(
             pending_delta_bytes: config.budgets.pending_delta_bytes,
             sink_ids: Vec::new(),
             committed_events: Some(committed_events),
+            recent_hard_bytes: config.budgets.recent_raw_hard_bytes,
+            ..SharedLiveRuntimeConfig::default()
         },
     )?;
     if let Some(control) = &backfill_control {
@@ -6188,29 +6303,9 @@ async fn run_network_lanes_once(
     );
     let archive_reconciliations =
         run_archive_reconciliations(config, &store, &processors, lane_cancellation.clone());
-    let handoffs = async move {
-        let mut records = Vec::with_capacity(backfills.len());
-        for backfill in backfills {
-            records.push(
-                backfill
-                    .await
-                    .context("automatic cold backfill task panicked")??,
-            );
-        }
-        let reconciliation = handoff_runtime
-            .reconcile_pending()
-            .await
-            .context("drain ordered live deltas after hot/cold handoff")?;
-        for (processor, report) in reconciliation.processors {
-            if report.pending != 0 {
-                bail!(
-                    "processor {processor} retains {} pending deltas after verified handoff",
-                    report.pending
-                );
-            }
-        }
-        Ok::<_, anyhow::Error>(records)
-    };
+    let handoff_store = store.clone();
+    let handoffs =
+        async move { finish_cold_handoffs(&handoff_store, &handoff_runtime, backfills).await };
     tokio::pin!(live);
     tokio::pin!(finality);
     tokio::pin!(p2p_bridge_updates);
@@ -6279,13 +6374,23 @@ async fn run_network_lanes_once(
             result = &mut handoffs, if !handoffs_verified => {
                 handoffs_finished = true;
                 match result {
-                    Ok(records) => {
+                    Ok(summary) if summary.failed.is_empty() => {
                         handoffs_verified = true;
                         info!(
-                            handoffs = records.len(),
+                            handoffs = summary.verified.len(),
                             overlap_from,
                             overlap_to = selected.execution_block_number,
                             "all hot/cold handoffs verified"
+                        );
+                    }
+                    Ok(summary) => {
+                        handoffs_verified = true;
+                        warn!(
+                            verified = summary.verified.len(),
+                            failed = ?summary.failed,
+                            overlap_from,
+                            overlap_to = selected.execution_block_number,
+                            "hot/cold handoffs finished with failures; the failed processors stay parked while the others follow live"
                         );
                     }
                     Err(error) => break Err(error.context("hot/cold handoff failed closed")),
@@ -6584,6 +6689,94 @@ async fn run_archive_reconciliations(
     }
 }
 
+/// One processor's automatic cold backfill, or the verification of its
+/// hot/cold overlap, failed. The failure belongs to that processor alone.
+#[derive(Debug)]
+struct ColdHandoffFailure {
+    processor: leani_processor_api::ProcessorDescriptor,
+    handoff_id: String,
+    detail: String,
+}
+
+impl std::fmt::Display for ColdHandoffFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "hot/cold handoff {} failed for processor {}: {}",
+            self.handoff_id, self.processor.instance, self.detail
+        )
+    }
+}
+
+impl std::error::Error for ColdHandoffFailure {}
+
+/// How the automatic hot/cold handoffs of one network-lane start ended.
+#[derive(Debug)]
+struct ColdHandoffSummary {
+    verified: Vec<leani_store_sqlite::HotColdHandoffRecord>,
+    /// Instances whose backfill or verification failed; their lanes are parked.
+    failed: Vec<String>,
+}
+
+/// Wait for every automatic cold backfill and its handoff verification, then
+/// drain the ordered live deltas they released.
+///
+/// A processor whose backfill or verification failed has its handoff marked
+/// failed and its live lane parked; the other processors' handoffs and live
+/// lanes continue. Any other error fails the network lanes as before.
+async fn finish_cold_handoffs(
+    store: &leani_store_sqlite::SqliteStore,
+    live: &leani_runtime::SharedLiveRuntime,
+    backfills: Vec<tokio::task::JoinHandle<Result<leani_store_sqlite::HotColdHandoffRecord>>>,
+) -> Result<ColdHandoffSummary> {
+    let mut records = Vec::with_capacity(backfills.len());
+    let mut failed = std::collections::BTreeSet::new();
+    let mut failed_instances = Vec::new();
+    for backfill in backfills {
+        let failure = match backfill
+            .await
+            .context("automatic cold backfill task panicked")?
+        {
+            Ok(record) => {
+                records.push(record);
+                continue;
+            }
+            Err(error) => error.downcast::<ColdHandoffFailure>()?,
+        };
+        warn!(
+            processor = %failure.processor.instance,
+            handoff = %failure.handoff_id,
+            detail = %failure.detail,
+            "hot/cold handoff failed for one processor; its live lane is parked while the others continue"
+        );
+        store
+            .fail_hot_cold_handoff(&failure.handoff_id, &failure.processor, &failure.detail)
+            .await
+            .with_context(|| format!("record the failed handoff {}", failure.handoff_id))?;
+        live.park_processor_lane(&failure.processor, "hot_cold_handoff_failed")
+            .await
+            .with_context(|| format!("park the live lane of {}", failure.processor.instance))?;
+        failed.insert(failure.processor.id.to_string());
+        failed_instances.push(failure.processor.instance.to_string());
+    }
+    let reconciliation = live
+        .reconcile_pending()
+        .await
+        .context("drain ordered live deltas after hot/cold handoff")?;
+    for (processor, report) in reconciliation.processors {
+        if report.pending != 0 && !failed.contains(&processor) {
+            bail!(
+                "processor {processor} retains {} pending deltas after verified handoff",
+                report.pending
+            );
+        }
+    }
+    Ok(ColdHandoffSummary {
+        verified: records,
+        failed: failed_instances,
+    })
+}
+
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn spawn_cold_backfills(
     config: &Config,
@@ -6767,11 +6960,15 @@ async fn spawn_cold_backfills(
                         &job_id,
                         leani_runtime::HistoricalJobOwner::Materialization,
                         state,
-                        Some(error_message),
+                        Some(error_message.clone()),
                     )
                     .await;
-                    return Err(anyhow::Error::new(error)
-                        .context(format!("automatic cold backfill failed for {processor_id}")));
+                    return Err(ColdHandoffFailure {
+                        processor: processor_descriptor,
+                        handoff_id,
+                        detail: format!("automatic cold backfill failed: {error_message}"),
+                    }
+                    .into());
                 }
             };
             NativeBackfillControl::record_success(
@@ -6797,7 +6994,7 @@ async fn spawn_cold_backfills(
                     () = tokio::time::sleep(std::time::Duration::from_millis(100)) => {}
                 }
             }
-            let record = handoff_store
+            let record = match handoff_store
                 .verify_hot_cold_handoff(
                     &handoff_id,
                     &processor_descriptor,
@@ -6806,7 +7003,22 @@ async fn spawn_cold_backfills(
                     anchor_hash,
                 )
                 .await
-                .with_context(|| format!("verify hot/cold overlap for processor {processor_id}"))?;
+            {
+                Ok(record) => record,
+                Err(leani_store_sqlite::StoreError::HandoffMismatch { detail, .. }) => {
+                    return Err(ColdHandoffFailure {
+                        processor: processor_descriptor,
+                        handoff_id,
+                        detail: format!("hot/cold overlap verification failed: {detail}"),
+                    }
+                    .into());
+                }
+                Err(error) => {
+                    return Err(anyhow::Error::new(error).context(format!(
+                        "verify hot/cold overlap for processor {processor_id}"
+                    )));
+                }
+            };
             info!(
                 processor = %processor_id,
                 overlap_from = overlap.start().0,
@@ -7403,5 +7615,149 @@ mod tests {
             .expect("converged");
         assert_eq!(observation.latest_block, 4);
         assert!(observation.latest_block_age_seconds <= 2);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn one_failed_cold_backfill_parks_only_its_processor() {
+        use std::sync::Arc;
+
+        use leani_primitives::{BlockNumber, BlockRange, ChainId};
+        use leani_runtime::{SharedLiveRuntime, SharedLiveRuntimeConfig};
+        use leani_source_api::{ChainEvent, LiveStart};
+        use leani_store_sqlite::{
+            HotColdHandoffState, ProcessorRunState, SqliteStore, StoreConfig,
+        };
+        use leani_testkit::{
+            LiveStep, OrderedLedgerProcessor, ScriptedLiveSource, default_source_budget,
+            fixture_source_descriptor,
+        };
+
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = SqliteStore::open(StoreConfig::new(directory.path().join("handoff.sqlite")))
+            .await
+            .expect("store");
+        let mut parent = leani_primitives::BlockHash::ZERO;
+        let mut chain = Vec::new();
+        for number in 0..=3 {
+            let frame = fixture_frame(number, parent);
+            parent = frame.block.hash;
+            chain.push(frame);
+        }
+        for frame in &chain[..=2] {
+            store.store_recent_frame(frame).await.expect("recent frame");
+        }
+        // The ordered processor's history is far behind, so a parked lane
+        // stays parked until a later backfill reaches its gap.
+        let failed = Arc::new(OrderedLedgerProcessor::named("handoff-failed-ledger"));
+        let verified = Arc::new(BlockLocalCounter::named("handoff-verified-counter"));
+        let overlap = BlockRange::new(BlockNumber(1), BlockNumber(2)).expect("overlap");
+        let live = SharedLiveRuntime::new(
+            store.clone(),
+            Arc::new(ScriptedLiveSource::new(
+                fixture_source_descriptor(
+                    "handoff-live",
+                    BlockRange::new(BlockNumber(0), BlockNumber(3)).expect("range"),
+                ),
+                vec![LiveStep::Event(ChainEvent::Block(Box::new(
+                    chain[3].clone(),
+                )))],
+            )),
+            vec![failed.clone(), verified.clone()],
+            SharedLiveRuntimeConfig::default(),
+        )
+        .expect("live runtime");
+        live.reconcile_pending()
+            .await
+            .expect("startup reconciliation");
+        for (id, processor) in [
+            ("handoff-failed", failed.descriptor()),
+            ("handoff-verified", verified.descriptor()),
+        ] {
+            store
+                .begin_hot_cold_handoff(id, processor, ChainId(1), overlap, chain[2].block.hash)
+                .await
+                .expect("begin handoff");
+        }
+        let verified_record = store
+            .hot_cold_handoff("handoff-verified", verified.descriptor())
+            .await
+            .expect("handoff")
+            .expect("record");
+        let failure = ColdHandoffFailure {
+            processor: failed.descriptor().clone(),
+            handoff_id: "handoff-failed".to_owned(),
+            detail: "automatic cold backfill failed: injected source exhaustion".to_owned(),
+        };
+        let backfills = vec![
+            tokio::spawn(async move { Err(anyhow::Error::new(failure)) }),
+            tokio::spawn(async move { Ok(verified_record) }),
+        ];
+
+        let summary = finish_cold_handoffs(&store, &live, backfills)
+            .await
+            .expect("one processor's failed cold backfill does not fail the other handoffs");
+
+        assert_eq!(summary.verified.len(), 1);
+        assert_eq!(summary.verified[0].processor_id, "handoff-verified-counter");
+        assert_eq!(
+            summary.failed,
+            vec![failed.descriptor().instance.to_string()]
+        );
+        let failed_handoff = store
+            .hot_cold_handoff("handoff-failed", failed.descriptor())
+            .await
+            .expect("handoff")
+            .expect("record");
+        assert_eq!(failed_handoff.state, HotColdHandoffState::Failed);
+        assert!(
+            failed_handoff
+                .failure
+                .as_deref()
+                .is_some_and(|failure| failure.contains("injected source exhaustion"))
+        );
+        let parked = store
+            .processor_runtime_state(failed.descriptor())
+            .await
+            .expect("state");
+        assert_eq!(parked.state, ProcessorRunState::Paused);
+        assert_eq!(parked.reason.as_deref(), Some("hot_cold_handoff_failed"));
+        assert_eq!(
+            store
+                .live_lane_gap(failed.descriptor())
+                .await
+                .expect("gap")
+                .expect("parked at the live tip")
+                .first_unapplied,
+            chain[2].block
+        );
+
+        // The other processor keeps following live blocks.
+        let report = live
+            .run(
+                LiveStart::Head,
+                default_source_budget(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("live run");
+        assert_eq!(report.processors["handoff-verified-counter"].applied, 1);
+        assert_eq!(report.processors["handoff-failed-ledger"].applied, 0);
+        assert_eq!(
+            store
+                .processor_runtime_state(verified.descriptor())
+                .await
+                .expect("state")
+                .state,
+            ProcessorRunState::Running
+        );
+        assert_eq!(
+            store
+                .processor_runtime_state(failed.descriptor())
+                .await
+                .expect("state")
+                .state,
+            ProcessorRunState::Paused
+        );
     }
 }

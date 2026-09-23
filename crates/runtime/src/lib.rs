@@ -22,8 +22,8 @@ use leani_primitives::{
     SourceKind, TrustModel, capability::CapabilitySet,
 };
 use leani_processor_api::{
-    DeliveryLimitAction, DeliveryOrdering, DeliveryPolicyMode, EncodedDelta, OutputPolicyMode,
-    Processor, ProcessorDescriptor, ProcessorError, PublicationPolicy, ReductionMode, StartPoint,
+    DeliveryLimitAction, DeliveryPolicyMode, EncodedDelta, OutputPolicyMode, Processor,
+    ProcessorDescriptor, ProcessorError, PublicationPolicy, ReductionMode, StartPoint,
 };
 use leani_source_api::{
     ChainEvent, ConsensusCheckpoint, DataRequest, FinalityEvent, FinalitySource, HistorySource,
@@ -40,9 +40,10 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
-use tracing::warn;
+use tracing::{debug, info, warn};
 
 const FINALITY_ANCHOR_RETRY_INTERVAL: Duration = Duration::from_millis(250);
+const RECENT_STORAGE_RETRY_INTERVAL: Duration = Duration::from_millis(250);
 const FINALITY_RECONNECT_BASE: Duration = Duration::from_secs(1);
 const FINALITY_RECONNECT_MAX: Duration = Duration::from_secs(30);
 
@@ -2051,7 +2052,16 @@ impl HistoricalRuntime {
         }))
     }
 
-    #[allow(clippy::too_many_arguments)]
+    /// Commit a gap from retained recent frames, streamed in bounded batches.
+    ///
+    /// Each batch holds an active-chunk permit, as a source chunk does, and
+    /// reads at most one commit's worth of blocks (`commit_maximum_blocks`)
+    /// and at most the pipeline's mapped-byte budget of encoded frames (at
+    /// least one frame). Reuse stops at the first frame the job cannot use:
+    /// with nothing committed that is `false`, and the job reads the gap from
+    /// its sources; after a committed prefix it is `true`, and the job reads
+    /// the rest of the gap, recomputed from its progress, from its sources.
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     async fn try_run_recent_gap(
         &self,
         job: &BackfillJob,
@@ -2082,62 +2092,94 @@ impl HistoricalRuntime {
             VerificationPolicy::TrustedDataset => TrustModel::TrustedDataset,
             VerificationPolicy::BestEffort => TrustModel::Untrusted,
         };
-        let initial_capacity = usize::try_from(request.range.len().min(4_096)).unwrap_or(4_096);
-        let mut frames = Vec::with_capacity(initial_capacity);
-        for number in request.range.start().0..=request.range.end().0 {
-            let Some(frame) = self
-                .store
-                .recent_frame(request.chain_id, BlockNumber(number))
-                .await?
-            else {
-                return Ok(false);
-            };
-            frame
-                .validate_shape()
-                .map_err(|error| SourceError::CorruptFrame(error.to_owned()))?;
-            if frame.chain_id != request.chain_id
-                || frame.block.number != BlockNumber(number)
-                || !frame
-                    .provenance
-                    .iter()
-                    .any(|provenance| provenance.trust >= minimum_trust)
-                || self
-                    .processor
-                    .descriptor()
-                    .requirements
-                    .iter()
-                    .any(|requirement| requirement.validate_frame(&frame).is_err())
-            {
-                return Ok(false);
-            }
-            frames.push(frame);
-        }
-        let last = self
-            .run_material_chunk(
-                HistoricalMaterialCoordinator::retained(frames),
-                request.range,
-                expected_parent,
-                job,
-                job_payload,
-                attempts,
-                checkpoint,
-                frames_mapped,
-                duplicate_frames,
-                source_bytes,
-                physical_source_bytes,
-                reused_source_bytes,
-                coalesced_frames,
-                acquisition_ids,
-                cancellation,
-                completes_subscription,
-                expected_successor_parent,
+        let batch_blocks = u64::try_from(self.config.commit_maximum_blocks)
+            .unwrap_or(u64::MAX)
+            .max(1);
+        let mut next = request.range.start();
+        let mut parent = expected_parent;
+        let mut committed = false;
+        loop {
+            let batch = BlockRange::new(
+                next,
+                BlockNumber(
+                    next.0
+                        .saturating_add(batch_blocks - 1)
+                        .min(request.range.end().0),
+                ),
             )
-            .await?;
-        verify_successor_anchor(request.range, last, expected_successor_parent)?;
-        checkpoint.chunks_completed = checkpoint.chunks_completed.saturating_add(1);
-        self.save_checkpoint(job, job_payload, JobState::Running, attempts, checkpoint)
-            .await?;
-        Ok(true)
+            .map_err(|error| RuntimeError::InvalidConfig(error.to_string()))?;
+            let _active_chunk = self
+                .pipeline_budget
+                .acquire_active_chunk(&cancellation)
+                .await?;
+            let mut frames = self
+                .store
+                .recent_frames(
+                    request.chain_id,
+                    batch,
+                    self.pipeline_budget.maximum_mapped_bytes,
+                )
+                .await?;
+            let mut usable = 0;
+            for (number, frame) in (next.0..).zip(&frames) {
+                frame
+                    .validate_shape()
+                    .map_err(|error| SourceError::CorruptFrame(error.to_owned()))?;
+                if frame.chain_id != request.chain_id
+                    || frame.block.number != BlockNumber(number)
+                    || !frame
+                        .provenance
+                        .iter()
+                        .any(|provenance| provenance.trust >= minimum_trust)
+                    || self
+                        .processor
+                        .descriptor()
+                        .requirements
+                        .iter()
+                        .any(|requirement| requirement.validate_frame(frame).is_err())
+                {
+                    break;
+                }
+                usable += 1;
+            }
+            frames.truncate(usable);
+            let Some(last) = frames.last().map(|frame| frame.block.number) else {
+                return Ok(committed);
+            };
+            let range = BlockRange::new(next, last)
+                .map_err(|error| RuntimeError::InvalidConfig(error.to_string()))?;
+            let completes = range.end() == request.range.end();
+            parent = self
+                .run_material_chunk(
+                    HistoricalMaterialCoordinator::retained(frames),
+                    range,
+                    parent,
+                    job,
+                    job_payload,
+                    attempts,
+                    checkpoint,
+                    frames_mapped,
+                    duplicate_frames,
+                    source_bytes,
+                    physical_source_bytes,
+                    reused_source_bytes,
+                    coalesced_frames,
+                    acquisition_ids,
+                    cancellation.clone(),
+                    completes_subscription && completes,
+                    expected_successor_parent.filter(|_| completes),
+                )
+                .await?;
+            checkpoint.chunks_completed = checkpoint.chunks_completed.saturating_add(1);
+            self.save_checkpoint(job, job_payload, JobState::Running, attempts, checkpoint)
+                .await?;
+            committed = true;
+            if completes {
+                verify_successor_anchor(request.range, parent, expected_successor_parent)?;
+                return Ok(true);
+            }
+            next = BlockNumber(last.0.saturating_add(1));
+        }
     }
 
     #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
@@ -3148,6 +3190,13 @@ pub struct SharedLiveRuntimeConfig {
     /// Optional post-commit event fanout for transports such as Ethereum
     /// WebSocket subscriptions.
     pub committed_events: Option<tokio::sync::broadcast::Sender<ChainEvent>>,
+    /// Hard limit on retained recent frames, in encoded bytes. At the limit
+    /// live ingestion waits, with readiness down, until finality prunes.
+    pub recent_hard_bytes: u64,
+    /// Longest wait at `recent_hard_bytes` before the live lane fails, so its
+    /// supervisor restarts it from a fresh finalized anchor that finality can
+    /// prune through.
+    pub recent_storage_stall_limit: Duration,
 }
 
 impl Default for SharedLiveRuntimeConfig {
@@ -3157,6 +3206,8 @@ impl Default for SharedLiveRuntimeConfig {
             pending_delta_bytes: 512 * 1_024 * 1_024,
             sink_ids: Vec::new(),
             committed_events: None,
+            recent_hard_bytes: 2 * 1024 * 1024 * 1024,
+            recent_storage_stall_limit: Duration::from_mins(15),
         }
     }
 }
@@ -3209,6 +3260,10 @@ pub struct SharedLiveRuntime {
     config: SharedLiveRuntimeConfig,
     finalized_gap_recovery: Option<Arc<dyn FinalizedLiveGapRecovery>>,
     unavailable_processors: Arc<StdMutex<HashSet<String>>>,
+    /// Serializes processor-lane work across clones: a live commit, a gap
+    /// drain, or parking a lane. A reconcile on one clone therefore never
+    /// races another clone's live loop over the same gap marker.
+    lane_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl std::fmt::Debug for SharedLiveRuntime {
@@ -3237,6 +3292,7 @@ impl std::fmt::Debug for SharedLiveRuntime {
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner),
             )
+            .field("lane_busy", &self.lane_lock.try_lock().is_err())
             .finish()
     }
 }
@@ -3259,9 +3315,14 @@ impl SharedLiveRuntime {
                 "shared live runtime requires at least one processor".to_owned(),
             ));
         }
-        if config.max_reorg_depth == 0 || config.pending_delta_bytes == 0 {
+        if config.max_reorg_depth == 0
+            || config.pending_delta_bytes == 0
+            || config.recent_hard_bytes == 0
+            || config.recent_storage_stall_limit.is_zero()
+        {
             return Err(RuntimeError::InvalidConfig(
-                "shared live reorg and pending-delta bounds must be non-zero".to_owned(),
+                "shared live reorg, pending-delta, and recent-storage bounds must be non-zero"
+                    .to_owned(),
             ));
         }
         let mut identities = HashSet::new();
@@ -3300,6 +3361,7 @@ impl SharedLiveRuntime {
             config,
             finalized_gap_recovery: None,
             unavailable_processors: Arc::new(StdMutex::new(HashSet::new())),
+            lane_lock: Arc::new(tokio::sync::Mutex::new(())),
         })
     }
 
@@ -3318,12 +3380,16 @@ impl SharedLiveRuntime {
     /// once per configured processor.
     ///
     /// Ordered processors that have not caught up from their declared start
-    /// retain bounded deltas; block-local processors publish immediately.
+    /// retain bounded deltas; block-local processors publish immediately. A
+    /// failure that belongs to one processor, such as its reducer rejecting a
+    /// block, parks only that processor's lane.
     ///
     /// # Errors
     ///
-    /// Fails closed on invalid frames, resource exhaustion, finalized/deep
-    /// reorgs, processor/store failures, or source resets.
+    /// Fails closed on invalid or non-contiguous frames, reorgs that are
+    /// finalized, too deep, or below the canonical tip, a stall at the recent
+    /// storage limit, store failures outside one processor's lane, or source
+    /// resets.
     pub async fn run(
         &self,
         start: LiveStart,
@@ -3367,7 +3433,10 @@ impl SharedLiveRuntime {
                 .register_processor(processor.descriptor())
                 .await?;
         }
-        Box::pin(self.drain_pending(&mut report)).await?;
+        {
+            let _lane = self.lane_lock.lock().await;
+            Box::pin(self.drain_pending(&mut report)).await?;
+        }
         for processor in &self.processors {
             let statistics = self.store.processor_stats(processor.descriptor()).await?;
             report
@@ -3377,6 +3446,73 @@ impl SharedLiveRuntime {
                 .pending = statistics.pending_deltas;
         }
         Ok(report)
+    }
+
+    /// Park one processor's live lane after a failure outside the live stream,
+    /// such as its cold backfill, while shared ingestion and every other lane
+    /// continue.
+    ///
+    /// The lane pauses with its gap at the newest retained canonical frame,
+    /// so its replay covers every block it skips from now on; replaying a
+    /// block it already applied is idempotent. A block-local lane replays and
+    /// resumes at the next drain, since its blocks do not depend on history.
+    /// An ordered lane waits until its history reaches the gap. A lane that is
+    /// already parked, or a store with no retained frame yet, is left as it
+    /// is. Returns whether the lane was parked.
+    ///
+    /// # Errors
+    ///
+    /// Rejects a processor this runtime does not run, and returns store
+    /// failures.
+    pub async fn park_processor_lane(
+        &self,
+        descriptor: &ProcessorDescriptor,
+        reason: &str,
+    ) -> Result<bool, RuntimeError> {
+        if !self
+            .processors
+            .iter()
+            .any(|processor| processor.descriptor().instance == descriptor.instance)
+        {
+            return Err(RuntimeError::InvalidConfig(format!(
+                "processor {} is not configured on this live runtime",
+                descriptor.instance
+            )));
+        }
+        let _lane = self.lane_lock.lock().await;
+        if self.store.processor_runtime_state(descriptor).await?.state != ProcessorRunState::Running
+            || self.store.live_lane_gap(descriptor).await?.is_some()
+        {
+            return Ok(false);
+        }
+        // The frame's own block reference: a canonical row seeded from a
+        // finality anchor carries no parent hash to replay against.
+        let chain_id = self.source.descriptor().chain_id;
+        let Some(retained) = self.store.recent_canonical_bounds(chain_id).await? else {
+            return Ok(false);
+        };
+        let Some(tip) = self
+            .store
+            .recent_frame(chain_id, retained.end())
+            .await?
+            .map(|frame| frame.block)
+        else {
+            return Ok(false);
+        };
+        self.store
+            .park_processor_live_lane_at(descriptor, tip, reason, false)
+            .await?;
+        self.unavailable_processors
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(descriptor.instance.to_string());
+        warn!(
+            processor_instance = %descriptor.instance,
+            first_unapplied_block = tip.number.0,
+            reason,
+            "parked one live processor lane; shared ingestion and other processors continue"
+        );
+        Ok(true)
     }
 
     #[allow(clippy::too_many_lines)]
@@ -3408,33 +3544,13 @@ impl SharedLiveRuntime {
                     .insert(processor.descriptor().instance.to_string());
             }
         }
-        let mut available_processors = {
-            let unavailable = self
-                .unavailable_processors
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            self.processors
-                .iter()
-                .filter(|processor| !unavailable.contains(processor.descriptor().instance.as_str()))
-                .cloned()
-                .collect::<Vec<_>>()
-        };
-        if available_processors.is_empty() {
-            // A parked lane can still be restored by a shallow reorg. Keep
-            // enough source material flowing to observe and apply that
-            // replacement even when every configured processor is currently
-            // paused; ordinary frames remain unmapped while the lane is
-            // unavailable.
-            available_processors.clone_from(&self.processors);
-        }
+        // Request every configured lane's material, including lanes that are
+        // parked now: they resume by replaying the frames retained meanwhile,
+        // so those frames must carry their material too.
         let events = self
             .source
             .subscribe(
-                compile_live_request(
-                    &available_processors,
-                    self.source.descriptor().chain_id,
-                    &start,
-                )?,
+                compile_live_request(&self.processors, self.source.descriptor().chain_id, &start)?,
                 start,
                 budget,
                 cancellation.clone(),
@@ -3460,6 +3576,7 @@ impl SharedLiveRuntime {
                 let event = tokio::select! {
                     () = cancellation.cancelled() => break,
                     () = self.store.wait_for_delivery_capacity_change() => {
+                        let _lane = self.lane_lock.lock().await;
                         Box::pin(self.drain_pending(&mut report)).await?;
                         continue;
                     }
@@ -3472,14 +3589,23 @@ impl SharedLiveRuntime {
                     ChainEvent::Block(frame) => {
                         signal_readiness(readiness.as_ref(), true);
                         let frame = *frame;
+                        self.verify_live_continuity(&frame).await?;
+                        if !self
+                            .retain_live_frame(&frame, readiness.as_ref(), &cancellation)
+                            .await?
+                        {
+                            break;
+                        }
+                        let _lane = self.lane_lock.lock().await;
                         let committed = frame.clone();
                         let prepared = self.prepare_frame(frame, false).await?;
-                        Box::pin(self.commit_prepared(prepared, true, &mut report)).await?;
+                        Box::pin(self.commit_prepared(prepared, &mut report)).await?;
                         self.publish_committed(ChainEvent::Block(Box::new(committed)));
                         report.chain_blocks = report.chain_blocks.saturating_add(1);
                     }
                     ChainEvent::Reorg { reverted, applied } => {
                         signal_readiness(readiness.as_ref(), true);
+                        let _lane = self.lane_lock.lock().await;
                         let committed_applied = applied.clone();
                         Box::pin(self.apply_reorg(&reverted, applied, &mut report)).await?;
                         self.publish_committed(ChainEvent::Reorg {
@@ -3505,7 +3631,10 @@ impl SharedLiveRuntime {
                     }
                 }
             }
-            Box::pin(self.drain_pending(&mut report)).await?;
+            {
+                let _lane = self.lane_lock.lock().await;
+                Box::pin(self.drain_pending(&mut report)).await?;
+            }
             for processor in &self.processors {
                 let statistics = self.store.processor_stats(processor.descriptor()).await?;
                 report
@@ -3524,6 +3653,126 @@ impl SharedLiveRuntime {
     fn publish_committed(&self, event: ChainEvent) {
         if let Some(events) = &self.config.committed_events {
             let _ = events.send(event);
+        }
+    }
+
+    /// Reject a live block that does not continue the retained canonical
+    /// chain, before any processor maps it.
+    ///
+    /// A block at a retained height must be that retained block (a source may
+    /// deliver it again), a new block must extend the canonical tip, and any
+    /// block must name its retained parent. A source that breaks this has
+    /// violated its protocol, and the error sends it through the reconnect
+    /// path instead of applying the block.
+    async fn verify_live_continuity(
+        &self,
+        frame: &leani_primitives::BlockFrame,
+    ) -> Result<(), RuntimeError> {
+        frame
+            .validate_shape()
+            .map_err(|error| RuntimeError::InvalidFrame(error.to_owned()))?;
+        let chain_id = self.source.descriptor().chain_id;
+        if frame.chain_id != chain_id {
+            return Err(RuntimeError::InvalidFrame(
+                "live frame and source chains differ".to_owned(),
+            ));
+        }
+        let number = frame.block.number;
+        if let Some((retained, _)) = self.store.canonical_block(chain_id, number).await? {
+            if retained.hash != frame.block.hash {
+                return Err(StoreError::CanonicalConflict {
+                    block: number,
+                    stored: retained.hash,
+                    incoming: frame.block.hash,
+                }
+                .into());
+            }
+        } else if let Some(tip) = self.store.canonical_tip(chain_id).await?
+            && number > tip.number
+        {
+            let expected = BlockNumber(tip.number.0.saturating_add(1));
+            if number != expected || frame.block.parent_hash != tip.hash {
+                return Err(RuntimeError::LiveGap {
+                    expected,
+                    received: frame.block,
+                });
+            }
+            return Ok(());
+        }
+        if let Some(parent) = number.0.checked_sub(1)
+            && let Some((parent, _)) = self
+                .store
+                .canonical_block(chain_id, BlockNumber(parent))
+                .await?
+            && parent.hash != frame.block.parent_hash
+        {
+            return Err(RuntimeError::LiveGap {
+                expected: number,
+                received: frame.block,
+            });
+        }
+        Ok(())
+    }
+
+    /// Retain a live frame within the recent hard limit before any processor
+    /// maps it, waiting while the limit is reached.
+    ///
+    /// Retained frames are the reorg and replay input, so none is dropped to
+    /// make room: ingestion stops and readiness drops until finality prunes
+    /// older frames. After `recent_storage_stall_limit` the lane fails, so its
+    /// supervisor restarts it from a fresh finalized anchor. Returns `false`
+    /// when cancelled while waiting.
+    async fn retain_live_frame(
+        &self,
+        frame: &leani_primitives::BlockFrame,
+        readiness: Option<&tokio::sync::watch::Sender<bool>>,
+        cancellation: &CancellationToken,
+    ) -> Result<bool, RuntimeError> {
+        let mut full_since = None;
+        loop {
+            match self
+                .store
+                .store_recent_frame_within(frame, self.config.recent_hard_bytes)
+                .await
+            {
+                Ok(()) => {
+                    if full_since.is_some() {
+                        signal_readiness(readiness, true);
+                        info!(
+                            block = frame.block.number.0,
+                            "recent frame storage has room again; live ingestion resumes"
+                        );
+                    }
+                    return Ok(true);
+                }
+                Err(StoreError::RecentStorageLimit {
+                    limit_bytes,
+                    projected_bytes,
+                }) => {
+                    let since = *full_since.get_or_insert_with(|| {
+                        signal_readiness(readiness, false);
+                        warn!(
+                            reason = "recent_storage_full",
+                            block = frame.block.number.0,
+                            limit_bytes,
+                            projected_bytes,
+                            "recent frame storage is at its hard limit; live ingestion waits until finality prunes it"
+                        );
+                        Instant::now()
+                    });
+                    if since.elapsed() >= self.config.recent_storage_stall_limit {
+                        return Err(RuntimeError::RecentStorageBudget {
+                            limit: limit_bytes,
+                            observed: projected_bytes,
+                        });
+                    }
+                    tokio::select! {
+                        () = cancellation.cancelled() => return Ok(false),
+                        () = tokio::time::sleep(RECENT_STORAGE_RETRY_INTERVAL) => {}
+                    }
+                }
+                Err(error) => return Err(error.into()),
+            }
         }
     }
 
@@ -3601,11 +3850,10 @@ impl SharedLiveRuntime {
         }
         let mut deltas = Vec::with_capacity(self.processors.len());
         for processor in &self.processors {
-            if !map_unavailable
-                && self
-                    .processor_live_lane_unavailable(processor.as_ref())
-                    .await?
-            {
+            let unavailable = self
+                .processor_live_lane_unavailable(processor.as_ref())
+                .await?;
+            if unavailable && !map_unavailable {
                 deltas.push(None);
                 continue;
             }
@@ -3627,6 +3875,19 @@ impl SharedLiveRuntime {
                     material: None,
                     _mapped_byte_permit: None,
                 })),
+                // A parked lane is mapped only to rebase its gap onto a reorg
+                // replacement. The reorg leaves its state alone; the lane's own
+                // replay maps the canonical block again and isolates a failure
+                // then.
+                Err(error) if unavailable => {
+                    debug!(
+                        processor_instance = %processor.descriptor().instance,
+                        block = frame.block.number.0,
+                        %error,
+                        "parked live lane cannot map a reorg replacement; its gap replay maps it again"
+                    );
+                    deltas.push(None);
+                }
                 Err(error) => {
                     self.isolate_live_mapping_failure(processor.as_ref(), frame.block, &error)
                         .await?;
@@ -3637,39 +3898,42 @@ impl SharedLiveRuntime {
         Ok(PreparedFrame { frame, deltas })
     }
 
+    /// Commit one mapped frame to every lane. The caller has already retained
+    /// the frame: a live block within the recent limit, a reorg replacement
+    /// with its reorg.
     async fn commit_prepared(
         &self,
         prepared: PreparedFrame,
-        retain_recent: bool,
         report: &mut SharedLiveReport,
     ) -> Result<(), RuntimeError> {
-        if retain_recent {
-            self.store.store_recent_frame(&prepared.frame).await?;
-        }
         for (processor, mapped) in self.processors.iter().zip(&prepared.deltas) {
             let Some(mapped) = mapped else {
                 continue;
             };
-            let isolated_block_local = processor.descriptor().mode == ReductionMode::BlockLocal
-                && processor.descriptor().delivery_ordering
-                    == DeliveryOrdering::BlockVersionedIdempotent;
-            if isolated_block_local {
-                let state = self
+            // A failed lane, or one parked at a gap, is not committed directly,
+            // whatever its mode or delivery ordering: its gap replay covers the
+            // block, and a lane failed elsewhere (such as by finality) stays
+            // frozen. It is not mapped again until it is available.
+            if self
+                .store
+                .processor_runtime_state(processor.descriptor())
+                .await?
+                .state
+                == ProcessorRunState::Failed
+                || self
                     .store
-                    .processor_runtime_state(processor.descriptor())
-                    .await?;
-                if state.state == ProcessorRunState::Failed
-                    || self
-                        .store
-                        .live_lane_gap(processor.descriptor())
-                        .await?
-                        .is_some()
-                {
-                    continue;
-                }
+                    .live_lane_gap(processor.descriptor())
+                    .await?
+                    .is_some()
+            {
+                self.unavailable_processors
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(processor.descriptor().instance.to_string());
+                continue;
             }
-            let outcome = if processor.descriptor().mode == ReductionMode::BlockLocal {
-                match commit_mapped_delta(
+            let committed = if processor.descriptor().mode == ReductionMode::BlockLocal {
+                commit_mapped_delta(
                     &self.store,
                     processor.as_ref(),
                     mapped,
@@ -3678,25 +3942,18 @@ impl SharedLiveRuntime {
                     None,
                 )
                 .await
-                {
-                    Ok(outcome) => Some(outcome),
-                    Err(error) if isolated_block_local && live_lane_isolatable_error(&error) => {
-                        self.park_live_lane(processor.as_ref(), mapped, &error)
-                            .await?;
-                        None
-                    }
-                    Err(error) => return Err(error),
-                }
+                .map(Some)
             } else {
-                match self.commit_ordered_mapped(processor.as_ref(), mapped).await {
-                    Ok(outcome) => outcome,
-                    Err(error) if live_lane_isolatable_error(&error) => {
-                        self.park_live_lane(processor.as_ref(), mapped, &error)
-                            .await?;
-                        None
-                    }
-                    Err(error) => return Err(error),
+                self.commit_ordered_mapped(processor.as_ref(), mapped).await
+            };
+            let outcome = match committed {
+                Ok(outcome) => outcome,
+                Err(error) if live_lane_isolatable_error(&error) => {
+                    self.park_live_lane(processor.as_ref(), mapped, &error)
+                        .await?;
+                    None
                 }
+                Err(error) => return Err(error),
             };
             if let Some(outcome) = outcome {
                 record_apply(
@@ -3731,40 +3988,16 @@ impl SharedLiveRuntime {
         }
         let persist_delta = encoded_bytes <= self.config.pending_delta_bytes
             && current.saturating_add(encoded_bytes) <= self.config.pending_delta_bytes;
-        let (reason, required_delivery_bytes, failed) = match error {
-            RuntimeError::Store(StoreError::DeliveryItemTooLarge { observed_bytes, .. }) => {
-                ("single_block_exceeds_delivery_limit", *observed_bytes, true)
-            }
-            RuntimeError::Store(StoreError::DeliveryLimit { action, .. }) => (
-                "delivery_spool_hard_limit",
-                0,
-                matches!(action, DeliveryLimitAction::Fail),
-            ),
-            RuntimeError::Store(StoreError::PhysicalStorageLimit { .. }) => {
-                ("physical_store_hard_limit", 0, false)
-            }
-            RuntimeError::Store(StoreError::ArtifactStorageLimit { .. }) => {
-                ("artifact_store_hard_limit", 0, false)
-            }
-            RuntimeError::Store(StoreError::ProcessorFailed(_)) => {
-                ("processor_live_lane_failed", 0, true)
-            }
-            RuntimeError::Store(StoreError::ProcessorPaused { .. }) => {
-                ("delivery_spool_hard_limit", 0, false)
-            }
-            RuntimeError::Processor(_) => ("processor_live_reduce_failed", 0, true),
-            _ => {
-                return Err(RuntimeError::InvalidConfig(format!(
-                    "attempted to isolate unsupported live-lane error: {error}"
-                )));
-            }
-        };
+        let (reason, required_delivery_bytes, failed) = live_lane_park_reason(error)?;
         let (reason, failed) = if persist_delta {
             (reason, failed)
         } else {
             ("live_gap_marker_exceeds_pending_delta_budget", true)
         };
-        self.store
+        // The store decides atomically: a lane failed meanwhile, such as by
+        // finality, keeps its first failure unchanged.
+        let recorded = self
+            .store
             .park_processor_live_lane(
                 processor.descriptor(),
                 &mapped.delta,
@@ -3778,13 +4011,22 @@ impl SharedLiveRuntime {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(processor.descriptor().instance.to_string());
-        warn!(
-            processor_instance = %processor.descriptor().instance,
-            first_unapplied_block = mapped.delta.block.number.0,
-            persist_delta,
-            %error,
-            "paused one live processor lane; shared ingestion and other processors continue"
-        );
+        if recorded {
+            warn!(
+                processor_instance = %processor.descriptor().instance,
+                first_unapplied_block = mapped.delta.block.number.0,
+                persist_delta,
+                %error,
+                "paused one live processor lane; shared ingestion and other processors continue"
+            );
+        } else {
+            warn!(
+                processor_instance = %processor.descriptor().instance,
+                block = mapped.delta.block.number.0,
+                %error,
+                "live processor lane had already failed; keeping its first failure"
+            );
+        }
         Ok(())
     }
 
@@ -3927,17 +4169,19 @@ impl SharedLiveRuntime {
             .store
             .recent_frame(self.source.descriptor().chain_id, first_unapplied.number)
             .await?
-            .filter(|frame| frame.block == first_unapplied)
+            .filter(|frame| same_block(frame.block, first_unapplied))
         else {
             return Ok(None);
         };
         for requirement in &processor.descriptor().requirements {
             if let Err(error) = requirement.validate_frame(&frame) {
-                warn!(
+                // Logged at debug: a lane waiting on this block retries every
+                // drain, and its park reason already says what it waits for.
+                debug!(
                     processor_instance = %processor.descriptor().instance,
                     block = first_unapplied.number.0,
                     %error,
-                    "retained frame cannot serve this processor's live-gap replay; recovering the block instead"
+                    "retained frame lacks material this processor requires; its live-gap replay treats the block as not retained"
                 );
                 return Ok(None);
             }
@@ -3945,29 +4189,293 @@ impl SharedLiveRuntime {
         Ok(Some(frame))
     }
 
+    /// Apply one live-gap block and move the gap past it.
+    ///
+    /// Every gap replay applies through here, so one isolation policy covers
+    /// them all: a processor-local failure stops only this lane (see
+    /// [`Self::isolate_replay_failure`]) and returns `false`.
+    async fn apply_gap_delta(
+        &self,
+        processor: &dyn Processor,
+        delta: &EncodedDelta,
+        finality: Finality,
+        report: &mut SharedLiveReport,
+    ) -> Result<bool, RuntimeError> {
+        let applied = if finality == Finality::Finalized {
+            self.apply_recovered_delta(processor, delta).await
+        } else {
+            self.apply_delta(processor, delta, finality).await
+        };
+        let outcome = match applied {
+            Ok(outcome) => outcome,
+            Err(error) if live_lane_isolatable_error(&error) => {
+                self.isolate_replay_failure(processor, delta.block, &error)
+                    .await?;
+                return Ok(false);
+            }
+            Err(error) => return Err(error),
+        };
+        record_apply(
+            report
+                .processors
+                .entry(processor.descriptor().id.to_string())
+                .or_default(),
+            &outcome,
+        );
+        self.advance_or_complete_live_gap(processor, delta.block)
+            .await
+    }
+
+    /// Map a retained frame for a lane's gap and apply it; `false` when the
+    /// lane stopped.
+    async fn replay_gap_frame(
+        &self,
+        processor: &dyn Processor,
+        frame: &leani_primitives::BlockFrame,
+        report: &mut SharedLiveReport,
+    ) -> Result<bool, RuntimeError> {
+        let (delta, _) = match map_with_finality_variants(processor, frame).await {
+            Ok(mapped) => mapped,
+            Err(error) => {
+                self.isolate_live_mapping_failure(processor, frame.block, &error)
+                    .await?;
+                return Ok(false);
+            }
+        };
+        self.apply_gap_delta(processor, &delta, frame.finality, report)
+            .await
+    }
+
+    /// Stop one lane after a processor-local failure while it replays.
+    ///
+    /// Capacity and backpressure errors leave the lane paused at its gap, and
+    /// a later drain retries it. Any other failure fails the lane at `block`
+    /// with the reason a live commit records, until an operator resets it.
+    async fn isolate_replay_failure(
+        &self,
+        processor: &dyn Processor,
+        block: BlockRef,
+        error: &RuntimeError,
+    ) -> Result<(), RuntimeError> {
+        let (reason, _, failed) = live_lane_park_reason(error)?;
+        if !failed || matches!(error, RuntimeError::Store(StoreError::ProcessorFailed(_))) {
+            return Ok(());
+        }
+        warn!(
+            processor_instance = %processor.descriptor().instance,
+            block = block.number.0,
+            reason,
+            %error,
+            "live-gap replay failed; isolating the processor lane while shared ingestion continues"
+        );
+        self.store
+            .park_processor_live_lane_at(processor.descriptor(), block, reason, true)
+            .await?;
+        self.unavailable_processors
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(processor.descriptor().instance.to_string());
+        Ok(())
+    }
+
+    /// Keep a lane paused at its gap for `reason`, writing only on a change so
+    /// a lane that waits across many drains keeps its first pause time.
+    async fn pause_live_gap(
+        &self,
+        processor: &dyn Processor,
+        first_unapplied: BlockRef,
+        reason: &str,
+    ) -> Result<(), RuntimeError> {
+        let state = self
+            .store
+            .processor_runtime_state(processor.descriptor())
+            .await?;
+        if state.state == ProcessorRunState::Paused && state.reason.as_deref() == Some(reason) {
+            return Ok(());
+        }
+        warn!(
+            processor_instance = %processor.descriptor().instance,
+            first_unapplied_block = first_unapplied.number.0,
+            reason,
+            "pausing one live lane at its gap; shared ingestion and other processors continue"
+        );
+        self.pause_lane(processor, reason).await
+    }
+
+    /// Pause one lane for `reason`. A lane that another component, such as
+    /// finality, failed meanwhile stays failed, which is not a live-lane error.
+    async fn pause_lane(
+        &self,
+        processor: &dyn Processor,
+        reason: &str,
+    ) -> Result<(), RuntimeError> {
+        match self
+            .store
+            .pause_processor_live_lane(processor.descriptor(), reason)
+            .await
+        {
+            Ok(()) | Err(StoreError::ProcessorFailed(_)) => Ok(()),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    /// The canonical block at `number`, taking its reference from the
+    /// retained frame when there is one: a canonical row seeded from a
+    /// finality anchor has no parent hash.
+    async fn canonical_ref(&self, number: BlockNumber) -> Result<Option<BlockRef>, RuntimeError> {
+        let chain_id = self.source.descriptor().chain_id;
+        Ok(match self.store.recent_frame(chain_id, number).await? {
+            Some(frame) => Some(frame.block),
+            None => self
+                .store
+                .canonical_block(chain_id, number)
+                .await?
+                .map(|(block, _)| block),
+        })
+    }
+
+    /// Whether a gap marker names a block on the canonical chain.
+    async fn gap_marker_is_canonical(&self, marker: BlockRef) -> Result<bool, RuntimeError> {
+        Ok(self
+            .store
+            .canonical_block(self.source.descriptor().chain_id, marker.number)
+            .await?
+            .is_some_and(|(canonical, _)| same_block(canonical, marker)))
+    }
+
+    /// Whether this lane has applied `block`, or never needs to: a block below
+    /// its start point, as the new tip after a reorg that reverted every block
+    /// the lane had applied.
+    async fn lane_has_applied(
+        &self,
+        processor: &dyn Processor,
+        block: BlockRef,
+    ) -> Result<bool, RuntimeError> {
+        Ok(self
+            .store
+            .coverage_block_by_hash(processor.descriptor(), block.hash)
+            .await?
+            == Some(block.number)
+            || block.number < processor_start(processor)?)
+    }
+
+    /// Keep a failed lane's marker on the first block it has not applied.
+    ///
+    /// A failed lane is not replayed, but a reorg without a replacement branch
+    /// leaves its marker on the new tip, which the lane has applied. Once the
+    /// tip's canonical successor is retained, the marker moves onto it, so an
+    /// operator reset replays from there.
+    async fn follow_failed_lane_marker(
+        &self,
+        processor: &dyn Processor,
+    ) -> Result<(), RuntimeError> {
+        let Some(gap) = self.store.live_lane_gap(processor.descriptor()).await? else {
+            return Ok(());
+        };
+        let marker = gap.first_unapplied;
+        if !self.lane_has_applied(processor, marker).await? {
+            return Ok(());
+        }
+        if let Some(next) = self
+            .canonical_ref(BlockNumber(marker.number.0.saturating_add(1)))
+            .await?
+            && (next.parent_hash == BlockHash::ZERO || next.parent_hash == marker.hash)
+        {
+            self.store
+                .advance_live_lane_gap(processor.descriptor(), marker, next)
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Re-point a gap marker that is off the canonical chain, such as one an
+    /// earlier version left on a reverted block, instead of completing or
+    /// failing the lane.
+    ///
+    /// The marker moves to the highest canonical block below it that the lane
+    /// has applied, or never needs to, within the reorg depth; the drain then
+    /// moves past it. If the lane applied none of those blocks, it replays
+    /// from the lowest. Returns `false` only when no canonical block is in
+    /// reach.
+    async fn repoint_orphaned_gap(
+        &self,
+        processor: &dyn Processor,
+        marker: BlockRef,
+    ) -> Result<bool, RuntimeError> {
+        let chain_id = self.source.descriptor().chain_id;
+        let Some(tip) = self.store.canonical_tip(chain_id).await? else {
+            return Ok(false);
+        };
+        let top = marker.number.0.saturating_sub(1).min(tip.number.0);
+        let floor =
+            top.saturating_sub(u64::try_from(self.config.max_reorg_depth).unwrap_or(u64::MAX));
+        let mut target = None;
+        for height in (floor..=top).rev() {
+            let Some(block) = self.canonical_ref(BlockNumber(height)).await? else {
+                continue;
+            };
+            target = Some(block);
+            if self.lane_has_applied(processor, block).await? {
+                break;
+            }
+        }
+        let Some(target) = target else {
+            return Ok(false);
+        };
+        warn!(
+            processor_instance = %processor.descriptor().instance,
+            orphaned_block = marker.number.0,
+            target_block = target.number.0,
+            "live-gap marker is off the canonical chain; re-pointing it"
+        );
+        self.store
+            .advance_live_lane_gap(processor.descriptor(), marker, target)
+            .await?;
+        Ok(true)
+    }
+
+    /// Move a lane's gap past `applied`, or complete it at the canonical tip.
+    ///
+    /// The successor's reference comes from its retained frame when there is
+    /// one: a canonical row seeded from a finality anchor has no parent hash.
+    /// A successor that does not descend from `applied` fails only this lane
+    /// (`live_gap_canonical_identity_changed`) and returns `false`.
     async fn advance_or_complete_live_gap(
         &self,
         processor: &dyn Processor,
         applied: BlockRef,
-    ) -> Result<(), RuntimeError> {
-        let chain_id = self.source.descriptor().chain_id;
-        let next_number = BlockNumber(applied.number.0.saturating_add(1));
-        if let Some((next, _)) = self.store.canonical_block(chain_id, next_number).await? {
-            if next.parent_hash != applied.hash {
-                return Err(RuntimeError::InvalidReorg(format!(
-                    "canonical live gap successor {} does not descend from block {}",
-                    next.number.0, applied.number.0
-                )));
-            }
-            self.store
-                .advance_live_lane_gap(processor.descriptor(), applied, next)
-                .await?;
-        } else {
+    ) -> Result<bool, RuntimeError> {
+        let next = self
+            .canonical_ref(BlockNumber(applied.number.0.saturating_add(1)))
+            .await?;
+        let Some(next) = next else {
             self.store
                 .complete_live_lane_gap(processor.descriptor(), applied)
                 .await?;
+            return Ok(true);
+        };
+        if next.parent_hash != BlockHash::ZERO && next.parent_hash != applied.hash {
+            warn!(
+                processor_instance = %processor.descriptor().instance,
+                applied_block = applied.number.0,
+                "canonical live-gap successor does not descend from the applied block; isolating the processor lane"
+            );
+            self.store
+                .fail_processor_live_lane(
+                    processor.descriptor(),
+                    "live_gap_canonical_identity_changed",
+                )
+                .await?;
+            self.unavailable_processors
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(processor.descriptor().instance.to_string());
+            return Ok(false);
         }
-        Ok(())
+        self.store
+            .advance_live_lane_gap(processor.descriptor(), applied, next)
+            .await?;
+        Ok(true)
     }
 
     #[allow(clippy::too_many_lines)]
@@ -3978,35 +4486,26 @@ impl SharedLiveRuntime {
         report: &mut SharedLiveReport,
     ) -> Result<bool, RuntimeError> {
         let chain_id = self.source.descriptor().chain_id;
-        let Some((canonical, finality)) =
-            self.store.canonical_block(chain_id, first.number).await?
+        // A marker off the canonical chain is never completed or failed on
+        // that basis: it is re-pointed onto the chain.
+        let Some((_, finality)) = self
+            .store
+            .canonical_block(chain_id, first.number)
+            .await?
+            .filter(|(canonical, _)| same_block(*canonical, first))
         else {
-            self.store
-                .complete_live_lane_gap(processor.descriptor(), first)
-                .await?;
-            return Ok(true);
+            return self.repoint_orphaned_gap(processor, first).await;
         };
-        if canonical.hash != first.hash || canonical.parent_hash != first.parent_hash {
-            self.store
-                .fail_processor_live_lane(
-                    processor.descriptor(),
-                    "live_gap_canonical_identity_changed",
-                )
-                .await?;
-            return Ok(false);
-        }
         if finality != Finality::Finalized {
-            self.store
-                .fail_processor_live_lane(processor.descriptor(), "unfinalized_gap_unrecoverable")
+            // No retained frame serves this block, and history serves only
+            // finalized blocks. Stay paused: the first drain after finality
+            // reaches the block recovers it from history.
+            self.pause_live_gap(processor, first, "unfinalized_gap_waiting_for_finality")
                 .await?;
             return Ok(false);
         }
         let Some(recovery) = &self.finalized_gap_recovery else {
-            self.store
-                .pause_processor_live_lane(
-                    processor.descriptor(),
-                    "finalized_gap_waiting_for_history_source",
-                )
+            self.pause_lane(processor, "finalized_gap_waiting_for_history_source")
                 .await?;
             return Ok(false);
         };
@@ -4041,11 +4540,7 @@ impl SharedLiveRuntime {
                     %error,
                     "finalized live-gap recovery is temporarily unavailable; keeping the processor lane paused"
                 );
-                self.store
-                    .pause_processor_live_lane(
-                        processor.descriptor(),
-                        "finalized_gap_recovery_unavailable",
-                    )
+                self.pause_lane(processor, "finalized_gap_recovery_unavailable")
                     .await?;
                 return Ok(false);
             }
@@ -4074,11 +4569,7 @@ impl SharedLiveRuntime {
                 recovered_frames = frames.len(),
                 "finalized live-gap recovery returned an incomplete chunk; keeping the processor lane paused"
             );
-            self.store
-                .pause_processor_live_lane(
-                    processor.descriptor(),
-                    "finalized_gap_recovery_incomplete",
-                )
+            self.pause_lane(processor, "finalized_gap_recovery_incomplete")
                 .await?;
             return Ok(false);
         }
@@ -4101,9 +4592,7 @@ impl SharedLiveRuntime {
             }
             if frame.chain_id != chain_id
                 || frame.finality != Finality::Finalized
-                || frame.block.number != expected.number
-                || frame.block.hash != expected.hash
-                || frame.block.parent_hash != expected.parent_hash
+                || !same_block(frame.block, expected)
             {
                 warn!(
                     processor_instance = %processor.descriptor().instance,
@@ -4173,20 +4662,12 @@ impl SharedLiveRuntime {
                     .await?;
                 return Ok(false);
             }
-            let outcome = match self.apply_recovered_delta(processor, &delta).await {
-                Ok(outcome) => outcome,
-                Err(error) if live_lane_isolatable_error(&error) => return Ok(false),
-                Err(error) => return Err(error),
-            };
-            record_apply(
-                report
-                    .processors
-                    .entry(processor.descriptor().id.to_string())
-                    .or_default(),
-                &outcome,
-            );
-            self.advance_or_complete_live_gap(processor, frame.block)
-                .await?;
+            if !self
+                .apply_gap_delta(processor, &delta, Finality::Finalized, report)
+                .await?
+            {
+                return Ok(false);
+            }
             let Some(gap) = self.store.live_lane_gap(processor.descriptor()).await? else {
                 return Ok(true);
             };
@@ -4224,6 +4705,7 @@ impl SharedLiveRuntime {
                         .processor_runtime_state(processor.descriptor())
                         .await?;
                     if state.state == ProcessorRunState::Failed {
+                        self.follow_failed_lane_marker(processor.as_ref()).await?;
                         break;
                     }
                     let Some(gap) = self.store.live_lane_gap(processor.descriptor()).await? else {
@@ -4239,31 +4721,49 @@ impl SharedLiveRuntime {
                             .await?;
                         if let Some(delta) = candidates.into_iter().next()
                             && self
-                                .clear_applied_pending_variant(processor.as_ref(), &delta, report)
+                                .settle_pending_variant(processor.as_ref(), &delta, report)
                                 .await?
+                                == Some(true)
                         {
                             continue;
                         }
                         break;
                     };
+                    if !self.gap_marker_is_canonical(gap.first_unapplied).await? {
+                        if self
+                            .repoint_orphaned_gap(processor.as_ref(), gap.first_unapplied)
+                            .await?
+                        {
+                            continue;
+                        }
+                        break;
+                    }
                     let candidates = self
                         .store
                         .pending_deltas(processor.descriptor(), gap.first_unapplied.number, 64)
                         .await?;
                     if let Some(delta) = candidates
                         .into_iter()
-                        .find(|delta| delta.block == gap.first_unapplied)
+                        .find(|delta| same_block(delta.block, gap.first_unapplied))
                     {
-                        if self
-                            .clear_applied_pending_variant(processor.as_ref(), &delta, report)
+                        match self
+                            .settle_pending_variant(processor.as_ref(), &delta, report)
                             .await?
                         {
-                            self.advance_or_complete_live_gap(
-                                processor.as_ref(),
-                                gap.first_unapplied,
-                            )
-                            .await?;
-                            continue;
+                            Some(true) => {
+                                if self
+                                    .advance_or_complete_live_gap(
+                                        processor.as_ref(),
+                                        gap.first_unapplied,
+                                    )
+                                    .await?
+                                {
+                                    continue;
+                                }
+                                break;
+                            }
+                            Some(false) => {}
+                            None => break,
                         }
                         if let Some(frame) = self
                             .store
@@ -4271,66 +4771,42 @@ impl SharedLiveRuntime {
                             .await?
                             .filter(|frame| frame.block == delta.block)
                         {
-                            let outcome = match if frame.finality == Finality::Finalized {
-                                self.apply_recovered_delta(processor.as_ref(), &delta).await
-                            } else {
-                                self.apply_delta(processor.as_ref(), &delta, frame.finality)
-                                    .await
-                            } {
-                                Ok(outcome) => outcome,
-                                Err(error) if live_lane_isolatable_error(&error) => break,
-                                Err(error) => return Err(error),
-                            };
-                            record_apply(
-                                report
-                                    .processors
-                                    .entry(processor.descriptor().id.to_string())
-                                    .or_default(),
-                                &outcome,
-                            );
-                            self.advance_or_complete_live_gap(processor.as_ref(), frame.block)
-                                .await?;
-                            continue;
+                            if self
+                                .apply_gap_delta(processor.as_ref(), &delta, frame.finality, report)
+                                .await?
+                            {
+                                continue;
+                            }
+                            break;
                         }
                     }
 
+                    // The lane already applied its gap block, or never needs
+                    // to, as when a reorg left its gap on the new tip: move
+                    // past it.
+                    if self
+                        .lane_has_applied(processor.as_ref(), gap.first_unapplied)
+                        .await?
+                    {
+                        if self
+                            .advance_or_complete_live_gap(processor.as_ref(), gap.first_unapplied)
+                            .await?
+                        {
+                            continue;
+                        }
+                        break;
+                    }
                     if let Some(frame) = self
                         .replayable_recent_frame(processor.as_ref(), gap.first_unapplied)
                         .await?
                     {
-                        let (delta, _) =
-                            match map_with_finality_variants(processor.as_ref(), &frame).await {
-                                Ok(mapped) => mapped,
-                                Err(error) => {
-                                    self.isolate_live_mapping_failure(
-                                        processor.as_ref(),
-                                        frame.block,
-                                        &error,
-                                    )
-                                    .await?;
-                                    break;
-                                }
-                            };
-                        let outcome = match if frame.finality == Finality::Finalized {
-                            self.apply_recovered_delta(processor.as_ref(), &delta).await
-                        } else {
-                            self.apply_delta(processor.as_ref(), &delta, frame.finality)
-                                .await
-                        } {
-                            Ok(outcome) => outcome,
-                            Err(error) if live_lane_isolatable_error(&error) => break,
-                            Err(error) => return Err(error),
-                        };
-                        record_apply(
-                            report
-                                .processors
-                                .entry(processor.descriptor().id.to_string())
-                                .or_default(),
-                            &outcome,
-                        );
-                        self.advance_or_complete_live_gap(processor.as_ref(), frame.block)
-                            .await?;
-                        continue;
+                        if self
+                            .replay_gap_frame(processor.as_ref(), &frame, report)
+                            .await?
+                        {
+                            continue;
+                        }
+                        break;
                     }
                     if !self
                         .recover_finalized_live_gap(processor.as_ref(), gap.first_unapplied, report)
@@ -4349,6 +4825,7 @@ impl SharedLiveRuntime {
                     .state
                     == ProcessorRunState::Failed
                 {
+                    self.follow_failed_lane_marker(processor.as_ref()).await?;
                     break;
                 }
                 let prior = self.store.processor_cursor(processor.descriptor()).await?;
@@ -4372,16 +4849,27 @@ impl SharedLiveRuntime {
                     .iter()
                     .find(|delta| delta.block.number < expected)
                 {
-                    if !self
-                        .clear_applied_pending_variant(processor.as_ref(), delta, report)
+                    match self
+                        .settle_pending_variant(processor.as_ref(), delta, report)
                         .await?
                     {
-                        return Err(StoreError::ConflictingApply {
-                            block: delta.block.number,
+                        Some(true) => continue,
+                        // Below the cursor yet never applied at this hash:
+                        // the delta contradicts the lane's applied history.
+                        Some(false) => {
+                            self.isolate_replay_failure(
+                                processor.as_ref(),
+                                delta.block,
+                                &StoreError::ConflictingApply {
+                                    block: delta.block.number,
+                                }
+                                .into(),
+                            )
+                            .await?;
+                            break;
                         }
-                        .into());
+                        None => break,
                     }
-                    continue;
                 }
                 let candidate = candidates.into_iter().find(|delta| {
                     delta.block.number == expected
@@ -4395,7 +4883,11 @@ impl SharedLiveRuntime {
                         .await
                     {
                         Ok(outcome) => outcome,
-                        Err(error) if live_lane_isolatable_error(&error) => break,
+                        Err(error) if live_lane_isolatable_error(&error) => {
+                            self.isolate_replay_failure(processor.as_ref(), delta.block, &error)
+                                .await?;
+                            break;
+                        }
                         Err(error) => return Err(error),
                     };
                     record_apply(
@@ -4406,10 +4898,12 @@ impl SharedLiveRuntime {
                         &outcome,
                     );
                     if let Some(gap) = self.store.live_lane_gap(processor.descriptor()).await?
-                        && gap.first_unapplied == delta.block
+                        && same_block(gap.first_unapplied, delta.block)
+                        && !self
+                            .advance_or_complete_live_gap(processor.as_ref(), delta.block)
+                            .await?
                     {
-                        self.advance_or_complete_live_gap(processor.as_ref(), delta.block)
-                            .await?;
+                        break;
                     }
                     continue;
                 }
@@ -4417,10 +4911,37 @@ impl SharedLiveRuntime {
                 let Some(gap) = self.store.live_lane_gap(processor.descriptor()).await? else {
                     break;
                 };
+                if !self.gap_marker_is_canonical(gap.first_unapplied).await? {
+                    if self
+                        .repoint_orphaned_gap(processor.as_ref(), gap.first_unapplied)
+                        .await?
+                    {
+                        continue;
+                    }
+                    break;
+                }
+                // History, such as a later backfill, already applied the
+                // parked block, or a reorg left the gap on the new tip: move
+                // the gap on instead of waiting forever for a replay the
+                // cursor has passed.
+                if gap.first_unapplied.number < expected
+                    && self
+                        .lane_has_applied(processor.as_ref(), gap.first_unapplied)
+                        .await?
+                {
+                    if self
+                        .advance_or_complete_live_gap(processor.as_ref(), gap.first_unapplied)
+                        .await?
+                    {
+                        continue;
+                    }
+                    break;
+                }
                 if gap.first_unapplied.number != expected
-                    || prior
-                        .as_ref()
-                        .is_some_and(|cursor| gap.first_unapplied.parent_hash != cursor.block_hash)
+                    || prior.as_ref().is_some_and(|cursor| {
+                        gap.first_unapplied.parent_hash != BlockHash::ZERO
+                            && gap.first_unapplied.parent_hash != cursor.block_hash
+                    })
                 {
                     break;
                 }
@@ -4428,39 +4949,13 @@ impl SharedLiveRuntime {
                     .replayable_recent_frame(processor.as_ref(), gap.first_unapplied)
                     .await?
                 {
-                    let (delta, _) =
-                        match map_with_finality_variants(processor.as_ref(), &frame).await {
-                            Ok(mapped) => mapped,
-                            Err(error) => {
-                                self.isolate_live_mapping_failure(
-                                    processor.as_ref(),
-                                    frame.block,
-                                    &error,
-                                )
-                                .await?;
-                                break;
-                            }
-                        };
-                    let outcome = match if frame.finality == Finality::Finalized {
-                        self.apply_recovered_delta(processor.as_ref(), &delta).await
-                    } else {
-                        self.apply_delta(processor.as_ref(), &delta, frame.finality)
-                            .await
-                    } {
-                        Ok(outcome) => outcome,
-                        Err(error) if live_lane_isolatable_error(&error) => break,
-                        Err(error) => return Err(error),
-                    };
-                    record_apply(
-                        report
-                            .processors
-                            .entry(processor.descriptor().id.to_string())
-                            .or_default(),
-                        &outcome,
-                    );
-                    self.advance_or_complete_live_gap(processor.as_ref(), frame.block)
-                        .await?;
-                    continue;
+                    if self
+                        .replay_gap_frame(processor.as_ref(), &frame, report)
+                        .await?
+                    {
+                        continue;
+                    }
+                    break;
                 }
                 if !self
                     .recover_finalized_live_gap(processor.as_ref(), gap.first_unapplied, report)
@@ -4471,6 +4966,30 @@ impl SharedLiveRuntime {
             }
         }
         Ok(())
+    }
+
+    /// [`Self::clear_applied_pending_variant`] under the replay isolation
+    /// policy: `Some(cleared)`, or `None` when a processor-local failure, such
+    /// as a pending delta that conflicts with the applied one, stopped only
+    /// this lane.
+    async fn settle_pending_variant(
+        &self,
+        processor: &dyn Processor,
+        delta: &EncodedDelta,
+        report: &mut SharedLiveReport,
+    ) -> Result<Option<bool>, RuntimeError> {
+        match self
+            .clear_applied_pending_variant(processor, delta, report)
+            .await
+        {
+            Ok(cleared) => Ok(Some(cleared)),
+            Err(error) if live_lane_isolatable_error(&error) => {
+                self.isolate_replay_failure(processor, delta.block, &error)
+                    .await?;
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     async fn clear_applied_pending_variant(
@@ -4536,6 +5055,29 @@ impl SharedLiveRuntime {
         Ok(true)
     }
 
+    /// Reject a reorg that does not first revert the canonical tip. `reverted`
+    /// runs tip-first, so a reorg starting below the tip would leave canonical
+    /// descendants of a block it replaces.
+    async fn verify_reorg_tip(
+        &self,
+        reverted: &[leani_primitives::BlockRef],
+    ) -> Result<(), RuntimeError> {
+        let tip = self
+            .store
+            .canonical_tip(self.source.descriptor().chain_id)
+            .await?;
+        if let Some(first) = reverted.first()
+            && tip.is_none_or(|tip| tip.number != first.number || tip.hash != first.hash)
+        {
+            return Err(RuntimeError::InvalidReorg(format!(
+                "reorg first reverts block {}, but the canonical tip is {:?}",
+                first.number.0,
+                tip.map(|tip| tip.number.0)
+            )));
+        }
+        Ok(())
+    }
+
     async fn apply_reorg(
         &self,
         reverted: &[leani_primitives::BlockRef],
@@ -4549,6 +5091,8 @@ impl SharedLiveRuntime {
                 self.config.max_reorg_depth
             )));
         }
+        self.verify_reorg_tip(reverted).await?;
+        let chain_id = self.source.descriptor().chain_id;
         let mut prepared = Vec::with_capacity(applied.len());
         for frame in applied {
             prepared.push(self.prepare_frame(frame, true).await?);
@@ -4564,7 +5108,6 @@ impl SharedLiveRuntime {
                 )));
             }
         }
-        let chain_id = self.source.descriptor().chain_id;
         self.store
             .reorg_recent_frames(
                 chain_id,
@@ -4575,22 +5118,27 @@ impl SharedLiveRuntime {
                     .collect::<Vec<_>>(),
             )
             .await?;
+        // `reverted` runs tip-first, so its last block is the lowest. The
+        // store has checked that the canonical ancestor, now the tip, is
+        // retained right below it.
+        let lowest_reverted = reverted.last().map_or(BlockNumber(0), |block| block.number);
+        let ancestor = match lowest_reverted.0.checked_sub(1) {
+            Some(number) => self.canonical_ref(BlockNumber(number)).await?,
+            None => None,
+        };
         for (processor_index, processor) in self.processors.iter().enumerate() {
             if let Some(gap) = self.store.live_lane_gap(processor.descriptor()).await?
-                && let Some(reverted_gap) =
-                    reverted.iter().find(|block| **block == gap.first_unapplied)
-                && let Some(replacement) = prepared
-                    .iter()
-                    .find(|prepared| prepared.frame.block.number == reverted_gap.number)
-                && let Some(replacement_delta) = &replacement.deltas[processor_index]
+                && gap.first_unapplied.number >= lowest_reverted
             {
-                self.store
-                    .rebase_live_lane_gap(
-                        processor.descriptor(),
-                        *reverted_gap,
-                        &replacement_delta.delta,
-                    )
-                    .await?;
+                self.rebase_gap_across_reorg(
+                    processor.as_ref(),
+                    gap.first_unapplied,
+                    prepared
+                        .first()
+                        .map(|first| (first.frame.block, first.deltas[processor_index].as_ref())),
+                    ancestor,
+                )
+                .await?;
             }
             for block in reverted {
                 self.store
@@ -4619,20 +5167,77 @@ impl SharedLiveRuntime {
                 }
             }
         }
+        if prepared.is_empty() {
+            // With no replacement branch nothing is committed, so no commit
+            // drains: drain here, so a lane whose gap moved onto the new tip
+            // settles before the next block.
+            return Box::pin(self.drain_pending(report)).await;
+        }
         for frame in prepared {
-            Box::pin(self.commit_prepared(frame, false, report)).await?;
+            Box::pin(self.commit_prepared(frame, report)).await?;
             report.chain_blocks = report.chain_blocks.saturating_add(1);
+        }
+        Ok(())
+    }
+
+    /// Keep a lane's gap on the canonical chain across a reorg that reverts
+    /// blocks at or below it.
+    ///
+    /// The reorg undoes every block the lane applied from the lowest reverted
+    /// height up, so its gap restarts at the first replacement block, even
+    /// when the gap sat higher: the lane must not skip replacement blocks
+    /// below it. With no replacement branch the gap moves onto the new tip,
+    /// the reorg's ancestor, which the lane has applied or which lies below
+    /// its start; the drain moves past it, completing the gap or moving it
+    /// onto the ancestor's successor once that block is retained. Either way
+    /// no marker stays on a height the new chain no longer has, whether the
+    /// lane is paused or failed.
+    async fn rebase_gap_across_reorg(
+        &self,
+        processor: &dyn Processor,
+        marker: BlockRef,
+        first_replacement: Option<(BlockRef, Option<&MappedFrame>)>,
+        ancestor: Option<BlockRef>,
+    ) -> Result<(), RuntimeError> {
+        match first_replacement {
+            Some((first, Some(replacement))) if marker.number == first.number => {
+                self.store
+                    .rebase_live_lane_gap(processor.descriptor(), marker, &replacement.delta)
+                    .await?;
+            }
+            // A higher gap, or a parked lane that could not map the
+            // replacement: its replay maps the canonical block.
+            Some((first, _)) => {
+                self.store
+                    .advance_live_lane_gap(processor.descriptor(), marker, first)
+                    .await?;
+            }
+            None => {
+                if let Some(ancestor) = ancestor {
+                    self.store
+                        .advance_live_lane_gap(processor.descriptor(), marker, ancestor)
+                        .await?;
+                }
+            }
         }
         Ok(())
     }
 }
 
+/// Whether a live-lane commit error belongs to one processor lane, so the lane
+/// is parked while shared ingestion continues. The store runs a processor's
+/// reducer, so its failures arrive as `StoreError::Processor`, and the
+/// store's per-apply invariants as `StoreError::Invariant`. A delta that
+/// conflicts with the one already applied for its block is `ConflictingApply`.
 fn live_lane_isolatable_error(error: &RuntimeError) -> bool {
     matches!(
         error,
         RuntimeError::Processor(_)
             | RuntimeError::Store(
-                StoreError::DeliveryLimit { .. }
+                StoreError::Processor(_)
+                    | StoreError::Invariant(_)
+                    | StoreError::ConflictingApply { .. }
+                    | StoreError::DeliveryLimit { .. }
                     | StoreError::ProcessorPaused { .. }
                     | StoreError::ProcessorFailed(_)
                     | StoreError::DeliveryItemTooLarge { .. }
@@ -4640,6 +5245,59 @@ fn live_lane_isolatable_error(error: &RuntimeError) -> bool {
                     | StoreError::ArtifactStorageLimit { .. }
             )
     )
+}
+
+/// The durable reason, the delivery bytes the lane needs, and whether the lane
+/// fails (and waits for an operator reset) rather than pauses, for one
+/// isolatable live-lane error.
+fn live_lane_park_reason(error: &RuntimeError) -> Result<(&'static str, u64, bool), RuntimeError> {
+    Ok(match error {
+        RuntimeError::Store(StoreError::DeliveryItemTooLarge { observed_bytes, .. }) => {
+            ("single_block_exceeds_delivery_limit", *observed_bytes, true)
+        }
+        RuntimeError::Store(StoreError::DeliveryLimit { action, .. }) => (
+            "delivery_spool_hard_limit",
+            0,
+            matches!(action, DeliveryLimitAction::Fail),
+        ),
+        RuntimeError::Store(StoreError::PhysicalStorageLimit { .. }) => {
+            ("physical_store_hard_limit", 0, false)
+        }
+        RuntimeError::Store(StoreError::ArtifactStorageLimit { .. }) => {
+            ("artifact_store_hard_limit", 0, false)
+        }
+        RuntimeError::Store(StoreError::ProcessorFailed(_)) => {
+            ("processor_live_lane_failed", 0, true)
+        }
+        RuntimeError::Store(StoreError::ProcessorPaused { .. }) => {
+            ("delivery_spool_hard_limit", 0, false)
+        }
+        RuntimeError::Store(StoreError::Processor(_) | StoreError::Invariant(_)) => {
+            ("processor_live_reduce_failed", 0, true)
+        }
+        // Processor code outside the reducer: mapping, finality variants, or
+        // delta encoding.
+        RuntimeError::Processor(_) => ("processor_live_mapping_failed", 0, true),
+        RuntimeError::Store(StoreError::ConflictingApply { .. }) => {
+            ("processor_live_delta_conflict", 0, true)
+        }
+        _ => {
+            return Err(RuntimeError::InvalidConfig(format!(
+                "attempted to isolate unsupported live-lane error: {error}"
+            )));
+        }
+    })
+}
+
+/// Whether two references name the same block. The hash commits to the whole
+/// header, so the number and hash decide. A zero parent hash is unknown, as on
+/// a canonical row seeded from a finality anchor, and is not compared.
+fn same_block(left: BlockRef, right: BlockRef) -> bool {
+    left.number == right.number
+        && left.hash == right.hash
+        && (left.parent_hash == BlockHash::ZERO
+            || right.parent_hash == BlockHash::ZERO
+            || left.parent_hash == right.parent_hash)
 }
 
 fn live_gap_recovery_retryable_error(error: &RuntimeError) -> bool {
@@ -4760,8 +5418,10 @@ fn compile_live_request(
 /// Narrowest pushdown scope that covers every one of `filters`.
 ///
 /// The fold starts from the first filter because the default scope is a
-/// wildcard, which would absorb every narrower filter.
-fn covering_filter_scope<'a>(
+/// wildcard, which would absorb every narrower filter. An empty `filters`
+/// yields the default, unfiltered scope.
+#[must_use]
+pub fn covering_filter_scope<'a>(
     filters: impl IntoIterator<Item = &'a leani_primitives::FilterScope>,
 ) -> leani_primitives::FilterScope {
     let mut filters = filters.into_iter();
@@ -5211,6 +5871,11 @@ pub struct SharedFinalityReport {
     pub deferred_finalized_anchor: Option<BlockHash>,
     pub processor_finalized_through: BTreeMap<String, BlockNumber>,
     pub deferred_processors: BTreeMap<String, BlockHash>,
+    /// Processors whose last finality advance failed, with the error. Their
+    /// failure did not stop the others. A coverage contradiction also fails
+    /// the processor's lane; any other failure is retried at the next anchor.
+    #[serde(default)]
+    pub failed_processors: BTreeMap<String, String>,
     pub pruned_recent_frames: u64,
     pub retained_recent_bytes: u64,
 }
@@ -5304,15 +5969,19 @@ impl SharedFinalityRuntime {
     /// already contain the exact execution hash.
     ///
     /// Processors still cold-backfilling defer the anchor instead of claiming
-    /// finality for unknown coverage.
+    /// finality for unknown coverage. A processor whose own finality update
+    /// fails is recorded in the report and retried at the next anchor; the
+    /// others advance and recent frames are pruned regardless. A processor
+    /// whose coverage contradicts the anchor has its lane failed, and a failed
+    /// lane is not finalized until an operator resets it.
     ///
     /// # Errors
     ///
     /// A verified finalized hash that races ahead of execution ingestion is
     /// retained and retried until the exact canonical frame arrives.
     ///
-    /// Fails closed on a finality contradiction/reset, store failure, or a
-    /// hard retention-limit conflict.
+    /// Fails closed on a finality contradiction/reset or a store failure
+    /// outside one processor's finality update.
     pub async fn run(
         &self,
         checkpoint: ConsensusCheckpoint,
@@ -5395,13 +6064,13 @@ impl SharedFinalityRuntime {
     ///
     /// An unavailable or disconnected source clears readiness and is retried
     /// from the original weak-subjectivity checkpoint. Verification
-    /// contradictions, protocol errors, store failures, and resource-limit
-    /// failures still terminate the lane fail-closed.
+    /// contradictions, protocol errors, and store failures still terminate the
+    /// lane fail-closed.
     ///
     /// # Errors
     ///
-    /// Returns non-transient source failures and the same fail-closed
-    /// processor, store, finality, and retention errors as [`Self::run`].
+    /// Returns non-transient source failures and the same fail-closed store
+    /// and finality errors as [`Self::run`].
     #[allow(clippy::too_many_lines)]
     pub async fn run_resilient_with_readiness(
         &self,
@@ -5575,28 +6244,33 @@ impl SharedFinalityRuntime {
         report.deferred_finalized_anchor = None;
         for processor in &self.processors {
             let id = processor.descriptor().id.to_string();
+            // One processor's failure must not hold back finality or recent
+            // pruning for the others: record it, and let the next anchor
+            // retry that processor.
             match self
-                .store
-                .coverage_block_by_hash(processor.descriptor(), block_hash)
-                .await?
+                .finalize_processor(processor.as_ref(), block_hash, canonical.number)
+                .await
             {
-                Some(through) if through == canonical.number => {
-                    self.store
-                        .mark_finalized(processor.descriptor(), through)
-                        .await?;
+                Ok(ProcessorFinality::Finalized(through)) => {
                     report
                         .processor_finalized_through
                         .insert(id.clone(), through);
                     report.deferred_processors.remove(&id);
+                    report.failed_processors.remove(&id);
                 }
-                Some(through) => {
-                    return Err(RuntimeError::InvalidReorg(format!(
-                        "processor {id} resolves finalized hash at {}, canonical recent material at {}",
-                        through.0, canonical.number.0
-                    )));
-                }
-                None => {
+                Ok(ProcessorFinality::Deferred) => {
+                    report.failed_processors.remove(&id);
                     report.deferred_processors.insert(id, block_hash);
+                }
+                Ok(ProcessorFinality::LaneFailed) => {}
+                Err(error) => {
+                    warn!(
+                        processor = %id,
+                        finalized_block = canonical.number.0,
+                        %error,
+                        "processor finality failed; finality and recent pruning continue for the others"
+                    );
+                    report.failed_processors.insert(id, error.to_string());
                 }
             }
         }
@@ -5631,13 +6305,77 @@ impl SharedFinalityRuntime {
             });
         }
         if pruned.hard_limit_exceeded {
-            return Err(RuntimeError::RecentStorageBudget {
-                limit: self.config.recent_hard_bytes,
-                observed: pruned.retained_bytes,
-            });
+            // The live lane enforces the hard limit when it retains a frame and
+            // waits for this pruning. Failing here would stop that pruning.
+            warn!(
+                limit = self.config.recent_hard_bytes,
+                retained = pruned.retained_bytes,
+                finalized_block = canonical.number.0,
+                "recent frames stay above their hard limit after pruning; live ingestion waits for a later finality advance"
+            );
         }
         Ok(true)
     }
+
+    /// Advance one processor's finality to the canonical anchor block.
+    ///
+    /// Coverage that holds the anchor hash at another height contradicts the
+    /// canonical chain. That is not transient, so it is checked first, even
+    /// for a lane that is already failed for another reason: the lane fails
+    /// with `processor_finality_conflict`, which overrides that earlier reason
+    /// and which the store refuses to reset (`live_lane_requires_rebuild`), so
+    /// no later anchor finalizes it through the contradicted height. Any other
+    /// failed lane is skipped until an operator resets it. Other errors, such
+    /// as a transient `mark_finalized` failure, leave the lane as it is for the
+    /// next anchor to retry.
+    async fn finalize_processor(
+        &self,
+        processor: &dyn Processor,
+        block_hash: BlockHash,
+        canonical: BlockNumber,
+    ) -> Result<ProcessorFinality, RuntimeError> {
+        let Some(through) = self
+            .store
+            .coverage_block_by_hash(processor.descriptor(), block_hash)
+            .await?
+        else {
+            return Ok(ProcessorFinality::Deferred);
+        };
+        if through != canonical {
+            self.store
+                .fail_processor_live_lane(processor.descriptor(), "processor_finality_conflict")
+                .await?;
+            return Err(RuntimeError::InvalidReorg(format!(
+                "processor {} resolves finalized hash at {}, canonical recent material at {}",
+                processor.descriptor().id,
+                through.0,
+                canonical.0
+            )));
+        }
+        if self
+            .store
+            .processor_runtime_state(processor.descriptor())
+            .await?
+            .state
+            == ProcessorRunState::Failed
+        {
+            return Ok(ProcessorFinality::LaneFailed);
+        }
+        self.store
+            .mark_finalized(processor.descriptor(), through)
+            .await?;
+        Ok(ProcessorFinality::Finalized(through))
+    }
+}
+
+/// How one processor took a finalized anchor.
+enum ProcessorFinality {
+    /// Finalized through the anchor block.
+    Finalized(BlockNumber),
+    /// Its coverage has not reached the anchor block yet.
+    Deferred,
+    /// Its lane is failed, so finality waits for an operator reset.
+    LaneFailed,
 }
 
 fn decode_checkpoint(bytes: &[u8]) -> Result<BackfillCheckpoint, RuntimeError> {
@@ -5954,7 +6692,11 @@ mod tests {
 
     impl FilteredCounter {
         fn new(requirements: Vec<leani_processor_api::DataRequirement>) -> Self {
-            let inner = BlockLocalCounter::named("filtered-counter");
+            Self::named("filtered-counter", requirements)
+        }
+
+        fn named(id: &str, requirements: Vec<leani_processor_api::DataRequirement>) -> Self {
+            let inner = BlockLocalCounter::named(id);
             let mut descriptor = inner.descriptor().clone();
             descriptor.requirements = requirements;
             Self { inner, descriptor }
@@ -6047,6 +6789,257 @@ mod tests {
             delta: &EncodedDelta,
         ) -> Result<leani_processor_api::DomainChanges, ProcessorError> {
             self.inner.reduce(transaction, cursor, delta).await
+        }
+    }
+
+    /// Runs `inner`, but its reducer rejects one block the way a production
+    /// reducer rejects input it cannot account for.
+    #[derive(Debug)]
+    struct FailingReduce<P> {
+        inner: P,
+        descriptor: ProcessorDescriptor,
+        block: BlockNumber,
+        failures_remaining: AtomicUsize,
+    }
+
+    impl<P: Processor> FailingReduce<P> {
+        fn new(inner: P, block: BlockNumber) -> Self {
+            let descriptor = inner.descriptor().clone();
+            Self {
+                inner,
+                descriptor,
+                block,
+                failures_remaining: AtomicUsize::new(usize::MAX),
+            }
+        }
+
+        fn with_delivery_ordering(
+            mut self,
+            ordering: leani_processor_api::DeliveryOrdering,
+        ) -> Self {
+            self.descriptor.delivery_ordering = ordering;
+            self
+        }
+
+        /// Reject the block only the first time, as after an operator fix.
+        fn failing_once(self) -> Self {
+            self.failures_remaining.store(1, Ordering::SeqCst);
+            self
+        }
+
+        fn starting_at(mut self, block: BlockNumber) -> Self {
+            self.descriptor.start = StartPoint::Block(block);
+            self
+        }
+    }
+
+    #[async_trait]
+    impl<P: Processor + std::fmt::Debug + 'static> Processor for FailingReduce<P> {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
+        fn descriptor(&self) -> &ProcessorDescriptor {
+            &self.descriptor
+        }
+
+        async fn map(
+            &self,
+            block: &leani_primitives::BlockFrame,
+        ) -> Result<EncodedDelta, ProcessorError> {
+            self.inner.map(block).await
+        }
+
+        async fn reduce(
+            &self,
+            transaction: &mut dyn leani_processor_api::ReducerTransaction,
+            cursor: &ProcessorCursor,
+            delta: &EncodedDelta,
+        ) -> Result<leani_processor_api::DomainChanges, ProcessorError> {
+            if delta.block.number == self.block
+                && self
+                    .failures_remaining
+                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                        remaining.checked_sub(1)
+                    })
+                    .is_ok()
+            {
+                return Err(ProcessorError::Invariant(
+                    "injected reducer failure".to_owned(),
+                ));
+            }
+            self.inner.reduce(transaction, cursor, delta).await
+        }
+    }
+
+    /// A counter that records every block it maps and can reject one.
+    #[derive(Debug)]
+    struct MapProbe {
+        inner: BlockLocalCounter,
+        fail_at: Option<BlockNumber>,
+        mapped: StdMutex<Vec<BlockNumber>>,
+    }
+
+    impl MapProbe {
+        fn new(id: &str, fail_at: Option<BlockNumber>) -> Self {
+            Self {
+                inner: BlockLocalCounter::named(id),
+                fail_at,
+                mapped: StdMutex::new(Vec::new()),
+            }
+        }
+
+        fn mapped(&self, block: BlockNumber) -> bool {
+            self.mapped
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains(&block)
+        }
+    }
+
+    #[async_trait]
+    impl Processor for MapProbe {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
+        fn descriptor(&self) -> &ProcessorDescriptor {
+            self.inner.descriptor()
+        }
+
+        async fn map(
+            &self,
+            block: &leani_primitives::BlockFrame,
+        ) -> Result<EncodedDelta, ProcessorError> {
+            self.mapped
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(block.block.number);
+            if self.fail_at == Some(block.block.number) {
+                return Err(ProcessorError::Input("injected mapping failure".to_owned()));
+            }
+            self.inner.map(block).await
+        }
+
+        async fn reduce(
+            &self,
+            transaction: &mut dyn leani_processor_api::ReducerTransaction,
+            cursor: &ProcessorCursor,
+            delta: &EncodedDelta,
+        ) -> Result<leani_processor_api::DomainChanges, ProcessorError> {
+            self.inner.reduce(transaction, cursor, delta).await
+        }
+    }
+
+    /// A counter whose mapping of block 0 waits briefly for a second mapper,
+    /// so two unserialized drains of the same gap both reach it.
+    #[derive(Debug)]
+    struct RendezvousCounter {
+        inner: BlockLocalCounter,
+        rendezvous: tokio::sync::Barrier,
+    }
+
+    #[async_trait]
+    impl Processor for RendezvousCounter {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
+        fn descriptor(&self) -> &ProcessorDescriptor {
+            self.inner.descriptor()
+        }
+
+        async fn map(
+            &self,
+            block: &leani_primitives::BlockFrame,
+        ) -> Result<EncodedDelta, ProcessorError> {
+            if block.block.number == BlockNumber(0) {
+                let _ =
+                    tokio::time::timeout(Duration::from_millis(200), self.rendezvous.wait()).await;
+            }
+            self.inner.map(block).await
+        }
+
+        async fn reduce(
+            &self,
+            transaction: &mut dyn leani_processor_api::ReducerTransaction,
+            cursor: &ProcessorCursor,
+            delta: &EncodedDelta,
+        ) -> Result<leani_processor_api::DomainChanges, ProcessorError> {
+            self.inner.reduce(transaction, cursor, delta).await
+        }
+    }
+
+    /// A live source that pushes the request's filter down like a production
+    /// source: every frame's transactions arrive filtered to the request's
+    /// scope. It records each request it serves.
+    #[derive(Debug)]
+    struct FilteringLiveSource {
+        descriptor: SourceDescriptor,
+        events: Vec<ChainEvent>,
+        requests: StdMutex<Vec<DataRequest>>,
+    }
+
+    impl FilteringLiveSource {
+        fn new(descriptor: SourceDescriptor, events: Vec<ChainEvent>) -> Self {
+            Self {
+                descriptor,
+                events,
+                requests: StdMutex::new(Vec::new()),
+            }
+        }
+
+        fn requests(&self) -> Vec<DataRequest> {
+            self.requests
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        }
+    }
+
+    #[async_trait]
+    impl LiveSource for FilteringLiveSource {
+        fn descriptor(&self) -> &SourceDescriptor {
+            &self.descriptor
+        }
+
+        async fn subscribe(
+            &self,
+            request: DataRequest,
+            _start: LiveStart,
+            _budget: SourceBudget,
+            _cancellation: CancellationToken,
+        ) -> Result<leani_source_api::ChainEventStream, SourceError> {
+            let project = |mut frame: leani_primitives::BlockFrame| {
+                if request.allow_filtered {
+                    frame.transactions = Material::Filtered {
+                        value: Vec::new(),
+                        scope: request.filters.scope.clone(),
+                        completeness: leani_primitives::Completeness::VerifiedPredicate,
+                    };
+                }
+                frame
+            };
+            let events = self
+                .events
+                .iter()
+                .cloned()
+                .map(|event| {
+                    Ok(match event {
+                        ChainEvent::Block(frame) => ChainEvent::Block(Box::new(project(*frame))),
+                        ChainEvent::Reorg { reverted, applied } => ChainEvent::Reorg {
+                            reverted,
+                            applied: applied.into_iter().map(project).collect(),
+                        },
+                        other => other,
+                    })
+                })
+                .collect::<Vec<_>>();
+            self.requests
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(request);
+            Ok(futures::stream::iter(events).boxed())
         }
     }
 
@@ -8376,6 +9369,105 @@ mod tests {
         assert_eq!(report.sources[0].source_id, "recent-store");
         assert_eq!(report.sources[0].attempts, 0);
         assert_eq!(report.final_coverage, vec![range]);
+    }
+
+    /// Runs a recent-reuse backfill of blocks `0..=9` and returns how many
+    /// chunks it committed them in.
+    async fn recent_gap_chunks(config: HistoricalRuntimeConfig) -> u64 {
+        let range = BlockRange::new(BlockNumber(0), BlockNumber(9)).expect("range");
+        let chain = e2e_chain(9)
+            .into_iter()
+            .map(|mut frame| {
+                frame.provenance.push(leani_primitives::Provenance {
+                    source_id: leani_primitives::SourceId::new("live-cache").expect("source ID"),
+                    source_kind: SourceKind::ExecutionP2p,
+                    trust: TrustModel::ProtocolVerified,
+                    range: Some(range),
+                    object: None,
+                    observed_at_unix_ms: 1,
+                    projection: Vec::new(),
+                });
+                frame
+            })
+            .collect::<Vec<_>>();
+        let source = Arc::new(ScriptedHistorySource::from_frames(
+            e2e_descriptor("unused-batched-history", range),
+            chain.clone(),
+        ));
+        let processor = Arc::new(BlockLocalCounter::named("recent-batch-counter"));
+        let (_directory, store) = store().await;
+        for frame in &chain {
+            store.store_recent_frame(frame).await.expect("recent frame");
+        }
+        let runtime = HistoricalRuntime::new(store.clone(), source.clone(), processor, config)
+            .expect("runtime");
+        let job = BackfillJob::for_processor(
+            "recent-batches",
+            runtime.processor.as_ref(),
+            ChainId(1),
+            range,
+            VerificationPolicy::CompleteCryptographic,
+        )
+        .expect("job");
+
+        let report = runtime
+            .run(job, default_source_budget(), CancellationToken::new())
+            .await
+            .expect("recent material backfill");
+
+        assert_eq!(source.plan_calls(), 0);
+        assert_eq!(report.source_id, "recent-store");
+        assert_eq!(report.frames_committed, 10);
+        assert_eq!(report.final_coverage, vec![range]);
+        decode_checkpoint(
+            &store
+                .job("recent-batches")
+                .await
+                .expect("job")
+                .expect("job record")
+                .checkpoint
+                .expect("checkpoint"),
+        )
+        .expect("decode checkpoint")
+        .chunks_completed
+    }
+
+    #[tokio::test]
+    async fn recent_gap_reuse_streams_bounded_batches() {
+        // A batch holds at most one commit's worth of blocks...
+        assert_eq!(
+            recent_gap_chunks(HistoricalRuntimeConfig {
+                mapper_concurrency: 2,
+                commit_maximum_blocks: 4,
+                ..HistoricalRuntimeConfig::default()
+            })
+            .await,
+            3,
+            "ten blocks stream as 4 + 4 + 2"
+        );
+        // ...and at most the pipeline's mapped-byte budget of frames.
+        let frame = e2e_chain(0).remove(0);
+        let mut measured = frame.clone();
+        measured.provenance.push(leani_primitives::Provenance {
+            source_id: leani_primitives::SourceId::new("live-cache").expect("source ID"),
+            source_kind: SourceKind::ExecutionP2p,
+            trust: TrustModel::ProtocolVerified,
+            range: Some(BlockRange::new(BlockNumber(0), BlockNumber(9)).expect("range")),
+            object: None,
+            observed_at_unix_ms: 1,
+            projection: Vec::new(),
+        });
+        let frame_bytes = encoded_recent_frame_bytes(&measured).await;
+        assert_eq!(
+            recent_gap_chunks(HistoricalRuntimeConfig {
+                mapper_concurrency: 2,
+                maximum_mapped_bytes: frame_bytes * 4,
+                ..HistoricalRuntimeConfig::default()
+            })
+            .await,
+            3,
+            "ten blocks of four frames' budget stream as 4 + 4 + 2"
+        );
     }
 
     #[tokio::test]
@@ -11076,6 +12168,16 @@ mod tests {
             blocked_state.reason.as_deref(),
             Some("single_block_exceeds_delivery_limit")
         );
+        // The store failed the lane itself; the park still records where a
+        // reset replays from.
+        assert_eq!(
+            store
+                .live_lane_gap(blocked.descriptor())
+                .await
+                .expect("gap")
+                .map(|gap| gap.first_unapplied),
+            Some(first.block)
+        );
         assert_eq!(
             store
                 .recent_frame(ChainId(1), third.block.number)
@@ -11426,6 +12528,50 @@ mod tests {
             .expect("park lane");
     }
 
+    async fn assert_parked_at(
+        store: &SqliteStore,
+        processor: &dyn Processor,
+        first_unapplied: leani_primitives::BlockRef,
+        state: ProcessorRunState,
+        reason: &str,
+    ) {
+        let runtime_state = store
+            .processor_runtime_state(processor.descriptor())
+            .await
+            .expect("state");
+        assert_eq!(runtime_state.state, state);
+        assert_eq!(runtime_state.reason.as_deref(), Some(reason));
+        assert_eq!(
+            store
+                .live_lane_gap(processor.descriptor())
+                .await
+                .expect("gap")
+                .expect("a parked lane keeps its gap")
+                .first_unapplied,
+            first_unapplied
+        );
+    }
+
+    /// Blocks `0..=through` as a live source delivers them.
+    fn live_blocks(through: u64) -> Vec<leani_primitives::BlockFrame> {
+        let mut parent = BlockHash::ZERO;
+        (0..=through)
+            .map(|number| {
+                let frame = live_fixture(number, parent);
+                parent = frame.block.hash;
+                frame
+            })
+            .collect()
+    }
+
+    fn block_events(frames: &[leani_primitives::BlockFrame]) -> Vec<LiveStep> {
+        frames
+            .iter()
+            .cloned()
+            .map(|frame| LiveStep::Event(ChainEvent::Block(Box::new(frame))))
+            .collect()
+    }
+
     async fn assert_gap_recovered(store: &SqliteStore, processor: &dyn Processor) {
         assert!(
             store
@@ -11509,7 +12655,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unfinalized_gap_replay_isolates_processors_that_cannot_read_retained_frames() {
+    async fn unfinalized_gap_replay_pauses_until_finality_then_recovers_from_history() {
         let range = BlockRange::new(BlockNumber(0), BlockNumber(4)).expect("range");
         let chain = live_chain(Finality::Included);
         let fourth = live_fixture(3, chain[2].block.hash);
@@ -11534,7 +12680,7 @@ mod tests {
         park_at_first_block(&store, block_local.as_ref(), &chain).await;
         park_at_first_block(&store, ordered.as_ref(), &chain).await;
 
-        let report = SharedLiveRuntime::new(
+        let runtime = SharedLiveRuntime::new(
             store.clone(),
             Arc::new(ScriptedLiveSource::new(
                 fixture_source_descriptor("unfinalized-gap-live", range),
@@ -11547,35 +12693,47 @@ mod tests {
             SharedLiveRuntimeConfig::default(),
         )
         .expect("runtime")
-        .run(
-            LiveStart::Head,
-            default_source_budget(),
-            CancellationToken::new(),
-        )
-        .await
-        .expect("an unreadable unfinalized gap isolates its processor, not the live lane");
+        .with_finalized_gap_recovery(Arc::new(StaticLiveGapRecovery {
+            frames: live_chain(Finality::Finalized),
+        }));
+        let report = runtime
+            .run(
+                LiveStart::Head,
+                default_source_budget(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("an unreadable unfinalized gap pauses its processor, not the live lane");
 
         assert_eq!(report.chain_blocks, 2);
         assert_eq!(report.processors["unfinalized-gap-healthy"].applied, 2);
         for processor in [block_local.as_ref() as &dyn Processor, ordered.as_ref()] {
-            let state = store
-                .processor_runtime_state(processor.descriptor())
-                .await
-                .expect("state");
-            assert_eq!(state.state, ProcessorRunState::Failed);
+            assert_parked_at(
+                &store,
+                processor,
+                chain[0].block,
+                ProcessorRunState::Paused,
+                "unfinalized_gap_waiting_for_finality",
+            )
+            .await;
+        }
+
+        // Finality reaches the gap, so history can serve it: the lanes heal
+        // on the next drain without an operator.
+        store
+            .mark_recent_finalized(ChainId(1), chain[2].block.number, chain[2].block.hash)
+            .await
+            .expect("finalize the gap");
+        let recovered = runtime
+            .reconcile_pending()
+            .await
+            .expect("a finalized gap recovers from history");
+        for processor in [block_local.as_ref() as &dyn Processor, ordered.as_ref()] {
             assert_eq!(
-                state.reason.as_deref(),
-                Some("unfinalized_gap_unrecoverable")
+                recovered.processors[processor.descriptor().id.as_str()].applied,
+                5
             );
-            assert_eq!(
-                store
-                    .live_lane_gap(processor.descriptor())
-                    .await
-                    .expect("gap")
-                    .expect("gap stays for an operator")
-                    .first_unapplied,
-                chain[0].block
-            );
+            assert_gap_recovered(&store, processor).await;
         }
     }
 
@@ -11613,6 +12771,1642 @@ mod tests {
             state.reason.as_deref(),
             Some("processor_live_mapping_failed")
         );
+    }
+
+    #[tokio::test]
+    async fn reducer_failure_parks_only_its_processor_while_shared_ingestion_continues() {
+        let chain = live_blocks(3);
+        let range = BlockRange::new(BlockNumber(0), BlockNumber(3)).expect("range");
+        let block_local = Arc::new(FailingReduce::new(
+            BlockLocalCounter::named("reduce-failure-counter"),
+            BlockNumber(1),
+        ));
+        let ordered = Arc::new(FailingReduce::new(
+            OrderedLedgerProcessor::named("reduce-failure-ledger"),
+            BlockNumber(1),
+        ));
+        let healthy = Arc::new(BlockLocalCounter::named("reduce-failure-healthy"));
+        let (_directory, store) = store().await;
+
+        let report = SharedLiveRuntime::new(
+            store.clone(),
+            Arc::new(ScriptedLiveSource::new(
+                fixture_source_descriptor("reduce-failure-live", range),
+                block_events(&chain),
+            )),
+            vec![block_local.clone(), ordered.clone(), healthy.clone()],
+            SharedLiveRuntimeConfig::default(),
+        )
+        .expect("runtime")
+        .run(
+            LiveStart::Head,
+            default_source_budget(),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("one processor's reducer failure must not stop shared ingestion");
+
+        assert_eq!(report.chain_blocks, 4);
+        assert_eq!(report.processors["reduce-failure-healthy"].applied, 4);
+        for processor in [block_local.as_ref() as &dyn Processor, ordered.as_ref()] {
+            assert_eq!(
+                report.processors[processor.descriptor().id.as_str()].applied,
+                1
+            );
+            assert_parked_at(
+                &store,
+                processor,
+                chain[1].block,
+                ProcessorRunState::Failed,
+                "processor_live_reduce_failed",
+            )
+            .await;
+        }
+    }
+
+    #[tokio::test]
+    async fn a_canonical_block_local_reducer_failure_parks_only_its_lane() {
+        let chain = live_blocks(2);
+        let range = BlockRange::new(BlockNumber(0), BlockNumber(2)).expect("range");
+        // Canonical delivery ordering is the SDK default for block-local
+        // processors. The failing lane comes first, so a lane-wide failure
+        // would also stop the healthy commit of the same block.
+        let failing = Arc::new(
+            FailingReduce::new(
+                BlockLocalCounter::named("canonical-reduce-failure"),
+                BlockNumber(1),
+            )
+            .with_delivery_ordering(leani_processor_api::DeliveryOrdering::Canonical),
+        );
+        let healthy = Arc::new(BlockLocalCounter::named("canonical-reduce-healthy"));
+        let (_directory, store) = store().await;
+
+        let report = SharedLiveRuntime::new(
+            store.clone(),
+            Arc::new(ScriptedLiveSource::new(
+                fixture_source_descriptor("canonical-reduce-live", range),
+                block_events(&chain),
+            )),
+            vec![failing.clone(), healthy.clone()],
+            SharedLiveRuntimeConfig::default(),
+        )
+        .expect("runtime")
+        .run(
+            LiveStart::Head,
+            default_source_budget(),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("a canonical block-local reducer failure must not stop shared ingestion");
+
+        assert_eq!(report.chain_blocks, 3);
+        assert_eq!(report.processors["canonical-reduce-healthy"].applied, 3);
+        assert_eq!(report.processors["canonical-reduce-failure"].applied, 1);
+        assert_parked_at(
+            &store,
+            failing.as_ref(),
+            chain[1].block,
+            ProcessorRunState::Failed,
+            "processor_live_reduce_failed",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_conflicting_pending_delta_fails_only_its_lane() {
+        let chain = live_blocks(1);
+        let range = BlockRange::new(BlockNumber(0), BlockNumber(1)).expect("range");
+        let conflicted = Arc::new(OrderedLedgerProcessor::named("conflicting-ledger"));
+        let healthy = Arc::new(BlockLocalCounter::named("conflict-healthy"));
+        let (_directory, store) = store().await;
+        // Block 0 is applied, but a pending delta for the same block carries
+        // other content, and no retained frame shows it is a finality variant.
+        apply_live_frame(&store, conflicted.as_ref(), &chain[0], 1).await;
+        store
+            .persist_delta(
+                conflicted.descriptor(),
+                &EncodedDelta::new(
+                    conflicted.descriptor(),
+                    ChainId(1),
+                    chain[0].block,
+                    vec![0xee; 32],
+                ),
+            )
+            .await
+            .expect("persist conflicting delta");
+        let runtime = SharedLiveRuntime::new(
+            store.clone(),
+            Arc::new(ScriptedLiveSource::new(
+                fixture_source_descriptor("conflict-live", range),
+                block_events(&chain[1..]),
+            )),
+            vec![conflicted.clone(), healthy.clone()],
+            SharedLiveRuntimeConfig::default(),
+        )
+        .expect("runtime");
+
+        runtime
+            .reconcile_pending()
+            .await
+            .expect("a conflicting pending delta fails its own lane, not the live lane");
+        assert_parked_at(
+            &store,
+            conflicted.as_ref(),
+            chain[0].block,
+            ProcessorRunState::Failed,
+            "processor_live_delta_conflict",
+        )
+        .await;
+        let report = runtime
+            .run(
+                LiveStart::Head,
+                default_source_budget(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("live run");
+        assert_eq!(report.processors["conflict-healthy"].applied, 1);
+        assert_eq!(report.processors["conflicting-ledger"].applied, 0);
+    }
+
+    #[tokio::test]
+    async fn a_lane_parked_below_a_seeded_anchor_walks_past_it_once_history_passes() {
+        let chain = live_blocks(9);
+        let ordered = Arc::new(OrderedLedgerProcessor::named("below-anchor-ledger"));
+        let runtime = |store: &SqliteStore| {
+            SharedLiveRuntime::new(
+                store.clone(),
+                Arc::new(ScriptedLiveSource::new(
+                    fixture_source_descriptor(
+                        "below-anchor-live",
+                        BlockRange::new(BlockNumber(0), BlockNumber(9)).expect("range"),
+                    ),
+                    Vec::new(),
+                )),
+                vec![ordered.clone()],
+                SharedLiveRuntimeConfig::default(),
+            )
+            .expect("runtime")
+        };
+        let (_directory, store) = store().await;
+        store
+            .register_processor(ordered.descriptor())
+            .await
+            .expect("register");
+        // The node seeds its finalized anchor, block 7, with no parent hash
+        // and no frame, while retained frames end at block 4.
+        store
+            .store_canonical_anchor(
+                ChainId(1),
+                leani_primitives::BlockRef {
+                    parent_hash: BlockHash::ZERO,
+                    timestamp: 1,
+                    ..chain[7].block
+                },
+                Finality::Finalized,
+            )
+            .await
+            .expect("seed anchor");
+        for frame in &chain[..=4] {
+            store.store_recent_frame(frame).await.expect("retain frame");
+        }
+        let live = runtime(&store);
+        assert!(
+            live.park_processor_lane(ordered.descriptor(), "hot_cold_handoff_failed")
+                .await
+                .expect("park")
+        );
+        for frame in chain[5..].iter().filter(|frame| frame.block.number.0 != 7) {
+            store.store_recent_frame(frame).await.expect("retain frame");
+        }
+
+        // History passes the parked block and the anchor.
+        for (sequence, frame) in (1..).zip(&chain) {
+            apply_live_frame(&store, ordered.as_ref(), frame, sequence).await;
+        }
+        live.reconcile_pending()
+            .await
+            .expect("the gap walks across the seeded anchor");
+        assert_gap_recovered(&store, ordered.as_ref()).await;
+        runtime(&store)
+            .reconcile_pending()
+            .await
+            .expect("a restart reconciles cleanly");
+    }
+
+    #[tokio::test]
+    async fn a_failed_canonical_delivery_lane_resets_through_the_api_and_resumes() {
+        let chain = live_blocks(2);
+        let range = BlockRange::new(BlockNumber(0), BlockNumber(2)).expect("range");
+        // Ordered processors deliver in canonical order, so they have no
+        // split live stream.
+        let ordered = Arc::new(
+            FailingReduce::new(
+                OrderedLedgerProcessor::named("api-reset-ledger"),
+                BlockNumber(1),
+            )
+            .failing_once(),
+        );
+        let (_directory, store) = store().await;
+        let runtime = SharedLiveRuntime::new(
+            store.clone(),
+            Arc::new(ScriptedLiveSource::new(
+                fixture_source_descriptor("api-reset-live", range),
+                block_events(&chain),
+            )),
+            vec![ordered.clone()],
+            SharedLiveRuntimeConfig::default(),
+        )
+        .expect("runtime");
+        runtime
+            .run(
+                LiveStart::Head,
+                default_source_budget(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("live run");
+        assert_parked_at(
+            &store,
+            ordered.as_ref(),
+            chain[1].block,
+            ProcessorRunState::Failed,
+            "processor_live_reduce_failed",
+        )
+        .await;
+
+        let api = leani_api::router_with_processors(
+            store.clone(),
+            vec![ordered.clone() as Arc<dyn Processor>],
+            Vec::new(),
+            leani_api::ApiConfig::default(),
+        )
+        .expect("API router");
+        let response = api
+            .oneshot(
+                Request::post("/admin/v1/processors/api-reset-ledger/lanes/live/reset")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("API response");
+        let status = response.status();
+        let body = to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .expect("API body");
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "reset refused: {}",
+            String::from_utf8_lossy(&body)
+        );
+
+        runtime
+            .reconcile_pending()
+            .await
+            .expect("the reset lane replays");
+        assert_gap_recovered(&store, ordered.as_ref()).await;
+        assert_eq!(
+            store
+                .processor_cursor(ordered.descriptor())
+                .await
+                .expect("cursor")
+                .expect("replayed")
+                .block_hash,
+            chain[2].block.hash
+        );
+    }
+
+    #[tokio::test]
+    async fn a_lane_failed_outside_the_live_lane_keeps_its_failure_and_is_not_remapped() {
+        let chain = live_blocks(6);
+        let range = BlockRange::new(BlockNumber(0), BlockNumber(6)).expect("range");
+        let mapped = Arc::new(MapProbe::new("externally-failed-mapped", None));
+        let failing = Arc::new(MapProbe::new(
+            "externally-failed-failing",
+            Some(BlockNumber(5)),
+        ));
+        let healthy = Arc::new(BlockLocalCounter::named("externally-failed-healthy"));
+        let (_directory, store) = store().await;
+        let mut steps = block_events(&chain[..=4]);
+        steps.push(LiveStep::Delay(Duration::from_secs(1)));
+        steps.extend(block_events(&chain[5..]));
+        let runtime = SharedLiveRuntime::new(
+            store.clone(),
+            Arc::new(ScriptedLiveSource::new(
+                fixture_source_descriptor("externally-failed-live", range),
+                steps,
+            )),
+            vec![mapped.clone(), failing.clone(), healthy.clone()],
+            SharedLiveRuntimeConfig::default(),
+        )
+        .expect("runtime");
+        let live = tokio::spawn(async move {
+            runtime
+                .run(
+                    LiveStart::Head,
+                    default_source_budget(),
+                    CancellationToken::new(),
+                )
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while store
+                .processor_cursor(healthy.descriptor())
+                .await
+                .expect("cursor")
+                .is_none_or(|cursor| cursor.block_number != BlockNumber(4))
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("block 4 committed");
+        // Finality fails both lanes on a coverage contradiction while the
+        // live lane is between blocks; it records no gap marker.
+        for processor in [mapped.as_ref(), failing.as_ref()] {
+            store
+                .fail_processor_live_lane(processor.descriptor(), "processor_finality_conflict")
+                .await
+                .expect("fail lane");
+        }
+        live.await.expect("live task").expect("live run");
+
+        for processor in [mapped.as_ref(), failing.as_ref()] {
+            let state = store
+                .processor_runtime_state(processor.descriptor())
+                .await
+                .expect("state");
+            assert_eq!(state.state, ProcessorRunState::Failed);
+            assert_eq!(
+                state.reason.as_deref(),
+                Some("processor_finality_conflict"),
+                "{} keeps its first failure",
+                processor.descriptor().id
+            );
+            assert!(
+                store
+                    .live_lane_gap(processor.descriptor())
+                    .await
+                    .expect("gap")
+                    .is_none(),
+                "no late marker is planted for {}",
+                processor.descriptor().id
+            );
+        }
+        // The first block after the failure is mapped before its commit is
+        // skipped; later blocks are not mapped at all.
+        assert!(!mapped.mapped(BlockNumber(6)));
+        assert!(!failing.mapped(BlockNumber(6)));
+        assert_eq!(
+            store
+                .processor_cursor(healthy.descriptor())
+                .await
+                .expect("cursor")
+                .expect("healthy")
+                .block_number,
+            BlockNumber(6)
+        );
+    }
+
+    /// Replaces blocks from `from` up with a branch of `length` blocks.
+    fn replacement_branch(
+        chain: &[leani_primitives::BlockFrame],
+        from: usize,
+        length: usize,
+    ) -> Vec<leani_primitives::BlockFrame> {
+        let mut parent = chain[from - 1].block.hash;
+        (from..from + length)
+            .map(|number| {
+                let mut frame = live_fixture(u64::try_from(number).expect("height"), parent);
+                frame.block.hash =
+                    BlockHash::new([0xc0 | u8::try_from(number).expect("small height"); 32]);
+                parent = frame.block.hash;
+                frame
+            })
+            .collect()
+    }
+
+    /// Retains `chain`, applies it to `healthy`, and applies `applied` of it
+    /// to `parked`, which is then paused with its gap at `gap`.
+    async fn gapped_lane_before_reorg(
+        store: &SqliteStore,
+        chain: &[leani_primitives::BlockFrame],
+        healthy: &dyn Processor,
+        parked: &dyn Processor,
+        applied: usize,
+        gap: usize,
+    ) {
+        for (sequence, frame) in (1..).zip(chain) {
+            store.store_recent_frame(frame).await.expect("retain frame");
+            apply_live_frame(store, healthy, frame, sequence).await;
+        }
+        for (sequence, frame) in (1..).zip(&chain[..applied]) {
+            apply_live_frame(store, parked, frame, sequence).await;
+        }
+        store
+            .park_processor_live_lane_at(
+                parked.descriptor(),
+                chain[gap].block,
+                "delivery_spool_hard_limit",
+                false,
+            )
+            .await
+            .expect("park lane");
+    }
+
+    async fn run_reorg(
+        store: &SqliteStore,
+        processors: Vec<Arc<dyn Processor>>,
+        reverted: Vec<leani_primitives::BlockRef>,
+        applied: Vec<leani_primitives::BlockFrame>,
+    ) {
+        let range = BlockRange::new(BlockNumber(0), BlockNumber(9)).expect("range");
+        let report = SharedLiveRuntime::new(
+            store.clone(),
+            Arc::new(ScriptedLiveSource::new(
+                fixture_source_descriptor("gapped-reorg-live", range),
+                vec![LiveStep::Event(ChainEvent::Reorg { reverted, applied })],
+            )),
+            processors,
+            SharedLiveRuntimeConfig::default(),
+        )
+        .expect("runtime")
+        .run(
+            LiveStart::Head,
+            default_source_budget(),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("live run");
+        assert_eq!(report.reorgs, 1);
+    }
+
+    #[tokio::test]
+    async fn an_ordered_gapped_lane_resumes_after_a_reorg_below_its_marker() {
+        let chain = live_blocks(3);
+        let replacement = replacement_branch(&chain, 2, 2);
+        let ordered = Arc::new(OrderedLedgerProcessor::named("deep-reorg-ledger"));
+        let healthy = Arc::new(BlockLocalCounter::named("deep-reorg-healthy"));
+        let (_directory, store) = store().await;
+        // Applied through block 2, parked at block 3; the reorg replaces
+        // blocks 2 and 3, so it also undoes block 2 for this lane.
+        gapped_lane_before_reorg(&store, &chain, healthy.as_ref(), ordered.as_ref(), 3, 3).await;
+
+        run_reorg(
+            &store,
+            vec![ordered.clone(), healthy.clone()],
+            vec![chain[3].block, chain[2].block],
+            replacement.clone(),
+        )
+        .await;
+
+        assert_gap_recovered(&store, ordered.as_ref()).await;
+        assert_eq!(
+            store
+                .processor_cursor(ordered.descriptor())
+                .await
+                .expect("cursor")
+                .expect("resumed")
+                .block_hash,
+            replacement[1].block.hash
+        );
+    }
+
+    #[tokio::test]
+    async fn a_block_local_gapped_lane_applies_a_shortening_reorg_without_a_hole() {
+        let chain = live_blocks(6);
+        let replacement = replacement_branch(&chain, 4, 1);
+        let block_local = Arc::new(BlockLocalCounter::named("shortening-reorg-counter"));
+        let healthy = Arc::new(BlockLocalCounter::named("shortening-reorg-healthy"));
+        let (_directory, store) = store().await;
+        // Applied through block 4, parked at block 5; the new branch ends at
+        // block 4, below the gap.
+        gapped_lane_before_reorg(&store, &chain, healthy.as_ref(), block_local.as_ref(), 5, 5)
+            .await;
+
+        run_reorg(
+            &store,
+            vec![block_local.clone(), healthy.clone()],
+            vec![chain[6].block, chain[5].block, chain[4].block],
+            replacement.clone(),
+        )
+        .await;
+
+        assert_gap_recovered(&store, block_local.as_ref()).await;
+        assert_eq!(
+            store
+                .coverage_block_by_hash(block_local.descriptor(), replacement[0].block.hash)
+                .await
+                .expect("coverage"),
+            Some(BlockNumber(4)),
+            "the replacement block below the gap is applied"
+        );
+    }
+
+    async fn rewind_probe_run(
+        store: &SqliteStore,
+        processors: Vec<Arc<dyn Processor>>,
+        steps: Vec<LiveStep>,
+    ) {
+        let range = BlockRange::new(BlockNumber(0), BlockNumber(9)).expect("range");
+        SharedLiveRuntime::new(
+            store.clone(),
+            Arc::new(ScriptedLiveSource::new(
+                fixture_source_descriptor("rewind-probe-live", range),
+                steps,
+            )),
+            processors,
+            SharedLiveRuntimeConfig::default(),
+        )
+        .expect("runtime")
+        .run(
+            LiveStart::Head,
+            default_source_budget(),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("live run");
+    }
+
+    async fn rewind_probe_describe(store: &SqliteStore, processor: &dyn Processor) -> String {
+        let state = store
+            .processor_runtime_state(processor.descriptor())
+            .await
+            .expect("state");
+        let gap = store
+            .live_lane_gap(processor.descriptor())
+            .await
+            .expect("gap");
+        let cursor = store
+            .processor_cursor(processor.descriptor())
+            .await
+            .expect("cursor");
+        format!(
+            "state={:?} reason={:?} gap={:?} cursor={:?}",
+            state.state,
+            state.reason,
+            gap.map(|gap| (gap.first_unapplied.number.0, gap.first_unapplied.hash)),
+            cursor.map(|cursor| (cursor.block_number.0, cursor.block_hash)),
+        )
+    }
+
+    // Block-local lane applied through 3, parked at 4; the source rewinds to
+    // block 2 (reverted [5, 4, 3], no replacement branch), then delivers 3'.
+    #[tokio::test]
+    async fn rewind_probe_block_local_gap_above_lowest_reverted() {
+        let chain = live_blocks(5);
+        let replacement = replacement_branch(&chain, 3, 1);
+        let lane = Arc::new(BlockLocalCounter::named("rewind-probe-block-local"));
+        let healthy = Arc::new(BlockLocalCounter::named("rewind-probe-healthy-a"));
+        let (_directory, store) = store().await;
+        gapped_lane_before_reorg(&store, &chain, healthy.as_ref(), lane.as_ref(), 4, 4).await;
+        rewind_probe_run(
+            &store,
+            vec![lane.clone(), healthy.clone()],
+            vec![
+                LiveStep::Event(ChainEvent::Reorg {
+                    reverted: vec![chain[5].block, chain[4].block, chain[3].block],
+                    applied: Vec::new(),
+                }),
+                LiveStep::Event(ChainEvent::Block(Box::new(replacement[0].clone()))),
+            ],
+        )
+        .await;
+        let described = rewind_probe_describe(&store, lane.as_ref()).await;
+        let lane_covers = store
+            .coverage_block_by_hash(lane.descriptor(), replacement[0].block.hash)
+            .await
+            .expect("coverage");
+        let healthy_covers = store
+            .coverage_block_by_hash(healthy.descriptor(), replacement[0].block.hash)
+            .await
+            .expect("coverage");
+        println!(
+            "PROBE-A block-local gap above lowest reverted: {described}; lane covers 3': {lane_covers:?}; healthy covers 3': {healthy_covers:?}"
+        );
+        assert_eq!(healthy_covers, Some(BlockNumber(3)));
+        assert_eq!(
+            lane_covers,
+            Some(BlockNumber(3)),
+            "PROBE-A lane skipped 3': {described}"
+        );
+    }
+
+    // Ordered lane applied through 3, parked at 4; the source rewinds to
+    // block 2, then delivers 3' and 4'.
+    #[tokio::test]
+    async fn rewind_probe_ordered_gap_above_lowest_reverted() {
+        let chain = live_blocks(5);
+        let replacement = replacement_branch(&chain, 3, 2);
+        let lane = Arc::new(OrderedLedgerProcessor::named("rewind-probe-ordered"));
+        let healthy = Arc::new(BlockLocalCounter::named("rewind-probe-healthy-b"));
+        let (_directory, store) = store().await;
+        gapped_lane_before_reorg(&store, &chain, healthy.as_ref(), lane.as_ref(), 4, 4).await;
+        rewind_probe_run(
+            &store,
+            vec![lane.clone(), healthy.clone()],
+            vec![
+                LiveStep::Event(ChainEvent::Reorg {
+                    reverted: vec![chain[5].block, chain[4].block, chain[3].block],
+                    applied: Vec::new(),
+                }),
+                LiveStep::Event(ChainEvent::Block(Box::new(replacement[0].clone()))),
+                LiveStep::Event(ChainEvent::Block(Box::new(replacement[1].clone()))),
+            ],
+        )
+        .await;
+        let described = rewind_probe_describe(&store, lane.as_ref()).await;
+        println!("PROBE-B ordered gap above lowest reverted: {described}");
+        assert!(
+            store
+                .live_lane_gap(lane.descriptor())
+                .await
+                .expect("gap")
+                .is_none(),
+            "PROBE-B ordered lane stalls: {described}"
+        );
+    }
+
+    // Block-local lane applied through 3, parked at 4; the source rewinds to
+    // block 3 (reverted [4], no replacement branch), then delivers 4'.
+    #[tokio::test]
+    async fn rewind_probe_block_local_gap_at_lowest_reverted() {
+        let chain = live_blocks(4);
+        let replacement = replacement_branch(&chain, 4, 1);
+        let lane = Arc::new(BlockLocalCounter::named("rewind-probe-block-local-at"));
+        let healthy = Arc::new(BlockLocalCounter::named("rewind-probe-healthy-c"));
+        let (_directory, store) = store().await;
+        gapped_lane_before_reorg(&store, &chain, healthy.as_ref(), lane.as_ref(), 4, 4).await;
+        rewind_probe_run(
+            &store,
+            vec![lane.clone(), healthy.clone()],
+            vec![
+                LiveStep::Event(ChainEvent::Reorg {
+                    reverted: vec![chain[4].block],
+                    applied: Vec::new(),
+                }),
+                LiveStep::Event(ChainEvent::Block(Box::new(replacement[0].clone()))),
+            ],
+        )
+        .await;
+        let described = rewind_probe_describe(&store, lane.as_ref()).await;
+        let lane_covers = store
+            .coverage_block_by_hash(lane.descriptor(), replacement[0].block.hash)
+            .await
+            .expect("coverage");
+        println!(
+            "PROBE-C block-local gap at lowest reverted: {described}; lane covers 4': {lane_covers:?}"
+        );
+        assert_eq!(
+            lane_covers,
+            Some(BlockNumber(4)),
+            "PROBE-C lane did not apply 4': {described}"
+        );
+    }
+
+    #[tokio::test]
+    async fn gapped_lanes_rewound_without_a_replacement_branch_stay_on_the_chain() {
+        let chain = live_blocks(5);
+        let replacement = replacement_branch(&chain, 3, 1);
+        let lane = Arc::new(BlockLocalCounter::named("rewind-failed-lane"));
+        let paused = Arc::new(BlockLocalCounter::named("rewind-paused-lane"));
+        let healthy = Arc::new(BlockLocalCounter::named("rewind-failed-healthy"));
+        let (_directory, store) = store().await;
+        gapped_lane_before_reorg(&store, &chain, healthy.as_ref(), lane.as_ref(), 4, 4).await;
+        store
+            .fail_processor_live_lane(lane.descriptor(), "processor_live_reduce_failed")
+            .await
+            .expect("fail lane");
+        for (sequence, frame) in (1..).zip(&chain[..4]) {
+            apply_live_frame(&store, paused.as_ref(), frame, sequence).await;
+        }
+        store
+            .park_processor_live_lane_at(
+                paused.descriptor(),
+                chain[4].block,
+                "delivery_spool_hard_limit",
+                false,
+            )
+            .await
+            .expect("park lane");
+        let processors: Vec<Arc<dyn Processor>> =
+            vec![lane.clone(), paused.clone(), healthy.clone()];
+        rewind_probe_run(
+            &store,
+            processors.clone(),
+            vec![LiveStep::Event(ChainEvent::Reorg {
+                reverted: vec![chain[5].block, chain[4].block, chain[3].block],
+                applied: Vec::new(),
+            })],
+        )
+        .await;
+
+        // Block 3 was undone, so both lanes have applied through the new tip,
+        // block 2. The paused lane's gap completes at once. The failed lane's
+        // gap points at that retained canonical block until its successor
+        // arrives.
+        assert_gap_recovered(&store, paused.as_ref()).await;
+        assert_parked_at(
+            &store,
+            lane.as_ref(),
+            chain[2].block,
+            ProcessorRunState::Failed,
+            "processor_live_reduce_failed",
+        )
+        .await;
+
+        // Once the successor is retained, the marker moves onto it, the
+        // first block the lane has not applied, and a reset replays it.
+        rewind_probe_run(
+            &store,
+            processors.clone(),
+            vec![LiveStep::Event(ChainEvent::Block(Box::new(
+                replacement[0].clone(),
+            )))],
+        )
+        .await;
+        assert_eq!(
+            store
+                .coverage_block_by_hash(paused.descriptor(), replacement[0].block.hash)
+                .await
+                .expect("coverage"),
+            Some(BlockNumber(3))
+        );
+        assert_parked_at(
+            &store,
+            lane.as_ref(),
+            replacement[0].block,
+            ProcessorRunState::Failed,
+            "processor_live_reduce_failed",
+        )
+        .await;
+        store
+            .reset_failed_live_lane(lane.descriptor())
+            .await
+            .expect("reset");
+        reduce_failure_runtime(&store, &processors, &[])
+            .reconcile_pending()
+            .await
+            .expect("replay after reset");
+        assert_gap_recovered(&store, lane.as_ref()).await;
+        assert_eq!(
+            store
+                .coverage_block_by_hash(lane.descriptor(), replacement[0].block.hash)
+                .await
+                .expect("coverage"),
+            Some(BlockNumber(3))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_rewind_without_a_replacement_branch_settles_a_paused_lane_at_once() {
+        let chain = live_blocks(5);
+        let range = BlockRange::new(BlockNumber(0), BlockNumber(9)).expect("range");
+        let paused = Arc::new(BlockLocalCounter::named("rewind-settle-paused"));
+        let healthy = Arc::new(BlockLocalCounter::named("rewind-settle-healthy"));
+        let (_directory, store) = store().await;
+        gapped_lane_before_reorg(&store, &chain, healthy.as_ref(), paused.as_ref(), 4, 4).await;
+        let runtime = SharedLiveRuntime::new(
+            store.clone(),
+            Arc::new(ScriptedLiveSource::new(
+                fixture_source_descriptor("rewind-settle-live", range),
+                vec![
+                    LiveStep::Event(ChainEvent::Reorg {
+                        reverted: vec![chain[5].block, chain[4].block, chain[3].block],
+                        applied: Vec::new(),
+                    }),
+                    // No later block arrives meanwhile.
+                    LiveStep::Delay(Duration::from_secs(30)),
+                ],
+            )),
+            vec![paused.clone(), healthy.clone()],
+            SharedLiveRuntimeConfig::default(),
+        )
+        .expect("runtime");
+        let cancellation = CancellationToken::new();
+        let live = tokio::spawn({
+            let cancellation = cancellation.clone();
+            async move {
+                runtime
+                    .run(LiveStart::Head, default_source_budget(), cancellation)
+                    .await
+            }
+        });
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while store
+                .live_lane_gap(paused.descriptor())
+                .await
+                .expect("gap")
+                .is_some()
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the paused lane settles on the new tip before any later block");
+        cancellation.cancel();
+        assert_cancelled_live(live.await.expect("live task"));
+        assert_gap_recovered(&store, paused.as_ref()).await;
+    }
+
+    // Ordered lane that starts at block 3, applied block 3 and parked at
+    // block 4; the source rewinds to block 2, below the lane's start, then
+    // delivers 3' and 4'.
+    #[tokio::test]
+    async fn a_gapped_lane_whose_whole_history_is_reverted_resumes_at_its_start() {
+        let chain = live_blocks(5);
+        let replacement = replacement_branch(&chain, 3, 2);
+        let lane = Arc::new(
+            FailingReduce::new(
+                OrderedLedgerProcessor::named("rewind-start-ledger"),
+                BlockNumber(u64::MAX),
+            )
+            .starting_at(BlockNumber(3)),
+        );
+        let healthy = Arc::new(BlockLocalCounter::named("rewind-start-healthy"));
+        let (_directory, store) = store().await;
+        for (sequence, frame) in (1..).zip(&chain) {
+            store.store_recent_frame(frame).await.expect("retain frame");
+            apply_live_frame(&store, healthy.as_ref(), frame, sequence).await;
+        }
+        apply_live_frame(&store, lane.as_ref(), &chain[3], 1).await;
+        store
+            .park_processor_live_lane_at(
+                lane.descriptor(),
+                chain[4].block,
+                "delivery_spool_hard_limit",
+                false,
+            )
+            .await
+            .expect("park lane");
+
+        rewind_probe_run(
+            &store,
+            vec![lane.clone(), healthy.clone()],
+            vec![
+                LiveStep::Event(ChainEvent::Reorg {
+                    reverted: vec![chain[5].block, chain[4].block, chain[3].block],
+                    applied: Vec::new(),
+                }),
+                LiveStep::Event(ChainEvent::Block(Box::new(replacement[0].clone()))),
+                LiveStep::Event(ChainEvent::Block(Box::new(replacement[1].clone()))),
+            ],
+        )
+        .await;
+
+        let described = rewind_probe_describe(&store, lane.as_ref()).await;
+        for frame in &replacement {
+            assert_eq!(
+                store
+                    .coverage_block_by_hash(lane.descriptor(), frame.block.hash)
+                    .await
+                    .expect("coverage"),
+                Some(frame.block.number),
+                "{described}"
+            );
+        }
+        assert_gap_recovered(&store, lane.as_ref()).await;
+    }
+
+    #[tokio::test]
+    async fn a_gap_marker_off_the_canonical_chain_is_re_pointed_instead_of_completed() {
+        let chain = live_blocks(3);
+        // Markers left off the canonical chain, as an earlier version could:
+        // above the canonical tip, and on a replaced block at block 3.
+        let above_tip = Arc::new(BlockLocalCounter::named("orphan-above-tip"));
+        let replaced = Arc::new(BlockLocalCounter::named("orphan-replaced"));
+        let ordered = Arc::new(OrderedLedgerProcessor::named("orphan-ordered-above-tip"));
+        let (_directory, store) = store().await;
+        for frame in &chain {
+            store.store_recent_frame(frame).await.expect("retain frame");
+        }
+        let mut replaced_block = chain[3].block;
+        replaced_block.hash = BlockHash::new([0xe3; 32]);
+        let orphan_above_tip = live_fixture(5, BlockHash::new([0x44; 32])).block;
+        let orphans: [(&dyn Processor, BlockRef); 3] = [
+            (above_tip.as_ref(), orphan_above_tip),
+            (replaced.as_ref(), replaced_block),
+            (ordered.as_ref(), orphan_above_tip),
+        ];
+        for (lane, orphan) in orphans {
+            for (sequence, frame) in (1..).zip(&chain[..=2]) {
+                apply_live_frame(&store, lane, frame, sequence).await;
+            }
+            store
+                .park_processor_live_lane_at(
+                    lane.descriptor(),
+                    orphan,
+                    "delivery_spool_hard_limit",
+                    false,
+                )
+                .await
+                .expect("park lane");
+        }
+        let lanes: Vec<Arc<dyn Processor>> =
+            vec![above_tip.clone(), replaced.clone(), ordered.clone()];
+        let runtime = reduce_failure_runtime(&store, &lanes, &[]);
+
+        // Finalized-gap recovery never completes an orphaned marker either: it
+        // re-points it at the last canonical block the lane applied.
+        assert!(
+            runtime
+                .recover_finalized_live_gap(
+                    above_tip.as_ref(),
+                    orphan_above_tip,
+                    &mut SharedLiveReport::default(),
+                )
+                .await
+                .expect("re-point")
+        );
+        assert_eq!(
+            store
+                .live_lane_gap(above_tip.descriptor())
+                .await
+                .expect("gap")
+                .map(|gap| gap.first_unapplied),
+            Some(chain[2].block)
+        );
+        runtime
+            .reconcile_pending()
+            .await
+            .expect("an orphaned marker is re-pointed, not a lane failure");
+
+        for (lane, _) in orphans {
+            assert_gap_recovered(&store, lane).await;
+            assert_eq!(
+                store
+                    .coverage_block_by_hash(lane.descriptor(), chain[3].block.hash)
+                    .await
+                    .expect("coverage"),
+                Some(BlockNumber(3)),
+                "{} replays the canonical block it had not applied",
+                lane.descriptor().id
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn pausing_a_lane_that_another_component_failed_is_benign() {
+        let chain = live_blocks(1);
+        let lane = Arc::new(BlockLocalCounter::named("pause-failed-lane"));
+        let (_directory, store) = store().await;
+        store
+            .park_processor_live_lane_at(
+                lane.descriptor(),
+                chain[1].block,
+                "delivery_spool_hard_limit",
+                false,
+            )
+            .await
+            .expect("park lane");
+        store
+            .fail_processor_live_lane(lane.descriptor(), "processor_finality_conflict")
+            .await
+            .expect("fail lane");
+        let runtime = reduce_failure_runtime(&store, &[lane.clone() as Arc<dyn Processor>], &[]);
+
+        runtime
+            .pause_live_gap(
+                lane.as_ref(),
+                chain[1].block,
+                "unfinalized_gap_waiting_for_finality",
+            )
+            .await
+            .expect("pausing a failed lane is not a live-lane failure");
+        let state = store
+            .processor_runtime_state(lane.descriptor())
+            .await
+            .expect("state");
+        assert_eq!(state.state, ProcessorRunState::Failed);
+        assert_eq!(state.reason.as_deref(), Some("processor_finality_conflict"));
+    }
+
+    fn reduce_failure_runtime(
+        store: &SqliteStore,
+        processors: &[Arc<dyn Processor>],
+        frames: &[leani_primitives::BlockFrame],
+    ) -> SharedLiveRuntime {
+        let range = BlockRange::new(BlockNumber(0), BlockNumber(4)).expect("range");
+        SharedLiveRuntime::new(
+            store.clone(),
+            Arc::new(ScriptedLiveSource::new(
+                fixture_source_descriptor("restart-reduce-live", range),
+                block_events(frames),
+            )),
+            processors.to_vec(),
+            SharedLiveRuntimeConfig::default(),
+        )
+        .expect("runtime")
+    }
+
+    #[tokio::test]
+    async fn a_lane_parked_by_its_reducer_does_not_fail_the_live_lane_after_restart() {
+        let chain = live_blocks(4);
+        let failing = Arc::new(FailingReduce::new(
+            OrderedLedgerProcessor::named("restart-reduce-ledger"),
+            BlockNumber(1),
+        ));
+        let healthy = Arc::new(BlockLocalCounter::named("restart-reduce-healthy"));
+        let processors: Vec<Arc<dyn Processor>> = vec![failing.clone(), healthy.clone()];
+        let (_directory, store) = store().await;
+        reduce_failure_runtime(&store, &processors, &chain[..=2])
+            .run(
+                LiveStart::Head,
+                default_source_budget(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("the first run isolates the reducer failure");
+
+        // A restarted node reconciles durable lanes before following new blocks.
+        let restarted = reduce_failure_runtime(&store, &processors, &chain[3..]);
+        restarted
+            .reconcile_pending()
+            .await
+            .expect("startup reconciliation leaves the parked lane alone");
+        let report = restarted
+            .run(
+                LiveStart::Head,
+                default_source_budget(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("the parked lane does not fail the restarted live lane");
+        assert_eq!(report.processors["restart-reduce-healthy"].applied, 2);
+        assert_parked_at(
+            &store,
+            failing.as_ref(),
+            chain[1].block,
+            ProcessorRunState::Failed,
+            "processor_live_reduce_failed",
+        )
+        .await;
+
+        // An operator reset replays into the same reducer failure, which parks
+        // the lane again instead of failing the live lane.
+        store
+            .reset_failed_live_lane(failing.descriptor())
+            .await
+            .expect("operator reset");
+        restarted
+            .reconcile_pending()
+            .await
+            .expect("replaying a block the reducer still rejects parks its lane again");
+        assert_parked_at(
+            &store,
+            failing.as_ref(),
+            chain[1].block,
+            ProcessorRunState::Failed,
+            "processor_live_reduce_failed",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_lane_parked_outside_the_live_stream_resumes_once_history_passes_its_gap() {
+        let chain = live_blocks(7);
+        let range = BlockRange::new(BlockNumber(0), BlockNumber(7)).expect("range");
+        let ordered = Arc::new(OrderedLedgerProcessor::named("parked-behind-ledger"));
+        let (_directory, store) = store().await;
+        // Live blocks 5..=7 arrive while the ordered history from block 0 is
+        // still behind, so their deltas wait as pending.
+        let live = SharedLiveRuntime::new(
+            store.clone(),
+            Arc::new(ScriptedLiveSource::new(
+                fixture_source_descriptor("parked-behind-live", range),
+                block_events(&chain[5..]),
+            )),
+            vec![ordered.clone()],
+            SharedLiveRuntimeConfig::default(),
+        )
+        .expect("runtime");
+        live.run(
+            LiveStart::Head,
+            default_source_budget(),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("live run");
+        let pending = || async {
+            store
+                .processor_stats(ordered.descriptor())
+                .await
+                .expect("stats")
+                .pending_deltas
+        };
+        assert_eq!(pending().await, 3);
+
+        // Its cold backfill fails: the lane parks at the newest retained
+        // frame, not at a finality anchor seeded above it without a parent.
+        store
+            .store_canonical_anchor(
+                ChainId(1),
+                leani_primitives::BlockRef {
+                    number: BlockNumber(9),
+                    hash: BlockHash::new([0x99; 32]),
+                    parent_hash: BlockHash::ZERO,
+                    timestamp: 1,
+                },
+                Finality::Finalized,
+            )
+            .await
+            .expect("seed anchor");
+        assert!(
+            live.park_processor_lane(ordered.descriptor(), "hot_cold_handoff_failed")
+                .await
+                .expect("park")
+        );
+        assert_parked_at(
+            &store,
+            ordered.as_ref(),
+            chain[7].block,
+            ProcessorRunState::Paused,
+            "hot_cold_handoff_failed",
+        )
+        .await;
+
+        // A later backfill applies history past the parked block; the lane
+        // then moves its gap on and resumes.
+        for (sequence, frame) in (1..).zip(&chain) {
+            apply_live_frame(&store, ordered.as_ref(), frame, sequence).await;
+        }
+        live.reconcile_pending().await.expect("reconcile");
+        assert_gap_recovered(&store, ordered.as_ref()).await;
+        assert_eq!(pending().await, 0);
+    }
+
+    #[tokio::test]
+    async fn a_lane_paused_at_subscribe_receives_material_it_requires_after_resuming() {
+        let range = BlockRange::new(BlockNumber(0), BlockNumber(2)).expect("range");
+        let chain = live_chain(Finality::Included);
+        let paused = Arc::new(FilteredCounter::named(
+            "paused-at-subscribe",
+            vec![sender_requirement(REPLAY_SENDER)],
+        ));
+        let live = Arc::new(FilteredCounter::named(
+            "live-at-subscribe",
+            vec![sender_requirement(OTHER_SENDER)],
+        ));
+        let (_directory, store) = store().await;
+        park_at_first_block(&store, paused.as_ref(), &chain).await;
+        let source = Arc::new(FilteringLiveSource::new(
+            fixture_source_descriptor("paused-at-subscribe-live", range),
+            chain
+                .iter()
+                .cloned()
+                .map(|frame| ChainEvent::Block(Box::new(frame)))
+                .collect(),
+        ));
+
+        let report = SharedLiveRuntime::new(
+            store.clone(),
+            source.clone(),
+            vec![paused.clone(), live.clone()],
+            SharedLiveRuntimeConfig::default(),
+        )
+        .expect("runtime")
+        .run(
+            LiveStart::Head,
+            default_source_budget(),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("live run");
+
+        let requests = source.requests();
+        assert_eq!(requests.len(), 1);
+        for processor in [paused.as_ref(), live.as_ref()] {
+            assert!(
+                requests[0]
+                    .filters
+                    .scope
+                    .covers(&processor.descriptor().requirements[0].filter),
+                "the live request must cover {}",
+                processor.descriptor().id
+            );
+        }
+        assert_eq!(report.processors["paused-at-subscribe"].applied, 3);
+        assert_eq!(report.processors["live-at-subscribe"].applied, 3);
+        assert_gap_recovered(&store, paused.as_ref()).await;
+    }
+
+    #[tokio::test]
+    async fn a_reorg_leaves_a_paused_lane_paused() {
+        let range = BlockRange::new(BlockNumber(0), BlockNumber(2)).expect("range");
+        let chain = live_chain(Finality::Included);
+        let mut replacement = live_fixture(2, chain[1].block.hash);
+        replacement.block.hash = BlockHash::new([0x72; 32]);
+        // Parked ahead of its cursor, so it stays paused until history
+        // reaches its gap.
+        let paused = Arc::new(Requiring::new(
+            OrderedLedgerProcessor::named("reorg-paused-ledger"),
+            vec![sender_requirement(REPLAY_SENDER)],
+        ));
+        let live = Arc::new(FilteredCounter::named(
+            "reorg-live-counter",
+            vec![sender_requirement(OTHER_SENDER)],
+        ));
+        let (_directory, store) = store().await;
+        // A lane parks at a block the store holds as canonical, so its marker
+        // is on the canonical chain.
+        store
+            .store_canonical_anchor(ChainId(1), chain[1].block, Finality::Included)
+            .await
+            .expect("canonical block");
+        store
+            .park_processor_live_lane_at(
+                paused.descriptor(),
+                chain[1].block,
+                "delivery_spool_hard_limit",
+                false,
+            )
+            .await
+            .expect("park lane");
+        let mut events = chain
+            .iter()
+            .cloned()
+            .map(|frame| ChainEvent::Block(Box::new(frame)))
+            .collect::<Vec<_>>();
+        events.push(ChainEvent::Reorg {
+            reverted: vec![chain[2].block],
+            applied: vec![replacement],
+        });
+
+        let report = SharedLiveRuntime::new(
+            store.clone(),
+            Arc::new(FilteringLiveSource::new(
+                fixture_source_descriptor("reorg-paused-live", range),
+                events,
+            )),
+            vec![paused.clone(), live.clone()],
+            SharedLiveRuntimeConfig::default(),
+        )
+        .expect("runtime")
+        .run(
+            LiveStart::Head,
+            default_source_budget(),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("live run");
+
+        assert_eq!(report.reorgs, 1);
+        assert_eq!(report.processors["reorg-live-counter"].applied, 4);
+        assert_parked_at(
+            &store,
+            paused.as_ref(),
+            chain[1].block,
+            ProcessorRunState::Paused,
+            "delivery_spool_hard_limit",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_mapping_failure_during_a_reorg_does_not_fail_a_paused_lane() {
+        let range = BlockRange::new(BlockNumber(0), BlockNumber(2)).expect("range");
+        let chain = live_chain(Finality::Included);
+        let mut replacement = live_fixture(2, chain[1].block.hash);
+        replacement.block.hash = BlockHash::new([0x73; 32]);
+        let paused = Arc::new(FailOnceCounter::named("reorg-mapping-paused"));
+        let (_directory, store) = store().await;
+        for frame in &chain {
+            store.store_recent_frame(frame).await.expect("retain frame");
+        }
+        // Parked at the block the reorg reverts, so the reorg must move its
+        // gap to the replacement even though mapping the replacement fails.
+        store
+            .park_processor_live_lane_at(
+                paused.descriptor(),
+                chain[2].block,
+                "delivery_spool_hard_limit",
+                false,
+            )
+            .await
+            .expect("park lane");
+
+        SharedLiveRuntime::new(
+            store.clone(),
+            Arc::new(ScriptedLiveSource::new(
+                fixture_source_descriptor("reorg-mapping-live", range),
+                vec![LiveStep::Event(ChainEvent::Reorg {
+                    reverted: vec![chain[2].block],
+                    applied: vec![replacement.clone()],
+                })],
+            )),
+            vec![paused.clone()],
+            SharedLiveRuntimeConfig::default(),
+        )
+        .expect("runtime")
+        .run(
+            LiveStart::Head,
+            default_source_budget(),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("live run");
+
+        // The reorg left the lane paused; its own replay then recovered it.
+        assert_gap_recovered(&store, paused.as_ref()).await;
+        assert_eq!(
+            store
+                .processor_cursor(paused.descriptor())
+                .await
+                .expect("cursor")
+                .expect("replayed")
+                .block_hash,
+            replacement.block.hash
+        );
+    }
+
+    #[tokio::test]
+    async fn shared_live_rejects_a_block_that_does_not_extend_the_canonical_tip() {
+        let chain = live_blocks(2);
+        let mut orphan = live_fixture(1, BlockHash::new([0x99; 32]));
+        orphan.block.hash = BlockHash::new([0x98; 32]);
+        for (name, next, expected) in [
+            ("skips a height", chain[2].clone(), BlockNumber(1)),
+            ("names another parent", orphan, BlockNumber(1)),
+        ] {
+            let range = BlockRange::new(BlockNumber(0), BlockNumber(2)).expect("range");
+            let processor = Arc::new(BlockLocalCounter::named("continuity-counter"));
+            let (_directory, store) = store().await;
+            let result = SharedLiveRuntime::new(
+                store.clone(),
+                Arc::new(ScriptedLiveSource::new(
+                    fixture_source_descriptor("continuity-live", range),
+                    block_events(&[chain[0].clone(), next.clone()]),
+                )),
+                vec![processor.clone()],
+                SharedLiveRuntimeConfig::default(),
+            )
+            .expect("runtime")
+            .run(
+                LiveStart::Head,
+                default_source_budget(),
+                CancellationToken::new(),
+            )
+            .await;
+
+            assert!(
+                matches!(
+                    &result,
+                    Err(RuntimeError::LiveGap { expected: gap, received })
+                        if *gap == expected && *received == next.block
+                ),
+                "a block that {name} must be rejected: {result:?}"
+            );
+            assert!(
+                store
+                    .recent_frame(ChainId(1), next.block.number)
+                    .await
+                    .expect("recent lookup")
+                    .is_none_or(|frame| frame.block != next.block),
+                "a rejected block that {name} is not retained"
+            );
+            assert_eq!(
+                store
+                    .processor_cursor(processor.descriptor())
+                    .await
+                    .expect("cursor")
+                    .expect("first block applied")
+                    .block_number,
+                BlockNumber(0)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn shared_live_rejects_a_reorg_that_does_not_revert_the_tip() {
+        let range = BlockRange::new(BlockNumber(0), BlockNumber(2)).expect("range");
+        let chain = live_blocks(2);
+        let mut replacement = live_fixture(1, chain[0].block.hash);
+        replacement.block.hash = BlockHash::new([0x61; 32]);
+        let mut events = block_events(&chain);
+        events.push(LiveStep::Event(ChainEvent::Reorg {
+            reverted: vec![chain[1].block],
+            applied: vec![replacement],
+        }));
+        let processor = Arc::new(BlockLocalCounter::named("reorg-tip-counter"));
+        let (_directory, store) = store().await;
+
+        let result = SharedLiveRuntime::new(
+            store.clone(),
+            Arc::new(ScriptedLiveSource::new(
+                fixture_source_descriptor("reorg-tip-live", range),
+                events,
+            )),
+            vec![processor.clone()],
+            SharedLiveRuntimeConfig::default(),
+        )
+        .expect("runtime")
+        .run(
+            LiveStart::Head,
+            default_source_budget(),
+            CancellationToken::new(),
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(RuntimeError::InvalidReorg(_))),
+            "a reorg below the tip must be rejected: {result:?}"
+        );
+        for frame in &chain {
+            assert_eq!(
+                store
+                    .recent_frame(ChainId(1), frame.block.number)
+                    .await
+                    .expect("recent lookup")
+                    .expect("canonical frame")
+                    .block,
+                frame.block
+            );
+        }
+        assert_eq!(
+            store
+                .processor_cursor(processor.descriptor())
+                .await
+                .expect("cursor")
+                .expect("cursor")
+                .block_hash,
+            chain[2].block.hash
+        );
+    }
+
+    async fn encoded_recent_frame_bytes(frame: &leani_primitives::BlockFrame) -> u64 {
+        let (_directory, scratch) = store().await;
+        scratch
+            .store_recent_frame(frame)
+            .await
+            .expect("measure frame");
+        scratch
+            .recent_stats(ChainId(1))
+            .await
+            .expect("recent stats")
+            .encoded_bytes
+    }
+
+    #[tokio::test]
+    async fn live_ingestion_waits_at_the_recent_hard_limit_until_finality_prunes() {
+        let range = BlockRange::new(BlockNumber(0), BlockNumber(2)).expect("range");
+        let chain = live_blocks(2);
+        let limit = encoded_recent_frame_bytes(&chain[0]).await * 2;
+        let processor = Arc::new(BlockLocalCounter::named("recent-limit-counter"));
+        let (_directory, store) = store().await;
+        let runtime = SharedLiveRuntime::new(
+            store.clone(),
+            Arc::new(ScriptedLiveSource::new(
+                fixture_source_descriptor("recent-limit-live", range),
+                block_events(&chain),
+            )),
+            vec![processor.clone()],
+            SharedLiveRuntimeConfig {
+                recent_hard_bytes: limit,
+                ..SharedLiveRuntimeConfig::default()
+            },
+        )
+        .expect("runtime");
+        let (ready, readiness) = tokio::sync::watch::channel(false);
+        let live = tokio::spawn(async move {
+            runtime
+                .run_with_readiness(
+                    LiveStart::Head,
+                    default_source_budget(),
+                    CancellationToken::new(),
+                    ready,
+                )
+                .await
+        });
+
+        // Two frames fill the limit. With no finality to prune them, the third
+        // block waits and the live lane reports itself not ready.
+        let recent_tip = || async {
+            store
+                .recent_stats(ChainId(1))
+                .await
+                .expect("recent stats")
+                .latest_block
+        };
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while recent_tip().await != Some(BlockNumber(1)) || *readiness.borrow() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("ingestion stops at the recent hard limit");
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert_eq!(recent_tip().await, Some(BlockNumber(1)));
+        assert!(!*readiness.borrow());
+        assert_eq!(
+            store
+                .processor_cursor(processor.descriptor())
+                .await
+                .expect("cursor")
+                .expect("applied")
+                .block_number,
+            BlockNumber(1)
+        );
+
+        store
+            .mark_recent_finalized(ChainId(1), BlockNumber(1), chain[1].block.hash)
+            .await
+            .expect("finalize");
+        store
+            .prune_recent_frames(ChainId(1), BlockNumber(1), 1, 1, limit)
+            .await
+            .expect("prune");
+        let report = tokio::time::timeout(Duration::from_secs(10), live)
+            .await
+            .expect("ingestion resumes after pruning")
+            .expect("live task")
+            .expect("live run");
+
+        assert_eq!(report.chain_blocks, 3);
+        assert_eq!(report.processors["recent-limit-counter"].applied, 3);
+        assert_eq!(recent_tip().await, Some(BlockNumber(2)));
+    }
+
+    #[tokio::test]
+    async fn live_ingestion_fails_after_waiting_too_long_at_the_recent_hard_limit() {
+        let range = BlockRange::new(BlockNumber(0), BlockNumber(2)).expect("range");
+        let chain = live_blocks(2);
+        let limit = encoded_recent_frame_bytes(&chain[0]).await * 2;
+        let (_directory, store) = store().await;
+
+        let result = SharedLiveRuntime::new(
+            store.clone(),
+            Arc::new(ScriptedLiveSource::new(
+                fixture_source_descriptor("recent-stall-live", range),
+                block_events(&chain),
+            )),
+            vec![Arc::new(BlockLocalCounter::named("recent-stall-counter"))],
+            SharedLiveRuntimeConfig {
+                recent_hard_bytes: limit,
+                recent_storage_stall_limit: Duration::from_millis(300),
+                ..SharedLiveRuntimeConfig::default()
+            },
+        )
+        .expect("runtime")
+        .run(
+            LiveStart::Head,
+            default_source_budget(),
+            CancellationToken::new(),
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(RuntimeError::RecentStorageBudget { limit: observed_limit, .. }) if observed_limit == limit),
+            "a stalled live lane fails for its supervisor to restart it: {result:?}"
+        );
+        assert_eq!(
+            store
+                .recent_stats(ChainId(1))
+                .await
+                .expect("recent stats")
+                .latest_block,
+            Some(BlockNumber(1)),
+            "no unfinalized frame is dropped to make room"
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_drains_of_one_live_gap_do_not_fail_the_lane() {
+        let range = BlockRange::new(BlockNumber(0), BlockNumber(2)).expect("range");
+        let chain = live_chain(Finality::Included);
+        let processor = Arc::new(RendezvousCounter {
+            inner: BlockLocalCounter::named("concurrent-gap-counter"),
+            rendezvous: tokio::sync::Barrier::new(2),
+        });
+        let (_directory, store) = store().await;
+        for frame in &chain {
+            store.store_recent_frame(frame).await.expect("retain frame");
+        }
+        park_at_first_block(&store, processor.as_ref(), &chain).await;
+        let live = SharedLiveRuntime::new(
+            store.clone(),
+            Arc::new(ScriptedLiveSource::new(
+                fixture_source_descriptor("concurrent-gap-live", range),
+                Vec::new(),
+            )),
+            vec![processor.clone()],
+            SharedLiveRuntimeConfig::default(),
+        )
+        .expect("runtime");
+        // The node reconciles on a clone while the live lane drains.
+        let handoff = live.clone();
+
+        let (first, second) = tokio::join!(live.reconcile_pending(), handoff.reconcile_pending());
+
+        let first = first.expect("first drain");
+        let second = second.expect("a concurrent drain of the same gap is not a lane failure");
+        assert_eq!(
+            first.processors["concurrent-gap-counter"].applied
+                + second.processors["concurrent-gap-counter"].applied,
+            3
+        );
+        assert_gap_recovered(&store, processor.as_ref()).await;
     }
 
     #[tokio::test]
@@ -12269,6 +15063,233 @@ mod tests {
                 .reorg_recent_frames(ChainId(1), &[frame.block], &[])
                 .await
                 .is_err()
+        );
+    }
+
+    async fn apply_live_frame(
+        store: &SqliteStore,
+        processor: &dyn Processor,
+        frame: &leani_primitives::BlockFrame,
+        sequence: u64,
+    ) {
+        let delta = processor.map(frame).await.expect("map");
+        store
+            .apply(
+                processor,
+                ProcessorCursor {
+                    processor_id: processor.descriptor().id.to_string(),
+                    processor_version: processor.descriptor().version.to_string(),
+                    chain_id: frame.chain_id,
+                    block_number: frame.block.number,
+                    block_hash: frame.block.hash,
+                    finality: frame.finality,
+                    sequence,
+                },
+                &delta,
+                &[],
+            )
+            .await
+            .expect("apply");
+    }
+
+    #[tokio::test]
+    async fn one_processor_finality_failure_does_not_stop_the_others_or_pruning() {
+        let range = BlockRange::new(BlockNumber(0), BlockNumber(3)).expect("range");
+        let chain = live_blocks(3);
+        let healthy = Arc::new(BlockLocalCounter::named("finality-healthy"));
+        let conflicting = Arc::new(BlockLocalCounter::named("finality-conflicting"));
+        let (_directory, store) = store().await;
+        for (sequence, frame) in (1..).zip(&chain) {
+            store.store_recent_frame(frame).await.expect("retain frame");
+            apply_live_frame(&store, healthy.as_ref(), frame, sequence).await;
+        }
+        // Corrupt coverage for one processor: it holds block 2's hash at
+        // height 1, so finalizing that hash contradicts its coverage. It also
+        // covers block 3, which a later anchor names.
+        apply_live_frame(&store, conflicting.as_ref(), &chain[0], 1).await;
+        let mut forged = live_fixture(1, chain[0].block.hash);
+        forged.block.hash = chain[2].block.hash;
+        apply_live_frame(&store, conflicting.as_ref(), &forged, 2).await;
+        apply_live_frame(&store, conflicting.as_ref(), &chain[3], 3).await;
+        let checkpoint = ConsensusCheckpoint {
+            beacon_slot: 1,
+            beacon_block_root: [1; 32],
+            execution_block_hash: BlockHash::ZERO,
+            obtained_at_unix_seconds: 1,
+            source: "fixture".to_owned(),
+        };
+        let finalized = |block: &leani_primitives::BlockFrame, slot| {
+            FinalityStep::Event(FinalityEvent::Finalized {
+                block_hash: block.block.hash,
+                beacon_slot: slot,
+                beacon_block_root: [2; 32],
+            })
+        };
+
+        let report = SharedFinalityRuntime::new(
+            store.clone(),
+            Arc::new(ScriptedFinalitySource::new(
+                fixture_source_descriptor("isolated-finality", range),
+                checkpoint.clone(),
+                vec![finalized(&chain[2], 2), finalized(&chain[3], 3)],
+            )),
+            vec![conflicting.clone(), healthy.clone()],
+            SharedFinalityRuntimeConfig {
+                minimum_recent_blocks: 1,
+                recent_soft_bytes: 1,
+                recent_hard_bytes: 1_000_000,
+            },
+        )
+        .expect("shared finality runtime")
+        .run(checkpoint, CancellationToken::new())
+        .await
+        .expect("one processor's finality failure must not stop finality for the others");
+
+        assert_eq!(report.finalized_through, Some(BlockNumber(3)));
+        assert_eq!(
+            report.processor_finalized_through.get("finality-healthy"),
+            Some(&BlockNumber(3))
+        );
+        assert_eq!(
+            store
+                .finalized_through(healthy.descriptor())
+                .await
+                .expect("healthy finality"),
+            Some(BlockNumber(3))
+        );
+        // The contradiction fails the processor's lane, so a later anchor
+        // does not finalize it through the contradicted height.
+        assert!(
+            !report
+                .processor_finalized_through
+                .contains_key("finality-conflicting")
+        );
+        assert!(
+            report.failed_processors["finality-conflicting"]
+                .contains("resolves finalized hash at 1")
+        );
+        let state = store
+            .processor_runtime_state(conflicting.descriptor())
+            .await
+            .expect("state");
+        assert_eq!(state.state, ProcessorRunState::Failed);
+        assert_eq!(state.reason.as_deref(), Some("processor_finality_conflict"));
+        assert_eq!(
+            store
+                .finalized_through(conflicting.descriptor())
+                .await
+                .expect("conflicting finality"),
+            None
+        );
+        assert_eq!(report.pruned_recent_frames, 3);
+        assert!(
+            store
+                .recent_frame(ChainId(1), BlockNumber(0))
+                .await
+                .expect("recent lookup")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_finality_contradiction_is_recorded_for_a_lane_failed_for_another_reason() {
+        let range = BlockRange::new(BlockNumber(0), BlockNumber(3)).expect("range");
+        let chain = live_blocks(3);
+        let healthy = Arc::new(BlockLocalCounter::named("hidden-conflict-healthy"));
+        let conflicting = Arc::new(BlockLocalCounter::named("hidden-conflict-lane"));
+        let (_directory, store) = store().await;
+        for (sequence, frame) in (1..).zip(&chain) {
+            store.store_recent_frame(frame).await.expect("retain frame");
+            apply_live_frame(&store, healthy.as_ref(), frame, sequence).await;
+        }
+        apply_live_frame(&store, conflicting.as_ref(), &chain[0], 1).await;
+        let mut forged = live_fixture(1, chain[0].block.hash);
+        forged.block.hash = chain[2].block.hash;
+        apply_live_frame(&store, conflicting.as_ref(), &forged, 2).await;
+        apply_live_frame(&store, conflicting.as_ref(), &chain[3], 3).await;
+        // The lane is already failed for another reason when finality reaches
+        // the contradicted hash.
+        store
+            .park_processor_live_lane_at(
+                conflicting.descriptor(),
+                chain[2].block,
+                "processor_live_reduce_failed",
+                true,
+            )
+            .await
+            .expect("fail lane");
+        let checkpoint = ConsensusCheckpoint {
+            beacon_slot: 1,
+            beacon_block_root: [1; 32],
+            execution_block_hash: BlockHash::ZERO,
+            obtained_at_unix_seconds: 1,
+            source: "fixture".to_owned(),
+        };
+        let finality = |steps| {
+            SharedFinalityRuntime::new(
+                store.clone(),
+                Arc::new(ScriptedFinalitySource::new(
+                    fixture_source_descriptor("hidden-conflict-finality", range),
+                    checkpoint.clone(),
+                    steps,
+                )),
+                vec![conflicting.clone(), healthy.clone()],
+                SharedFinalityRuntimeConfig {
+                    minimum_recent_blocks: 1,
+                    recent_soft_bytes: 1,
+                    recent_hard_bytes: 1_000_000,
+                },
+            )
+            .expect("shared finality runtime")
+        };
+        let finalized = |block: &leani_primitives::BlockFrame, slot| {
+            FinalityStep::Event(FinalityEvent::Finalized {
+                block_hash: block.block.hash,
+                beacon_slot: slot,
+                beacon_block_root: [2; 32],
+            })
+        };
+
+        let report = finality(vec![finalized(&chain[2], 2)])
+            .run(checkpoint.clone(), CancellationToken::new())
+            .await
+            .expect("finality run");
+        assert!(
+            report.failed_processors["hidden-conflict-lane"]
+                .contains("resolves finalized hash at 1")
+        );
+        let state = store
+            .processor_runtime_state(conflicting.descriptor())
+            .await
+            .expect("state");
+        assert_eq!(state.state, ProcessorRunState::Failed);
+        assert_eq!(state.reason.as_deref(), Some("processor_finality_conflict"));
+
+        // A contradicted lane needs a rebuild: a reset would let finality
+        // advance it again.
+        assert!(
+            store
+                .reset_failed_live_lane(conflicting.descriptor())
+                .await
+                .is_err()
+        );
+        finality(vec![finalized(&chain[3], 3)])
+            .run(checkpoint, CancellationToken::new())
+            .await
+            .expect("later finality run");
+        assert_eq!(
+            store
+                .finalized_through(conflicting.descriptor())
+                .await
+                .expect("conflicting finality"),
+            None
+        );
+        assert_eq!(
+            store
+                .finalized_through(healthy.descriptor())
+                .await
+                .expect("healthy finality"),
+            Some(BlockNumber(3))
         );
     }
 

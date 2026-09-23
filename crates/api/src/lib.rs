@@ -4213,11 +4213,14 @@ struct LiveLaneResetResponse {
     required_delivery_bytes: String,
 }
 
+/// Reset a failed live lane for replay. A lane of any delivery ordering can
+/// fail, so this needs no split live stream: the reset reads only the lane's
+/// gap marker and the processor's delivery limit.
 async fn reset_live_lane(
     State(state): State<ApiState>,
     Path(processor): Path<String>,
 ) -> Result<Json<LiveLaneResetResponse>, ApiError> {
-    let (processor, _) = live_delivery_scope(&state, &processor).await?;
+    let processor = configured_processor(&state, &processor)?;
     let gap = match state
         .store
         .reset_failed_live_lane(processor.descriptor())
@@ -7436,6 +7439,9 @@ impl From<StoreError> for ApiError {
             matched @ StoreError::CheckpointRestoreBoundary { .. } => {
                 Self::conflict("checkpoint_restore_boundary", &matched.to_string())
             }
+            matched @ StoreError::LiveLaneRequiresRebuild { .. } => {
+                Self::conflict("live_lane_requires_rebuild", &matched.to_string())
+            }
             matched @ StoreError::ArtifactContract => Self::new(
                 StatusCode::UNPROCESSABLE_ENTITY,
                 "artifact_contract_incompatible",
@@ -9519,6 +9525,50 @@ mod tests {
         assert_eq!(second["rowCount"], "2");
         assert_eq!(second["data"].as_array().expect("data").len(), 1);
         assert!(second["nextCursor"].is_null());
+    }
+
+    #[tokio::test]
+    async fn resetting_a_contradicted_live_lane_answers_that_it_needs_a_rebuild() {
+        use leani_testkit::BlockLocalCounter;
+
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = SqliteStore::open(leani_store_sqlite::StoreConfig::new(
+            directory.path().join("reset-api.sqlite"),
+        ))
+        .await
+        .expect("store");
+        let processor = Arc::new(BlockLocalCounter::named("contradicted-counter"));
+        // Finality found the lane's coverage contradicting the canonical
+        // chain. It records no gap marker, so the refusal must not depend on
+        // one.
+        store
+            .register_processor(processor.descriptor())
+            .await
+            .expect("register");
+        store
+            .fail_processor_live_lane(processor.descriptor(), "processor_finality_conflict")
+            .await
+            .expect("contradiction");
+        let configured: Arc<dyn Processor> = processor.clone();
+        let response =
+            router_with_processors(store, vec![configured], Vec::new(), ApiConfig::default())
+                .expect("router")
+                .oneshot(
+                    Request::post("/admin/v1/processors/contradicted-counter/lanes/live/reset")
+                        .body(Body::empty())
+                        .expect("request"),
+                )
+                .await
+                .expect("response");
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body: Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body"),
+        )
+        .expect("JSON");
+        assert_eq!(body["error"]["code"], "live_lane_requires_rebuild");
     }
 
     #[tokio::test]

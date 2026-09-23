@@ -131,9 +131,20 @@ GET  /admin/v1/backfill-subscriptions
 GET  /admin/v1/backfill-subscriptions/{id}
 POST /admin/v1/backfill-subscriptions/{id}/cancel
 DELETE /admin/v1/backfill-subscriptions/{id}
-POST /admin/v1/processors/{processor}/rebuild
-POST /admin/v1/sources/{source}/probe
+POST /admin/v1/raw-history-jobs
+GET  /admin/v1/raw-history-jobs
+GET  /admin/v1/raw-history-jobs/{id}
+POST /admin/v1/raw-history-jobs/{id}/cancel
+DELETE /admin/v1/raw-history-jobs/{id}
+POST /admin/v1/processors/{processor}/lanes/live/reset
+DELETE /admin/v1/processors/{processor}/artifacts
+POST /admin/v1/processors/{processor}/artifacts/replay
 ```
+
+There is no route that rebuilds a processor instance in place. A processor
+whose coverage contradicts the canonical chain is rebuilt as a replacement
+instance; its live-lane reset answers `409 live_lane_requires_rebuild` (see
+the operations runbook).
 
 The first administration client can be the Rust CLI over a Unix socket or
 localhost-only HTTP. Starting or cancelling a backfill changes durable state
