@@ -22,6 +22,29 @@ record, and documented RPC contracts.
 - Node stores move to schema 22, which adds coverage lookup indexes. A
   schema-21 store upgrades in place on its next start; earlier binaries then
   refuse it, so keep a backup if you might roll back.
+- Breaking for processor authors (`leani-processor-api`):
+  `DataRequirement::validate_frame` is stricter for requirements with
+  `allow_filtered`. Each filtered component that can supply a required
+  capability, directly or by derivation, must claim predicate completeness
+  (`Completeness::Partial` is rejected), and its `FilterScope` must cover the
+  requirement's `filter` at the frame's block. Material filtered for another
+  consumer's predicate no longer passes.
+- Breaking (`leani-processor-api`): `ProcessorInstanceId::legacy` returns
+  `Result<ProcessorInstanceId, ProcessorInstanceIdError>` instead of panicking
+  when the derived key is invalid, which happens for a version with `+` build
+  metadata or when the ID and version exceed 192 bytes together. Decoding a
+  descriptor without an `instance` reports that as an error.
+- Breaking (`leani-primitives`, `leani-processor-api`): decoding validates
+  values the way their constructors do. A `BlockRange` whose end precedes its
+  start, `CapabilitySet` or `LogFieldSet` bits that name no capability or log
+  field, and a `ProcessorId` that `ProcessorId::new` rejects all fail to
+  decode. Encodings are unchanged; new golden fixtures pin the `BlockFrame`,
+  `ProcessorCursor`, and `EncodedDelta` durable encodings.
+- `leani-primitives`: `BlockRange::len` saturates at `u64::MAX` for the full
+  `0..=u64::MAX` range instead of overflowing, and the new
+  `BlockRange::checked_len` returns `None` for it. The new
+  `FilterScope::covers` and `FilterScope::covers_at` check whether material
+  filtered by one scope is complete for another filter.
 
 ### Fixed
 
@@ -121,6 +144,23 @@ record, and documented RPC contracts.
   retention, and size caps before taking the writer and stop counting once a
   cap is exceeded, so `query_too_expensive` reports at least that many rows
   and bytes; only the copy itself waits for the writer.
+- Historical backfills no longer reuse retained recent frames whose material
+  was filtered for other processors, which could silently produce incomplete
+  results. Such frames now miss and the job reads from its source.
+- A paused processor lane that resumes no longer replays retained frames
+  filtered for the processors that stayed live meanwhile. Live-gap replay
+  treats such a frame as missing: it recovers a finalized block from the
+  configured history source, and at an unfinalized block it fails only that
+  processor's lane (`unfinalized_gap_unrecoverable`), as for a block that was
+  never retained. A mapping failure during block-local gap replay now also
+  fails only that processor's lane (`processor_live_mapping_failed`), as
+  ordered replay already did, instead of stopping shared live ingestion.
+- A source request compiled for several filtering requirements no longer
+  narrows a field that one requirement leaves unfiltered. Previously an
+  unfiltered field such as `addresses` took another requirement's list, so the
+  source could omit material the unfiltered requirement needed.
+- `coverage_gaps` in `leani-source-api` no longer reports a range covered
+  through block `u64::MAX` as missing.
 
 ## [0.1.0-rc.1] - 2026-09-20
 

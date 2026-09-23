@@ -80,7 +80,8 @@ impl BlobsProcessor {
             .map_err(|error| ProcessorError::Input(error.to_string()))?;
         let version = Version::new(1, 4, 0);
         let descriptor = ProcessorDescriptor {
-            instance: ProcessorInstanceId::legacy(&id, &version, config_hash),
+            instance: ProcessorInstanceId::legacy(&id, &version, config_hash)
+                .map_err(|error| ProcessorError::Input(error.to_string()))?,
             id,
             version,
             code_hash,

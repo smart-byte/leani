@@ -17678,7 +17678,8 @@ mod tests {
             let config_hash = BlockHash::new([2; 32]);
             Self {
                 descriptor: ProcessorDescriptor {
-                    instance: ProcessorInstanceId::legacy(&id, &version, config_hash),
+                    instance: ProcessorInstanceId::legacy(&id, &version, config_hash)
+                        .expect("legacy instance"),
                     id,
                     version,
                     code_hash: BlockHash::new([1; 32]),
@@ -18794,7 +18795,8 @@ mod tests {
             &processor.descriptor.id,
             &processor.descriptor.version,
             processor.descriptor.config_hash,
-        );
+        )
+        .expect("legacy instance");
         processor
     }
 
@@ -22919,7 +22921,8 @@ mod tests {
             &processor.descriptor.id,
             &processor.descriptor.version,
             processor.descriptor.config_hash,
-        );
+        )
+        .expect("legacy instance");
         processor
     }
 

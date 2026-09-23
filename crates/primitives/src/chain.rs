@@ -94,10 +94,32 @@ fixed_bytes_newtype!(Address, 20);
 fixed_bytes_newtype!(Quantity, 32);
 
 /// Inclusive canonical block interval.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+///
+/// Decoding goes through [`BlockRange::new`], so no decoded range ends before
+/// it starts.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize)]
 pub struct BlockRange {
     start: BlockNumber,
     end: BlockNumber,
+}
+
+impl<'de> Deserialize<'de> for BlockRange {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        /// Mirrors the serialized name, fields, and field order, so every
+        /// existing encoding decodes unchanged.
+        #[derive(Deserialize)]
+        #[serde(rename = "BlockRange")]
+        struct BlockRangeWire {
+            start: BlockNumber,
+            end: BlockNumber,
+        }
+
+        let wire = BlockRangeWire::deserialize(deserializer)?;
+        Self::new(wire.start, wire.end).map_err(serde::de::Error::custom)
+    }
 }
 
 impl BlockRange {
@@ -137,9 +159,22 @@ impl BlockRange {
         block.0 >= self.start.0 && block.0 <= self.end.0
     }
 
+    /// Number of blocks in the interval.
+    ///
+    /// `0..=u64::MAX` holds 2^64 blocks, one more than a `u64` can hold, so
+    /// its length saturates at `u64::MAX`. A budget comparison such as
+    /// `range.len() > limit` therefore still rejects it for any smaller limit.
+    /// Use [`Self::checked_len`] when the exact count matters.
     #[must_use]
     pub const fn len(self) -> u64 {
-        self.end.0 - self.start.0 + 1
+        (self.end.0 - self.start.0).saturating_add(1)
+    }
+
+    /// Exact number of blocks, or `None` for the full `0..=u64::MAX` interval
+    /// whose count does not fit in a `u64`.
+    #[must_use]
+    pub const fn checked_len(self) -> Option<u64> {
+        (self.end.0 - self.start.0).checked_add(1)
     }
 
     #[must_use]
@@ -274,6 +309,42 @@ mod tests {
             vec![BlockNumber(4), BlockNumber(5), BlockNumber(6)]
         );
         assert!(BlockRange::new(BlockNumber(7), BlockNumber(6)).is_err());
+    }
+
+    #[test]
+    fn decoding_rejects_a_range_whose_end_precedes_its_start() {
+        let inverted = postcard::to_allocvec(&(BlockNumber(9), BlockNumber(1))).expect("encode");
+        assert!(postcard::from_bytes::<BlockRange>(&inverted).is_err());
+        let fields = [("start", 9_u64), ("end", 1_u64)];
+        let map = serde::de::value::MapDeserializer::<_, serde::de::value::Error>::new(
+            fields.into_iter(),
+        );
+        assert!(BlockRange::deserialize(map).is_err());
+
+        let valid = BlockRange::new(BlockNumber(1), BlockNumber(9)).expect("range");
+        let encoded = postcard::to_allocvec(&valid).expect("encode");
+        assert_eq!(
+            postcard::from_bytes::<BlockRange>(&encoded).expect("decode"),
+            valid
+        );
+    }
+
+    #[test]
+    fn full_range_length_saturates_instead_of_overflowing() {
+        let full = BlockRange::new(BlockNumber(0), BlockNumber(u64::MAX)).expect("range");
+        assert_eq!(full.len(), u64::MAX);
+        assert_eq!(BlockRange::single(BlockNumber(u64::MAX)).len(), 1);
+    }
+
+    #[test]
+    fn checked_length_reports_only_the_full_range_as_unrepresentable() {
+        let full = BlockRange::new(BlockNumber(0), BlockNumber(u64::MAX)).expect("range");
+        assert_eq!(full.checked_len(), None);
+        let almost = BlockRange::new(BlockNumber(1), BlockNumber(u64::MAX)).expect("range");
+        assert_eq!(almost.checked_len(), Some(u64::MAX));
+        assert_eq!(almost.len(), u64::MAX);
+        let small = BlockRange::new(BlockNumber(4), BlockNumber(6)).expect("range");
+        assert_eq!(small.checked_len(), Some(3));
     }
 
     #[test]

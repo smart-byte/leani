@@ -1511,11 +1511,6 @@ fn normalize_frames(inputs: NormalizationInputs<'_>) -> Result<Vec<BlockFrame>, 
                 logs: Vec::new(),
             });
         }
-        let mut receipt_scope = scope.clone();
-        receipt_scope.transaction_hashes = transactions
-            .iter()
-            .map(|transaction| transaction.hash)
-            .collect();
         frames.push(BlockFrame {
             chain_id: ChainId(1),
             block: BlockRef {
@@ -1551,9 +1546,12 @@ fn normalize_frames(inputs: NormalizationInputs<'_>) -> Result<Vec<BlockFrame>, 
                 scope: scope.clone(),
                 completeness: Completeness::DatasetDeclared,
             },
+            // One receipt per projected transaction, so the receipts are
+            // complete for the same type-3 predicate. Listing their hashes
+            // would narrow the claim below the consumer's filter.
             receipts: Material::Filtered {
                 value: receipts,
-                scope: receipt_scope,
+                scope: scope.clone(),
                 completeness: Completeness::DatasetDeclared,
             },
             logs: Material::Missing(MissingReason::NotRequested),
@@ -2408,6 +2406,102 @@ mod tests {
                 .expect("exact size"),
             34_975
         );
+    }
+
+    #[test]
+    fn blob_receipts_declare_the_predicate_of_their_transactions() {
+        let number = 19_426_589;
+        let transaction_hash = TransactionHash::new([0x33; 32]);
+        let execution = ExecutionBlockRow {
+            number,
+            hash: BlockHash::new([0x11; 32]),
+            timestamp: 1_710_338_159,
+            gas_used: 7_155_950,
+            extra_data: vec![0; 11],
+            base_fee_per_gas: 55_745_530_424,
+        };
+        let beacon = BeaconBlockRow {
+            slot: 8_626_181,
+            number,
+            hash: execution.hash,
+            parent_hash: BlockHash::ZERO,
+            timestamp: execution.timestamp,
+            consensus_size_bytes: 148_616,
+            fork: ExecutionBlockFork::Cancun,
+            base_fee_per_gas: quantity_from_u64(execution.base_fee_per_gas),
+            blob_gas_used: 131_072,
+            excess_blob_gas: 0,
+            gas_limit: 30_000_000,
+            gas_used: execution.gas_used,
+            transaction_count: 79,
+            transactions_total_bytes: 33_644,
+        };
+        let withdrawals = (0..16)
+            .map(|offset| WithdrawalRow {
+                index: 38_266_054 + offset,
+                validator_index: 1_268_201 + offset,
+                address: Address::new([0; 20]),
+                amount_gwei: if offset == 15 { 60_026_761 } else { 16_025_579 },
+            })
+            .collect::<Vec<_>>();
+        let slot = beacon.slot;
+        let frames = normalize_frames(NormalizationInputs {
+            range: BlockRange::single(BlockNumber(number)),
+            execution_blocks: &BTreeMap::from([(number, execution)]),
+            beacon_blocks: &BTreeMap::from([(number, beacon)]),
+            beacon_transactions: vec![BeaconTransactionRow {
+                slot,
+                index: 60,
+                hash: transaction_hash,
+                from: Address::new([0x44; 20]),
+                to: Some(Address::new([0x55; 20])),
+                gas_limit: 21_000,
+                size_bytes: 150,
+                blob_gas: 131_072,
+                max_fee_per_blob_gas: quantity_from_u64(1),
+                blob_hashes: vec![BlockHash::new([0x66; 32])],
+            }],
+            transaction_sizes: &BTreeMap::from([(slot, dencun_transaction_sizes())]),
+            withdrawals: &BTreeMap::from([(slot, withdrawals)]),
+            execution_transactions: &BTreeMap::from([(
+                transaction_hash,
+                ExecutionTransactionRow {
+                    block_number: number,
+                    index: 60,
+                    hash: transaction_hash,
+                    gas_used: 21_000,
+                    gas_price: quantity_from_u64(1),
+                    success: true,
+                },
+            )]),
+            provenance: &[],
+        })
+        .expect("normalized blob frame");
+
+        let frame = &frames[0];
+        let Material::Filtered {
+            scope: transaction_scope,
+            ..
+        } = &frame.transactions
+        else {
+            panic!("blob transactions are a filtered projection");
+        };
+        let Material::Filtered {
+            value: receipts,
+            scope: receipt_scope,
+            ..
+        } = &frame.receipts
+        else {
+            panic!("blob receipts are a filtered projection");
+        };
+        assert_eq!(receipts.len(), 1);
+        assert_eq!(receipt_scope, transaction_scope);
+        // The blobs processor's requirement filter.
+        let blob_transactions = FilterScope {
+            transaction_types: vec![3],
+            ..FilterScope::default()
+        };
+        assert!(receipt_scope.covers_at(&blob_transactions, frame.block.number));
     }
 
     #[test]

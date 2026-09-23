@@ -104,7 +104,8 @@ impl UniswapLatestProcessor {
         let version = Version::new(2, 0, 0);
         let config_hash = BlockHash::new(*blake3::hash(&encoded).as_bytes());
         let descriptor = ProcessorDescriptor {
-            instance: ProcessorInstanceId::legacy(&id, &version, config_hash),
+            instance: ProcessorInstanceId::legacy(&id, &version, config_hash)
+                .map_err(|error| ProcessorError::Input(error.to_string()))?,
             id,
             version,
             code_hash: BlockHash::new(*blake3::hash(b"leani/uniswap-latest/2.0.0").as_bytes()),
@@ -189,7 +190,8 @@ impl UniswapObservationsProcessor {
         let version = Version::new(2, 1, 0);
         let config_hash = BlockHash::new(*blake3::hash(&encoded).as_bytes());
         let descriptor = ProcessorDescriptor {
-            instance: ProcessorInstanceId::legacy(&id, &version, config_hash),
+            instance: ProcessorInstanceId::legacy(&id, &version, config_hash)
+                .map_err(|error| ProcessorError::Input(error.to_string()))?,
             id,
             version,
             code_hash: BlockHash::new(

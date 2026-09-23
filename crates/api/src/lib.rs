@@ -7084,12 +7084,12 @@ fn validate_api_cursor(
         2 => cursor.processor_id == descriptor.instance.as_str(),
         1 => {
             cursor.processor_id == descriptor.id.as_str()
-                && descriptor.instance
-                    == leani_processor_api::ProcessorInstanceId::legacy(
-                        &descriptor.id,
-                        &descriptor.version,
-                        descriptor.config_hash,
-                    )
+                && leani_processor_api::ProcessorInstanceId::legacy(
+                    &descriptor.id,
+                    &descriptor.version,
+                    descriptor.config_hash,
+                )
+                .is_ok_and(|legacy| descriptor.instance == legacy)
         }
         _ => false,
     };

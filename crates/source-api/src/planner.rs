@@ -139,7 +139,11 @@ pub fn coverage_gaps(requested: BlockRange, covered: &[BlockRange]) -> Vec<Block
         {
             gaps.push(gap);
         }
-        next = next.max(end.saturating_add(1));
+        let Some(after) = end.checked_add(1) else {
+            // Covered through the last representable block: nothing follows.
+            return gaps;
+        };
+        next = next.max(after);
         if next > requested.end().0 {
             break;
         }
@@ -217,6 +221,25 @@ mod tests {
         assert_eq!(
             coverage_gaps(requested, &covered),
             vec![BlockRange::new(BlockNumber(16), BlockNumber(17)).expect("gap")]
+        );
+    }
+
+    #[test]
+    fn coverage_through_the_maximum_block_leaves_no_gap() {
+        let edge = BlockRange::single(BlockNumber(u64::MAX));
+        assert_eq!(coverage_gaps(edge, &[edge]), Vec::new());
+
+        let requested =
+            BlockRange::new(BlockNumber(u64::MAX - 5), BlockNumber(u64::MAX)).expect("range");
+        let covered = [
+            BlockRange::new(BlockNumber(u64::MAX - 2), BlockNumber(u64::MAX))
+                .expect("covered range"),
+        ];
+        assert_eq!(
+            coverage_gaps(requested, &covered),
+            vec![
+                BlockRange::new(BlockNumber(u64::MAX - 5), BlockNumber(u64::MAX - 3)).expect("gap")
+            ]
         );
     }
 }

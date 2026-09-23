@@ -374,7 +374,8 @@ fn descriptor(id: &str, capabilities: CapabilitySet, mode: ReductionMode) -> Pro
     let version = Version::new(1, 0, 0);
     let config_hash = BlockHash::new([0x22; 32]);
     ProcessorDescriptor {
-        instance: ProcessorInstanceId::legacy(&id, &version, config_hash),
+        instance: ProcessorInstanceId::legacy(&id, &version, config_hash)
+            .expect("synthetic processor instance"),
         id,
         version,
         code_hash: BlockHash::new([0x11; 32]),

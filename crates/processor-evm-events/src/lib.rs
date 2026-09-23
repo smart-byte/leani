@@ -158,7 +158,8 @@ impl EvmEventsProcessor {
         let config_hash = BlockHash::new(*blake3::hash(&normalized).as_bytes());
         let topics = parsed.iter().map(|event| event.topic0).collect();
         let descriptor = ProcessorDescriptor {
-            instance: ProcessorInstanceId::legacy(&id, &version, config_hash),
+            instance: ProcessorInstanceId::legacy(&id, &version, config_hash)
+                .map_err(|error| input_error(error.to_string()))?,
             id,
             version,
             code_hash: BlockHash::new(*blake3::hash(b"leani/evm-events/1.0.0").as_bytes()),

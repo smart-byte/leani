@@ -3,13 +3,15 @@
 use std::{fmt, str::FromStr};
 
 use leani_primitives::{
-    BlockFrame, BlockHash, BlockNumber, CapabilitySet, FilterScope, Finality, LogField, LogFieldSet,
+    BlockFrame, BlockHash, BlockNumber, Capability, CapabilitySet, Completeness, FilterScope,
+    Finality, LogField, LogFieldSet, Material,
 };
 use semver::Version;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-#[derive(Clone, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+/// Stable processor namespace. Decoding validates it like [`Self::new`].
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(transparent)]
 pub struct ProcessorId(String);
 
@@ -53,6 +55,16 @@ impl FromStr for ProcessorId {
     }
 }
 
+impl<'de> Deserialize<'de> for ProcessorId {
+    fn deserialize<Deserializer>(deserializer: Deserializer) -> Result<Self, Deserializer::Error>
+    where
+        Deserializer: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::new(value).map_err(serde::de::Error::custom)
+    }
+}
+
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 #[error("invalid processor ID `{0}`; use 1-64 ASCII letters, digits, '.', '_' or '-'")]
 pub struct ProcessorIdError(String);
@@ -90,14 +102,17 @@ impl ProcessorInstanceId {
 
     /// Reproduce the processor-instance key used before explicit instance IDs.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// The derived value is always valid for supported processor IDs,
-    /// versions, and hashes.
-    #[must_use]
-    pub fn legacy(id: &ProcessorId, version: &Version, config_hash: BlockHash) -> Self {
+    /// Returns [`ProcessorInstanceIdError`] when the derived key is not a
+    /// valid instance ID: the version carries `+` build metadata, or the ID
+    /// and version together exceed the 192-byte limit.
+    pub fn legacy(
+        id: &ProcessorId,
+        version: &Version,
+        config_hash: BlockHash,
+    ) -> Result<Self, ProcessorInstanceIdError> {
         Self::new(format!("{id}@{version}:{}", hex::encode(config_hash.0)))
-            .expect("legacy processor instance is valid")
     }
 
     #[must_use]
@@ -567,6 +582,13 @@ pub struct DataRequirement {
 impl DataRequirement {
     /// Check frame-level material and finality requirements.
     ///
+    /// When the requirement accepts filtered material, every filtered
+    /// component that can supply one of its capabilities, directly or by
+    /// derivation, must claim predicate completeness rather than
+    /// [`Completeness::Partial`], and its scope must cover [`Self::filter`] at
+    /// the frame's block ([`FilterScope::covers_at`]). Filtered components for
+    /// other capabilities are not inspected.
+    ///
     /// # Errors
     ///
     /// Returns a static reason when the frame cannot be passed to the mapper.
@@ -579,6 +601,9 @@ impl DataRequirement {
             .satisfies(self.capabilities, self.allow_filtered)
         {
             return Err("frame does not meet capability completeness");
+        }
+        if self.allow_filtered {
+            self.validate_filtered_material(frame)?;
         }
         if frame.verification.has_failures() {
             return Err("frame contains failed verification");
@@ -600,6 +625,47 @@ impl DataRequirement {
             return Err("frame logs omit a required transaction hash");
         }
         Ok(())
+    }
+
+    fn validate_filtered_material(&self, frame: &BlockFrame) -> Result<(), &'static str> {
+        let components = [
+            (Capability::Header, filter_claim(&frame.header)),
+            (Capability::Transactions, filter_claim(&frame.transactions)),
+            (Capability::Receipts, filter_claim(&frame.receipts)),
+            (Capability::Logs, filter_claim(&frame.logs)),
+            (Capability::Withdrawals, filter_claim(&frame.withdrawals)),
+            (Capability::BlobSidecars, filter_claim(&frame.blob_sidecars)),
+            (Capability::Traces, filter_claim(&frame.traces)),
+            (Capability::StateDiffs, filter_claim(&frame.state_diffs)),
+        ];
+        for (capability, claim) in components {
+            let Some((scope, completeness)) = claim else {
+                continue;
+            };
+            let supplies = CapabilitySet::of(capability).with_derivable();
+            if supplies.intersection(self.capabilities) == CapabilitySet::NONE {
+                continue;
+            }
+            if completeness == Completeness::Partial {
+                return Err("filtered frame material is only a partial projection");
+            }
+            if !scope.covers_at(&self.filter, frame.block.number) {
+                return Err("filtered frame material does not cover the requirement filter");
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The predicate and completeness claim of filtered material.
+fn filter_claim<T>(material: &Material<T>) -> Option<(&FilterScope, Completeness)> {
+    match material {
+        Material::Filtered {
+            scope,
+            completeness,
+            ..
+        } => Some((scope, *completeness)),
+        Material::Complete(_) | Material::Missing(_) => None,
     }
 }
 
@@ -687,9 +753,11 @@ impl<'de> Deserialize<'de> for ProcessorDescriptor {
         }
 
         let wire = DescriptorWire::deserialize(deserializer)?;
-        let instance = wire.instance.unwrap_or_else(|| {
-            ProcessorInstanceId::legacy(&wire.id, &wire.version, wire.config_hash)
-        });
+        let instance = match wire.instance {
+            Some(instance) => instance,
+            None => ProcessorInstanceId::legacy(&wire.id, &wire.version, wire.config_hash)
+                .map_err(serde::de::Error::custom)?,
+        };
         let lifecycle = wire.lifecycle.unwrap_or_else(|| {
             LifecyclePolicies::from_legacy(
                 wire.retention.unwrap_or(RetentionPolicy::FullOutputHistory),
@@ -715,8 +783,9 @@ impl<'de> Deserialize<'de> for ProcessorDescriptor {
 #[cfg(test)]
 mod tests {
     use leani_primitives::{
-        Address, BlockHash, BlockRef, Capability, ChainId, Log, Material, MissingReason,
-        ReceiptEnvelope, TransactionHash, VerificationReport,
+        Address, BlockHash, BlockRange, BlockRef, Capability, ChainId, Completeness,
+        HeaderEnvelope, Log, Material, MissingReason, ReceiptEnvelope, TransactionHash,
+        VerificationReport,
     };
 
     use super::*;
@@ -823,6 +892,258 @@ mod tests {
         );
     }
 
+    fn empty_frame() -> BlockFrame {
+        BlockFrame {
+            chain_id: ChainId(1),
+            block: BlockRef {
+                number: BlockNumber(1),
+                hash: BlockHash::new([1; 32]),
+                parent_hash: BlockHash::ZERO,
+                timestamp: 1,
+            },
+            finality: Finality::Finalized,
+            header: Material::Missing(MissingReason::NotRequested),
+            transactions: Material::Missing(MissingReason::NotRequested),
+            receipts: Material::Missing(MissingReason::NotRequested),
+            logs: Material::Missing(MissingReason::NotRequested),
+            withdrawals: Material::Missing(MissingReason::NotRequested),
+            blob_sidecars: Material::Missing(MissingReason::NotRequested),
+            traces: Material::Missing(MissingReason::NotRequested),
+            state_diffs: Material::Missing(MissingReason::NotRequested),
+            provenance: Vec::new(),
+            verification: VerificationReport::default(),
+        }
+    }
+
+    fn address_scope(addresses: &[u8]) -> FilterScope {
+        FilterScope {
+            addresses: addresses
+                .iter()
+                .map(|byte| Address::new([*byte; 20]))
+                .collect(),
+            ..FilterScope::default()
+        }
+    }
+
+    fn filtered<T>(value: T, scope: FilterScope, completeness: Completeness) -> Material<T> {
+        Material::Filtered {
+            value,
+            scope,
+            completeness,
+        }
+    }
+
+    fn filtered_log_requirement(addresses: &[u8]) -> DataRequirement {
+        DataRequirement {
+            capabilities: CapabilitySet::of(Capability::Logs),
+            log_fields: LogFieldSet::NONE,
+            allow_filtered: true,
+            filter: address_scope(addresses),
+            minimum_finality: Finality::Included,
+        }
+    }
+
+    #[test]
+    fn filtered_material_must_be_predicate_complete_and_cover_the_requirement_filter() {
+        let requirement = filtered_log_requirement(&[0xaa]);
+        let mut frame = empty_frame();
+
+        // Audit probe: another consumer's partial projection was accepted.
+        frame.logs = filtered(Vec::new(), address_scope(&[0xbb]), Completeness::Partial);
+        assert!(requirement.validate_frame(&frame).is_err());
+
+        frame.logs = filtered(
+            Vec::new(),
+            address_scope(&[0xbb]),
+            Completeness::VerifiedPredicate,
+        );
+        assert_eq!(
+            requirement.validate_frame(&frame),
+            Err("filtered frame material does not cover the requirement filter")
+        );
+
+        frame.logs = filtered(
+            Vec::new(),
+            address_scope(&[0xaa, 0xbb]),
+            Completeness::Partial,
+        );
+        assert_eq!(
+            requirement.validate_frame(&frame),
+            Err("filtered frame material is only a partial projection")
+        );
+
+        frame.logs = filtered(
+            Vec::new(),
+            address_scope(&[0xbb, 0xaa]),
+            Completeness::DatasetDeclared,
+        );
+        assert_eq!(requirement.validate_frame(&frame), Ok(()));
+
+        frame.logs = filtered(
+            Vec::new(),
+            FilterScope::default(),
+            Completeness::VerifiedPredicate,
+        );
+        assert_eq!(requirement.validate_frame(&frame), Ok(()));
+
+        frame.logs = Material::Complete(Vec::new());
+        assert_eq!(requirement.validate_frame(&frame), Ok(()));
+
+        let wildcard = filtered_log_requirement(&[]);
+        frame.logs = filtered(
+            Vec::new(),
+            address_scope(&[0xaa]),
+            Completeness::VerifiedPredicate,
+        );
+        assert_eq!(
+            wildcard.validate_frame(&frame),
+            Err("filtered frame material does not cover the requirement filter")
+        );
+    }
+
+    #[test]
+    fn filtered_receipts_that_derive_logs_must_cover_the_requirement_filter() {
+        let requirement = filtered_log_requirement(&[0xaa]);
+        let mut frame = empty_frame();
+        frame.receipts = filtered(
+            Vec::new(),
+            address_scope(&[0xbb]),
+            Completeness::VerifiedPredicate,
+        );
+        assert_eq!(
+            requirement.validate_frame(&frame),
+            Err("filtered frame material does not cover the requirement filter")
+        );
+
+        // Covering logs do not excuse other non-covering material a mapper
+        // could read for the same capability.
+        frame.logs = filtered(
+            Vec::new(),
+            address_scope(&[0xaa]),
+            Completeness::VerifiedPredicate,
+        );
+        assert_eq!(
+            requirement.validate_frame(&frame),
+            Err("filtered frame material does not cover the requirement filter")
+        );
+
+        frame.receipts = Material::Missing(MissingReason::NotRequested);
+        assert_eq!(requirement.validate_frame(&frame), Ok(()));
+    }
+
+    #[test]
+    fn filtered_material_the_requirement_does_not_read_is_ignored() {
+        let requirement = filtered_log_requirement(&[0xaa]);
+        let mut frame = empty_frame();
+        frame.logs = Material::Complete(Vec::new());
+        frame.transactions = filtered(Vec::new(), address_scope(&[0xbb]), Completeness::Partial);
+        frame.header = filtered(
+            HeaderEnvelope {
+                rlp: None,
+                transactions_root: None,
+                receipts_root: None,
+                withdrawals_root: None,
+                gas_limit: None,
+                gas_used: None,
+                base_fee_per_gas: None,
+                blob_gas_used: None,
+                excess_blob_gas: None,
+                size_bytes: None,
+                transaction_count: None,
+                consensus_size_bytes: None,
+            },
+            address_scope(&[0xbb]),
+            Completeness::Partial,
+        );
+        assert_eq!(requirement.validate_frame(&frame), Ok(()));
+    }
+
+    #[test]
+    fn filtered_material_is_compared_at_the_frame_block() {
+        let requirement = filtered_log_requirement(&[0xaa]);
+        let mut frame = empty_frame();
+        let mut scope = address_scope(&[0xaa]);
+        scope.block_range = Some(BlockRange::single(frame.block.number));
+        frame.logs = filtered(Vec::new(), scope.clone(), Completeness::DatasetDeclared);
+        assert_eq!(requirement.validate_frame(&frame), Ok(()));
+
+        scope.block_range = Some(BlockRange::single(BlockNumber(2)));
+        frame.logs = filtered(Vec::new(), scope, Completeness::DatasetDeclared);
+        assert_eq!(
+            requirement.validate_frame(&frame),
+            Err("filtered frame material does not cover the requirement filter")
+        );
+    }
+
+    #[test]
+    fn invalid_ranges_ids_and_capability_bits_do_not_deserialize() {
+        // Audit probe: both decoded without validation.
+        assert!(serde_json::from_str::<BlockRange>(r#"{"start":9,"end":1}"#).is_err());
+        assert!(serde_json::from_str::<ProcessorId>(r#""../bad""#).is_err());
+        assert!(serde_json::from_str::<CapabilitySet>("4096").is_err());
+        assert!(serde_json::from_str::<LogFieldSet>("2").is_err());
+
+        assert_eq!(
+            serde_json::from_str::<BlockRange>(r#"{"start":1,"end":9}"#).expect("range"),
+            BlockRange::new(BlockNumber(1), BlockNumber(9)).expect("range")
+        );
+        assert_eq!(
+            serde_json::from_str::<ProcessorId>(r#""fixture""#).expect("ID"),
+            ProcessorId::new("fixture").expect("ID")
+        );
+        assert_eq!(
+            serde_json::from_str::<CapabilitySet>("4095").expect("capabilities"),
+            CapabilitySet::ALL
+        );
+        assert_eq!(
+            serde_json::from_str::<LogFieldSet>("1").expect("log fields"),
+            LogFieldSet::ALL
+        );
+    }
+
+    #[test]
+    fn legacy_instance_derivation_failure_is_a_deserialization_error() {
+        let descriptor = |id: &str, version: &str| {
+            serde_json::json!({
+                "id": id,
+                "version": version,
+                "code_hash": BlockHash::new([1; 32]),
+                "config_hash": BlockHash::new([2; 32]),
+                "start": "Genesis",
+                "requirements": [{
+                    "capabilities": CapabilitySet::of(Capability::Header),
+                    "log_fields": LogFieldSet::NONE,
+                    "allow_filtered": false,
+                    "filter": FilterScope::default(),
+                    "minimum_finality": "Included"
+                }],
+                "mode": "BlockLocal",
+                "delivery_ordering": "block_versioned_idempotent",
+                "publication": "finalized_only",
+                "schemas": {
+                    "delta_version": 1,
+                    "entity_schema": "fixture.entity.v1",
+                    "change_schema": "fixture.change.v1"
+                }
+            })
+        };
+
+        // Audit probe: semver build metadata panicked while deriving the
+        // legacy instance.
+        let error =
+            serde_json::from_value::<ProcessorDescriptor>(descriptor("fixture", "1.0.0+build"))
+                .expect_err("build metadata cannot form a legacy instance ID");
+        assert!(error.to_string().contains("invalid processor instance ID"));
+
+        let long_version = format!("1.0.0-{}", "a".repeat(64));
+        let error = serde_json::from_value::<ProcessorDescriptor>(descriptor(
+            &"p".repeat(64),
+            &long_version,
+        ))
+        .expect_err("an over-long legacy instance ID is invalid");
+        assert!(error.to_string().contains("invalid processor instance ID"));
+    }
+
     #[test]
     fn artifact_policy_is_independent_and_window_is_bounded() {
         let mut lifecycle = LifecyclePolicies::default();
@@ -888,6 +1209,7 @@ mod tests {
                 &descriptor.version,
                 descriptor.config_hash
             )
+            .expect("legacy instance")
         );
     }
 }

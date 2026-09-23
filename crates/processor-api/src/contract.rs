@@ -336,7 +336,8 @@ mod tests {
         let version = Version::new(1, 2, 3);
         let config_hash = BlockHash::new([2; 32]);
         ProcessorDescriptor {
-            instance: ProcessorInstanceId::legacy(&id, &version, config_hash),
+            instance: ProcessorInstanceId::legacy(&id, &version, config_hash)
+                .expect("legacy instance"),
             id,
             version,
             code_hash: BlockHash::new([1; 32]),

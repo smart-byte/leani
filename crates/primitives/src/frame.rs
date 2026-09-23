@@ -21,9 +21,28 @@ impl LogField {
 }
 
 /// Stable bit representation of optional log identity requirements.
-#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, Hash, PartialEq, Serialize)]
+///
+/// Decoding rejects bits that name no [`LogField`].
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq, Serialize)]
 #[serde(transparent)]
 pub struct LogFieldSet(u8);
+
+impl<'de> Deserialize<'de> for LogFieldSet {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let bits = u8::deserialize(deserializer)?;
+        if bits & !Self::ALL.0 == 0 {
+            Ok(Self(bits))
+        } else {
+            Err(serde::de::Error::custom(format!(
+                "unknown log field bits 0x{:02x}",
+                bits & !Self::ALL.0
+            )))
+        }
+    }
+}
 
 impl LogFieldSet {
     pub const NONE: Self = Self(0);
@@ -75,6 +94,11 @@ pub struct HeaderEnvelope {
     ///
     /// This is deliberately distinct from [`Self::size_bytes`]: neither value
     /// may be substituted for the other.
+    ///
+    /// The serde default only lets self-describing input written before this
+    /// field existed, such as JSON-lines history archives, omit it. Durable
+    /// postcard frames always encode every field, so it adds no compatibility
+    /// for them.
     #[serde(default)]
     pub consensus_size_bytes: Option<u64>,
 }
@@ -473,6 +497,18 @@ mod tests {
         assert_eq!(
             frame.validate_shape(),
             Err("complete transaction and receipt counts differ")
+        );
+    }
+
+    #[test]
+    fn decoding_rejects_unknown_log_field_bits() {
+        let encoded = postcard::to_allocvec(&0b10_u8).expect("encode");
+        assert!(postcard::from_bytes::<LogFieldSet>(&encoded).is_err());
+
+        let encoded = postcard::to_allocvec(&LogFieldSet::ALL).expect("encode");
+        assert_eq!(
+            postcard::from_bytes::<LogFieldSet>(&encoded).expect("decode"),
+            LogFieldSet::ALL
         );
     }
 

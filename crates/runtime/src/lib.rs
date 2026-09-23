@@ -615,10 +615,8 @@ impl BackfillJob {
             .iter()
             .all(|requirement| requirement.allow_filtered);
         let filters = if allow_filtered {
-            let mut scope = leani_primitives::FilterScope::default();
-            for requirement in requirements {
-                union_filter_scope(&mut scope, &requirement.filter);
-            }
+            let scope =
+                covering_filter_scope(requirements.iter().map(|requirement| &requirement.filter));
             leani_source_api::FilterSet {
                 senders: scope.senders.clone(),
                 recipients: scope.recipients.clone(),
@@ -3913,6 +3911,40 @@ impl SharedLiveRuntime {
             .map_err(Into::into)
     }
 
+    /// The retained frame for a lane's first unapplied block, if the
+    /// processor can read it.
+    ///
+    /// A retained frame carries only the material requested by the processors
+    /// that were live when it arrived, so a lane that was paused then may find
+    /// it filtered for others. Such a frame is a miss: the caller recovers the
+    /// block like one that was never retained, instead of failing the lane.
+    async fn replayable_recent_frame(
+        &self,
+        processor: &dyn Processor,
+        first_unapplied: BlockRef,
+    ) -> Result<Option<leani_primitives::BlockFrame>, RuntimeError> {
+        let Some(frame) = self
+            .store
+            .recent_frame(self.source.descriptor().chain_id, first_unapplied.number)
+            .await?
+            .filter(|frame| frame.block == first_unapplied)
+        else {
+            return Ok(None);
+        };
+        for requirement in &processor.descriptor().requirements {
+            if let Err(error) = requirement.validate_frame(&frame) {
+                warn!(
+                    processor_instance = %processor.descriptor().instance,
+                    block = first_unapplied.number.0,
+                    %error,
+                    "retained frame cannot serve this processor's live-gap replay; recovering the block instead"
+                );
+                return Ok(None);
+            }
+        }
+        Ok(Some(frame))
+    }
+
     async fn advance_or_complete_live_gap(
         &self,
         processor: &dyn Processor,
@@ -4263,21 +4295,22 @@ impl SharedLiveRuntime {
                     }
 
                     if let Some(frame) = self
-                        .store
-                        .recent_frame(
-                            self.source.descriptor().chain_id,
-                            gap.first_unapplied.number,
-                        )
+                        .replayable_recent_frame(processor.as_ref(), gap.first_unapplied)
                         .await?
-                        .filter(|frame| frame.block == gap.first_unapplied)
                     {
-                        for requirement in &processor.descriptor().requirements {
-                            requirement
-                                .validate_frame(&frame)
-                                .map_err(|error| ProcessorError::Input(error.to_owned()))?;
-                        }
                         let (delta, _) =
-                            map_with_finality_variants(processor.as_ref(), &frame).await?;
+                            match map_with_finality_variants(processor.as_ref(), &frame).await {
+                                Ok(mapped) => mapped,
+                                Err(error) => {
+                                    self.isolate_live_mapping_failure(
+                                        processor.as_ref(),
+                                        frame.block,
+                                        &error,
+                                    )
+                                    .await?;
+                                    break;
+                                }
+                            };
                         let outcome = match if frame.finality == Finality::Finalized {
                             self.apply_recovered_delta(processor.as_ref(), &delta).await
                         } else {
@@ -4392,35 +4425,22 @@ impl SharedLiveRuntime {
                     break;
                 }
                 if let Some(frame) = self
-                    .store
-                    .recent_frame(
-                        self.source.descriptor().chain_id,
-                        gap.first_unapplied.number,
-                    )
+                    .replayable_recent_frame(processor.as_ref(), gap.first_unapplied)
                     .await?
-                    .filter(|frame| frame.block == gap.first_unapplied)
                 {
-                    let mapped = async {
-                        for requirement in &processor.descriptor().requirements {
-                            requirement
-                                .validate_frame(&frame)
-                                .map_err(|error| ProcessorError::Input(error.to_owned()))?;
-                        }
-                        map_with_finality_variants(processor.as_ref(), &frame).await
-                    }
-                    .await;
-                    let (delta, _) = match mapped {
-                        Ok(mapped) => mapped,
-                        Err(error) => {
-                            self.isolate_live_mapping_failure(
-                                processor.as_ref(),
-                                frame.block,
-                                &error,
-                            )
-                            .await?;
-                            break;
-                        }
-                    };
+                    let (delta, _) =
+                        match map_with_finality_variants(processor.as_ref(), &frame).await {
+                            Ok(mapped) => mapped,
+                            Err(error) => {
+                                self.isolate_live_mapping_failure(
+                                    processor.as_ref(),
+                                    frame.block,
+                                    &error,
+                                )
+                                .await?;
+                                break;
+                            }
+                        };
                     let outcome = match if frame.finality == Finality::Finalized {
                         self.apply_recovered_delta(processor.as_ref(), &delta).await
                     } else {
@@ -4714,10 +4734,8 @@ fn compile_live_request(
         .iter()
         .all(|requirement| requirement.allow_filtered);
     let filters = if allow_filtered {
-        let mut scope = leani_primitives::FilterScope::default();
-        for requirement in requirements {
-            union_filter_scope(&mut scope, &requirement.filter);
-        }
+        let scope =
+            covering_filter_scope(requirements.iter().map(|requirement| &requirement.filter));
         leani_source_api::FilterSet {
             senders: scope.senders.clone(),
             recipients: scope.recipients.clone(),
@@ -4739,6 +4757,29 @@ fn compile_live_request(
     })
 }
 
+/// Narrowest pushdown scope that covers every one of `filters`.
+///
+/// The fold starts from the first filter because the default scope is a
+/// wildcard, which would absorb every narrower filter.
+fn covering_filter_scope<'a>(
+    filters: impl IntoIterator<Item = &'a leani_primitives::FilterScope>,
+) -> leani_primitives::FilterScope {
+    let mut filters = filters.into_iter();
+    let Some(first) = filters.next() else {
+        return leani_primitives::FilterScope::default();
+    };
+    filters.fold(first.clone(), |mut scope, filter| {
+        union_filter_scope(&mut scope, filter);
+        scope
+    })
+}
+
+/// Widen `retained` so it also covers everything `incoming` matches.
+///
+/// A missing block range and an empty list are wildcards, so a wildcard on
+/// either side stays a wildcard. Two block ranges widen to their hull and two
+/// lists to their union. A topic position stays constrained only when both
+/// sides constrain it. The result may match more than either side, never less.
 fn union_filter_scope(
     retained: &mut leani_primitives::FilterScope,
     incoming: &leani_primitives::FilterScope,
@@ -4751,23 +4792,46 @@ fn union_filter_scope(
         }
     }
 
-    extend_unique(&mut retained.addresses, &incoming.addresses);
-    extend_unique(
+    fn union_values<T: Clone + Eq>(retained: &mut Vec<T>, incoming: &[T]) {
+        if incoming.is_empty() {
+            retained.clear();
+        } else if !retained.is_empty() {
+            extend_unique(retained, incoming);
+        }
+    }
+
+    retained.block_range =
+        retained
+            .block_range
+            .zip(incoming.block_range)
+            .and_then(|(retained, incoming)| {
+                BlockRange::new(
+                    retained.start().min(incoming.start()),
+                    retained.end().max(incoming.end()),
+                )
+                .ok()
+            });
+    union_values(&mut retained.addresses, &incoming.addresses);
+    union_values(
         &mut retained.transaction_hashes,
         &incoming.transaction_hashes,
     );
-    extend_unique(&mut retained.transaction_types, &incoming.transaction_types);
-    extend_unique(&mut retained.senders, &incoming.senders);
-    extend_unique(&mut retained.recipients, &incoming.recipients);
-    for topic in &incoming.topics {
-        if let Some(existing) = retained
+    union_values(&mut retained.transaction_types, &incoming.transaction_types);
+    union_values(&mut retained.senders, &incoming.senders);
+    union_values(&mut retained.recipients, &incoming.recipients);
+    retained.topics.retain(|topic| {
+        incoming
             .topics
-            .iter_mut()
-            .find(|existing| existing.position == topic.position)
+            .iter()
+            .any(|other| other.position == topic.position)
+    });
+    for topic in &mut retained.topics {
+        for other in incoming
+            .topics
+            .iter()
+            .filter(|other| other.position == topic.position)
         {
-            extend_unique(&mut existing.alternatives, &topic.alternatives);
-        } else {
-            retained.topics.push(topic.clone());
+            extend_unique(&mut topic.alternatives, &other.alternatives);
         }
     }
 }
@@ -5880,6 +5944,112 @@ mod tests {
         }
     }
 
+    /// Counts whatever transaction material the frame carries, so reusing
+    /// material filtered for another consumer would silently undercount.
+    #[derive(Debug)]
+    struct FilteredCounter {
+        inner: BlockLocalCounter,
+        descriptor: ProcessorDescriptor,
+    }
+
+    impl FilteredCounter {
+        fn new(requirements: Vec<leani_processor_api::DataRequirement>) -> Self {
+            let inner = BlockLocalCounter::named("filtered-counter");
+            let mut descriptor = inner.descriptor().clone();
+            descriptor.requirements = requirements;
+            Self { inner, descriptor }
+        }
+    }
+
+    #[async_trait]
+    impl Processor for FilteredCounter {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
+        fn descriptor(&self) -> &ProcessorDescriptor {
+            &self.descriptor
+        }
+
+        async fn map(
+            &self,
+            block: &leani_primitives::BlockFrame,
+        ) -> Result<EncodedDelta, ProcessorError> {
+            for requirement in &self.descriptor.requirements {
+                requirement
+                    .validate_frame(block)
+                    .map_err(|error| ProcessorError::Input(error.to_owned()))?;
+            }
+            let count = block.transactions.as_present().map_or(0, Vec::len);
+            let count = u64::try_from(count).map_err(|_| {
+                ProcessorError::Invariant("transaction count exceeds u64".to_owned())
+            })?;
+            Ok(EncodedDelta::new(
+                &self.descriptor,
+                block.chain_id,
+                block.block,
+                count.to_be_bytes().to_vec(),
+            ))
+        }
+
+        async fn reduce(
+            &self,
+            transaction: &mut dyn leani_processor_api::ReducerTransaction,
+            cursor: &ProcessorCursor,
+            delta: &EncodedDelta,
+        ) -> Result<leani_processor_api::DomainChanges, ProcessorError> {
+            self.inner.reduce(transaction, cursor, delta).await
+        }
+    }
+
+    /// Runs `inner` under replaced input requirements, which its mapper
+    /// checks first like a production processor does.
+    #[derive(Debug)]
+    struct Requiring<P> {
+        inner: P,
+        descriptor: ProcessorDescriptor,
+    }
+
+    impl<P: Processor> Requiring<P> {
+        fn new(inner: P, requirements: Vec<leani_processor_api::DataRequirement>) -> Self {
+            let mut descriptor = inner.descriptor().clone();
+            descriptor.requirements = requirements;
+            Self { inner, descriptor }
+        }
+    }
+
+    #[async_trait]
+    impl<P: Processor + std::fmt::Debug + 'static> Processor for Requiring<P> {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
+        fn descriptor(&self) -> &ProcessorDescriptor {
+            &self.descriptor
+        }
+
+        async fn map(
+            &self,
+            block: &leani_primitives::BlockFrame,
+        ) -> Result<EncodedDelta, ProcessorError> {
+            for requirement in &self.descriptor.requirements {
+                requirement
+                    .validate_frame(block)
+                    .map_err(|error| ProcessorError::Input(error.to_owned()))?;
+            }
+            self.inner.map(block).await
+        }
+
+        async fn reduce(
+            &self,
+            transaction: &mut dyn leani_processor_api::ReducerTransaction,
+            cursor: &ProcessorCursor,
+            delta: &EncodedDelta,
+        ) -> Result<leani_processor_api::DomainChanges, ProcessorError> {
+            self.inner.reduce(transaction, cursor, delta).await
+        }
+    }
+
     #[async_trait]
     impl Processor for FinalitySensitiveCounter {
         fn as_any(&self) -> &dyn std::any::Any {
@@ -6278,6 +6448,297 @@ mod tests {
         assert_eq!(retained.addresses, [first, second]);
         assert_eq!(retained.topics.len(), 1);
         assert_eq!(retained.topics[0].alternatives, [[0x33; 32], [0x44; 32]]);
+    }
+
+    fn narrow_filter_scope() -> leani_primitives::FilterScope {
+        leani_primitives::FilterScope {
+            block_range: Some(BlockRange::new(BlockNumber(1), BlockNumber(5)).expect("range")),
+            addresses: vec![leani_primitives::Address::new([0x11; 20])],
+            topics: vec![leani_primitives::TopicFilter {
+                position: 0,
+                alternatives: vec![[0x33; 32]],
+            }],
+            transaction_hashes: vec![leani_primitives::TransactionHash::new([0x44; 32])],
+            transaction_types: vec![3],
+            senders: vec![leani_primitives::Address::new([0x55; 20])],
+            recipients: vec![leani_primitives::Address::new([0x66; 20])],
+        }
+    }
+
+    #[test]
+    fn a_wildcard_on_either_side_of_a_filter_union_stays_a_wildcard() {
+        let mut retained = narrow_filter_scope();
+        union_filter_scope(&mut retained, &leani_primitives::FilterScope::default());
+        assert_eq!(retained, leani_primitives::FilterScope::default());
+
+        let mut retained = leani_primitives::FilterScope::default();
+        union_filter_scope(&mut retained, &narrow_filter_scope());
+        assert_eq!(retained, leani_primitives::FilterScope::default());
+    }
+
+    #[test]
+    fn a_filter_union_narrows_only_what_both_sides_narrow() {
+        let mut retained = leani_primitives::FilterScope {
+            block_range: Some(BlockRange::new(BlockNumber(1), BlockNumber(5)).expect("range")),
+            addresses: vec![leani_primitives::Address::new([0x11; 20])],
+            topics: vec![leani_primitives::TopicFilter {
+                position: 0,
+                alternatives: vec![[0x33; 32]],
+            }],
+            ..leani_primitives::FilterScope::default()
+        };
+        let incoming = leani_primitives::FilterScope {
+            block_range: Some(BlockRange::new(BlockNumber(10), BlockNumber(12)).expect("range")),
+            topics: vec![leani_primitives::TopicFilter {
+                position: 1,
+                alternatives: vec![[0x44; 32]],
+            }],
+            senders: vec![leani_primitives::Address::new([0x55; 20])],
+            ..leani_primitives::FilterScope::default()
+        };
+        union_filter_scope(&mut retained, &incoming);
+        assert_eq!(
+            retained,
+            leani_primitives::FilterScope {
+                block_range: Some(BlockRange::new(BlockNumber(1), BlockNumber(12)).expect("hull")),
+                ..leani_primitives::FilterScope::default()
+            }
+        );
+    }
+
+    #[test]
+    fn a_filter_union_covers_both_sides() {
+        let other = leani_primitives::FilterScope {
+            block_range: Some(BlockRange::new(BlockNumber(8), BlockNumber(9)).expect("range")),
+            addresses: vec![leani_primitives::Address::new([0x12; 20])],
+            topics: vec![
+                leani_primitives::TopicFilter {
+                    position: 0,
+                    alternatives: vec![[0x34; 32], [0x35; 32]],
+                },
+                leani_primitives::TopicFilter {
+                    position: 0,
+                    alternatives: vec![[0x35; 32]],
+                },
+            ],
+            transaction_hashes: vec![leani_primitives::TransactionHash::new([0x45; 32])],
+            transaction_types: vec![2],
+            senders: vec![leani_primitives::Address::new([0x56; 20])],
+            recipients: vec![leani_primitives::Address::new([0x67; 20])],
+        };
+        let pairs = [
+            (narrow_filter_scope(), other.clone()),
+            (other, narrow_filter_scope()),
+            (narrow_filter_scope(), narrow_filter_scope()),
+            (
+                narrow_filter_scope(),
+                leani_primitives::FilterScope::default(),
+            ),
+        ];
+        for (left, right) in pairs {
+            let mut union = left.clone();
+            union_filter_scope(&mut union, &right);
+            assert!(union.covers(&left), "{union:?} must cover {left:?}");
+            assert!(union.covers(&right), "{union:?} must cover {right:?}");
+        }
+    }
+
+    #[test]
+    fn processor_requests_push_down_a_filter_that_covers_every_requirement() {
+        let sender = leani_primitives::Address::new([0x55; 20]);
+        let requirement = |filter| leani_processor_api::DataRequirement {
+            capabilities: CapabilitySet::of(Capability::Transactions),
+            log_fields: LogFieldSet::NONE,
+            allow_filtered: true,
+            filter,
+            minimum_finality: Finality::Included,
+        };
+        let sender_scope = leani_primitives::FilterScope {
+            senders: vec![sender],
+            ..leani_primitives::FilterScope::default()
+        };
+        let range = BlockRange::single(BlockNumber(1));
+
+        let single = FilteredCounter::new(vec![requirement(sender_scope.clone())]);
+        let job = BackfillJob::for_processor(
+            "single-filter",
+            &single,
+            ChainId(1),
+            range,
+            VerificationPolicy::CompleteCryptographic,
+        )
+        .expect("job");
+        assert!(job.request.allow_filtered);
+        assert_eq!(job.request.filters.scope, sender_scope);
+        assert_eq!(job.request.filters.senders, [sender]);
+
+        let mixed = FilteredCounter::new(vec![
+            requirement(sender_scope),
+            requirement(leani_primitives::FilterScope::default()),
+        ]);
+        let job = BackfillJob::for_processor(
+            "mixed-filter",
+            &mixed,
+            ChainId(1),
+            range,
+            VerificationPolicy::CompleteCryptographic,
+        )
+        .expect("job");
+        assert_eq!(job.request.filters, FilterSet::default());
+        let live = compile_live_request(
+            &[Arc::new(mixed) as Arc<dyn Processor>],
+            ChainId(1),
+            &LiveStart::Head,
+        )
+        .expect("live request");
+        assert_eq!(live.filters, FilterSet::default());
+    }
+
+    async fn store_recent_transactions_filtered_to(
+        store: &SqliteStore,
+        range: BlockRange,
+        scope: &leani_primitives::FilterScope,
+    ) {
+        for mut frame in frames(range) {
+            frame.transactions = Material::Filtered {
+                value: Vec::new(),
+                scope: scope.clone(),
+                completeness: leani_primitives::Completeness::VerifiedPredicate,
+            };
+            frame.provenance.push(leani_primitives::Provenance {
+                source_id: leani_primitives::SourceId::new("live-cache").expect("source ID"),
+                source_kind: SourceKind::ExecutionP2p,
+                trust: TrustModel::ProtocolVerified,
+                range: Some(range),
+                object: None,
+                observed_at_unix_ms: 1,
+                projection: Vec::new(),
+            });
+            store
+                .store_recent_frame(&frame)
+                .await
+                .expect("recent frame");
+        }
+    }
+
+    fn sender_requirement(
+        sender: leani_primitives::Address,
+    ) -> leani_processor_api::DataRequirement {
+        leani_processor_api::DataRequirement {
+            capabilities: CapabilitySet::of(Capability::Transactions),
+            log_fields: LogFieldSet::NONE,
+            allow_filtered: true,
+            filter: leani_primitives::FilterScope {
+                senders: vec![sender],
+                ..leani_primitives::FilterScope::default()
+            },
+            minimum_finality: Finality::Included,
+        }
+    }
+
+    fn sender_filtered_counter(sender: leani_primitives::Address) -> FilteredCounter {
+        FilteredCounter::new(vec![sender_requirement(sender)])
+    }
+
+    #[tokio::test]
+    async fn historical_run_does_not_reuse_recent_material_filtered_for_another_scope() {
+        let range = BlockRange::new(BlockNumber(1), BlockNumber(3)).expect("range");
+        let source = Arc::new(ScriptedHistorySource::from_frames(
+            fixture_source_descriptor("filtered-history", range),
+            frames(range),
+        ));
+        let sender = leani_primitives::Address::new([0x55; 20]);
+        let processor = Arc::new(sender_filtered_counter(sender));
+        let (_directory, store) = store().await;
+        // Retained by the live runtime for another processor's sender.
+        store_recent_transactions_filtered_to(
+            &store,
+            range,
+            &leani_primitives::FilterScope {
+                senders: vec![leani_primitives::Address::new([0x77; 20])],
+                ..leani_primitives::FilterScope::default()
+            },
+        )
+        .await;
+        let runtime = HistoricalRuntime::new(
+            store,
+            source.clone(),
+            processor.clone(),
+            HistoricalRuntimeConfig {
+                mapper_concurrency: 2,
+                ..HistoricalRuntimeConfig::default()
+            },
+        )
+        .expect("runtime");
+        let job = BackfillJob::for_processor(
+            "recent-filter-miss",
+            processor.as_ref(),
+            ChainId(1),
+            range,
+            VerificationPolicy::CompleteCryptographic,
+        )
+        .expect("job");
+
+        let report = runtime
+            .run(job, default_source_budget(), CancellationToken::new())
+            .await
+            .expect("source fallback");
+
+        assert_eq!(source.plan_calls(), 1);
+        assert_eq!(source.open_calls(), 1);
+        assert_eq!(report.source_id, "filtered-history");
+        assert_eq!(report.frames_committed, range.len());
+        assert_eq!(report.final_coverage, vec![range]);
+    }
+
+    #[tokio::test]
+    async fn historical_run_reuses_recent_material_whose_filter_covers_the_requirement() {
+        let range = BlockRange::new(BlockNumber(1), BlockNumber(3)).expect("range");
+        let source = Arc::new(ScriptedHistorySource::from_frames(
+            fixture_source_descriptor("unused-filtered-history", range),
+            frames(range),
+        ));
+        let sender = leani_primitives::Address::new([0x55; 20]);
+        let processor = Arc::new(sender_filtered_counter(sender));
+        let (_directory, store) = store().await;
+        store_recent_transactions_filtered_to(
+            &store,
+            range,
+            &leani_primitives::FilterScope {
+                senders: vec![leani_primitives::Address::new([0x77; 20]), sender],
+                ..leani_primitives::FilterScope::default()
+            },
+        )
+        .await;
+        let runtime = HistoricalRuntime::new(
+            store,
+            source.clone(),
+            processor.clone(),
+            HistoricalRuntimeConfig {
+                mapper_concurrency: 2,
+                ..HistoricalRuntimeConfig::default()
+            },
+        )
+        .expect("runtime");
+        let job = BackfillJob::for_processor(
+            "recent-filter-hit",
+            processor.as_ref(),
+            ChainId(1),
+            range,
+            VerificationPolicy::CompleteCryptographic,
+        )
+        .expect("job");
+
+        let report = runtime
+            .run(job, default_source_budget(), CancellationToken::new())
+            .await
+            .expect("recent material backfill");
+
+        assert_eq!(source.plan_calls(), 0);
+        assert_eq!(source.open_calls(), 0);
+        assert_eq!(report.source_id, "recent-store");
+        assert_eq!(report.frames_committed, range.len());
+        assert_eq!(report.final_coverage, vec![range]);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -10910,6 +11371,247 @@ mod tests {
                 .expect("recovering state")
                 .state,
             ProcessorRunState::Running
+        );
+    }
+
+    const REPLAY_SENDER: leani_primitives::Address = leani_primitives::Address::new([0x55; 20]);
+    const OTHER_SENDER: leani_primitives::Address = leani_primitives::Address::new([0x77; 20]);
+
+    /// Blocks 0..=2 with complete material, as history recovery returns them.
+    fn live_chain(finality: Finality) -> Vec<leani_primitives::BlockFrame> {
+        let mut parent = BlockHash::ZERO;
+        (0..=2)
+            .map(|number| {
+                let mut frame = live_fixture(number, parent);
+                frame.finality = finality;
+                parent = frame.block.hash;
+                frame
+            })
+            .collect()
+    }
+
+    /// Retains `chain` as a live lane compiled for another sender's processor
+    /// would: transactions filtered to `OTHER_SENDER`.
+    async fn retain_for_other_sender(store: &SqliteStore, chain: &[leani_primitives::BlockFrame]) {
+        for frame in chain {
+            let mut retained = frame.clone();
+            retained.transactions = Material::Filtered {
+                value: Vec::new(),
+                scope: leani_primitives::FilterScope {
+                    senders: vec![OTHER_SENDER],
+                    ..leani_primitives::FilterScope::default()
+                },
+                completeness: leani_primitives::Completeness::VerifiedPredicate,
+            };
+            store
+                .store_recent_frame(&retained)
+                .await
+                .expect("retain frame");
+        }
+    }
+
+    async fn park_at_first_block(
+        store: &SqliteStore,
+        processor: &dyn Processor,
+        chain: &[leani_primitives::BlockFrame],
+    ) {
+        store
+            .park_processor_live_lane_at(
+                processor.descriptor(),
+                chain[0].block,
+                "delivery_spool_hard_limit",
+                false,
+            )
+            .await
+            .expect("park lane");
+    }
+
+    async fn assert_gap_recovered(store: &SqliteStore, processor: &dyn Processor) {
+        assert!(
+            store
+                .live_lane_gap(processor.descriptor())
+                .await
+                .expect("gap")
+                .is_none()
+        );
+        assert_eq!(
+            store
+                .processor_runtime_state(processor.descriptor())
+                .await
+                .expect("state")
+                .state,
+            ProcessorRunState::Running
+        );
+    }
+
+    #[tokio::test]
+    async fn block_local_gap_replay_recovers_blocks_retained_without_its_filtered_material() {
+        let range = BlockRange::new(BlockNumber(0), BlockNumber(2)).expect("range");
+        let chain = live_chain(Finality::Finalized);
+        let processor = Arc::new(Requiring::new(
+            BlockLocalCounter::named("filtered-gap-counter")
+                .with_split_delivery()
+                .with_output_none(),
+            vec![sender_requirement(REPLAY_SENDER)],
+        ));
+        let (_directory, store) = store().await;
+        retain_for_other_sender(&store, &chain).await;
+        park_at_first_block(&store, processor.as_ref(), &chain).await;
+
+        let report = SharedLiveRuntime::new(
+            store.clone(),
+            Arc::new(ScriptedLiveSource::new(
+                fixture_source_descriptor("filtered-gap-live", range),
+                Vec::new(),
+            )),
+            vec![processor.clone()],
+            SharedLiveRuntimeConfig::default(),
+        )
+        .expect("runtime")
+        .with_finalized_gap_recovery(Arc::new(StaticLiveGapRecovery { frames: chain }))
+        .reconcile_pending()
+        .await
+        .expect("a retained frame the processor cannot read is a miss, not a lane failure");
+
+        assert_eq!(report.processors["filtered-gap-counter"].applied, 3);
+        assert_gap_recovered(&store, processor.as_ref()).await;
+    }
+
+    #[tokio::test]
+    async fn ordered_gap_replay_recovers_blocks_retained_without_its_filtered_material() {
+        let range = BlockRange::new(BlockNumber(0), BlockNumber(2)).expect("range");
+        let chain = live_chain(Finality::Finalized);
+        let processor = Arc::new(Requiring::new(
+            OrderedLedgerProcessor::named("filtered-gap-ledger"),
+            vec![sender_requirement(REPLAY_SENDER)],
+        ));
+        let (_directory, store) = store().await;
+        retain_for_other_sender(&store, &chain).await;
+        park_at_first_block(&store, processor.as_ref(), &chain).await;
+
+        let report = SharedLiveRuntime::new(
+            store.clone(),
+            Arc::new(ScriptedLiveSource::new(
+                fixture_source_descriptor("filtered-gap-ledger-live", range),
+                Vec::new(),
+            )),
+            vec![processor.clone()],
+            SharedLiveRuntimeConfig::default(),
+        )
+        .expect("runtime")
+        .with_finalized_gap_recovery(Arc::new(StaticLiveGapRecovery { frames: chain }))
+        .reconcile_pending()
+        .await
+        .expect("ordered replay recovers instead of failing");
+
+        assert_eq!(report.processors["filtered-gap-ledger"].applied, 3);
+        assert_gap_recovered(&store, processor.as_ref()).await;
+    }
+
+    #[tokio::test]
+    async fn unfinalized_gap_replay_isolates_processors_that_cannot_read_retained_frames() {
+        let range = BlockRange::new(BlockNumber(0), BlockNumber(4)).expect("range");
+        let chain = live_chain(Finality::Included);
+        let fourth = live_fixture(3, chain[2].block.hash);
+        let fifth = live_fixture(4, fourth.block.hash);
+        let block_local = Arc::new(Requiring::new(
+            BlockLocalCounter::named("unfinalized-gap-counter")
+                .with_split_delivery()
+                .with_output_none(),
+            vec![sender_requirement(REPLAY_SENDER)],
+        ));
+        let ordered = Arc::new(Requiring::new(
+            OrderedLedgerProcessor::named("unfinalized-gap-ledger"),
+            vec![sender_requirement(REPLAY_SENDER)],
+        ));
+        let healthy = Arc::new(
+            BlockLocalCounter::named("unfinalized-gap-healthy")
+                .with_split_delivery()
+                .with_output_none(),
+        );
+        let (_directory, store) = store().await;
+        retain_for_other_sender(&store, &chain).await;
+        park_at_first_block(&store, block_local.as_ref(), &chain).await;
+        park_at_first_block(&store, ordered.as_ref(), &chain).await;
+
+        let report = SharedLiveRuntime::new(
+            store.clone(),
+            Arc::new(ScriptedLiveSource::new(
+                fixture_source_descriptor("unfinalized-gap-live", range),
+                vec![fourth, fifth]
+                    .into_iter()
+                    .map(|frame| LiveStep::Event(ChainEvent::Block(Box::new(frame))))
+                    .collect(),
+            )),
+            vec![block_local.clone(), ordered.clone(), healthy.clone()],
+            SharedLiveRuntimeConfig::default(),
+        )
+        .expect("runtime")
+        .run(
+            LiveStart::Head,
+            default_source_budget(),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("an unreadable unfinalized gap isolates its processor, not the live lane");
+
+        assert_eq!(report.chain_blocks, 2);
+        assert_eq!(report.processors["unfinalized-gap-healthy"].applied, 2);
+        for processor in [block_local.as_ref() as &dyn Processor, ordered.as_ref()] {
+            let state = store
+                .processor_runtime_state(processor.descriptor())
+                .await
+                .expect("state");
+            assert_eq!(state.state, ProcessorRunState::Failed);
+            assert_eq!(
+                state.reason.as_deref(),
+                Some("unfinalized_gap_unrecoverable")
+            );
+            assert_eq!(
+                store
+                    .live_lane_gap(processor.descriptor())
+                    .await
+                    .expect("gap")
+                    .expect("gap stays for an operator")
+                    .first_unapplied,
+                chain[0].block
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn block_local_gap_replay_isolates_a_mapping_failure_instead_of_failing_the_lane() {
+        let range = BlockRange::new(BlockNumber(0), BlockNumber(2)).expect("range");
+        let chain = live_chain(Finality::Included);
+        let processor = Arc::new(FailOnceCounter::named("replay-mapping-failure"));
+        let (_directory, store) = store().await;
+        for frame in &chain {
+            store.store_recent_frame(frame).await.expect("retain frame");
+        }
+        park_at_first_block(&store, processor.as_ref(), &chain).await;
+
+        SharedLiveRuntime::new(
+            store.clone(),
+            Arc::new(ScriptedLiveSource::new(
+                fixture_source_descriptor("replay-mapping-live", range),
+                Vec::new(),
+            )),
+            vec![processor.clone()],
+            SharedLiveRuntimeConfig::default(),
+        )
+        .expect("runtime")
+        .reconcile_pending()
+        .await
+        .expect("a processor mapping failure isolates its lane, not the live lane");
+
+        let state = store
+            .processor_runtime_state(processor.descriptor())
+            .await
+            .expect("state");
+        assert_eq!(state.state, ProcessorRunState::Failed);
+        assert_eq!(
+            state.reason.as_deref(),
+            Some("processor_live_mapping_failed")
         );
     }
 

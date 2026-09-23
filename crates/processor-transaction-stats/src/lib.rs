@@ -72,7 +72,8 @@ impl TransactionStatsProcessor {
         let version = Version::new(1, 0, 0);
         let config_hash = BlockHash::new(*blake3::hash(&encoded).as_bytes());
         let descriptor = ProcessorDescriptor {
-            instance: ProcessorInstanceId::legacy(&id, &version, config_hash),
+            instance: ProcessorInstanceId::legacy(&id, &version, config_hash)
+                .map_err(|error| ProcessorError::Input(error.to_string()))?,
             id,
             version,
             code_hash: BlockHash::new(*blake3::hash(b"leani/transaction-stats/1.0.0").as_bytes()),
