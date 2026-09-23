@@ -42,8 +42,14 @@ response is the machine-readable authority for a running node.
 `eth_config` follows final EIP-7910: it accepts no parameters and returns
 `current`, `next`, and `last` fork configurations with JSON-number blob
 parameters, chain ID, fork hash, precompiles, and system contracts. Its
-checked Mainnet schedule uses exact activation timestamps and execution
-blocks; it does not call an upstream configuration RPC.
+checked Mainnet schedule uses exact activation timestamps; it does not call an
+upstream configuration RPC.
+
+Blob transaction receipts report `blobGasPrice` as the protocol blob base fee
+of the fork active at the block's timestamp, from the same schedule and fee
+function as the `blobs-money` processor. A blob receipt whose block no
+scheduled fork covers fails with `-32004`
+(`blob_gas_price_schedule_unavailable`) rather than carrying a guessed price.
 
 For a number/range request outside the recent window, the router selects the
 lowest-priority viable `HistorySource`, enforces finality/trust and hard

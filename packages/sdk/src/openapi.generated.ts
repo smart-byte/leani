@@ -1485,12 +1485,15 @@ export interface components {
             blobCount: components["schemas"]["SafeInteger"];
             blobGasUsed: components["schemas"]["DecimalQuantity"];
             excessBlobGas: components["schemas"]["DecimalQuantity"];
+            /** @description Protocol blob base fee in wei per blob gas: the EIP-4844 fee for excessBlobGas under the fork active at the block's timestamp. EIP-7918 does not change it. */
             blobBaseFee: components["schemas"]["DecimalQuantity"];
             executionBaseFee: components["schemas"]["DecimalQuantity"];
             gasUsed: components["schemas"]["DecimalQuantity"];
             gasLimit: components["schemas"]["DecimalQuantity"];
             executionEthBurnedWei: components["schemas"]["DecimalQuantity"];
+            /** @description blobBaseFee times blobGasUsed. */
             blobEthBurnedWei: components["schemas"]["DecimalQuantity"];
+            /** @description EIP-7918 reserve price in wei per blob gas from Fusaka on, null before. It only changes how excess blob gas evolves and is not applied to blobBaseFee. */
             reserveFeeWei: components["schemas"]["DecimalQuantity"] | null;
             transactionCount: components["schemas"]["SafeInteger"];
             targetBlobsPerBlock: components["schemas"]["SafeInteger"];
@@ -1509,11 +1512,14 @@ export interface components {
             blobCount: components["schemas"]["SafeInteger"];
             totalBurnedWei: components["schemas"]["DecimalQuantity"];
             executionBurnedWei: components["schemas"]["DecimalQuantity"];
+            /** @description The block's blobBaseFee times this transaction's blob gas. */
             blobBurnedWei: components["schemas"]["DecimalQuantity"];
         };
         BlobSchedule: {
             name: string;
+            /** @description Block-number label for atBlock lookups. For Dencun it is 19426589, the first block the blobs processor covers. */
             activationBlock: components["schemas"]["SafeInteger"];
+            /** @description The fork's parameters apply to blocks from this timestamp on. */
             activationTimestamp: components["schemas"]["SafeInteger"];
             forkId: string;
             targetBlobsPerBlock: components["schemas"]["SafeInteger"];

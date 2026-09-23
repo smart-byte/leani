@@ -686,7 +686,7 @@ software could theoretically implement:
     {
       "id": "blobs-money",
       "instance": "blobs-production",
-      "version": "1.4.0",
+      "version": "1.5.0",
       "genericApi": "processor-v1",
       "changeSchema": "blobs-money.change.v1",
       "queryExtensions": [
@@ -779,6 +779,16 @@ export interface BlobSchedule {
   source: "chain_spec" | "eth_config" | "configured";
 }
 ```
+
+`blobBaseFee` is the protocol blob base fee in wei per blob gas: the EIP-4844
+fee for the block's excess blob gas under the fork active at its timestamp.
+`blobEthBurnedWei` and each transaction's `blobBurnedWei` multiply it by the
+blob gas used. `reserveFeeWei` is the EIP-7918 reserve price from Fusaka on
+(`null` before); it only changes how excess blob gas evolves and is never
+applied to `blobBaseFee`. A schedule's parameters apply from its
+`activationTimestamp`; `activationBlock` is the block-number label `atBlock`
+lookups use, and for Dencun it is 19,426,589, the first block the processor
+covers.
 
 The API should not use decimal floating point for ETH values. Presentation as
 ETH belongs in blobs.money.

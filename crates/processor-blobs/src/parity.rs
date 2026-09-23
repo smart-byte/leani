@@ -280,6 +280,7 @@ fn decimal(value: Quantity) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{BlobsProcessor, processor::tests::blob_frame};
 
     fn block(number: u64) -> CompatibilityBlock {
         CompatibilityBlock {
@@ -333,6 +334,39 @@ mod tests {
                 .mismatches
                 .iter()
                 .any(|mismatch| mismatch.field == "blobBaseFee")
+        );
+    }
+
+    #[test]
+    fn blobs_money_reserve_clamped_fees_differ_from_the_protocol_fee() {
+        // blobs.money computes the blob fee as max(protocol fee, EIP-7918
+        // reserve) and burns with it, the formula bug blobs-money 1.5.0
+        // fixed. Its rows therefore differ from Fusaka on wherever the reserve
+        // binds: zero excess blob gas at a 0.1 gwei execution base fee.
+        let delta = BlobsProcessor::default()
+            .derive(&blob_frame(23_935_694, 1_764_798_551, 0, 100_000_000))
+            .expect("derive");
+        let actual = BlobsCompatibilityExport::from_deltas(&[delta]);
+        assert_eq!(actual.blocks[0].blob_base_fee, "1");
+        assert_eq!(actual.blocks[0].reserve_fee.as_deref(), Some("6250000"));
+        let mut blobs_money = actual.clone();
+        blobs_money.blocks[0].blob_base_fee = "6250000".to_owned();
+        blobs_money.blocks[0].blob_eth_burned = Some("819200000000".to_owned());
+        blobs_money.blob_transactions[0].blob_eth_burned = "819200000000".to_owned();
+        blobs_money.blob_transactions[0].eth_burned = "821200000000".to_owned();
+        let report = blobs_money.compare(&actual);
+        assert_eq!(
+            report
+                .mismatches
+                .iter()
+                .map(|mismatch| (mismatch.entity.as_str(), mismatch.field.as_str()))
+                .collect::<Vec<_>>(),
+            [
+                ("block", "blobBaseFee"),
+                ("block", "blobEthBurned"),
+                ("blob_transaction", "blobEthBurned"),
+                ("blob_transaction", "ethBurned"),
+            ]
         );
     }
 }

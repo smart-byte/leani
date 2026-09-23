@@ -19,7 +19,7 @@ use semver::Version;
 
 use crate::{
     BLOB_GAS_PER_BLOB, BlobSchedule, BlobTransactionEntity, BlobsBlockEntity, BlobsDelta,
-    calculate_eip7918_floor, get_blob_base_fee, get_blob_base_fee_eip7918, math::checked_mul,
+    calculate_eip7918_floor, get_blob_base_fee, math::checked_mul,
 };
 
 pub const BLOCK_COLLECTION: &str = "blobs.blocks";
@@ -75,10 +75,10 @@ impl BlobsProcessor {
         // compatible with databases created before starts were reflected in
         // the descriptor.
         let config_hash = BlockHash::new(*blake3::hash(&encoded_schedule).as_bytes());
-        let code_hash = BlockHash::new(*blake3::hash(b"leani/blobs-processor/1.4.0").as_bytes());
+        let code_hash = BlockHash::new(*blake3::hash(b"leani/blobs-processor/1.5.0").as_bytes());
         let id = ProcessorId::new("blobs-money")
             .map_err(|error| ProcessorError::Input(error.to_string()))?;
-        let version = Version::new(1, 4, 0);
+        let version = Version::new(1, 5, 0);
         let descriptor = ProcessorDescriptor {
             instance: ProcessorInstanceId::legacy(&id, &version, config_hash)
                 .map_err(|error| ProcessorError::Input(error.to_string()))?,
@@ -152,7 +152,7 @@ impl BlobsProcessor {
         }
         let parameters = self
             .schedule
-            .parameters(frame.block.number.0)
+            .parameters_at_timestamp(frame.block.timestamp)
             .ok_or_else(|| ProcessorError::Input("block predates blob activation".to_owned()))?;
         let header = accepted_material(&frame.header, "header")?;
         let transactions = accepted_material(&frame.transactions, "transactions")?;
@@ -181,15 +181,11 @@ impl BlobsProcessor {
                 "block exceeds configured maximum blobs".to_owned(),
             ));
         }
-        let blob_base_fee = if parameters.eip7918 {
-            get_blob_base_fee_eip7918(
-                excess_blob_gas,
-                execution_base_fee,
-                parameters.base_fee_update_fraction,
-            )?
-        } else {
-            get_blob_base_fee(excess_blob_gas, parameters.base_fee_update_fraction)?
-        };
+        // Blob gas pays and burns the protocol fee under every fork. EIP-7918
+        // only changes how excess blob gas evolves, so its reserve price is
+        // reported beside the fee rather than applied to it.
+        let blob_base_fee =
+            get_blob_base_fee(excess_blob_gas, parameters.base_fee_update_fraction)?;
         let reserve_fee = parameters
             .eip7918
             .then(|| calculate_eip7918_floor(execution_base_fee))
@@ -502,7 +498,7 @@ fn validate_delta_cursor(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use leani_primitives::{
         Address, BlockRef, ChainId, HeaderEnvelope, ReceiptEnvelope, TransactionEnvelope,
         VerificationReport,
@@ -591,6 +587,105 @@ mod tests {
             state_diffs: Material::Missing(leani_primitives::MissingReason::Unsupported),
             provenance: Vec::new(),
             verification: VerificationReport::default(),
+        }
+    }
+
+    /// The one-blob fixture at `number` and `timestamp`, with the header's
+    /// excess blob gas and execution base fee replaced.
+    pub(crate) fn blob_frame(
+        number: u64,
+        timestamp: u64,
+        excess_blob_gas: u64,
+        execution_base_fee: u64,
+    ) -> BlockFrame {
+        let mut frame = frame(Completeness::DatasetDeclared);
+        frame.block.number = number.into();
+        frame.block.timestamp = timestamp;
+        let Material::Filtered { value: header, .. } = &mut frame.header else {
+            panic!("fixture header is filtered");
+        };
+        header.excess_blob_gas = Some(excess_blob_gas);
+        header.base_fee_per_gas = Some(quantity(execution_base_fee));
+        frame
+    }
+
+    #[test]
+    fn eip7918_reports_the_protocol_blob_fee_and_the_reserve_separately() {
+        // Audit probe (H22): once EIP-7918 applied, the blob fee was
+        // max(protocol fee, reserve price). Zero excess blob gas at a 0.1 gwei
+        // execution base fee reported and burned 6,250,000 wei per blob gas,
+        // the reserve, instead of the protocol's 1 wei.
+        let frame = blob_frame(23_935_694, 1_764_798_551, 0, 100_000_000);
+        let delta = BlobsProcessor::default().derive(&frame).expect("derive");
+        assert_eq!(quantity_to_u256(delta.block.blob_base_fee), U256::from(1));
+        assert_eq!(
+            delta.block.reserve_fee.map(quantity_to_u256),
+            Some(U256::from(6_250_000))
+        );
+        assert_eq!(
+            delta.block.blob_burn.map(quantity_to_u256),
+            Some(U256::from(BLOB_GAS_PER_BLOB))
+        );
+        assert_eq!(
+            quantity_to_u256(delta.transactions[0].blob_burn),
+            U256::from(BLOB_GAS_PER_BLOB)
+        );
+        assert_eq!(
+            quantity_to_u256(delta.transactions[0].total_burn),
+            U256::from(20 * 100_000_000 + BLOB_GAS_PER_BLOB)
+        );
+    }
+
+    #[test]
+    fn fork_parameters_follow_the_block_timestamp() {
+        // Audit probe (Processor-4): parameters were selected by block number,
+        // but forks activate by timestamp. Each block number below lies on the
+        // other side of its fork's activation block, so only the timestamp
+        // selects the expected fork.
+        // Protocol fees at 107,610,112 excess blob gas per update fraction.
+        let (cancun, prague, bpo1, bpo2) = (99_710_729_314_173_u64, 2_150_273_305, 397_645, 9_991);
+        let cases = [
+            // One second before Dencun, then Dencun (Cancun parameters).
+            (1_710_338_134, 19_426_589, None),
+            (1_710_338_135, 19_426_588, Some((3, 6, false, cancun))),
+            // Prague.
+            (1_746_612_310, 22_431_084, Some((3, 6, false, cancun))),
+            (1_746_612_311, 22_431_083, Some((6, 9, false, prague))),
+            // Fusaka: EIP-7918 exposes the reserve.
+            (1_764_798_550, 23_935_694, Some((6, 9, false, prague))),
+            (1_764_798_551, 23_935_693, Some((6, 9, true, prague))),
+            // BPO1.
+            (1_765_290_070, 23_975_778, Some((6, 9, true, prague))),
+            (1_765_290_071, 23_975_777, Some((10, 15, true, bpo1))),
+            // BPO2.
+            (1_767_747_670, 24_179_383, Some((10, 15, true, bpo1))),
+            (1_767_747_671, 24_179_382, Some((14, 21, true, bpo2))),
+        ];
+        let processor = BlobsProcessor::default();
+        for (timestamp, number, expected) in cases {
+            let derived = processor.derive(&blob_frame(number, timestamp, 107_610_112, 10));
+            let Some((target, max, reserve, fee)) = expected else {
+                assert!(
+                    matches!(
+                        &derived,
+                        Err(ProcessorError::Input(message))
+                            if message == "block predates blob activation"
+                    ),
+                    "timestamp {timestamp}: {derived:?}"
+                );
+                continue;
+            };
+            let block = derived.expect("derive").block;
+            assert_eq!(
+                (
+                    block.target_blobs_per_block,
+                    block.max_blobs_per_block,
+                    block.reserve_fee.is_some(),
+                    quantity_to_u256(block.blob_base_fee),
+                ),
+                (target, max, reserve, U256::from(fee)),
+                "timestamp {timestamp}"
+            );
         }
     }
 

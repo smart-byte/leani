@@ -14,7 +14,7 @@ These processors ship in the standard binary. Downstream projects can assemble
 a custom binary and register independent native processors through the public
 factory/registry API; see [Build a custom processor](https://leani.dev/docs/guides/custom-processor/).
 
-## blobs-money 1.4.0
+## blobs-money 1.5.0
 
 Block-local Dencun-and-later blob economics and type-3 transaction output. It
 accepts the filtered Xatu projection or complete normalized execution frames.
@@ -24,12 +24,20 @@ All wei quantities are lossless integers.
 coverage. It does not disable canonical live processing, normal JSON-RPC, or
 WebSocket head subscriptions.
 
-Version 1.4 emits one atomic block change containing the block and all of its
-blob transactions. Materialized output stores only the block entity,
+The processor emits one atomic block change containing the block and all of
+its blob transactions. Materialized output stores only the block entity,
 transaction entities, and transaction-by-block index; snapshot queries
 reconstruct that same bundle without retaining a second permanent copy. The
 processor retains the exact post-Fusaka BPO activation schedule and keeps
 consensus-block size distinct from the exact execution-block RLP size.
+
+Each block uses the parameters of the fork active at its timestamp. The blob
+base fee and every blob burn use the protocol fee, EIP-4844's
+`fake_exponential(1, excess_blob_gas, update_fraction)`, under every fork.
+From Fusaka on, the EIP-7918 reserve price (execution base fee × 2^13 / 2^17)
+is reported separately as `reserveFeeWei` and is not applied to the fee.
+Version 1.5 fixes the fee and burn that 1.4 overstated wherever the reserve
+bound; blobs.money's own formula still clamps the fee to the reserve.
 
 ## evm-events 1.1.0
 

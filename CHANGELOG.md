@@ -58,6 +58,11 @@ record, and documented RPC contracts.
   processor's state and delivery history, raw history, and the P2P identity.
   The ERC-20 entity and change schemas are now `erc20.balance.entity.v2` and
   `erc20.balance.change.v2`, and both processors use delta schema 2.
+- `blobs-money` 1.5.0 changes stored output from Fusaka on (see Fixed).
+  Rebuild existing instances the same way: set `version = "1.5.0"` and
+  configure a new `instance`, which indexes from its `start_block`; the node
+  refuses 1.5.0 under a 1.4.0 instance ID. Entity, change, and delta schemas
+  are unchanged.
 - ERC-20 balances gain `incompleteFrom` (`null`, or the block from which the
   token/holder pair is no longer derived) in the typed query, the change JSON,
   the OpenAPI `Erc20Balance` schema, and the SDK `Erc20Balance` type.
@@ -430,6 +435,33 @@ record, and documented RPC contracts.
 - `uniswap-latest` never lets an older observation replace a newer one, as
   `uniswap-observations` already did. Ordered lanes apply blocks in order, so
   stored output does not change and the version stays 2.0.0.
+- `blobs-money` reports the blob base fee the protocol charges. From Fusaka
+  on it used the larger of the EIP-4844 fee and the EIP-7918 reserve price,
+  but EIP-7918 only changes how excess blob gas evolves. Wherever the reserve
+  binds, `blobBaseFee`, the block's `blobEthBurnedWei`, and each blob
+  transaction's `blobBurnedWei` and `totalBurnedWei` were overstated: zero
+  excess blob gas at a 0.1 gwei execution base fee reported 6,250,000 wei per
+  blob gas instead of 1. `reserveFeeWei` still reports the reserve price
+  separately. The fee is no longer capped at 10^30 wei, and fork parameters
+  follow the block's timestamp, as forks activate, instead of hard-coded
+  block numbers. A fork's `activationBlock` remains the block-number label
+  that `atBlock` schedule lookups use; for Dencun, 19,426,589 is the first
+  block the processor covers, two slots after the fork activated.
+
+  blobs.money's own fee formula has the same bug, so its compatibility exports
+  stop matching from Fusaka on: `leani source probe xatu --expected-export`
+  reports the block's `blobBaseFee` and `blobEthBurned` and the transaction's
+  `blobEthBurned` and `ethBurned` as mismatches wherever the reserve binds,
+  until blobs.money charges the protocol fee too.
+- JSON-RPC receipts price blob gas (`blobGasPrice`) with the fork active at the
+  block's timestamp, from the same schedule and fee function as `blobs-money`,
+  instead of with Cancun's parameters for every fork. Prague and later
+  receipts were wrong at non-trivial excess blob gas: 107,610,112 under Prague
+  costs 2,150,273,305 wei per blob gas, not 99,710,729,314,173. A blob receipt
+  whose block no scheduled fork covers, or whose header lacks excess blob gas,
+  fails with `-32004` (`blob_gas_price_schedule_unavailable` or
+  `header_excess_blob_gas_missing`) instead of carrying a Cancun price.
+  `leani conformance rpc` prices blob receipts the same way.
 
 ## [0.1.0-rc.1] - 2026-09-20
 

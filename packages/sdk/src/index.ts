@@ -148,12 +148,23 @@ export interface BlobsBlock {
   blobCount: number;
   blobGasUsed: string;
   excessBlobGas: string;
+  /**
+   * Protocol blob base fee in wei per blob gas: the EIP-4844 fee for
+   * `excessBlobGas` under the fork active at `timestamp`. EIP-7918 does not
+   * change it.
+   */
   blobBaseFee: string;
   executionBaseFee: string;
   gasUsed: string;
   gasLimit: string;
   executionEthBurnedWei: string;
+  /** `blobBaseFee` times `blobGasUsed`. */
   blobEthBurnedWei: string;
+  /**
+   * EIP-7918 reserve price in wei per blob gas from Fusaka on, `null` before.
+   * It only changes how excess blob gas evolves and is not applied to
+   * `blobBaseFee`.
+   */
   reserveFeeWei: string | null;
   transactionCount: number;
   targetBlobsPerBlock: number;
@@ -173,6 +184,7 @@ export interface BlobTransaction {
   blobCount: number;
   totalBurnedWei: string;
   executionBurnedWei: string;
+  /** The block's `blobBaseFee` times this transaction's blob gas. */
   blobBurnedWei: string;
 }
 
@@ -273,7 +285,12 @@ export interface DurableConsumer {
 
 export interface BlobSchedule {
   name: string;
+  /**
+   * Block-number label for `atBlock` lookups. For Dencun it is 19426589, the
+   * first block the blobs processor covers.
+   */
   activationBlock: number;
+  /** The fork's parameters apply to blocks from this timestamp on. */
   activationTimestamp: number;
   forkId: Hex;
   targetBlobsPerBlock: number;

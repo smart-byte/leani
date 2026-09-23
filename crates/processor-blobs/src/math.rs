@@ -7,10 +7,6 @@ pub const BLOB_GAS_PER_BLOB: u64 = 131_072;
 const MIN_BLOB_BASE_FEE: u64 = 1;
 const BLOB_BASE_COST: u64 = 1 << 13;
 
-fn max_blob_base_fee() -> U256 {
-    U256::from(10_u64).pow(U256::from(30_u64))
-}
-
 /// Integer Taylor expansion specified by EIP-4844.
 ///
 /// # Errors
@@ -49,25 +45,33 @@ pub fn fake_exponential(
     Ok(output / denominator)
 }
 
-/// Calculate the EIP-4844 blob base fee with the legacy application's safety
-/// cap.
+/// Calculate the protocol blob base fee, EIP-4844's
+/// `get_base_fee_per_blob_gas`: the price every unit of blob gas pays and
+/// burns, for the update fraction of the fork active at the block.
+///
+/// EIP-7918 leaves this fee unchanged. Its reserve price
+/// ([`calculate_eip7918_floor`]) only changes how excess blob gas evolves, so
+/// callers report it beside the fee instead of applying it.
 ///
 /// # Errors
 ///
-/// Returns an invariant error for invalid parameters or arithmetic overflow.
+/// Returns an invariant error for a zero update fraction or when a 256-bit
+/// intermediate would overflow, which takes an excess of about 145 update
+/// fractions, far beyond any fee a block could charge. Either way the
+/// expansion ends within about 410 iterations for `u64` inputs.
 pub fn get_blob_base_fee(
     excess_blob_gas: u64,
     update_fraction: u64,
 ) -> Result<U256, ProcessorError> {
-    let fee = fake_exponential(
+    fake_exponential(
         U256::from(MIN_BLOB_BASE_FEE),
         U256::from(excess_blob_gas),
         U256::from(update_fraction),
-    )?;
-    Ok(fee.min(max_blob_base_fee()))
+    )
 }
 
-/// Calculate the EIP-7918 execution-fee-derived floor.
+/// Calculate the EIP-7918 reserve price per blob gas: the execution base fee
+/// times `BLOB_BASE_COST / GAS_PER_BLOB`.
 ///
 /// # Errors
 ///
@@ -77,21 +81,6 @@ pub fn calculate_eip7918_floor(execution_base_fee: U256) -> Result<U256, Process
         .checked_mul(U256::from(BLOB_BASE_COST))
         .map(|value| value / U256::from(BLOB_GAS_PER_BLOB))
         .ok_or_else(|| ProcessorError::Invariant("reserve fee overflow".to_owned()))
-}
-
-/// Calculate the blob fee with the EIP-7918 reserve floor.
-///
-/// # Errors
-///
-/// Returns an invariant error for invalid parameters or arithmetic overflow.
-pub fn get_blob_base_fee_eip7918(
-    excess_blob_gas: u64,
-    execution_base_fee: U256,
-    update_fraction: u64,
-) -> Result<U256, ProcessorError> {
-    let raw = get_blob_base_fee(excess_blob_gas, update_fraction)?;
-    let floor = calculate_eip7918_floor(execution_base_fee)?;
-    Ok(raw.max(floor))
 }
 
 pub(crate) fn checked_mul(left: U256, right: U256) -> Result<U256, ProcessorError> {
@@ -104,27 +93,37 @@ mod tests {
     use super::*;
 
     #[test]
-    fn matches_blobs_money_eip4844_vectors() {
-        assert_eq!(
-            get_blob_base_fee(30_539_776, 3_338_477).expect("fee"),
-            U256::from(9_393_u64)
-        );
-        assert_eq!(
-            get_blob_base_fee(107_610_112, 3_338_477).expect("fee"),
-            U256::from(99_710_729_314_173_u64)
-        );
-    }
-
-    #[test]
-    fn matches_blobs_money_eip7691_vectors() {
-        assert_eq!(
-            get_blob_base_fee(30_539_776, 5_007_716).expect("fee"),
-            U256::from(445_u64)
-        );
-        assert_eq!(
-            get_blob_base_fee(107_610_112, 5_007_716).expect("fee"),
-            U256::from(2_150_273_305_u64)
-        );
+    fn blob_base_fee_matches_the_exact_integer_reference() {
+        // Outputs of the EIP-4844 `fake_exponential` in exact Python 3
+        // integers, per mainnet update fraction: Cancun, Prague (and Fusaka),
+        // BPO1, BPO2.
+        let cases = [
+            (3_338_477, 0, 1_u128),
+            (3_338_477, 30_539_776, 9_393),
+            (3_338_477, 107_610_112, 99_710_729_314_173),
+            (5_007_716, 0, 1),
+            (5_007_716, 30_539_776, 445),
+            (5_007_716, 107_610_112, 2_150_273_305),
+            (8_346_193, 0, 1),
+            (8_346_193, 30_539_776, 38),
+            (8_346_193, 107_610_112, 397_645),
+            (11_684_671, 0, 1),
+            (11_684_671, 30_539_776, 13),
+            (11_684_671, 107_610_112, 9_991),
+            // Above the former 10^30 cap.
+            (
+                3_338_477,
+                250_000_000,
+                332_584_186_920_530_080_845_367_541_284_883,
+            ),
+        ];
+        for (update_fraction, excess_blob_gas, fee) in cases {
+            assert_eq!(
+                get_blob_base_fee(excess_blob_gas, update_fraction).expect("fee"),
+                U256::from(fee),
+                "update fraction {update_fraction}, excess {excess_blob_gas}"
+            );
+        }
     }
 
     #[test]

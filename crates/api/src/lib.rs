@@ -3444,12 +3444,15 @@ pub struct BlobsBlock {
     blob_count: u32,
     blob_gas_used: String,
     excess_blob_gas: String,
+    /// Protocol blob base fee in wei per blob gas; EIP-7918 does not change it.
     blob_base_fee: String,
     execution_base_fee: String,
     gas_used: String,
     gas_limit: String,
     execution_eth_burned_wei: String,
+    /// `blob_base_fee` times the block's blob gas.
     blob_eth_burned_wei: String,
+    /// EIP-7918 reserve price from Fusaka on, reported but never applied.
     reserve_fee_wei: Option<String>,
     transaction_count: u32,
     target_blobs_per_block: u32,
@@ -3501,6 +3504,7 @@ pub struct BlobTransaction {
     blob_count: u32,
     total_burned_wei: String,
     execution_burned_wei: String,
+    /// The block's protocol blob base fee times this transaction's blob gas.
     blob_burned_wei: String,
 }
 

@@ -112,7 +112,7 @@ Set the configured processor start to the numeric value printed as `FROM`:
 ```toml
 [[processors]]
 id = "blobs-money"
-version = "1.4.0"
+version = "1.5.0"
 start_block = 0 # Replace 0 with the numeric FROM value printed above.
 publish = "included_and_finalized"
 retention = "full_output_history"
@@ -382,7 +382,7 @@ minimum_agreement = 1
 
 [[processors]]
 id = "blobs-money"
-version = "1.4.0"
+version = "1.5.0"
 start_block = 0 # Replace 0 with the numeric FROM value printed above.
 publish = "included_and_finalized"
 retention = "full_output_history"

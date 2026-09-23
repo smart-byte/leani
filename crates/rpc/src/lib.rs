@@ -18,7 +18,7 @@ use alloy_consensus::{
     constants::EMPTY_OMMER_ROOT_HASH,
     transaction::{Recovered, SignerRecoverable, TransactionInfo},
 };
-use alloy_eips::{calc_blob_gasprice, eip2718::Decodable2718};
+use alloy_eips::eip2718::Decodable2718;
 use alloy_primitives::{B256, U256};
 use alloy_rlp::Decodable;
 use alloy_rpc_types_eth::{
@@ -42,7 +42,7 @@ use leani_primitives::{
     FilterScope, Finality, Material, TopicFilter, TransactionHash, TrustModel,
 };
 use leani_processor_api::{Processor, ProcessorDescriptor, StartPoint};
-use leani_processor_blobs::{BlobFork, BlobSchedule, BlobsProcessor};
+use leani_processor_blobs::{BlobFork, BlobSchedule, BlobsProcessor, get_blob_base_fee};
 use leani_source_api::{
     ChainEvent, DataRequest, FieldProjection, FilterSet, HistorySource, SelectionPolicy,
     SourceBudget, SourceError, VerificationPolicy, select_source,
@@ -90,17 +90,20 @@ impl RpcCompatibilityError {
 }
 
 /// Reconstruct the exact block and receipt responses represented by a frame.
+/// Blob receipts price blob gas with `schedule`, as the JSON-RPC server does.
 ///
 /// # Errors
 ///
 /// Fails closed when canonical header, transaction, receipt, withdrawal, or
-/// signer material is absent, invalid, or internally inconsistent.
+/// signer material is absent, invalid, or internally inconsistent, or when
+/// `schedule` has no fork for a block with blob receipts.
 pub fn rpc_compatibility_snapshot(
     frame: &BlockFrame,
+    schedule: &BlobSchedule,
 ) -> Result<RpcCompatibilitySnapshot, RpcCompatibilityError> {
     let block_hashes = rpc_block(frame, false).map_err(RpcCompatibilityError::from)?;
     let block_full = rpc_block(frame, true).map_err(RpcCompatibilityError::from)?;
-    let receipts = rpc_receipts(frame)
+    let receipts = rpc_receipts(frame, schedule)
         .and_then(serialize_rpc)
         .map_err(RpcCompatibilityError::from)?;
     Ok(RpcCompatibilitySnapshot {
@@ -1490,7 +1493,7 @@ async fn eth_get_block_receipts(
     let Some(frame) = frame else {
         return Ok(Value::Null);
     };
-    serialize_rpc(rpc_receipts(&frame)?)
+    serialize_rpc(rpc_receipts(&frame, &state.blob_schedule)?)
 }
 
 async fn eth_get_block_transaction_count(
@@ -1574,7 +1577,7 @@ async fn eth_get_transaction_receipt(
     else {
         return Ok(Value::Null);
     };
-    let receipts = rpc_receipts(&frame)?;
+    let receipts = rpc_receipts(&frame, &state.blob_schedule)?;
     receipts
         .into_iter()
         .nth(index)
@@ -1884,7 +1887,10 @@ fn rpc_transaction(frame: &BlockFrame, index: usize) -> Result<RpcTransaction, R
     ))
 }
 
-fn rpc_receipts(frame: &BlockFrame) -> Result<Vec<RpcTransactionReceipt>, RpcError> {
+fn rpc_receipts(
+    frame: &BlockFrame,
+    schedule: &BlobSchedule,
+) -> Result<Vec<RpcTransactionReceipt>, RpcError> {
     let transactions = complete(&frame.transactions, "complete_transactions_not_retained")?;
     let receipts = complete(&frame.receipts, "complete_receipts_not_retained")?;
     if transactions.len() != receipts.len() {
@@ -1893,7 +1899,13 @@ fn rpc_receipts(frame: &BlockFrame) -> Result<Vec<RpcTransactionReceipt>, RpcErr
         ));
     }
     let header = complete(&frame.header, "complete_header_not_retained")?;
-    let blob_gas_price = header.excess_blob_gas.map(calc_blob_gasprice);
+    // Only blob receipts carry a price, so a block without a priced fork
+    // fails closed only when it has one.
+    let blob_gas_price = receipts
+        .iter()
+        .any(|receipt| receipt.blob_gas_used.is_some())
+        .then(|| protocol_blob_gas_price(schedule, frame, header.excess_blob_gas))
+        .transpose()?;
     let mut next_log_index = 0_u64;
     transactions
         .iter()
@@ -1955,6 +1967,26 @@ fn rpc_receipts(frame: &BlockFrame) -> Result<Vec<RpcTransactionReceipt>, RpcErr
             Ok(rpc)
         })
         .collect()
+}
+
+/// The protocol blob gas price of `frame`'s block: the blob base fee under the
+/// fork active at its header timestamp, from the schedule and fee function the
+/// blobs processor uses.
+fn protocol_blob_gas_price(
+    schedule: &BlobSchedule,
+    frame: &BlockFrame,
+    excess_blob_gas: Option<u64>,
+) -> Result<u128, RpcError> {
+    let excess_blob_gas = excess_blob_gas
+        .ok_or_else(|| RpcError::data_unavailable_reason("header_excess_blob_gas_missing"))?;
+    let parameters = schedule
+        .parameters_at_timestamp(frame.block.timestamp)
+        .filter(|_| schedule.chain_id == frame.chain_id.0)
+        .ok_or_else(|| RpcError::data_unavailable_reason("blob_gas_price_schedule_unavailable"))?;
+    // With a validated schedule the fee fails only on a 256-bit overflow.
+    get_blob_base_fee(excess_blob_gas, parameters.base_fee_update_fraction)
+        .map_err(|_| RpcError::data_unavailable_reason("quantity_exceeds_u128"))
+        .and_then(u256_to_u128)
 }
 
 async fn find_recent_transaction(
@@ -3096,12 +3128,205 @@ mod tests {
 
     #[test]
     fn exact_rpc_snapshot_matches_the_checked_in_compatibility_vector() {
-        let actual = rpc_compatibility_snapshot(&rpc_frame(9)).expect("canonical snapshot");
+        let actual = rpc_compatibility_snapshot(&rpc_frame(9), &BlobSchedule::mainnet())
+            .expect("canonical snapshot");
         let expected: RpcCompatibilitySnapshot = serde_json::from_str(include_str!(
             "../fixtures/ethereum-jsonrpc-empty-block.json"
         ))
         .expect("compatibility fixture");
         assert_eq!(actual, expected);
+    }
+
+    /// A block at `timestamp` whose header carries `excess_blob_gas`, with one
+    /// type-3 transaction and its canonical receipt.
+    fn blob_receipt_frame(timestamp: u64, excess_blob_gas: u64) -> BlockFrame {
+        use alloy_consensus::{Receipt, ReceiptWithBloom};
+        use alloy_eips::eip2718::Encodable2718;
+
+        let mut frame = rpc_frame_with_header(&ConsensusHeader {
+            number: 20,
+            timestamp,
+            base_fee_per_gas: Some(7),
+            withdrawals_root: Some(B256::ZERO),
+            blob_gas_used: Some(131_072),
+            excess_blob_gas: Some(excess_blob_gas),
+            parent_beacon_block_root: Some(B256::ZERO),
+            ..Default::default()
+        });
+        let hash = TransactionHash::new([0x33; 32]);
+        let receipt = ConsensusReceiptEnvelope::Eip4844(ReceiptWithBloom {
+            receipt: Receipt {
+                status: true.into(),
+                cumulative_gas_used: 21_000,
+                logs: Vec::new(),
+            },
+            logs_bloom: alloy_primitives::Bloom::ZERO,
+        });
+        frame.transactions = Material::Complete(vec![leani_primitives::TransactionEnvelope {
+            hash,
+            transaction_type: 3,
+            index: 0,
+            encoded: None,
+            from: Some(Address::new([0x11; 20])),
+            to: Some(Address::new([0x22; 20])),
+            nonce: Some(0),
+            gas_limit: Some(21_000),
+            value: None,
+            input: None,
+            max_fee_per_gas: None,
+            max_priority_fee_per_gas: None,
+            max_fee_per_blob_gas: None,
+            blob_versioned_hashes: vec![BlockHash::new([0x01; 32])],
+            size_bytes: None,
+        }]);
+        frame.receipts = Material::Complete(vec![leani_primitives::ReceiptEnvelope {
+            transaction_hash: hash,
+            transaction_type: 3,
+            transaction_index: 0,
+            encoded: Some(receipt.encoded_2718()),
+            success: Some(true),
+            gas_used: Some(21_000),
+            effective_gas_price: Some(U256::from(7).into()),
+            blob_gas_used: Some(131_072),
+            blob_gas_price: None,
+            logs: Vec::new(),
+        }]);
+        frame
+    }
+
+    async fn block_receipts(router: Router, frame: &BlockFrame) -> Value {
+        let (_, body) = call(
+            router,
+            json!({
+                "jsonrpc":"2.0",
+                "id":1,
+                "method":"eth_getBlockReceipts",
+                "params":[hex_bytes(frame.block.hash.as_array())]
+            }),
+        )
+        .await;
+        body.expect("body")
+    }
+
+    #[tokio::test]
+    async fn blob_gas_price_uses_the_fork_at_the_header_timestamp() {
+        // Audit probe (H23): `blobGasPrice` used Cancun's update fraction for
+        // every fork, so Prague and later receipts were wrong whenever the
+        // excess blob gas was non-trivial.
+        let cases = [
+            // Cancun, unchanged: 99,710,729,314,173 wei.
+            (1_710_338_135, "0x5aafb699df7d"),
+            // Prague: 2,150,273,305 wei.
+            (1_746_612_311, "0x802a9119"),
+            // BPO2: 9,991 wei.
+            (1_767_747_671, "0x2707"),
+        ];
+        for (timestamp, price) in cases {
+            let (router, store, _directory) = test_router_and_store().await;
+            let frame = blob_receipt_frame(timestamp, 107_610_112);
+            store
+                .store_recent_frame(&frame)
+                .await
+                .expect("recent frame");
+            let receipts = block_receipts(router, &frame).await;
+            let receipt = &receipts["result"][0];
+            assert_eq!(receipt["type"], "0x3", "timestamp {timestamp}");
+            assert_eq!(receipt["blobGasUsed"], "0x20000", "timestamp {timestamp}");
+            assert_eq!(receipt["blobGasPrice"], price, "timestamp {timestamp}");
+        }
+    }
+
+    #[tokio::test]
+    async fn blob_gas_price_without_a_scheduled_fork_fails_closed() {
+        // One second before Dencun no fork prices blob gas.
+        let (router, store, _directory) = test_router_and_store().await;
+        let frame = blob_receipt_frame(1_710_338_134, 107_610_112);
+        store
+            .store_recent_frame(&frame)
+            .await
+            .expect("recent frame");
+        let receipts = block_receipts(router, &frame).await;
+        assert_eq!(receipts["error"]["code"], DATA_UNAVAILABLE);
+        assert_eq!(
+            receipts["error"]["data"]["reason"],
+            "blob_gas_price_schedule_unavailable"
+        );
+
+        // A schedule for another chain does not price this chain's blocks.
+        let (state, store, _directory) = test_state_and_store().await;
+        let frame = blob_receipt_frame(1_746_612_311, 107_610_112);
+        store
+            .store_recent_frame(&frame)
+            .await
+            .expect("recent frame");
+        let mut schedule = BlobSchedule::mainnet();
+        schedule.chain_id = 2;
+        let router = http_router_with_progress(
+            state.store,
+            state.progress,
+            Arc::new(schedule),
+            state.config,
+            state.committed_events,
+        );
+        let receipts = block_receipts(router, &frame).await;
+        assert_eq!(
+            receipts["error"]["data"]["reason"],
+            "blob_gas_price_schedule_unavailable"
+        );
+    }
+
+    #[test]
+    fn protocol_blob_fee_agrees_with_alloy_for_every_scheduled_fraction() {
+        // Alloy's independent EIP-4844 `fake_exponential` works in 512 bits
+        // and saturates at `u128::MAX`; compare up to that point.
+        for fork in &BlobSchedule::mainnet().forks {
+            let fraction = fork.base_fee_update_fraction;
+            for excess in (0..u64::MAX).step_by(4_999_999) {
+                let reference = alloy_eips::eip4844::fake_exponential(
+                    1,
+                    u128::from(excess),
+                    u128::from(fraction),
+                );
+                if reference == u128::MAX {
+                    break;
+                }
+                assert_eq!(
+                    get_blob_base_fee(excess, fraction).expect("fee"),
+                    U256::from(reference),
+                    "{} at excess {excess}",
+                    fork.name
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn type_3_receipt_snapshot_reports_every_receipt_field() {
+        let frame = blob_receipt_frame(1_746_612_311, 107_610_112);
+        let receipts = rpc_receipts(&frame, &BlobSchedule::mainnet())
+            .and_then(serialize_rpc)
+            .expect("receipts");
+        assert_eq!(
+            receipts,
+            json!([{
+                "type": "0x3",
+                "status": "0x1",
+                "cumulativeGasUsed": "0x5208",
+                "logs": [],
+                "logsBloom": format!("0x{}", "0".repeat(512)),
+                "transactionHash": hex_bytes(&[0x33; 32]),
+                "transactionIndex": "0x0",
+                "blockHash": hex_bytes(frame.block.hash.as_array()),
+                "blockNumber": "0x14",
+                "gasUsed": "0x5208",
+                "effectiveGasPrice": "0x7",
+                "blobGasUsed": "0x20000",
+                "blobGasPrice": "0x802a9119",
+                "from": hex_bytes(&[0x11; 20]),
+                "to": hex_bytes(&[0x22; 20]),
+                "contractAddress": null
+            }])
+        );
     }
 
     #[tokio::test]
@@ -3341,16 +3566,20 @@ mod tests {
     }
 
     fn rpc_frame(number: u64) -> BlockFrame {
-        let header = ConsensusHeader {
+        rpc_frame_with_header(&ConsensusHeader {
             number,
             timestamp: 1_700_000_000 + number,
             ..Default::default()
-        };
+        })
+    }
+
+    fn rpc_frame_with_header(header: &ConsensusHeader) -> BlockFrame {
         let hash = header.hash_slow();
-        let mut frame = fixture_frame(number, BlockHash::ZERO);
+        let mut frame = fixture_frame(header.number, BlockHash::ZERO);
         frame.block.hash = BlockHash::new(hash.0);
+        frame.block.timestamp = header.timestamp;
         frame.header = Material::Complete(leani_primitives::HeaderEnvelope {
-            rlp: Some(alloy_rlp::encode(&header)),
+            rlp: Some(alloy_rlp::encode(header)),
             transactions_root: Some(BlockHash::new(header.transactions_root.0)),
             receipts_root: Some(BlockHash::new(header.receipts_root.0)),
             withdrawals_root: header.withdrawals_root.map(|root| BlockHash::new(root.0)),
@@ -3359,7 +3588,7 @@ mod tests {
             base_fee_per_gas: header.base_fee_per_gas.map(U256::from).map(Into::into),
             blob_gas_used: header.blob_gas_used,
             excess_blob_gas: header.excess_blob_gas,
-            size_bytes: Some(u64::try_from(alloy_rlp::encode(&header).len()).unwrap_or(u64::MAX)),
+            size_bytes: Some(u64::try_from(alloy_rlp::encode(header).len()).unwrap_or(u64::MAX)),
             consensus_size_bytes: None,
             transaction_count: Some(0),
         });

@@ -78,6 +78,14 @@ adapter maps those values into the shapes of the existing `blocks` and
 `blob_transactions` tables for parity testing. It does not write the
 application database during the core build.
 
+The blob base fee and blob burn are the protocol's: EIP-4844's fee for the
+block's excess blob gas under the fork active at its timestamp. The EIP-7918
+reserve price is reported separately as the reserve fee. blobs.money's current
+formula instead uses the larger of the two from Fusaka on, so its base fee,
+blob burn, and transaction burns differ from Leani's wherever the reserve
+binds, and the parity report lists those fields until blobs.money adopts the
+protocol fee.
+
 ## 3. Historical processor
 
 Implemented flow:
@@ -153,7 +161,7 @@ The compatibility path can use `eth_config` to discover current/future blob
 schedules. This traffic is tiny compared with blocks and receipts.
 
 The node now maintains a versioned Mainnet schedule with exact activation
-timestamps/blocks and fork hashes, and serves the final EIP-7910 response
+timestamps and fork hashes, and serves the final EIP-7910 response
 locally. Future changes must be reconciled against protocol announcements and
 client chain specs before release. The native blobs processor carries the
 checked schedule in its versioned contract.
@@ -187,7 +195,8 @@ Use these cutover stages:
 ## 8. Acceptance criteria
 
 - Full Dencun-to-head backfill without paid RPC.
-- Exact parity with the current formulas and schema over the agreed range.
+- Exact parity with the current formulas and schema over the agreed range,
+  except the reserve-clamped blob fee and burns described in section 2.
 - No permanent raw block/receipt storage.
 - Live included-block lag normally within two blocks.
 - Finalized cursor exposed separately.

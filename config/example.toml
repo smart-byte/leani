@@ -156,7 +156,7 @@ discovery_port = 0
 [[processors]]
 id = "blobs-money"
 instance = "blobs-production"
-version = "1.4.0"
+version = "1.5.0"
 history_control = "node_owned"
 history_mode = "automatic"
 start_block = 19426589

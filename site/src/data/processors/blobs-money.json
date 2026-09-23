@@ -1,9 +1,9 @@
 {
   "caption": "One atomic block bundle—economics plus every blob transaction. Node commits are atomic; consumers receive at-least-once and commit their cursor before ACK.",
-  "config": "[[processors]]\nid = \"blobs-money\"\ninstance = \"blobs-production\"\nversion = \"1.4.0\"\nhistory_mode = \"on_demand\"\nstart_block = 19426589  # Dencun\npublish = \"included_and_finalized\"\n\n[processors.state]\nmode = \"checkpointed\"\n\n[processors.artifacts]\nmode = \"none\"\n\n[processors.output]\nmode = \"full\"\n\n[processors.delivery]\nmode = \"window\"\n\n[processors.checkpoint]\nmode = \"automatic\"\nkeep = 3\n\n[processors.undo]\nmode = \"unfinalized\"\nsafety_blocks = 256",
+  "config": "[[processors]]\nid = \"blobs-money\"\ninstance = \"blobs-production\"\nversion = \"1.5.0\"\nhistory_mode = \"on_demand\"\nstart_block = 19426589  # Dencun\npublish = \"included_and_finalized\"\n\n[processors.state]\nmode = \"checkpointed\"\n\n[processors.artifacts]\nmode = \"none\"\n\n[processors.output]\nmode = \"full\"\n\n[processors.delivery]\nmode = \"window\"\n\n[processors.checkpoint]\nmode = \"automatic\"\nkeep = 3\n\n[processors.undo]\nmode = \"unfinalized\"\nsafety_blocks = 256",
   "configLang": "toml",
   "dataType": "{\n  block: {\n    blobBaseFee: string;\n    blobCount: number;\n    blobEthBurnedWei: string;\n    blobGasUsed: string;\n    blockHash: Hex;\n    blockNumber: number;\n    excessBlobGas: string;\n    executionBaseFee: string;\n    executionEthBurnedWei: string;\n    finality: \"preview\" | \"included\" | \"finalized\";\n    gasLimit: string;\n    gasUsed: string;\n    maxBlobsPerBlock: number;\n    network: string;\n    parentHash: Hex;\n    reserveFeeWei: string;\n    size: string;\n    targetBlobsPerBlock: number;\n    timestamp: number;\n    transactionCount: number;\n    transformVersion: number;\n  };\n  transactions: {\n    blobBurnedWei: string;\n    blobCount: number;\n    blobVersionedHashes: Hex[];\n    blockHash: Hex;\n    blockNumber: number;\n    executionBurnedWei: string;\n    network: string;\n    senderAddress: Hex;\n    totalBurnedWei: string;\n    transactionIndex: number;\n    txHash: Hex;\n  }[];\n}",
-  "docsUrl": "/docs/reference/processor-contracts/#blobs-money-140",
+  "docsUrl": "/docs/reference/processor-contracts/#blobs-money-150",
   "helloJson": {
     "apiVersion": "1",
     "chainId": 1,
@@ -26,7 +26,7 @@
     "processor": {
       "artifactRetention": "none",
       "changeSchema": "blobs.block-bundle.v1",
-      "codeHash": "0x6147829a779380bef409a63b7ede907aac4350f50137c495ff71e758868d5697",
+      "codeHash": "0x595755a0ede8adeec7f6f5fca4949a6e1317818104e55daccb1b9859c60fd17e",
       "configHash": "0x8ea21cedc162b4fa3edf143b115e0d3a87c8c958be74e0b1a61ebf8fb53bfa9f",
       "deliveryOrdering": "block_versioned_idempotent",
       "genericApi": "processor-v1",
@@ -40,7 +40,7 @@
         }
       ],
       "subscriptions": true,
-      "version": "1.4.0"
+      "version": "1.5.0"
     }
   },
   "id": "blobs-money",
@@ -55,7 +55,7 @@
       "timestamp": 1710500000
     },
     "chainId": 1,
-    "cursor": "02000000000000000000000000000000000110626c6f62732d70726f64756374696f6e05312e342e3001743f67ce7c929c7babc790a657015f2c",
+    "cursor": "02000000000000000000000000000000000110626c6f62732d70726f64756374696f6e05312e352e3001def08a089468418945535e654ff99da7",
     "data": {
       "block": {
         "blobBaseFee": "1",
@@ -111,5 +111,5 @@
     "schema": "blobs.block-bundle.v1",
     "sequence": "1"
   },
-  "sseId": "02000000000000000000000000000000000110626c6f62732d70726f64756374696f6e05312e342e3001743f67ce7c929c7babc790a657015f2c"
+  "sseId": "02000000000000000000000000000000000110626c6f62732d70726f64756374696f6e05312e352e3001def08a089468418945535e654ff99da7"
 }

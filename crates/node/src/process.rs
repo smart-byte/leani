@@ -3087,9 +3087,11 @@ fn compare_rpc_exports(
     report: Option<&Path>,
 ) -> Result<()> {
     let frames = read_frames(frames)?;
+    // The served JSON-RPC prices blob gas with the checked mainnet schedule.
+    let schedule = leani_processor_blobs::BlobSchedule::mainnet();
     let actual = frames
         .iter()
-        .map(leani_rpc::rpc_compatibility_snapshot)
+        .map(|frame| leani_rpc::rpc_compatibility_snapshot(frame, &schedule))
         .collect::<Result<Vec<_>, _>>()?;
     if let Some(path) = output {
         write_json(path, &actual)?;

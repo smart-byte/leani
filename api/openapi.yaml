@@ -1862,6 +1862,10 @@ components:
         excessBlobGas:
           $ref: "#/components/schemas/DecimalQuantity"
         blobBaseFee:
+          description: >-
+            Protocol blob base fee in wei per blob gas: the EIP-4844 fee for
+            excessBlobGas under the fork active at the block's timestamp.
+            EIP-7918 does not change it.
           $ref: "#/components/schemas/DecimalQuantity"
         executionBaseFee:
           $ref: "#/components/schemas/DecimalQuantity"
@@ -1872,8 +1876,13 @@ components:
         executionEthBurnedWei:
           $ref: "#/components/schemas/DecimalQuantity"
         blobEthBurnedWei:
+          description: blobBaseFee times blobGasUsed.
           $ref: "#/components/schemas/DecimalQuantity"
         reserveFeeWei:
+          description: >-
+            EIP-7918 reserve price in wei per blob gas from Fusaka on, null
+            before. It only changes how excess blob gas evolves and is not
+            applied to blobBaseFee.
           oneOf:
             - $ref: "#/components/schemas/DecimalQuantity"
             - type: "null"
@@ -1916,6 +1925,7 @@ components:
         executionBurnedWei:
           $ref: "#/components/schemas/DecimalQuantity"
         blobBurnedWei:
+          description: The block's blobBaseFee times this transaction's blob gas.
           $ref: "#/components/schemas/DecimalQuantity"
     BlobSchedule:
       type: object
@@ -1926,8 +1936,12 @@ components:
         name:
           type: string
         activationBlock:
+          description: >-
+            Block-number label for atBlock lookups. For Dencun it is 19426589,
+            the first block the blobs processor covers.
           $ref: "#/components/schemas/SafeInteger"
         activationTimestamp:
+          description: The fork's parameters apply to blocks from this timestamp on.
           $ref: "#/components/schemas/SafeInteger"
         forkId:
           type: string
