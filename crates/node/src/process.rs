@@ -3499,6 +3499,9 @@ async fn mainnet_e2e(
             "Mainnet E2E block/freshness bounds must be non-zero and timeout must exceed stable time"
         );
     }
+    // The run owns its data directory as a node does: never open a store,
+    // peer store or identity that a node or another run is using.
+    let _data_dir_lock = crate::local_state::lock_runtime_directory(&options.data_dir)?;
     let database_path = options.data_dir.join("leani.sqlite");
     if database_path.exists() && !options.resume {
         bail!(
@@ -4315,6 +4318,13 @@ fn p2p_probe_source(
     config: &Config,
     options: &P2pProbeOptions,
 ) -> Result<leani_source_p2p::RethP2pSource> {
+    leani_source_p2p::RethP2pSource::mainnet(p2p_probe_config(config, options)?).map_err(Into::into)
+}
+
+fn p2p_probe_config(
+    config: &Config,
+    options: &P2pProbeOptions,
+) -> Result<leani_source_p2p::RethP2pConfig> {
     use std::time::Duration;
 
     use leani_source_p2p::RethP2pConfig;
@@ -4331,7 +4341,7 @@ fn p2p_probe_source(
         .iter()
         .map(|peer| leani_source_p2p::parse_trusted_peer(peer))
         .collect::<Result<Vec<_>, _>>()?;
-    leani_source_p2p::RethP2pSource::mainnet(RethP2pConfig {
+    Ok(RethP2pConfig {
         minimum_peers: options.minimum_peers,
         body_serving_peer_target: config
             .sources
@@ -4352,9 +4362,12 @@ fn p2p_probe_source(
             .max_concurrent_dials
             .min(max_outbound_peers)
             .max(1),
-        listener_port: config.sources.live.listener_port,
-        discovery_port: config.sources.live.discovery_port,
-        discv5_port: config.sources.live.discv5_port,
+        // The probe runs beside a live node without its data-directory lock,
+        // so it must not contend for the node's ports, peer store or identity:
+        // it uses ephemeral ports, an in-memory peer store and a throwaway key.
+        listener_port: 0,
+        discovery_port: 0,
+        discv5_port: 0,
         enable_discv5: config.sources.live.enable_discv5,
         nat: leani_source_p2p::parse_nat_resolver(&config.sources.live.nat)?,
         trusted_peers,
@@ -4375,8 +4388,8 @@ fn p2p_probe_source(
         material_request_blocks: config.sources.live.material_request_blocks,
         history_header_request_concurrency: config.sources.live.history_header_request_concurrency,
         history_header_request_blocks: config.sources.live.history_header_request_blocks,
-        peer_store_path: Some(config.data_dir.join("execution-network.sqlite")),
-        secret_key_path: Some(config.data_dir.join("execution-p2p-secret")),
+        peer_store_path: None,
+        secret_key_path: None,
         peer_store_max_entries: config.sources.live.peer_store_max_entries,
         peer_store_flush_interval: Duration::from_secs(
             config.sources.live.peer_store_flush_seconds,
@@ -4385,7 +4398,6 @@ fn p2p_probe_source(
         max_reorg_depth: 64,
         network_telemetry: leani_source_api::NetworkTelemetry::default(),
     })
-    .map_err(Into::into)
 }
 
 async fn probe_p2p(config_path: &Path, options: P2pProbeOptions) -> Result<Exit> {
@@ -8073,5 +8085,69 @@ markets = ["ETH/USDT"]
         );
         assert!(message.contains("a new `data_dir`"), "{message}");
         assert!(message.contains("a new `instance`"), "{message}");
+    }
+
+    #[test]
+    fn p2p_probe_uses_an_ephemeral_identity_and_peer_store() {
+        let mut config: Config =
+            toml::from_str(crate::config::VALID_CONFIG_TOML).expect("configuration fixture");
+        config.sources.live.listener_port = 30_303;
+        config.sources.live.discovery_port = 30_303;
+        config.sources.live.discv5_port = 30_304;
+        let probe = p2p_probe_config(
+            &config,
+            &P2pProbeOptions {
+                from_block: 25_000_000,
+                to_block: 25_000_001,
+                expected_tip: None,
+                minimum_peers: 1,
+                peer_wait_seconds: 1,
+                request_timeout_seconds: 1,
+                retries: 1,
+                retry_backoff_seconds: 1,
+                max_input_bytes: 1,
+                report: None,
+                output: None,
+            },
+        )
+        .expect("probe configuration");
+        // The probe never opens the node's peer store or identity, so it can
+        // run beside a live node without its data-directory lock...
+        assert_eq!(probe.peer_store_path, None);
+        assert_eq!(probe.secret_key_path, None);
+        // ...or contending for the node's fixed listener and discovery ports.
+        assert_eq!(
+            (probe.listener_port, probe.discovery_port, probe.discv5_port),
+            (0, 0, 0)
+        );
+    }
+
+    #[tokio::test]
+    async fn mainnet_e2e_refuses_a_data_dir_another_process_holds() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let _node = crate::local_state::lock_runtime_directory(directory.path())
+            .expect("a node holds the data directory");
+        let error = mainnet_e2e(
+            &directory.path().join("leani.toml"),
+            MainnetE2eOptions {
+                processor: "blobs-money".to_owned(),
+                from_block: 1,
+                data_dir: directory.path().to_path_buf(),
+                resume: true,
+                minimum_follow_blocks: 1,
+                stable_seconds: 1,
+                max_head_age_seconds: 1,
+                timeout_seconds: 2,
+                report: directory.path().join("report.json"),
+            },
+            &ProcessorRegistry::standard(),
+        )
+        .await
+        .expect_err("a held data directory is refused");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("already in use by another Leani process"),
+            "{message}"
+        );
     }
 }

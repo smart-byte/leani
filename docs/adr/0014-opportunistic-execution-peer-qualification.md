@@ -37,8 +37,28 @@ commitments, and receipts are checked against both the receipt root and body.
   receive a real material request;
 - successful material requests update the same persistent capability evidence
   as qualification probes;
-- failures cool only the affected header, body, or receipt lane, while
-  commitment-invalid responses retain the existing global ban behavior;
+- failures cool only the affected header, body, or receipt lane. Only an
+  invalid response bans the peer and records a persisted failure: material
+  that breaks its commitments, structure, or block numbers, or that
+  contradicts a verified expectation, meaning the consensus-verified finalized
+  anchor or a hash proven to link to it;
+- a response that contradicts only an unverified expectation, such as a head
+  taken from peers' handshake statuses, is a disagreement, as is an empty or
+  short reply: no ban and no persisted failure, at most a short local cooldown.
+  Honest peers on another branch, or behind a claimed head, answer this way;
+- polling for the next block asks one or two peers per poll, taken from those
+  not yet asked for that block; once every eligible peer has been asked, the
+  rotation starts over. An empty reply there is not a failure, but once
+  another peer has served the block, the peers that answered "not yet" get
+  the normal lane cooldown. Requests for blocks that exist, such as a
+  catch-up range or the minimum live head, race the eligible peers, and an
+  empty reply to them cools the peer's lane;
+- qualification probes each peer with real requests at the current target,
+  never from its handshake head, and compares targets by block number and
+  hash. Lagging and timed-out probes are not persisted as failures and never
+  clear a session's verified lanes;
+- qualification is background work: it never occupies the material request
+  slots reserved for the live lane;
 - `body_serving_peer_target` is independent from `minimum_peers` and controls
   the background qualification concurrency target.
 
@@ -54,6 +74,17 @@ ranking learns its capability. Existing request concurrency, per-material
 cooldowns, Reth dial backoff, and commitment validation bound that cost. The
 network status distinguishes connected sessions from qualified body servers so
 operators can still evaluate pool health.
+
+A peer that answers from another branch is never banned for it, so a head
+that one peer claims cannot get honest peers banned, and an orphaned head costs
+them at most a short cooldown. Such peers may be asked again sooner;
+commitment validation still rejects any material they serve that does not
+match, and a verified expectation still bans a peer that contradicts it.
+
+Peers that withhold the next block cannot stall the live lane either: each
+poll asks peers not yet asked for the block, and a peer that answered "not
+yet" for a block another peer served cools like any lagging peer. A slightly
+late but honest peer pays the same short cooldown, and a success resets it.
 
 ## Evidence
 

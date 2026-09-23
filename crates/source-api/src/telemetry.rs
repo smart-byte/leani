@@ -557,7 +557,12 @@ impl NetworkSessionTelemetry {
         self.update(|record| record.range = range);
     }
 
-    /// Advance the highest execution head observed from the connected peer set.
+    /// Advance the highest execution head this session has verified.
+    ///
+    /// Pass only the number of a header that passed validation. A peer's
+    /// claimed head, such as its handshake status, is not a verified head:
+    /// kept as a maximum, one inflated claim would overstate the head for the
+    /// session's lifetime.
     ///
     /// This is intentionally independent from [`Self::set_range`]: a request
     /// may probe the block after the observed head without making that future
@@ -784,7 +789,8 @@ pub struct NetworkSessionSnapshot {
     pub connected_peers: usize,
     pub known_peers: usize,
     pub attempts: u64,
-    /// Highest execution block currently advertised or directly served by a peer.
+    /// Highest execution block this session has verified: a header that passed
+    /// validation, never a peer's claimed head.
     pub observed_head_block: Option<u64>,
     /// First block in the current material request, if a request is active.
     pub from_block: Option<u64>,

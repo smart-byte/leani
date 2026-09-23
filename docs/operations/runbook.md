@@ -116,16 +116,22 @@ or `discv4_or_5`. Prometheus exports the same origin labels through
 and warm startup instead of treating cache size as evidence of usefulness.
 
 Every new ETH session is immediately tested against the current independently
-verified execution anchor. Leani races qualifications until the configured
-body-serving target is ready, then continues one qualification at a time at
-normal priority. Qualification ranks proven serving peers first but does not
-exclude a newly connected peer: each material response is independently
-verified before use, so fresh peers remain immediate fallbacks. Proven serving
-peers are tried before untested discovery records on the next start.
+verified execution anchor. Leani qualifies several sessions concurrently until
+the configured body-serving target is ready, then one at a time. Qualification
+is background work at normal priority throughout: it never uses the request
+slots reserved for the live lane. Qualification ranks proven serving peers
+first but does not exclude a newly connected peer: each material response is
+independently verified before use, so fresh peers remain immediate fallbacks.
+Proven serving peers are tried before untested discovery records on the next
+start.
 
 `sources.live.material_request_concurrency` bounds simultaneous physical
 requests together with the global source budget and connected-peer capacity.
-The default ceiling is 32, but each source acquisition's
+Every execution P2P request shares one process-wide limit: the larger of
+`material_request_concurrency` and `history_header_request_concurrency`, 32 by
+default. History, probes, and peer qualification leave four of those slots
+free for the live lane (half the limit when it is below eight), and a waiting
+live request gets the next free slot first. Each source acquisition's
 `max_in_flight_requests` and the four-request per-peer pipeline usually impose
 a lower effective limit. More concurrency helps only when the peer pool and
 link have spare capacity; it also multiplies decoded response buffers. Treat
@@ -186,10 +192,12 @@ configured start through `processedThrough` has no internal gaps. It does not
 mean that `processedThrough` has reached the live source. The network status
 adds `storedRangeContiguous`, `syncTargetBlock`, and `blocksRemaining`; use
 those fields together with `readiness.liveReady` when diagnosing catch-up.
-`syncTargetBlock` is derived from the live session's `observedHeadBlock`;
-`fromBlock` and `toBlock` describe only its current material request. A
-speculative request for the block after the observed head therefore does not
-create artificial processor lag.
+`syncTargetBlock` is derived from the live session's `observedHeadBlock`: the
+newest header the live lane has validated, never a head a peer only claimed.
+It reports validated progress, so while the node catches up it trails the
+network head. `fromBlock` and `toBlock` describe only its current material
+request. A speculative request for the block after the observed head therefore
+does not create artificial processor lag.
 `blocksRemaining` counts every missing block from the configured start through
 the observed head, including internal gaps; it is not merely the distance
 between the highest stored block and that head.

@@ -31,6 +31,24 @@ record, and documented RPC contracts.
   only when it was verified from that checkpoint. An anchor from another
   trust root is ignored with a warning, and `leani doctor` reports it, so
   changing the checkpoint re-anchors the node.
+- Execution P2P no longer bans honest peers, or stores failures against them,
+  for contradicting a head that peers only claimed. The live lane used the
+  head most peers declared in their handshake status as the expected tip of
+  its next header range, and banned every peer that served another tip: any
+  one peer could claim a head, and an honestly orphaned head had the same
+  effect. Failed responses are now classified. Material that breaks its
+  commitments, structure, or block numbers, or that contradicts a verified
+  expectation (the consensus-verified finalized anchor, or the header chain
+  proven to it), still bans the peer and stores the failure. A mismatch with
+  an unverified expectation, and an empty or short reply, costs at most a
+  short local cooldown. The same rule applies to the peer preview of
+  `leani subscribe`, to the replacement branch fetched for a reorg, and to
+  `leani source probe p2p --expected-tip`. Reorg reconstruction still reports
+  a peer to Reth when it returns no headers for the claimed head's hash.
+- An existing execution P2P identity (`execution-p2p-secret`) that group or
+  other users can access is restricted to mode 0600 on load, with a warning.
+  Creating the identity removes its temporary file on every failure and syncs
+  the directory after installing it.
 
 ### Changed
 
@@ -161,6 +179,22 @@ record, and documented RPC contracts.
   managed Beacon endpoint pool plus every responding checkpoint provider that
   also serves the Beacon light-client API, without duplicates, instead of the
   responding providers alone.
+- `leani-source-api`: `NetworkSessionTelemetry::observe_head` takes only
+  verified heads; its signature is unchanged. Execution P2P now reports as a
+  session's `observedHeadBlock`, and so as `syncTargetBlock` and the base of
+  `blocksRemaining`, the newest header it validated, not the highest head a
+  peer claimed in its status. One status claiming block 18446744073709551615
+  set that value for the session's lifetime. While the node catches up, these
+  fields now follow its validated progress instead of the claimed network
+  head.
+- Execution P2P schedules every material request under one process-wide
+  limit, the larger of `material_request_concurrency` and
+  `history_header_request_concurrency`, instead of comparing each caller's
+  own limit with the shared count. Live-lane requests may use every slot.
+  History, probes, and background peer qualification leave four slots free,
+  or half the limit (rounded down) when it is below eight, and a waiting live
+  request gets the next free slot first. Qualification never runs at high
+  priority.
 
 ### Fixed
 
@@ -534,6 +568,46 @@ record, and documented RPC contracts.
   fails with `-32004` (`blob_gas_price_schedule_unavailable` or
   `header_excess_blob_gas_missing`) instead of carrying a Cancun price.
   `leani conformance rpc` prices blob receipts the same way.
+- A request slot freed just after a waiting execution P2P request found none
+  free no longer leaves that request waiting for the next release. Background
+  peer qualification, with its limit of 32, no longer holds every slot while
+  live requests, limited to 4, wait behind it.
+- Polling execution peers for the next block asks one or two peers per poll
+  instead of racing every eligible peer, and each poll asks peers that have
+  not been asked for that block yet, until every eligible peer has been asked
+  and the rotation starts over. An empty reply for a block that is not
+  produced yet no longer counts as a failure with an exponential cooldown.
+  Once another peer has served the block, the peers that answered "not yet"
+  for it get the normal lane cooldown, so peers that withhold new blocks drop
+  out of later polls; nothing is stored against them and they are not
+  banned. The request for the minimum live head, the verified tip or the
+  block after the finalized anchor, still races every eligible peer, and an
+  empty reply there cools the peer's header lane.
+- Execution peer qualification no longer marks a peer `lagging` from its
+  handshake head, which is fixed when the session opens, but asks the peer.
+  Lagging and timed-out probes are no longer stored as service failures and no
+  longer clear a session's verified header and body lanes. The qualification
+  target is a block number and hash, so advertising the same block again with
+  another timestamp or parent no longer resets every peer's qualification.
+- Execution peers that disconnect with `useless_peer` or
+  `tcp_subsystem_error` no longer get a stored service failure. Remote peers
+  send `useless_peer` to this node, which serves no chain data, and TCP
+  subsystem errors are often local or transient.
+- The direct execution-peer pool is reconciled with the network manager's
+  active sessions every 10 seconds. A lost session event no longer leaves a
+  closed session's request sender in the pool or hides a connected peer. A
+  peer dropped for invalid material is not taken back while its session
+  lasts, which Reth keeps open for trusted peers.
+- `leani source probe p2p` uses a throwaway identity, an in-memory peer store,
+  and ephemeral ports, so it can run beside a live node without the
+  data-directory lock and never changes the node's peer store or identity. It
+  advertises the genesis block instead of the probed range's end with a zero
+  hash, which made every peer fail qualification and stored those failures in
+  the node's peer store.
+- `leani e2e mainnet` takes the data directory's lock, so `--resume` no
+  longer opens a store that a running node or another run is using.
+- The execution peer store path is used literally: `%` and `?` in `data_dir`
+  no longer open another file.
 
 ## [0.1.0-rc.1] - 2026-09-20
 

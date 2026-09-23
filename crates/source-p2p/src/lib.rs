@@ -119,6 +119,16 @@ const MATERIAL_BATCH_GROW_SUCCESS_WINDOWS: usize = 8;
 // consume the entire global history budget.
 const MAX_MATERIAL_REQUESTS_PER_PEER: usize = 4;
 const DEFAULT_MATERIAL_REQUEST_CONCURRENCY: usize = 32;
+// Material request slots only live requests may use: history, probes and
+// background qualification leave them free, so they never starve the lane
+// that follows the head.
+const RESERVED_LIVE_MATERIAL_REQUESTS: usize = 4;
+// Peers one poll for a block at the head asks. It usually does not exist yet,
+// so racing every eligible peer only multiplies "not yet" replies.
+const AT_HEAD_HEADER_PEERS: usize = 2;
+// Session events reach the direct-peer pool over a lossy broadcast, so the
+// pool is reconciled with Reth's active sessions this often.
+const DIRECT_PEER_RECONCILE_INTERVAL: Duration = Duration::from_secs(10);
 const DEFAULT_PEER_STORE_MAX_ENTRIES: usize = 4_096;
 // Cryptographically verified execution material is stronger evidence than a
 // successful handshake. Persist a small positive signal so later runs try
@@ -847,6 +857,9 @@ impl P2pSession {
         self.telemetry.set_range(range);
     }
 
+    /// Observe a head this session verified: the number of a header that
+    /// passed validation at a block this node requested. Peer status claims
+    /// never reach it.
     fn observe_head(&self, head: BlockNumber) {
         self.telemetry.observe_head(head);
     }
@@ -999,7 +1012,7 @@ impl PeerQualificationPool {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if state.target != target {
+        if !same_qualification_target(state.target, target) {
             state.target = target;
             state.outcomes.clear();
             drop(state);
@@ -1023,7 +1036,7 @@ impl PeerQualificationPool {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if state.target == target {
+        if same_qualification_target(state.target, target) {
             state.outcomes.insert(peer_id, outcome);
             drop(state);
             self.changed.notify_waiters();
@@ -1044,7 +1057,7 @@ impl PeerQualificationPool {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if state.target != target {
+        if !same_qualification_target(state.target, target) {
             return 0;
         }
         state
@@ -1059,12 +1072,18 @@ impl PeerQualificationPool {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        state.target == target
+        same_qualification_target(state.target, target)
             && state
                 .outcomes
                 .get(&peer_id)
                 .is_some_and(|outcome| matches!(outcome, PeerQualification::BodyServing))
     }
+}
+
+/// Qualification targets are blocks: the same block advertised again with a
+/// synthetic parent or a fresh timestamp is the same target.
+fn same_qualification_target(left: BlockRef, right: BlockRef) -> bool {
+    left.number == right.number && left.hash == right.hash
 }
 
 #[derive(Debug)]
@@ -1079,7 +1098,7 @@ struct PersistentNetwork {
 
 impl PersistentNetwork {
     fn drop_peer(&self, peer_id: B512) {
-        self.direct_peers.remove(peer_id);
+        self.direct_peers.invalidate(peer_id);
         self.qualifications.remove(peer_id);
     }
 
@@ -1106,7 +1125,6 @@ struct DirectPeer {
     peer_id: B512,
     eth_version: EthVersion,
     messages: PeerRequestSender<PeerRequest<EthNetworkPrimitives>>,
-    advertised_head: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -1137,6 +1155,17 @@ struct DirectPeerState {
 }
 
 impl DirectPeerState {
+    fn new(peer: DirectPeer, connection_id: u64) -> Self {
+        Self {
+            peer,
+            connection_id,
+            in_flight: 0,
+            header: PeerServiceState::new(),
+            body: PeerServiceState::new(),
+            receipts: PeerServiceState::new(),
+        }
+    }
+
     fn service(&self, kind: PeerMaterialKind) -> &PeerServiceState {
         match kind {
             PeerMaterialKind::Header => &self.header,
@@ -1165,6 +1194,10 @@ fn cool_peer_service(peer: &mut DirectPeerState, kind: PeerMaterialKind) {
 #[derive(Debug)]
 struct DirectPeerPool {
     peers: Mutex<Vec<DirectPeerState>>,
+    /// Peers dropped for invalid material. Reth keeps a trusted peer's
+    /// session despite a ban, so the reconciler must not adopt such a peer
+    /// again before that session closes.
+    invalidated: Mutex<HashSet<B512>>,
     cursor: AtomicUsize,
     next_connection_id: AtomicU64,
     changed: tokio::sync::Notify,
@@ -1175,6 +1208,7 @@ impl DirectPeerPool {
     fn new(quality: Arc<ExecutionPeerStore>) -> Self {
         Self {
             peers: Mutex::new(Vec::new()),
+            invalidated: Mutex::new(HashSet::new()),
             cursor: AtomicUsize::new(0),
             next_connection_id: AtomicU64::new(1),
             changed: tokio::sync::Notify::new(),
@@ -1184,29 +1218,24 @@ impl DirectPeerPool {
 
     fn insert(&self, peer: DirectPeer) {
         let connection_id = self.next_connection_id.fetch_add(1, Ordering::Relaxed);
+        // A new session starts over, even for a peer whose previous session
+        // was dropped for invalid material.
+        self.invalidated
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&peer.peer_id);
         let mut peers = self
             .peers
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let state = DirectPeerState::new(peer, connection_id);
         if let Some(existing) = peers
             .iter_mut()
-            .find(|existing| existing.peer.peer_id == peer.peer_id)
+            .find(|existing| existing.peer.peer_id == state.peer.peer_id)
         {
-            existing.peer = peer;
-            existing.connection_id = connection_id;
-            existing.in_flight = 0;
-            existing.header = PeerServiceState::new();
-            existing.body = PeerServiceState::new();
-            existing.receipts = PeerServiceState::new();
+            *existing = state;
         } else {
-            peers.push(DirectPeerState {
-                peer,
-                connection_id,
-                in_flight: 0,
-                header: PeerServiceState::new(),
-                body: PeerServiceState::new(),
-                receipts: PeerServiceState::new(),
-            });
+            peers.push(state);
         }
         drop(peers);
         self.changed.notify_waiters();
@@ -1220,8 +1249,38 @@ impl DirectPeerPool {
         self.changed.notify_waiters();
     }
 
+    /// Drop a peer for invalid material and keep it out until its session
+    /// closes.
+    fn invalidate(&self, peer_id: B512) {
+        self.invalidated
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(peer_id);
+        self.remove(peer_id);
+    }
+
+    /// Drop a peer whose session closed; a later session may join again.
+    fn session_closed(&self, peer_id: B512) {
+        self.invalidated
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&peer_id);
+        self.remove(peer_id);
+    }
+
+    fn invalidated(&self) -> HashSet<B512> {
+        self.invalidated
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
     fn clear(&self) {
         self.peers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+        self.invalidated
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clear();
@@ -1236,21 +1295,23 @@ impl DirectPeerPool {
     }
 
     fn set_qualification(&self, peer_id: B512, qualification: PeerQualification) {
+        // A probe at one target only adds evidence. A lagging, timed-out or
+        // header-only answer says nothing against material the session has
+        // already served verifiably, so it never clears a verified lane.
+        let served_header = qualification_served_header(qualification);
+        let served_body = matches!(qualification, PeerQualification::BodyServing);
         let mut peers = self
             .peers
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(peer) = peers.iter_mut().find(|peer| peer.peer.peer_id == peer_id) {
-            peer.header.verified = matches!(
-                qualification,
-                PeerQualification::BodyServing | PeerQualification::HeadersOnly
-            );
-            peer.body.verified = matches!(qualification, PeerQualification::BodyServing);
-            if peer.header.verified {
+            if served_header {
+                peer.header.verified = true;
                 peer.header.failures = 0;
                 peer.header.retry_at = Instant::now();
             }
-            if peer.body.verified {
+            if served_body {
+                peer.body.verified = true;
                 peer.body.failures = 0;
                 peer.body.retry_at = Instant::now();
             }
@@ -1266,6 +1327,33 @@ impl DirectPeerPool {
             .iter()
             .find(|peer| peer.peer.peer_id == peer_id)
             .map(|peer| peer.peer.clone())
+    }
+
+    /// Lease a header peer for a poll for the next block at the head: the
+    /// best eligible peer the rotation has not asked for that block yet, or,
+    /// once every eligible peer has been asked, the best one again.
+    fn lease_for_head_poll(
+        self: &Arc<Self>,
+        rotation: &mut HeadPollRotation,
+        per_peer_limit: usize,
+    ) -> Option<DirectPeerLease> {
+        let lease = match self.try_acquire_excluding(
+            PeerMaterialKind::Header,
+            per_peer_limit,
+            rotation.exclusions(),
+            None,
+        ) {
+            Some(lease) => lease,
+            None if rotation.start_over() => self.try_acquire_excluding(
+                PeerMaterialKind::Header,
+                per_peer_limit,
+                rotation.exclusions(),
+                None,
+            )?,
+            None => return None,
+        };
+        rotation.record_asked(lease.peer.peer_id);
+        Some(lease)
     }
 
     fn record_material_failure(&self, peer_id: B512, kind: PeerMaterialKind) {
@@ -1442,6 +1530,61 @@ impl DirectPeerPool {
             .map(|state| state.peer.clone())
             .collect()
     }
+
+    fn sessions(&self) -> Vec<PooledPeerSession> {
+        self.peers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .map(|state| PooledPeerSession {
+                peer_id: state.peer.peer_id,
+                connection_id: state.connection_id,
+                sender_open: !state.peer.messages.to_session_tx.is_closed(),
+            })
+            .collect()
+    }
+
+    /// Remove an entry only while it still belongs to `connection_id`, so a
+    /// session re-established meanwhile stays.
+    fn remove_connection(&self, peer_id: B512, connection_id: u64) -> bool {
+        let mut peers = self
+            .peers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let before = peers.len();
+        peers.retain(|state| state.peer.peer_id != peer_id || state.connection_id != connection_id);
+        let removed = peers.len() != before;
+        drop(peers);
+        if removed {
+            self.changed.notify_waiters();
+        }
+        removed
+    }
+
+    /// Add a session the pool missed, unless its open event arrived meanwhile
+    /// or the peer was dropped for invalid material since.
+    fn insert_missing(&self, peer: DirectPeer) -> bool {
+        if self
+            .invalidated
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(&peer.peer_id)
+        {
+            return false;
+        }
+        let connection_id = self.next_connection_id.fetch_add(1, Ordering::Relaxed);
+        let mut peers = self
+            .peers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if peers.iter().any(|state| state.peer.peer_id == peer.peer_id) {
+            return false;
+        }
+        peers.push(DirectPeerState::new(peer, connection_id));
+        drop(peers);
+        self.changed.notify_waiters();
+        true
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1510,47 +1653,85 @@ impl Drop for PersistentNetwork {
     }
 }
 
-#[derive(Debug, Default)]
+/// Process-wide scheduler for material requests: one global limit shared by
+/// every lane, with slots reserved for high-priority live requests.
+#[derive(Debug)]
 struct MaterialRequestGate {
+    limit: usize,
     in_flight: AtomicUsize,
     high_priority_waiters: AtomicUsize,
     changed: tokio::sync::Notify,
 }
 
 impl MaterialRequestGate {
+    fn new(limit: usize) -> Self {
+        Self {
+            limit: limit.max(1),
+            in_flight: AtomicUsize::new(0),
+            high_priority_waiters: AtomicUsize::new(0),
+            changed: tokio::sync::Notify::new(),
+        }
+    }
+
+    /// Take a slot if a request of `priority` may use one now. Normal work
+    /// leaves the reserved live slots free and yields to a waiting live
+    /// request.
+    fn try_acquire(self: &Arc<Self>, priority: Priority) -> Option<MaterialRequestPermit> {
+        if priority.is_normal() && self.high_priority_waiters.load(Ordering::Acquire) != 0 {
+            return None;
+        }
+        let capacity = material_request_capacity(self.limit, priority);
+        self.in_flight
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                (current < capacity).then(|| current.saturating_add(1))
+            })
+            .ok()
+            .map(|_| MaterialRequestPermit { gate: self.clone() })
+    }
+
     async fn acquire(
         self: &Arc<Self>,
-        limit: usize,
         priority: Priority,
         cancellation: &CancellationToken,
     ) -> Result<MaterialRequestPermit, P2pError> {
-        let limit = limit.max(1);
-        let high_priority_waiter = matches!(priority, Priority::High).then(|| {
+        let _high_priority_waiter = priority.is_high().then(|| {
             self.high_priority_waiters.fetch_add(1, Ordering::AcqRel);
             HighPriorityWaiter { gate: self.clone() }
         });
-        loop {
-            let current = self.in_flight.load(Ordering::Acquire);
-            let can_dispatch = high_priority_waiter.is_some()
-                || self.high_priority_waiters.load(Ordering::Acquire) == 0;
-            if can_dispatch
-                && current < limit
-                && self
-                    .in_flight
-                    .compare_exchange_weak(
-                        current,
-                        current.saturating_add(1),
-                        Ordering::AcqRel,
-                        Ordering::Acquire,
-                    )
-                    .is_ok()
-            {
-                return Ok(MaterialRequestPermit { gate: self.clone() });
-            }
-            tokio::select! {
-                () = cancellation.cancelled() => return Err(P2pError::Cancelled),
-                () = self.changed.notified() => {}
-            }
+        wait_for_release(&self.changed, cancellation, || self.try_acquire(priority)).await
+    }
+}
+
+/// Slots a request of `priority` may occupy under the gate's global `limit`.
+/// Live (high-priority) requests may use every slot. Other work leaves
+/// `RESERVED_LIVE_MATERIAL_REQUESTS` slots free, and at most half the limit,
+/// so both classes always keep a slot.
+fn material_request_capacity(limit: usize, priority: Priority) -> usize {
+    let limit = limit.max(1);
+    match priority {
+        Priority::High => limit,
+        Priority::Normal => limit - RESERVED_LIVE_MATERIAL_REQUESTS.min(limit / 2),
+    }
+}
+
+/// Retry `try_acquire` until it succeeds, waiting for `changed` in between.
+/// The wakeup is registered, as an enabled waiter, before every check, so a
+/// slot released between a failed check and the wait still wakes the caller,
+/// whether the release notifies every waiter or only the first one.
+async fn wait_for_release<T>(
+    changed: &tokio::sync::Notify,
+    cancellation: &CancellationToken,
+    mut try_acquire: impl FnMut() -> Option<T>,
+) -> Result<T, P2pError> {
+    loop {
+        let mut released = std::pin::pin!(changed.notified());
+        released.as_mut().enable();
+        if let Some(acquired) = try_acquire() {
+            return Ok(acquired);
+        }
+        tokio::select! {
+            () = cancellation.cancelled() => return Err(P2pError::Cancelled),
+            () = released => {}
         }
     }
 }
@@ -1697,6 +1878,120 @@ fn direct_peer_request_limit(total_concurrency: usize, connected_peers: usize) -
         .clamp(1, MAX_MATERIAL_REQUESTS_PER_PEER)
 }
 
+/// Parallel and total peers one live header request asks. Polling at the head
+/// asks a cohort of one or two peers per poll, because the next block is
+/// usually not produced yet; catching up races every eligible peer.
+fn live_header_fanout(at_head: bool, request_limit: usize) -> (usize, usize) {
+    if at_head {
+        let cohort = request_limit.clamp(1, AT_HEAD_HEADER_PEERS);
+        (cohort, cohort)
+    } else {
+        (request_limit, usize::MAX)
+    }
+}
+
+/// What a failed live header reply costs its peer.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HeaderReplyCost {
+    /// Invalid material: ban the session and persist the failure.
+    Ban,
+    /// A lagging or disagreeing peer: the normal header-lane cooldown.
+    Cooldown,
+    /// "Not yet" for the next block at the head: nothing now. The lane's
+    /// rotation asks other peers, and cools this one if another peer then
+    /// serves the block.
+    NotYet,
+}
+
+/// What a failed live header reply costs its peer. An empty or short reply to
+/// a head poll only says the block is not produced yet; for blocks that
+/// exist, such as a catch-up range or the minimum live head, it is a lagging
+/// peer.
+const fn live_header_reply_cost(
+    error: &P2pError,
+    expectation: ExpectationTrust,
+    head_poll: bool,
+) -> HeaderReplyCost {
+    match classify_response_failure(error, expectation) {
+        ResponseFault::Invalid => HeaderReplyCost::Ban,
+        ResponseFault::Disagreement
+            if head_poll && matches!(error, P2pError::IncompleteResponse { .. }) =>
+        {
+            HeaderReplyCost::NotYet
+        }
+        ResponseFault::Disagreement => HeaderReplyCost::Cooldown,
+    }
+}
+
+/// The live lane's rotation over the peers it polls for the next block.
+///
+/// Each poll asks peers the rotation has not asked for that block yet, and it
+/// starts over once every eligible peer has been asked, so two peers that
+/// answer "not yet" cannot hold the lane: the next poll asks others. Once the
+/// lane has moved past the block, another peer has served it, and the peers
+/// that answered "not yet" for it earn the normal header-lane cooldown.
+#[derive(Debug, Default)]
+struct HeadPollRotation {
+    block: Option<BlockNumber>,
+    /// Peers asked for `block` since the rotation last started over.
+    asked: HashSet<B512>,
+    /// Peers the current poll asked.
+    polling: HashSet<B512>,
+    /// Peers that answered "not yet" for `block`.
+    not_yet: HashSet<B512>,
+}
+
+impl HeadPollRotation {
+    /// Begin a poll for `block`. Once the lane has moved past the block polled
+    /// before, returns the peers that answered "not yet" for it, to cool.
+    fn begin_poll(&mut self, block: BlockNumber) -> Vec<B512> {
+        self.polling.clear();
+        if self.block == Some(block) {
+            return Vec::new();
+        }
+        let served = self.block.is_some_and(|polled| block.0 > polled.0);
+        self.block = Some(block);
+        self.asked.clear();
+        let not_yet = std::mem::take(&mut self.not_yet);
+        if !served {
+            return Vec::new();
+        }
+        let mut withheld = not_yet.into_iter().collect::<Vec<_>>();
+        withheld.sort_unstable();
+        withheld
+    }
+
+    /// Peers the next lease for this poll skips.
+    const fn exclusions(&self) -> &HashSet<B512> {
+        &self.asked
+    }
+
+    fn record_asked(&mut self, peer_id: B512) {
+        self.asked.insert(peer_id);
+        self.polling.insert(peer_id);
+    }
+
+    /// Every eligible peer has been asked for the block: ask them again,
+    /// except those this poll has asked. Returns whether any peer is released.
+    fn start_over(&mut self) -> bool {
+        if self.asked.len() == self.polling.len() {
+            return false;
+        }
+        self.asked.clone_from(&self.polling);
+        true
+    }
+
+    fn record_not_yet(&mut self, peer_id: B512) {
+        self.not_yet.insert(peer_id);
+    }
+
+    /// A peer that served the block withheld nothing, even if it answered
+    /// "not yet" before.
+    fn record_served(&mut self, peer_id: B512) {
+        self.not_yet.remove(&peer_id);
+    }
+}
+
 fn repeated_incomplete_response(
     responses: &mut HashMap<B512, usize>,
     peer_id: B512,
@@ -1803,31 +2098,13 @@ async fn qualify_execution_peer(
     target: BlockRef,
     timeout: Duration,
     request_gate: Arc<MaterialRequestGate>,
-    request_limit: usize,
-    priority: Priority,
     cancellation: CancellationToken,
 ) -> PeerQualificationResult {
+    // Qualification is background ranking work: it never takes the request
+    // slots reserved for the live lane. A peer is qualified by what it serves
+    // now, never by its static handshake head.
     let result = async {
-        if peer
-            .advertised_head
-            .is_some_and(|head| head < target.number.0)
-        {
-            return PeerQualificationResult {
-                target,
-                peer_id: peer.peer_id,
-                outcome: PeerQualification::Lagging,
-                detail: Some(format!(
-                    "advertised head is below verified block {}",
-                    target.number.0
-                )),
-                header_elapsed: None,
-                body_elapsed: None,
-            };
-        }
-        let permit = match request_gate
-            .acquire(request_limit, priority, &cancellation)
-            .await
-        {
+        let permit = match request_gate.acquire(Priority::Normal, &cancellation).await {
             Ok(permit) => permit,
             Err(error) => {
                 return PeerQualificationResult {
@@ -1850,7 +2127,7 @@ async fn qualify_execution_peer(
         .await;
         drop(permit);
         let header_elapsed = header_started.elapsed();
-        let mut headers = match header_response {
+        let headers = match header_response {
             Ok(headers) => headers,
             Err(error) => {
                 let outcome = if matches!(error, P2pError::Timeout { .. }) {
@@ -1868,33 +2145,33 @@ async fn qualify_execution_peer(
                 };
             }
         };
-        let Some(header) = headers.pop() else {
-            return PeerQualificationResult {
-                target,
-                peer_id: peer.peer_id,
-                outcome: PeerQualification::Lagging,
-                detail: Some("verified anchor header was not served".to_owned()),
-                header_elapsed: Some(header_elapsed),
-                body_elapsed: None,
-            };
+        let header = match validate_target_header(target, headers) {
+            Ok(header) => header,
+            Err(error) => {
+                // The target is requested by hash, a verified expectation:
+                // another block is invalid, while none says the peer lags.
+                let (outcome, detail) =
+                    match classify_response_failure(&error, ExpectationTrust::Verified) {
+                        ResponseFault::Invalid => (
+                            PeerQualification::Rejected,
+                            "peer returned a mismatched verified anchor header",
+                        ),
+                        ResponseFault::Disagreement => (
+                            PeerQualification::Lagging,
+                            "verified anchor header was not served",
+                        ),
+                    };
+                return PeerQualificationResult {
+                    target,
+                    peer_id: peer.peer_id,
+                    outcome,
+                    detail: Some(detail.to_owned()),
+                    header_elapsed: Some(header_elapsed),
+                    body_elapsed: None,
+                };
+            }
         };
-        if !headers.is_empty()
-            || header.number != target.number.0
-            || header.hash_slow() != B256::from(*target.hash.as_array())
-        {
-            return PeerQualificationResult {
-                target,
-                peer_id: peer.peer_id,
-                outcome: PeerQualification::Rejected,
-                detail: Some("peer returned a mismatched verified anchor header".to_owned()),
-                header_elapsed: Some(header_elapsed),
-                body_elapsed: None,
-            };
-        }
-        let permit = match request_gate
-            .acquire(request_limit, priority, &cancellation)
-            .await
-        {
+        let permit = match request_gate.acquire(Priority::Normal, &cancellation).await {
             Ok(permit) => permit,
             Err(error) => {
                 return PeerQualificationResult {
@@ -1927,21 +2204,25 @@ async fn qualify_execution_peer(
                     header_elapsed: Some(header_elapsed),
                     body_elapsed: Some(body_elapsed),
                 },
-                Err(P2pError::IncompleteResponse { .. }) => PeerQualificationResult {
-                    target,
-                    peer_id: peer.peer_id,
-                    outcome: PeerQualification::HeadersOnly,
-                    detail: Some("verified anchor body was not served".to_owned()),
-                    header_elapsed: Some(header_elapsed),
-                    body_elapsed: Some(body_elapsed),
-                },
-                Err(error) => PeerQualificationResult {
-                    target,
-                    peer_id: peer.peer_id,
-                    outcome: PeerQualification::Rejected,
-                    detail: Some(error.to_string()),
-                    header_elapsed: Some(header_elapsed),
-                    body_elapsed: Some(body_elapsed),
+                // The body answers to the target header's commitments, a
+                // verified expectation.
+                Err(error) => match classify_response_failure(&error, ExpectationTrust::Verified) {
+                    ResponseFault::Disagreement => PeerQualificationResult {
+                        target,
+                        peer_id: peer.peer_id,
+                        outcome: PeerQualification::HeadersOnly,
+                        detail: Some("verified anchor body was not served".to_owned()),
+                        header_elapsed: Some(header_elapsed),
+                        body_elapsed: Some(body_elapsed),
+                    },
+                    ResponseFault::Invalid => PeerQualificationResult {
+                        target,
+                        peer_id: peer.peer_id,
+                        outcome: PeerQualification::Rejected,
+                        detail: Some(error.to_string()),
+                        header_elapsed: Some(header_elapsed),
+                        body_elapsed: Some(body_elapsed),
+                    },
                 },
             },
             Err(error) => PeerQualificationResult {
@@ -2001,11 +2282,6 @@ fn spawn_peer_qualification_worker(
             } else {
                 1
             };
-            let priority = if ready == 0 {
-                Priority::High
-            } else {
-                Priority::Normal
-            };
             if tasks.len() < qualification_concurrency {
                 let mut candidates = direct_peers.snapshot();
                 candidates.sort_by_key(|peer| std::cmp::Reverse(quality.rank(peer.peer_id)));
@@ -2027,8 +2303,6 @@ fn spawn_peer_qualification_worker(
                         target,
                         request_timeout,
                         request_gate.clone(),
-                        concurrency,
-                        priority,
                         shutdown.clone(),
                     )));
                 }
@@ -2060,7 +2334,7 @@ fn spawn_peer_qualification_worker(
                         continue;
                     };
                     pending.remove(&result.peer_id);
-                    if result.target != target {
+                    if !same_qualification_target(result.target, target) {
                         continue;
                     }
                     if let Some(elapsed) = result.header_elapsed
@@ -2123,7 +2397,7 @@ fn spawn_peer_qualification_worker(
                         retry_at.insert(result.peer_id, Instant::now() + delay);
                         if matches!(result.outcome, PeerQualification::Rejected) {
                             handle.ban_peer(result.peer_id);
-                            direct_peers.remove(result.peer_id);
+                            direct_peers.invalidate(result.peer_id);
                             qualifications.remove(result.peer_id);
                         }
                     }
@@ -2545,6 +2819,13 @@ where
             body_serving_peer_target,
             shutdown.clone(),
         );
+        let direct_peer_reconciler = spawn_direct_peer_reconciler(
+            manager.as_ref().get_ref().handle().clone(),
+            direct_peers.clone(),
+            qualifications.clone(),
+            request_timeout,
+            shutdown.clone(),
+        );
         let mut network_events_open = true;
         let mut zero_peers_since = Some(tokio::time::Instant::now());
         let mut peer_store_flush = tokio::time::interval_at(
@@ -2593,11 +2874,10 @@ where
                                 peer_id: info.peer_id,
                                 eth_version: info.version,
                                 messages,
-                                advertised_head: info.status.latest_block,
                             });
                         }
                         Some(NetworkEvent::Peer(PeerEvent::SessionClosed { peer_id, reason })) => {
-                            direct_peers.remove(peer_id);
+                            direct_peers.session_closed(peer_id);
                             qualifications.remove(peer_id);
                             let classified = classify_disconnect_reason(reason);
                             if disconnect_invalidates_service_evidence(classified) {
@@ -2649,6 +2929,8 @@ where
         let _ = cached_peer_admitter.await;
         qualification_worker.abort();
         let _ = qualification_worker.await;
+        direct_peer_reconciler.abort();
+        let _ = direct_peer_reconciler.await;
         let (response, persisted) = tokio::sync::oneshot::channel();
         let final_request = PeerPersistenceRequest {
             records: manager.as_ref().get_ref().all_peers().collect(),
@@ -2666,6 +2948,171 @@ where
         drop(persistence_requests);
         let _ = persistence_worker.await;
         direct_peers.clear();
+    })
+}
+
+/// One direct-peer pool entry as the session reconciler sees it.
+#[derive(Clone, Copy, Debug)]
+struct PooledPeerSession {
+    peer_id: B512,
+    connection_id: u64,
+    sender_open: bool,
+}
+
+/// Pool entries to drop and Reth sessions to adopt.
+#[derive(Debug, Default, Eq, PartialEq)]
+struct DirectPeerReconciliation {
+    /// Entries, by peer and connection, whose session is gone.
+    stale: Vec<(B512, u64)>,
+    /// Active sessions the pool does not hold.
+    missing: Vec<B512>,
+    /// Missing sessions the previous reconciliation found missing too.
+    adopt: Vec<B512>,
+}
+
+/// Diff the direct-peer pool against Reth's active sessions. An entry is stale
+/// once its request sender is closed, or when its session is missing from a
+/// snapshot requested after the entry was added; entries added since the
+/// snapshot was requested (`snapshot_connection_id` or later) cannot be judged
+/// by it. Active sessions without an open entry are missing, and are adopted
+/// once the previous reconciliation found them `missing_before` as well: an
+/// event that is merely late, or a session that is closing, such as a peer
+/// banned since the snapshot, leaves the list by then. A peer dropped for
+/// invalid material is never missing while its session lasts: Reth keeps a
+/// trusted peer's session despite the ban.
+fn reconcile_direct_peers(
+    pooled: &[PooledPeerSession],
+    active: &HashSet<B512>,
+    snapshot_connection_id: u64,
+    missing_before: &HashSet<B512>,
+    invalidated: &HashSet<B512>,
+) -> DirectPeerReconciliation {
+    let stale = pooled
+        .iter()
+        .filter(|session| {
+            !session.sender_open
+                || (session.connection_id < snapshot_connection_id
+                    && !active.contains(&session.peer_id))
+        })
+        .map(|session| (session.peer_id, session.connection_id))
+        .collect();
+    let open = pooled
+        .iter()
+        .filter(|session| session.sender_open)
+        .map(|session| session.peer_id)
+        .collect::<HashSet<_>>();
+    let mut missing = active
+        .iter()
+        .filter(|peer_id| !open.contains(*peer_id) && !invalidated.contains(*peer_id))
+        .copied()
+        .collect::<Vec<_>>();
+    missing.sort_unstable();
+    let adopt = missing
+        .iter()
+        .filter(|peer_id| missing_before.contains(*peer_id))
+        .copied()
+        .collect();
+    DirectPeerReconciliation {
+        stale,
+        missing,
+        adopt,
+    }
+}
+
+/// A request sender for a session whose `ActivePeerSession` event was lost.
+/// Its requests reach that session through the network manager, which drops
+/// them, and so fails the request, once the session is gone.
+fn manager_routed_peer_sender(
+    handle: NetworkHandle<EthNetworkPrimitives>,
+    peer_id: B512,
+) -> PeerRequestSender<PeerRequest<EthNetworkPrimitives>> {
+    let (sender, mut requests) = tokio::sync::mpsc::channel(MAX_MATERIAL_REQUESTS_PER_PEER);
+    // The forwarder ends once the pool and every lease drop the sender.
+    drop(tokio::spawn(async move {
+        while let Some(request) = requests.recv().await {
+            handle.send_request(peer_id, request);
+        }
+    }));
+    PeerRequestSender::new(peer_id, sender)
+}
+
+/// Keep the direct-peer pool in step with Reth's active sessions: drop entries
+/// whose session is gone and adopt sessions whose open event was lost.
+fn spawn_direct_peer_reconciler(
+    handle: NetworkHandle<EthNetworkPrimitives>,
+    direct_peers: Arc<DirectPeerPool>,
+    qualifications: Arc<PeerQualificationPool>,
+    request_timeout: Duration,
+    shutdown: CancellationToken,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut reconcile = tokio::time::interval_at(
+            tokio::time::Instant::now() + DIRECT_PEER_RECONCILE_INTERVAL,
+            DIRECT_PEER_RECONCILE_INTERVAL,
+        );
+        reconcile.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut missing_before = HashSet::new();
+        loop {
+            tokio::select! {
+                () = shutdown.cancelled() => break,
+                _ = reconcile.tick() => {}
+            }
+            // Entries added from here on may postdate the session snapshot.
+            let snapshot_connection_id = direct_peers.next_connection_id.load(Ordering::Relaxed);
+            let sessions = match cancellable_timeout(
+                handle.get_all_peers(),
+                request_timeout,
+                &shutdown,
+                "peer sessions",
+            )
+            .await
+            {
+                Ok(sessions) => sessions,
+                Err(P2pError::Cancelled) => break,
+                Err(error) => {
+                    debug!(%error, "could not list execution peer sessions for reconciliation");
+                    continue;
+                }
+            };
+            let active = sessions
+                .iter()
+                .map(|session| session.remote_id)
+                .collect::<HashSet<_>>();
+            let reconciliation = reconcile_direct_peers(
+                &direct_peers.sessions(),
+                &active,
+                snapshot_connection_id,
+                &missing_before,
+                &direct_peers.invalidated(),
+            );
+            missing_before = reconciliation.missing.iter().copied().collect();
+            let mut dropped = 0_usize;
+            for (peer_id, connection_id) in reconciliation.stale {
+                if direct_peers.remove_connection(peer_id, connection_id) {
+                    qualifications.remove(peer_id);
+                    dropped = dropped.saturating_add(1);
+                }
+            }
+            let mut adopted = 0_usize;
+            for session in sessions
+                .into_iter()
+                .filter(|session| reconciliation.adopt.contains(&session.remote_id))
+            {
+                if direct_peers.insert_missing(DirectPeer {
+                    peer_id: session.remote_id,
+                    eth_version: session.eth_version,
+                    messages: manager_routed_peer_sender(handle.clone(), session.remote_id),
+                }) {
+                    adopted = adopted.saturating_add(1);
+                }
+            }
+            if dropped > 0 || adopted > 0 {
+                debug!(
+                    dropped,
+                    adopted, "reconciled direct execution peers with active sessions"
+                );
+            }
+        }
     })
 }
 
@@ -2731,12 +3178,14 @@ fn classify_disconnect_reason(reason: Option<DisconnectReason>) -> NetworkDiscon
     }
 }
 
+/// Only a protocol fault the peer is responsible for invalidates its stored
+/// service evidence. `UselessPeer` is as often a remote peer dropping this
+/// node, which serves no chain data, and TCP subsystem errors are often local
+/// or transient, so neither is held against the peer.
 const fn disconnect_invalidates_service_evidence(reason: NetworkDisconnectReason) -> bool {
     matches!(
         reason,
-        NetworkDisconnectReason::TcpSubsystemError
-            | NetworkDisconnectReason::ProtocolBreach
-            | NetworkDisconnectReason::UselessPeer
+        NetworkDisconnectReason::ProtocolBreach
             | NetworkDisconnectReason::UnexpectedHandshakeIdentity
     )
 }
@@ -2821,7 +3270,10 @@ fn load_or_create_secret_key(path: Option<&Path>) -> Result<SecretKey, P2pError>
         return Ok(rng_secret_key());
     };
     match std::fs::read_to_string(path) {
-        Ok(encoded) => return parse_secret_key(encoded.trim(), path),
+        Ok(encoded) => {
+            restrict_secret_key_permissions(path)?;
+            return parse_secret_key(encoded.trim(), path);
+        }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => {
             return Err(P2pError::InvalidConfig(format!(
@@ -2830,14 +3282,16 @@ fn load_or_create_secret_key(path: Option<&Path>) -> Result<SecretKey, P2pError>
             )));
         }
     }
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|error| {
-            P2pError::InvalidConfig(format!(
-                "failed creating execution P2P identity directory {}: {error}",
-                parent.display()
-            ))
-        })?;
-    }
+    let directory = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(directory).map_err(|error| {
+        P2pError::InvalidConfig(format!(
+            "failed creating execution P2P identity directory {}: {error}",
+            directory.display()
+        ))
+    })?;
     let secret = rng_secret_key();
     let encoded = hex::encode(secret.secret_bytes());
     let sequence = SECRET_KEY_WRITE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
@@ -2852,26 +3306,85 @@ fn load_or_create_secret_key(path: Option<&Path>) -> Result<SecretKey, P2pError>
             temporary.display()
         ))
     })?;
-    file.write_all(encoded.as_bytes()).map_err(|error| {
-        P2pError::InvalidConfig(format!(
-            "failed writing execution P2P identity {}: {error}",
-            temporary.display()
-        ))
-    })?;
-    file.sync_all().map_err(|error| {
-        P2pError::InvalidConfig(format!(
-            "failed syncing execution P2P identity {}: {error}",
-            temporary.display()
-        ))
-    })?;
-    std::fs::rename(&temporary, path).map_err(|error| {
+    // The temporary file is ours from here on: remove it on every failure.
+    let installed = file
+        .write_all(encoded.as_bytes())
+        .map_err(|error| {
+            P2pError::InvalidConfig(format!(
+                "failed writing execution P2P identity {}: {error}",
+                temporary.display()
+            ))
+        })
+        .and_then(|()| {
+            file.sync_all().map_err(|error| {
+                P2pError::InvalidConfig(format!(
+                    "failed syncing execution P2P identity {}: {error}",
+                    temporary.display()
+                ))
+            })
+        })
+        .and_then(|()| {
+            std::fs::rename(&temporary, path).map_err(|error| {
+                P2pError::InvalidConfig(format!(
+                    "failed installing execution P2P identity {}: {error}",
+                    path.display()
+                ))
+            })
+        });
+    drop(file);
+    if let Err(error) = installed {
         let _ = std::fs::remove_file(&temporary);
+        return Err(error);
+    }
+    // A crash must not undo the rename after the identity is in use.
+    #[cfg(unix)]
+    std::fs::File::open(directory)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| {
+            P2pError::InvalidConfig(format!(
+                "failed syncing execution P2P identity directory {}: {error}",
+                directory.display()
+            ))
+        })?;
+    Ok(secret)
+}
+
+/// Restrict an existing identity file that other users can access to 0600:
+/// the key authenticates this node on the execution network.
+#[cfg(unix)]
+fn restrict_secret_key_permissions(path: &Path) -> Result<(), P2pError> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let mode = std::fs::metadata(path)
+        .map_err(|error| {
+            P2pError::InvalidConfig(format!(
+                "failed reading execution P2P identity permissions {}: {error}",
+                path.display()
+            ))
+        })?
+        .permissions()
+        .mode()
+        & 0o777;
+    let group_or_other = mode & 0o077;
+    if group_or_other == 0 {
+        return Ok(());
+    }
+    warn!(
+        path = %path.display(),
+        mode = %format!("{mode:03o}"),
+        "execution P2P identity is accessible to other users; restricting it to 0600"
+    );
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).map_err(|error| {
         P2pError::InvalidConfig(format!(
-            "failed installing execution P2P identity {}: {error}",
+            "failed restricting execution P2P identity {} to 0600: {error}",
             path.display()
         ))
-    })?;
-    Ok(secret)
+    })
+}
+
+#[cfg(not(unix))]
+fn restrict_secret_key_permissions(_path: &Path) -> Result<(), P2pError> {
+    Ok(())
 }
 
 fn parse_secret_key(encoded: &str, path: &Path) -> Result<SecretKey, P2pError> {
@@ -2900,6 +3413,7 @@ struct P2pLiveState {
     recent: VecDeque<BlockRef>,
     required_peer_head: BlockNumber,
     pending_material_attempts: usize,
+    head_poll: HeadPollRotation,
     head_unavailable_since: Option<Instant>,
     reconnect_error: Option<String>,
     disconnect_reported: bool,
@@ -2951,7 +3465,13 @@ impl RethP2pSource {
         let network = Arc::new(PersistentNetwork {
             state: tokio::sync::Mutex::new(None),
             next_generation: AtomicU64::new(1),
-            request_gate: Arc::new(MaterialRequestGate::default()),
+            // One global limit for every lane: history header proofs may use
+            // their own configured concurrency, bodies and receipts theirs.
+            request_gate: Arc::new(MaterialRequestGate::new(
+                config
+                    .material_request_concurrency
+                    .max(config.history_header_request_concurrency),
+            )),
             direct_peers: Arc::new(DirectPeerPool::new(peer_store.clone())),
             peer_store,
             qualifications: Arc::new(PeerQualificationPool::new(initial_target)),
@@ -3006,7 +3526,7 @@ impl RethP2pSource {
         if let Some(running) = state.as_ref() {
             running.handle.update_status(block_status_head(head));
             running.qualification_target.send_if_modified(|current| {
-                if *current == head {
+                if same_qualification_target(*current, head) {
                     false
                 } else {
                     *current = head;
@@ -3131,7 +3651,11 @@ impl RethP2pSource {
             .fetch_headers(
                 &session.fetch,
                 range,
-                Some(head_hash),
+                // The head was discovered from peer claims.
+                Some(ExpectedTip {
+                    hash: head_hash,
+                    trust: ExpectationTrust::Unverified,
+                }),
                 false,
                 MaterialRequestPolicy {
                     concurrency: budget.max_in_flight_requests,
@@ -3286,7 +3810,7 @@ impl RethP2pSource {
             let permit = self
                 .network
                 .request_gate
-                .acquire(request_limit, policy.priority, cancellation)
+                .acquire(policy.priority, cancellation)
                 .await?;
             self.config
                 .network_telemetry
@@ -3338,7 +3862,11 @@ impl RethP2pSource {
                                 request_started_at.elapsed(),
                                 P2pRequestOutcome::Failed,
                             );
-                            if matches!(error, P2pError::InvalidResponse(_)) {
+                            // Receipts requested by hash answer to their
+                            // header's commitments, a verified expectation.
+                            if classify_response_failure(&error, ExpectationTrust::Verified)
+                                == ResponseFault::Invalid
+                            {
                                 session.handle.ban_peer(peer);
                                 self.network.invalidate_peer(peer, &error.to_string());
                             } else if matches!(error, P2pError::IncompleteResponse { .. })
@@ -3565,7 +4093,7 @@ impl RethP2pSource {
         if let Some(running) = state.as_ref() {
             running.handle.update_status(block_status_head(advertised));
             running.qualification_target.send_if_modified(|current| {
-                if *current == advertised {
+                if same_qualification_target(*current, advertised) {
                     false
                 } else {
                     *current = advertised;
@@ -3714,7 +4242,7 @@ impl RethP2pSource {
         &self,
         session: &P2pSession,
         range: BlockRange,
-        expected_tip: Option<BlockHash>,
+        expected_tip: Option<ExpectedTip>,
         budget: SourceBudget,
         cancellation: &CancellationToken,
     ) -> Result<(Vec<BlockFrame>, usize), P2pError> {
@@ -3725,6 +4253,7 @@ impl RethP2pSource {
                 session,
                 range,
                 expected_tip,
+                None,
                 MaterialRequestPolicy {
                     concurrency: budget.max_in_flight_requests,
                     priority: Priority::High,
@@ -3741,9 +4270,11 @@ impl RethP2pSource {
         };
         let hashes = headers.iter().map(Sealable::hash_slow).collect::<Vec<_>>();
         session.set_phase(NetworkPhase::FetchingBodies);
+        // Live material, like the rest of the live lane, may use the request
+        // slots reserved for live requests.
         let material_policy = MaterialRequestPolicy {
             concurrency: budget.max_in_flight_requests,
-            priority: Priority::Normal,
+            priority: Priority::High,
         };
         let body_result = if let ([header], [hash]) = (headers.as_slice(), hashes.as_slice()) {
             self.fetch_live_body_from_untried_peers(
@@ -3821,7 +4352,7 @@ impl RethP2pSource {
         &self,
         session: &P2pSession,
         range: BlockRange,
-        expected_tip: Option<BlockHash>,
+        expected_tip: Option<ExpectedTip>,
         request: &DataRequest,
         budget: SourceBudget,
         cancellation: &CancellationToken,
@@ -3844,6 +4375,7 @@ impl RethP2pSource {
                 session,
                 range,
                 expected_tip,
+                None,
                 MaterialRequestPolicy {
                     concurrency: budget.max_in_flight_requests,
                     priority: Priority::High,
@@ -4011,6 +4543,7 @@ impl RethP2pSource {
         next: BlockNumber,
         request: &DataRequest,
         budget: SourceBudget,
+        head_poll: &mut HeadPollRotation,
         cancellation: &CancellationToken,
     ) -> Result<Option<BlockFrame>, P2pError> {
         session.set_range(Some(BlockRange::single(next)));
@@ -4021,6 +4554,7 @@ impl RethP2pSource {
                 session,
                 range,
                 None,
+                Some(head_poll),
                 MaterialRequestPolicy {
                     concurrency: budget.max_in_flight_requests,
                     priority: Priority::High,
@@ -4123,7 +4657,7 @@ impl RethP2pSource {
         &self,
         advertised: BlockRef,
         range: BlockRange,
-        expected_tip: Option<BlockHash>,
+        expected_tip: Option<ExpectedTip>,
         request: &DataRequest,
         budget: SourceBudget,
         cancellation: &CancellationToken,
@@ -4217,43 +4751,38 @@ impl RethP2pSource {
             "peer status",
         )
         .await?;
-        let mut declared = BTreeMap::<(u64, [u8; 32]), usize>::new();
-        let mut unknown_hashes = Vec::new();
-        for peer in peers {
-            if let Some(number) = peer.status.latest_block {
-                if number < minimum.0 {
-                    debug!(
-                        peer_head = number,
-                        required_head = minimum.0,
-                        "execution peer is behind the required live head; retaining it for a grace retry"
-                    );
-                    continue;
-                }
-                let key = (number, peer.status.blockhash.0);
-                *declared.entry(key).or_default() += 1;
-            } else if peer.status.blockhash != B256::ZERO {
-                unknown_hashes.push((peer.remote_id, peer.status.blockhash));
-            }
+        let declared = declared_peer_heads(
+            peers.iter().map(|peer| {
+                (
+                    peer.remote_id,
+                    peer.status.latest_block,
+                    peer.status.blockhash,
+                )
+            }),
+            minimum,
+        );
+        if let Some((number, hash)) = declared.head {
+            return Ok(settle_discovered_head(
+                &session.telemetry,
+                DiscoveredHead::Claimed(number, hash),
+            ));
         }
-        if let Some(((number, hash), _)) = declared
-            .into_iter()
-            .max_by_key(|((number, _), count)| (*count, *number))
-        {
-            session.observe_head(BlockNumber(number));
-            return Ok((BlockNumber(number), BlockHash::new(hash)));
-        }
+        let unknown_hashes = declared.hash_only;
         // Asking for the exact minimum first uses the dynamic direct-peer
-        // scheduler: newly established sessions join this request while older
-        // peers are still pending. Resolving status-only head hashes remains a
-        // fallback for peers that cannot serve the minimum by number.
-        if let Some((head, serving_peer)) = self
+        // scheduler: the minimum exists, so the request races every eligible
+        // peer, and newly established sessions join it while older peers are
+        // still pending. Resolving status-only head hashes remains a fallback
+        // for peers that cannot serve the minimum by number.
+        if let Some(((number, hash), serving_peer)) = self
             .minimum_live_head(session, minimum, cancellation)
             .await?
         {
+            let validated =
+                settle_discovered_head(&session.telemetry, DiscoveredHead::Validated(number, hash));
             if let Some((_, advertised_hash)) = unknown_hashes
                 .iter()
                 .find(|(peer_id, _)| *peer_id == serving_peer)
-                && let Some(advertised_head) = self
+                && let Some((number, hash)) = self
                     .resolve_advertised_peer_head(
                         session,
                         vec![(serving_peer, *advertised_hash)],
@@ -4262,16 +4791,22 @@ impl RethP2pSource {
                     )
                     .await?
             {
-                return Ok(advertised_head);
+                return Ok(settle_discovered_head(
+                    &session.telemetry,
+                    DiscoveredHead::Claimed(number, hash),
+                ));
             }
-            return Ok(head);
+            return Ok(validated);
         }
 
-        if let Some(head) = self
+        if let Some((number, hash)) = self
             .resolve_advertised_peer_head(session, unknown_hashes, minimum, cancellation)
             .await?
         {
-            return Ok(head);
+            return Ok(settle_discovered_head(
+                &session.telemetry,
+                DiscoveredHead::Claimed(number, hash),
+            ));
         }
 
         Err(P2pError::Request {
@@ -4336,9 +4871,9 @@ impl RethP2pSource {
                 self.network
                     .invalidate_peer(peer_id, "peer did not serve its advertised execution head");
             } else if header.number >= minimum.0 {
-                let head = (BlockNumber(header.number), BlockHash::new(hash.0));
-                session.observe_head(head.0);
-                return Ok(Some(head));
+                // The peer's own header proves only its claim: it steers the
+                // next request but is not observed as a verified head.
+                return Ok(Some((BlockNumber(header.number), BlockHash::new(hash.0))));
             } else {
                 debug!(
                     peer_head = header.number,
@@ -4366,6 +4901,10 @@ impl RethP2pSource {
                 session,
                 range,
                 None,
+                // The minimum is the verified tip or the block after the
+                // finalized anchor: it exists, so this is no head poll, and an
+                // empty reply is a lagging peer.
+                None,
                 MaterialRequestPolicy {
                     concurrency: self.config.material_request_concurrency,
                     priority: Priority::High,
@@ -4381,9 +4920,10 @@ impl RethP2pSource {
         let header = headers
             .pop()
             .expect("one validated minimum live header was returned");
-        let head = (minimum, BlockHash::new(header.hash_slow().0));
-        session.observe_head(minimum);
-        Ok(Some((head, serving_peer)))
+        Ok(Some((
+            (minimum, BlockHash::new(header.hash_slow().0)),
+            serving_peer,
+        )))
     }
 
     async fn wait_for_peer_head(
@@ -4446,7 +4986,11 @@ impl RethP2pSource {
                 .fetch_requested_live_range(
                     &state.session,
                     range,
-                    Some(head_hash),
+                    // The replacement head was discovered from peer claims.
+                    Some(ExpectedTip {
+                        hash: head_hash,
+                        trust: ExpectationTrust::Unverified,
+                    }),
                     &state.request,
                     state.budget,
                     &state.cancellation,
@@ -4497,7 +5041,10 @@ impl RethP2pSource {
                     match validate_descending_headers(head_number, head_hash, &headers) {
                         Ok(()) => return Ok(headers),
                         Err(error) => {
-                            if !matches!(error, P2pError::IncompleteResponse { .. }) {
+                            // The replacement head is a peer claim.
+                            if classify_response_failure(&error, ExpectationTrust::Unverified)
+                                == ResponseFault::Invalid
+                            {
                                 fetch.report_bad_message(peer);
                             }
                             last_error = Some(error);
@@ -4549,15 +5096,7 @@ impl RethP2pSource {
             }));
         }
         let started = Instant::now();
-        let advertised = BlockRef {
-            number: range.end(),
-            hash: expected_tip.unwrap_or(BlockHash::ZERO),
-            parent_hash: BlockHash::ZERO,
-            timestamp: SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs(),
-        };
+        let advertised = Self::probe_advertised_head();
         let (session, connected_peers) = self
             .connect(advertised, NetworkLane::Probe, &cancellation)
             .await?;
@@ -4570,7 +5109,12 @@ impl RethP2pSource {
                 .fetch_headers(
                     &session.fetch,
                     range,
-                    expected_tip,
+                    // Leani has not verified an operator-supplied tip: a
+                    // contradiction fails the probe but never the peer.
+                    expected_tip.map(|hash| ExpectedTip {
+                        hash,
+                        trust: ExpectationTrust::Unverified,
+                    }),
                     false,
                     MaterialRequestPolicy {
                         concurrency: budget.max_in_flight_requests,
@@ -4649,11 +5193,19 @@ impl RethP2pSource {
         result
     }
 
+    /// Status head a fixed-range probe advertises, which also becomes its
+    /// peers' qualification target. A probe has no verified execution head,
+    /// so it advertises genesis: never a zero hash or an operator-supplied tip
+    /// that peers would be qualified, and penalized, against.
+    fn probe_advertised_head() -> BlockRef {
+        Self::mainnet_genesis_block()
+    }
+
     async fn fetch_headers<C>(
         &self,
         fetch: &C,
         range: BlockRange,
-        expected_tip: Option<BlockHash>,
+        expected_tip: Option<ExpectedTip>,
         history_proof: bool,
         policy: MaterialRequestPolicy,
         cancellation: &CancellationToken,
@@ -4662,21 +5214,15 @@ impl RethP2pSource {
         C: HeadersClient<Header = Header> + DownloadClient,
     {
         let mut last_error = None;
+        let expectation = expected_tip.map_or(ExpectationTrust::Unverified, |tip| tip.trust);
         for _ in 0..self.config.retries {
             let request =
                 HeadersRequest::rising(BlockHashOrNumber::Number(range.start().0), range.len());
-            let request_limit = effective_material_concurrency(
-                fetch.num_connected_peers(),
-                self.config
-                    .material_request_concurrency
-                    .max(self.config.history_header_request_concurrency),
-                policy.concurrency,
-            );
             let queued_at = Instant::now();
             let permit = self
                 .network
                 .request_gate
-                .acquire(request_limit, policy.priority, cancellation)
+                .acquire(policy.priority, cancellation)
                 .await?;
             self.config
                 .network_telemetry
@@ -4694,7 +5240,7 @@ impl RethP2pSource {
                 Ok(response) => {
                     let (peer, headers) = response.split();
                     let response_payload_bytes = headers.length();
-                    match validate_headers(range, &headers, expected_tip) {
+                    match validate_headers(range, &headers, expected_tip.map(|tip| tip.hash)) {
                         Ok(()) => {
                             self.config.network_telemetry.request_succeeded();
                             self.request_metrics.record_header(
@@ -4717,7 +5263,9 @@ impl RethP2pSource {
                                 request_started_at.elapsed(),
                                 P2pRequestOutcome::Failed,
                             );
-                            if !matches!(error, P2pError::IncompleteResponse { .. }) {
+                            if classify_response_failure(&error, expectation)
+                                == ResponseFault::Invalid
+                            {
                                 fetch.report_bad_message(peer);
                             }
                             last_error = Some(error);
@@ -4749,7 +5297,6 @@ impl RethP2pSource {
         &self,
         lease: DirectPeerLease,
         range: BlockRange,
-        request_limit: usize,
         priority: Priority,
         cancellation: &CancellationToken,
     ) -> (DirectPeerLease, Duration, Result<Vec<Header>, P2pError>) {
@@ -4757,7 +5304,7 @@ impl RethP2pSource {
         let permit = self
             .network
             .request_gate
-            .acquire(request_limit, priority, cancellation)
+            .acquire(priority, cancellation)
             .await;
         self.config
             .network_telemetry
@@ -4781,17 +5328,24 @@ impl RethP2pSource {
         (lease, request_started_at.elapsed(), response)
     }
 
+    /// Fetch a live header range from the first peer that serves it validly.
+    /// With the lane's `head_poll` rotation, the range is the next block at
+    /// the head, polled from a small cohort of peers not yet asked for it; a
+    /// "not yet" reply then costs a peer nothing until another serves the
+    /// block. Without it, the blocks exist and eligible peers race.
     #[allow(clippy::too_many_lines)]
     async fn fetch_live_headers_from_untried_peers(
         &self,
         session: &P2pSession,
         range: BlockRange,
-        expected_tip: Option<BlockHash>,
+        expected_tip: Option<ExpectedTip>,
+        mut head_poll: Option<&mut HeadPollRotation>,
         policy: MaterialRequestPolicy,
         cancellation: &CancellationToken,
     ) -> Result<(B512, Vec<Header>), P2pError> {
         let mut tried = HashSet::new();
         let mut last_error = None;
+        let expectation = expected_tip.map_or(ExpectationTrust::Unverified, |tip| tip.trust);
         let connected_peers = session.fetch.num_connected_peers();
         let request_limit = effective_material_concurrency(
             connected_peers,
@@ -4799,54 +5353,82 @@ impl RethP2pSource {
             policy.concurrency,
         );
         let per_peer_limit = direct_peer_request_limit(request_limit, connected_peers);
-        let Some(first) = self
-            .network
-            .direct_peers
-            .acquire_excluding(
-                PeerMaterialKind::Header,
-                per_peer_limit,
-                self.config.request_timeout,
-                &tried,
-                None,
-                cancellation,
-            )
-            .await?
-        else {
-            return Err(P2pError::Request {
-                component: "headers",
-                detail: "all connected peers were unexpectedly excluded".to_owned(),
-            });
+        let (fanout, peer_budget) = live_header_fanout(head_poll.is_some(), request_limit);
+        let head_poll_lease = match head_poll.as_deref_mut() {
+            Some(rotation) => self
+                .network
+                .direct_peers
+                .lease_for_head_poll(rotation, per_peer_limit),
+            None => None,
         };
-        tried.insert(first.peer.peer_id);
-        let mut pending = FuturesUnordered::new();
-        pending.push(self.request_live_headers(
-            first,
-            range,
-            request_limit,
-            policy.priority,
-            cancellation,
-        ));
-
-        loop {
-            while pending.len() < request_limit {
-                let Some(lease) = self.network.direct_peers.try_acquire_excluding(
+        let first = if let Some(lease) = head_poll_lease {
+            lease
+        } else {
+            // No eligible peer right now: wait for one.
+            let Some(lease) = self
+                .network
+                .direct_peers
+                .acquire_excluding(
                     PeerMaterialKind::Header,
                     per_peer_limit,
+                    self.config.request_timeout,
                     &tried,
                     None,
-                ) else {
+                    cancellation,
+                )
+                .await?
+            else {
+                return Err(P2pError::Request {
+                    component: "headers",
+                    detail: "all connected peers were unexpectedly excluded".to_owned(),
+                });
+            };
+            if let Some(rotation) = head_poll.as_deref_mut() {
+                rotation.record_asked(lease.peer.peer_id);
+            }
+            lease
+        };
+        tried.insert(first.peer.peer_id);
+        let mut asked = 1_usize;
+        let mut pending = FuturesUnordered::new();
+        pending.push(self.request_live_headers(first, range, policy.priority, cancellation));
+
+        loop {
+            while pending.len() < fanout && asked < peer_budget {
+                let lease = match head_poll.as_deref_mut() {
+                    Some(rotation) => self
+                        .network
+                        .direct_peers
+                        .lease_for_head_poll(rotation, per_peer_limit),
+                    None => self.network.direct_peers.try_acquire_excluding(
+                        PeerMaterialKind::Header,
+                        per_peer_limit,
+                        &tried,
+                        None,
+                    ),
+                };
+                let Some(lease) = lease else {
                     break;
                 };
                 tried.insert(lease.peer.peer_id);
+                asked = asked.saturating_add(1);
                 pending.push(self.request_live_headers(
                     lease,
                     range,
-                    request_limit,
                     policy.priority,
                     cancellation,
                 ));
             }
             if pending.is_empty() {
+                if head_poll.is_some() || asked >= peer_budget {
+                    // The polling cohort has answered; the lane polls again
+                    // later, asking other peers, instead of waiting here for
+                    // a block that is usually not produced yet.
+                    return Err(last_error.unwrap_or_else(|| P2pError::Request {
+                        component: "headers",
+                        detail: "the polled peers did not serve the next block".to_owned(),
+                    }));
+                }
                 match self
                     .network
                     .direct_peers
@@ -4862,10 +5444,10 @@ impl RethP2pSource {
                 {
                     Ok(Some(lease)) => {
                         tried.insert(lease.peer.peer_id);
+                        asked = asked.saturating_add(1);
                         pending.push(self.request_live_headers(
                             lease,
                             range,
-                            request_limit,
                             policy.priority,
                             cancellation,
                         ));
@@ -4885,7 +5467,9 @@ impl RethP2pSource {
             let next = tokio::select! {
                 () = cancellation.cancelled() => return Err(P2pError::Cancelled),
                 response = pending.next() => response,
-                () = self.network.direct_peers.changed.notified(), if pending.len() < request_limit => {
+                () = self.network.direct_peers.changed.notified(),
+                    if pending.len() < fanout && asked < peer_budget =>
+                {
                     continue;
                 }
             };
@@ -4896,9 +5480,12 @@ impl RethP2pSource {
             match response {
                 Ok(headers) => {
                     let response_payload_bytes = headers.length();
-                    match validate_headers(range, &headers, expected_tip) {
+                    match validate_headers(range, &headers, expected_tip.map(|tip| tip.hash)) {
                         Ok(()) => {
                             lease.succeeded();
+                            if let Some(rotation) = head_poll.as_deref_mut() {
+                                rotation.record_served(peer_id);
+                            }
                             self.network.peer_store.record_success(
                                 peer_id,
                                 PeerMaterialKind::Header,
@@ -4918,7 +5505,6 @@ impl RethP2pSource {
                             return Ok((peer_id, headers));
                         }
                         Err(error) => {
-                            lease.failed();
                             self.config.network_telemetry.request_failed();
                             self.request_metrics.record_header(
                                 false,
@@ -4928,9 +5514,18 @@ impl RethP2pSource {
                                 elapsed,
                                 P2pRequestOutcome::Failed,
                             );
-                            if !matches!(error, P2pError::IncompleteResponse { .. }) {
-                                session.handle.ban_peer(peer_id);
-                                self.network.invalidate_peer(peer_id, &error.to_string());
+                            match live_header_reply_cost(&error, expectation, head_poll.is_some()) {
+                                HeaderReplyCost::Ban => {
+                                    lease.failed();
+                                    session.handle.ban_peer(peer_id);
+                                    self.network.invalidate_peer(peer_id, &error.to_string());
+                                }
+                                HeaderReplyCost::Cooldown => lease.failed(),
+                                HeaderReplyCost::NotYet => {
+                                    if let Some(rotation) = head_poll.as_deref_mut() {
+                                        rotation.record_not_yet(peer_id);
+                                    }
+                                }
                             }
                             last_error = Some(error);
                         }
@@ -4958,7 +5553,6 @@ impl RethP2pSource {
         &self,
         lease: DirectPeerLease,
         hash: B256,
-        request_limit: usize,
         priority: Priority,
         cancellation: &CancellationToken,
     ) -> (
@@ -4970,7 +5564,7 @@ impl RethP2pSource {
         let permit = self
             .network
             .request_gate
-            .acquire(request_limit, priority, cancellation)
+            .acquire(priority, cancellation)
             .await;
         self.config
             .network_telemetry
@@ -5031,7 +5625,6 @@ impl RethP2pSource {
                     pending.push(self.request_live_body(
                         lease,
                         hash,
-                        request_limit,
                         policy.priority,
                         cancellation,
                     ));
@@ -5055,7 +5648,6 @@ impl RethP2pSource {
                             pending.push(self.request_live_body(
                                 lease,
                                 hash,
-                                request_limit,
                                 policy.priority,
                                 cancellation,
                             ));
@@ -5143,7 +5735,11 @@ impl RethP2pSource {
                                     elapsed,
                                     P2pRequestOutcome::Failed,
                                 );
-                                if matches!(error, P2pError::IncompleteResponse { .. }) {
+                                // Material requested by hash answers to its
+                                // header's commitments, a verified expectation.
+                                if classify_response_failure(&error, ExpectationTrust::Verified)
+                                    == ResponseFault::Disagreement
+                                {
                                     // An empty latest-material response is not
                                     // malicious, but immediately selecting the
                                     // same peer again can spam a lagging or
@@ -5254,7 +5850,7 @@ impl RethP2pSource {
                 let permit = self
                     .network
                     .request_gate
-                    .acquire(request_limit, policy.priority, cancellation)
+                    .acquire(policy.priority, cancellation)
                     .await?;
                 self.config
                     .network_telemetry
@@ -5315,7 +5911,9 @@ impl RethP2pSource {
                                     request_started_at.elapsed(),
                                     P2pRequestOutcome::Failed,
                                 );
-                                if matches!(error, P2pError::IncompleteResponse { .. }) {
+                                if classify_response_failure(&error, ExpectationTrust::Verified)
+                                    == ResponseFault::Disagreement
+                                {
                                     // See the matching live-body path: prefer
                                     // fresh peers and retry only this material
                                     // lane after its local cooldown.
@@ -5395,16 +5993,11 @@ impl RethP2pSource {
             self.config.retries
         };
         for attempt in 0..attempts {
-            let request_limit = effective_material_concurrency(
-                fetch.num_connected_peers(),
-                self.config.material_request_concurrency,
-                policy.concurrency,
-            );
             let queued_at = Instant::now();
             let permit = self
                 .network
                 .request_gate
-                .acquire(request_limit, policy.priority, cancellation)
+                .acquire(policy.priority, cancellation)
                 .await?;
             self.config
                 .network_telemetry
@@ -5448,7 +6041,11 @@ impl RethP2pSource {
                                 request_started_at.elapsed(),
                                 P2pRequestOutcome::Failed,
                             );
-                            if !matches!(error, P2pError::IncompleteResponse { .. }) {
+                            // Material requested by hash answers to its
+                            // header's commitments, a verified expectation.
+                            if classify_response_failure(&error, ExpectationTrust::Verified)
+                                == ResponseFault::Invalid
+                            {
                                 fetch.report_bad_message(peer);
                             }
                             last_error = Some(error);
@@ -5603,16 +6200,11 @@ impl RethP2pSource {
             self.config.retries
         };
         for attempt in 0..attempts {
-            let request_limit = effective_material_concurrency(
-                fetch.num_connected_peers(),
-                self.config.material_request_concurrency,
-                policy.concurrency,
-            );
             let queued_at = Instant::now();
             let permit = self
                 .network
                 .request_gate
-                .acquire(request_limit, policy.priority, cancellation)
+                .acquire(policy.priority, cancellation)
                 .await?;
             self.config
                 .network_telemetry
@@ -5654,7 +6246,11 @@ impl RethP2pSource {
                                 request_started_at.elapsed(),
                                 P2pRequestOutcome::Failed,
                             );
-                            if !matches!(error, P2pError::IncompleteResponse { .. }) {
+                            // Material requested by hash answers to its
+                            // header's commitments, a verified expectation.
+                            if classify_response_failure(&error, ExpectationTrust::Verified)
+                                == ResponseFault::Invalid
+                            {
                                 fetch.report_bad_message(peer);
                             }
                             last_error = Some(error);
@@ -6037,7 +6633,12 @@ impl RethP2pHistorySource {
             .fetch_headers(
                 &session.fetch,
                 requested,
-                Some(expected_tip),
+                // Proven by the header chain that links to the finalized
+                // consensus anchor.
+                Some(ExpectedTip {
+                    hash: expected_tip,
+                    trust: ExpectationTrust::Verified,
+                }),
                 false,
                 MaterialRequestPolicy {
                     concurrency: budget.max_in_flight_requests,
@@ -6441,7 +7042,7 @@ impl RethP2pHistorySource {
                 .source
                 .network
                 .request_gate
-                .acquire(request_limit, policy.priority, cancellation)
+                .acquire(policy.priority, cancellation)
                 .await?;
             self.source
                 .config
@@ -6494,7 +7095,11 @@ impl RethP2pHistorySource {
                                 request_started_at.elapsed(),
                                 P2pRequestOutcome::Failed,
                             );
-                            if matches!(error, P2pError::InvalidResponse(_)) {
+                            // Receipts requested by hash answer to their
+                            // header's commitments, a verified expectation.
+                            if classify_response_failure(&error, ExpectationTrust::Verified)
+                                == ResponseFault::Invalid
+                            {
                                 session.handle.ban_peer(peer_id);
                                 self.source
                                     .network
@@ -7313,7 +7918,11 @@ impl LiveSource for RethP2pSource {
                 .connect_and_fetch_requested_live_range(
                     anchor,
                     range,
-                    Some(anchor.hash),
+                    // The overlap ends at the consensus-verified anchor.
+                    Some(ExpectedTip {
+                        hash: anchor.hash,
+                        trust: ExpectationTrust::Verified,
+                    }),
                     &request,
                     budget,
                     &cancellation,
@@ -7361,6 +7970,7 @@ impl LiveSource for RethP2pSource {
             recent,
             required_peer_head,
             pending_material_attempts: 0,
+            head_poll: HeadPollRotation::default(),
             head_unavailable_since: None,
             reconnect_error: None,
             disconnect_reported: false,
@@ -7449,6 +8059,15 @@ async fn next_live_event(
         };
         let next = state.last.number.0.saturating_add(1);
         if head_number.0 < next {
+            // Peers that answered "not yet" for a block the lane has since
+            // moved past withheld or lagged a block another peer served.
+            for peer_id in state.head_poll.begin_poll(BlockNumber(next)) {
+                state
+                    .source
+                    .network
+                    .direct_peers
+                    .record_material_failure(peer_id, PeerMaterialKind::Header);
+            }
             match state
                 .source
                 .poll_next_verified_frame(
@@ -7456,6 +8075,7 @@ async fn next_live_event(
                     BlockNumber(next),
                     &state.request,
                     state.budget,
+                    &mut state.head_poll,
                     &state.cancellation,
                 )
                 .await
@@ -7523,7 +8143,12 @@ async fn next_live_event(
                 return Some((Err(SourceError::Protocol(error.to_string())), state));
             }
         };
-        let expected_tip = (end == head_number.0).then_some(head_hash);
+        // The discovered head is a peer claim: peers that contradict it are
+        // not penalized for it.
+        let expected_tip = (end == head_number.0).then_some(ExpectedTip {
+            hash: head_hash,
+            trust: ExpectationTrust::Unverified,
+        });
         let frames = state
             .source
             .fetch_requested_live_range(
@@ -7570,7 +8195,81 @@ async fn next_live_event(
             let event = reconstruct_reorg_event(&mut state, head_number, head_hash).await;
             return Some((Ok(event), state));
         }
+        // Validated headers linked to the verified tip are the heads the
+        // session observes; the claimed head above them is not.
+        if let Some(tip) = frames.last() {
+            state.session.observe_head(tip.block.number);
+        }
         state.queued.extend(frames);
+    }
+}
+
+/// Heads that peers declared in their handshake statuses.
+#[derive(Debug, Default, Eq, PartialEq)]
+struct DeclaredPeerHeads {
+    /// The most commonly declared head at or above the required minimum.
+    head: Option<(BlockNumber, BlockHash)>,
+    /// Peers that declared only a head hash.
+    hash_only: Vec<(B512, B256)>,
+}
+
+/// Collect the heads peers declared in their handshake statuses. Declared
+/// heads are peer claims: they may steer requests as unverified expectations
+/// but never become the session's observed head.
+fn declared_peer_heads(
+    statuses: impl IntoIterator<Item = (B512, Option<u64>, B256)>,
+    minimum: BlockNumber,
+) -> DeclaredPeerHeads {
+    let mut declared = BTreeMap::<(u64, [u8; 32]), usize>::new();
+    let mut unknown_hashes = Vec::new();
+    for (peer_id, latest_block, blockhash) in statuses {
+        if let Some(number) = latest_block {
+            if number < minimum.0 {
+                debug!(
+                    peer_head = number,
+                    required_head = minimum.0,
+                    "execution peer is behind the required live head; retaining it for a grace retry"
+                );
+                continue;
+            }
+            let key = (number, blockhash.0);
+            *declared.entry(key).or_default() += 1;
+        } else if blockhash != B256::ZERO {
+            unknown_hashes.push((peer_id, blockhash));
+        }
+    }
+    DeclaredPeerHeads {
+        head: declared
+            .into_iter()
+            .max_by_key(|((number, _), count)| (*count, *number))
+            .map(|((number, hash), _)| (BlockNumber(number), BlockHash::new(hash))),
+        hash_only: unknown_hashes,
+    }
+}
+
+/// How head discovery learned a head.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DiscoveredHead {
+    /// A peer's claim: its handshake status, or its own header for the hash
+    /// it advertised. It steers the next request only.
+    Claimed(BlockNumber, BlockHash),
+    /// A header this node validated at a block it requested.
+    Validated(BlockNumber, BlockHash),
+}
+
+/// Settle a discovered head on the session. Only a validated head advances
+/// the session's observed head; a claim is returned to steer the next
+/// request, and nothing else.
+fn settle_discovered_head(
+    telemetry: &NetworkSessionTelemetry,
+    head: DiscoveredHead,
+) -> (BlockNumber, BlockHash) {
+    match head {
+        DiscoveredHead::Claimed(number, hash) => (number, hash),
+        DiscoveredHead::Validated(number, hash) => {
+            telemetry.observe_head(number);
+            (number, hash)
+        }
     }
 }
 
@@ -7683,6 +8382,7 @@ fn should_retry_session_error(config: &RethP2pConfig, attempts: usize, error: &P
             | P2pError::Timeout { .. }
             | P2pError::Request { .. }
             | P2pError::InvalidResponse(_)
+            | P2pError::ExpectationMismatch(_)
             | P2pError::IncompleteResponse { .. }
     ) && should_retry_session(config, attempts)
 }
@@ -7997,6 +8697,54 @@ async fn request_direct_receipts70(
     })
 }
 
+/// Whether the expectation a peer response is checked against was verified
+/// independently of the peers that serve it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ExpectationTrust {
+    /// A consensus-verified anchor, or a hash proven to link to one.
+    Verified,
+    /// A peer claim, such as a handshake-status head, that honest peers on
+    /// another branch or behind the claim may contradict.
+    Unverified,
+}
+
+/// An expected tip hash and the trust of its source.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ExpectedTip {
+    hash: BlockHash,
+    trust: ExpectationTrust,
+}
+
+/// Penalty class of a peer response that failed validation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ResponseFault {
+    /// Broken commitments, structure or block numbers, or a contradiction of a
+    /// verified expectation: ban the session and persist the failure.
+    Invalid,
+    /// A mismatch with an unverified expectation, or an empty, short or
+    /// unknown reply: no ban and no persisted failure, at most a short local
+    /// cooldown.
+    Disagreement,
+}
+
+/// Classify a peer response that failed validation against an expectation of
+/// the given trust. Only material that breaks its own commitments, or that
+/// contradicts a verified expectation, proves the peer invalid: honest peers
+/// on another branch, or behind a claimed head, contradict unverified ones.
+const fn classify_response_failure(
+    error: &P2pError,
+    expectation: ExpectationTrust,
+) -> ResponseFault {
+    match error {
+        P2pError::InvalidResponse(_) => ResponseFault::Invalid,
+        P2pError::ExpectationMismatch(_) => match expectation {
+            ExpectationTrust::Verified => ResponseFault::Invalid,
+            ExpectationTrust::Unverified => ResponseFault::Disagreement,
+        },
+        _ => ResponseFault::Disagreement,
+    }
+}
+
 fn validate_headers(
     range: BlockRange,
     headers: &[Header],
@@ -8032,12 +8780,33 @@ fn validate_headers(
     if let (Some(expected), Some(tip)) = (expected_tip, headers.last())
         && tip.hash_slow() != B256::from(*expected.as_array())
     {
-        return Err(P2pError::InvalidResponse(format!(
+        return Err(P2pError::ExpectationMismatch(format!(
             "tip hash {}, expected {expected}",
             tip.hash_slow()
         )));
     }
     Ok(())
+}
+
+/// Validate a reply to a request for the qualification target by hash: the
+/// target block, and only it. No block is an incomplete reply.
+fn validate_target_header(target: BlockRef, mut headers: Vec<Header>) -> Result<Header, P2pError> {
+    let Some(header) = headers.pop() else {
+        return Err(P2pError::IncompleteResponse {
+            component: "headers",
+            returned: 0,
+            expected: 1,
+        });
+    };
+    if !headers.is_empty()
+        || header.number != target.number.0
+        || header.hash_slow() != B256::from(*target.hash.as_array())
+    {
+        return Err(P2pError::InvalidResponse(
+            "peer returned a mismatched verified anchor header".to_owned(),
+        ));
+    }
+    Ok(header)
 }
 
 #[cfg(test)]
@@ -8073,10 +8842,18 @@ fn validate_descending_headers(
             "empty descending header response".to_owned(),
         ));
     };
-    if first.number != head_number.0 || first.hash_slow() != B256::from(*head_hash.as_array()) {
+    // The request is by hash: another block breaks the protocol, while the
+    // requested block at another height only contradicts the claimed number.
+    if first.hash_slow() != B256::from(*head_hash.as_array()) {
         return Err(P2pError::InvalidResponse(
-            "descending header response does not start at the declared head".to_owned(),
+            "descending header response does not start at the requested head".to_owned(),
         ));
+    }
+    if first.number != head_number.0 {
+        return Err(P2pError::ExpectationMismatch(format!(
+            "requested head is block {}, expected {}",
+            first.number, head_number.0
+        )));
     }
     for pair in headers.windows(2) {
         let newer = &pair[0];
@@ -9192,6 +9969,11 @@ pub enum P2pError {
     },
     #[error("invalid peer response: {0}")]
     InvalidResponse(String),
+    /// A self-consistent response that contradicts the block the request
+    /// expected. Whether that proves the peer invalid depends on how the
+    /// expectation was obtained.
+    #[error("peer response contradicts the expected chain: {0}")]
+    ExpectationMismatch(String),
     #[error("incomplete peer {component} response: returned {returned}, expected {expected}")]
     IncompleteResponse {
         component: &'static str,
@@ -9207,7 +9989,9 @@ impl From<P2pError> for SourceError {
         match error {
             P2pError::Cancelled => Self::Cancelled,
             P2pError::Source(error) => error,
-            P2pError::InvalidResponse(detail) => Self::CorruptFrame(detail),
+            P2pError::InvalidResponse(detail) | P2pError::ExpectationMismatch(detail) => {
+                Self::CorruptFrame(detail)
+            }
             P2pError::PeerTimeout { .. } | P2pError::Network(_) => {
                 Self::Unavailable(error.to_string())
             }
@@ -10114,7 +10898,6 @@ mod tests {
             peer_id,
             eth_version: EthVersion::Eth68,
             messages: PeerRequestSender::new(peer_id, sender),
-            advertised_head: Some(header.number),
         };
         let responder = tokio::spawn(async move {
             let PeerRequest::GetBlockHeaders { response, .. } =
@@ -10136,9 +10919,7 @@ mod tests {
             peer,
             target,
             Duration::from_secs(1),
-            Arc::new(MaterialRequestGate::default()),
-            1,
-            Priority::High,
+            Arc::new(MaterialRequestGate::new(1)),
             CancellationToken::new(),
         )
         .await;
@@ -10198,7 +10979,6 @@ mod tests {
             peer_id,
             eth_version: EthVersion::Eth68,
             messages: PeerRequestSender::new(peer_id, sender),
-            advertised_head: None,
         });
 
         assert_eq!(pool.len(), 1, "the physical session satisfies the floor");
@@ -10661,7 +11441,6 @@ mod tests {
                 peer_id,
                 eth_version: EthVersion::Eth68,
                 messages: PeerRequestSender::new(peer_id, sender),
-                advertised_head: None,
             });
             pool.set_qualification(peer_id, PeerQualification::BodyServing);
         }
@@ -10756,7 +11535,6 @@ mod tests {
                 peer_id,
                 eth_version: EthVersion::Eth68,
                 messages: PeerRequestSender::new(peer_id, sender),
-                advertised_head: None,
             });
             pool.set_qualification(peer_id, PeerQualification::BodyServing);
         }
@@ -10786,7 +11564,6 @@ mod tests {
             peer_id: fresh_peer,
             eth_version: EthVersion::Eth68,
             messages: PeerRequestSender::new(fresh_peer, sender),
-            advertised_head: None,
         });
         pool.set_qualification(fresh_peer, PeerQualification::BodyServing);
         let lease = pool
@@ -10815,7 +11592,6 @@ mod tests {
             peer_id,
             eth_version: EthVersion::Eth68,
             messages: PeerRequestSender::new(peer_id, sender),
-            advertised_head: None,
         });
         pool.set_qualification(peer_id, PeerQualification::HeadersOnly);
 
@@ -10859,7 +11635,6 @@ mod tests {
             peer_id,
             eth_version: EthVersion::Eth68,
             messages: PeerRequestSender::new(peer_id, first_sender),
-            advertised_head: None,
         });
         let mut stale_lease = pool
             .try_acquire_excluding(PeerMaterialKind::Body, 1, &HashSet::new(), None)
@@ -10872,7 +11647,6 @@ mod tests {
             peer_id,
             eth_version: EthVersion::Eth68,
             messages: PeerRequestSender::new(peer_id, second_sender),
-            advertised_head: None,
         });
         let current = pool
             .try_acquire_excluding(PeerMaterialKind::Body, 1, &HashSet::new(), None)
@@ -10911,7 +11685,9 @@ mod tests {
         let network = PersistentNetwork {
             state: tokio::sync::Mutex::new(None),
             next_generation: AtomicU64::new(1),
-            request_gate: Arc::new(MaterialRequestGate::default()),
+            request_gate: Arc::new(MaterialRequestGate::new(
+                DEFAULT_MATERIAL_REQUEST_CONCURRENCY,
+            )),
             direct_peers: direct_peers.clone(),
             peer_store: peer_store.clone(),
             qualifications: Arc::new(PeerQualificationPool::new(
@@ -10924,7 +11700,6 @@ mod tests {
             peer_id,
             eth_version: EthVersion::Eth68,
             messages: PeerRequestSender::new(peer_id, sender),
-            advertised_head: None,
         });
         peer_store.record_success(
             peer_id,
@@ -10949,7 +11724,6 @@ mod tests {
             peer_id,
             eth_version: EthVersion::Eth68,
             messages: PeerRequestSender::new(peer_id, sender),
-            advertised_head: None,
         };
         let hash = B256::from([0x55; 32]);
         let responder = tokio::spawn(async move {
@@ -10984,7 +11758,6 @@ mod tests {
             peer_id,
             eth_version: EthVersion::Eth68,
             messages: PeerRequestSender::new(peer_id, sender),
-            advertised_head: None,
         };
         let hash = B256::from([0x77; 32]);
         let responder = tokio::spawn(async move {
@@ -11015,10 +11788,10 @@ mod tests {
 
     #[tokio::test]
     async fn live_head_requests_take_the_next_available_material_slot() {
-        let gate = Arc::new(MaterialRequestGate::default());
+        let gate = Arc::new(MaterialRequestGate::new(1));
         let cancellation = CancellationToken::new();
         let occupied = gate
-            .acquire(1, Priority::Normal, &cancellation)
+            .acquire(Priority::Normal, &cancellation)
             .await
             .expect("initial slot");
         let (order, mut observed) = tokio::sync::mpsc::unbounded_channel();
@@ -11028,7 +11801,7 @@ mod tests {
         let normal_order = order.clone();
         let normal = tokio::spawn(async move {
             let _permit = normal_gate
-                .acquire(1, Priority::Normal, &normal_cancellation)
+                .acquire(Priority::Normal, &normal_cancellation)
                 .await
                 .expect("normal slot");
             normal_order.send("normal").expect("record normal");
@@ -11039,7 +11812,7 @@ mod tests {
         let high_cancellation = cancellation.clone();
         let high = tokio::spawn(async move {
             let _permit = high_gate
-                .acquire(1, Priority::High, &high_cancellation)
+                .acquire(Priority::High, &high_cancellation)
                 .await
                 .expect("high-priority slot");
             order.send("high").expect("record high priority");
@@ -11309,5 +12082,783 @@ mod tests {
             )
             .await;
         assert!(matches!(result, Err(SourceError::InvalidPlan(_))));
+    }
+
+    #[test]
+    fn failed_responses_are_invalid_only_against_verified_expectations() {
+        use ExpectationTrust::{Unverified, Verified};
+        use ResponseFault::{Disagreement, Invalid};
+
+        let (range, headers, bodies, _) = empty_fixture();
+        let other_tip = BlockHash::new([0x99; 32]);
+        let tip_mismatch =
+            validate_headers(range, &headers, Some(other_tip)).expect_err("another tip");
+        let mut discontinuous = headers.clone();
+        discontinuous[1].parent_hash = B256::ZERO;
+        let broken_continuity =
+            validate_headers(range, &discontinuous, None).expect_err("broken continuity");
+        let mut renumbered = headers.clone();
+        renumbered[0].number = 9;
+        let wrong_number = validate_headers(range, &renumbered, None).expect_err("wrong number");
+        let short = validate_headers(range, &headers[..1], None).expect_err("short reply");
+        let empty = validate_headers(range, &[], None).expect_err("empty reply");
+        let mut uncommitted = headers.clone();
+        uncommitted[0].transactions_root = B256::ZERO;
+        let broken_commitment =
+            validate_bodies(&uncommitted, &bodies).expect_err("broken body commitment");
+        // A reorg request by hash that the peer answers with the requested
+        // block at another height contradicts only the claimed number.
+        let tip = headers.last().expect("fixture tip").clone();
+        let claimed_number = validate_descending_headers(
+            BlockNumber(tip.number + 1),
+            block_hash(tip.hash_slow()),
+            std::slice::from_ref(&tip),
+        )
+        .expect_err("claimed number");
+        let other_block = validate_descending_headers(
+            BlockNumber(tip.number),
+            other_tip,
+            std::slice::from_ref(&tip),
+        )
+        .expect_err("another block");
+        let timeout = P2pError::Timeout {
+            component: "headers",
+        };
+
+        let table = [
+            (&tip_mismatch, Verified, Invalid),
+            (&tip_mismatch, Unverified, Disagreement),
+            (&claimed_number, Verified, Invalid),
+            (&claimed_number, Unverified, Disagreement),
+            (&other_block, Unverified, Invalid),
+            (&broken_continuity, Unverified, Invalid),
+            (&wrong_number, Unverified, Invalid),
+            (&broken_commitment, Unverified, Invalid),
+            (&short, Verified, Disagreement),
+            (&empty, Unverified, Disagreement),
+            (&timeout, Verified, Disagreement),
+        ];
+        for (error, expectation, fault) in table {
+            assert_eq!(
+                classify_response_failure(error, expectation),
+                fault,
+                "{error} against a {expectation:?} expectation"
+            );
+        }
+    }
+
+    #[test]
+    fn head_polling_asks_a_small_cohort_and_ignores_not_yet_replies() {
+        // Catching up races every eligible peer; polling for the next block
+        // asks one or two peers per poll.
+        assert_eq!(live_header_fanout(false, 32), (32, usize::MAX));
+        assert_eq!(live_header_fanout(true, 32), (2, 2));
+        assert_eq!(live_header_fanout(true, 1), (1, 1));
+
+        let not_yet = P2pError::IncompleteResponse {
+            component: "headers",
+            returned: 0,
+            expected: 1,
+        };
+        let unverified = ExpectationTrust::Unverified;
+        assert_eq!(
+            live_header_reply_cost(&not_yet, unverified, true),
+            HeaderReplyCost::NotYet,
+            "an empty reply at the head only says the block is not produced yet"
+        );
+        assert_eq!(
+            live_header_reply_cost(&not_yet, unverified, false),
+            HeaderReplyCost::Cooldown,
+            "a short catch-up reply still cools the header lane"
+        );
+        let timeout = P2pError::Timeout {
+            component: "headers",
+        };
+        assert_eq!(
+            live_header_reply_cost(&timeout, unverified, true),
+            HeaderReplyCost::Cooldown
+        );
+        let (range, headers, _, _) = empty_fixture();
+        let broken = validate_headers(range, &headers[..1], None).expect_err("incomplete");
+        assert!(matches!(broken, P2pError::IncompleteResponse { .. }));
+        let mut renumbered = headers;
+        renumbered[0].number = 9;
+        let invalid = validate_headers(range, &renumbered, None).expect_err("wrong number");
+        assert_eq!(
+            live_header_reply_cost(&invalid, unverified, true),
+            HeaderReplyCost::Ban
+        );
+    }
+
+    #[test]
+    fn peer_status_head_claims_never_reach_the_observed_head() {
+        let telemetry = NetworkTelemetry::default();
+        let session = telemetry.register(NetworkLane::Live);
+        let observed = || telemetry.snapshot().sessions[0].observed_head_block;
+        let liar = B512::from([0x11; 64]);
+        let honest = B512::from([0x12; 64]);
+        let hash_only = B512::from([0x13; 64]);
+        let declared = declared_peer_heads(
+            [
+                (liar, Some(u64::MAX), B256::from([0xee; 32])),
+                (honest, Some(100), B256::from([0x64; 32])),
+                (hash_only, None, B256::from([0x65; 32])),
+            ],
+            BlockNumber(90),
+        );
+        assert_eq!(
+            declared,
+            DeclaredPeerHeads {
+                head: Some((BlockNumber(u64::MAX), BlockHash::new([0xee; 32]))),
+                hash_only: vec![(hash_only, B256::from([0x65; 32]))],
+            }
+        );
+        let (number, hash) = declared.head.expect("a declared head");
+
+        // Discovery settles every head it returns on the session. A status
+        // claim, even one of u64::MAX, and a peer's own header for the hash it
+        // advertised only steer the next request...
+        assert_eq!(
+            settle_discovered_head(&session, DiscoveredHead::Claimed(number, hash)),
+            (BlockNumber(u64::MAX), BlockHash::new([0xee; 32]))
+        );
+        settle_discovered_head(
+            &session,
+            DiscoveredHead::Claimed(BlockNumber(u64::MAX - 1), BlockHash::new([0x66; 32])),
+        );
+        assert_eq!(observed(), None, "a claimed head was observed");
+
+        // ...while a header validated at a requested block is observed.
+        assert_eq!(
+            settle_discovered_head(
+                &session,
+                DiscoveredHead::Validated(BlockNumber(100), BlockHash::new([0x64; 32]))
+            ),
+            (BlockNumber(100), BlockHash::new([0x64; 32]))
+        );
+        assert_eq!(observed(), Some(100));
+        settle_discovered_head(&session, DiscoveredHead::Claimed(number, hash));
+        assert_eq!(observed(), Some(100), "a claimed head was observed");
+    }
+
+    #[test]
+    fn qualification_never_clears_verified_material_lanes() {
+        let pool = direct_peer_pool();
+        let mut receivers = Vec::new();
+        for marker in [0x52_u8, 0x53] {
+            let peer_id = B512::from([marker; 64]);
+            let (sender, receiver) = tokio::sync::mpsc::channel(1);
+            receivers.push(receiver);
+            pool.insert(DirectPeer {
+                peer_id,
+                eth_version: EthVersion::Eth68,
+                messages: PeerRequestSender::new(peer_id, sender),
+            });
+        }
+        let proven = B512::from([0x52; 64]);
+        let lanes = |peer_id: B512| {
+            pool.peers
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .iter()
+                .find(|state| state.peer.peer_id == peer_id)
+                .map(|state| (state.header.verified, state.body.verified))
+                .expect("pooled peer")
+        };
+        pool.set_qualification(proven, PeerQualification::BodyServing);
+        for outcome in [
+            PeerQualification::HeadersOnly,
+            PeerQualification::Lagging,
+            PeerQualification::TimedOut,
+            PeerQualification::Rejected,
+        ] {
+            pool.set_qualification(proven, outcome);
+            assert_eq!(
+                lanes(proven),
+                (true, true),
+                "{outcome:?} cleared verified service evidence"
+            );
+        }
+
+        let header_only = B512::from([0x53; 64]);
+        pool.set_qualification(header_only, PeerQualification::HeadersOnly);
+        assert_eq!(lanes(header_only), (true, false));
+        drop(receivers);
+    }
+
+    #[test]
+    fn qualification_targets_compare_by_number_and_hash() {
+        let target = BlockRef {
+            number: BlockNumber(25_000_000),
+            hash: BlockHash::new([0x11; 32]),
+            parent_hash: BlockHash::new([0x10; 32]),
+            timestamp: 1_788_000_000,
+        };
+        let peer = B512::from([0x42; 64]);
+        let qualifications = PeerQualificationPool::new(target);
+        qualifications.record(target, peer, PeerQualification::BodyServing);
+
+        // Every connect() rebuilds the same block with a synthetic parent and
+        // a fresh timestamp; that is still the same target.
+        let restamped = BlockRef {
+            parent_hash: BlockHash::ZERO,
+            timestamp: target.timestamp + 12,
+            ..target
+        };
+        qualifications.set_target(restamped);
+        assert_eq!(qualifications.ready(restamped), 1);
+        assert!(qualifications.peer_is_ready(target, peer));
+
+        let next = BlockRef {
+            number: BlockNumber(target.number.0 + 1),
+            hash: BlockHash::new([0x12; 32]),
+            ..target
+        };
+        qualifications.set_target(next);
+        assert_eq!(qualifications.ready(next), 0);
+        assert!(!qualifications.peer_is_ready(target, peer));
+    }
+
+    #[tokio::test]
+    async fn a_release_between_a_full_check_and_the_wait_is_not_lost() {
+        use std::sync::atomic::AtomicBool;
+
+        let changed = tokio::sync::Notify::new();
+        let released = AtomicBool::new(false);
+        let mut checks = 0_usize;
+        let acquired = tokio::time::timeout(
+            Duration::from_secs(1),
+            wait_for_release(&changed, &CancellationToken::new(), || {
+                checks += 1;
+                if released.load(Ordering::Acquire) {
+                    return Some(());
+                }
+                // The only slot is released right after this check saw it
+                // taken and before the caller waits for a release.
+                released.store(true, Ordering::Release);
+                changed.notify_waiters();
+                None
+            }),
+        )
+        .await;
+        assert!(
+            acquired.is_ok(),
+            "a release racing the capacity check was lost"
+        );
+        assert_eq!(checks, 2);
+    }
+
+    #[tokio::test]
+    async fn live_requests_proceed_while_qualification_saturates_the_gate() {
+        // One global limit of 32 keeps 4 slots for live requests; small limits
+        // reserve at most half, so background work always keeps a slot.
+        assert_eq!(material_request_capacity(32, Priority::High), 32);
+        assert_eq!(material_request_capacity(32, Priority::Normal), 28);
+        assert_eq!(material_request_capacity(4, Priority::Normal), 2);
+        assert_eq!(material_request_capacity(1, Priority::Normal), 1);
+
+        let gate = Arc::new(MaterialRequestGate::new(32));
+        let cancellation = CancellationToken::new();
+        // Background qualification takes every slot it may...
+        let mut qualification = Vec::new();
+        while let Some(permit) = gate.try_acquire(Priority::Normal) {
+            qualification.push(permit);
+        }
+        assert_eq!(qualification.len(), 28);
+        // ...and live requests still proceed on the reserved slots.
+        let mut live = Vec::new();
+        for _ in 0..4 {
+            live.push(
+                tokio::time::timeout(
+                    Duration::from_millis(250),
+                    gate.acquire(Priority::High, &cancellation),
+                )
+                .await
+                .expect("the live request starved behind background qualification")
+                .expect("live slot"),
+            );
+        }
+        assert!(
+            gate.try_acquire(Priority::High).is_none(),
+            "the global limit still holds"
+        );
+        // While a live request waits, background work may not take a slot,
+        // even below its own capacity...
+        let waiting = tokio::spawn({
+            let gate = gate.clone();
+            let cancellation = cancellation.clone();
+            async move { gate.acquire(Priority::High, &cancellation).await }
+        });
+        while gate.high_priority_waiters.load(Ordering::Acquire) == 0 {
+            tokio::task::yield_now().await;
+        }
+        qualification.truncate(qualification.len() - 5);
+        assert!(
+            gate.try_acquire(Priority::Normal).is_none(),
+            "background work took a slot a live request was waiting for"
+        );
+        // ...the live request gets a freed slot, and background work resumes
+        // once no live request waits.
+        let freed = tokio::time::timeout(Duration::from_secs(1), waiting)
+            .await
+            .expect("the waiting live request is woken")
+            .expect("live task")
+            .expect("freed slot");
+        drop(freed);
+        assert!(gate.try_acquire(Priority::Normal).is_some());
+    }
+
+    #[test]
+    fn local_or_transient_session_errors_keep_peer_evidence() {
+        for reason in [
+            NetworkDisconnectReason::UselessPeer,
+            NetworkDisconnectReason::TcpSubsystemError,
+            NetworkDisconnectReason::ConnectionClosed,
+            NetworkDisconnectReason::TooManyPeers,
+            NetworkDisconnectReason::PingTimeout,
+        ] {
+            assert!(
+                !disconnect_invalidates_service_evidence(reason),
+                "{reason:?}"
+            );
+        }
+        for reason in [
+            NetworkDisconnectReason::ProtocolBreach,
+            NetworkDisconnectReason::UnexpectedHandshakeIdentity,
+        ] {
+            assert!(
+                disconnect_invalidates_service_evidence(reason),
+                "{reason:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn reconciliation_drops_dead_sessions_and_adopts_missed_ones() {
+        let peer = |marker: u8| B512::from([marker; 64]);
+        let session = |marker: u8, connection_id: u64, sender_open: bool| PooledPeerSession {
+            peer_id: peer(marker),
+            connection_id,
+            sender_open,
+        };
+        let pooled = [
+            // Active and open: kept.
+            session(1, 1, true),
+            // Its session ended but the close event was lost: stale.
+            session(2, 2, true),
+            // Its sender closed, though the peer reconnected: stale.
+            session(3, 3, false),
+            // Inserted after the snapshot was requested: kept while open...
+            session(4, 9, true),
+            // ...but dropped once its sender is closed.
+            session(6, 10, false),
+        ];
+        let active = HashSet::from([peer(1), peer(3), peer(5)]);
+        let first = reconcile_direct_peers(&pooled, &active, 9, &HashSet::new(), &HashSet::new());
+        assert_eq!(
+            first,
+            DirectPeerReconciliation {
+                stale: vec![(peer(2), 2), (peer(3), 3), (peer(6), 10)],
+                // The reconnected session behind the closed sender, and the
+                // session whose open event was lost, are missing...
+                missing: vec![peer(3), peer(5)],
+                // ...but its event may only be late, or the session closing.
+                adopt: Vec::new(),
+            }
+        );
+
+        // Still missing one reconciliation later, both are adopted; a session
+        // missing for the first time waits for the next one.
+        let pooled = [session(1, 1, true), session(4, 9, true)];
+        let active = HashSet::from([peer(1), peer(3), peer(4), peer(5), peer(7)]);
+        let missing_before = first.missing.iter().copied().collect::<HashSet<_>>();
+        assert_eq!(
+            reconcile_direct_peers(&pooled, &active, 11, &missing_before, &HashSet::new()),
+            DirectPeerReconciliation {
+                stale: Vec::new(),
+                missing: vec![peer(3), peer(5), peer(7)],
+                adopt: vec![peer(3), peer(5)],
+            }
+        );
+        // A session that has left the list since, such as a peer banned after
+        // the first snapshot, is not adopted.
+        let left = reconcile_direct_peers(
+            &pooled,
+            &HashSet::from([peer(1), peer(4)]),
+            11,
+            &missing_before,
+            &HashSet::new(),
+        );
+        assert!(left.missing.is_empty() && left.adopt.is_empty());
+    }
+
+    #[test]
+    fn reconciliation_only_touches_the_session_it_judged() {
+        let pool = direct_peer_pool();
+        let peer_id = B512::from([0x61; 64]);
+        let (sender, receiver) = tokio::sync::mpsc::channel(1);
+        pool.insert(DirectPeer {
+            peer_id,
+            eth_version: EthVersion::Eth68,
+            messages: PeerRequestSender::new(peer_id, sender),
+        });
+        // The session ended without a close event.
+        drop(receiver);
+        let [stale] = pool.sessions()[..] else {
+            panic!("one pooled session");
+        };
+        assert!(!stale.sender_open);
+
+        // The peer reconnects before the stale entry is dropped: the new
+        // session stays, and adopting the peer again does not replace it.
+        let (sender, _receiver) = tokio::sync::mpsc::channel(1);
+        pool.insert(DirectPeer {
+            peer_id,
+            eth_version: EthVersion::Eth68,
+            messages: PeerRequestSender::new(peer_id, sender),
+        });
+        assert!(!pool.remove_connection(peer_id, stale.connection_id));
+        let (routed, _routed_receiver) = tokio::sync::mpsc::channel(1);
+        assert!(!pool.insert_missing(DirectPeer {
+            peer_id,
+            eth_version: EthVersion::Eth68,
+            messages: PeerRequestSender::new(peer_id, routed),
+        }));
+        let [current] = pool.sessions()[..] else {
+            panic!("one pooled session");
+        };
+        assert!(current.sender_open);
+        assert!(pool.remove_connection(peer_id, current.connection_id));
+        assert_eq!(pool.len(), 0);
+    }
+
+    #[test]
+    fn probes_advertise_genesis_rather_than_a_zero_or_unverified_head() {
+        let advertised = RethP2pSource::probe_advertised_head();
+        assert_ne!(advertised.hash, BlockHash::ZERO);
+        assert_eq!(advertised, RethP2pSource::mainnet_genesis_block());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn existing_identity_files_are_restricted_to_the_owner() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("execution-p2p-secret");
+        let mode = |path: &Path| {
+            std::fs::metadata(path)
+                .expect("identity metadata")
+                .permissions()
+                .mode()
+                & 0o777
+        };
+        let created = load_or_create_secret_key(Some(&path)).expect("create identity");
+        assert_eq!(mode(&path), 0o600);
+        assert_eq!(
+            std::fs::read_dir(directory.path())
+                .expect("identity directory")
+                .count(),
+            1,
+            "only the identity itself is left behind"
+        );
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+            .expect("loosen identity");
+        let reloaded = load_or_create_secret_key(Some(&path)).expect("reload identity");
+        assert_eq!(reloaded.secret_bytes(), created.secret_bytes());
+        assert_eq!(
+            mode(&path),
+            0o600,
+            "an identity other users can read is tightened"
+        );
+    }
+
+    /// Pool header peers whose lanes are qualified, in insertion order.
+    fn header_peer_pool(markers: &[u8]) -> (Arc<DirectPeerPool>, Vec<B512>, Vec<PeerReceiver>) {
+        let pool = direct_peer_pool();
+        let mut peers = Vec::new();
+        let mut receivers = Vec::new();
+        for marker in markers {
+            let peer_id = B512::from([*marker; 64]);
+            let (sender, receiver) = tokio::sync::mpsc::channel(1);
+            receivers.push(receiver);
+            pool.insert(DirectPeer {
+                peer_id,
+                eth_version: EthVersion::Eth68,
+                messages: PeerRequestSender::new(peer_id, sender),
+            });
+            pool.set_qualification(peer_id, PeerQualification::BodyServing);
+            peers.push(peer_id);
+        }
+        (pool, peers, receivers)
+    }
+
+    type PeerReceiver = tokio::sync::mpsc::Receiver<PeerRequest<EthNetworkPrimitives>>;
+
+    /// A header lane's failure count and remaining cooldown.
+    fn header_lane(pool: &DirectPeerPool, peer_id: B512) -> (u32, Duration) {
+        pool.peers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .find(|state| state.peer.peer_id == peer_id)
+            .map(|state| {
+                (
+                    state.header.failures,
+                    state
+                        .header
+                        .retry_at
+                        .saturating_duration_since(Instant::now()),
+                )
+            })
+            .expect("pooled peer")
+    }
+
+    /// Move every header-lane cooldown `by` into the past, as if that much
+    /// time had passed: the pool reads the real clock.
+    fn age_header_lanes(pool: &DirectPeerPool, by: Duration) {
+        for state in pool
+            .peers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter_mut()
+        {
+            if let Some(earlier) = state.header.retry_at.checked_sub(by) {
+                state.header.retry_at = earlier;
+            }
+        }
+    }
+
+    #[test]
+    fn head_polls_rotate_to_peers_not_yet_asked_for_the_block() {
+        let config = RethP2pConfig::default();
+        let (pool, peers, receivers) = header_peer_pool(&[0x81, 0x82, 0x83, 0x84]);
+        // The first two peers rank highest, so a choice by rank alone asks
+        // them on every poll.
+        for peer_id in &peers[..2] {
+            pool.quality.record_success(
+                *peer_id,
+                PeerMaterialKind::Body,
+                25_000_000,
+                Duration::from_millis(10),
+            );
+        }
+        let request_limit =
+            effective_material_concurrency(peers.len(), config.material_request_concurrency, 4);
+        let (cohort, _) = live_header_fanout(true, request_limit);
+        assert_eq!(cohort, AT_HEAD_HEADER_PEERS);
+        let not_yet = P2pError::IncompleteResponse {
+            component: "headers",
+            returned: 0,
+            expected: 1,
+        };
+        let block = BlockNumber(25_000_001);
+        let mut rotation = HeadPollRotation::default();
+        let mut cohorts = Vec::new();
+        for _ in 0..3 {
+            assert!(rotation.begin_poll(block).is_empty());
+            let leases = (0..cohort)
+                .map(|_| {
+                    pool.lease_for_head_poll(&mut rotation, 1)
+                        .expect("an eligible peer")
+                })
+                .collect::<Vec<_>>();
+            cohorts.push(
+                leases
+                    .iter()
+                    .map(|lease| lease.peer.peer_id)
+                    .collect::<HashSet<_>>(),
+            );
+            for lease in leases {
+                assert_eq!(
+                    live_header_reply_cost(&not_yet, ExpectationTrust::Unverified, true),
+                    HeaderReplyCost::NotYet
+                );
+                rotation.record_not_yet(lease.peer.peer_id);
+            }
+            // The next poll starts at least one production poll interval,
+            // plus the first retry pause, later.
+            age_header_lanes(&pool, config.poll_interval + Duration::from_millis(250));
+        }
+        assert_eq!(cohorts[0], HashSet::from([peers[0], peers[1]]));
+        assert!(
+            cohorts[0].is_disjoint(&cohorts[1]),
+            "two consecutive polls asked the same peers: {cohorts:?}"
+        );
+        // Once every eligible peer has been asked, the rotation starts over.
+        assert_eq!(cohorts[2], cohorts[0]);
+        drop(receivers);
+    }
+
+    #[test]
+    fn head_polls_cool_peers_that_withheld_a_served_block() {
+        let (pool, _, receivers) = header_peer_pool(&[0x91, 0x92, 0x93]);
+        let block = BlockNumber(25_000_001);
+        let mut rotation = HeadPollRotation::default();
+        assert!(rotation.begin_poll(block).is_empty());
+        let withholder = pool
+            .lease_for_head_poll(&mut rotation, 1)
+            .expect("a peer to poll");
+        let server = pool
+            .lease_for_head_poll(&mut rotation, 1)
+            .expect("a second peer to poll");
+        let (withholder_id, server_id) = (withholder.peer.peer_id, server.peer.peer_id);
+        // One peer answers "not yet", which costs it nothing yet, while the
+        // other serves the block.
+        rotation.record_not_yet(withholder_id);
+        drop(withholder);
+        rotation.record_served(server_id);
+        drop(server);
+        assert_eq!(header_lane(&pool, withholder_id).0, 0);
+
+        // The lane moves on: the peer withheld, or lagged, a block another
+        // peer served, and gets the normal header-lane cooldown, 250 ms at
+        // first. Nothing is persisted, and it stays pooled.
+        let withheld = rotation.begin_poll(BlockNumber(block.0 + 1));
+        assert_eq!(withheld, vec![withholder_id]);
+        for peer_id in withheld {
+            pool.record_material_failure(peer_id, PeerMaterialKind::Header);
+        }
+        let (failures, cooling_for) = header_lane(&pool, withholder_id);
+        assert_eq!(failures, 1);
+        assert!(
+            cooling_for > Duration::from_millis(100) && cooling_for <= Duration::from_millis(250),
+            "{cooling_for:?}"
+        );
+        assert_eq!(pool.len(), 3);
+        // The next poll asks the other peers while it cools.
+        let polled = (0..2)
+            .map(|_| {
+                pool.lease_for_head_poll(&mut rotation, 1)
+                    .expect("an eligible peer")
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            polled
+                .iter()
+                .all(|lease| lease.peer.peer_id != withholder_id)
+        );
+        drop(polled);
+        drop(receivers);
+    }
+
+    #[test]
+    fn minimum_live_head_empties_earn_the_normal_cooldown() {
+        // The minimum live head is the verified tip or the block after the
+        // finalized anchor: it exists, so `minimum_live_head` is no head poll
+        // (it passes no rotation, which only the lane's head poll holds), and
+        // an empty reply is a lagging peer.
+        let empty = P2pError::IncompleteResponse {
+            component: "headers",
+            returned: 0,
+            expected: 1,
+        };
+        assert_eq!(
+            live_header_reply_cost(&empty, ExpectationTrust::Unverified, false),
+            HeaderReplyCost::Cooldown
+        );
+        // That is the normal header-lane cooldown, 250 ms at first.
+        let (pool, peers, receivers) = header_peer_pool(&[0xa1]);
+        let mut lease = pool
+            .try_acquire_excluding(PeerMaterialKind::Header, 1, &HashSet::new(), None)
+            .expect("the peer");
+        lease.failed();
+        drop(lease);
+        let (failures, cooling_for) = header_lane(&pool, peers[0]);
+        assert_eq!(failures, 1);
+        assert!(
+            cooling_for > Duration::from_millis(100) && cooling_for <= Duration::from_millis(250),
+            "{cooling_for:?}"
+        );
+        drop(receivers);
+    }
+
+    #[test]
+    fn reconciliation_never_readopts_a_peer_dropped_for_invalid_material() {
+        let peer = |marker: u8| B512::from([marker; 64]);
+        // Reth keeps a trusted peer's session despite a ban, so a peer dropped
+        // for invalid material can stay active.
+        let invalidated = HashSet::from([peer(8)]);
+        let active = HashSet::from([peer(1), peer(8)]);
+        let pooled = [PooledPeerSession {
+            peer_id: peer(1),
+            connection_id: 1,
+            sender_open: true,
+        }];
+        let first = reconcile_direct_peers(&pooled, &active, 2, &HashSet::new(), &invalidated);
+        let missing_before = first.missing.iter().copied().collect::<HashSet<_>>();
+        let second = reconcile_direct_peers(&pooled, &active, 3, &missing_before, &invalidated);
+        assert!(
+            second.adopt.is_empty(),
+            "a peer dropped for invalid material was adopted again: {second:?}"
+        );
+        assert!(second.missing.is_empty());
+    }
+
+    #[test]
+    fn invalidated_peers_stay_out_of_the_pool_until_their_session_closes() {
+        let (pool, peers, receivers) = header_peer_pool(&[0xb1]);
+        let peer_id = peers[0];
+        let session = || {
+            let (sender, receiver) = tokio::sync::mpsc::channel(1);
+            (
+                DirectPeer {
+                    peer_id,
+                    eth_version: EthVersion::Eth68,
+                    messages: PeerRequestSender::new(peer_id, sender),
+                },
+                receiver,
+            )
+        };
+        pool.invalidate(peer_id);
+        assert_eq!(pool.len(), 0);
+        assert_eq!(pool.invalidated(), HashSet::from([peer_id]));
+        // The reconciler cannot adopt the peer while its session lasts...
+        let (adopted, _adopted_receiver) = session();
+        assert!(!pool.insert_missing(adopted));
+        // ...but once that session closes, a later one joins again.
+        pool.session_closed(peer_id);
+        assert!(pool.invalidated().is_empty());
+        let (adopted, _adopted_receiver) = session();
+        assert!(pool.insert_missing(adopted));
+        // A new session announced by Reth starts over as well.
+        pool.invalidate(peer_id);
+        let (announced, _announced_receiver) = session();
+        pool.insert(announced);
+        assert!(pool.invalidated().is_empty());
+        assert_eq!(pool.len(), 1);
+        drop(receivers);
+    }
+
+    #[tokio::test]
+    async fn a_release_reaches_the_waiter_that_registered_first() {
+        use std::sync::atomic::AtomicBool;
+
+        // A single release (`notify_one`) wakes the waiter that registered
+        // first. A waiter must register before its capacity check, or one
+        // that registers later takes the release meant for it.
+        let changed = tokio::sync::Notify::new();
+        let mut later = std::pin::pin!(changed.notified());
+        let released = AtomicBool::new(false);
+        let acquired = tokio::time::timeout(
+            Duration::from_secs(1),
+            wait_for_release(&changed, &CancellationToken::new(), || {
+                if released.load(Ordering::Acquire) {
+                    return Some(());
+                }
+                // Another waiter registers after this check, and the only
+                // slot is released to one waiter.
+                later.as_mut().enable();
+                released.store(true, Ordering::Release);
+                changed.notify_one();
+                None
+            }),
+        )
+        .await;
+        assert!(
+            acquired.is_ok(),
+            "the release went to a waiter that registered later"
+        );
     }
 }

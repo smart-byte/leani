@@ -530,7 +530,7 @@
         ? "No active catch-up target"
         : onDemand
           ? `Requested through ${fmt(processor.syncTargetBlock)}`
-          : `Observed peer head ${fmt(processor.syncTargetBlock)}`;
+          : `Verified head ${fmt(processor.syncTargetBlock)}`;
       const remaining = processor.blocksRemaining == null
         ? ""
         : processor.blocksRemaining === 0
