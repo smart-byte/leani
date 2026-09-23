@@ -261,6 +261,38 @@ record, and documented RPC contracts.
 - Network telemetry no longer panics when it shortens a long error message that
   contains non-ASCII text, such as one from a Beacon API endpoint. The panic
   stopped the network supervisor. Messages are now cut at a character boundary.
+- A backfill paused by delivery or artifact backpressure, such as a
+  subscription whose consumer stopped acknowledging, no longer holds history
+  resources while it waits. It used to keep its node-wide active-chunk slots
+  (`budgets.history_pipeline.maximum_active_chunks`), the chunks it had read
+  ahead, its place in shared source reads, and the mapped blocks of the commit
+  batch it could not deliver, counted against
+  `budgets.history_pipeline.maximum_mapped_bytes`. So it could stop every other
+  historical job, including the cold backfills a hot/cold handoff waits for,
+  and hold jobs that shared a source read with it to its pace. A paused job now
+  keeps only the one mapped block whose commit was refused. Once it commits,
+  the job resumes from its durable progress and reads and maps the blocks it
+  dropped again.
+- Chunks that a backfill opens ahead of the one it is reading can use at most
+  half of `budgets.history_material.memory_bytes`. The rest stays free for
+  chunks being read. Before, read-ahead chunks could fill the whole budget
+  while the chunk the job needed next waited for memory, and the job stalled
+  for good.
+- A historical backfill no longer stalls when shared material memory, or room
+  in a shared read's frame buffer, is freed just as its reader finds it full.
+  The reader now registers for the wakeup before it checks.
+- A history source that panics while streaming fails its read with a
+  retryable source error. Its backfills retry, on another source when one is
+  configured. Before, every backfill waiting on that read hung.
+- Transient history-source errors are retried per gap, not per job, and a gap
+  that committed blocks before failing starts a fresh retry budget. A long
+  backfill with a few scattered transient errors no longer fails. Each gap is
+  read from the highest-priority source, and the job moves to the next source
+  only after an error. Before, every gap attempt moved on to the next source,
+  even after a success.
+- A historical job whose task stops just after the node-wide commit scheduler
+  picks it no longer leaves every other historical job waiting for a commit
+  turn.
 
 ## [0.1.0-rc.1] - 2026-09-20
 

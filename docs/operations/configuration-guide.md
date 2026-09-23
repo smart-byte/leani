@@ -115,7 +115,9 @@ limit it waits, with live readiness down, until finality prunes (see the
 operations runbook's storage pressure section).
 
 `[budgets.history_material]` is the sole budget for shared immutable source
-frames and acquisition reorder buffers. `[budgets.history_pipeline]` is
+frames and acquisition reorder buffers. Chunks read ahead of the one a job is
+reading can use at most half of its `memory_bytes`, so size it to at least
+twice the largest expected frame. `[budgets.history_pipeline]` is
 separate: `maximum_active_chunks` caps physical history reads node-wide and
 `maximum_mapped_bytes` caps processor-owned mapped deltas across every active
 job. Its nested `commit` table flushes a contiguous SQLite transaction at the

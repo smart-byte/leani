@@ -75,6 +75,8 @@ pub struct HistoricalRuntimeConfig {
     pub commit_maximum_encoded_bytes: u64,
     pub commit_maximum_delay: Duration,
     pub commit_target_writer_hold: Duration,
+    /// Consecutive failed source attempts allowed on one gap before the job
+    /// fails. A gap that commits blocks before failing starts a new budget.
     pub max_attempts: u32,
     pub retry_base: Duration,
     pub retry_max: Duration,
@@ -329,7 +331,11 @@ impl Drop for HistoricalFairJobRegistration {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        debug_assert_ne!(state.selected.as_deref(), Some(self.job_id.as_str()));
+        // A `run()` future dropped after being selected, but before claiming
+        // its turn, must not leave every other job waiting for it.
+        if state.selected.as_deref() == Some(self.job_id.as_str()) {
+            state.selected = None;
+        }
         state.order.retain(|queued| queued != &self.job_id);
         state.jobs.remove(&self.job_id);
         drop(state);
@@ -1011,6 +1017,34 @@ struct MappedFrame {
     _mapped_byte_permit: Option<OwnedSemaphorePermit>,
 }
 
+/// How far one historical chunk got.
+#[derive(Clone, Copy, Debug)]
+enum ChunkOutcome {
+    /// Every frame committed; the last committed block hash.
+    Committed(Option<BlockHash>),
+    /// A backpressure pause released the job's streams and chunk slots, and
+    /// the frame it held then committed. The job replans the rest of its gap
+    /// from durable progress.
+    Released,
+}
+
+/// Release what a job paused for backpressure holds beyond the one mapped
+/// frame whose commit it retries: the streams and chunk slots `release`
+/// drops, the rest of its split microbatch with those frames' mapped-byte
+/// permits, and the source frame, with its material memory, behind the
+/// frame it keeps. The job maps the rest again when it replans.
+fn release_while_paused(
+    release: &mut (dyn FnMut() + Send),
+    refused: &mut [MappedFrame],
+    pending: &mut VecDeque<(Vec<MappedFrame>, bool)>,
+) {
+    release();
+    pending.clear();
+    for mapped in refused {
+        mapped.material = None;
+    }
+}
+
 fn mapped_delta_bytes(delta: &EncodedDelta, equivalent_checksums: &[BlockHash]) -> u64 {
     let durable = delta.encode_durable().map_or(u64::MAX, |encoded| {
         u64::try_from(encoded.len()).unwrap_or(u64::MAX)
@@ -1475,6 +1509,12 @@ impl HistoricalRuntime {
         let mut frames_mapped = 0_u64;
         let mut duplicate_frames = 0_u64;
         let mut attempts = 0_u32;
+        // Retries are budgeted per gap: consecutive failed source attempts
+        // since the current gap last committed a block.
+        let mut gap_failures = 0_u32;
+        // Sources are in priority order. A gap starts on the first and moves
+        // to the next only after a source error.
+        let mut source_index = 0_usize;
         let mut source_bytes = 0_u64;
         let mut physical_source_bytes = 0_u64;
         let mut reused_source_bytes = 0_u64;
@@ -1653,12 +1693,10 @@ impl HistoricalRuntime {
                 recent_report.elapsed_milliseconds = recent_report
                     .elapsed_milliseconds
                     .saturating_add(elapsed_milliseconds(recent_started));
+                gap_failures = 0;
                 continue;
             }
 
-            let source_index = usize::try_from(attempts)
-                .unwrap_or(usize::MAX)
-                .rem_euclid(source_count);
             let source = self.sources.get(source_index).cloned().ok_or_else(|| {
                 RuntimeError::InvalidConfig("historical source index is invalid".to_owned())
             })?;
@@ -1746,17 +1784,30 @@ impl HistoricalRuntime {
             {
                 source_report.failures = source_report.failures.saturating_add(1);
                 source_report.last_error = Some(error.to_string());
+                // A failure after committing blocks opens a fresh budget, so
+                // scattered transient errors never exhaust a long job.
+                let progressed = checkpoint.frames_committed > committed_before
+                    || duplicate_frames > duplicates_before;
+                gap_failures = if progressed {
+                    1
+                } else {
+                    gap_failures.saturating_add(1)
+                };
             }
             match attempt {
-                Ok(()) => {}
+                Ok(()) => {
+                    gap_failures = 0;
+                    source_index = 0;
+                }
                 Err(RuntimeError::Source(error))
-                    if failover_source_error(&error) && attempts < self.config.max_attempts =>
+                    if failover_source_error(&error) && gap_failures < self.config.max_attempts =>
                 {
+                    source_index = source_index.saturating_add(1) % source_count;
                     let delay =
-                        retry_delay(self.config.retry_base, self.config.retry_max, attempts);
+                        retry_delay(self.config.retry_base, self.config.retry_max, gap_failures);
                     warn!(
                         job_id = %job.id,
-                        attempt = attempts,
+                        attempt = gap_failures,
                         source_id = %source.descriptor().id,
                         ?delay,
                         error = %error,
@@ -2061,6 +2112,8 @@ impl HistoricalRuntime {
     /// with nothing committed that is `false`, and the job reads the gap from
     /// its sources; after a committed prefix it is `true`, and the job reads
     /// the rest of the gap, recomputed from its progress, from its sources.
+    /// A backpressure pause also ends reuse with `true`, once the frame it
+    /// held commits, so the paused job holds no chunk slot.
     #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     async fn try_run_recent_gap(
         &self,
@@ -2108,10 +2161,11 @@ impl HistoricalRuntime {
                 ),
             )
             .map_err(|error| RuntimeError::InvalidConfig(error.to_string()))?;
-            let _active_chunk = self
-                .pipeline_budget
-                .acquire_active_chunk(&cancellation)
-                .await?;
+            let mut active_chunk = Some(
+                self.pipeline_budget
+                    .acquire_active_chunk(&cancellation)
+                    .await?,
+            );
             let mut frames = self
                 .store
                 .recent_frames(
@@ -2149,7 +2203,7 @@ impl HistoricalRuntime {
             let range = BlockRange::new(next, last)
                 .map_err(|error| RuntimeError::InvalidConfig(error.to_string()))?;
             let completes = range.end() == request.range.end();
-            parent = self
+            parent = match self
                 .run_material_chunk(
                     HistoricalMaterialCoordinator::retained(frames),
                     range,
@@ -2168,8 +2222,13 @@ impl HistoricalRuntime {
                     cancellation.clone(),
                     completes_subscription && completes,
                     expected_successor_parent.filter(|_| completes),
+                    &mut || active_chunk = None,
                 )
-                .await?;
+                .await?
+            {
+                ChunkOutcome::Committed(last) => last,
+                ChunkOutcome::Released => return Ok(true),
+            };
             checkpoint.chunks_completed = checkpoint.chunks_completed.saturating_add(1);
             self.save_checkpoint(job, job_payload, JobState::Running, attempts, checkpoint)
                 .await?;
@@ -2276,7 +2335,7 @@ impl HistoricalRuntime {
             while let Some((chunk, logical_range, stream)) = opened.pop_front() {
                 let completes_subscription =
                     completes_subscription && opened.is_empty() && planned.is_empty();
-                prior_chunk_last = self
+                prior_chunk_last = match self
                     .run_material_chunk(
                         stream,
                         logical_range,
@@ -2303,8 +2362,14 @@ impl HistoricalRuntime {
                         (logical_range.end() == request.range.end())
                             .then_some(expected_successor_parent)
                             .flatten(),
+                        &mut || opened.clear(),
                     )
-                    .await?;
+                    .await?
+                {
+                    ChunkOutcome::Committed(last) => last,
+                    // The job replans the rest of the gap from its progress.
+                    ChunkOutcome::Released => return Ok(()),
+                };
                 checkpoint.chunks_completed = checkpoint.chunks_completed.saturating_add(1);
                 self.save_checkpoint(job, job_payload, JobState::Running, attempts, checkpoint)
                     .await?;
@@ -2327,14 +2392,15 @@ impl HistoricalRuntime {
         startup_registration.complete();
         while let Some((chunk, logical_range)) = planned.pop_front() {
             let completes_subscription = completes_subscription && planned.is_empty();
-            let _active_chunk = self
-                .pipeline_budget
-                .acquire_active_chunk(&cancellation)
-                .await?;
+            let mut active_chunk = Some(
+                self.pipeline_budget
+                    .acquire_active_chunk(&cancellation)
+                    .await?,
+            );
             let stream = HistoricalMaterialCoordinator::standalone(
                 source.open(&chunk, budget, cancellation.clone()).await?,
             );
-            prior_chunk_last = self
+            prior_chunk_last = match self
                 .run_material_chunk(
                     stream,
                     logical_range,
@@ -2361,8 +2427,14 @@ impl HistoricalRuntime {
                     (logical_range.end() == request.range.end())
                         .then_some(expected_successor_parent)
                         .flatten(),
+                    &mut || active_chunk = None,
                 )
-                .await?;
+                .await?
+            {
+                ChunkOutcome::Committed(last) => last,
+                // The job replans the rest of the gap from its progress.
+                ChunkOutcome::Released => return Ok(()),
+            };
             checkpoint.chunks_completed = checkpoint.chunks_completed.saturating_add(1);
             self.save_checkpoint(job, job_payload, JobState::Running, attempts, checkpoint)
                 .await?;
@@ -2371,6 +2443,17 @@ impl HistoricalRuntime {
         Ok(())
     }
 
+    /// Map and commit one chunk's frames in block order.
+    ///
+    /// A job that pauses for delivery or artifact backpressure keeps only the
+    /// one mapped frame whose commit was refused. Before it waits, it drops
+    /// the rest of a split microbatch with its mapped-byte permits, this
+    /// chunk's stream, buffered source frames, and shared acquisitions it
+    /// reads, and calls `release` so the caller drops the streams and chunk
+    /// slots it holds for the job. Other jobs, and other readers of a shared
+    /// acquisition, keep running. Once that frame commits, the chunk ends as
+    /// [`ChunkOutcome::Released`] and the job replans the rest of its gap
+    /// from durable progress, reading and mapping the dropped frames again.
     #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     async fn run_material_chunk(
         &self,
@@ -2391,7 +2474,8 @@ impl HistoricalRuntime {
         cancellation: CancellationToken,
         completes_subscription: bool,
         expected_end_hash: Option<BlockHash>,
-    ) -> Result<Option<BlockHash>, RuntimeError> {
+        release: &mut (dyn FnMut() + Send),
+    ) -> Result<ChunkOutcome, RuntimeError> {
         let descriptor = self.processor.descriptor();
         let subscription_microbatch = job.delivery_stream_id.is_some()
             && matches!(descriptor.lifecycle.output.mode, OutputPolicyMode::None);
@@ -2418,6 +2502,7 @@ impl HistoricalRuntime {
                     cancellation,
                     completes_subscription,
                     expected_end_hash,
+                    release,
                 )
                 .await;
         }
@@ -2465,12 +2550,13 @@ impl HistoricalRuntime {
                 })
             }
         });
-        let mut mapped = mapped.buffered(self.config.mapper_concurrency);
-        while let Some(result) = mapped.next().await {
+        let mut mapped_frames = mapped.buffered(self.config.mapper_concurrency).boxed();
+        let mut released = false;
+        while let Some(result) = mapped_frames.next().await {
             if cancellation.is_cancelled() {
                 return Err(RuntimeError::Cancelled);
             }
-            let mapped = result?;
+            let mut mapped = result?;
             if mapped.delta.block.number.0 != next_number {
                 return Err(RuntimeError::Source(SourceError::CorruptFrame(format!(
                     "chunk expected block {next_number}, received {}",
@@ -2541,6 +2627,10 @@ impl HistoricalRuntime {
                                 .await?;
                             backpressured = true;
                         }
+                        release();
+                        mapped_frames = futures::stream::empty().boxed();
+                        mapped.material = None;
+                        released = true;
                         tokio::select! {
                             () = cancellation.cancelled() => {
                                 return Err(RuntimeError::Cancelled);
@@ -2575,11 +2665,16 @@ impl HistoricalRuntime {
                     *duplicate_frames = duplicate_frames.saturating_add(1);
                 }
             }
-            material.acknowledge();
+            if let Some(material) = &mapped.material {
+                material.acknowledge();
+            }
             checkpoint.last_block = Some(mapped.delta.block.number);
             checkpoint.last_hash = Some(mapped.delta.block.hash);
             self.save_checkpoint(job, job_payload, JobState::Running, attempts, checkpoint)
                 .await?;
+        }
+        if released {
+            return Ok(ChunkOutcome::Released);
         }
         if next_number != range.end().0.saturating_add(1) {
             return Err(RuntimeError::IncompleteChunk {
@@ -2587,7 +2682,7 @@ impl HistoricalRuntime {
                 next: BlockNumber(next_number),
             });
         }
-        Ok(expected_parent)
+        Ok(ChunkOutcome::Committed(expected_parent))
     }
 
     #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
@@ -2610,7 +2705,8 @@ impl HistoricalRuntime {
         cancellation: CancellationToken,
         completes_subscription: bool,
         expected_end_hash: Option<BlockHash>,
-    ) -> Result<Option<BlockHash>, RuntimeError> {
+        release: &mut (dyn FnMut() + Send),
+    ) -> Result<ChunkOutcome, RuntimeError> {
         let mut next_number = range.start().0;
         let processor = self.processor.clone();
         let pipeline_budget = self.pipeline_budget.clone();
@@ -2655,8 +2751,9 @@ impl HistoricalRuntime {
                 })
             }
         });
-        let mut mapped = Box::pin(mapped.buffered(self.config.mapper_concurrency));
+        let mut mapped = mapped.buffered(self.config.mapper_concurrency).boxed();
         let mut stream_complete = false;
+        let mut released = false;
         while !stream_complete {
             if cancellation.is_cancelled() {
                 return Err(RuntimeError::Cancelled);
@@ -2742,8 +2839,16 @@ impl HistoricalRuntime {
                 duplicate_frames,
                 cancellation.clone(),
                 completes_subscription,
+                &mut || {
+                    mapped = futures::stream::empty().boxed();
+                    released = true;
+                    release();
+                },
             )
             .await?;
+        }
+        if released {
+            return Ok(ChunkOutcome::Released);
         }
         if next_number != range.end().0.saturating_add(1) {
             return Err(RuntimeError::IncompleteChunk {
@@ -2751,7 +2856,7 @@ impl HistoricalRuntime {
                 next: BlockNumber(next_number),
             });
         }
-        Ok(expected_parent)
+        Ok(ChunkOutcome::Committed(expected_parent))
     }
 
     #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
@@ -2765,6 +2870,7 @@ impl HistoricalRuntime {
         duplicate_frames: &mut u64,
         cancellation: CancellationToken,
         completes_subscription: bool,
+        release: &mut (dyn FnMut() + Send),
     ) -> Result<(), RuntimeError> {
         let stream_id = job.delivery_stream_id.as_deref();
         let mut pending = VecDeque::from([(mapped, completes_subscription)]);
@@ -2889,11 +2995,9 @@ impl HistoricalRuntime {
                         backpressured = false;
                     }
                     for mapped in &batch {
-                        mapped
-                            .material
-                            .as_ref()
-                            .expect("historical mapped frame has material")
-                            .acknowledge();
+                        if let Some(material) = &mapped.material {
+                            material.acknowledge();
+                        }
                     }
                     *checkpoint = proposed_checkpoint;
                 }
@@ -2938,11 +3042,9 @@ impl HistoricalRuntime {
                                 *duplicate_frames = duplicate_frames.saturating_add(1);
                             }
                         }
-                        mapped
-                            .material
-                            .as_ref()
-                            .expect("historical mapped frame has material")
-                            .acknowledge();
+                        if let Some(material) = &mapped.material {
+                            material.acknowledge();
+                        }
                         checkpoint.last_block = Some(mapped.delta.block.number);
                         checkpoint.last_hash = Some(mapped.delta.block.hash);
                         self.save_checkpoint(
@@ -2983,6 +3085,7 @@ impl HistoricalRuntime {
                             .await?;
                         backpressured = true;
                     }
+                    release_while_paused(release, &mut batch, &mut pending);
                     tokio::select! {
                         () = cancellation.cancelled() => {
                             return Err(RuntimeError::Cancelled);
@@ -3004,6 +3107,7 @@ impl HistoricalRuntime {
                             .await?;
                         backpressured = true;
                     }
+                    release_while_paused(release, &mut batch, &mut pending);
                     tokio::select! {
                         () = cancellation.cancelled() => {
                             return Err(RuntimeError::Cancelled);
@@ -7220,6 +7324,63 @@ mod tests {
         assert_eq!(order, vec!["dense", "sparse", "sparse", "dense"]);
     }
 
+    #[tokio::test]
+    async fn dropping_a_selected_job_hands_the_commit_turn_to_the_next_job() {
+        let scheduler = HistoricalFairCommitScheduler::new(1_024);
+        let _holder_registration = scheduler.register_job("holder").expect("register holder");
+        let dropped_registration = scheduler.register_job("dropped").expect("register dropped");
+        let _waiter_registration = scheduler.register_job("waiter").expect("register waiter");
+        let cancellation = CancellationToken::new();
+        let holder = scheduler
+            .acquire("holder", &cancellation)
+            .await
+            .expect("holder turn");
+
+        // "dropped" queues first, so the holder's release selects it.
+        let mut dropped_turn = Box::pin(scheduler.acquire("dropped", &cancellation));
+        assert!(
+            futures::FutureExt::now_or_never(&mut dropped_turn).is_none(),
+            "dropped job waits behind the holder"
+        );
+        let waiter_scheduler = scheduler.clone();
+        let waiter_cancellation = cancellation.clone();
+        let waiter = tokio::spawn(async move {
+            waiter_scheduler
+                .acquire("waiter", &waiter_cancellation)
+                .await
+                .map(|turn| turn.complete(1))
+        });
+        wait_for_fair_scheduler_waiter(&scheduler, "waiter").await;
+        holder.complete(1);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let selected = scheduler
+                    .inner
+                    .state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .selected
+                    .clone();
+                if selected.as_deref() == Some("dropped") {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the released turn selects the dropped job");
+
+        // Its `run()` future is dropped while selected, before it claims the turn.
+        drop(dropped_turn);
+        drop(dropped_registration);
+
+        tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("the remaining job gets a commit turn")
+            .expect("waiter task")
+            .expect("waiter turn");
+    }
+
     async fn externalized_subscription_job(
         store: &SqliteStore,
         processor: &dyn Processor,
@@ -7825,6 +7986,124 @@ mod tests {
 
         assert_eq!(report.frames_committed, range.len());
         assert_eq!(source.open_calls(), 3);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn read_ahead_chunks_leave_material_memory_for_the_chunk_being_read() {
+        let range = BlockRange::new(BlockNumber(1), BlockNumber(4)).expect("range");
+        // Header bytes give every frame the same nonzero retained size.
+        let all_frames = frames(range)
+            .into_iter()
+            .map(|mut frame| {
+                frame.header = Material::Complete(HeaderEnvelope {
+                    rlp: Some(vec![0_u8; 64]),
+                    transactions_root: None,
+                    receipts_root: None,
+                    withdrawals_root: None,
+                    gas_limit: None,
+                    gas_used: None,
+                    base_fee_per_gas: None,
+                    blob_gas_used: None,
+                    excess_blob_gas: None,
+                    size_bytes: None,
+                    transaction_count: None,
+                    consensus_size_bytes: None,
+                });
+                frame
+            })
+            .collect::<Vec<_>>();
+        let frame_bytes = all_frames
+            .iter()
+            .map(leani_primitives::BlockFrame::estimated_heap_bytes)
+            .collect::<Vec<_>>();
+        assert!(
+            frame_bytes[0] > 0 && frame_bytes.iter().all(|bytes| *bytes == frame_bytes[0]),
+            "frames share one nonzero size: {frame_bytes:?}"
+        );
+        // The first chunk starts late, so the read-ahead chunk produces first.
+        let source = Arc::new(ScriptedHistorySource::new(
+            fixture_source_descriptor("read-ahead-memory", range),
+            vec![
+                ScriptedChunk {
+                    range: BlockRange::new(BlockNumber(1), BlockNumber(2)).expect("first range"),
+                    schema_version: "fixture-v1".to_owned(),
+                    estimated_bytes: None,
+                    steps: std::iter::once(HistoryStep::Delay(Duration::from_millis(250)))
+                        .chain(
+                            all_frames[..2]
+                                .iter()
+                                .cloned()
+                                .map(|frame| HistoryStep::Frame(Box::new(frame))),
+                        )
+                        .collect(),
+                },
+                ScriptedChunk {
+                    range: BlockRange::new(BlockNumber(3), BlockNumber(4)).expect("second range"),
+                    schema_version: "fixture-v1".to_owned(),
+                    estimated_bytes: None,
+                    steps: all_frames[2..]
+                        .iter()
+                        .cloned()
+                        .map(|frame| HistoryStep::Frame(Box::new(frame)))
+                        .collect(),
+                },
+            ],
+        ));
+        let pipeline_budget =
+            HistoricalPipelineBudget::new(2, 2, 4 * 1_024 * 1_024).expect("pipeline budget");
+        let coordinator = HistoricalMaterialCoordinator::new_with_pipeline_budget(
+            HistoricalMaterialCoordinatorConfig {
+                // Room for two frames less one byte: a frame the read-ahead
+                // chunk buffers leaves no room for the chunk being read.
+                memory_bytes: frame_bytes[0] * 2 - 1,
+                maximum_buffered_frames_per_acquisition: 8,
+                ..HistoricalMaterialCoordinatorConfig::default()
+            },
+            &pipeline_budget,
+        )
+        .expect("coordinator");
+        let (_directory, store) = store().await;
+        let processor = Arc::new(BlockLocalCounter::default());
+        let runtime = HistoricalRuntime::new(
+            store,
+            source.clone(),
+            processor.clone(),
+            HistoricalRuntimeConfig {
+                mapper_concurrency: 1,
+                ..HistoricalRuntimeConfig::default()
+            },
+        )
+        .expect("runtime")
+        .with_pipeline_budget(pipeline_budget)
+        .with_material_coordinator(coordinator.clone());
+        let job = BackfillJob::for_processor(
+            "read-ahead-memory",
+            processor.as_ref(),
+            ChainId(1),
+            range,
+            VerificationPolicy::CompleteCryptographic,
+        )
+        .expect("job");
+        let mut budget = default_source_budget();
+        budget.max_in_flight_requests = 2;
+
+        let report = tokio::time::timeout(
+            Duration::from_secs(5),
+            runtime.run(job, budget, CancellationToken::new()),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "read-ahead material starved the chunk being read after {} source opens: {:?}",
+                source.open_calls(),
+                coordinator.snapshot()
+            )
+        })
+        .expect("backfill");
+
+        assert_eq!(report.frames_committed, range.len());
+        assert_eq!(source.open_calls(), 2);
     }
 
     #[tokio::test]
@@ -10379,6 +10658,104 @@ mod tests {
         assert_eq!(coordinator.snapshot().buffered_bytes, 0);
     }
 
+    /// Plans like `inner`, but every frame stream it opens panics when first
+    /// polled, as a buggy source adapter would.
+    #[derive(Debug)]
+    struct PanickingHistorySource {
+        inner: ScriptedHistorySource,
+    }
+
+    #[async_trait]
+    impl HistorySource for PanickingHistorySource {
+        fn descriptor(&self) -> &SourceDescriptor {
+            self.inner.descriptor()
+        }
+
+        async fn plan(
+            &self,
+            request: &DataRequest,
+        ) -> Result<leani_source_api::SourcePlan, SourceError> {
+            self.inner.plan(request).await
+        }
+
+        async fn open(
+            &self,
+            _chunk: &SourceChunk,
+            _budget: SourceBudget,
+            _cancellation: CancellationToken,
+        ) -> Result<leani_source_api::BlockFrameStream, SourceError> {
+            Ok(futures::stream::poll_fn(
+                |_| -> std::task::Poll<Option<Result<leani_primitives::BlockFrame, SourceError>>> {
+                    panic!("injected history source panic")
+                },
+            )
+            .boxed())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_panicking_history_source_fails_its_job_instead_of_hanging_it() {
+        let range = BlockRange::new(BlockNumber(1), BlockNumber(2)).expect("range");
+        let source = Arc::new(PanickingHistorySource {
+            inner: ScriptedHistorySource::from_frames(
+                fixture_source_descriptor("panicking-history", range),
+                frames(range),
+            ),
+        });
+        let coordinator =
+            HistoricalMaterialCoordinator::new(HistoricalMaterialCoordinatorConfig::default())
+                .expect("coordinator");
+        let processor = Arc::new(BlockLocalCounter::default());
+        let (_directory, store) = store().await;
+        let runtime = HistoricalRuntime::new(
+            store.clone(),
+            source,
+            processor.clone(),
+            HistoricalRuntimeConfig {
+                mapper_concurrency: 1,
+                max_attempts: 1,
+                ..HistoricalRuntimeConfig::default()
+            },
+        )
+        .expect("runtime")
+        .with_material_coordinator(coordinator.clone());
+        let job = BackfillJob::for_processor(
+            "panicking-history",
+            processor.as_ref(),
+            ChainId(1),
+            range,
+            VerificationPolicy::CompleteCryptographic,
+        )
+        .expect("job");
+
+        let error = tokio::time::timeout(
+            Duration::from_secs(5),
+            runtime.run(job, default_source_budget(), CancellationToken::new()),
+        )
+        .await
+        .expect("a panicking source must fail its job, not hang it")
+        .expect_err("the job fails");
+
+        assert!(
+            matches!(
+                &error,
+                RuntimeError::Source(SourceError::Unavailable(message))
+                    if message.contains("panicked")
+            ),
+            "unexpected error: {error:?}"
+        );
+        assert_eq!(
+            store
+                .job("panicking-history")
+                .await
+                .expect("job")
+                .expect("durable job")
+                .state,
+            JobState::Failed
+        );
+        assert_eq!(coordinator.snapshot().active_acquisitions, 0);
+    }
+
     #[tokio::test]
     async fn incompatible_source_policies_do_not_share_an_acquisition() {
         let range = BlockRange::new(BlockNumber(0), BlockNumber(0)).expect("one-block range");
@@ -11435,7 +11812,9 @@ mod tests {
         );
         assert_eq!(resumed.frames_mapped, 4);
         assert_eq!(resumed.frames_committed, range.len());
-        assert_eq!(resumed_source.open_calls(), 1);
+        // Each pause at the work-ahead limit releases the source stream, and
+        // the job reopens the rest of the range once it can commit again.
+        assert!(resumed_source.open_calls() >= 1);
         let subscription = reopened
             .backfill_subscription_for_job(&job.id)
             .await
@@ -11494,6 +11873,598 @@ mod tests {
                 .state,
             leani_store_sqlite::BackfillSubscriptionState::CompleteReclaimable
         );
+    }
+
+    async fn wait_for_subscription_state(
+        store: &SqliteStore,
+        job_id: &str,
+        state: leani_store_sqlite::BackfillSubscriptionState,
+    ) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let current = store
+                    .backfill_subscription_for_job(job_id)
+                    .await
+                    .expect("subscription")
+                    .expect("durable subscription")
+                    .state;
+                if current == state {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("subscription {job_id} never reached {state:?}"));
+    }
+
+    /// Acknowledge a history stream at every progress boundary, as a consumer
+    /// that keeps up does, and return the completion marker's sequence.
+    async fn acknowledge_history_until_complete(
+        store: SqliteStore,
+        descriptor: ProcessorDescriptor,
+        stream_id: String,
+        consumer_id: &'static str,
+    ) -> u64 {
+        let mut after = 0;
+        loop {
+            let changes = store
+                .changes_in_stream(&descriptor, &stream_id, ChainId(1), after, 100)
+                .await
+                .expect("consume history changes");
+            if let Some(boundary) = changes.iter().rev().find(|record| {
+                matches!(
+                    record.change.kind.as_str(),
+                    "system.backfill_progress" | "system.backfill_complete"
+                )
+            }) {
+                after = boundary.cursor.sequence;
+                store
+                    .acknowledge_consumer_in_stream(&descriptor, &stream_id, consumer_id, after)
+                    .await
+                    .expect("acknowledge history boundary");
+                if boundary.change.kind == "system.backfill_complete" {
+                    return after;
+                }
+            } else {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }
+    }
+
+    /// Assert that a resumed subscription delivered every block exactly once.
+    async fn assert_subscription_delivered_once(
+        store: &SqliteStore,
+        processor: &dyn Processor,
+        job_id: &str,
+        stream_id: &str,
+        range: BlockRange,
+        completion: u64,
+    ) {
+        let changes = store
+            .changes_in_stream(processor.descriptor(), stream_id, ChainId(1), 0, 100)
+            .await
+            .expect("history stream");
+        assert_eq!(
+            changes
+                .iter()
+                .filter(|record| record.change.kind == "synthetic.counter")
+                .map(|record| record.block.number.0)
+                .collect::<Vec<_>>(),
+            range.iter().map(|number| number.0).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            changes
+                .iter()
+                .filter(|record| record.change.kind == "system.backfill_complete")
+                .count(),
+            1
+        );
+        let subscription = store
+            .backfill_subscription_for_job(job_id)
+            .await
+            .expect("subscription")
+            .expect("durable subscription");
+        assert_eq!(
+            subscription.state,
+            leani_store_sqlite::BackfillSubscriptionState::Draining
+        );
+        assert_eq!(subscription.processed_work_blocks, range.len());
+        assert_eq!(subscription.completion_sequence, Some(completion));
+    }
+
+    /// A subscription whose consumer stops acknowledging pauses at its
+    /// work-ahead limit while it holds every node-wide chunk slot: the chunk
+    /// it reads and, when coordinated, the chunk it opened ahead. The pause
+    /// must free every slot, another job must get one, and the subscription
+    /// must resume and finish once its consumer acknowledges.
+    #[allow(clippy::too_many_lines)]
+    async fn backpressured_job_releases_the_chunk_slot(coordinated: bool, microbatched: bool) {
+        let paused_range = BlockRange::new(BlockNumber(1), BlockNumber(6)).expect("paused range");
+        let other_range = BlockRange::new(BlockNumber(1), BlockNumber(3)).expect("other range");
+        let slots = if coordinated { 2 } else { 1 };
+        let pipeline_budget =
+            HistoricalPipelineBudget::new(slots, 2, 4 * 1_024 * 1_024).expect("pipeline budget");
+        let coordinator = coordinated.then(|| {
+            HistoricalMaterialCoordinator::new_with_pipeline_budget(
+                HistoricalMaterialCoordinatorConfig {
+                    memory_bytes: 4 * 1_024 * 1_024,
+                    maximum_buffered_frames_per_acquisition: 1,
+                    ..HistoricalMaterialCoordinatorConfig::default()
+                },
+                &pipeline_budget,
+            )
+            .expect("coordinator")
+        });
+        let with_budgets = |runtime: HistoricalRuntime| {
+            let runtime = runtime.with_pipeline_budget(pipeline_budget.clone());
+            match &coordinator {
+                Some(coordinator) => runtime.with_material_coordinator(coordinator.clone()),
+                None => runtime,
+            }
+        };
+        let config = HistoricalRuntimeConfig {
+            mapper_concurrency: 1,
+            commit_maximum_blocks: 1,
+            commit_maximum_delay: Duration::from_mins(1),
+            ..HistoricalRuntimeConfig::default()
+        };
+        let (_directory, store) = store().await;
+
+        // Retained output makes a subscription commit block by block.
+        let paused_processor = BlockLocalCounter::named("paused-subscriber").with_split_delivery();
+        let paused_processor = Arc::new(if microbatched {
+            paused_processor.with_output_none()
+        } else {
+            paused_processor
+        });
+        let paused_job = externalized_subscription_job_with_limits(
+            &store,
+            paused_processor.as_ref(),
+            "paused-subscription",
+            paused_range,
+            BackfillMode::FillMissing,
+            0,
+            2,
+            64 * 1024 * 1024,
+        )
+        .await;
+        let stream_id = paused_job
+            .delivery_stream_id
+            .clone()
+            .expect("history delivery stream");
+        let paused_frames = frames(paused_range);
+        let paused_source = Arc::new(ScriptedHistorySource::new(
+            fixture_source_descriptor("paused-history", paused_range),
+            [(1, 4), (5, 6)]
+                .into_iter()
+                .map(|(start, end)| ScriptedChunk {
+                    range: BlockRange::new(BlockNumber(start), BlockNumber(end))
+                        .expect("chunk range"),
+                    schema_version: "fixture-v1".to_owned(),
+                    estimated_bytes: None,
+                    steps: paused_frames
+                        .iter()
+                        .filter(|frame| (start..=end).contains(&frame.block.number.0))
+                        .cloned()
+                        .map(|frame| HistoryStep::Frame(Box::new(frame)))
+                        .collect(),
+                })
+                .collect(),
+        ));
+        let paused_runtime = with_budgets(
+            HistoricalRuntime::new(
+                store.clone(),
+                paused_source.clone(),
+                paused_processor.clone(),
+                config.clone(),
+            )
+            .expect("paused runtime"),
+        );
+        let mut paused_budget = default_source_budget();
+        paused_budget.max_in_flight_requests = slots;
+        let paused = tokio::spawn(async move {
+            paused_runtime
+                .run(paused_job, paused_budget, CancellationToken::new())
+                .await
+        });
+        wait_for_subscription_state(
+            &store,
+            "paused-subscription",
+            leani_store_sqlite::BackfillSubscriptionState::Backpressured,
+        )
+        .await;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while pipeline_budget.active_chunks.available_permits() < slots {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .expect("the paused job frees every chunk slot it holds");
+
+        let other_processor =
+            Arc::new(BlockLocalCounter::named("independent-job").with_delivery_none());
+        let other_runtime = with_budgets(
+            HistoricalRuntime::new(
+                store.clone(),
+                Arc::new(ScriptedHistorySource::from_frames(
+                    fixture_source_descriptor("independent-history", other_range),
+                    frames(other_range),
+                )),
+                other_processor.clone(),
+                config,
+            )
+            .expect("independent runtime"),
+        );
+        let other_job = BackfillJob::for_processor(
+            "independent-job",
+            other_processor.as_ref(),
+            ChainId(1),
+            other_range,
+            VerificationPolicy::CompleteCryptographic,
+        )
+        .expect("independent job");
+        let other = tokio::time::timeout(
+            Duration::from_secs(5),
+            other_runtime.run(other_job, default_source_budget(), CancellationToken::new()),
+        )
+        .await
+        .expect("another job gets the chunk slot while the subscription is paused")
+        .expect("independent backfill");
+        assert_eq!(other.frames_committed, other_range.len());
+
+        let consumer = tokio::spawn(acknowledge_history_until_complete(
+            store.clone(),
+            paused_processor.descriptor().clone(),
+            stream_id.clone(),
+            "destination-0",
+        ));
+        let resumed = tokio::time::timeout(Duration::from_secs(10), paused)
+            .await
+            .expect("the paused job resumes once its consumer acknowledges")
+            .expect("paused task")
+            .expect("paused backfill");
+        let completion = tokio::time::timeout(Duration::from_secs(5), consumer)
+            .await
+            .expect("consumer sees the completion marker")
+            .expect("consumer task");
+        assert_eq!(resumed.frames_committed, paused_range.len());
+        assert!(
+            paused_source.open_calls() > 1,
+            "the paused job re-reads the frames it dropped when it paused"
+        );
+        assert_subscription_delivered_once(
+            &store,
+            paused_processor.as_ref(),
+            "paused-subscription",
+            &stream_id,
+            paused_range,
+            completion,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_backpressured_job_releases_its_coordinated_chunk_slots() {
+        backpressured_job_releases_the_chunk_slot(true, true).await;
+    }
+
+    #[tokio::test]
+    async fn a_backpressured_job_releases_its_direct_chunk_slot() {
+        backpressured_job_releases_the_chunk_slot(false, true).await;
+    }
+
+    #[tokio::test]
+    async fn a_backpressured_block_by_block_job_releases_its_chunk_slots() {
+        backpressured_job_releases_the_chunk_slot(true, false).await;
+    }
+
+    /// A subscription that commits eight blocks at once pauses at its
+    /// eight-block work-ahead limit with the rest of a split microbatch still
+    /// mapped. While it waits it must hold at most the one mapped frame it
+    /// retries, so another job can map, and it must still deliver every
+    /// block once.
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn a_backpressured_microbatch_keeps_one_mapped_frame_while_paused() {
+        let paused_range = BlockRange::new(BlockNumber(1), BlockNumber(16)).expect("paused range");
+        let other_range = BlockRange::new(BlockNumber(1), BlockNumber(3)).expect("other range");
+        let paused_processor = Arc::new(
+            BlockLocalCounter::named("paused-batcher")
+                .with_split_delivery()
+                .with_output_none(),
+        );
+        let other_processor =
+            Arc::new(BlockLocalCounter::named("other-batcher").with_delivery_none());
+        let paused_frames = frames(paused_range);
+        let mut frame_bytes = Vec::with_capacity(paused_frames.len());
+        for frame in &paused_frames {
+            let (delta, checksums) = map_with_finality_variants(paused_processor.as_ref(), frame)
+                .await
+                .expect("map frame");
+            frame_bytes.push(mapped_delta_bytes(&delta, &checksums));
+        }
+        let largest_frame = frame_bytes.iter().copied().max().expect("frames");
+        // Room for exactly one microbatch of eight mapped frames.
+        let budget_bytes = largest_frame * 8;
+        let pipeline_budget =
+            HistoricalPipelineBudget::new(2, 2, budget_bytes).expect("pipeline budget");
+        let held_bytes = || {
+            budget_bytes.saturating_sub(
+                u64::try_from(pipeline_budget.mapped_bytes.available_permits())
+                    .expect("available mapped bytes"),
+            )
+        };
+        let config = HistoricalRuntimeConfig {
+            mapper_concurrency: 1,
+            commit_maximum_blocks: 8,
+            commit_maximum_delay: Duration::from_mins(1),
+            ..HistoricalRuntimeConfig::default()
+        };
+        let (_directory, store) = store().await;
+
+        let paused_job = externalized_subscription_job_with_limits(
+            &store,
+            paused_processor.as_ref(),
+            "paused-batcher",
+            paused_range,
+            BackfillMode::FillMissing,
+            0,
+            8,
+            64 * 1024 * 1024,
+        )
+        .await;
+        let stream_id = paused_job
+            .delivery_stream_id
+            .clone()
+            .expect("history delivery stream");
+        let paused_runtime = HistoricalRuntime::new(
+            store.clone(),
+            Arc::new(ScriptedHistorySource::from_frames(
+                fixture_source_descriptor("paused-batch-history", paused_range),
+                paused_frames,
+            )),
+            paused_processor.clone(),
+            config.clone(),
+        )
+        .expect("paused runtime")
+        .with_pipeline_budget(pipeline_budget.clone());
+        let paused = tokio::spawn(async move {
+            paused_runtime
+                .run(
+                    paused_job,
+                    default_source_budget(),
+                    CancellationToken::new(),
+                )
+                .await
+        });
+        // Blocks 1-8 commit. Blocks 9-16 are refused and split down to
+        // block 9, with blocks 10-16 still mapped behind it.
+        wait_for_subscription_state(
+            &store,
+            "paused-batcher",
+            leani_store_sqlite::BackfillSubscriptionState::Backpressured,
+        )
+        .await;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while held_bytes() > largest_frame {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "the paused job holds {} mapped bytes; one frame is {largest_frame}",
+                held_bytes()
+            )
+        });
+
+        // Another job maps and commits its whole microbatch meanwhile.
+        let other_runtime = HistoricalRuntime::new(
+            store.clone(),
+            Arc::new(ScriptedHistorySource::from_frames(
+                fixture_source_descriptor("other-batch-history", other_range),
+                frames(other_range),
+            )),
+            other_processor.clone(),
+            config,
+        )
+        .expect("other runtime")
+        .with_pipeline_budget(pipeline_budget.clone());
+        let other_job = BackfillJob::for_processor(
+            "other-batcher",
+            other_processor.as_ref(),
+            ChainId(1),
+            other_range,
+            VerificationPolicy::CompleteCryptographic,
+        )
+        .expect("other job");
+        let other = tokio::time::timeout(
+            Duration::from_secs(5),
+            other_runtime.run(other_job, default_source_budget(), CancellationToken::new()),
+        )
+        .await
+        .expect("another job maps while the subscription is paused")
+        .expect("other backfill");
+        assert_eq!(other.frames_committed, other_range.len());
+
+        let consumer = tokio::spawn(acknowledge_history_until_complete(
+            store.clone(),
+            paused_processor.descriptor().clone(),
+            stream_id.clone(),
+            "destination-0",
+        ));
+        let resumed = tokio::time::timeout(Duration::from_secs(10), paused)
+            .await
+            .expect("the paused job resumes once its consumer acknowledges")
+            .expect("paused task")
+            .expect("paused backfill");
+        let completion = tokio::time::timeout(Duration::from_secs(5), consumer)
+            .await
+            .expect("consumer sees the completion marker")
+            .expect("consumer task");
+        assert_eq!(resumed.frames_committed, paused_range.len());
+        assert_subscription_delivered_once(
+            &store,
+            paused_processor.as_ref(),
+            "paused-batcher",
+            &stream_id,
+            paused_range,
+            completion,
+        )
+        .await;
+        assert_eq!(held_bytes(), 0, "no mapped bytes stay reserved");
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn a_backpressured_job_detaches_from_an_acquisition_it_shares() {
+        let range = BlockRange::new(BlockNumber(1), BlockNumber(6)).expect("range");
+        let source = Arc::new(ScriptedHistorySource::from_frames(
+            fixture_source_descriptor("shared-lagging-history", range),
+            frames(range),
+        ));
+        let pipeline_budget =
+            HistoricalPipelineBudget::new(2, 2, 4 * 1_024 * 1_024).expect("pipeline budget");
+        let coordinator = HistoricalMaterialCoordinator::new_with_pipeline_budget(
+            HistoricalMaterialCoordinatorConfig {
+                memory_bytes: 4 * 1_024 * 1_024,
+                maximum_buffered_frames_per_acquisition: 1,
+                ..HistoricalMaterialCoordinatorConfig::default()
+            },
+            &pipeline_budget,
+        )
+        .expect("coordinator");
+        // Both jobs register before either reads, so they share one acquisition.
+        let mut permits = coordinator.startup_batch(2);
+        let steady_permit = permits.pop().expect("steady permit");
+        let lagging_permit = permits.pop().expect("lagging permit");
+        let config = HistoricalRuntimeConfig {
+            mapper_concurrency: 1,
+            commit_maximum_blocks: 1,
+            commit_maximum_delay: Duration::from_mins(1),
+            ..HistoricalRuntimeConfig::default()
+        };
+        let (_directory, store) = store().await;
+
+        let lagging_processor = Arc::new(
+            BlockLocalCounter::named("lagging-subscriber")
+                .with_split_delivery()
+                .with_output_none(),
+        );
+        let lagging_job = externalized_subscription_job_with_limits(
+            &store,
+            lagging_processor.as_ref(),
+            "lagging-subscription",
+            range,
+            BackfillMode::FillMissing,
+            0,
+            2,
+            64 * 1024 * 1024,
+        )
+        .await;
+        let stream_id = lagging_job
+            .delivery_stream_id
+            .clone()
+            .expect("history delivery stream");
+        let lagging_runtime = HistoricalRuntime::new(
+            store.clone(),
+            source.clone(),
+            lagging_processor.clone(),
+            config.clone(),
+        )
+        .expect("lagging runtime")
+        .with_pipeline_budget(pipeline_budget.clone())
+        .with_material_coordinator(coordinator.clone())
+        .with_material_startup_permit(lagging_permit);
+        let lagging = tokio::spawn(async move {
+            lagging_runtime
+                .run(
+                    lagging_job,
+                    default_source_budget(),
+                    CancellationToken::new(),
+                )
+                .await
+        });
+
+        let steady_processor =
+            Arc::new(BlockLocalCounter::named("steady-job").with_delivery_none());
+        let steady_runtime = HistoricalRuntime::new(
+            store.clone(),
+            source.clone(),
+            steady_processor.clone(),
+            config,
+        )
+        .expect("steady runtime")
+        .with_pipeline_budget(pipeline_budget)
+        .with_material_coordinator(coordinator.clone())
+        .with_material_startup_permit(steady_permit);
+        let steady_job = BackfillJob::for_processor(
+            "steady-job",
+            steady_processor.as_ref(),
+            ChainId(1),
+            range,
+            VerificationPolicy::CompleteCryptographic,
+        )
+        .expect("steady job");
+        let steady = tokio::time::timeout(
+            Duration::from_secs(5),
+            steady_runtime.run(
+                steady_job,
+                default_source_budget(),
+                CancellationToken::new(),
+            ),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "the shared acquisition stalled behind the paused subscriber: {:?}",
+                coordinator.snapshot()
+            )
+        })
+        .expect("steady backfill");
+        assert_eq!(steady.frames_committed, range.len());
+        assert_eq!(
+            coordinator.snapshot().requests_coalesced,
+            1,
+            "both jobs read one shared acquisition"
+        );
+        assert_eq!(
+            store
+                .backfill_subscription_for_job("lagging-subscription")
+                .await
+                .expect("subscription")
+                .expect("durable subscription")
+                .state,
+            leani_store_sqlite::BackfillSubscriptionState::Backpressured,
+            "the steady job finished while the other subscriber was paused"
+        );
+
+        let consumer = tokio::spawn(acknowledge_history_until_complete(
+            store.clone(),
+            lagging_processor.descriptor().clone(),
+            stream_id.clone(),
+            "destination-0",
+        ));
+        let resumed = tokio::time::timeout(Duration::from_secs(10), lagging)
+            .await
+            .expect("the paused job resumes once its consumer acknowledges")
+            .expect("lagging task")
+            .expect("lagging backfill");
+        let completion = tokio::time::timeout(Duration::from_secs(5), consumer)
+            .await
+            .expect("consumer sees the completion marker")
+            .expect("consumer task");
+        assert_eq!(resumed.frames_committed, range.len());
+        assert_subscription_delivered_once(
+            &store,
+            lagging_processor.as_ref(),
+            "lagging-subscription",
+            &stream_id,
+            range,
+            completion,
+        )
+        .await;
     }
 
     #[tokio::test]
@@ -11772,6 +12743,181 @@ mod tests {
             .await
             .expect_err("cross-source parent break");
         assert!(error.to_string().contains("parent mismatch at block 2"));
+    }
+
+    /// Serves `inner`, except that the first open of a chunk starting at one
+    /// of `failing_starts` fails with a transient outage.
+    #[derive(Debug)]
+    struct FlakyHistorySource {
+        inner: ScriptedHistorySource,
+        failing_starts: StdMutex<BTreeSet<BlockNumber>>,
+    }
+
+    impl FlakyHistorySource {
+        fn new(
+            inner: ScriptedHistorySource,
+            failing_starts: impl IntoIterator<Item = BlockNumber>,
+        ) -> Self {
+            Self {
+                inner,
+                failing_starts: StdMutex::new(failing_starts.into_iter().collect()),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl HistorySource for FlakyHistorySource {
+        fn descriptor(&self) -> &SourceDescriptor {
+            self.inner.descriptor()
+        }
+
+        async fn plan(
+            &self,
+            request: &DataRequest,
+        ) -> Result<leani_source_api::SourcePlan, SourceError> {
+            self.inner.plan(request).await
+        }
+
+        async fn open(
+            &self,
+            chunk: &SourceChunk,
+            budget: SourceBudget,
+            cancellation: CancellationToken,
+        ) -> Result<leani_source_api::BlockFrameStream, SourceError> {
+            if self
+                .failing_starts
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&chunk.range.start())
+            {
+                return Err(SourceError::Unavailable(format!(
+                    "injected transient outage at block {}",
+                    chunk.range.start().0
+                )));
+            }
+            self.inner.open(chunk, budget, cancellation).await
+        }
+    }
+
+    /// Two-block ranges with one unrequested block between them.
+    fn spaced_ranges(count: u64) -> Vec<BlockRange> {
+        (0..count)
+            .map(|index| {
+                let start = 1 + index * 3;
+                BlockRange::new(BlockNumber(start), BlockNumber(start + 1)).expect("gap range")
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn scattered_transient_errors_retry_their_gap_without_failing_a_long_job() {
+        let ranges = spaced_ranges(10);
+        let bounding = BlockRange::new(ranges[0].start(), ranges[9].end()).expect("bounding");
+        let source = Arc::new(FlakyHistorySource::new(
+            ScriptedHistorySource::from_frames(
+                fixture_source_descriptor("scattered-outages", bounding),
+                frames(bounding),
+            ),
+            [ranges[1].start(), ranges[4].start(), ranges[7].start()],
+        ));
+        let processor = Arc::new(BlockLocalCounter::default());
+        let (_directory, store) = store().await;
+        let runtime = HistoricalRuntime::new(
+            store,
+            source,
+            processor.clone(),
+            HistoricalRuntimeConfig {
+                mapper_concurrency: 1,
+                max_attempts: 3,
+                retry_base: Duration::from_millis(1),
+                retry_max: Duration::from_millis(1),
+                ..HistoricalRuntimeConfig::default()
+            },
+        )
+        .expect("runtime");
+        let job = BackfillJob::for_processor_ranges(
+            "scattered-outages",
+            processor.as_ref(),
+            ChainId(1),
+            ranges.clone(),
+            VerificationPolicy::CompleteCryptographic,
+        )
+        .expect("job");
+
+        let report = runtime
+            .run(job, default_source_budget(), CancellationToken::new())
+            .await
+            .expect("three transient errors across ten gaps must not fail the job");
+
+        assert_eq!(report.final_coverage, ranges);
+        assert_eq!(report.frames_committed, 20);
+        assert_eq!(report.source_attempts, 13);
+        assert_eq!(report.sources[0].failures, 3);
+    }
+
+    #[tokio::test]
+    async fn healthy_gaps_use_the_highest_priority_source_and_fail_over_only_on_error() {
+        let ranges = spaced_ranges(4);
+        let bounding = BlockRange::new(ranges[0].start(), ranges[3].end()).expect("bounding");
+        let mut primary_descriptor = fixture_source_descriptor("primary-history", bounding);
+        primary_descriptor.priority = 0;
+        let primary: Arc<dyn HistorySource> = Arc::new(FlakyHistorySource::new(
+            ScriptedHistorySource::from_frames(primary_descriptor, frames(bounding)),
+            [ranges[1].start()],
+        ));
+        let mut fallback_descriptor = fixture_source_descriptor("fallback-history", bounding);
+        fallback_descriptor.priority = 1;
+        let fallback: Arc<dyn HistorySource> = Arc::new(ScriptedHistorySource::from_frames(
+            fallback_descriptor,
+            frames(bounding),
+        ));
+        let processor = Arc::new(BlockLocalCounter::default());
+        let (_directory, store) = store().await;
+        let runtime = HistoricalRuntime::new_with_sources(
+            store,
+            vec![fallback, primary],
+            processor.clone(),
+            HistoricalRuntimeConfig {
+                mapper_concurrency: 1,
+                max_attempts: 3,
+                retry_base: Duration::from_millis(1),
+                retry_max: Duration::from_millis(1),
+                ..HistoricalRuntimeConfig::default()
+            },
+        )
+        .expect("runtime");
+        let job = BackfillJob::for_processor_ranges(
+            "priority-sources",
+            processor.as_ref(),
+            ChainId(1),
+            ranges.clone(),
+            VerificationPolicy::CompleteCryptographic,
+        )
+        .expect("job");
+
+        let report = runtime
+            .run(job, default_source_budget(), CancellationToken::new())
+            .await
+            .expect("backfill");
+
+        let usage = |id: &str| {
+            report
+                .sources
+                .iter()
+                .find(|source| source.source_id == id)
+                .map(|source| (source.attempts, source.failures))
+        };
+        assert_eq!(
+            usage("primary-history"),
+            Some((4, 1)),
+            "every gap starts on the highest-priority source"
+        );
+        assert_eq!(
+            usage("fallback-history"),
+            Some((1, 0)),
+            "only the gap whose primary read failed falls over"
+        );
+        assert_eq!(report.final_coverage, ranges);
     }
 
     #[tokio::test]
