@@ -20,6 +20,33 @@ record, and documented RPC contracts.
   generated listing previously omitted. The Homebrew package now also installs
   Leani's own `LICENSE`, and the container image declares OCI license metadata.
 
+### Fixed
+
+- New node stores enable SQLite incremental auto-vacuum, so pruning shrinks
+  the database file and storage admission recovers instead of staying at the
+  high-water mark. Existing stores log a warning at startup until one
+  `leani db compact` converts them.
+- The node database path is used literally: `%` and `?` in `data_dir` no
+  longer make SQLite open a different file.
+- A new store's schema is created in one transaction, so an interrupted first
+  start no longer leaves a store that every later start refuses.
+- Retained recent frames report their block's current finality after
+  finality promotes it. Recompute backfills over the retained recent window no
+  longer fail with "historical microbatch must be contiguous, finalized, and
+  single-chain", and live-lane replays apply promoted blocks as finalized.
+- `publish = "finalized_only"` processors with canonical delivery ordering
+  publish their held blocks before a block applied directly as finalized, such
+  as after gap recovery, so the stream stays in block order.
+- Undoing a block restores each output entity's previous block, timestamp,
+  finality, and write time instead of stamping the reverted block. Undo
+  records written by earlier versions keep the old stamping.
+- Rows that a window output policy pruned while applying an unfinalized block
+  come back when that block is undone.
+- A full artifact budget no longer stalls finality for every processor.
+  Finality commits, finalized artifact candidates stay pending with a warning,
+  and a later finality advance promotes them once the retained budget has
+  room.
+
 ## [0.1.0-rc.1] - 2026-09-20
 
 The first public release is a preview. Review the documented preview

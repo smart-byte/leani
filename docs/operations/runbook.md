@@ -268,9 +268,14 @@ then start the previous compatible binary. Retain the moved database until
 coverage, processor counts, cursors, and subscriptions are verified.
 
 `db compact` checkpoints the WAL and vacuums the active database; immutable
-artifact segments need no rewrite. Schedule it only with sufficient free disk
-and lower ingestion load. `db prune-changes` is lease-aware; expired consumers
-must perform the documented snapshot/reset flow.
+artifact segments need no rewrite. The rewrite also turns on SQLite
+incremental auto-vacuum, which new stores have from creation, so pages freed by
+pruning return to the filesystem. A store created before auto-vacuum was
+enabled logs a warning at every start and never shrinks below its high-water
+mark; run `db compact` on it once. Schedule it only with sufficient free disk,
+because the vacuum rewrites the whole database, and lower ingestion load.
+`db prune-changes` is lease-aware; expired consumers must perform the
+documented snapshot/reset flow.
 
 ## Failure runbooks
 
@@ -309,7 +314,9 @@ operator review of checkpoint provenance and independent endpoints.
 Inspect per-processor attribution with `db inspect` and `/metrics`. Prune
 change history only through `db prune-changes`, respecting active leases.
 Never evict rollback data required by unfinalized blocks. Add capacity or stop
-included advancement before the hard limit.
+included advancement before the hard limit. If the database file stays at its
+high-water mark after pruning, check the startup log for the auto-vacuum
+warning and run `db compact` once.
 
 ### SQLite failure
 

@@ -9186,6 +9186,100 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn recompute_microbatch_reuses_recent_frames_promoted_after_retention() {
+        let range = BlockRange::new(BlockNumber(1), BlockNumber(3)).expect("range");
+        let processor = Arc::new(
+            BlockLocalCounter::default()
+                .with_split_delivery()
+                .with_output_none(),
+        );
+        let (_directory, store) = store().await;
+        let config = HistoricalRuntimeConfig {
+            mapper_concurrency: 2,
+            ..HistoricalRuntimeConfig::default()
+        };
+        let seed_job = externalized_subscription_job(
+            &store,
+            processor.as_ref(),
+            "promoted-recent-seed",
+            range,
+            BackfillMode::FillMissing,
+            0,
+        )
+        .await;
+        HistoricalRuntime::new(
+            store.clone(),
+            Arc::new(ScriptedHistorySource::from_frames(
+                fixture_source_descriptor("promoted-recent-seed-source", range),
+                frames(range),
+            )),
+            processor.clone(),
+            config.clone(),
+        )
+        .expect("seed runtime")
+        .run(seed_job, default_source_budget(), CancellationToken::new())
+        .await
+        .expect("seed exact coverage");
+
+        // The live lane retained these frames while they were only included;
+        // finality promoted them afterwards.
+        let mut tip = None;
+        for mut frame in frames(range) {
+            frame.finality = Finality::Included;
+            frame.provenance.push(leani_primitives::Provenance {
+                source_id: leani_primitives::SourceId::new("live-cache").expect("source ID"),
+                source_kind: SourceKind::ExecutionP2p,
+                trust: TrustModel::ProtocolVerified,
+                range: Some(range),
+                object: None,
+                observed_at_unix_ms: 1,
+                projection: Vec::new(),
+            });
+            store
+                .store_recent_frame(&frame)
+                .await
+                .expect("retain included frame");
+            tip = Some(frame.block);
+        }
+        let tip = tip.expect("recent tip");
+        store
+            .mark_recent_finalized(ChainId(1), tip.number, tip.hash)
+            .await
+            .expect("promote retained frames");
+
+        let recompute_job = externalized_subscription_job(
+            &store,
+            processor.as_ref(),
+            "promoted-recent-recompute",
+            range,
+            BackfillMode::Recompute,
+            1,
+        )
+        .await;
+        let unused_source = Arc::new(ScriptedHistorySource::from_frames(
+            fixture_source_descriptor("promoted-recent-unused-source", range),
+            frames(range),
+        ));
+        let report = HistoricalRuntime::new(
+            store.clone(),
+            unused_source.clone(),
+            processor.clone(),
+            config,
+        )
+        .expect("recompute runtime")
+        .run(
+            recompute_job,
+            default_source_budget(),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("recompute over promoted recent frames");
+        assert_eq!(unused_source.open_calls(), 0);
+        assert_eq!(report.source_id, "recent-store");
+        assert_eq!(report.frames_committed, range.len());
+    }
+
+    #[tokio::test]
     async fn terminal_historical_job_spools_only_its_final_result() {
         let range = BlockRange::new(BlockNumber(1), BlockNumber(3)).expect("range");
         let source = Arc::new(ScriptedHistorySource::from_frames(

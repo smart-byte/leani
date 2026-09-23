@@ -9,7 +9,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     path::{Component, Path, PathBuf},
-    str::FromStr,
     sync::{Arc, Mutex as StdMutex},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -31,9 +30,10 @@ use leani_store_artifacts::{
 };
 use serde::{Deserialize, Serialize};
 use sqlx::{
-    Row, Sqlite, SqlitePool, Transaction,
+    Acquire, ConnectOptions, Connection, Row, Sqlite, SqlitePool, Transaction,
     sqlite::{
-        SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteRow, SqliteSynchronous,
+        SqliteAutoVacuum, SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteRow,
+        SqliteSynchronous,
     },
 };
 use thiserror::Error;
@@ -1775,16 +1775,49 @@ pub trait ProcessorArtifactStore: Send + Sync {
     ) -> Result<ProcessorArtifactExport, StoreError>;
 }
 
-async fn migrate(pool: &SqlitePool, new_store: bool) -> Result<(), StoreError> {
+/// Bootstrap or upgrade the schema in one transaction.
+///
+/// A database without any schema objects is new, whether its file was just
+/// created or an interrupted first open left it empty. Its schema-1
+/// bootstrap commits together with every migration, so no open can leave a
+/// partially initialized store behind.
+async fn migrate(pool: &SqlitePool) -> Result<(), StoreError> {
+    // IMMEDIATE takes the write lock before the schema is inspected, so a
+    // concurrent opener waits and then sees the committed schema.
+    let mut transaction = pool.begin_with("BEGIN IMMEDIATE").await?;
+    let objects: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sqlite_master")
+        .fetch_one(&mut *transaction)
+        .await?;
+    let new_store = objects == 0;
+    if new_store {
+        sqlx::raw_sql(SCHEMA_V1).execute(&mut *transaction).await?;
+    } else {
+        let has_node_meta: bool = sqlx::query_scalar(
+            "SELECT EXISTS (
+               SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'node_meta'
+             )",
+        )
+        .fetch_one(&mut *transaction)
+        .await?;
+        if !has_node_meta {
+            return Err(StoreError::InvalidConfig(
+                "database is not a Leani store: it has tables but no node_meta".to_owned(),
+            ));
+        }
+    }
     let encoded: Vec<u8> =
         sqlx::query_scalar("SELECT value FROM node_meta WHERE key = 'schema_version'")
-            .fetch_one(pool)
-            .await?;
+            .fetch_optional(&mut *transaction)
+            .await?
+            .ok_or_else(|| {
+                StoreError::InvalidConfig("database has no schema version".to_owned())
+            })?;
     let bytes: [u8; 4] = encoded
         .try_into()
         .map_err(|_| StoreError::Invariant("schema_version must contain four bytes".to_owned()))?;
     let version = u32::from_be_bytes(bytes);
     if version == CURRENT_SCHEMA_VERSION {
+        transaction.commit().await?;
         return Ok(());
     }
     if version > CURRENT_SCHEMA_VERSION {
@@ -1799,8 +1832,8 @@ async fn migrate(pool: &SqlitePool, new_store: bool) -> Result<(), StoreError> {
     }
     // Older stores encode finality 0 = optimistic inside postcard cursors and
     // undo records; that value now means Preview and cannot be rewritten by
-    // SQL. Only the schema-1 bootstrap of a store created by this call may
-    // continue through the migration chain.
+    // SQL. Only the schema-1 bootstrap of a store created by this transaction
+    // may continue through the migration chain.
     if !new_store && version < CURRENT_SCHEMA_VERSION {
         return Err(StoreError::InvalidConfig(format!(
             "database schema {version} predates the included/finalized vocabulary; \
@@ -1830,7 +1863,6 @@ async fn migrate(pool: &SqlitePool, new_store: bool) -> Result<(), StoreError> {
         (20, SCHEMA_V20),
         (21, SCHEMA_V21),
     ];
-    let mut transaction = pool.begin().await?;
     for (target, migration) in migrations {
         if target > version {
             sqlx::raw_sql(migration).execute(&mut *transaction).await?;
@@ -1903,7 +1935,6 @@ impl SqliteStore {
                 })
             })
             .transpose()?;
-        let new_store = !config.path.exists();
         if let Some(parent) = config.path.parent()
             && !parent.as_os_str().is_empty()
         {
@@ -1913,25 +1944,45 @@ impl SqliteStore {
             Durability::Full => SqliteSynchronous::Full,
             Durability::Normal => SqliteSynchronous::Normal,
         };
-        let options =
-            SqliteConnectOptions::from_str(&format!("sqlite://{}", config.path.to_string_lossy()))?
-                .create_if_missing(true)
-                .foreign_keys(true)
-                .journal_mode(SqliteJournalMode::Wal)
-                .synchronous(synchronous)
-                .busy_timeout(config.busy_timeout);
+        // A plain filename, not a `sqlite://` URL: URL parsing percent-decodes
+        // the path and treats `?` as the start of connection parameters.
+        let options = SqliteConnectOptions::new()
+            .filename(&config.path)
+            .create_if_missing(true)
+            .foreign_keys(true)
+            .journal_mode(SqliteJournalMode::Wal)
+            .synchronous(synchronous)
+            .busy_timeout(config.busy_timeout);
+        // The first switch to WAL writes page 1 of a new file, after which
+        // auto_vacuum can only change through VACUUM. sqlx sets auto_vacuum
+        // before journal_mode, so this connection creates new stores with
+        // incremental vacuum. Pooled connections leave it out: on an
+        // incremental store the pragma rewrites page 1 under the write lock,
+        // which each new pooled connection would otherwise repeat.
+        options
+            .clone()
+            .auto_vacuum(SqliteAutoVacuum::Incremental)
+            .connect()
+            .await?
+            .close()
+            .await?;
         let pool = SqlitePoolOptions::new()
             .min_connections(1)
             .max_connections(config.reader_connections.saturating_add(1))
             .connect_with(options)
             .await?;
-        if new_store {
-            sqlx::query("PRAGMA auto_vacuum = INCREMENTAL")
-                .execute(&pool)
-                .await?;
+        migrate(&pool).await?;
+        let auto_vacuum: i64 = sqlx::query_scalar("PRAGMA auto_vacuum")
+            .fetch_one(&pool)
+            .await?;
+        if auto_vacuum != 2 {
+            tracing::warn!(
+                database = %config.path.display(),
+                auto_vacuum,
+                "SQLite store predates incremental auto-vacuum, so pruned pages never \
+                 shrink the file; stop the node and run `leani db compact` once to convert it"
+            );
         }
-        sqlx::raw_sql(SCHEMA_V1).execute(&pool).await?;
-        migrate(&pool, new_store).await?;
         let now = now_i64()?;
         let mut hasher = blake3::Hasher::new();
         hasher.update(config.path.to_string_lossy().as_bytes());
@@ -2660,15 +2711,18 @@ impl SqliteStore {
                 StoreError::Invariant("a non-advancing block must have a prior cursor".to_owned())
             })?
         };
-        let undo = UndoRecord {
+        let mut undo = UndoRecord {
             mutations: batch.mutations.clone(),
             inverse_changes,
             prior_cursor,
             block: delta.block,
             finality: cursor.finality,
         };
-        let undo_bytes = postcard::to_allocvec(&undo)
+        let mut undo_bytes = postcard::to_allocvec(&undo)
             .map_err(|error| StoreError::Encoding(error.to_string()))?;
+        // Finalized blocks are never undone, so only reversible ones record
+        // output metadata and window-pruned rows for their undo.
+        let reversible = cursor.finality != Finality::Finalized;
         if retains_processor_output(descriptor) || artifact_encoded.is_some() {
             let output_bytes = if retains_processor_output(descriptor) {
                 estimated_retained_mutation_bytes(&batch.mutations, true)?
@@ -2709,6 +2763,11 @@ impl SqliteStore {
             )
             .await?;
         }
+        let mut undo_metadata = UndoMetadata::default();
+        if reversible && retains_processor_output(descriptor) {
+            undo_metadata.entities =
+                entity_meta_images(&mut transaction, &instance, &batch.mutations).await?;
+        }
         apply_mutations(
             &mut transaction,
             &instance,
@@ -2719,13 +2778,26 @@ impl SqliteStore {
             cursor.finality,
         )
         .await?;
-        prune_output_window(
+        let pruned = prune_output_window(
             &mut transaction,
             processor.descriptor(),
             &instance,
             delta.block,
         )
         .await?;
+        if reversible {
+            if !pruned.mutations.is_empty() {
+                // Pruning belongs to this block: its undo puts the rows back.
+                undo.mutations.extend(pruned.mutations);
+                undo_bytes = postcard::to_allocvec(&undo)
+                    .map_err(|error| StoreError::Encoding(error.to_string()))?;
+            }
+            undo_metadata.entities.extend(pruned.entities);
+            undo_bytes.extend(
+                postcard::to_allocvec(&undo_metadata)
+                    .map_err(|error| StoreError::Encoding(error.to_string()))?,
+            );
+        }
         sqlx::query(
             "INSERT INTO undo_journal(
                 instance, block_number, block_hash, encoded_undo, finalized
@@ -2815,6 +2887,21 @@ impl SqliteStore {
             .execute(&mut *transaction)
             .await?;
         }
+        // A finalized block proves every older held block final as well.
+        // Canonical ordering publishes those first, in block order, so this
+        // block cannot overtake them; block-versioned output keeps waiting
+        // for mark_finalized.
+        let released_held = if matches!(descriptor.publication, PublicationPolicy::FinalizedOnly)
+            && descriptor.delivery_ordering == DeliveryOrdering::Canonical
+            && delivery_enabled
+            && publish_changes
+            && cursor.finality == Finality::Finalized
+            && let Some(below) = cursor.block_number.0.checked_sub(1)
+        {
+            release_deferred_changes(&mut transaction, &instance, BlockNumber(below)).await?
+        } else {
+            false
+        };
         let (mut first, mut last) = if delivery_enabled {
             append_changes(
                 &mut transaction,
@@ -2878,7 +2965,7 @@ impl SqliteStore {
             enforce_artifact_storage_capacity(&mut transaction, self.inner.artifact_budget).await?;
         }
         transaction.commit().await?;
-        if last.is_some() {
+        if last.is_some() || released_held {
             self.inner.delivery_changes_available.notify_waiters();
         }
         Ok(ApplyOutcome::Applied {
@@ -4047,19 +4134,41 @@ impl SqliteStore {
             return Err(StoreError::FinalizedUndo(block_number));
         }
         let bytes: Vec<u8> = row.try_get("encoded_undo")?;
-        let undo: UndoRecord = postcard::from_bytes(&bytes)
-            .map_err(|error| StoreError::Encoding(error.to_string()))?;
+        let (undo, metadata) = decode_undo(&bytes)?;
+        let retain_output = retains_processor_output(descriptor);
+        let metadata = metadata.filter(|_| retain_output);
+        let finalized_through = if metadata.as_ref().is_some_and(|metadata| {
+            metadata
+                .entities
+                .iter()
+                .any(|image| image.finality != Finality::Finalized)
+        }) {
+            self.finalized_through(descriptor).await?
+        } else {
+            None
+        };
         let mut transaction = self.inner.pool.begin().await?;
         apply_mutations(
             &mut transaction,
             &instance,
             &undo.mutations,
             true,
-            retains_processor_output(descriptor),
+            retain_output,
             undo.block,
             undo.finality,
         )
         .await?;
+        // Records written before undo metadata existed stamp restored
+        // entities with the reverted block, as they always did.
+        if let Some(metadata) = &metadata {
+            restore_entity_metadata(
+                &mut transaction,
+                &instance,
+                &metadata.entities,
+                finalized_through,
+            )
+            .await?;
+        }
         sqlx::query(
             "DELETE FROM processor_coverage
              WHERE instance = ? AND block_number = ? AND block_hash = ?",
@@ -4184,8 +4293,23 @@ impl SqliteStore {
             })
             .transpose()?;
         let mut transaction = self.inner.pool.begin().await?;
-        promote_processor_artifact_candidates(&mut transaction, descriptor, &instance, through)
-            .await?;
+        if let Some(shortfall) = promote_processor_artifact_candidates_within_budget(
+            &mut transaction,
+            descriptor,
+            &instance,
+            through,
+            self.inner.artifact_budget,
+        )
+        .await?
+        {
+            tracing::warn!(
+                processor_instance = %instance,
+                finalized_through = through.0,
+                %shortfall,
+                "finalized artifact candidates stay pending until the retained artifact \
+                 budget has room; a later finality advance retries their promotion"
+            );
+        }
         let result = sqlx::query(
             "UPDATE undo_journal SET finalized = 1
              WHERE instance = ? AND block_number <= ? AND finalized = 0",
@@ -4214,71 +4338,13 @@ impl SqliteStore {
         .bind(finality_i64(Finality::Finalized))
         .execute(&mut *transaction)
         .await?;
-        let mut flushed_deferred = false;
-        if matches!(descriptor.publication, PublicationPolicy::FinalizedOnly)
+        let flushed_deferred = if matches!(descriptor.publication, PublicationPolicy::FinalizedOnly)
             && descriptor.lifecycle.delivery.mode != DeliveryPolicyMode::None
         {
-            // Bytes were admitted at apply time, so no capacity check here:
-            // finality advancement must never fail on delivery pressure.
-            loop {
-                let rows = sqlx::query(
-                    "SELECT id, stream_id, chain_id, block, origin, changes, sink_ids
-                     FROM deferred_changes
-                     WHERE instance = ? AND block_number <= ?
-                     ORDER BY block_number, id
-                     LIMIT ?",
-                )
-                .bind(&instance)
-                .bind(u64_i64(through.0, "block_number")?)
-                .bind(i64::try_from(DEFERRED_FLUSH_BATCH).unwrap_or(i64::MAX))
-                .fetch_all(&mut *transaction)
-                .await?;
-                if rows.is_empty() {
-                    break;
-                }
-                for row in &rows {
-                    let id: i64 = row.try_get("id")?;
-                    let stream_id: String = row.try_get("stream_id")?;
-                    let chain_id = ChainId(i64_u64(row.try_get("chain_id")?, "deferred chain id")?);
-                    let block: BlockRef =
-                        postcard::from_bytes(&row.try_get::<Vec<u8>, _>("block")?)
-                            .map_err(|error| StoreError::Encoding(error.to_string()))?;
-                    let origin: DeliveryOrigin =
-                        postcard::from_bytes(&row.try_get::<Vec<u8>, _>("origin")?)
-                            .map_err(|error| StoreError::Encoding(error.to_string()))?;
-                    let changes: Vec<DomainChange> =
-                        postcard::from_bytes(&row.try_get::<Vec<u8>, _>("changes")?)
-                            .map_err(|error| StoreError::Encoding(error.to_string()))?;
-                    let sink_ids: Vec<String> =
-                        postcard::from_bytes(&row.try_get::<Vec<u8>, _>("sink_ids")?)
-                            .map_err(|error| StoreError::Encoding(error.to_string()))?;
-                    append_changes(
-                        &mut transaction,
-                        &instance,
-                        &stream_id,
-                        &origin,
-                        chain_id,
-                        block,
-                        Finality::Finalized,
-                        ChangeDirection::Apply,
-                        &changes,
-                        &sink_ids,
-                    )
-                    .await?;
-                    // Rows are ordered by block, not by insertion id, so a
-                    // block admitted early can carry a low id: delete exactly
-                    // what was published, never a cutoff.
-                    sqlx::query("DELETE FROM deferred_changes WHERE id = ?")
-                        .bind(id)
-                        .execute(&mut *transaction)
-                        .await?;
-                }
-                flushed_deferred = true;
-                if rows.len() < DEFERRED_FLUSH_BATCH {
-                    break;
-                }
-            }
-        }
+            release_deferred_changes(&mut transaction, &instance, through).await?
+        } else {
+            false
+        };
         let mut checkpoint_cursor = cursor.clone();
         if let Some(finalized_cursor) = checkpoint_cursor.as_mut()
             && finalized_cursor.block_number <= through
@@ -4332,12 +4398,6 @@ impl SqliteStore {
                 descriptor.lifecycle.checkpoint.keep,
             )
             .await?;
-        }
-        if !matches!(
-            descriptor.lifecycle.artifacts.mode,
-            ArtifactPolicyMode::None
-        ) {
-            enforce_artifact_storage_capacity(&mut transaction, self.inner.artifact_budget).await?;
         }
         transaction.commit().await?;
         if result.rows_affected() > 0 || flushed_deferred {
@@ -6169,6 +6229,9 @@ impl SqliteStore {
 
     /// Read one retained canonical frame by block number.
     ///
+    /// The frame reports the canonical block's current finality, not the
+    /// finality it was retained with.
+    ///
     /// # Errors
     ///
     /// Returns an error for corrupt durable material or a database failure.
@@ -6177,8 +6240,8 @@ impl SqliteStore {
         chain_id: ChainId,
         block_number: BlockNumber,
     ) -> Result<Option<BlockFrame>, StoreError> {
-        let encoded: Option<Vec<u8>> = sqlx::query_scalar(
-            "SELECT recent.encoded_frame
+        let row: Option<(Vec<u8>, Vec<u8>, i64)> = sqlx::query_as(
+            "SELECT recent.encoded_frame, canonical.block_hash, canonical.finality
              FROM canonical_blocks AS canonical
              JOIN recent_blocks AS recent
                ON recent.chain_id = canonical.chain_id
@@ -6190,20 +6253,17 @@ impl SqliteStore {
         .bind(u64_i64(block_number.0, "block_number")?)
         .fetch_optional(&self.inner.pool)
         .await?;
-        encoded
-            .map(|encoded| {
-                leani_primitives::durable::decode(
-                    DurableKind::BlockFrame,
-                    leani_primitives::BLOCK_FRAME_SCHEMA_VERSION,
-                    &encoded,
-                )
-                .map_err(|error| StoreError::Encoding(error.to_string()))
-            })
-            .transpose()
+        row.map(|(encoded, canonical_hash, finality)| {
+            decode_recent_frame(&encoded, Some((canonical_hash, finality)))
+        })
+        .transpose()
     }
 
     /// Read one retained frame by its exact block hash, including a bounded
     /// non-canonical fork candidate.
+    ///
+    /// A canonical frame reports the block's current finality; a fork
+    /// candidate keeps the finality it was retained with.
     ///
     /// # Errors
     ///
@@ -6213,24 +6273,26 @@ impl SqliteStore {
         chain_id: ChainId,
         block_hash: BlockHash,
     ) -> Result<Option<BlockFrame>, StoreError> {
-        let encoded: Option<Vec<u8>> = sqlx::query_scalar(
-            "SELECT encoded_frame FROM recent_blocks
-             WHERE chain_id = ? AND block_hash = ? LIMIT 1",
+        let row = sqlx::query(
+            "SELECT recent.encoded_frame, canonical.block_hash, canonical.finality
+             FROM recent_blocks AS recent
+             LEFT JOIN canonical_blocks AS canonical
+               ON canonical.chain_id = recent.chain_id
+              AND canonical.block_number = recent.block_number
+              AND canonical.block_hash = recent.block_hash
+             WHERE recent.chain_id = ? AND recent.block_hash = ? LIMIT 1",
         )
         .bind(u64_i64(chain_id.0, "chain_id")?)
         .bind(block_hash.0.as_slice())
         .fetch_optional(&self.inner.pool)
         .await?;
-        encoded
-            .map(|encoded| {
-                leani_primitives::durable::decode(
-                    DurableKind::BlockFrame,
-                    leani_primitives::BLOCK_FRAME_SCHEMA_VERSION,
-                    &encoded,
-                )
-                .map_err(|error| StoreError::Encoding(error.to_string()))
-            })
-            .transpose()
+        row.map(|row| {
+            let canonical = row
+                .try_get::<Option<Vec<u8>>, _>("block_hash")?
+                .zip(row.try_get::<Option<i64>, _>("finality")?);
+            decode_recent_frame(&row.try_get::<Vec<u8>, _>("encoded_frame")?, canonical)
+        })
+        .transpose()
     }
 
     /// Resolve a transaction hash to its retained canonical recent frame.
@@ -11980,8 +12042,7 @@ impl SqliteStore {
             .fetch_all(&self.inner.pool)
             .await?;
         for bytes in records {
-            let _: UndoRecord = postcard::from_bytes(&bytes)
-                .map_err(|error| StoreError::Encoding(error.to_string()))?;
+            decode_undo(&bytes)?;
         }
         let inconsistent_artifact_totals: Option<String> = sqlx::query_scalar(
             "SELECT processors.instance
@@ -12092,20 +12153,29 @@ impl SqliteStore {
 
     /// Run a truncating WAL checkpoint and reclaim free pages.
     ///
+    /// The rewrite also enables incremental auto-vacuum, converting stores
+    /// created before it was set so later pruning can shrink the file.
+    ///
     /// # Errors
     ///
     /// Returns an error when checkpointing or compaction fails.
     pub async fn compact(&self) -> Result<(), StoreError> {
         let _guard = self.inner.writer.lock().await;
+        // The requested auto_vacuum mode belongs to the connection until
+        // VACUUM rewrites the file, so both run on the same connection.
+        let mut connection = self.inner.pool.acquire().await?;
         sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
-            .execute(&self.inner.pool)
+            .execute(&mut *connection)
             .await?;
-        sqlx::query("VACUUM").execute(&self.inner.pool).await?;
+        sqlx::query("PRAGMA auto_vacuum = INCREMENTAL")
+            .execute(&mut *connection)
+            .await?;
+        sqlx::query("VACUUM").execute(&mut *connection).await?;
         // VACUUM rewrites the database through WAL mode. Truncate that rewrite
         // before returning so an explicit compaction cannot leave a second,
         // database-sized physical copy behind in the WAL.
         sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
-            .execute(&self.inner.pool)
+            .execute(&mut *connection)
             .await?;
         Ok(())
     }
@@ -12222,6 +12292,57 @@ struct UndoRecord {
     prior_cursor: Option<ProcessorCursor>,
     block: BlockRef,
     finality: Finality,
+}
+
+/// Output metadata before-images for one reversible block.
+///
+/// `undo_journal.encoded_undo` holds the postcard [`UndoRecord`] followed by
+/// this second postcard value. Undo restores each entity's provenance from
+/// it; records written before it existed end after the [`UndoRecord`] and
+/// still stamp restored entities with the reverted block. Readers that
+/// decode only the [`UndoRecord`] ignore the trailing value.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+struct UndoMetadata {
+    /// Entities that existed before the block, including rows removed by the
+    /// block's window pruning.
+    entities: Vec<EntityMetaImage>,
+}
+
+/// One `output_entity_meta` row as it was before a block changed it.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct EntityMetaImage {
+    collection: String,
+    key: Vec<u8>,
+    block_number: u64,
+    block_timestamp: u64,
+    finality: Finality,
+    written_at_unix_ms: i64,
+    value_bytes: u64,
+}
+
+/// Output rows removed by one window pruning pass, recorded so undo of the
+/// block that pruned them can restore them.
+#[derive(Debug, Default)]
+struct PrunedOutput {
+    mutations: Vec<Mutation>,
+    entities: Vec<EntityMetaImage>,
+}
+
+/// Decode an undo journal entry and its [`UndoMetadata`], when present.
+fn decode_undo(bytes: &[u8]) -> Result<(UndoRecord, Option<UndoMetadata>), StoreError> {
+    let (record, trailer) = postcard::take_from_bytes::<UndoRecord>(bytes)
+        .map_err(|error| StoreError::Encoding(error.to_string()))?;
+    if trailer.is_empty() {
+        return Ok((record, None));
+    }
+    let (metadata, rest) = postcard::take_from_bytes::<UndoMetadata>(trailer)
+        .map_err(|error| StoreError::Encoding(error.to_string()))?;
+    if !rest.is_empty() {
+        return Err(StoreError::Encoding(
+            "undo record has trailing bytes after its metadata".to_owned(),
+        ));
+    }
+    Ok((record, Some(metadata)))
 }
 
 #[derive(Debug)]
@@ -13004,6 +13125,44 @@ async fn promote_processor_artifact_candidates(
     Ok(promoted)
 }
 
+/// Promote finalized artifact candidates when the retained artifact budget
+/// has room, returning the capacity error that deferred them otherwise.
+///
+/// Promotion runs in a savepoint, so a full budget rolls back only the
+/// promotion and finality still commits. The candidates stay pending and
+/// every later `mark_finalized` retries them. Promotion only lowers pending
+/// bytes, so an exceeded pending budget does not hold it back.
+async fn promote_processor_artifact_candidates_within_budget(
+    transaction: &mut Transaction<'_, Sqlite>,
+    descriptor: &ProcessorDescriptor,
+    instance: &str,
+    through: BlockNumber,
+    budget: ArtifactStorageBudget,
+) -> Result<Option<StoreError>, StoreError> {
+    if matches!(
+        descriptor.lifecycle.artifacts.mode,
+        ArtifactPolicyMode::None
+    ) {
+        return Ok(None);
+    }
+    let mut promotion = transaction.begin().await?;
+    promote_processor_artifact_candidates(&mut promotion, descriptor, instance, through).await?;
+    match enforce_artifact_storage_capacity(&mut promotion, budget).await {
+        Ok(())
+        | Err(StoreError::ArtifactStorageLimit {
+            scope: "pending", ..
+        }) => {
+            promotion.commit().await?;
+            Ok(None)
+        }
+        Err(error @ StoreError::ArtifactStorageLimit { .. }) => {
+            promotion.rollback().await?;
+            Ok(Some(error))
+        }
+        Err(error) => Err(error),
+    }
+}
+
 async fn insert_artifact_owner(
     transaction: &mut Transaction<'_, Sqlite>,
     instance: &str,
@@ -13252,6 +13411,163 @@ async fn apply_mutations(
         }
     }
     Ok(())
+}
+
+fn entity_meta_image(row: &SqliteRow) -> Result<EntityMetaImage, StoreError> {
+    Ok(EntityMetaImage {
+        collection: row.try_get("collection")?,
+        key: row.try_get("entity_key")?,
+        block_number: i64_u64(row.try_get("block_number")?, "output block number")?,
+        block_timestamp: i64_u64(row.try_get("block_timestamp")?, "output block timestamp")?,
+        finality: decode_finality(row.try_get("finality")?)?,
+        written_at_unix_ms: row.try_get("written_at_unix_ms")?,
+        value_bytes: i64_u64(row.try_get("value_bytes")?, "output value bytes")?,
+    })
+}
+
+/// Capture the output metadata of every existing entity a block changes, so
+/// undo can restore it instead of stamping the reverted block.
+async fn entity_meta_images(
+    transaction: &mut Transaction<'_, Sqlite>,
+    instance: &str,
+    mutations: &[Mutation],
+) -> Result<Vec<EntityMetaImage>, StoreError> {
+    let mut images = Vec::new();
+    for mutation in mutations {
+        let Mutation::Entity {
+            collection,
+            key,
+            before: Some(_),
+            ..
+        } = mutation
+        else {
+            continue;
+        };
+        let row = sqlx::query(
+            "SELECT collection, entity_key, block_number, block_timestamp, finality,
+                    written_at_unix_ms, value_bytes
+             FROM output_entity_meta
+             WHERE instance = ? AND collection = ? AND entity_key = ?",
+        )
+        .bind(instance)
+        .bind(collection)
+        .bind(key)
+        .fetch_optional(&mut **transaction)
+        .await?;
+        if let Some(row) = row {
+            images.push(entity_meta_image(&row)?);
+        }
+    }
+    Ok(images)
+}
+
+/// Restore output metadata before-images after undo restored the values.
+///
+/// A before-image taken while its block was still included is restored as
+/// finalized once finality has passed that block, as `mark_finalized` would
+/// have recorded it meanwhile.
+async fn restore_entity_metadata(
+    transaction: &mut Transaction<'_, Sqlite>,
+    instance: &str,
+    images: &[EntityMetaImage],
+    finalized_through: Option<BlockNumber>,
+) -> Result<(), StoreError> {
+    for image in images {
+        let finality = if finalized_through.is_some_and(|through| image.block_number <= through.0) {
+            Finality::Finalized
+        } else {
+            image.finality
+        };
+        sqlx::query(
+            "UPDATE output_entity_meta
+             SET block_number = ?, block_timestamp = ?, finality = ?,
+                 written_at_unix_ms = ?, value_bytes = ?
+             WHERE instance = ? AND collection = ? AND entity_key = ?",
+        )
+        .bind(u64_i64(image.block_number, "output block number")?)
+        .bind(u64_i64(image.block_timestamp, "output block timestamp")?)
+        .bind(finality_i64(finality))
+        .bind(image.written_at_unix_ms)
+        .bind(u64_i64(image.value_bytes, "output value bytes")?)
+        .bind(instance)
+        .bind(&image.collection)
+        .bind(&image.key)
+        .execute(&mut **transaction)
+        .await?;
+    }
+    Ok(())
+}
+
+/// Publish the parked changes of a `finalized_only` instance for every block
+/// through `through`, in block order, as finalized applies.
+///
+/// Bytes were admitted when the rows were parked, so no capacity check runs
+/// here: finality advancement must never fail on delivery pressure. Returns
+/// whether any row was published.
+async fn release_deferred_changes(
+    transaction: &mut Transaction<'_, Sqlite>,
+    instance: &str,
+    through: BlockNumber,
+) -> Result<bool, StoreError> {
+    let mut released = false;
+    loop {
+        let rows = sqlx::query(
+            "SELECT id, stream_id, chain_id, block, origin, changes, sink_ids
+             FROM deferred_changes
+             WHERE instance = ? AND block_number <= ?
+             ORDER BY block_number, id
+             LIMIT ?",
+        )
+        .bind(instance)
+        .bind(u64_i64(through.0, "block_number")?)
+        .bind(i64::try_from(DEFERRED_FLUSH_BATCH).unwrap_or(i64::MAX))
+        .fetch_all(&mut **transaction)
+        .await?;
+        if rows.is_empty() {
+            break;
+        }
+        for row in &rows {
+            let id: i64 = row.try_get("id")?;
+            let stream_id: String = row.try_get("stream_id")?;
+            let chain_id = ChainId(i64_u64(row.try_get("chain_id")?, "deferred chain id")?);
+            let block: BlockRef = postcard::from_bytes(&row.try_get::<Vec<u8>, _>("block")?)
+                .map_err(|error| StoreError::Encoding(error.to_string()))?;
+            let origin: DeliveryOrigin =
+                postcard::from_bytes(&row.try_get::<Vec<u8>, _>("origin")?)
+                    .map_err(|error| StoreError::Encoding(error.to_string()))?;
+            let changes: Vec<DomainChange> =
+                postcard::from_bytes(&row.try_get::<Vec<u8>, _>("changes")?)
+                    .map_err(|error| StoreError::Encoding(error.to_string()))?;
+            let sink_ids: Vec<String> =
+                postcard::from_bytes(&row.try_get::<Vec<u8>, _>("sink_ids")?)
+                    .map_err(|error| StoreError::Encoding(error.to_string()))?;
+            append_changes(
+                transaction,
+                instance,
+                &stream_id,
+                &origin,
+                chain_id,
+                block,
+                Finality::Finalized,
+                ChangeDirection::Apply,
+                &changes,
+                &sink_ids,
+            )
+            .await?;
+            // Rows are ordered by block, not by insertion id, so a block
+            // admitted early can carry a low id: delete exactly what was
+            // published, never a cutoff.
+            sqlx::query("DELETE FROM deferred_changes WHERE id = ?")
+                .bind(id)
+                .execute(&mut **transaction)
+                .await?;
+        }
+        released = true;
+        if rows.len() < DEFERRED_FLUSH_BATCH {
+            break;
+        }
+    }
+    Ok(released)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -13773,21 +14089,24 @@ async fn create_recovery_checkpoint(
     Ok(())
 }
 
+/// Delete retained output that fell out of the window, returning the removed
+/// rows so a reversible block's undo record can restore them.
 #[allow(clippy::too_many_lines)]
 async fn prune_output_window(
     transaction: &mut Transaction<'_, Sqlite>,
     descriptor: &ProcessorDescriptor,
     instance: &str,
     current_block: BlockRef,
-) -> Result<u64, StoreError> {
+) -> Result<PrunedOutput, StoreError> {
     if !matches!(descriptor.lifecycle.output.mode, OutputPolicyMode::Window) {
-        return Ok(0);
+        return Ok(PrunedOutput::default());
     }
     let window = descriptor.lifecycle.output.window.ok_or_else(|| {
         StoreError::Invariant("window output policy is missing its bound".to_owned())
     })?;
     let rows = sqlx::query(
-        "SELECT collection, entity_key, block_number, written_at_unix_ms, value_bytes
+        "SELECT collection, entity_key, block_number, block_timestamp, finality,
+                written_at_unix_ms, value_bytes
          FROM output_entity_meta
          WHERE instance = ? AND finality = ?
          ORDER BY block_number, written_at_unix_ms, collection, entity_key
@@ -13807,10 +14126,7 @@ async fn prune_output_window(
         for row in rows {
             let block_number = i64_u64(row.try_get("block_number")?, "output block number")?;
             if block_number < retained_from {
-                candidates.push((
-                    row.try_get::<String, _>("collection")?,
-                    row.try_get::<Vec<u8>, _>("entity_key")?,
-                ));
+                candidates.push(entity_meta_image(&row)?);
             }
         }
     } else if let Some(max_age_seconds) = window.max_age_seconds {
@@ -13821,10 +14137,7 @@ async fn prune_output_window(
         for row in rows {
             let written_at: i64 = row.try_get("written_at_unix_ms")?;
             if written_at < cutoff {
-                candidates.push((
-                    row.try_get::<String, _>("collection")?,
-                    row.try_get::<Vec<u8>, _>("entity_key")?,
-                ));
+                candidates.push(entity_meta_image(&row)?);
             }
         }
     } else if let Some(max_rows) = window.max_rows {
@@ -13837,10 +14150,7 @@ async fn prune_output_window(
             .unwrap_or(usize::MAX)
             .min(rows.len());
         for row in rows.into_iter().take(take) {
-            candidates.push((
-                row.try_get::<String, _>("collection")?,
-                row.try_get::<Vec<u8>, _>("entity_key")?,
-            ));
+            candidates.push(entity_meta_image(&row)?);
         }
     } else if let Some(max_bytes) = window.max_bytes {
         let total: i64 = sqlx::query_scalar(
@@ -13856,39 +14166,58 @@ async fn prune_output_window(
                 break;
             }
             let bytes = i64_u64(row.try_get("value_bytes")?, "output entity bytes")?;
-            candidates.push((
-                row.try_get::<String, _>("collection")?,
-                row.try_get::<Vec<u8>, _>("entity_key")?,
-            ));
+            candidates.push(entity_meta_image(&row)?);
             excess = excess.saturating_sub(bytes);
         }
     }
-    for (collection, key) in &candidates {
-        sqlx::query(
+    let mut pruned = PrunedOutput::default();
+    if candidates.is_empty() {
+        return Ok(pruned);
+    }
+    for image in candidates {
+        let value: Option<Vec<u8>> = sqlx::query_scalar(
             "DELETE FROM entities
-             WHERE instance = ? AND collection = ? AND entity_key = ?",
+             WHERE instance = ? AND collection = ? AND entity_key = ?
+             RETURNING value",
         )
         .bind(instance)
-        .bind(collection)
-        .bind(key)
-        .execute(&mut **transaction)
+        .bind(&image.collection)
+        .bind(&image.key)
+        .fetch_optional(&mut **transaction)
         .await?;
+        if let Some(value) = value {
+            pruned.mutations.push(Mutation::Entity {
+                collection: image.collection.clone(),
+                key: image.key.clone(),
+                before: Some(value),
+                after: None,
+            });
+            pruned.entities.push(image);
+        }
     }
-    if !candidates.is_empty() {
-        sqlx::query(
-            "DELETE FROM entity_indexes
-             WHERE instance = ?
-               AND NOT EXISTS (
-                 SELECT 1 FROM entities
-                 WHERE entities.instance = entity_indexes.instance
-                   AND entities.entity_key = entity_indexes.entity_key
-               )",
-        )
-        .bind(instance)
-        .execute(&mut **transaction)
-        .await?;
+    let orphaned: Vec<(String, Vec<u8>, Vec<u8>)> = sqlx::query_as(
+        "DELETE FROM entity_indexes
+         WHERE instance = ?
+           AND NOT EXISTS (
+             SELECT 1 FROM entities
+             WHERE entities.instance = entity_indexes.instance
+               AND entities.entity_key = entity_indexes.entity_key
+           )
+         RETURNING index_name, index_key, entity_key",
+    )
+    .bind(instance)
+    .fetch_all(&mut **transaction)
+    .await?;
+    for (index, index_key, entity_key) in orphaned {
+        pruned.mutations.push(Mutation::Index {
+            index,
+            index_key,
+            entity_key,
+            before: true,
+            after: false,
+        });
     }
-    u64::try_from(candidates.len()).map_err(|_| StoreError::Numeric("pruned output entities"))
+    Ok(pruned)
 }
 
 #[allow(clippy::too_many_lines)]
@@ -14208,6 +14537,34 @@ async fn applied_checksum(
     .fetch_optional(pool)
     .await?;
     value.map(decode_hash).transpose()
+}
+
+/// Decode a retained recent frame, overlaying its canonical block's current
+/// finality when it has one.
+///
+/// Payloads keep the finality they were retained with, while finality
+/// promotion only updates `canonical_blocks`; without the overlay a promoted
+/// frame would still read as included.
+fn decode_recent_frame(
+    encoded: &[u8],
+    canonical: Option<(Vec<u8>, i64)>,
+) -> Result<BlockFrame, StoreError> {
+    let mut frame: BlockFrame = leani_primitives::durable::decode(
+        DurableKind::BlockFrame,
+        leani_primitives::BLOCK_FRAME_SCHEMA_VERSION,
+        encoded,
+    )
+    .map_err(|error| StoreError::Encoding(error.to_string()))?;
+    if let Some((canonical_hash, finality)) = canonical {
+        if decode_hash(canonical_hash)? != frame.block.hash {
+            return Err(StoreError::Invariant(format!(
+                "recent frame {} does not match its canonical block hash",
+                frame.block.number.0
+            )));
+        }
+        frame.finality = decode_finality(finality)?;
+    }
+    Ok(frame)
 }
 
 fn same_recent_material(stored: &BlockFrame, incoming: &BlockFrame) -> bool {
@@ -17013,45 +17370,88 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn artifact_finality_promotion_rolls_back_when_retained_budget_is_full() {
+    async fn full_artifact_budget_defers_promotion_without_stalling_finality() {
         let directory = tempfile::tempdir().expect("tempdir");
-        let store = SqliteStore::open(
-            StoreConfig::new(directory.path().join("node.sqlite")).with_artifact_budget(
-                ArtifactStorageBudget {
-                    maximum_retained_bytes: 1,
-                    maximum_pending_bytes: 1_024 * 1_024,
-                },
-            ),
-        )
+        let path = directory.path().join("node.sqlite");
+        let store = SqliteStore::open(StoreConfig::new(&path).with_artifact_budget(
+            ArtifactStorageBudget {
+                maximum_retained_bytes: 1,
+                maximum_pending_bytes: 1_024 * 1_024,
+            },
+        ))
         .await
         .expect("open artifact-bounded store");
         let mut processor = FixtureProcessor::full_artifacts();
-        processor.descriptor.lifecycle.output.mode = OutputPolicyMode::None;
-        processor.descriptor.lifecycle.delivery.mode = DeliveryPolicyMode::None;
-        processor.descriptor.lifecycle.delivery.consumers.clear();
-        let optimistic = frame(1, BlockHash::ZERO);
-        let delta = processor.map(&optimistic).await.expect("map optimistic");
+        processor.descriptor.publication = PublicationPolicy::FinalizedOnly;
+        let included = frame(1, BlockHash::ZERO);
+        let delta = processor.map(&included).await.expect("map included");
         store
-            .apply(&processor, cursor(&processor, &optimistic, 1), &delta, &[])
+            .apply(&processor, cursor(&processor, &included, 1), &delta, &[])
             .await
             .expect("stage candidate");
+        assert_eq!(deferred_rows(&store, &processor).await, 1);
+
+        assert_eq!(
+            store
+                .mark_finalized(&processor.descriptor, included.block.number)
+                .await
+                .expect("finality advances while the artifact budget is full"),
+            1
+        );
+        assert_eq!(
+            store
+                .finalized_through(&processor.descriptor)
+                .await
+                .expect("finalized coverage"),
+            Some(included.block.number)
+        );
         assert!(matches!(
             store
-                .mark_finalized(&processor.descriptor, optimistic.block.number)
+                .undo(
+                    &processor.descriptor,
+                    included.chain_id,
+                    included.block.number,
+                    included.block.hash,
+                    &[],
+                )
                 .await,
-            Err(StoreError::ArtifactStorageLimit {
-                scope: "retained",
-                limit_bytes: 1,
-                ..
-            })
+            Err(StoreError::FinalizedUndo(BlockNumber(1)))
         ));
+        assert_eq!(deferred_rows(&store, &processor).await, 0);
+        let published = store
+            .changes(&processor.descriptor, ChainId(1), 0, 100)
+            .await
+            .expect("changes");
+        assert_eq!(
+            published
+                .iter()
+                .map(|change| change.change.kind.as_str())
+                .collect::<Vec<_>>(),
+            vec!["fixture.counter", "system.finality"]
+        );
         let stats = store
             .processor_stats(&processor.descriptor)
             .await
-            .expect("stats after promotion rejection");
+            .expect("stats after deferred promotion");
         assert_eq!(stats.pending_processor_artifacts, 1);
         assert_eq!(stats.processor_artifacts, 0);
-        assert_eq!(stats.undo_records, 1);
+        store.inner.pool.close().await;
+        drop(store);
+
+        // The next finality advance retries promotion once capacity allows it.
+        let store = SqliteStore::open(StoreConfig::new(&path))
+            .await
+            .expect("reopen with the default artifact budget");
+        store
+            .mark_finalized(&processor.descriptor, included.block.number)
+            .await
+            .expect("retry promotion");
+        let stats = store
+            .processor_stats(&processor.descriptor)
+            .await
+            .expect("stats after promotion");
+        assert_eq!(stats.pending_processor_artifacts, 0);
+        assert_eq!(stats.processor_artifacts, 1);
     }
 
     #[tokio::test]
@@ -17409,6 +17809,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn finalized_only_releases_held_blocks_before_a_finalized_apply() {
+        let (_directory, store) = store().await;
+        let processor = finalized_only_processor();
+        let mut parent = BlockHash::ZERO;
+        for number in 1..=5 {
+            let mut block = frame(number, parent);
+            if number == 1 || number == 5 {
+                block.finality = Finality::Finalized;
+            }
+            parent = block.block.hash;
+            let delta = processor.map(&block).await.expect("map");
+            store
+                .apply(&processor, cursor(&processor, &block, number), &delta, &[])
+                .await
+                .expect("apply");
+        }
+
+        let published = store
+            .changes(&processor.descriptor, ChainId(1), 0, 100)
+            .await
+            .expect("changes");
+        assert_eq!(
+            published
+                .iter()
+                .map(|change| (change.block.number.0, change.finality, change.direction))
+                .collect::<Vec<_>>(),
+            (1..=5)
+                .map(|number| (number, Finality::Finalized, ChangeDirection::Apply))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(deferred_rows(&store, &processor).await, 0);
+    }
+
+    #[tokio::test]
+    async fn block_versioned_finalized_only_output_keeps_holding_older_blocks() {
+        let (_directory, store) = store().await;
+        let mut processor = FixtureProcessor::block_output();
+        processor.descriptor.publication = PublicationPolicy::FinalizedOnly;
+        let held = frame(1, BlockHash::ZERO);
+        let mut finalized = frame(2, held.block.hash);
+        finalized.finality = Finality::Finalized;
+        for (sequence, block) in [(1, &held), (2, &finalized)] {
+            let delta = processor.map(block).await.expect("map");
+            store
+                .apply(&processor, cursor(&processor, block, sequence), &delta, &[])
+                .await
+                .expect("apply");
+        }
+
+        let published = store
+            .changes(&processor.descriptor, ChainId(1), 0, 100)
+            .await
+            .expect("changes");
+        assert_eq!(
+            published
+                .iter()
+                .map(|change| change.block.number.0)
+                .collect::<Vec<_>>(),
+            vec![2]
+        );
+        assert_eq!(deferred_rows(&store, &processor).await, 1);
+    }
+
+    #[tokio::test]
     async fn deferred_bytes_count_toward_the_delivery_limit_without_stalling_siblings() {
         let (_directory, store) = store().await;
         let mut slow = finalized_only_processor();
@@ -17716,14 +18180,176 @@ mod tests {
         );
     }
 
+    async fn auto_vacuum_mode(store: &SqliteStore) -> i64 {
+        // The pragma reports the connection's cached header; a read first
+        // refreshes it after another pooled connection ran VACUUM.
+        let mut connection = store.inner.pool.acquire().await.expect("connection");
+        sqlx::query("SELECT COUNT(*) FROM sqlite_master")
+            .execute(&mut *connection)
+            .await
+            .expect("refresh database header");
+        sqlx::query_scalar("PRAGMA auto_vacuum")
+            .fetch_one(&mut *connection)
+            .await
+            .expect("auto_vacuum mode")
+    }
+
+    async fn checkpoint_wal(store: &SqliteStore) {
+        sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
+            .execute(&store.inner.pool)
+            .await
+            .expect("checkpoint WAL");
+    }
+
+    #[tokio::test]
+    async fn fresh_stores_enable_incremental_auto_vacuum() {
+        let (_directory, store) = store().await;
+        assert_eq!(auto_vacuum_mode(&store).await, 2);
+    }
+
+    #[tokio::test]
+    async fn compaction_enables_incremental_auto_vacuum_on_older_stores() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("node.sqlite");
+        let store = SqliteStore::open(StoreConfig::new(&path))
+            .await
+            .expect("open fresh store");
+        store.inner.pool.close().await;
+        drop(store);
+        let mut legacy = SqliteConnectOptions::new()
+            .filename(&path)
+            .connect()
+            .await
+            .expect("legacy connection");
+        sqlx::raw_sql("PRAGMA auto_vacuum = NONE; VACUUM;")
+            .execute(&mut legacy)
+            .await
+            .expect("represent a store created without auto-vacuum");
+        legacy.close().await.expect("close legacy connection");
+
+        let store = SqliteStore::open(StoreConfig::new(&path))
+            .await
+            .expect("reopen older store");
+        assert_eq!(auto_vacuum_mode(&store).await, 0);
+        store.compact().await.expect("compact");
+        assert_eq!(auto_vacuum_mode(&store).await, 2);
+    }
+
+    #[tokio::test]
+    async fn reclaiming_free_pages_shrinks_a_fresh_store_after_pruning() {
+        let (directory, store) = store().await;
+        let path = directory.path().join("node.sqlite");
+        let mut parent = BlockHash::ZERO;
+        for number in 1..=32 {
+            let mut current = wide_frame(number, parent);
+            if let Material::Complete(header) = &mut current.header {
+                header.rlp = Some(vec![0xa5; 64 * 1_024]);
+            }
+            parent = current.block.hash;
+            store
+                .store_recent_frame(&current)
+                .await
+                .expect("store recent frame");
+        }
+        checkpoint_wal(&store).await;
+        let grown = std::fs::metadata(&path).expect("grown store").len();
+
+        let pruned = store
+            .prune_recent_frames(ChainId(1), BlockNumber(32), 1, 1, u64::MAX)
+            .await
+            .expect("prune recent frames");
+        assert_eq!(pruned.deleted_frames, 31);
+        store
+            .reclaim_free_pages(u32::MAX)
+            .await
+            .expect("reclaim free pages");
+        checkpoint_wal(&store).await;
+        let shrunk = std::fs::metadata(&path).expect("shrunk store").len();
+        assert!(
+            shrunk < grown / 4,
+            "store kept {shrunk} of {grown} bytes after pruning"
+        );
+    }
+
+    #[tokio::test]
+    async fn database_paths_are_opened_literally() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let requested = directory.path().join("audit%41.sqlite");
+        let _store = SqliteStore::open(StoreConfig::new(&requested))
+            .await
+            .expect("open percent-named store");
+        assert!(requested.exists());
+        assert!(!directory.path().join("auditA.sqlite").exists());
+    }
+
+    #[tokio::test]
+    async fn a_first_open_interrupted_before_the_schema_commit_bootstraps_again() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("node.sqlite");
+        // The file and its WAL header exist, but no schema was committed.
+        let interrupted = SqliteConnectOptions::new()
+            .filename(&path)
+            .create_if_missing(true)
+            .journal_mode(SqliteJournalMode::Wal)
+            .connect()
+            .await
+            .expect("create the interrupted store file");
+        interrupted
+            .close()
+            .await
+            .expect("close interrupted connection");
+        assert!(path.exists());
+
+        let store = SqliteStore::open(StoreConfig::new(&path))
+            .await
+            .expect("bootstrap the schema-less file");
+        assert_eq!(
+            store.stats().await.expect("stats").schema_version,
+            CURRENT_SCHEMA_VERSION
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_bootstrap_leaves_no_partial_schema() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("node.sqlite");
+        // A page budget far below the schema's size fails the bootstrap
+        // part-way through its statements.
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(
+                SqliteConnectOptions::new()
+                    .filename(&path)
+                    .create_if_missing(true)
+                    .journal_mode(SqliteJournalMode::Wal)
+                    .pragma("max_page_count", "8"),
+            )
+            .await
+            .expect("page-limited pool");
+        assert!(migrate(&pool).await.is_err());
+        let objects: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sqlite_master")
+            .fetch_one(&pool)
+            .await
+            .expect("schema objects");
+        assert_eq!(objects, 0);
+        pool.close().await;
+
+        let store = SqliteStore::open(StoreConfig::new(&path))
+            .await
+            .expect("bootstrap after the failed attempt");
+        assert_eq!(
+            store.stats().await.expect("stats").schema_version,
+            CURRENT_SCHEMA_VERSION
+        );
+    }
+
     #[tokio::test]
     async fn pre_existing_v1_stores_are_refused() {
         let directory = tempfile::tempdir().expect("tempdir");
         let path = directory.path().join("legacy.sqlite");
-        let options =
-            SqliteConnectOptions::from_str(&format!("sqlite://{}", path.to_string_lossy()))
-                .expect("options")
-                .create_if_missing(true);
+        let options = SqliteConnectOptions::new()
+            .filename(&path)
+            .create_if_missing(true);
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
             .connect_with(options)
@@ -17791,9 +18417,7 @@ mod tests {
         store.inner.pool.close().await;
         drop(store);
 
-        let options =
-            SqliteConnectOptions::from_str(&format!("sqlite://{}", path.to_string_lossy()))
-                .expect("options");
+        let options = SqliteConnectOptions::new().filename(&path);
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
             .connect_with(options)
@@ -18712,6 +19336,108 @@ mod tests {
         assert_eq!(stats.state_entries, 1);
     }
 
+    async fn output_meta(
+        store: &SqliteStore,
+        processor: &FixtureProcessor,
+        collection: &str,
+        key: &[u8],
+    ) -> Option<(i64, i64, i64, i64, i64)> {
+        sqlx::query_as(
+            "SELECT block_number, block_timestamp, finality, written_at_unix_ms, value_bytes
+             FROM output_entity_meta
+             WHERE instance = ? AND collection = ? AND entity_key = ?",
+        )
+        .bind(processor_instance(&processor.descriptor))
+        .bind(collection)
+        .bind(key)
+        .fetch_optional(&store.inner.pool)
+        .await
+        .expect("output metadata")
+    }
+
+    async fn index_rows(
+        store: &SqliteStore,
+        processor: &FixtureProcessor,
+    ) -> Vec<(String, Vec<u8>, Vec<u8>)> {
+        sqlx::query_as(
+            "SELECT index_name, index_key, entity_key FROM entity_indexes
+             WHERE instance = ? ORDER BY index_name, index_key, entity_key",
+        )
+        .bind(processor_instance(&processor.descriptor))
+        .fetch_all(&store.inner.pool)
+        .await
+        .expect("index rows")
+    }
+
+    #[tokio::test]
+    async fn undo_restores_output_pruned_by_an_unfinalized_window_apply() {
+        let (_directory, store) = store().await;
+        let mut processor = FixtureProcessor::block_output();
+        processor.descriptor.lifecycle.output.mode = OutputPolicyMode::Window;
+        processor.descriptor.lifecycle.output.window = Some(OutputWindow {
+            max_blocks: Some(2),
+            max_age_seconds: None,
+            max_rows: None,
+            max_bytes: None,
+        });
+        let mut parent = BlockHash::ZERO;
+        for number in 1..=2 {
+            let mut block = frame(number, parent);
+            block.finality = Finality::Finalized;
+            let delta = processor.map(&block).await.expect("map");
+            store
+                .apply(&processor, cursor(&processor, &block, number), &delta, &[])
+                .await
+                .expect("apply finalized block");
+            parent = block.block.hash;
+        }
+        let oldest = 1_u64.to_be_bytes();
+        let oldest_value = store
+            .entity(&processor.descriptor, "state", &oldest)
+            .await
+            .expect("entity");
+        assert!(oldest_value.is_some());
+        let oldest_meta = output_meta(&store, &processor, "state", &oldest).await;
+        let indexes = index_rows(&store, &processor).await;
+
+        let included = frame(3, parent);
+        let delta = processor.map(&included).await.expect("map included");
+        store
+            .apply(&processor, cursor(&processor, &included, 3), &delta, &[])
+            .await
+            .expect("apply included block");
+        assert_eq!(
+            store
+                .entity(&processor.descriptor, "state", &oldest)
+                .await
+                .expect("pruned entity"),
+            None
+        );
+
+        store
+            .undo(
+                &processor.descriptor,
+                ChainId(1),
+                included.block.number,
+                included.block.hash,
+                &[],
+            )
+            .await
+            .expect("undo included block");
+        assert_eq!(
+            store
+                .entity(&processor.descriptor, "state", &oldest)
+                .await
+                .expect("restored entity"),
+            oldest_value
+        );
+        assert_eq!(
+            output_meta(&store, &processor, "state", &oldest).await,
+            oldest_meta
+        );
+        assert_eq!(index_rows(&store, &processor).await, indexes);
+    }
+
     #[tokio::test]
     async fn automatic_checkpoints_are_bounded_and_savepoints_are_explicit() {
         let (_directory, store) = store().await;
@@ -19053,12 +19779,16 @@ mod tests {
             .store_recent_frame(&replay)
             .await
             .expect("same material with refreshed evidence is idempotent");
+        // The retained evidence is not rewritten; only finality follows the
+        // canonical block, which the finalized replay promoted.
+        let mut retained = original;
+        retained.finality = Finality::Finalized;
         assert_eq!(
             store
-                .recent_frame(ChainId(1), original.block.number)
+                .recent_frame(ChainId(1), retained.block.number)
                 .await
                 .expect("read retained frame"),
-            Some(original)
+            Some(retained)
         );
 
         let mut conflicting = replay;
@@ -19185,6 +19915,151 @@ mod tests {
                 .expect("prior cursor")
                 .block_number,
             BlockNumber(1)
+        );
+    }
+
+    #[tokio::test]
+    async fn undo_restores_the_previous_output_metadata() {
+        let (_directory, store) = store().await;
+        let processor = FixtureProcessor::new();
+        let mut finalized = frame(1, BlockHash::ZERO);
+        finalized.finality = Finality::Finalized;
+        let delta = processor.map(&finalized).await.expect("map finalized");
+        store
+            .apply(&processor, cursor(&processor, &finalized, 1), &delta, &[])
+            .await
+            .expect("apply finalized block");
+        let finalized_meta = output_meta(&store, &processor, "state", b"counter")
+            .await
+            .expect("finalized metadata");
+
+        let included = frame(2, finalized.block.hash);
+        let delta = processor.map(&included).await.expect("map included");
+        store
+            .apply(&processor, cursor(&processor, &included, 2), &delta, &[])
+            .await
+            .expect("apply included block");
+        assert_eq!(
+            output_meta(&store, &processor, "state", b"counter")
+                .await
+                .expect("included metadata")
+                .0,
+            2
+        );
+
+        store
+            .undo(
+                &processor.descriptor,
+                ChainId(1),
+                included.block.number,
+                included.block.hash,
+                &[],
+            )
+            .await
+            .expect("undo included block");
+        assert_eq!(
+            output_meta(&store, &processor, "state", b"counter").await,
+            Some(finalized_meta)
+        );
+    }
+
+    #[tokio::test]
+    async fn undo_restores_metadata_as_finalized_once_finality_passed_its_block() {
+        let (_directory, store) = store().await;
+        let processor = FixtureProcessor::new();
+        let first = frame(1, BlockHash::ZERO);
+        let second = frame(2, first.block.hash);
+        for (sequence, block) in [(1, &first), (2, &second)] {
+            let delta = processor.map(block).await.expect("map");
+            store
+                .apply(&processor, cursor(&processor, block, sequence), &delta, &[])
+                .await
+                .expect("apply included block");
+        }
+        store
+            .mark_finalized(&processor.descriptor, first.block.number)
+            .await
+            .expect("finalize block 1");
+
+        store
+            .undo(
+                &processor.descriptor,
+                ChainId(1),
+                second.block.number,
+                second.block.hash,
+                &[],
+            )
+            .await
+            .expect("undo block 2");
+        let (block_number, _, finality, _, _) =
+            output_meta(&store, &processor, "state", b"counter")
+                .await
+                .expect("restored metadata");
+        assert_eq!(block_number, 1);
+        assert_eq!(finality, finality_i64(Finality::Finalized));
+    }
+
+    #[tokio::test]
+    async fn undo_records_without_output_metadata_still_restore_values() {
+        let (_directory, store) = store().await;
+        let processor = FixtureProcessor::new();
+        let first = frame(1, BlockHash::ZERO);
+        let second = frame(2, first.block.hash);
+        for (sequence, block) in [(1, &first), (2, &second)] {
+            let delta = processor.map(block).await.expect("map");
+            store
+                .apply(&processor, cursor(&processor, block, sequence), &delta, &[])
+                .await
+                .expect("apply included block");
+        }
+        store.verify().await.expect("verify records with metadata");
+
+        // Rewrite block 2's record as written before undo metadata existed.
+        let instance = processor_instance(&processor.descriptor);
+        let encoded: Vec<u8> = sqlx::query_scalar(
+            "SELECT encoded_undo FROM undo_journal WHERE instance = ? AND block_number = 2",
+        )
+        .bind(&instance)
+        .fetch_one(&store.inner.pool)
+        .await
+        .expect("undo record");
+        let (record, metadata) =
+            postcard::take_from_bytes::<UndoRecord>(&encoded).expect("decode undo record");
+        assert!(!metadata.is_empty());
+        sqlx::query(
+            "UPDATE undo_journal SET encoded_undo = ? WHERE instance = ? AND block_number = 2",
+        )
+        .bind(postcard::to_allocvec(&record).expect("encode legacy record"))
+        .bind(&instance)
+        .execute(&store.inner.pool)
+        .await
+        .expect("store legacy record");
+        store.verify().await.expect("verify legacy record");
+
+        store
+            .undo(
+                &processor.descriptor,
+                ChainId(1),
+                second.block.number,
+                second.block.hash,
+                &[],
+            )
+            .await
+            .expect("undo legacy record");
+        assert_eq!(
+            store
+                .entity(&processor.descriptor, "state", b"counter")
+                .await
+                .expect("entity"),
+            Some(1_u64.to_be_bytes().to_vec())
+        );
+        // Without metadata the entity keeps the reverted block's stamp.
+        assert_eq!(
+            output_meta(&store, &processor, "state", b"counter")
+                .await
+                .expect("metadata")
+                .0,
+            2
         );
     }
 
@@ -20707,6 +21582,61 @@ mod tests {
                 .block,
             original.block
         );
+    }
+
+    #[tokio::test]
+    async fn recent_frames_report_finality_promoted_after_retention() {
+        let (_directory, store) = store().await;
+        let first = frame(1, BlockHash::ZERO);
+        let second = frame(2, first.block.hash);
+        assert_eq!(first.finality, Finality::Included);
+        for current in [&first, &second] {
+            store
+                .store_recent_frame(current)
+                .await
+                .expect("store recent frame");
+        }
+        let mut replacement = frame(2, first.block.hash);
+        replacement.block.hash = BlockHash::new([0x22; 32]);
+        store
+            .reorg_recent_frames(
+                ChainId(1),
+                &[second.block],
+                std::slice::from_ref(&replacement),
+            )
+            .await
+            .expect("replace block 2");
+        store
+            .mark_recent_finalized(ChainId(1), BlockNumber(2), replacement.block.hash)
+            .await
+            .expect("promote recent prefix");
+
+        for number in [1, 2] {
+            assert_eq!(
+                store
+                    .recent_frame(ChainId(1), BlockNumber(number))
+                    .await
+                    .expect("read by number")
+                    .expect("retained canonical frame")
+                    .finality,
+                Finality::Finalized
+            );
+        }
+        for (hash, finality) in [
+            (first.block.hash, Finality::Finalized),
+            (replacement.block.hash, Finality::Finalized),
+            (second.block.hash, Finality::Included),
+        ] {
+            assert_eq!(
+                store
+                    .recent_frame_by_hash(ChainId(1), hash)
+                    .await
+                    .expect("read by hash")
+                    .expect("retained frame")
+                    .finality,
+                finality
+            );
+        }
     }
 
     #[tokio::test]

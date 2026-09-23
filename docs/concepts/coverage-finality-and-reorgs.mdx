@@ -71,7 +71,10 @@ With `publish = "finalized_only"` the change stream carries only finalized
 processor state and journaled for undo, but their changes stay in the store
 until verified finality promotes them. Their bytes count against the delivery
 budget from the moment they are applied, so a slow consumer pauses the
-processor exactly as it would with included publication. A reorg of an
+processor exactly as it would with included publication. For a processor with
+the default canonical delivery ordering, a block that is already finalized
+when it is applied, for example after gap recovery, first publishes the older
+blocks still waiting, so the stream stays in block order. A reorg of an
 unpublished block emits nothing downstream.
 
 Use processor status for exact intervals and `/v1/network/status` for the

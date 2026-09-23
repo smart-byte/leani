@@ -126,14 +126,19 @@ immediately because waiting cannot make that item fit.
 `[budgets.store].maximum_physical_bytes` is the emergency node-store admission
 bound shared by SQLite, its WAL, and configured processor-artifact segments.
 It is deliberately not nested under delivery: artifacts, materialized views,
-correctness metadata, and delivery share the same physical capacity.
+correctness metadata, and delivery share the same physical capacity. It
+measures allocated file bytes. Stores use SQLite incremental auto-vacuum, so
+pruning returns pages to the filesystem and admission recovers; a store created
+before that needs one `leani db compact` (see the operations runbook).
 
 `[budgets.artifacts]` independently caps immutable finalized artifact bytes and
 included-block candidate bytes awaiting finality. A transaction that would exceed
-either logical limit rolls back without advancing processor coverage. A
-processor's `window` policy may prune its own instance below a tighter bound;
-the node-wide artifact budget still protects against the aggregate of many
-processors.
+either logical limit rolls back without advancing processor coverage. Finality
+is the exception: when the retained limit is full, finality still advances,
+the finalized candidates stay pending with a logged warning, and a later
+finality advance promotes them once there is room. A processor's `window`
+policy may prune its own instance below a tighter bound; the node-wide
+artifact budget still protects against the aggregate of many processors.
 
 `[artifact_storage] backend = "sqlite"` retains those immutable artifacts as
 KV rows. The opt-in `tiered_segments` backend uses SQLite as the durable write
