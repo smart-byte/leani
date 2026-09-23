@@ -292,6 +292,12 @@ export interface Erc20Balance {
   finality: Finality;
   coverageFrom: number;
   complete: boolean;
+  /**
+   * Block whose transfer proved the ledger incomplete for this token and
+   * holder. From that block the pair is no longer derived and `balance` keeps
+   * its last derived value; `null` while the pair is derived.
+   */
+  incompleteFrom: number | null;
   method: "erc20_transfer_ledger";
 }
 
@@ -314,7 +320,9 @@ export interface EvmEvent {
 export interface TransactionStats {
   from: Hex;
   to: Hex;
+  /** Submitted transactions from `from` to `to`, reverted ones included. */
   count: number;
+  /** Submitted value in wei, including the value of reverted transactions. */
   totalValueWei: string;
   asOfBlock: number;
   blockHash: Hex;

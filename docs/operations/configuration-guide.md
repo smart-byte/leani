@@ -228,7 +228,7 @@ Every modern entry declares:
 [[processors]]
 id = "evm-events"              # registered processor kind
 instance = "weth-transfer-v1"  # stable operator-selected identity
-version = "1.0.0"
+version = "1.1.0"
 start_block = 12965000
 publish = "included_and_finalized"
 ```
@@ -259,8 +259,11 @@ checkpoint, and undo semantics cannot be inferred from one overloaded setting.
 
 ### State
 
-`[processors.state] mode` is `ephemeral`, `durable`, or `checkpointed`.
-Included publication cannot use ephemeral state.
+`[processors.state] mode` is `durable` or `checkpointed`. The store persists
+processor state in both modes, and `[processors.checkpoint]` alone decides
+whether recovery checkpoints are taken: `checkpointed` requires
+`[processors.checkpoint] mode = "automatic"`. `ephemeral` is rejected, because
+no mode discards processor state.
 
 ### Artifacts
 

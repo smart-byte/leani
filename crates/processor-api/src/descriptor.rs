@@ -181,12 +181,19 @@ pub enum RetentionPolicy {
     FinalizedHistory,
 }
 
+/// Persistence of processor working state.
+///
+/// The store persists state in every mode; [`CheckpointPolicy`] alone takes
+/// recovery checkpoints. [`LifecyclePolicies::validate`] therefore rejects
+/// `Ephemeral`, and `Checkpointed` without automatic checkpoints.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StatePolicyMode {
+    /// Not implemented: rejected by validation.
     Ephemeral,
     #[default]
     Durable,
+    /// Durable state with automatic recovery checkpoints.
     Checkpointed,
 }
 
@@ -561,10 +568,20 @@ impl LifecyclePolicies {
         {
             return Err("automatic checkpoints must retain at least one checkpoint");
         }
-        if matches!(self.state.mode, StatePolicyMode::Ephemeral)
-            && matches!(publication, PublicationPolicy::IncludedAndFinalized)
-        {
-            return Err("included publication requires durable processor state");
+        // The store always persists processor state, and only the checkpoint
+        // policy takes checkpoints. Reject the modes that promise otherwise.
+        match self.state.mode {
+            StatePolicyMode::Ephemeral => {
+                return Err(
+                    "ephemeral processor state is not implemented; use durable or checkpointed state",
+                );
+            }
+            StatePolicyMode::Checkpointed
+                if !matches!(self.checkpoint.mode, CheckpointPolicyMode::Automatic) =>
+            {
+                return Err("checkpointed processor state requires automatic checkpoints");
+            }
+            StatePolicyMode::Durable | StatePolicyMode::Checkpointed => {}
         }
         Ok(())
     }
@@ -1172,6 +1189,31 @@ mod tests {
             lifecycle.validate(PublicationPolicy::FinalizedOnly),
             Err("artifact window must declare exactly one block, age, or byte limit")
         );
+    }
+
+    #[test]
+    fn state_modes_without_distinct_persistence_are_rejected() {
+        // Audit probe (Processor-6): `ephemeral` validated whenever
+        // publication was not included, although the store always persists
+        // processor state, and `checkpointed` state validated without
+        // checkpoints.
+        let mut lifecycle = LifecyclePolicies::default();
+        lifecycle.state.mode = StatePolicyMode::Ephemeral;
+        assert_eq!(
+            lifecycle.validate(PublicationPolicy::FinalizedOnly),
+            Err("ephemeral processor state is not implemented; use durable or checkpointed state")
+        );
+        lifecycle.state.mode = StatePolicyMode::Checkpointed;
+        lifecycle.checkpoint.mode = CheckpointPolicyMode::None;
+        assert_eq!(
+            lifecycle.validate(PublicationPolicy::FinalizedOnly),
+            Err("checkpointed processor state requires automatic checkpoints")
+        );
+        lifecycle.checkpoint.mode = CheckpointPolicyMode::Automatic;
+        assert_eq!(lifecycle.validate(PublicationPolicy::FinalizedOnly), Ok(()));
+        lifecycle.state.mode = StatePolicyMode::Durable;
+        lifecycle.checkpoint.mode = CheckpointPolicyMode::None;
+        assert_eq!(lifecycle.validate(PublicationPolicy::FinalizedOnly), Ok(()));
     }
 
     #[test]

@@ -152,6 +152,19 @@ read and mutate namespaced collections/indexes and emit domain changes, but
 cannot access SQLite directly. The core captures preimages and commits state,
 coverage, cursor, undo, and changes atomically.
 
+The core derives each change's undo from its key's mutation, so emitted
+changes must describe each key's net mutation in the block: at most one change
+per key, an upsert of the key's final value or a delete of a removed key. A
+key the block created may carry a different change payload, because its undo
+is a delete. A reducer that writes a key more than once in a block emits one
+change, for the last write; the store rejects an unfinalized block whose
+changes do not match its mutations.
+
+A mapper must not fail a block because of a log another contract emitted. Any
+contract can emit any topic zero, so a log that does not decode as the
+expected event is skipped, and preferably counted in the delta, rather than
+treated as invalid input.
+
 `change_json` is an optional public rendering hook. Durable output remains the
 processor's compact bytes. A processor with a stable JSON representation can
 render those bytes for HTTP/SSE clients; otherwise the API publishes

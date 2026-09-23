@@ -31,7 +31,7 @@ reconstruct that same bundle without retaining a second permanent copy. The
 processor retains the exact post-Fusaka BPO activation schedule and keeps
 consensus-block size distinct from the exact execution-block RLP size.
 
-## evm-events 1.0.0
+## evm-events 1.1.0
 
 A block-local declarative event decoder. Configuration supplies contract
 addresses, static Solidity event ABI fragments, and output mappings. The
@@ -40,10 +40,27 @@ topic-zero signatures, pushes address/topic predicates into capable sources,
 and decodes without EVM execution.
 
 Supported ABI values are `address`, `bool`, fixed `bytes1..bytes32`, and
-`uint`/`int` widths from 8 through 256. Dynamic values, tuples, arrays,
-anonymous events, duplicate signatures, malformed keys, and more than three
-indexed fields fail deterministically during `doctor`.
+`uint`/`int` widths from 8 through 256. Every parameter needs a name
+(`type name` or `type indexed name`), because decoded values are keyed by
+name. Dynamic values, tuples, arrays, unnamed parameters, anonymous events,
+duplicate signatures, malformed keys, and more than three indexed fields fail
+deterministically during `doctor`. The order of the configured events is part
+of the configuration hash, so reordering them creates a new processor
+instance.
 
+Any contract can emit a log with a configured event's topic zero. A log whose
+topics or data do not decode as that event, such as an ERC-721 `Transfer`
+(four topics, no data) against the ERC-20 `Transfer` ABI or a `bool` word
+other than 0 or 1, is not that event: it is skipped rather than failing the
+block, and the block's mapped delta counts the skipped logs.
+
+With `key_fields`, a block emits one change per key, for its last event. When
+the processor stores output entities (`[processors.output] mode` other than
+`none`), an entity holds the newest event for its key by block number,
+transaction index, and log index, even when the hot and cold lanes apply
+blocks out of order: an older event never replaces the stored newer one and
+emits no change. The comparison needs the stored entity, so with
+`mode = "none"` events are published in the order blocks apply.
 
 `publish = "finalized_only"` holds included-block changes in the store until
 verified finality promotes them. The stream then contains only finalized
@@ -54,7 +71,7 @@ Held bytes count against `[processors.delivery] max_bytes` from admission.
 [[processors]]
 id = "evm-events"
 instance = "weth-transfers"
-version = "1.0.0"
+version = "1.1.0"
 start_block = 12965000
 publish = "finalized_only"
 
@@ -104,7 +121,10 @@ supports deterministic wall-clock buckets from canonical block timestamps.
 An ordered A-to-B aggregate that retains constant-sized private working state:
 transaction count, exact total value, cursor, checkpoints, and the bounded
 unfinalized contribution journal. It requests transaction envelopes and
-sender/recipient predicates without receipts.
+sender/recipient predicates without receipts, so it cannot tell whether a
+transaction reverted: `count` and `totalValueWei` cover every submitted
+transaction from the sender to the recipient. `totalValueWei` is the
+submitted value, not the value the recipient received.
 
 ```toml
 [[processors]]
@@ -146,22 +166,35 @@ and coverage for every block but spool only the final aggregate; after
 acknowledgement the job is complete/reclaimable and deletion remains an
 explicit operator action.
 
-## erc20-balances 1.0.0
+## erc20-balances 1.1.0
 
 An ordered watchlist ledger derived from canonical ERC-20 `Transfer` logs.
 Configuration declares watched addresses, an optional token allowlist, a start
 block, and whether the opening coverage is complete.
 
-The stored method is explicitly `erc20_transfer_ledger`. Outgoing underflow
-fails the processor because it proves that the selected start/snapshot is
-incomplete. Rebasing, reflection, and non-standard tokens are not represented
-as general EVM balances.
+The stored method is explicitly `erc20_transfer_ledger`. Rebasing,
+reflection, and non-standard tokens are not represented as general EVM
+balances. Any contract can emit a `Transfer` log, so a log with that
+signature that is not a canonical ERC-20 transfer (three topics, zero-padded
+addresses, and a 32-byte value), such as an ERC-721 transfer, is skipped
+rather than failing the block; the block's mapped delta counts the skipped
+logs.
+
+A transfer the ledger cannot apply proves it incomplete for that token and
+holder: an outgoing transfer above the derived balance means transfers before
+the start block or outside the ERC-20 model, such as a rebasing or forged
+token, and an incoming one can overflow it. The pair is then marked
+incomplete: `incompleteFrom` holds that block, `complete` is `false`,
+`balance` keeps its last derived value, and later transfers for the pair are
+ignored. Undoing that block restores the derived pair. Only a token in the
+`tokens` allowlist with `complete_from_start = true` fails the processor
+instead, because the configuration declares that ledger complete.
 
 ```toml
 [[processors]]
 id = "erc20-balances"
 instance = "erc20-watchlist"
-version = "1.0.0"
+version = "1.1.0"
 start_block = 1234567
 publish = "included_and_finalized"
 

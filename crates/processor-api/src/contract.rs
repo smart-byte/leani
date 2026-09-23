@@ -218,6 +218,16 @@ pub trait ReducerTransaction: Send {
         limit: usize,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, ProcessorError>;
 
+    /// Publish one domain change of the block being reduced.
+    ///
+    /// Changes must describe each key's net mutation in the block, because
+    /// the store derives their undo from it: at most one change per key, an
+    /// `Upsert` carrying the key's final value (from `put` or `state_put`)
+    /// or a `Delete` for a key the block removed. A key the block created
+    /// may instead carry a different payload, since its undo is a delete. A
+    /// reducer that writes a key more than once in a block emits one change,
+    /// for the last write. The store rejects the apply of an unfinalized
+    /// block whose changes do not match its mutations.
     async fn emit(&mut self, change: DomainChange) -> Result<(), ProcessorError>;
 }
 

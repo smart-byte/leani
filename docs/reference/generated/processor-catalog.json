@@ -19,7 +19,7 @@
     },
     {
       "id": "transaction-stats",
-      "description": "Directional transaction counts and value totals for one address pair"
+      "description": "Directional transaction counts and submitted value totals for one address pair"
     },
     {
       "id": "uniswap-latest",

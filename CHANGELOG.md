@@ -45,6 +45,77 @@ record, and documented RPC contracts.
   `BlockRange::checked_len` returns `None` for it. The new
   `FilterScope::covers` and `FilterScope::covers_at` check whether material
   filtered by one scope is complete for another filter.
+- `erc20-balances` 1.1.0 and `evm-events` 1.1.0 change stored output (see
+  Fixed). Existing instances need a rebuild: set `version = "1.1.0"` and
+  configure a new `instance`, which indexes from its `start_block`. The node
+  refuses the new version under an existing instance ID (`processor instance
+  … conflicts with its stored descriptor`), and a 1.1.0 binary cannot run a
+  1.0.0 instance. Move consumers to the new instance's stream. The old
+  instance's rows stay in the store, because no command deletes a single
+  processor instance. To reclaim that space, rebuild in a new `data_dir`; or,
+  only when nothing else in the data directory must be kept, run
+  `leani reset all`, which deletes the whole directory, including every
+  processor's state and delivery history, raw history, and the P2P identity.
+  The ERC-20 entity and change schemas are now `erc20.balance.entity.v2` and
+  `erc20.balance.change.v2`, and both processors use delta schema 2.
+- ERC-20 balances gain `incompleteFrom` (`null`, or the block from which the
+  token/holder pair is no longer derived) in the typed query, the change JSON,
+  the OpenAPI `Erc20Balance` schema, and the SDK `Erc20Balance` type.
+- Breaking (`leani-processor-api`): `LifecyclePolicies::validate` rejects
+  `StatePolicyMode::Ephemeral` for every publication policy, and
+  `StatePolicyMode::Checkpointed` unless the checkpoint policy is
+  `automatic`. The store persists processor state in every mode, and only the
+  checkpoint policy takes checkpoints, so these modes promised behavior that
+  did not exist. `[processors.state] mode = "ephemeral"` now fails validation,
+  and the configuration schema no longer offers it.
+- `leani-processor-api` documents the change-to-mutation contract on
+  `ReducerTransaction::emit`: at most one change per key and block, matching
+  the key's net mutation.
+- `leani-testkit` has no public signature changes, but tests may observe:
+  `MemoryReducer` keeps `state_*` data apart from output entities and rejects
+  scan limits outside `1..=10_000`, as the store does. `fixture_frame` gives
+  every block number its own hash (numbers below 255 keep `[number; 32]`) and
+  saturates its timestamp. `ScriptedLiveSource::subscribe` rejects, as the
+  execution P2P live source does, a request for another chain, for
+  capabilities its descriptor does not supply completely (even when the
+  request accepts filtered material), or for finality it does not reach. The
+  generated Uniswap-like corpus emits V3 `Swap` logs with sender and
+  recipient topics, which changes its frame digests.
+- The built-in `ETH/USDT` and `WBTC/ETH` Uniswap V3 markets start at the V3
+  factory deployment block 12,369,621 instead of 12,376,729, the creation
+  block of the USDC/WETH 0.05% pool, which both pools may predate. No V3 pool
+  predates the factory, so this is a safe lower bound. `ETH/USDC` keeps its
+  exact creation block, so an ETH/USDC-only starter is unchanged.
+
+  Affected are compact `[uniswap]` nodes and `leani subscribe uniswap-v3`
+  subscriptions whose markets include `ETH/USDT` or `WBTC/ETH`. Their data
+  from earlier releases may miss those pools' events between pool creation
+  and block 12,376,729, and the new start block changes the processor's
+  identity, so the node refuses the processor its store holds:
+  `processor instance uniswap-observations conflicts with its stored
+  descriptor` (`cli-uniswap-v3-prices` for a subscription). The node prints
+  the routes for that refusal before the message. In order of preference:
+
+  1. Start the node with a new `data_dir`. Nothing is deleted, and the old
+     directory stays usable with the previous binary as a rollback.
+  2. Replace the compact document with an advanced configuration, as expanded
+     in `config/defaults/ethereum-mainnet.toml`, whose `uniswap-observations`
+     `[[processors]]` entry names a new `instance`. The node keeps its raw
+     history, P2P identity, and embedded subscriptions; the old instance's rows
+     stay in the store.
+  3. For a subscription, `leani reset subscription uniswap-v3 <markets> --yes`,
+     with the subscription's `--finality`, `--data-dir`, and `--config`
+     options, deletes only that subscription's state. The refusal prints this
+     exact command.
+  4. Only as a last resort, `leani reset all` deletes the entire data
+     directory: the node database with every processor's state, output,
+     delivery history, and consumer positions, raw history, processor
+     artifacts, the execution peer store and P2P identity
+     (`execution-p2p-secret`), `checkpoint.json`, and every embedded
+     subscription, and with them the rollback.
+- `transaction-stats` documents `count` and `totalValueWei` as submitted
+  totals: without receipts, reverted transactions and their value are
+  included. Behavior is unchanged.
 
 ### Fixed
 
@@ -317,6 +388,48 @@ record, and documented RPC contracts.
   startup reconciliation deletes a pending delta for a block the lane already
   applied, so restarting the node and then resetting the lane replays it.
   Before, the reset failed the lane again on the same delta.
+- Logs from unrelated or hostile contracts no longer fail a block. Any
+  contract can emit an event's topic zero, and `erc20-balances` failed the
+  block on a `Transfer` log with non-zero address padding, and `evm-events` on
+  any log that did not decode as the configured event, such as an ERC-721
+  `Transfer` (four topics, no data) against the ERC-20 ABI or a `bool` word
+  other than 0 or 1. Such logs are now skipped as not being that event, and
+  each block's mapped delta counts them.
+- `erc20-balances` no longer fails when a transfer cannot be applied to a
+  watched balance. Before, one forged `Transfer(watched, x, 1)` from any token
+  without an allowlist, or a rebasing token, underflowed the balance and failed
+  the processor, even with `complete_from_start = false`. An outgoing transfer
+  above the derived balance, or an incoming one that overflows it, now marks
+  that token/holder pair incomplete from its block (`incompleteFrom`,
+  `complete = false`): its balance keeps the last derived value and later
+  transfers for the pair are ignored, and undoing the block restores the
+  pair. Only a token in the `tokens` allowlist with
+  `complete_from_start = true` still fails the processor, because the
+  configuration declares that ledger complete.
+- `evm-events` outputs with `key_fields` no longer fail a block that changes
+  an existing key twice (`change … has 0 matching state mutations`): a block
+  emits one change per key, for its last event. When the processor stores
+  output entities (`[processors.output] mode` other than `none`), a keyed
+  entity now holds the newest event by block number, transaction index, and
+  log index, even when the hot and cold lanes apply blocks out of order;
+  before, the block applied last won. An older event no longer replaces a
+  stored newer one and emits no change. With `mode = "none"` no entity is
+  stored to compare against, so events are published in the order blocks
+  apply.
+- `evm-events` accepts the included and finalized deltas of one block as
+  equivalent on replay. Its entities carry the block's finality, and the
+  processor only accepted the exact checksum, so replaying a block whose
+  finality changed could report a conflicting delta once the frame was
+  pruned.
+- `evm-events` ABI parsing no longer reads an unnamed indexed parameter such as
+  `address indexed` as a data field named `indexed`; unnamed parameters are
+  rejected, since decoded values are keyed by name. A parameter whose name
+  contains `anonymous`, such as `anonymousVoter`, is no longer rejected; the
+  `anonymous` event attribute still is. The order of configured events stays
+  part of the instance identity.
+- `uniswap-latest` never lets an older observation replace a newer one, as
+  `uniswap-observations` already did. Ordered lanes apply blocks in order, so
+  stored output does not change and the version stays 2.0.0.
 
 ## [0.1.0-rc.1] - 2026-09-20
 

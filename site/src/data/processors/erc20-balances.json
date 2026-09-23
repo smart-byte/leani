@@ -1,9 +1,9 @@
 {
   "caption": "Event-derived watchlist balances with declared coverage. Exact for conventional Transfer semantics when indexing begins before the relevant initial mint; rebasing, reflection, and non-standard tokens need a different model.",
-  "config": "[[processors]]\nid = \"erc20-balances\"\ninstance = \"erc20-watchlist\"\nversion = \"1.0.0\"\nhistory_mode = \"on_demand\"\nstart_block = 1234567\npublish = \"included_and_finalized\"\n\n[processors.state]\nmode = \"durable\"\n\n[processors.artifacts]\nmode = \"none\"\n\n[processors.output]\nmode = \"latest\"\n\n[processors.delivery]\nmode = \"window\"\n\n[processors.checkpoint]\nmode = \"automatic\"\nkeep = 3\n\n[processors.undo]\nmode = \"unfinalized\"\nsafety_blocks = 256\n\n[processors.settings]\naddresses = [\"0x1111111111111111111111111111111111111111\"]\ntokens = [\"0x2222222222222222222222222222222222222222\"]\ncomplete_from_start = true",
+  "config": "[[processors]]\nid = \"erc20-balances\"\ninstance = \"erc20-watchlist\"\nversion = \"1.1.0\"\nhistory_mode = \"on_demand\"\nstart_block = 1234567\npublish = \"included_and_finalized\"\n\n[processors.state]\nmode = \"durable\"\n\n[processors.artifacts]\nmode = \"none\"\n\n[processors.output]\nmode = \"latest\"\n\n[processors.delivery]\nmode = \"window\"\n\n[processors.checkpoint]\nmode = \"automatic\"\nkeep = 3\n\n[processors.undo]\nmode = \"unfinalized\"\nsafety_blocks = 256\n\n[processors.settings]\naddresses = [\"0x1111111111111111111111111111111111111111\"]\ntokens = [\"0x2222222222222222222222222222222222222222\"]\ncomplete_from_start = true",
   "configLang": "toml",
-  "dataType": "{\n  token: Hex;\n  address: Hex;\n  balance: string;\n  asOfBlock: number;\n  blockHash: Hex;\n  finality: \"preview\" | \"included\" | \"finalized\";\n  coverageFrom: number;\n  complete: boolean;\n  method: \"erc20_transfer_ledger\";\n}",
-  "docsUrl": "/docs/reference/processor-contracts/#erc20-balances-100",
+  "dataType": "{\n  token: Hex;\n  address: Hex;\n  balance: string;\n  asOfBlock: number;\n  blockHash: Hex;\n  finality: \"preview\" | \"included\" | \"finalized\";\n  coverageFrom: number;\n  complete: boolean;\n  incompleteFrom: number | null;\n  method: \"erc20_transfer_ledger\";\n}",
+  "docsUrl": "/docs/reference/processor-contracts/#erc20-balances-110",
   "helloJson": {
     "apiVersion": "1",
     "chainId": 1,
@@ -25,8 +25,8 @@
     },
     "processor": {
       "artifactRetention": "none",
-      "changeSchema": "erc20.balance.change.v1",
-      "codeHash": "0xacb6d26482e17309a53171a6524dbf27fae7020927facb647cad98fee2bc8ddd",
+      "changeSchema": "erc20.balance.change.v2",
+      "codeHash": "0x95c5f9ba233dad3921f35b4b78a87b7ddfa4a4d1b46ef5c8c3ede33f7909df24",
       "configHash": "0x286fc393037f30bc3360400281755f19a6741292e7585e781a4294c02facb8ac",
       "deliveryOrdering": "canonical",
       "genericApi": "processor-v1",
@@ -40,7 +40,7 @@
         }
       ],
       "subscriptions": true,
-      "version": "1.0.0"
+      "version": "1.1.0"
     }
   },
   "id": "erc20-balances",
@@ -54,7 +54,7 @@
       "timestamp": 1710500000
     },
     "chainId": 1,
-    "cursor": "0200000000000000000000000000000000010f65726332302d77617463686c69737405312e302e30011ead1cd8d6ca2b8f409b07f68687fe5f",
+    "cursor": "0200000000000000000000000000000000010f65726332302d77617463686c69737405312e312e300123f9aa31b9230edace91ab4139f4aa20",
     "data": {
       "address": "0x1111111111111111111111111111111111111111",
       "asOfBlock": 19430000,
@@ -63,6 +63,7 @@
       "complete": true,
       "coverageFrom": 1234567,
       "finality": "finalized",
+      "incompleteFrom": null,
       "method": "erc20_transfer_ledger",
       "token": "0x2222222222222222222222222222222222222222"
     },
@@ -74,8 +75,8 @@
     "originId": "illustrative-fixture",
     "originKind": "historical_backfill",
     "publicationRevision": "0",
-    "schema": "erc20.balance.change.v1",
+    "schema": "erc20.balance.change.v2",
     "sequence": "1"
   },
-  "sseId": "0200000000000000000000000000000000010f65726332302d77617463686c69737405312e302e30011ead1cd8d6ca2b8f409b07f68687fe5f"
+  "sseId": "0200000000000000000000000000000000010f65726332302d77617463686c69737405312e312e300123f9aa31b9230edace91ab4139f4aa20"
 }

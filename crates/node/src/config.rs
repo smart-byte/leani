@@ -167,7 +167,11 @@ impl StarterConfig {
             (None, Some(uniswap)) => {
                 let markets = crate::uniswap_markets::resolve_markets(&uniswap.markets)
                     .map_err(|error| error.to_string())?;
-                crate::uniswap_markets::processor_config(&markets, "uniswap-observations", false)
+                crate::uniswap_markets::processor_config(
+                    &markets,
+                    crate::uniswap_markets::COMPACT_INSTANCE,
+                    false,
+                )
             }
             _ => {
                 return Err(

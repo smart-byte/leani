@@ -1946,7 +1946,7 @@ components:
     Erc20Balance:
       type: object
       additionalProperties: false
-      required: [token, address, balance, asOfBlock, blockHash, finality, coverageFrom, complete, method]
+      required: [token, address, balance, asOfBlock, blockHash, finality, coverageFrom, complete, incompleteFrom, method]
       properties:
         token:
           $ref: "#/components/schemas/Address"
@@ -1964,6 +1964,16 @@ components:
           $ref: "#/components/schemas/SafeInteger"
         complete:
           type: boolean
+        incompleteFrom:
+          description: >-
+            Block whose transfer the ledger could not apply for this token and
+            holder, an outgoing transfer above the derived balance or an
+            incoming one that overflows it. From that block the pair is
+            incomplete and no longer derived, and balance keeps its last
+            derived value. Null while the pair is derived.
+          oneOf:
+            - $ref: "#/components/schemas/SafeInteger"
+            - type: "null"
         method:
           type: string
           const: erc20_transfer_ledger

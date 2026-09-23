@@ -380,7 +380,7 @@
       "additionalProperties": false,
       "required": ["mode"],
       "properties": {
-        "mode": { "enum": ["ephemeral", "durable", "checkpointed"] }
+        "mode": { "enum": ["durable", "checkpointed"] }
       }
     },
     "outputWindow": {

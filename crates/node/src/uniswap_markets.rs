@@ -3,7 +3,9 @@
 use std::collections::HashSet;
 
 use anyhow::{Context as _, Result, bail};
+use leani_processor_api::ProcessorInstanceId;
 use leani_processor_uniswap::UNISWAP_OBSERVATIONS_VERSION;
+use leani_store_sqlite::StoreError;
 
 use crate::{builtin_processors::processor_contract, config::ProcessorConfig};
 
@@ -46,6 +48,16 @@ const WBTC: Token = Token {
     decimals: 8,
 };
 
+/// Exact creation block of the USDC/WETH 0.05% pool.
+const USDC_WETH_500_CREATION_BLOCK: u64 = 12_376_729;
+
+/// Uniswap V3 factory deployment block: a lower bound for a pool whose exact
+/// creation block is not pinned here, since no V3 pool predates the factory.
+pub(crate) const UNISWAP_V3_FACTORY_BLOCK: u64 = 12_369_621;
+
+/// Processor instance of a compact `[uniswap]` node configuration.
+pub(crate) const COMPACT_INSTANCE: &str = "uniswap-observations";
+
 pub(crate) const MARKET_CATALOG: &[Market] = &[
     Market {
         symbol: "ETH/USDC",
@@ -54,7 +66,7 @@ pub(crate) const MARKET_CATALOG: &[Market] = &[
         token0: USDC,
         token1: WETH,
         base_is_token0: false,
-        start_block: 12_376_729,
+        start_block: USDC_WETH_500_CREATION_BLOCK,
     },
     Market {
         symbol: "ETH/USDT",
@@ -63,7 +75,7 @@ pub(crate) const MARKET_CATALOG: &[Market] = &[
         token0: WETH,
         token1: USDT,
         base_is_token0: true,
-        start_block: 12_376_729,
+        start_block: UNISWAP_V3_FACTORY_BLOCK,
     },
     Market {
         symbol: "WBTC/ETH",
@@ -72,7 +84,7 @@ pub(crate) const MARKET_CATALOG: &[Market] = &[
         token0: WBTC,
         token1: WETH,
         base_is_token0: true,
-        start_block: 12_376_729,
+        start_block: UNISWAP_V3_FACTORY_BLOCK,
     },
 ];
 
@@ -137,6 +149,25 @@ pub(crate) fn processor_config(
         .settings
         .insert("pools".to_owned(), toml::Value::Array(pools));
     Ok(processor)
+}
+
+/// Name the operator's routes when the store refuses the compact
+/// `[uniswap]` processor it holds: that processor's identity includes its
+/// market set and start block, as when ETH/USDT or WBTC/ETH moved to the
+/// factory block. Other processors and errors pass through.
+pub(crate) fn explain_compact_refusal(
+    error: StoreError,
+    instance: &ProcessorInstanceId,
+) -> anyhow::Error {
+    if instance.as_str() != COMPACT_INSTANCE || !matches!(error, StoreError::ProcessorIdentity(_)) {
+        return error.into();
+    }
+    anyhow::Error::new(error).context(format!(
+        "this store's `{COMPACT_INSTANCE}` processor was created for another market set or start \
+         block (ETH/USDT and WBTC/ETH now start at the Uniswap V3 factory block \
+         {UNISWAP_V3_FACTORY_BLOCK}); keep that data and start with a new `data_dir`, or move to \
+         an advanced configuration whose `[[processors]]` entry names a new `instance`"
+    ))
 }
 
 #[cfg(test)]

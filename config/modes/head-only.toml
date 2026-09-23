@@ -42,7 +42,7 @@ checkpoint = ""
 [[processors]]
 id = "evm-events"
 instance = "weth-transfer-head"
-version = "1.0.0"
+version = "1.1.0"
 history_control = "node_owned"
 history_mode = "automatic"
 start_block = 12965000

@@ -26,7 +26,7 @@ use leani_source_api::{
     ChainEvent, ChainEventStream, DataRequest, FieldProjection, FilterSet, LiveSource as _,
     LiveStart, NetworkTelemetrySnapshot, SourceBudget, SourceError, VerificationPolicy,
 };
-use leani_store_sqlite::{ChangeDirection, ChangeRecord, SqliteStore};
+use leani_store_sqlite::{ChangeDirection, ChangeRecord, SqliteStore, StoreError};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use url::Url;
@@ -42,7 +42,9 @@ use crate::{
     local_state,
     process::{Exit, configured_store_config, spawn_embedded_network_runtime},
     processors::ProcessorRegistry,
-    uniswap_markets::{MARKET_CATALOG, Market, Token, processor_config, resolve_markets},
+    uniswap_markets::{
+        MARKET_CATALOG, Market, Token, UNISWAP_V3_FACTORY_BLOCK, processor_config, resolve_markets,
+    },
 };
 
 const BLOCK_PROCESSOR_INSTANCE: &str = "cli-ethereum-blocks";
@@ -564,6 +566,40 @@ async fn endpoint_is_reachable(options: &SubscribeOptions, endpoint: Option<&Url
         .is_ok_and(|response| response.status().is_success())
 }
 
+/// Name the reset that rebuilds a Uniswap subscription whose stored
+/// processor the store refuses: its identity includes its start block, as
+/// when ETH/USDT or WBTC/ETH moved to the factory block. Other protocols and
+/// errors pass through.
+fn explain_subscription_refusal(
+    error: StoreError,
+    options: &SubscribeOptions,
+    markets: &[Market],
+) -> anyhow::Error {
+    if options.protocol != SubscribeProtocol::UniswapV3
+        || !matches!(error, StoreError::ProcessorIdentity(_))
+    {
+        return error.into();
+    }
+    let mut command = vec!["leani reset subscription uniswap-v3".to_owned()];
+    command.extend(markets.iter().map(|market| market.symbol.to_owned()));
+    if options.finality == SubscribeFinality::Finalized {
+        command.push("--finality finalized".to_owned());
+    }
+    if let Some(data_dir) = &options.data_dir {
+        command.push(format!("--data-dir {}", data_dir.display()));
+    }
+    if let Some(config) = &options.requested_config {
+        command.push(format!("--config {}", config.display()));
+    }
+    command.push("--yes".to_owned());
+    anyhow::Error::new(error).context(format!(
+        "this subscription's state was created with an earlier start block (ETH/USDT and \
+         WBTC/ETH now start at the Uniswap V3 factory block {UNISWAP_V3_FACTORY_BLOCK}); \
+         rebuild it with `{}`",
+        command.join(" ")
+    ))
+}
+
 #[allow(clippy::too_many_lines)]
 async fn subscribe_embedded(
     options: &SubscribeOptions,
@@ -605,7 +641,10 @@ async fn subscribe_embedded(
         data_dir.join("leani.sqlite"),
     ))
     .await?;
-    store.register_processor(processor.descriptor()).await?;
+    store
+        .register_processor(processor.descriptor())
+        .await
+        .map_err(|error| explain_subscription_refusal(error, options, markets))?;
     let mut after = store
         .change_bounds(processor.descriptor())
         .await?
@@ -4089,6 +4128,65 @@ mod tests {
         )
         .expect("Uniswap identity");
         assert_ne!(blocks.file_name(), uniswap.file_name());
+    }
+
+    #[test]
+    fn eth_usdc_starter_keeps_its_identity() {
+        // ETH/USDC starts at its pool's exact creation block, so existing
+        // ETH/USDC subscriptions and compact nodes reopen their state.
+        let markets = resolve_markets(&["ETH/USDC".to_owned()]).expect("market");
+        assert_eq!(markets[0].start_block, 12_376_729);
+        let directory = subscription_data_dir_for(
+            None,
+            SubscribeProtocol::UniswapV3,
+            &markets,
+            None,
+            SubscribeFinality::Included,
+            Path::new("."),
+        )
+        .expect("Uniswap identity");
+        assert_eq!(
+            directory.file_name().and_then(|name| name.to_str()),
+            Some("f7a9f202aa323e4d")
+        );
+    }
+
+    #[test]
+    fn a_refused_subscription_names_its_exact_reset_command() {
+        let mut options = subscribe_options(Vec::new());
+        options.finality = SubscribeFinality::Finalized;
+        options.data_dir = Some(PathBuf::from("/srv/leani"));
+        let markets =
+            resolve_markets(&["weth/usdt".to_owned(), "WBTC/ETH".to_owned()]).expect("markets");
+        let refusal = leani_store_sqlite::StoreError::ProcessorIdentity(
+            UNISWAP_PROCESSOR_INSTANCE.to_owned(),
+        );
+        let message = format!(
+            "{:#}",
+            explain_subscription_refusal(refusal, &options, &markets)
+        );
+        assert!(
+            message.contains(
+                "`leani reset subscription uniswap-v3 ETH/USDT WBTC/ETH --finality finalized --data-dir /srv/leani --yes`"
+            ),
+            "{message}"
+        );
+        assert!(
+            message.ends_with(
+                "processor instance cli-uniswap-v3-prices conflicts with its stored descriptor"
+            ),
+            "{message}"
+        );
+        // Other store failures keep their own message.
+        let other = explain_subscription_refusal(
+            leani_store_sqlite::StoreError::Numeric("fixture"),
+            &options,
+            &markets,
+        );
+        assert_eq!(
+            format!("{other:#}"),
+            leani_store_sqlite::StoreError::Numeric("fixture").to_string()
+        );
     }
 
     #[test]

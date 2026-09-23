@@ -42,7 +42,7 @@ checkpoint = ""
 [[processors]]
 id = "evm-events"
 instance = "uniswap-v2-sync-30d"
-version = "1.0.0"
+version = "1.1.0"
 history_control = "node_owned"
 history_mode = "on_demand"
 start_block = 17000000

@@ -192,8 +192,12 @@ Uniswap history, included/finalized publication, a 256 block undo window,
 64 MiB/24 hour delivery retention, ephemeral P2P listener ports, RPC on
 `18545`/`18546`, and the native API on `18080`. Pool addresses, fee tiers, and
 the earliest processor block come from the same built-in market catalog as
-`subscribe`. Operators who need to tune any of these can use the full
-configuration schema instead. The pinned checkpoint is the trust root; Beacon
+`subscribe`: `ETH/USDC` starts at its pool's creation block, 12,376,729, and
+`ETH/USDT` and `WBTC/ETH` at the Uniswap V3 factory deployment block,
+12,369,621, which no pool predates. The start block is part of the
+processor's identity, so a release that moves one makes the node refuse the
+state it kept and name the ways to move on (see the changelog). Operators who
+need to tune any of these can use the full configuration schema instead. The pinned checkpoint is the trust root; Beacon
 API endpoints only transport untrusted consensus data and never provide
 execution blocks or Uniswap observations. Leani queries those transports
 concurrently, verifies their responses locally, and cancels the remaining

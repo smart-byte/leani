@@ -1532,6 +1532,8 @@ export interface components {
             finality: components["schemas"]["Finality"];
             coverageFrom: components["schemas"]["SafeInteger"];
             complete: boolean;
+            /** @description Block whose transfer the ledger could not apply for this token and holder, an outgoing transfer above the derived balance or an incoming one that overflows it. From that block the pair is incomplete and no longer derived, and balance keeps its last derived value. Null while the pair is derived. */
+            incompleteFrom: components["schemas"]["SafeInteger"] | null;
             /** @constant */
             method: "erc20_transfer_ledger";
         };
@@ -2806,6 +2808,21 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content?: never;
+            };
+            /**
+             * @description The lane cannot be reset. `single_block_exceeds_delivery_limit`:
+             *     its first unapplied block still exceeds the delivery limit; raise
+             *     the limit first. `live_lane_requires_rebuild`: the lane failed with
+             *     `processor_finality_conflict`, so its coverage contradicts the
+             *     canonical chain; rebuild the processor as a replacement instance.
+             */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
             };
             default: components["responses"]["Error"];
         };

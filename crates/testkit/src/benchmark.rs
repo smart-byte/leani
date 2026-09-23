@@ -870,9 +870,18 @@ fn generated_log(
             .saturating_mul(U256::from(number.0.saturating_add(seed).max(1)));
         let mut data = vec![0_u8; 160];
         data[64..96].copy_from_slice(&sqrt_price.to_be_bytes::<32>());
+        // A V3 pool indexes the swap's sender and recipient addresses.
+        let mut sender = [0_u8; 32];
+        sender[12..].fill(0x5e);
+        let mut recipient = [0_u8; 32];
+        recipient[12..].fill(0x7e);
         return (
             uniswap_weth_usdc_pool(),
-            vec![keccak256("Swap(address,address,int256,int256,uint160,uint128,int24)").0],
+            vec![
+                keccak256("Swap(address,address,int256,int256,uint160,uint128,int24)").0,
+                sender,
+                recipient,
+            ],
             data,
         );
     }
@@ -1010,6 +1019,29 @@ mod tests {
             SyntheticCorpusKind::UniswapLike,
         ] {
             assert_corpus_matches_manifest(kind).await;
+        }
+    }
+
+    #[test]
+    fn generated_uniswap_swaps_have_the_v3_log_layout() {
+        // Audit probe (Processor-10): synthetic `Swap` logs carried only
+        // topic zero, unlike the three topics a V3 pool emits.
+        let (source, _) = GeneratedHistorySource::new(SyntheticCorpusKind::UniswapLike, 16, 7, 16)
+            .expect("uniswap corpus");
+        let frame = source.frame(BlockNumber(4));
+        let logs = frame.logs.as_complete().expect("complete logs");
+        assert!(!logs.is_empty());
+        for log in logs {
+            assert_eq!(log.address, uniswap_weth_usdc_pool());
+            assert_eq!(log.topics.len(), 3);
+            assert_eq!(
+                log.topics[0],
+                keccak256("Swap(address,address,int256,int256,uint160,uint128,int24)").0
+            );
+            for address in &log.topics[1..] {
+                assert!(address[..12].iter().all(|byte| *byte == 0));
+            }
+            assert_eq!(log.data.len(), 5 * 32);
         }
     }
 

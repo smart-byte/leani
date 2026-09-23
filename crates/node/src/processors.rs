@@ -657,7 +657,7 @@ impl ProcessorFactory for TransactionStatsProcessorFactory {
     }
 
     fn description(&self) -> &str {
-        "Directional transaction counts and value totals for one address pair"
+        "Directional transaction counts and submitted value totals for one address pair"
     }
 
     fn create(

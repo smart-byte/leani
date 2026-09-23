@@ -14,8 +14,17 @@ use leani_processor_api::{
 };
 use semver::Version;
 
+/// Largest prefix-scan page the store accepts.
+const MAX_SCAN_LIMIT: usize = 10_000;
+
+/// In-memory reducer transaction for processor tests.
+///
+/// Like the store, it keeps processor state (`state_*`) and output entities
+/// apart and accepts prefix-scan limits in `1..=10_000`. It keeps no undo
+/// journal: to model an undo, clone it before a block and restore the clone.
 #[derive(Clone, Debug, Default)]
 pub struct MemoryReducer {
+    state: BTreeMap<(String, Vec<u8>), Vec<u8>>,
     entities: BTreeMap<(String, Vec<u8>), Vec<u8>>,
     indexes: BTreeSet<(String, Vec<u8>, Vec<u8>)>,
     emitted: Vec<DomainChange>,
@@ -35,8 +44,66 @@ impl MemoryReducer {
     }
 }
 
+fn check_scan_limit(limit: usize) -> Result<(), ProcessorError> {
+    if limit == 0 || limit > MAX_SCAN_LIMIT {
+        return Err(ProcessorError::State(
+            "scan limit must be in 1..=10000".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn scan(
+    rows: &BTreeMap<(String, Vec<u8>), Vec<u8>>,
+    namespace: &str,
+    prefix: &[u8],
+    limit: usize,
+) -> Vec<(Vec<u8>, Vec<u8>)> {
+    rows.range((namespace.to_owned(), prefix.to_vec())..)
+        .take_while(|((stored, key), _)| stored == namespace && key.starts_with(prefix))
+        .take(limit)
+        .map(|((_, key), value)| (key.clone(), value.clone()))
+        .collect()
+}
+
 #[async_trait]
 impl ReducerTransaction for MemoryReducer {
+    async fn state_get(
+        &mut self,
+        namespace: &str,
+        key: &[u8],
+    ) -> Result<Option<Vec<u8>>, ProcessorError> {
+        Ok(self
+            .state
+            .get(&(namespace.to_owned(), key.to_vec()))
+            .cloned())
+    }
+
+    async fn state_put(
+        &mut self,
+        namespace: &str,
+        key: Vec<u8>,
+        value: Vec<u8>,
+    ) -> Result<(), ProcessorError> {
+        self.state.insert((namespace.to_owned(), key), value);
+        Ok(())
+    }
+
+    async fn state_delete(&mut self, namespace: &str, key: &[u8]) -> Result<(), ProcessorError> {
+        self.state.remove(&(namespace.to_owned(), key.to_vec()));
+        Ok(())
+    }
+
+    async fn state_scan_prefix(
+        &mut self,
+        namespace: &str,
+        prefix: &[u8],
+        limit: usize,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, ProcessorError> {
+        check_scan_limit(limit)?;
+        Ok(scan(&self.state, namespace, prefix, limit))
+    }
+
     async fn get(
         &mut self,
         collection: &str,
@@ -91,15 +158,8 @@ impl ReducerTransaction for MemoryReducer {
         prefix: &[u8],
         limit: usize,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, ProcessorError> {
-        Ok(self
-            .entities
-            .iter()
-            .filter(|((stored_collection, key), _)| {
-                stored_collection == collection && key.starts_with(prefix)
-            })
-            .take(limit)
-            .map(|((_, key), value)| (key.clone(), value.clone()))
-            .collect())
+        check_scan_limit(limit)?;
+        Ok(scan(&self.entities, collection, prefix, limit))
     }
 
     async fn emit(&mut self, change: DomainChange) -> Result<(), ProcessorError> {
@@ -508,6 +568,78 @@ mod tests {
             .await
             .expect("reduce");
         assert_eq!(changes.changes[0].payload, 2_u64.to_be_bytes());
+    }
+
+    #[tokio::test]
+    async fn memory_reducer_keeps_state_and_output_apart_like_the_store() {
+        // Audit probe (Processor-10): state and entities shared one map, so a
+        // reducer that read state it had only written as output passed.
+        let mut reducer = MemoryReducer::default();
+        reducer
+            .state_put("ledger", b"key".to_vec(), b"state".to_vec())
+            .await
+            .expect("state put");
+        reducer
+            .put("ledger", b"key".to_vec(), b"output".to_vec())
+            .await
+            .expect("output put");
+        assert_eq!(
+            reducer
+                .state_get("ledger", b"key")
+                .await
+                .expect("state get"),
+            Some(b"state".to_vec())
+        );
+        assert_eq!(
+            reducer.get("ledger", b"key").await.expect("output get"),
+            Some(b"output".to_vec())
+        );
+        reducer
+            .state_delete("ledger", b"key")
+            .await
+            .expect("state delete");
+        assert_eq!(reducer.entity("ledger", b"key"), Some(&b"output"[..]));
+        assert!(
+            reducer
+                .state_scan_prefix("ledger", b"", 10)
+                .await
+                .expect("state scan")
+                .is_empty()
+        );
+        assert_eq!(
+            reducer
+                .scan_prefix("ledger", b"", 10)
+                .await
+                .expect("output scan"),
+            vec![(b"key".to_vec(), b"output".to_vec())]
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_reducer_enforces_the_store_scan_limits() {
+        // Audit probe (Processor-10): the store rejects 0 and more than
+        // 10,000 rows, the memory reducer accepted any limit.
+        let mut reducer = MemoryReducer::default();
+        for limit in [0, 10_001] {
+            assert!(matches!(
+                reducer.scan_prefix("ledger", b"", limit).await,
+                Err(ProcessorError::State(_))
+            ));
+            assert!(matches!(
+                reducer.state_scan_prefix("ledger", b"", limit).await,
+                Err(ProcessorError::State(_))
+            ));
+        }
+        for limit in [1, 10_000] {
+            reducer
+                .scan_prefix("ledger", b"", limit)
+                .await
+                .expect("output scan within limits");
+            reducer
+                .state_scan_prefix("ledger", b"", limit)
+                .await
+                .expect("state scan within limits");
+        }
     }
 
     #[tokio::test]

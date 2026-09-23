@@ -13461,7 +13461,7 @@ mod tests {
         let mut replacement = live_fixture(2, second.block.hash);
         replacement.block.hash = BlockHash::new([0x42; 32]);
         let source = Arc::new(ScriptedLiveSource::new(
-            fixture_source_descriptor("shared-live", range),
+            e2e_descriptor("shared-live", range),
             vec![
                 LiveStep::Event(ChainEvent::Block(Box::new(first))),
                 LiveStep::Event(ChainEvent::Block(Box::new(second))),
@@ -14283,7 +14283,7 @@ mod tests {
         let report = SharedLiveRuntime::new(
             store.clone(),
             Arc::new(ScriptedLiveSource::new(
-                fixture_source_descriptor("reduce-failure-live", range),
+                e2e_descriptor("reduce-failure-live", range),
                 block_events(&chain),
             )),
             vec![block_local.clone(), ordered.clone(), healthy.clone()],
@@ -14389,7 +14389,7 @@ mod tests {
         let runtime = SharedLiveRuntime::new(
             store.clone(),
             Arc::new(ScriptedLiveSource::new(
-                fixture_source_descriptor("conflict-live", range),
+                e2e_descriptor("conflict-live", range),
                 block_events(&chain[1..]),
             )),
             vec![conflicted.clone(), healthy.clone()],
@@ -14503,7 +14503,7 @@ mod tests {
         let runtime = SharedLiveRuntime::new(
             store.clone(),
             Arc::new(ScriptedLiveSource::new(
-                fixture_source_descriptor("api-reset-live", range),
+                e2e_descriptor("api-reset-live", range),
                 block_events(&chain),
             )),
             vec![ordered.clone()],
@@ -14717,7 +14717,7 @@ mod tests {
         let report = SharedLiveRuntime::new(
             store.clone(),
             Arc::new(ScriptedLiveSource::new(
-                fixture_source_descriptor("gapped-reorg-live", range),
+                e2e_descriptor("gapped-reorg-live", range),
                 vec![LiveStep::Event(ChainEvent::Reorg { reverted, applied })],
             )),
             processors,
@@ -14805,7 +14805,7 @@ mod tests {
         SharedLiveRuntime::new(
             store.clone(),
             Arc::new(ScriptedLiveSource::new(
-                fixture_source_descriptor("rewind-probe-live", range),
+                e2e_descriptor("rewind-probe-live", range),
                 steps,
             )),
             processors,
@@ -15284,7 +15284,7 @@ mod tests {
         SharedLiveRuntime::new(
             store.clone(),
             Arc::new(ScriptedLiveSource::new(
-                fixture_source_descriptor("restart-reduce-live", range),
+                e2e_descriptor("restart-reduce-live", range),
                 block_events(frames),
             )),
             processors.to_vec(),
@@ -15312,7 +15312,7 @@ mod tests {
         SharedLiveRuntime::new(
             store.clone(),
             Arc::new(ScriptedLiveSource::new(
-                fixture_source_descriptor("crash-live", range),
+                e2e_descriptor("crash-live", range),
                 steps,
             )),
             processors.to_vec(),
@@ -16598,7 +16598,7 @@ mod tests {
         let live = SharedLiveRuntime::new(
             store.clone(),
             Arc::new(ScriptedLiveSource::new(
-                fixture_source_descriptor("parked-behind-live", range),
+                e2e_descriptor("parked-behind-live", range),
                 block_events(&chain[5..]),
             )),
             vec![ordered.clone()],
@@ -17342,7 +17342,7 @@ mod tests {
         let runtime = SharedLiveRuntime::new(
             store.clone(),
             Arc::new(ScriptedLiveSource::new(
-                fixture_source_descriptor("ordered-limit-live", range),
+                e2e_descriptor("ordered-limit-live", range),
                 vec![first, second.clone()]
                     .into_iter()
                     .map(|frame| LiveStep::Event(ChainEvent::Block(Box::new(frame))))
@@ -17446,7 +17446,7 @@ mod tests {
         let processors: Vec<Arc<dyn Processor>> = vec![processor.clone()];
         let (_directory, store) = store().await;
         let first_source = Arc::new(ScriptedLiveSource::new(
-            fixture_source_descriptor("first-live", range),
+            e2e_descriptor("first-live", range),
             chain
                 .iter()
                 .cloned()
@@ -17489,7 +17489,7 @@ mod tests {
         assert_eq!(reconciliation.processors["synthetic-ledger"].pending, 0);
 
         let replay_source = Arc::new(ScriptedLiveSource::new(
-            fixture_source_descriptor("replayed-live", range),
+            e2e_descriptor("replayed-live", range),
             chain
                 .into_iter()
                 .map(|frame| LiveStep::Event(ChainEvent::Block(Box::new(frame))))
@@ -17715,6 +17715,108 @@ mod tests {
                 .await
                 .expect("finalized"),
             Some(BlockNumber(0))
+        );
+    }
+
+    #[tokio::test]
+    async fn evm_events_replay_accepts_a_finality_variant_without_the_frame() {
+        use leani_processor_evm_events::{
+            EventDefinition, EventOutput, EvmEventsConfig, EvmEventsProcessor,
+        };
+
+        // Audit probe (M-P3): evm-events embeds finality in its delta, so a
+        // stale included pending delta of a block applied as finalized was
+        // a conflict once the block's frame had left the recent store.
+        let processor = Arc::new(
+            EvmEventsProcessor::new(EvmEventsConfig {
+                start_block: BlockNumber(0),
+                addresses: Vec::new(),
+                events: vec![EventDefinition {
+                    abi: "event Transfer(address indexed from, address indexed to, uint256 value)"
+                        .to_owned(),
+                    output: EventOutput {
+                        collection: "events.transfers".to_owned(),
+                        kind: "events.transfer".to_owned(),
+                        key_fields: Vec::new(),
+                        bucket_seconds: None,
+                    },
+                }],
+            })
+            .expect("processor"),
+        );
+        // The requirement's topic filter holds the event's topic zero.
+        let transfer = processor.descriptor().requirements[0].filter.topics[0].alternatives[0];
+        let mut from = [0_u8; 32];
+        from[12..].fill(0x22);
+        let mut value = vec![0_u8; 32];
+        value[31] = 9;
+        let mut included = included_frame(0, BlockHash::ZERO);
+        included.logs = Material::Complete(vec![leani_primitives::Log {
+            address: leani_primitives::Address::new([0x11; 20]),
+            topics: vec![transfer, from, [0; 32]],
+            data: value,
+            transaction_hash: Some(leani_primitives::TransactionHash::new([0x44; 32])),
+            transaction_index: 0,
+            log_index: 0,
+        }]);
+        let mut finalized = included.clone();
+        finalized.finality = Finality::Finalized;
+        let (_directory, store) = store().await;
+        let applied = processor.map(&finalized).await.expect("map finalized");
+        store
+            .apply(
+                processor.as_ref(),
+                ProcessorCursor {
+                    processor_id: processor.descriptor().id.to_string(),
+                    processor_version: processor.descriptor().version.to_string(),
+                    chain_id: finalized.chain_id,
+                    block_number: finalized.block.number,
+                    block_hash: finalized.block.hash,
+                    finality: Finality::Finalized,
+                    sequence: 1,
+                },
+                &applied,
+                &[],
+            )
+            .await
+            .expect("apply the finalized block");
+        let stale = processor.map(&included).await.expect("map included");
+        assert_ne!(stale.checksum, applied.checksum);
+        store
+            .persist_delta(processor.descriptor(), &stale)
+            .await
+            .expect("persist the stale included delta");
+
+        let processors: Vec<Arc<dyn Processor>> = vec![processor.clone()];
+        let report = SharedLiveRuntime::new(
+            store.clone(),
+            Arc::new(ScriptedLiveSource::new(
+                fixture_source_descriptor("evm-events-live", BlockRange::single(BlockNumber(0))),
+                Vec::new(),
+            )),
+            processors,
+            SharedLiveRuntimeConfig::default(),
+        )
+        .expect("live runtime")
+        .reconcile_pending()
+        .await
+        .expect("reconcile the stale variant");
+        assert!(
+            store
+                .recent_frame(ChainId(1), BlockNumber(0))
+                .await
+                .expect("recent lookup")
+                .is_none()
+        );
+        assert_eq!(report.processors["evm-events"].duplicates, 1);
+        assert_eq!(report.processors["evm-events"].pending, 0);
+        assert_eq!(
+            store
+                .processor_runtime_state(processor.descriptor())
+                .await
+                .expect("state")
+                .state,
+            ProcessorRunState::Running
         );
     }
 

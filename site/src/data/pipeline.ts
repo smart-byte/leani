@@ -9,8 +9,8 @@ export const pipelineStages = [
 ] as const;
 
 export const pipelineProcessors = [
-  { id: 'erc20', short: 'ERC-20', label: 'Token balances', color: '#8fe3a7', map: 'Decode watched ERC-20 Transfer logs.', reduce: 'Apply transfers to the watchlist ledger in order.', output: 'Event-derived token balances', href: '/docs/reference/processor-contracts/#erc20-balances-100' },
+  { id: 'erc20', short: 'ERC-20', label: 'Token balances', color: '#8fe3a7', map: 'Decode watched ERC-20 Transfer logs.', reduce: 'Apply transfers to the watchlist ledger in order.', output: 'Event-derived token balances', href: '/docs/reference/processor-contracts/#erc20-balances-110' },
   { id: 'pools', short: 'Pools', label: 'Pool state', color: '#86d8df', map: 'Decode configured Uniswap V2 / V3 pool events.', reduce: 'Replace each pool’s latest observation in order.', output: 'Exact reserves and sqrtPriceX96', href: '/docs/reference/processor-contracts/#uniswap-observations-210--uniswap-latest-200' },
-  { id: 'events', short: 'Events', label: 'Decoded events', color: '#b8b2f2', map: 'Decode logs against your static event ABI.', reduce: 'Write configured entities and emit typed changes.', output: 'Application-shaped event collections', href: '/docs/reference/processor-contracts/#evm-events-100' },
+  { id: 'events', short: 'Events', label: 'Decoded events', color: '#b8b2f2', map: 'Decode logs against your static event ABI.', reduce: 'Write configured entities and emit typed changes.', output: 'Application-shaped event collections', href: '/docs/reference/processor-contracts/#evm-events-110' },
   { id: 'custom', short: 'Yours', label: 'Your processor', color: '#edcb89', map: 'Transform block material with your native Rust logic.', reduce: 'Update your own collections and emit domain changes.', output: 'Your schema, queries, and durable streams', href: '/docs/guides/custom-processor/' },
 ] as const;

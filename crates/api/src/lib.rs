@@ -3377,6 +3377,7 @@ pub struct Erc20Balance {
     finality: &'static str,
     coverage_from: u64,
     complete: bool,
+    incomplete_from: Option<u64>,
     method: String,
 }
 
@@ -3391,6 +3392,7 @@ impl From<&TokenBalanceEntity> for Erc20Balance {
             finality: finality_name(value.finality),
             coverage_from: value.coverage_from.0,
             complete: value.complete,
+            incomplete_from: value.incomplete_from.map(|block| block.0),
             method: value.method.clone(),
         }
     }
@@ -9922,6 +9924,33 @@ mod tests {
         assert_eq!(hello["chainId"], 1);
         assert_eq!(hello["processor"]["id"], "blobs-money");
         assert!(hello["coverage"].is_object());
+    }
+
+    #[test]
+    fn erc20_balance_renders_where_the_ledger_became_incomplete() {
+        let mut entity = TokenBalanceEntity {
+            token: Address::new([0x22; 20]),
+            address: Address::new([0x11; 20]),
+            balance: Quantity::new([0; 32]),
+            as_of_block: BlockNumber(7),
+            block_hash: BlockHash::new([7; 32]),
+            finality: Finality::Included,
+            coverage_from: BlockNumber(1),
+            complete: false,
+            incomplete_from: Some(BlockNumber(7)),
+            method: "erc20_transfer_ledger".to_owned(),
+        };
+        let json = serde_json::to_value(Erc20Balance::from(&entity)).expect("render");
+        assert_eq!(json["incompleteFrom"], 7);
+        assert_eq!(json["complete"], false);
+        entity.incomplete_from = None;
+        let json = serde_json::to_value(Erc20Balance::from(&entity)).expect("render");
+        assert!(json["incompleteFrom"].is_null());
+        assert!(
+            json.as_object()
+                .expect("object")
+                .contains_key("incompleteFrom")
+        );
     }
 
     #[test]

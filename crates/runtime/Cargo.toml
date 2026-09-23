@@ -27,6 +27,7 @@ tracing.workspace = true
 axum.workspace = true
 leani-api = { path = "../api" }
 leani-processor-blobs = { path = "../processor-blobs" }
+leani-processor-evm-events = { path = "../processor-evm-events" }
 leani-testkit = { path = "../testkit" }
 tempfile.workspace = true
 tower.workspace = true

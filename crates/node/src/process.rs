@@ -4854,7 +4854,15 @@ async fn serve(path: &Path, registry: &ProcessorRegistry) -> Result<Exit> {
         // registered, so bootstrap the immutable processor/stream identity
         // before restoring or creating its consumers. Runtime registration is
         // deliberately idempotent and will verify the same identity later.
-        store.register_processor(processor.descriptor()).await?;
+        store
+            .register_processor(processor.descriptor())
+            .await
+            .map_err(|error| {
+                crate::uniswap_markets::explain_compact_refusal(
+                    error,
+                    &processor.descriptor().instance,
+                )
+            })?;
         for configured_consumer in &processor.descriptor().lifecycle.delivery.consumers {
             let role = if configured_consumer.required {
                 leani_store_sqlite::ConsumerRole::Required
@@ -7653,13 +7661,22 @@ mod tests {
         let failed = Arc::new(OrderedLedgerProcessor::named("handoff-failed-ledger"));
         let verified = Arc::new(BlockLocalCounter::named("handoff-verified-counter"));
         let overlap = BlockRange::new(BlockNumber(1), BlockNumber(2)).expect("overlap");
+        // Like an execution live source, it also supplies the headers the
+        // ledger requests.
+        let mut live_descriptor = fixture_source_descriptor(
+            "handoff-live",
+            BlockRange::new(BlockNumber(0), BlockNumber(3)).expect("range"),
+        );
+        live_descriptor.capabilities = live_descriptor
+            .capabilities
+            .with(leani_primitives::Capability::Header);
+        live_descriptor.complete_capabilities = live_descriptor
+            .complete_capabilities
+            .with(leani_primitives::Capability::Header);
         let live = SharedLiveRuntime::new(
             store.clone(),
             Arc::new(ScriptedLiveSource::new(
-                fixture_source_descriptor(
-                    "handoff-live",
-                    BlockRange::new(BlockNumber(0), BlockNumber(3)).expect("range"),
-                ),
+                live_descriptor,
                 vec![LiveStep::Event(ChainEvent::Block(Box::new(
                     chain[3].clone(),
                 )))],
@@ -7760,5 +7777,71 @@ mod tests {
                 .state,
             ProcessorRunState::Paused
         );
+    }
+
+    #[tokio::test]
+    async fn a_compact_uniswap_node_names_its_routes_when_the_store_refuses_the_starter() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let data_dir = temp.path().join("data");
+        fs::create_dir_all(&data_dir).expect("data directory");
+        let config_path = temp.path().join("leani.toml");
+        fs::write(
+            &config_path,
+            format!(
+                r#"config_version = 1
+network = "ethereum-mainnet"
+data_dir = "{}"
+
+[finality]
+checkpoint = "0x1111111111111111111111111111111111111111111111111111111111111111"
+checkpoint_slot = 15000000
+endpoints = ["https://ethereum-beacon-api.publicnode.com/"]
+
+[uniswap]
+markets = ["ETH/USDT"]
+"#,
+                data_dir.display()
+            ),
+        )
+        .expect("write compact config");
+        // An earlier release stored the starter processor with ETH/USDT
+        // starting at the USDC/WETH pool's creation block.
+        let mut markets =
+            crate::uniswap_markets::resolve_markets(&["ETH/USDT".to_owned()]).expect("market");
+        markets[0].start_block = 12_376_729;
+        let earlier =
+            crate::uniswap_markets::processor_config(&markets, "uniswap-observations", false)
+                .expect("earlier starter");
+        let earlier = ProcessorRegistry::standard()
+            .instantiate(&earlier, 1)
+            .expect("earlier processor");
+        let config = Config::load(&config_path)
+            .expect("load compact config")
+            .validate()
+            .expect("valid compact config");
+        let store = leani_store_sqlite::SqliteStore::open(configured_store_config(
+            config.get(),
+            data_dir.join("leani.sqlite"),
+        ))
+        .await
+        .expect("store");
+        store
+            .register_processor(earlier.descriptor())
+            .await
+            .expect("register the earlier starter");
+        drop(store);
+
+        let error = serve(&config_path, &ProcessorRegistry::standard())
+            .await
+            .expect_err("the store refuses the moved start block");
+        let message = format!("{error:#}");
+        assert!(
+            message.ends_with(
+                "processor instance uniswap-observations conflicts with its stored descriptor"
+            ),
+            "{message}"
+        );
+        assert!(message.contains("a new `data_dir`"), "{message}");
+        assert!(message.contains("a new `instance`"), "{message}");
     }
 }
