@@ -4712,6 +4712,7 @@ version = "0.1.0-rc.1"
 dependencies = [
  "async-trait",
  "blake3",
+ "futures",
  "hex",
  "leani-primitives",
  "leani-processor-api",

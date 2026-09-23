@@ -311,14 +311,25 @@ enqueue/acknowledgement time, not Ethereum block timestamps.
 
 ### Checkpoint and undo
 
-`[processors.checkpoint] mode` is `none` or `automatic`; automatic mode keeps
-the newest positive `keep` count. Portable savepoints are created and deleted
-explicitly through the API and are not covered by automatic checkpoint
-pruning.
+`[processors.checkpoint] mode` is `none` or `automatic`. Automatic mode
+checkpoints processor state at most once per 1,000 finalized blocks, and again
+when a historical job completes, and keeps the newest positive `keep` count.
+A restore repairs state only when the processor's cursor sits exactly on a
+checkpoint: a cadence block or the end of a completed job, even if finality
+reached that block later. A processor between checkpoints cannot be restored
+from one; take a portable savepoint while it is at rest, or restore a
+full-store backup. Portable savepoints are created and deleted explicitly
+through the API and are not covered by automatic checkpoint pruning. Each
+processor instance keeps at most 16, and each new one counts against the
+physical store budget. Editing lifecycle policies, for example to raise a
+limit, leaves existing checkpoints and savepoints valid.
 
-`[processors.undo] mode` is `none` or `unfinalized`.
-`included_and_finalized` requires `unfinalized`; `safety_blocks` extends the
-bounded correctness window.
+`[processors.undo] mode` is `none` or `unfinalized`, and
+`included_and_finalized` requires `unfinalized`. Unfinalized blocks always
+keep their undo records, so a reorg can revert them in either mode. Once
+finality passes a block, `unfinalized` keeps its record for another
+`safety_blocks` blocks and `none` deletes it at once. Blocks applied as
+already finalized record no undo.
 
 ## API and credentials
 

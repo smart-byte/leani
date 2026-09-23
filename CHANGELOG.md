@@ -46,6 +46,60 @@ record, and documented RPC contracts.
   Finality commits, finalized artifact candidates stay pending with a warning,
   and a later finality advance promotes them once the retained budget has
   room.
+- The undo journal no longer grows forever. Blocks applied as already
+  finalized record no undo, and each finality advance deletes finalized
+  records more than `[processors.undo] safety_blocks` below the finalized
+  height, or all of them with `mode = "none"`. Unfinalized blocks keep their
+  records, so reorgs undo as before. A backlog from earlier versions drains
+  by at most 10,000 records per finality advance.
+- Automatic recovery checkpoints are taken at most once per 1,000 finalized
+  blocks instead of on every finalized block and finality event, and they
+  stream processor state instead of loading it whole. `keep` is unchanged. A
+  completed historical job also checkpoints its processor at rest, and a
+  restore accepts a checkpoint whose block was finalized after it was taken.
+  A restore still needs a checkpoint at the current cursor, so between
+  checkpoints use a portable savepoint or a full-store backup.
+- Checkpoints and portable savepoints stay valid after lifecycle edits such
+  as raising a limit: their identity is the processor contract without its
+  lifecycle policies. Snapshots written by earlier versions stay valid while
+  the descriptor is unchanged.
+- Each processor instance keeps at most 16 portable savepoints, and a new one
+  is admitted against the physical store budget. The API answers a full quota
+  with `409 savepoint_limit`.
+- Coverage that arrives out of order, such as an older backfill range that
+  finishes after a newer one, is now owned and therefore compacted. Adjacent
+  owner ranges coalesce.
+- Re-applying a block that coverage compaction already folded into a compact
+  interval is an idempotent no-op instead of re-running the reducer and
+  publishing duplicate changes. Hot/cold handoff verification accepts
+  compacted blocks through their segment's end hash. Compaction leaves the
+  overlap of a running handoff exact until it is verified, logging that once
+  per handoff, and a new handoff fails any unverified one left by an
+  interrupted run.
+- Reducer prefix scans (`scan_prefix`, `state_scan_prefix`) keep reading
+  until `limit` rows survive the reducer's own uncommitted deletes, so pages
+  are no longer short and an uncommitted key no longer skips ahead of unread
+  committed keys.
+- A `required` consumer is rejected on a live stream whose delivery mode is
+  not `until_acknowledged`, where it would pin window retention indefinitely.
+  Backfill streams still accept it. Consumers registered earlier keep their
+  role, and re-creating one still returns `409 consumer_exists`. A store that
+  holds such consumers logs a startup warning listing them: revoke each one
+  (`DELETE /v1/processors/{processor}/consumers/{consumer}`) and register a
+  `best_effort` consumer under a new ID, or switch the processor to
+  `until_acknowledged` delivery. The durable-consumer SDK example now
+  registers a best-effort consumer, matching the window-retained stream of
+  the PostgreSQL guide.
+- Deleting terminal backfill work removes its subscription ranges and coverage
+  ownership even when the job ID differs from the subscription ID.
+- A late microbatch commit or completion no longer overwrites a cancelled or
+  failed job, and a late state change no longer revives a cancelled, failed,
+  or reclaimable subscription.
+- Store stats and `/metrics` report changes held for `finalized_only`
+  processors: `deferred_changes`, `deferred_change_bytes`,
+  `leani_store_deferred_changes`, and `leani_store_deferred_change_bytes`.
+- Refusing an older store schema names the actual reason instead of always
+  claiming the store predates the included/finalized vocabulary.
 
 ## [0.1.0-rc.1] - 2026-09-20
 

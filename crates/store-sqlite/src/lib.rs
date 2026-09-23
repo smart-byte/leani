@@ -14,15 +14,16 @@ use std::{
 };
 
 use async_trait::async_trait;
+use futures::TryStreamExt;
 use leani_primitives::{
     BlockFrame, BlockHash, BlockNumber, BlockRange, BlockRef, ChainId, ChangeCursor, CursorKind,
     DurableKind, Finality, Material, OpaqueCursor, ProcessorCursor, TransactionHash,
 };
 use leani_processor_api::{
     ArtifactPolicyMode, ChangeOperation, CheckpointPolicyMode, DeliveryLimitAction,
-    DeliveryOrdering, DeliveryPolicyMode, DomainChange, EncodedDelta, OutputPolicyMode, Processor,
-    ProcessorDescriptor, ProcessorError, PublicationPolicy, ReducerTransaction, ReductionMode,
-    StartPoint,
+    DeliveryOrdering, DeliveryPolicyMode, DomainChange, EncodedDelta, LifecyclePolicies,
+    OutputPolicyMode, Processor, ProcessorDescriptor, ProcessorError, PublicationPolicy,
+    ReducerTransaction, ReductionMode, StartPoint, UndoPolicyMode,
 };
 use leani_store_artifacts::{
     ArtifactBatchReceipt, ArtifactBatchSink, ArtifactCompression, ArtifactSegmentLimits,
@@ -30,7 +31,7 @@ use leani_store_artifacts::{
 };
 use serde::{Deserialize, Serialize};
 use sqlx::{
-    Acquire, ConnectOptions, Connection, Row, Sqlite, SqlitePool, Transaction,
+    Acquire, ConnectOptions, Connection, Row, Sqlite, SqliteConnection, SqlitePool, Transaction,
     sqlite::{
         SqliteAutoVacuum, SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteRow,
         SqliteSynchronous,
@@ -66,6 +67,18 @@ pub const CURRENT_SCHEMA_VERSION: u32 = 21;
 pub const DELIVERY_ENCODING_VERSION: u16 = 1;
 /// Deferred rows promoted per SQL round trip inside `mark_finalized`.
 const DEFERRED_FLUSH_BATCH: usize = 256;
+/// Finalized undo rows deleted per `mark_finalized`, so a backlog left by
+/// earlier versions drains over several finality advances instead of one
+/// long write under the live writer lock.
+const UNDO_PRUNE_BATCH: i64 = 10_000;
+/// Minimum block distance between automatic recovery checkpoints. Each one
+/// copies the processor's whole working state.
+const AUTOMATIC_CHECKPOINT_INTERVAL_BLOCKS: u64 = 1_000;
+/// Operator-created portable savepoints retained per processor instance.
+const PORTABLE_SAVEPOINT_LIMIT: u64 = 16;
+/// First schema whose durable cursors and undo records use the
+/// included/finalized finality vocabulary.
+const FINALITY_VOCABULARY_SCHEMA_VERSION: u32 = 21;
 
 /// `SQLite` fsync policy.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -835,6 +848,10 @@ pub struct StoreStats {
     pub pending_processor_artifact_bytes: u64,
     pub delivery_retained_bytes: u64,
     pub history_delivery_retained_bytes: u64,
+    /// Changes held back until finality by `finalized_only` processors.
+    pub deferred_changes: u64,
+    /// Delivery-budget bytes charged for the held changes.
+    pub deferred_change_bytes: u64,
     pub database_bytes: u64,
     pub freelist_bytes: u64,
     pub wal_bytes: u64,
@@ -1032,6 +1049,23 @@ struct StateSnapshotEntry {
     namespace: String,
     key: Vec<u8>,
     value: Vec<u8>,
+}
+
+/// The [`StateSnapshot`] fields before its entries, encoded identically.
+#[derive(Serialize)]
+struct StateSnapshotHeader<'a> {
+    format_version: u16,
+    processor_instance: &'a str,
+    descriptor_hash: BlockHash,
+    cursor: &'a ProcessorCursor,
+}
+
+/// A borrowed [`StateSnapshotEntry`], encoded identically.
+#[derive(Serialize)]
+struct StateSnapshotEntryRef<'a> {
+    namespace: &'a str,
+    key: &'a [u8],
+    value: &'a [u8],
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1719,6 +1753,8 @@ struct StoreInner {
     artifact_budget: ArtifactStorageBudget,
     artifact_segments: Option<ArtifactSegmentStorage>,
     artifact_compaction: Mutex<()>,
+    /// Running hot/cold handoffs whose compaction hold was already logged.
+    logged_handoff_holds: StdMutex<BTreeSet<String>>,
 }
 
 #[derive(Clone, Debug)]
@@ -1773,6 +1809,20 @@ pub trait ProcessorArtifactStore: Send + Sync {
         range: BlockRange,
         limit: usize,
     ) -> Result<ProcessorArtifactExport, StoreError>;
+}
+
+/// Refusal for an existing store whose schema is older than this binary's.
+fn older_schema_refusal(version: u32) -> StoreError {
+    let reason = if version < FINALITY_VOCABULARY_SCHEMA_VERSION {
+        "predates the included/finalized vocabulary".to_owned()
+    } else {
+        format!(
+            "is older than supported schema {CURRENT_SCHEMA_VERSION} and has no in-place upgrade"
+        )
+    };
+    StoreError::InvalidConfig(format!(
+        "database schema {version} {reason}; delete the data directory and re-initialize"
+    ))
 }
 
 /// Bootstrap or upgrade the schema in one transaction.
@@ -1830,15 +1880,13 @@ async fn migrate(pool: &SqlitePool) -> Result<(), StoreError> {
             "database schema 0 cannot be upgraded by this binary".to_owned(),
         ));
     }
-    // Older stores encode finality 0 = optimistic inside postcard cursors and
-    // undo records; that value now means Preview and cannot be rewritten by
-    // SQL. Only the schema-1 bootstrap of a store created by this transaction
-    // may continue through the migration chain.
+    // Stores before the finality vocabulary encode finality 0 = optimistic
+    // inside postcard cursors and undo records; that value now means Preview
+    // and cannot be rewritten by SQL. Later stores have no in-place upgrade
+    // yet either. Only the schema-1 bootstrap of a store created by this
+    // transaction may continue through the migration chain.
     if !new_store && version < CURRENT_SCHEMA_VERSION {
-        return Err(StoreError::InvalidConfig(format!(
-            "database schema {version} predates the included/finalized vocabulary; \
-             delete the data directory and re-initialize"
-        )));
+        return Err(older_schema_refusal(version));
     }
 
     let migrations = [
@@ -1983,6 +2031,15 @@ impl SqliteStore {
                  shrink the file; stop the node and run `leani db compact` once to convert it"
             );
         }
+        let pinning = required_consumers_on_pruned_streams(&pool).await?;
+        if !pinning.is_empty() {
+            tracing::warn!(
+                consumers = ?pinning,
+                "required consumers on streams without until_acknowledged delivery hold back \
+                 pruning until they acknowledge; revoke them and register best_effort \
+                 consumers, or switch those processors to until_acknowledged delivery"
+            );
+        }
         let now = now_i64()?;
         let mut hasher = blake3::Hasher::new();
         hasher.update(config.path.to_string_lossy().as_bytes());
@@ -2016,6 +2073,7 @@ impl SqliteStore {
                 artifact_budget,
                 artifact_segments,
                 artifact_compaction: Mutex::new(()),
+                logged_handoff_holds: StdMutex::new(BTreeSet::new()),
             }),
         };
         store.recover_artifact_segment_catalog().await?;
@@ -2577,19 +2635,29 @@ impl SqliteStore {
             self.validate_delivery_stream(&instance, stream_id).await?;
         }
         let _guard = self.inner.writer.lock().await;
-        if let Some(checksum) = applied_checksum(
+        let applied = applied_checksum(
             &self.inner.pool,
             &instance,
             cursor.block_number,
             cursor.block_hash,
         )
-        .await?
+        .await?;
+        if applied.is_some_and(|checksum| checksum != delta.checksum) {
+            return Err(StoreError::ConflictingApply {
+                block: cursor.block_number,
+            });
+        }
+        // Coverage compaction drops the exact rows of blocks it folds into a
+        // compact interval, so those count as applied too.
+        if applied.is_some()
+            || compacted_coverage_contains(
+                &self.inner.pool,
+                &instance,
+                cursor.block_number,
+                cursor.block_hash,
+            )
+            .await?
         {
-            if checksum != delta.checksum {
-                return Err(StoreError::ConflictingApply {
-                    block: cursor.block_number,
-                });
-            }
             let mut transaction = self.inner.pool.begin().await?;
             if let Some(encoded) = artifact_encoded.as_deref() {
                 stage_or_retain_processor_artifact(
@@ -2694,11 +2762,9 @@ impl SqliteStore {
             )
             .await?;
         }
-        let inverse_changes = if delivery_enabled && publish_changes && !defer_publication {
-            build_inverse_changes(&batch)?
-        } else {
-            Vec::new()
-        };
+        // Finalized blocks are never undone, so only reversible ones journal
+        // an undo record, with their output metadata and window-pruned rows.
+        let reversible = cursor.finality != Finality::Finalized;
         let prior_cursor = self.processor_cursor_by_instance(&instance).await?;
         let advances_cursor = processor.descriptor().mode == ReductionMode::OrderedState
             || prior_cursor
@@ -2711,18 +2777,27 @@ impl SqliteStore {
                 StoreError::Invariant("a non-advancing block must have a prior cursor".to_owned())
             })?
         };
-        let mut undo = UndoRecord {
-            mutations: batch.mutations.clone(),
-            inverse_changes,
-            prior_cursor,
-            block: delta.block,
-            finality: cursor.finality,
+        let mut undo = if reversible {
+            Some(UndoRecord {
+                mutations: batch.mutations.clone(),
+                inverse_changes: if delivery_enabled && publish_changes && !defer_publication {
+                    build_inverse_changes(&batch)?
+                } else {
+                    Vec::new()
+                },
+                prior_cursor,
+                block: delta.block,
+                finality: cursor.finality,
+            })
+        } else {
+            None
         };
-        let mut undo_bytes = postcard::to_allocvec(&undo)
-            .map_err(|error| StoreError::Encoding(error.to_string()))?;
-        // Finalized blocks are never undone, so only reversible ones record
-        // output metadata and window-pruned rows for their undo.
-        let reversible = cursor.finality != Finality::Finalized;
+        let mut undo_bytes = undo
+            .as_ref()
+            .map(postcard::to_allocvec)
+            .transpose()
+            .map_err(|error| StoreError::Encoding(error.to_string()))?
+            .unwrap_or_default();
         if retains_processor_output(descriptor) || artifact_encoded.is_some() {
             let output_bytes = if retains_processor_output(descriptor) {
                 estimated_retained_mutation_bytes(&batch.mutations, true)?
@@ -2785,11 +2860,11 @@ impl SqliteStore {
             delta.block,
         )
         .await?;
-        if reversible {
+        if let Some(undo) = undo.as_mut() {
             if !pruned.mutations.is_empty() {
                 // Pruning belongs to this block: its undo puts the rows back.
                 undo.mutations.extend(pruned.mutations);
-                undo_bytes = postcard::to_allocvec(&undo)
+                undo_bytes = postcard::to_allocvec(undo)
                     .map_err(|error| StoreError::Encoding(error.to_string()))?;
             }
             undo_metadata.entities.extend(pruned.entities);
@@ -2797,19 +2872,18 @@ impl SqliteStore {
                 postcard::to_allocvec(&undo_metadata)
                     .map_err(|error| StoreError::Encoding(error.to_string()))?,
             );
+            sqlx::query(
+                "INSERT INTO undo_journal(
+                    instance, block_number, block_hash, encoded_undo, finalized
+                 ) VALUES (?, ?, ?, ?, 0)",
+            )
+            .bind(&instance)
+            .bind(u64_i64(cursor.block_number.0, "block_number")?)
+            .bind(cursor.block_hash.0.as_slice())
+            .bind(undo_bytes)
+            .execute(&mut *transaction)
+            .await?;
         }
-        sqlx::query(
-            "INSERT INTO undo_journal(
-                instance, block_number, block_hash, encoded_undo, finalized
-             ) VALUES (?, ?, ?, ?, ?)",
-        )
-        .bind(&instance)
-        .bind(u64_i64(cursor.block_number.0, "block_number")?)
-        .bind(cursor.block_hash.0.as_slice())
-        .bind(undo_bytes)
-        .bind(i64::from(cursor.finality == Finality::Finalized))
-        .execute(&mut *transaction)
-        .await?;
         sqlx::query(
             "INSERT INTO applied_blocks(
                 instance, block_number, block_hash, delta_checksum, applied_at_unix_ms
@@ -3125,6 +3199,16 @@ impl SqliteStore {
                             incoming: item.delta.block.hash,
                         });
                     }
+                    return Err(StoreError::HistoricalBatchRequiresFallback);
+                }
+                if compacted_coverage_contains(
+                    &self.inner.pool,
+                    &instance,
+                    item.delta.block.number,
+                    item.delta.block.hash,
+                )
+                .await?
+                {
                     return Err(StoreError::HistoricalBatchRequiresFallback);
                 }
             }
@@ -3445,9 +3529,14 @@ impl SqliteStore {
             published_changes,
         )
         .await?;
+        // A job cancelled or finished while this batch ran keeps that state.
         let updated = sqlx::query(
             "UPDATE jobs
-             SET state = 'running', checkpoint = ?, attempts = ?, updated_at_unix_ms = ?
+             SET state = CASE
+                   WHEN state IN ('completed', 'failed', 'cancelled') THEN state
+                   ELSE 'running'
+                 END,
+                 checkpoint = ?, attempts = ?, updated_at_unix_ms = ?
              WHERE job_id = ?",
         )
         .bind(job_checkpoint)
@@ -3495,8 +3584,9 @@ impl SqliteStore {
     /// stream.
     ///
     /// Reducer visibility remains canonical across the batch, while output
-    /// metadata, undo records, coverage, the processor cursor, and the job
-    /// checkpoint retain their per-block identities inside one transaction.
+    /// metadata, coverage, the processor cursor, and the job checkpoint
+    /// retain their per-block identities inside one transaction. Finalized
+    /// blocks cannot be undone, so the batch journals no undo records.
     ///
     /// # Errors
     ///
@@ -3621,6 +3711,16 @@ impl SqliteStore {
                 }
                 return Err(StoreError::HistoricalBatchRequiresFallback);
             }
+            if compacted_coverage_contains(
+                &self.inner.pool,
+                &instance,
+                item.delta.block.number,
+                item.delta.block.hash,
+            )
+            .await?
+            {
+                return Err(StoreError::HistoricalBatchRequiresFallback);
+            }
         }
 
         let prior_cursor = self.processor_cursor_by_instance(&instance).await?;
@@ -3670,19 +3770,14 @@ impl SqliteStore {
             });
         }
 
+        // Finalized blocks journal no undo, so only retained output counts.
         let output_bytes = if retains_processor_output(descriptor) {
             block_batches
                 .iter()
                 .try_fold(0_u64, |total, batch| -> Result<u64, StoreError> {
                     let retained = estimated_retained_mutation_bytes(&batch.mutations, true)?;
-                    let undo = u64::try_from(
-                        postcard::to_allocvec(&batch.mutations)
-                            .map_err(|error| StoreError::Encoding(error.to_string()))?
-                            .len(),
-                    )
-                    .map_err(|_| StoreError::Numeric("materialization undo bytes"))?;
                     total
-                        .checked_add(retained.saturating_add(undo).saturating_add(256))
+                        .checked_add(retained.saturating_add(256))
                         .ok_or(StoreError::Numeric(
                             "materialization physical admission bytes",
                         ))
@@ -3751,26 +3846,6 @@ impl SqliteStore {
                         artifact_totals_delta.added_owners.saturating_add(1);
                 }
             }
-            let undo = UndoRecord {
-                mutations: batch.mutations.clone(),
-                inverse_changes: Vec::new(),
-                prior_cursor: committed_cursor.clone(),
-                block: item.delta.block,
-                finality: Finality::Finalized,
-            };
-            let undo_bytes = postcard::to_allocvec(&undo)
-                .map_err(|error| StoreError::Encoding(error.to_string()))?;
-            sqlx::query(
-                "INSERT INTO undo_journal(
-                    instance, block_number, block_hash, encoded_undo, finalized
-                 ) VALUES (?, ?, ?, ?, 1)",
-            )
-            .bind(&instance)
-            .bind(u64_i64(item.delta.block.number.0, "block_number")?)
-            .bind(item.delta.block.hash.0.as_slice())
-            .bind(undo_bytes)
-            .execute(&mut *transaction)
-            .await?;
             sqlx::query(
                 "INSERT INTO applied_blocks(
                     instance, block_number, block_hash, delta_checksum, applied_at_unix_ms
@@ -3858,9 +3933,14 @@ impl SqliteStore {
                 .await?;
             }
         }
+        // A job cancelled or finished while this batch ran keeps that state.
         let updated = sqlx::query(
             "UPDATE jobs
-             SET state = 'running', checkpoint = ?, attempts = ?, updated_at_unix_ms = ?
+             SET state = CASE
+                   WHEN state IN ('completed', 'failed', 'cancelled') THEN state
+                   ELSE 'running'
+                 END,
+                 checkpoint = ?, attempts = ?, updated_at_unix_ms = ?
              WHERE job_id = ?",
         )
         .bind(job_checkpoint)
@@ -4128,8 +4208,25 @@ impl SqliteStore {
         .bind(u64_i64(block_number.0, "block_number")?)
         .bind(block_hash.0.as_slice())
         .fetch_optional(&self.inner.pool)
-        .await?
-        .ok_or(StoreError::UndoNotFound(block_number))?;
+        .await?;
+        let Some(row) = row else {
+            // Finalized blocks keep no undo record: applies that were already
+            // final write none, and finality prunes the rest.
+            let finality: Option<i64> = sqlx::query_scalar(
+                "SELECT finality FROM processor_coverage
+                 WHERE instance = ? AND block_number = ? AND block_hash = ?",
+            )
+            .bind(&instance)
+            .bind(u64_i64(block_number.0, "block_number")?)
+            .bind(block_hash.0.as_slice())
+            .fetch_optional(&self.inner.pool)
+            .await?;
+            return Err(if finality == Some(finality_i64(Finality::Finalized)) {
+                StoreError::FinalizedUndo(block_number)
+            } else {
+                StoreError::UndoNotFound(block_number)
+            });
+        };
         if row.try_get::<i64, _>("finalized")? != 0 {
             return Err(StoreError::FinalizedUndo(block_number));
         }
@@ -4261,7 +4358,8 @@ impl SqliteStore {
     }
 
     /// Mark all undo records through a height final. They can no longer be
-    /// reversed by the normal runtime path.
+    /// reversed by the normal runtime path, so finalized records older than
+    /// the processor's undo safety depth are deleted.
     ///
     /// # Errors
     ///
@@ -4318,6 +4416,7 @@ impl SqliteStore {
         .bind(u64_i64(through.0, "block_number")?)
         .execute(&mut *transaction)
         .await?;
+        prune_finalized_undo(&mut transaction, descriptor, &instance, through).await?;
         sqlx::query(
             "UPDATE processor_coverage SET finality = ?
              WHERE instance = ? AND block_number <= ? AND finality < ?",
@@ -4450,6 +4549,11 @@ impl SqliteStore {
     /// Restore private processor state from an automatic checkpoint at the
     /// exact current cursor boundary.
     ///
+    /// The cursor must match the checkpoint's block, hash, and sequence; only
+    /// a later finality promotion of that block may differ. Automatic
+    /// checkpoints follow a block cadence and job completion, so a processor
+    /// between them has no restorable checkpoint.
+    ///
     /// This repairs corrupted working state without changing output,
     /// coverage, delivery, or undo history. Rewinding to an older checkpoint
     /// is rejected because those independent storage classes would otherwise
@@ -4484,13 +4588,26 @@ impl SqliteStore {
         let encoded: Vec<u8> = row.try_get("state_snapshot")?;
         let checksum = decode_hash(row.try_get("state_checksum")?)?;
         let snapshot = decode_state_snapshot(descriptor, &instance, &encoded, checksum)?;
-        let current = self.processor_cursor_by_instance(&instance).await?;
-        if current.as_ref() != Some(&snapshot.cursor) {
-            return Err(StoreError::CheckpointRestoreBoundary {
-                checkpoint: snapshot.cursor.block_number,
-                current: current.map(|cursor| cursor.block_number),
-            });
-        }
+        // Finality promotion relabels the cursor without touching state, so
+        // a checkpoint taken while its block was only included still fits.
+        let current = match self.processor_cursor_by_instance(&instance).await? {
+            Some(current)
+                if current.finality >= snapshot.cursor.finality
+                    && current
+                        == (ProcessorCursor {
+                            finality: current.finality,
+                            ..snapshot.cursor.clone()
+                        }) =>
+            {
+                current
+            }
+            current => {
+                return Err(StoreError::CheckpointRestoreBoundary {
+                    checkpoint: snapshot.cursor.block_number,
+                    current: current.map(|cursor| cursor.block_number),
+                });
+            }
+        };
 
         let mut transaction = self.inner.pool.begin().await?;
         sqlx::query("DELETE FROM processor_state WHERE instance = ?")
@@ -4510,17 +4627,20 @@ impl SqliteStore {
             .await?;
         }
         transaction.commit().await?;
-        Ok(snapshot.cursor)
+        Ok(current)
     }
 
     /// Create an operator-owned savepoint from the current atomic state/cursor.
     ///
-    /// Savepoints are never removed by automatic checkpoint pruning.
+    /// Savepoints are never removed by automatic checkpoint pruning, so each
+    /// processor instance retains at most [`PORTABLE_SAVEPOINT_LIMIT`] and
+    /// every new one is admitted against the physical store budget.
     ///
     /// # Errors
     ///
-    /// Returns an error for an invalid/duplicate ID, missing cursor, encoding
-    /// failure, or failed write.
+    /// Returns an error for an invalid/duplicate ID, a full savepoint quota,
+    /// missing cursor, encoding failure, exhausted physical store capacity, or
+    /// failed write.
     pub async fn create_portable_savepoint(
         &self,
         descriptor: &ProcessorDescriptor,
@@ -4537,9 +4657,41 @@ impl SqliteStore {
             .processor_cursor_by_instance(&instance)
             .await?
             .ok_or_else(|| StoreError::NoProcessorCursor(instance.clone()))?;
-        let mut transaction = self.inner.pool.begin().await?;
+        let (retained, exists): (i64, i64) = sqlx::query_as(
+            "SELECT COUNT(*), COALESCE(SUM(savepoint_id = ?), 0)
+             FROM portable_savepoints WHERE instance = ?",
+        )
+        .bind(savepoint_id)
+        .bind(&instance)
+        .fetch_one(&self.inner.pool)
+        .await?;
+        if exists != 0 {
+            return Err(StoreError::SavepointExists {
+                instance,
+                savepoint_id: savepoint_id.to_owned(),
+            });
+        }
+        if i64_u64(retained, "retained savepoints")? >= PORTABLE_SAVEPOINT_LIMIT {
+            return Err(StoreError::SavepointLimit {
+                instance,
+                limit: PORTABLE_SAVEPOINT_LIMIT,
+            });
+        }
+        // Encode before the write transaction so admission, which may
+        // checkpoint the WAL, runs first. The writer lock keeps the state
+        // unchanged until the insert.
+        let mut snapshot = self.inner.pool.begin().await?;
         let (encoded_cursor, encoded_snapshot, checksum) =
-            encode_state_snapshot(&mut transaction, descriptor, &instance, &cursor).await?;
+            encode_state_snapshot(&mut snapshot, descriptor, &instance, &cursor).await?;
+        snapshot.rollback().await?;
+        enforce_physical_store_capacity(
+            &self.inner,
+            u64::try_from(encoded_snapshot.len().saturating_add(encoded_cursor.len()))
+                .unwrap_or(u64::MAX)
+                .saturating_add(256),
+        )
+        .await?;
+        let mut transaction = self.inner.pool.begin().await?;
         let now = now_i64()?;
         let result = sqlx::query(
             "INSERT INTO portable_savepoints(
@@ -6816,6 +6968,8 @@ impl SqliteStore {
         through: BlockNumber,
     ) -> Result<u64, StoreError> {
         let instance = processor_instance(descriptor);
+        self.log_handoff_compaction_holds(&instance, through)
+            .await?;
         let count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM processor_coverage AS coverage
              WHERE coverage.instance = ?
@@ -6830,6 +6984,13 @@ impl SqliteStore {
                    SELECT 1 FROM finalized_coverage_intervals AS compact
                     WHERE compact.instance = coverage.instance
                       AND coverage.block_number BETWEEN compact.start_block AND compact.end_block
+               )
+               AND NOT EXISTS (
+                   SELECT 1 FROM hot_cold_handoffs AS handoff
+                    WHERE handoff.processor_instance = coverage.instance
+                      AND handoff.state = 'running'
+                      AND coverage.block_number
+                          BETWEEN handoff.overlap_from AND handoff.overlap_to
                )",
         )
         .bind(&instance)
@@ -6840,6 +7001,43 @@ impl SqliteStore {
         i64_u64(count, "compactable finalized coverage count")
     }
 
+    /// Log once per handoff that compaction holds back the overlap of a
+    /// running hot/cold handoff below `through` until it is verified.
+    async fn log_handoff_compaction_holds(
+        &self,
+        instance: &str,
+        through: BlockNumber,
+    ) -> Result<(), StoreError> {
+        let holds: Vec<(String, i64, i64)> = sqlx::query_as(
+            "SELECT handoff_id, overlap_from, overlap_to FROM hot_cold_handoffs
+             WHERE processor_instance = ? AND state = 'running' AND overlap_from <= ?
+             ORDER BY overlap_from",
+        )
+        .bind(instance)
+        .bind(u64_i64(through.0, "coverage compaction through")?)
+        .fetch_all(&self.inner.pool)
+        .await?;
+        for (handoff_id, overlap_from, overlap_to) in holds {
+            let first = self
+                .inner
+                .logged_handoff_holds
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(handoff_id.clone());
+            if first {
+                tracing::info!(
+                    processor_instance = %instance,
+                    handoff_id,
+                    overlap_from,
+                    overlap_to,
+                    "coverage compaction skips the overlap of a running hot/cold handoff \
+                     until the handoff is verified"
+                );
+            }
+        }
+        Ok(())
+    }
+
     /// Compact one contiguous bounded run of finalized block-local coverage.
     ///
     /// Exact coverage, applied-idempotency, and finalized undo rows are
@@ -6848,6 +7046,8 @@ impl SqliteStore {
     /// compact interval replaces only redundant finalized execution metadata.
     /// Compaction pauses while any subscription still owns creation-time work,
     /// because overlapping jobs may need exact rows for stream-safe replay.
+    /// Blocks inside the overlap of a running hot/cold handoff stay exact
+    /// until that handoff is verified.
     ///
     /// # Errors
     ///
@@ -6887,6 +7087,8 @@ impl SqliteStore {
         if active_subscriptions != 0 {
             return Ok(FinalizedCoverageCompaction::default());
         }
+        self.log_handoff_compaction_holds(&instance, through)
+            .await?;
         let rows = sqlx::query(
             "SELECT coverage.block_number, coverage.block_hash, coverage.parent_hash
              FROM processor_coverage AS coverage
@@ -6902,6 +7104,13 @@ impl SqliteStore {
                    SELECT 1 FROM finalized_coverage_intervals AS compact
                     WHERE compact.instance = coverage.instance
                       AND coverage.block_number BETWEEN compact.start_block AND compact.end_block
+               )
+               AND NOT EXISTS (
+                   SELECT 1 FROM hot_cold_handoffs AS handoff
+                    WHERE handoff.processor_instance = coverage.instance
+                      AND handoff.state = 'running'
+                      AND coverage.block_number
+                          BETWEEN handoff.overlap_from AND handoff.overlap_to
                )
              ORDER BY coverage.block_number
              LIMIT ?",
@@ -7082,6 +7291,10 @@ impl SqliteStore {
     ///
     /// Reopening the same identity and bounds is idempotent. Reusing an
     /// identity for another processor, range, chain, or anchor is rejected.
+    /// A new handoff fails any older one of the same processor that is still
+    /// running: each start anchors its own handoff, so an older one can only
+    /// be left over from an interrupted run and would otherwise hold back
+    /// coverage compaction of its overlap forever.
     ///
     /// # Errors
     ///
@@ -7107,6 +7320,26 @@ impl SqliteStore {
             return Ok(existing);
         }
         let updated_at_unix_ms = now_milliseconds()?;
+        let mut transaction = self.inner.pool.begin().await?;
+        let superseded: Vec<String> = sqlx::query_scalar(
+            "UPDATE hot_cold_handoffs
+             SET state = 'failed', failure = ?, updated_at_unix_ms = ?
+             WHERE processor_instance = ? AND state = 'running'
+             RETURNING handoff_id",
+        )
+        .bind(format!("superseded by handoff {id:?} before verification"))
+        .bind(u64_i64(updated_at_unix_ms, "updated_at_unix_ms")?)
+        .bind(&instance)
+        .fetch_all(&mut *transaction)
+        .await?;
+        if !superseded.is_empty() {
+            tracing::warn!(
+                processor_instance = %instance,
+                handoff_id = id,
+                ?superseded,
+                "a new hot/cold handoff supersedes unverified handoffs from an interrupted run"
+            );
+        }
         sqlx::query(
             "INSERT INTO hot_cold_handoffs(
                 handoff_id, chain_id, processor_instance, overlap_from,
@@ -7121,8 +7354,9 @@ impl SqliteStore {
         .bind(u64_i64(overlap.end().0, "overlap_to")?)
         .bind(anchor_hash.0.as_slice())
         .bind(u64_i64(updated_at_unix_ms, "updated_at_unix_ms")?)
-        .execute(&self.inner.pool)
+        .execute(&mut *transaction)
         .await?;
+        transaction.commit().await?;
         Ok(HotColdHandoffRecord {
             id: id.to_owned(),
             chain_id,
@@ -7139,6 +7373,10 @@ impl SqliteStore {
 
     /// Compare every historical processor-coverage hash with the retained
     /// canonical live hash over the declared overlap and persist the verdict.
+    ///
+    /// A block whose exact coverage was compacted is compared through its
+    /// compact segment: the segment is a parent-linked chain, so its end hash
+    /// matching the live chain vouches for every block inside it.
     ///
     /// # Errors
     ///
@@ -7164,15 +7402,24 @@ impl SqliteStore {
         let rows = sqlx::query(
             "SELECT canonical.block_number AS block_number,
                     canonical.block_hash AS canonical_hash,
-                    coverage.block_hash AS coverage_hash
+                    coverage.block_hash AS coverage_hash,
+                    segment.end_hash AS segment_end_hash,
+                    segment_tip.block_hash AS segment_tip_hash
              FROM canonical_blocks AS canonical
              LEFT JOIN processor_coverage AS coverage
                ON coverage.instance = ?
               AND coverage.block_number = canonical.block_number
+             LEFT JOIN finalized_coverage_segments AS segment
+               ON segment.instance = ?
+              AND canonical.block_number BETWEEN segment.segment_start AND segment.segment_end
+             LEFT JOIN canonical_blocks AS segment_tip
+               ON segment_tip.chain_id = canonical.chain_id
+              AND segment_tip.block_number = segment.segment_end
              WHERE canonical.chain_id = ?
                AND canonical.block_number BETWEEN ? AND ?
              ORDER BY canonical.block_number",
         )
+        .bind(&instance)
         .bind(&instance)
         .bind(u64_i64(chain_id.0, "chain_id")?)
         .bind(u64_i64(overlap.start().0, "overlap_from")?)
@@ -7192,22 +7439,37 @@ impl SqliteStore {
                 break;
             }
             let canonical_hash = decode_hash(row.try_get("canonical_hash")?)?;
-            let coverage_hash = row
-                .try_get::<Option<Vec<u8>>, _>("coverage_hash")?
-                .map(decode_hash)
-                .transpose()?;
-            match coverage_hash {
-                Some(coverage_hash) if coverage_hash == canonical_hash => {
+            let optional_hash = |column: &str| -> Result<Option<BlockHash>, StoreError> {
+                row.try_get::<Option<Vec<u8>>, _>(column)?
+                    .map(decode_hash)
+                    .transpose()
+            };
+            let coverage_hash = optional_hash("coverage_hash")?;
+            let segment_end_hash = optional_hash("segment_end_hash")?;
+            let segment_tip_hash = optional_hash("segment_tip_hash")?;
+            match (coverage_hash, segment_end_hash) {
+                (Some(coverage_hash), _) if coverage_hash == canonical_hash => {
                     compared_blocks = compared_blocks.saturating_add(1);
                     expected = expected.saturating_add(1);
                 }
-                Some(coverage_hash) => {
+                (Some(coverage_hash), _) => {
                     failure = Some(format!(
                         "block {number} differs: live {canonical_hash:?}, historical {coverage_hash:?}"
                     ));
                     break;
                 }
-                None => {
+                (None, Some(end_hash)) if segment_tip_hash == Some(end_hash) => {
+                    compared_blocks = compared_blocks.saturating_add(1);
+                    expected = expected.saturating_add(1);
+                }
+                (None, Some(end_hash)) => {
+                    failure = Some(format!(
+                        "compact historical coverage of block {number} ends at {end_hash:?}, \
+                         which the live canonical chain does not contain"
+                    ));
+                    break;
+                }
+                (None, None) => {
                     failure = Some(format!(
                         "historical processor coverage is missing block {number}"
                     ));
@@ -7500,6 +7762,11 @@ impl SqliteStore {
 
     /// Insert or update one scheduler job atomically.
     ///
+    /// When a job completes and its JSON payload names a
+    /// `processor_instance`, as historical jobs do, that processor also takes
+    /// an automatic recovery checkpoint at its cursor outside the checkpoint
+    /// cadence, so it can be restored while it rests after the backfill.
+    ///
     /// # Errors
     ///
     /// Returns an error for an invalid job identity, numeric overflow, or a
@@ -7511,7 +7778,8 @@ impl SqliteStore {
             ));
         }
         let _guard = self.inner.writer.lock().await;
-        sqlx::query(
+        let mut transaction = self.inner.pool.begin().await?;
+        let state: String = sqlx::query_scalar(
             "INSERT INTO jobs(
                 job_id, kind, state, payload, checkpoint, attempts, updated_at_unix_ms
              ) VALUES (?, ?, ?, ?, ?, ?, ?)
@@ -7528,7 +7796,8 @@ impl SqliteStore {
                payload = excluded.payload,
                checkpoint = excluded.checkpoint,
                attempts = excluded.attempts,
-               updated_at_unix_ms = excluded.updated_at_unix_ms",
+               updated_at_unix_ms = excluded.updated_at_unix_ms
+             RETURNING state",
         )
         .bind(&job.id)
         .bind(&job.kind)
@@ -7537,8 +7806,12 @@ impl SqliteStore {
         .bind(&job.checkpoint)
         .bind(i64::from(job.attempts))
         .bind(u64_i64(job.updated_at_unix_ms, "updated_at_unix_ms")?)
-        .execute(&self.inner.pool)
+        .fetch_one(&mut *transaction)
         .await?;
+        if job.state == JobState::Completed && JobState::parse(&state)? == JobState::Completed {
+            checkpoint_completed_job_processor(&mut transaction, &job.payload).await?;
+        }
+        transaction.commit().await?;
         Ok(())
     }
 
@@ -8236,6 +8509,10 @@ impl SqliteStore {
 
     /// Advance the exact durable lifecycle state for one backfill job.
     ///
+    /// A reclaimable, cancelled, or failed subscription keeps that terminal
+    /// state, so a late runtime transition cannot revive it; the call then
+    /// returns `false`.
+    ///
     /// # Errors
     ///
     /// Returns an error when the state update cannot be represented or the
@@ -8263,13 +8540,15 @@ impl SqliteStore {
                  END,
                  last_error = ?,
                  updated_at_unix_ms = ?
-             WHERE job_id = ?",
+             WHERE job_id = ?
+               AND (state NOT IN ('complete_reclaimable', 'cancelled', 'failed') OR state = ?)",
         )
         .bind(state.as_str())
         .bind(state.as_str())
         .bind(last_error)
         .bind(now_i64()?)
         .bind(job_id)
+        .bind(state.as_str())
         .execute(&self.inner.pool)
         .await?;
         Ok(result.rows_affected() != 0)
@@ -8411,14 +8690,16 @@ impl SqliteStore {
 
         let mut deletion = HistoricalWorkDeletion::default();
         if subscription {
-            let row: Option<(String, String, String)> = sqlx::query_as(
-                "SELECT state, history_stream_id, instance
+            // Ranges and coverage owners are keyed by the subscription ID,
+            // which need not equal its job ID.
+            let row: Option<(String, String, String, String)> = sqlx::query_as(
+                "SELECT subscription_id, state, history_stream_id, instance
                  FROM backfill_subscriptions WHERE job_id = ?",
             )
             .bind(job_id)
             .fetch_optional(&mut *transaction)
             .await?;
-            let Some((state, stream_id, instance)) = row else {
+            let Some((subscription_id, state, stream_id, instance)) = row else {
                 return Err(StoreError::Invariant(format!(
                     "historical subscription {job_id} disappeared before deletion"
                 )));
@@ -8455,7 +8736,7 @@ impl SqliteStore {
                     "SELECT COUNT(*) FROM backfill_subscription_ranges
                      WHERE subscription_id = ?",
                 )
-                .bind(job_id)
+                .bind(&subscription_id)
                 .fetch_one(&mut *transaction)
                 .await?,
             )
@@ -8480,7 +8761,7 @@ impl SqliteStore {
                  ORDER BY from_block",
             )
             .bind(&instance)
-            .bind(job_id)
+            .bind(&subscription_id)
             .fetch_all(&mut *transaction)
             .await?;
             let descriptor_json: String = sqlx::query_scalar(
@@ -8500,7 +8781,7 @@ impl SqliteStore {
                  WHERE instance = ? AND owner_kind = 'subscription' AND owner_id = ?",
             )
             .bind(&instance)
-            .bind(job_id)
+            .bind(&subscription_id)
             .execute(&mut *transaction)
             .await?;
             if descriptor.lifecycle.output.mode == OutputPolicyMode::None {
@@ -9669,7 +9950,7 @@ impl SqliteStore {
         .await
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     async fn create_consumer_inner(
         &self,
         descriptor: &ProcessorDescriptor,
@@ -9706,6 +9987,8 @@ impl SqliteStore {
                 consumer_id: consumer_id.to_owned(),
             });
         }
+        // Only new consumers take the rule; earlier ones keep their role.
+        ensure_required_consumer_retention(&self.inner.pool, descriptor, stream_id, role).await?;
         let earliest: Option<i64> =
             sqlx::query_scalar("SELECT MIN(stream_sequence) FROM change_log WHERE stream_id = ?")
                 .bind(stream_id)
@@ -10803,6 +11086,23 @@ impl SqliteStore {
         let instance = self.register_processor(descriptor).await?;
         let stream_id = default_delivery_stream_id(descriptor);
         let _guard = self.inner.writer.lock().await;
+        let exists: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM durable_consumers
+             WHERE stream_id = ? AND consumer_id = ?",
+        )
+        .bind(&stream_id)
+        .bind(consumer_id)
+        .fetch_one(&self.inner.pool)
+        .await?;
+        if exists == 0 {
+            ensure_required_consumer_retention(
+                &self.inner.pool,
+                descriptor,
+                &stream_id,
+                ConsumerRole::Required,
+            )
+            .await?;
+        }
         let now = now_i64()?;
         let ttl_ms = i64::try_from(ttl.as_millis())
             .map_err(|_| StoreError::Numeric("consumer lease TTL"))?;
@@ -11223,6 +11523,10 @@ impl SqliteStore {
         )
         .fetch_one(&self.inner.pool)
         .await?;
+        let (deferred_changes, deferred_change_bytes): (i64, i64) =
+            sqlx::query_as("SELECT COUNT(*), COALESCE(SUM(bytes), 0) FROM deferred_changes")
+                .fetch_one(&self.inner.pool)
+                .await?;
         Ok(StoreStats {
             schema_version: u32::from_be_bytes(version),
             processor_instances: table_count(&self.inner.pool, "processor_instances").await?,
@@ -11261,6 +11565,8 @@ impl SqliteStore {
                 history_delivery_retained_bytes,
                 "history retained delivery bytes",
             )?,
+            deferred_changes: i64_u64(deferred_changes, "deferred changes")?,
+            deferred_change_bytes: i64_u64(deferred_change_bytes, "deferred change bytes")?,
             database_bytes: storage.database_bytes,
             freelist_bytes: storage.freelist_bytes,
             wal_bytes: storage.wal_bytes,
@@ -12038,10 +12344,9 @@ impl SqliteStore {
         for cursor in cursors {
             let _: ProcessorCursor = OpaqueCursor::parse(cursor)?.decode(CursorKind::Processor)?;
         }
-        let records: Vec<Vec<u8>> = sqlx::query_scalar("SELECT encoded_undo FROM undo_journal")
-            .fetch_all(&self.inner.pool)
-            .await?;
-        for bytes in records {
+        let mut records = sqlx::query_scalar::<_, Vec<u8>>("SELECT encoded_undo FROM undo_journal")
+            .fetch(&self.inner.pool);
+        while let Some(bytes) = records.try_next().await? {
             decode_undo(&bytes)?;
         }
         let inconsistent_artifact_totals: Option<String> = sqlx::query_scalar(
@@ -12575,6 +12880,79 @@ impl ReducerOverlay {
             changes: std::mem::take(&mut self.changes),
         }
     }
+
+    /// Merge committed rows under `prefix` with this reducer's uncommitted
+    /// writes, first key first.
+    ///
+    /// `queries` read one page of committed rows with and without an
+    /// exclusive upper bound. Overlay deletes can hide committed rows, so
+    /// pages are refilled until `limit` rows survive the merge or the
+    /// committed rows run out; an overlay key is only returned once every
+    /// committed key before it has been read.
+    async fn scan_merged_prefix(
+        &self,
+        queries: [&str; 2],
+        scope: &str,
+        prefix: &[u8],
+        limit: usize,
+        overlay: &BTreeMap<Vec<u8>, Option<Vec<u8>>>,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, ProcessorError> {
+        let page =
+            usize_i64(limit, "limit").map_err(|error| ProcessorError::State(error.to_string()))?;
+        let upper = prefix_upper_bound(prefix);
+        let mut merged = BTreeMap::new();
+        let mut lower = prefix.to_vec();
+        let read_through = loop {
+            let query = match &upper {
+                Some(upper) => sqlx::query(queries[0])
+                    .bind(&self.instance)
+                    .bind(scope)
+                    .bind(&lower)
+                    .bind(upper),
+                None => sqlx::query(queries[1])
+                    .bind(&self.instance)
+                    .bind(scope)
+                    .bind(&lower),
+            };
+            let rows = query
+                .bind(page)
+                .fetch_all(&self.pool)
+                .await
+                .map_err(state_error)?;
+            let exhausted = rows.len() < limit;
+            let mut last = None;
+            for row in rows {
+                let key: Vec<u8> = row.try_get(0).map_err(state_error)?;
+                if !overlay.contains_key(&key) {
+                    let value: Vec<u8> = row.try_get(1).map_err(state_error)?;
+                    merged.insert(key.clone(), value);
+                }
+                last = Some(key);
+            }
+            let Some(last) = last.filter(|_| !exhausted) else {
+                break None;
+            };
+            let visible = merged.len()
+                + overlay
+                    .range::<Vec<u8>, _>(..=&last)
+                    .filter(|(_, value)| value.is_some())
+                    .count();
+            if visible >= limit {
+                break Some(last);
+            }
+            // The smallest key after `last` in SQLite's BLOB order.
+            lower = last;
+            lower.push(0);
+        };
+        for (key, value) in overlay {
+            if let Some(value) = value
+                && read_through.as_ref().is_none_or(|through| key <= through)
+            {
+                merged.insert(key.clone(), value.clone());
+            }
+        }
+        Ok(merged.into_iter().take(limit).collect())
+    }
 }
 
 #[async_trait]
@@ -12634,60 +13012,28 @@ impl ReducerTransaction for ReducerOverlay {
                 "scan limit must be in 1..=10000".to_owned(),
             ));
         }
-        let upper = prefix_upper_bound(prefix);
-        let rows = match upper {
-            Some(upper) => sqlx::query(
+        let overlay = self
+            .state
+            .iter()
+            .filter(|(key, _)| key.namespace == namespace && key.key.starts_with(prefix))
+            .map(|(key, value)| (key.key.clone(), value.after.clone()))
+            .collect();
+        self.scan_merged_prefix(
+            [
                 "SELECT state_key, value FROM processor_state
                  WHERE instance = ? AND namespace = ?
                    AND state_key >= ? AND state_key < ?
                  ORDER BY state_key LIMIT ?",
-            )
-            .bind(&self.instance)
-            .bind(namespace)
-            .bind(prefix)
-            .bind(upper)
-            .bind(
-                usize_i64(limit, "limit")
-                    .map_err(|error| ProcessorError::State(error.to_string()))?,
-            )
-            .fetch_all(&self.pool)
-            .await
-            .map_err(state_error)?,
-            None => sqlx::query(
                 "SELECT state_key, value FROM processor_state
                  WHERE instance = ? AND namespace = ? AND state_key >= ?
                  ORDER BY state_key LIMIT ?",
-            )
-            .bind(&self.instance)
-            .bind(namespace)
-            .bind(prefix)
-            .bind(
-                usize_i64(limit, "limit")
-                    .map_err(|error| ProcessorError::State(error.to_string()))?,
-            )
-            .fetch_all(&self.pool)
-            .await
-            .map_err(state_error)?,
-        };
-        let mut merged = BTreeMap::new();
-        for row in rows {
-            let key: Vec<u8> = row.try_get("state_key").map_err(state_error)?;
-            let value: Vec<u8> = row.try_get("value").map_err(state_error)?;
-            merged.insert(key, value);
-        }
-        for (key, value) in &self.state {
-            if key.namespace == namespace && key.key.starts_with(prefix) {
-                match &value.after {
-                    Some(value) => {
-                        merged.insert(key.key.clone(), value.clone());
-                    }
-                    None => {
-                        merged.remove(&key.key);
-                    }
-                }
-            }
-        }
-        Ok(merged.into_iter().take(limit).collect())
+            ],
+            namespace,
+            prefix,
+            limit,
+            &overlay,
+        )
+        .await
     }
 
     async fn get(
@@ -12781,60 +13127,28 @@ impl ReducerTransaction for ReducerOverlay {
                 "scan limit must be in 1..=10000".to_owned(),
             ));
         }
-        let upper = prefix_upper_bound(prefix);
-        let rows = match upper {
-            Some(upper) => sqlx::query(
+        let overlay = self
+            .entities
+            .iter()
+            .filter(|(key, _)| key.collection == collection && key.key.starts_with(prefix))
+            .map(|(key, value)| (key.key.clone(), value.after.clone()))
+            .collect();
+        self.scan_merged_prefix(
+            [
                 "SELECT entity_key, value FROM entities
-                     WHERE instance = ? AND collection = ?
-                       AND entity_key >= ? AND entity_key < ?
-                     ORDER BY entity_key LIMIT ?",
-            )
-            .bind(&self.instance)
-            .bind(collection)
-            .bind(prefix)
-            .bind(upper)
-            .bind(
-                usize_i64(limit, "limit")
-                    .map_err(|error| ProcessorError::State(error.to_string()))?,
-            )
-            .fetch_all(&self.pool)
-            .await
-            .map_err(state_error)?,
-            None => sqlx::query(
+                 WHERE instance = ? AND collection = ?
+                   AND entity_key >= ? AND entity_key < ?
+                 ORDER BY entity_key LIMIT ?",
                 "SELECT entity_key, value FROM entities
-                     WHERE instance = ? AND collection = ? AND entity_key >= ?
-                     ORDER BY entity_key LIMIT ?",
-            )
-            .bind(&self.instance)
-            .bind(collection)
-            .bind(prefix)
-            .bind(
-                usize_i64(limit, "limit")
-                    .map_err(|error| ProcessorError::State(error.to_string()))?,
-            )
-            .fetch_all(&self.pool)
-            .await
-            .map_err(state_error)?,
-        };
-        let mut merged = BTreeMap::new();
-        for row in rows {
-            let key: Vec<u8> = row.try_get("entity_key").map_err(state_error)?;
-            let value: Vec<u8> = row.try_get("value").map_err(state_error)?;
-            merged.insert(key, value);
-        }
-        for (key, value) in &self.entities {
-            if key.collection == collection && key.key.starts_with(prefix) {
-                match &value.after {
-                    Some(value) => {
-                        merged.insert(key.key.clone(), value.clone());
-                    }
-                    None => {
-                        merged.remove(&key.key);
-                    }
-                }
-            }
-        }
-        Ok(merged.into_iter().take(limit).collect())
+                 WHERE instance = ? AND collection = ? AND entity_key >= ?
+                 ORDER BY entity_key LIMIT ?",
+            ],
+            collection,
+            prefix,
+            limit,
+            &overlay,
+        )
+        .await
     }
 
     async fn emit(&mut self, change: DomainChange) -> Result<(), ProcessorError> {
@@ -13884,11 +14198,14 @@ async fn append_backfill_completion_transaction(
     .bind(subscription_id)
     .execute(&mut **transaction)
     .await?;
+    // Work cancelled, failed, or already reclaimable while its last batch
+    // committed keeps that terminal state.
     sqlx::query(
         "UPDATE backfill_subscriptions
          SET state = 'draining', completion_sequence = ?, last_error = NULL,
              updated_at_unix_ms = ?
-         WHERE subscription_id = ?",
+         WHERE subscription_id = ?
+           AND state NOT IN ('complete_reclaimable', 'cancelled', 'failed')",
     )
     .bind(u64_i64(sequence, "backfill completion sequence")?)
     .bind(now)
@@ -13900,7 +14217,8 @@ async fn append_backfill_completion_transaction(
          SET state = 'completed', updated_at_unix_ms = ?
          WHERE job_id = (
            SELECT job_id FROM backfill_subscriptions WHERE subscription_id = ?
-         )",
+         )
+           AND state NOT IN ('failed', 'cancelled')",
     )
     .bind(now)
     .bind(subscription_id)
@@ -14045,7 +14363,121 @@ fn encode_backfill_completion_metadata(metadata: BackfillCompletionMetadata) -> 
     payload
 }
 
+/// Delete finalized undo records older than the processor's undo safety
+/// depth: `safety_blocks` below `through` for `unfinalized`, none for `none`.
+///
+/// Unfinalized records stay for reorgs whatever the mode. At most
+/// [`UNDO_PRUNE_BATCH`] rows go per call, oldest first.
+async fn prune_finalized_undo(
+    transaction: &mut Transaction<'_, Sqlite>,
+    descriptor: &ProcessorDescriptor,
+    instance: &str,
+    through: BlockNumber,
+) -> Result<(), StoreError> {
+    let through = u64_i64(through.0, "block_number")?;
+    let retained_from = match descriptor.lifecycle.undo.mode {
+        UndoPolicyMode::None => through.saturating_add(1),
+        UndoPolicyMode::Unfinalized => through.saturating_sub(
+            i64::try_from(descriptor.lifecycle.undo.safety_blocks).unwrap_or(i64::MAX),
+        ),
+    };
+    let batch_end: Option<i64> = sqlx::query_scalar(
+        "SELECT block_number FROM undo_journal
+         WHERE instance = ? AND finalized = 1 AND block_number < ?
+         ORDER BY block_number LIMIT 1 OFFSET ?",
+    )
+    .bind(instance)
+    .bind(retained_from)
+    .bind(UNDO_PRUNE_BATCH)
+    .fetch_optional(&mut **transaction)
+    .await?;
+    sqlx::query(
+        "DELETE FROM undo_journal
+         WHERE instance = ? AND finalized = 1 AND block_number < ?",
+    )
+    .bind(instance)
+    .bind(batch_end.unwrap_or(retained_from))
+    .execute(&mut **transaction)
+    .await?;
+    Ok(())
+}
+
+/// Checkpoint the processor's state at `cursor` when the newest automatic
+/// checkpoint is at least [`AUTOMATIC_CHECKPOINT_INTERVAL_BLOCKS`] older,
+/// then prune to the newest `keep`.
 async fn create_recovery_checkpoint(
+    transaction: &mut Transaction<'_, Sqlite>,
+    descriptor: &ProcessorDescriptor,
+    instance: &str,
+    cursor: &ProcessorCursor,
+    keep: u32,
+) -> Result<(), StoreError> {
+    let latest: Option<i64> =
+        sqlx::query_scalar("SELECT MAX(block_number) FROM recovery_checkpoints WHERE instance = ?")
+            .bind(instance)
+            .fetch_one(&mut **transaction)
+            .await?;
+    if let Some(latest) = latest
+        && cursor.block_number.0
+            < i64_u64(latest, "checkpoint block number")?
+                .saturating_add(AUTOMATIC_CHECKPOINT_INTERVAL_BLOCKS)
+    {
+        return Ok(());
+    }
+    insert_recovery_checkpoint(transaction, descriptor, instance, cursor, keep).await
+}
+
+/// Checkpoint the processor that a completed historical job's JSON payload
+/// names at its current cursor, outside the cadence, so a processor at rest
+/// after a backfill has a checkpoint it can restore.
+///
+/// A payload without a known processor, or a processor without automatic
+/// checkpoints or a cursor, takes none.
+async fn checkpoint_completed_job_processor(
+    transaction: &mut Transaction<'_, Sqlite>,
+    payload: &[u8],
+) -> Result<(), StoreError> {
+    #[derive(Deserialize)]
+    struct HistoricalJobProcessor {
+        processor_instance: String,
+    }
+
+    let Ok(job) = serde_json::from_slice::<HistoricalJobProcessor>(payload) else {
+        return Ok(());
+    };
+    let processor: Option<(String, String)> = sqlx::query_as(
+        "SELECT processors.descriptor_json, cursors.cursor
+         FROM processor_instances AS processors
+         JOIN processor_cursors AS cursors ON cursors.instance = processors.instance
+         WHERE processors.instance = ?",
+    )
+    .bind(&job.processor_instance)
+    .fetch_optional(&mut **transaction)
+    .await?;
+    let Some((descriptor, cursor)) = processor else {
+        return Ok(());
+    };
+    let descriptor: ProcessorDescriptor = serde_json::from_str(&descriptor)?;
+    if !matches!(
+        descriptor.lifecycle.checkpoint.mode,
+        CheckpointPolicyMode::Automatic
+    ) {
+        return Ok(());
+    }
+    let cursor: ProcessorCursor = OpaqueCursor::parse(cursor)?.decode(CursorKind::Processor)?;
+    insert_recovery_checkpoint(
+        transaction,
+        &descriptor,
+        &job.processor_instance,
+        &cursor,
+        descriptor.lifecycle.checkpoint.keep,
+    )
+    .await
+}
+
+/// Checkpoint the processor's state at `cursor` regardless of cadence, then
+/// prune to the newest `keep`.
+async fn insert_recovery_checkpoint(
     transaction: &mut Transaction<'_, Sqlite>,
     descriptor: &ProcessorDescriptor,
     instance: &str,
@@ -14360,40 +14792,59 @@ async fn prune_processor_artifact_window(
     Ok(deleted)
 }
 
+/// Encode a [`StateSnapshot`] of the processor's working state while its
+/// rows stream in, rather than collecting every row first.
+///
+/// Postcard writes a struct as its fields in order and a sequence as its
+/// length followed by its elements, so the header, the row count, and each
+/// row encode exactly as the whole snapshot would. Callers read inside one
+/// transaction or under the writer lock, so the count matches the rows.
 async fn encode_state_snapshot(
-    transaction: &mut Transaction<'_, Sqlite>,
+    connection: &mut SqliteConnection,
     descriptor: &ProcessorDescriptor,
     instance: &str,
     cursor: &ProcessorCursor,
 ) -> Result<(Vec<u8>, Vec<u8>, BlockHash), StoreError> {
-    let rows = sqlx::query(
+    let expected: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM processor_state WHERE instance = ?")
+            .bind(instance)
+            .fetch_one(&mut *connection)
+            .await?;
+    let row_count = i64_u64(expected, "processor state rows")?;
+    let mut encoded_snapshot = postcard::to_allocvec(&StateSnapshotHeader {
+        format_version: 1,
+        processor_instance: instance,
+        descriptor_hash: descriptor_hash(descriptor)?,
+        cursor,
+    })
+    .and_then(|header| postcard::to_extend(&row_count, header))
+    .map_err(|error| StoreError::Encoding(error.to_string()))?;
+    let mut rows = sqlx::query(
         "SELECT namespace, state_key, value
          FROM processor_state
          WHERE instance = ?
          ORDER BY namespace, state_key",
     )
     .bind(instance)
-    .fetch_all(&mut **transaction)
-    .await?;
-    let entries = rows
-        .into_iter()
-        .map(|row| {
-            Ok(StateSnapshotEntry {
+    .fetch(&mut *connection);
+    let mut encoded_rows = 0_i64;
+    while let Some(row) = rows.try_next().await? {
+        encoded_snapshot = postcard::to_extend(
+            &StateSnapshotEntryRef {
                 namespace: row.try_get("namespace")?,
                 key: row.try_get("state_key")?,
                 value: row.try_get("value")?,
-            })
-        })
-        .collect::<Result<Vec<_>, sqlx::Error>>()?;
-    let snapshot = StateSnapshot {
-        format_version: 1,
-        processor_instance: instance.to_owned(),
-        descriptor_hash: descriptor_hash(descriptor)?,
-        cursor: cursor.clone(),
-        entries,
-    };
-    let encoded_snapshot = postcard::to_allocvec(&snapshot)
+            },
+            encoded_snapshot,
+        )
         .map_err(|error| StoreError::Encoding(error.to_string()))?;
+        encoded_rows = encoded_rows.saturating_add(1);
+    }
+    if encoded_rows != expected {
+        return Err(StoreError::Invariant(
+            "processor state changed while its snapshot was encoded".to_owned(),
+        ));
+    }
     let encoded_cursor =
         postcard::to_allocvec(cursor).map_err(|error| StoreError::Encoding(error.to_string()))?;
     let checksum = BlockHash::new(*blake3::hash(&encoded_snapshot).as_bytes());
@@ -14423,7 +14874,8 @@ fn decode_state_snapshot(
         postcard::from_bytes(encoded).map_err(|error| StoreError::Encoding(error.to_string()))?;
     if snapshot.format_version != 1
         || snapshot.processor_instance != instance
-        || snapshot.descriptor_hash != descriptor_hash(descriptor)?
+        || (snapshot.descriptor_hash != descriptor_hash(descriptor)?
+            && snapshot.descriptor_hash != full_descriptor_hash(descriptor)?)
         || snapshot.cursor.processor_id != descriptor.id.as_str()
         || snapshot.cursor.processor_version != descriptor.version.to_string()
     {
@@ -14432,7 +14884,20 @@ fn decode_state_snapshot(
     Ok(snapshot)
 }
 
+/// Identity a state snapshot is bound to: the descriptor with its lifecycle
+/// policies reset, the same identity `register_processor` keeps immutable.
+/// Operators may edit lifecycle limits in place, for example to raise a
+/// hard limit, without invalidating checkpoints or savepoints.
 fn descriptor_hash(descriptor: &ProcessorDescriptor) -> Result<BlockHash, StoreError> {
+    full_descriptor_hash(&ProcessorDescriptor {
+        lifecycle: LifecyclePolicies::default(),
+        ..descriptor.clone()
+    })
+}
+
+/// Hash over the whole descriptor, which snapshots recorded before lifecycle
+/// policies left their identity; those stay valid while it is unchanged.
+fn full_descriptor_hash(descriptor: &ProcessorDescriptor) -> Result<BlockHash, StoreError> {
     let encoded = serde_json::to_vec(descriptor)?;
     Ok(BlockHash::new(*blake3::hash(&encoded).as_bytes()))
 }
@@ -14537,6 +15002,43 @@ async fn applied_checksum(
     .fetch_optional(pool)
     .await?;
     value.map(decode_hash).transpose()
+}
+
+/// Whether finalized coverage compaction already folded `block_number` into
+/// a compact interval, which replaced its exact coverage and applied rows.
+///
+/// A segment keeps only its end hash, so a conflicting hash is detected at
+/// segment ends; interior blocks are committed to by that end hash.
+async fn compacted_coverage_contains(
+    pool: &SqlitePool,
+    instance: &str,
+    block_number: BlockNumber,
+    block_hash: BlockHash,
+) -> Result<bool, StoreError> {
+    let segment: Option<(i64, i64, Vec<u8>)> = sqlx::query_as(
+        "SELECT segment_start, segment_end, end_hash FROM finalized_coverage_segments
+         WHERE instance = ? AND segment_end >= ?
+         ORDER BY segment_end LIMIT 1",
+    )
+    .bind(instance)
+    .bind(u64_i64(block_number.0, "block_number")?)
+    .fetch_optional(pool)
+    .await?;
+    let Some((segment_start, segment_end, end_hash)) = segment else {
+        return Ok(false);
+    };
+    if i64_u64(segment_start, "compact segment start")? > block_number.0 {
+        return Ok(false);
+    }
+    let end_hash = decode_hash(end_hash)?;
+    if i64_u64(segment_end, "compact segment end")? == block_number.0 && end_hash != block_hash {
+        return Err(StoreError::CanonicalConflict {
+            block: block_number,
+            stored: end_hash,
+            incoming: block_hash,
+        });
+    }
+    Ok(true)
 }
 
 /// Decode a retained recent frame, overlaying its canonical block's current
@@ -14915,6 +15417,52 @@ async fn delivery_stream_is_backfill(
             .fetch_one(pool)
             .await?;
     Ok(DeliveryStreamKind::parse(&kind)? == DeliveryStreamKind::Backfill)
+}
+
+/// Refuse a required consumer on a stream that does not wait for
+/// acknowledgement, mirroring the descriptor rule for configured consumers.
+///
+/// A required consumer fences pruning until it acknowledges. Window and
+/// best-effort streams prune by their own limits, so one would pin their
+/// retention indefinitely. Backfill streams always retain until
+/// acknowledged.
+async fn ensure_required_consumer_retention(
+    pool: &SqlitePool,
+    descriptor: &ProcessorDescriptor,
+    stream_id: &str,
+    role: ConsumerRole,
+) -> Result<(), StoreError> {
+    if role != ConsumerRole::Required
+        || descriptor.lifecycle.delivery.mode == DeliveryPolicyMode::UntilAcknowledged
+        || delivery_stream_is_backfill(pool, stream_id).await?
+    {
+        return Ok(());
+    }
+    Err(StoreError::InvalidConfig(format!(
+        "required consumers need until_acknowledged delivery; stream {stream_id:?} prunes \
+         without waiting for acknowledgements, so register a best_effort consumer instead"
+    )))
+}
+
+/// Active required consumers, as `(stream, consumer)`, on default streams
+/// whose processor, as last registered, does not retain delivery until
+/// acknowledged. Earlier releases accepted them; they pin window retention.
+async fn required_consumers_on_pruned_streams(
+    pool: &SqlitePool,
+) -> Result<Vec<(String, String)>, StoreError> {
+    Ok(sqlx::query_as(
+        "SELECT consumer.stream_id, consumer.consumer_id
+         FROM durable_consumers AS consumer
+         JOIN delivery_streams AS stream ON stream.stream_id = consumer.stream_id
+         JOIN processor_instances AS processors ON processors.instance = stream.instance
+         WHERE consumer.role = 'required' AND consumer.state = 'active'
+           AND stream.stream_kind != 'backfill'
+           AND json_extract(processors.descriptor_json, '$.lifecycle.delivery.mode')
+               IS NOT 'until_acknowledged'
+         ORDER BY consumer.stream_id, consumer.consumer_id",
+    )
+    .fetch_all(pool)
+    .await?)
 }
 
 fn historical_batch_cursor(
@@ -15785,44 +16333,66 @@ async fn extend_shared_coverage_owner(
     extend_shared_coverage_owner_range(transaction, instance, BlockRange::single(block)).await
 }
 
+/// Add `range` to the shared canonical owner's ranges, merging every owner
+/// range it overlaps or touches, so older coverage that arrives after newer
+/// coverage is owned (and compactable) too.
 async fn extend_shared_coverage_owner_range(
     transaction: &mut Transaction<'_, Sqlite>,
     instance: &str,
     range: BlockRange,
 ) -> Result<(), StoreError> {
-    let latest: Option<(i64, i64)> = sqlx::query_as(
+    let start = u64_i64(range.start().0, "shared coverage owner start")?;
+    let end = u64_i64(range.end().0, "shared coverage owner end")?;
+    let touching: Vec<(i64, i64)> = sqlx::query_as(
         "SELECT from_block, to_block FROM finalized_coverage_owners
          WHERE instance = ? AND owner_kind = 'shared' AND owner_id = 'canonical'
-         ORDER BY to_block DESC LIMIT 1",
+           AND from_block <= ? AND to_block >= ?
+         ORDER BY from_block",
     )
     .bind(instance)
-    .fetch_optional(&mut **transaction)
+    .bind(end.saturating_add(1))
+    .bind(start.saturating_sub(1))
+    .fetch_all(&mut **transaction)
     .await?;
-    if let Some((from, to)) = latest {
-        let to = i64_u64(to, "shared coverage owner end")?;
-        if range.start().0 <= to.saturating_add(1) {
+    let merged_start = touching.first().map_or(start, |(from, _)| start.min(*from));
+    let merged_end = touching.iter().fold(end, |merged, (_, to)| merged.max(*to));
+    // Live applies usually extend, or already sit inside, the one range
+    // that starts first.
+    if let [(from, to)] = touching.as_slice()
+        && *from == merged_start
+    {
+        if *to != merged_end {
             sqlx::query(
-                "UPDATE finalized_coverage_owners
-                 SET to_block = MAX(to_block, ?)
+                "UPDATE finalized_coverage_owners SET to_block = ?
                  WHERE instance = ? AND owner_kind = 'shared'
                    AND owner_id = 'canonical' AND from_block = ?",
             )
-            .bind(u64_i64(range.end().0, "shared coverage owner end")?)
+            .bind(merged_end)
             .bind(instance)
-            .bind(from)
+            .bind(*from)
             .execute(&mut **transaction)
             .await?;
-            return Ok(());
         }
+        return Ok(());
     }
+    sqlx::query(
+        "DELETE FROM finalized_coverage_owners
+         WHERE instance = ? AND owner_kind = 'shared' AND owner_id = 'canonical'
+           AND from_block <= ? AND to_block >= ?",
+    )
+    .bind(instance)
+    .bind(end.saturating_add(1))
+    .bind(start.saturating_sub(1))
+    .execute(&mut **transaction)
+    .await?;
     sqlx::query(
         "INSERT INTO finalized_coverage_owners(
             instance, owner_kind, owner_id, from_block, to_block
          ) VALUES (?, 'shared', 'canonical', ?, ?)",
     )
     .bind(instance)
-    .bind(u64_i64(range.start().0, "shared coverage owner start")?)
-    .bind(u64_i64(range.end().0, "shared coverage owner end")?)
+    .bind(merged_start)
+    .bind(merged_end)
     .execute(&mut **transaction)
     .await?;
     Ok(())
@@ -16487,6 +17057,10 @@ pub enum StoreError {
         instance: String,
         savepoint_id: String,
     },
+    #[error(
+        "processor instance {instance} already retains {limit} portable savepoints; delete one before creating another"
+    )]
+    SavepointLimit { instance: String, limit: u64 },
     #[error("portable savepoint checksum mismatch")]
     SavepointChecksum,
     #[error("portable savepoint belongs to another processor contract")]
@@ -16567,9 +17141,9 @@ mod tests {
         SourceKind, TransactionEnvelope, TrustModel, VerificationCheck, VerificationReport,
     };
     use leani_processor_api::{
-        ArtifactPolicyMode, DataRequirement, DomainChanges, LifecyclePolicies, OutputWindow,
-        ProcessorId, ProcessorInstanceId, ProcessorSchemas, PublicationPolicy, ReductionMode,
-        RetentionPolicy, StartPoint,
+        ArtifactPolicyMode, DataRequirement, DomainChanges, DurableConsumerPolicy,
+        LifecyclePolicies, OutputWindow, ProcessorId, ProcessorInstanceId, ProcessorSchemas,
+        PublicationPolicy, ReductionMode, RetentionPolicy, StartPoint, UndoPolicyMode,
     };
     use semver::Version;
 
@@ -18375,7 +18949,7 @@ mod tests {
         let store = SqliteStore::open(StoreConfig::new(&path))
             .await
             .expect("open current store");
-        let processor = FixtureProcessor::new();
+        let processor = until_acknowledged(FixtureProcessor::new());
         let first = frame(1, BlockHash::ZERO);
         let second = frame(2, first.block.hash);
         for (sequence, current) in [(1, &first), (2, &second)] {
@@ -18941,7 +19515,8 @@ mod tests {
             .expect("compact node-owned metadata");
         assert_eq!(compacted.exact_coverage_deleted, 6);
         assert_eq!(compacted.applied_blocks_deleted, 6);
-        assert_eq!(compacted.finalized_undo_deleted, 6);
+        // Finalized materialization journals no undo records to compact.
+        assert_eq!(compacted.finalized_undo_deleted, 0);
 
         let after = store
             .processor_stats(&processor.descriptor)
@@ -19144,9 +19719,12 @@ mod tests {
             .register_processor(&processor.descriptor)
             .await
             .expect("register");
-        let id = "owned-coverage";
+        // Distinct identities catch a job ID bound where the subscription ID
+        // belongs.
+        let id = "owned-coverage-job";
+        let subscription_id = "owned-coverage";
         let stream = store
-            .create_backfill_delivery_stream(&processor.descriptor, id)
+            .create_backfill_delivery_stream(&processor.descriptor, subscription_id)
             .await
             .expect("stream")
             .stream_id;
@@ -19174,7 +19752,7 @@ mod tests {
         store
             .create_backfill_subscription_job(
                 &BackfillSubscriptionRecord {
-                    subscription_id: id.to_owned(),
+                    subscription_id: subscription_id.to_owned(),
                     job_id: id.to_owned(),
                     processor_instance: processor.descriptor.instance.to_string(),
                     history_stream_id: stream.clone(),
@@ -19236,7 +19814,7 @@ mod tests {
             .expect("ack completion");
         assert!(
             store
-                .mark_backfill_subscription_reclaimable(id, completion)
+                .mark_backfill_subscription_reclaimable(subscription_id, completion)
                 .await
                 .expect("reclaimable")
         );
@@ -19245,11 +19823,19 @@ mod tests {
             .await
             .expect("compact owned coverage");
         let deleted = store
-            .delete_terminal_historical_work(id, "owned-coverage:outcome", true)
+            .delete_terminal_historical_work(id, "owned-coverage-job:outcome", true)
             .await
             .expect("delete owned coverage");
+        assert_eq!(deleted.subscription_ranges, 1);
         assert_eq!(deleted.coverage_intervals, 1);
         assert_eq!(deleted.coverage_segments, 1);
+        let subscription_owners: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM finalized_coverage_owners WHERE owner_kind = 'subscription'",
+        )
+        .fetch_one(&store.inner.pool)
+        .await
+        .expect("subscription owners");
+        assert_eq!(subscription_owners, 0);
         assert_eq!(
             store
                 .coverage(&processor.descriptor, range)
@@ -19440,47 +20026,28 @@ mod tests {
 
     #[tokio::test]
     async fn automatic_checkpoints_are_bounded_and_savepoints_are_explicit() {
-        let (_directory, store) = store().await;
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = SqliteStore::open(StoreConfig {
+            durability: Durability::Normal,
+            ..StoreConfig::new(directory.path().join("node.sqlite"))
+        })
+        .await
+        .expect("open");
         let mut processor = FixtureProcessor::new();
         processor.descriptor.lifecycle.checkpoint.keep = 2;
-        let mut parent = BlockHash::ZERO;
-        for number in 1..=3 {
-            let mut block = frame(number, parent);
-            block.finality = Finality::Finalized;
-            let delta = processor.map(&block).await.expect("map");
-            store
-                .apply(&processor, cursor(&processor, &block, number), &delta, &[])
-                .await
-                .expect("apply");
-            parent = block.block.hash;
-        }
+        let instance = processor_instance(&processor.descriptor);
+        let parent = apply_finalized_chain(&store, &processor, 1..=2001, BlockHash::ZERO).await;
 
-        let checkpoints = store
+        // A checkpoint at the exact current cursor repairs corrupted state.
+        let latest = store
             .recovery_checkpoints(&processor.descriptor)
             .await
-            .expect("checkpoints");
-        assert_eq!(checkpoints.len(), 2);
-        assert_eq!(checkpoints[0].block_number, BlockNumber(3));
-        assert_eq!(checkpoints[1].block_number, BlockNumber(2));
-        assert!(matches!(
-            store
-                .restore_recovery_checkpoint(&processor.descriptor, checkpoints[1].checkpoint_id)
-                .await,
-            Err(StoreError::CheckpointRestoreBoundary {
-                checkpoint: BlockNumber(2),
-                current: Some(BlockNumber(3))
-            })
-        ));
-        let instance = processor_instance(&processor.descriptor);
-        let expected_state: Vec<(String, Vec<u8>, Vec<u8>)> = sqlx::query_as(
-            "SELECT namespace, state_key, value
-             FROM processor_state WHERE instance = ?
-             ORDER BY namespace, state_key",
-        )
-        .bind(&instance)
-        .fetch_all(&store.inner.pool)
-        .await
-        .expect("expected state");
+            .expect("checkpoints")
+            .first()
+            .cloned()
+            .expect("automatic checkpoint");
+        assert_eq!(latest.block_number, BlockNumber(2001));
+        let expected_state = processor_state_rows(&store, &instance).await;
         assert!(!expected_state.is_empty());
         sqlx::query("UPDATE processor_state SET value = X'ff' WHERE instance = ?")
             .bind(&instance)
@@ -19488,26 +20055,50 @@ mod tests {
             .await
             .expect("inject state corruption");
         let restored = store
-            .restore_recovery_checkpoint(&processor.descriptor, checkpoints[0].checkpoint_id)
+            .restore_recovery_checkpoint(&processor.descriptor, latest.checkpoint_id)
             .await
             .expect("restore latest checkpoint");
-        assert_eq!(restored.block_number, BlockNumber(3));
-        let repaired_state: Vec<(String, Vec<u8>, Vec<u8>)> = sqlx::query_as(
-            "SELECT namespace, state_key, value
-             FROM processor_state WHERE instance = ?
-             ORDER BY namespace, state_key",
-        )
-        .bind(&instance)
-        .fetch_all(&store.inner.pool)
-        .await
-        .expect("repaired state");
-        assert_eq!(repaired_state, expected_state);
+        assert_eq!(restored.block_number, BlockNumber(2001));
+        assert_eq!(
+            processor_state_rows(&store, &instance).await,
+            expected_state
+        );
+
+        // 2,500 finalized blocks checkpoint only at blocks 1, 1001, and 2001,
+        // and `keep` still retains the newest two.
+        apply_finalized_chain(&store, &processor, 2002..=2500, parent).await;
+        let checkpoints = store
+            .recovery_checkpoints(&processor.descriptor)
+            .await
+            .expect("checkpoints");
+        assert_eq!(
+            checkpoints
+                .iter()
+                .map(|checkpoint| checkpoint.block_number)
+                .collect::<Vec<_>>(),
+            vec![BlockNumber(2001), BlockNumber(1001)]
+        );
+        assert!(
+            checkpoints
+                .iter()
+                .all(|checkpoint| checkpoint.checkpoint_id <= 3),
+            "{checkpoints:?}"
+        );
+        assert!(matches!(
+            store
+                .restore_recovery_checkpoint(&processor.descriptor, checkpoints[1].checkpoint_id)
+                .await,
+            Err(StoreError::CheckpointRestoreBoundary {
+                checkpoint: BlockNumber(1001),
+                current: Some(BlockNumber(2500))
+            })
+        ));
 
         let created = store
             .create_portable_savepoint(&processor.descriptor, "before-upgrade")
             .await
             .expect("create savepoint");
-        assert_eq!(created.block_number, BlockNumber(3));
+        assert_eq!(created.block_number, BlockNumber(2500));
         let archive = store
             .export_portable_savepoint(&processor.descriptor, "before-upgrade")
             .await
@@ -19515,7 +20106,7 @@ mod tests {
         let restored_cursor =
             SqliteStore::validate_portable_savepoint(&processor.descriptor, &archive)
                 .expect("validate archive");
-        assert_eq!(restored_cursor.block_number, BlockNumber(3));
+        assert_eq!(restored_cursor.block_number, BlockNumber(2500));
         let mut corrupt = archive;
         let last = corrupt.last_mut().expect("archive bytes");
         *last ^= 1;
@@ -20115,7 +20706,7 @@ mod tests {
     #[tokio::test]
     async fn active_consumer_lease_bounds_change_pruning() {
         let (_directory, store) = store().await;
-        let processor = FixtureProcessor::new();
+        let processor = until_acknowledged(FixtureProcessor::new());
         let first = frame(1, BlockHash::ZERO);
         let second = frame(2, first.block.hash);
         for (sequence, current) in [(1, &first), (2, &second)] {
@@ -20160,7 +20751,7 @@ mod tests {
     #[tokio::test]
     async fn required_consumer_remains_protective_after_lease_lapse() {
         let (_directory, store) = store().await;
-        let processor = FixtureProcessor::new();
+        let processor = until_acknowledged(FixtureProcessor::new());
         let first = frame(1, BlockHash::ZERO);
         let second = frame(2, first.block.hash);
         for (sequence, current) in [(1, &first), (2, &second)] {
@@ -20205,7 +20796,7 @@ mod tests {
     #[tokio::test]
     async fn expired_stream_session_can_be_replaced_without_being_renewed_by_reads() {
         let (_directory, store) = store().await;
-        let processor = FixtureProcessor::new();
+        let processor = until_acknowledged(FixtureProcessor::new());
         let first = frame(1, BlockHash::ZERO);
         let delta = processor.map(&first).await.expect("map");
         store
@@ -20303,7 +20894,7 @@ mod tests {
     #[tokio::test]
     async fn released_stream_session_reacquires_without_stale_generation_interference() {
         let (_directory, store) = store().await;
-        let processor = FixtureProcessor::new();
+        let processor = until_acknowledged(FixtureProcessor::new());
         store
             .register_processor(&processor.descriptor)
             .await
@@ -20355,7 +20946,7 @@ mod tests {
     #[tokio::test]
     async fn acknowledgement_is_bounded_by_committed_stream_head() {
         let (_directory, store) = store().await;
-        let processor = FixtureProcessor::block_output();
+        let processor = until_acknowledged(FixtureProcessor::block_output());
         let first = frame(1, BlockHash::ZERO);
         let second = frame(2, first.block.hash);
         let third = frame(3, second.block.hash);
@@ -20437,7 +21028,7 @@ mod tests {
     #[allow(clippy::too_many_lines)]
     async fn split_live_and_backfill_consumers_have_independent_progress() {
         let (_directory, store) = store().await;
-        let mut processor = FixtureProcessor::block_output();
+        let mut processor = until_acknowledged(FixtureProcessor::block_output());
         processor.descriptor.delivery_ordering = DeliveryOrdering::BlockVersionedIdempotent;
         let live_stream = default_delivery_stream_id(&processor.descriptor);
         store
@@ -21009,7 +21600,7 @@ mod tests {
     #[tokio::test]
     async fn explicit_start_rejects_a_pruned_cursor() {
         let (_directory, store) = store().await;
-        let processor = FixtureProcessor::new();
+        let processor = until_acknowledged(FixtureProcessor::new());
         let first = frame(1, BlockHash::ZERO);
         let second = frame(2, first.block.hash);
         for (sequence, current) in [(1, &first), (2, &second)] {
@@ -21833,5 +22424,1383 @@ mod tests {
         assert_eq!(prefix_upper_bound(&[0x01, 0xff]), Some(vec![0x02]));
         assert_eq!(prefix_upper_bound(&[0xff]), None);
         assert_eq!(prefix_upper_bound(&[]), None);
+    }
+
+    fn with_id(mut processor: FixtureProcessor, id: &str) -> FixtureProcessor {
+        processor.descriptor.id = ProcessorId::new(id).expect("id");
+        processor.descriptor.instance = ProcessorInstanceId::legacy(
+            &processor.descriptor.id,
+            &processor.descriptor.version,
+            processor.descriptor.config_hash,
+        );
+        processor
+    }
+
+    /// Retain delivery until acknowledged, as required consumers need.
+    fn until_acknowledged(mut processor: FixtureProcessor) -> FixtureProcessor {
+        processor.descriptor.lifecycle.delivery.mode = DeliveryPolicyMode::UntilAcknowledged;
+        processor.descriptor.lifecycle.delivery.consumers = vec![DurableConsumerPolicy {
+            id: "required-destination".to_owned(),
+            required: true,
+            lease_ttl_seconds: 60,
+        }];
+        processor
+    }
+
+    /// A frame whose hash stays unique past block 255.
+    fn long_chain_frame(number: u64, parent: BlockHash) -> BlockFrame {
+        let mut current = frame(number, parent);
+        let mut hash = [0x5a; 32];
+        hash[..8].copy_from_slice(&number.to_be_bytes());
+        current.block.hash = BlockHash::new(hash);
+        current
+    }
+
+    async fn apply_finalized_chain(
+        store: &SqliteStore,
+        processor: &FixtureProcessor,
+        numbers: std::ops::RangeInclusive<u64>,
+        mut parent: BlockHash,
+    ) -> BlockHash {
+        for number in numbers {
+            let mut block = long_chain_frame(number, parent);
+            block.finality = Finality::Finalized;
+            let delta = processor.map(&block).await.expect("map");
+            store
+                .apply(processor, cursor(processor, &block, number), &delta, &[])
+                .await
+                .expect("apply finalized block");
+            parent = block.block.hash;
+        }
+        parent
+    }
+
+    async fn finalized_items(processor: &FixtureProcessor, count: u64) -> Vec<HistoricalBatchItem> {
+        let mut items = Vec::new();
+        let mut parent = BlockHash::ZERO;
+        for number in 1..=count {
+            let mut current = frame(number, parent);
+            current.finality = Finality::Finalized;
+            items.push(HistoricalBatchItem {
+                delta: processor.map(&current).await.expect("map"),
+                finality: Finality::Finalized,
+                publish_changes: true,
+            });
+            parent = current.block.hash;
+        }
+        items
+    }
+
+    const TEST_COMMIT_LIMITS: HistoricalCommitLimits = HistoricalCommitLimits {
+        maximum_changes: 100,
+        maximum_encoded_bytes: 1024 * 1024,
+    };
+
+    fn queued_job(id: &str, kind: &str) -> JobRecord {
+        JobRecord {
+            id: id.to_owned(),
+            kind: kind.to_owned(),
+            state: JobState::Queued,
+            payload: id.as_bytes().to_vec(),
+            checkpoint: None,
+            attempts: 0,
+            updated_at_unix_ms: 1,
+        }
+    }
+
+    async fn undo_rows(store: &SqliteStore, processor: &FixtureProcessor) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM undo_journal WHERE instance = ?")
+            .bind(processor_instance(&processor.descriptor))
+            .fetch_one(&store.inner.pool)
+            .await
+            .expect("count undo rows")
+    }
+
+    async fn processor_state_rows(
+        store: &SqliteStore,
+        instance: &str,
+    ) -> Vec<(String, Vec<u8>, Vec<u8>)> {
+        sqlx::query_as(
+            "SELECT namespace, state_key, value
+             FROM processor_state WHERE instance = ?
+             ORDER BY namespace, state_key",
+        )
+        .bind(instance)
+        .fetch_all(&store.inner.pool)
+        .await
+        .expect("processor state")
+    }
+
+    #[tokio::test]
+    async fn finalized_applies_write_no_undo_rows() {
+        let (_directory, store) = store().await;
+        let processor = FixtureProcessor::new();
+        let tip = apply_finalized_chain(&store, &processor, 1..=3, BlockHash::ZERO).await;
+        assert_eq!(undo_rows(&store, &processor).await, 0);
+        assert!(matches!(
+            store
+                .undo(&processor.descriptor, ChainId(1), BlockNumber(3), tip, &[])
+                .await,
+            Err(StoreError::FinalizedUndo(BlockNumber(3)))
+        ));
+
+        let mut materialized = with_id(FixtureProcessor::block_output(), "materialized");
+        materialized.descriptor.lifecycle.delivery.mode = DeliveryPolicyMode::None;
+        let job = queued_job("materialized-job", "materialization_job");
+        store.save_job(&job).await.expect("save job");
+        store
+            .commit_historical_materialization_microbatch(
+                &materialized,
+                &finalized_items(&materialized, 2).await,
+                &job.id,
+                b"checkpoint",
+                0,
+                HistoricalArtifactTarget::Sqlite,
+                TEST_COMMIT_LIMITS,
+            )
+            .await
+            .expect("materialize finalized blocks");
+        assert_eq!(undo_rows(&store, &materialized).await, 0);
+    }
+
+    #[tokio::test]
+    async fn ordered_undo_rows_stay_within_the_safety_depth() {
+        let (_directory, store) = store().await;
+        let mut processor = FixtureProcessor::new();
+        processor.descriptor.lifecycle.undo.safety_blocks = 4;
+        let mut frames = Vec::new();
+        let mut parent = BlockHash::ZERO;
+        for number in 1..=30 {
+            let current = frame(number, parent);
+            let delta = processor.map(&current).await.expect("map");
+            store
+                .apply(
+                    &processor,
+                    cursor(&processor, &current, number),
+                    &delta,
+                    &[],
+                )
+                .await
+                .expect("apply included block");
+            parent = current.block.hash;
+            frames.push(current);
+            if let Some(through) = number.checked_sub(2).filter(|through| *through > 0) {
+                store
+                    .mark_finalized(&processor.descriptor, BlockNumber(through))
+                    .await
+                    .expect("finalize");
+                // Two unfinalized blocks, the finalized tip, and four safety
+                // blocks below it.
+                let retained = undo_rows(&store, &processor).await;
+                assert!(retained <= 7, "{retained} undo rows at block {number}");
+            }
+        }
+
+        // A reorg within the unfinalized depth still undoes exactly.
+        for current in frames[28..].iter().rev() {
+            store
+                .undo(
+                    &processor.descriptor,
+                    current.chain_id,
+                    current.block.number,
+                    current.block.hash,
+                    &[],
+                )
+                .await
+                .expect("undo unfinalized block");
+        }
+        assert_eq!(
+            store
+                .entity(&processor.descriptor, "state", b"counter")
+                .await
+                .expect("entity"),
+            Some(28_u64.to_be_bytes().to_vec())
+        );
+        // A pruned finalized block still reports that it is final.
+        assert!(matches!(
+            store
+                .undo(
+                    &processor.descriptor,
+                    ChainId(1),
+                    frames[9].block.number,
+                    frames[9].block.hash,
+                    &[]
+                )
+                .await,
+            Err(StoreError::FinalizedUndo(BlockNumber(10)))
+        ));
+    }
+
+    #[tokio::test]
+    async fn undo_mode_none_keeps_no_finalized_undo_rows() {
+        let (_directory, store) = store().await;
+        let mut processor = finalized_only_processor();
+        processor.descriptor.lifecycle.undo.mode = UndoPolicyMode::None;
+        let mut frames = Vec::new();
+        let mut parent = BlockHash::ZERO;
+        for number in 1..=5 {
+            let current = frame(number, parent);
+            let delta = processor.map(&current).await.expect("map");
+            store
+                .apply(
+                    &processor,
+                    cursor(&processor, &current, number),
+                    &delta,
+                    &[],
+                )
+                .await
+                .expect("apply included block");
+            parent = current.block.hash;
+            frames.push(current);
+        }
+        store
+            .mark_finalized(&processor.descriptor, BlockNumber(3))
+            .await
+            .expect("finalize");
+        assert_eq!(undo_rows(&store, &processor).await, 2);
+        // Included blocks keep their undo rows for reorg safety.
+        store
+            .undo(
+                &processor.descriptor,
+                frames[4].chain_id,
+                frames[4].block.number,
+                frames[4].block.hash,
+                &[],
+            )
+            .await
+            .expect("undo included block");
+        assert_eq!(undo_rows(&store, &processor).await, 1);
+    }
+
+    #[tokio::test]
+    async fn finality_drains_an_undo_backlog_in_bounded_batches() {
+        let (_directory, store) = store().await;
+        let processor = FixtureProcessor::new();
+        let instance = store
+            .register_processor(&processor.descriptor)
+            .await
+            .expect("register");
+        // Earlier versions kept a finalized record for every block forever.
+        let backlog = UNDO_PRUNE_BATCH + 50;
+        let mut transaction = store.inner.pool.begin().await.expect("transaction");
+        for number in 1..=backlog {
+            sqlx::query(
+                "INSERT INTO undo_journal(
+                    instance, block_number, block_hash, encoded_undo, finalized
+                 ) VALUES (?, ?, ?, X'00', 1)",
+            )
+            .bind(&instance)
+            .bind(number)
+            .bind(BlockHash::ZERO.0.as_slice())
+            .execute(&mut *transaction)
+            .await
+            .expect("legacy undo row");
+        }
+        transaction.commit().await.expect("commit backlog");
+        let through = BlockNumber(u64::try_from(backlog * 2).expect("through"));
+        store
+            .mark_finalized(&processor.descriptor, through)
+            .await
+            .expect("first finality advance");
+        assert_eq!(undo_rows(&store, &processor).await, 50);
+        store
+            .mark_finalized(&processor.descriptor, through)
+            .await
+            .expect("second finality advance");
+        assert_eq!(undo_rows(&store, &processor).await, 0);
+    }
+
+    #[tokio::test]
+    async fn state_snapshots_stream_every_state_row() {
+        let (_directory, store) = store().await;
+        let processor = FixtureProcessor::new();
+        let instance = store
+            .register_processor(&processor.descriptor)
+            .await
+            .expect("register");
+        for index in 0_u16..300 {
+            sqlx::query(
+                "INSERT INTO processor_state(instance, namespace, state_key, value)
+                 VALUES (?, ?, ?, ?)",
+            )
+            .bind(&instance)
+            .bind(if index % 2 == 0 { "even" } else { "odd" })
+            .bind(index.to_be_bytes().to_vec())
+            .bind(vec![0xab; usize::from(index)])
+            .execute(&store.inner.pool)
+            .await
+            .expect("state row");
+        }
+        let snapshot_cursor = cursor(&processor, &frame(1, BlockHash::ZERO), 1);
+        let mut transaction = store.inner.pool.begin().await.expect("transaction");
+        let (_, encoded, checksum) = encode_state_snapshot(
+            &mut transaction,
+            &processor.descriptor,
+            &instance,
+            &snapshot_cursor,
+        )
+        .await
+        .expect("encode snapshot");
+        drop(transaction);
+
+        let expected = processor_state_rows(&store, &instance).await;
+        let decoded = decode_state_snapshot(&processor.descriptor, &instance, &encoded, checksum)
+            .expect("decode snapshot");
+        let entries = decoded
+            .entries
+            .into_iter()
+            .map(|entry| (entry.namespace, entry.key, entry.value))
+            .collect::<Vec<_>>();
+        assert_eq!(entries, expected);
+        let whole = postcard::to_allocvec(&StateSnapshot {
+            format_version: 1,
+            processor_instance: instance,
+            descriptor_hash: decoded.descriptor_hash,
+            cursor: snapshot_cursor,
+            entries: expected
+                .into_iter()
+                .map(|(namespace, key, value)| StateSnapshotEntry {
+                    namespace,
+                    key,
+                    value,
+                })
+                .collect(),
+        })
+        .expect("encode whole snapshot");
+        assert_eq!(encoded, whole);
+    }
+
+    #[tokio::test]
+    async fn lifecycle_edits_keep_snapshots_restorable_and_exportable() {
+        let (_directory, store) = store().await;
+        let processor = FixtureProcessor::new();
+        let mut block = frame(1, BlockHash::ZERO);
+        block.finality = Finality::Finalized;
+        let delta = processor.map(&block).await.expect("map");
+        store
+            .apply(&processor, cursor(&processor, &block, 1), &delta, &[])
+            .await
+            .expect("apply");
+        store
+            .create_portable_savepoint(&processor.descriptor, "before-limit-raise")
+            .await
+            .expect("savepoint");
+
+        // Raising a hard limit is the documented repair and keeps the instance.
+        let mut raised = processor.descriptor.clone();
+        raised.lifecycle.delivery.max_bytes = raised.lifecycle.delivery.max_bytes.saturating_mul(2);
+        raised.lifecycle.checkpoint.keep = 5;
+        store
+            .register_processor(&raised)
+            .await
+            .expect("lifecycle edit keeps the instance");
+        let checkpoint = store
+            .recovery_checkpoints(&raised)
+            .await
+            .expect("checkpoints")
+            .first()
+            .cloned()
+            .expect("automatic checkpoint");
+        store
+            .restore_recovery_checkpoint(&raised, checkpoint.checkpoint_id)
+            .await
+            .expect("restore after a lifecycle edit");
+        let archive = store
+            .export_portable_savepoint(&raised, "before-limit-raise")
+            .await
+            .expect("export after a lifecycle edit");
+        assert_eq!(
+            SqliteStore::validate_portable_savepoint(&raised, &archive)
+                .expect("validate after a lifecycle edit")
+                .block_number,
+            BlockNumber(1)
+        );
+        let mut upgraded = raised.clone();
+        upgraded.version = Version::new(2, 0, 0);
+        assert!(matches!(
+            SqliteStore::validate_portable_savepoint(&upgraded, &archive),
+            Err(StoreError::SavepointContract)
+        ));
+
+        // Snapshots hashed over the whole descriptor stay valid while that
+        // exact descriptor is configured.
+        let instance = processor_instance(&processor.descriptor);
+        let legacy_hash = BlockHash::new(
+            *blake3::hash(&serde_json::to_vec(&processor.descriptor).expect("descriptor JSON"))
+                .as_bytes(),
+        );
+        let legacy = postcard::to_allocvec(&StateSnapshot {
+            format_version: 1,
+            processor_instance: instance.clone(),
+            descriptor_hash: legacy_hash,
+            cursor: cursor(&processor, &block, 1),
+            entries: Vec::new(),
+        })
+        .expect("legacy snapshot");
+        let checksum = BlockHash::new(*blake3::hash(&legacy).as_bytes());
+        validate_state_snapshot(&processor.descriptor, &instance, &legacy, checksum)
+            .expect("legacy snapshot under its own descriptor");
+        assert!(matches!(
+            validate_state_snapshot(&raised, &instance, &legacy, checksum),
+            Err(StoreError::SavepointContract)
+        ));
+    }
+
+    #[tokio::test]
+    async fn portable_savepoints_are_bounded_per_processor() {
+        let (_directory, store) = store().await;
+        let processor = FixtureProcessor::new();
+        let block = frame(1, BlockHash::ZERO);
+        let delta = processor.map(&block).await.expect("map");
+        store
+            .apply(&processor, cursor(&processor, &block, 1), &delta, &[])
+            .await
+            .expect("apply");
+        for index in 1..=16 {
+            store
+                .create_portable_savepoint(&processor.descriptor, &format!("savepoint-{index}"))
+                .await
+                .expect("savepoint within the quota");
+        }
+        let rejected = store
+            .create_portable_savepoint(&processor.descriptor, "savepoint-17")
+            .await
+            .expect_err("the 17th savepoint exceeds the quota");
+        assert!(
+            matches!(rejected, StoreError::SavepointLimit { limit: 16, .. }),
+            "{rejected}"
+        );
+        assert_eq!(
+            store
+                .portable_savepoints(&processor.descriptor)
+                .await
+                .expect("savepoints")
+                .len(),
+            16
+        );
+        store
+            .delete_portable_savepoint(&processor.descriptor, "savepoint-1")
+            .await
+            .expect("delete savepoint");
+        store
+            .create_portable_savepoint(&processor.descriptor, "savepoint-17")
+            .await
+            .expect("savepoint after freeing the quota");
+    }
+
+    #[tokio::test]
+    async fn portable_savepoints_respect_physical_store_capacity() {
+        let directory = tempfile::tempdir().expect("directory");
+        let store = SqliteStore::open(
+            StoreConfig::new(directory.path().join("node.sqlite")).with_storage_budget(
+                StoreStorageBudget {
+                    maximum_physical_bytes: 1,
+                },
+            ),
+        )
+        .await
+        .expect("open");
+        // Private state only, so the apply itself needs no physical admission.
+        let mut processor = FixtureProcessor::new();
+        processor.descriptor.lifecycle.output.mode = OutputPolicyMode::None;
+        processor.descriptor.lifecycle.delivery.mode = DeliveryPolicyMode::None;
+        let block = frame(1, BlockHash::ZERO);
+        let delta = processor.map(&block).await.expect("map");
+        store
+            .apply(&processor, cursor(&processor, &block, 1), &delta, &[])
+            .await
+            .expect("apply");
+        assert!(matches!(
+            store
+                .create_portable_savepoint(&processor.descriptor, "over-budget")
+                .await,
+            Err(StoreError::PhysicalStorageLimit { .. })
+        ));
+        assert!(
+            store
+                .portable_savepoints(&processor.descriptor)
+                .await
+                .expect("savepoints")
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn shared_coverage_owners_merge_out_of_order_ranges() {
+        let (_directory, store) = store().await;
+        let processor = FixtureProcessor::block_output();
+        let instance = store
+            .register_processor(&processor.descriptor)
+            .await
+            .expect("register");
+        let steps = [
+            ((10, 20), vec![(10, 20)]),
+            // Older coverage arriving after newer coverage.
+            ((1, 5), vec![(1, 5), (10, 20)]),
+            // Adjacent on both sides.
+            ((6, 9), vec![(1, 20)]),
+            // Live extension.
+            ((21, 21), vec![(1, 21)]),
+            ((30, 30), vec![(1, 21), (30, 30)]),
+            // Overlap swallowing a gap.
+            ((15, 35), vec![(1, 35)]),
+        ];
+        for ((start, end), expected) in steps {
+            let mut transaction = store.inner.pool.begin().await.expect("transaction");
+            extend_shared_coverage_owner_range(
+                &mut transaction,
+                &instance,
+                BlockRange::new(BlockNumber(start), BlockNumber(end)).expect("range"),
+            )
+            .await
+            .expect("extend owner");
+            transaction.commit().await.expect("commit");
+            let owners: Vec<(i64, i64)> = sqlx::query_as(
+                "SELECT from_block, to_block FROM finalized_coverage_owners
+                 WHERE instance = ? AND owner_kind = 'shared' AND owner_id = 'canonical'
+                 ORDER BY from_block",
+            )
+            .bind(&instance)
+            .fetch_all(&store.inner.pool)
+            .await
+            .expect("owners");
+            assert_eq!(owners, expected, "after adding {start}..={end}");
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn compacted_coverage_counts_as_already_applied() {
+        let (_directory, store) = store().await;
+        let processor = FixtureProcessor::block_output();
+        let mut frames = Vec::new();
+        let mut parent = BlockHash::ZERO;
+        for number in 1_u64..=4 {
+            let mut current = frame(number, parent);
+            current.finality = Finality::Finalized;
+            let delta = processor.map(&current).await.expect("map");
+            store
+                .apply(
+                    &processor,
+                    cursor(&processor, &current, number),
+                    &delta,
+                    &[],
+                )
+                .await
+                .expect("apply finalized block");
+            parent = current.block.hash;
+            frames.push(current);
+        }
+        let compacted = store
+            .compact_finalized_coverage(&processor.descriptor, BlockNumber(4), 2, 4)
+            .await
+            .expect("compact");
+        assert_eq!(compacted.exact_coverage_deleted, 4);
+        let published = store
+            .changes(&processor.descriptor, ChainId(1), 0, 100)
+            .await
+            .expect("changes")
+            .len();
+
+        let delta = processor.map(&frames[1]).await.expect("map");
+        assert_eq!(
+            store
+                .apply(&processor, cursor(&processor, &frames[1], 2), &delta, &[])
+                .await
+                .expect("re-apply compacted block"),
+            ApplyOutcome::AlreadyApplied
+        );
+        assert_eq!(
+            store
+                .changes(&processor.descriptor, ChainId(1), 0, 100)
+                .await
+                .expect("changes")
+                .len(),
+            published
+        );
+        assert_eq!(
+            store
+                .processor_stats(&processor.descriptor)
+                .await
+                .expect("stats")
+                .applied_blocks,
+            0
+        );
+        // A compact segment end still anchors its hash.
+        let mut conflicting = frames[3].clone();
+        conflicting.block.hash = BlockHash::new([0x44; 32]);
+        let delta = processor
+            .map(&conflicting)
+            .await
+            .expect("map conflicting block");
+        assert!(matches!(
+            store
+                .apply(&processor, cursor(&processor, &conflicting, 4), &delta, &[])
+                .await,
+            Err(StoreError::CanonicalConflict {
+                block: BlockNumber(4),
+                ..
+            })
+        ));
+
+        // A materialization microbatch over compacted blocks falls back to
+        // idempotent per-block applies.
+        let mut materialized = with_id(FixtureProcessor::block_output(), "materialized");
+        materialized.descriptor.lifecycle.delivery.mode = DeliveryPolicyMode::None;
+        let job = queued_job("compacted-materialization", "materialization_job");
+        store.save_job(&job).await.expect("save job");
+        let items = finalized_items(&materialized, 4).await;
+        store
+            .commit_historical_materialization_microbatch(
+                &materialized,
+                &items,
+                &job.id,
+                b"first",
+                0,
+                HistoricalArtifactTarget::Sqlite,
+                TEST_COMMIT_LIMITS,
+            )
+            .await
+            .expect("materialize");
+        store
+            .compact_finalized_coverage(&materialized.descriptor, BlockNumber(4), 2, 4)
+            .await
+            .expect("compact materialized coverage");
+        assert!(matches!(
+            store
+                .commit_historical_materialization_microbatch(
+                    &materialized,
+                    &items[..2],
+                    &job.id,
+                    b"again",
+                    1,
+                    HistoricalArtifactTarget::Sqlite,
+                    TEST_COMMIT_LIMITS,
+                )
+                .await,
+            Err(StoreError::HistoricalBatchRequiresFallback)
+        ));
+    }
+
+    #[tokio::test]
+    async fn hot_cold_handoff_verifies_across_compacted_coverage() {
+        let mut processor = FixtureProcessor::block_output();
+        processor.descriptor.lifecycle.delivery.mode = DeliveryPolicyMode::None;
+        // The second store's history ends on a block the live chain replaced.
+        for history_diverges in [false, true] {
+            let (_directory, store) = store().await;
+            let mut parent = BlockHash::ZERO;
+            let mut tip = BlockHash::ZERO;
+            for number in 1_u64..=4 {
+                let mut live = frame(number, parent);
+                live.finality = Finality::Finalized;
+                store
+                    .store_recent_frame(&live)
+                    .await
+                    .expect("store live frame");
+                let mut historical = live.clone();
+                if history_diverges && number == 4 {
+                    historical.block.hash = BlockHash::new([0x77; 32]);
+                }
+                let delta = processor.map(&historical).await.expect("map");
+                store
+                    .apply(
+                        &processor,
+                        cursor(&processor, &historical, number),
+                        &delta,
+                        &[],
+                    )
+                    .await
+                    .expect("apply historical block");
+                parent = live.block.hash;
+                tip = live.block.hash;
+            }
+            store
+                .compact_finalized_coverage(&processor.descriptor, BlockNumber(4), 2, 4)
+                .await
+                .expect("compact");
+            let overlap = BlockRange::new(BlockNumber(1), BlockNumber(4)).expect("overlap");
+            let verdict = store
+                .verify_hot_cold_handoff(
+                    "compacted-handoff",
+                    &processor.descriptor,
+                    ChainId(1),
+                    overlap,
+                    tip,
+                )
+                .await;
+            if history_diverges {
+                assert!(
+                    matches!(verdict, Err(StoreError::HandoffMismatch { .. })),
+                    "{verdict:?}"
+                );
+            } else {
+                let verified = verdict.expect("verify across compacted coverage");
+                assert_eq!(verified.state, HotColdHandoffState::Verified);
+                assert_eq!(verified.compared_blocks, 4);
+            }
+        }
+    }
+
+    /// Store blocks 1..=4 as the live chain and apply them as finalized
+    /// history of a block-local processor without delivery.
+    async fn finalized_live_history(store: &SqliteStore) -> (FixtureProcessor, Vec<BlockFrame>) {
+        let mut processor = FixtureProcessor::block_output();
+        processor.descriptor.lifecycle.delivery.mode = DeliveryPolicyMode::None;
+        let mut frames = Vec::new();
+        let mut parent = BlockHash::ZERO;
+        for number in 1_u64..=4 {
+            let mut current = frame(number, parent);
+            current.finality = Finality::Finalized;
+            store
+                .store_recent_frame(&current)
+                .await
+                .expect("store live frame");
+            let delta = processor.map(&current).await.expect("map");
+            store
+                .apply(
+                    &processor,
+                    cursor(&processor, &current, number),
+                    &delta,
+                    &[],
+                )
+                .await
+                .expect("apply historical block");
+            parent = current.block.hash;
+            frames.push(current);
+        }
+        (processor, frames)
+    }
+
+    #[tokio::test]
+    async fn running_handoffs_hold_back_only_their_overlap() {
+        let (_directory, store) = store().await;
+        let (processor, frames) = finalized_live_history(&store).await;
+        // A handoff that never finishes, for example after a crash, holds
+        // back only the blocks it compares.
+        let overlap = BlockRange::new(BlockNumber(3), BlockNumber(4)).expect("overlap");
+        store
+            .begin_hot_cold_handoff(
+                "orphaned-handoff",
+                &processor.descriptor,
+                ChainId(1),
+                overlap,
+                frames[3].block.hash,
+            )
+            .await
+            .expect("begin handoff");
+        let outside = store
+            .compact_finalized_coverage(&processor.descriptor, BlockNumber(4), 2, 4)
+            .await
+            .expect("compaction pass");
+        assert_eq!(
+            outside.compacted_range,
+            Some(BlockRange::new(BlockNumber(1), BlockNumber(2)).expect("range"))
+        );
+        assert_eq!(
+            store
+                .processor_stats(&processor.descriptor)
+                .await
+                .expect("stats")
+                .applied_blocks,
+            2
+        );
+        store
+            .verify_hot_cold_handoff(
+                "orphaned-handoff",
+                &processor.descriptor,
+                ChainId(1),
+                overlap,
+                frames[3].block.hash,
+            )
+            .await
+            .expect("verify handoff");
+        let released = store
+            .compact_finalized_coverage(&processor.descriptor, BlockNumber(4), 2, 4)
+            .await
+            .expect("compaction after the handoff");
+        assert_eq!(released.compacted_range, Some(overlap));
+    }
+
+    #[tokio::test]
+    async fn a_new_handoff_supersedes_an_unfinished_one() {
+        let (_directory, store) = store().await;
+        let (processor, frames) = finalized_live_history(&store).await;
+        // Every start begins a handoff for its own anchor, so a restart
+        // abandons the previous one unverified.
+        let first = BlockRange::new(BlockNumber(1), BlockNumber(2)).expect("overlap");
+        let second = BlockRange::new(BlockNumber(3), BlockNumber(4)).expect("overlap");
+        store
+            .begin_hot_cold_handoff(
+                "handoff-a",
+                &processor.descriptor,
+                ChainId(1),
+                first,
+                frames[1].block.hash,
+            )
+            .await
+            .expect("begin the first handoff");
+        store
+            .begin_hot_cold_handoff(
+                "handoff-b",
+                &processor.descriptor,
+                ChainId(1),
+                second,
+                frames[3].block.hash,
+            )
+            .await
+            .expect("begin the second handoff");
+        let superseded = store
+            .hot_cold_handoff("handoff-a", &processor.descriptor)
+            .await
+            .expect("read the first handoff")
+            .expect("first handoff");
+        assert_eq!(superseded.state, HotColdHandoffState::Failed);
+        assert!(
+            superseded
+                .failure
+                .as_deref()
+                .is_some_and(|failure| failure.contains("handoff-b")),
+            "{superseded:?}"
+        );
+        store
+            .verify_hot_cold_handoff(
+                "handoff-b",
+                &processor.descriptor,
+                ChainId(1),
+                second,
+                frames[3].block.hash,
+            )
+            .await
+            .expect("verify the second handoff");
+        let compacted = store
+            .compact_finalized_coverage(&processor.descriptor, BlockNumber(4), 2, 4)
+            .await
+            .expect("compaction");
+        assert_eq!(compacted.exact_coverage_deleted, 4);
+    }
+
+    #[tokio::test]
+    async fn reducer_prefix_scans_refill_past_overlay_deletes() {
+        let (_directory, store) = store().await;
+        let processor = FixtureProcessor::new();
+        let instance = store
+            .register_processor(&processor.descriptor)
+            .await
+            .expect("register");
+        let key = |number: u64| [b"k".as_slice(), &number.to_be_bytes()].concat();
+        for number in 1..=20 {
+            sqlx::query(
+                "INSERT INTO entities(instance, collection, entity_key, value)
+                 VALUES (?, 'rows', ?, ?)",
+            )
+            .bind(&instance)
+            .bind(key(number))
+            .bind(number.to_be_bytes().to_vec())
+            .execute(&store.inner.pool)
+            .await
+            .expect("entity row");
+            sqlx::query(
+                "INSERT INTO processor_state(instance, namespace, state_key, value)
+                 VALUES (?, 'rows', ?, ?)",
+            )
+            .bind(&instance)
+            .bind(key(number))
+            .bind(number.to_be_bytes().to_vec())
+            .execute(&store.inner.pool)
+            .await
+            .expect("state row");
+        }
+        let mut overlay = ReducerOverlay::new(store.inner.pool.clone(), instance);
+        for number in 1..=5 {
+            overlay
+                .delete("rows", &key(number))
+                .await
+                .expect("delete entity");
+            overlay
+                .state_delete("rows", &key(number))
+                .await
+                .expect("delete state");
+        }
+        overlay
+            .put("rows", key(100), vec![100])
+            .await
+            .expect("put entity");
+        overlay
+            .state_put("rows", key(100), vec![100])
+            .await
+            .expect("put state");
+        let keys = |page: &[(Vec<u8>, Vec<u8>)]| {
+            page.iter()
+                .map(|(entry_key, _)| entry_key.clone())
+                .collect::<Vec<_>>()
+        };
+
+        let first = (6..=15).map(key).collect::<Vec<_>>();
+        let entities = overlay
+            .scan_prefix("rows", b"k", 10)
+            .await
+            .expect("entity scan");
+        assert_eq!(keys(&entities), first);
+        let state = overlay
+            .state_scan_prefix("rows", b"k", 10)
+            .await
+            .expect("state scan");
+        assert_eq!(keys(&state), first);
+
+        // Consuming a page and scanning again continues without skipping.
+        for (entity_key, _) in &entities {
+            overlay
+                .delete("rows", entity_key)
+                .await
+                .expect("consume entity");
+        }
+        for (state_key, _) in &state {
+            overlay
+                .state_delete("rows", state_key)
+                .await
+                .expect("consume state");
+        }
+        let next = (16..=20).chain([100]).map(key).collect::<Vec<_>>();
+        assert_eq!(
+            keys(
+                &overlay
+                    .scan_prefix("rows", b"k", 10)
+                    .await
+                    .expect("next entity scan")
+            ),
+            next
+        );
+        assert_eq!(
+            keys(
+                &overlay
+                    .state_scan_prefix("rows", b"k", 10)
+                    .await
+                    .expect("next state scan")
+            ),
+            next
+        );
+    }
+
+    #[tokio::test]
+    async fn required_consumers_need_acknowledgement_retention() {
+        let (_directory, store) = store().await;
+        let processor = FixtureProcessor::new();
+        assert_eq!(
+            processor.descriptor.lifecycle.delivery.mode,
+            DeliveryPolicyMode::Window
+        );
+        let rejected = store
+            .create_consumer(
+                &processor.descriptor,
+                "window-pin",
+                ConsumerRole::Required,
+                ConsumerStartPosition::CurrentHead,
+                Duration::from_mins(1),
+            )
+            .await
+            .expect_err("a required consumer would pin window retention");
+        assert!(
+            matches!(&rejected, StoreError::InvalidConfig(message) if message.contains("until_acknowledged")),
+            "{rejected}"
+        );
+        assert!(
+            store
+                .renew_consumer_lease(
+                    &processor.descriptor,
+                    "legacy-pin",
+                    0,
+                    Duration::from_mins(1)
+                )
+                .await
+                .is_err()
+        );
+        store
+            .create_consumer(
+                &processor.descriptor,
+                "window-reader",
+                ConsumerRole::BestEffort,
+                ConsumerStartPosition::CurrentHead,
+                Duration::from_mins(1),
+            )
+            .await
+            .expect("best-effort consumer on a window stream");
+
+        let acknowledged = with_id(until_acknowledged(FixtureProcessor::new()), "acknowledged");
+        store
+            .create_consumer(
+                &acknowledged.descriptor,
+                "required-destination",
+                ConsumerRole::Required,
+                ConsumerStartPosition::CurrentHead,
+                Duration::from_mins(1),
+            )
+            .await
+            .expect("required consumer on an acknowledgement stream");
+
+        let split = with_id(FixtureProcessor::block_output(), "split");
+        let history = store
+            .create_backfill_delivery_stream(&split.descriptor, "required-history")
+            .await
+            .expect("history stream")
+            .stream_id;
+        store
+            .create_consumer_in_stream(
+                &split.descriptor,
+                &history,
+                "history-destination",
+                ConsumerRole::Required,
+                ConsumerStartPosition::EarliestRetained,
+                Duration::from_mins(1),
+            )
+            .await
+            .expect("required consumer on a backfill stream");
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn late_microbatch_commits_keep_cancelled_jobs_cancelled() {
+        let (_directory, store) = store().await;
+
+        let mut materialized = FixtureProcessor::block_output();
+        materialized.descriptor.lifecycle.delivery.mode = DeliveryPolicyMode::None;
+        let mut job = queued_job("cancelled-materialization", "materialization_job");
+        job.state = JobState::Running;
+        store.save_job(&job).await.expect("save running job");
+        job.state = JobState::Cancelled;
+        store.save_job(&job).await.expect("cancel job");
+        store
+            .commit_historical_materialization_microbatch(
+                &materialized,
+                &finalized_items(&materialized, 2).await,
+                &job.id,
+                b"late",
+                1,
+                HistoricalArtifactTarget::Sqlite,
+                TEST_COMMIT_LIMITS,
+            )
+            .await
+            .expect("late materialization commit");
+        assert_eq!(
+            store
+                .job(&job.id)
+                .await
+                .expect("job")
+                .expect("durable job")
+                .state,
+            JobState::Cancelled
+        );
+
+        let mut subscribed = with_id(FixtureProcessor::block_output(), "subscribed");
+        subscribed.descriptor.lifecycle.output.mode = OutputPolicyMode::None;
+        let subscription_id = "late-subscription";
+        let stream = store
+            .create_backfill_delivery_stream(&subscribed.descriptor, subscription_id)
+            .await
+            .expect("stream")
+            .stream_id;
+        store
+            .create_consumer_in_stream(
+                &subscribed.descriptor,
+                &stream,
+                "destination",
+                ConsumerRole::Required,
+                ConsumerStartPosition::EarliestRetained,
+                Duration::from_mins(1),
+            )
+            .await
+            .expect("consumer");
+        let range = BlockRange::new(BlockNumber(1), BlockNumber(2)).expect("range");
+        let job = queued_job("late-subscription-job", "backfill_subscription_job");
+        store
+            .create_backfill_subscription_job(
+                &BackfillSubscriptionRecord {
+                    subscription_id: subscription_id.to_owned(),
+                    job_id: job.id.clone(),
+                    processor_instance: subscribed.descriptor.instance.to_string(),
+                    history_stream_id: stream.clone(),
+                    mode: BackfillSubscriptionMode::FillMissing,
+                    publication_revision: 0,
+                    state: BackfillSubscriptionState::Queued,
+                    consumer_id: "destination".to_owned(),
+                    ranges: vec![range],
+                    range,
+                    preexisting_coverage: Vec::new(),
+                    captured_finalized_target: range.end(),
+                    idempotency_key: "late-subscription-key".to_owned(),
+                    effective_block_limit: 16,
+                    effective_byte_limit: 1024 * 1024,
+                    resume_below_ratio_millionths: 750_000,
+                    delivery_batch_limits: BackfillDeliveryBatchLimits::default(),
+                    initial_sequence: 0,
+                    completion_sequence: None,
+                    processed_work_blocks: 0,
+                },
+                &job,
+                BlockHash::new([5; 32]),
+            )
+            .await
+            .expect("subscription");
+        store
+            .save_job(&JobRecord {
+                state: JobState::Cancelled,
+                ..job.clone()
+            })
+            .await
+            .expect("cancel job");
+        store
+            .set_backfill_subscription_state(&job.id, BackfillSubscriptionState::Cancelled, None)
+            .await
+            .expect("cancel subscription");
+        store
+            .commit_historical_microbatch(
+                &subscribed,
+                HistoricalBatchMode::Apply,
+                &finalized_items(&subscribed, 2).await,
+                &[],
+                &stream,
+                &job.id,
+                b"late",
+                1,
+                true,
+                TEST_COMMIT_LIMITS,
+            )
+            .await
+            .expect("late final microbatch");
+        assert_eq!(
+            store
+                .job(&job.id)
+                .await
+                .expect("job")
+                .expect("durable job")
+                .state,
+            JobState::Cancelled
+        );
+        assert_eq!(
+            store
+                .backfill_subscription_for_job(&job.id)
+                .await
+                .expect("subscription")
+                .expect("durable subscription")
+                .state,
+            BackfillSubscriptionState::Cancelled
+        );
+        // A late runtime transition cannot revive the subscription either.
+        store
+            .set_backfill_subscription_state(&job.id, BackfillSubscriptionState::Running, None)
+            .await
+            .expect("late running transition");
+        assert_eq!(
+            store
+                .backfill_subscription_for_job(&job.id)
+                .await
+                .expect("subscription")
+                .expect("durable subscription")
+                .state,
+            BackfillSubscriptionState::Cancelled
+        );
+    }
+
+    #[tokio::test]
+    async fn store_stats_report_held_deferred_changes() {
+        let (_directory, store) = store().await;
+        let processor = finalized_only_processor();
+        let block = frame(1, BlockHash::ZERO);
+        let delta = processor.map(&block).await.expect("map");
+        store
+            .apply(&processor, cursor(&processor, &block, 1), &delta, &[])
+            .await
+            .expect("apply included block");
+        let held_bytes: i64 = sqlx::query_scalar("SELECT SUM(bytes) FROM deferred_changes")
+            .fetch_one(&store.inner.pool)
+            .await
+            .expect("held bytes");
+        assert!(held_bytes > 0);
+        let stats = store.stats().await.expect("stats");
+        assert_eq!(stats.deferred_changes, 1);
+        assert_eq!(
+            stats.deferred_change_bytes,
+            u64::try_from(held_bytes).expect("held bytes")
+        );
+        store
+            .mark_finalized(&processor.descriptor, BlockNumber(1))
+            .await
+            .expect("finalize");
+        let stats = store.stats().await.expect("stats after release");
+        assert_eq!(
+            (stats.deferred_changes, stats.deferred_change_bytes),
+            (0, 0)
+        );
+    }
+
+    #[test]
+    fn older_schema_refusals_are_version_accurate() {
+        let before_vocabulary = older_schema_refusal(20).to_string();
+        assert!(
+            before_vocabulary.contains("predates the included/finalized vocabulary")
+                && before_vocabulary.contains("re-initialize"),
+            "{before_vocabulary}"
+        );
+        let after_vocabulary = older_schema_refusal(21).to_string();
+        assert!(
+            !after_vocabulary.contains("vocabulary")
+                && after_vocabulary.contains("schema 21")
+                && after_vocabulary.contains("re-initialize"),
+            "{after_vocabulary}"
+        );
+    }
+
+    #[tokio::test]
+    async fn completed_jobs_leave_a_restorable_checkpoint() {
+        let (_directory, store) = store().await;
+        let processor = FixtureProcessor::new();
+        let instance = processor_instance(&processor.descriptor);
+        let mut job = queued_job("completed-backfill", "materialization_job");
+        job.payload = serde_json::json!({ "processor_instance": instance })
+            .to_string()
+            .into_bytes();
+        store.save_job(&job).await.expect("queue job");
+        // The cadence checkpoints only the first of these blocks.
+        apply_finalized_chain(&store, &processor, 1..=5, BlockHash::ZERO).await;
+        job.state = JobState::Completed;
+        store.save_job(&job).await.expect("complete job");
+
+        let latest = store
+            .recovery_checkpoints(&processor.descriptor)
+            .await
+            .expect("checkpoints")
+            .first()
+            .cloned()
+            .expect("automatic checkpoint");
+        assert_eq!(latest.block_number, BlockNumber(5));
+        let expected_state = processor_state_rows(&store, &instance).await;
+        sqlx::query("UPDATE processor_state SET value = X'ff' WHERE instance = ?")
+            .bind(&instance)
+            .execute(&store.inner.pool)
+            .await
+            .expect("inject state corruption");
+        let restored = store
+            .restore_recovery_checkpoint(&processor.descriptor, latest.checkpoint_id)
+            .await
+            .expect("restore at the completed job's cursor");
+        assert_eq!(restored.block_number, BlockNumber(5));
+        assert_eq!(
+            processor_state_rows(&store, &instance).await,
+            expected_state
+        );
+    }
+
+    #[tokio::test]
+    async fn checkpoint_restore_accepts_later_finality_promotion() {
+        let (_directory, store) = store().await;
+        let processor = FixtureProcessor::new();
+        let instance = processor_instance(&processor.descriptor);
+        let mut parent = BlockHash::ZERO;
+        for number in 1..=3 {
+            let current = frame(number, parent);
+            let delta = processor.map(&current).await.expect("map");
+            store
+                .apply(
+                    &processor,
+                    cursor(&processor, &current, number),
+                    &delta,
+                    &[],
+                )
+                .await
+                .expect("apply included block");
+            parent = current.block.hash;
+        }
+        // Finality below the cursor checkpoints the included cursor; finality
+        // reaching it later promotes only the cursor's label.
+        store
+            .mark_finalized(&processor.descriptor, BlockNumber(1))
+            .await
+            .expect("finalize below the cursor");
+        store
+            .mark_finalized(&processor.descriptor, BlockNumber(3))
+            .await
+            .expect("finalize the cursor");
+        let current = store
+            .processor_cursor(&processor.descriptor)
+            .await
+            .expect("cursor")
+            .expect("durable cursor");
+        assert_eq!(current.finality, Finality::Finalized);
+        let checkpoint = store
+            .recovery_checkpoints(&processor.descriptor)
+            .await
+            .expect("checkpoints")
+            .first()
+            .cloned()
+            .expect("automatic checkpoint");
+        assert_eq!(checkpoint.block_number, BlockNumber(3));
+        let expected_state = processor_state_rows(&store, &instance).await;
+        sqlx::query("UPDATE processor_state SET value = X'ff' WHERE instance = ?")
+            .bind(&instance)
+            .execute(&store.inner.pool)
+            .await
+            .expect("inject state corruption");
+        let restored = store
+            .restore_recovery_checkpoint(&processor.descriptor, checkpoint.checkpoint_id)
+            .await
+            .expect("restore after finality promotion");
+        assert_eq!(restored, current);
+        assert_eq!(
+            processor_state_rows(&store, &instance).await,
+            expected_state
+        );
+    }
+
+    #[tokio::test]
+    async fn existing_required_consumers_still_report_a_conflict() {
+        let (_directory, store) = store().await;
+        let acknowledged = until_acknowledged(FixtureProcessor::new());
+        store
+            .create_consumer(
+                &acknowledged.descriptor,
+                "earlier-destination",
+                ConsumerRole::Required,
+                ConsumerStartPosition::CurrentHead,
+                Duration::from_mins(1),
+            )
+            .await
+            .expect("required consumer");
+        // A lifecycle edit, or an earlier release, leaves the required
+        // consumer on a window-retained stream.
+        let window = FixtureProcessor::new();
+        store
+            .register_processor(&window.descriptor)
+            .await
+            .expect("lifecycle edit");
+        assert!(matches!(
+            store
+                .create_consumer(
+                    &window.descriptor,
+                    "earlier-destination",
+                    ConsumerRole::Required,
+                    ConsumerStartPosition::CurrentHead,
+                    Duration::from_mins(1),
+                )
+                .await,
+            Err(StoreError::ConsumerExists { .. })
+        ));
+        store
+            .renew_consumer_lease(
+                &window.descriptor,
+                "earlier-destination",
+                0,
+                Duration::from_mins(1),
+            )
+            .await
+            .expect("renew the existing consumer");
+        assert_eq!(
+            required_consumers_on_pruned_streams(&store.inner.pool)
+                .await
+                .expect("list pinning consumers"),
+            vec![(
+                default_delivery_stream_id(&window.descriptor),
+                "earlier-destination".to_owned()
+            )]
+        );
     }
 }

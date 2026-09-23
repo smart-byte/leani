@@ -266,7 +266,13 @@ The typed `/v1/q/blobs/snapshot` route remains a built-in convenience wrapper.
 ### Durable consumer registration
 
 Required or best-effort consumers have a server-side cumulative delivered and
-acknowledged watermark. Creation always names a start position:
+acknowledged watermark. A `required` consumer also holds back pruning until it
+acknowledges, so only a stream that retains until acknowledged accepts one: a
+live stream with `until_acknowledged` delivery, or a backfill stream. A
+`window` or `best_effort` stream prunes by its own limits and rejects a new
+`required` consumer with `400`. Re-creating a consumer that already exists
+returns `409 consumer_exists` whatever its role. Creation always names a
+start position:
 
 ```http
 POST /v1/processors/blobs-money/consumers
@@ -274,7 +280,7 @@ content-type: application/json
 
 {
   "id": "blobs-api",
-  "role": "required",
+  "role": "best_effort",
   "start": { "position": "earliest_retained" },
   "leaseTtlSeconds": 300,
   "credential": "<random per-consumer secret>"
@@ -418,10 +424,14 @@ storage-backpressured work resume.
 ### Checkpoints and portable savepoints
 
 Automatic recovery checkpoints are read-only through
-`GET /v1/processors/{processor}/checkpoints` and obey configured count
-retention. `POST .../checkpoints/{checkpoint}/restore` atomically repairs
-private processor state only when the checkpoint is at the exact current
-cursor. Older checkpoints are rejected because rewinding state without also
+`GET /v1/processors/{processor}/checkpoints`, are taken at most once per
+1,000 finalized blocks and when a historical job completes, and obey
+configured count retention. `POST .../checkpoints/{checkpoint}/restore`
+atomically repairs private processor state only when the processor's cursor
+sits exactly on the checkpoint; finality reaching that block afterwards does
+not matter. Between checkpoints no automatic checkpoint can be restored: take
+a portable savepoint while the processor is at rest, or restore a full-store
+backup. Older checkpoints are rejected because rewinding state without also
 rewinding independent output, delivery, coverage, and undo storage would be
 unsafe; use a deterministic rebuild or a full-store backup for that case.
 Portable savepoints are operator-created:
@@ -433,10 +443,14 @@ content-type: application/json
 { "id": "before-v2-upgrade" }
 ```
 
-`GET .../savepoints/{id}` exports a checksummed, versioned
-`application/vnd.leani.savepoint` archive. Deletion is explicit with
-`DELETE`; acknowledgement or checkpoint pruning never deletes a portable
-savepoint.
+Each processor instance keeps at most 16 savepoints; creating another returns
+`409 savepoint_limit` until one is deleted. A savepoint is also admitted
+against the physical store budget. `GET .../savepoints/{id}` exports a
+checksummed, versioned `application/vnd.leani.savepoint` archive. Deletion is
+explicit with `DELETE`; acknowledgement or checkpoint pruning never deletes a
+portable savepoint. Checkpoints and savepoints are bound to the processor
+contract without its lifecycle policies, so raising a limit does not
+invalidate them; a different processor version does.
 
 ## 4. Change protocol
 

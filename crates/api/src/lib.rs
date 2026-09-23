@@ -2577,6 +2577,8 @@ async fn metrics(State(state): State<ApiState>) -> Result<Response, ApiError> {
             "history_delivery_retained_bytes",
             store_metrics.history_delivery_retained_bytes,
         ),
+        ("deferred_changes", store_metrics.deferred_changes),
+        ("deferred_change_bytes", store_metrics.deferred_change_bytes),
         ("recent_frames", recent_metrics.frames),
         ("recent_frame_bytes", recent_metrics.encoded_bytes),
     ] {
@@ -7417,6 +7419,9 @@ impl From<StoreError> for ApiError {
             matched @ StoreError::SavepointExists { .. } => {
                 Self::conflict("savepoint_exists", &matched.to_string())
             }
+            matched @ StoreError::SavepointLimit { .. } => {
+                Self::conflict("savepoint_limit", &matched.to_string())
+            }
             matched @ (StoreError::SavepointChecksum | StoreError::SavepointContract) => {
                 Self::conflict("savepoint_invalid", &matched.to_string())
             }
@@ -7501,6 +7506,20 @@ mod tests {
             "processor": context.descriptor().instance,
             "extension": context.extension_id(),
         }))
+    }
+
+    /// Retain live delivery until the named required consumer acknowledges.
+    fn acknowledged_delivery(
+        mut lifecycle: leani_processor_api::LifecyclePolicies,
+        consumer: &str,
+    ) -> leani_processor_api::LifecyclePolicies {
+        lifecycle.delivery.mode = leani_processor_api::DeliveryPolicyMode::UntilAcknowledged;
+        lifecycle.delivery.consumers = vec![leani_processor_api::DurableConsumerPolicy {
+            id: consumer.to_owned(),
+            required: true,
+            lease_ttl_seconds: 300,
+        }];
+        lifecycle
     }
 
     async fn seed_blob_block(
@@ -9010,7 +9029,10 @@ mod tests {
         ))
         .await
         .expect("store");
-        let processor = Arc::new(BlockLocalCounter::default().with_split_delivery());
+        let counter = BlockLocalCounter::default().with_split_delivery();
+        let lifecycle =
+            acknowledged_delivery(counter.descriptor().lifecycle.clone(), "destination");
+        let processor = Arc::new(counter.with_lifecycle(lifecycle));
         store
             .register_processor(processor.descriptor())
             .await
@@ -9174,6 +9196,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn recreating_an_existing_required_consumer_still_conflicts() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = SqliteStore::open(leani_store_sqlite::StoreConfig::new(
+            directory.path().join("node.sqlite"),
+        ))
+        .await
+        .expect("store");
+        // Registered while the stream retained until acknowledged, as an
+        // earlier release also allowed on window streams.
+        let blobs = BlobsProcessor::default();
+        let lifecycle = acknowledged_delivery(blobs.descriptor().lifecycle.clone(), "blobs-api");
+        let instance = blobs.descriptor().instance.clone();
+        let publication = blobs.descriptor().publication;
+        let acknowledged = blobs.with_contract(instance, publication, lifecycle);
+        store
+            .create_consumer(
+                acknowledged.descriptor(),
+                "blobs-api",
+                ConsumerRole::Required,
+                ConsumerStartPosition::CurrentHead,
+                Duration::from_mins(5),
+            )
+            .await
+            .expect("required consumer");
+        let router = router(
+            store,
+            Arc::new(BlobsProcessor::default()),
+            ApiConfig::default(),
+        )
+        .expect("router");
+        let response = router
+            .oneshot(
+                Request::post("/v1/processors/blobs-money/consumers")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "id": "blobs-api",
+                            "role": "required",
+                            "start": { "position": "current_head" },
+                            "leaseTtlSeconds": 300,
+                            "credential": "blobs-api-test-credential"
+                        })
+                        .to_string(),
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn durable_consumer_api_rejects_acknowledgement_beyond_committed_head() {
         let directory = tempfile::tempdir().expect("tempdir");
         let store = SqliteStore::open(leani_store_sqlite::StoreConfig::new(
@@ -9192,23 +9267,31 @@ mod tests {
         })
         .expect("cursor");
         let router = router(store, processor, ApiConfig::default()).expect("router");
+        let create_consumer = |role: &str| {
+            Request::post("/v1/processors/blobs-money/consumers")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "id": "blobs-api",
+                        "role": role,
+                        "start": { "position": "current_head" },
+                        "leaseTtlSeconds": 300,
+                        "credential": "blobs-api-test-credential"
+                    })
+                    .to_string(),
+                ))
+                .expect("request")
+        };
+        // A required consumer would pin the window-retained live stream.
+        let required = router
+            .clone()
+            .oneshot(create_consumer("required"))
+            .await
+            .expect("response");
+        assert_eq!(required.status(), StatusCode::BAD_REQUEST);
         let create = router
             .clone()
-            .oneshot(
-                Request::post("/v1/processors/blobs-money/consumers")
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(
-                        serde_json::json!({
-                            "id": "blobs-api",
-                            "role": "required",
-                            "start": { "position": "current_head" },
-                            "leaseTtlSeconds": 300,
-                            "credential": "blobs-api-test-credential"
-                        })
-                        .to_string(),
-                    ))
-                    .expect("request"),
-            )
+            .oneshot(create_consumer("best_effort"))
             .await
             .expect("response");
         assert_eq!(create.status(), StatusCode::CREATED);
@@ -9958,7 +10041,12 @@ mod tests {
         ))
         .await
         .expect("store");
-        let processor = Arc::new(BlobsProcessor::default());
+        let blobs = BlobsProcessor::default();
+        let lifecycle =
+            acknowledged_delivery(blobs.descriptor().lifecycle.clone(), "metrics-required");
+        let instance = blobs.descriptor().instance.clone();
+        let publication = blobs.descriptor().publication;
+        let processor = Arc::new(blobs.with_contract(instance, publication, lifecycle));
         store
             .create_consumer(
                 processor.descriptor(),
@@ -10029,6 +10117,8 @@ mod tests {
         assert!(body.contains("leani_processor_required_ack_watermark"));
         assert!(body.contains("leani_consumer_acknowledged_sequence"));
         assert!(body.contains("leani_consumer_lease_active"));
+        assert!(body.contains("leani_store_deferred_changes 0"));
+        assert!(body.contains("leani_store_deferred_change_bytes 0"));
     }
 
     #[tokio::test]

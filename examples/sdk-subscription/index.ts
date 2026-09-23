@@ -39,9 +39,11 @@ export async function consumeDurably<T>(
     });
   } catch (error) {
     if (!(error instanceof LeaniError) || error.status !== 404) throw error;
+    // Only an until_acknowledged stream accepts a required consumer that
+    // fences pruning; a window stream prunes by its own limits.
     await consumers.create(options.processor, {
       id: options.consumer,
-      role: "required",
+      role: "best_effort",
       start: { position: "earliest_retained" },
       leaseTtlSeconds: options.leaseTtlSeconds ?? 60,
       credential: options.credential,

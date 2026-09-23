@@ -20,7 +20,7 @@ query need and has its own budget.
 | Output | Entities served by generic or processor-owned queries | latest, window, full, or none |
 | Artifacts | Compact immutable results reusable for replay/export | bounded retention or none |
 | Delivery | Ordered change history for external consumers | best effort, until acknowledged, or none |
-| Checkpoints | Recovery points for processor state | automatic with a finite keep count |
+| Checkpoints | Recovery points for processor state | automatic, at most once per 1,000 finalized blocks, with a finite keep count |
 | Undo | Unfinalized branch replacement | bounded by a reorg safety depth |
 | Raw history | Reusable normalized source material | explicitly enabled, segmented, and bounded |
 

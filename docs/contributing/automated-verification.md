@@ -71,7 +71,10 @@ runtime, store, and API boundaries:
 | source corruption and input budget overrun | `history_stream_rejects_corruption_and_budget_overrun` |
 | reorg apply/undo and removed logs | `shared_live_runtime_fans_out_and_reorgs_one_source_subscription`, `websocket_reorg_marks_old_logs_removed_before_replacements` |
 | process interruption/restart | `historical_run_resumes_from_durable_coverage_after_process_reopen`, the 10,000-block gate |
-| checkpoint corruption/restore, retention, and portable savepoint integrity | `automatic_checkpoints_are_bounded_and_savepoints_are_explicit` |
+| checkpoint cadence and retention, restore of corrupted state at an exact checkpoint cursor, and portable savepoint integrity | `automatic_checkpoints_are_bounded_and_savepoints_are_explicit`, `portable_savepoints_are_bounded_per_processor` |
+| restorable checkpoints at job completion and after finality promotion | `completed_jobs_leave_a_restorable_checkpoint`, `checkpoint_restore_accepts_later_finality_promotion` |
+| undo retention past finality | `ordered_undo_rows_stay_within_the_safety_depth`, `finalized_applies_write_no_undo_rows` |
+| compacted coverage re-apply and handoff, interrupted handoffs | `compacted_coverage_counts_as_already_applied`, `hot_cold_handoff_verifies_across_compacted_coverage`, `running_handoffs_hold_back_only_their_overlap`, `a_new_handoff_supersedes_an_unfinished_one` |
 | slow required consumer | `required_consumer_remains_protective_after_lease_lapse` |
 | disk/delivery pressure | `delivery_limit_pauses_and_auto_resumes_below_low_water` |
 | acknowledgement/pruning/upgrade replay faults | `acknowledgement_cannot_exceed_the_consumers_delivered_head`, `delivery_pruner_applies_finality_age_and_bounded_batch_limits`, `unacknowledged_changes_survive_a_v6_to_v7_upgrade` |
