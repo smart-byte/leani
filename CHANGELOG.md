@@ -11,6 +11,26 @@ record, and documented RPC contracts.
 - Updated Reth's transitive `imbl` dependency to 7.0.2 and
   `imbl-sized-chunks` to 0.2.0 to address RUSTSEC-2026-0292. This also removes
   the unmaintained `bitmaps` dependency and its policy exceptions.
+- The weak-subjectivity checkpoint quorum used by `leani init` and
+  `leani subscribe` now needs a strict majority of the providers tried, not
+  just `--checkpoint-quorum` of them. It fails closed when a responding
+  provider reports another root at the agreed slot, or when two answers both
+  reach the threshold. The confirmation prompt lists every provider's answer
+  or failure. Providers must use HTTPS, with plain HTTP accepted only on
+  loopback. Leani does not follow their redirects, reads at most 1 MiB from
+  each, and rejects a provider listed twice with the same scheme, host, port,
+  and path.
+- Beacon API finality endpoints are no longer followed through redirects, and
+  their responses, error bodies included, are capped at 16 MiB while they
+  stream in. Errors, logs, `source probe finality` reports, and the checkpoint
+  prompt show endpoint and provider URLs as `scheme://host[:port]`, with `/…`
+  in place of a path, so API keys in userinfo, query strings, or paths are not
+  printed. Request errors add the API path, and endpoints that would show
+  alike carry their index, such as `finality.endpoints[1]`.
+- A persisted finality anchor replaces the configured `finality.checkpoint`
+  only when it was verified from that checkpoint. An anchor from another
+  trust root is ignored with a warning, and `leani doctor` reports it, so
+  changing the checkpoint re-anchors the node.
 
 ### Changed
 
@@ -121,9 +141,61 @@ record, and documented RPC contracts.
 - `transaction-stats` documents `count` and `totalValueWei` as submitted
   totals: without receipts, reverted transactions and their value are
   included. Behavior is unchanged.
+- Verified finality persists its newest epoch-aligned anchor as
+  `finality-anchor.json` in `data_dir`, written off the async runtime.
+  `/metrics` exports `leani_finality_anchor_age_seconds`,
+  `leani_finality_anchor_expiry_seconds` (the time left before a restart can
+  no longer bootstrap from that anchor), and
+  `leani_finality_anchor_write_failures_total`. `leani doctor` warns, and
+  lists the warning under `warnings` in `--json`, when the anchor a restart
+  would use expires within three days or was verified from another
+  checkpoint. The alert rules add `LeaniFinalityAnchorExpiring`.
+  `leani source probe finality` and the benchmark's history probe start from
+  the persisted anchor by the same rules but never write it.
+  `leani reset all` removes the file.
+- Configuration validation rejects `finality.minimum_peers` above 24, the
+  consensus P2P peer set; an all-zero `finality.checkpoint`; and
+  `finality.endpoints` that name one transport twice, even with different
+  letter case, default port, trailing slash, credentials, or query string.
+- `leani init`, and `leani subscribe` without a configuration, use the
+  managed Beacon endpoint pool plus every responding checkpoint provider that
+  also serves the Beacon light-client API, without duplicates, instead of the
+  responding providers alone.
 
 ### Fixed
 
+- Verified finality no longer stops about 14 days after the configured
+  checkpoint's slot. Beacon API finality keeps one bootstrapped light client
+  per endpoint and advances it with each finality update, plus the
+  sync-committee update when a period ends. It no longer verifies the whole
+  chain again from the checkpoint, including its age check, on every
+  12-second poll. Every start and network lane restart, with either finality
+  source, bootstraps from the persisted anchor when that is newer than the
+  configured checkpoint and younger than 14 days, so the configured
+  checkpoint's age no longer matters after the first start. A corrupt or
+  unreadable anchor file falls back to the configured checkpoint with a
+  warning, and so does a persisted anchor whose bootstrap no endpoint or peer
+  serves. A Beacon API endpoint that is down at start or bootstraps slowly
+  bootstraps later from the newest agreed anchor, so it can join after the
+  configured checkpoint ages out; its bootstrap is no longer cancelled by the
+  agreement grace period.
+- Beacon API agreement waits about two seconds after the first verified
+  endpoint for the others, then follows the highest finalized slot that
+  `finality.minimum_agreement` endpoints have reached or passed. A lagging
+  endpoint no longer holds finality back, readiness no longer drops at epoch
+  transitions, and finality never moves backwards.
+- A Beacon API endpoint without a trailing slash keeps its last path segment:
+  `https://host/beacon` is queried as `https://host/beacon/eth/v1/...`.
+- One invalid or stale peer no longer ends consensus P2P finality and restarts
+  every lane. A peer whose light-client material fails verification is
+  banned, and neither asked nor dialed again across reconnects until the
+  lanes restart; the next peer is tried, peers are tried in random order, and
+  updates that are stale, or signed ahead of the local clock beyond one slot
+  of tolerated skew, are retried. An update whose own slots are inconsistent
+  is invalid. Contradicting verified anchors still fail closed.
+- The consensus P2P Status message advertises the checkpoint's finalized
+  epoch rounded up, so a checkpoint whose epoch-boundary slot was skipped
+  advertises its own epoch, with a head slot at or after that epoch's start.
 - New node stores enable SQLite incremental auto-vacuum, so pruning shrinks
   the database file and storage admission recovers instead of staying at the
   high-water mark. Existing stores log a warning at startup until one

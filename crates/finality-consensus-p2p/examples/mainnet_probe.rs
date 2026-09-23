@@ -1,3 +1,4 @@
+use leani_finality_beacon_api::{CheckpointOrigin, TrustedCheckpoint};
 use leani_finality_consensus_p2p::{ConsensusP2pConfig, VerifiedConsensusP2p};
 
 #[tokio::main]
@@ -27,7 +28,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.bootnodes = bootnodes;
     }
     let source = VerifiedConsensusP2p::mainnet(config)?;
-    let report = source.probe_checkpoint(checkpoint, checkpoint_slot).await;
+    let report = source
+        .probe_checkpoint(TrustedCheckpoint {
+            root: checkpoint,
+            slot: Some(checkpoint_slot),
+            origin: CheckpointOrigin::Operator,
+        })
+        .await;
     println!("{}", serde_json::to_string_pretty(&report)?);
     if !report.accepted {
         return Err("consensus P2P probe was not accepted".into());

@@ -31,9 +31,11 @@ leani init uniswap-v3 ETH/USDC
 leani doctor
 ```
 
-`init` requires two configured checkpoint providers to agree on one finalized
-slot and root, asks before accepting them, writes `leani.toml`, and never
-overwrites an existing file. A global `--config PATH` selects another output
+`init` requires a strict majority of the configured checkpoint providers, at
+least two of the three defaults, to agree on one finalized slot and root, and
+fails closed if a responding provider reports another root at that slot. It
+shows every provider's answer, asks before accepting the checkpoint, writes
+`leani.toml`, and never overwrites an existing file. A global `--config PATH` selects another output
 path. The generated document contains only the choices an operator normally
 needs:
 
@@ -45,7 +47,10 @@ data_dir = "./data"
 [finality]
 checkpoint = "0x..."
 checkpoint_slot = 15100000
-endpoints = ["https://ethereum-beacon-api.publicnode.com/"]
+endpoints = [
+    "https://ethereum-beacon-api.publicnode.com/",
+    "https://lodestar-mainnet.chainsafe.io/",
+]
 
 [blocks]
 
@@ -58,12 +63,16 @@ quorum result. The checkpoint is the trust root. PublicNode
 (`https://ethereum-beacon-api.publicnode.com/`) and Lodestar
 (`https://lodestar-mainnet.chainsafe.io/`) are ordinary, untrusted Beacon API
 transports in the compact profile's managed transport pool; they do not provide
-execution blocks or Uniswap data. Leani queries the pool concurrently, verifies
-every response locally from the pinned checkpoint, and accepts the first set
-that satisfies `minimum_agreement`. With the compact profile's default
-agreement of one, the first valid response wins, so a stalled transport does
-not hold up node startup. Listing endpoints in the compact document replaces
-the managed defaults, which lets operators use only self-hosted transports.
+execution blocks or Uniswap data. `init` writes that pool plus every responding
+checkpoint provider that also serves the Beacon light-client API, without
+duplicates. Leani queries the pool concurrently and verifies every response
+locally from the pinned checkpoint. After the first verified response it waits
+about two seconds for the others, then follows the highest finalized slot that
+`minimum_agreement` endpoints have reached or passed. With the compact
+profile's default agreement of one, the most recent verified finality wins,
+and a stalled transport does not hold up node startup. Listing endpoints in
+the compact document replaces the managed defaults, which lets operators use
+only self-hosted transports.
 Compact Ethereum Mainnet configurations expand to:
 
 | Concern | Default |
@@ -215,10 +224,15 @@ pool of execution nodes prepared to accept indexing traffic; compact and
 advanced configurations leave it unset by default.
 
 Finality checkpoints are bootstrap trust anchors, not evergreen config
-defaults. `consensus_p2p` requires a recent 32-byte checkpoint root and its
-non-zero finalized beacon slot. `beacon_api` requires one or more endpoints
-and `minimum_agreement` within their count. Disabling finality is suitable for
-bounded finalized-dataset backfills, not verified head following.
+defaults. The first start needs a checkpoint at most 14 days old; later starts
+bootstrap from the newest verified anchor the node persisted (see the
+runbook's [checkpoint lifecycle](runbook.md#checkpoint-lifecycle)).
+Enabled finality requires a recent 32-byte checkpoint root other than all
+zeros. `consensus_p2p` also requires its non-zero finalized beacon slot and a
+`finality.minimum_peers` of at most 24, the consensus peers dialed at once.
+`beacon_api` requires one or more endpoints, each transport listed once, and
+`minimum_agreement` within their count. Disabling finality is suitable for bounded finalized-dataset
+backfills, not verified head following.
 
 ## Processor identity and publication
 

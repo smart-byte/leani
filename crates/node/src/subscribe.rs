@@ -50,6 +50,8 @@ use crate::{
 const BLOCK_PROCESSOR_INSTANCE: &str = "cli-ethereum-blocks";
 const UNISWAP_PROCESSOR_INSTANCE: &str = "cli-uniswap-v3-prices";
 const CHECKPOINT_CACHE_MAX_AGE: Duration = Duration::from_hours(12);
+/// Largest checkpoint provider response body read.
+const MAX_CHECKPOINT_RESPONSE_BYTES: usize = 1_024 * 1_024;
 const LOCALLY_VERIFIED_CHECKPOINT_MAX_AGE: Duration = Duration::from_hours(13 * 24);
 const MAINNET_SLOT_SECONDS: u64 = 12;
 const INCLUDED_UPDATE_MAX_AGE: Duration = Duration::from_secs(90);
@@ -173,6 +175,8 @@ pub(crate) struct InitializedCheckpoint {
 #[derive(Clone, Debug)]
 struct ProviderCheckpoint {
     provider: Url,
+    /// The provider as the prompt and errors show it, without secrets.
+    label: String,
     root: String,
     slot: u64,
     beacon_api: bool,
@@ -185,6 +189,8 @@ struct CheckpointQuorum {
     agreeing_providers: Vec<Url>,
     beacon_api_endpoints: Vec<Url>,
     attempted: usize,
+    /// Every provider's answer or failure, without URL secrets.
+    observations: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -611,7 +617,8 @@ async fn subscribe_embedded(
     fs::create_dir_all(&data_dir)
         .with_context(|| format!("create subscription data directory {}", data_dir.display()))?;
     let data_dir_lock = local_state::lock_runtime_directory(&data_dir)?;
-    let config = embedded_config(options, markets, config_path, &data_dir).await?;
+    let (config, checkpoint_origin) =
+        embedded_config(options, markets, config_path, &data_dir).await?;
     if let Some(peer_store) = merge_local_execution_peer_stores(
         config_path,
         &data_dir,
@@ -649,8 +656,13 @@ async fn subscribe_embedded(
         .change_bounds(processor.descriptor())
         .await?
         .map_or(0, |bounds| bounds.latest);
-    let mut runtime =
-        spawn_embedded_network_runtime(config.clone(), store.clone(), processors, data_dir_lock)?;
+    let mut runtime = spawn_embedded_network_runtime(
+        config.clone(),
+        store.clone(),
+        processors,
+        data_dir_lock,
+        checkpoint_origin,
+    )?;
     let preview_requirement = processor
         .descriptor()
         .requirements
@@ -1054,7 +1066,8 @@ async fn embedded_config(
     markets: &[Market],
     config_path: Option<&Path>,
     data_dir: &Path,
-) -> Result<Config> {
+) -> Result<(Config, leani_finality_beacon_api::CheckpointOrigin)> {
+    let mut origin = leani_finality_beacon_api::CheckpointOrigin::Operator;
     let mut config = if let Some(path) = config_path {
         Config::load(path)?
     } else {
@@ -1097,13 +1110,20 @@ async fn embedded_config(
             true,
         )
         .await?;
+        // A cached anchor this node verified is replaced by a later persisted
+        // one; an accepted provider quorum is an operator trust root.
+        if checkpoint.trust == CheckpointTrust::LocallyVerified {
+            origin = leani_finality_beacon_api::CheckpointOrigin::LocallyVerified;
+        }
         config.finality.checkpoint = checkpoint.root;
         config.finality.checkpoint_slot = checkpoint.slot;
-        config.finality.endpoints = checkpoint
-            .beacon_api_endpoints
-            .iter()
-            .map(|endpoint| Url::parse(endpoint).context("parse cached Beacon API endpoint"))
-            .collect::<Result<Vec<_>>>()?;
+        config.finality.endpoints = crate::init::starter_finality_endpoints(
+            checkpoint
+                .beacon_api_endpoints
+                .iter()
+                .map(|endpoint| Url::parse(endpoint).context("parse cached Beacon API endpoint"))
+                .collect::<Result<Vec<_>>>()?,
+        )?;
     }
     match finality_kind {
         FinalitySourceKind::BeaconApi => {
@@ -1123,7 +1143,7 @@ async fn embedded_config(
         markets,
         options.finality,
     )?];
-    Ok(config.validate()?.into_inner())
+    Ok((config.validate()?.into_inner(), origin))
 }
 
 fn subscription_processor(
@@ -1428,38 +1448,82 @@ async fn fetch_checkpoint_quorum(options: &SubscribeOptions) -> Result<Checkpoin
             options.checkpoint_urls.len()
         );
     }
-    let mut unique = HashSet::new();
-    for provider in &options.checkpoint_urls {
-        if !unique.insert(provider.as_str()) {
-            bail!("checkpoint provider {provider} is configured more than once");
-        }
-    }
+    validate_checkpoint_providers(&options.checkpoint_urls)?;
     let attempted = options.checkpoint_urls.len();
+    let client = checkpoint_client_builder()
+        .build()
+        .context("build the checkpoint provider client")?;
+    let labels =
+        leani_finality_beacon_api::endpoint_labels(&options.checkpoint_urls, "--checkpoint-url");
     let responses = futures::future::join_all(
         options
             .checkpoint_urls
             .iter()
             .cloned()
-            .map(fetch_checkpoint),
+            .zip(labels.iter().cloned())
+            .map(|(provider, label)| fetch_checkpoint(&client, provider, label)),
     )
     .await;
     let mut successful = Vec::new();
     let mut failures = Vec::new();
-    for response in responses {
+    for (label, response) in labels.iter().zip(responses) {
         match response {
             Ok(response) => successful.push(response),
-            Err(error) => failures.push(format!("{error:#}")),
+            Err(error) => failures.push(format!("{label}: {error:#}")),
         }
     }
     select_checkpoint_quorum(&successful, failures, attempted, options.checkpoint_quorum)
 }
 
+/// The HTTP client for untrusted checkpoint providers: a bounded timeout,
+/// and no redirect is ever followed to another origin.
+fn checkpoint_client_builder() -> reqwest::ClientBuilder {
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_secs(15))
+}
+
+/// Reject provider sets that cannot form an independent, authenticated
+/// quorum: plain HTTP outside loopback, or one provider listed twice.
+fn validate_checkpoint_providers(providers: &[Url]) -> Result<()> {
+    let mut unique = HashSet::new();
+    for provider in providers {
+        let loopback = match provider.host() {
+            Some(url::Host::Domain(host)) => host.eq_ignore_ascii_case("localhost"),
+            Some(url::Host::Ipv4(address)) => address.is_loopback(),
+            Some(url::Host::Ipv6(address)) => address.is_loopback(),
+            None => false,
+        };
+        if provider.scheme() != "https" && !(provider.scheme() == "http" && loopback) {
+            bail!(
+                "checkpoint provider {} must use https; plain http is accepted only on loopback",
+                leani_finality_beacon_api::redacted_url(provider)
+            );
+        }
+        // Scheme, host, port, and path identify a provider, as they identify
+        // a Beacon endpoint. A credential, query, or trailing slash does not
+        // make it independent.
+        let identity = crate::config::finality_endpoint_identity(provider);
+        if !unique.insert(identity) {
+            bail!(
+                "checkpoint provider {} is configured more than once",
+                leani_finality_beacon_api::redacted_url(provider)
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Select the checkpoint that a strict majority of the attempted providers
+/// report. Competing quorums, or any provider reporting another root at the
+/// selected slot, fail closed.
 fn select_checkpoint_quorum(
     successful: &[ProviderCheckpoint],
     failures: Vec<String>,
     attempted: usize,
     minimum_agreement: usize,
 ) -> Result<CheckpointQuorum> {
+    let required = minimum_agreement.max(attempted / 2 + 1);
     let beacon_api_endpoints = successful
         .iter()
         .filter(|response| response.beacon_api)
@@ -1472,21 +1536,40 @@ fn select_checkpoint_quorum(
             .or_default()
             .push(response.provider.clone());
     }
-    let selected = grouped
+    let observations = successful
         .iter()
-        .filter(|(_, providers)| providers.len() >= minimum_agreement)
-        .max_by_key(|((slot, _), providers)| (*slot, providers.len()));
-    let Some(((slot, root), providers)) = selected else {
-        let observations = grouped
-            .iter()
-            .map(|((slot, root), providers)| {
-                format!("slot {slot} root {root} from {}", providers.len())
-            })
-            .chain(failures)
-            .collect::<Vec<_>>()
-            .join("; ");
-        bail!("checkpoint quorum {minimum_agreement}/{attempted} was not reached: {observations}");
+        .map(|response| {
+            format!(
+                "{}: slot {} root {}",
+                response.label, response.slot, response.root
+            )
+        })
+        .chain(failures)
+        .collect::<Vec<_>>();
+    let mut reached = grouped
+        .iter()
+        .filter(|(_, providers)| providers.len() >= required);
+    let Some(((slot, root), providers)) = reached.next() else {
+        bail!(
+            "checkpoint quorum {required}/{attempted} was not reached: {}",
+            observations.join("; ")
+        );
     };
+    if reached.next().is_some() {
+        bail!(
+            "checkpoint providers reached conflicting quorums: {}",
+            observations.join("; ")
+        );
+    }
+    if successful
+        .iter()
+        .any(|response| response.slot == *slot && response.root != *root)
+    {
+        bail!(
+            "checkpoint providers disagree about the root at slot {slot}: {}",
+            observations.join("; ")
+        );
+    }
     let mut agreeing_providers = providers.clone();
     agreeing_providers.sort_by(|left, right| left.as_str().cmp(right.as_str()));
     Ok(CheckpointQuorum {
@@ -1495,22 +1578,32 @@ fn select_checkpoint_quorum(
         agreeing_providers,
         beacon_api_endpoints,
         attempted,
+        observations,
     })
 }
 
-async fn fetch_checkpoint(provider: Url) -> Result<ProviderCheckpoint> {
-    let client = reqwest::Client::new();
+async fn fetch_checkpoint(
+    client: &reqwest::Client,
+    provider: Url,
+    label: String,
+) -> Result<ProviderCheckpoint> {
     let beacon_endpoint = provider_url(&provider, "eth/v1/beacon/headers/finalized")?;
     let beacon_response = client
-        .get(beacon_endpoint)
-        .timeout(Duration::from_secs(15))
+        .get(beacon_endpoint.clone())
         .send()
-        .await?;
+        .await
+        .map_err(reqwest::Error::without_url)?;
     if beacon_response.status().is_success() {
-        let response = beacon_response.json::<BeaconHeaderResponse>().await?;
+        let response: BeaconHeaderResponse = read_provider_json(
+            beacon_response,
+            &provider,
+            "eth/v1/beacon/headers/finalized",
+        )
+        .await?;
         let root = normalized_checkpoint_root(&response.data.root)?;
         return Ok(ProviderCheckpoint {
             provider,
+            label,
             root,
             slot: response
                 .data
@@ -1525,13 +1618,12 @@ async fn fetch_checkpoint(provider: Url) -> Result<ProviderCheckpoint> {
 
     let checkpointz_endpoint = provider_url(&provider, "checkpointz/v1/beacon/slots")?;
     let response = client
-        .get(checkpointz_endpoint)
-        .timeout(Duration::from_secs(15))
+        .get(checkpointz_endpoint.clone())
         .send()
-        .await?
-        .error_for_status()?
-        .json::<CheckpointzResponse>()
-        .await?;
+        .await
+        .map_err(reqwest::Error::without_url)?;
+    let response: CheckpointzResponse =
+        read_provider_json(response, &provider, "checkpointz/v1/beacon/slots").await?;
     let slot = response
         .data
         .slots
@@ -1542,6 +1634,7 @@ async fn fetch_checkpoint(provider: Url) -> Result<ProviderCheckpoint> {
         normalized_checkpoint_root(&slot.block_root.expect("usable checkpoint has a block root"))?;
     Ok(ProviderCheckpoint {
         provider,
+        label,
         root,
         slot: slot
             .slot
@@ -1549,6 +1642,22 @@ async fn fetch_checkpoint(provider: Url) -> Result<ProviderCheckpoint> {
             .context("checkpoint response contains an invalid slot")?,
         beacon_api: false,
     })
+}
+
+/// Decode a provider response read with a size cap, refusing redirects.
+async fn read_provider_json<T: serde::de::DeserializeOwned>(
+    response: reqwest::Response,
+    provider: &Url,
+    path: &str,
+) -> Result<T> {
+    let label = leani_finality_beacon_api::request_label(
+        &leani_finality_beacon_api::normalized_endpoint(provider),
+        path,
+    );
+    let body =
+        leani_finality_beacon_api::read_response(response, &label, MAX_CHECKPOINT_RESPONSE_BYTES)
+            .await?;
+    serde_json::from_slice(&body).context("decode the checkpoint provider response")
 }
 
 fn normalized_checkpoint_root(root: &str) -> Result<String> {
@@ -1565,18 +1674,30 @@ fn provider_url(provider: &Url, suffix: &str) -> Result<Url> {
     provider.join(suffix).context("construct checkpoint URL")
 }
 
-fn confirm_checkpoint(options: &SubscribeOptions, checkpoint: &CheckpointQuorum) -> Result<()> {
-    eprintln!("leani: weak-subjectivity checkpoint bootstrap");
-    eprintln!(
+/// The checkpoint summary shown before an operator accepts a new trust root:
+/// every provider's answer or failure, not only the agreeing ones.
+fn checkpoint_summary(checkpoint: &CheckpointQuorum) -> Vec<String> {
+    let mut lines = vec![format!(
         "  quorum:   {}/{} providers",
         checkpoint.agreeing_providers.len(),
         checkpoint.attempted
+    )];
+    lines.extend(
+        checkpoint
+            .observations
+            .iter()
+            .map(|observation| format!("  provider: {observation}")),
     );
-    for provider in &checkpoint.agreeing_providers {
-        eprintln!("  provider: {provider}");
+    lines.push(format!("  root:     {}", checkpoint.root));
+    lines.push(format!("  slot:     {}", checkpoint.slot));
+    lines
+}
+
+fn confirm_checkpoint(options: &SubscribeOptions, checkpoint: &CheckpointQuorum) -> Result<()> {
+    eprintln!("leani: weak-subjectivity checkpoint bootstrap");
+    for line in checkpoint_summary(checkpoint) {
+        eprintln!("{line}");
     }
-    eprintln!("  root:     {}", checkpoint.root);
-    eprintln!("  slot:     {}", checkpoint.slot);
     eprintln!("Subsequent light-client updates are verified from this agreed root.");
     if options.accept_checkpoint {
         return Ok(());
@@ -3167,8 +3288,10 @@ mod tests {
     use leani_store_sqlite::{DeliveryOrigin, DeliveryOriginKind};
 
     fn checkpoint_provider(provider: &str, root_byte: u8, slot: u64) -> ProviderCheckpoint {
+        let url = Url::parse(provider).expect("provider URL");
         ProviderCheckpoint {
-            provider: Url::parse(provider).expect("provider URL"),
+            label: leani_finality_beacon_api::redacted_url(&url),
+            provider: url,
             root: format!("0x{}", hex::encode([root_byte; 32])),
             slot,
             beacon_api: provider.contains("publicnode"),
@@ -3903,7 +4026,7 @@ mod tests {
             &[
                 checkpoint_provider("https://ethereum-beacon-api.publicnode.com/", 0xaa, 100),
                 checkpoint_provider("https://mainnet.checkpoint.sigp.io/", 0xaa, 100),
-                checkpoint_provider("https://beaconstate-mainnet.chainsafe.io/", 0xbb, 100),
+                checkpoint_provider("https://beaconstate-mainnet.chainsafe.io/", 0xbb, 132),
             ],
             Vec::new(),
             3,
@@ -3926,6 +4049,282 @@ mod tests {
         )
         .expect_err("no quorum");
         assert!(error.to_string().contains("quorum 2/3 was not reached"));
+    }
+
+    #[test]
+    fn checkpoint_quorum_requires_a_strict_majority_of_attempted_providers() {
+        let error = select_checkpoint_quorum(
+            &[
+                checkpoint_provider("https://a.example/", 0xaa, 100),
+                checkpoint_provider("https://b.example/", 0xaa, 100),
+            ],
+            vec![
+                "https://c.example/: unavailable".to_owned(),
+                "https://d.example/: unavailable".to_owned(),
+            ],
+            4,
+            2,
+        )
+        .expect_err("two of four providers are not a majority");
+        assert!(error.to_string().contains("3/4"), "{error:#}");
+
+        let quorum = select_checkpoint_quorum(
+            &[
+                checkpoint_provider("https://a.example/", 0xaa, 100),
+                checkpoint_provider("https://b.example/", 0xaa, 100),
+                checkpoint_provider("https://c.example/", 0xaa, 100),
+            ],
+            vec!["https://d.example/: unavailable".to_owned()],
+            4,
+            2,
+        )
+        .expect("three of four providers are a majority");
+        assert_eq!(quorum.agreeing_providers.len(), 3);
+    }
+
+    #[test]
+    fn checkpoint_quorum_fails_closed_on_dissent_or_competing_quorums() {
+        let error = select_checkpoint_quorum(
+            &[
+                checkpoint_provider("https://a.example/", 0xaa, 100),
+                checkpoint_provider("https://b.example/", 0xaa, 100),
+                checkpoint_provider("https://c.example/", 0xbb, 100),
+            ],
+            Vec::new(),
+            3,
+            2,
+        )
+        .expect_err("a provider reports another root at the agreed slot");
+        assert!(error.to_string().contains("slot 100"), "{error:#}");
+
+        // A provider at a different slot is not dissent.
+        let quorum = select_checkpoint_quorum(
+            &[
+                checkpoint_provider("https://a.example/", 0xaa, 100),
+                checkpoint_provider("https://b.example/", 0xaa, 100),
+                checkpoint_provider("https://c.example/", 0xbb, 132),
+            ],
+            Vec::new(),
+            3,
+            2,
+        )
+        .expect("majority at slot 100");
+        assert_eq!(quorum.slot, 100);
+
+        let error = select_checkpoint_quorum(
+            &[
+                checkpoint_provider("https://a.example/", 0xaa, 100),
+                checkpoint_provider("https://b.example/", 0xaa, 100),
+                checkpoint_provider("https://c.example/", 0xbb, 132),
+                checkpoint_provider("https://d.example/", 0xbb, 132),
+            ],
+            Vec::new(),
+            2,
+            2,
+        )
+        .expect_err("two groups reach the quorum");
+        assert!(error.to_string().contains("conflicting"), "{error:#}");
+    }
+
+    #[test]
+    fn checkpoint_providers_must_be_https_and_unique_after_normalization() {
+        let url = |value: &str| Url::parse(value).expect("provider URL");
+        assert!(validate_checkpoint_providers(&[url("http://checkpoint.example/")]).is_err());
+        validate_checkpoint_providers(&[
+            url("http://127.0.0.1:5052/"),
+            url("http://localhost:5052/"),
+            url("http://[::1]:5052/"),
+            url("https://checkpoint.example/"),
+        ])
+        .expect("plain HTTP is allowed for loopback providers");
+        assert!(
+            validate_checkpoint_providers(&[
+                url("https://a.example/beacon"),
+                url("HTTPS://A.EXAMPLE:443/beacon/?source=alias"),
+            ])
+            .is_err()
+        );
+        // A different port is a different provider, as for Beacon endpoints.
+        validate_checkpoint_providers(&[url("https://a.example:8443/"), url("https://a.example/")])
+            .expect("another port is another provider");
+        assert!(
+            validate_checkpoint_providers(&[
+                url("https://a.example:443/"),
+                url("https://a.example/"),
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn checkpoint_prompt_hides_provider_path_tokens() {
+        let providers = [
+            Url::parse("https://example.quiknode.pro/hunter5/").expect("URL"),
+            Url::parse("https://example.quiknode.pro/hunter6/").expect("URL"),
+            Url::parse("https://c.example/").expect("URL"),
+        ];
+        let labels = leani_finality_beacon_api::endpoint_labels(&providers, "--checkpoint-url");
+        let responses = providers
+            .iter()
+            .zip(&labels)
+            .map(|(provider, label)| ProviderCheckpoint {
+                provider: provider.clone(),
+                label: label.clone(),
+                root: format!("0x{}", hex::encode([0xaa; 32])),
+                slot: 100,
+                beacon_api: true,
+            })
+            .collect::<Vec<_>>();
+        let quorum = select_checkpoint_quorum(&responses, Vec::new(), 3, 2).expect("quorum");
+        let summary = checkpoint_summary(&quorum).join("\n");
+        assert!(!summary.contains("hunter"), "{summary}");
+        assert!(summary.contains("--checkpoint-url[1]"), "{summary}");
+    }
+
+    /// Serve up to `connections` HTTP/1.1 exchanges on 127.0.0.1 with a
+    /// canned `response`. The handle yields how many clients connected.
+    async fn loopback_server(
+        response: String,
+        connections: usize,
+    ) -> (Url, tokio::task::JoinHandle<usize>) {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("loopback listener");
+        let address = listener.local_addr().expect("listener address");
+        let served = tokio::spawn(async move {
+            let mut served = 0;
+            while served < connections {
+                let Ok(Ok((mut stream, _))) =
+                    tokio::time::timeout(Duration::from_secs(1), listener.accept()).await
+                else {
+                    break;
+                };
+                served += 1;
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 1_024];
+                while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    match stream.read(&mut buffer).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(read) => request.extend_from_slice(&buffer[..read]),
+                    }
+                }
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.shutdown().await;
+            }
+            served
+        });
+        (
+            Url::parse(&format!("http://{address}/")).expect("loopback URL"),
+            served,
+        )
+    }
+
+    #[tokio::test]
+    async fn the_checkpoint_client_never_follows_redirects() {
+        let (target, contacted) = loopback_server(
+            "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}".to_owned(),
+            2,
+        )
+        .await;
+        let (origin, _served) = loopback_server(
+            format!(
+                "HTTP/1.1 302 Found\r\nLocation: {target}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            ),
+            2,
+        )
+        .await;
+        let client = checkpoint_client_builder()
+            .no_proxy()
+            .build()
+            .expect("client");
+        let error = fetch_checkpoint(&client, origin, "loopback".to_owned())
+            .await
+            .expect_err("redirected provider");
+        assert!(format!("{error:#}").contains("redirect"), "{error:#}");
+        assert_eq!(
+            contacted.await.expect("redirect target"),
+            0,
+            "the redirect target was contacted"
+        );
+    }
+
+    #[tokio::test]
+    async fn embedded_subscriptions_use_the_default_pool_and_responding_providers() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let now = unix_seconds();
+        let slot =
+            (now - leani_finality_beacon_api::MAINNET_GENESIS_TIME) / MAINNET_SLOT_SECONDS - 100;
+        write_checkpoint_cache(
+            &directory.path().join("checkpoint.json"),
+            &CachedCheckpoint {
+                schema: "leani.verified-checkpoint.v1".to_owned(),
+                root: format!("0x{}", hex::encode([0xaa; 32])),
+                slot,
+                execution_block_hash: Some(format!("0x{}", hex::encode([0xbb; 32]))),
+                trust: CheckpointTrust::LocallyVerified,
+                accepted_providers: Vec::new(),
+                beacon_api_endpoints: vec!["https://beacon.example/".to_owned()],
+                updated_at_unix_seconds: now,
+            },
+        )
+        .expect("cached checkpoint");
+        let markets = resolve_markets(&["ETH/USDC".to_owned()]).expect("market");
+        let (config, origin) = embedded_config(
+            &subscribe_options(Vec::new()),
+            &markets,
+            None,
+            directory.path(),
+        )
+        .await
+        .expect("embedded configuration");
+        assert_eq!(
+            config
+                .finality
+                .endpoints
+                .iter()
+                .map(Url::as_str)
+                .collect::<Vec<_>>(),
+            [
+                "https://ethereum-beacon-api.publicnode.com/",
+                "https://lodestar-mainnet.chainsafe.io/",
+                "https://beacon.example/",
+            ]
+        );
+        assert_eq!(
+            origin,
+            leani_finality_beacon_api::CheckpointOrigin::LocallyVerified
+        );
+    }
+
+    #[test]
+    fn checkpoint_prompt_lists_every_provider_answer_and_failure() {
+        let quorum = select_checkpoint_quorum(
+            &[
+                checkpoint_provider("https://a.example/", 0xaa, 100),
+                checkpoint_provider("https://b.example/", 0xaa, 100),
+                checkpoint_provider("https://c.example/", 0xaa, 100),
+                checkpoint_provider("https://d.example/", 0xbb, 132),
+            ],
+            vec!["https://e.example: timed out".to_owned()],
+            5,
+            2,
+        )
+        .expect("quorum");
+        let summary = checkpoint_summary(&quorum).join("\n");
+        for expected in [
+            "a.example",
+            "b.example",
+            "c.example",
+            "https://d.example: slot 132",
+            "https://e.example: timed out",
+        ] {
+            assert!(
+                summary.contains(expected),
+                "{expected} missing from:\n{summary}"
+            );
+        }
     }
 
     #[test]

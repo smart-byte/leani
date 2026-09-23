@@ -126,6 +126,11 @@ struct ReadinessInner {
     finality_required: bool,
     live_ready: AtomicBool,
     finality_ready: AtomicBool,
+    /// Unix seconds of the newest verified finality anchor; zero when none.
+    finality_anchor_unix_seconds: AtomicU64,
+    finality_anchor_expires_unix_seconds: AtomicU64,
+    /// Failed writes of the persisted finality anchor.
+    finality_anchor_write_failures: Arc<AtomicU64>,
 }
 
 impl ReadinessHandle {
@@ -137,6 +142,9 @@ impl ReadinessHandle {
                 finality_required,
                 live_ready: AtomicBool::new(false),
                 finality_ready: AtomicBool::new(false),
+                finality_anchor_unix_seconds: AtomicU64::new(0),
+                finality_anchor_expires_unix_seconds: AtomicU64::new(0),
+                finality_anchor_write_failures: Arc::default(),
             }),
         }
     }
@@ -147,6 +155,40 @@ impl ReadinessHandle {
 
     pub fn set_finality_ready(&self, ready: bool) {
         self.inner.finality_ready.store(ready, Ordering::Release);
+    }
+
+    /// Record a verified finality anchor's slot time and the time a restart
+    /// can no longer bootstrap from it, both in Unix seconds. An older anchor
+    /// than the one already recorded is ignored.
+    pub fn set_finality_anchor(&self, anchor_unix_seconds: u64, expires_unix_seconds: u64) {
+        self.inner
+            .finality_anchor_expires_unix_seconds
+            .fetch_max(expires_unix_seconds, Ordering::AcqRel);
+        self.inner
+            .finality_anchor_unix_seconds
+            .fetch_max(anchor_unix_seconds, Ordering::AcqRel);
+    }
+
+    /// The counter a finality source increments when persisting its anchor
+    /// fails.
+    #[must_use]
+    pub fn finality_anchor_write_failures(&self) -> Arc<AtomicU64> {
+        self.inner.finality_anchor_write_failures.clone()
+    }
+
+    fn finality_anchor(&self) -> Option<(u64, u64)> {
+        let anchor = self
+            .inner
+            .finality_anchor_unix_seconds
+            .load(Ordering::Acquire);
+        (anchor != 0).then(|| {
+            (
+                anchor,
+                self.inner
+                    .finality_anchor_expires_unix_seconds
+                    .load(Ordering::Acquire),
+            )
+        })
     }
 
     /// Whether every required live/finality lane is currently ready.
@@ -2530,6 +2572,49 @@ async fn metrics(State(state): State<ApiState>) -> Result<Response, ApiError> {
         writeln!(output, "# TYPE leani_{name} gauge")?;
         writeln!(output, "leani_{name} {}", u8::from(value))?;
     }
+    if let Some((anchor, expires)) = state.config.readiness.finality_anchor() {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        writeln!(
+            output,
+            "# HELP leani_finality_anchor_age_seconds Age of the newest verified finality anchor."
+        )?;
+        writeln!(output, "# TYPE leani_finality_anchor_age_seconds gauge")?;
+        writeln!(
+            output,
+            "leani_finality_anchor_age_seconds {}",
+            now.saturating_sub(anchor)
+        )?;
+        writeln!(
+            output,
+            "# HELP leani_finality_anchor_expiry_seconds Seconds until a restart can no longer bootstrap from that anchor; negative once it has expired."
+        )?;
+        writeln!(output, "# TYPE leani_finality_anchor_expiry_seconds gauge")?;
+        writeln!(
+            output,
+            "leani_finality_anchor_expiry_seconds {}",
+            i128::from(expires) - i128::from(now)
+        )?;
+    }
+    writeln!(
+        output,
+        "# HELP leani_finality_anchor_write_failures_total Failed writes of the persisted finality anchor."
+    )?;
+    writeln!(
+        output,
+        "# TYPE leani_finality_anchor_write_failures_total counter"
+    )?;
+    writeln!(
+        output,
+        "leani_finality_anchor_write_failures_total {}",
+        state
+            .config
+            .readiness
+            .finality_anchor_write_failures()
+            .load(Ordering::Relaxed)
+    )?;
     writeln!(output, "# TYPE leani_uptime_seconds counter")?;
     writeln!(
         output,
@@ -10125,6 +10210,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn readiness_is_component_specific_and_metrics_are_exposed() {
         let directory = tempfile::tempdir().expect("tempdir");
         let store = SqliteStore::open(leani_store_sqlite::StoreConfig::new(
@@ -10169,6 +10255,14 @@ mod tests {
         assert!(!readiness.finality_ready());
         readiness.set_live_ready(true);
         readiness.set_finality_ready(true);
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_secs();
+        readiness.set_finality_anchor(now - 3_600, now + 3 * 86_400);
+        readiness
+            .finality_anchor_write_failures()
+            .fetch_add(2, Ordering::Relaxed);
         assert!(readiness.is_ready());
         assert!(readiness.live_ready());
         assert!(readiness.finality_ready());
@@ -10203,6 +10297,18 @@ mod tests {
         assert!(body.contains("leani_live_ready 1"));
         assert!(body.contains("leani_finality_required 1"));
         assert!(body.contains("leani_finality_ready 1"));
+        let gauge = |name: &str| {
+            body.lines()
+                .find_map(|line| line.strip_prefix(&format!("{name} ")))
+                .and_then(|value| value.parse::<i64>().ok())
+                .unwrap_or_else(|| panic!("{name} missing from metrics"))
+        };
+        assert!((3_600..3_700).contains(&gauge("leani_finality_anchor_age_seconds")));
+        assert!(
+            (3 * 86_400 - 100..=3 * 86_400)
+                .contains(&gauge("leani_finality_anchor_expiry_seconds"))
+        );
+        assert_eq!(gauge("leani_finality_anchor_write_failures_total"), 2);
         assert!(body.contains("leani_processor_delivery_live_bytes"));
         assert!(body.contains("leani_processor_delivery_pruned_through_sequence"));
         assert!(body.contains("leani_processor_required_ack_watermark"));

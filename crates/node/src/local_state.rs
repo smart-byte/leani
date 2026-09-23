@@ -29,6 +29,7 @@ const RUNTIME_STATE_ENTRIES: &[&str] = &[
     "execution-network.sqlite-wal",
     "execution-p2p-secret",
     "checkpoint.json",
+    leani_finality_beacon_api::FINALITY_ANCHOR_FILE,
     "subscriptions",
 ];
 

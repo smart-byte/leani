@@ -77,7 +77,10 @@ data_dir = "./data"
 [finality]
 checkpoint = "0x..."
 checkpoint_slot = 15100000
-endpoints = ["https://ethereum-beacon-api.publicnode.com/"]
+endpoints = [
+    "https://ethereum-beacon-api.publicnode.com/",
+    "https://lodestar-mainnet.chainsafe.io/",
+]
 
 [blocks]
 

@@ -8,8 +8,11 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+    fmt,
+    hash::{BuildHasher as _, RandomState},
     io::{Read, Write},
     net::{IpAddr, Ipv4Addr},
+    sync::{Arc, Mutex, PoisonError},
     time::Duration,
 };
 
@@ -24,8 +27,10 @@ use helios_consensus_core::{
     types::{Bootstrap, FinalityUpdate, Update},
 };
 use leani_finality_beacon_api::{
-    BeaconApiError, DEFAULT_MAX_CHECKPOINT_AGE, HELIOS_REVISION, MainnetLightClientVerifier,
-    VerifiedFinalityAnchor, mainnet_fork_digest,
+    AnchorFile, AnchorWriter, BeaconApiError, CheckpointOrigin, Clock, DEFAULT_MAX_CHECKPOINT_AGE,
+    HELIOS_REVISION, MainnetLightClientVerifier, StartAnchor, TrustedCheckpoint,
+    VerifiedFinalityAnchor, current_slot, mainnet_fork_digest, resolve_start_anchor,
+    verification_slot,
 };
 use leani_primitives::{Capability, CapabilitySet, ChainId, SourceId, SourceKind, TrustModel};
 use leani_source_api::{
@@ -45,7 +50,7 @@ use ssz::Decode;
 use thiserror::Error;
 use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
-use tracing::debug;
+use tracing::{debug, info, warn};
 
 const BOOTSTRAP_PROTOCOL: &str = "/eth2/beacon_chain/req/light_client_bootstrap/1/ssz_snappy";
 const UPDATE_PROTOCOL: &str = "/eth2/beacon_chain/req/light_client_updates_by_range/1/ssz_snappy";
@@ -60,6 +65,10 @@ const STATUS_BYTES: usize = 84;
 const DISCOVERY_QUERIES: usize = 3;
 const PEER_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(4);
 const MAX_PEER_REDIALS: usize = 2;
+/// Default and largest consensus peer set dialed at once.
+pub const DEFAULT_MAXIMUM_PEERS: usize = 24;
+/// How often an exhausted peer set is reported at `warn` level.
+const EXHAUSTED_PEERS_WARNING_INTERVAL: Duration = Duration::from_mins(5);
 const EMBEDDED_MAINNET_BOOTNODES: &str = include_str!("../assets/mainnet-bootnodes.txt");
 
 /// Native consensus-network settings.
@@ -75,6 +84,9 @@ pub struct ConsensusP2pConfig {
     pub request_timeout: Duration,
     pub poll_interval: Duration,
     pub max_checkpoint_age: Duration,
+    /// Whether the newest verified anchor is read from, and persisted to, a
+    /// file for restarts.
+    pub anchor: AnchorFile,
 }
 
 impl Default for ConsensusP2pConfig {
@@ -84,12 +96,13 @@ impl Default for ConsensusP2pConfig {
             discovery_ip: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
             discovery_port: 0,
             minimum_peers: 2,
-            maximum_peers: 24,
+            maximum_peers: DEFAULT_MAXIMUM_PEERS,
             discovery_timeout: Duration::from_secs(15),
             connection_timeout: Duration::from_secs(20),
             request_timeout: Duration::from_secs(15),
             poll_interval: Duration::from_secs(12),
             max_checkpoint_age: DEFAULT_MAX_CHECKPOINT_AGE,
+            anchor: AnchorFile::Disabled,
         }
     }
 }
@@ -149,6 +162,16 @@ pub struct ConsensusP2pProbeReport {
 pub struct VerifiedConsensusP2p {
     config: ConsensusP2pConfig,
     descriptor: SourceDescriptor,
+    connector: Arc<dyn PeerConnector>,
+    clock: Clock,
+    /// Peers that served invalid material: never asked or dialed again by
+    /// this source, across reconnects.
+    banned: Arc<Mutex<HashSet<PeerId>>>,
+    anchor_writer: AnchorWriter,
+    /// The checkpoint the last probe started for and the anchor it chose, so
+    /// a subscription from the handed-over anchor keeps the operator's trust
+    /// root.
+    trust: Arc<Mutex<Option<(TrustedCheckpoint, StartAnchor)>>>,
 }
 
 impl VerifiedConsensusP2p {
@@ -158,8 +181,28 @@ impl VerifiedConsensusP2p {
     ///
     /// Rejects invalid peer bounds, timeouts, or bootnode ENRs.
     pub fn mainnet(config: ConsensusP2pConfig) -> Result<Self, ConsensusP2pError> {
+        let clock = Clock::default();
+        Self::with_connector(
+            config,
+            Arc::new(Libp2pConnector {
+                clock: clock.clone(),
+            }),
+            clock,
+        )
+    }
+
+    fn with_connector(
+        config: ConsensusP2pConfig,
+        connector: Arc<dyn PeerConnector>,
+        clock: Clock,
+    ) -> Result<Self, ConsensusP2pError> {
         config.validate()?;
         Ok(Self {
+            connector,
+            clock,
+            banned: Arc::default(),
+            anchor_writer: AnchorWriter::new(config.anchor.clone()),
+            trust: Arc::default(),
             config,
             descriptor: SourceDescriptor {
                 id: SourceId::new("consensus-p2p-light-client")
@@ -181,32 +224,27 @@ impl VerifiedConsensusP2p {
 
     /// Discover peers, perform the required status handshake, and verify a
     /// complete checkpoint-to-finality sync.
-    pub async fn probe_checkpoint(
-        &self,
-        checkpoint_root: [u8; 32],
-        checkpoint_slot: u64,
-    ) -> ConsensusP2pProbeReport {
-        match P2pLightClient::connect_and_sync(
-            self.config.clone(),
-            checkpoint_root,
-            checkpoint_slot,
-            CancellationToken::new(),
-        )
-        .await
-        {
-            Ok(client) => ConsensusP2pProbeReport {
-                verifier: format!("helios-consensus-core@{HELIOS_REVISION}"),
-                checkpoint_root,
-                checkpoint_slot,
-                accepted: true,
-                selected: client.verifier.finalized_anchor().ok(),
-                checkpoint_anchor: Some(client.verifier.checkpoint_anchor()),
-                updates_verified: client.verifier.updates_verified(),
-                discovered_peers: client.network.discovered_peers,
-                connected_peers: client.network.connected_count(),
-                attempted_peers: client.network.attempted_peers,
-                errors: client.network.peer_errors.clone(),
-            },
+    pub async fn probe_checkpoint(&self, checkpoint: TrustedCheckpoint) -> ConsensusP2pProbeReport {
+        let checkpoint_root = checkpoint.root;
+        let checkpoint_slot = checkpoint.slot.unwrap_or_default();
+        match P2pLightClient::connect_and_sync(self, checkpoint, CancellationToken::new()).await {
+            Ok(client) => {
+                *self.trust.lock().unwrap_or_else(PoisonError::into_inner) =
+                    Some((checkpoint, client.start));
+                ConsensusP2pProbeReport {
+                    verifier: format!("helios-consensus-core@{HELIOS_REVISION}"),
+                    checkpoint_root,
+                    checkpoint_slot,
+                    accepted: true,
+                    selected: client.verifier.finalized_anchor().ok(),
+                    checkpoint_anchor: Some(client.verifier.checkpoint_anchor()),
+                    updates_verified: client.verifier.updates_verified(),
+                    discovered_peers: client.network.discovered_peers,
+                    connected_peers: client.network.connected_count(),
+                    attempted_peers: client.network.attempted_peers,
+                    errors: client.network.peer_errors.clone(),
+                }
+            }
             Err(failure) => ConsensusP2pProbeReport {
                 verifier: format!("helios-consensus-core@{HELIOS_REVISION}"),
                 checkpoint_root,
@@ -240,18 +278,34 @@ impl FinalitySource for VerifiedConsensusP2p {
                 "weak-subjectivity checkpoint root must not be zero".to_owned(),
             ));
         }
-        let client = P2pLightClient::connect_and_sync(
-            self.config.clone(),
-            checkpoint.beacon_block_root,
-            checkpoint.beacon_slot,
-            cancellation.clone(),
-        )
-        .await
-        .map_err(|failure| SourceError::Unavailable(failure.errors.join("; ")))?;
+        // The anchor a probe handed over belongs to the probe's trust root.
+        // Without a probe, the checkpoint is the operator's trust root.
+        let remembered = *self.trust.lock().unwrap_or_else(PoisonError::into_inner);
+        let trusted = remembered
+            .filter(|(configured, start)| {
+                start.root == checkpoint.beacon_block_root
+                    || configured.root == checkpoint.beacon_block_root
+            })
+            .map_or(
+                TrustedCheckpoint {
+                    root: checkpoint.beacon_block_root,
+                    slot: Some(checkpoint.beacon_slot),
+                    origin: CheckpointOrigin::Operator,
+                },
+                |(configured, _)| configured,
+            );
+        let client = P2pLightClient::connect_and_sync(self, trusted, cancellation.clone())
+            .await
+            .map_err(|failure| SourceError::Unavailable(failure.errors.join("; ")))?;
         let bootstrap = client.verifier.checkpoint_anchor();
-        if bootstrap.beacon_slot != checkpoint.beacon_slot
-            || bootstrap.beacon_block_root != checkpoint.beacon_block_root
-            || bootstrap.execution_block_hash != checkpoint.execution_block_hash
+        // The checkpoint must match its own verified bootstrap exactly. The
+        // start may instead be a persisted anchor the rules accepted, or the
+        // trust root a probe started from.
+        let expected = bootstrap.beacon_block_root == checkpoint.beacon_block_root;
+        if (expected
+            && (bootstrap.beacon_slot != checkpoint.beacon_slot
+                || bootstrap.execution_block_hash != checkpoint.execution_block_hash))
+            || (!expected && !client.start.persisted && client.start.root != trusted.root)
         {
             return Err(SourceError::Protocol(
                 "configured checkpoint differs from the P2P-verified bootstrap".to_owned(),
@@ -266,6 +320,7 @@ impl FinalitySource for VerifiedConsensusP2p {
             cancellation,
             pending: Some(pending),
             last_emitted: None,
+            last_exhausted_warning: None,
             terminal: false,
         };
         Ok(stream::unfold(state, next_finality).boxed())
@@ -278,6 +333,7 @@ struct SubscriptionState {
     cancellation: CancellationToken,
     pending: Option<VerifiedFinalityAnchor>,
     last_emitted: Option<VerifiedFinalityAnchor>,
+    last_exhausted_warning: Option<tokio::time::Instant>,
     terminal: bool,
 }
 
@@ -315,10 +371,21 @@ async fn next_finality(
         match state.client.refresh().await {
             Ok(anchor) => state.pending = Some(anchor),
             Err(error) if retryable_refresh_error(&error) => {
-                debug!(
-                    %error,
-                    "consensus finality refresh exhausted its current peer cohort; retrying"
-                );
+                let now = tokio::time::Instant::now();
+                if state.last_exhausted_warning.is_none_or(|warned| {
+                    now.duration_since(warned) >= EXHAUSTED_PEERS_WARNING_INTERVAL
+                }) {
+                    state.last_exhausted_warning = Some(now);
+                    warn!(
+                        %error,
+                        "consensus finality refresh exhausted its peer set; retrying"
+                    );
+                } else {
+                    debug!(
+                        %error,
+                        "consensus finality refresh exhausted its peer set; retrying"
+                    );
+                }
             }
             Err(error) => {
                 state.terminal = true;
@@ -337,158 +404,170 @@ fn retryable_refresh_error(error: &SourceError) -> bool {
 
 #[derive(Debug)]
 struct P2pLightClient {
-    config: ConsensusP2pConfig,
+    source: VerifiedConsensusP2p,
     cancellation: CancellationToken,
     network: P2pNetwork,
     verifier: MainnetLightClientVerifier,
-    next_period: u64,
+    start: StartAnchor,
 }
 
 impl P2pLightClient {
+    /// Bootstrap once, from the checkpoint or a newer persisted anchor, then
+    /// verify the latest finality update. When no peer serves a bootstrap for
+    /// the persisted anchor, the checkpoint itself is used.
     async fn connect_and_sync(
-        config: ConsensusP2pConfig,
-        checkpoint_root: [u8; 32],
-        checkpoint_slot: u64,
+        source: &VerifiedConsensusP2p,
+        checkpoint: TrustedCheckpoint,
         cancellation: CancellationToken,
     ) -> Result<Self, ProbeFailure> {
-        let mut network = P2pNetwork::connect(
-            &config,
-            checkpoint_root,
-            checkpoint_slot,
-            cancellation.child_token(),
-        )
-        .await?;
-        let bootstrap = match network.fetch_bootstrap(checkpoint_root).await {
-            Ok(bootstrap) => bootstrap,
-            Err(error) => {
-                network = reconnect_network(
-                    &config,
-                    checkpoint_root,
+        let mut start = resolve_start_anchor(
+            source.config.anchor.path(),
+            checkpoint,
+            source.config.max_checkpoint_age,
+            source.clock.now(),
+        );
+        if start.persisted {
+            info!(
+                beacon_slot = start.slot,
+                "bootstrapping consensus P2P finality from the persisted verified anchor"
+            );
+        }
+        let checkpoint_slot = checkpoint.slot.unwrap_or_default();
+        let start_slot = start.slot.unwrap_or(checkpoint_slot);
+        let mut network = connect_network(source, start.root, start_slot, &cancellation).await?;
+        let verifier = match bootstrap(source, &mut network, start.root, start_slot, &cancellation)
+            .await
+        {
+            Ok(verifier) => verifier,
+            Err(failure) if start.persisted => {
+                warn!(
+                    beacon_slot = start.slot,
+                    "no consensus peer served a bootstrap for the persisted finality anchor; bootstrapping from the configured checkpoint"
+                );
+                start = StartAnchor::configured(checkpoint);
+                bootstrap(
+                    source,
+                    &mut network,
+                    start.root,
                     checkpoint_slot,
                     &cancellation,
-                    error,
                 )
-                .await?;
-                network
-                    .fetch_bootstrap(checkpoint_root)
-                    .await
-                    .map_err(|error| network.failure(error))?
+                .await
+                .map_err(|mut fallback| {
+                    fallback.errors.splice(0..0, failure.errors);
+                    fallback
+                })?
             }
+            Err(failure) => return Err(failure),
         };
-        let mut verifier = MainnetLightClientVerifier::bootstrap(
-            checkpoint_root,
-            &bootstrap,
-            config.max_checkpoint_age,
-        )
-        .map_err(|error| network.failure(error.to_string()))?;
-        let current_period = MainnetLightClientVerifier::current_period();
-        let mut period = verifier.first_required_period();
-        // A bootstrap already supplies the current sync committee. Period P's
-        // update is needed to cross into P+1, not to verify finality within P.
-        // Deferring the current-period update avoids requiring peers to serve
-        // optional next-committee material during initial startup.
-        while period < current_period {
-            let update = match network.fetch_update(period).await {
-                Ok(update) => update,
-                Err(error) => {
-                    let anchor = verifier
-                        .finalized_anchor()
-                        .unwrap_or_else(|_| verifier.checkpoint_anchor());
-                    network = reconnect_network(
-                        &config,
-                        anchor.beacon_block_root,
-                        anchor.beacon_slot,
-                        &cancellation,
-                        error,
-                    )
-                    .await?;
-                    network
-                        .fetch_update(period)
-                        .await
-                        .map_err(|error| network.failure(error))?
-                }
-            };
-            verifier
-                .apply_update(&update)
-                .map_err(|error| network.failure(error.to_string()))?;
-            period = period.saturating_add(1);
-        }
-        let update = match network.fetch_finality().await {
-            Ok(update) => update,
-            Err(error) => {
-                let anchor = verifier
-                    .finalized_anchor()
-                    .unwrap_or_else(|_| verifier.checkpoint_anchor());
-                network = reconnect_network(
-                    &config,
-                    anchor.beacon_block_root,
-                    anchor.beacon_slot,
-                    &cancellation,
-                    error,
-                )
-                .await?;
-                network
-                    .fetch_finality()
-                    .await
-                    .map_err(|error| network.failure(error))?
-            }
-        };
-        verifier
-            .apply_finality_update(&update)
-            .map_err(|error| network.failure(error.to_string()))?;
-        Ok(Self {
-            config,
+        let mut client = Self {
+            source: source.clone(),
             cancellation,
             network,
             verifier,
-            next_period: current_period,
-        })
+            start,
+        };
+        if let Err(error) = client.refresh().await {
+            return Err(client.network.failure(error.to_string()));
+        }
+        Ok(client)
     }
 
+    /// Verify the latest finality update from any peer. Every failure here is
+    /// retryable: one stale or invalid peer never ends the stream.
     async fn refresh(&mut self) -> Result<VerifiedFinalityAnchor, SourceError> {
-        let current_period = MainnetLightClientVerifier::current_period();
-        while self.next_period < current_period {
-            let update = self.fetch_update_resilient(self.next_period).await?;
-            self.verifier
-                .apply_update(&update)
-                .map_err(|error| beacon_source_error(&error))?;
-            self.next_period = self.next_period.saturating_add(1);
-        }
-        let update = self.fetch_finality_resilient().await?;
-        self.verifier
-            .apply_finality_update(&update)
-            .map_err(|error| beacon_source_error(&error))
-    }
-
-    async fn fetch_update_resilient(
-        &mut self,
-        period: u64,
-    ) -> Result<Update<MainnetConsensusSpec>, SourceError> {
-        match self.network.fetch_update(period).await {
-            Ok(update) => Ok(update),
+        match self.refresh_once().await {
+            Ok(anchor) => Ok(anchor),
             Err(error) => {
                 self.reconnect(error).await?;
-                self.network
-                    .fetch_update(period)
-                    .await
-                    .map_err(SourceError::Unavailable)
+                self.refresh_once().await.map_err(SourceError::Unavailable)
             }
         }
     }
 
-    async fn fetch_finality_resilient(
-        &mut self,
-    ) -> Result<FinalityUpdate<MainnetConsensusSpec>, SourceError> {
-        match self.network.fetch_finality().await {
-            Ok(update) => Ok(update),
-            Err(error) => {
-                self.reconnect(error).await?;
-                self.network
-                    .fetch_finality()
-                    .await
-                    .map_err(SourceError::Unavailable)
+    async fn refresh_once(&mut self) -> Result<VerifiedFinalityAnchor, String> {
+        let deadline = tokio::time::Instant::now() + self.network.request_timeout;
+        let mut tried = HashSet::new();
+        let mut errors = Vec::new();
+        while let Some(peer) = self
+            .network
+            .next_peer(&mut tried, deadline)
+            .await
+            .map_err(RequestFailure::into_message)?
+        {
+            let update = match self
+                .network
+                .request(peer, LightClientRequest::Finality, deadline)
+                .await
+            {
+                Ok(LightClientResponse::Finality(update)) => update,
+                Ok(_) => {
+                    errors.push(self.network.ban(peer, "answered with other material"));
+                    continue;
+                }
+                Err(PeerFailure::Unavailable(error)) => {
+                    errors.push(format!("{peer}: {error}"));
+                    continue;
+                }
+                Err(PeerFailure::Invalid(error)) => {
+                    errors.push(self.network.ban(peer, error));
+                    continue;
+                }
+            };
+            let signature_slot = *update.signature_slot();
+            if signature_slot > verification_slot(self.source.clock.now()) {
+                errors.push(format!(
+                    "{peer}: finality update signed at slot {signature_slot} is ahead of the local clock"
+                ));
+                continue;
+            }
+            // The update's signature may need the next sync committees.
+            for period in self.verifier.update_periods_before(signature_slot) {
+                self.sync_period(period).await?;
+            }
+            match self
+                .verifier
+                .apply_finality_update(&update, self.source.clock.now())
+            {
+                Ok(anchor) => {
+                    self.source
+                        .anchor_writer
+                        .persist(anchor, self.start.checkpoint_root)
+                        .await;
+                    return Ok(anchor);
+                }
+                Err(error) if error.is_stale_update() => errors.push(format!("{peer}: {error}")),
+                Err(error) => errors.push(self.network.ban(peer, error)),
             }
         }
+        if errors.is_empty() {
+            errors
+                .push("no connected peer became available before the request deadline".to_owned());
+        }
+        self.network.peer_errors.extend(errors.iter().cloned());
+        Err(format!(
+            "no connected consensus peer served a verifiable finality update: {}",
+            errors.join("; ")
+        ))
+    }
+
+    async fn sync_period(&mut self, period: u64) -> Result<(), String> {
+        let verifier = &mut self.verifier;
+        let clock = &self.source.clock;
+        self.network
+            .request_verified(
+                LightClientRequest::Update { period },
+                |response| match response {
+                    LightClientResponse::Update(update) => {
+                        verifier.apply_update(&update, clock.now())
+                    }
+                    _ => Err(BeaconApiError::Protocol(
+                        "answered an update request with other material".to_owned(),
+                    )),
+                },
+            )
+            .await
+            .map_err(RequestFailure::into_message)
     }
 
     async fn reconnect(&mut self, previous_error: String) -> Result<(), SourceError> {
@@ -497,7 +576,7 @@ impl P2pLightClient {
             .finalized_anchor()
             .unwrap_or_else(|_| self.verifier.checkpoint_anchor());
         self.network = reconnect_network(
-            &self.config,
+            &self.source,
             anchor.beacon_block_root,
             anchor.beacon_slot,
             &self.cancellation,
@@ -509,23 +588,111 @@ impl P2pLightClient {
     }
 }
 
-async fn reconnect_network(
+/// Bootstrap from `root`, reconnecting once when no connected peer serves a
+/// verifiable bootstrap.
+async fn bootstrap(
+    source: &VerifiedConsensusP2p,
+    network: &mut P2pNetwork,
+    root: [u8; 32],
+    status_slot: u64,
+    cancellation: &CancellationToken,
+) -> Result<MainnetLightClientVerifier, ProbeFailure> {
+    match bootstrap_verified(network, &source.config, &source.clock, root).await {
+        Ok(verifier) => Ok(verifier),
+        Err(RequestFailure::Fatal(error)) => Err(network.failure(error)),
+        Err(RequestFailure::Retry(error)) => {
+            *network = reconnect_network(source, root, status_slot, cancellation, error).await?;
+            bootstrap_verified(network, &source.config, &source.clock, root)
+                .await
+                .map_err(|failure| network.failure(failure.into_message()))
+        }
+    }
+}
+
+/// Bootstrap from `root` with the first peer whose bootstrap verifies.
+async fn bootstrap_verified(
+    network: &mut P2pNetwork,
     config: &ConsensusP2pConfig,
+    clock: &Clock,
+    root: [u8; 32],
+) -> Result<MainnetLightClientVerifier, RequestFailure> {
+    network
+        .request_verified(
+            LightClientRequest::Bootstrap(root),
+            |response| match response {
+                LightClientResponse::Bootstrap(bootstrap) => MainnetLightClientVerifier::bootstrap(
+                    root,
+                    &bootstrap,
+                    config.max_checkpoint_age,
+                    clock.now(),
+                ),
+                _ => Err(BeaconApiError::Protocol(
+                    "answered a bootstrap request with other material".to_owned(),
+                )),
+            },
+        )
+        .await
+}
+
+/// Why no connected peer served acceptable light-client material.
+#[derive(Debug)]
+enum RequestFailure {
+    /// Other peers, a reconnect, or a later poll may succeed.
+    Retry(String),
+    /// The local trust root is unusable, whichever peer answers.
+    Fatal(String),
+}
+
+impl RequestFailure {
+    fn into_message(self) -> String {
+        match self {
+            Self::Retry(error) | Self::Fatal(error) => error,
+        }
+    }
+}
+
+/// Open a peer set that skips, and keeps sharing, the source's banned peers.
+async fn connect_network(
+    source: &VerifiedConsensusP2p,
+    status_root: [u8; 32],
+    status_slot: u64,
+    cancellation: &CancellationToken,
+) -> Result<P2pNetwork, ProbeFailure> {
+    let banned = source
+        .banned
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clone();
+    let mut network = source
+        .connector
+        .connect(
+            &source.config,
+            status_root,
+            status_slot,
+            &banned,
+            cancellation.child_token(),
+        )
+        .await?;
+    network.banned = source.banned.clone();
+    Ok(network)
+}
+
+async fn reconnect_network(
+    source: &VerifiedConsensusP2p,
     status_root: [u8; 32],
     status_slot: u64,
     cancellation: &CancellationToken,
     previous_error: String,
 ) -> Result<P2pNetwork, ProbeFailure> {
-    let mut network =
-        P2pNetwork::connect(config, status_root, status_slot, cancellation.child_token())
-            .await
-            .map_err(|mut failure| {
-                failure.errors.insert(
-                    0,
-                    format!("reconnect after request failure: {previous_error}"),
-                );
-                failure
-            })?;
+    let mut network = connect_network(source, status_root, status_slot, cancellation)
+        .await
+        .map_err(|mut failure| {
+            failure.errors.insert(
+                0,
+                format!("reconnect after request failure: {previous_error}"),
+            );
+            failure
+        })?;
     network.peer_errors.push(format!(
         "reconnected after request failure: {previous_error}"
     ));
@@ -544,15 +711,222 @@ struct ProbeFailure {
     errors: Vec<String>,
 }
 
-struct P2pNetwork {
+/// Light-client material requested from one consensus peer.
+#[derive(Clone, Copy, Debug)]
+enum LightClientRequest {
+    Bootstrap([u8; 32]),
+    Update { period: u64 },
+    Finality,
+}
+
+/// Decoded, fork-context-checked, but still unverified peer material.
+enum LightClientResponse {
+    Bootstrap(Box<Bootstrap<MainnetConsensusSpec>>),
+    Update(Box<Update<MainnetConsensusSpec>>),
+    Finality(Box<FinalityUpdate<MainnetConsensusSpec>>),
+}
+
+/// Why one peer did not serve usable light-client material.
+#[derive(Debug)]
+enum PeerFailure {
+    /// Transport failure or an error response; the peer may serve later.
+    Unavailable(String),
+    /// Undecodable or wrong-fork material.
+    Invalid(String),
+}
+
+impl fmt::Display for PeerFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Unavailable(error) | Self::Invalid(error) => formatter.write_str(error),
+        }
+    }
+}
+
+/// Consensus peers that completed the Status handshake. The libp2p swarm
+/// implements it; tests script it.
+#[async_trait]
+trait ConsensusPeers: Send {
+    fn connected(&self) -> Vec<PeerId>;
+
+    /// Wait until the connected set changes; `false` once it never will.
+    async fn changed(&mut self) -> bool;
+
+    async fn request(
+        &mut self,
+        peer: PeerId,
+        request: LightClientRequest,
+        timeout: Duration,
+    ) -> Result<LightClientResponse, PeerFailure>;
+}
+
+/// Opens a consensus peer set that advertises `status_root`/`status_slot`.
+#[async_trait]
+trait PeerConnector: Send + Sync + fmt::Debug {
+    async fn connect(
+        &self,
+        config: &ConsensusP2pConfig,
+        status_root: [u8; 32],
+        status_slot: u64,
+        banned: &HashSet<PeerId>,
+        cancellation: CancellationToken,
+    ) -> Result<P2pNetwork, ProbeFailure>;
+}
+
+/// Discovers mainnet peers over discv5 and dials them over libp2p.
+#[derive(Debug)]
+struct Libp2pConnector {
+    clock: Clock,
+}
+
+#[async_trait]
+impl PeerConnector for Libp2pConnector {
+    async fn connect(
+        &self,
+        config: &ConsensusP2pConfig,
+        status_root: [u8; 32],
+        status_slot: u64,
+        banned: &HashSet<PeerId>,
+        cancellation: CancellationToken,
+    ) -> Result<P2pNetwork, ProbeFailure> {
+        let current_slot = current_slot(self.clock.now());
+        let mut discovered = discover_mainnet_peers(config, current_slot, cancellation.clone())
+            .await
+            .map_err(|error| ProbeFailure {
+                discovered_peers: 0,
+                connected_peers: 0,
+                attempted_peers: 0,
+                errors: vec![error.to_string()],
+            })?;
+        discovered.retain(|peer| !banned.contains(&peer.peer_id));
+        let discovered_peers = discovered.len();
+        if discovered_peers < config.minimum_peers {
+            return Err(ProbeFailure {
+                discovered_peers,
+                connected_peers: 0,
+                attempted_peers: 0,
+                errors: vec![format!(
+                    "discovery found {discovered_peers} dialable peers, need {}",
+                    config.minimum_peers
+                )],
+            });
+        }
+        let attempted_peers = discovered.len().min(config.maximum_peers);
+        let status = encode_status(status_root, status_slot, current_slot);
+        let peers = discovered
+            .into_iter()
+            .take(config.maximum_peers)
+            .collect::<Vec<_>>();
+        let (control, connected) = spawn_swarm(
+            &peers,
+            status.clone(),
+            self.clock.clone(),
+            cancellation.clone(),
+        )
+        .map_err(|error| ProbeFailure {
+            discovered_peers,
+            connected_peers: 0,
+            attempted_peers,
+            errors: vec![error.to_string()],
+        })?;
+        let mut network = P2pNetwork::new(
+            Box::new(Libp2pPeers { control, connected }),
+            config,
+            cancellation,
+            discovered_peers,
+            attempted_peers,
+        );
+        network
+            .wait_for_connections(config.minimum_peers, config.connection_timeout)
+            .await
+            .map_err(|error| network.failure(error))?;
+        Ok(network)
+    }
+}
+
+struct Libp2pPeers {
     control: libp2p_stream::Control,
     connected: watch::Receiver<Vec<PeerId>>,
+}
+
+#[async_trait]
+impl ConsensusPeers for Libp2pPeers {
+    fn connected(&self) -> Vec<PeerId> {
+        self.connected.borrow().clone()
+    }
+
+    async fn changed(&mut self) -> bool {
+        self.connected.changed().await.is_ok()
+    }
+
+    async fn request(
+        &mut self,
+        peer: PeerId,
+        request: LightClientRequest,
+        timeout: Duration,
+    ) -> Result<LightClientResponse, PeerFailure> {
+        let (protocol, payload) = match request {
+            LightClientRequest::Bootstrap(root) => (BOOTSTRAP_PROTOCOL, root.to_vec()),
+            LightClientRequest::Update { period } => {
+                let mut payload = Vec::with_capacity(16);
+                payload.extend_from_slice(&period.to_le_bytes());
+                payload.extend_from_slice(&1_u64.to_le_bytes());
+                (UPDATE_PROTOCOL, payload)
+            }
+            LightClientRequest::Finality => (FINALITY_PROTOCOL, Vec::new()),
+        };
+        let response = request_peer(
+            &mut self.control,
+            peer,
+            StreamProtocol::new(protocol),
+            &payload,
+            true,
+            timeout,
+        )
+        .await
+        .map_err(PeerFailure::Unavailable)?;
+        let (material, slot) = match request {
+            LightClientRequest::Bootstrap(_) => {
+                let bootstrap =
+                    Bootstrap::<MainnetConsensusSpec>::from_ssz_bytes(&response.payload).map_err(
+                        |error| PeerFailure::Invalid(format!("invalid bootstrap SSZ: {error:?}")),
+                    )?;
+                let slot = bootstrap.header().beacon().slot;
+                (LightClientResponse::Bootstrap(Box::new(bootstrap)), slot)
+            }
+            LightClientRequest::Update { .. } => {
+                let update = Update::<MainnetConsensusSpec>::from_ssz_bytes(&response.payload)
+                    .map_err(|error| {
+                        PeerFailure::Invalid(format!("invalid light-client update SSZ: {error:?}"))
+                    })?;
+                let slot = update.attested_header().beacon().slot;
+                (LightClientResponse::Update(Box::new(update)), slot)
+            }
+            LightClientRequest::Finality => {
+                let update =
+                    FinalityUpdate::<MainnetConsensusSpec>::from_ssz_bytes(&response.payload)
+                        .map_err(|error| {
+                            PeerFailure::Invalid(format!("invalid finality update SSZ: {error:?}"))
+                        })?;
+                let slot = update.attested_header().beacon().slot;
+                (LightClientResponse::Finality(Box::new(update)), slot)
+            }
+        };
+        validate_context(response.context, slot).map_err(PeerFailure::Invalid)?;
+        Ok(material)
+    }
+}
+
+struct P2pNetwork {
+    peers: Box<dyn ConsensusPeers>,
     cancellation: CancellationToken,
     request_timeout: Duration,
     poll_interval: Duration,
     discovered_peers: usize,
     attempted_peers: usize,
     peer_errors: Vec<String>,
+    /// Peers that served invalid material, shared with the source.
+    banned: Arc<Mutex<HashSet<PeerId>>>,
 }
 
 impl std::fmt::Debug for P2pNetwork {
@@ -576,64 +950,27 @@ impl Drop for P2pNetwork {
 }
 
 impl P2pNetwork {
-    async fn connect(
+    fn new(
+        peers: Box<dyn ConsensusPeers>,
         config: &ConsensusP2pConfig,
-        checkpoint_root: [u8; 32],
-        checkpoint_slot: u64,
         cancellation: CancellationToken,
-    ) -> Result<Self, ProbeFailure> {
-        let discovered = discover_mainnet_peers(config, cancellation.clone())
-            .await
-            .map_err(|error| ProbeFailure {
-                discovered_peers: 0,
-                connected_peers: 0,
-                attempted_peers: 0,
-                errors: vec![error.to_string()],
-            })?;
-        let discovered_peers = discovered.len();
-        if discovered_peers < config.minimum_peers {
-            return Err(ProbeFailure {
-                discovered_peers,
-                connected_peers: 0,
-                attempted_peers: 0,
-                errors: vec![format!(
-                    "discovery found {discovered_peers} dialable peers, need {}",
-                    config.minimum_peers
-                )],
-            });
-        }
-        let attempted_peers = discovered.len().min(config.maximum_peers);
-        let status = encode_status(checkpoint_root, checkpoint_slot);
-        let peers = discovered
-            .into_iter()
-            .take(config.maximum_peers)
-            .collect::<Vec<_>>();
-        let (control, connected) = spawn_swarm(&peers, status.clone(), cancellation.clone())
-            .map_err(|error| ProbeFailure {
-                discovered_peers,
-                connected_peers: 0,
-                attempted_peers,
-                errors: vec![error.to_string()],
-            })?;
-        let mut network = Self {
-            control,
-            connected,
+        discovered_peers: usize,
+        attempted_peers: usize,
+    ) -> Self {
+        Self {
+            peers,
             cancellation,
             request_timeout: config.request_timeout,
             poll_interval: config.poll_interval,
             discovered_peers,
             attempted_peers,
             peer_errors: Vec::new(),
-        };
-        network
-            .wait_for_connections(config.minimum_peers, config.connection_timeout)
-            .await
-            .map_err(|error| network.failure(error))?;
-        Ok(network)
+            banned: Arc::default(),
+        }
     }
 
     fn connected_count(&self) -> usize {
-        self.connected.borrow().len()
+        self.peers.connected().len()
     }
 
     fn failure(&self, error: String) -> ProbeFailure {
@@ -658,8 +995,10 @@ impl P2pNetwork {
                     return Ok(());
                 }
                 tokio::select! {
-                    changed = self.connected.changed() => {
-                        changed.map_err(|_| "consensus swarm stopped".to_owned())?;
+                    changed = self.peers.changed() => {
+                        if !changed {
+                            return Err("consensus swarm stopped".to_owned());
+                        }
                     }
                     () = self.cancellation.cancelled() => {
                         return Err("consensus P2P connection was cancelled".to_owned());
@@ -676,109 +1015,114 @@ impl P2pNetwork {
         })?
     }
 
-    async fn fetch_bootstrap(
+    /// The next connected peer not yet tried or banned, in random order so
+    /// no single peer answers first every time. Waits for new connections
+    /// until `deadline`.
+    async fn next_peer(
         &mut self,
-        checkpoint_root: [u8; 32],
-    ) -> Result<Bootstrap<MainnetConsensusSpec>, String> {
-        let response = self
-            .request_failover(
-                StreamProtocol::new(BOOTSTRAP_PROTOCOL),
-                checkpoint_root.to_vec(),
-                true,
-            )
-            .await?;
-        let bootstrap = Bootstrap::<MainnetConsensusSpec>::from_ssz_bytes(&response.payload)
-            .map_err(|error| format!("invalid bootstrap SSZ: {error:?}"))?;
-        validate_context(response.context, bootstrap.header().beacon().slot)?;
-        Ok(bootstrap)
-    }
-
-    async fn fetch_update(&mut self, period: u64) -> Result<Update<MainnetConsensusSpec>, String> {
-        let mut request = Vec::with_capacity(16);
-        request.extend_from_slice(&period.to_le_bytes());
-        request.extend_from_slice(&1_u64.to_le_bytes());
-        let response = self
-            .request_failover(StreamProtocol::new(UPDATE_PROTOCOL), request, true)
-            .await?;
-        let update = Update::<MainnetConsensusSpec>::from_ssz_bytes(&response.payload)
-            .map_err(|error| format!("invalid light-client update SSZ: {error:?}"))?;
-        validate_context(response.context, update.attested_header().beacon().slot)?;
-        Ok(update)
-    }
-
-    async fn fetch_finality(&mut self) -> Result<FinalityUpdate<MainnetConsensusSpec>, String> {
-        let response = self
-            .request_failover(StreamProtocol::new(FINALITY_PROTOCOL), Vec::new(), true)
-            .await?;
-        let update = FinalityUpdate::<MainnetConsensusSpec>::from_ssz_bytes(&response.payload)
-            .map_err(|error| format!("invalid finality update SSZ: {error:?}"))?;
-        validate_context(response.context, update.attested_header().beacon().slot)?;
-        Ok(update)
-    }
-
-    async fn request_failover(
-        &mut self,
-        protocol: StreamProtocol,
-        request: Vec<u8>,
-        response_has_context: bool,
-    ) -> Result<PeerResponse, String> {
-        let deadline = tokio::time::Instant::now() + self.request_timeout;
-        let mut attempted = HashSet::new();
-        let mut errors = Vec::new();
+        tried: &mut HashSet<PeerId>,
+        deadline: tokio::time::Instant,
+    ) -> Result<Option<PeerId>, RequestFailure> {
+        let order = RandomState::new();
         loop {
-            let peers = self.connected.borrow().clone();
-            for peer in peers {
-                if !attempted.insert(peer) {
-                    continue;
-                }
-                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-                if remaining.is_zero() {
-                    break;
-                }
-                match request_peer(
-                    &mut self.control,
-                    peer,
-                    protocol.clone(),
-                    &request,
-                    response_has_context,
-                    remaining.min(PEER_ATTEMPT_TIMEOUT),
-                )
-                .await
-                {
-                    Ok(response) => return Ok(response),
-                    Err(error) => errors.push(format!("{peer}: {error}")),
-                }
+            let banned = self
+                .banned
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone();
+            let candidate = self
+                .peers
+                .connected()
+                .into_iter()
+                .filter(|peer| !tried.contains(peer) && !banned.contains(peer))
+                .min_by_key(|peer| order.hash_one(peer));
+            if let Some(peer) = candidate {
+                tried.insert(peer);
+                return Ok(Some(peer));
             }
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             if remaining.is_zero() {
-                break;
+                return Ok(None);
             }
             // Dials continue in the swarm task after the minimum connection
             // threshold is reached. Give newly connected peers a chance
             // instead of freezing failover to the first transient snapshot.
-            let pause = remaining.min(Duration::from_millis(100));
             tokio::select! {
-                changed = self.connected.changed() => {
-                    if changed.is_err() {
-                        break;
+                changed = self.peers.changed() => {
+                    if !changed {
+                        return Ok(None);
                     }
                 }
-                () = tokio::time::sleep(pause) => {}
+                () = tokio::time::sleep(remaining.min(Duration::from_millis(100))) => {}
                 () = self.cancellation.cancelled() => {
-                    return Err("consensus P2P request was cancelled".to_owned());
+                    return Err(RequestFailure::Retry(
+                        "consensus P2P request was cancelled".to_owned(),
+                    ));
                 }
             }
+        }
+    }
+
+    async fn request(
+        &mut self,
+        peer: PeerId,
+        request: LightClientRequest,
+        deadline: tokio::time::Instant,
+    ) -> Result<LightClientResponse, PeerFailure> {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        self.peers
+            .request(peer, request, remaining.min(PEER_ATTEMPT_TIMEOUT))
+            .await
+    }
+
+    /// Ban `peer` for the source's lifetime after it served invalid
+    /// material.
+    fn ban(&mut self, peer: PeerId, error: impl fmt::Display) -> String {
+        debug!(%peer, %error, "banning consensus peer for invalid light-client material");
+        self.banned
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(peer);
+        format!("{peer}: {error} (banned)")
+    }
+
+    /// Request `request` from peers until `accept` verifies a response.
+    ///
+    /// A peer whose material fails verification is banned for this session;
+    /// one whose material is only stale is skipped.
+    async fn request_verified<T>(
+        &mut self,
+        request: LightClientRequest,
+        mut accept: impl FnMut(LightClientResponse) -> Result<T, BeaconApiError>,
+    ) -> Result<T, RequestFailure> {
+        let deadline = tokio::time::Instant::now() + self.request_timeout;
+        let mut tried = HashSet::new();
+        let mut errors = Vec::new();
+        while let Some(peer) = self.next_peer(&mut tried, deadline).await? {
+            let error = match self.request(peer, request, deadline).await {
+                Ok(response) => match accept(response) {
+                    Ok(accepted) => return Ok(accepted),
+                    Err(error) if error.is_stale_update() => format!("{peer}: {error}"),
+                    Err(
+                        error @ (BeaconApiError::CheckpointTooOld { .. }
+                        | BeaconApiError::InvalidCheckpointTime),
+                    ) => return Err(RequestFailure::Fatal(error.to_string())),
+                    Err(error) => self.ban(peer, error),
+                },
+                Err(PeerFailure::Unavailable(error)) => format!("{peer}: {error}"),
+                Err(PeerFailure::Invalid(error)) => self.ban(peer, error),
+            };
+            errors.push(error);
         }
         if errors.is_empty() {
             errors
                 .push("no connected peer became available before the request deadline".to_owned());
         }
         self.peer_errors.extend(errors.iter().cloned());
-        Err(format!(
-            "all connected peers failed {}: {}",
-            protocol.as_ref(),
+        Err(RequestFailure::Retry(format!(
+            "no connected consensus peer served a verifiable {request:?}: {}",
             errors.join("; ")
-        ))
+        )))
     }
 }
 
@@ -931,8 +1275,11 @@ fn validate_context(context: Option<[u8; 4]>, slot: u64) -> Result<(), String> {
     Ok(())
 }
 
-fn encode_status(checkpoint_root: [u8; 32], checkpoint_slot: u64) -> Vec<u8> {
-    let current_slot = current_slot();
+fn encode_status(checkpoint_root: [u8; 32], checkpoint_slot: u64, current_slot: u64) -> Vec<u8> {
+    // A checkpoint block before its epoch's first slot means that slot was
+    // skipped, so the block is the checkpoint of the epoch that follows it.
+    let finalized_epoch = checkpoint_slot.div_ceil(32);
+    let head_slot = checkpoint_slot.max(finalized_epoch.saturating_mul(32));
     let mut status = Vec::with_capacity(STATUS_BYTES);
     status.extend_from_slice(&mainnet_fork_digest(current_slot));
     // The weak-subjectivity checkpoint is locally trusted before bootstrap
@@ -941,20 +1288,20 @@ fn encode_status(checkpoint_root: [u8; 32], checkpoint_slot: u64) -> Vec<u8> {
     // genesis status makes current full nodes classify the client as
     // irrelevant and disconnect it before a bootstrap can complete.
     status.extend_from_slice(&checkpoint_root);
-    status.extend_from_slice(&(checkpoint_slot / 32).to_le_bytes());
+    status.extend_from_slice(&finalized_epoch.to_le_bytes());
     status.extend_from_slice(&checkpoint_root);
-    status.extend_from_slice(&checkpoint_slot.to_le_bytes());
+    status.extend_from_slice(&head_slot.to_le_bytes());
     status
 }
 
-fn validate_peer_status(status: &[u8]) -> Result<(), String> {
+fn validate_peer_status(status: &[u8], current_slot: u64) -> Result<(), String> {
     if status.len() != STATUS_BYTES {
         return Err(format!(
             "status response is {} bytes, expected {STATUS_BYTES}",
             status.len()
         ));
     }
-    let expected = mainnet_fork_digest(current_slot());
+    let expected = mainnet_fork_digest(current_slot);
     if status[..4] != expected {
         return Err(format!(
             "peer status fork digest {:02x?} differs from expected {expected:02x?}",
@@ -962,16 +1309,6 @@ fn validate_peer_status(status: &[u8]) -> Result<(), String> {
         ));
     }
     Ok(())
-}
-
-fn current_slot() -> u64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-        .saturating_sub(leani_finality_beacon_api::MAINNET_GENESIS_TIME)
-        / 12
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -982,6 +1319,7 @@ struct PeerAddress {
 
 async fn discover_mainnet_peers(
     config: &ConsensusP2pConfig,
+    current_slot: u64,
     cancellation: CancellationToken,
 ) -> Result<Vec<PeerAddress>, ConsensusP2pError> {
     let key = CombinedKey::generate_secp256k1();
@@ -1028,7 +1366,7 @@ async fn discover_mainnet_peers(
         }
     }
     enrs.extend(discovery.table_entries_enr());
-    let expected_digest = mainnet_fork_digest(current_slot());
+    let expected_digest = mainnet_fork_digest(current_slot);
     let mut digest_counts = BTreeMap::<[u8; 4], usize>::new();
     let mut configured_preferred = BTreeSet::new();
     let mut preferred = BTreeSet::new();
@@ -1110,6 +1448,7 @@ fn enr_peer_id(enr: &Enr) -> Option<PeerId> {
 fn spawn_swarm(
     peers: &[PeerAddress],
     status: Vec<u8>,
+    clock: Clock,
     cancellation: CancellationToken,
 ) -> Result<(libp2p_stream::Control, watch::Receiver<Vec<PeerId>>), ConsensusP2pError> {
     let key = identity::Keypair::generate_secp256k1();
@@ -1190,6 +1529,7 @@ fn spawn_swarm(
                             let mut peer_control = status_control.clone();
                             let peer_status = status.clone();
                             let peer_status_tx = status_tx.clone();
+                            let peer_clock = clock.clone();
                             tokio::spawn(async move {
                                 let result = async {
                                     let response = request_peer(
@@ -1201,7 +1541,10 @@ fn spawn_swarm(
                                         PEER_ATTEMPT_TIMEOUT,
                                     )
                                     .await?;
-                                    validate_peer_status(&response.payload)
+                                    validate_peer_status(
+                                        &response.payload,
+                                        current_slot(peer_clock.now()),
+                                    )
                                 }
                                 .await;
                                 let _ = peer_status_tx.send((peer_id, result));
@@ -1372,7 +1715,633 @@ pub enum ConsensusP2pError {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        path::Path,
+        sync::atomic::{AtomicUsize, Ordering},
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    use alloy_primitives::b256;
+    use leani_finality_beacon_api::{
+        CheckpointOrigin, FINALITY_ANCHOR_FILE, PersistedFinalityAnchor, persist_finality_anchor,
+        read_finality_anchor,
+    };
+    use leani_primitives::BlockHash;
+
     use super::*;
+
+    const BOOTSTRAP_JSON: &str =
+        include_str!("../../finality-beacon-api/tests/fixtures/helios/bootstrap.json");
+    const UPDATES_JSON: &str =
+        include_str!("../../finality-beacon-api/tests/fixtures/helios/updates.json");
+    const FINALITY_JSON: &str =
+        include_str!("../../finality-beacon-api/tests/fixtures/helios/finality.json");
+    const BOOTSTRAP_SLOT: u64 = 7_069_376;
+    const FINALIZED_SLOT: u64 = 7_109_344;
+    const SIGNATURE_SLOT: u64 = 7_109_431;
+    const SLOTS_PER_PERIOD: u64 = 8_192;
+    const SLOT_SECONDS: u64 = 12;
+    const DAY: u64 = 86_400;
+    /// An earlier checkpoint root that no scripted peer serves.
+    const UNSERVED_ROOT: [u8; 32] = [0x11; 32];
+
+    fn bootstrap_root() -> [u8; 32] {
+        b256!("5afc212a7924789b2bc86acad3ab3a6ffb1f6e97253ea50bee7f4f51422c9275").into()
+    }
+
+    fn bootstrap_anchor() -> VerifiedFinalityAnchor {
+        VerifiedFinalityAnchor {
+            beacon_slot: BOOTSTRAP_SLOT,
+            beacon_block_root: bootstrap_root(),
+            execution_block_number: 17_883_333,
+            execution_block_hash: BlockHash::new(
+                b256!("d131b92cb98455882c2c7b4ebf55dc6d02cc47e0e55a4d9570dea498affd6e74").into(),
+            ),
+        }
+    }
+
+    fn checkpoint(anchor: VerifiedFinalityAnchor) -> ConsensusCheckpoint {
+        ConsensusCheckpoint {
+            beacon_slot: anchor.beacon_slot,
+            beacon_block_root: anchor.beacon_block_root,
+            execution_block_hash: anchor.execution_block_hash,
+            obtained_at_unix_seconds: 0,
+            source: "test checkpoint".to_owned(),
+        }
+    }
+
+    fn fixture_data(encoded: &str) -> serde_json::Value {
+        let mut response: serde_json::Value =
+            serde_json::from_str(encoded).expect("fixture response");
+        response["data"].take()
+    }
+
+    fn fixture_updates() -> Vec<serde_json::Value> {
+        serde_json::from_str::<Vec<serde_json::Value>>(UPDATES_JSON)
+            .expect("fixture updates")
+            .into_iter()
+            .map(|mut update| update["data"].take())
+            .collect()
+    }
+
+    fn attested_slot(update: &serde_json::Value) -> u64 {
+        update["attested_header"]["beacon"]["slot"]
+            .as_str()
+            .and_then(|slot| slot.parse().ok())
+            .expect("attested slot")
+    }
+
+    fn fixture_bootstrap() -> Bootstrap<MainnetConsensusSpec> {
+        serde_json::from_value(fixture_data(BOOTSTRAP_JSON)).expect("fixture bootstrap")
+    }
+
+    fn fixture_update(period: u64) -> Option<Update<MainnetConsensusSpec>> {
+        fixture_updates()
+            .into_iter()
+            .find(|update| attested_slot(update) / SLOTS_PER_PERIOD == period)
+            .map(|update| serde_json::from_value(update).expect("fixture update"))
+    }
+
+    fn fixture_finality(behaviour: Behaviour) -> FinalityUpdate<MainnetConsensusSpec> {
+        let data = match behaviour {
+            Behaviour::Honest => fixture_data(FINALITY_JSON),
+            // The signed period-867 update served again as an older
+            // finality update.
+            Behaviour::Stale => {
+                let mut update = fixture_updates().swap_remove(5);
+                let fields = update.as_object_mut().expect("update fields");
+                fields.remove("next_sync_committee");
+                fields.remove("next_sync_committee_branch");
+                update
+            }
+            // A different attested header than the sync committee signed.
+            Behaviour::Forged => {
+                let mut update = fixture_data(FINALITY_JSON);
+                update["attested_header"]["beacon"]["proposer_index"] =
+                    serde_json::Value::from("1");
+                update
+            }
+        };
+        serde_json::from_value(data).expect("fixture finality update")
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum Behaviour {
+        Honest,
+        Stale,
+        Forged,
+    }
+
+    /// A scripted consensus peer set serving the vendored Helios fixtures.
+    #[derive(Debug)]
+    struct Script {
+        behaviours: Mutex<BTreeMap<PeerId, Behaviour>>,
+        /// Peers that stay disconnected until a peer serves a forged update.
+        late: Mutex<BTreeSet<PeerId>>,
+        revealed: watch::Sender<bool>,
+        requests: Mutex<Vec<String>>,
+        connects: AtomicUsize,
+        /// The banned peers each connection was asked to skip.
+        dial_bans: Mutex<Vec<HashSet<PeerId>>>,
+    }
+
+    impl Default for Script {
+        fn default() -> Self {
+            Self {
+                behaviours: Mutex::default(),
+                late: Mutex::default(),
+                revealed: watch::channel(false).0,
+                requests: Mutex::default(),
+                connects: AtomicUsize::default(),
+                dial_bans: Mutex::default(),
+            }
+        }
+    }
+
+    impl Script {
+        /// Peers in ascending `PeerId` order with the given behaviours.
+        fn new(behaviours: &[Behaviour]) -> (Arc<Self>, Vec<PeerId>) {
+            let mut peers = behaviours
+                .iter()
+                .map(|_| PeerId::random())
+                .collect::<Vec<_>>();
+            peers.sort();
+            let script = Self::default();
+            script
+                .behaviours
+                .lock()
+                .expect("behaviours")
+                .extend(peers.iter().copied().zip(behaviours.iter().copied()));
+            (Arc::new(script), peers)
+        }
+
+        /// Add an honest peer that connects only after a forged update.
+        fn late_honest_peer(&self) -> PeerId {
+            let peer = PeerId::random();
+            self.set(peer, Behaviour::Honest);
+            self.late.lock().expect("late peers").insert(peer);
+            peer
+        }
+
+        fn set(&self, peer: PeerId, behaviour: Behaviour) {
+            self.behaviours
+                .lock()
+                .expect("behaviours")
+                .insert(peer, behaviour);
+        }
+
+        fn requests(&self) -> Vec<String> {
+            self.requests.lock().expect("requests").clone()
+        }
+
+        fn count(&self, fragment: &str) -> usize {
+            self.requests()
+                .iter()
+                .filter(|request| request.contains(fragment))
+                .count()
+        }
+    }
+
+    struct ScriptedPeers {
+        script: Arc<Script>,
+        revealed: watch::Receiver<bool>,
+    }
+
+    #[async_trait]
+    impl ConsensusPeers for ScriptedPeers {
+        fn connected(&self) -> Vec<PeerId> {
+            let revealed = *self.revealed.borrow();
+            let late = self.script.late.lock().expect("late peers").clone();
+            self.script
+                .behaviours
+                .lock()
+                .expect("behaviours")
+                .keys()
+                .copied()
+                .filter(|peer| revealed || !late.contains(peer))
+                .collect()
+        }
+
+        async fn changed(&mut self) -> bool {
+            self.revealed.changed().await.is_ok()
+        }
+
+        async fn request(
+            &mut self,
+            peer: PeerId,
+            request: LightClientRequest,
+            _timeout: Duration,
+        ) -> Result<LightClientResponse, PeerFailure> {
+            let label = match request {
+                LightClientRequest::Bootstrap(root) => format!("bootstrap {}", hex::encode(root)),
+                LightClientRequest::Update { period } => format!("update {period}"),
+                LightClientRequest::Finality => "finality".to_owned(),
+            };
+            self.script
+                .requests
+                .lock()
+                .expect("requests")
+                .push(format!("{peer} {label}"));
+            let behaviour = self
+                .script
+                .behaviours
+                .lock()
+                .expect("behaviours")
+                .get(&peer)
+                .copied()
+                .ok_or_else(|| PeerFailure::Unavailable("peer disconnected".to_owned()))?;
+            let unavailable = || PeerFailure::Unavailable("resource unavailable".to_owned());
+            match request {
+                LightClientRequest::Bootstrap(root) if root == bootstrap_root() => Ok(
+                    LightClientResponse::Bootstrap(Box::new(fixture_bootstrap())),
+                ),
+                LightClientRequest::Bootstrap(_) => Err(unavailable()),
+                LightClientRequest::Update { period } => fixture_update(period)
+                    .map(|update| LightClientResponse::Update(Box::new(update)))
+                    .ok_or_else(unavailable),
+                LightClientRequest::Finality => {
+                    if behaviour == Behaviour::Forged {
+                        self.script.revealed.send_replace(true);
+                    }
+                    Ok(LightClientResponse::Finality(Box::new(fixture_finality(
+                        behaviour,
+                    ))))
+                }
+            }
+        }
+    }
+
+    #[derive(Debug)]
+    struct ScriptedConnector(Arc<Script>);
+
+    #[async_trait]
+    impl PeerConnector for ScriptedConnector {
+        async fn connect(
+            &self,
+            config: &ConsensusP2pConfig,
+            _status_root: [u8; 32],
+            _status_slot: u64,
+            banned: &HashSet<PeerId>,
+            cancellation: CancellationToken,
+        ) -> Result<P2pNetwork, ProbeFailure> {
+            self.0.connects.fetch_add(1, Ordering::SeqCst);
+            self.0
+                .dial_bans
+                .lock()
+                .expect("dial bans")
+                .push(banned.clone());
+            let peers = self.0.behaviours.lock().expect("behaviours").len();
+            Ok(P2pNetwork::new(
+                Box::new(ScriptedPeers {
+                    script: self.0.clone(),
+                    revealed: self.0.revealed.subscribe(),
+                }),
+                config,
+                cancellation,
+                peers,
+                peers,
+            ))
+        }
+    }
+
+    fn slot_time(slot: u64) -> u64 {
+        leani_finality_beacon_api::MAINNET_GENESIS_TIME + slot * SLOT_SECONDS
+    }
+
+    /// Wall clock that advances with tokio time, so paused-time tests
+    /// simulate days of polling instantly.
+    fn simulated_clock(start: u64) -> Clock {
+        let started = tokio::time::Instant::now();
+        Clock::new(move || UNIX_EPOCH + Duration::from_secs(start) + started.elapsed())
+    }
+
+    fn scripted_source(
+        script: &Arc<Script>,
+        clock: Clock,
+        anchor: AnchorFile,
+        poll_interval: Duration,
+    ) -> VerifiedConsensusP2p {
+        VerifiedConsensusP2p::with_connector(
+            ConsensusP2pConfig {
+                minimum_peers: 1,
+                poll_interval,
+                anchor,
+                ..ConsensusP2pConfig::default()
+            },
+            Arc::new(ScriptedConnector(script.clone())),
+            clock,
+        )
+        .expect("scripted source")
+    }
+
+    fn read_write(path: &Path) -> AnchorFile {
+        AnchorFile::ReadWrite {
+            path: path.to_path_buf(),
+            write_failures: Arc::default(),
+        }
+    }
+
+    /// The operator's configured checkpoint.
+    fn operator(root: [u8; 32], slot: u64) -> TrustedCheckpoint {
+        TrustedCheckpoint {
+            root,
+            slot: Some(slot),
+            origin: CheckpointOrigin::Operator,
+        }
+    }
+
+    fn finalized_slot(event: Option<Result<FinalityEvent, SourceError>>) -> u64 {
+        match event {
+            Some(Ok(FinalityEvent::Finalized { beacon_slot, .. })) => beacon_slot,
+            other => panic!("expected a finalized event, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn status_advertises_the_epoch_of_a_skipped_boundary_slot() {
+        let epoch = 400_000_u64;
+        let status = encode_status([0x42; 32], epoch * 32 - 3, epoch * 32);
+        assert_eq!(&status[36..44], &epoch.to_le_bytes());
+        let head_slot = u64::from_le_bytes(status[76..84].try_into().expect("head slot"));
+        assert!(head_slot >= epoch * 32, "head slot {head_slot}");
+
+        let aligned = encode_status([0x42; 32], epoch * 32, epoch * 32);
+        assert_eq!(&aligned[36..44], &epoch.to_le_bytes());
+        assert_eq!(&aligned[76..84], &(epoch * 32).to_le_bytes());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_bad_first_peer_does_not_fail_startup() {
+        // Only the forging peer is connected at first, so it answers first.
+        let (script, peers) = Script::new(&[Behaviour::Forged]);
+        let honest = script.late_honest_peer();
+        let source = scripted_source(
+            &script,
+            simulated_clock(slot_time(SIGNATURE_SLOT) + 60),
+            AnchorFile::Disabled,
+            Duration::from_secs(SLOT_SECONDS),
+        );
+        let mut events = source
+            .subscribe(checkpoint(bootstrap_anchor()), CancellationToken::new())
+            .await
+            .expect("startup survives a forged finality update");
+        assert_eq!(finalized_slot(events.next().await), FINALIZED_SLOT);
+        let requests = script.requests();
+        let forged = requests
+            .iter()
+            .position(|request| request == &format!("{} finality", peers[0]))
+            .expect("the forging peer is asked first");
+        assert!(
+            requests[forged..]
+                .iter()
+                .any(|request| request == &format!("{honest} finality")),
+            "{requests:?}"
+        );
+
+        let report = source
+            .probe_checkpoint(operator(bootstrap_root(), BOOTSTRAP_SLOT))
+            .await;
+        assert!(report.accepted, "{:?}", report.errors);
+        assert_eq!(
+            report.selected.map(|anchor| anchor.beacon_slot),
+            Some(FINALIZED_SLOT)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stale_or_forged_peers_do_not_end_the_finality_stream() {
+        let (script, peers) = Script::new(&[Behaviour::Honest, Behaviour::Honest]);
+        let source = scripted_source(
+            &script,
+            simulated_clock(slot_time(SIGNATURE_SLOT) + 60),
+            AnchorFile::Disabled,
+            Duration::from_secs(SLOT_SECONDS),
+        );
+        let mut events = source
+            .subscribe(checkpoint(bootstrap_anchor()), CancellationToken::new())
+            .await
+            .expect("subscribe");
+        assert_eq!(finalized_slot(events.next().await), FINALIZED_SLOT);
+
+        // The first peer falls behind the verified store.
+        script.set(peers[0], Behaviour::Stale);
+        let quiet =
+            tokio::time::timeout(Duration::from_secs(10 * SLOT_SECONDS), events.next()).await;
+        assert!(quiet.is_err(), "a stale peer ended the stream: {quiet:?}");
+
+        // Then it forges an update and is not asked again this session.
+        script.set(peers[0], Behaviour::Forged);
+        let before = script.requests().len();
+        let quiet =
+            tokio::time::timeout(Duration::from_secs(10 * SLOT_SECONDS), events.next()).await;
+        assert!(
+            quiet.is_err(),
+            "a forged update ended the stream: {quiet:?}"
+        );
+        let forged_requests = script.requests()[before..]
+            .iter()
+            .filter(|request| request.starts_with(&format!("{} finality", peers[0])))
+            .count();
+        assert!(
+            forged_requests <= 1,
+            "{forged_requests} requests to a banned peer"
+        );
+        assert_eq!(script.connects.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn restart_uses_the_persisted_anchor_without_the_configured_checkpoint_age() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join(FINALITY_ANCHOR_FILE);
+        persist_finality_anchor(
+            &path,
+            &PersistedFinalityAnchor {
+                anchor: bootstrap_anchor(),
+                checkpoint_root: UNSERVED_ROOT,
+            },
+        )
+        .expect("persist anchor");
+        let (script, _) = Script::new(&[Behaviour::Honest, Behaviour::Honest]);
+        // The configured checkpoint is more than 14 days old; the persisted
+        // anchor verified from it is not.
+        let source = scripted_source(
+            &script,
+            simulated_clock(slot_time(BOOTSTRAP_SLOT) + 13 * DAY),
+            read_write(&path),
+            Duration::from_secs(SLOT_SECONDS),
+        );
+        let report = source
+            .probe_checkpoint(operator(UNSERVED_ROOT, BOOTSTRAP_SLOT - SLOTS_PER_PERIOD))
+            .await;
+        assert!(report.accepted, "{:?}", report.errors);
+        assert_eq!(report.checkpoint_anchor, Some(bootstrap_anchor()));
+        assert_eq!(
+            report.selected.map(|anchor| anchor.beacon_slot),
+            Some(FINALIZED_SLOT)
+        );
+        assert_eq!(
+            script.count(&format!("bootstrap {}", hex::encode(UNSERVED_ROOT))),
+            0
+        );
+        let persisted = read_finality_anchor(&path)
+            .expect("read anchor")
+            .expect("anchor present");
+        assert_eq!(persisted.anchor.beacon_slot, FINALIZED_SLOT);
+        assert_eq!(persisted.checkpoint_root, UNSERVED_ROOT);
+
+        // The node then subscribes with the verified bootstrap anchor the
+        // probe handed over, and keeps the operator's lineage. The fixtures
+        // hold one bootstrap, so persist that one again.
+        std::fs::remove_file(&path).expect("reset anchor");
+        persist_finality_anchor(
+            &path,
+            &PersistedFinalityAnchor {
+                anchor: bootstrap_anchor(),
+                checkpoint_root: UNSERVED_ROOT,
+            },
+        )
+        .expect("persist anchor");
+        let mut events = source
+            .subscribe(checkpoint(bootstrap_anchor()), CancellationToken::new())
+            .await
+            .expect("subscribe from the handed-over anchor");
+        assert_eq!(finalized_slot(events.next().await), FINALIZED_SLOT);
+        assert_eq!(
+            read_finality_anchor(&path)
+                .expect("read anchor")
+                .expect("anchor present")
+                .checkpoint_root,
+            UNSERVED_ROOT
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_persisted_anchor_from_another_trust_root_is_ignored() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join(FINALITY_ANCHOR_FILE);
+        persist_finality_anchor(
+            &path,
+            &PersistedFinalityAnchor {
+                anchor: VerifiedFinalityAnchor {
+                    beacon_slot: FINALIZED_SLOT,
+                    beacon_block_root: [0x55; 32],
+                    ..bootstrap_anchor()
+                },
+                checkpoint_root: [0x44; 32],
+            },
+        )
+        .expect("persist anchor");
+        let (script, _) = Script::new(&[Behaviour::Honest, Behaviour::Honest]);
+        let source = scripted_source(
+            &script,
+            simulated_clock(slot_time(SIGNATURE_SLOT) + 60),
+            read_write(&path),
+            Duration::from_secs(SLOT_SECONDS),
+        );
+        let report = source
+            .probe_checkpoint(operator(bootstrap_root(), BOOTSTRAP_SLOT))
+            .await;
+        assert!(report.accepted, "{:?}", report.errors);
+        assert_eq!(report.checkpoint_anchor, Some(bootstrap_anchor()));
+        assert_eq!(
+            script.count(&format!("bootstrap {}", hex::encode([0x55; 32]))),
+            0
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_unserved_persisted_anchor_falls_back_to_the_configured_checkpoint() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join(FINALITY_ANCHOR_FILE);
+        persist_finality_anchor(
+            &path,
+            &PersistedFinalityAnchor {
+                anchor: VerifiedFinalityAnchor {
+                    beacon_slot: FINALIZED_SLOT,
+                    beacon_block_root: [0x66; 32],
+                    ..bootstrap_anchor()
+                },
+                checkpoint_root: bootstrap_root(),
+            },
+        )
+        .expect("persist anchor");
+        let (script, _) = Script::new(&[Behaviour::Honest, Behaviour::Honest]);
+        let source = scripted_source(
+            &script,
+            simulated_clock(slot_time(SIGNATURE_SLOT) + 60),
+            read_write(&path),
+            Duration::from_secs(SLOT_SECONDS),
+        );
+        let report = source
+            .probe_checkpoint(operator(bootstrap_root(), BOOTSTRAP_SLOT))
+            .await;
+        assert!(report.accepted, "{:?}", report.errors);
+        assert_eq!(report.checkpoint_anchor, Some(bootstrap_anchor()));
+        assert!(script.count(&format!("bootstrap {}", hex::encode([0x66; 32]))) > 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn banned_peers_stay_banned_across_reconnects() {
+        let (script, peers) = Script::new(&[Behaviour::Honest, Behaviour::Honest]);
+        let source = scripted_source(
+            &script,
+            simulated_clock(slot_time(SIGNATURE_SLOT) + 60),
+            AnchorFile::Disabled,
+            Duration::from_secs(SLOT_SECONDS),
+        );
+        let mut events = source
+            .subscribe(checkpoint(bootstrap_anchor()), CancellationToken::new())
+            .await
+            .expect("subscribe");
+        assert_eq!(finalized_slot(events.next().await), FINALIZED_SLOT);
+
+        // One peer forges and the other falls behind, so each refresh
+        // exhausts the peer set and reconnects.
+        script.set(peers[0], Behaviour::Forged);
+        script.set(peers[1], Behaviour::Stale);
+        let before = script.requests().len();
+        let quiet =
+            tokio::time::timeout(Duration::from_secs(5 * SLOT_SECONDS), events.next()).await;
+        assert!(quiet.is_err(), "the stream ended: {quiet:?}");
+        assert!(
+            script.connects.load(Ordering::SeqCst) >= 2,
+            "the exhausted peer set reconnects"
+        );
+        let forged_requests = script.requests()[before..]
+            .iter()
+            .filter(|request| request.starts_with(&format!("{} finality", peers[0])))
+            .count();
+        assert_eq!(forged_requests, 1, "a banned peer was asked again");
+        let dial_bans = script.dial_bans.lock().expect("dial bans").clone();
+        assert!(
+            dial_bans
+                .last()
+                .is_some_and(|banned| banned.contains(&peers[0])),
+            "{dial_bans:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn one_bootstrap_serves_polls_past_the_checkpoint_age_limit() {
+        let (script, _) = Script::new(&[Behaviour::Honest]);
+        let source = scripted_source(
+            &script,
+            simulated_clock(slot_time(SIGNATURE_SLOT) + 60),
+            AnchorFile::Disabled,
+            Duration::from_secs(DAY),
+        );
+        let mut events = source
+            .subscribe(checkpoint(bootstrap_anchor()), CancellationToken::new())
+            .await
+            .expect("subscribe");
+        assert_eq!(finalized_slot(events.next().await), FINALIZED_SLOT);
+        let quiet = tokio::time::timeout(Duration::from_secs(20 * DAY), events.next()).await;
+        assert!(quiet.is_err(), "finality stream yielded {quiet:?}");
+        assert!(script.count("finality") >= 20);
+        assert_eq!(script.count("bootstrap"), 1);
+        assert_eq!(script.count("update"), 5);
+        assert_eq!(script.connects.load(Ordering::SeqCst), 1);
+    }
 
     #[test]
     fn protobuf_varints_are_strict() {
@@ -1412,13 +2381,14 @@ mod tests {
 
     #[test]
     fn status_is_exact_ssz_container() {
-        let status = encode_status([0x42; 32], 12_345);
+        let now = current_slot(SystemTime::now());
+        let status = encode_status([0x42; 32], 12_352, now);
         assert_eq!(status.len(), STATUS_BYTES);
         assert_eq!(&status[4..36], &[0x42; 32]);
-        assert_eq!(&status[36..44], &(12_345_u64 / 32).to_le_bytes());
+        assert_eq!(&status[36..44], &(12_352_u64 / 32).to_le_bytes());
         assert_eq!(&status[44..76], &[0x42; 32]);
-        assert_eq!(&status[76..84], &12_345_u64.to_le_bytes());
-        assert!(validate_peer_status(&status).is_ok());
+        assert_eq!(&status[76..84], &12_352_u64.to_le_bytes());
+        assert!(validate_peer_status(&status, now).is_ok());
     }
 
     #[test]
@@ -1426,7 +2396,7 @@ mod tests {
         assert!(decode_peer_response(&[], true).is_err());
         let payload = encode_snappy_payload(b"ok").expect("frame");
         let mut wire = vec![0];
-        wire.extend_from_slice(&mainnet_fork_digest(current_slot()));
+        wire.extend_from_slice(&mainnet_fork_digest(current_slot(SystemTime::now())));
         wire.extend_from_slice(&payload);
         let decoded = decode_peer_response(&wire, true).expect("response");
         assert_eq!(decoded.payload, b"ok");

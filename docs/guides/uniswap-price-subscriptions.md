@@ -28,10 +28,14 @@ is none, it starts the embedded runtime. Use `--mode embedded` only when a
 reachable local node should intentionally be ignored.
 
 The first run asks three independent checkpoint providers for a recent
-finalized weak-subjectivity checkpoint. At least two must return the exact same
-slot and block root before Leani asks you to accept it. Execution then follows
-native P2P peers, while later Beacon API responses are proof-checked from that
-agreed root. For an intentional non-interactive invocation, use `--yes`.
+finalized weak-subjectivity checkpoint. More than half of them, so at least two
+of the three, must return the exact same slot and block root, and no responding
+provider may report another root at that slot. Leani then shows every
+provider's answer and asks you to accept the agreed one. Providers must use
+HTTPS, except on loopback, and their redirects are not followed. Execution then
+follows native P2P peers, while later Beacon API responses are proof-checked
+from that agreed root. For an intentional non-interactive invocation, use
+`--yes`.
 
 To reproduce a completely cold embedded start, reset the reconstructible state
 for the exact protocol, market set, and finality mode, then subscribe again:
@@ -157,9 +161,11 @@ the processor's immutable pool catalog and rejects any requested market that
 the node does not process. Running-node subscriptions never mutate processor
 scope; all clients reuse the configured durable stream.
 
-The initializer fetches a current two-provider checkpoint quorum and pins it
-in a compact configuration. It asks before accepting a new trust root and
-refuses to overwrite an existing file. `leani --config demo.toml init ...`
+The initializer fetches a current majority checkpoint quorum and pins it in a
+compact configuration. It asks before accepting a new trust root and refuses
+to overwrite an existing file. `endpoints` holds the managed PublicNode and
+Lodestar Beacon API pool plus every responding checkpoint provider that also
+serves the Beacon light-client API, without duplicates. `leani --config demo.toml init ...`
 writes to a different path; `--yes` is available for an intentional
 non-interactive setup. A generated ETH/USDC file has this shape (the root and
 slot are live values):
@@ -172,7 +178,10 @@ data_dir = "./data"
 [finality]
 checkpoint = "0x..."
 checkpoint_slot = 15100000
-endpoints = ["https://ethereum-beacon-api.publicnode.com/"]
+endpoints = [
+    "https://ethereum-beacon-api.publicnode.com/",
+    "https://lodestar-mainnet.chainsafe.io/",
+]
 
 [uniswap]
 markets = ["ETH/USDC"]
@@ -183,8 +192,8 @@ bind = "127.0.0.1:18080"
 
 The compact document expands to the standard local-node profile: native
 execution P2P with an opportunistic minimum of one peer and a 16-peer healthy
-target, locally verified Beacon finality over a managed transport pool that
-includes the ordinary PublicNode
+target, locally verified Beacon finality over the `endpoints` transport pool,
+which `leani init` fills with the ordinary PublicNode
 (`https://ethereum-beacon-api.publicnode.com/`) and Lodestar
 (`https://lodestar-mainnet.chainsafe.io/`) Beacon API endpoints, Xatu history
 fallback, bounded 512 MiB memory and 2 GiB temporary-disk budgets, on-demand
@@ -200,9 +209,15 @@ state it kept and name the ways to move on (see the changelog). Operators who
 need to tune any of these can use the full configuration schema instead. The pinned checkpoint is the trust root; Beacon
 API endpoints only transport untrusted consensus data and never provide
 execution blocks or Uniswap observations. Leani queries those transports
-concurrently, verifies their responses locally, and cancels the remaining
-requests as soon as the configured agreement threshold is met. With the
-compact default of one, the first valid response wins.
+concurrently and verifies their responses locally. After the first verified
+response it waits about two seconds for the others, then follows the highest
+finalized slot that the configured agreement threshold of endpoints has
+reached or passed; with the compact default of one, the most recent verified
+finality wins, and finality never moves backwards. The node needs the pinned
+checkpoint only for its first start: it then keeps the newest verified
+finality anchor in `data_dir` and restarts from it, so the checkpoint does not
+expire while the node keeps verifying finality (see the runbook's
+[checkpoint lifecycle](../operations/runbook.md#checkpoint-lifecycle)).
 
 ## TypeScript SDK
 

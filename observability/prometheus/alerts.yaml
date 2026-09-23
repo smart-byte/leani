@@ -55,6 +55,15 @@ groups:
           summary: Processor finality is not advancing
           description: Processor {{ $labels.processor }} has not finalized a block for at least thirty minutes.
 
+      - alert: LeaniFinalityAnchorExpiring
+        expr: leani_finality_anchor_expiry_seconds < 3 * 86400
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: Verified finality anchor is close to its 14-day age limit
+          description: A restart can bootstrap from the newest verified anchor for less than three days. Restore verified finality, or refresh finality.checkpoint before restarting.
+
       - alert: LeaniOutboxBacklog
         expr: leani_processor_outbox_records > 0
         for: 10m

@@ -222,7 +222,17 @@ trust requirement.
 `finality.kind = "beacon_api"` remains available when HTTP consensus
 transports are operationally preferable. Configure
 `finality.minimum_agreement` above one when independent transports are
-available.
+available. Each poll waits about two seconds after the first verified endpoint
+for the others, then follows the highest finalized slot that
+`minimum_agreement` endpoints have reached or passed, so a lagging endpoint
+neither holds finality back nor drops readiness at an epoch transition.
+Finality never moves backwards, and two verified endpoints that report
+different roots at one slot fail closed. Endpoints that name one transport
+twice, for example with and without a trailing slash, fail validation because
+each would count toward agreement.
+
+See [Checkpoint lifecycle](#checkpoint-lifecycle) for how the configured
+checkpoint is used and when it must be refreshed.
 
 On-demand RPC shares the configured source-concurrency ceiling. The node
 divides its memory and temporary-disk budgets across those request slots,
@@ -240,15 +250,95 @@ Suggested alerts:
 - pending-delta or outbox bytes exceed 80% of configured budget: warn;
 - database size approaches the filesystem limit: warn at 70%, page at 90%;
 - finalized cursor does not advance for 20 minutes: warn;
+- `leani_finality_anchor_expiry_seconds` below three days: warn;
 - any finalized contradiction or store-integrity failure: stop publication
   and page immediately.
 
 Import `observability/grafana/leani.json` for the release dashboard and
 load `observability/prometheus/alerts.yaml` into the Prometheus-compatible rule
 evaluator. The checked rules cover missing scrapes, required-component
-readiness, stalled processor/finality cursors, and a non-draining outbox.
+readiness, stalled processor/finality cursors, a non-draining outbox, and a
+finality anchor close to its age limit.
 Filesystem percentage alerts remain the host operator's responsibility because
 the node exports its database/recent-cache byte counts but not host capacity.
+
+## Checkpoint lifecycle
+
+`finality.checkpoint`, with `finality.checkpoint_slot`, is the trust root, and
+it is needed only for the first start. That start verifies a light-client
+bootstrap for the checkpoint, which must be at most 14 days (336 hours) older
+than its slot.
+
+From then on, the finality source keeps one bootstrapped light client, one per
+endpoint for `beacon_api`, and advances it with every finality update, plus
+the sync-committee update when a period ends. Nothing is bootstrapped again,
+and no age check runs while the node keeps running. A `beacon_api` endpoint
+that was down at start, or bootstraps slowly, bootstraps later from the newest
+anchor the endpoints agreed on, so it can still join after the configured
+checkpoint has aged out. Its bootstrap keeps running across polls instead of
+restarting each time.
+
+The node persists the newest verified finalized anchor as
+`finality-anchor.json` in `data_dir`. It writes a temporary file, syncs it to
+disk, and renames it over the old one, so a crash leaves either the previous
+anchor or the new one. The file records the anchor's beacon slot and root, its
+execution block number and hash, the configured checkpoint it was verified
+from, and a format `version`. It holds no secrets. Only anchors at an epoch's
+first slot are written, because Beacon nodes serve bootstraps for
+epoch-boundary blocks, so the file trails finality by about one epoch. An
+older anchor never replaces a newer one.
+
+Every start, and every restart of the network lanes, bootstraps from the
+persisted anchor instead of the configured checkpoint when both hold:
+
+- the anchor was verified from the configured checkpoint, so it is newer by
+  construction; and
+- the anchor is at most 14 days old.
+
+An anchor verified from another checkpoint is never used: changing
+`finality.checkpoint` re-anchors the node on the new root, and the node logs a
+warning naming both roots. `leani doctor` reports the mismatch too. The one
+exception is an embedded subscription (`leani subscribe` without a running
+node): its checkpoint is an anchor it verified itself before, so a persisted
+anchor at a later slot replaces it.
+
+The bootstrap is still verified against the anchor's block root, and the
+configured checkpoint's own age is not checked. A missing, corrupt, or
+unreadable file, or an anchor past the limit, falls back to the configured
+checkpoint with a warning. So does a persisted anchor whose bootstrap no
+endpoint or peer serves. Startup fails only when the configured checkpoint is
+unusable too, for example because it is older than 14 days.
+`leani source probe finality` and the benchmark's history probe start from
+the persisted anchor by the same rules, but never write the file.
+
+The persisted anchor stops advancing while verified finality stalls, while the
+node is stopped, and while writing the file fails. A failed write is logged
+and counted, and never fails finality itself. Watch these:
+
+- `leani_finality_anchor_age_seconds` is the age of the newest verified
+  anchor;
+- `leani_finality_anchor_expiry_seconds` is the time left before a restart
+  can no longer bootstrap from it, and turns negative once it has passed;
+- `leani_finality_anchor_write_failures_total` counts failed writes of
+  `finality-anchor.json`: while it grows, a restart may start from an older
+  anchor than these gauges show;
+- the `LeaniFinalityAnchorExpiring` alert fires when fewer than three days
+  remain;
+- `leani doctor` warns when the anchor a restart would use expires within
+  three days: the persisted anchor, or the configured checkpoint if none
+  applies.
+
+To refresh the trust root, take a recent finalized checkpoint root and slot
+from independent providers, set `finality.checkpoint` and
+`finality.checkpoint_slot`, and restart: the persisted anchor verified from
+the old root is then ignored. `leani reset all` removes the file with the rest
+of the runtime state.
+
+Errors, logs, and probe reports show endpoint and provider URLs as
+`scheme://host[:port]`, with `/…` in place of any path, because providers put
+API keys in userinfo, query strings, and paths. Request errors add the API
+path, such as `eth/v1/beacon/genesis`. Endpoints that would show alike carry
+their index, such as `finality.endpoints[1]`.
 
 ## Backup, restore, and compact
 
@@ -318,7 +408,12 @@ processor version/configuration and block identity before resuming.
 
 Continue only explicitly included publication. Do not advance or prune the
 finalized cursor. A disagreement or contradiction is fail-closed and requires
-operator review of checkpoint provenance and independent endpoints.
+operator review of checkpoint provenance and independent endpoints. A single
+bad transport is not an outage: consensus P2P bans a peer whose light-client
+material fails verification, asks the next one, and neither asks nor dials it
+again, across reconnects, until the lanes restart. Stale updates are retried,
+so neither ends the finality stream. An exhausted peer set logs a warning at
+most every five minutes.
 
 ### Storage pressure
 

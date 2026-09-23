@@ -1,7 +1,7 @@
 //! Strict, versioned node configuration.
 
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fmt, fs,
     net::SocketAddr,
     path::{Path, PathBuf},
@@ -190,6 +190,28 @@ impl StarterConfig {
         config.api.bind = self.api.bind;
         Ok(config)
     }
+}
+
+/// The managed Beacon transport pool of the built-in Mainnet defaults.
+pub(crate) fn default_finality_endpoints() -> Result<Vec<Url>, String> {
+    let defaults: Config = toml::from_str(include_str!(
+        "../../../config/defaults/ethereum-mainnet.toml"
+    ))
+    .map_err(|error| format!("built-in Ethereum Mainnet defaults are invalid: {error}"))?;
+    Ok(defaults.finality.endpoints)
+}
+
+/// A Beacon endpoint's identity: scheme, host, port, and path. Credentials,
+/// query strings, and a trailing slash do not make a separate transport.
+pub(crate) fn finality_endpoint_identity(endpoint: &Url) -> String {
+    let endpoint = leani_finality_beacon_api::normalized_endpoint(endpoint);
+    format!(
+        "{}://{}:{}{}",
+        endpoint.scheme(),
+        endpoint.host_str().unwrap_or_default(),
+        endpoint.port_or_known_default().unwrap_or_default(),
+        endpoint.path()
+    )
 }
 
 /// Physical backend for immutable finalized processor artifacts. Lifecycle
@@ -2024,6 +2046,11 @@ fn validate_finality(finality: &FinalityConfig, errors: &mut Vec<ValidationError
             "finality.checkpoint",
             "must be a 0x-prefixed 32-byte weak-subjectivity checkpoint root",
         ));
+    } else if finality.checkpoint[2..].bytes().all(|digit| digit == b'0') {
+        errors.push(ValidationError::new(
+            "finality.checkpoint",
+            "must not be the all-zero placeholder root",
+        ));
     }
     match finality.kind {
         FinalitySourceKind::BeaconApi => {
@@ -2041,11 +2068,23 @@ fn validate_finality(finality: &FinalityConfig, errors: &mut Vec<ValidationError
                     "must be within 1..=the number of endpoints",
                 ));
             }
+            let mut identities = HashMap::new();
             for (index, endpoint) in finality.endpoints.iter().enumerate() {
                 if !matches!(endpoint.scheme(), "http" | "https") {
                     errors.push(ValidationError::new(
                         format!("finality.endpoints[{index}]"),
                         "only http and https URLs are supported",
+                    ));
+                }
+                let first = *identities
+                    .entry(finality_endpoint_identity(endpoint))
+                    .or_insert(index);
+                if first != index {
+                    errors.push(ValidationError::new(
+                        format!("finality.endpoints[{index}]"),
+                        format!(
+                            "duplicates finality.endpoints[{first}]; each transport counts once toward agreement"
+                        ),
                     ));
                 }
             }
@@ -2063,10 +2102,11 @@ fn validate_finality(finality: &FinalityConfig, errors: &mut Vec<ValidationError
                     "must be empty for consensus_p2p finality",
                 ));
             }
-            if finality.minimum_peers == 0 || finality.minimum_peers > 128 {
+            let maximum = leani_finality_consensus_p2p::DEFAULT_MAXIMUM_PEERS;
+            if finality.minimum_peers == 0 || finality.minimum_peers > maximum {
                 errors.push(ValidationError::new(
                     "finality.minimum_peers",
-                    "must be between 1 and 128",
+                    format!("must be between 1 and {maximum}, the consensus peers dialed at once"),
                 ));
             }
             for (index, bootnode) in finality.bootnodes.iter().enumerate() {
@@ -2405,7 +2445,7 @@ minimum_peers = 1
 
 [finality]
 kind = "beacon_api"
-checkpoint = "0x0000000000000000000000000000000000000000000000000000000000000000"
+checkpoint = "0x1111111111111111111111111111111111111111111111111111111111111111"
 checkpoint_slot = 0
 endpoints = ["http://127.0.0.1:5052"]
 
@@ -2996,6 +3036,59 @@ verification_segment_blocks = 8192"#,
             errors
                 .iter()
                 .any(|error| error.field == "finality.checkpoint")
+        );
+    }
+
+    fn finality_errors(config: Config) -> Vec<ValidationError> {
+        config
+            .validate()
+            .map_or_else(|errors| errors.0, |_| Vec::new())
+    }
+
+    #[test]
+    fn finality_validation_rejects_the_all_zero_checkpoint_root() {
+        let mut config = config();
+        config.finality.checkpoint = format!("0x{}", "00".repeat(32));
+        let errors = finality_errors(config);
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.field == "finality.checkpoint"),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn finality_validation_limits_minimum_peers_to_the_consensus_peer_set() {
+        let mut config = config();
+        config.finality.kind = FinalitySourceKind::ConsensusP2p;
+        config.finality.endpoints.clear();
+        config.finality.checkpoint_slot = 12_345;
+        config.finality.minimum_peers = 25;
+        let errors = finality_errors(config.clone());
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.field == "finality.minimum_peers"),
+            "{errors:?}"
+        );
+        config.finality.minimum_peers = 24;
+        config.validate().expect("the P2P maximum is attainable");
+    }
+
+    #[test]
+    fn finality_validation_rejects_endpoint_aliases() {
+        let mut config = config();
+        config.finality.endpoints = vec![
+            Url::parse("https://a.example/beacon").expect("URL"),
+            Url::parse("HTTPS://A.EXAMPLE:443/beacon/?key=alias").expect("URL"),
+        ];
+        let errors = finality_errors(config);
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.field == "finality.endpoints[1]"),
+            "{errors:?}"
         );
     }
 

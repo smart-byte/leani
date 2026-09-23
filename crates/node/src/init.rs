@@ -58,19 +58,20 @@ pub(crate) async fn init(options: InitOptions) -> Result<Exit> {
         &runtime_data_dir,
     )
     .await?;
+    let endpoints = starter_finality_endpoints(checkpoint.beacon_api_endpoints)?;
     let config = match options.protocol {
         SubscribeProtocol::Blocks => StarterConfig::blocks(
             options.data_dir,
             checkpoint.root,
             checkpoint.slot,
-            checkpoint.beacon_api_endpoints,
+            endpoints,
         ),
         SubscribeProtocol::UniswapV3 => StarterConfig::uniswap(
             options.data_dir,
             market_names.clone(),
             checkpoint.root,
             checkpoint.slot,
-            checkpoint.beacon_api_endpoints,
+            endpoints,
         ),
     };
     let encoded = toml::to_string_pretty(&config).context("render compact configuration")?;
@@ -94,6 +95,23 @@ pub(crate) async fn init(options: InitOptions) -> Result<Exit> {
         }
     }
     Ok(Exit::Success)
+}
+
+/// Beacon transports for a new compact configuration: the managed default
+/// pool plus every responding checkpoint provider that also serves the
+/// Beacon light-client API, without normalized duplicates.
+pub(crate) fn starter_finality_endpoints(responding: Vec<Url>) -> Result<Vec<Url>> {
+    let mut endpoints = crate::config::default_finality_endpoints().map_err(anyhow::Error::msg)?;
+    for endpoint in responding {
+        let identity = crate::config::finality_endpoint_identity(&endpoint);
+        if !endpoints
+            .iter()
+            .any(|existing| crate::config::finality_endpoint_identity(existing) == identity)
+        {
+            endpoints.push(endpoint);
+        }
+    }
+    Ok(endpoints)
 }
 
 fn absolute_path(working_directory: &Path, path: &Path) -> PathBuf {
@@ -133,6 +151,23 @@ fn write_new_config(path: &Path, contents: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn starter_endpoints_keep_the_default_pool_and_add_responding_providers() {
+        let endpoints = starter_finality_endpoints(vec![
+            Url::parse("https://ethereum-beacon-api.publicnode.com").expect("URL"),
+            Url::parse("https://beacon.example/").expect("URL"),
+        ])
+        .expect("starter endpoints");
+        assert_eq!(
+            endpoints.iter().map(Url::as_str).collect::<Vec<_>>(),
+            [
+                "https://ethereum-beacon-api.publicnode.com/",
+                "https://lodestar-mainnet.chainsafe.io/",
+                "https://beacon.example/",
+            ]
+        );
+    }
 
     #[test]
     fn configuration_writer_never_overwrites() {

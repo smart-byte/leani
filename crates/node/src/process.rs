@@ -3557,6 +3557,7 @@ async fn mainnet_e2e(
             cancellation: cancellation.clone(),
             backfill_control: None,
             verified_anchor: None,
+            checkpoint_origin: leani_finality_beacon_api::CheckpointOrigin::Operator,
         };
         let live_source = execution_p2p_source(&config, handles.network_telemetry.clone())?;
         tokio::spawn(async move {
@@ -4463,6 +4464,18 @@ async fn probe_finality(
     let checkpoint =
         parse_checkpoint_root(checkpoint_override.unwrap_or(config.finality.checkpoint.as_str()))?;
     let checkpoint_slot = checkpoint_slot_override.unwrap_or(config.finality.checkpoint_slot);
+    let trusted_checkpoint = leani_finality_beacon_api::TrustedCheckpoint {
+        root: checkpoint,
+        slot: (checkpoint_slot > 0).then_some(checkpoint_slot),
+        origin: leani_finality_beacon_api::CheckpointOrigin::Operator,
+    };
+    // A probe starts from the node's persisted anchor when it applies, but
+    // never writes it.
+    let anchor_file = leani_finality_beacon_api::AnchorFile::ReadOnly(
+        config
+            .data_dir
+            .join(leani_finality_beacon_api::FINALITY_ANCHOR_FILE),
+    );
     let (accepted, encoded) = match config.finality.kind {
         crate::config::FinalitySourceKind::BeaconApi => {
             let endpoints = if endpoint_overrides.is_empty() {
@@ -4474,8 +4487,9 @@ async fn probe_finality(
             if let Some(minimum_agreement) = minimum_agreement {
                 beacon_config.minimum_agreement = minimum_agreement;
             }
+            beacon_config.anchor = anchor_file;
             let source = VerifiedBeaconApi::mainnet(beacon_config)?;
-            let report = source.probe_root(checkpoint).await;
+            let report = source.probe_root(trusted_checkpoint).await;
             (report.accepted, serde_json::to_string_pretty(&report)?)
         }
         crate::config::FinalitySourceKind::ConsensusP2p => {
@@ -4484,13 +4498,15 @@ async fn probe_finality(
                     "--endpoint and --minimum-agreement only apply to beacon_api finality probes"
                 );
             }
-            let source = VerifiedConsensusP2p::mainnet(consensus_p2p_config(&config.finality))?;
+            let mut p2p_config = consensus_p2p_config(&config.finality);
+            p2p_config.anchor = anchor_file;
+            let source = VerifiedConsensusP2p::mainnet(p2p_config)?;
             if checkpoint_slot == 0 {
                 bail!(
                     "consensus_p2p finality probe requires --checkpoint-slot or finality.checkpoint_slot"
                 );
             }
-            let report = source.probe_checkpoint(checkpoint, checkpoint_slot).await;
+            let report = source.probe_checkpoint(trusted_checkpoint).await;
             (report.accepted, serde_json::to_string_pretty(&report)?)
         }
         crate::config::FinalitySourceKind::Disabled => {
@@ -4755,6 +4771,7 @@ struct DoctorReport<'a> {
     listeners: Listeners,
     valid: bool,
     errors: Vec<ValidationError>,
+    warnings: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -4764,10 +4781,77 @@ struct Listeners {
     rpc_ws: String,
 }
 
+/// Warn when the anchor a restart would bootstrap from expires within three
+/// days: after that, startup needs a refreshed `finality.checkpoint`.
+fn finality_anchor_warnings(config: &Config, now: SystemTime) -> Vec<String> {
+    use leani_finality_beacon_api::{
+        DEFAULT_MAX_CHECKPOINT_AGE, FINALITY_ANCHOR_FILE, parse_checkpoint_root,
+        resolve_start_anchor, slot_unix_seconds,
+    };
+
+    const WARNING_WINDOW: Duration = Duration::from_hours(3 * 24);
+    if matches!(
+        config.finality.kind,
+        crate::config::FinalitySourceKind::Disabled
+    ) {
+        return Vec::new();
+    }
+    // An invalid checkpoint is already a validation error.
+    let Ok(checkpoint_root) = parse_checkpoint_root(&config.finality.checkpoint) else {
+        return Vec::new();
+    };
+    let anchor_path = config.data_dir.join(FINALITY_ANCHOR_FILE);
+    let mut warnings = Vec::new();
+    if let Ok(Some(persisted)) = leani_finality_beacon_api::read_finality_anchor(&anchor_path)
+        && persisted.checkpoint_root != checkpoint_root
+        && persisted.anchor.beacon_block_root != checkpoint_root
+    {
+        warnings.push(format!(
+            "the persisted finality anchor at slot {} was verified from checkpoint 0x{}, not the configured finality.checkpoint {}; startup ignores it",
+            persisted.anchor.beacon_slot,
+            hex::encode(persisted.checkpoint_root),
+            config.finality.checkpoint
+        ));
+    }
+    let start = resolve_start_anchor(
+        Some(&anchor_path),
+        leani_finality_beacon_api::TrustedCheckpoint {
+            root: checkpoint_root,
+            slot: (config.finality.checkpoint_slot > 0).then_some(config.finality.checkpoint_slot),
+            origin: leani_finality_beacon_api::CheckpointOrigin::Operator,
+        },
+        DEFAULT_MAX_CHECKPOINT_AGE,
+        now,
+    );
+    let Some(slot) = start.slot else {
+        return warnings;
+    };
+    let anchor = if start.persisted {
+        format!("persisted finality anchor at slot {slot}")
+    } else {
+        format!("configured checkpoint at slot {slot}")
+    };
+    let expires = slot_unix_seconds(slot).saturating_add(DEFAULT_MAX_CHECKPOINT_AGE.as_secs());
+    let now = now.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+    if expires <= now {
+        warnings.push(format!(
+            "{anchor} expired {} hours ago; startup fails until finality.checkpoint is refreshed",
+            (now - expires) / 3_600
+        ));
+    } else if expires - now <= WARNING_WINDOW.as_secs() {
+        warnings.push(format!(
+            "{anchor} expires in {} hours; a later restart needs a refreshed finality.checkpoint",
+            (expires - now) / 3_600
+        ));
+    }
+    warnings
+}
+
 fn doctor(path: &Path, json: bool, registry: &ProcessorRegistry) -> Result<Exit> {
     let config = Config::load(path)?;
     let mut errors = config.validation_errors();
     errors.extend(registry.validation_errors(&config));
+    let warnings = finality_anchor_warnings(&config, SystemTime::now());
     let report = DoctorReport {
         project: leani_primitives::PROJECT_NAME,
         version: env!("CARGO_PKG_VERSION"),
@@ -4796,6 +4880,7 @@ fn doctor(path: &Path, json: bool, registry: &ProcessorRegistry) -> Result<Exit>
         },
         valid: errors.is_empty(),
         errors,
+        warnings,
     };
 
     if json {
@@ -4822,6 +4907,9 @@ fn doctor(path: &Path, json: bool, registry: &ProcessorRegistry) -> Result<Exit>
             for error in &report.errors {
                 println!("- {}: {}", error.field, error.message);
             }
+        }
+        for warning in &report.warnings {
+            println!("warning: {warning}");
         }
     }
 
@@ -5329,6 +5417,7 @@ async fn serve(path: &Path, registry: &ProcessorRegistry) -> Result<Exit> {
             cancellation: cancellation.clone(),
             backfill_control: Some(backfill_control),
             verified_anchor: None,
+            checkpoint_origin: leani_finality_beacon_api::CheckpointOrigin::Operator,
         };
         Some(tokio::spawn(async move {
             Box::pin(supervise_network_lanes(
@@ -5678,6 +5767,9 @@ struct NetworkLaneHandles {
     backfill_control: Option<Arc<NativeBackfillControl>>,
     verified_anchor:
         Option<tokio::sync::watch::Sender<Option<leani_runtime::AppliedFinalityAnchor>>>,
+    /// Where `finality.checkpoint` came from: the operator, or an anchor an
+    /// embedded subscription verified before.
+    checkpoint_origin: leani_finality_beacon_api::CheckpointOrigin,
 }
 
 fn publish_verified_anchor(
@@ -5771,6 +5863,7 @@ pub(crate) fn spawn_embedded_network_runtime(
     store: leani_store_sqlite::SqliteStore,
     processors: Vec<std::sync::Arc<dyn leani_processor_api::Processor>>,
     data_dir_lock: crate::local_state::RuntimeDirectoryLock,
+    checkpoint_origin: leani_finality_beacon_api::CheckpointOrigin,
 ) -> Result<EmbeddedNetworkRuntime> {
     let readiness = leani_api::ReadinessHandle::new(true, true);
     let cancellation = CancellationToken::new();
@@ -5786,6 +5879,7 @@ pub(crate) fn spawn_embedded_network_runtime(
         cancellation: cancellation.clone(),
         backfill_control: None,
         verified_anchor: Some(verified_anchor),
+        checkpoint_origin,
     };
     let task = tokio::spawn(supervise_network_lanes(
         config,
@@ -5876,11 +5970,21 @@ pub(crate) async fn verified_p2p_history_anchor(
     if config.chain.chain_id != 1 {
         bail!("execution P2P historical fallback currently supports Ethereum mainnet only");
     }
-    let checkpoint = parse_checkpoint_root(&config.finality.checkpoint)?;
+    let checkpoint = leani_finality_beacon_api::TrustedCheckpoint {
+        root: parse_checkpoint_root(&config.finality.checkpoint)?,
+        slot: (config.finality.checkpoint_slot > 0).then_some(config.finality.checkpoint_slot),
+        origin: leani_finality_beacon_api::CheckpointOrigin::Operator,
+    };
+    let anchor_file = leani_finality_beacon_api::AnchorFile::ReadOnly(
+        config
+            .data_dir
+            .join(leani_finality_beacon_api::FINALITY_ANCHOR_FILE),
+    );
     let selected = match config.finality.kind {
         crate::config::FinalitySourceKind::BeaconApi => {
             let mut finality = BeaconApiConfig::mainnet(config.finality.endpoints.clone());
             finality.minimum_agreement = config.finality.minimum_agreement;
+            finality.anchor = anchor_file;
             let source = VerifiedBeaconApi::mainnet(finality)?;
             let report = source.probe_root(checkpoint).await;
             if !report.accepted {
@@ -5894,10 +5998,10 @@ pub(crate) async fn verified_p2p_history_anchor(
                 .context("accepted finality report omitted its selected anchor")?
         }
         crate::config::FinalitySourceKind::ConsensusP2p => {
-            let source = VerifiedConsensusP2p::mainnet(consensus_p2p_config(&config.finality))?;
-            let report = source
-                .probe_checkpoint(checkpoint, config.finality.checkpoint_slot)
-                .await;
+            let mut p2p_config = consensus_p2p_config(&config.finality);
+            p2p_config.anchor = anchor_file;
+            let source = VerifiedConsensusP2p::mainnet(p2p_config)?;
+            let report = source.probe_checkpoint(checkpoint).await;
             if !report.accepted {
                 bail!(
                     "verified consensus P2P finality was not accepted: {}",
@@ -6032,6 +6136,7 @@ async fn run_network_lanes_once(
         cancellation,
         backfill_control,
         verified_anchor,
+        checkpoint_origin,
     } = handles;
     if config.chain.chain_id != 1 {
         bail!("the direct P2P/finality lane currently supports Ethereum mainnet only");
@@ -6051,6 +6156,19 @@ async fn run_network_lanes_once(
         );
     }
     let checkpoint_root = parse_checkpoint_root(&config.finality.checkpoint)?;
+    let trusted_checkpoint = leani_finality_beacon_api::TrustedCheckpoint {
+        root: checkpoint_root,
+        slot: (config.finality.checkpoint_slot > 0).then_some(config.finality.checkpoint_slot),
+        origin: checkpoint_origin,
+    };
+    // Verified finality persists its newest anchor here, so a restart does
+    // not depend on the configured checkpoint's age.
+    let anchor_file = leani_finality_beacon_api::AnchorFile::ReadWrite {
+        path: config
+            .data_dir
+            .join(leani_finality_beacon_api::FINALITY_ANCHOR_FILE),
+        write_failures: readiness.finality_anchor_write_failures(),
+    };
     let (finality_source, selected, bootstrap): (
         Arc<dyn FinalitySource>,
         VerifiedFinalityAnchor,
@@ -6059,8 +6177,9 @@ async fn run_network_lanes_once(
         crate::config::FinalitySourceKind::BeaconApi => {
             let mut beacon_config = BeaconApiConfig::mainnet(config.finality.endpoints.clone());
             beacon_config.minimum_agreement = config.finality.minimum_agreement;
+            beacon_config.anchor = anchor_file;
             let source = Arc::new(VerifiedBeaconApi::mainnet(beacon_config)?);
-            let probe = source.probe_root(checkpoint_root).await;
+            let probe = source.probe_root(trusted_checkpoint).await;
             if !probe.accepted {
                 bail!(
                     "verified Beacon API finality quorum was not accepted: {}",
@@ -6071,20 +6190,15 @@ async fn run_network_lanes_once(
                 .selected
                 .context("accepted finality report omitted its selected anchor")?;
             let bootstrap = probe
-                .endpoints
-                .iter()
-                .filter(|endpoint| endpoint.verified)
-                .find_map(|endpoint| endpoint.checkpoint_anchor)
+                .checkpoint_anchor
                 .context("accepted finality report omitted its checkpoint anchor")?;
             (source, selected, bootstrap)
         }
         crate::config::FinalitySourceKind::ConsensusP2p => {
-            let source = Arc::new(VerifiedConsensusP2p::mainnet(consensus_p2p_config(
-                &config.finality,
-            ))?);
-            let probe = source
-                .probe_checkpoint(checkpoint_root, config.finality.checkpoint_slot)
-                .await;
+            let mut p2p_config = consensus_p2p_config(&config.finality);
+            p2p_config.anchor = anchor_file;
+            let source = Arc::new(VerifiedConsensusP2p::mainnet(p2p_config)?);
+            let probe = source.probe_checkpoint(trusted_checkpoint).await;
             if !probe.accepted {
                 bail!(
                     "verified consensus P2P finality was not accepted: {}",
@@ -6108,8 +6222,10 @@ async fn run_network_lanes_once(
     info!(
         elapsed_ms = u64::try_from(startup_started.elapsed().as_millis()).unwrap_or(u64::MAX),
         finalized_execution_block = selected.execution_block_number,
+        bootstrap_slot = bootstrap.beacon_slot,
         "verified finality startup anchor resolved"
     );
+    observe_finality_anchor(&readiness, selected.beacon_slot);
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -6151,7 +6267,12 @@ async fn run_network_lanes_once(
         beacon_block_root: bootstrap.beacon_block_root,
         execution_block_hash: bootstrap.execution_block_hash,
         obtained_at_unix_seconds: now,
-        source: "configured weak-subjectivity checkpoint".to_owned(),
+        source: if bootstrap.beacon_block_root == checkpoint_root {
+            "configured weak-subjectivity checkpoint"
+        } else {
+            "persisted verified finality anchor"
+        }
+        .to_owned(),
     };
 
     let mut live_runtime = SharedLiveRuntime::new(
@@ -6212,6 +6333,7 @@ async fn run_network_lanes_once(
         let control = backfill_control.clone();
         let source = live_source.as_ref().clone();
         let verified_anchor = verified_anchor.clone();
+        let readiness = readiness.clone();
         async move {
             loop {
                 let applied = match applied_anchor_updates.recv().await {
@@ -6230,6 +6352,7 @@ async fn run_network_lanes_once(
                 if let Some(verified_anchor) = &verified_anchor {
                     publish_verified_anchor(verified_anchor, applied)?;
                 }
+                observe_finality_anchor(&readiness, applied.beacon_slot);
                 if let Some(control) = &control {
                     control
                         .update_p2p_bridge(
@@ -6417,6 +6540,16 @@ async fn run_network_lanes_once(
     rpc_readiness.set_live_ready(false);
     readiness.set_finality_ready(false);
     result
+}
+
+/// Publish the newest verified finality anchor's slot time and the time a
+/// restart can no longer bootstrap from it, for the anchor metrics.
+fn observe_finality_anchor(readiness: &leani_api::ReadinessHandle, beacon_slot: u64) {
+    let anchor = leani_finality_beacon_api::slot_unix_seconds(beacon_slot);
+    readiness.set_finality_anchor(
+        anchor,
+        anchor.saturating_add(leani_finality_beacon_api::DEFAULT_MAX_CHECKPOINT_AGE.as_secs()),
+    );
 }
 
 fn spawn_execution_peer_warmup(
@@ -7069,6 +7202,101 @@ mod tests {
     use leani_testkit::{BlockLocalCounter, fixture_frame};
 
     use super::*;
+
+    #[test]
+    fn doctor_warns_when_the_active_finality_anchor_expires_within_three_days() {
+        use leani_finality_beacon_api::{
+            FINALITY_ANCHOR_FILE, MAINNET_GENESIS_TIME, PersistedFinalityAnchor,
+            VerifiedFinalityAnchor, persist_finality_anchor,
+        };
+        use leani_primitives::BlockHash;
+
+        const DAY: u64 = 86_400;
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let mut config: Config =
+            toml::from_str(crate::config::VALID_CONFIG_TOML).expect("configuration fixture");
+        config.data_dir = directory.path().to_path_buf();
+        let checkpoint_slot = 10_000_000;
+        config.finality.checkpoint_slot = checkpoint_slot;
+        let checkpoint_time = MAINNET_GENESIS_TIME + checkpoint_slot * 12;
+        let at = |seconds: u64| UNIX_EPOCH + Duration::from_secs(seconds);
+
+        assert!(finality_anchor_warnings(&config, at(checkpoint_time + 10 * DAY)).is_empty());
+        let warnings = finality_anchor_warnings(&config, at(checkpoint_time + 12 * DAY));
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].contains("configured checkpoint"),
+            "{warnings:?}"
+        );
+
+        // A newer anchor verified from the configured checkpoint is active
+        // instead, and it expires later.
+        let root = checkpoint_root(&config);
+        persist_finality_anchor(
+            &directory.path().join(FINALITY_ANCHOR_FILE),
+            &PersistedFinalityAnchor {
+                anchor: VerifiedFinalityAnchor {
+                    beacon_slot: checkpoint_slot + 10 * 7_200,
+                    beacon_block_root: [0xaa; 32],
+                    execution_block_number: 20_000_000,
+                    execution_block_hash: BlockHash::new([0xbb; 32]),
+                },
+                checkpoint_root: root,
+            },
+        )
+        .expect("persist anchor");
+        assert!(finality_anchor_warnings(&config, at(checkpoint_time + 12 * DAY)).is_empty());
+        let warnings = finality_anchor_warnings(&config, at(checkpoint_time + 22 * DAY));
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("persisted"), "{warnings:?}");
+        let expired = finality_anchor_warnings(&config, at(checkpoint_time + 30 * DAY));
+        assert!(expired[0].contains("expired"), "{expired:?}");
+
+        config.finality.kind = crate::config::FinalitySourceKind::Disabled;
+        assert!(finality_anchor_warnings(&config, at(checkpoint_time + 30 * DAY)).is_empty());
+    }
+
+    #[test]
+    fn doctor_warns_about_a_persisted_anchor_from_another_trust_root() {
+        use leani_finality_beacon_api::{
+            FINALITY_ANCHOR_FILE, MAINNET_GENESIS_TIME, PersistedFinalityAnchor,
+            VerifiedFinalityAnchor, persist_finality_anchor,
+        };
+        use leani_primitives::BlockHash;
+
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let mut config: Config =
+            toml::from_str(crate::config::VALID_CONFIG_TOML).expect("configuration fixture");
+        config.data_dir = directory.path().to_path_buf();
+        let checkpoint_slot = 10_000_000;
+        config.finality.checkpoint_slot = checkpoint_slot;
+        persist_finality_anchor(
+            &directory.path().join(FINALITY_ANCHOR_FILE),
+            &PersistedFinalityAnchor {
+                anchor: VerifiedFinalityAnchor {
+                    beacon_slot: checkpoint_slot + 7_200,
+                    beacon_block_root: [0xaa; 32],
+                    execution_block_number: 20_000_000,
+                    execution_block_hash: BlockHash::new([0xbb; 32]),
+                },
+                checkpoint_root: [0x44; 32],
+            },
+        )
+        .expect("persist anchor");
+        let now = UNIX_EPOCH + Duration::from_secs(MAINNET_GENESIS_TIME + checkpoint_slot * 12);
+        let warnings = finality_anchor_warnings(&config, now);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].contains(&format!("0x{}", hex::encode([0x44; 32])))
+                && warnings[0].contains(&config.finality.checkpoint),
+            "{warnings:?}"
+        );
+    }
+
+    fn checkpoint_root(config: &Config) -> [u8; 32] {
+        leani_finality_beacon_api::parse_checkpoint_root(&config.finality.checkpoint)
+            .expect("checkpoint root")
+    }
 
     #[test]
     fn verified_anchor_notifications_never_rewind_or_replace_a_conflicting_identity() {
