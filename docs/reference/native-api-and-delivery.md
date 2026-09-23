@@ -107,6 +107,9 @@ GET  /v1/q/uniswap/pools/{address}
 Health distinguishes process/store liveness from required live/finality
 readiness and processor range coverage. The operational routes are not behind
 the optional API bearer token so a protected local supervisor can probe them.
+Neither health route scans store tables: liveness runs a trivial SQLite query,
+and readiness adds in-memory actor state. `/metrics` and `/v1/network/status`
+reuse store row and byte counts for up to 10 seconds.
 ERC-20 and Uniswap streams share the generic processor cursor contract; their
 typed queries and changes encode large quantities as lossless decimal strings.
 The `/query/*` subtree is supplied by the selected processor's optional native

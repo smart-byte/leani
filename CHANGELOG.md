@@ -19,6 +19,9 @@ record, and documented RPC contracts.
   files of the Arrow, Parquet, object_store, and Moka dependencies, which the
   generated listing previously omitted. The Homebrew package now also installs
   Leani's own `LICENSE`, and the container image declares OCI license metadata.
+- Node stores move to schema 22, which adds coverage lookup indexes. A
+  schema-21 store upgrades in place on its next start; earlier binaries then
+  refuse it, so keep a backup if you might roll back.
 
 ### Fixed
 
@@ -100,6 +103,24 @@ record, and documented RPC contracts.
   `leani_store_deferred_changes`, and `leani_store_deferred_change_bytes`.
 - Refusing an older store schema names the actual reason instead of always
   claiming the store predates the included/finalized vocabulary.
+- `/health/live` and `/health/ready` no longer count whole store tables on
+  every probe, which could exceed the container health check's 3-second
+  timeout on large stores. They answer from in-memory readiness plus a trivial
+  SQLite query. `/metrics` and `/v1/network/status` reuse store-wide and
+  per-processor row and byte counts for up to 10 seconds, and `/v1/status`
+  reads the database size from page counts.
+- A processor's finalized height and coverage head are found with index
+  searches instead of scanning all of its coverage on each metrics scrape,
+  status poll, or undo, and block-hash coverage lookups are indexed.
+- Read-only API paths no longer queue for the store writer, where each one
+  held back history writers (they yield to every waiting live writer), so
+  steady API traffic could starve backfill. Consumer change pages, change
+  bounds, and delivery stream listings and statistics read without it and no
+  longer register an unknown processor as a side effect, and re-registering
+  an unchanged processor writes nothing. Query snapshots check coverage,
+  retention, and size caps before taking the writer and stop counting once a
+  cap is exceeded, so `query_too_expensive` reports at least that many rows
+  and bytes; only the copy itself waits for the writer.
 
 ## [0.1.0-rc.1] - 2026-09-20
 

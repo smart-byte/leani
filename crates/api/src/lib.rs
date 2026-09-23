@@ -1279,7 +1279,8 @@ struct StatusResponse {
 }
 
 async fn status(State(state): State<ApiState>) -> Result<Json<StatusResponse>, ApiError> {
-    let store_stats = state.store.stats().await?;
+    // Page counts give the database size without scanning tables.
+    let store_stats = state.store.storage_stats().await?;
     let processors = processor_summaries(&state);
     Ok(Json(StatusResponse {
         api_version: API_VERSION,
@@ -1402,7 +1403,10 @@ async fn network_status(
     let mut applied_blocks = 0_u64;
     for processor in state.processors.values() {
         let coverage = coverage(&state, processor.as_ref(), None).await?;
-        let store_stats = state.store.processor_stats(processor.descriptor()).await?;
+        let store_stats = state
+            .store
+            .cached_processor_stats(processor.descriptor())
+            .await?;
         applied_blocks = applied_blocks.saturating_add(store_stats.applied_blocks);
         let runtime = state
             .store
@@ -2420,8 +2424,11 @@ struct HealthResponse {
     reasons: Vec<&'static str>,
 }
 
+// Health probes are unauthenticated and polled every few seconds, often with
+// a short timeout: they read in-memory readiness plus a trivial store ping and
+// never scan tables.
 async fn liveness(State(state): State<ApiState>) -> Response {
-    let database_ok = state.store.stats().await.is_ok();
+    let database_ok = state.store.ping().await.is_ok();
     let body = HealthResponse {
         status: if database_ok { "live" } else { "failed" },
         uptime_seconds: state.started.elapsed().as_secs(),
@@ -2449,7 +2456,7 @@ async fn liveness(State(state): State<ApiState>) -> Response {
 }
 
 async fn readiness(State(state): State<ApiState>) -> Response {
-    let database_ok = state.store.stats().await.is_ok();
+    let database_ok = state.store.ping().await.is_ok();
     let readiness = state.config.readiness.snapshot();
     let mut reasons = Vec::new();
     if !database_ok {
@@ -2487,7 +2494,8 @@ async fn readiness(State(state): State<ApiState>) -> Response {
 async fn metrics(State(state): State<ApiState>) -> Result<Response, ApiError> {
     use std::fmt::Write as _;
 
-    let store_metrics = state.store.stats().await?;
+    // Whole-table counts refresh at most once per store stats TTL.
+    let store_metrics = state.store.cached_stats().await?;
     let store_budgets = state.store.budget_stats().await?;
     let recent_metrics = state.store.recent_stats(state.config.chain_id).await?;
     let readiness = state.config.readiness.snapshot();
@@ -2878,7 +2886,7 @@ async fn append_processor_metrics(output: &mut String, state: &ApiState) -> Resu
         let descriptor = processor.descriptor();
         let cursor = state.store.processor_cursor(descriptor).await?;
         let finalized = state.store.finalized_through(descriptor).await?;
-        let processor_store = state.store.processor_stats(descriptor).await?;
+        let processor_store = state.store.cached_processor_stats(descriptor).await?;
         let delivery = state.store.delivery_stream_stats(descriptor).await?;
         if let Ok(runtime) = state.store.processor_runtime_state(descriptor).await {
             writeln!(
@@ -10119,6 +10127,53 @@ mod tests {
         assert!(body.contains("leani_consumer_lease_active"));
         assert!(body.contains("leani_store_deferred_changes 0"));
         assert!(body.contains("leani_store_deferred_change_bytes 0"));
+    }
+
+    #[tokio::test]
+    async fn health_probes_skip_store_scans_and_metrics_reuse_cached_counts() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = SqliteStore::open(leani_store_sqlite::StoreConfig::new(
+            directory.path().join("node.sqlite"),
+        ))
+        .await
+        .expect("store");
+        let processor = Arc::new(BlobsProcessor::default());
+        store
+            .register_processor(processor.descriptor())
+            .await
+            .expect("register");
+        let router = router(store.clone(), processor, ApiConfig::default()).expect("router");
+        let get = |path: &'static str| {
+            let router = router.clone();
+            async move {
+                router
+                    .oneshot(Request::get(path).body(Body::empty()).expect("request"))
+                    .await
+                    .expect("response")
+                    .status()
+            }
+        };
+
+        let before = store.statistics_scans();
+        assert_eq!(get("/health/live").await, StatusCode::OK);
+        assert_eq!(get("/health/ready").await, StatusCode::OK);
+        assert_eq!(get("/v1/status").await, StatusCode::OK);
+        assert_eq!(
+            store.statistics_scans(),
+            before,
+            "health and status probes scanned store tables"
+        );
+
+        assert_eq!(get("/metrics").await, StatusCode::OK);
+        let scanned = store.statistics_scans();
+        assert!(scanned > before);
+        assert_eq!(get("/metrics").await, StatusCode::OK);
+        assert_eq!(get("/v1/network/status").await, StatusCode::OK);
+        assert_eq!(
+            store.statistics_scans(),
+            scanned,
+            "metrics and network status rescanned within the cache TTL"
+        );
     }
 
     #[tokio::test]

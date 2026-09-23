@@ -9,7 +9,10 @@
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     path::{Component, Path, PathBuf},
-    sync::{Arc, Mutex as StdMutex},
+    sync::{
+        Arc, Mutex as StdMutex,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -61,8 +64,9 @@ const SCHEMA_V18: &str = include_str!("../migrations/0018_processor_artifact_tot
 const SCHEMA_V19: &str = include_str!("../migrations/0019_bulk_artifact_accounting.sql");
 const SCHEMA_V20: &str = include_str!("../migrations/0020_query_snapshot_filters.sql");
 const SCHEMA_V21: &str = include_str!("../migrations/0021_deferred_changes.sql");
+const SCHEMA_V22: &str = include_str!("../migrations/0022_coverage_lookup_indexes.sql");
 /// Current on-disk `SQLite` schema version written by this crate.
-pub const CURRENT_SCHEMA_VERSION: u32 = 21;
+pub const CURRENT_SCHEMA_VERSION: u32 = 22;
 /// Stable encoding version attached to durable delivery records.
 pub const DELIVERY_ENCODING_VERSION: u16 = 1;
 /// Deferred rows promoted per SQL round trip inside `mark_finalized`.
@@ -79,6 +83,14 @@ const PORTABLE_SAVEPOINT_LIMIT: u64 = 16;
 /// First schema whose durable cursors and undo records use the
 /// included/finalized finality vocabulary.
 const FINALITY_VOCABULARY_SCHEMA_VERSION: u32 = 21;
+/// Oldest existing store schema that upgrades in place through the migration
+/// chain. Older stores are refused with [`older_schema_refusal`].
+const OLDEST_UPGRADABLE_SCHEMA_VERSION: u32 = FINALITY_VOCABULARY_SCHEMA_VERSION;
+/// Longest time [`SqliteStore::cached_stats`] and
+/// [`SqliteStore::cached_processor_stats`] reuse one scan. Health and metrics
+/// endpoints poll far more often than these counts move, and each scan reads
+/// whole tables.
+pub const STATS_CACHE_TTL: Duration = Duration::from_secs(10);
 
 /// `SQLite` fsync policy.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -1755,6 +1767,49 @@ struct StoreInner {
     artifact_compaction: Mutex<()>,
     /// Running hot/cold handoffs whose compaction hold was already logged.
     logged_handoff_holds: StdMutex<BTreeSet<String>>,
+    /// Full statistics scans run since open; see
+    /// [`SqliteStore::statistics_scans`].
+    statistics_scans: AtomicU64,
+    /// Committed writes that removed processor coverage (undo, historical
+    /// work deletion), bumped under the writer after commit. Snapshot
+    /// admission checks coverage before taking the writer and re-reads it
+    /// under the writer only when this moved.
+    coverage_removals: AtomicU64,
+    /// Recent scans reused by operational readers for [`STATS_CACHE_TTL`].
+    statistics_cache: Mutex<StatisticsCache>,
+}
+
+/// One statistics scan and when it ran.
+#[derive(Debug)]
+struct CachedStatistics<T> {
+    refreshed_at: Instant,
+    value: T,
+}
+
+impl<T: Clone> CachedStatistics<T> {
+    fn new(value: T) -> Self {
+        Self {
+            refreshed_at: Instant::now(),
+            value,
+        }
+    }
+
+    fn is_fresh(&self, now: Instant) -> bool {
+        now.saturating_duration_since(self.refreshed_at) < STATS_CACHE_TTL
+    }
+
+    /// The scanned value while it is younger than [`STATS_CACHE_TTL`].
+    fn fresh(&self, now: Instant) -> Option<T> {
+        self.is_fresh(now).then(|| self.value.clone())
+    }
+}
+
+/// Statistics shared by every handle of one store.
+#[derive(Debug, Default)]
+struct StatisticsCache {
+    store: Option<CachedStatistics<StoreStats>>,
+    /// Keyed by processor instance.
+    processors: BTreeMap<String, CachedStatistics<ProcessorStoreStats>>,
 }
 
 #[derive(Clone, Debug)]
@@ -1882,10 +1937,10 @@ async fn migrate(pool: &SqlitePool) -> Result<(), StoreError> {
     }
     // Stores before the finality vocabulary encode finality 0 = optimistic
     // inside postcard cursors and undo records; that value now means Preview
-    // and cannot be rewritten by SQL. Later stores have no in-place upgrade
-    // yet either. Only the schema-1 bootstrap of a store created by this
-    // transaction may continue through the migration chain.
-    if !new_store && version < CURRENT_SCHEMA_VERSION {
+    // and cannot be rewritten by SQL. Stores from the oldest upgradable
+    // schema on continue through the migration chain, as does the schema-1
+    // bootstrap of a store created by this transaction.
+    if !new_store && version < OLDEST_UPGRADABLE_SCHEMA_VERSION {
         return Err(older_schema_refusal(version));
     }
 
@@ -1910,6 +1965,7 @@ async fn migrate(pool: &SqlitePool) -> Result<(), StoreError> {
         (19, SCHEMA_V19),
         (20, SCHEMA_V20),
         (21, SCHEMA_V21),
+        (22, SCHEMA_V22),
     ];
     for (target, migration) in migrations {
         if target > version {
@@ -1922,6 +1978,34 @@ async fn migrate(pool: &SqlitePool) -> Result<(), StoreError> {
     }
     Ok(())
 }
+
+/// A processor's stored registration, read without the writer.
+#[derive(Clone, Copy, Debug)]
+struct StoredRegistration {
+    /// The stored descriptor equals the caller's, lifecycle included.
+    identical: bool,
+    runtime_state: bool,
+    default_stream: bool,
+}
+
+impl StoredRegistration {
+    /// Registering `descriptor` again would write nothing.
+    fn is_current(self, descriptor: &ProcessorDescriptor) -> bool {
+        self.identical
+            && self.runtime_state
+            && (self.default_stream
+                || descriptor.lifecycle.delivery.mode == DeliveryPolicyMode::None)
+    }
+}
+
+/// Delivery statistics of a stream with nothing retained, as registration
+/// creates it; also reported when delivery is disabled.
+const EMPTY_DELIVERY_STREAM_STATS: DeliveryStreamStats = DeliveryStreamStats {
+    live_bytes: 0,
+    pruned_through_sequence: 0,
+    required_ack_watermark: None,
+    format_version: 1,
+};
 
 impl SqliteStore {
     /// Open a WAL-mode store and apply embedded migrations.
@@ -2074,6 +2158,9 @@ impl SqliteStore {
                 artifact_segments,
                 artifact_compaction: Mutex::new(()),
                 logged_handoff_holds: StdMutex::new(BTreeSet::new()),
+                statistics_scans: AtomicU64::new(0),
+                coverage_removals: AtomicU64::new(0),
+                statistics_cache: Mutex::new(StatisticsCache::default()),
             }),
         };
         store.recover_artifact_segment_catalog().await?;
@@ -2161,13 +2248,54 @@ impl SqliteStore {
         Ok(())
     }
 
+    /// Read `descriptor`'s registration without writing: the read-only lookup
+    /// behind [`Self::register_processor`] and the read paths, which never
+    /// register. `None` means the instance is not registered yet.
+    ///
+    /// Fails for an invalid descriptor, a different processor stored under
+    /// the same instance key, or a failed read.
+    async fn stored_registration(
+        &self,
+        descriptor: &ProcessorDescriptor,
+    ) -> Result<Option<StoredRegistration>, StoreError> {
+        descriptor
+            .validate()
+            .map_err(|error| StoreError::InvalidConfig(error.to_owned()))?;
+        let instance = processor_instance(descriptor);
+        let row: Option<(String, bool, bool)> = sqlx::query_as(
+            "SELECT descriptor_json,
+                    EXISTS (SELECT 1 FROM processor_runtime_state WHERE instance = ?1),
+                    EXISTS (SELECT 1 FROM delivery_streams WHERE stream_id = ?2)
+             FROM processor_instances WHERE instance = ?1",
+        )
+        .bind(&instance)
+        .bind(default_delivery_stream_id(descriptor))
+        .fetch_optional(&self.inner.pool)
+        .await?;
+        let Some((stored, runtime_state, default_stream)) = row else {
+            return Ok(None);
+        };
+        let stored: ProcessorDescriptor = serde_json::from_str(&stored)?;
+        let identical = stored == *descriptor;
+        if !identical && !same_processor_identity(&stored, descriptor) {
+            return Err(StoreError::ProcessorIdentity(instance));
+        }
+        Ok(Some(StoredRegistration {
+            identical,
+            runtime_state,
+            default_stream,
+        }))
+    }
+
     /// Register an immutable processor identity and its current operational
     /// lifecycle policy.
     ///
-    /// Re-registering the same identity is idempotent. Code, configuration,
-    /// requirements, ordering, publication, and start-point drift under the
-    /// same instance key is rejected. Lifecycle limits are mutable operator
-    /// policy so a failed lane can be repaired by raising a hard limit.
+    /// Re-registering the same identity is idempotent. An unchanged
+    /// registration is read, not written, so it never waits for the writer.
+    /// Code, configuration, requirements, ordering, publication, and
+    /// start-point drift under the same instance key is rejected. Lifecycle
+    /// limits are mutable operator policy so a failed lane can be repaired by
+    /// raising a hard limit.
     ///
     /// # Errors
     ///
@@ -2177,10 +2305,16 @@ impl SqliteStore {
         &self,
         descriptor: &ProcessorDescriptor,
     ) -> Result<String, StoreError> {
-        descriptor
-            .validate()
-            .map_err(|error| StoreError::InvalidConfig(error.to_owned()))?;
         let instance = processor_instance(descriptor);
+        // Every apply and several admin paths re-register: take the writer
+        // only when registration changes something.
+        if self
+            .stored_registration(descriptor)
+            .await?
+            .is_some_and(|stored| stored.is_current(descriptor))
+        {
+            return Ok(instance);
+        }
         let stream_id = default_delivery_stream_id(descriptor);
         let descriptor_json = serde_json::to_string(descriptor)?;
         let _guard = self.inner.writer.lock().await;
@@ -2329,15 +2463,18 @@ impl SqliteStore {
 
     /// List every delivery stream owned by one processor instance.
     ///
+    /// A pure read: an unregistered processor owns no streams and is not
+    /// registered.
+    ///
     /// # Errors
     ///
-    /// Returns an error when processor registration, decoding, or the query
-    /// fails.
+    /// Returns an error for an invalid descriptor, an identity collision,
+    /// corrupt stored streams, or a failed query.
     pub async fn delivery_streams(
         &self,
         descriptor: &ProcessorDescriptor,
     ) -> Result<Vec<DeliveryStream>, StoreError> {
-        self.register_processor(descriptor).await?;
+        self.stored_registration(descriptor).await?;
         let rows = sqlx::query(
             "SELECT stream_id, instance, stream_kind, subscription_id,
                     created_at_unix_ms
@@ -4347,6 +4484,7 @@ impl SqliteStore {
             .await?
         };
         transaction.commit().await?;
+        self.inner.coverage_removals.fetch_add(1, Ordering::AcqRel);
         if last.is_some() {
             self.inner.delivery_changes_available.notify_waiters();
         }
@@ -4874,29 +5012,21 @@ impl SqliteStore {
         descriptor: &ProcessorDescriptor,
         hash: BlockHash,
     ) -> Result<Option<BlockNumber>, StoreError> {
-        let value: Option<i64> = sqlx::query_scalar(
-            "SELECT block_number FROM processor_coverage
-             WHERE instance = ? AND block_hash = ?
-             LIMIT 1",
-        )
-        .bind(processor_instance(descriptor))
-        .bind(hash.0.as_slice())
-        .fetch_optional(&self.inner.pool)
-        .await?;
+        let value: Option<i64> = sqlx::query_scalar(EXACT_COVERAGE_BY_HASH)
+            .bind(processor_instance(descriptor))
+            .bind(hash.0.as_slice())
+            .fetch_optional(&self.inner.pool)
+            .await?;
         if let Some(value) = value {
             return i64_u64(value, "coverage block number")
                 .map(BlockNumber)
                 .map(Some);
         }
-        let value: Option<i64> = sqlx::query_scalar(
-            "SELECT segment_end FROM finalized_coverage_segments
-             WHERE instance = ? AND end_hash = ?
-             ORDER BY segment_end DESC LIMIT 1",
-        )
-        .bind(processor_instance(descriptor))
-        .bind(hash.0.as_slice())
-        .fetch_optional(&self.inner.pool)
-        .await?;
+        let value: Option<i64> = sqlx::query_scalar(COMPACT_COVERAGE_BY_HASH)
+            .bind(processor_instance(descriptor))
+            .bind(hash.0.as_slice())
+            .fetch_optional(&self.inner.pool)
+            .await?;
         value
             .map(|value| i64_u64(value, "compact coverage block number").map(BlockNumber))
             .transpose()
@@ -4974,6 +5104,8 @@ impl SqliteStore {
 
     /// Return the highest block whose processor coverage is finalized.
     ///
+    /// Two index searches, exact and compact coverage, read in one snapshot.
+    ///
     /// # Errors
     ///
     /// Returns an error for corrupt numeric data or a failed read.
@@ -4981,21 +5113,19 @@ impl SqliteStore {
         &self,
         descriptor: &ProcessorDescriptor,
     ) -> Result<Option<BlockNumber>, StoreError> {
-        let value: Option<i64> = sqlx::query_scalar(
-            "SELECT MAX(block_number) FROM (
-                SELECT block_number FROM processor_coverage
-                 WHERE instance = ? AND finality = ?
-                UNION ALL
-                SELECT end_block AS block_number FROM finalized_coverage_intervals
-                 WHERE instance = ?
-             )",
-        )
-        .bind(processor_instance(descriptor))
-        .bind(finality_i64(Finality::Finalized))
-        .bind(processor_instance(descriptor))
-        .fetch_one(&self.inner.pool)
-        .await?;
-        value
+        let instance = processor_instance(descriptor);
+        let mut transaction = self.inner.pool.begin().await?;
+        let exact: Option<i64> = sqlx::query_scalar(FINALIZED_EXACT_COVERAGE_HEAD)
+            .bind(&instance)
+            .fetch_optional(&mut *transaction)
+            .await?;
+        let compact: Option<i64> = sqlx::query_scalar(FINALIZED_COMPACT_COVERAGE_HEAD)
+            .bind(&instance)
+            .fetch_optional(&mut *transaction)
+            .await?;
+        transaction.commit().await?;
+        exact
+            .max(compact)
             .map(|value| i64_u64(value, "finalized block number").map(BlockNumber))
             .transpose()
     }
@@ -8939,6 +9069,7 @@ impl SqliteStore {
             .await?
             .rows_affected();
         transaction.commit().await?;
+        self.inner.coverage_removals.fetch_add(1, Ordering::AcqRel);
         Ok(deletion)
     }
 
@@ -9011,6 +9142,10 @@ impl SqliteStore {
     /// Materialize a bounded, immutable output snapshot and its stream boundary
     /// in one transaction.
     ///
+    /// The per-snapshot size caps are probed before the writer is taken, so
+    /// an oversized request fails without waiting for block writers. The copy
+    /// made under the writer is measured again and is what gets admitted.
+    ///
     /// # Errors
     ///
     /// Returns an error for invalid filters, a zero TTL/budget, an oversized
@@ -9029,7 +9164,12 @@ impl SqliteStore {
     }
 
     /// Create a snapshot only if its explicit block range remains covered and
-    /// retained while holding the store writer lock.
+    /// retained when it is copied.
+    ///
+    /// Coverage and retention are checked before the writer is taken, so a
+    /// rejection never waits for it, and re-validated under the writer
+    /// atomically with the copy. Coverage is re-read there only if an undo or
+    /// deletion removed coverage since the first check.
     ///
     /// # Errors
     /// Returns an error for an uncovered or pruned range, invalid admission
@@ -9075,96 +9215,52 @@ impl SqliteStore {
         }
         let instance = self.register_processor(descriptor).await?;
         let stream_id = default_delivery_stream_id(descriptor);
-        let from_block = query
-            .from_block
-            .map(|value| u64_i64(value.0, "query from block"))
-            .transpose()?;
-        let to_block = query
-            .to_block
-            .map(|value| u64_i64(value.0, "query to block"))
-            .transpose()?;
-        let from_timestamp = query
-            .from_timestamp
-            .map(|value| u64_i64(value, "query from timestamp"))
-            .transpose()?;
-        let to_timestamp = query
-            .to_timestamp
-            .map(|value| u64_i64(value, "query to timestamp"))
-            .transpose()?;
+        let bounds = SnapshotBounds::new(query)?;
+        // Coverage, retention, and size are reads. Checking them before the
+        // writer means a rejected snapshot never queues behind (or delays)
+        // block writers, and the size probe stops at the first chunk past a
+        // cap instead of counting the whole collection.
+        let covered =
+            if require_coverage && let Some((from, to)) = query.from_block.zip(query.to_block) {
+                let requested = BlockRange::new(from, to)
+                    .map_err(|error| StoreError::InvalidConfig(error.to_string()))?;
+                // Read before the coverage it vouches for.
+                let removals = self.inner.coverage_removals.load(Ordering::Acquire);
+                self.ensure_snapshot_range_covered(descriptor, requested)
+                    .await?;
+                self.ensure_snapshot_range_retained(descriptor, collection, from)
+                    .await?;
+                Some((requested, removals))
+            } else {
+                None
+            };
+        let (probed_rows, probed_bytes) = probe_query_snapshot_size(
+            &self.inner.pool,
+            &instance,
+            collection,
+            bounds,
+            max_rows,
+            max_bytes,
+        )
+        .await?;
         let _guard = self.inner.writer.lock().await;
-        if require_coverage && let Some((from, to)) = query.from_block.zip(query.to_block) {
-            let requested = BlockRange::new(from, to)
-                .map_err(|error| StoreError::InvalidConfig(error.to_string()))?;
-            if self.coverage(descriptor, requested).await? != [requested] {
-                return Err(StoreError::OutputRangeIncomplete { from, to });
+        // Re-validate under the writer so the checks and the copy are atomic.
+        // Coverage only grows unless an undo or deletion removed some since
+        // the check, so it is re-read only then; window pruning moves with
+        // every block, so retention is always re-checked.
+        if let Some((requested, removals)) = covered {
+            if self.inner.coverage_removals.load(Ordering::Acquire) != removals {
+                self.ensure_snapshot_range_covered(descriptor, requested)
+                    .await?;
             }
-            if descriptor.lifecycle.output.mode == OutputPolicyMode::Window {
-                let block_floor = descriptor
-                    .lifecycle
-                    .output
-                    .window
-                    .and_then(|window| window.max_blocks);
-                let floor = if let Some(blocks) = block_floor {
-                    self.processor_cursor(descriptor).await?.map(|cursor| {
-                        BlockNumber(
-                            cursor
-                                .block_number
-                                .0
-                                .saturating_add(1)
-                                .saturating_sub(blocks),
-                        )
-                    })
-                } else {
-                    self.output_bounds(descriptor, collection)
-                        .await?
-                        .map(|bounds| bounds.earliest_block)
-                };
-                if floor.is_some_and(|floor| from < floor) {
-                    return Err(StoreError::OutputRangePruned);
-                }
-            }
+            self.ensure_snapshot_range_retained(descriptor, collection, requested.start())
+                .await?;
         }
         let now = now_i64()?;
         sqlx::query("DELETE FROM query_snapshots WHERE expires_at_unix_ms <= ?")
             .bind(now)
             .execute(&self.inner.pool)
             .await?;
-        let row = sqlx::query(
-            "SELECT COUNT(*) AS row_count,
-                    COALESCE(SUM(length(entity.value) + length(entity.entity_key) + 128), 0) AS value_bytes
-             FROM entities AS entity
-             JOIN output_entity_meta AS meta
-               ON meta.instance = entity.instance
-              AND meta.collection = entity.collection
-              AND meta.entity_key = entity.entity_key
-             WHERE entity.instance = ? AND entity.collection = ?
-               AND (? IS NULL OR meta.block_number >= ?)
-               AND (? IS NULL OR meta.block_number <= ?)
-               AND (? IS NULL OR meta.block_timestamp >= ?)
-               AND (? IS NULL OR meta.block_timestamp <= ?)",
-        )
-        .bind(&instance)
-        .bind(collection)
-        .bind(from_block)
-        .bind(from_block)
-        .bind(to_block)
-        .bind(to_block)
-        .bind(from_timestamp)
-        .bind(from_timestamp)
-        .bind(to_timestamp)
-        .bind(to_timestamp)
-        .fetch_one(&self.inner.pool)
-        .await?;
-        let row_count = i64_u64(row.try_get("row_count")?, "query snapshot rows")?;
-        let value_bytes = i64_u64(row.try_get("value_bytes")?, "query snapshot bytes")?;
-        if row_count > max_rows || value_bytes > max_bytes {
-            return Err(StoreError::QueryTooExpensive {
-                rows: row_count,
-                bytes: value_bytes,
-                max_rows,
-                max_bytes,
-            });
-        }
         let totals = sqlx::query(
             "SELECT COUNT(*) AS count, COALESCE(SUM(value_bytes), 0) AS bytes FROM query_snapshots",
         )
@@ -9172,7 +9268,7 @@ impl SqliteStore {
         .await?;
         let count = i64_u64(totals.try_get("count")?, "active query snapshots")?;
         let bytes = i64_u64(totals.try_get("bytes")?, "active query snapshot bytes")?;
-        if count >= max_total_snapshots || bytes.saturating_add(value_bytes) > max_total_bytes {
+        if count >= max_total_snapshots || bytes.saturating_add(probed_bytes) > max_total_bytes {
             return Err(StoreError::QuerySnapshotCapacity {
                 max_snapshots: max_total_snapshots,
                 max_bytes: max_total_bytes,
@@ -9182,7 +9278,7 @@ impl SqliteStore {
         // transaction; admission may checkpoint/vacuum under physical pressure.
         enforce_physical_store_capacity(
             &self.inner,
-            value_bytes.saturating_mul(4).saturating_add(16_384),
+            probed_bytes.saturating_mul(4).saturating_add(16_384),
         )
         .await?;
         let mut transaction = self.inner.pool.begin().await?;
@@ -9219,16 +9315,19 @@ impl SqliteStore {
         .bind(&instance)
         .bind(collection)
         .bind(u64_i64(boundary, "query snapshot boundary")?)
-        .bind(u64_i64(row_count, "query snapshot rows")?)
-        .bind(u64_i64(value_bytes, "query snapshot bytes")?)
+        .bind(u64_i64(probed_rows, "query snapshot rows")?)
+        .bind(u64_i64(probed_bytes, "query snapshot bytes")?)
         .bind(now)
         .bind(expires)
-        .bind(from_block)
-        .bind(to_block)
-        .bind(from_timestamp)
-        .bind(to_timestamp)
+        .bind(bounds.from_block)
+        .bind(bounds.to_block)
+        .bind(bounds.from_timestamp)
+        .bind(bounds.to_timestamp)
         .execute(&mut *transaction)
         .await?;
+        // One row past the cap is enough to reject a collection that grew
+        // after the probe.
+        let copy_limit = i64::try_from(max_rows.saturating_add(1)).unwrap_or(i64::MAX);
         sqlx::query(
             "INSERT INTO query_snapshot_entities(
                 snapshot_id, ordinal, entity_key, value,
@@ -9247,21 +9346,60 @@ impl SqliteStore {
                AND (? IS NULL OR meta.block_number <= ?)
                AND (? IS NULL OR meta.block_timestamp >= ?)
                AND (? IS NULL OR meta.block_timestamp <= ?)
-             ORDER BY entity.entity_key",
+             ORDER BY entity.entity_key
+             LIMIT ?",
         )
         .bind(snapshot_id.as_slice())
         .bind(&instance)
         .bind(collection)
-        .bind(from_block)
-        .bind(from_block)
-        .bind(to_block)
-        .bind(to_block)
-        .bind(from_timestamp)
-        .bind(from_timestamp)
-        .bind(to_timestamp)
-        .bind(to_timestamp)
+        .bind(bounds.from_block)
+        .bind(bounds.from_block)
+        .bind(bounds.to_block)
+        .bind(bounds.to_block)
+        .bind(bounds.from_timestamp)
+        .bind(bounds.from_timestamp)
+        .bind(bounds.to_timestamp)
+        .bind(bounds.to_timestamp)
+        .bind(copy_limit)
         .execute(&mut *transaction)
         .await?;
+        // Blocks committed between the probe and the writer may have changed
+        // the collection, so the copy itself is what gets admitted and
+        // recorded.
+        let (row_count, value_bytes): (i64, i64) = sqlx::query_as(
+            "SELECT COUNT(*), COALESCE(SUM(length(value) + length(entity_key) + 128), 0)
+             FROM query_snapshot_entities WHERE snapshot_id = ?",
+        )
+        .bind(snapshot_id.as_slice())
+        .fetch_one(&mut *transaction)
+        .await?;
+        let row_count = i64_u64(row_count, "query snapshot rows")?;
+        let value_bytes = i64_u64(value_bytes, "query snapshot bytes")?;
+        if row_count > max_rows || value_bytes > max_bytes {
+            return Err(StoreError::QueryTooExpensive {
+                rows: row_count,
+                bytes: value_bytes,
+                max_rows,
+                max_bytes,
+            });
+        }
+        if bytes.saturating_add(value_bytes) > max_total_bytes {
+            return Err(StoreError::QuerySnapshotCapacity {
+                max_snapshots: max_total_snapshots,
+                max_bytes: max_total_bytes,
+            });
+        }
+        if (row_count, value_bytes) != (probed_rows, probed_bytes) {
+            sqlx::query(
+                "UPDATE query_snapshots SET row_count = ?, value_bytes = ?
+                 WHERE snapshot_id = ?",
+            )
+            .bind(u64_i64(row_count, "query snapshot rows")?)
+            .bind(u64_i64(value_bytes, "query snapshot bytes")?)
+            .bind(snapshot_id.as_slice())
+            .execute(&mut *transaction)
+            .await?;
+        }
         transaction.commit().await?;
         Ok(QuerySnapshot {
             snapshot_id,
@@ -9274,6 +9412,59 @@ impl SqliteStore {
             created_at_unix_ms: i64_u64(now, "query snapshot creation time")?,
             expires_at_unix_ms: i64_u64(expires, "query snapshot expiry")?,
         })
+    }
+
+    /// Reject a snapshot range the processor has not fully covered.
+    async fn ensure_snapshot_range_covered(
+        &self,
+        descriptor: &ProcessorDescriptor,
+        requested: BlockRange,
+    ) -> Result<(), StoreError> {
+        if self.coverage(descriptor, requested).await? != [requested] {
+            return Err(StoreError::OutputRangeIncomplete {
+                from: requested.start(),
+                to: requested.end(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Reject a window-policy snapshot whose range starts below the window's
+    /// retained floor. Block windows derive the floor from the cursor; other
+    /// windows from the collection's earliest retained block.
+    async fn ensure_snapshot_range_retained(
+        &self,
+        descriptor: &ProcessorDescriptor,
+        collection: &str,
+        from: BlockNumber,
+    ) -> Result<(), StoreError> {
+        if descriptor.lifecycle.output.mode != OutputPolicyMode::Window {
+            return Ok(());
+        }
+        let block_floor = descriptor
+            .lifecycle
+            .output
+            .window
+            .and_then(|window| window.max_blocks);
+        let floor = if let Some(blocks) = block_floor {
+            self.processor_cursor(descriptor).await?.map(|cursor| {
+                BlockNumber(
+                    cursor
+                        .block_number
+                        .0
+                        .saturating_add(1)
+                        .saturating_sub(blocks),
+                )
+            })
+        } else {
+            self.output_bounds(descriptor, collection)
+                .await?
+                .map(|bounds| bounds.earliest_block)
+        };
+        if floor.is_some_and(|floor| from < floor) {
+            return Err(StoreError::OutputRangePruned);
+        }
+        Ok(())
     }
 
     /// Remove expired snapshots and their copied entities independently of reads.
@@ -9676,11 +9867,7 @@ impl SqliteStore {
         limit: usize,
         check_retention: bool,
     ) -> Result<Vec<ChangeRecord>, StoreError> {
-        if limit == 0 || limit > 10_000 {
-            return Err(StoreError::InvalidConfig(
-                "change limit must be in 1..=10000".to_owned(),
-            ));
-        }
+        validate_change_limit(limit)?;
         self.validate_delivery_stream(&processor_instance(descriptor), stream_id)
             .await?;
         // The watermark and page must share a read transaction: a separate
@@ -9716,90 +9903,32 @@ impl SqliteStore {
         } else {
             after.unwrap_or(0)
         };
-        let rows = sqlx::query(
-            "SELECT stream_sequence, encoding_version, chain_id,
-                    origin_kind, origin_id, publication_revision,
-                    block_number, block_hash, parent_hash,
-                    block_timestamp, finality, direction, kind, entity_key,
-                    operation, payload, created_at_unix_ms
-             FROM change_log
-             WHERE stream_id = ? AND stream_sequence > ?
-             ORDER BY stream_sequence LIMIT ?",
-        )
-        .bind(stream_id)
-        .bind(u64_i64(after_sequence, "sequence")?)
-        .bind(usize_i64(limit, "limit")?)
-        .fetch_all(&mut *transaction)
-        .await?;
+        let rows = change_page_rows(&mut transaction, stream_id, after_sequence, limit).await?;
         transaction.commit().await?;
-        rows.into_iter()
-            .map(|row| {
-                let sequence = i64_u64(row.try_get("stream_sequence")?, "sequence")?;
-                let encoding_version = i64_u64(
-                    row.try_get("encoding_version")?,
-                    "delivery encoding version",
-                )?;
-                if encoding_version != u64::from(DELIVERY_ENCODING_VERSION) {
-                    return Err(StoreError::Invariant(format!(
-                        "unsupported delivery encoding version {encoding_version}"
-                    )));
-                }
-                let stored_chain_id =
-                    ChainId(i64_u64(row.try_get("chain_id")?, "change chain ID")?);
-                if stored_chain_id != chain_id {
-                    return Err(StoreError::Invariant(format!(
-                        "processor change belongs to chain {}, requested {}",
-                        stored_chain_id.0, chain_id.0
-                    )));
-                }
-                Ok(ChangeRecord {
-                    delivery_encoding_version: DELIVERY_ENCODING_VERSION,
-                    cursor: ChangeCursor {
-                        chain_id,
-                        processor_id: descriptor.id.to_string(),
-                        sequence,
-                    },
-                    origin: DeliveryOrigin {
-                        kind: DeliveryOriginKind::parse(row.try_get("origin_kind")?)?,
-                        id: row.try_get("origin_id")?,
-                        publication_revision: i64_u64(
-                            row.try_get("publication_revision")?,
-                            "publication revision",
-                        )?,
-                    },
-                    block: BlockRef {
-                        number: BlockNumber(i64_u64(row.try_get("block_number")?, "block_number")?),
-                        hash: decode_hash(row.try_get("block_hash")?)?,
-                        parent_hash: decode_hash(row.try_get("parent_hash")?)?,
-                        timestamp: i64_u64(row.try_get("block_timestamp")?, "block_timestamp")?,
-                    },
-                    finality: decode_finality(row.try_get("finality")?)?,
-                    direction: ChangeDirection::parse(row.try_get("direction")?)?,
-                    change: DomainChange {
-                        kind: row.try_get("kind")?,
-                        key: row.try_get("entity_key")?,
-                        operation: decode_operation(row.try_get("operation")?)?,
-                        payload: row.try_get("payload")?,
-                    },
-                    emitted_at_unix_ms: i64_u64(
-                        row.try_get("created_at_unix_ms")?,
-                        "created_at_unix_ms",
-                    )?,
-                })
-            })
-            .collect()
+        decode_change_rows(rows, descriptor, chain_id)
     }
 
     /// Return the first and last retained sequence for a processor.
     ///
+    /// A pure read: an unregistered processor has no retained changes and is
+    /// not registered.
+    ///
     /// # Errors
     ///
-    /// Returns an error when stored sequences are invalid or the read fails.
+    /// Returns an error for an invalid descriptor, an identity collision,
+    /// invalid stored sequences, or a failed read.
     pub async fn change_bounds(
         &self,
         descriptor: &ProcessorDescriptor,
     ) -> Result<Option<ChangeBounds>, StoreError> {
-        self.register_processor(descriptor).await?;
+        let default_stream = self
+            .stored_registration(descriptor)
+            .await?
+            .is_some_and(|stored| stored.default_stream);
+        if !default_stream && descriptor.lifecycle.delivery.mode != DeliveryPolicyMode::None {
+            // Registration creates this stream empty.
+            return Ok(None);
+        }
         self.change_bounds_in_stream(descriptor, &default_delivery_stream_id(descriptor))
             .await
     }
@@ -10269,22 +10398,23 @@ impl SqliteStore {
     /// A lapsed lease remains active and therefore remains in the watermark
     /// until an explicit reset or revocation.
     ///
+    /// A pure read: an unregistered processor reports the empty stream that
+    /// registration would create, and is not registered.
+    ///
     /// # Errors
     ///
-    /// Returns an error when the processor is absent, stored values are
-    /// invalid, or the read fails.
+    /// Returns an error for an invalid descriptor, an identity collision,
+    /// invalid stored values, or a failed read.
     pub async fn delivery_stream_stats(
         &self,
         descriptor: &ProcessorDescriptor,
     ) -> Result<DeliveryStreamStats, StoreError> {
-        if descriptor.lifecycle.delivery.mode == DeliveryPolicyMode::None {
-            self.register_processor(descriptor).await?;
-            return Ok(DeliveryStreamStats {
-                live_bytes: 0,
-                pruned_through_sequence: 0,
-                required_ack_watermark: None,
-                format_version: 1,
-            });
+        let default_stream = self
+            .stored_registration(descriptor)
+            .await?
+            .is_some_and(|stored| stored.default_stream);
+        if descriptor.lifecycle.delivery.mode == DeliveryPolicyMode::None || !default_stream {
+            return Ok(EMPTY_DELIVERY_STREAM_STATS);
         }
         self.delivery_stream_stats_in_stream(descriptor, &default_delivery_stream_id(descriptor))
             .await
@@ -10292,16 +10422,18 @@ impl SqliteStore {
 
     /// Inspect one explicit delivery stream's retention watermarks.
     ///
+    /// A pure read that never registers the processor.
+    ///
     /// # Errors
     ///
-    /// Returns an error for an invalid stream, corrupt stored watermarks, or a
-    /// failed query.
+    /// Returns an error for an invalid descriptor or stream, an identity
+    /// collision, corrupt stored watermarks, or a failed query.
     pub async fn delivery_stream_stats_in_stream(
         &self,
         descriptor: &ProcessorDescriptor,
         stream_id: &str,
     ) -> Result<DeliveryStreamStats, StoreError> {
-        self.register_processor(descriptor).await?;
+        self.stored_registration(descriptor).await?;
         self.validate_delivery_stream(&processor_instance(descriptor), stream_id)
             .await?;
         let row = sqlx::query(
@@ -10645,6 +10777,9 @@ impl SqliteStore {
     /// Read after an in-memory session cursor while retaining the durable
     /// acknowledgement as the replay point.
     ///
+    /// The page is a pure read and does not wait for the writer. Only a
+    /// consumer that pruning overtook is written, as `reset_required`.
+    ///
     /// # Errors
     ///
     /// Returns an error when the consumer or stream is invalid, bounds are
@@ -10660,62 +10795,50 @@ impl SqliteStore {
     ) -> Result<Vec<ChangeRecord>, StoreError> {
         let instance = processor_instance(descriptor);
         self.validate_delivery_stream(&instance, stream_id).await?;
-        let _guard = self.inner.writer.lock().await;
-        let row = sqlx::query(
-            "SELECT state, acknowledged_sequence FROM durable_consumers
-             WHERE stream_id = ? AND consumer_id = ?",
-        )
-        .bind(stream_id)
-        .bind(consumer_id)
-        .fetch_optional(&self.inner.pool)
-        .await?
-        .ok_or_else(|| StoreError::ConsumerNotFound {
-            instance: instance.clone(),
-            consumer_id: consumer_id.to_owned(),
-        })?;
-        let state = ConsumerState::parse(row.try_get("state")?)?;
-        if state != ConsumerState::Active {
-            return Err(StoreError::ConsumerInactive {
-                consumer_id: consumer_id.to_owned(),
-                state,
-            });
-        }
-        let acknowledged = i64_u64(
-            row.try_get("acknowledged_sequence")?,
-            "consumer acknowledged sequence",
-        )?;
-        if after < acknowledged {
-            return Err(StoreError::AcknowledgementBackwards {
-                sequence: after,
-                acknowledged,
-            });
-        }
-        let pruned_through: i64 = sqlx::query_scalar(
-            "SELECT pruned_through_sequence FROM delivery_streams WHERE stream_id = ?",
-        )
-        .bind(stream_id)
-        .fetch_one(&self.inner.pool)
-        .await?;
-        let pruned_through = i64_u64(pruned_through, "pruned delivery sequence")?;
-        if acknowledged < pruned_through {
-            sqlx::query(
+        loop {
+            // One read transaction holds the consumer check, the pruning
+            // watermark, and the page at one snapshot, so the pruner cannot
+            // delete rows between the check and the page.
+            let mut transaction = self.inner.pool.begin().await?;
+            if consumer_read_is_retained(&mut transaction, &instance, stream_id, consumer_id, after)
+                .await?
+            {
+                validate_change_limit(limit)?;
+                let rows = change_page_rows(&mut transaction, stream_id, after, limit).await?;
+                transaction.commit().await?;
+                return decode_change_rows(rows, descriptor, chain_id);
+            }
+            transaction.commit().await?;
+            // Pruning overtook the acknowledgement. Recording that is a write,
+            // so it re-checks under the writer; a consumer that acknowledged,
+            // reset, or was revoked meanwhile is read again instead.
+            let writer_guard = self.inner.writer.lock().await;
+            let marked = sqlx::query(
                 "UPDATE durable_consumers
                  SET state = 'reset_required', updated_at_unix_ms = ?
-                 WHERE stream_id = ? AND consumer_id = ?",
+                 WHERE stream_id = ? AND consumer_id = ? AND state = 'active'
+                   AND acknowledged_sequence < (
+                       SELECT pruned_through_sequence FROM delivery_streams
+                       WHERE stream_id = ?
+                   )",
             )
             .bind(now_i64()?)
             .bind(stream_id)
             .bind(consumer_id)
+            .bind(stream_id)
             .execute(&self.inner.pool)
-            .await?;
-            let bounds = self.change_bounds_in_stream(descriptor, stream_id).await?;
-            return Err(StoreError::ConsumerResetRequired {
-                earliest_available: bounds.map(|value| value.earliest),
-                latest_available: bounds.map(|value| value.latest),
-            });
+            .await?
+            .rows_affected()
+                != 0;
+            drop(writer_guard);
+            if marked {
+                let bounds = self.change_bounds_in_stream(descriptor, stream_id).await?;
+                return Err(StoreError::ConsumerResetRequired {
+                    earliest_available: bounds.map(|value| value.earliest),
+                    latest_available: bounds.map(|value| value.latest),
+                });
+            }
         }
-        self.changes_in_stream(descriptor, stream_id, chain_id, after, limit)
-            .await
     }
 
     /// Advance a cumulative acknowledgement after destination commit.
@@ -11482,11 +11605,15 @@ impl SqliteStore {
 
     /// Inspect schema and logical storage counts.
     ///
+    /// Every call scans whole tables; operational readers that poll should
+    /// use [`Self::cached_stats`].
+    ///
     /// # Errors
     ///
     /// Returns an error for corrupt metadata, numeric overflow, or a failed
     /// database read.
     pub async fn stats(&self) -> Result<StoreStats, StoreError> {
+        self.inner.statistics_scans.fetch_add(1, Ordering::Relaxed);
         let schema: Vec<u8> =
             sqlx::query_scalar("SELECT value FROM node_meta WHERE key = 'schema_version'")
                 .fetch_one(&self.inner.pool)
@@ -11656,7 +11783,79 @@ impl SqliteStore {
         })
     }
 
+    /// Serve [`Self::stats`] from a scan at most [`STATS_CACHE_TTL`] old.
+    ///
+    /// Concurrent callers share one refresh, so polling health and metrics
+    /// endpoints cost at most one scan per TTL between them.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a refresh scan fails.
+    pub async fn cached_stats(&self) -> Result<StoreStats, StoreError> {
+        let mut cache = self.inner.statistics_cache.lock().await;
+        if let Some(stats) = cache
+            .store
+            .as_ref()
+            .and_then(|cached| cached.fresh(Instant::now()))
+        {
+            return Ok(stats);
+        }
+        let stats = self.stats().await?;
+        cache.store = Some(CachedStatistics::new(stats.clone()));
+        Ok(stats)
+    }
+
+    /// Serve [`Self::processor_stats`] from a scan at most
+    /// [`STATS_CACHE_TTL`] old.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a refresh scan fails.
+    pub async fn cached_processor_stats(
+        &self,
+        descriptor: &ProcessorDescriptor,
+    ) -> Result<ProcessorStoreStats, StoreError> {
+        let instance = processor_instance(descriptor);
+        let mut cache = self.inner.statistics_cache.lock().await;
+        let now = Instant::now();
+        if let Some(stats) = cache
+            .processors
+            .get(&instance)
+            .and_then(|cached| cached.fresh(now))
+        {
+            return Ok(stats);
+        }
+        let stats = self.processor_stats(descriptor).await?;
+        // Drop entries of processors nobody has asked about for a TTL.
+        cache.processors.retain(|_, cached| cached.is_fresh(now));
+        cache
+            .processors
+            .insert(instance, CachedStatistics::new(stats.clone()));
+        Ok(stats)
+    }
+
+    /// Check that the store answers a trivial statement on a pooled
+    /// connection, reading no table. Health probes use this instead of
+    /// [`Self::stats`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when no connection can be acquired or `SQLite` fails.
+    pub async fn ping(&self) -> Result<(), StoreError> {
+        sqlx::query("SELECT 1").execute(&self.inner.pool).await?;
+        Ok(())
+    }
+
+    /// Full statistics scans, [`Self::stats`] and [`Self::processor_stats`]
+    /// including cache refreshes, run since this store was opened.
+    pub fn statistics_scans(&self) -> u64 {
+        self.inner.statistics_scans.load(Ordering::Relaxed)
+    }
+
     /// Inspect logical storage attributable to one processor instance.
+    ///
+    /// Every call scans the processor's rows; operational readers that poll
+    /// should use [`Self::cached_processor_stats`].
     ///
     /// # Errors
     ///
@@ -11666,6 +11865,7 @@ impl SqliteStore {
         &self,
         descriptor: &ProcessorDescriptor,
     ) -> Result<ProcessorStoreStats, StoreError> {
+        self.inner.statistics_scans.fetch_add(1, Ordering::Relaxed);
         let instance = processor_instance(descriptor);
         let (entities, entity_bytes) = instance_count_bytes(
             &self.inner.pool,
@@ -14921,37 +15121,70 @@ fn query_snapshot_id(epoch: [u8; 16], instance: &str, collection: &str, boundary
         .expect("BLAKE3 digest contains sixteen bytes")
 }
 
+// Coverage probes run on every metrics scrape and status poll, so each one is
+// a single index search: exact and compact coverage are probed separately and
+// combined in Rust instead of scanning a UNION of both.
+
+/// Highest finalized exact coverage block. The literal 2 is
+/// `finality_i64(Finality::Finalized)`: the partial index
+/// `processor_coverage_finalized` is only usable for that literal, and it
+/// skips included rows, which grow without bound while finality is disabled.
+const FINALIZED_EXACT_COVERAGE_HEAD: &str = "SELECT block_number FROM processor_coverage
+     WHERE instance = ? AND finality = 2
+     ORDER BY block_number DESC LIMIT 1";
+/// Highest end of a compact finalized interval.
+const FINALIZED_COMPACT_COVERAGE_HEAD: &str = "SELECT end_block FROM finalized_coverage_intervals
+     WHERE instance = ?
+     ORDER BY end_block DESC LIMIT 1";
+/// Highest exact coverage block of any finality.
+const EXACT_COVERAGE_HEAD: &str =
+    "SELECT block_number, block_hash, finality FROM processor_coverage
+     WHERE instance = ?
+     ORDER BY block_number DESC LIMIT 1";
+/// Highest compact proof segment end.
+const COMPACT_COVERAGE_HEAD: &str = "SELECT segment_end, end_hash FROM finalized_coverage_segments
+     WHERE instance = ?
+     ORDER BY segment_end DESC LIMIT 1";
+/// Exact coverage block with one hash.
+const EXACT_COVERAGE_BY_HASH: &str = "SELECT block_number FROM processor_coverage
+     WHERE instance = ? AND block_hash = ?
+     LIMIT 1";
+/// Highest compact proof segment ending in one hash.
+const COMPACT_COVERAGE_BY_HASH: &str = "SELECT segment_end FROM finalized_coverage_segments
+     WHERE instance = ? AND end_hash = ?
+     ORDER BY segment_end DESC LIMIT 1";
+
 async fn highest_coverage_cursor(
     transaction: &mut Transaction<'_, Sqlite>,
     descriptor: &ProcessorDescriptor,
     chain_id: ChainId,
 ) -> Result<Option<ProcessorCursor>, StoreError> {
-    let row = sqlx::query(
-        "SELECT block_number, block_hash, finality FROM (
-            SELECT block_number, block_hash, finality
-              FROM processor_coverage WHERE instance = ?
-            UNION ALL
-            SELECT segment_end AS block_number, end_hash AS block_hash, ? AS finality
-              FROM finalized_coverage_segments WHERE instance = ?
-         ) ORDER BY block_number DESC LIMIT 1",
-    )
-    .bind(processor_instance(descriptor))
-    .bind(finality_i64(Finality::Finalized))
-    .bind(processor_instance(descriptor))
-    .fetch_optional(&mut **transaction)
-    .await?;
-    row.map(|row| {
-        let block_number = BlockNumber(i64_u64(
-            row.try_get("block_number")?,
-            "coverage block number",
-        )?);
+    let instance = processor_instance(descriptor);
+    let exact: Option<(i64, Vec<u8>, i64)> = sqlx::query_as(EXACT_COVERAGE_HEAD)
+        .bind(&instance)
+        .fetch_optional(&mut **transaction)
+        .await?;
+    let compact: Option<(i64, Vec<u8>)> = sqlx::query_as(COMPACT_COVERAGE_HEAD)
+        .bind(&instance)
+        .fetch_optional(&mut **transaction)
+        .await?;
+    // Exact coverage wins a tie, as in other exact-before-compact lookups.
+    let head = match (exact, compact) {
+        (Some(exact), Some((segment_end, _))) if exact.0 >= segment_end => Some(exact),
+        (_, Some((segment_end, end_hash))) => {
+            Some((segment_end, end_hash, finality_i64(Finality::Finalized)))
+        }
+        (exact, None) => exact,
+    };
+    head.map(|(block_number, block_hash, finality)| {
+        let block_number = BlockNumber(i64_u64(block_number, "coverage block number")?);
         Ok(ProcessorCursor {
             processor_id: descriptor.id.to_string(),
             processor_version: descriptor.version.to_string(),
             chain_id,
             block_number,
-            block_hash: decode_hash(row.try_get("block_hash")?)?,
-            finality: decode_finality(row.try_get("finality")?)?,
+            block_hash: decode_hash(block_hash)?,
+            finality: decode_finality(finality)?,
             sequence: block_number.0,
         })
     })
@@ -16398,6 +16631,258 @@ async fn extend_shared_coverage_owner_range(
     Ok(())
 }
 
+fn validate_change_limit(limit: usize) -> Result<(), StoreError> {
+    if limit == 0 || limit > 10_000 {
+        return Err(StoreError::InvalidConfig(
+            "change limit must be in 1..=10000".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+/// One page of a stream's committed changes after `after_sequence`.
+async fn change_page_rows(
+    connection: &mut SqliteConnection,
+    stream_id: &str,
+    after_sequence: u64,
+    limit: usize,
+) -> Result<Vec<SqliteRow>, StoreError> {
+    Ok(sqlx::query(
+        "SELECT stream_sequence, encoding_version, chain_id,
+                origin_kind, origin_id, publication_revision,
+                block_number, block_hash, parent_hash,
+                block_timestamp, finality, direction, kind, entity_key,
+                operation, payload, created_at_unix_ms
+         FROM change_log
+         WHERE stream_id = ? AND stream_sequence > ?
+         ORDER BY stream_sequence LIMIT ?",
+    )
+    .bind(stream_id)
+    .bind(u64_i64(after_sequence, "sequence")?)
+    .bind(usize_i64(limit, "limit")?)
+    .fetch_all(&mut *connection)
+    .await?)
+}
+
+fn decode_change_rows(
+    rows: Vec<SqliteRow>,
+    descriptor: &ProcessorDescriptor,
+    chain_id: ChainId,
+) -> Result<Vec<ChangeRecord>, StoreError> {
+    rows.into_iter()
+        .map(|row| {
+            let sequence = i64_u64(row.try_get("stream_sequence")?, "sequence")?;
+            let encoding_version = i64_u64(
+                row.try_get("encoding_version")?,
+                "delivery encoding version",
+            )?;
+            if encoding_version != u64::from(DELIVERY_ENCODING_VERSION) {
+                return Err(StoreError::Invariant(format!(
+                    "unsupported delivery encoding version {encoding_version}"
+                )));
+            }
+            let stored_chain_id = ChainId(i64_u64(row.try_get("chain_id")?, "change chain ID")?);
+            if stored_chain_id != chain_id {
+                return Err(StoreError::Invariant(format!(
+                    "processor change belongs to chain {}, requested {}",
+                    stored_chain_id.0, chain_id.0
+                )));
+            }
+            Ok(ChangeRecord {
+                delivery_encoding_version: DELIVERY_ENCODING_VERSION,
+                cursor: ChangeCursor {
+                    chain_id,
+                    processor_id: descriptor.id.to_string(),
+                    sequence,
+                },
+                origin: DeliveryOrigin {
+                    kind: DeliveryOriginKind::parse(row.try_get("origin_kind")?)?,
+                    id: row.try_get("origin_id")?,
+                    publication_revision: i64_u64(
+                        row.try_get("publication_revision")?,
+                        "publication revision",
+                    )?,
+                },
+                block: BlockRef {
+                    number: BlockNumber(i64_u64(row.try_get("block_number")?, "block_number")?),
+                    hash: decode_hash(row.try_get("block_hash")?)?,
+                    parent_hash: decode_hash(row.try_get("parent_hash")?)?,
+                    timestamp: i64_u64(row.try_get("block_timestamp")?, "block_timestamp")?,
+                },
+                finality: decode_finality(row.try_get("finality")?)?,
+                direction: ChangeDirection::parse(row.try_get("direction")?)?,
+                change: DomainChange {
+                    kind: row.try_get("kind")?,
+                    key: row.try_get("entity_key")?,
+                    operation: decode_operation(row.try_get("operation")?)?,
+                    payload: row.try_get("payload")?,
+                },
+                emitted_at_unix_ms: i64_u64(
+                    row.try_get("created_at_unix_ms")?,
+                    "created_at_unix_ms",
+                )?,
+            })
+        })
+        .collect()
+}
+
+/// Check that a consumer may read after `after`, returning `false` when
+/// pruning has overtaken its acknowledgement and it needs a reset.
+async fn consumer_read_is_retained(
+    connection: &mut SqliteConnection,
+    instance: &str,
+    stream_id: &str,
+    consumer_id: &str,
+    after: u64,
+) -> Result<bool, StoreError> {
+    let row = sqlx::query(
+        "SELECT state, acknowledged_sequence FROM durable_consumers
+         WHERE stream_id = ? AND consumer_id = ?",
+    )
+    .bind(stream_id)
+    .bind(consumer_id)
+    .fetch_optional(&mut *connection)
+    .await?
+    .ok_or_else(|| StoreError::ConsumerNotFound {
+        instance: instance.to_owned(),
+        consumer_id: consumer_id.to_owned(),
+    })?;
+    let state = ConsumerState::parse(row.try_get("state")?)?;
+    if state != ConsumerState::Active {
+        return Err(StoreError::ConsumerInactive {
+            consumer_id: consumer_id.to_owned(),
+            state,
+        });
+    }
+    let acknowledged = i64_u64(
+        row.try_get("acknowledged_sequence")?,
+        "consumer acknowledged sequence",
+    )?;
+    if after < acknowledged {
+        return Err(StoreError::AcknowledgementBackwards {
+            sequence: after,
+            acknowledged,
+        });
+    }
+    let pruned_through: i64 = sqlx::query_scalar(
+        "SELECT pruned_through_sequence FROM delivery_streams WHERE stream_id = ?",
+    )
+    .bind(stream_id)
+    .fetch_one(&mut *connection)
+    .await?;
+    Ok(acknowledged >= i64_u64(pruned_through, "pruned delivery sequence")?)
+}
+
+/// Rows a query-snapshot size probe counts per statement. An oversized
+/// request stops within one chunk of the first cap it exceeds.
+const QUERY_SNAPSHOT_PROBE_ROWS: u64 = 1_024;
+
+/// Count and estimated bytes of one keyset chunk of a query snapshot, from
+/// the chunk's first key on. The estimate matches the copy's accounting.
+const QUERY_SNAPSHOT_PROBE: &str =
+    "SELECT COUNT(*), COALESCE(SUM(bytes), 0), MAX(entity_key) FROM (
+        SELECT entity.entity_key,
+               length(entity.value) + length(entity.entity_key) + 128 AS bytes
+        FROM entities AS entity
+        JOIN output_entity_meta AS meta
+          ON meta.instance = entity.instance
+         AND meta.collection = entity.collection
+         AND meta.entity_key = entity.entity_key
+        WHERE entity.instance = ? AND entity.collection = ? AND entity.entity_key >= ?
+          AND (? IS NULL OR meta.block_number >= ?)
+          AND (? IS NULL OR meta.block_number <= ?)
+          AND (? IS NULL OR meta.block_timestamp >= ?)
+          AND (? IS NULL OR meta.block_timestamp <= ?)
+        ORDER BY entity.entity_key LIMIT ?
+     )";
+
+/// Block and timestamp bounds of a query snapshot, as bound to SQL.
+#[derive(Clone, Copy, Debug)]
+struct SnapshotBounds {
+    from_block: Option<i64>,
+    to_block: Option<i64>,
+    from_timestamp: Option<i64>,
+    to_timestamp: Option<i64>,
+}
+
+impl SnapshotBounds {
+    fn new(query: OutputQuery) -> Result<Self, StoreError> {
+        Ok(Self {
+            from_block: query
+                .from_block
+                .map(|value| u64_i64(value.0, "query from block"))
+                .transpose()?,
+            to_block: query
+                .to_block
+                .map(|value| u64_i64(value.0, "query to block"))
+                .transpose()?,
+            from_timestamp: query
+                .from_timestamp
+                .map(|value| u64_i64(value, "query from timestamp"))
+                .transpose()?,
+            to_timestamp: query
+                .to_timestamp
+                .map(|value| u64_i64(value, "query to timestamp"))
+                .transpose()?,
+        })
+    }
+}
+
+/// Rows and estimated bytes a query snapshot would copy, counted in keyset
+/// chunks that stop once either cap is exceeded instead of counting the
+/// whole collection. This is an admission estimate taken without the writer;
+/// the copy itself is measured again under it.
+async fn probe_query_snapshot_size(
+    pool: &SqlitePool,
+    instance: &str,
+    collection: &str,
+    bounds: SnapshotBounds,
+    max_rows: u64,
+    max_bytes: u64,
+) -> Result<(u64, u64), StoreError> {
+    let (mut rows, mut bytes) = (0_u64, 0_u64);
+    // The empty key sorts first; each next chunk starts right after the
+    // previous chunk's last key.
+    let mut start = Vec::new();
+    loop {
+        let chunk = QUERY_SNAPSHOT_PROBE_ROWS.min(max_rows.saturating_add(1).saturating_sub(rows));
+        let (count, chunk_bytes, last): (i64, i64, Option<Vec<u8>>) =
+            sqlx::query_as(QUERY_SNAPSHOT_PROBE)
+                .bind(instance)
+                .bind(collection)
+                .bind(start.as_slice())
+                .bind(bounds.from_block)
+                .bind(bounds.from_block)
+                .bind(bounds.to_block)
+                .bind(bounds.to_block)
+                .bind(bounds.from_timestamp)
+                .bind(bounds.from_timestamp)
+                .bind(bounds.to_timestamp)
+                .bind(bounds.to_timestamp)
+                .bind(u64_i64(chunk, "query snapshot probe rows")?)
+                .fetch_one(pool)
+                .await?;
+        let count = i64_u64(count, "query snapshot rows")?;
+        rows = rows.saturating_add(count);
+        bytes = bytes.saturating_add(i64_u64(chunk_bytes, "query snapshot bytes")?);
+        if rows > max_rows || bytes > max_bytes {
+            return Err(StoreError::QueryTooExpensive {
+                rows,
+                bytes,
+                max_rows,
+                max_bytes,
+            });
+        }
+        match last {
+            Some(mut last) if count == chunk => {
+                last.push(0);
+                start = last;
+            }
+            _ => return Ok((rows, bytes)),
+        }
+    }
+}
+
 async fn table_count(pool: &SqlitePool, table: &str) -> Result<u64, StoreError> {
     const TABLES: &[&str] = &[
         "processor_instances",
@@ -17065,8 +17550,10 @@ pub enum StoreError {
     SavepointChecksum,
     #[error("portable savepoint belongs to another processor contract")]
     SavepointContract,
+    /// Admission stops counting at the first cap exceeded, so `rows` and
+    /// `bytes` are lower bounds.
     #[error(
-        "query snapshot requires {rows} rows/{bytes} bytes; limits are {max_rows} rows/{max_bytes} bytes"
+        "query snapshot requires at least {rows} rows/{bytes} bytes; limits are {max_rows} rows/{max_bytes} bytes"
     )]
     QueryTooExpensive {
         rows: u64,
@@ -23802,5 +24289,724 @@ mod tests {
                 "earlier-destination".to_owned()
             )]
         );
+    }
+
+    /// Longest a read may take while a test holds the writer.
+    const PROMPT: Duration = Duration::from_secs(5);
+
+    /// Await `future`, failing when it waits for the writer the test holds.
+    async fn promptly<T>(label: &str, future: impl std::future::Future<Output = T>) -> T {
+        tokio::time::timeout(PROMPT, future)
+            .await
+            .unwrap_or_else(|_| panic!("{label} waited for the writer"))
+    }
+
+    async fn apply_included_blocks(
+        store: &SqliteStore,
+        processor: &FixtureProcessor,
+        numbers: std::ops::RangeInclusive<u64>,
+        mut parent: BlockHash,
+    ) -> BlockHash {
+        for number in numbers {
+            let current = frame(number, parent);
+            let delta = processor.map(&current).await.expect("map");
+            store
+                .apply(processor, cursor(processor, &current, number), &delta, &[])
+                .await
+                .expect("apply included block");
+            parent = current.block.hash;
+        }
+        parent
+    }
+
+    #[tokio::test]
+    async fn statistics_reads_within_the_ttl_reuse_one_scan() {
+        let (_directory, store) = store().await;
+        let processor = FixtureProcessor::new();
+        apply_included_blocks(&store, &processor, 1..=2, BlockHash::ZERO).await;
+        let before = store.statistics_scans();
+        let first = store.cached_stats().await.expect("store stats");
+        let second = store.cached_stats().await.expect("cached store stats");
+        assert_eq!(first, second);
+        let first_processor = store
+            .cached_processor_stats(&processor.descriptor)
+            .await
+            .expect("processor stats");
+        let second_processor = store
+            .cached_processor_stats(&processor.descriptor)
+            .await
+            .expect("cached processor stats");
+        assert_eq!(first_processor, second_processor);
+        assert_eq!(
+            store.statistics_scans() - before,
+            2,
+            "one store-wide and one processor scan serve both reads"
+        );
+
+        // An entry as old as the TTL is refreshed on the next read.
+        {
+            let expired = Instant::now()
+                .checked_sub(STATS_CACHE_TTL)
+                .expect("monotonic clock older than the TTL");
+            let mut cache = store.inner.statistics_cache.lock().await;
+            cache
+                .store
+                .as_mut()
+                .expect("cached store stats")
+                .refreshed_at = expired;
+            cache
+                .processors
+                .get_mut(&processor_instance(&processor.descriptor))
+                .expect("cached processor stats")
+                .refreshed_at = expired;
+        }
+        store.cached_stats().await.expect("refreshed store stats");
+        store
+            .cached_processor_stats(&processor.descriptor)
+            .await
+            .expect("refreshed processor stats");
+        assert_eq!(store.statistics_scans() - before, 4);
+    }
+
+    async fn query_plan(store: &SqliteStore, statement: &str) -> Vec<String> {
+        sqlx::query(&format!("EXPLAIN QUERY PLAN {statement}"))
+            .fetch_all(&store.inner.pool)
+            .await
+            .expect("query plan")
+            .iter()
+            .map(|row| row.try_get("detail").expect("plan detail"))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn coverage_probes_are_single_index_searches() {
+        let (_directory, store) = store().await;
+        for (statement, index) in [
+            (
+                FINALIZED_EXACT_COVERAGE_HEAD,
+                "processor_coverage_finalized",
+            ),
+            (
+                FINALIZED_COMPACT_COVERAGE_HEAD,
+                "finalized_coverage_intervals_lookup",
+            ),
+            (EXACT_COVERAGE_HEAD, "PRIMARY KEY"),
+            (COMPACT_COVERAGE_HEAD, "finalized_coverage_segments_lookup"),
+            (EXACT_COVERAGE_BY_HASH, "processor_coverage_by_hash"),
+            (
+                COMPACT_COVERAGE_BY_HASH,
+                "finalized_coverage_segments_by_hash",
+            ),
+        ] {
+            let plan = query_plan(&store, statement).await;
+            assert!(
+                plan.len() == 1
+                    && plan[0].starts_with("SEARCH")
+                    && plan[0].contains(index)
+                    && !plan[0].contains("TEMP B-TREE"),
+                "{statement}\n{plan:?}"
+            );
+        }
+    }
+
+    /// `finalized_through` before its indexed probes: MAX over a UNION.
+    const FINALIZED_THROUGH_UNION_SCAN: &str = "SELECT MAX(block_number) FROM (
+            SELECT block_number FROM processor_coverage
+             WHERE instance = ? AND finality = ?
+            UNION ALL
+            SELECT end_block AS block_number FROM finalized_coverage_intervals
+             WHERE instance = ?
+         )";
+
+    /// `highest_coverage_cursor` before its indexed probes.
+    const COVERAGE_HEAD_UNION_SCAN: &str = "SELECT block_number, block_hash, finality FROM (
+            SELECT block_number, block_hash, finality
+              FROM processor_coverage WHERE instance = ?
+            UNION ALL
+            SELECT segment_end AS block_number, end_hash AS block_hash, ? AS finality
+              FROM finalized_coverage_segments WHERE instance = ?
+         ) ORDER BY block_number DESC LIMIT 1";
+
+    async fn assert_coverage_probes_match_union_scans(
+        store: &SqliteStore,
+        descriptor: &ProcessorDescriptor,
+        label: &str,
+    ) {
+        let instance = processor_instance(descriptor);
+        let finalized = finality_i64(Finality::Finalized);
+        let scanned: Option<i64> = sqlx::query_scalar(FINALIZED_THROUGH_UNION_SCAN)
+            .bind(&instance)
+            .bind(finalized)
+            .bind(&instance)
+            .fetch_one(&store.inner.pool)
+            .await
+            .expect("union scan");
+        assert_eq!(
+            store
+                .finalized_through(descriptor)
+                .await
+                .expect("finalized through"),
+            scanned.map(|block| BlockNumber(i64_u64(block, "block").expect("block"))),
+            "finalized_through: {label}"
+        );
+
+        let mut transaction = store.inner.pool.begin().await.expect("transaction");
+        let probed = highest_coverage_cursor(&mut transaction, descriptor, ChainId(1))
+            .await
+            .expect("coverage head")
+            .map(|head| (head.block_number, head.block_hash, head.finality));
+        let scanned: Option<(i64, Vec<u8>, i64)> = sqlx::query_as(COVERAGE_HEAD_UNION_SCAN)
+            .bind(&instance)
+            .bind(finalized)
+            .bind(&instance)
+            .fetch_optional(&mut *transaction)
+            .await
+            .expect("union scan");
+        let scanned = scanned.map(|(block, hash, finality)| {
+            (
+                BlockNumber(i64_u64(block, "block").expect("block")),
+                decode_hash(hash).expect("hash"),
+                decode_finality(finality).expect("finality"),
+            )
+        });
+        assert_eq!(probed, scanned, "highest_coverage_cursor: {label}");
+    }
+
+    #[tokio::test]
+    async fn coverage_probes_match_the_union_scans() {
+        let (_directory, store) = store().await;
+        let processor = FixtureProcessor::block_output();
+        let descriptor = &processor.descriptor;
+        assert_coverage_probes_match_union_scans(&store, descriptor, "no coverage").await;
+
+        let mut parent = BlockHash::ZERO;
+        for number in 1_u64..=4 {
+            let mut current = frame(number, parent);
+            current.finality = Finality::Finalized;
+            let delta = processor.map(&current).await.expect("map");
+            store
+                .apply(
+                    &processor,
+                    cursor(&processor, &current, number),
+                    &delta,
+                    &[],
+                )
+                .await
+                .expect("apply finalized block");
+            parent = current.block.hash;
+        }
+        assert_coverage_probes_match_union_scans(&store, descriptor, "finalized exact rows").await;
+        store
+            .compact_finalized_coverage(descriptor, BlockNumber(4), 2, 4)
+            .await
+            .expect("compact");
+        assert_eq!(
+            store.finalized_through(descriptor).await.expect("head"),
+            Some(BlockNumber(4))
+        );
+        assert_coverage_probes_match_union_scans(&store, descriptor, "compact interval only").await;
+
+        apply_included_blocks(&store, &processor, 5..=7, parent).await;
+        assert_coverage_probes_match_union_scans(
+            &store,
+            descriptor,
+            "included rows above the interval",
+        )
+        .await;
+        store
+            .mark_finalized(descriptor, BlockNumber(6))
+            .await
+            .expect("finalize");
+        assert_eq!(
+            store.finalized_through(descriptor).await.expect("head"),
+            Some(BlockNumber(6))
+        );
+        assert_coverage_probes_match_union_scans(
+            &store,
+            descriptor,
+            "finalized rows above the interval",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn schema_21_stores_upgrade_in_place_with_coverage_indexes() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("node.sqlite");
+        let store = SqliteStore::open(StoreConfig::new(&path))
+            .await
+            .expect("open fresh store");
+        let processor = FixtureProcessor::new();
+        let block = frame(1, BlockHash::ZERO);
+        let delta = processor.map(&block).await.expect("map");
+        store
+            .apply(&processor, cursor(&processor, &block, 1), &delta, &[])
+            .await
+            .expect("apply");
+        // Rewind to the rc.1 layout: schema 21 without the lookup indexes.
+        sqlx::raw_sql(
+            "DROP INDEX IF EXISTS processor_coverage_by_hash;
+             DROP INDEX IF EXISTS processor_coverage_finalized;
+             DROP INDEX IF EXISTS finalized_coverage_segments_by_hash;
+             UPDATE node_meta SET value = X'00000015' WHERE key = 'schema_version';",
+        )
+        .execute(&store.inner.pool)
+        .await
+        .expect("rewind to schema 21");
+        store.inner.pool.close().await;
+        drop(store);
+
+        let reopened = SqliteStore::open(StoreConfig::new(&path))
+            .await
+            .expect("schema 21 upgrades in place");
+        assert_eq!(CURRENT_SCHEMA_VERSION, 22);
+        assert_eq!(
+            reopened.stats().await.expect("stats").schema_version,
+            CURRENT_SCHEMA_VERSION
+        );
+        let indexes: Vec<String> = sqlx::query_scalar(
+            "SELECT name FROM sqlite_master
+             WHERE type = 'index' AND name IN (
+                 'processor_coverage_by_hash',
+                 'processor_coverage_finalized',
+                 'finalized_coverage_segments_by_hash'
+             ) ORDER BY name",
+        )
+        .fetch_all(&reopened.inner.pool)
+        .await
+        .expect("indexes");
+        assert_eq!(
+            indexes,
+            [
+                "finalized_coverage_segments_by_hash",
+                "processor_coverage_by_hash",
+                "processor_coverage_finalized",
+            ]
+        );
+        assert_eq!(
+            reopened
+                .coverage_block_by_hash(&processor.descriptor, block.block.hash)
+                .await
+                .expect("hash lookup"),
+            Some(BlockNumber(1))
+        );
+        assert_eq!(
+            reopened
+                .processor_cursor(&processor.descriptor)
+                .await
+                .expect("cursor")
+                .map(|cursor| cursor.block_number),
+            Some(BlockNumber(1))
+        );
+    }
+
+    #[tokio::test]
+    async fn pure_reads_do_not_wait_for_the_writer() {
+        let (_directory, store) = store().await;
+        let processor = FixtureProcessor::new();
+        apply_included_blocks(&store, &processor, 1..=3, BlockHash::ZERO).await;
+        store
+            .create_consumer(
+                &processor.descriptor,
+                "reader",
+                ConsumerRole::BestEffort,
+                ConsumerStartPosition::EarliestRetained,
+                Duration::from_mins(1),
+            )
+            .await
+            .expect("consumer");
+        let unregistered = with_id(FixtureProcessor::new(), "unregistered");
+        let writer = store.inner.writer.lock().await;
+
+        let changes = promptly(
+            "a consumer change read",
+            store.consumer_changes(&processor.descriptor, ChainId(1), "reader", 100),
+        )
+        .await
+        .expect("consumer changes");
+        assert_eq!(changes.len(), 3);
+        assert_eq!(
+            promptly("change bounds", store.change_bounds(&processor.descriptor))
+                .await
+                .expect("change bounds"),
+            Some(ChangeBounds {
+                earliest: 1,
+                latest: 3
+            })
+        );
+        assert_eq!(
+            promptly(
+                "delivery streams",
+                store.delivery_streams(&processor.descriptor)
+            )
+            .await
+            .expect("delivery streams")
+            .len(),
+            1
+        );
+        assert!(
+            promptly(
+                "delivery stream stats",
+                store.delivery_stream_stats(&processor.descriptor)
+            )
+            .await
+            .expect("delivery stream stats")
+            .live_bytes
+                > 0
+        );
+
+        // Reads look an unregistered processor up; they never register it.
+        assert_eq!(
+            promptly(
+                "unregistered change bounds",
+                store.change_bounds(&unregistered.descriptor)
+            )
+            .await
+            .expect("unregistered change bounds"),
+            None
+        );
+        assert!(
+            promptly(
+                "unregistered delivery streams",
+                store.delivery_streams(&unregistered.descriptor)
+            )
+            .await
+            .expect("unregistered delivery streams")
+            .is_empty()
+        );
+        assert_eq!(
+            promptly(
+                "unregistered delivery stream stats",
+                store.delivery_stream_stats(&unregistered.descriptor)
+            )
+            .await
+            .expect("unregistered delivery stream stats"),
+            DeliveryStreamStats {
+                live_bytes: 0,
+                pruned_through_sequence: 0,
+                required_ack_watermark: None,
+                format_version: 1,
+            }
+        );
+        drop(writer);
+        let registered: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM processor_instances WHERE instance = ?")
+                .bind(processor_instance(&unregistered.descriptor))
+                .fetch_one(&store.inner.pool)
+                .await
+                .expect("registrations");
+        assert_eq!(registered, 0);
+    }
+
+    #[tokio::test]
+    async fn consumer_reads_still_mark_an_overtaken_consumer_for_reset() {
+        let (_directory, store) = store().await;
+        let processor = FixtureProcessor::new();
+        apply_included_blocks(&store, &processor, 1..=2, BlockHash::ZERO).await;
+        store
+            .create_consumer(
+                &processor.descriptor,
+                "overtaken",
+                ConsumerRole::BestEffort,
+                ConsumerStartPosition::EarliestRetained,
+                Duration::from_mins(1),
+            )
+            .await
+            .expect("consumer");
+        let pruned = store
+            .prune_changes_before(&processor.descriptor, 999)
+            .await
+            .expect("prune");
+        assert_eq!(pruned.deleted, 1);
+
+        assert!(matches!(
+            store
+                .consumer_changes(&processor.descriptor, ChainId(1), "overtaken", 10)
+                .await,
+            Err(StoreError::ConsumerResetRequired {
+                earliest_available: Some(2),
+                latest_available: Some(2)
+            })
+        ));
+        assert_eq!(
+            store
+                .consumer(&processor.descriptor, "overtaken")
+                .await
+                .expect("consumer")
+                .expect("consumer exists")
+                .state,
+            ConsumerState::ResetRequired
+        );
+    }
+
+    #[tokio::test]
+    async fn unchanged_processor_registration_skips_the_writer() {
+        let (_directory, store) = store().await;
+        let processor = FixtureProcessor::new();
+        store
+            .register_processor(&processor.descriptor)
+            .await
+            .expect("first registration");
+        let writer = store.inner.writer.lock().await;
+        assert_eq!(
+            promptly(
+                "re-registering an unchanged processor",
+                store.register_processor(&processor.descriptor)
+            )
+            .await
+            .expect("re-register"),
+            processor_instance(&processor.descriptor)
+        );
+
+        // A lifecycle edit writes, so it still takes the writer.
+        let edited = until_acknowledged(FixtureProcessor::new());
+        let edit_store = store.clone();
+        let edited_descriptor = edited.descriptor.clone();
+        let edit =
+            tokio::spawn(async move { edit_store.register_processor(&edited_descriptor).await });
+        loop {
+            let waiting = {
+                let state = store
+                    .inner
+                    .writer
+                    .state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                state.live_waiters == 1
+            };
+            if waiting {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        drop(writer);
+        edit.await
+            .expect("registration task")
+            .expect("lifecycle edit");
+        let stored: String = sqlx::query_scalar(
+            "SELECT descriptor_json FROM processor_instances WHERE instance = ?",
+        )
+        .bind(processor_instance(&edited.descriptor))
+        .fetch_one(&store.inner.pool)
+        .await
+        .expect("stored descriptor");
+        assert_eq!(
+            serde_json::from_str::<ProcessorDescriptor>(&stored).expect("descriptor"),
+            edited.descriptor
+        );
+    }
+
+    #[tokio::test]
+    async fn query_snapshot_rejections_do_not_wait_for_the_writer() {
+        let (_directory, store) = store().await;
+        let processor = FixtureProcessor::block_output();
+        apply_included_blocks(&store, &processor, 1..=6, BlockHash::ZERO).await;
+        let limits = QuerySnapshotLimits::default();
+        let writer = store.inner.writer.lock().await;
+
+        // The size probe stops at the first row past the row cap.
+        assert!(matches!(
+            promptly(
+                "a row-cap rejection",
+                store.create_query_snapshot(
+                    &processor.descriptor,
+                    "state",
+                    OutputQuery::default(),
+                    QuerySnapshotLimits {
+                        max_rows: 2,
+                        ..limits
+                    },
+                )
+            )
+            .await,
+            Err(StoreError::QueryTooExpensive {
+                rows: 3,
+                max_rows: 2,
+                ..
+            })
+        ));
+        assert!(matches!(
+            promptly(
+                "a byte-cap rejection",
+                store.create_query_snapshot(
+                    &processor.descriptor,
+                    "state",
+                    OutputQuery::default(),
+                    QuerySnapshotLimits {
+                        max_bytes: 1,
+                        ..limits
+                    },
+                )
+            )
+            .await,
+            Err(StoreError::QueryTooExpensive { max_bytes: 1, .. })
+        ));
+        assert!(matches!(
+            promptly(
+                "a coverage rejection",
+                store.create_covered_query_snapshot(
+                    &processor.descriptor,
+                    "state",
+                    OutputQuery {
+                        from_block: Some(BlockNumber(1)),
+                        to_block: Some(BlockNumber(9)),
+                        ..OutputQuery::default()
+                    },
+                    limits,
+                )
+            )
+            .await,
+            Err(StoreError::OutputRangeIncomplete { .. })
+        ));
+        drop(writer);
+
+        let snapshot = store
+            .create_covered_query_snapshot(
+                &processor.descriptor,
+                "state",
+                OutputQuery {
+                    from_block: Some(BlockNumber(1)),
+                    to_block: Some(BlockNumber(6)),
+                    ..OutputQuery::default()
+                },
+                limits,
+            )
+            .await
+            .expect("admitted snapshot");
+        assert_eq!(snapshot.row_count, 6);
+        let copied: (i64, i64) = sqlx::query_as(
+            "SELECT COUNT(*), SUM(length(value) + length(entity_key) + 128)
+             FROM query_snapshot_entities WHERE snapshot_id = ?",
+        )
+        .bind(snapshot.snapshot_id.as_slice())
+        .fetch_one(&store.inner.pool)
+        .await
+        .expect("copied rows");
+        assert_eq!(
+            (
+                i64_u64(copied.0, "rows").expect("rows"),
+                i64_u64(copied.1, "bytes").expect("bytes")
+            ),
+            (snapshot.row_count, snapshot.value_bytes)
+        );
+    }
+
+    #[tokio::test]
+    async fn covered_snapshots_recheck_coverage_removed_while_waiting_for_the_writer() {
+        let (_directory, store) = store().await;
+        let processor = FixtureProcessor::block_output();
+        let head = apply_included_blocks(&store, &processor, 1..=3, BlockHash::ZERO).await;
+        let removals = store.inner.coverage_removals.load(Ordering::Acquire);
+        store
+            .undo(&processor.descriptor, ChainId(1), BlockNumber(3), head, &[])
+            .await
+            .expect("undo");
+        assert_eq!(
+            store.inner.coverage_removals.load(Ordering::Acquire),
+            removals + 1,
+            "an undo counts as a coverage removal"
+        );
+
+        let writer = store.inner.writer.lock().await;
+        let snapshot_store = store.clone();
+        let descriptor = processor.descriptor.clone();
+        let snapshot = tokio::spawn(async move {
+            snapshot_store
+                .create_covered_query_snapshot(
+                    &descriptor,
+                    "state",
+                    OutputQuery {
+                        from_block: Some(BlockNumber(1)),
+                        to_block: Some(BlockNumber(2)),
+                        ..OutputQuery::default()
+                    },
+                    QuerySnapshotLimits::default(),
+                )
+                .await
+        });
+        // The snapshot passed its checks and now waits for the writer.
+        loop {
+            let waiting = {
+                let state = store
+                    .inner
+                    .writer
+                    .state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                state.live_waiters == 1
+            };
+            if waiting {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        // A reorg removes block 2 meanwhile, as an undo would.
+        sqlx::query("DELETE FROM processor_coverage WHERE instance = ? AND block_number = 2")
+            .bind(processor_instance(&processor.descriptor))
+            .execute(&store.inner.pool)
+            .await
+            .expect("remove coverage");
+        store.inner.coverage_removals.fetch_add(1, Ordering::AcqRel);
+        drop(writer);
+        assert!(matches!(
+            snapshot.await.expect("snapshot task"),
+            Err(StoreError::OutputRangeIncomplete { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn query_snapshot_size_probe_stops_past_the_byte_cap() {
+        let (_directory, store) = store().await;
+        let processor = FixtureProcessor::new();
+        store
+            .register_processor(&processor.descriptor)
+            .await
+            .expect("register");
+        let instance = processor_instance(&processor.descriptor);
+        let mut transaction = store.inner.pool.begin().await.expect("seed transaction");
+        for key in 0_u32..3_000 {
+            sqlx::query(
+                "INSERT INTO entities(instance, collection, entity_key, value)
+                 VALUES (?, 'wide', ?, ?)",
+            )
+            .bind(&instance)
+            .bind(key.to_be_bytes().as_slice())
+            .bind([0xa5_u8; 100].as_slice())
+            .execute(&mut *transaction)
+            .await
+            .expect("seed entity");
+            sqlx::query(
+                "INSERT INTO output_entity_meta(
+                    instance, collection, entity_key, block_number, block_timestamp,
+                    finality, written_at_unix_ms, value_bytes
+                 ) VALUES (?, 'wide', ?, 1, 1, 2, 1, 100)",
+            )
+            .bind(&instance)
+            .bind(key.to_be_bytes().as_slice())
+            .execute(&mut *transaction)
+            .await
+            .expect("seed entity metadata");
+        }
+        transaction.commit().await.expect("seed");
+
+        match store
+            .create_query_snapshot(
+                &processor.descriptor,
+                "wide",
+                OutputQuery::default(),
+                QuerySnapshotLimits {
+                    max_rows: 1_000_000,
+                    max_bytes: 1_024,
+                    ..QuerySnapshotLimits::default()
+                },
+            )
+            .await
+        {
+            Err(StoreError::QueryTooExpensive { rows, bytes, .. }) => {
+                assert!(rows < 3_000, "the probe counted all {rows} rows");
+                assert!(bytes > 1_024);
+            }
+            other => panic!("expected a byte-cap rejection, got {other:?}"),
+        }
     }
 }

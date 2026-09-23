@@ -30,11 +30,17 @@ limits.
 
 ## Health and metrics
 
-- `GET /health/live` checks the process and SQLite readability.
-- `GET /health/ready` additionally checks every required live/finality actor.
+- `GET /health/live` checks that the process serves requests and SQLite
+  answers a trivial query. It reads no tables, so it stays fast on large
+  stores.
+- `GET /health/ready` additionally checks every required live/finality actor
+  from in-memory readiness state.
 - `GET /debug/network` serves the built-in P2P and coverage dashboard.
 - `GET /v1/network/status` returns the dashboard's machine-readable snapshot.
 - `GET /metrics` returns bounded-cardinality Prometheus text metrics.
+  Store-wide and per-processor row and byte counts are recounted at most
+  every 10 seconds and can lag by that much. `/v1/network/status` shares the
+  per-processor counts.
 - `GET /v1/processors/{id}/status` reports coverage independently of process
   health.
 
