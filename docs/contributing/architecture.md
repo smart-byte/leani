@@ -387,6 +387,8 @@ apply new branch in forward order
 publish apply events
 ```
 
+Each such transaction covers one processor. The shared live lane retains a block's canonical frame, and switches the canonical chain for a reorg, before any processor applies or undoes it, and a delta can be persisted as pending before its apply; each of those steps commits separately. Startup reconciliation repairs an interruption between them before the live lanes open: it undoes unfinalized processor blocks that are not canonical, deletes pending deltas no processor can apply, and replays retained canonical frames to lanes that trail them.
+
 When consensus finality advances:
 
 - mark matching outputs finalized;

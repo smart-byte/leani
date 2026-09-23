@@ -1114,6 +1114,60 @@ async fn accept_existing_delta_variant(
     Ok(true)
 }
 
+/// Test-only crash points between the separately committed steps of a live
+/// commit or reorg. A test arms a point for one processor instance and block,
+/// and the runtime then fails there once with an error no lane isolates, so
+/// the run ends as if the process had died before the next durable step.
+#[cfg(test)]
+mod failpoints {
+    use std::sync::{Mutex, PoisonError};
+
+    use leani_primitives::BlockNumber;
+    use leani_processor_api::ProcessorDescriptor;
+
+    use crate::RuntimeError;
+
+    /// After the canonical recent write, before one processor's apply.
+    pub(crate) const BEFORE_LIVE_APPLY: &str = "before_live_apply";
+    /// After a delta's `persist_delta`, before its apply.
+    pub(crate) const AFTER_PERSIST_DELTA: &str = "after_persist_delta";
+    /// After a reorg's canonical switch, before one processor's undo.
+    pub(crate) const BEFORE_REORG_UNDO: &str = "before_reorg_undo";
+    /// After the store paused or failed a lane at its delivery limit, before
+    /// the runtime records the lane's gap marker.
+    pub(crate) const BEFORE_LIVE_PARK: &str = "before_live_park";
+
+    static ARMED: Mutex<Vec<(&str, String, BlockNumber)>> = Mutex::new(Vec::new());
+
+    pub(crate) fn arm(point: &'static str, processor: &ProcessorDescriptor, block: BlockNumber) {
+        ARMED.lock().unwrap_or_else(PoisonError::into_inner).push((
+            point,
+            processor.instance.to_string(),
+            block,
+        ));
+    }
+
+    pub(crate) fn hit(
+        point: &'static str,
+        processor: &ProcessorDescriptor,
+        block: BlockNumber,
+    ) -> Result<(), RuntimeError> {
+        let instance = processor.instance.to_string();
+        let mut armed = ARMED.lock().unwrap_or_else(PoisonError::into_inner);
+        let Some(index) = armed
+            .iter()
+            .position(|armed| armed.0 == point && armed.1 == instance && armed.2 == block)
+        else {
+            return Ok(());
+        };
+        armed.swap_remove(index);
+        Err(RuntimeError::InvalidConfig(format!(
+            "injected crash at {point} for {instance} at block {}",
+            block.0
+        )))
+    }
+}
+
 async fn commit_mapped_delta(
     store: &SqliteStore,
     processor: &dyn Processor,
@@ -1137,6 +1191,12 @@ async fn commit_mapped_delta(
         }
         return Err(error.into());
     }
+    #[cfg(test)]
+    failpoints::hit(
+        failpoints::AFTER_PERSIST_DELTA,
+        processor.descriptor(),
+        mapped.delta.block.number,
+    )?;
     let sequence = store
         .processor_cursor(processor.descriptor())
         .await?
@@ -3552,6 +3612,187 @@ impl SharedLiveRuntime {
         Ok(report)
     }
 
+    /// Repair what an interrupted commit or reorg left in every processor's
+    /// state, then drain like [`Self::reconcile_pending`]. Run it before the
+    /// live lanes open.
+    ///
+    /// The canonical recent write and each processor's apply commit
+    /// separately, as do a reorg's canonical switch and each processor's
+    /// undo. A crash, abort, or error between them can leave a processor on
+    /// a reverted branch, behind the canonical tip, or holding pending deltas
+    /// that no drain applies. For every processor, reconciliation:
+    ///
+    /// 1. undoes its unfinalized blocks that are not canonical at their
+    ///    height, newest first;
+    /// 2. records the first unapplied block of a lane without a gap that
+    ///    trails the retained canonical frames, so the drain replays them
+    ///    through the normal gap path: a running lane pauses there
+    ///    (`startup_reconciliation_replay`), and a lane the store paused or
+    ///    failed at a delivery limit keeps its state until it resumes or is
+    ///    reset;
+    /// 3. deletes its pending deltas that it can never apply: below its
+    ///    start, for a block that is not canonical, for a block it already
+    ///    applied, or, for a block-local lane, below its first unapplied
+    ///    block. The drain applies the rest.
+    ///
+    /// Each repair is logged, and the report counts undone blocks as
+    /// reverted. A consistent store is left untouched, so a second run is a
+    /// no-op.
+    ///
+    /// # Errors
+    ///
+    /// Returns store failures, and the errors of [`Self::reconcile_pending`].
+    pub async fn reconcile_startup(&self) -> Result<SharedLiveReport, RuntimeError> {
+        for processor in &self.processors {
+            self.store
+                .register_processor(processor.descriptor())
+                .await?;
+        }
+        let mut undone = Vec::with_capacity(self.processors.len());
+        {
+            let _lane = self.lane_lock.lock().await;
+            for processor in &self.processors {
+                undone.push(self.repair_interrupted_commit(processor.as_ref()).await?);
+            }
+        }
+        let mut report = self.reconcile_pending().await?;
+        for (processor, undone) in self.processors.iter().zip(undone) {
+            let processor_report = report
+                .processors
+                .entry(processor.descriptor().id.to_string())
+                .or_default();
+            processor_report.reverted = processor_report.reverted.saturating_add(undone);
+        }
+        Ok(report)
+    }
+
+    /// The per-processor repairs of [`Self::reconcile_startup`]. Returns how
+    /// many blocks it undid.
+    async fn repair_interrupted_commit(
+        &self,
+        processor: &dyn Processor,
+    ) -> Result<u64, RuntimeError> {
+        let descriptor = processor.descriptor();
+        let chain_id = self.source.descriptor().chain_id;
+        let reverted = self
+            .store
+            .noncanonical_unfinalized_blocks(descriptor, chain_id)
+            .await?;
+        for (number, hash) in &reverted {
+            self.store
+                .undo(descriptor, chain_id, *number, *hash, &self.config.sink_ids)
+                .await?;
+        }
+        let start = processor_start(processor)?;
+        let replay_from = self.park_lane_behind_retained_tip(processor, start).await?;
+        // A block-local lane applies a pending delta only at its gap, so one
+        // below its first unapplied block, such as an interrupted backfill
+        // commit left, never applies; that backfill maps the block again.
+        let keep_from = if descriptor.mode == ReductionMode::BlockLocal {
+            match self.store.live_lane_gap(descriptor).await? {
+                Some(gap) => gap.first_unapplied.number,
+                None => self
+                    .store
+                    .processor_cursor(descriptor)
+                    .await?
+                    .map_or(start, |cursor| {
+                        BlockNumber(cursor.block_number.0.saturating_add(1))
+                    }),
+            }
+            .max(start)
+        } else {
+            start
+        };
+        let discarded = self
+            .store
+            .discard_unappliable_pending_deltas(descriptor, chain_id, keep_from)
+            .await?;
+        let undone = u64::try_from(reverted.len()).unwrap_or(u64::MAX);
+        if undone != 0 || discarded != 0 || replay_from.is_some() {
+            warn!(
+                processor_instance = %descriptor.instance,
+                undone_blocks = undone,
+                highest_undone_block = ?reverted.first().map(|(number, _)| number.0),
+                discarded_pending_deltas = discarded,
+                replay_from_block = ?replay_from.map(|block| block.0),
+                "startup reconciliation repaired processor state against the canonical chain"
+            );
+        }
+        Ok(undone)
+    }
+
+    /// Record the first unapplied block of a lane without a gap marker that
+    /// trails the retained canonical frames, so the drain replays them, and
+    /// return that block.
+    ///
+    /// A running lane pauses there (`startup_reconciliation_replay`). A paused
+    /// or failed lane keeps its state and reason: the store stopped it at a
+    /// delivery limit, and an interruption kept the runtime from recording
+    /// where, so it replays from there once it resumes or is reset. A lane
+    /// failed for another reason, such as a finality contradiction, gets no
+    /// marker.
+    ///
+    /// An ordered lane replays from the block after its cursor, or from its
+    /// start, which must be retained; earlier blocks are history's, and the
+    /// drain replays only a block that descends from the cursor. A
+    /// block-local lane replays every retained block above its cursor, from
+    /// the first one retained: a hole in the retained frames, such as blocks
+    /// never retained over downtime, is its cold backfill's.
+    async fn park_lane_behind_retained_tip(
+        &self,
+        processor: &dyn Processor,
+        start: BlockNumber,
+    ) -> Result<Option<BlockNumber>, RuntimeError> {
+        let descriptor = processor.descriptor();
+        let chain_id = self.source.descriptor().chain_id;
+        if self.store.live_lane_gap(descriptor).await?.is_some() {
+            return Ok(None);
+        }
+        let Some(retained) = self.store.recent_canonical_bounds(chain_id).await? else {
+            return Ok(None);
+        };
+        let cursor = self.store.processor_cursor(descriptor).await?;
+        let mut first = cursor.as_ref().map_or(start, |cursor| {
+            BlockNumber(cursor.block_number.0.saturating_add(1))
+        });
+        if descriptor.mode == ReductionMode::BlockLocal {
+            first = first.max(retained.start());
+        }
+        if first > retained.end() {
+            return Ok(None);
+        }
+        let frame = if descriptor.mode == ReductionMode::BlockLocal {
+            self.store.next_recent_frame(chain_id, first).await?
+        } else {
+            self.store.recent_frame(chain_id, first).await?
+        };
+        let Some(frame) = frame else {
+            return Ok(None);
+        };
+        let state = self.store.processor_runtime_state(descriptor).await?;
+        let reason = match state.state {
+            ProcessorRunState::Running => None,
+            ProcessorRunState::Paused | ProcessorRunState::Failed => state.reason.as_deref(),
+        };
+        if !self
+            .store
+            .park_processor_live_lane_at(
+                descriptor,
+                frame.block,
+                reason.unwrap_or("startup_reconciliation_replay"),
+                state.state == ProcessorRunState::Failed,
+            )
+            .await?
+        {
+            return Ok(None);
+        }
+        self.unavailable_processors
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(descriptor.instance.to_string());
+        Ok(Some(frame.block.number))
+    }
+
     /// Park one processor's live lane after a failure outside the live stream,
     /// such as its cold backfill, while shared ingestion and every other lane
     /// continue.
@@ -3902,7 +4143,11 @@ impl SharedLiveRuntime {
             .live_lane_gap(processor.descriptor())
             .await?
             .is_some();
-        if state.state == ProcessorRunState::Running && !has_gap {
+        // A lane the store paused at its delivery limit without a gap marker,
+        // as a cold-backfill commit on its live stream can, is mapped again:
+        // its next block commits as usual, so a refusal parks it where it
+        // stopped instead of the lane skipping blocks.
+        if state.state != ProcessorRunState::Failed && !has_gap {
             self.unavailable_processors
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -4011,7 +4256,15 @@ impl SharedLiveRuntime {
         report: &mut SharedLiveReport,
     ) -> Result<(), RuntimeError> {
         for (processor, mapped) in self.processors.iter().zip(&prepared.deltas) {
+            #[cfg(test)]
+            failpoints::hit(
+                failpoints::BEFORE_LIVE_APPLY,
+                processor.descriptor(),
+                prepared.frame.block.number,
+            )?;
             let Some(mapped) = mapped else {
+                self.record_failed_lane_block(processor.as_ref(), prepared.frame.block)
+                    .await?;
                 continue;
             };
             // A failed lane, or one parked at a gap, is not committed directly,
@@ -4034,6 +4287,8 @@ impl SharedLiveRuntime {
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .insert(processor.descriptor().instance.to_string());
+                self.record_failed_lane_block(processor.as_ref(), prepared.frame.block)
+                    .await?;
                 continue;
             }
             let committed = if processor.descriptor().mode == ReductionMode::BlockLocal {
@@ -4074,12 +4329,65 @@ impl SharedLiveRuntime {
         Box::pin(self.drain_pending(report)).await
     }
 
+    /// Record `block` as the first unapplied block of a lane the store failed
+    /// at its delivery limit, as a cold-backfill commit on the lane's live
+    /// stream can, before anything recorded where the lane stopped: without
+    /// that marker an operator reset has nothing to replay from. A block-local
+    /// lane records a block it has not applied. An ordered lane records only
+    /// the block right after its cursor, or its start: a block further ahead
+    /// would put its gap above blocks it still needs from history.
+    async fn record_failed_lane_block(
+        &self,
+        processor: &dyn Processor,
+        block: BlockRef,
+    ) -> Result<(), RuntimeError> {
+        let descriptor = processor.descriptor();
+        let state = self.store.processor_runtime_state(descriptor).await?;
+        if state.state != ProcessorRunState::Failed
+            || self.store.live_lane_gap(descriptor).await?.is_some()
+        {
+            return Ok(());
+        }
+        let first_unapplied = if descriptor.mode == ReductionMode::OrderedState {
+            let next = match self.store.processor_cursor(descriptor).await? {
+                Some(cursor) => BlockNumber(cursor.block_number.0.saturating_add(1)),
+                None => processor_start(processor)?,
+            };
+            block.number == next
+        } else {
+            !self.lane_has_applied(processor, block).await?
+        };
+        // The store records a marker only for a failure it recorded itself
+        // at a delivery limit; a lane failed for another reason is left alone.
+        if first_unapplied
+            && let Some(reason) = state.reason.as_deref()
+            && self
+                .store
+                .park_processor_live_lane_at(descriptor, block, reason, true)
+                .await?
+        {
+            warn!(
+                processor_instance = %descriptor.instance,
+                first_unapplied_block = block.number.0,
+                reason,
+                "recorded where a live lane the store failed stopped; an operator reset replays from there"
+            );
+        }
+        Ok(())
+    }
+
     async fn park_live_lane(
         &self,
         processor: &dyn Processor,
         mapped: &MappedFrame,
         error: &RuntimeError,
     ) -> Result<(), RuntimeError> {
+        #[cfg(test)]
+        failpoints::hit(
+            failpoints::BEFORE_LIVE_PARK,
+            processor.descriptor(),
+            mapped.delta.block.number,
+        )?;
         let encoded_bytes = u64::try_from(mapped.delta.encode_durable()?.len()).unwrap_or(u64::MAX);
         let mut current = 0_u64;
         for configured in &self.processors {
@@ -5041,16 +5349,30 @@ impl SharedLiveRuntime {
                     }
                     break;
                 }
-                if gap.first_unapplied.number != expected
-                    || prior.as_ref().is_some_and(|cursor| {
-                        gap.first_unapplied.parent_hash != BlockHash::ZERO
-                            && gap.first_unapplied.parent_hash != cursor.block_hash
-                    })
+                // The gap block must descend from the cursor. A marker on a
+                // seeded anchor row has no parent hash: the block's retained
+                // frame supplies it, and without one the replay requires the
+                // cursor, which history recovery checks the block against.
+                let mut first = gap.first_unapplied;
+                if first.parent_hash == BlockHash::ZERO
+                    && let Some(cursor) = &prior
+                {
+                    first.parent_hash = self
+                        .canonical_ref(first.number)
+                        .await?
+                        .map(|block| block.parent_hash)
+                        .filter(|parent| *parent != BlockHash::ZERO)
+                        .unwrap_or(cursor.block_hash);
+                }
+                if first.number != expected
+                    || prior
+                        .as_ref()
+                        .is_some_and(|cursor| first.parent_hash != cursor.block_hash)
                 {
                     break;
                 }
                 if let Some(frame) = self
-                    .replayable_recent_frame(processor.as_ref(), gap.first_unapplied)
+                    .replayable_recent_frame(processor.as_ref(), first)
                     .await?
                 {
                     if self
@@ -5062,7 +5384,7 @@ impl SharedLiveRuntime {
                     break;
                 }
                 if !self
-                    .recover_finalized_live_gap(processor.as_ref(), gap.first_unapplied, report)
+                    .recover_finalized_live_gap(processor.as_ref(), first, report)
                     .await?
                 {
                     break;
@@ -5231,6 +5553,12 @@ impl SharedLiveRuntime {
             None => None,
         };
         for (processor_index, processor) in self.processors.iter().enumerate() {
+            #[cfg(test)]
+            failpoints::hit(
+                failpoints::BEFORE_REORG_UNDO,
+                processor.descriptor(),
+                lowest_reverted,
+            )?;
             if let Some(gap) = self.store.live_lane_gap(processor.descriptor()).await?
                 && gap.first_unapplied.number >= lowest_reverted
             {
@@ -5293,9 +5621,12 @@ impl SharedLiveRuntime {
     /// below it. With no replacement branch the gap moves onto the new tip,
     /// the reorg's ancestor, which the lane has applied or which lies below
     /// its start; the drain moves past it, completing the gap or moving it
-    /// onto the ancestor's successor once that block is retained. Either way
-    /// no marker stays on a height the new chain no longer has, whether the
-    /// lane is paused or failed.
+    /// onto the ancestor's successor once that block is retained. A paused
+    /// block-local lane that never applied the ancestor, such as a seeded
+    /// finality anchor that no live block delivered, skipped nothing the new
+    /// chain still has, so its gap completes. An ordered lane still needs the
+    /// ancestor in order, and a failed lane keeps it for a reset. Either way no
+    /// marker stays on a height the new chain no longer has.
     async fn rebase_gap_across_reorg(
         &self,
         processor: &dyn Processor,
@@ -5317,7 +5648,22 @@ impl SharedLiveRuntime {
                     .await?;
             }
             None => {
-                if let Some(ancestor) = ancestor {
+                let Some(ancestor) = ancestor else {
+                    return Ok(());
+                };
+                if processor.descriptor().mode == ReductionMode::BlockLocal
+                    && !self.lane_has_applied(processor, ancestor).await?
+                    && self
+                        .store
+                        .processor_runtime_state(processor.descriptor())
+                        .await?
+                        .state
+                        != ProcessorRunState::Failed
+                {
+                    self.store
+                        .complete_live_lane_gap(processor.descriptor(), marker)
+                        .await?;
+                } else {
                     self.store
                         .advance_live_lane_gap(processor.descriptor(), marker, ancestor)
                         .await?;
@@ -14945,6 +15291,1237 @@ mod tests {
             SharedLiveRuntimeConfig::default(),
         )
         .expect("runtime")
+    }
+
+    /// Two block-local lanes and an ordered one, named for one test so an
+    /// armed failpoint cannot fire in another.
+    fn crash_lanes(test: &str) -> Vec<Arc<dyn Processor>> {
+        vec![
+            Arc::new(BlockLocalCounter::named(&format!("{test}-first"))),
+            Arc::new(BlockLocalCounter::named(&format!("{test}-second"))),
+            Arc::new(OrderedLedgerProcessor::named(&format!("{test}-ledger"))),
+        ]
+    }
+
+    fn scripted_live(
+        store: &SqliteStore,
+        processors: &[Arc<dyn Processor>],
+        steps: Vec<LiveStep>,
+    ) -> SharedLiveRuntime {
+        let range = BlockRange::new(BlockNumber(0), BlockNumber(9)).expect("range");
+        SharedLiveRuntime::new(
+            store.clone(),
+            Arc::new(ScriptedLiveSource::new(
+                fixture_source_descriptor("crash-live", range),
+                steps,
+            )),
+            processors.to_vec(),
+            SharedLiveRuntimeConfig::default(),
+        )
+        .expect("runtime")
+    }
+
+    async fn run_live(runtime: &SharedLiveRuntime) -> Result<SharedLiveReport, RuntimeError> {
+        runtime
+            .run(
+                LiveStart::Head,
+                default_source_budget(),
+                CancellationToken::new(),
+            )
+            .await
+    }
+
+    /// What queries and consumers can observe of one processor, apart from
+    /// change sequence numbers and write times.
+    #[derive(Debug, PartialEq)]
+    struct LaneState {
+        cursor: Option<ProcessorCursor>,
+        coverage: Vec<Option<BlockHash>>,
+        entities: Vec<(Vec<u8>, Vec<u8>)>,
+        changes: Vec<(
+            BlockRef,
+            Finality,
+            ChangeDirection,
+            leani_processor_api::DomainChange,
+            leani_store_sqlite::DeliveryOrigin,
+        )>,
+        stats: leani_store_sqlite::ProcessorStoreStats,
+        gap: Option<BlockRef>,
+        state: (ProcessorRunState, Option<String>),
+    }
+
+    async fn lane_state(store: &SqliteStore, processor: &dyn Processor) -> LaneState {
+        let descriptor = processor.descriptor();
+        let mut coverage = Vec::new();
+        for number in 0..=9 {
+            coverage.push(
+                store
+                    .coverage_hash(descriptor, BlockNumber(number))
+                    .await
+                    .expect("coverage"),
+            );
+        }
+        let mut entities = Vec::new();
+        for collection in ["counter.blocks", "ledger"] {
+            entities.extend(
+                store
+                    .scan_entities(descriptor, collection, None, 1_000)
+                    .await
+                    .expect("entities"),
+            );
+        }
+        let state = store
+            .processor_runtime_state(descriptor)
+            .await
+            .expect("state");
+        LaneState {
+            cursor: store.processor_cursor(descriptor).await.expect("cursor"),
+            coverage,
+            entities,
+            changes: store
+                .changes(descriptor, ChainId(1), 0, 1_000)
+                .await
+                .expect("changes")
+                .into_iter()
+                .map(|record| {
+                    (
+                        record.block,
+                        record.finality,
+                        record.direction,
+                        record.change,
+                        record.origin,
+                    )
+                })
+                .collect(),
+            stats: store.processor_stats(descriptor).await.expect("stats"),
+            gap: store
+                .live_lane_gap(descriptor)
+                .await
+                .expect("gap")
+                .map(|gap| gap.first_unapplied),
+            state: (state.state, state.reason),
+        }
+    }
+
+    /// Run `before` into the armed failpoint, then restart like the process
+    /// would: fresh runtime objects over the same store file run startup
+    /// reconciliation, then follow `after`.
+    async fn crash_then_restart(
+        path: &std::path::Path,
+        lanes: &dyn Fn() -> Vec<Arc<dyn Processor>>,
+        before: Vec<LiveStep>,
+        after: Vec<LiveStep>,
+    ) -> (SqliteStore, SharedLiveReport) {
+        let store = SqliteStore::open(leani_store_sqlite::StoreConfig::new(path))
+            .await
+            .expect("store");
+        let crashed = run_live(&scripted_live(&store, &lanes(), before)).await;
+        assert!(
+            matches!(&crashed, Err(RuntimeError::InvalidConfig(message)) if message.starts_with("injected crash")),
+            "the run ends at the injected crash: {crashed:?}"
+        );
+        drop(store);
+
+        let store = SqliteStore::open(leani_store_sqlite::StoreConfig::new(path))
+            .await
+            .expect("reopen store");
+        let restarted = scripted_live(&store, &lanes(), after);
+        let report = restarted
+            .reconcile_startup()
+            .await
+            .expect("startup reconciliation");
+        run_live(&restarted)
+            .await
+            .expect("live run after the restart");
+        (store, report)
+    }
+
+    async fn assert_like_clean_run(
+        store: &SqliteStore,
+        clean: &SqliteStore,
+        lanes: &[Arc<dyn Processor>],
+    ) {
+        for lane in lanes {
+            assert_eq!(
+                lane_state(store, lane.as_ref()).await,
+                lane_state(clean, lane.as_ref()).await,
+                "{} ends as in a run without the crash",
+                lane.descriptor().id
+            );
+        }
+    }
+
+    /// Startup reconciliation, on a store with nothing to repair, writes
+    /// nothing, including lane state times.
+    async fn assert_reconciliation_is_a_no_op(store: &SqliteStore, lanes: &[Arc<dyn Processor>]) {
+        let mut before = Vec::new();
+        for lane in lanes {
+            before.push((
+                lane_state(store, lane.as_ref()).await,
+                store
+                    .processor_runtime_state(lane.descriptor())
+                    .await
+                    .expect("state"),
+                store.live_lane_gap(lane.descriptor()).await.expect("gap"),
+            ));
+        }
+        let report = scripted_live(store, lanes, Vec::new())
+            .reconcile_startup()
+            .await
+            .expect("startup reconciliation");
+        for (lane, before) in lanes.iter().zip(before) {
+            let processor_report = &report.processors[lane.descriptor().id.as_str()];
+            assert_eq!(
+                (processor_report.applied, processor_report.reverted),
+                (0, 0),
+                "{} needs no repair",
+                lane.descriptor().id
+            );
+            assert_eq!(
+                (
+                    lane_state(store, lane.as_ref()).await,
+                    store
+                        .processor_runtime_state(lane.descriptor())
+                        .await
+                        .expect("state"),
+                    store.live_lane_gap(lane.descriptor()).await.expect("gap"),
+                ),
+                before,
+                "{} is untouched",
+                lane.descriptor().id
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn startup_reconciliation_replays_a_block_a_crash_kept_from_some_lanes() {
+        let test = "crash-before-apply";
+        let chain = live_blocks(4);
+        let (_clean_directory, clean) = store().await;
+        run_live(&scripted_live(
+            &clean,
+            &crash_lanes(test),
+            block_events(&chain),
+        ))
+        .await
+        .expect("clean run");
+
+        // Block 2 is retained and the first lane applies it; the process dies
+        // before the second lane and the ledger do.
+        failpoints::arm(
+            failpoints::BEFORE_LIVE_APPLY,
+            crash_lanes(test)[1].descriptor(),
+            BlockNumber(2),
+        );
+        let directory = tempfile::tempdir().expect("tempdir");
+        let (store, report) = crash_then_restart(
+            &directory.path().join("node.sqlite"),
+            &|| crash_lanes(test),
+            block_events(&chain[..=2]),
+            block_events(&chain[3..]),
+        )
+        .await;
+
+        assert_like_clean_run(&store, &clean, &crash_lanes(test)).await;
+        assert_eq!(report.processors[&format!("{test}-second")].applied, 1);
+        assert_eq!(report.processors[&format!("{test}-ledger")].applied, 1);
+    }
+
+    #[tokio::test]
+    async fn startup_reconciliation_applies_a_delta_a_crash_left_pending() {
+        let test = "crash-after-persist";
+        let chain = live_blocks(4);
+        let (_clean_directory, clean) = store().await;
+        run_live(&scripted_live(
+            &clean,
+            &crash_lanes(test),
+            block_events(&chain),
+        ))
+        .await
+        .expect("clean run");
+
+        // The second lane persists its block-2 delta; the process dies before
+        // that delta applies, and before the ledger sees block 2.
+        failpoints::arm(
+            failpoints::AFTER_PERSIST_DELTA,
+            crash_lanes(test)[1].descriptor(),
+            BlockNumber(2),
+        );
+        let directory = tempfile::tempdir().expect("tempdir");
+        let (store, report) = crash_then_restart(
+            &directory.path().join("node.sqlite"),
+            &|| crash_lanes(test),
+            block_events(&chain[..=2]),
+            block_events(&chain[3..]),
+        )
+        .await;
+
+        // No orphan pending delta is left to hold back a hot/cold handoff.
+        for lane in crash_lanes(test) {
+            assert_eq!(
+                report.processors[lane.descriptor().id.as_str()].pending,
+                0,
+                "{} keeps no pending delta",
+                lane.descriptor().id
+            );
+        }
+        assert_like_clean_run(&store, &clean, &crash_lanes(test)).await;
+    }
+
+    #[tokio::test]
+    async fn startup_reconciliation_undoes_a_branch_a_crashed_reorg_left_applied() {
+        let test = "crash-in-reorg";
+        let chain = live_blocks(4);
+        let replacement = replacement_branch(&chain, 3, 2);
+        // A shortening reorg replaces blocks 3 and 4 with 3' alone; 4' follows.
+        let reorg = LiveStep::Event(ChainEvent::Reorg {
+            reverted: vec![chain[4].block, chain[3].block],
+            applied: vec![replacement[0].clone()],
+        });
+        let mut steps = block_events(&chain);
+        steps.push(reorg.clone());
+        steps.extend(block_events(&replacement[1..]));
+        let (_clean_directory, clean) = store().await;
+        run_live(&scripted_live(&clean, &crash_lanes(test), steps))
+            .await
+            .expect("clean run");
+
+        // The reorg switches the canonical chain and the first lane undoes the
+        // old branch; the process dies before the second lane and the ledger
+        // undo it, and before any lane applies 3'.
+        failpoints::arm(
+            failpoints::BEFORE_REORG_UNDO,
+            crash_lanes(test)[1].descriptor(),
+            BlockNumber(3),
+        );
+        let mut before = block_events(&chain);
+        before.push(reorg);
+        let directory = tempfile::tempdir().expect("tempdir");
+        let (store, report) = crash_then_restart(
+            &directory.path().join("node.sqlite"),
+            &|| crash_lanes(test),
+            before,
+            block_events(&replacement[1..]),
+        )
+        .await;
+
+        assert_eq!(report.processors[&format!("{test}-first")].reverted, 0);
+        assert_eq!(report.processors[&format!("{test}-second")].reverted, 2);
+        assert_eq!(report.processors[&format!("{test}-ledger")].reverted, 2);
+        assert_like_clean_run(&store, &clean, &crash_lanes(test)).await;
+        assert_reconciliation_is_a_no_op(&store, &crash_lanes(test)).await;
+    }
+
+    /// A block-local counter and an ordered ledger whose live delivery holds
+    /// three blocks' changes (56 and 38 bytes each), so block 3 reaches their
+    /// limits and takes `action`, and a counter without a limit.
+    fn delivery_limited_lanes(test: &str, action: DeliveryLimitAction) -> Vec<Arc<dyn Processor>> {
+        let limited = |lifecycle: &leani_processor_api::LifecyclePolicies, max_bytes| {
+            let mut lifecycle = lifecycle.clone();
+            lifecycle.delivery.max_bytes = max_bytes;
+            lifecycle.delivery.on_limit = action;
+            lifecycle
+        };
+        let counter = BlockLocalCounter::named(&format!("{test}-limited"));
+        let ledger = OrderedLedgerProcessor::named(&format!("{test}-limited-ledger"));
+        vec![
+            Arc::new(
+                counter
+                    .clone()
+                    .with_lifecycle(limited(&counter.descriptor().lifecycle, 180)),
+            ),
+            Arc::new(
+                ledger
+                    .clone()
+                    .with_lifecycle(limited(&ledger.descriptor().lifecycle, 120)),
+            ),
+            Arc::new(BlockLocalCounter::named(&format!("{test}-healthy"))),
+        ]
+    }
+
+    /// Consumers acknowledge, so pruning frees every lane's delivery capacity;
+    /// an operator resets each failed lane; then the lanes drain.
+    async fn free_delivery_and_drain(store: &SqliteStore, lanes: &[Arc<dyn Processor>]) {
+        for lane in lanes {
+            store
+                .prune_changes_before(lane.descriptor(), u64::MAX)
+                .await
+                .expect("free delivery capacity");
+            if store
+                .processor_runtime_state(lane.descriptor())
+                .await
+                .expect("state")
+                .state
+                == ProcessorRunState::Failed
+            {
+                store
+                    .reset_failed_live_lane(lane.descriptor())
+                    .await
+                    .expect("operator reset");
+            }
+        }
+        scripted_live(store, lanes, Vec::new())
+            .reconcile_pending()
+            .await
+            .expect("drain");
+    }
+
+    /// Live blocks 0..=4, where the limited lanes reach their delivery limits
+    /// at block 3. The process dies after the store paused or failed
+    /// `lanes[crashed]`, before the runtime recorded its gap marker.
+    async fn crash_at_a_delivery_limit(
+        test: &str,
+        action: DeliveryLimitAction,
+        state: ProcessorRunState,
+        crashed: usize,
+    ) {
+        let chain = live_blocks(4);
+        let lanes = || delivery_limited_lanes(test, action);
+        let (_clean_directory, clean) = store().await;
+        run_live(&scripted_live(&clean, &lanes(), block_events(&chain)))
+            .await
+            .expect("clean run");
+        assert_parked_at(
+            &clean,
+            lanes()[crashed].as_ref(),
+            chain[3].block,
+            state,
+            "delivery_spool_hard_limit",
+        )
+        .await;
+        free_delivery_and_drain(&clean, &lanes()).await;
+
+        failpoints::arm(
+            failpoints::BEFORE_LIVE_PARK,
+            lanes()[crashed].descriptor(),
+            BlockNumber(3),
+        );
+        let directory = tempfile::tempdir().expect("tempdir");
+        let (store, _) = crash_then_restart(
+            &directory.path().join("node.sqlite"),
+            &lanes,
+            block_events(&chain[..=3]),
+            block_events(&chain[4..]),
+        )
+        .await;
+
+        // Reconciliation records where the lane stopped and keeps its state,
+        // so it replays from there when it resumes or is reset.
+        assert_parked_at(
+            &store,
+            lanes()[crashed].as_ref(),
+            chain[3].block,
+            state,
+            "delivery_spool_hard_limit",
+        )
+        .await;
+        assert_reconciliation_is_a_no_op(&store, &lanes()).await;
+        free_delivery_and_drain(&store, &lanes()).await;
+        assert_like_clean_run(&store, &clean, &lanes()).await;
+    }
+
+    #[tokio::test]
+    async fn startup_reconciliation_records_where_a_crash_paused_a_lane_at_its_delivery_limit() {
+        crash_at_a_delivery_limit(
+            "crash-delivery-pause",
+            DeliveryLimitAction::Pause,
+            ProcessorRunState::Paused,
+            0,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn startup_reconciliation_records_where_a_crash_failed_a_lane_at_its_delivery_limit() {
+        crash_at_a_delivery_limit(
+            "crash-delivery-fail",
+            DeliveryLimitAction::Fail,
+            ProcessorRunState::Failed,
+            0,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn startup_reconciliation_records_where_a_crash_stopped_a_ledger_at_its_delivery_limit() {
+        crash_at_a_delivery_limit(
+            "crash-delivery-ordered",
+            DeliveryLimitAction::Pause,
+            ProcessorRunState::Paused,
+            1,
+        )
+        .await;
+    }
+
+    /// A live source that sends `before`, then holds its stream until the
+    /// test opens `gate` and sends `after`, so the test can change the store
+    /// between two blocks of one live run.
+    #[derive(Debug)]
+    struct GatedLiveSource {
+        descriptor: SourceDescriptor,
+        before: Vec<leani_primitives::BlockFrame>,
+        after: Vec<leani_primitives::BlockFrame>,
+        gate: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait]
+    impl LiveSource for GatedLiveSource {
+        fn descriptor(&self) -> &SourceDescriptor {
+            &self.descriptor
+        }
+
+        async fn subscribe(
+            &self,
+            _request: DataRequest,
+            _start: LiveStart,
+            _budget: SourceBudget,
+            _cancellation: CancellationToken,
+        ) -> Result<leani_source_api::ChainEventStream, SourceError> {
+            let events = |frames: Vec<leani_primitives::BlockFrame>| {
+                futures::stream::iter(
+                    frames
+                        .into_iter()
+                        .map(|frame| Ok::<_, SourceError>(ChainEvent::Block(Box::new(frame)))),
+                )
+            };
+            let gate = Arc::clone(&self.gate);
+            let after = self.after.clone();
+            Ok(events(self.before.clone())
+                .chain(
+                    futures::stream::once(async move {
+                        gate.notified().await;
+                        events(after)
+                    })
+                    .flatten(),
+                )
+                .boxed())
+        }
+    }
+
+    /// The writes the store makes when a commit on a lane's live stream that
+    /// is not the lane's own, such as its cold backfill's, reaches the
+    /// delivery limit: the lane pauses or fails, and nothing records where.
+    async fn stop_limited_lanes(
+        store: &SqliteStore,
+        lanes: &[Arc<dyn Processor>],
+        action: DeliveryLimitAction,
+    ) {
+        for lane in &lanes[..2] {
+            if action == DeliveryLimitAction::Fail {
+                store
+                    .fail_processor_live_lane(lane.descriptor(), "delivery_spool_hard_limit")
+                    .await
+                    .expect("store-recorded failure");
+            } else {
+                store
+                    .pause_processor_live_lane(lane.descriptor(), "delivery_spool_hard_limit")
+                    .await
+                    .expect("store-recorded pause");
+            }
+        }
+    }
+
+    /// Live blocks 0..=4, and between blocks 2 and 3 the store stops the
+    /// limited lanes, which have applied through the tip. A run without a
+    /// restart, and one restarted right after the stop, must end alike once
+    /// delivery capacity frees up and failed lanes are reset.
+    async fn stop_at_the_tip_then_restart(test: &str, action: DeliveryLimitAction) {
+        let chain = live_blocks(4);
+        let lanes = || delivery_limited_lanes(test, action);
+        let (_clean_directory, clean) = store().await;
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let runtime = SharedLiveRuntime::new(
+            clean.clone(),
+            Arc::new(GatedLiveSource {
+                descriptor: fixture_source_descriptor(
+                    "gated-live",
+                    BlockRange::new(BlockNumber(0), BlockNumber(4)).expect("range"),
+                ),
+                before: chain[..=2].to_vec(),
+                after: chain[3..].to_vec(),
+                gate: Arc::clone(&gate),
+            }),
+            lanes(),
+            SharedLiveRuntimeConfig::default(),
+        )
+        .expect("runtime");
+        let live = tokio::spawn(async move { run_live(&runtime).await });
+        tokio::time::timeout(Duration::from_secs(10), async {
+            for lane in lanes() {
+                while store_cursor(&clean, lane.as_ref()).await != Some(BlockNumber(2)) {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            }
+        })
+        .await
+        .expect("every lane applies block 2");
+        stop_limited_lanes(&clean, &lanes(), action).await;
+        gate.notify_one();
+        live.await.expect("live task").expect("clean run");
+        free_delivery_and_drain(&clean, &lanes()).await;
+
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("node.sqlite");
+        let store = SqliteStore::open(leani_store_sqlite::StoreConfig::new(&path))
+            .await
+            .expect("store");
+        run_live(&scripted_live(&store, &lanes(), block_events(&chain[..=2])))
+            .await
+            .expect("live run before the restart");
+        stop_limited_lanes(&store, &lanes(), action).await;
+        drop(store);
+        let store = SqliteStore::open(leani_store_sqlite::StoreConfig::new(&path))
+            .await
+            .expect("reopen store");
+        let restarted = scripted_live(&store, &lanes(), block_events(&chain[3..]));
+        restarted
+            .reconcile_startup()
+            .await
+            .expect("startup reconciliation");
+        run_live(&restarted)
+            .await
+            .expect("live run after the restart");
+        free_delivery_and_drain(&store, &lanes()).await;
+        assert_like_clean_run(&store, &clean, &lanes()).await;
+    }
+
+    async fn store_cursor(store: &SqliteStore, processor: &dyn Processor) -> Option<BlockNumber> {
+        store
+            .processor_cursor(processor.descriptor())
+            .await
+            .expect("cursor")
+            .map(|cursor| cursor.block_number)
+    }
+
+    #[tokio::test]
+    async fn a_lane_the_store_paused_at_the_tip_resumes_after_a_restart_without_a_hole() {
+        stop_at_the_tip_then_restart("tip-delivery-pause", DeliveryLimitAction::Pause).await;
+    }
+
+    #[tokio::test]
+    async fn a_lane_the_store_failed_at_the_tip_can_be_reset_after_a_restart() {
+        stop_at_the_tip_then_restart("tip-delivery-fail", DeliveryLimitAction::Fail).await;
+    }
+
+    #[tokio::test]
+    async fn a_known_unavailable_lane_the_store_paused_without_a_marker_is_mapped_again() {
+        let counter = Arc::new(BlockLocalCounter::named("repaused-counter"));
+        let (_directory, store) = store().await;
+        store
+            .register_processor(counter.descriptor())
+            .await
+            .expect("register");
+        let runtime = reduce_failure_runtime(&store, &[counter.clone() as Arc<dyn Processor>], &[]);
+        // The live lane parked this lane before, and its gap completed since.
+        // A cold-backfill commit on its live stream then reached the delivery
+        // limit, so the store paused it without a marker.
+        runtime
+            .unavailable_processors
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(counter.descriptor().instance.to_string());
+        store
+            .pause_processor_live_lane(counter.descriptor(), "delivery_spool_hard_limit")
+            .await
+            .expect("store-recorded pause");
+
+        assert!(
+            !runtime
+                .processor_live_lane_unavailable(counter.as_ref())
+                .await
+                .expect("availability"),
+            "its next block commits, so a refusal parks it where it stopped"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_ledger_behind_its_history_gets_no_marker_ahead_of_its_cursor() {
+        let chain = live_blocks(5);
+        let ledger = Arc::new(OrderedLedgerProcessor::named("behind-failed-ledger"));
+        let counter = Arc::new(BlockLocalCounter::named("behind-failed-counter"));
+        let lanes: Vec<Arc<dyn Processor>> = vec![ledger.clone(), counter.clone()];
+        let (_directory, store) = store().await;
+        // Live frames reached block 4 and the counter applied them, while the
+        // ledger's history reached only block 1. The store then failed both
+        // lanes at their delivery limits, recording no marker.
+        for (sequence, frame) in (1..).zip(&chain[..=4]) {
+            store.store_recent_frame(frame).await.expect("retain frame");
+            apply_live_frame(&store, counter.as_ref(), frame, sequence).await;
+        }
+        for (sequence, frame) in (1..).zip(&chain[..=1]) {
+            apply_live_frame(&store, ledger.as_ref(), frame, sequence).await;
+        }
+        for lane in &lanes {
+            store
+                .fail_processor_live_lane(lane.descriptor(), "delivery_spool_hard_limit")
+                .await
+                .expect("store-recorded failure");
+        }
+
+        reduce_failure_runtime(&store, &lanes, &chain[5..])
+            .run(
+                LiveStart::Head,
+                default_source_budget(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("live run");
+
+        // The counter records block 5, which it has not applied. The ledger
+        // records nothing: block 5 is not the block after its cursor.
+        assert_parked_at(
+            &store,
+            counter.as_ref(),
+            chain[5].block,
+            ProcessorRunState::Failed,
+            "delivery_spool_hard_limit",
+        )
+        .await;
+        assert!(
+            store
+                .live_lane_gap(ledger.descriptor())
+                .await
+                .expect("gap")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_reconciliation_replays_retained_frames_above_a_hole() {
+        let chain = live_blocks(6);
+        let counter = Arc::new(BlockLocalCounter::named("hole-above-counter"));
+        let lanes: Vec<Arc<dyn Processor>> = vec![counter.clone()];
+        let (_directory, store) = store().await;
+        // Frames 0..=2 survive from before downtime; the node then seeded its
+        // finalized anchor, block 5, and retained 5 and 6 from its overlap.
+        // Nothing retained blocks 3 and 4, which the cold backfill covers.
+        for (sequence, frame) in (1..).zip(&chain[..=2]) {
+            store.store_recent_frame(frame).await.expect("retain frame");
+            apply_live_frame(&store, counter.as_ref(), frame, sequence).await;
+        }
+        store
+            .store_canonical_anchor(
+                ChainId(1),
+                BlockRef {
+                    parent_hash: BlockHash::ZERO,
+                    timestamp: 1,
+                    ..chain[5].block
+                },
+                Finality::Finalized,
+            )
+            .await
+            .expect("seed anchor");
+        for frame in &chain[5..] {
+            store.store_recent_frame(frame).await.expect("retain frame");
+        }
+
+        reduce_failure_runtime(&store, &lanes, &[])
+            .reconcile_startup()
+            .await
+            .expect("startup reconciliation");
+
+        let described = rewind_probe_describe(&store, counter.as_ref()).await;
+        assert_eq!(
+            store_cursor(&store, counter.as_ref()).await,
+            Some(BlockNumber(6)),
+            "the lane replays the frames retained above the hole: {described}"
+        );
+        assert_gap_recovered(&store, counter.as_ref()).await;
+        for (number, covered) in [(3, false), (4, false), (5, true), (6, true)] {
+            assert_eq!(
+                store
+                    .coverage_hash(counter.descriptor(), BlockNumber(number))
+                    .await
+                    .expect("coverage")
+                    .is_some(),
+                covered,
+                "block {number}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn startup_reconciliation_leaves_a_consistent_store_untouched() {
+        let chain = live_blocks(4);
+        let replacement = replacement_branch(&chain, 3, 2);
+        let mut lanes = crash_lanes("consistent-restart");
+        // A lane whose reducer rejects block 3 fails there, and the reorg
+        // moves its gap onto 3' with a pending delta; it stays frozen.
+        lanes.push(Arc::new(FailingReduce::new(
+            BlockLocalCounter::named("consistent-restart-failed"),
+            BlockNumber(3),
+        )));
+        let mut steps = block_events(&chain);
+        steps.push(LiveStep::Event(ChainEvent::Reorg {
+            reverted: vec![chain[4].block, chain[3].block],
+            applied: replacement.clone(),
+        }));
+        let (_directory, store) = store().await;
+        run_live(&scripted_live(&store, &lanes, steps))
+            .await
+            .expect("live run");
+        assert_parked_at(
+            &store,
+            lanes[3].as_ref(),
+            replacement[0].block,
+            ProcessorRunState::Failed,
+            "processor_live_reduce_failed",
+        )
+        .await;
+
+        assert_reconciliation_is_a_no_op(&store, &lanes).await;
+    }
+
+    #[tokio::test]
+    async fn startup_reconciliation_deletes_pending_deltas_no_lane_can_apply() {
+        let chain = live_blocks(2);
+        let ledger = Arc::new(OrderedLedgerProcessor::named("stale-pending-ledger"));
+        let (_directory, store) = store().await;
+        for (sequence, frame) in (1..).zip(&chain[..=1]) {
+            store.store_recent_frame(frame).await.expect("retain frame");
+            apply_live_frame(&store, ledger.as_ref(), frame, sequence).await;
+        }
+        store
+            .store_recent_frame(&chain[2])
+            .await
+            .expect("retain frame");
+        let delta = |block: BlockRef| {
+            EncodedDelta::new(
+                ledger.descriptor(),
+                ChainId(1),
+                block,
+                block.hash.0.to_vec(),
+            )
+        };
+        let mut reverted = chain[2].block;
+        reverted.hash = BlockHash::new([0xd2; 32]);
+        // A delta for a block the ledger applied, one for a block a reorg
+        // replaced, and one it still needs.
+        for block in [chain[1].block, reverted, chain[2].block] {
+            store
+                .persist_delta(ledger.descriptor(), &delta(block))
+                .await
+                .expect("persist delta");
+        }
+
+        let report = reduce_failure_runtime(&store, &[ledger.clone() as Arc<dyn Processor>], &[])
+            .reconcile_startup()
+            .await
+            .expect("startup reconciliation");
+
+        let described = rewind_probe_describe(&store, ledger.as_ref()).await;
+        assert_eq!(
+            report.processors["stale-pending-ledger"].pending, 0,
+            "{described}"
+        );
+        assert_gap_recovered(&store, ledger.as_ref()).await;
+        assert_eq!(report.processors["stale-pending-ledger"].applied, 1);
+        assert_eq!(
+            store
+                .processor_cursor(ledger.descriptor())
+                .await
+                .expect("cursor")
+                .expect("ledger cursor")
+                .block_hash,
+            chain[2].block.hash
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_reconciliation_replays_retained_frames_to_lanes_that_applied_none() {
+        let chain = live_blocks(4);
+        // A block-local lane from genesis and an ordered lane from block 3,
+        // neither of which applied a block, while frames 2..=4 are retained.
+        let counter = Arc::new(BlockLocalCounter::named("late-counter"));
+        let ledger = Arc::new(
+            FailingReduce::new(
+                OrderedLedgerProcessor::named("late-ledger"),
+                BlockNumber(u64::MAX),
+            )
+            .starting_at(BlockNumber(3)),
+        );
+        let (_directory, store) = store().await;
+        for frame in &chain[2..] {
+            store.store_recent_frame(frame).await.expect("retain frame");
+        }
+
+        let lanes: Vec<Arc<dyn Processor>> = vec![counter.clone(), ledger.clone()];
+        let report = reduce_failure_runtime(&store, &lanes, &[])
+            .reconcile_startup()
+            .await
+            .expect("startup reconciliation");
+
+        assert_eq!(report.processors["late-counter"].applied, 3);
+        assert_eq!(report.processors["late-ledger"].applied, 2);
+        for (lane, first) in lanes.iter().zip([2, 3]) {
+            let lane = lane.as_ref();
+            assert_gap_recovered(&store, lane).await;
+            for frame in &chain[first..] {
+                assert_eq!(
+                    store
+                        .coverage_hash(lane.descriptor(), frame.block.number)
+                        .await
+                        .expect("coverage"),
+                    Some(frame.block.hash),
+                    "{} replays block {}",
+                    lane.descriptor().id,
+                    frame.block.number.0
+                );
+            }
+        }
+    }
+
+    /// Retain frames 0..=4 and apply blocks 3 and 4 to `counter` as the live
+    /// lane would, ahead of its cold backfill.
+    async fn retain_live_tip_before_backfill(
+        store: &SqliteStore,
+        counter: &Arc<BlockLocalCounter>,
+    ) {
+        for frame in live_blocks(4) {
+            store
+                .store_recent_frame(&frame)
+                .await
+                .expect("retain frame");
+            if frame.block.number >= BlockNumber(3) {
+                apply_live_frame(store, counter.as_ref(), &frame, frame.block.number.0).await;
+            }
+        }
+    }
+
+    /// The automatic cold backfill's job for `counter` over `range`, served
+    /// from history.
+    async fn run_counter_backfill(
+        store: &SqliteStore,
+        counter: &Arc<BlockLocalCounter>,
+        range: BlockRange,
+    ) -> Result<BackfillReport, RuntimeError> {
+        HistoricalRuntime::new(
+            store.clone(),
+            Arc::new(ScriptedHistorySource::from_frames(
+                fixture_source_descriptor("counter-backfill-history", range),
+                frames(range),
+            )),
+            counter.clone(),
+            HistoricalRuntimeConfig {
+                mapper_concurrency: 2,
+                ..HistoricalRuntimeConfig::default()
+            },
+        )
+        .expect("runtime")
+        .run(
+            BackfillJob::for_processor(
+                "counter-backfill",
+                counter.as_ref(),
+                ChainId(1),
+                range,
+                VerificationPolicy::CompleteCryptographic,
+            )
+            .expect("job"),
+            default_source_budget(),
+            CancellationToken::new(),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn startup_reconciliation_deletes_a_delta_a_crashed_backfill_left_pending() {
+        let range = BlockRange::new(BlockNumber(0), BlockNumber(4)).expect("range");
+        let counter = Arc::new(BlockLocalCounter::named("crash-backfill-counter"));
+        let lanes: Vec<Arc<dyn Processor>> = vec![counter.clone()];
+        let (_clean_directory, clean) = store().await;
+        retain_live_tip_before_backfill(&clean, &counter).await;
+        run_counter_backfill(&clean, &counter, range)
+            .await
+            .expect("clean backfill");
+
+        // The backfill persists block 1's delta; the process dies before that
+        // delta applies.
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("node.sqlite");
+        let store = SqliteStore::open(leani_store_sqlite::StoreConfig::new(&path))
+            .await
+            .expect("store");
+        retain_live_tip_before_backfill(&store, &counter).await;
+        failpoints::arm(
+            failpoints::AFTER_PERSIST_DELTA,
+            counter.descriptor(),
+            BlockNumber(1),
+        );
+        let crashed = run_counter_backfill(&store, &counter, range).await;
+        assert!(
+            matches!(&crashed, Err(RuntimeError::InvalidConfig(message)) if message.starts_with("injected crash")),
+            "the backfill ends at the injected crash: {crashed:?}"
+        );
+        drop(store);
+
+        // The restart reconciles before its cold backfill runs again.
+        let store = SqliteStore::open(leani_store_sqlite::StoreConfig::new(&path))
+            .await
+            .expect("reopen store");
+        let report = reduce_failure_runtime(&store, &lanes, &[])
+            .reconcile_startup()
+            .await
+            .expect("startup reconciliation");
+        assert_eq!(
+            report.processors["crash-backfill-counter"].pending, 0,
+            "no orphan pending delta is left to hold back the hot/cold handoff"
+        );
+        run_counter_backfill(&store, &counter, range)
+            .await
+            .expect("backfill after the restart");
+        assert_eq!(
+            lane_state(&store, counter.as_ref()).await,
+            lane_state(&clean, counter.as_ref()).await
+        );
+    }
+
+    #[tokio::test]
+    async fn a_hole_below_the_retained_window_is_left_to_the_cold_backfill() {
+        let range = BlockRange::new(BlockNumber(1), BlockNumber(5)).expect("range");
+        let history = frames(range);
+        let counter = Arc::new(BlockLocalCounter::named("hole-backfill-counter"));
+        let (_directory, store) = store().await;
+        // Blocks 1..=5 are covered except block 3, and no frame is retained.
+        for (sequence, frame) in (1..).zip(
+            history
+                .iter()
+                .filter(|frame| frame.block.number != BlockNumber(3)),
+        ) {
+            apply_live_frame(&store, counter.as_ref(), frame, sequence).await;
+        }
+        reduce_failure_runtime(&store, &[counter.clone() as Arc<dyn Processor>], &[])
+            .reconcile_startup()
+            .await
+            .expect("startup reconciliation");
+        assert!(
+            store
+                .live_lane_gap(counter.descriptor())
+                .await
+                .expect("gap")
+                .is_none(),
+            "reconciliation has no retained frame to replay block 3 from"
+        );
+
+        // The automatic cold backfill plans its coverage gaps: block 3 alone.
+        let report = run_counter_backfill(&store, &counter, range)
+            .await
+            .expect("cold backfill");
+        assert_eq!(report.frames_committed, 1);
+        assert_eq!(report.final_coverage, vec![range]);
+    }
+
+    #[tokio::test]
+    async fn an_ordered_replay_onto_a_seeded_anchor_checks_its_parent_link() {
+        let chain = live_blocks(2);
+        let mut fork = live_fixture(1, chain[0].block.hash);
+        fork.block.hash = BlockHash::new([0xf1; 32]);
+        let ledger = Arc::new(OrderedLedgerProcessor::named("anchor-link-ledger"));
+        let (_directory, store) = store().await;
+        store
+            .register_processor(ledger.descriptor())
+            .await
+            .expect("register");
+        for frame in &chain[..=1] {
+            store.store_recent_frame(frame).await.expect("retain frame");
+        }
+        // Block 2 is a seeded finality anchor, with no parent hash and no
+        // frame. The ledger applied a block 1 that is not its parent.
+        let anchor = BlockRef {
+            parent_hash: BlockHash::ZERO,
+            timestamp: 1,
+            ..chain[2].block
+        };
+        store
+            .store_canonical_anchor(ChainId(1), anchor, Finality::Finalized)
+            .await
+            .expect("seed anchor");
+        apply_live_frame(&store, ledger.as_ref(), &chain[0], 1).await;
+        apply_live_frame(&store, ledger.as_ref(), &fork, 2).await;
+        store
+            .park_processor_live_lane_at(
+                ledger.descriptor(),
+                anchor,
+                "delivery_spool_hard_limit",
+                false,
+            )
+            .await
+            .expect("park lane");
+        let mut finalized = chain[2].clone();
+        finalized.finality = Finality::Finalized;
+
+        reduce_failure_runtime(&store, &[ledger.clone() as Arc<dyn Processor>], &[])
+            .with_finalized_gap_recovery(Arc::new(StaticLiveGapRecovery {
+                frames: vec![finalized],
+            }))
+            .reconcile_pending()
+            .await
+            .expect("drain");
+
+        assert!(
+            store
+                .coverage_hash(ledger.descriptor(), BlockNumber(2))
+                .await
+                .expect("coverage")
+                .is_none(),
+            "the ledger applies no block that does not descend from its cursor"
+        );
+        assert_parked_at(
+            &store,
+            ledger.as_ref(),
+            anchor,
+            ProcessorRunState::Failed,
+            "finalized_gap_recovery_canonical_mismatch",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_rewind_onto_a_seeded_anchor_a_paused_lane_never_applied_completes_its_gap() {
+        let chain = live_blocks(5);
+        let lane = Arc::new(BlockLocalCounter::named("anchor-rewind-lane"));
+        let ledger = Arc::new(OrderedLedgerProcessor::named("anchor-rewind-ledger"));
+        let healthy = Arc::new(BlockLocalCounter::named("anchor-rewind-healthy"));
+        let (_directory, store) = store().await;
+        for processor in [lane.descriptor(), ledger.descriptor(), healthy.descriptor()] {
+            store.register_processor(processor).await.expect("register");
+        }
+        // After downtime the node seeds its finalized anchor, block 2, with no
+        // frame, and follows live blocks from there, so no lane saw block 2.
+        let anchor = BlockRef {
+            parent_hash: BlockHash::ZERO,
+            timestamp: 1,
+            ..chain[2].block
+        };
+        store
+            .store_canonical_anchor(ChainId(1), anchor, Finality::Finalized)
+            .await
+            .expect("seed anchor");
+        for (sequence, frame) in (1..).zip(&chain[3..]) {
+            store.store_recent_frame(frame).await.expect("retain frame");
+            apply_live_frame(&store, healthy.as_ref(), frame, sequence).await;
+        }
+        apply_live_frame(&store, lane.as_ref(), &chain[3], 1).await;
+        store
+            .park_processor_live_lane_at(
+                lane.descriptor(),
+                chain[4].block,
+                "delivery_spool_hard_limit",
+                false,
+            )
+            .await
+            .expect("park lane");
+        // The ledger's history has not reached the anchor yet, and its failed
+        // cold backfill parked it at the live tip.
+        store
+            .park_processor_live_lane_at(
+                ledger.descriptor(),
+                chain[5].block,
+                "hot_cold_handoff_failed",
+                false,
+            )
+            .await
+            .expect("park ledger");
+
+        // The source rewinds to the anchor without a replacement branch.
+        rewind_probe_run(
+            &store,
+            vec![lane.clone(), ledger.clone(), healthy.clone()],
+            vec![LiveStep::Event(ChainEvent::Reorg {
+                reverted: vec![chain[5].block, chain[4].block, chain[3].block],
+                applied: Vec::new(),
+            })],
+        )
+        .await;
+
+        let described = rewind_probe_describe(&store, lane.as_ref()).await;
+        assert!(
+            store
+                .live_lane_gap(lane.descriptor())
+                .await
+                .expect("gap")
+                .is_none(),
+            "the paused lane resumes at the new tip: {described}"
+        );
+        assert_gap_recovered(&store, lane.as_ref()).await;
+        // The ledger still needs the anchor in order, so it waits there for
+        // its history.
+        assert_parked_at(
+            &store,
+            ledger.as_ref(),
+            anchor,
+            ProcessorRunState::Paused,
+            "hot_cold_handoff_failed",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_delta_conflict_lane_resumes_after_a_restart_and_a_reset() {
+        let chain = live_blocks(1);
+        let ledger = Arc::new(OrderedLedgerProcessor::named("conflict-restart-ledger"));
+        let lanes: Vec<Arc<dyn Processor>> = vec![ledger.clone()];
+        let (_directory, store) = store().await;
+        // Canonical blocks whose frames finality has pruned, so no retained
+        // frame shows a pending delta to be a finality variant.
+        for (sequence, frame) in (1..).zip(&chain) {
+            store
+                .store_canonical_anchor(ChainId(1), frame.block, Finality::Included)
+                .await
+                .expect("canonical block");
+            apply_live_frame(&store, ledger.as_ref(), frame, sequence).await;
+        }
+        // A pending delta for an applied block carries other content.
+        store
+            .persist_delta(
+                ledger.descriptor(),
+                &EncodedDelta::new(
+                    ledger.descriptor(),
+                    ChainId(1),
+                    chain[0].block,
+                    vec![0xee; 32],
+                ),
+            )
+            .await
+            .expect("persist conflicting delta");
+        reduce_failure_runtime(&store, &lanes, &[])
+            .reconcile_pending()
+            .await
+            .expect("the conflict fails only its lane");
+        assert_parked_at(
+            &store,
+            ledger.as_ref(),
+            chain[0].block,
+            ProcessorRunState::Failed,
+            "processor_live_delta_conflict",
+        )
+        .await;
+
+        // After investigating, the operator restarts the node and resets the
+        // lane.
+        let restarted = reduce_failure_runtime(&store, &lanes, &[]);
+        restarted
+            .reconcile_startup()
+            .await
+            .expect("startup reconciliation");
+        store
+            .reset_failed_live_lane(ledger.descriptor())
+            .await
+            .expect("reset");
+        restarted
+            .reconcile_pending()
+            .await
+            .expect("replay after the reset");
+
+        let described = rewind_probe_describe(&store, ledger.as_ref()).await;
+        assert!(
+            store
+                .pending_deltas(ledger.descriptor(), BlockNumber(0), 10)
+                .await
+                .expect("pending")
+                .is_empty(),
+            "startup reconciliation deletes the redundant delta: {described}"
+        );
+        assert_gap_recovered(&store, ledger.as_ref()).await;
     }
 
     #[tokio::test]

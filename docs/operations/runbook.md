@@ -364,10 +364,17 @@ chain no longer has. A reorg that replaces blocks at or below it moves it down
 to the first replacement block, so the lane replays the whole new branch. A
 reorg without a replacement branch moves it onto the new tip, which the lane
 has applied: a paused lane resumes at once, and a failed lane's first
-unapplied block moves onto the new tip's successor once that block arrives. A
-first unapplied block found off the canonical chain, as an earlier version
-could leave one, moves back to the last canonical block the lane applied; the
-lane then replays from there instead of skipping blocks or failing.
+unapplied block moves onto the new tip's successor once that block arrives. If
+the lane never applied the new tip, such as the finalized anchor the node
+seeds after downtime, a paused block-local lane's gap simply completes, while
+an ordered lane waits there for that block from history. A failed block-local
+lane keeps its first unapplied block on that tip, so after a reset it waits
+for a history source to serve it (`finalized_gap_waiting_for_history_source`),
+a block it does not need: make sure a history source can serve the finalized
+anchor, and the lane applies it and resumes by itself. A first unapplied
+block found off the canonical chain, as an earlier version could leave one,
+moves back to the last canonical block the lane applied; the lane then
+replays from there instead of skipping blocks or failing.
 
 | Reason | State | Resumes when |
 |---|---|---|
@@ -375,13 +382,81 @@ lane then replays from there instead of skipping blocks or failing.
 | `unfinalized_gap_waiting_for_finality` | paused | Finality reaches the first unapplied block, which then comes from the history source. No retained frame can serve that block, for example because it was retained without this processor's material. |
 | `finalized_gap_waiting_for_history_source`, `finalized_gap_recovery_unavailable`, `finalized_gap_recovery_incomplete` | paused | A history source can serve the finalized gap. |
 | `operator_reset_pending_replay` | paused | The replay after an operator reset reaches the live tip. |
+| `startup_reconciliation_replay` | paused | The replay of retained frames that [startup reconciliation](#crash-or-interrupted-commit) started reaches the live tip, normally before live blocks resume. |
 | `hot_cold_handoff_failed` | paused | The processor's automatic cold backfill or its overlap verification failed; the handoff is recorded as failed. A block-local lane replays and resumes at once. An ordered lane resumes once a later backfill, such as the one at the next start, passes its gap. |
 | `processor_live_reduce_failed` | failed | Reset after fixing the processor or its input. Its reducer, or the store's check of what the reducer wrote, rejected the block. |
 | `processor_live_mapping_failed` | failed | Reset after fixing the processor or its input. Mapping the block, or checking a pending delta's finality variants, failed. |
-| `processor_live_delta_conflict` | failed | Investigate before resetting: a pending delta for an applied block carries different content, so the processor's transform is not deterministic or its inputs differed. |
+| `processor_live_delta_conflict` | failed | Investigate before resetting: a pending delta for an applied block carries different content, so the processor's transform is not deterministic or its inputs differed. The applied block stands. Restart the node, whose [startup reconciliation](#crash-or-interrupted-commit) deletes that pending delta, then reset the lane. |
 | `single_block_exceeds_delivery_limit`, `single_delta_exceeds_pending_delta_limit`, `live_gap_marker_exceeds_pending_delta_budget` | failed | Reset after raising the limit. |
-| `live_gap_canonical_identity_changed` and the other `finalized_gap_recovery_*` reasons | failed | Reset after checking the history source against the canonical chain. |
+| `live_gap_canonical_identity_changed` and the other `finalized_gap_recovery_*` reasons | failed | Reset after checking the history source against the canonical chain. For an ordered lane, `finalized_gap_recovery_canonical_mismatch` can also mean that the block history returned does not descend from the lane's own last applied block, which is then off the canonical chain: restart the node, whose [startup reconciliation](#crash-or-interrupted-commit) undoes an unfinalized off-chain block, then reset; a finalized one needs a rebuild. |
 | `processor_finality_conflict` | failed | Rebuild the processor as a replacement instance; the reset route refuses this lane with `409 live_lane_requires_rebuild`. The same instance cannot be rebuilt in place today: configure a replacement instance, with a new processor version or configuration, and move to it as in [Processor rebuild or rollback](#processor-rebuild-or-rollback). Its coverage holds a finalized block hash at another height, so it contradicts the canonical chain, and finality stops advancing it. This reason replaces any earlier failure reason. |
+
+### Crash or interrupted commit
+
+A live block commits in steps: the node first retains its frame as the new
+canonical block, then each processor applies it in a transaction of its own.
+A reorg likewise switches the canonical chain first and then undoes each
+processor's reverted blocks. When an apply reaches a processor's delivery
+limit, the store pauses or fails the lane first and the runtime then records
+its first unapplied block. A crash, a kill, the embedded subscription
+runtime's shutdown abort, or a network-lane restart can stop between those
+steps. That leaves a processor behind the canonical chain or on a reverted
+branch, a pending delta that nothing applies, or a stopped lane with no record
+of where it stopped. Every network-lane start therefore runs startup
+reconciliation for each processor before any lane opens:
+
+1. It undoes the processor's unfinalized blocks that are not the canonical
+   block at their height, newest first, and publishes their undo changes as
+   the reorg would have.
+2. It deletes pending deltas the processor can never apply: those below its
+   start, for a block that is not canonical, and for a block it already
+   applied. For a block-local processor that includes any below its first
+   unapplied block, such as one an interrupted cold-backfill commit left; the
+   backfill maps that block again.
+3. It pauses a running lane that trails the retained canonical frames at its
+   first unapplied one, with reason `startup_reconciliation_replay`, and
+   replays those frames through the normal gap path before live blocks resume.
+   A lane that has applied nothing yet, such as a newly configured block-local
+   processor, replays the retained frames too. A block-local lane whose next
+   block falls in a hole in the retained frames, such as blocks never retained
+   over downtime, replays from the first retained frame above the hole; its
+   cold backfill covers the hole.
+4. A lane the store paused or failed at its delivery limit, but whose first
+   unapplied block was never recorded, gets that block recorded and keeps its
+   state and reason. A paused lane replays from there once consumers
+   acknowledge and delivery capacity frees up, instead of skipping the blocks
+   it missed, and a failed lane can be reset. The recorded block carries no
+   required delivery size, so for `single_block_exceeds_delivery_limit` the
+   reset route cannot refuse a limit that is still too small; the replay then
+   fails the lane again on the same block.
+
+The store can also pause or fail a lane at its delivery limit while the lane
+is at the live tip, for example in its cold backfill's commit on the lane's
+live stream. That records no first unapplied block either, and at a restart
+reconciliation has no retained block to record yet. The live lane handles it
+with its next block: a paused lane commits that block as usual, so the store's
+refusal parks the lane there, or applies it once capacity has freed up. A
+failed lane records that block, which a block-local lane has not applied or
+which follows an ordered lane's last applied block, so a reset replays from
+there. A failed ordered lane still behind its history records nothing: it
+waits for its history, and startup reconciliation records its first
+unapplied block once that block is among the retained frames.
+
+A paused or failed lane whose first unapplied block is already recorded
+replays from there as usual, and a lane failed for another reason, such as
+`processor_finality_conflict`, is left alone. Reconciliation replays nothing
+below the retained frames. A processor's automatic cold backfill fills those
+blocks up to the finalized anchor; an on-demand processor waits for a backfill
+request.
+
+Each processor that needed a repair logs one warning, "startup reconciliation
+repaired processor state against the canonical chain", with the fields
+`undone_blocks`, `highest_undone_block`, `discarded_pending_deltas`, and
+`replay_from_block`. The info line "startup reconciliation completed" then
+reports, per processor, the blocks applied and reverted and the pending deltas
+left. A consistent store is left untouched, so the warning appears only after
+an interruption or for a lane that trails the retained frames. No operator
+action is needed.
 
 ### SQLite failure
 

@@ -5739,8 +5739,10 @@ impl EmbeddedNetworkRuntime {
         {
             // Some networking internals finish their own peer-store flush and socket
             // teardown on a fixed timer. A CLI subscription must nevertheless
-            // honor Ctrl-C promptly; aborting the supervisor after cancellation
-            // is safe because both SQLite stores commit atomically.
+            // honor Ctrl-C promptly, so the supervisor is aborted after
+            // cancellation. The abort can land between a live commit's or a
+            // reorg's separately committed steps; startup reconciliation at the
+            // next start repairs that partial commit.
             self.task.abort();
             let _ = (&mut self.task).await;
         }
@@ -6158,14 +6160,13 @@ async fn run_network_lanes_once(
     if let Some(control) = &backfill_control {
         live_runtime = live_runtime.with_finalized_gap_recovery(control.clone());
     }
-    let startup_reconciliation = live_runtime
-        .reconcile_pending()
-        .await
-        .context("reconcile durable live deltas before opening network lanes")?;
-    info!(
-        ?startup_reconciliation,
-        "startup pending-delta reconciliation completed"
-    );
+    // A crash, abort, or lane restart can interrupt a live commit or reorg
+    // between its separately committed steps; repair every processor against
+    // the canonical chain before any lane or handoff check runs.
+    let startup_reconciliation = live_runtime.reconcile_startup().await.context(
+        "reconcile processor state with the canonical chain before opening network lanes",
+    )?;
+    info!(?startup_reconciliation, "startup reconciliation completed");
     let (applied_anchors, mut applied_anchor_updates) = tokio::sync::broadcast::channel(16);
     let finality_runtime = SharedFinalityRuntime::new(
         store.clone(),

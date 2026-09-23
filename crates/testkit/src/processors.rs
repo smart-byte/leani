@@ -283,6 +283,12 @@ impl OrderedLedgerProcessor {
         self.descriptor.lifecycle.delivery.consumers.clear();
         self
     }
+
+    #[must_use]
+    pub fn with_lifecycle(mut self, lifecycle: LifecyclePolicies) -> Self {
+        self.descriptor.lifecycle = lifecycle;
+        self
+    }
 }
 
 #[async_trait]

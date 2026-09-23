@@ -4495,6 +4495,44 @@ impl SqliteStore {
         })
     }
 
+    /// List a processor's unfinalized applied blocks that are not the
+    /// canonical block at their height, newest first: blocks a reorg reverted
+    /// whose undo never ran. Every unfinalized apply keeps an undo record, so
+    /// the bounded undo journal lists them.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for corrupt stored values or a failed read.
+    pub async fn noncanonical_unfinalized_blocks(
+        &self,
+        descriptor: &ProcessorDescriptor,
+        chain_id: ChainId,
+    ) -> Result<Vec<(BlockNumber, BlockHash)>, StoreError> {
+        let rows: Vec<(i64, Vec<u8>)> = sqlx::query_as(
+            "SELECT journal.block_number, journal.block_hash
+             FROM undo_journal AS journal
+             WHERE journal.instance = ? AND journal.finalized = 0
+               AND NOT EXISTS (
+                   SELECT 1 FROM canonical_blocks AS canonical
+                   WHERE canonical.chain_id = ?
+                     AND canonical.block_number = journal.block_number
+                     AND canonical.block_hash = journal.block_hash)
+             ORDER BY journal.block_number DESC",
+        )
+        .bind(processor_instance(descriptor))
+        .bind(u64_i64(chain_id.0, "chain_id")?)
+        .fetch_all(&self.inner.pool)
+        .await?;
+        rows.into_iter()
+            .map(|(number, hash)| {
+                Ok((
+                    BlockNumber(i64_u64(number, "unfinalized block number")?),
+                    decode_hash(hash)?,
+                ))
+            })
+            .collect()
+    }
+
     /// Mark all undo records through a height final. They can no longer be
     /// reversed by the normal runtime path, so finalized records older than
     /// the processor's undo safety depth are deleted.
@@ -6185,6 +6223,50 @@ impl SqliteStore {
         Ok(result.rows_affected() != 0)
     }
 
+    /// Delete a processor's pending deltas that its lane can never apply:
+    /// those below `from`, the lowest block the lane still applies a pending
+    /// delta for, those for a block that is not the canonical block at its
+    /// height, and those for a block the processor already covers. Returns
+    /// how many were deleted.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid numeric input or a database failure.
+    pub async fn discard_unappliable_pending_deltas(
+        &self,
+        descriptor: &ProcessorDescriptor,
+        chain_id: ChainId,
+        from: BlockNumber,
+    ) -> Result<u64, StoreError> {
+        let _guard = self.inner.writer.lock().await;
+        let result = sqlx::query(
+            "DELETE FROM pending_deltas
+             WHERE instance = ?1
+               AND (block_number < ?3
+                 OR NOT EXISTS (
+                     SELECT 1 FROM canonical_blocks AS canonical
+                     WHERE canonical.chain_id = ?2
+                       AND canonical.block_number = pending_deltas.block_number
+                       AND canonical.block_hash = pending_deltas.block_hash)
+                 OR EXISTS (
+                     SELECT 1 FROM processor_coverage AS coverage
+                     WHERE coverage.instance = ?1
+                       AND coverage.block_number = pending_deltas.block_number
+                       AND coverage.block_hash = pending_deltas.block_hash)
+                 OR EXISTS (
+                     SELECT 1 FROM finalized_coverage_segments AS segment
+                     WHERE segment.instance = ?1
+                       AND pending_deltas.block_number
+                           BETWEEN segment.segment_start AND segment.segment_end))",
+        )
+        .bind(processor_instance(descriptor))
+        .bind(u64_i64(chain_id.0, "chain_id")?)
+        .bind(u64_i64(from.0, "pending delta floor")?)
+        .execute(&self.inner.pool)
+        .await?;
+        Ok(result.rows_affected())
+    }
+
     /// Persist one complete recent frame and its canonical block pointer.
     ///
     /// # Errors
@@ -6601,6 +6683,39 @@ impl SqliteStore {
         )
         .bind(u64_i64(chain_id.0, "chain_id")?)
         .bind(u64_i64(block_number.0, "block_number")?)
+        .fetch_optional(&self.inner.pool)
+        .await?;
+        row.map(|(encoded, canonical_hash, finality)| {
+            decode_recent_frame(&encoded, Some((canonical_hash, finality)))
+        })
+        .transpose()
+    }
+
+    /// Read the lowest retained canonical frame at or above `from`, past any
+    /// hole in the retained frames. It reports its canonical block's current
+    /// finality, as [`Self::recent_frame`] does.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for corrupt durable material or a database failure.
+    pub async fn next_recent_frame(
+        &self,
+        chain_id: ChainId,
+        from: BlockNumber,
+    ) -> Result<Option<BlockFrame>, StoreError> {
+        let row: Option<(Vec<u8>, Vec<u8>, i64)> = sqlx::query_as(
+            "SELECT recent.encoded_frame, canonical.block_hash, canonical.finality
+             FROM canonical_blocks AS canonical
+             JOIN recent_blocks AS recent
+               ON recent.chain_id = canonical.chain_id
+              AND recent.block_number = canonical.block_number
+              AND recent.block_hash = canonical.block_hash
+             WHERE canonical.chain_id = ? AND canonical.block_number >= ?
+             ORDER BY canonical.block_number
+             LIMIT 1",
+        )
+        .bind(u64_i64(chain_id.0, "chain_id")?)
+        .bind(u64_i64(from.0, "block_number")?)
         .fetch_optional(&self.inner.pool)
         .await?;
         row.map(|(encoded, canonical_hash, finality)| {
@@ -12295,22 +12410,10 @@ impl SqliteStore {
         let now = now_i64()?;
         let _guard = self.inner.writer.lock().await;
         let mut transaction = self.inner.pool.begin().await?;
-        let (already_failed, store_recorded): (bool, bool) = sqlx::query_as(
-            "SELECT state = 'failed',
-                    IFNULL(reason, '') IN (
-                        'single_block_exceeds_delivery_limit', 'delivery_spool_hard_limit'
-                    ) AND NOT EXISTS(SELECT 1 FROM live_lane_gaps WHERE instance = ?)
-             FROM processor_runtime_state WHERE instance = ?",
-        )
-        .bind(&instance)
-        .bind(&instance)
-        .fetch_optional(&mut *transaction)
-        .await?
-        .unwrap_or_default();
-        if already_failed && !store_recorded {
+        let Some(already_failed) = live_lane_park_guard(&mut transaction, &instance).await? else {
             transaction.rollback().await?;
             return Ok(false);
-        }
+        };
         if persist_delta {
             sqlx::query(
                 "INSERT INTO pending_deltas(
@@ -12360,19 +12463,15 @@ impl SqliteStore {
         .bind(now)
         .execute(&mut *transaction)
         .await?;
-        if !already_failed {
-            sqlx::query(
-                "UPDATE processor_runtime_state
-                 SET state = ?, reason = ?, updated_at_unix_ms = ?
-                 WHERE instance = ?",
-            )
-            .bind(if failed { "failed" } else { "paused" })
-            .bind(reason)
-            .bind(now)
-            .bind(&instance)
-            .execute(&mut *transaction)
-            .await?;
-        }
+        set_parked_lane_state(
+            &mut transaction,
+            &instance,
+            already_failed,
+            failed,
+            reason,
+            now,
+        )
+        .await?;
         transaction.commit().await?;
         Ok(true)
     }
@@ -12386,6 +12485,12 @@ impl SqliteStore {
     /// A lane that is already failed keeps its first failure: neither its
     /// reason nor its marker changes, and no marker is planted where it has
     /// none, so a later park can neither move its replay point nor unfail it.
+    /// As in [`Self::park_processor_live_lane`], the one exception is the
+    /// failure the store records itself at a delivery limit: while that lane
+    /// has no marker yet, the marker is recorded, keeping the failed state
+    /// and its reason, so an operator reset can replay the block.
+    ///
+    /// Returns whether anything was recorded.
     ///
     /// # Errors
     ///
@@ -12396,7 +12501,7 @@ impl SqliteStore {
         first_unapplied: BlockRef,
         reason: &str,
         failed: bool,
-    ) -> Result<(), StoreError> {
+    ) -> Result<bool, StoreError> {
         if reason.trim().is_empty() {
             return Err(StoreError::InvalidConfig(
                 "processor live-lane park reason must not be empty".to_owned(),
@@ -12405,15 +12510,11 @@ impl SqliteStore {
         let instance = self.register_processor(descriptor).await?;
         let now = now_i64()?;
         let _guard = self.inner.writer.lock().await;
-        let state: Option<String> =
-            sqlx::query_scalar("SELECT state FROM processor_runtime_state WHERE instance = ?")
-                .bind(&instance)
-                .fetch_optional(&self.inner.pool)
-                .await?;
-        if state.as_deref() == Some(ProcessorRunState::Failed.as_str()) {
-            return Ok(());
-        }
         let mut transaction = self.inner.pool.begin().await?;
+        let Some(already_failed) = live_lane_park_guard(&mut transaction, &instance).await? else {
+            transaction.rollback().await?;
+            return Ok(false);
+        };
         sqlx::query(
             "INSERT INTO live_lane_gaps(
                 instance, first_unapplied_block, first_unapplied_hash,
@@ -12432,19 +12533,17 @@ impl SqliteStore {
         .bind(now)
         .execute(&mut *transaction)
         .await?;
-        sqlx::query(
-            "UPDATE processor_runtime_state
-             SET state = ?, reason = ?, updated_at_unix_ms = ?
-             WHERE instance = ?",
+        set_parked_lane_state(
+            &mut transaction,
+            &instance,
+            already_failed,
+            failed,
+            reason,
+            now,
         )
-        .bind(if failed { "failed" } else { "paused" })
-        .bind(reason)
-        .bind(now)
-        .bind(&instance)
-        .execute(&mut *transaction)
         .await?;
         transaction.commit().await?;
-        Ok(())
+        Ok(true)
     }
 
     /// Advance the durable first-unapplied marker after one recovered block.
@@ -15994,6 +16093,57 @@ fn backfill_progress_blocks(payload: &[u8]) -> Result<u64, StoreError> {
         ));
     }
     Ok(processed_blocks)
+}
+
+/// Whether a park may write a lane's gap marker and state, read in the
+/// park's writer transaction: `None` when the lane already failed and keeps
+/// its first failure, otherwise whether it is failed already. A failed lane
+/// still gets its marker when the store failed it itself at a delivery limit,
+/// with a reason `enforce_delivery_capacity` records, and it has none yet.
+async fn live_lane_park_guard(
+    transaction: &mut Transaction<'_, Sqlite>,
+    instance: &str,
+) -> Result<Option<bool>, StoreError> {
+    let (already_failed, store_recorded): (bool, bool) = sqlx::query_as(
+        "SELECT state = 'failed',
+                IFNULL(reason, '') IN (
+                    'single_block_exceeds_delivery_limit', 'delivery_spool_hard_limit'
+                ) AND NOT EXISTS(SELECT 1 FROM live_lane_gaps WHERE instance = ?)
+         FROM processor_runtime_state WHERE instance = ?",
+    )
+    .bind(instance)
+    .bind(instance)
+    .fetch_optional(&mut **transaction)
+    .await?
+    .unwrap_or_default();
+    Ok((!already_failed || store_recorded).then_some(already_failed))
+}
+
+/// Pause or fail a parked lane with `reason`, unless it is failed already and
+/// keeps its first failure.
+async fn set_parked_lane_state(
+    transaction: &mut Transaction<'_, Sqlite>,
+    instance: &str,
+    already_failed: bool,
+    failed: bool,
+    reason: &str,
+    now: i64,
+) -> Result<(), StoreError> {
+    if already_failed {
+        return Ok(());
+    }
+    sqlx::query(
+        "UPDATE processor_runtime_state
+         SET state = ?, reason = ?, updated_at_unix_ms = ?
+         WHERE instance = ?",
+    )
+    .bind(if failed { "failed" } else { "paused" })
+    .bind(reason)
+    .bind(now)
+    .bind(instance)
+    .execute(&mut **transaction)
+    .await?;
+    Ok(())
 }
 
 async fn set_processor_run_state(

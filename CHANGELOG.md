@@ -293,6 +293,30 @@ record, and documented RPC contracts.
 - A historical job whose task stops just after the node-wide commit scheduler
   picks it no longer leaves every other historical job waiting for a commit
   turn.
+- A crash, abort, or error in the middle of a live commit or reorg no longer
+  leaves holes in processors, reverted-branch output that finality could
+  later finalize, stalled ordered processors, orphan pending deltas that fail
+  the hot/cold handoff, or stopped lanes that skip blocks or cannot be reset.
+  Every network-lane start now reconciles each processor with the canonical
+  chain before its lanes open, and logs what it repaired; see
+  [Crash or interrupted commit](docs/operations/runbook.md#crash-or-interrupted-commit).
+  A lane the store pauses or fails at its delivery limit, for example in a
+  cold-backfill commit, now records where it stopped, even without a restart.
+- An ordered lane's replay onto a finalized anchor that the node seeded without
+  a parent hash now checks that the block descends from the lane's cursor. The
+  parent comes from the block's retained frame, or else from the frame that
+  history recovery returns, and a block that does not descend fails the lane
+  (`finalized_gap_recovery_canonical_mismatch`) instead of being applied.
+- A reorg without a replacement branch onto a block that a paused block-local
+  lane never applied, such as the finalized anchor the node seeds after
+  downtime, completes the lane's gap, so the lane resumes at the next block.
+  Before, the gap moved onto that block, which has no retained frame, and the
+  lane waited for a history source to serve a block it did not need. An
+  ordered lane, which needs that block in order, still waits for it there.
+- A lane failed with `processor_live_delta_conflict` can now be recovered:
+  startup reconciliation deletes a pending delta for a block the lane already
+  applied, so restarting the node and then resetting the lane replays it.
+  Before, the reset failed the lane again on the same delta.
 
 ## [0.1.0-rc.1] - 2026-09-20
 
