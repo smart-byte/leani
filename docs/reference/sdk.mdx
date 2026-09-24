@@ -62,7 +62,13 @@ Durable live/history sessions live in `@smart-byte/leani-sdk/backfill`. Construc
 entry points use the same `LeaniError` class and HTTP error fields (`status`,
 `code`, `retryable`, `requestId`). The deadline applies to JSON requests, not to
 established streams. Always close delivery sessions in `finally`. Commit
-idempotent destination writes before acknowledging a batch. See
+idempotent destination writes before acknowledging a batch. Acknowledge a
+batch's boundary, never a change's own cursor: the node refuses one inside a
+live block or a history progress unit. A backfill session's `deliveryBatches()`
+yields every boundary as `ackCursor` with the `events` it covers, including
+batches without changes and the completion; `events()` flattens the changes
+without boundaries. A consumer with a credential passes it as `credential`
+on every call and stream. See
 [durable delivery](/docs/concepts/durable-delivery/) for lease and reset semantics.
 
 The inventory below is generated from both public entry points and shared error

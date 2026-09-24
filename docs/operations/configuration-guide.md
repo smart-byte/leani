@@ -345,12 +345,13 @@ when a historical job completes, and keeps the newest positive `keep` count.
 A restore repairs state only when the processor's cursor sits exactly on a
 checkpoint: a cadence block or the end of a completed job, even if finality
 reached that block later. A processor between checkpoints cannot be restored
-from one; take a portable savepoint while it is at rest, or restore a
-full-store backup. Portable savepoints are created and deleted explicitly
-through the API and are not covered by automatic checkpoint pruning. Each
-processor instance keeps at most 16, and each new one counts against the
-physical store budget. Editing lifecycle policies, for example to raise a
-limit, leaves existing checkpoints and savepoints valid.
+from one; restore a full-store backup or rebuild the processor. Portable
+savepoints are exports, created and deleted explicitly through the API; the
+node cannot restore them, and automatic checkpoint pruning does not cover
+them. Each processor instance keeps at most 16, and each new one counts
+against the physical store budget, which answers 507 when it does not fit.
+Editing lifecycle policies, for example to raise a limit, leaves existing
+checkpoints and savepoints valid.
 
 `[processors.undo] mode` is `none` or `unfinalized`, and
 `included_and_finalized` requires `unfinalized`. Unfinalized blocks always
@@ -369,10 +370,20 @@ to start when the variable is unset, holds fewer than 16 characters, or holds
 anything but printable ASCII without spaces, which no client could send; use
 a random value such as `openssl rand -hex 32`. Clients send
 `Authorization: Bearer <token>`, with the scheme in any case, and the node
-compares tokens in constant time. Consumer creation can issue a separate
-credential; subsequent renew, read, and acknowledgement calls use
-`x-leani-consumer-credential`, so one consumer cannot move another
-consumer's cursor.
+compares tokens in constant time. A consumer created through the API carries
+its own credential, and a backfill subscription's consumer can; a new one
+holds 32 to 512 printable ASCII characters without spaces, such as
+`openssl rand -hex 32`. Every consumer-scoped call for a consumer with a
+credential, its streams included, then needs it in
+`x-leani-consumer-credential` besides the bearer, and gets 403 without it, so
+one client cannot move another consumer's cursor. Listing, inspecting, and
+revoking consumers stay administrative: only the bearer protects them, so an
+operator can revoke a consumer whose credential is lost. Consumers
+declared under `[[processors.delivery.consumers]]` have no credential and
+need only the bearer. The store keeps credential hashes and session-token
+keys under a random per-store secret, which backups carry with the store. A
+backfill subscription's credential also enters its idempotency identity, an
+unkeyed hash of the whole request, so use random credentials.
 
 The native API, HTTP RPC, and WebSocket RPC binds must all differ. RPC has no
 built-in authentication. A bind beyond loopback, such as `0.0.0.0`, fails
@@ -415,8 +426,14 @@ browser:
 - The native API refuses, with 403 `cross_site_request`, a GET or HEAD
   without an `Origin` that the browser's Fetch Metadata marks as coming from
   another site's page (`Sec-Fetch-Site: cross-site` or `same-site`) and not
-  as a navigation (`Sec-Fetch-Mode` other than `navigate`). Current
-  browsers send Fetch Metadata; the SDK and curl do not, and pass.
+  as a navigation (`Sec-Fetch-Mode` other than `navigate`). A consumer's
+  live or backfill stream route refuses such a request even as a navigation,
+  since opening the stream takes the consumer's session lease. Current
+  browsers send Fetch Metadata only to potentially trustworthy URLs, which
+  are HTTPS, loopback addresses, and `localhost`; a node reached over plain
+  HTTP by another name or address, such as a LAN IP with
+  `allow_unauthenticated_remote`, gets none, and neither refusal applies
+  there. The SDK and curl send none either, and pass.
 - A native API POST or DELETE needs `content-type: application/json` or the
   header `x-leani-request: 1`, and gets 415 otherwise. JSON-RPC calls need
   `content-type: application/json`. The SDK sends both. A cross-site page
@@ -426,11 +443,14 @@ browser:
   without one.
 
 What still reaches the native API from a page: navigations from another
-site, including into a frame, and subresource loads from browsers without
-Fetch Metadata. The page cannot read the responses, but a GET that opens a
-consumer's live or backfill stream takes that consumer's session lease.
-Set `api.bearer_token_env` to keep pages from doing that; a browser never
-adds the bearer token on its own.
+site, including into a frame, to routes other than consumer streams, and
+GET or HEAD requests without Fetch Metadata: from browsers without it, or to
+a node served over plain HTTP by a name or address other than loopback or
+`localhost`. The page cannot read the responses, but without Fetch Metadata
+a GET that opens a consumer's live or backfill stream takes that consumer's
+session lease. A consumer's credential keeps pages from opening its stream,
+and `api.bearer_token_env` keeps them from opening any; a browser adds
+neither header on its own.
 
 ### JSON-RPC limits
 

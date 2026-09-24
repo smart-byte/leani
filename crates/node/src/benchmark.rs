@@ -4495,6 +4495,10 @@ async fn consume_subscription(
             .saturating_add(batch_sample.transmitted_bytes);
         measurement.batch_samples.push(batch_sample);
         if let Some(sequence) = boundary {
+            // This direct sink received the page it read, through `after`.
+            store
+                .record_consumer_delivery_in_stream(stream_id, consumer_id, None, after)
+                .await?;
             store
                 .acknowledge_consumer_in_stream(descriptor, stream_id, consumer_id, sequence)
                 .await?;

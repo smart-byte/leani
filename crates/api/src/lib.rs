@@ -3834,6 +3834,7 @@ async fn renew_consumer(
 ) -> Result<Json<ConsumerResponse>, ApiError> {
     let processor = configured_processor(&state, &processor)?;
     authorize_consumer_scope(&state, processor.as_ref(), &consumer, &headers).await?;
+    ensure_unfenced_default_stream(&state, processor.as_ref()).await?;
     let consumer = state
         .store
         .renew_consumer(processor.descriptor(), &consumer)
@@ -3891,6 +3892,13 @@ async fn consumer_changes(
             limit,
         )
         .await?;
+    record_page_delivery(
+        &state,
+        &default_delivery_stream_id(processor.descriptor()),
+        &consumer,
+        &records,
+    )
+    .await?;
     let coverage = coverage(&state, processor.as_ref(), None).await?;
     let data = records
         .into_iter()
@@ -3918,6 +3926,7 @@ async fn acknowledge_consumer(
 ) -> Result<Json<ConsumerResponse>, ApiError> {
     let processor = configured_processor(&state, &processor)?;
     authorize_consumer_scope(&state, processor.as_ref(), &consumer, &headers).await?;
+    ensure_unfenced_default_stream(&state, processor.as_ref()).await?;
     let sequence = decode_change_cursor(&state, processor.as_ref(), &request.cursor)?.sequence;
     let consumer = state
         .store
@@ -3926,6 +3935,44 @@ async fn acknowledge_consumer(
     Ok(Json(
         consumer_response(&state, processor.as_ref(), consumer).await?,
     ))
+}
+
+/// A split live stream fences renewal and acknowledgement by session, which
+/// the generic consumer routes cannot check, so they refuse its processors;
+/// their consumers renew and acknowledge through the live stream routes.
+async fn ensure_unfenced_default_stream(
+    state: &ApiState,
+    processor: &dyn Processor,
+) -> Result<(), ApiError> {
+    let stream = state
+        .store
+        .delivery_stream(&default_delivery_stream_id(processor.descriptor()))
+        .await?;
+    if stream.is_some_and(|stream| stream.kind == DeliveryStreamKind::Live) {
+        return Err(ApiError::conflict(
+            "consumer_session_required",
+            "this processor delivers through a split live stream; renew and acknowledge through /streams/live/consumers/{consumer}/lease and /ack with its x-leani-consumer-session",
+        ));
+    }
+    Ok(())
+}
+
+/// Record that a consumer page was handed out, through its last change, so
+/// the consumer may acknowledge it. A consumer that left the active state
+/// meanwhile records nothing, and its acknowledgement fails on that state.
+async fn record_page_delivery(
+    state: &ApiState,
+    stream_id: &str,
+    consumer: &str,
+    records: &[ChangeRecord],
+) -> Result<(), ApiError> {
+    if let Some(last) = records.last() {
+        state
+            .store
+            .record_consumer_delivery_in_stream(stream_id, consumer, None, last.cursor.sequence)
+            .await?;
+    }
+    Ok(())
 }
 
 async fn backfill_consumer_changes(
@@ -3948,6 +3995,7 @@ async fn backfill_consumer_changes(
             limit,
         )
         .await?;
+    record_page_delivery(&state, &stream_id, &consumer, &records).await?;
     let coverage = coverage(&state, processor.as_ref(), None).await?;
     let data = records
         .into_iter()
@@ -4101,6 +4149,8 @@ struct HistoryProgressUnit {
     raw_payload_bytes: u64,
     encoded_change_bytes: u64,
     acknowledgeable_cursor: String,
+    /// The progress boundary's sequence, the unit's last.
+    acknowledgeable_sequence: u64,
     changes: Vec<ChangeEnvelope>,
 }
 
@@ -4115,6 +4165,7 @@ struct PendingHistoryBatch {
     raw_payload_bytes: u64,
     encoded_change_bytes: u64,
     acknowledgeable_cursor: String,
+    acknowledgeable_sequence: u64,
     changes: Vec<ChangeEnvelope>,
 }
 
@@ -4143,6 +4194,9 @@ struct LiveConsumerStreamState {
     consumer_id: String,
     fetch_after: u64,
     fetched: VecDeque<ChangeRecord>,
+    /// The last page read reached the stream head, so the last block in
+    /// `fetched` is whole: a block's records commit together.
+    fetched_through_head: bool,
     gzip: bool,
     terminal: bool,
     lease: ConsumerSessionGuard,
@@ -4200,6 +4254,7 @@ async fn stream_live_consumer(
         consumer_id: consumer.clone(),
         fetch_after: durable_consumer.acknowledged_sequence,
         fetched: VecDeque::new(),
+        fetched_through_head: false,
         gzip,
         terminal: false,
         lease: ConsumerSessionGuard {
@@ -4402,20 +4457,18 @@ async fn poll_live_consumer(
         return None;
     }
     loop {
-        if let Some(first) = stream_state.fetched.front().cloned() {
-            let mut records = Vec::new();
-            while stream_state
+        if let Some((first, block_records)) = whole_live_block(
+            &stream_state.fetched,
+            stream_state.fetched_through_head,
+            stream_state.state.config.live_batch_limits.maximum_events,
+        ) {
+            let records = stream_state
                 .fetched
-                .front()
-                .is_some_and(|record| same_live_commit(&first, record))
-            {
-                records.push(
-                    stream_state
-                        .fetched
-                        .pop_front()
-                        .expect("front record exists"),
-                );
-            }
+                .drain(..block_records)
+                .collect::<Vec<_>>();
+            let delivered_through = records
+                .last()
+                .map_or(first.cursor.sequence, |record| record.cursor.sequence);
             let live_limits = stream_state.state.config.live_batch_limits;
             if u64::try_from(records.len()).unwrap_or(u64::MAX) > live_limits.maximum_events {
                 stream_state.terminal = true;
@@ -4541,17 +4594,17 @@ async fn poll_live_consumer(
                 last_cursor: Some(last_cursor),
                 changes,
             };
-            if !live_stream_session_is_current(&stream_state).await {
+            if let Some(failure) = record_session_delivery(
+                &stream_state.state,
+                &stream_state.stream_id,
+                &stream_state.consumer_id,
+                stream_state.lease.generation,
+                delivered_through,
+            )
+            .await
+            {
                 stream_state.terminal = true;
-                return Some((
-                    Ok(ndjson_failure(
-                        "consumer_session_lost",
-                        "consumer streaming lease is no longer current".to_owned(),
-                        None,
-                        None,
-                    )),
-                    stream_state,
-                ));
+                return Some((Ok(failure), stream_state));
             }
             return Some((Ok(ndjson_line_or_error(&batch)), stream_state));
         }
@@ -4580,10 +4633,16 @@ async fn poll_live_consumer(
             .await
         {
             Ok(records) if !records.is_empty() => {
+                stream_state.fetched_through_head = records.len() < fetch_limit;
                 stream_state.fetch_after = records
                     .last()
                     .map_or(stream_state.fetch_after, |record| record.cursor.sequence);
                 stream_state.fetched.extend(records);
+            }
+            Ok(_) if !stream_state.fetched.is_empty() => {
+                // The previous full page ended exactly at the head, and so
+                // did its last block.
+                stream_state.fetched_through_head = true;
             }
             Ok(_) => {
                 tokio::select! {
@@ -4639,6 +4698,59 @@ async fn poll_live_consumer(
                 ));
             }
         }
+    }
+}
+
+/// The first block of `fetched` and its record count, once it can go out as
+/// one batch: a record of another commit follows it, or the page read that
+/// fetched it reached the stream head, since a block's records commit
+/// together. A block already past `maximum_events` is returned to fail the
+/// stream. Otherwise a page read ended inside the block, which waits for the
+/// next read.
+fn whole_live_block(
+    fetched: &VecDeque<ChangeRecord>,
+    fetched_through_head: bool,
+    maximum_events: u64,
+) -> Option<(ChangeRecord, usize)> {
+    let first = fetched.front()?;
+    let records = fetched
+        .iter()
+        .take_while(|record| same_live_commit(first, record))
+        .count();
+    (records < fetched.len()
+        || fetched_through_head
+        || u64::try_from(records).unwrap_or(u64::MAX) > maximum_events)
+        .then(|| (first.clone(), records))
+}
+
+/// Record a batch as delivered through `sequence` for the session sending
+/// it, so the consumer may acknowledge it, and return the failure record to
+/// send instead when that session is no longer current or the store fails.
+async fn record_session_delivery(
+    state: &ApiState,
+    stream_id: &str,
+    consumer_id: &str,
+    generation: u64,
+    sequence: u64,
+) -> Option<Bytes> {
+    match state
+        .store
+        .record_consumer_delivery_in_stream(stream_id, consumer_id, Some(generation), sequence)
+        .await
+    {
+        Ok(true) => None,
+        Ok(false) => Some(ndjson_failure(
+            "consumer_session_lost",
+            "consumer streaming lease is no longer current".to_owned(),
+            None,
+            None,
+        )),
+        Err(error) => Some(ndjson_failure(
+            "delivery_failed",
+            error.to_string(),
+            None,
+            None,
+        )),
     }
 }
 
@@ -5085,6 +5197,7 @@ fn build_history_progress_unit(
     }
     let (from_block, through_block, processed_blocks) =
         decode_progress_boundary(&boundary.change.payload, boundary.block.number.0)?;
+    let acknowledgeable_sequence = boundary.cursor.sequence;
     let acknowledgeable_cursor = change_envelope_in_stream(
         &stream_state.state,
         stream_state.processor.as_ref(),
@@ -5142,6 +5255,7 @@ fn build_history_progress_unit(
         raw_payload_bytes,
         encoded_change_bytes,
         acknowledgeable_cursor,
+        acknowledgeable_sequence,
         changes,
     })
 }
@@ -5200,6 +5314,7 @@ fn append_history_unit(batch: &mut Option<PendingHistoryBatch>, unit: HistoryPro
             .encoded_change_bytes
             .saturating_add(unit.encoded_change_bytes);
         batch.acknowledgeable_cursor = unit.acknowledgeable_cursor;
+        batch.acknowledgeable_sequence = unit.acknowledgeable_sequence;
         batch.changes.extend(unit.changes);
     } else {
         *batch = Some(PendingHistoryBatch {
@@ -5213,6 +5328,7 @@ fn append_history_unit(batch: &mut Option<PendingHistoryBatch>, unit: HistoryPro
             raw_payload_bytes: unit.raw_payload_bytes,
             encoded_change_bytes: unit.encoded_change_bytes,
             acknowledgeable_cursor: unit.acknowledgeable_cursor,
+            acknowledgeable_sequence: unit.acknowledgeable_sequence,
             changes: unit.changes,
         });
     }
@@ -5221,18 +5337,6 @@ fn append_history_unit(batch: &mut Option<PendingHistoryBatch>, unit: HistoryPro
 async fn emit_history_batch(
     mut stream_state: BackfillConsumerStreamState,
 ) -> (Result<Bytes, Infallible>, BackfillConsumerStreamState) {
-    if !backfill_stream_session_is_current(&stream_state).await {
-        stream_state.terminal = true;
-        return (
-            Ok(ndjson_failure(
-                "consumer_session_lost",
-                "consumer streaming lease is no longer current".to_owned(),
-                None,
-                None,
-            )),
-            stream_state,
-        );
-    }
     let Some(pending) = stream_state.pending_batch.take() else {
         stream_state.terminal = true;
         return (
@@ -5245,6 +5349,7 @@ async fn emit_history_batch(
             stream_state,
         );
     };
+    let delivered_through = pending.acknowledgeable_sequence;
     let first_cursor = pending.changes.first().map(|change| change.cursor.clone());
     let last_cursor = pending.changes.last().map(|change| change.cursor.clone());
     let encoded_event_payload = match serde_json::to_vec(&pending.changes) {
@@ -5301,6 +5406,18 @@ async fn emit_history_batch(
         acknowledgeable_cursor: pending.acknowledgeable_cursor,
         changes: pending.changes,
     };
+    if let Some(failure) = record_session_delivery(
+        &stream_state.state,
+        &stream_state.stream_id,
+        &stream_state.consumer_id,
+        stream_state.lease.generation,
+        delivered_through,
+    )
+    .await
+    {
+        stream_state.terminal = true;
+        return (Ok(failure), stream_state);
+    }
     (Ok(ndjson_line_or_error(&batch)), stream_state)
 }
 
@@ -5308,18 +5425,6 @@ async fn emit_backfill_completion(
     mut stream_state: BackfillConsumerStreamState,
     record: ChangeRecord,
 ) -> (Result<Bytes, Infallible>, BackfillConsumerStreamState) {
-    if !backfill_stream_session_is_current(&stream_state).await {
-        stream_state.terminal = true;
-        return (
-            Ok(ndjson_failure(
-                "consumer_session_lost",
-                "consumer streaming lease is no longer current".to_owned(),
-                None,
-                None,
-            )),
-            stream_state,
-        );
-    }
     let metadata =
         match leani_store_sqlite::decode_backfill_completion_metadata(&record.change.payload) {
             Ok(metadata) => metadata,
@@ -5389,6 +5494,18 @@ async fn emit_backfill_completion(
         repair_hint: (metadata.republished_blocks < metadata.requested_blocks)
             .then_some("recompute"),
     };
+    if let Some(failure) = record_session_delivery(
+        &stream_state.state,
+        &stream_state.stream_id,
+        &stream_state.consumer_id,
+        stream_state.lease.generation,
+        record.cursor.sequence,
+    )
+    .await
+    {
+        stream_state.terminal = true;
+        return (Ok(failure), stream_state);
+    }
     stream_state.completion_sequence = Some(record.cursor.sequence);
     (Ok(ndjson_line_or_error(&completion)), stream_state)
 }
@@ -5786,28 +5903,21 @@ async fn authorize_consumer_scope(
     consumer: &str,
     headers: &HeaderMap,
 ) -> Result<(), ApiError> {
-    if let Some(credential) = headers
-        .get(CONSUMER_CREDENTIAL_HEADER)
-        .and_then(|value| value.to_str().ok())
-    {
-        if state
-            .store
-            .consumer_credential_matches(processor.descriptor(), consumer, credential)
-            .await?
-        {
-            return Ok(());
-        }
-        return Err(ApiError::forbidden(
-            "consumer credential does not match this durable consumer",
-        ));
-    }
-    // The optional global bearer setting is the API trust boundary. When it is
-    // configured, the router middleware has already authenticated this
-    // request. When it is omitted (for example on a loopback-only local
-    // sidecar), consumer operations are intentionally unauthenticated too.
-    Ok(())
+    authorize_consumer_scope_in_stream(
+        state,
+        processor,
+        &default_delivery_stream_id(processor.descriptor()),
+        consumer,
+        headers,
+    )
+    .await
 }
 
+/// A consumer with a credential needs it in `x-leani-consumer-credential`
+/// on every consumer-scoped request, in addition to any bearer token the
+/// router already checked; the store compares it in constant time. A
+/// consumer without one, such as one the node configuration declares, is
+/// reachable with the bearer alone.
 async fn authorize_consumer_scope_in_stream(
     state: &ApiState,
     processor: &dyn Processor,
@@ -5815,27 +5925,25 @@ async fn authorize_consumer_scope_in_stream(
     consumer: &str,
     headers: &HeaderMap,
 ) -> Result<(), ApiError> {
-    if let Some(credential) = headers
+    let presented = headers
         .get(CONSUMER_CREDENTIAL_HEADER)
-        .and_then(|value| value.to_str().ok())
+        .map(HeaderValue::as_bytes);
+    if state
+        .store
+        .consumer_credential_authorizes_in_stream(
+            processor.descriptor(),
+            stream_id,
+            consumer,
+            presented,
+        )
+        .await?
     {
-        if state
-            .store
-            .consumer_credential_matches_in_stream(
-                processor.descriptor(),
-                stream_id,
-                consumer,
-                credential,
-            )
-            .await?
-        {
-            return Ok(());
-        }
-        return Err(ApiError::forbidden(
-            "consumer credential does not match this durable consumer",
-        ));
+        Ok(())
+    } else {
+        Err(ApiError::forbidden(
+            "x-leani-consumer-credential is missing or does not match this durable consumer",
+        ))
     }
-    Ok(())
 }
 
 async fn consumer_response(
@@ -6493,10 +6601,14 @@ async fn read_generic_snapshot_page(
         .output_bounds(processor.descriptor(), collection)
         .await?
         .map(OutputBoundsResponse::from);
+    // A finalized_only processor's snapshot holds blocks whose changes are
+    // still unpublished, so it offers no boundary to follow, as
+    // query-and-follow refuses it.
     let boundary_cursor = (processor.descriptor().lifecycle.delivery.mode
-        != leani_processor_api::DeliveryPolicyMode::None)
-        .then(|| encode_consumer_cursor(state, processor.as_ref(), snapshot.boundary_sequence))
-        .transpose()?;
+        != leani_processor_api::DeliveryPolicyMode::None
+        && ensure_snapshot_follow_supported(processor.as_ref()).is_ok())
+    .then(|| encode_consumer_cursor(state, processor.as_ref(), snapshot.boundary_sequence))
+    .transpose()?;
     let requested = snapshot
         .query
         .from_block
@@ -6861,12 +6973,25 @@ async fn change_stream(
     State(state): State<ApiState>,
     Path(processor): Path<String>,
     Query(query): Query<ChangesQuery>,
+    headers: HeaderMap,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, ApiError> {
     let processor = configured_processor(&state, &processor)?;
     ensure_delivery_enabled(processor.as_ref())?;
+    // An EventSource reconnects with the last event's ID, which is its
+    // cursor, in `Last-Event-ID`; an explicit `after` takes precedence.
+    let last_event_id = headers
+        .get("last-event-id")
+        .map(|value| {
+            value
+                .to_str()
+                .map_err(|_| ApiError::cursor("Last-Event-ID is not a valid cursor"))
+        })
+        .transpose()?
+        .filter(|value| !value.is_empty());
     let after = query
         .after
         .as_deref()
+        .or(last_event_id)
         .map(|cursor| decode_change_cursor(&state, processor.as_ref(), cursor))
         .transpose()?
         .map(|cursor| cursor.sequence);
@@ -7306,6 +7431,12 @@ fn decode_stream_change_cursor(
     Ok(cursor)
 }
 
+/// Key-derivation context of consumer session token MACs.
+const SESSION_TOKEN_CONTEXT: &str = "leani 2026-09-24 consumer session token";
+
+/// A session token is its postcard payload and a BLAKE3 MAC of it, keyed
+/// from the store's secret, so no client can make one for a session it does
+/// not hold. Version 1 tokens carried an unkeyed checksum.
 fn encode_consumer_session_token(
     state: &ApiState,
     processor: &dyn Processor,
@@ -7313,8 +7444,8 @@ fn encode_consumer_session_token(
     consumer_id: &str,
     generation: u64,
 ) -> Result<String, ApiError> {
-    encode_cursor(&ConsumerSessionToken {
-        version: 1,
+    let mut token = postcard::to_allocvec(&ConsumerSessionToken {
+        version: 2,
         epoch: state.store.epoch(),
         chain_id: state.config.chain_id.0,
         processor_id: processor.descriptor().instance.to_string(),
@@ -7323,8 +7454,15 @@ fn encode_consumer_session_token(
         consumer_id: consumer_id.to_owned(),
         generation,
     })
+    .map_err(|error| ApiError::internal(&format!("session token encoding failed: {error}")))?;
+    let tag = state.store.node_mac(SESSION_TOKEN_CONTEXT, &token);
+    token.extend_from_slice(tag.as_bytes());
+    Ok(hex::encode(token))
 }
 
+/// Verify a session token's MAC in constant time, then its scope. A token
+/// this node cannot verify, including one issued before an upgrade, is a
+/// lost session: the client opens a new stream.
 fn decode_consumer_session_token(
     state: &ApiState,
     processor: &dyn Processor,
@@ -7332,8 +7470,20 @@ fn decode_consumer_session_token(
     consumer_id: &str,
     encoded: &str,
 ) -> Result<u64, ApiError> {
-    let token: ConsumerSessionToken = decode_cursor_payload(encoded)?;
-    if token.version != 1
+    let lost = || {
+        ApiError::conflict(
+            "consumer_session_lost",
+            "consumer session token is not valid for this store, chain, processor, stream, consumer, or generation",
+        )
+    };
+    let bytes = hex::decode(encoded).map_err(|_| lost())?;
+    let payload_length = bytes.len().checked_sub(blake3::OUT_LEN).ok_or_else(lost)?;
+    let (payload, tag) = bytes.split_at(payload_length);
+    if state.store.node_mac(SESSION_TOKEN_CONTEXT, payload) != *tag {
+        return Err(lost());
+    }
+    let token: ConsumerSessionToken = postcard::from_bytes(payload).map_err(|_| lost())?;
+    if token.version != 2
         || token.epoch != state.store.epoch()
         || token.chain_id != state.config.chain_id.0
         || token.processor_id != processor.descriptor().instance.as_str()
@@ -7341,10 +7491,7 @@ fn decode_consumer_session_token(
         || token.stream_id != stream_id
         || token.consumer_id != consumer_id
     {
-        return Err(ApiError::conflict(
-            "consumer_session_lost",
-            "consumer session token belongs to another store, chain, processor, stream, consumer, or generation",
-        ));
+        return Err(lost());
     }
     Ok(token.generation)
 }
@@ -7675,6 +7822,7 @@ impl ApiError {
 }
 
 impl From<StoreError> for ApiError {
+    #[allow(clippy::too_many_lines)]
     fn from(error: StoreError) -> Self {
         match error {
             StoreError::OutputRangePruned => Self::output_not_retained(
@@ -7725,10 +7873,46 @@ impl From<StoreError> for ApiError {
                 response
             }
             matched @ (StoreError::AcknowledgementBackwards { .. }
-            | StoreError::AcknowledgementBeyondDelivered { .. }
             | StoreError::AcknowledgementNotBoundary { .. }
             | StoreError::AcknowledgementBeyondHead { .. }) => {
                 Self::conflict("acknowledgement_invalid", &matched.to_string())
+            }
+            matched @ StoreError::AcknowledgementBeyondDelivered {
+                sequence,
+                delivered,
+            } => {
+                let mut response =
+                    Self::conflict("acknowledgement_beyond_delivered", &matched.to_string());
+                response.details = Some(json!({
+                    "sequence": sequence.to_string(),
+                    "deliveredSequence": delivered.to_string()
+                }));
+                response
+            }
+            matched @ StoreError::AcknowledgementMidBlock { sequence, block } => {
+                let mut response =
+                    Self::conflict("acknowledgement_mid_block", &matched.to_string());
+                response.details = Some(json!({
+                    "sequence": sequence.to_string(),
+                    "blockNumber": block.0
+                }));
+                response
+            }
+            matched @ StoreError::PhysicalStorageLimit {
+                limit_bytes,
+                projected_bytes,
+            } => {
+                let mut response = Self::new(
+                    StatusCode::INSUFFICIENT_STORAGE,
+                    "physical_storage_limit",
+                    &matched.to_string(),
+                    false,
+                );
+                response.details = Some(json!({
+                    "limitBytes": limit_bytes.to_string(),
+                    "projectedBytes": projected_bytes.to_string()
+                }));
+                response
             }
             matched @ StoreError::QueryTooExpensive { .. } => {
                 Self::too_expensive(&matched.to_string())
@@ -7855,11 +8039,167 @@ mod tests {
         lifecycle
     }
 
+    /// A consumer credential of an accepted length.
+    const TEST_CREDENTIAL: &str = "test-consumer-credential-0123456789abcdef";
+    /// Another consumer's credential, equally valid on its own.
+    const OTHER_CREDENTIAL: &str = "other-consumer-credential-0123456789abcdef";
+
+    /// Apply finalized blocks through `processor.map`. The frames carry an
+    /// empty complete header, which an ordered ledger requires.
+    async fn apply_finalized_blocks(
+        store: &SqliteStore,
+        processor: &dyn Processor,
+        blocks: std::ops::RangeInclusive<u64>,
+    ) {
+        for number in blocks {
+            let parent = if number > 1 {
+                leani_testkit::fixture_frame(number - 1, BlockHash::ZERO)
+                    .block
+                    .hash
+            } else {
+                BlockHash::ZERO
+            };
+            let mut frame = leani_testkit::fixture_frame(number, parent);
+            frame.header = leani_primitives::Material::Complete(leani_primitives::HeaderEnvelope {
+                rlp: None,
+                transactions_root: None,
+                receipts_root: None,
+                withdrawals_root: None,
+                gas_limit: None,
+                gas_used: None,
+                base_fee_per_gas: None,
+                blob_gas_used: None,
+                excess_blob_gas: None,
+                size_bytes: None,
+                transaction_count: None,
+                consensus_size_bytes: None,
+            });
+            let delta = processor.map(&frame).await.expect("map");
+            store
+                .apply(
+                    processor,
+                    ProcessorCursor {
+                        chain_id: frame.chain_id,
+                        processor_id: processor.descriptor().id.to_string(),
+                        processor_version: processor.descriptor().version.to_string(),
+                        block_number: frame.block.number,
+                        block_hash: frame.block.hash,
+                        finality: Finality::Finalized,
+                        sequence: number,
+                    },
+                    &delta,
+                    &[],
+                )
+                .await
+                .expect("apply finalized block");
+        }
+    }
+
+    /// A block-local counter whose block `n` publishes `n + 1` changes, so a
+    /// live commit can end past a page read.
+    #[derive(Debug)]
+    struct FanOutCounter(leani_testkit::BlockLocalCounter);
+
+    #[async_trait]
+    impl Processor for FanOutCounter {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
+        fn descriptor(&self) -> &ProcessorDescriptor {
+            self.0.descriptor()
+        }
+
+        async fn map(
+            &self,
+            block: &leani_primitives::BlockFrame,
+        ) -> Result<leani_processor_api::EncodedDelta, leani_processor_api::ProcessorError>
+        {
+            self.0.map(block).await
+        }
+
+        async fn reduce(
+            &self,
+            transaction: &mut dyn leani_processor_api::ReducerTransaction,
+            cursor: &ProcessorCursor,
+            _delta: &leani_processor_api::EncodedDelta,
+        ) -> Result<leani_processor_api::DomainChanges, leani_processor_api::ProcessorError>
+        {
+            let mut changes = Vec::new();
+            for index in 0..=cursor.block_number.0 {
+                let mut key = cursor.block_number.0.to_be_bytes().to_vec();
+                key.extend_from_slice(&index.to_be_bytes());
+                let payload = index.to_be_bytes().to_vec();
+                transaction
+                    .put("counter.fan-out", key.clone(), payload.clone())
+                    .await?;
+                let change = leani_processor_api::DomainChange {
+                    kind: "synthetic.counter".to_owned(),
+                    key,
+                    operation: ChangeOperation::Upsert,
+                    payload,
+                };
+                transaction.emit(change.clone()).await?;
+                changes.push(change);
+            }
+            Ok(leani_processor_api::DomainChanges { changes })
+        }
+    }
+
+    /// Read the next NDJSON record of a delivery stream.
+    async fn next_ndjson_record(
+        body: &mut (impl Stream<Item = Result<Bytes, axum::Error>> + Unpin),
+        buffered: &mut Vec<u8>,
+    ) -> Value {
+        while !buffered.contains(&b'\n') {
+            let chunk = tokio::time::timeout(Duration::from_secs(5), body.next())
+                .await
+                .expect("stream record in time")
+                .expect("stream record")
+                .expect("stream bytes");
+            buffered.extend_from_slice(&chunk);
+        }
+        let newline = buffered
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .expect("record line");
+        let line = buffered.drain(..=newline).collect::<Vec<_>>();
+        serde_json::from_slice(&line[..newline]).expect("NDJSON record")
+    }
+
+    /// Read SSE frames until the first one with an `id:`, and return its
+    /// data.
+    async fn first_sse_change(
+        body: &mut (impl Stream<Item = Result<Bytes, axum::Error>> + Unpin),
+    ) -> Value {
+        let mut text = String::new();
+        loop {
+            if let Some(end) = text.find("\n\n") {
+                let frame = text.drain(..end + 2).collect::<String>();
+                if frame.lines().any(|line| line.starts_with("id:")) {
+                    let data = frame
+                        .lines()
+                        .find_map(|line| line.strip_prefix("data: "))
+                        .expect("data line");
+                    return serde_json::from_str(data).expect("change JSON");
+                }
+                continue;
+            }
+            let chunk = tokio::time::timeout(Duration::from_secs(5), body.next())
+                .await
+                .expect("SSE frame in time")
+                .expect("SSE frame")
+                .expect("SSE bytes");
+            text.push_str(std::str::from_utf8(&chunk).expect("UTF-8 frame"));
+        }
+    }
+
     async fn seed_blob_block(
         store: &SqliteStore,
         processor: &BlobsProcessor,
         number: u64,
         transaction_count: u32,
+        finality: Finality,
     ) {
         let hash_byte = u8::try_from(number % 251).expect("small hash byte");
         let parent_byte = u8::try_from(number.saturating_sub(1) % 251).expect("small parent byte");
@@ -7871,7 +8211,7 @@ mod tests {
             block_hash,
             parent_hash,
             timestamp: number,
-            finality: Finality::Finalized,
+            finality,
             size_bytes: 1,
             blob_count: transaction_count,
             blob_gas_used: u64::from(transaction_count) * 131_072,
@@ -7933,7 +8273,7 @@ mod tests {
                     chain_id: ChainId(1),
                     block_number: BlockNumber(number),
                     block_hash,
-                    finality: Finality::Finalized,
+                    finality,
                     sequence: number,
                 },
                 &delta,
@@ -7943,10 +8283,14 @@ mod tests {
             .expect("apply blob fixture");
     }
 
+    /// Seed one observation at block 42 into either Uniswap processor. Only
+    /// a live block leaves a retained canonical row; a backfilled one has
+    /// none.
     async fn seed_uniswap_observation(
         store: &SqliteStore,
-        processor: &leani_processor_uniswap::UniswapObservationsProcessor,
+        processor: &dyn Processor,
         pool: Address,
+        canonical_row: bool,
     ) -> leani_primitives::BlockRef {
         let block = leani_primitives::BlockRef {
             number: BlockNumber(42),
@@ -7954,10 +8298,12 @@ mod tests {
             parent_hash: BlockHash::new([0x41; 32]),
             timestamp: 1_800_000_000,
         };
-        store
-            .store_canonical_anchor(ChainId(1), block, Finality::Included)
-            .await
-            .expect("canonical observation block");
+        if canonical_row {
+            store
+                .store_canonical_anchor(ChainId(1), block, Finality::Included)
+                .await
+                .expect("canonical observation block");
+        }
         let payload = postcard::to_allocvec(&leani_processor_uniswap::UniswapPriceDelta {
             observations: vec![leani_processor_uniswap::PoolPriceEntity {
                 pool,
@@ -8054,6 +8400,48 @@ mod tests {
             .await
             .expect("apply block summary");
         block
+    }
+
+    /// Mint 100 of token `0x33…33` to `0x11…11` in an included block.
+    async fn seed_erc20_balance(
+        store: &SqliteStore,
+        processor: &leani_processor_erc20::Erc20BalanceProcessor,
+    ) -> leani_primitives::BlockRef {
+        let mut recipient = [0; 32];
+        recipient[12..].copy_from_slice(&[0x11; 20]);
+        let mut frame = leani_testkit::fixture_frame(1, BlockHash::ZERO);
+        frame.finality = Finality::Included;
+        frame.logs = leani_primitives::Material::Complete(vec![leani_primitives::Log {
+            address: Address::new([0x33; 20]),
+            topics: vec![
+                alloy_primitives::keccak256("Transfer(address,address,uint256)").0,
+                [0; 32],
+                recipient,
+            ],
+            data: U256::from(100).to_be_bytes::<32>().to_vec(),
+            transaction_hash: Some(leani_primitives::TransactionHash::new([7; 32])),
+            transaction_index: 0,
+            log_index: 0,
+        }]);
+        let delta = processor.map(&frame).await.expect("map mint");
+        store
+            .apply(
+                processor,
+                ProcessorCursor {
+                    processor_id: processor.descriptor().id.to_string(),
+                    processor_version: processor.descriptor().version.to_string(),
+                    chain_id: ChainId(1),
+                    block_number: frame.block.number,
+                    block_hash: frame.block.hash,
+                    finality: Finality::Included,
+                    sequence: 1,
+                },
+                &delta,
+                &[],
+            )
+            .await
+            .expect("apply mint");
+        frame.block
     }
 
     #[test]
@@ -8611,7 +8999,8 @@ mod tests {
         );
         let instance = processor.descriptor().instance.to_string();
         let block =
-            seed_uniswap_observation(&store, processor.as_ref(), Address::new([0x22; 20])).await;
+            seed_uniswap_observation(&store, processor.as_ref(), Address::new([0x22; 20]), true)
+                .await;
         let processor: Arc<dyn Processor> = processor;
         let registration = QueryExtensionRegistration::new(
             processor.clone(),
@@ -8659,6 +9048,212 @@ mod tests {
         assert_eq!(body["timestamp"], block.timestamp);
         assert_eq!(body["data"]["blockNumber"], block.number.0);
         assert_eq!(body["data"]["logIndex"], 7);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn typed_endpoints_report_finality_from_entity_metadata() {
+        // Audit M-P1: typed endpoints reported the finality a block had when
+        // it was reduced, so finalized data stayed "included".
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = SqliteStore::open(leani_store_sqlite::StoreConfig::new(
+            directory.path().join("node.sqlite"),
+        ))
+        .await
+        .expect("store");
+        let summary = Arc::new(
+            leani_processor_block_summary::BlockSummaryProcessor::new(
+                leani_processor_block_summary::BlockSummaryConfig {
+                    start_block: BlockNumber(0),
+                },
+            )
+            .expect("block-summary processor"),
+        );
+        let summary_block = seed_block_summary(&store, summary.as_ref()).await;
+        let observations = Arc::new(observations_processor());
+        let observed = seed_uniswap_observation(
+            &store,
+            observations.as_ref(),
+            Address::new([0x22; 20]),
+            true,
+        )
+        .await;
+        let latest = Arc::new(
+            leani_processor_uniswap::UniswapLatestProcessor::new(uniswap_config())
+                .expect("latest processor"),
+        );
+        seed_uniswap_observation(&store, latest.as_ref(), Address::new([0x22; 20]), false).await;
+        let blobs = Arc::new(BlobsProcessor::default());
+        let blob_block = blobs.schedule().first_block();
+        seed_blob_block(&store, &blobs, blob_block, 0, Finality::Included).await;
+        let blob_hash =
+            BlockHash::new([u8::try_from(blob_block % 251).expect("small hash byte"); 32]);
+        // Review 1, minor 2: ERC-20 balances too.
+        let erc20 = Arc::new(
+            leani_processor_erc20::Erc20BalanceProcessor::new(
+                leani_processor_erc20::Erc20BalanceConfig {
+                    start_block: BlockNumber(1),
+                    addresses: vec![Address::new([0x11; 20])],
+                    tokens: vec![Address::new([0x33; 20])],
+                    complete_from_start: true,
+                },
+            )
+            .expect("ERC-20 processor"),
+        );
+        let minted = seed_erc20_balance(&store, erc20.as_ref()).await;
+        for (descriptor, number, hash) in [
+            (
+                summary.descriptor(),
+                summary_block.number,
+                summary_block.hash,
+            ),
+            (observations.descriptor(), observed.number, observed.hash),
+            (latest.descriptor(), observed.number, observed.hash),
+            (blobs.descriptor(), BlockNumber(blob_block), blob_hash),
+            (erc20.descriptor(), minted.number, minted.hash),
+        ] {
+            store
+                .mark_finalized(descriptor, number, hash)
+                .await
+                .expect("finalize");
+        }
+        let summary_instance = summary.descriptor().instance.to_string();
+        let observations_instance = observations.descriptor().instance.to_string();
+        let latest_instance = latest.descriptor().instance.to_string();
+        let erc20_instance = erc20.descriptor().instance.to_string();
+        let summary: Arc<dyn Processor> = summary;
+        let observations: Arc<dyn Processor> = observations;
+        let latest: Arc<dyn Processor> = latest;
+        let blobs: Arc<dyn Processor> = blobs;
+        let erc20: Arc<dyn Processor> = erc20;
+        let registrations = vec![
+            QueryExtensionRegistration::new(summary.clone(), Arc::new(BlockSummaryQueryExtension)),
+            QueryExtensionRegistration::new(
+                observations.clone(),
+                Arc::new(UniswapObservationsQueryExtension),
+            ),
+            QueryExtensionRegistration::new(latest.clone(), Arc::new(UniswapQueryExtension)),
+            QueryExtensionRegistration::new(blobs.clone(), Arc::new(BlobsQueryExtension)),
+            QueryExtensionRegistration::new(erc20.clone(), Arc::new(Erc20QueryExtension)),
+        ];
+        let app = router_with_processors(
+            store,
+            vec![summary, observations, latest, blobs, erc20],
+            registrations,
+            ApiConfig::default(),
+        )
+        .expect("router");
+
+        for (path, finality) in [
+            (
+                format!(
+                    "/v1/processors/{latest_instance}/query/pools/0x{}",
+                    "22".repeat(20)
+                ),
+                "/finality",
+            ),
+            (
+                format!("/v1/processors/{summary_instance}/query/latest"),
+                "/data/finality",
+            ),
+            (
+                format!(
+                    "/v1/processors/{summary_instance}/query/blocks/{}",
+                    summary_block.number.0
+                ),
+                "/data/finality",
+            ),
+            (
+                format!(
+                    "/v1/processors/{observations_instance}/query/pools/0x{}/latest",
+                    "22".repeat(20)
+                ),
+                "/data/finality",
+            ),
+            (format!("/v1/q/blobs/blocks/{blob_block}"), "/finality"),
+            (
+                format!("/v1/q/blobs/blocks?fromBlock={blob_block}&toBlock={blob_block}"),
+                "/data/0/finality",
+            ),
+            (
+                format!("/v1/q/blobs/snapshot?fromBlock={blob_block}&toBlock={blob_block}"),
+                "/data/0/block/finality",
+            ),
+            (
+                format!(
+                    "/v1/processors/{erc20_instance}/query/balances/0x{}/0x{}",
+                    "33".repeat(20),
+                    "11".repeat(20)
+                ),
+                "/finality",
+            ),
+        ] {
+            let (status, body) = send(&app, get_request(&path)).await;
+            assert_eq!(status, StatusCode::OK, "{path}: {body}");
+            assert_eq!(
+                body.pointer(finality),
+                Some(&json!("finalized")),
+                "{path}: {body}"
+            );
+        }
+    }
+
+    /// One configured V3 pool, at `0x22…22`.
+    fn uniswap_config() -> leani_processor_uniswap::UniswapConfig {
+        leani_processor_uniswap::UniswapConfig {
+            start_block: BlockNumber(1),
+            pools: vec![leani_processor_uniswap::PoolConfig {
+                address: Address::new([0x22; 20]),
+                kind: leani_processor_uniswap::PoolKind::V3,
+            }],
+        }
+    }
+
+    fn observations_processor() -> leani_processor_uniswap::UniswapObservationsProcessor {
+        leani_processor_uniswap::UniswapObservationsProcessor::new(uniswap_config())
+            .expect("observations processor")
+    }
+
+    #[tokio::test]
+    async fn latest_uniswap_observation_needs_no_retained_canonical_block() {
+        // Audit Processor-9: the latest observation needed a retained
+        // canonical block, which a backfilled block does not leave, so it
+        // answered 404 for an indexed observation.
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = SqliteStore::open(leani_store_sqlite::StoreConfig::new(
+            directory.path().join("node.sqlite"),
+        ))
+        .await
+        .expect("store");
+        let processor = Arc::new(observations_processor());
+        let observed =
+            seed_uniswap_observation(&store, processor.as_ref(), Address::new([0x22; 20]), false)
+                .await;
+        let instance = processor.descriptor().instance.to_string();
+        let processor: Arc<dyn Processor> = processor;
+        let registration = QueryExtensionRegistration::new(
+            processor.clone(),
+            Arc::new(UniswapObservationsQueryExtension),
+        );
+        let app = router_with_processors(
+            store,
+            vec![processor],
+            vec![registration],
+            ApiConfig::default(),
+        )
+        .expect("router");
+        let (status, body) = send(
+            &app,
+            get_request(&format!(
+                "/v1/processors/{instance}/query/pools/0x{}/latest",
+                "22".repeat(20)
+            )),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["timestamp"], observed.timestamp);
+        assert_eq!(body["data"]["blockNumber"], observed.number.0);
+        assert_eq!(body["data"]["finality"], "included");
     }
 
     #[tokio::test]
@@ -8966,6 +9561,9 @@ mod tests {
             },
         )
         .expect("router");
+        // Review 1, Important 2: the control plane judges a short credential
+        // after its idempotency lookup, since a subscription created before
+        // the 32-character rule re-submits it; the API passes it on.
         let response = router
             .oneshot(
                 Request::post("/admin/v1/backfill-subscriptions")
@@ -9560,25 +10158,30 @@ mod tests {
             ApiConfig::default(),
         )
         .expect("router");
-        let response = router
-            .oneshot(
-                Request::post("/v1/processors/blobs-money/consumers")
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(
-                        serde_json::json!({
-                            "id": "blobs-api",
-                            "role": "required",
-                            "start": { "position": "current_head" },
-                            "leaseTtlSeconds": 300,
-                            "credential": "blobs-api-test-credential"
-                        })
-                        .to_string(),
-                    ))
-                    .expect("request"),
-            )
-            .await
-            .expect("response");
-        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let create = |id: &str| {
+            Request::post("/v1/processors/blobs-money/consumers")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "id": id,
+                        "role": "required",
+                        "start": { "position": "current_head" },
+                        "leaseTtlSeconds": 300,
+                        "credential": "blobs-api-test-credential"
+                    })
+                    .to_string(),
+                ))
+                .expect("request")
+        };
+        // Review 1, Important 2: an application that re-creates its consumer
+        // at startup still learns that it exists, whatever its credential;
+        // only a new consumer needs 32 characters.
+        let (status, body) = send(&router, create("blobs-api")).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["error"]["code"], "consumer_exists");
+        let (status, body) = send(&router, create("blobs-api-2")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["error"]["code"], "invalid_request");
     }
 
     #[tokio::test]
@@ -9590,7 +10193,9 @@ mod tests {
         ))
         .await
         .expect("store");
-        let processor = Arc::new(BlobsProcessor::default());
+        // A canonical stream: split live streams fence acknowledgement by
+        // session and refuse the generic route.
+        let processor = Arc::new(leani_testkit::OrderedLedgerProcessor::default());
         let future_cursor = encode_cursor(&ApiCursor {
             version: 2,
             epoch: store.epoch(),
@@ -9600,23 +10205,26 @@ mod tests {
             sequence: 1,
         })
         .expect("cursor");
-        let router = router(store, processor, ApiConfig::default()).expect("router");
+        let configured: Arc<dyn Processor> = processor;
+        let router =
+            router_with_processors(store, vec![configured], Vec::new(), ApiConfig::default())
+                .expect("router");
         let create_consumer = |role: &str| {
-            Request::post("/v1/processors/blobs-money/consumers")
+            Request::post("/v1/processors/synthetic-ledger/consumers")
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(Body::from(
                     serde_json::json!({
-                        "id": "blobs-api",
+                        "id": "ledger-api",
                         "role": role,
                         "start": { "position": "current_head" },
                         "leaseTtlSeconds": 300,
-                        "credential": "blobs-api-test-credential"
+                        "credential": TEST_CREDENTIAL
                     })
                     .to_string(),
                 ))
                 .expect("request")
         };
-        // A required consumer would pin the window-retained live stream.
+        // A required consumer would pin the window-retained stream.
         let required = router
             .clone()
             .oneshot(create_consumer("required"))
@@ -9630,10 +10238,11 @@ mod tests {
             .expect("response");
         assert_eq!(create.status(), StatusCode::CREATED);
 
+        // Audit H24: the credential is required once the consumer has one.
         let unauthenticated = router
             .clone()
             .oneshot(
-                Request::post("/v1/processors/blobs-money/consumers/blobs-api/ack")
+                Request::post("/v1/processors/synthetic-ledger/consumers/ledger-api/ack")
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from(
                         serde_json::json!({ "cursor": future_cursor.clone() }).to_string(),
@@ -9642,14 +10251,14 @@ mod tests {
             )
             .await
             .expect("response");
-        assert_eq!(unauthenticated.status(), StatusCode::CONFLICT);
+        assert_eq!(unauthenticated.status(), StatusCode::FORBIDDEN);
 
         let forbidden = router
             .clone()
             .oneshot(
-                Request::post("/v1/processors/blobs-money/consumers/blobs-api/ack")
+                Request::post("/v1/processors/synthetic-ledger/consumers/ledger-api/ack")
                     .header(header::CONTENT_TYPE, "application/json")
-                    .header(CONSUMER_CREDENTIAL_HEADER, "another-consumer-secret")
+                    .header(CONSUMER_CREDENTIAL_HEADER, OTHER_CREDENTIAL)
                     .body(Body::from(
                         serde_json::json!({ "cursor": future_cursor.clone() }).to_string(),
                     ))
@@ -9662,9 +10271,9 @@ mod tests {
         let acknowledge = router
             .clone()
             .oneshot(
-                Request::post("/v1/processors/blobs-money/consumers/blobs-api/ack")
+                Request::post("/v1/processors/synthetic-ledger/consumers/ledger-api/ack")
                     .header(header::CONTENT_TYPE, "application/json")
-                    .header(CONSUMER_CREDENTIAL_HEADER, "blobs-api-test-credential")
+                    .header(CONSUMER_CREDENTIAL_HEADER, TEST_CREDENTIAL)
                     .body(Body::from(
                         serde_json::json!({ "cursor": future_cursor }).to_string(),
                     ))
@@ -9681,7 +10290,7 @@ mod tests {
 
         let list = router
             .oneshot(
-                Request::get("/v1/processors/blobs-money/consumers")
+                Request::get("/v1/processors/synthetic-ledger/consumers")
                     .body(Body::empty())
                     .expect("request"),
             )
@@ -9690,9 +10299,704 @@ mod tests {
         assert_eq!(list.status(), StatusCode::OK);
         let body = to_bytes(list.into_body(), usize::MAX).await.expect("body");
         let body: Value = serde_json::from_slice(&body).expect("JSON");
-        assert_eq!(body["data"][0]["id"], "blobs-api");
+        assert_eq!(body["data"][0]["id"], "ledger-api");
         assert_eq!(body["data"][0]["acknowledgedSequence"], "0");
         assert_eq!(body["data"][0]["deliveredSequence"], "0");
+    }
+
+    fn consumer_request(
+        method: &Method,
+        path: &str,
+        credential: Option<&str>,
+        body: Option<&Value>,
+    ) -> Request<Body> {
+        let mut request = Request::builder().method(method.clone()).uri(path);
+        if let Some(credential) = credential {
+            request = request.header(CONSUMER_CREDENTIAL_HEADER, credential);
+        }
+        match body {
+            Some(body) => request
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_string())),
+            None => request.header("x-leani-request", "1").body(Body::empty()),
+        }
+        .expect("consumer request")
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn consumer_credentials_guard_every_consumer_scoped_route() {
+        // Audit H24 and Auth-4: a credential was checked only when a request
+        // sent one, and a client could choose any 16-byte credential.
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = SqliteStore::open(leani_store_sqlite::StoreConfig::new(
+            directory.path().join("node.sqlite"),
+        ))
+        .await
+        .expect("store");
+        let ledger = Arc::new(leani_testkit::OrderedLedgerProcessor::default());
+        let counter = leani_testkit::BlockLocalCounter::default();
+        let lifecycle =
+            acknowledged_delivery(counter.descriptor().lifecycle.clone(), "destination");
+        let split = Arc::new(counter.with_lifecycle(lifecycle));
+        for processor in [ledger.descriptor(), split.descriptor()] {
+            store
+                .register_processor(processor)
+                .await
+                .expect("register processor");
+        }
+        let live_stream = default_delivery_stream_id(split.descriptor());
+        let history_stream = store
+            .create_backfill_delivery_stream(split.descriptor(), "repair-1")
+            .await
+            .expect("history stream")
+            .stream_id;
+        for stream_id in [&live_stream, &history_stream] {
+            store
+                .create_consumer_with_credential_in_stream(
+                    split.descriptor(),
+                    stream_id,
+                    "destination",
+                    ConsumerRole::Required,
+                    ConsumerStartPosition::EarliestRetained,
+                    Duration::from_secs(30),
+                    TEST_CREDENTIAL,
+                )
+                .await
+                .expect("consumer with a credential");
+        }
+        apply_finalized_blocks(&store, ledger.as_ref(), 1..=1).await;
+        let control = Arc::new(StaticBackfillControl {
+            status: BackfillStatus {
+                id: "repair-1".to_owned(),
+                owner: HistoricalWorkOwner::Subscription,
+                processor: split.descriptor().instance.to_string(),
+                delivery_stream_id: Some(history_stream.clone()),
+                publication_revision: Some("0".to_owned()),
+                from_block: 1,
+                to_block: 1,
+                ranges: vec![BackfillRange {
+                    from_block: 1,
+                    to_block: 1,
+                }],
+                requested_blocks: 1,
+                processed_blocks: 0,
+                remaining_blocks: 1,
+                captured_finalized_target: Some(1),
+                mode: BackfillExecutionMode::FillMissing,
+                batching: None,
+                state: BackfillState::Running,
+                attempts: 1,
+                updated_at_unix_ms: 1,
+                report: None,
+                last_error: None,
+            },
+        });
+        let ledger: Arc<dyn Processor> = ledger;
+        let split: Arc<dyn Processor> = split;
+        let app = router_with_processors(
+            store,
+            vec![ledger, split],
+            Vec::new(),
+            ApiConfig {
+                backfill_control: Some(control),
+                ..ApiConfig::default()
+            },
+        )
+        .expect("router");
+
+        let create = |credential: &str| {
+            consumer_request(
+                &Method::POST,
+                "/v1/processors/synthetic-ledger/consumers",
+                None,
+                Some(&json!({
+                    "id": "reader",
+                    "role": "best_effort",
+                    "start": { "position": "earliest_retained" },
+                    "leaseTtlSeconds": 300,
+                    "credential": credential
+                })),
+            )
+        };
+        // 27 characters: enough before, too short now.
+        let (status, body) = send(&app, create("short-credential-0123456789")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(
+            send(&app, create(TEST_CREDENTIAL)).await.0,
+            StatusCode::CREATED
+        );
+
+        let cursor = json!({ "cursor": "00" });
+        let live = "/v1/processors/synthetic-counter/streams/live/consumers/destination";
+        let history = "/v1/backfill-subscriptions/repair-1/consumers/destination";
+        let routes = [
+            (
+                Method::POST,
+                "/v1/processors/synthetic-ledger/consumers/reader/lease".to_owned(),
+                None,
+            ),
+            (
+                Method::GET,
+                "/v1/processors/synthetic-ledger/consumers/reader/changes".to_owned(),
+                None,
+            ),
+            (
+                Method::POST,
+                "/v1/processors/synthetic-ledger/consumers/reader/ack".to_owned(),
+                Some(&cursor),
+            ),
+            (Method::POST, format!("{live}/ack"), Some(&cursor)),
+            (Method::POST, format!("{live}/lease"), None),
+            (Method::DELETE, format!("{live}/lease"), None),
+            (Method::GET, format!("{live}/stream"), None),
+            (Method::GET, format!("{history}/changes"), None),
+            (Method::POST, format!("{history}/ack"), Some(&cursor)),
+            (Method::POST, format!("{history}/lease"), None),
+            (Method::DELETE, format!("{history}/lease"), None),
+            (Method::GET, format!("{history}/stream"), None),
+        ];
+        // Review 1, minor 3: every mismatch is collected, so a regression
+        // names each route it opens.
+        let mut mismatches = Vec::new();
+        for (method, path, body) in routes {
+            for (presented, credential, forbidden) in [
+                ("no credential", None, true),
+                ("another credential", Some(OTHER_CREDENTIAL), true),
+                ("its credential", Some(TEST_CREDENTIAL), false),
+            ] {
+                // Stream bodies never end, so only the status is read.
+                let status = app
+                    .clone()
+                    .oneshot(consumer_request(&method, &path, credential, body))
+                    .await
+                    .expect("response")
+                    .status();
+                if (status == StatusCode::FORBIDDEN) != forbidden {
+                    mismatches.push(format!("{method} {path} with {presented}: {status}"));
+                }
+            }
+        }
+        assert!(mismatches.is_empty(), "{mismatches:#?}");
+    }
+
+    #[tokio::test]
+    async fn session_tokens_are_authenticated_by_the_node() {
+        // Audit H24: a session token carried an unkeyed checksum over values
+        // anyone could read, so a client could forge another's session.
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = SqliteStore::open(leani_store_sqlite::StoreConfig::new(
+            directory.path().join("node.sqlite"),
+        ))
+        .await
+        .expect("store");
+        let counter = leani_testkit::BlockLocalCounter::default();
+        let lifecycle =
+            acknowledged_delivery(counter.descriptor().lifecycle.clone(), "destination");
+        let processor = Arc::new(counter.with_lifecycle(lifecycle));
+        store
+            .register_processor(processor.descriptor())
+            .await
+            .expect("register processor");
+        let stream_id = default_delivery_stream_id(processor.descriptor());
+        store
+            .create_consumer_in_stream(
+                processor.descriptor(),
+                &stream_id,
+                "destination",
+                ConsumerRole::Required,
+                ConsumerStartPosition::EarliestRetained,
+                Duration::from_secs(30),
+            )
+            .await
+            .expect("consumer");
+        let forged = |version: u8| {
+            encode_cursor(&ConsumerSessionToken {
+                version,
+                epoch: store.epoch(),
+                chain_id: 1,
+                processor_id: processor.descriptor().instance.to_string(),
+                processor_version: processor.descriptor().version.to_string(),
+                stream_id: stream_id.clone(),
+                consumer_id: "destination".to_owned(),
+                generation: 1,
+            })
+            .expect("forged token")
+        };
+        let forged = [forged(1), forged(2)];
+        let configured: Arc<dyn Processor> = processor.clone();
+        let app = router_with_processors(store, vec![configured], Vec::new(), ApiConfig::default())
+            .expect("router");
+        let path = "/v1/processors/synthetic-counter/streams/live/consumers/destination";
+        let stream = app
+            .clone()
+            .oneshot(get_request(&format!("{path}/stream")))
+            .await
+            .expect("stream");
+        assert_eq!(stream.status(), StatusCode::OK);
+        let mut body = stream.into_body().into_data_stream();
+        let hello = next_ndjson_record(&mut body, &mut Vec::new()).await;
+        let token = hello["sessionToken"].as_str().expect("session token");
+        let renew = |token: &str| {
+            Request::post(format!("{path}/lease"))
+                .header(CONSUMER_SESSION_HEADER, token)
+                .header("x-leani-request", "1")
+                .body(Body::empty())
+                .expect("renew request")
+        };
+        for forged in &forged {
+            assert_ne!(forged, token);
+            let (status, body) = send(&app, renew(forged)).await;
+            assert_eq!(status, StatusCode::CONFLICT, "{body}");
+            assert_eq!(body["error"]["code"], "consumer_session_lost");
+        }
+        assert_eq!(send(&app, renew(token)).await.0, StatusCode::OK);
+        drop(body);
+    }
+
+    #[tokio::test]
+    async fn generic_consumer_routes_refuse_split_live_processors() {
+        // Audit M-A4: the generic renew and acknowledgement routes skipped
+        // the session fence of a split live stream.
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = SqliteStore::open(leani_store_sqlite::StoreConfig::new(
+            directory.path().join("node.sqlite"),
+        ))
+        .await
+        .expect("store");
+        let counter = leani_testkit::BlockLocalCounter::default();
+        let lifecycle =
+            acknowledged_delivery(counter.descriptor().lifecycle.clone(), "destination");
+        let processor = Arc::new(counter.with_lifecycle(lifecycle));
+        store
+            .register_processor(processor.descriptor())
+            .await
+            .expect("register processor");
+        store
+            .create_consumer_with_credential(
+                processor.descriptor(),
+                "destination",
+                ConsumerRole::Required,
+                ConsumerStartPosition::EarliestRetained,
+                Duration::from_secs(30),
+                TEST_CREDENTIAL,
+            )
+            .await
+            .expect("consumer");
+        apply_finalized_blocks(&store, processor.as_ref(), 1..=1).await;
+        let cursor = encode_stream_cursor_for(&store, processor.descriptor(), 1);
+        let configured: Arc<dyn Processor> = processor;
+        let app = router_with_processors(store, vec![configured], Vec::new(), ApiConfig::default())
+            .expect("router");
+        let path = "/v1/processors/synthetic-counter/consumers/destination";
+        for (method, route, body) in [
+            (Method::POST, "lease", None),
+            (Method::POST, "ack", Some(json!({ "cursor": cursor }))),
+        ] {
+            let (status, response) = send(
+                &app,
+                consumer_request(
+                    &method,
+                    &format!("{path}/{route}"),
+                    Some(TEST_CREDENTIAL),
+                    body.as_ref(),
+                ),
+            )
+            .await;
+            assert_eq!(status, StatusCode::CONFLICT, "{route}: {response}");
+            assert_eq!(
+                response["error"]["code"], "consumer_session_required",
+                "{route}"
+            );
+        }
+        // Reading needs no session.
+        let (status, page) = send(
+            &app,
+            consumer_request(
+                &Method::GET,
+                &format!("{path}/changes"),
+                Some(TEST_CREDENTIAL),
+                None,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{page}");
+        assert_eq!(page["data"].as_array().map(Vec::len), Some(1));
+    }
+
+    /// A generic change cursor for `sequence` of a processor's default stream.
+    fn encode_stream_cursor_for(
+        store: &SqliteStore,
+        descriptor: &ProcessorDescriptor,
+        sequence: u64,
+    ) -> String {
+        encode_cursor(&ApiCursor {
+            version: 2,
+            epoch: store.epoch(),
+            chain_id: 1,
+            processor_id: descriptor.instance.to_string(),
+            processor_version: descriptor.version.to_string(),
+            sequence,
+        })
+        .expect("cursor")
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn acknowledgements_stop_at_what_the_consumer_was_delivered() {
+        // Audit M-A5: acknowledgements were checked against the stream head,
+        // so a client could acknowledge changes it never read.
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = SqliteStore::open(leani_store_sqlite::StoreConfig::new(
+            directory.path().join("node.sqlite"),
+        ))
+        .await
+        .expect("store");
+        let processor = Arc::new(leani_testkit::OrderedLedgerProcessor::default());
+        store
+            .register_processor(processor.descriptor())
+            .await
+            .expect("register processor");
+        store
+            .create_consumer_with_credential(
+                processor.descriptor(),
+                "reader",
+                ConsumerRole::BestEffort,
+                ConsumerStartPosition::EarliestRetained,
+                Duration::from_secs(30),
+                TEST_CREDENTIAL,
+            )
+            .await
+            .expect("consumer");
+        apply_finalized_blocks(&store, processor.as_ref(), 1..=2).await;
+        let cursors = [1, 2]
+            .map(|sequence| encode_stream_cursor_for(&store, processor.descriptor(), sequence));
+        let configured: Arc<dyn Processor> = processor;
+        let app = router_with_processors(store, vec![configured], Vec::new(), ApiConfig::default())
+            .expect("router");
+        let path = "/v1/processors/synthetic-ledger/consumers/reader";
+        let acknowledge = |cursor: &str| {
+            consumer_request(
+                &Method::POST,
+                &format!("{path}/ack"),
+                Some(TEST_CREDENTIAL),
+                Some(&json!({ "cursor": cursor })),
+            )
+        };
+        let read = |limit: usize| {
+            consumer_request(
+                &Method::GET,
+                &format!("{path}/changes?limit={limit}"),
+                Some(TEST_CREDENTIAL),
+                None,
+            )
+        };
+        let (status, body) = send(&app, acknowledge(&cursors[1])).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["error"]["code"], "acknowledgement_beyond_delivered");
+
+        let (status, page) = send(&app, read(1)).await;
+        assert_eq!(status, StatusCode::OK, "{page}");
+        assert_eq!(page["data"][0]["sequence"], "1");
+        let (_, consumer) = send(&app, consumer_request(&Method::GET, path, None, None)).await;
+        assert_eq!(consumer["deliveredSequence"], "1");
+        let (status, body) = send(&app, acknowledge(&cursors[1])).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["error"]["code"], "acknowledgement_beyond_delivered");
+        let (status, body) = send(&app, acknowledge(&cursors[0])).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+
+        let (_, page) = send(&app, read(10)).await;
+        assert_eq!(page["data"][0]["sequence"], "2");
+        let (status, body) = send(&app, acknowledge(&cursors[1])).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["acknowledgedSequence"], "2");
+        assert_eq!(body["deliveredSequence"], "2");
+    }
+
+    #[tokio::test]
+    async fn live_batches_keep_blocks_whole_and_acknowledgements_end_them() {
+        // Audit M-A3: a page read that ended inside a block sent that block
+        // in two batches, and a destination could commit and acknowledge
+        // half of it. A page of 4 ends inside block 2; the next read reaches
+        // the head.
+        stream_two_whole_live_blocks(3).await;
+        // Review 1, minor 2: a page of 5 ends exactly at the head, so only
+        // the empty read after it shows that block 2 is complete.
+        stream_two_whole_live_blocks(4).await;
+    }
+
+    #[tokio::test]
+    async fn a_live_block_past_the_event_limit_fails_without_reading_on() {
+        // Review 1, minor 2: a read that ended inside a block too large for
+        // one batch must not wait for the rest of it, which would buffer
+        // the whole block.
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = SqliteStore::open(leani_store_sqlite::StoreConfig::new(
+            directory.path().join("node.sqlite"),
+        ))
+        .await
+        .expect("store");
+        let processor = FanOutCounter(leani_testkit::BlockLocalCounter::default());
+        apply_finalized_blocks(&store, &processor, 1..=2).await;
+        let second_block = store
+            .changes(processor.descriptor(), ChainId(1), 2, 10)
+            .await
+            .expect("block 2")
+            .into_iter()
+            .collect::<VecDeque<_>>();
+        assert_eq!(second_block.len(), 3);
+        let batch = |maximum_events| {
+            whole_live_block(&second_block, false, maximum_events).map(|(_, records)| records)
+        };
+        assert_eq!(batch(3), None);
+        assert_eq!(batch(2), Some(3));
+    }
+
+    /// Stream two fan-out blocks, of 2 and 3 records, through a live stream
+    /// whose batches hold `maximum_events`, and acknowledge them.
+    #[allow(clippy::too_many_lines)]
+    async fn stream_two_whole_live_blocks(maximum_events: u64) {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = SqliteStore::open(leani_store_sqlite::StoreConfig::new(
+            directory.path().join("node.sqlite"),
+        ))
+        .await
+        .expect("store");
+        let counter = leani_testkit::BlockLocalCounter::default();
+        let lifecycle =
+            acknowledged_delivery(counter.descriptor().lifecycle.clone(), "destination");
+        let processor = Arc::new(FanOutCounter(counter.with_lifecycle(lifecycle)));
+        store
+            .register_processor(processor.descriptor())
+            .await
+            .expect("register processor");
+        let stream_id = default_delivery_stream_id(processor.descriptor());
+        store
+            .create_consumer_in_stream(
+                processor.descriptor(),
+                &stream_id,
+                "destination",
+                ConsumerRole::Required,
+                ConsumerStartPosition::EarliestRetained,
+                Duration::from_secs(30),
+            )
+            .await
+            .expect("consumer");
+        // A page read holds one record more than a batch.
+        apply_finalized_blocks(&store, processor.as_ref(), 1..=2).await;
+        let configured: Arc<dyn Processor> = processor;
+        let app = router_with_processors(
+            store,
+            vec![configured],
+            Vec::new(),
+            ApiConfig {
+                live_batch_limits: DeliveryBatchLimits {
+                    maximum_events,
+                    ..DeliveryBatchLimits::live_default()
+                },
+                ..ApiConfig::default()
+            },
+        )
+        .expect("router");
+        let path = "/v1/processors/synthetic-counter/streams/live/consumers/destination";
+        let stream = app
+            .clone()
+            .oneshot(get_request(&format!("{path}/stream")))
+            .await
+            .expect("stream");
+        assert_eq!(stream.status(), StatusCode::OK);
+        let mut body = stream.into_body().into_data_stream();
+        let mut buffered = Vec::new();
+        let hello = next_ndjson_record(&mut body, &mut buffered).await;
+        let token = hello["sessionToken"]
+            .as_str()
+            .expect("session token")
+            .to_owned();
+        let mut batches = Vec::new();
+        let mut delivered = 0;
+        while delivered < 5 {
+            let batch = next_ndjson_record(&mut body, &mut buffered).await;
+            assert_eq!(batch["type"], "batch", "{batch}");
+            let changes = batch["changes"].as_array().expect("changes").len();
+            delivered += changes;
+            batches.push((
+                batch["throughBlock"].as_u64().expect("block"),
+                changes,
+                batch,
+            ));
+        }
+        assert_eq!(
+            batches
+                .iter()
+                .map(|(block, changes, _)| (*block, *changes))
+                .collect::<Vec<_>>(),
+            [(1, 2), (2, 3)]
+        );
+        let second = &batches[1].2;
+        let acknowledge = |cursor: &Value| {
+            Request::post(format!("{path}/ack"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(CONSUMER_SESSION_HEADER, token.as_str())
+                .body(Body::from(json!({ "cursor": cursor }).to_string()))
+                .expect("acknowledgement request")
+        };
+        let (status, response) = send(&app, acknowledge(&second["changes"][0]["cursor"])).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{response}");
+        assert_eq!(response["error"]["code"], "acknowledgement_mid_block");
+        let (status, response) = send(&app, acknowledge(&second["acknowledgeableCursor"])).await;
+        assert_eq!(status, StatusCode::OK, "{response}");
+        assert_eq!(response["acknowledgedSequence"], "5");
+        drop(body);
+    }
+
+    #[tokio::test]
+    async fn change_streams_resume_from_last_event_id() {
+        // Audit SSE-1: EventSource reconnects with Last-Event-ID, which the
+        // stream ignored, so it restarted from the oldest retained change.
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = SqliteStore::open(leani_store_sqlite::StoreConfig::new(
+            directory.path().join("node.sqlite"),
+        ))
+        .await
+        .expect("store");
+        let processor = Arc::new(leani_testkit::OrderedLedgerProcessor::default());
+        apply_finalized_blocks(&store, processor.as_ref(), 1..=3).await;
+        let cursors = [1, 2]
+            .map(|sequence| encode_stream_cursor_for(&store, processor.descriptor(), sequence));
+        let configured: Arc<dyn Processor> = processor;
+        let app = router_with_processors(store, vec![configured], Vec::new(), ApiConfig::default())
+            .expect("router");
+        for (query, last_event_id, first) in [
+            (String::new(), cursors[0].as_str(), "2"),
+            // An explicit `after` wins.
+            (format!("?after={}", cursors[1]), cursors[0].as_str(), "3"),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::get(format!("/v1/processors/synthetic-ledger/stream{query}"))
+                        .header("last-event-id", last_event_id)
+                        .body(Body::empty())
+                        .expect("request"),
+                )
+                .await
+                .expect("response");
+            assert_eq!(response.status(), StatusCode::OK);
+            let mut body = response.into_body().into_data_stream();
+            assert_eq!(
+                first_sse_change(&mut body).await["sequence"],
+                first,
+                "{query}"
+            );
+        }
+        let (status, body) = send(
+            &app,
+            Request::get("/v1/processors/synthetic-ledger/stream")
+                .header("last-event-id", "not-a-cursor")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["error"]["code"], "cursor_invalid");
+    }
+
+    #[tokio::test]
+    async fn finalized_only_snapshots_carry_no_follow_boundary() {
+        // Audit M-A2: a snapshot of a finalized_only processor still offered
+        // a boundary cursor to follow, which query-and-follow refuses.
+        use leani_processor_api::PublicationPolicy;
+
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = SqliteStore::open(leani_store_sqlite::StoreConfig::new(
+            directory.path().join("node.sqlite"),
+        ))
+        .await
+        .expect("store");
+        let processor = Arc::new(
+            leani_testkit::BlockLocalCounter::default()
+                .with_publication(PublicationPolicy::FinalizedOnly),
+        );
+        apply_finalized_blocks(&store, processor.as_ref(), 1..=2).await;
+        let configured: Arc<dyn Processor> = processor;
+        let app = router_with_processors(store, vec![configured], Vec::new(), ApiConfig::default())
+            .expect("router");
+        let path = "/v1/processors/synthetic-counter/collections/counter.blocks/entities";
+        let (status, first) = send(
+            &app,
+            Request::post(path)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"limit":1}"#))
+                .expect("request"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{first}");
+        let next = first["nextCursor"].as_str().expect("next page").to_owned();
+        let (status, second) = send(&app, get_request(&format!("{path}?cursor={next}"))).await;
+        assert_eq!(status, StatusCode::OK, "{second}");
+        for page in [&first, &second] {
+            assert_eq!(page["data"].as_array().map(Vec::len), Some(1));
+            assert_eq!(page["boundaryCursor"], Value::Null, "{page}");
+            assert_eq!(page["recovery"]["follow"], Value::Null, "{page}");
+        }
+        // Reading current output without a snapshot offers no boundary.
+        let (status, current) = send(&app, get_request(path)).await;
+        assert_eq!(status, StatusCode::OK, "{current}");
+        assert!(current.get("boundaryCursor").is_none(), "{current}");
+    }
+
+    #[tokio::test]
+    async fn portable_savepoint_refusals_have_stable_codes() {
+        // Task 2 review: a full physical store budget answered 500.
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = SqliteStore::open(leani_store_sqlite::StoreConfig::new(
+            directory.path().join("node.sqlite"),
+        ))
+        .await
+        .expect("store");
+        let processor = Arc::new(leani_testkit::BlockLocalCounter::default());
+        apply_finalized_blocks(&store, processor.as_ref(), 1..=1).await;
+        let configured: Arc<dyn Processor> = processor;
+        let app = router_with_processors(store, vec![configured], Vec::new(), ApiConfig::default())
+            .expect("router");
+        let create = |id: &str| {
+            Request::post("/v1/processors/synthetic-counter/savepoints")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(json!({ "id": id }).to_string()))
+                .expect("savepoint request")
+        };
+        for index in 1..=16 {
+            let (status, body) = send(&app, create(&format!("savepoint-{index}"))).await;
+            assert_eq!(status, StatusCode::CREATED, "{body}");
+        }
+        let (status, body) = send(&app, create("savepoint-17")).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["error"]["code"], "savepoint_limit");
+
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = SqliteStore::open(
+            leani_store_sqlite::StoreConfig::new(directory.path().join("node.sqlite"))
+                .with_storage_budget(leani_store_sqlite::StoreStorageBudget {
+                    maximum_physical_bytes: 1,
+                }),
+        )
+        .await
+        .expect("store");
+        // Private state only, so the apply itself needs no physical admission.
+        let processor = Arc::new(
+            leani_testkit::BlockLocalCounter::default()
+                .with_output_none()
+                .with_delivery_none(),
+        );
+        apply_finalized_blocks(&store, processor.as_ref(), 1..=1).await;
+        let configured: Arc<dyn Processor> = processor;
+        let app = router_with_processors(store, vec![configured], Vec::new(), ApiConfig::default())
+            .expect("router");
+        let (status, body) = send(&app, create("over-budget")).await;
+        assert_eq!(status, StatusCode::INSUFFICIENT_STORAGE, "{body}");
+        assert_eq!(body["error"]["code"], "physical_storage_limit");
+        assert_eq!(body["error"]["retryable"], false);
     }
 
     #[tokio::test]
@@ -10077,8 +11381,8 @@ mod tests {
         .expect("store");
         let processor = Arc::new(BlobsProcessor::default());
         let first_block = processor.schedule().first_block();
-        seed_blob_block(&store, &processor, first_block, 2).await;
-        seed_blob_block(&store, &processor, first_block + 1, 0).await;
+        seed_blob_block(&store, &processor, first_block, 2, Finality::Finalized).await;
+        seed_blob_block(&store, &processor, first_block + 1, 0, Finality::Finalized).await;
         let router = router(store, processor, ApiConfig::default()).expect("router");
 
         let first_page = router
@@ -10908,6 +12212,117 @@ mod tests {
             .expect("consumer response");
         assert_eq!(consumer.status(), StatusCode::OK);
         drop(image);
+    }
+
+    /// Headers a browser sends for a navigation of a hidden frame to another
+    /// site's URL.
+    const CROSS_SITE_FRAME: [(&str, &str); 3] = [
+        ("sec-fetch-site", "cross-site"),
+        ("sec-fetch-mode", "navigate"),
+        ("sec-fetch-dest", "iframe"),
+    ];
+
+    #[tokio::test]
+    async fn cross_site_navigations_cannot_open_a_consumer_stream() {
+        // Task 13 review: a hidden frame or a redirect of another site's page
+        // navigates without an `Origin`, so it passed the subresource check
+        // and took a consumer's session lease.
+        let (router, _directory) = blobs_router(ApiConfig::default()).await;
+        let top_level: [(&str, &str); 4] = [
+            ("sec-fetch-site", "cross-site"),
+            ("sec-fetch-mode", "navigate"),
+            ("sec-fetch-dest", "document"),
+            ("sec-fetch-user", "?1"),
+        ];
+        let same_site: [(&str, &str); 3] = [
+            ("sec-fetch-site", "same-site"),
+            ("sec-fetch-mode", "navigate"),
+            ("sec-fetch-dest", "document"),
+        ];
+        let streams = [
+            "/v1/processors/blobs-money/streams/live/consumers/destination/stream",
+            "/v1/backfill-subscriptions/repair-1/consumers/destination/stream",
+        ];
+        for path in streams {
+            for headers in [&CROSS_SITE_FRAME[..], &top_level[..], &same_site[..]] {
+                for method in [Method::GET, Method::HEAD] {
+                    let (status, body) = send(&router, with_headers(&method, path, headers)).await;
+                    assert_eq!(status, StatusCode::FORBIDDEN, "{method} {path} {headers:?}");
+                    if method == Method::GET {
+                        assert_eq!(body["error"]["code"], "cross_site_request", "{path}");
+                    }
+                }
+            }
+            // The SDK and curl, a typed address, the node's own pages, and a
+            // CORS request from an allowed origin still reach the route.
+            let allowed: [&[(&str, &str)]; 4] = [
+                &[],
+                &[("sec-fetch-site", "none"), ("sec-fetch-mode", "navigate")],
+                &[
+                    ("sec-fetch-site", "same-origin"),
+                    ("sec-fetch-mode", "cors"),
+                ],
+                &[
+                    ("origin", "http://localhost:5173"),
+                    ("sec-fetch-site", "same-site"),
+                    ("sec-fetch-mode", "cors"),
+                ],
+            ];
+            for headers in allowed {
+                let (status, body) = send(&router, with_headers(&Method::GET, path, headers)).await;
+                assert_ne!(status, StatusCode::FORBIDDEN, "{path} {headers:?}: {body}");
+            }
+        }
+        // Other routes still let navigations through.
+        let (status, _) = send(
+            &router,
+            with_headers(&Method::GET, "/v1/status", &CROSS_SITE_FRAME),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        // End to end: the frame does not take the lease, the consumer does.
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = SqliteStore::open(leani_store_sqlite::StoreConfig::new(
+            directory.path().join("node.sqlite"),
+        ))
+        .await
+        .expect("store");
+        let counter = leani_testkit::BlockLocalCounter::default();
+        let lifecycle =
+            acknowledged_delivery(counter.descriptor().lifecycle.clone(), "destination");
+        let processor = Arc::new(counter.with_lifecycle(lifecycle));
+        store
+            .register_processor(processor.descriptor())
+            .await
+            .expect("register processor");
+        store
+            .create_consumer_in_stream(
+                processor.descriptor(),
+                &default_delivery_stream_id(processor.descriptor()),
+                "destination",
+                ConsumerRole::Required,
+                ConsumerStartPosition::EarliestRetained,
+                Duration::from_secs(30),
+            )
+            .await
+            .expect("consumer");
+        let configured: Arc<dyn Processor> = processor;
+        let app = router_with_processors(store, vec![configured], Vec::new(), ApiConfig::default())
+            .expect("router");
+        let path = "/v1/processors/synthetic-counter/streams/live/consumers/destination/stream";
+        let frame = app
+            .clone()
+            .oneshot(with_headers(&Method::GET, path, &CROSS_SITE_FRAME))
+            .await
+            .expect("frame response");
+        assert_eq!(frame.status(), StatusCode::FORBIDDEN);
+        let consumer = app
+            .oneshot(get_request(path))
+            .await
+            .expect("consumer response");
+        assert_eq!(consumer.status(), StatusCode::OK);
+        drop(frame);
     }
 
     #[tokio::test]

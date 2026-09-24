@@ -250,7 +250,10 @@ export interface paths {
          * Snapshot processor entities
          * @description Copies the matching retained output into a stable, short-lived
          *     snapshot and returns its first page. Read later pages with GET and the
-         *     page's `nextCursor`, and release the snapshot when done.
+         *     page's `nextCursor`, and release the snapshot when done. A
+         *     `finalized_only` processor's snapshot holds blocks whose changes are
+         *     not published yet, so it offers no boundary to follow:
+         *     `boundaryCursor` and `recovery.follow` are null.
          */
         post: operations["createProcessorEntitySnapshot"];
         delete?: never;
@@ -430,11 +433,21 @@ export interface paths {
             };
             cookie?: never;
         };
-        /** Read a durable consumer */
+        /**
+         * Read a durable consumer
+         * @description Administrative: only the bearer token protects it, whether or not the
+         *     consumer has a credential, as for the consumer list. A credential
+         *     isolates applications on the consumer-scoped delivery routes.
+         */
         get: operations["getDurableConsumer"];
         put?: never;
         post?: never;
-        /** Revoke a durable consumer */
+        /**
+         * Revoke a durable consumer
+         * @description Administrative: only the bearer token protects it, whether or not the
+         *     consumer has a credential, so an operator can revoke a consumer whose
+         *     credential is lost.
+         */
         delete: operations["revokeDurableConsumer"];
         options?: never;
         head?: never;
@@ -446,8 +459,12 @@ export interface paths {
             query?: never;
             header?: {
                 /**
-                 * @description Consumer-scoped credential. An administrator bearer credential can be
-                 *     used instead on the protected listener.
+                 * @description The consumer's credential. A consumer created with one needs it on
+                 *     every consumer-scoped request, in addition to any bearer token, and
+                 *     gets 403 `forbidden` without it or with another; the node compares
+                 *     it in constant time. A consumer without one, such as a configured
+                 *     consumer, takes none. Credentials created before 32 characters were
+                 *     required keep working.
                  */
                 "x-leani-consumer-credential"?: components["parameters"]["ConsumerCredential"];
             };
@@ -459,7 +476,12 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** Renew a durable consumer lease */
+        /**
+         * Renew a durable consumer lease
+         * @description A split live stream fences renewal by session, so its processors get
+         *     409 `consumer_session_required`; renew through
+         *     `/streams/live/consumers/{consumer}/lease` instead.
+         */
         post: operations["renewDurableConsumerLease"];
         delete?: never;
         options?: never;
@@ -472,8 +494,12 @@ export interface paths {
             query?: never;
             header?: {
                 /**
-                 * @description Consumer-scoped credential. An administrator bearer credential can be
-                 *     used instead on the protected listener.
+                 * @description The consumer's credential. A consumer created with one needs it on
+                 *     every consumer-scoped request, in addition to any bearer token, and
+                 *     gets 403 `forbidden` without it or with another; the node compares
+                 *     it in constant time. A consumer without one, such as a configured
+                 *     consumer, takes none. Credentials created before 32 characters were
+                 *     required keep working.
                  */
                 "x-leani-consumer-credential"?: components["parameters"]["ConsumerCredential"];
             };
@@ -498,8 +524,12 @@ export interface paths {
             query?: never;
             header?: {
                 /**
-                 * @description Consumer-scoped credential. An administrator bearer credential can be
-                 *     used instead on the protected listener.
+                 * @description The consumer's credential. A consumer created with one needs it on
+                 *     every consumer-scoped request, in addition to any bearer token, and
+                 *     gets 403 `forbidden` without it or with another; the node compares
+                 *     it in constant time. A consumer without one, such as a configured
+                 *     consumer, takes none. Credentials created before 32 characters were
+                 *     required keep working.
                  */
                 "x-leani-consumer-credential"?: components["parameters"]["ConsumerCredential"];
             };
@@ -511,7 +541,14 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** Acknowledge durable consumer changes */
+        /**
+         * Acknowledge durable consumer changes
+         * @description A cursor beyond the consumer's delivered sequence gets 409
+         *     `acknowledgement_beyond_delivered`. A split live stream fences
+         *     acknowledgement by session, so its processors get 409
+         *     `consumer_session_required`; acknowledge through
+         *     `/streams/live/consumers/{consumer}/ack` instead.
+         */
         post: operations["acknowledgeDurableConsumerChanges"];
         delete?: never;
         options?: never;
@@ -582,8 +619,12 @@ export interface paths {
             query?: never;
             header?: {
                 /**
-                 * @description Consumer-scoped credential. An administrator bearer credential can be
-                 *     used instead on the protected listener.
+                 * @description The consumer's credential. A consumer created with one needs it on
+                 *     every consumer-scoped request, in addition to any bearer token, and
+                 *     gets 403 `forbidden` without it or with another; the node compares
+                 *     it in constant time. A consumer without one, such as a configured
+                 *     consumer, takes none. Credentials created before 32 characters were
+                 *     required keep working.
                  */
                 "x-leani-consumer-credential"?: components["parameters"]["ConsumerCredential"];
             };
@@ -593,7 +634,13 @@ export interface paths {
             };
             cookie?: never;
         };
-        /** Stream the dedicated live lane for a durable consumer */
+        /**
+         * Stream the dedicated live lane for a durable consumer
+         * @description Each batch holds one whole block's commit, and records the consumer's
+         *     delivered sequence through it. A request whose `Sec-Fetch-Site` is
+         *     `cross-site` or `same-site` without an allowed `Origin`, such as a
+         *     navigation of another site's frame, gets 403 `cross_site_request`.
+         */
         get: operations["streamLiveDurableConsumer"];
         put?: never;
         post?: never;
@@ -608,8 +655,12 @@ export interface paths {
             query?: never;
             header?: {
                 /**
-                 * @description Consumer-scoped credential. An administrator bearer credential can be
-                 *     used instead on the protected listener.
+                 * @description The consumer's credential. A consumer created with one needs it on
+                 *     every consumer-scoped request, in addition to any bearer token, and
+                 *     gets 403 `forbidden` without it or with another; the node compares
+                 *     it in constant time. A consumer without one, such as a configured
+                 *     consumer, takes none. Credentials created before 32 characters were
+                 *     required keep working.
                  */
                 "x-leani-consumer-credential"?: components["parameters"]["ConsumerCredential"];
             };
@@ -621,7 +672,13 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** Acknowledge a live-lane consumer batch */
+        /**
+         * Acknowledge a live-lane consumer batch
+         * @description The cursor must end a block's commit, as a batch's
+         *     `acknowledgeableCursor` does, and gets 409
+         *     `acknowledgement_mid_block` otherwise. A cursor beyond the consumer's
+         *     delivered sequence gets 409 `acknowledgement_beyond_delivered`.
+         */
         post: operations["acknowledgeLiveDurableConsumer"];
         delete?: never;
         options?: never;
@@ -634,8 +691,12 @@ export interface paths {
             query?: never;
             header?: {
                 /**
-                 * @description Consumer-scoped credential. An administrator bearer credential can be
-                 *     used instead on the protected listener.
+                 * @description The consumer's credential. A consumer created with one needs it on
+                 *     every consumer-scoped request, in addition to any bearer token, and
+                 *     gets 403 `forbidden` without it or with another; the node compares
+                 *     it in constant time. A consumer without one, such as a configured
+                 *     consumer, takes none. Credentials created before 32 characters were
+                 *     required keep working.
                  */
                 "x-leani-consumer-credential"?: components["parameters"]["ConsumerCredential"];
             };
@@ -661,8 +722,12 @@ export interface paths {
             query?: never;
             header?: {
                 /**
-                 * @description Consumer-scoped credential. An administrator bearer credential can be
-                 *     used instead on the protected listener.
+                 * @description The consumer's credential. A consumer created with one needs it on
+                 *     every consumer-scoped request, in addition to any bearer token, and
+                 *     gets 403 `forbidden` without it or with another; the node compares
+                 *     it in constant time. A consumer without one, such as a configured
+                 *     consumer, takes none. Credentials created before 32 characters were
+                 *     required keep working.
                  */
                 "x-leani-consumer-credential"?: components["parameters"]["ConsumerCredential"];
             };
@@ -687,8 +752,12 @@ export interface paths {
             query?: never;
             header?: {
                 /**
-                 * @description Consumer-scoped credential. An administrator bearer credential can be
-                 *     used instead on the protected listener.
+                 * @description The consumer's credential. A consumer created with one needs it on
+                 *     every consumer-scoped request, in addition to any bearer token, and
+                 *     gets 403 `forbidden` without it or with another; the node compares
+                 *     it in constant time. A consumer without one, such as a configured
+                 *     consumer, takes none. Credentials created before 32 characters were
+                 *     required keep working.
                  */
                 "x-leani-consumer-credential"?: components["parameters"]["ConsumerCredential"];
             };
@@ -698,7 +767,14 @@ export interface paths {
             };
             cookie?: never;
         };
-        /** Stream changes from one backfill subscription */
+        /**
+         * Stream changes from one backfill subscription
+         * @description Each batch and the completion record the consumer's delivered
+         *     sequence through their acknowledgement boundary. A request whose
+         *     `Sec-Fetch-Site` is `cross-site` or `same-site` without an allowed
+         *     `Origin`, such as a navigation of another site's frame, gets 403
+         *     `cross_site_request`.
+         */
         get: operations["streamBackfillConsumer"];
         put?: never;
         post?: never;
@@ -713,8 +789,12 @@ export interface paths {
             query?: never;
             header?: {
                 /**
-                 * @description Consumer-scoped credential. An administrator bearer credential can be
-                 *     used instead on the protected listener.
+                 * @description The consumer's credential. A consumer created with one needs it on
+                 *     every consumer-scoped request, in addition to any bearer token, and
+                 *     gets 403 `forbidden` without it or with another; the node compares
+                 *     it in constant time. A consumer without one, such as a configured
+                 *     consumer, takes none. Credentials created before 32 characters were
+                 *     required keep working.
                  */
                 "x-leani-consumer-credential"?: components["parameters"]["ConsumerCredential"];
             };
@@ -726,7 +806,13 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** Acknowledge a backfill subscription batch */
+        /**
+         * Acknowledge a backfill subscription batch
+         * @description The cursor must be a batch's `acknowledgeableCursor` or the
+         *     completion's `cursor` (409 `acknowledgement_invalid` otherwise), and
+         *     not beyond the consumer's delivered sequence (409
+         *     `acknowledgement_beyond_delivered`).
+         */
         post: operations["acknowledgeBackfillConsumer"];
         delete?: never;
         options?: never;
@@ -739,8 +825,12 @@ export interface paths {
             query?: never;
             header?: {
                 /**
-                 * @description Consumer-scoped credential. An administrator bearer credential can be
-                 *     used instead on the protected listener.
+                 * @description The consumer's credential. A consumer created with one needs it on
+                 *     every consumer-scoped request, in addition to any bearer token, and
+                 *     gets 403 `forbidden` without it or with another; the node compares
+                 *     it in constant time. A consumer without one, such as a configured
+                 *     consumer, takes none. Credentials created before 32 characters were
+                 *     required keep working.
                  */
                 "x-leani-consumer-credential"?: components["parameters"]["ConsumerCredential"];
             };
@@ -828,7 +918,15 @@ export interface paths {
         /** List backfill subscriptions */
         get: operations["listBackfillSubscriptions"];
         put?: never;
-        /** Create a backfill subscription */
+        /**
+         * Create a backfill subscription
+         * @description A new subscription's consumer `credential` holds 32 to 512 printable
+         *     ASCII characters without spaces (400 otherwise). Re-submitting an
+         *     existing subscription's request unchanged returns its status, even
+         *     with a credential from before that rule. The credential enters the
+         *     request's idempotency identity, an unkeyed BLAKE3 hash of the whole
+         *     request that the node keeps, so use a random one.
+         */
         post: operations["createBackfillSubscription"];
         delete?: never;
         options?: never;
@@ -1408,7 +1506,10 @@ export interface components {
             data: components["schemas"]["GenericOutputEntity"][];
             nextCursor: components["schemas"]["Cursor"] | null;
             snapshotId: string;
-            /** @description Null when the processor has delivery disabled. */
+            /**
+             * @description Null when the processor has delivery disabled or is
+             *     `finalized_only`, whose retained state holds unpublished blocks.
+             */
             boundaryCursor: components["schemas"]["Cursor"] | null;
             rowCount: components["schemas"]["DecimalQuantity"];
             /** @description Snapshot accounting bytes, including entity keys and row overhead. */
@@ -1444,6 +1545,13 @@ export interface components {
                 cursor: components["schemas"]["Cursor"];
             };
             leaseTtlSeconds: number;
+            /**
+             * @description A random secret of 32 to 512 printable ASCII characters without
+             *     spaces, such as `openssl rand -hex 32`. Only a hash keyed with the
+             *     node's secret is stored. Every consumer-scoped request then needs
+             *     it. An existing consumer ID gets 409 `consumer_exists` whatever
+             *     the credential.
+             */
             credential: string;
         };
         DurableConsumer: {
@@ -1454,6 +1562,10 @@ export interface components {
             /** @enum {string} */
             state: "active" | "reset_required" | "revoked";
             acknowledgedSequence: components["schemas"]["DecimalQuantity"];
+            /**
+             * @description The last sequence a page read or stream batch handed to this
+             *     consumer; acknowledgement cannot pass it.
+             */
             deliveredSequence: components["schemas"]["DecimalQuantity"];
             acknowledgedCursor: components["schemas"]["Cursor"];
             deliveredCursor: components["schemas"]["Cursor"];
@@ -1699,8 +1811,12 @@ export interface components {
         Collection: string;
         Consumer: string;
         /**
-         * @description Consumer-scoped credential. An administrator bearer credential can be
-         *     used instead on the protected listener.
+         * @description The consumer's credential. A consumer created with one needs it on
+         *     every consumer-scoped request, in addition to any bearer token, and
+         *     gets 403 `forbidden` without it or with another; the node compares
+         *     it in constant time. A consumer without one, such as a configured
+         *     consumer, takes none. Credentials created before 32 characters were
+         *     required keep working.
          */
         ConsumerCredential: string;
         /**
@@ -1976,7 +2092,14 @@ export interface operations {
                 /** @description Opaque cursor of the last fully committed event. */
                 after?: components["parameters"]["After"];
             };
-            header?: never;
+            header?: {
+                /**
+                 * @description The id of the last event received, which is its cursor, as an
+                 *     EventSource sends it when it reconnects. The stream resumes after
+                 *     it when `after` is absent.
+                 */
+                "Last-Event-ID"?: components["schemas"]["Cursor"];
+            };
             path: {
                 processor: components["parameters"]["Processor"];
             };
@@ -2300,6 +2423,30 @@ export interface operations {
                     "application/json": components["schemas"]["PortableSavepoint"];
                 };
             };
+            /**
+             * @description `savepoint_limit`: the processor instance already keeps 16
+             *     savepoints; delete one first. `savepoint_exists`: the ID is taken.
+             */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /**
+             * @description `physical_storage_limit`: the savepoint would exceed the physical
+             *     store budget. Free space or raise the budget first.
+             */
+            507: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
             default: components["responses"]["Error"];
         };
     };
@@ -2468,8 +2615,12 @@ export interface operations {
             query?: never;
             header?: {
                 /**
-                 * @description Consumer-scoped credential. An administrator bearer credential can be
-                 *     used instead on the protected listener.
+                 * @description The consumer's credential. A consumer created with one needs it on
+                 *     every consumer-scoped request, in addition to any bearer token, and
+                 *     gets 403 `forbidden` without it or with another; the node compares
+                 *     it in constant time. A consumer without one, such as a configured
+                 *     consumer, takes none. Credentials created before 32 characters were
+                 *     required keep working.
                  */
                 "x-leani-consumer-credential"?: components["parameters"]["ConsumerCredential"];
                 /**
@@ -2506,8 +2657,12 @@ export interface operations {
             };
             header?: {
                 /**
-                 * @description Consumer-scoped credential. An administrator bearer credential can be
-                 *     used instead on the protected listener.
+                 * @description The consumer's credential. A consumer created with one needs it on
+                 *     every consumer-scoped request, in addition to any bearer token, and
+                 *     gets 403 `forbidden` without it or with another; the node compares
+                 *     it in constant time. A consumer without one, such as a configured
+                 *     consumer, takes none. Credentials created before 32 characters were
+                 *     required keep working.
                  */
                 "x-leani-consumer-credential"?: components["parameters"]["ConsumerCredential"];
             };
@@ -2519,7 +2674,11 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description Replay batch; advances only the delivered head. */
+            /**
+             * @description Replay batch after the acknowledgement. Its last change becomes
+             *     the consumer's delivered sequence, which bounds acknowledgement;
+             *     the acknowledgement does not move.
+             */
             200: {
                 headers: {
                     [name: string]: unknown;
@@ -2536,8 +2695,12 @@ export interface operations {
             query?: never;
             header?: {
                 /**
-                 * @description Consumer-scoped credential. An administrator bearer credential can be
-                 *     used instead on the protected listener.
+                 * @description The consumer's credential. A consumer created with one needs it on
+                 *     every consumer-scoped request, in addition to any bearer token, and
+                 *     gets 403 `forbidden` without it or with another; the node compares
+                 *     it in constant time. A consumer without one, such as a configured
+                 *     consumer, takes none. Credentials created before 32 characters were
+                 *     required keep working.
                  */
                 "x-leani-consumer-credential"?: components["parameters"]["ConsumerCredential"];
             };
@@ -2636,8 +2799,12 @@ export interface operations {
             query?: never;
             header?: {
                 /**
-                 * @description Consumer-scoped credential. An administrator bearer credential can be
-                 *     used instead on the protected listener.
+                 * @description The consumer's credential. A consumer created with one needs it on
+                 *     every consumer-scoped request, in addition to any bearer token, and
+                 *     gets 403 `forbidden` without it or with another; the node compares
+                 *     it in constant time. A consumer without one, such as a configured
+                 *     consumer, takes none. Credentials created before 32 characters were
+                 *     required keep working.
                  */
                 "x-leani-consumer-credential"?: components["parameters"]["ConsumerCredential"];
             };
@@ -2664,8 +2831,12 @@ export interface operations {
             query?: never;
             header?: {
                 /**
-                 * @description Consumer-scoped credential. An administrator bearer credential can be
-                 *     used instead on the protected listener.
+                 * @description The consumer's credential. A consumer created with one needs it on
+                 *     every consumer-scoped request, in addition to any bearer token, and
+                 *     gets 403 `forbidden` without it or with another; the node compares
+                 *     it in constant time. A consumer without one, such as a configured
+                 *     consumer, takes none. Credentials created before 32 characters were
+                 *     required keep working.
                  */
                 "x-leani-consumer-credential"?: components["parameters"]["ConsumerCredential"];
             };
@@ -2692,8 +2863,12 @@ export interface operations {
             query?: never;
             header?: {
                 /**
-                 * @description Consumer-scoped credential. An administrator bearer credential can be
-                 *     used instead on the protected listener.
+                 * @description The consumer's credential. A consumer created with one needs it on
+                 *     every consumer-scoped request, in addition to any bearer token, and
+                 *     gets 403 `forbidden` without it or with another; the node compares
+                 *     it in constant time. A consumer without one, such as a configured
+                 *     consumer, takes none. Credentials created before 32 characters were
+                 *     required keep working.
                  */
                 "x-leani-consumer-credential"?: components["parameters"]["ConsumerCredential"];
                 /**
@@ -2726,8 +2901,12 @@ export interface operations {
             query?: never;
             header?: {
                 /**
-                 * @description Consumer-scoped credential. An administrator bearer credential can be
-                 *     used instead on the protected listener.
+                 * @description The consumer's credential. A consumer created with one needs it on
+                 *     every consumer-scoped request, in addition to any bearer token, and
+                 *     gets 403 `forbidden` without it or with another; the node compares
+                 *     it in constant time. A consumer without one, such as a configured
+                 *     consumer, takes none. Credentials created before 32 characters were
+                 *     required keep working.
                  */
                 "x-leani-consumer-credential"?: components["parameters"]["ConsumerCredential"];
                 /**
@@ -2760,8 +2939,12 @@ export interface operations {
             query?: never;
             header?: {
                 /**
-                 * @description Consumer-scoped credential. An administrator bearer credential can be
-                 *     used instead on the protected listener.
+                 * @description The consumer's credential. A consumer created with one needs it on
+                 *     every consumer-scoped request, in addition to any bearer token, and
+                 *     gets 403 `forbidden` without it or with another; the node compares
+                 *     it in constant time. A consumer without one, such as a configured
+                 *     consumer, takes none. Credentials created before 32 characters were
+                 *     required keep working.
                  */
                 "x-leani-consumer-credential"?: components["parameters"]["ConsumerCredential"];
             };
@@ -2788,8 +2971,12 @@ export interface operations {
             query?: never;
             header?: {
                 /**
-                 * @description Consumer-scoped credential. An administrator bearer credential can be
-                 *     used instead on the protected listener.
+                 * @description The consumer's credential. A consumer created with one needs it on
+                 *     every consumer-scoped request, in addition to any bearer token, and
+                 *     gets 403 `forbidden` without it or with another; the node compares
+                 *     it in constant time. A consumer without one, such as a configured
+                 *     consumer, takes none. Credentials created before 32 characters were
+                 *     required keep working.
                  */
                 "x-leani-consumer-credential"?: components["parameters"]["ConsumerCredential"];
             };
@@ -2816,8 +3003,12 @@ export interface operations {
             query?: never;
             header?: {
                 /**
-                 * @description Consumer-scoped credential. An administrator bearer credential can be
-                 *     used instead on the protected listener.
+                 * @description The consumer's credential. A consumer created with one needs it on
+                 *     every consumer-scoped request, in addition to any bearer token, and
+                 *     gets 403 `forbidden` without it or with another; the node compares
+                 *     it in constant time. A consumer without one, such as a configured
+                 *     consumer, takes none. Credentials created before 32 characters were
+                 *     required keep working.
                  */
                 "x-leani-consumer-credential"?: components["parameters"]["ConsumerCredential"];
             };
@@ -2844,8 +3035,12 @@ export interface operations {
             query?: never;
             header?: {
                 /**
-                 * @description Consumer-scoped credential. An administrator bearer credential can be
-                 *     used instead on the protected listener.
+                 * @description The consumer's credential. A consumer created with one needs it on
+                 *     every consumer-scoped request, in addition to any bearer token, and
+                 *     gets 403 `forbidden` without it or with another; the node compares
+                 *     it in constant time. A consumer without one, such as a configured
+                 *     consumer, takes none. Credentials created before 32 characters were
+                 *     required keep working.
                  */
                 "x-leani-consumer-credential"?: components["parameters"]["ConsumerCredential"];
                 /**
@@ -2878,8 +3073,12 @@ export interface operations {
             query?: never;
             header?: {
                 /**
-                 * @description Consumer-scoped credential. An administrator bearer credential can be
-                 *     used instead on the protected listener.
+                 * @description The consumer's credential. A consumer created with one needs it on
+                 *     every consumer-scoped request, in addition to any bearer token, and
+                 *     gets 403 `forbidden` without it or with another; the node compares
+                 *     it in constant time. A consumer without one, such as a configured
+                 *     consumer, takes none. Credentials created before 32 characters were
+                 *     required keep working.
                  */
                 "x-leani-consumer-credential"?: components["parameters"]["ConsumerCredential"];
                 /**

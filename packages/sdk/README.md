@@ -52,7 +52,9 @@ Historical subscription orchestration and unified live/history iterators are
 available from `@smart-byte/leani-sdk/backfill`. Required consumers should commit the
 application transaction before acknowledging the Leani-owned durable cursor.
 Destination writes must be idempotent because a crash between those steps can
-replay a change.
+replay a change. Acknowledge a batch's `ackCursor` (or `acknowledgeableCursor`),
+never a change's own cursor; a backfill session's `deliveryBatches()` yields
+every such boundary with its changes, while `events()` yields changes only.
 
 The browser build assumes a same-origin deployment or a reverse proxy that
 adds the application's CORS policy. Leani does not enable cross-origin access

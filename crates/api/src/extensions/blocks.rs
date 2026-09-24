@@ -9,6 +9,7 @@ use axum::{
 use leani_processor_block_summary::{
     BLOCK_COLLECTION, BLOCK_NUMBER_INDEX_COLLECTION, BlockSummaryEntity, BlockSummaryProcessor,
 };
+use leani_store_sqlite::QuerySnapshotEntity;
 use serde::Serialize;
 
 use crate::{ApiError, QueryContext, QueryExtension};
@@ -90,18 +91,27 @@ async fn latest(
         .processor_cursor()
         .await?
         .ok_or_else(|| ApiError::not_found("no Ethereum block summary has been indexed"))?;
-    let value = context
-        .entity(BLOCK_COLLECTION, &cursor.block_hash.0)
+    let stored = context
+        .output_entity(BLOCK_COLLECTION, &cursor.block_hash.0)
         .await?
         .ok_or_else(|| ApiError::not_found("no Ethereum block summary has been indexed"))?;
-    let entity: BlockSummaryEntity = postcard::from_bytes(&value).map_err(|error| {
+    Ok(Json(LatestBlockSummaryResponse {
+        data: stored_summary(&stored)?,
+    }))
+}
+
+/// A stored summary with the finality its output metadata records now; the
+/// entity keeps the finality its block had when reduced.
+fn stored_summary(stored: &QuerySnapshotEntity) -> Result<PublicBlockSummary, ApiError> {
+    let entity: BlockSummaryEntity = postcard::from_bytes(&stored.value).map_err(|error| {
         ApiError::internal(&format!(
             "stored Ethereum block summary is invalid: {error}"
         ))
     })?;
-    Ok(Json(LatestBlockSummaryResponse {
-        data: entity.into(),
-    }))
+    Ok(PublicBlockSummary {
+        finality: stored.finality.name(),
+        ..PublicBlockSummary::from(entity)
+    })
 }
 
 async fn by_number(
@@ -121,16 +131,11 @@ async fn by_number(
         .entity(BLOCK_NUMBER_INDEX_COLLECTION, &number.to_be_bytes())
         .await?
         .ok_or_else(|| ApiError::not_found("Ethereum block summary is not indexed"))?;
-    let value = context
-        .entity(BLOCK_COLLECTION, &hash)
+    let stored = context
+        .output_entity(BLOCK_COLLECTION, &hash)
         .await?
         .ok_or_else(|| ApiError::internal("block summary number index is inconsistent"))?;
-    let entity: BlockSummaryEntity = postcard::from_bytes(&value).map_err(|error| {
-        ApiError::internal(&format!(
-            "stored Ethereum block summary is invalid: {error}"
-        ))
-    })?;
     Ok(Json(LatestBlockSummaryResponse {
-        data: entity.into(),
+        data: stored_summary(&stored)?,
     }))
 }

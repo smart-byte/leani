@@ -4,7 +4,7 @@
 use std::{collections::BTreeSet, sync::Arc};
 
 use axum::{
-    extract::{Request, State},
+    extract::{MatchedPath, Request, State},
     http::{HeaderMap, Method, StatusCode, header},
     middleware::Next,
     response::{IntoResponse, Response},
@@ -15,6 +15,13 @@ use crate::ApiError;
 /// Marks a mutating request without a JSON body as sent by a Leani client.
 /// A cross-site page cannot add it without a CORS preflight.
 const LEANI_REQUEST_HEADER: &str = "x-leani-request";
+
+/// Routes whose GET opens a durable consumer's stream and takes its session
+/// lease. Nothing navigates to them legitimately.
+const CONSUMER_STREAM_ROUTES: [&str; 2] = [
+    "/v1/processors/{processor}/streams/live/consumers/{consumer}/stream",
+    "/v1/backfill-subscriptions/{subscription}/consumers/{consumer}/stream",
+];
 
 /// Host names and browser origins, besides loopback ones, the API answers.
 #[derive(Debug)]
@@ -39,9 +46,9 @@ pub(crate) fn normalized_origins(values: &BTreeSet<String>) -> BTreeSet<String> 
         .collect()
 }
 
-/// Checks run before routing and authentication, so a web page can neither
-/// read nor change a loopback API through the visitor's browser. A `Host`
-/// name other than `localhost` or an allowed one gets 421: a page that
+/// Checks run before authentication and every handler, so a web page can
+/// neither read nor change a loopback API through the visitor's browser. A
+/// `Host` name other than `localhost` or an allowed one gets 421: a page that
 /// rebinds its own name to 127.0.0.1 still sends that name. An IP address
 /// passes, since no rebinding produces one. An `Origin` that is neither
 /// loopback nor allowed gets 403, streams included. A GET or HEAD that
@@ -49,9 +56,12 @@ pub(crate) fn normalized_origins(values: &BTreeSet<String>) -> BTreeSet<String> 
 /// load, carries no `Origin` and gets 403 by its Fetch Metadata. A mutating
 /// request needs a JSON content type or `x-leani-request: 1`, which a
 /// cross-site page can only send after a CORS preflight the API never
-/// grants, so it gets 415 otherwise. Navigations, and GETs from browsers
-/// without Fetch Metadata, still pass; only the bearer token keeps them off
-/// GET routes with side effects, such as opening a consumer's stream.
+/// grants, so it gets 415 otherwise. Navigations still pass, except to the
+/// two consumer stream routes, which refuse any cross-site or same-site
+/// request without an allowed `Origin`, since a hidden frame or a redirect
+/// would otherwise take a consumer's session lease. Browsers without Fetch
+/// Metadata still reach them; only the bearer token or the consumer's
+/// credential keeps those off.
 pub(crate) async fn guard_browser_requests(
     State(policy): State<Arc<RequestPolicy>>,
     request: Request,
@@ -74,6 +84,12 @@ pub(crate) async fn guard_browser_requests(
             StatusCode::FORBIDDEN,
             "cross_site_request",
             "browser requests from another site are refused unless they navigate",
+        ))
+    } else if opens_consumer_stream_from_another_site(&request) {
+        Some((
+            StatusCode::FORBIDDEN,
+            "cross_site_request",
+            "another site's page cannot open a consumer stream, not even by navigation",
         ))
     } else if !matches!(
         *request.method(),
@@ -106,17 +122,42 @@ pub(crate) async fn guard_browser_requests(
 /// Fetch Metadata, such as the SDK and curl, pass, as do navigations and
 /// same-origin requests.
 fn is_cross_site_subresource(request: &Request) -> bool {
-    let header_is = |name: &str, values: &[&str]| {
-        request.headers().get(name).is_some_and(|value| {
-            values
-                .iter()
-                .any(|expected| value.as_bytes().eq_ignore_ascii_case(expected.as_bytes()))
-        })
-    };
     matches!(*request.method(), Method::GET | Method::HEAD)
         && !request.headers().contains_key(header::ORIGIN)
-        && header_is("sec-fetch-site", &["cross-site", "same-site"])
-        && !header_is("sec-fetch-mode", &["navigate"])
+        && header_is(
+            request.headers(),
+            "sec-fetch-site",
+            &["cross-site", "same-site"],
+        )
+        && !header_is(request.headers(), "sec-fetch-mode", &["navigate"])
+}
+
+/// Whether a page of another site, or of another origin of the same site,
+/// sent this request to a consumer stream route in any mode, navigations
+/// into frames or tabs included. Such a request carries no `Origin`, or the
+/// Origin check has already refused it; one with an allowed `Origin` is a
+/// CORS request of a listed app and passes, as do clients without Fetch
+/// Metadata.
+fn opens_consumer_stream_from_another_site(request: &Request) -> bool {
+    request
+        .extensions()
+        .get::<MatchedPath>()
+        .is_some_and(|path| CONSUMER_STREAM_ROUTES.contains(&path.as_str()))
+        && !request.headers().contains_key(header::ORIGIN)
+        && header_is(
+            request.headers(),
+            "sec-fetch-site",
+            &["cross-site", "same-site"],
+        )
+}
+
+/// Whether the header holds one of `values`, in any case.
+fn header_is(headers: &HeaderMap, name: &str, values: &[&str]) -> bool {
+    headers.get(name).is_some_and(|value| {
+        values
+            .iter()
+            .any(|expected| value.as_bytes().eq_ignore_ascii_case(expected.as_bytes()))
+    })
 }
 
 /// Whether every host the request names, in `Host` headers or an absolute

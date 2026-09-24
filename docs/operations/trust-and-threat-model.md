@@ -77,15 +77,33 @@ runtime exists.
   it with Fetch Metadata (403); mutations need a JSON body or
   `x-leani-request: 1`, and JSON-RPC calls `application/json` (415
   otherwise), which a cross-site page cannot send without a preflight the
-  node never grants; and only POST creates query snapshots;
+  node never grants; only POST creates query snapshots; and a consumer's
+  live or backfill stream route refuses any request that Fetch Metadata
+  marks as cross-site or same-site without an allowed `Origin`, navigations
+  into frames and tabs included (403);
 - a native API bind beyond loopback requires a bearer token, and a JSON-RPC
   bind beyond loopback an explicit opt-in; startup rejects tokens shorter than
   16 characters or other than printable ASCII without spaces, tokens are
   compared in constant time, and CLI help never prints the values of
   `LEANI_API_TOKEN` or `LEANI_CHECKPOINT_URLS`;
 - optional bearer authentication with redacted debug output;
-- random per-consumer bearer credentials stored only as one-way hashes and
-  scoped to that processor instance and consumer identity;
+- per-consumer credentials: a consumer created with one needs it on every
+  consumer-scoped delivery route, streams included, besides any bearer token
+  (403 otherwise); it is compared in constant time, stored as a BLAKE3 hash
+  keyed with a random per-store secret, scoped to that processor instance,
+  stream, and consumer identity, and a new one holds at least 32 printable
+  ASCII characters. A backfill subscription's credential also enters the
+  subscription's idempotency identity, an unkeyed BLAKE3 hash of the whole
+  request. Credentials isolate applications on the delivery routes only:
+  listing, inspecting, and revoking a consumer are administrative
+  operations that only the bearer token protects;
+- consumer session tokens authenticated by a BLAKE3 MAC keyed with the
+  per-store secret, which is drawn once from the operating system's random
+  source and never leaves the store;
+- acknowledgements bounded by what each consumer was delivered, by a page
+  read or a stream batch, and on live streams by block boundaries; the
+  generic consumer routes refuse consumers of split live streams, whose
+  sessions fence renewal and acknowledgement;
 - no CORS layer; administrative routes share the native API listener and its
   bearer authentication, so binding it beyond localhost exposes those routes
   as well;
@@ -115,17 +133,33 @@ runtime exists.
   progress, and a stale or incorrectly sourced weak-subjectivity checkpoint
   can select the wrong consensus history;
 - bearer tokens do not provide transport encryption;
-- two kinds of browser GET still reach a loopback API without the bearer
-  token: navigations from another site's page, including into a frame, and
-  subresource loads from browsers that send no Fetch Metadata. The page
-  cannot read either response, and neither creates a query snapshot, but a
-  GET that opens a consumer's live or backfill stream takes that consumer's
-  session lease, which locks the consumer out while the connection stays
-  open. A bearer token protects consumers from such pages, since a browser
-  never adds it on its own; a consumer credential does not yet, because its
-  header is optional. `allow_unauthenticated_remote` and the
-  `allowed_hosts` and `allowed_origins` lists widen what reaches a listener;
-  keep them to what clients need;
+- two kinds of browser GET still reach the native API without the bearer
+  token: navigations from another site's page to routes other than consumer
+  streams, including into a frame, and subresource loads that carry no Fetch
+  Metadata. Browsers send Fetch Metadata only to potentially trustworthy
+  URLs, which are HTTPS, loopback addresses, and `localhost`, so a node
+  reached over plain HTTP by another name or address, such as a LAN IP with
+  `allow_unauthenticated_remote`, gets none from current browsers either.
+  The page cannot read either response, and neither creates a query
+  snapshot. Without Fetch Metadata, such a GET, a navigation included, can
+  still open the live or backfill stream of a consumer without a credential
+  and take its session lease, which locks the consumer out while the
+  connection stays open. A bearer token, or the consumer's own credential,
+  prevents it, since a browser adds neither on its own. Consumers declared
+  in the node configuration have no credential.
+  `allow_unauthenticated_remote` and the `allowed_hosts` and
+  `allowed_origins` lists widen what reaches a listener; keep them to what
+  clients need;
+- consumer credentials do not guard the administrative routes: whoever holds
+  the bearer token, or any client that reaches the API when none is
+  configured, can list, inspect, and revoke every consumer, as it can reset
+  a live lane;
+- the per-store secret lives in the store: anyone who can read the database
+  or one of its backups can test guesses of consumer credentials offline and
+  make session tokens, and a backfill subscription's idempotency identity,
+  an unkeyed hash of its request, lets them test guesses of that
+  subscription's credential without the secret. Credentials created before
+  the 32-character minimum keep working until their consumer is re-created;
 - a malicious or compromised native processor can exhaust resources, disclose
   node secrets, corrupt process memory through unsafe dependencies, or emit
   plausible but false output;

@@ -6,6 +6,7 @@ use axum::Router;
 use futures::{StreamExt as _, TryStreamExt as _, stream};
 use leani_primitives::{BlockHash, BlockRange, BlockRef, ChainId, ProcessorCursor};
 use leani_processor_api::{Processor, ProcessorDescriptor};
+use leani_store_sqlite::QuerySnapshotEntity;
 use serde::{Deserialize, Serialize};
 
 use crate::{ApiError, ApiState, CoverageResponse, coverage, decode_cursor_payload, encode_cursor};
@@ -146,6 +147,46 @@ impl QueryContext {
             .await?)
     }
 
+    /// Read one entity with the block metadata of its latest write. Its
+    /// finality follows finalization, unlike a finality the processor
+    /// embedded in the value when it reduced the block; its block timestamp
+    /// needs no retained canonical block, which backfilled blocks lack.
+    ///
+    /// # Errors
+    ///
+    /// Returns a store error using the API's stable error envelope.
+    pub async fn output_entity(
+        &self,
+        collection: &str,
+        key: &[u8],
+    ) -> Result<Option<QuerySnapshotEntity>, ApiError> {
+        Ok(self
+            .state
+            .store
+            .output_entity(self.descriptor(), collection, key)
+            .await?)
+    }
+
+    /// Scan like [`Self::scan`], with each entity's block metadata as in
+    /// [`Self::output_entity`].
+    ///
+    /// # Errors
+    ///
+    /// Rejects zero or oversized limits and failed store reads.
+    pub async fn scan_output(
+        &self,
+        collection: &str,
+        after: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<Vec<QuerySnapshotEntity>, ApiError> {
+        self.check_scan_limit(limit)?;
+        Ok(self
+            .state
+            .store
+            .scan_output_entities(self.descriptor(), collection, after, limit)
+            .await?)
+    }
+
     /// Resolve retained canonical block metadata for an entity's block hash.
     ///
     /// # Errors
@@ -202,17 +243,23 @@ impl QueryContext {
         after: Option<&[u8]>,
         limit: usize,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, ApiError> {
+        self.check_scan_limit(limit)?;
+        Ok(self
+            .state
+            .store
+            .scan_entities(self.descriptor(), collection, after, limit)
+            .await?)
+    }
+
+    /// A scan's limit: one page plus a look-ahead item at most.
+    fn check_scan_limit(&self, limit: usize) -> Result<(), ApiError> {
         let maximum = self.state.config.max_page_size.saturating_add(1);
         if limit == 0 || limit > maximum {
             return Err(ApiError::too_expensive(&format!(
                 "extension scan limit must be in 1..={maximum}"
             )));
         }
-        Ok(self
-            .state
-            .store
-            .scan_entities(self.descriptor(), collection, after, limit)
-            .await?)
+        Ok(())
     }
 
     /// Read entity keys from one processor-maintained index.

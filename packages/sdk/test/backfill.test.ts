@@ -287,6 +287,91 @@ describe("backfill subscriptions", () => {
     expect(kinds).toEqual(["pool.price.put"]);
   });
 
+  test("delivery batches carry every acknowledgement boundary with their changes", async () => {
+    // Audit SDK-3: events() drops the batch acknowledgement cursor, and a
+    // batch without changes or the completion yields nothing at all.
+    const acknowledged: string[] = [];
+    const client = createBackfillSubscriptionClient({
+      baseUrl: "http://node.test",
+      fetch: async (input, init) => {
+        const request = new Request(input, init);
+        if (request.method === "DELETE") {
+          return new Response(null, { status: 204 });
+        }
+        if (request.url.endsWith("/ack")) {
+          acknowledged.push(((await request.json()) as { cursor: string }).cursor);
+          return Response.json({ acknowledgedSequence: "1" });
+        }
+        return new Response(
+          chunkedBody([
+            '{"type":"hello","apiVersion":"1","chainId":1,"processor":{"id":"blobs-money","instance":"blobs-production","version":"1.0.0","codeHash":"0x01","configHash":"0x02","genericApi":"processor-v1","changeSchema":"blobs-money.change.v1","queryExtensions":[],"subscriptions":true,"artifactRetention":"none","deliveryOrdering":"block_versioned_idempotent"},"subscriptionId":"repair-1","streamId":"history-1","streamKind":"backfill","publicationRevision":"0","ranges":[{"fromBlock":1,"toBlock":3}],"acknowledgedCursor":"cursor-0","storeEpoch":"00","heartbeatIntervalMs":"15000","sessionToken":"history-session","sessionExpiresAtUnixMs":"1000","leaseTtlMs":"300000"}\n',
+            '{"type":"batch","streamId":"history-1","originKind":"historical_backfill","originId":"repair-1","publicationRevision":"0","fromBlock":1,"throughBlock":1,"processedBlockCount":"1","domainChangeCount":"1","progressUnitCount":"1","rawPayloadBytes":"8","uncompressedEncodedBytes":"32","transmittedBytes":"32","buildDelayMs":"0","firstCursor":"event-1","lastCursor":"event-1","acknowledgeableCursor":"boundary-1","changes":[{"kind":"pool.price.put","cursor":"event-1"}]}\n',
+            '{"type":"batch","streamId":"history-1","originKind":"historical_backfill","originId":"repair-1","publicationRevision":"0","fromBlock":2,"throughBlock":3,"processedBlockCount":"2","domainChangeCount":"0","progressUnitCount":"1","rawPayloadBytes":"0","uncompressedEncodedBytes":"2","transmittedBytes":"2","buildDelayMs":"0","firstCursor":null,"lastCursor":null,"acknowledgeableCursor":"boundary-3","changes":[]}\n',
+            '{"type":"backfill_complete","subscriptionId":"repair-1","streamId":"history-1","ranges":[{"fromBlock":1,"toBlock":3}],"throughBlock":3,"cursor":"complete-4","mode":"fill_missing","disposition":"published_all","requestedBlockCount":"3","coveredBeforeRequestBlockCount":"0","coveredBeforeRequestRanges":[],"newlyProcessedBlockCount":"3","republishedBlockCount":"3","domainChangeCount":"1","preexistingCoverageSkipped":false}\n',
+          ]),
+          { headers: { "content-type": "application/x-ndjson" } },
+        );
+      },
+    });
+    const session = await client.stream<{ kind: string }>("repair-1", "destination");
+    const observed: Array<[string, string[], boolean]> = [];
+    for await (const batch of session.deliveryBatches()) {
+      observed.push([
+        batch.ackCursor,
+        batch.events.map((event) => event.kind),
+        batch.completion !== undefined,
+      ]);
+      await session.acknowledge(batch.ackCursor);
+    }
+    await session.close();
+    expect(observed).toEqual([
+      ["boundary-1", ["pool.price.put"], false],
+      ["boundary-3", [], false],
+      ["complete-4", [], true],
+    ]);
+    expect(acknowledged).toEqual(["boundary-1", "boundary-3", "complete-4"]);
+  });
+
+  test("unified live acknowledgements use the batch boundary, not its last change", async () => {
+    // Audit M-A3: the node refuses a live acknowledgement inside a block.
+    const acknowledged: string[] = [];
+    const client = createBackfillSubscriptionClient({
+      baseUrl: "http://node.test",
+      fetch: async (input, init) => {
+        const request = new Request(input, init);
+        if (request.method === "DELETE") {
+          return new Response(null, { status: 204 });
+        }
+        if (request.url.endsWith("/ack")) {
+          acknowledged.push(((await request.json()) as { cursor: string }).cursor);
+          return Response.json({ acknowledgedSequence: "2" });
+        }
+        return new Response(
+          chunkedBody([
+            '{"type":"hello","apiVersion":"1","chainId":1,"processor":{"id":"prices","instance":"prices","version":"1.0.0","codeHash":"0x01","configHash":"0x02","genericApi":"processor-v1","changeSchema":"prices.change.v1","queryExtensions":[],"subscriptions":true,"artifactRetention":"none","deliveryOrdering":"block_versioned_idempotent"},"streamId":"prices:live","streamKind":"live","acknowledgedCursor":"live-0","storeEpoch":"00","heartbeatIntervalMs":"15000","sessionToken":"live-session","sessionExpiresAtUnixMs":"1000","leaseTtlMs":"300000"}\n',
+            '{"type":"batch","streamId":"prices:live","originKind":"live","originId":"prices","publicationRevision":"0","fromBlock":20,"throughBlock":20,"processedBlockCount":"1","domainChangeCount":"2","progressUnitCount":"1","rawPayloadBytes":"16","uncompressedEncodedBytes":"64","transmittedBytes":"64","buildDelayMs":"0","firstCursor":"live-event-1","lastCursor":"live-event-2","acknowledgeableCursor":"live-block-20","changes":[{"kind":"price.live","cursor":"live-event-1"},{"kind":"price.live","cursor":"live-event-2"}]}\n',
+          ]),
+          { headers: { "content-type": "application/x-ndjson" } },
+        );
+      },
+    });
+    const delivery = await client.subscribe<{ kind: string }>({
+      processor: "prices",
+      consumer: "destination",
+      lanes: { live: true },
+    });
+    for await (const batch of delivery.batches()) {
+      expect(batch.events.map((event) => event.cursor)).toEqual([
+        "live-event-1",
+        "live-event-2",
+      ]);
+      await delivery.acknowledge(batch);
+      break;
+    }
+    await delivery.close();
+    expect(acknowledged).toEqual(["live-block-20"]);
+  });
+
   test("one subscription merges ready live before history and routes lane acknowledgements", async () => {
     const acknowledged: string[] = [];
     const client = createBackfillSubscriptionClient({

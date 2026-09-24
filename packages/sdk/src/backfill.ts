@@ -296,6 +296,16 @@ export interface DeliverySession<THello, TRecord>
 export interface BackfillDeliverySession<T = unknown>
   extends DeliverySession<BackfillStreamHello, BackfillStreamRecord<T>> {
   batches(): AsyncIterable<BackfillStreamBatch<T>>;
+  /**
+   * Every acknowledgement boundary with the changes it covers: each batch,
+   * including one without changes, then the completion. Commit `events`,
+   * then acknowledge `ackCursor`.
+   */
+  deliveryBatches(): AsyncIterable<HistoryDeliveryBatch<T>>;
+  /**
+   * The batches' changes, flattened. They carry no acknowledgement
+   * boundary; acknowledge from `deliveryBatches()` or `batches()`.
+   */
   events(): AsyncIterable<ChangeEnvelope<T>>;
 }
 
@@ -336,6 +346,12 @@ export type UnifiedDeliveryBatch<T = unknown> =
       completion?: BackfillStreamCompletion;
       record: BackfillStreamBatch<T> | BackfillStreamCompletion;
     };
+
+/** One history lane's batch, as `BackfillDeliverySession.deliveryBatches()` yields it. */
+export type HistoryDeliveryBatch<T = unknown> = Extract<
+  UnifiedDeliveryBatch<T>,
+  { laneKind: "history" }
+>;
 
 export interface MultiLaneDelivery<T = unknown> {
   batches(): AsyncIterable<UnifiedDeliveryBatch<T>>;
@@ -897,38 +913,41 @@ function unifiedHistoryLane<T>(
         const next = await connection.next();
         if (next.done) return { done: true, value: undefined };
         if (next.value.type === "heartbeat") continue;
-        if (next.value.type === "backfill_complete") {
-          complete = true;
-          const record = next.value;
-          return {
-            done: false,
-            value: {
-              laneKind: "history",
-              laneId: subscriptionId,
-              streamId: record.streamId,
-              ackCursor: record.cursor,
-              events: [],
-              completion: record,
-              record,
-            },
-          };
-        }
-        const record = next.value;
+        complete = next.value.type === "backfill_complete";
         return {
           done: false,
-          value: {
-            laneKind: "history",
-            laneId: subscriptionId,
-            streamId: record.streamId,
-            ackCursor: record.acknowledgeableCursor,
-            events: record.changes,
-            record,
-          },
+          value: historyDeliveryBatch(subscriptionId, next.value),
         };
       }
     },
     acknowledge: connection.acknowledge,
     close: connection.close,
+  };
+}
+
+/** A history batch or the completion with the cursor that acknowledges it. */
+function historyDeliveryBatch<T>(
+  laneId: string,
+  record: BackfillStreamBatch<T> | BackfillStreamCompletion,
+): HistoryDeliveryBatch<T> {
+  if (record.type === "backfill_complete") {
+    return {
+      laneKind: "history",
+      laneId,
+      streamId: record.streamId,
+      ackCursor: record.cursor,
+      events: [],
+      completion: record,
+      record,
+    };
+  }
+  return {
+    laneKind: "history",
+    laneId,
+    streamId: record.streamId,
+    ackCursor: record.acknowledgeableCursor,
+    events: record.changes,
+    record,
   };
 }
 
@@ -1198,6 +1217,17 @@ async function openBackfillStream<T>(
       }
     }
   };
+  // The stream ends once the completion is acknowledged, so iteration
+  // continues past it rather than closing the session first.
+  const deliveryBatches = async function* (): AsyncGenerator<
+    HistoryDeliveryBatch<T>
+  > {
+    for await (const record of session) {
+      if (record.type !== "heartbeat") {
+        yield historyDeliveryBatch(session.hello.subscriptionId, record);
+      }
+    }
+  };
   const events = async function* (): AsyncGenerator<ChangeEnvelope<T>> {
     for await (const batch of batches()) {
       yield* batch.changes;
@@ -1208,6 +1238,7 @@ async function openBackfillStream<T>(
     acknowledge: session.acknowledge.bind(session),
     close: session.close.bind(session),
     batches,
+    deliveryBatches,
     events,
     [Symbol.asyncIterator]: session[Symbol.asyncIterator].bind(session),
   });

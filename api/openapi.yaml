@@ -13,9 +13,16 @@ info:
     `api.allowed_origins` with 403 `origin_not_allowed`. A GET or HEAD
     without an `Origin` whose `Sec-Fetch-Site` is `cross-site` or
     `same-site` and whose `Sec-Fetch-Mode` is not `navigate` gets 403
-    `cross_site_request`. A POST or DELETE needs
+    `cross_site_request`; on the two consumer stream routes, so does one in
+    any mode, navigations included. A POST or DELETE needs
     `content-type: application/json` or `x-leani-request: 1`, and gets 415
     `unsupported_media_type` otherwise.
+
+    A consumer created with a credential needs it in
+    `x-leani-consumer-credential` on every consumer-scoped delivery route,
+    in addition to any bearer token, and gets 403 `forbidden` without it.
+    Listing, reading, and revoking consumers are administrative: only the
+    bearer token protects them, whether or not a consumer has a credential.
 servers:
   - url: http://127.0.0.1:8080
 security:
@@ -195,6 +202,15 @@ paths:
     get:
       summary: Stream processor changes
       operationId: streamProcessorChanges
+      parameters:
+        - name: Last-Event-ID
+          in: header
+          description: |
+            The id of the last event received, which is its cursor, as an
+            EventSource sends it when it reconnects. The stream resumes after
+            it when `after` is absent.
+          schema:
+            $ref: "#/components/schemas/Cursor"
       responses:
         "200":
           description: |
@@ -260,7 +276,10 @@ paths:
       description: |
         Copies the matching retained output into a stable, short-lived
         snapshot and returns its first page. Read later pages with GET and the
-        page's `nextCursor`, and release the snapshot when done.
+        page's `nextCursor`, and release the snapshot when done. A
+        `finalized_only` processor's snapshot holds blocks whose changes are
+        not published yet, so it offers no boundary to follow:
+        `boundaryCursor` and `recovery.follow` are null.
       requestBody:
         required: true
         content:
@@ -448,6 +467,22 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/PortableSavepoint"
+        "409":
+          description: |
+            `savepoint_limit`: the processor instance already keeps 16
+            savepoints; delete one first. `savepoint_exists`: the ID is taken.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorBody"
+        "507":
+          description: |
+            `physical_storage_limit`: the savepoint would exceed the physical
+            store budget. Free space or raise the budget first.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorBody"
         default:
           $ref: "#/components/responses/Error"
   /v1/processors/{processor}/savepoints/{savepoint}:
@@ -530,6 +565,10 @@ paths:
     get:
       summary: Read a durable consumer
       operationId: getDurableConsumer
+      description: |
+        Administrative: only the bearer token protects it, whether or not the
+        consumer has a credential, as for the consumer list. A credential
+        isolates applications on the consumer-scoped delivery routes.
       responses:
         "200":
           description: Durable consumer state and lag.
@@ -542,6 +581,10 @@ paths:
     delete:
       summary: Revoke a durable consumer
       operationId: revokeDurableConsumer
+      description: |
+        Administrative: only the bearer token protects it, whether or not the
+        consumer has a credential, so an operator can revoke a consumer whose
+        credential is lost.
       parameters:
         - $ref: "#/components/parameters/LeaniRequest"
       responses:
@@ -561,6 +604,10 @@ paths:
     post:
       summary: Renew a durable consumer lease
       operationId: renewDurableConsumerLease
+      description: |
+        A split live stream fences renewal by session, so its processors get
+        409 `consumer_session_required`; renew through
+        `/streams/live/consumers/{consumer}/lease` instead.
       parameters:
         - $ref: "#/components/parameters/LeaniRequest"
       responses:
@@ -584,7 +631,10 @@ paths:
         - $ref: "#/components/parameters/Limit"
       responses:
         "200":
-          description: Replay batch; advances only the delivered head.
+          description: |
+            Replay batch after the acknowledgement. Its last change becomes
+            the consumer's delivered sequence, which bounds acknowledgement;
+            the acknowledgement does not move.
           content:
             application/json:
               schema:
@@ -599,6 +649,12 @@ paths:
     post:
       summary: Acknowledge durable consumer changes
       operationId: acknowledgeDurableConsumerChanges
+      description: |
+        A cursor beyond the consumer's delivered sequence gets 409
+        `acknowledgement_beyond_delivered`. A split live stream fences
+        acknowledgement by session, so its processors get 409
+        `consumer_session_required`; acknowledge through
+        `/streams/live/consumers/{consumer}/ack` instead.
       requestBody:
         required: true
         content:
@@ -661,6 +717,11 @@ paths:
     get:
       summary: Stream the dedicated live lane for a durable consumer
       operationId: streamLiveDurableConsumer
+      description: |
+        Each batch holds one whole block's commit, and records the consumer's
+        delivered sequence through it. A request whose `Sec-Fetch-Site` is
+        `cross-site` or `same-site` without an allowed `Origin`, such as a
+        navigation of another site's frame, gets 403 `cross_site_request`.
       responses:
         "200":
           description: Server-sent live-lane batches.
@@ -674,6 +735,11 @@ paths:
     post:
       summary: Acknowledge a live-lane consumer batch
       operationId: acknowledgeLiveDurableConsumer
+      description: |
+        The cursor must end a block's commit, as a batch's
+        `acknowledgeableCursor` does, and gets 409
+        `acknowledgement_mid_block` otherwise. A cursor beyond the consumer's
+        delivered sequence gets 409 `acknowledgement_beyond_delivered`.
       responses:
         "200":
           description: Updated live-lane acknowledgement state.
@@ -725,6 +791,12 @@ paths:
     get:
       summary: Stream changes from one backfill subscription
       operationId: streamBackfillConsumer
+      description: |
+        Each batch and the completion record the consumer's delivered
+        sequence through their acknowledgement boundary. A request whose
+        `Sec-Fetch-Site` is `cross-site` or `same-site` without an allowed
+        `Origin`, such as a navigation of another site's frame, gets 403
+        `cross_site_request`.
       responses:
         "200":
           description: Server-sent backfill delivery batches.
@@ -738,6 +810,11 @@ paths:
     post:
       summary: Acknowledge a backfill subscription batch
       operationId: acknowledgeBackfillConsumer
+      description: |
+        The cursor must be a batch's `acknowledgeableCursor` or the
+        completion's `cursor` (409 `acknowledgement_invalid` otherwise), and
+        not beyond the consumer's delivered sequence (409
+        `acknowledgement_beyond_delivered`).
       responses:
         "200":
           description: Updated backfill acknowledgement state.
@@ -828,6 +905,13 @@ paths:
     post:
       summary: Create a backfill subscription
       operationId: createBackfillSubscription
+      description: |
+        A new subscription's consumer `credential` holds 32 to 512 printable
+        ASCII characters without spaces (400 otherwise). Re-submitting an
+        existing subscription's request unchanged returns its status, even
+        with a credential from before that rule. The credential enters the
+        request's idempotency identity, an unkeyed BLAKE3 hash of the whole
+        request that the node keeps, so use a random one.
       responses:
         "201":
           description: Created backfill subscription.
@@ -1311,8 +1395,12 @@ components:
       in: header
       required: false
       description: |
-        Consumer-scoped credential. An administrator bearer credential can be
-        used instead on the protected listener.
+        The consumer's credential. A consumer created with one needs it on
+        every consumer-scoped request, in addition to any bearer token, and
+        gets 403 `forbidden` without it or with another; the node compares
+        it in constant time. A consumer without one, such as a configured
+        consumer, takes none. Credentials created before 32 characters were
+        required keep working.
       schema:
         type: string
         minLength: 16
@@ -1737,7 +1825,9 @@ components:
           type: string
           pattern: "^[0-9a-f]{32}$"
         boundaryCursor:
-          description: Null when the processor has delivery disabled.
+          description: |
+            Null when the processor has delivery disabled or is
+            `finalized_only`, whose retained state holds unpublished blocks.
           oneOf:
             - $ref: "#/components/schemas/Cursor"
             - type: "null"
@@ -1815,9 +1905,16 @@ components:
           type: integer
           minimum: 1
         credential:
+          description: |
+            A random secret of 32 to 512 printable ASCII characters without
+            spaces, such as `openssl rand -hex 32`. Only a hash keyed with the
+            node's secret is stored. Every consumer-scoped request then needs
+            it. An existing consumer ID gets 409 `consumer_exists` whatever
+            the credential.
           type: string
-          minLength: 16
+          minLength: 32
           maxLength: 512
+          pattern: "^[!-~]+$"
           writeOnly: true
     DurableConsumer:
       type: object
@@ -1838,6 +1935,9 @@ components:
         acknowledgedSequence:
           $ref: "#/components/schemas/DecimalQuantity"
         deliveredSequence:
+          description: |
+            The last sequence a page read or stream batch handed to this
+            consumer; acknowledgement cannot pass it.
           $ref: "#/components/schemas/DecimalQuantity"
         acknowledgedCursor:
           $ref: "#/components/schemas/Cursor"

@@ -291,11 +291,11 @@ returns `409 consumer_exists` whatever its role. Creation always names a
 start position:
 
 ```http
-POST /v1/processors/blobs-money/consumers
+POST /v1/processors/usdc-weth-latest/consumers
 content-type: application/json
 
 {
-  "id": "blobs-api",
+  "id": "prices-api",
   "role": "best_effort",
   "start": { "position": "earliest_retained" },
   "leaseTtlSeconds": 300,
@@ -307,36 +307,75 @@ content-type: application/json
 field. An old, wrong-store, wrong-instance, or incompatible cursor returns
 `reset_required`; the node never substitutes another position.
 
-Consumer-scoped renew, change-read, and acknowledgement calls send:
+A consumer created with a credential needs it on every consumer-scoped call,
+in addition to any bearer token: the lease, change, and acknowledgement
+routes below, and its live and backfill streams with their lease and
+acknowledgement routes:
 
 ```http
 x-leani-consumer-credential: <random per-consumer secret>
 ```
 
-The secret is hashed at rest. A consumer credential cannot inspect or
-acknowledge another consumer. Administrative bearer authorization remains
-available when configured.
+A missing or wrong credential gets `403`, whatever the bearer token. The
+node compares credentials in constant time and stores each as a BLAKE3 hash
+keyed with a random per-store secret. A backfill subscription's credential
+also enters the subscription's idempotency identity, an unkeyed BLAKE3 hash
+of the whole request that the store keeps, so use a random credential. A new
+credential holds 32 to 512 printable ASCII characters without spaces, such
+as the output of `openssl rand -hex 32`. A consumer or backfill subscription
+created before that rule keeps its credential: re-creating the consumer
+still gets `409 consumer_exists`, and re-submitting the subscription's
+request unchanged its status. A consumer declared in the node configuration
+has no credential and takes none.
+
+Credentials isolate applications on these consumer-scoped delivery routes
+only. Listing consumers, inspecting one with
+`GET .../consumers/{consumer}`, and revoking one with `DELETE` on that path
+are administrative operations that only the bearer token protects, whether
+or not the consumer has a credential. The list already shows what an
+inspection does, an operator must be able to revoke an abandoned consumer
+whose credential is lost, and without a bearer token every client that
+reaches the API is trusted with the administrative routes, such as
+live-lane resets, anyway.
 
 Read a batch:
 
 ```http
-GET /v1/processors/blobs-money/consumers/blobs-api/changes?limit=500
+GET /v1/processors/usdc-weth-latest/consumers/prices-api/changes?limit=500
 x-leani-consumer-credential: ...
 ```
 
 After committing the destination transaction and its cursor atomically:
 
 ```http
-POST /v1/processors/blobs-money/consumers/blobs-api/ack
+POST /v1/processors/usdc-weth-latest/consumers/prices-api/ack
 x-leani-consumer-credential: ...
 content-type: application/json
 
 { "cursor": "<highest durably committed cursor>" }
 ```
 
-Acknowledgement is monotonic and idempotent. A cursor beyond the highest
-sequence delivered to that consumer is rejected, preventing a buggy client
-from pruning unseen changes. `commit_then_ack` in the Rust API helper does not
+Acknowledgement is monotonic and idempotent. A page read or a stream batch
+records the last sequence it hands out as the consumer's delivered sequence
+(`deliveredSequence`), and a cursor beyond it gets `409
+acknowledgement_beyond_delivered`, so a buggy client cannot let retention
+prune changes it never received. A live stream batch holds one block's whole
+commit, and a live acknowledgement must end one, as each batch's
+`acknowledgeableCursor` does (`409 acknowledgement_mid_block` otherwise). A
+backfill acknowledgement must be a batch's `acknowledgeableCursor` or the
+completion's `cursor`.
+
+A processor with a split live stream (`block_versioned_idempotent` delivery
+ordering, such as `blobs-money`) fences renewal and acknowledgement by
+streaming session. Its consumers renew and acknowledge through
+`/streams/live/consumers/{consumer}/lease` and `/ack` with the
+`x-leani-consumer-session` token from the stream's `hello`, and the generic
+lease and acknowledgement routes answer `409 consumer_session_required`. A
+session token carries a MAC keyed with the per-store secret; one the node
+cannot verify, such as a token from before an upgrade, gets `409
+consumer_session_lost`, and the client opens a new stream.
+
+`commit_then_ack` in the Rust API helper does not
 construct or execute the acknowledgement future until the destination commit
 succeeds. The TypeScript SDK exposes the equivalent
 `commitThenAcknowledge(() => destinationCommit(), cursor =>
@@ -392,6 +431,13 @@ With delivery disabled, ordinary entity queries still work, and snapshots
 return `boundaryCursor: null` and `recovery.follow: null`. Query-and-follow, change-head,
 change-page, and stream requests return non-retryable HTTP 409
 `delivery_disabled`; enable a delivery policy before subscribing.
+
+A `finalized_only` processor's snapshots also return `boundaryCursor: null`
+and `recovery.follow: null`, and query-and-follow returns HTTP 409
+`finalized_only_snapshot`: its retained state already holds included blocks
+whose changes are published only once finalized, and the stream never undoes
+a block it never published, so a copy followed from a boundary could keep
+rows of a reorged block.
 
 Release a no-longer-needed snapshot early:
 
@@ -466,12 +512,12 @@ Automatic recovery checkpoints are read-only through
 configured count retention. `POST .../checkpoints/{checkpoint}/restore`
 atomically repairs private processor state only when the processor's cursor
 sits exactly on the checkpoint; finality reaching that block afterwards does
-not matter. Between checkpoints no automatic checkpoint can be restored: take
-a portable savepoint while the processor is at rest, or restore a full-store
-backup. Older checkpoints are rejected because rewinding state without also
-rewinding independent output, delivery, coverage, and undo storage would be
-unsafe; use a deterministic rebuild or a full-store backup for that case.
-Portable savepoints are operator-created:
+not matter. Between checkpoints no checkpoint can be restored: restore a
+full-store backup or rebuild the processor. Older checkpoints are rejected
+because rewinding state without also rewinding independent output, delivery,
+coverage, and undo storage would be unsafe; use a deterministic rebuild or a
+full-store backup for that case. Portable savepoints are operator-created
+exports, which the node cannot restore:
 
 ```http
 POST /v1/processors/{processor}/savepoints
@@ -482,7 +528,8 @@ content-type: application/json
 
 Each processor instance keeps at most 16 savepoints; creating another returns
 `409 savepoint_limit` until one is deleted. A savepoint is also admitted
-against the physical store budget. `GET .../savepoints/{id}` exports a
+against the physical store budget and gets `507 physical_storage_limit` when
+it does not fit. `GET .../savepoints/{id}` exports a
 checksummed, versioned `application/vnd.leani.savepoint` archive. Deletion is
 explicit with `DELETE`; acknowledgement or checkpoint pruning never deletes a
 portable savepoint. Checkpoints and savepoints are bound to the processor
@@ -621,6 +668,10 @@ data: {"apiVersion":"1",...}
 
 ```
 
+A browser `EventSource` reconnects on its own and sends the last event's
+`id:`, its cursor, as `Last-Event-ID`; without `after`, the stream resumes
+after that cursor. An explicit `after` takes precedence.
+
 The server sends comments as heartbeats. The SDK reconnects with the last fully
 yielded cursor, uses exponential backoff with jitter, and treats these
 differently:
@@ -673,6 +724,7 @@ Relevant status mappings:
 | `422` | source exists but cannot provide the required capability |
 | `429` | concurrency/query budget exceeded |
 | `503` | source/finality temporarily unavailable |
+| `507` | the physical store budget refuses the write (`physical_storage_limit`) |
 
 Standard JSON-RPC uses standard errors where applicable and a documented custom
 server-error range for unsupported capability, incomplete coverage, and
@@ -1017,9 +1069,10 @@ Compatibility rules within `/v1`:
 Localhost is the default trust boundary. The current optional API bearer token
 protects all native query, stream, consumer, and `/admin/v1` routes on one
 listener, and a bind beyond loopback requires it unless
-`api.allow_unauthenticated_remote` is set. Consumer credentials additionally
-fence one consumer's lease and cursor; they do not replace the listener bearer
-when it is configured. `/health/live`, `/health/ready`, `/metrics`,
+`api.allow_unauthenticated_remote` is set. A consumer's credential, when it
+has one, is required as well on every consumer-scoped route, streams
+included, and fences that consumer's lease and cursor; it does not replace
+the listener bearer when one is configured. `/health/live`, `/health/ready`, `/metrics`,
 `/v1/network/status`, and `/debug/network` remain unauthenticated operational
 routes. The JSON-RPC listeners have no built-in authentication.
 
@@ -1031,17 +1084,19 @@ to keep web pages from reading or changing a loopback node:
 | `Host` name other than `localhost` or one in `api.allowed_hosts`; IP addresses pass | 421 `host_not_allowed` |
 | browser `Origin` other than a loopback one or one in `api.allowed_origins` | 403 `origin_not_allowed` |
 | GET or HEAD without an `Origin`, with `Sec-Fetch-Site: cross-site` or `same-site` and a `Sec-Fetch-Mode` other than `navigate`, such as another page's image load | 403 `cross_site_request` |
+| request to a consumer's live or backfill `stream` route without an allowed `Origin`, with `Sec-Fetch-Site: cross-site` or `same-site` in any mode, navigations included | 403 `cross_site_request` |
 | POST or DELETE without `content-type: application/json` or `x-leani-request: 1` | 415 `unsupported_media_type` |
 
 A request without `Host`, `Origin`, and `Sec-Fetch-*` headers, as the SDK,
-curl, and other non-browser clients send it, passes the first three checks.
-So do navigations, including from another site's page or into a frame, and
-requests from browsers that send no Fetch Metadata. A page cannot read those
-responses, and they create no query snapshot, but a GET that opens a
-consumer's live or backfill stream takes the consumer's session lease; only
-the bearer token keeps pages from doing that. The SDK sends
-`x-leani-request: 1` on its requests without a JSON body; other clients must
-add it, for example `curl -X DELETE -H 'x-leani-request: 1' ...`.
+curl, and other non-browser clients send it, passes the first four checks.
+So do navigations to other routes, including from another site's page or
+into a frame, and requests from browsers that send no Fetch Metadata. A page
+cannot read those responses, and they create no query snapshot. Opening a
+consumer's stream takes its session lease, so the stream routes refuse
+navigations from other sites too; a browser without Fetch Metadata can still
+open one, which the bearer token and the consumer's credential prevent. The
+SDK sends `x-leani-request: 1` on its requests without a JSON body; other
+clients must add it, for example `curl -X DELETE -H 'x-leani-request: 1' ...`.
 
 When remotely exposed:
 

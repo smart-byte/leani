@@ -7,9 +7,13 @@ use leani_processor_uniswap::{
     CURRENT_COLLECTION, OBSERVATION_LATEST_COLLECTION, PoolKind, PoolPriceEntity,
     UniswapObservationsProcessor,
 };
+use leani_store_sqlite::QuerySnapshotEntity;
 use serde::Serialize;
 
-use crate::{ApiError, QueryContext, QueryExtension, UniswapPoolPrice, address_hex, parse_address};
+use crate::{
+    ApiError, QueryContext, QueryExtension, UniswapPoolPrice, address_hex, finality_name,
+    parse_address,
+};
 
 /// Read-only configuration discovery for a Uniswap observation stream.
 #[derive(Clone, Copy, Debug, Default)]
@@ -96,21 +100,29 @@ async fn latest_observation(
             "Uniswap pool is not configured for this processor",
         ));
     }
-    let value = context
-        .entity(OBSERVATION_LATEST_COLLECTION, &address.0)
+    // The output metadata carries the block's timestamp and current
+    // finality. A backfilled block leaves no retained canonical block to
+    // read them from, and a reorg removes the entity itself.
+    let stored = context
+        .output_entity(OBSERVATION_LATEST_COLLECTION, &address.0)
         .await?
         .ok_or_else(|| ApiError::not_found("Uniswap pool has no indexed observation"))?;
-    let entity: PoolPriceEntity = postcard::from_bytes(&value).map_err(|error| {
+    let entity: PoolPriceEntity = postcard::from_bytes(&stored.value).map_err(|error| {
         ApiError::internal(&format!("stored Uniswap observation is invalid: {error}"))
     })?;
-    let block = context
-        .canonical_block_by_hash(entity.block_hash)
-        .await?
-        .ok_or_else(|| ApiError::not_found("latest Uniswap observation is no longer canonical"))?;
     Ok(Json(LatestObservationResponse {
-        data: UniswapPoolPrice::from(&entity),
-        timestamp: block.timestamp,
+        data: pool_price(&entity, &stored),
+        timestamp: stored.block_timestamp,
     }))
+}
+
+/// A pool price with the finality its output metadata records now; the
+/// entity keeps the finality its block had when reduced.
+fn pool_price(entity: &PoolPriceEntity, stored: &QuerySnapshotEntity) -> UniswapPoolPrice {
+    UniswapPoolPrice {
+        finality: finality_name(stored.finality),
+        ..UniswapPoolPrice::from(entity)
+    }
 }
 
 /// Typed latest-price queries backed by one Uniswap processor instance.
@@ -136,11 +148,11 @@ async fn get_pool(
     Path(address): Path<String>,
 ) -> Result<Json<UniswapPoolPrice>, ApiError> {
     let address = parse_address(&address)?;
-    let value = context
-        .entity(CURRENT_COLLECTION, &address.0)
+    let stored = context
+        .output_entity(CURRENT_COLLECTION, &address.0)
         .await?
         .ok_or_else(|| ApiError::not_found("Uniswap pool is not indexed"))?;
-    let entity: PoolPriceEntity = postcard::from_bytes(&value)
+    let entity: PoolPriceEntity = postcard::from_bytes(&stored.value)
         .map_err(|error| ApiError::internal(&format!("stored Uniswap pool is invalid: {error}")))?;
-    Ok(Json(UniswapPoolPrice::from(&entity)))
+    Ok(Json(pool_price(&entity, &stored)))
 }

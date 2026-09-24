@@ -122,9 +122,8 @@ record, and documented RPC contracts.
   which counts against a node-wide cap of 32, now takes a POST: any page
   could fill the cap with GET requests. Navigations from another site,
   including into a frame, and subresource loads from browsers without Fetch
-  Metadata still reach GET routes. The page cannot read the response, but
-  opening a consumer's stream that way takes its session lease; only a bearer
-  token prevents it.
+  Metadata still reach GET routes, except that the consumer stream routes
+  refuse such navigations (see below). The page cannot read the response.
 - JSON-RPC bounds its work and output. A batch holds at most 100 calls, and
   a response or batch response at most 16 MiB, with each call past that
   answered by `-32005`. `eth_getLogs` returns at most 10,000 logs, and a log
@@ -141,6 +140,45 @@ record, and documented RPC contracts.
   the `Bearer` scheme matches in any case, and `--help` no longer prints the
   values of `LEANI_API_TOKEN` or `LEANI_CHECKPOINT_URLS`, whose provider URLs
   can carry API keys.
+- A durable consumer created with a credential now needs it on every
+  consumer-scoped route, in addition to any bearer token: its lease, change,
+  and acknowledgement routes, and its live and backfill streams with their
+  leases and acknowledgements. A missing or wrong credential gets 403. The
+  header was optional, so any client of the node could renew, read, or
+  acknowledge another consumer, and move its cursor past changes it never
+  received. Credentials are compared in constant time and stored as BLAKE3
+  hashes keyed with a random per-store secret, and a new one must hold 32 to
+  512 printable ASCII characters without spaces. A backfill subscription's
+  credential also enters the subscription's idempotency identity, an
+  unkeyed BLAKE3 hash of the whole request that the store keeps. Consumers
+  declared in the node configuration have no credential and still need only
+  the bearer token. Credentials isolate applications on these delivery
+  routes only: listing, inspecting, and revoking a consumer stay
+  administrative operations that only the bearer token protects, whether or
+  not the consumer has a credential, so an operator can revoke a consumer
+  whose credential is lost.
+- Consumer session tokens carry a BLAKE3 MAC keyed with the per-store secret
+  instead of an unkeyed checksum, so a client can no longer forge a token for
+  another consumer's session from the values the API shows.
+- An acknowledgement can no longer pass what the consumer was delivered. A
+  consumer page read, and each live batch, backfill batch, or completion a
+  stream sends, records the consumer's delivered sequence; an
+  acknowledgement beyond it gets 409 `acknowledgement_beyond_delivered`. It
+  was checked against the stream head only, so a client could acknowledge,
+  and let retention prune, changes it never received.
+- The generic consumer lease and acknowledgement routes no longer act on a
+  consumer of a split live stream, whose streaming sessions fence both, and
+  answer 409 `consumer_session_required`; they let a client without the
+  session move the consumer.
+- The live and backfill consumer stream routes answer 403
+  `cross_site_request` to any request whose `Sec-Fetch-Site` is `cross-site`
+  or `same-site` and that carries no allowed `Origin`, navigations included:
+  a hidden frame or a redirect on another site's page could open a
+  consumer's stream and hold its session lease, locking the consumer out.
+  Requests without Fetch Metadata still reach these routes, which the bearer
+  token and the consumer's credential guard: browsers send it only to HTTPS,
+  loopback, and `localhost` URLs, so a node served over plain HTTP by
+  another name or address gets none.
 
 ### Changed
 
@@ -181,14 +219,57 @@ record, and documented RPC contracts.
 - SDK: `processors.queryEntities()` without a cursor creates its snapshot with
   the new POST route, and mutations without a JSON body send
   `x-leani-request: 1`. Update the SDK together with the node.
+- Breaking for durable consumers of the native API:
+  - A consumer created with a credential needs `x-leani-consumer-credential`
+    on each of its lease, change, acknowledgement, and stream requests (403
+    otherwise). A new credential needs 32 to 512 printable ASCII characters
+    without spaces (400 otherwise), such as `openssl rand -hex 32`. Existing
+    credentials keep working, and a shorter one still gets 409
+    `consumer_exists` when its consumer is created again, or its
+    subscription's status when an unchanged backfill request is submitted
+    again. A credential stored before the upgrade that begins or ends with
+    whitespace cannot be sent as it is, since HTTP trims header values, and
+    one with a control character cannot be sent at all; now that the header
+    is mandatory, revoke such a consumer and create it again with a new
+    credential.
+  - An acknowledgement needs a cursor this consumer was delivered (409
+    `acknowledgement_beyond_delivered`, with `deliveredSequence` in the error
+    details). On a live stream it must also end a block's commit, as every
+    batch's `acknowledgeableCursor` does (409 `acknowledgement_mid_block`).
+    Each live batch now holds one whole block: a page read that ended inside
+    a block used to send it in two batches.
+  - For a processor with a split live stream (`block_versioned_idempotent`
+    delivery ordering), `POST .../consumers/{consumer}/lease` and `/ack`
+    answer 409 `consumer_session_required`; renew and acknowledge through
+    `/streams/live/consumers/{consumer}/lease` and `/ack` with the stream's
+    session token.
+  - Any session token the node cannot verify gets 409
+    `consumer_session_lost`: every token issued before the upgrade, and a
+    malformed one, which got 400 `cursor_invalid`. The SDK treats the 409 as
+    a lost session and opens a new stream on its own; other clients
+    reconnect for a new token.
+  - A query snapshot of a `finalized_only` processor returns
+    `boundaryCursor` and `recovery.follow` as null: its retained state holds
+    blocks whose changes are not published yet, so following from it would
+    keep reorged rows, and query-and-follow refuses such processors.
+- SDK: `BackfillDeliverySession.deliveryBatches()` yields every
+  acknowledgement boundary of a backfill stream with the changes it covers,
+  including batches without changes and the completion, in the shape of the
+  unified history lane. `events()` is unchanged and carries no boundary; do
+  not acknowledge a change's own cursor.
 - `THIRD_PARTY_LICENSES.txt` is now committed, verified against `Cargo.lock`
   in CI, and linked from the README and site. It adds the Apache-2.0 NOTICE
   files of the Arrow, Parquet, object_store, and Moka dependencies, which the
   generated listing previously omitted. The Homebrew package now also installs
   Leani's own `LICENSE`, and the container image declares OCI license metadata.
-- Node stores move to schema 22, which adds coverage lookup indexes. A
-  schema-21 store upgrades in place on its next start; earlier binaries then
-  refuse it, so keep a backup if you might roll back.
+- Node stores move to schema 23. Schema 22 adds coverage lookup indexes.
+  Schema 23 adds a random per-store secret, drawn once from the operating
+  system, for session tokens and consumer credential hashes; keys the stored
+  credential hashes with it, so existing credentials keep working; and starts
+  every consumer's delivered sequence at its stream head, so acknowledgements
+  of changes delivered before the upgrade still pass. A schema-21 or -22
+  store upgrades in place on its next start; earlier binaries then refuse
+  it, so keep a backup if you might roll back. A backup holds the secret.
 - Breaking for processor authors (`leani-processor-api`):
   `DataRequirement::validate_frame` is stricter for requirements with
   `allow_filtered`. Each filtered component that can supply a required
@@ -417,7 +498,8 @@ record, and documented RPC contracts.
   completed historical job also checkpoints its processor at rest, and a
   restore accepts a checkpoint whose block was finalized after it was taken.
   A restore still needs a checkpoint at the current cursor, so between
-  checkpoints use a portable savepoint or a full-store backup.
+  checkpoints restore a full-store backup or rebuild the processor; portable
+  savepoints are exports and cannot be restored.
 - Checkpoints and portable savepoints stay valid after lifecycle edits such
   as raising a limit: their identity is the processor contract without its
   lifecycle policies. Snapshots written by earlier versions stay valid while
@@ -792,6 +874,21 @@ record, and documented RPC contracts.
   restarts its network lanes every minute: seeding the finalized anchor
   failed when a retained block of the reorged branch held its height. Such
   blocks are now reverted before the anchor is seeded.
+- Typed query endpoints report the finality a block has now. Blobs blocks and
+  snapshots, block summaries, ERC-20 balances, and Uniswap pools and
+  observations read it from the entity's output metadata, which finalization
+  updates, instead of the finality embedded in the entity when its block was
+  reduced, which stayed `included`.
+- The latest Uniswap observation of a backfilled block no longer answers 404
+  "no longer canonical". Its timestamp comes from the entity's output
+  metadata instead of a retained canonical block, which only blocks followed
+  live leave.
+- The SSE change stream resumes after the `Last-Event-ID` an EventSource
+  sends when it reconnects, when `after` is absent. It ignored the header and
+  restarted from the oldest retained change.
+- A portable savepoint beyond the physical store budget, like any request the
+  budget refuses, answers 507 `physical_storage_limit` with the limit and
+  projected bytes in the error details, instead of 500.
 
 ## [0.1.0-rc.1] - 2026-09-20
 

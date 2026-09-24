@@ -65,8 +65,18 @@ const SCHEMA_V19: &str = include_str!("../migrations/0019_bulk_artifact_accounti
 const SCHEMA_V20: &str = include_str!("../migrations/0020_query_snapshot_filters.sql");
 const SCHEMA_V21: &str = include_str!("../migrations/0021_deferred_changes.sql");
 const SCHEMA_V22: &str = include_str!("../migrations/0022_coverage_lookup_indexes.sql");
+const SCHEMA_V23: &str = include_str!("../migrations/0023_consumer_delivery_and_node_secret.sql");
 /// Current on-disk `SQLite` schema version written by this crate.
-pub const CURRENT_SCHEMA_VERSION: u32 = 22;
+pub const CURRENT_SCHEMA_VERSION: u32 = 23;
+/// Schema that added the node secret, which its migration generates.
+const NODE_SECRET_SCHEMA_VERSION: u32 = 23;
+/// Name of the one [`NodeSecret`] row in `node_secrets`.
+const NODE_SECRET_NAME: &str = "node";
+/// Key-derivation context of consumer credential hashes.
+const CONSUMER_CREDENTIAL_CONTEXT: &str = "leani 2026-09-24 consumer credential hash";
+/// Fewest characters a client-chosen consumer credential may hold: nothing
+/// else vouches for its entropy.
+const MINIMUM_CONSUMER_CREDENTIAL_CHARS: usize = 32;
 /// Stable encoding version attached to durable delivery records.
 pub const DELIVERY_ENCODING_VERSION: u16 = 1;
 /// Deferred rows promoted per SQL round trip inside `mark_finalized`.
@@ -1780,6 +1790,7 @@ struct StoreInner {
     delivery_changes_available: Notify,
     path: PathBuf,
     epoch: [u8; 16],
+    secret: NodeSecret,
     storage_budget: StoreStorageBudget,
     delivery_budget: DeliveryStorageBudget,
     artifact_budget: ArtifactStorageBudget,
@@ -1986,15 +1997,114 @@ async fn migrate(pool: &SqlitePool) -> Result<(), StoreError> {
         (20, SCHEMA_V20),
         (21, SCHEMA_V21),
         (22, SCHEMA_V22),
+        (23, SCHEMA_V23),
     ];
     for (target, migration) in migrations {
         if target > version {
             sqlx::raw_sql(migration).execute(&mut *transaction).await?;
         }
     }
+    if version < NODE_SECRET_SCHEMA_VERSION {
+        install_node_secret(&mut transaction).await?;
+    }
     transaction.commit().await?;
     if version <= 2 {
         rebuild_recent_transaction_locators(pool).await?;
+    }
+    Ok(())
+}
+
+/// Per-store key material for consumer credential hashes and the MACs of
+/// [`SqliteStore::node_mac`]. It never leaves the store, and debug output
+/// redacts it.
+struct NodeSecret([u8; 32]);
+
+impl std::fmt::Debug for NodeSecret {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("NodeSecret([REDACTED])")
+    }
+}
+
+impl NodeSecret {
+    /// A key for one purpose; `context` is a hardcoded, unique string.
+    fn derived_key(&self, context: &str) -> [u8; 32] {
+        blake3::derive_key(context, &self.0)
+    }
+
+    /// The stored form of a consumer credential.
+    fn credential_hash(&self, credential: &[u8]) -> blake3::Hash {
+        self.keyed_credential_digest(blake3::hash(credential).as_bytes())
+    }
+
+    /// Key a credential's bare BLAKE3 digest, the form schema 22 stored, so
+    /// the upgrade can key stored digests without their credentials.
+    fn keyed_credential_digest(&self, digest: &[u8; 32]) -> blake3::Hash {
+        blake3::keyed_hash(&self.derived_key(CONSUMER_CREDENTIAL_CONTEXT), digest)
+    }
+}
+
+/// Fill `node_secrets` from the operating system's random source, and key
+/// the consumer credential digests earlier schemas stored bare, so those
+/// credentials keep working. Runs in the migration transaction to schema 23,
+/// so the secret is generated once, together with the schema that holds it.
+async fn install_node_secret(transaction: &mut Transaction<'_, Sqlite>) -> Result<(), StoreError> {
+    let mut value = [0_u8; 32];
+    getrandom::fill(&mut value).map_err(|error| {
+        StoreError::Io(std::io::Error::other(format!(
+            "the operating system random source failed: {error}"
+        )))
+    })?;
+    let secret = NodeSecret(value);
+    sqlx::query("INSERT INTO node_secrets(name, value) VALUES (?, ?)")
+        .bind(NODE_SECRET_NAME)
+        .bind(secret.0.as_slice())
+        .execute(&mut **transaction)
+        .await?;
+    let stored: Vec<(String, String, Vec<u8>)> = sqlx::query_as(
+        "SELECT stream_id, consumer_id, credential_hash FROM durable_consumers
+         WHERE credential_hash IS NOT NULL",
+    )
+    .fetch_all(&mut **transaction)
+    .await?;
+    for (stream_id, consumer_id, digest) in stored {
+        let digest: [u8; 32] = digest.try_into().map_err(|_| {
+            StoreError::Invariant("a stored consumer credential hash is not 32 bytes".to_owned())
+        })?;
+        sqlx::query(
+            "UPDATE durable_consumers SET credential_hash = ?
+             WHERE stream_id = ? AND consumer_id = ?",
+        )
+        .bind(
+            secret
+                .keyed_credential_digest(&digest)
+                .as_bytes()
+                .as_slice(),
+        )
+        .bind(stream_id)
+        .bind(consumer_id)
+        .execute(&mut **transaction)
+        .await?;
+    }
+    Ok(())
+}
+
+/// Check a client-chosen consumer credential: 32 to 512 printable ASCII
+/// characters without spaces, as generated secrets are. An HTTP header
+/// carries nothing else unchanged. Only a new consumer must meet it; one
+/// created before the rule keeps its credential.
+///
+/// # Errors
+///
+/// Returns the rule, as a message for the client, for any other credential.
+pub fn validate_consumer_credential(credential: &str) -> Result<(), String> {
+    if credential.len() < MINIMUM_CONSUMER_CREDENTIAL_CHARS
+        || credential.len() > 512
+        || !credential.bytes().all(|byte| byte.is_ascii_graphic())
+    {
+        return Err(format!(
+            "consumer credential must hold {MINIMUM_CONSUMER_CREDENTIAL_CHARS} to 512 printable \
+             ASCII characters without spaces; use a random value such as `openssl rand -hex 32`"
+        ));
     }
     Ok(())
 }
@@ -2164,6 +2274,16 @@ impl SqliteStore {
         let epoch: [u8; 16] = epoch
             .try_into()
             .map_err(|_| StoreError::Invariant("store epoch is not 16 bytes".to_owned()))?;
+        let secret: Vec<u8> = sqlx::query_scalar("SELECT value FROM node_secrets WHERE name = ?")
+            .bind(NODE_SECRET_NAME)
+            .fetch_optional(&pool)
+            .await?
+            .ok_or_else(|| StoreError::Invariant("the store has no node secret".to_owned()))?;
+        let secret = NodeSecret(
+            secret
+                .try_into()
+                .map_err(|_| StoreError::Invariant("node secret is not 32 bytes".to_owned()))?,
+        );
         let store = Self {
             inner: Arc::new(StoreInner {
                 pool,
@@ -2172,6 +2292,7 @@ impl SqliteStore {
                 delivery_changes_available: Notify::new(),
                 path: config.path,
                 epoch,
+                secret,
                 storage_budget,
                 delivery_budget,
                 artifact_budget,
@@ -10235,6 +10356,47 @@ impl SqliteStore {
         Ok((entities, more))
     }
 
+    /// Scan public entities after `after` in key order, each with the block
+    /// metadata of its latest write. That finality follows finalization,
+    /// unlike one a processor embedded in the value when it reduced the
+    /// block.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid limit, corrupt metadata, or a failed
+    /// read.
+    pub async fn scan_output_entities(
+        &self,
+        descriptor: &ProcessorDescriptor,
+        collection: &str,
+        after: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<Vec<QuerySnapshotEntity>, StoreError> {
+        if limit == 0 || limit > 10_000 {
+            return Err(StoreError::InvalidConfig(
+                "scan limit must be in 1..=10000".to_owned(),
+            ));
+        }
+        let rows = sqlx::query(
+            "SELECT entity.entity_key, entity.value, meta.block_number,
+                    meta.block_timestamp, meta.finality
+             FROM entities AS entity
+             JOIN output_entity_meta AS meta
+               ON meta.instance = entity.instance
+              AND meta.collection = entity.collection
+              AND meta.entity_key = entity.entity_key
+             WHERE entity.instance = ? AND entity.collection = ? AND entity.entity_key > ?
+             ORDER BY entity.entity_key LIMIT ?",
+        )
+        .bind(processor_instance(descriptor))
+        .bind(collection)
+        .bind(after.unwrap_or_default())
+        .bind(usize_i64(limit, "limit")?)
+        .fetch_all(&self.inner.pool)
+        .await?;
+        rows.iter().map(|row| output_row(row, 0)).collect()
+    }
+
     /// Scan entity keys in deterministic byte order.
     ///
     /// # Errors
@@ -10561,13 +10723,15 @@ impl SqliteStore {
 
     /// Register a durable consumer with an isolated acknowledgement credential.
     ///
-    /// Only a one-way hash is persisted. The caller must retain the original
-    /// credential and present it on consumer-scoped delivery operations.
+    /// Only a hash keyed with the node secret is persisted. The caller must
+    /// retain the original credential and present it on every
+    /// consumer-scoped delivery operation. The credential holds 32 to 512
+    /// printable ASCII characters without spaces.
     ///
     /// # Errors
     ///
     /// Returns the same errors as [`Self::create_consumer`] plus an invalid
-    /// credential error.
+    /// credential error for a new consumer.
     pub async fn create_consumer_with_credential(
         &self,
         descriptor: &ProcessorDescriptor,
@@ -10577,11 +10741,6 @@ impl SqliteStore {
         ttl: Duration,
         credential: &str,
     ) -> Result<DurableConsumer, StoreError> {
-        if credential.len() < 16 || credential.len() > 512 {
-            return Err(StoreError::InvalidConfig(
-                "consumer credential must contain 16-512 bytes".to_owned(),
-            ));
-        }
         self.create_consumer_with_credential_in_stream(
             descriptor,
             &default_delivery_stream_id(descriptor),
@@ -10599,7 +10758,7 @@ impl SqliteStore {
     /// # Errors
     ///
     /// Returns the same errors as [`Self::create_consumer_in_stream`] plus an
-    /// invalid credential error.
+    /// invalid credential error for a new consumer.
     #[allow(clippy::too_many_arguments)]
     pub async fn create_consumer_with_credential_in_stream(
         &self,
@@ -10611,11 +10770,6 @@ impl SqliteStore {
         ttl: Duration,
         credential: &str,
     ) -> Result<DurableConsumer, StoreError> {
-        if credential.len() < 16 || credential.len() > 512 {
-            return Err(StoreError::InvalidConfig(
-                "consumer credential must contain 16-512 bytes".to_owned(),
-            ));
-        }
         self.create_consumer_inner(
             descriptor,
             stream_id,
@@ -10623,9 +10777,7 @@ impl SqliteStore {
             role,
             start,
             ttl,
-            Some(BlockHash::new(
-                *blake3::hash(credential.as_bytes()).as_bytes(),
-            )),
+            Some(credential),
         )
         .await
     }
@@ -10639,7 +10791,7 @@ impl SqliteStore {
         role: ConsumerRole,
         start: ConsumerStartPosition,
         ttl: Duration,
-        credential_hash: Option<BlockHash>,
+        credential: Option<&str>,
     ) -> Result<DurableConsumer, StoreError> {
         if !valid_consumer_id(consumer_id) || ttl.is_zero() {
             return Err(StoreError::InvalidConfig(
@@ -10667,6 +10819,18 @@ impl SqliteStore {
                 consumer_id: consumer_id.to_owned(),
             });
         }
+        // An existing consumer answers above whatever it presents, so one
+        // created before the credential rule still learns that it exists.
+        if let Some(credential) = credential {
+            validate_consumer_credential(credential).map_err(StoreError::InvalidConfig)?;
+        }
+        let credential_hash = credential.map(|credential| {
+            self.inner
+                .secret
+                .credential_hash(credential.as_bytes())
+                .as_bytes()
+                .to_vec()
+        });
         // Only new consumers take the rule; earlier ones keep their role.
         ensure_required_consumer_retention(&self.inner.pool, descriptor, stream_id, role).await?;
         let earliest: Option<i64> =
@@ -10734,7 +10898,7 @@ impl SqliteStore {
         .bind(expires)
         .bind(now)
         .bind(now)
-        .bind(credential_hash.map(|hash| hash.0.to_vec()))
+        .bind(credential_hash)
         .execute(&mut *transaction)
         .await?;
         transaction.commit().await?;
@@ -10766,7 +10930,8 @@ impl SqliteStore {
         .await
     }
 
-    /// Verify a consumer credential in one explicit delivery stream.
+    /// Verify a consumer credential in one explicit delivery stream, in
+    /// constant time. A consumer without a credential matches none.
     ///
     /// # Errors
     ///
@@ -10779,6 +10944,49 @@ impl SqliteStore {
         consumer_id: &str,
         credential: &str,
     ) -> Result<bool, StoreError> {
+        Ok(self
+            .stored_consumer_credential(descriptor, stream_id, consumer_id)
+            .await?
+            .is_some_and(|stored| {
+                self.inner.secret.credential_hash(credential.as_bytes()) == *stored.as_slice()
+            }))
+    }
+
+    /// Whether the credential presented with a consumer-scoped request
+    /// authorizes it. A consumer with a credential needs that credential on
+    /// every such request, compared in constant time; a consumer without
+    /// one, such as one the node configuration declares, accepts none.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the stream or consumer is absent, stored metadata
+    /// is invalid, or the query fails.
+    pub async fn consumer_credential_authorizes_in_stream(
+        &self,
+        descriptor: &ProcessorDescriptor,
+        stream_id: &str,
+        consumer_id: &str,
+        presented: Option<&[u8]>,
+    ) -> Result<bool, StoreError> {
+        let stored = self
+            .stored_consumer_credential(descriptor, stream_id, consumer_id)
+            .await?;
+        Ok(match (stored, presented) {
+            (None, None) => true,
+            (Some(stored), Some(presented)) => {
+                self.inner.secret.credential_hash(presented) == *stored.as_slice()
+            }
+            (None, Some(_)) | (Some(_), None) => false,
+        })
+    }
+
+    /// One consumer's stored credential hash, when it has a credential.
+    async fn stored_consumer_credential(
+        &self,
+        descriptor: &ProcessorDescriptor,
+        stream_id: &str,
+        consumer_id: &str,
+    ) -> Result<Option<Vec<u8>>, StoreError> {
         self.validate_delivery_stream(&processor_instance(descriptor), stream_id)
             .await?;
         let stored: Option<Option<Vec<u8>>> = sqlx::query_scalar(
@@ -10789,14 +10997,10 @@ impl SqliteStore {
         .bind(consumer_id)
         .fetch_optional(&self.inner.pool)
         .await?;
-        let stored = stored.ok_or_else(|| StoreError::ConsumerNotFound {
+        stored.ok_or_else(|| StoreError::ConsumerNotFound {
             instance: processor_instance(descriptor),
             consumer_id: consumer_id.to_owned(),
-        })?;
-        let Some(stored) = stored else {
-            return Ok(false);
-        };
-        Ok(stored.as_slice() == blake3::hash(credential.as_bytes()).as_bytes())
+        })
     }
 
     /// Inspect one durable consumer.
@@ -11236,6 +11440,66 @@ impl SqliteStore {
             && expires_at > now_i64()?)
     }
 
+    /// Record that every change through `sequence` reached the consumer, so
+    /// it may acknowledge up to there; the watermark never moves back.
+    ///
+    /// Reading changes records nothing and never waits for the writer; the
+    /// reader records the page or stream batch it hands out, taking the
+    /// writer only when that raises the watermark. A re-read below it only
+    /// checks, off the writer, that the consumer or its session is current.
+    /// With `session_generation`, only that session, while current and
+    /// unexpired, records delivery. Returns whether the active consumer, or
+    /// its session, recorded it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a value cannot be represented or the write fails.
+    pub async fn record_consumer_delivery_in_stream(
+        &self,
+        stream_id: &str,
+        consumer_id: &str,
+        session_generation: Option<u64>,
+        sequence: u64,
+    ) -> Result<bool, StoreError> {
+        let generation = session_generation
+            .map(|generation| u64_i64(generation, "consumer lease generation"))
+            .transpose()?;
+        let sequence = u64_i64(sequence, "delivered sequence")?;
+        let delivered: Option<i64> = sqlx::query_scalar(
+            "SELECT delivered_sequence FROM durable_consumers
+             WHERE stream_id = ? AND consumer_id = ? AND state = 'active'
+               AND (? IS NULL OR (lease_generation = ? AND lease_expires_at_unix_ms > ?))",
+        )
+        .bind(stream_id)
+        .bind(consumer_id)
+        .bind(generation)
+        .bind(generation)
+        .bind(now_i64()?)
+        .fetch_optional(&self.inner.pool)
+        .await?;
+        match delivered {
+            None => return Ok(false),
+            Some(delivered) if sequence <= delivered => return Ok(true),
+            Some(_) => {}
+        }
+        let _guard = self.inner.writer.lock().await;
+        let result = sqlx::query(
+            "UPDATE durable_consumers
+             SET delivered_sequence = MAX(delivered_sequence, ?)
+             WHERE stream_id = ? AND consumer_id = ? AND state = 'active'
+               AND (? IS NULL OR (lease_generation = ? AND lease_expires_at_unix_ms > ?))",
+        )
+        .bind(sequence)
+        .bind(stream_id)
+        .bind(consumer_id)
+        .bind(generation)
+        .bind(generation)
+        .bind(now_i64()?)
+        .execute(&self.inner.pool)
+        .await?;
+        Ok(result.rows_affected() != 0)
+    }
+
     /// Release a streaming session without affecting acknowledgement
     /// retention. A stale generation cannot release its successor.
     ///
@@ -11266,10 +11530,12 @@ impl SqliteStore {
         Ok(result.rows_affected() != 0)
     }
 
-    /// Read the next replay batch and durably advance only the delivered head.
+    /// Read the next replay batch after the durable acknowledgement.
     ///
-    /// The acknowledged cursor is unchanged until [`Self::acknowledge_consumer`]
-    /// is called after the destination commit.
+    /// Reading records no delivery: the caller records what it hands out
+    /// with [`Self::record_consumer_delivery_in_stream`], which bounds
+    /// [`Self::acknowledge_consumer`]. The acknowledged cursor is unchanged
+    /// until that is called after the destination commit.
     ///
     /// # Errors
     ///
@@ -11397,8 +11663,9 @@ impl SqliteStore {
     /// # Errors
     ///
     /// Rejects backwards acknowledgements and sequences beyond the committed
-    /// stream head. Delivery sessions intentionally keep sent progress only in
-    /// memory; the durable acknowledgement remains the replay authority.
+    /// stream head or beyond what was recorded as delivered to the consumer
+    /// ([`Self::record_consumer_delivery_in_stream`]). The durable
+    /// acknowledgement remains the replay authority.
     pub async fn acknowledge_consumer(
         &self,
         descriptor: &ProcessorDescriptor,
@@ -11414,12 +11681,15 @@ impl SqliteStore {
         .await
     }
 
-    /// Advance one stream-scoped cumulative acknowledgement.
+    /// Advance one stream-scoped cumulative acknowledgement. A backfill
+    /// stream accepts only progress and completion boundaries, and a live
+    /// stream only the end of a block's commit.
     ///
     /// # Errors
     ///
     /// Returns an error for an invalid stream or consumer, a backwards,
-    /// non-boundary, or future acknowledgement, or a failed transaction.
+    /// non-boundary, undelivered, or future acknowledgement, or a failed
+    /// transaction.
     pub async fn acknowledge_consumer_in_stream(
         &self,
         descriptor: &ProcessorDescriptor,
@@ -11478,8 +11748,9 @@ impl SqliteStore {
         let mut transaction = self.inner.pool.begin().await?;
         let now = now_i64()?;
         let row = sqlx::query(
-            "SELECT state, acknowledged_sequence, acknowledged_work_blocks,
-                    lease_generation, lease_expires_at_unix_ms, lease_ttl_ms
+            "SELECT state, acknowledged_sequence, delivered_sequence,
+                    acknowledged_work_blocks, lease_generation,
+                    lease_expires_at_unix_ms, lease_ttl_ms
              FROM durable_consumers WHERE stream_id = ? AND consumer_id = ?",
         )
         .bind(stream_id)
@@ -11538,26 +11809,46 @@ impl SqliteStore {
             if sequence > head {
                 return Err(StoreError::AcknowledgementBeyondHead { sequence, head });
             }
+            let delivered = i64_u64(
+                row.try_get("delivered_sequence")?,
+                "consumer delivered sequence",
+            )?;
+            if sequence > delivered {
+                return Err(StoreError::AcknowledgementBeyondDelivered {
+                    sequence,
+                    delivered,
+                });
+            }
             let stream_kind: String =
                 sqlx::query_scalar("SELECT stream_kind FROM delivery_streams WHERE stream_id = ?")
                     .bind(stream_id)
                     .fetch_one(&mut *transaction)
                     .await?;
-            if DeliveryStreamKind::parse(&stream_kind)? == DeliveryStreamKind::Backfill {
-                let kind: Option<String> = sqlx::query_scalar(
-                    "SELECT kind FROM change_log
-                     WHERE stream_id = ? AND stream_sequence = ?",
-                )
-                .bind(stream_id)
-                .bind(u64_i64(sequence, "acknowledged delivery sequence")?)
-                .fetch_optional(&mut *transaction)
-                .await?;
-                if !matches!(
-                    kind.as_deref(),
-                    Some("system.backfill_progress" | "system.backfill_complete")
-                ) {
-                    return Err(StoreError::AcknowledgementNotBoundary { sequence });
+            match DeliveryStreamKind::parse(&stream_kind)? {
+                DeliveryStreamKind::Backfill => {
+                    let kind: Option<String> = sqlx::query_scalar(
+                        "SELECT kind FROM change_log
+                         WHERE stream_id = ? AND stream_sequence = ?",
+                    )
+                    .bind(stream_id)
+                    .bind(u64_i64(sequence, "acknowledged delivery sequence")?)
+                    .fetch_optional(&mut *transaction)
+                    .await?;
+                    if !matches!(
+                        kind.as_deref(),
+                        Some("system.backfill_progress" | "system.backfill_complete")
+                    ) {
+                        return Err(StoreError::AcknowledgementNotBoundary { sequence });
+                    }
                 }
+                DeliveryStreamKind::Live => {
+                    if let Some(block) =
+                        live_commit_continues_after(&mut transaction, stream_id, sequence).await?
+                    {
+                        return Err(StoreError::AcknowledgementMidBlock { sequence, block });
+                    }
+                }
+                DeliveryStreamKind::Canonical => {}
             }
         }
         let progress_payloads: Vec<Vec<u8>> = sqlx::query_scalar(
@@ -13317,6 +13608,16 @@ impl SqliteStore {
     #[must_use]
     pub fn epoch(&self) -> [u8; 16] {
         self.inner.epoch
+    }
+
+    /// Authenticate `message` with a key derived from this store's secret
+    /// for `context`, a hardcoded string unique to one purpose, so a tag made
+    /// for one purpose never verifies for another. The secret is random per
+    /// store, generated once, and never leaves it. [`blake3::Hash`] equality
+    /// is constant-time.
+    #[must_use]
+    pub fn node_mac(&self, context: &str, message: &[u8]) -> blake3::Hash {
+        blake3::keyed_hash(&self.inner.secret.derived_key(context), message)
     }
 
     /// Wait until acknowledgement or pruning may have released delivery
@@ -17377,6 +17678,43 @@ fn decode_change_rows(
         .collect()
 }
 
+/// The block whose live commit continues past `sequence`: the stream's next
+/// record belongs to the same commit, which one live batch carries whole. A
+/// commit is one block's records at one finality, direction, and origin, and
+/// commits atomically, so the stream head always ends one.
+async fn live_commit_continues_after(
+    connection: &mut SqliteConnection,
+    stream_id: &str,
+    sequence: u64,
+) -> Result<Option<BlockNumber>, StoreError> {
+    let block: Option<i64> = sqlx::query_scalar(
+        "SELECT current.block_number
+         FROM change_log AS current
+         JOIN change_log AS next
+           ON next.stream_id = current.stream_id
+          AND next.stream_sequence = (
+              SELECT MIN(stream_sequence) FROM change_log
+              WHERE stream_id = current.stream_id
+                AND stream_sequence > current.stream_sequence
+          )
+         WHERE current.stream_id = ? AND current.stream_sequence = ?
+           AND next.block_number = current.block_number
+           AND next.block_hash = current.block_hash
+           AND next.finality = current.finality
+           AND next.direction = current.direction
+           AND next.origin_kind = current.origin_kind
+           AND next.origin_id = current.origin_id
+           AND next.publication_revision = current.publication_revision",
+    )
+    .bind(stream_id)
+    .bind(u64_i64(sequence, "acknowledged delivery sequence")?)
+    .fetch_optional(&mut *connection)
+    .await?;
+    block
+        .map(|block| i64_u64(block, "block_number").map(BlockNumber))
+        .transpose()
+}
+
 /// Check that a consumer may read after `after`, returning `false` when
 /// pruning has overtaken its acknowledgement and it needs a reset.
 async fn consumer_read_is_retained(
@@ -18123,6 +18461,11 @@ pub enum StoreError {
     AcknowledgementBeyondDelivered { sequence: u64, delivered: u64 },
     #[error("acknowledgement {sequence} is not a committed progress boundary")]
     AcknowledgementNotBoundary { sequence: u64 },
+    #[error(
+        "acknowledgement {sequence} ends inside the live commit of block {}; acknowledge a batch's acknowledgeable cursor",
+        block.0
+    )]
+    AcknowledgementMidBlock { sequence: u64, block: BlockNumber },
     #[error("cursor {sequence} exceeds current delivery head {head}")]
     AcknowledgementBeyondHead { sequence: u64, head: u64 },
     #[error("historical job {job_id} in state {state} is not safe to delete")]
@@ -18362,6 +18705,8 @@ mod tests {
     struct FixtureProcessor {
         descriptor: ProcessorDescriptor,
         output_key_by_block: bool,
+        /// Changes each block publishes; the extra ones only publish.
+        changes_per_block: u8,
     }
 
     impl FixtureProcessor {
@@ -18396,6 +18741,7 @@ mod tests {
                     },
                 },
                 output_key_by_block: false,
+                changes_per_block: 1,
             }
         }
 
@@ -18478,10 +18824,22 @@ mod tests {
                 operation: ChangeOperation::Upsert,
                 payload,
             };
-            transaction.emit(change.clone()).await?;
-            Ok(DomainChanges {
-                changes: vec![change],
-            })
+            let mut changes = vec![change];
+            for extra in 1..self.changes_per_block {
+                let mut key = changes[0].key.clone();
+                key.push(extra);
+                transaction
+                    .put("state", key.clone(), changes[0].payload.clone())
+                    .await?;
+                changes.push(DomainChange {
+                    key,
+                    ..changes[0].clone()
+                });
+            }
+            for change in &changes {
+                transaction.emit(change.clone()).await?;
+            }
+            Ok(DomainChanges { changes })
         }
     }
 
@@ -20998,6 +21356,10 @@ mod tests {
             .await
             .expect("draining");
         store
+            .record_consumer_delivery_in_stream(&stream, "destination", None, completion)
+            .await
+            .expect("deliver completion");
+        store
             .acknowledge_consumer_in_stream(
                 &processor.descriptor,
                 &stream,
@@ -21511,9 +21873,39 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn durable_consumer_credentials_are_isolated() {
+    #[allow(clippy::too_many_lines)]
+    async fn durable_consumer_credentials_are_isolated_keyed_and_required() {
+        // Audit H24 and Auth-4: a client-chosen credential had no length
+        // check, was stored as a bare digest, and was optional on requests.
         let (_directory, store) = store().await;
         let processor = FixtureProcessor::new();
+        let stream_id = default_delivery_stream_id(&processor.descriptor);
+        let credential = "consumer-a-0123456789-abcdef-secret";
+        let other = "consumer-b-0123456789-abcdef-secret";
+        for rejected in [
+            "consumer-a-secret".to_owned(),
+            "x".repeat(31),
+            format!("{} {}", "a".repeat(16), "b".repeat(16)),
+            "é".repeat(32),
+            "y".repeat(513),
+        ] {
+            assert!(
+                matches!(
+                    store
+                        .create_consumer_with_credential(
+                            &processor.descriptor,
+                            "rejected",
+                            ConsumerRole::BestEffort,
+                            ConsumerStartPosition::CurrentHead,
+                            Duration::from_mins(1),
+                            &rejected,
+                        )
+                        .await,
+                    Err(StoreError::InvalidConfig(_))
+                ),
+                "{rejected:?}"
+            );
+        }
         store
             .create_consumer_with_credential(
                 &processor.descriptor,
@@ -21521,30 +21913,91 @@ mod tests {
                 ConsumerRole::BestEffort,
                 ConsumerStartPosition::CurrentHead,
                 Duration::from_mins(1),
-                "consumer-a-secret",
+                credential,
             )
             .await
             .expect("consumer");
+        store
+            .create_consumer(
+                &processor.descriptor,
+                "local",
+                ConsumerRole::BestEffort,
+                ConsumerStartPosition::CurrentHead,
+                Duration::from_mins(1),
+            )
+            .await
+            .expect("configured consumer without a credential");
         assert!(
             store
-                .consumer_credential_matches(
-                    &processor.descriptor,
-                    "consumer-a",
-                    "consumer-a-secret"
-                )
+                .consumer_credential_matches(&processor.descriptor, "consumer-a", credential)
                 .await
                 .expect("matching credential")
         );
         assert!(
             !store
-                .consumer_credential_matches(
-                    &processor.descriptor,
-                    "consumer-a",
-                    "consumer-b-secret"
-                )
+                .consumer_credential_matches(&processor.descriptor, "consumer-a", other)
                 .await
                 .expect("wrong credential")
         );
+        // The stored hash is keyed with the node secret, not the bare digest.
+        let stored: Vec<u8> = sqlx::query_scalar(
+            "SELECT credential_hash FROM durable_consumers WHERE consumer_id = 'consumer-a'",
+        )
+        .fetch_one(&store.inner.pool)
+        .await
+        .expect("stored hash");
+        assert_eq!(stored.len(), 32);
+        assert_ne!(stored, blake3::hash(credential.as_bytes()).as_bytes());
+        for (consumer, presented, authorized) in [
+            ("consumer-a", Some(credential.as_bytes()), true),
+            ("consumer-a", Some(other.as_bytes()), false),
+            ("consumer-a", None, false),
+            ("local", None, true),
+            ("local", Some(credential.as_bytes()), false),
+        ] {
+            assert_eq!(
+                store
+                    .consumer_credential_authorizes_in_stream(
+                        &processor.descriptor,
+                        &stream_id,
+                        consumer,
+                        presented,
+                    )
+                    .await
+                    .expect("credential check"),
+                authorized,
+                "{consumer} {presented:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn the_node_secret_is_random_per_store_and_survives_reopen() {
+        // Audit H24: session tokens carried an unkeyed checksum anyone could
+        // compute from public values.
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("node.sqlite");
+        let store = SqliteStore::open(StoreConfig::new(&path))
+            .await
+            .expect("open");
+        let tag = store.node_mac("leani test context", b"message");
+        assert_ne!(tag, store.node_mac("leani other context", b"message"));
+        assert_ne!(tag, blake3::hash(b"message"));
+        let secret: Vec<u8> = sqlx::query_scalar("SELECT value FROM node_secrets")
+            .fetch_one(&store.inner.pool)
+            .await
+            .expect("one node secret");
+        assert_eq!(secret.len(), 32);
+        assert!(!format!("{store:?}").contains(&format!("{secret:?}")));
+        store.inner.pool.close().await;
+        drop(store);
+
+        let reopened = SqliteStore::open(StoreConfig::new(&path))
+            .await
+            .expect("reopen");
+        assert_eq!(reopened.node_mac("leani test context", b"message"), tag);
+        let (_other_directory, other) = self::store().await;
+        assert_ne!(other.node_mac("leani test context", b"message"), tag);
     }
 
     #[tokio::test]
@@ -21988,6 +22441,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn expired_stream_session_can_be_replaced_without_being_renewed_by_reads() {
         let (_directory, store) = store().await;
         let processor = until_acknowledged(FixtureProcessor::new());
@@ -22071,6 +22525,17 @@ mod tests {
                 .await,
             Err(StoreError::ConsumerSessionLost { .. })
         ));
+        assert!(
+            store
+                .record_consumer_delivery_in_stream(
+                    &stream_id,
+                    "session-owner",
+                    Some(replacement.generation),
+                    1,
+                )
+                .await
+                .expect("replacement session delivery")
+        );
         let acknowledged = store
             .acknowledge_consumer_session_in_stream(
                 &processor.descriptor,
@@ -22138,9 +22603,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn acknowledgement_is_bounded_by_committed_stream_head() {
+    #[allow(clippy::too_many_lines)]
+    async fn acknowledgement_is_bounded_by_the_delivered_sequence() {
+        // Audit M-A5: acknowledgements were checked against the stream head
+        // only, so a consumer could acknowledge changes it never received.
         let (_directory, store) = store().await;
         let processor = until_acknowledged(FixtureProcessor::block_output());
+        let stream_id = default_delivery_stream_id(&processor.descriptor);
         let first = frame(1, BlockHash::ZERO);
         let second = frame(2, first.block.hash);
         let third = frame(3, second.block.hash);
@@ -22166,32 +22635,55 @@ mod tests {
             )
             .await
             .expect("consumer");
-        let first_ack = store
-            .acknowledge_consumer(&processor.descriptor, "bounded-ack", 1)
-            .await
-            .expect("acknowledge committed head without a durable sent watermark");
-        assert_eq!(first_ack.acknowledged_sequence, 1);
-        assert_eq!(first_ack.delivered_sequence, 1);
+        assert!(matches!(
+            store
+                .acknowledge_consumer(&processor.descriptor, "bounded-ack", 1)
+                .await,
+            Err(StoreError::AcknowledgementBeyondDelivered {
+                sequence: 1,
+                delivered: 0
+            })
+        ));
         let changes = store
             .consumer_changes(&processor.descriptor, ChainId(1), "bounded-ack", 100)
             .await
-            .expect("deliver changes");
-        assert_eq!(changes.len(), 2);
+            .expect("read changes");
+        assert_eq!(changes.len(), 3);
         assert!(
             changes
                 .iter()
                 .all(|change| change.delivery_encoding_version == 1)
         );
-        assert_eq!(
+        let delivered = |store: &SqliteStore| {
+            let store = store.clone();
+            let descriptor = processor.descriptor.clone();
+            async move {
+                store
+                    .consumer(&descriptor, "bounded-ack")
+                    .await
+                    .expect("consumer")
+                    .expect("consumer exists")
+                    .delivered_sequence
+            }
+        };
+        // Reading alone records nothing: the reader records what it hands out.
+        assert_eq!(delivered(&store).await, 0);
+        assert!(
             store
-                .consumer(&processor.descriptor, "bounded-ack")
+                .record_consumer_delivery_in_stream(&stream_id, "bounded-ack", None, 2)
                 .await
-                .expect("consumer")
-                .expect("consumer exists")
-                .delivered_sequence,
-            1,
-            "stream reads must not persist a sent watermark"
+                .expect("record delivery")
         );
+        assert_eq!(delivered(&store).await, 2);
+        assert!(matches!(
+            store
+                .acknowledge_consumer(&processor.descriptor, "bounded-ack", 3)
+                .await,
+            Err(StoreError::AcknowledgementBeyondDelivered {
+                sequence: 3,
+                delivered: 2
+            })
+        ));
         assert!(matches!(
             store
                 .acknowledge_consumer(&processor.descriptor, "bounded-ack", 4)
@@ -22201,10 +22693,16 @@ mod tests {
                 head: 3
             })
         ));
+        // A lower record never lowers the watermark.
+        store
+            .record_consumer_delivery_in_stream(&stream_id, "bounded-ack", None, 1)
+            .await
+            .expect("record an older delivery");
+        assert_eq!(delivered(&store).await, 2);
         let acknowledged = store
             .acknowledge_consumer(&processor.descriptor, "bounded-ack", 2)
             .await
-            .expect("acknowledge delivered head");
+            .expect("acknowledge delivered changes");
         assert_eq!(acknowledged.acknowledged_sequence, 2);
         let pruned = store
             .prune_changes_before(&processor.descriptor, 3)
@@ -22216,6 +22714,230 @@ mod tests {
             .await
             .expect("retry already-applied acknowledgement after pruning");
         assert_eq!(retried.acknowledged_sequence, 2);
+    }
+
+    /// A split live stream whose required `destination` consumer has two
+    /// blocks of two records ahead: sequences 1-2 are block 1, 3-4 block 2.
+    async fn two_block_live_consumer() -> (tempfile::TempDir, SqliteStore, FixtureProcessor, String)
+    {
+        let (directory, store) = store().await;
+        let mut processor = until_acknowledged(FixtureProcessor::block_output());
+        processor.changes_per_block = 2;
+        let stream_id = default_delivery_stream_id(&processor.descriptor);
+        store
+            .register_processor(&processor.descriptor)
+            .await
+            .expect("register");
+        store
+            .create_consumer_in_stream(
+                &processor.descriptor,
+                &stream_id,
+                "destination",
+                ConsumerRole::Required,
+                ConsumerStartPosition::EarliestRetained,
+                Duration::from_mins(1),
+            )
+            .await
+            .expect("consumer");
+        let first = frame(1, BlockHash::ZERO);
+        let second = frame(2, first.block.hash);
+        for (sequence, current) in [(1, &first), (2, &second)] {
+            let delta = processor.map(current).await.expect("map");
+            store
+                .apply(
+                    &processor,
+                    cursor(&processor, current, sequence),
+                    &delta,
+                    &[],
+                )
+                .await
+                .expect("apply");
+        }
+        let records = store
+            .consumer_changes_in_stream(
+                &processor.descriptor,
+                &stream_id,
+                ChainId(1),
+                "destination",
+                10,
+            )
+            .await
+            .expect("read");
+        assert_eq!(
+            records
+                .iter()
+                .map(|record| (record.cursor.sequence, record.block.number.0))
+                .collect::<Vec<_>>(),
+            [(1, 1), (2, 1), (3, 2), (4, 2)]
+        );
+        (directory, store, processor, stream_id)
+    }
+
+    #[tokio::test]
+    async fn live_acknowledgements_must_end_a_block() {
+        // Audit M-A3: a live acknowledgement inside a block let a destination
+        // resume after half of it.
+        let (_directory, store, processor, stream_id) = two_block_live_consumer().await;
+        assert!(
+            store
+                .record_consumer_delivery_in_stream(&stream_id, "destination", None, 4)
+                .await
+                .expect("record delivery")
+        );
+        for (sequence, block) in [(1, 1), (3, 2)] {
+            let rejected = store
+                .acknowledge_consumer_in_stream(
+                    &processor.descriptor,
+                    &stream_id,
+                    "destination",
+                    sequence,
+                )
+                .await
+                .expect_err("an acknowledgement inside a block");
+            assert!(
+                matches!(
+                    rejected,
+                    StoreError::AcknowledgementMidBlock { sequence: rejected_sequence, block: rejected_block }
+                        if rejected_sequence == sequence && rejected_block == BlockNumber(block)
+                ),
+                "{rejected}"
+            );
+        }
+        for sequence in [2, 4] {
+            let acknowledged = store
+                .acknowledge_consumer_in_stream(
+                    &processor.descriptor,
+                    &stream_id,
+                    "destination",
+                    sequence,
+                )
+                .await
+                .expect("an acknowledgement at the end of a block");
+            assert_eq!(acknowledged.acknowledged_sequence, sequence);
+        }
+    }
+
+    #[tokio::test]
+    async fn only_the_current_session_records_delivery() {
+        // Audit M-A5: a stream records what its session sends; a replaced
+        // session can neither record nor acknowledge past it.
+        let (_directory, store, processor, stream_id) = two_block_live_consumer().await;
+        let session = store
+            .acquire_consumer_session_in_stream(&processor.descriptor, &stream_id, "destination")
+            .await
+            .expect("session");
+        let delivered = || async {
+            store
+                .consumer_in_stream(&processor.descriptor, &stream_id, "destination")
+                .await
+                .expect("consumer")
+                .expect("consumer exists")
+                .delivered_sequence
+        };
+        assert!(
+            !store
+                .record_consumer_delivery_in_stream(
+                    &stream_id,
+                    "destination",
+                    Some(session.generation + 1),
+                    4,
+                )
+                .await
+                .expect("stale session")
+        );
+        assert_eq!(delivered().await, 0);
+        assert!(matches!(
+            store
+                .acknowledge_consumer_session_in_stream(
+                    &processor.descriptor,
+                    &stream_id,
+                    "destination",
+                    session.generation,
+                    2,
+                )
+                .await,
+            Err(StoreError::AcknowledgementBeyondDelivered {
+                sequence: 2,
+                delivered: 0
+            })
+        ));
+        assert!(
+            store
+                .record_consumer_delivery_in_stream(
+                    &stream_id,
+                    "destination",
+                    Some(session.generation),
+                    4,
+                )
+                .await
+                .expect("current session")
+        );
+        assert_eq!(delivered().await, 4);
+        store
+            .acknowledge_consumer_session_in_stream(
+                &processor.descriptor,
+                &stream_id,
+                "destination",
+                session.generation,
+                4,
+            )
+            .await
+            .expect("acknowledge what the session delivered");
+    }
+
+    #[tokio::test]
+    async fn delivery_below_the_watermark_does_not_wait_for_the_writer() {
+        // Review 1, minor 1: a re-read of a page records nothing new, so,
+        // like any pure read, it must not queue behind the writer.
+        let (_directory, store, processor, stream_id) = two_block_live_consumer().await;
+        let session = store
+            .acquire_consumer_session_in_stream(&processor.descriptor, &stream_id, "destination")
+            .await
+            .expect("session");
+        let record = |generation: Option<u64>, sequence: u64| {
+            store.record_consumer_delivery_in_stream(
+                &stream_id,
+                "destination",
+                generation,
+                sequence,
+            )
+        };
+        assert!(record(None, 2).await.expect("first delivery"));
+        let writer = store.inner.writer.lock().await;
+        for (generation, sequence, current) in [
+            (None, 2, true),
+            (None, 1, true),
+            (Some(session.generation), 2, true),
+            (Some(session.generation + 1), 1, false),
+        ] {
+            assert_eq!(
+                promptly(
+                    "a delivery below the watermark",
+                    record(generation, sequence)
+                )
+                .await
+                .expect("delivery"),
+                current,
+                "session {generation:?} through {sequence}"
+            );
+        }
+        // Raising the watermark still writes, and so waits.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), record(None, 3))
+                .await
+                .is_err()
+        );
+        drop(writer);
+        assert!(record(None, 3).await.expect("raise the watermark"));
+        assert_eq!(
+            store
+                .consumer_in_stream(&processor.descriptor, &stream_id, "destination")
+                .await
+                .expect("consumer")
+                .expect("consumer exists")
+                .delivered_sequence,
+            3
+        );
     }
 
     #[tokio::test]
@@ -22408,6 +23130,10 @@ mod tests {
         assert_eq!(committed_range_blocks, 1);
 
         let history_head = history.last().expect("history head").cursor.sequence;
+        store
+            .record_consumer_delivery_in_stream(&history_stream, "destination", None, history_head)
+            .await
+            .expect("deliver history");
         assert!(matches!(
             store
                 .acknowledge_consumer_in_stream(
@@ -22520,6 +23246,10 @@ mod tests {
                 .await,
             Err(StoreError::HistoricalWorkNotDeletable { .. })
         ));
+        store
+            .record_consumer_delivery_in_stream(&history_stream, "destination", None, completion)
+            .await
+            .expect("deliver completion");
         store
             .acknowledge_consumer_in_stream(
                 &processor.descriptor,
@@ -25521,11 +26251,13 @@ mod tests {
             .apply(&processor, cursor(&processor, &block, 1), &delta, &[])
             .await
             .expect("apply");
-        // Rewind to the rc.1 layout: schema 21 without the lookup indexes.
+        // Rewind to the rc.1 layout: schema 21 without the lookup indexes or
+        // the node secret.
         sqlx::raw_sql(
             "DROP INDEX IF EXISTS processor_coverage_by_hash;
              DROP INDEX IF EXISTS processor_coverage_finalized;
              DROP INDEX IF EXISTS finalized_coverage_segments_by_hash;
+             DROP TABLE IF EXISTS node_secrets;
              UPDATE node_meta SET value = X'00000015' WHERE key = 'schema_version';",
         )
         .execute(&store.inner.pool)
@@ -25537,7 +26269,7 @@ mod tests {
         let reopened = SqliteStore::open(StoreConfig::new(&path))
             .await
             .expect("schema 21 upgrades in place");
-        assert_eq!(CURRENT_SCHEMA_VERSION, 22);
+        assert_eq!(CURRENT_SCHEMA_VERSION, 23);
         assert_eq!(
             reopened.stats().await.expect("stats").schema_version,
             CURRENT_SCHEMA_VERSION
@@ -25576,6 +26308,163 @@ mod tests {
                 .map(|cursor| cursor.block_number),
             Some(BlockNumber(1))
         );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn schema_22_stores_upgrade_with_delivered_watermarks_and_a_node_secret() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("node.sqlite");
+        let store = SqliteStore::open(StoreConfig::new(&path))
+            .await
+            .expect("open fresh store");
+        let processor = until_acknowledged(FixtureProcessor::new());
+        let stream_id = default_delivery_stream_id(&processor.descriptor);
+        let mut parent = BlockHash::ZERO;
+        for number in 1..=3 {
+            let current = frame(number, parent);
+            let delta = processor.map(&current).await.expect("map");
+            store
+                .apply(
+                    &processor,
+                    cursor(&processor, &current, number),
+                    &delta,
+                    &[],
+                )
+                .await
+                .expect("apply");
+            parent = current.block.hash;
+        }
+        let credential = "upgraded-consumer-0123456789abcdef";
+        store
+            .create_consumer_with_credential(
+                &processor.descriptor,
+                "keyed",
+                ConsumerRole::Required,
+                ConsumerStartPosition::EarliestRetained,
+                Duration::from_mins(1),
+                credential,
+            )
+            .await
+            .expect("consumer with a credential");
+        store
+            .create_consumer(
+                &processor.descriptor,
+                "plain",
+                ConsumerRole::BestEffort,
+                ConsumerStartPosition::EarliestRetained,
+                Duration::from_mins(1),
+            )
+            .await
+            .expect("consumer without a credential");
+        let pruned = with_id(FixtureProcessor::new(), "pruned");
+        apply_included_blocks(&store, &pruned, 1..=2, BlockHash::ZERO).await;
+        store
+            .create_consumer(
+                &pruned.descriptor,
+                "overtaken",
+                ConsumerRole::BestEffort,
+                ConsumerStartPosition::EarliestRetained,
+                Duration::from_mins(1),
+            )
+            .await
+            .expect("consumer of a stream to prune");
+        // Rewind to the schema-22 layout: no node secret, bare credential
+        // digests, and delivered watermarks that only acknowledgements moved.
+        sqlx::raw_sql(
+            "DROP TABLE IF EXISTS node_secrets;
+             UPDATE durable_consumers SET delivered_sequence = acknowledged_sequence;
+             UPDATE node_meta SET value = X'00000016' WHERE key = 'schema_version';",
+        )
+        .execute(&store.inner.pool)
+        .await
+        .expect("rewind to schema 22");
+        sqlx::query("UPDATE durable_consumers SET credential_hash = ? WHERE consumer_id = 'keyed'")
+            .bind(blake3::hash(credential.as_bytes()).as_bytes().as_slice())
+            .execute(&store.inner.pool)
+            .await
+            .expect("bare credential digest");
+        // Review 1, minor 2: a stream pruned of every change has no head row,
+        // so its pruned sequence marks the head.
+        let pruned_stream = default_delivery_stream_id(&pruned.descriptor);
+        sqlx::query("DELETE FROM change_log WHERE stream_id = ?")
+            .bind(&pruned_stream)
+            .execute(&store.inner.pool)
+            .await
+            .expect("prune every change");
+        sqlx::query("UPDATE delivery_streams SET pruned_through_sequence = 2 WHERE stream_id = ?")
+            .bind(&pruned_stream)
+            .execute(&store.inner.pool)
+            .await
+            .expect("pruned through the head");
+        store.inner.pool.close().await;
+        drop(store);
+
+        let reopened = SqliteStore::open(StoreConfig::new(&path))
+            .await
+            .expect("schema 22 upgrades in place");
+        assert_eq!(CURRENT_SCHEMA_VERSION, 23);
+        assert_eq!(
+            reopened.stats().await.expect("stats").schema_version,
+            CURRENT_SCHEMA_VERSION
+        );
+        // Consumers keep acknowledging what they received before the upgrade.
+        for consumer in ["keyed", "plain"] {
+            let upgraded = reopened
+                .consumer(&processor.descriptor, consumer)
+                .await
+                .expect("consumer")
+                .expect("consumer exists");
+            assert_eq!(
+                (upgraded.acknowledged_sequence, upgraded.delivered_sequence),
+                (0, 3),
+                "{consumer}"
+            );
+        }
+        let overtaken = reopened
+            .consumer(&pruned.descriptor, "overtaken")
+            .await
+            .expect("consumer")
+            .expect("consumer exists");
+        assert_eq!(
+            (
+                overtaken.acknowledged_sequence,
+                overtaken.delivered_sequence
+            ),
+            (0, 2)
+        );
+        reopened
+            .acknowledge_consumer(&processor.descriptor, "keyed", 3)
+            .await
+            .expect("acknowledge a delivery from before the upgrade");
+        // The bare digest was keyed, so the credential still authorizes.
+        let stored: Vec<u8> = sqlx::query_scalar(
+            "SELECT credential_hash FROM durable_consumers WHERE consumer_id = 'keyed'",
+        )
+        .fetch_one(&reopened.inner.pool)
+        .await
+        .expect("stored hash");
+        assert_ne!(stored, blake3::hash(credential.as_bytes()).as_bytes());
+        for (presented, authorized) in [(Some(credential.as_bytes()), true), (None, false)] {
+            assert_eq!(
+                reopened
+                    .consumer_credential_authorizes_in_stream(
+                        &processor.descriptor,
+                        &stream_id,
+                        "keyed",
+                        presented,
+                    )
+                    .await
+                    .expect("credential check"),
+                authorized
+            );
+        }
+        let secrets: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM node_secrets WHERE length(value) = 32")
+                .fetch_one(&reopened.inner.pool)
+                .await
+                .expect("node secret");
+        assert_eq!(secrets, 1);
     }
 
     #[tokio::test]

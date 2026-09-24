@@ -1535,6 +1535,16 @@ impl leani_api::BackfillControl for NativeBackfillControl {
             let outcome = self.outcome(&record.id).await?;
             return self.status(&record, outcome.as_ref()).await;
         }
+        // Only here: a subscription created before the credential rule
+        // re-submits its credential and gets its status above.
+        if let Some(credential) = request
+            .consumer
+            .as_ref()
+            .and_then(|consumer| consumer.credential.as_deref())
+        {
+            leani_store_sqlite::validate_consumer_credential(credential)
+                .map_err(leani_api::BackfillControlError::Invalid)?;
+        }
         let chain_id = leani_primitives::ChainId(self.config.chain.chain_id);
         let finalized_head = self
             .store
@@ -7811,6 +7821,135 @@ mod tests {
                 .expect("outcome exists")
                 .state,
             leani_store_sqlite::JobState::Failed
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn short_consumer_credentials_are_refused_only_for_new_subscriptions() {
+        // Review 1, Important 2: an application re-submits its subscription
+        // at startup, and one created while 16 characters sufficed must still
+        // get its status back. Only a new subscription meets the 32-character
+        // rule, as a client error before any stream exists.
+        use leani_api::BackfillControl as _;
+
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let store = leani_store_sqlite::SqliteStore::open(leani_store_sqlite::StoreConfig::new(
+            directory.path().join("node.sqlite"),
+        ))
+        .await
+        .expect("store");
+        let processor: Arc<dyn Processor> = Arc::new(BlockLocalCounter::default());
+        let instance = processor.descriptor().instance.to_string();
+        let mut config: Config =
+            toml::from_str(crate::config::VALID_CONFIG_TOML).expect("configuration fixture");
+        config.processors[0].instance.clone_from(&instance);
+        config.processors[0].history_control =
+            crate::config::ProcessorHistoryControl::ApplicationSubscriptions;
+        let control = NativeBackfillControl::new(
+            config,
+            store.clone(),
+            vec![processor.clone()],
+            CancellationToken::new(),
+            None,
+            None,
+            leani_runtime::HistoricalPipelineBudget::new(1, 1, 1_024).expect("pipeline budget"),
+        );
+        let request = |idempotency_key: &str| leani_api::CreateBackfillRequest {
+            processor: instance.clone(),
+            from_block: Some(1),
+            to_block: Some(2.into()),
+            ranges: Vec::new(),
+            mode: leani_api::BackfillExecutionMode::FillMissing,
+            consumer: Some(leani_api::CreateBackfillConsumerRequest {
+                id: "destination".to_owned(),
+                role: leani_store_sqlite::ConsumerRole::Required,
+                lease_ttl_seconds: 60,
+                credential: Some("twenty-char-secret-1".to_owned()),
+            }),
+            limits: None,
+            batching: None,
+            idempotency_key: idempotency_key.to_owned(),
+        };
+
+        // What an earlier release stored for such a request; the idempotent
+        // path reads only the job and the request's identity.
+        let before_upgrade = request("before-upgrade");
+        let id = format!("subscription:{instance}:before-upgrade");
+        let mut job = leani_runtime::BackfillJob::for_processor(
+            id.clone(),
+            processor.as_ref(),
+            leani_primitives::ChainId(1),
+            leani_primitives::BlockRange::new(
+                leani_primitives::BlockNumber(1),
+                leani_primitives::BlockNumber(2),
+            )
+            .expect("range"),
+            leani_source_api::VerificationPolicy::TrustedDataset,
+        )
+        .expect("job");
+        job.owner = leani_runtime::HistoricalJobOwner::Subscription;
+        store
+            .create_historical_job(
+                &leani_store_sqlite::JobRecord {
+                    id: id.clone(),
+                    kind: job.owner.job_kind().to_owned(),
+                    state: leani_store_sqlite::JobState::Queued,
+                    payload: serde_json::to_vec(&job).expect("job payload"),
+                    checkpoint: None,
+                    attempts: 0,
+                    updated_at_unix_ms: 1,
+                },
+                NativeBackfillControl::historical_request_identity(
+                    &before_upgrade,
+                    leani_api::HistoricalWorkOwner::Subscription,
+                    &instance,
+                )
+                .expect("request identity"),
+            )
+            .await
+            .expect("subscription from before the upgrade");
+        let status = control
+            .create_subscription(before_upgrade)
+            .await
+            .expect("a re-submission gets the stored status");
+        assert_eq!(status.id, id);
+        assert_eq!(status.state, leani_api::BackfillState::Queued);
+
+        store
+            .store_canonical_anchor(
+                leani_primitives::ChainId(1),
+                leani_primitives::BlockRef {
+                    number: leani_primitives::BlockNumber(10),
+                    hash: leani_primitives::BlockHash::new([10; 32]),
+                    parent_hash: leani_primitives::BlockHash::new([9; 32]),
+                    timestamp: 1,
+                },
+                leani_primitives::Finality::Finalized,
+            )
+            .await
+            .expect("finalized head");
+        let streams = store
+            .delivery_streams(processor.descriptor())
+            .await
+            .expect("streams")
+            .len();
+        let refused = control.create_subscription(request("after-upgrade")).await;
+        assert!(
+            matches!(
+                &refused,
+                Err(leani_api::BackfillControlError::Invalid(message))
+                    if message.contains("32 to 512")
+            ),
+            "{refused:?}"
+        );
+        assert_eq!(
+            store
+                .delivery_streams(processor.descriptor())
+                .await
+                .expect("streams")
+                .len(),
+            streams
         );
     }
 

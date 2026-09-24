@@ -12262,6 +12262,10 @@ mod tests {
             .cursor
             .sequence;
         reopened
+            .record_consumer_delivery_in_stream(&stream_id, "destination-0", None, acknowledged)
+            .await
+            .expect("record the delivered prefix");
+        reopened
             .acknowledge_consumer_in_stream(
                 processor.descriptor(),
                 &stream_id,
@@ -12310,6 +12314,15 @@ mod tests {
                     )
                 }) {
                     after = boundary.cursor.sequence;
+                    consumer_store
+                        .record_consumer_delivery_in_stream(
+                            &consumer_stream,
+                            "destination-0",
+                            None,
+                            after,
+                        )
+                        .await
+                        .expect("record the delivered boundary");
                     consumer_store
                         .acknowledge_consumer_in_stream(
                             &consumer_descriptor,
@@ -12452,6 +12465,10 @@ mod tests {
                 )
             }) {
                 after = boundary.cursor.sequence;
+                store
+                    .record_consumer_delivery_in_stream(&stream_id, consumer_id, None, after)
+                    .await
+                    .expect("record the delivered boundary");
                 store
                     .acknowledge_consumer_in_stream(&descriptor, &stream_id, consumer_id, after)
                     .await

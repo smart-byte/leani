@@ -4722,6 +4722,7 @@ dependencies = [
  "async-trait",
  "blake3",
  "futures",
+ "getrandom 0.3.4",
  "hex",
  "leani-primitives",
  "leani-processor-api",
