@@ -203,6 +203,15 @@ impl BlockLocalCounter {
         }
     }
 
+    /// Run as another instance of the same processor kind, configured apart
+    /// as instances of one kind are: `config_hash` stands for its settings.
+    #[must_use]
+    pub fn with_instance(mut self, instance: ProcessorInstanceId, config_hash: BlockHash) -> Self {
+        self.descriptor.instance = instance;
+        self.descriptor.config_hash = config_hash;
+        self
+    }
+
     #[must_use]
     pub fn with_publication(mut self, publication: PublicationPolicy) -> Self {
         self.descriptor.publication = publication;

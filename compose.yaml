@@ -4,6 +4,8 @@ services:
       context: .
     restart: unless-stopped
     init: true
+    # `serve` takes up to 15 seconds to stop; Docker's default allows 10.
+    stop_grace_period: 30s
     # The image's /etc/leani/node.toml (deploy/container.toml) reads the API
     # bearer token from LEANI_API_TOKEN; `serve` refuses to start unless it
     # holds at least 16 printable ASCII characters. Export it before any

@@ -215,7 +215,9 @@ paths:
         "200":
           description: |
             Resumable SSE stream. The event id is the opaque resume cursor and
-            each data field contains one ChangeEnvelope.
+            each data field contains one ChangeEnvelope. When the node shuts
+            down, the stream ends after a whole event; reconnect after the
+            last event's id.
           content:
             text/event-stream:
               schema:
@@ -722,6 +724,8 @@ paths:
         delivered sequence through it. A request whose `Sec-Fetch-Site` is
         `cross-site` or `same-site` without an allowed `Origin`, such as a
         navigation of another site's frame, gets 403 `cross_site_request`.
+        When the node shuts down, the stream ends after a whole record;
+        reconnect to resume after the acknowledged cursor.
       responses:
         "200":
           description: Server-sent live-lane batches.
@@ -796,7 +800,8 @@ paths:
         sequence through their acknowledgement boundary. A request whose
         `Sec-Fetch-Site` is `cross-site` or `same-site` without an allowed
         `Origin`, such as a navigation of another site's frame, gets 403
-        `cross_site_request`.
+        `cross_site_request`. When the node shuts down, the stream ends after
+        a whole record; reconnect to resume after the acknowledged cursor.
       responses:
         "200":
           description: Server-sent backfill delivery batches.
@@ -913,8 +918,8 @@ paths:
         request's idempotency identity, an unkeyed BLAKE3 hash of the whole
         request that the node keeps, so use a random one.
       responses:
-        "201":
-          description: Created backfill subscription.
+        "202":
+          description: Backfill subscription accepted; its current status.
         default:
           $ref: "#/components/responses/Error"
   /admin/v1/backfill-subscriptions/{id}:
@@ -964,8 +969,8 @@ paths:
       summary: Create a materialization job
       operationId: createMaterializationJob
       responses:
-        "201":
-          description: Created materialization job.
+        "202":
+          description: Materialization job accepted; its current status.
         default:
           $ref: "#/components/responses/Error"
   /admin/v1/materialization-jobs/{id}:
@@ -1015,8 +1020,8 @@ paths:
       summary: Create a raw-history job
       operationId: createRawHistoryJob
       responses:
-        "201":
-          description: Created raw-history job.
+        "202":
+          description: Raw-history job accepted; its current state.
         default:
           $ref: "#/components/responses/Error"
   /admin/v1/raw-history-jobs/{id}:
@@ -1904,6 +1909,7 @@ components:
         leaseTtlSeconds:
           type: integer
           minimum: 1
+          maximum: 3153600000
         credential:
           description: |
             A random secret of 32 to 512 printable ASCII characters without

@@ -1,5 +1,7 @@
 //! Process-wide diagnostics, structured logging, cancellation, and exit policy.
 
+mod shutdown;
+
 use std::{
     collections::BTreeMap,
     fs,
@@ -16,6 +18,10 @@ use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
+
+use self::shutdown::{
+    BackgroundTasks, ShutdownSignals, forward_shutdown_signals, serve_until_shutdown,
+};
 
 use crate::{
     benchmark::{BenchmarkOptions, RealSourceBenchmarkOptions},
@@ -138,17 +144,71 @@ struct OnDemandP2pBridge {
     anchor: leani_source_p2p::P2pHistoryAnchor,
 }
 
+/// How often the durable job scheduler looks again at jobs that wait on
+/// storage headroom or failed to resume for a reason that may pass.
+const DURABLE_JOB_RECHECK: Duration = Duration::from_secs(5);
+
+/// How long deleting a historical job waits for its task to end.
+const HISTORICAL_JOB_STOP_WAIT: Duration = Duration::from_secs(10);
+
+/// The task of one running historical job.
+#[derive(Clone)]
+struct RunningJob {
+    cancellation: CancellationToken,
+    /// Cancelled once the task has ended, after its last write for the job.
+    ended: CancellationToken,
+}
+
 #[derive(Clone)]
 struct NativeBackfillControl {
     config: Arc<Config>,
     store: leani_store_sqlite::SqliteStore,
     processors: Arc<Vec<Arc<dyn leani_processor_api::Processor>>>,
     cancellation: CancellationToken,
-    tasks: Arc<tokio::sync::Mutex<BTreeMap<String, CancellationToken>>>,
+    tasks: Arc<tokio::sync::Mutex<BTreeMap<String, RunningJob>>>,
+    /// Wakes the durable job scheduler: a job was created, or a job's task
+    /// ended, which frees a slot and changes its job.
+    jobs_changed: Arc<tokio::sync::Notify>,
     p2p_bridge: Arc<tokio::sync::RwLock<Option<OnDemandP2pBridge>>>,
     raw_history_store: Option<leani_store_history::HistoryStore>,
     material_coordinator: Option<leani_runtime::HistoricalMaterialCoordinator>,
     pipeline_budget: leani_runtime::HistoricalPipelineBudget,
+}
+
+/// What one scheduler pass did with a durable job.
+enum JobResume {
+    /// Nothing more to do for now.
+    Done,
+    /// It waits for storage headroom, which no job change signals.
+    WaitingForStorage,
+    /// Every backfill slot is taken; a task that ends wakes the scheduler.
+    AtCapacity,
+}
+
+/// The historical runtime settings of a backfill over `sources` history
+/// sources: the configured pipeline, and three attempts per source on a gap.
+fn historical_runtime_config(
+    config: &Config,
+    sources: usize,
+) -> leani_runtime::HistoricalRuntimeConfig {
+    let pipeline = config.budgets.history_pipeline;
+    leani_runtime::HistoricalRuntimeConfig {
+        mapper_concurrency: config.budgets.mapper_concurrency,
+        maximum_active_chunks: pipeline.maximum_active_chunks,
+        maximum_mapped_bytes: pipeline.maximum_mapped_bytes.bytes(),
+        commit_maximum_blocks: pipeline.commit.maximum_blocks,
+        commit_maximum_changes: pipeline.commit.maximum_changes,
+        commit_maximum_encoded_bytes: pipeline.commit.maximum_encoded_bytes.bytes(),
+        commit_maximum_delay: Duration::from_millis(pipeline.commit.maximum_delay.milliseconds()),
+        commit_target_writer_hold: Duration::from_millis(
+            pipeline.commit.target_writer_hold.milliseconds(),
+        ),
+        max_attempts: u32::try_from(sources)
+            .unwrap_or(u32::MAX)
+            .saturating_mul(3)
+            .max(leani_runtime::HistoricalRuntimeConfig::default().max_attempts),
+        ..leani_runtime::HistoricalRuntimeConfig::default()
+    }
 }
 
 impl std::fmt::Debug for NativeBackfillControl {
@@ -177,33 +237,11 @@ impl NativeBackfillControl {
             processors: Arc::new(processors),
             cancellation,
             tasks: Arc::new(tokio::sync::Mutex::new(BTreeMap::new())),
+            jobs_changed: Arc::new(tokio::sync::Notify::new()),
             p2p_bridge: Arc::new(tokio::sync::RwLock::new(None)),
             raw_history_store,
             material_coordinator,
             pipeline_budget,
-        }
-    }
-
-    fn historical_runtime_config(
-        &self,
-        max_attempts: u32,
-    ) -> leani_runtime::HistoricalRuntimeConfig {
-        let pipeline = self.config.budgets.history_pipeline;
-        leani_runtime::HistoricalRuntimeConfig {
-            mapper_concurrency: self.config.budgets.mapper_concurrency,
-            maximum_active_chunks: pipeline.maximum_active_chunks,
-            maximum_mapped_bytes: pipeline.maximum_mapped_bytes.bytes(),
-            commit_maximum_blocks: pipeline.commit.maximum_blocks,
-            commit_maximum_changes: pipeline.commit.maximum_changes,
-            commit_maximum_encoded_bytes: pipeline.commit.maximum_encoded_bytes.bytes(),
-            commit_maximum_delay: Duration::from_millis(
-                pipeline.commit.maximum_delay.milliseconds(),
-            ),
-            commit_target_writer_hold: Duration::from_millis(
-                pipeline.commit.target_writer_hold.milliseconds(),
-            ),
-            max_attempts,
-            ..leani_runtime::HistoricalRuntimeConfig::default()
         }
     }
 
@@ -994,15 +1032,12 @@ impl NativeBackfillControl {
             Vec::new()
         };
         let artifact_segments_per_pass = self.config.artifact_storage.maximum_segments_per_cycle;
-        let max_attempts = u32::try_from(sources.len())
-            .unwrap_or(u32::MAX)
-            .saturating_mul(3)
-            .max(leani_runtime::HistoricalRuntimeConfig::default().max_attempts);
+        let runtime_config = historical_runtime_config(&self.config, sources.len());
         let runtime = leani_runtime::HistoricalRuntime::new_with_sources(
             self.store.clone(),
             sources,
             processor,
-            self.historical_runtime_config(max_attempts),
+            runtime_config,
         )
         .map_err(|error| leani_api::BackfillControlError::Invalid(error.to_string()))?
         .with_pipeline_budget(self.pipeline_budget.clone());
@@ -1012,26 +1047,39 @@ impl NativeBackfillControl {
             runtime
         };
         let token = self.cancellation.child_token();
-        tasks.insert(job.id.clone(), token.clone());
+        let ended = CancellationToken::new();
+        tasks.insert(
+            job.id.clone(),
+            RunningJob {
+                cancellation: token.clone(),
+                ended: ended.clone(),
+            },
+        );
         drop(tasks);
-        if job.owner == leani_runtime::HistoricalJobOwner::Subscription {
-            self.store
+        if job.owner == leani_runtime::HistoricalJobOwner::Subscription
+            && let Err(error) = self
+                .store
                 .set_backfill_subscription_state(
                     &job.id,
                     leani_store_sqlite::BackfillSubscriptionState::Running,
                     None,
                 )
                 .await
-                .map_err(|error| leani_api::BackfillControlError::Internal(error.to_string()))?;
+        {
+            self.tasks.lock().await.remove(&job.id);
+            ended.cancel();
+            return Err(leani_api::BackfillControlError::Internal(error.to_string()));
         }
 
         let budget = self.source_budget(job.request.range);
         let tasks = self.tasks.clone();
+        let jobs_changed = self.jobs_changed.clone();
         let store = self.store.clone();
         let process_cancellation = self.cancellation.clone();
         let job_id = job.id.clone();
         let owner = job.owner;
-        tokio::spawn(async move {
+        let job_task = (store.clone(), job_id.clone());
+        let work = tokio::spawn(async move {
             match runtime.run(job, budget, token).await {
                 Ok(report) => {
                     if tier_artifacts {
@@ -1118,13 +1166,36 @@ impl NativeBackfillControl {
                     .await;
                 }
             }
+        });
+        tokio::spawn(async move {
+            let (store, job_id) = job_task;
+            // Marks the job ended however its work ends: a deletion waits for it.
+            let _ended = ended.drop_guard();
+            // A panic fails the job, so that its slot frees and the scheduler
+            // does not resume it into the same panic.
+            if let Err(error) = work.await {
+                Self::record_failure(
+                    &store,
+                    "on_demand",
+                    &job_id,
+                    owner,
+                    leani_store_sqlite::JobState::Failed,
+                    Some(format!("the job's task ended unexpectedly: {error}")),
+                )
+                .await;
+            }
             tasks.lock().await.remove(&job_id);
+            jobs_changed.notify_one();
         });
         Ok(())
     }
 
-    #[allow(clippy::too_many_lines)]
-    async fn resume_durable_jobs(&self) -> Result<(), leani_api::BackfillControlError> {
+    /// One scheduler pass over the durable historical jobs. A job that cannot
+    /// be read or resumed is skipped with a warning, so it never holds back
+    /// the others. Returns whether a job waits on storage headroom or failed
+    /// for a reason that may pass, so that the scheduler looks again even
+    /// without a job change.
+    async fn resume_durable_jobs(&self) -> Result<bool, leani_api::BackfillControlError> {
         let mut records = self
             .store
             .jobs(Some(
@@ -1141,143 +1212,193 @@ impl NativeBackfillControl {
                 .map_err(|error| leani_api::BackfillControlError::Internal(error.to_string()))?,
         );
         records.sort_by_key(|record| record.updated_at_unix_ms);
+        let mut recheck = false;
         for record in records {
-            let job: leani_runtime::BackfillJob =
-                serde_json::from_slice(&record.payload).map_err(|error| {
-                    leani_api::BackfillControlError::Internal(format!(
-                        "durable backfill {} has an invalid payload: {error}",
-                        record.id
-                    ))
-                })?;
-            let processor = self.processor(&job.processor_instance)?;
-            let configured = config_for_processor_descriptor(&self.config, processor.descriptor())
-                .map_err(|error| leani_api::BackfillControlError::Internal(error.to_string()))?;
-            if job.owner == leani_runtime::HistoricalJobOwner::Materialization
-                && configured.history_mode == crate::config::ProcessorHistoryMode::Automatic
-            {
-                // The hot/cold handoff owns this stable system job. It uses the
-                // same durable materialization record, but must not also be
-                // launched by the on-demand supervisor.
-                continue;
+            match self.resume_durable_job(&record).await {
+                Ok(JobResume::Done) => {}
+                Ok(JobResume::WaitingForStorage) => recheck = true,
+                Ok(JobResume::AtCapacity) => break,
+                Err(error) => {
+                    warn!(
+                        job_id = %record.id,
+                        %error,
+                        "durable historical job not resumed; resuming the others"
+                    );
+                    recheck |= matches!(error, leani_api::BackfillControlError::Internal(_));
+                }
             }
-            if record.state == leani_store_sqlite::JobState::Completed {
-                if let Some(mut subscription) = self
+        }
+        Ok(recheck)
+    }
+
+    /// Resume one durable job, or move its completed subscription on.
+    #[allow(clippy::too_many_lines)]
+    async fn resume_durable_job(
+        &self,
+        record: &leani_store_sqlite::JobRecord,
+    ) -> Result<JobResume, leani_api::BackfillControlError> {
+        // Terminal jobs are skipped before their payload is decoded, so an
+        // obsolete one costs nothing. Only a completed subscription still
+        // delivers until its consumer acknowledged the completion.
+        let subscription = match record.state {
+            leani_store_sqlite::JobState::Queued
+            | leani_store_sqlite::JobState::Running
+            | leani_store_sqlite::JobState::StorageBackpressured => None,
+            leani_store_sqlite::JobState::Completed
+                if record.kind == leani_runtime::HistoricalJobOwner::Subscription.job_kind() =>
+            {
+                match self
                     .store
                     .backfill_subscription_for_job(&record.id)
                     .await
                     .map_err(|error| leani_api::BackfillControlError::Internal(error.to_string()))?
                 {
-                    if matches!(
-                        subscription.state,
-                        leani_store_sqlite::BackfillSubscriptionState::WaitingForConsumer
-                            | leani_store_sqlite::BackfillSubscriptionState::Queued
-                            | leani_store_sqlite::BackfillSubscriptionState::Running
-                            | leani_store_sqlite::BackfillSubscriptionState::Backpressured
-                    ) {
-                        self.store
-                            .append_backfill_completion(
-                                processor.descriptor(),
-                                &subscription.history_stream_id,
-                                job.request.chain_id,
-                                job.request.range.end(),
-                            )
-                            .await
-                            .map_err(|error| {
-                                leani_api::BackfillControlError::Internal(error.to_string())
-                            })?;
-                        self.store
-                            .set_backfill_subscription_state(
-                                &record.id,
-                                leani_store_sqlite::BackfillSubscriptionState::Draining,
-                                None,
-                            )
-                            .await
-                            .map_err(|error| {
-                                leani_api::BackfillControlError::Internal(error.to_string())
-                            })?;
-                        subscription = self
-                            .store
-                            .backfill_subscription_for_job(&record.id)
-                            .await
-                            .map_err(|error| {
-                                leani_api::BackfillControlError::Internal(error.to_string())
-                            })?
-                            .ok_or_else(|| {
-                                leani_api::BackfillControlError::Internal(format!(
-                                    "durable subscription {} disappeared",
-                                    record.id
-                                ))
-                            })?;
-                    }
-                    if subscription.state == leani_store_sqlite::BackfillSubscriptionState::Draining
-                        && let Some(completion) = subscription.completion_sequence
-                        && let Some(consumer) = self
-                            .store
-                            .consumer_in_stream(
-                                processor.descriptor(),
-                                &subscription.history_stream_id,
-                                &subscription.consumer_id,
-                            )
-                            .await
-                            .map_err(|error| {
-                                leani_api::BackfillControlError::Internal(error.to_string())
-                            })?
-                        && consumer.acknowledged_sequence >= completion
+                    Some(subscription)
+                        if !matches!(
+                            subscription.state,
+                            leani_store_sqlite::BackfillSubscriptionState::CompleteReclaimable
+                                | leani_store_sqlite::BackfillSubscriptionState::Cancelled
+                                | leani_store_sqlite::BackfillSubscriptionState::Failed
+                        ) =>
                     {
-                        self.store
-                            .mark_backfill_subscription_reclaimable(
-                                &subscription.subscription_id,
-                                consumer.acknowledged_sequence,
-                            )
-                            .await
-                            .map_err(|error| {
-                                leani_api::BackfillControlError::Internal(error.to_string())
-                            })?;
+                        Some(subscription)
                     }
+                    _ => return Ok(JobResume::Done),
                 }
-                continue;
             }
-            if !matches!(
-                record.state,
-                leani_store_sqlite::JobState::Queued
-                    | leani_store_sqlite::JobState::Running
-                    | leani_store_sqlite::JobState::StorageBackpressured
+            leani_store_sqlite::JobState::Completed
+            | leani_store_sqlite::JobState::Failed
+            | leani_store_sqlite::JobState::Cancelled => return Ok(JobResume::Done),
+        };
+        let job: leani_runtime::BackfillJob =
+            serde_json::from_slice(&record.payload).map_err(|error| {
+                leani_api::BackfillControlError::Invalid(format!(
+                    "durable backfill {} has an invalid payload: {error}",
+                    record.id
+                ))
+            })?;
+        let processor = self.processor(&job.processor_instance)?;
+        let configured = config_for_processor_descriptor(&self.config, processor.descriptor())
+            .map_err(|error| leani_api::BackfillControlError::Invalid(error.to_string()))?;
+        if job.owner == leani_runtime::HistoricalJobOwner::Materialization
+            && configured.history_mode == crate::config::ProcessorHistoryMode::Automatic
+        {
+            // The hot/cold handoff owns this stable system job. It uses the
+            // same durable materialization record, but must not also be
+            // launched by the on-demand supervisor.
+            return Ok(JobResume::Done);
+        }
+        if let Some(mut subscription) = subscription {
+            if matches!(
+                subscription.state,
+                leani_store_sqlite::BackfillSubscriptionState::WaitingForConsumer
+                    | leani_store_sqlite::BackfillSubscriptionState::Queued
+                    | leani_store_sqlite::BackfillSubscriptionState::Running
+                    | leani_store_sqlite::BackfillSubscriptionState::Backpressured
             ) {
-                continue;
-            }
-            if record.state == leani_store_sqlite::JobState::StorageBackpressured
-                && !self
+                self.store
+                    .append_backfill_completion(
+                        processor.descriptor(),
+                        &subscription.history_stream_id,
+                        job.request.chain_id,
+                        job.request.range.end(),
+                    )
+                    .await
+                    .map_err(|error| {
+                        leani_api::BackfillControlError::Internal(error.to_string())
+                    })?;
+                self.store
+                    .set_backfill_subscription_state(
+                        &record.id,
+                        leani_store_sqlite::BackfillSubscriptionState::Draining,
+                        None,
+                    )
+                    .await
+                    .map_err(|error| {
+                        leani_api::BackfillControlError::Internal(error.to_string())
+                    })?;
+                subscription = self
                     .store
-                    .storage_below_low_water()
+                    .backfill_subscription_for_job(&record.id)
                     .await
                     .map_err(|error| leani_api::BackfillControlError::Internal(error.to_string()))?
+                    .ok_or_else(|| {
+                        leani_api::BackfillControlError::Internal(format!(
+                            "durable subscription {} disappeared",
+                            record.id
+                        ))
+                    })?;
+            }
+            if subscription.state == leani_store_sqlite::BackfillSubscriptionState::Draining
+                && let Some(completion) = subscription.completion_sequence
+                && let Some(consumer) = self
+                    .store
+                    .consumer_in_stream(
+                        processor.descriptor(),
+                        &subscription.history_stream_id,
+                        &subscription.consumer_id,
+                    )
+                    .await
+                    .map_err(|error| leani_api::BackfillControlError::Internal(error.to_string()))?
+                && consumer.acknowledged_sequence >= completion
             {
-                continue;
+                self.store
+                    .mark_backfill_subscription_reclaimable(
+                        &subscription.subscription_id,
+                        consumer.acknowledged_sequence,
+                    )
+                    .await
+                    .map_err(|error| {
+                        leani_api::BackfillControlError::Internal(error.to_string())
+                    })?;
             }
-            match self.spawn(job, processor).await {
-                Ok(()) => {}
-                Err(leani_api::BackfillControlError::Unavailable(message))
-                    if message.contains("processor backfills are already active") =>
-                {
-                    break;
-                }
-                Err(error) => return Err(error),
-            }
+            return Ok(JobResume::Done);
         }
-        Ok(())
+        if record.state == leani_store_sqlite::JobState::StorageBackpressured
+            && !self
+                .store
+                .storage_below_low_water()
+                .await
+                .map_err(|error| leani_api::BackfillControlError::Internal(error.to_string()))?
+        {
+            return Ok(JobResume::WaitingForStorage);
+        }
+        match self.spawn(job, processor).await {
+            Ok(()) => Ok(JobResume::Done),
+            Err(leani_api::BackfillControlError::Unavailable(message))
+                if message.contains("processor backfills are already active") =>
+            {
+                Ok(JobResume::AtCapacity)
+            }
+            Err(error) => Err(error),
+        }
     }
 
+    /// Resume durable jobs at startup, and again only after a change: a job
+    /// was created or a job's task ended. Jobs that wait on storage headroom,
+    /// or failed to resume for a reason that may pass, are looked at again
+    /// every [`DURABLE_JOB_RECHECK`]. Passes run at most once a second.
     async fn supervise_durable_jobs(self: Arc<Self>) {
         loop {
             if self.cancellation.is_cancelled() {
                 return;
             }
-            if let Err(error) = self.resume_durable_jobs().await {
-                warn!(%error, "durable backfill scheduler pass failed");
+            let pass = tokio::time::Instant::now();
+            let recheck = match self.resume_durable_jobs().await {
+                Ok(recheck) => recheck,
+                Err(error) => {
+                    warn!(%error, "durable backfill scheduler pass failed");
+                    true
+                }
+            };
+            tokio::select! {
+                () = self.cancellation.cancelled() => return,
+                () = self.jobs_changed.notified() => {}
+                () = tokio::time::sleep(DURABLE_JOB_RECHECK), if recheck => {}
             }
             tokio::select! {
                 () = self.cancellation.cancelled() => return,
-                () = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
+                () = tokio::time::sleep_until(pass + Duration::from_secs(1)) => {}
             }
         }
     }
@@ -1536,7 +1657,15 @@ impl leani_api::BackfillControl for NativeBackfillControl {
             return self.status(&record, outcome.as_ref()).await;
         }
         // Only here: a subscription created before the credential rule
-        // re-submits its credential and gets its status above.
+        // re-submits its credential and gets its status above. A new
+        // subscription's consumer is refused before its history stream exists.
+        if let Some(consumer) = request.consumer.as_ref() {
+            leani_store_sqlite::validate_consumer_registration(
+                &consumer.id,
+                Duration::from_secs(consumer.lease_ttl_seconds),
+            )
+            .map_err(leani_api::BackfillControlError::Invalid)?;
+        }
         if let Some(credential) = request
             .consumer
             .as_ref()
@@ -1923,6 +2052,8 @@ impl leani_api::BackfillControl for NativeBackfillControl {
                 .await
                 .map_err(|error| leani_api::BackfillControlError::Conflict(error.to_string()))?
         };
+        // The scheduler resumes a job this call does not start below.
+        self.jobs_changed.notify_one();
 
         if matches!(
             record.state,
@@ -2031,8 +2162,8 @@ impl leani_api::BackfillControl for NativeBackfillControl {
                     "durable historical job {id} has an invalid payload: {error}"
                 ))
             })?;
-        if let Some(token) = self.tasks.lock().await.get(id).cloned() {
-            token.cancel();
+        if let Some(running) = self.tasks.lock().await.get(id) {
+            running.cancellation.cancel();
         }
         if matches!(
             record.state,
@@ -2088,6 +2219,20 @@ impl leani_api::BackfillControl for NativeBackfillControl {
                 status.state
             )));
         }
+        // A cancelled job's task may still be stopping. Its last writes for
+        // the job, such as its outcome, would outlive a deletion before then.
+        let running = self.tasks.lock().await.get(id).cloned();
+        if let Some(running) = running {
+            running.cancellation.cancel();
+            if tokio::time::timeout(HISTORICAL_JOB_STOP_WAIT, running.ended.cancelled())
+                .await
+                .is_err()
+            {
+                return Err(leani_api::BackfillControlError::Unavailable(format!(
+                    "historical job {id} is still stopping; retry the deletion"
+                )));
+            }
+        }
         let subscription = status.owner == leani_api::HistoricalWorkOwner::Subscription;
         let deleted = self
             .store
@@ -2099,7 +2244,6 @@ impl leani_api::BackfillControl for NativeBackfillControl {
                 }
                 _ => leani_api::BackfillControlError::Internal(error.to_string()),
             })?;
-        self.tasks.lock().await.remove(id);
         Ok(leani_api::HistoricalWorkDeletion {
             id: id.to_owned(),
             owner: status.owner,
@@ -3176,7 +3320,7 @@ async fn backfill(
     registry: &ProcessorRegistry,
 ) -> Result<Exit> {
     use leani_primitives::{BlockNumber, BlockRange, ChainId};
-    use leani_runtime::{BackfillJob, HistoricalRuntime, HistoricalRuntimeConfig};
+    use leani_runtime::{BackfillJob, HistoricalRuntime};
     use leani_source_api::SourceBudget;
     use leani_store_sqlite::SqliteStore;
 
@@ -3218,14 +3362,13 @@ async fn backfill(
         config.data_dir.join("leani.sqlite"),
     ))
     .await?;
+    // The configured pipeline, as the node's on-demand backfills use it.
+    let runtime_config = historical_runtime_config(&config, sources.len());
     let runtime = HistoricalRuntime::new_with_sources(
         store.clone(),
         sources,
         processor.clone(),
-        HistoricalRuntimeConfig {
-            mapper_concurrency: config.budgets.mapper_concurrency,
-            ..HistoricalRuntimeConfig::default()
-        },
+        runtime_config,
     )?;
     let job = BackfillJob::for_processor(
         format!("{processor_id}-{}-{from}-{to}", config.chain.chain_id),
@@ -5213,10 +5356,21 @@ async fn serve(path: &Path, registry: &ProcessorRegistry) -> Result<Exit> {
         material_coordinator,
         pipeline_budget,
     ));
-    let durable_job_supervisor = tokio::spawn(backfill_control.clone().supervise_durable_jobs());
-    let raw_history_supervisor = raw_history_control
-        .as_ref()
-        .map(|control| tokio::spawn(control.clone().supervise_durable_jobs()));
+    let mut background = BackgroundTasks::default();
+    background.spawn("durable backfill scheduler", {
+        let control = backfill_control.clone();
+        async move {
+            control.supervise_durable_jobs().await;
+            Ok(())
+        }
+    });
+    if let Some(control) = &raw_history_control {
+        let control = control.clone();
+        background.spawn("raw-history scheduler", async move {
+            control.supervise_durable_jobs().await;
+            Ok(())
+        });
+    }
     let on_demand_processors = config
         .get()
         .processors
@@ -5383,9 +5537,11 @@ async fn serve(path: &Path, registry: &ProcessorRegistry) -> Result<Exit> {
             raw_history_control: raw_history_control
                 .clone()
                 .map(|control| control as Arc<dyn leani_api::RawHistoryControl>),
+            shutdown: cancellation.clone(),
             ..NativeApiConfig::default()
         },
     )?;
+    let websocket_sessions = tokio_util::task::TaskTracker::new();
     let rpc_settings = &config.get().rpc;
     let rpc_config = leani_rpc::RpcConfig {
         chain_id: leani_primitives::ChainId(config.get().chain.chain_id),
@@ -5405,6 +5561,8 @@ async fn serve(path: &Path, registry: &ProcessorRegistry) -> Result<Exit> {
         max_log_topic_alternatives: rpc_settings.max_log_topic_alternatives,
         max_subscriptions_per_connection: rpc_settings.max_subscriptions_per_connection,
         max_websocket_connections: rpc_settings.max_websocket_connections,
+        shutdown: cancellation.clone(),
+        websocket_sessions: websocket_sessions.clone(),
         ..leani_rpc::RpcConfig::default()
     };
     let rpc_progress = processors
@@ -5447,20 +5605,25 @@ async fn serve(path: &Path, registry: &ProcessorRegistry) -> Result<Exit> {
     let rpc_websocket_listener = tokio::net::TcpListener::bind(config.get().rpc.ws_bind)
         .await
         .with_context(|| format!("bind WebSocket JSON-RPC {}", config.get().rpc.ws_bind))?;
+    // Installed before the listeners serve, so no signal finds them unset.
+    let signals = ShutdownSignals::new();
     let signal_token = cancellation.clone();
     let signal = tokio::spawn(async move {
-        match shutdown_signal().await {
-            Ok(()) => {
-                info!("shutdown signal received");
-                signal_token.cancel();
+        match signals {
+            Ok(signals) => {
+                forward_shutdown_signals(signals.into_stream(), signal_token, |code| {
+                    std::process::exit(code)
+                })
+                .await;
             }
             Err(error) => warn!(%error, "failed to install shutdown signal handler"),
         }
     });
-    let network_supervisor = if live_required && finality_required {
+    if live_required && finality_required {
         let supervisor_config = config.get().clone();
         let supervisor_store = store.clone();
         let supervisor_processors = processors.clone();
+        let supervisor_cancellation = cancellation.clone();
         let supervisor_handles = NetworkLaneHandles {
             readiness: readiness.clone(),
             rpc_readiness: rpc_readiness.clone(),
@@ -5472,19 +5635,23 @@ async fn serve(path: &Path, registry: &ProcessorRegistry) -> Result<Exit> {
             checkpoint_origin: leani_finality_beacon_api::CheckpointOrigin::Operator,
             attested_heads: leani_source_api::AttestedHeadPublisher::new(),
         };
-        Some(tokio::spawn(async move {
-            Box::pin(supervise_network_lanes(
+        background.spawn("network lane supervisor", async move {
+            let end = Box::pin(supervise_network_lanes(
                 supervisor_config,
                 supervisor_store,
                 supervisor_processors,
                 supervisor_handles,
                 None,
             ))
-            .await;
-        }))
-    } else {
-        None
-    };
+            .await?;
+            // Halted lanes stay stopped and not ready until the node
+            // restarts, while the node keeps serving what it stored.
+            if end == NetworkLanesEnd::Halted {
+                supervisor_cancellation.cancelled().await;
+            }
+            Ok(())
+        });
+    }
     let tiered_artifact_processors = processors
         .iter()
         .filter(|processor| {
@@ -5493,14 +5660,13 @@ async fn serve(path: &Path, registry: &ProcessorRegistry) -> Result<Exit> {
         })
         .cloned()
         .collect::<Vec<_>>();
-    let artifact_compaction_supervisor = if config.get().artifact_storage.backend
-        == ArtifactStorageBackend::TieredSegments
+    if config.get().artifact_storage.backend == ArtifactStorageBackend::TieredSegments
         && !tiered_artifact_processors.is_empty()
     {
         let artifact_store = store.clone();
         let artifact_config = config.get().artifact_storage;
         let artifact_cancellation = cancellation.clone();
-        Some(tokio::spawn(async move {
+        background.spawn("artifact compaction", async move {
             supervise_artifact_compaction(
                 artifact_store,
                 tiered_artifact_processors,
@@ -5508,13 +5674,12 @@ async fn serve(path: &Path, registry: &ProcessorRegistry) -> Result<Exit> {
                 artifact_cancellation,
             )
             .await;
-        }))
-    } else {
-        None
-    };
+            Ok(())
+        });
+    }
     let snapshot_store = store.clone();
     let snapshot_cancellation = cancellation.clone();
-    let snapshot_maintenance = tokio::spawn(async move {
+    background.spawn("query snapshot cleanup", async move {
         let mut ticker = tokio::time::interval(std::time::Duration::from_secs(30));
         loop {
             tokio::select! {
@@ -5526,21 +5691,15 @@ async fn serve(path: &Path, registry: &ProcessorRegistry) -> Result<Exit> {
                 }
             }
         }
+        Ok(())
     });
-    let processor_maintenance = processors
-        .iter()
-        .zip(&config.get().processors)
-        .filter(|(processor, _)| {
-            processor.descriptor().lifecycle.delivery.mode
-                != leani_processor_api::DeliveryPolicyMode::None
-                || processor.descriptor().mode == leani_processor_api::ReductionMode::BlockLocal
-        })
-        .map(|(processor, configured)| {
-            let processor = processor.clone();
-            let verification_segment_blocks = configured.coverage.verification_segment_blocks;
-            let pruner_store = store.clone();
-            let pruner_cancellation = cancellation.clone();
-            tokio::spawn(async move {
+    for (processor, verification_segment_blocks) in maintained_processors(config.get(), &processors)
+    {
+        let pruner_store = store.clone();
+        let pruner_cancellation = cancellation.clone();
+        background.spawn(
+            format!("maintenance of {}", processor.descriptor().instance),
+            async move {
                 supervise_processor_maintenance(
                     pruner_store,
                     processor,
@@ -5548,9 +5707,10 @@ async fn serve(path: &Path, registry: &ProcessorRegistry) -> Result<Exit> {
                     pruner_cancellation,
                 )
                 .await;
-            })
-        })
-        .collect::<Vec<_>>();
+                Ok(())
+            },
+        );
+    }
 
     info!(
         api = %config.get().api.bind,
@@ -5571,25 +5731,19 @@ async fn serve(path: &Path, registry: &ProcessorRegistry) -> Result<Exit> {
         .with_graceful_shutdown(cancellation.clone().cancelled_owned());
     let rpc_websocket_server = axum::serve(rpc_websocket_listener, rpc_websocket)
         .with_graceful_shutdown(cancellation.clone().cancelled_owned());
-    let server_result =
-        tokio::try_join!(api_server, rpc_server, rpc_websocket_server).context("API server failed");
-    cancellation.cancel();
-    if let Some(network_supervisor) = network_supervisor {
-        let _ = network_supervisor.await;
-    }
-    if let Some(artifact_compaction_supervisor) = artifact_compaction_supervisor {
-        let _ = artifact_compaction_supervisor.await;
-    }
-    let _ = snapshot_maintenance.await;
-    for maintenance in processor_maintenance {
-        let _ = maintenance.await;
-    }
-    let _ = durable_job_supervisor.await;
-    if let Some(raw_history_supervisor) = raw_history_supervisor {
-        let _ = raw_history_supervisor.await;
-    }
+    let servers = async {
+        let listeners = tokio::try_join!(api_server, rpc_server, rpc_websocket_server)
+            .map(|_| ())
+            .context("API server failed");
+        // WebSocket connections outlive their listener's graceful shutdown:
+        // wait for their going-away close frames too.
+        websocket_sessions.close();
+        websocket_sessions.wait().await;
+        listeners
+    };
+    let served = serve_until_shutdown(servers, &mut background, &cancellation).await;
     signal.abort();
-    server_result?;
+    served?;
     Ok(Exit::Success)
 }
 
@@ -5653,6 +5807,31 @@ pub(crate) async fn supervise_artifact_compaction(
             }
         }
     }
+}
+
+/// The processors that [`supervise_processor_maintenance`] maintains, with
+/// their coverage verification segment size: those that deliver changes,
+/// whose delivery log it prunes, and block-local ones, whose finalized
+/// coverage it compacts.
+fn maintained_processors(
+    config: &Config,
+    processors: &[std::sync::Arc<dyn leani_processor_api::Processor>],
+) -> Vec<(std::sync::Arc<dyn leani_processor_api::Processor>, u64)> {
+    processors
+        .iter()
+        .zip(&config.processors)
+        .filter(|(processor, _)| {
+            processor.descriptor().lifecycle.delivery.mode
+                != leani_processor_api::DeliveryPolicyMode::None
+                || processor.descriptor().mode == leani_processor_api::ReductionMode::BlockLocal
+        })
+        .map(|(processor, configured)| {
+            (
+                processor.clone(),
+                configured.coverage.verification_segment_blocks,
+            )
+        })
+        .collect()
 }
 
 #[allow(clippy::too_many_lines)]
@@ -5826,18 +6005,8 @@ fn api_bearer_token(name: &str, value: Result<String, std::env::VarError>) -> Re
     Ok(Arc::from(token))
 }
 
-#[cfg(unix)]
 async fn shutdown_signal() -> std::io::Result<()> {
-    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-    tokio::select! {
-        result = tokio::signal::ctrl_c() => result,
-        _ = terminate.recv() => Ok(()),
-    }
-}
-
-#[cfg(not(unix))]
-async fn shutdown_signal() -> std::io::Result<()> {
-    tokio::signal::ctrl_c().await
+    ShutdownSignals::new()?.recv().await
 }
 
 #[derive(Clone)]
@@ -5973,13 +6142,37 @@ pub(crate) fn spawn_embedded_network_runtime(
         checkpoint_origin,
         attested_heads,
     };
-    let task = tokio::spawn(supervise_network_lanes(
+    // The node's delivery pruning and coverage compaction run beside the
+    // lanes, as in `serve`: without them the delivery window fills and pauses
+    // the subscription's processor. They stop with the lanes.
+    let maintenance =
+        futures::future::join_all(maintained_processors(&config, &processors).into_iter().map(
+            |(processor, verification_segment_blocks)| {
+                supervise_processor_maintenance(
+                    store.clone(),
+                    processor,
+                    verification_segment_blocks,
+                    cancellation.clone(),
+                )
+            },
+        ));
+    let lanes = Box::pin(supervise_network_lanes(
         config,
         store,
         processors,
         handles,
         Some(execution_source.clone()),
     ));
+    // The task ends with the lanes, even when nothing needs maintenance.
+    let task = tokio::spawn(async move {
+        tokio::select! {
+            _ = lanes => {}
+            () = async {
+                maintenance.await;
+                std::future::pending::<()>().await;
+            } => {}
+        }
+    });
     Ok(EmbeddedNetworkRuntime {
         readiness,
         verified_anchor: verified_anchor_updates,
@@ -6133,13 +6326,15 @@ pub(crate) async fn verified_p2p_history_anchor(
     })
 }
 
+/// Supervise the network lanes until the node shuts down or they halt. A
+/// persistent execution P2P source that cannot be built is an error.
 async fn supervise_network_lanes(
     config: Config,
     store: leani_store_sqlite::SqliteStore,
     processors: Vec<std::sync::Arc<dyn leani_processor_api::Processor>>,
     handles: NetworkLaneHandles,
     live_source: Option<std::sync::Arc<leani_source_p2p::RethP2pSource>>,
-) {
+) -> Result<NetworkLanesEnd> {
     let live_source = match live_source {
         Some(source) => source,
         None => match execution_p2p_source(
@@ -6149,15 +6344,13 @@ async fn supervise_network_lanes(
         ) {
             Ok(source) => source,
             Err(error) => {
-                handles
-                    .network_telemetry
-                    .supervisor_backoff(&error, std::time::Duration::from_mins(1));
+                handles.network_telemetry.supervisor_halted(&error);
                 warn!(%error, "failed to construct persistent execution P2P source");
-                return;
+                return Err(error.context("construct the persistent execution P2P source"));
             }
         },
     };
-    supervise_lane_runs(&handles, || {
+    let end = supervise_lane_runs(&handles, || {
         Box::pin(run_network_lanes_once(
             &config,
             store.clone(),
@@ -6167,11 +6360,9 @@ async fn supervise_network_lanes(
         ))
     })
     .await;
-    handles.readiness.set_live_ready(false);
-    handles.rpc_readiness.set_live_ready(false);
-    handles.readiness.set_finality_ready(false);
     handles.network_telemetry.supervisor_stopped();
     live_source.shutdown().await;
+    Ok(end)
 }
 
 /// Occurrences of one contradiction between verified finality and retained
@@ -6179,22 +6370,59 @@ async fn supervise_network_lanes(
 /// restarting again: the restarts before it did not repair it.
 const FINALITY_REORG_HALT_OCCURRENCE: usize = 3;
 
+/// Delay before the network lanes restart after a failure. It doubles with
+/// each further failure, up to a minute.
+const INITIAL_LANE_BACKOFF: Duration = Duration::from_secs(1);
+
+/// A network-lane run that stayed up this long, the longest backoff, was
+/// healthy: its failure restarts the lanes after [`INITIAL_LANE_BACKOFF`].
+const HEALTHY_LANE_RUN: Duration = Duration::from_mins(1);
+
+/// How the network lane supervisor stopped.
+#[derive(Debug, Eq, PartialEq)]
+enum NetworkLanesEnd {
+    /// The node shuts down.
+    Cancelled,
+    /// The lanes halted: they stay stopped and not ready until the node
+    /// restarts.
+    Halted,
+}
+
+/// Drops the network lanes' readiness when dropped.
+struct LaneReadinessGuard<'a>(&'a NetworkLaneHandles);
+
+impl Drop for LaneReadinessGuard<'_> {
+    fn drop(&mut self) {
+        self.0.readiness.set_live_ready(false);
+        self.0.rpc_readiness.set_live_ready(false);
+        self.0.readiness.set_finality_ready(false);
+    }
+}
+
 /// Run the network lanes with `run_once` until cancelled. A failed run
 /// restarts after a bounded exponential backoff, unless it halts (see
 /// [`network_lane_failure`]): the lanes then stay stopped and not ready,
 /// with the error, until the node restarts.
-async fn supervise_lane_runs<F, Fut>(handles: &NetworkLaneHandles, mut run_once: F)
+///
+/// However the supervisor stops, even by a panic unwinding out of a run or
+/// with its task aborted, readiness drops.
+async fn supervise_lane_runs<F, Fut>(
+    handles: &NetworkLaneHandles,
+    mut run_once: F,
+) -> NetworkLanesEnd
 where
     F: FnMut() -> Fut,
     Fut: Future<Output = Result<()>>,
 {
-    let mut retry = std::time::Duration::from_secs(1);
+    let _not_ready = LaneReadinessGuard(handles);
+    let mut retry = INITIAL_LANE_BACKOFF;
     let mut reorgs = FinalityReorgRestarts::default();
     while !handles.cancellation.is_cancelled() {
         handles.readiness.set_live_ready(false);
         handles.rpc_readiness.set_live_ready(false);
         handles.readiness.set_finality_ready(false);
         handles.network_telemetry.supervisor_running();
+        let started = tokio::time::Instant::now();
         let result = run_once().await;
         if handles.cancellation.is_cancelled() {
             break;
@@ -6206,7 +6434,7 @@ where
                     "verified finality contradicts the retained canonical chain; network lanes halt until the node restarts"
                 );
                 handles.network_telemetry.supervisor_halted(&failure);
-                break;
+                return NetworkLanesEnd::Halted;
             }
             LaneFailure::Heal(failure) => {
                 warn!(
@@ -6223,6 +6451,12 @@ where
                 failure
             }
         };
+        // Only the backoff starts over after a healthy run. The count of a
+        // recurring finality contradiction follows finality, not time: it
+        // resets only when a contradiction names another finalized block.
+        if started.elapsed() >= HEALTHY_LANE_RUN {
+            retry = INITIAL_LANE_BACKOFF;
+        }
         handles.network_telemetry.supervisor_backoff(failure, retry);
         tokio::select! {
             () = handles.cancellation.cancelled() => break,
@@ -6232,6 +6466,7 @@ where
             .saturating_mul(2)
             .min(std::time::Duration::from_mins(1));
     }
+    NetworkLanesEnd::Cancelled
 }
 
 /// How the supervisor handles a failed network-lane run.
@@ -6317,13 +6552,128 @@ fn finality_reorg(
     )
 }
 
-#[allow(clippy::too_many_lines)]
+/// The automatic cold backfills of one network-lane run, named for the log.
+#[derive(Default)]
+struct ColdBackfills {
+    tasks: tokio::task::JoinSet<Result<leani_store_sqlite::HotColdHandoffRecord>>,
+    names: std::collections::HashMap<tokio::task::Id, String>,
+}
+
+impl ColdBackfills {
+    fn spawn(
+        &mut self,
+        name: impl Into<String>,
+        backfill: impl Future<Output = Result<leani_store_sqlite::HotColdHandoffRecord>>
+        + Send
+        + 'static,
+    ) {
+        let id = self.tasks.spawn(backfill).id();
+        self.names.insert(id, name.into());
+    }
+
+    fn len(&self) -> usize {
+        self.tasks.len()
+    }
+
+    /// Wait for the next backfill to end, as [`tokio::task::JoinSet::join_next`]
+    /// does.
+    async fn join_next(
+        &mut self,
+    ) -> Option<Result<Result<leani_store_sqlite::HotColdHandoffRecord>, tokio::task::JoinError>>
+    {
+        let ended = self.tasks.join_next_with_id().await?;
+        self.names.remove(&match &ended {
+            Ok((id, _)) => *id,
+            Err(error) => error.id(),
+        });
+        Some(ended.map(|(_, backfill)| backfill))
+    }
+}
+
+/// Run the network lanes once. However the run ends, even by an early error,
+/// its cold backfills are cancelled and joined before it returns, so none of
+/// them outlives it into the next run's startup reconciliation.
 async fn run_network_lanes_once(
     config: &Config,
     store: leani_store_sqlite::SqliteStore,
     processors: Vec<std::sync::Arc<dyn leani_processor_api::Processor>>,
     handles: NetworkLaneHandles,
     live_source: std::sync::Arc<leani_source_p2p::RethP2pSource>,
+) -> Result<()> {
+    let cancellation = handles.cancellation.clone();
+    with_cold_backfills(&cancellation, async move |lane_cancellation, backfills| {
+        Box::pin(run_network_lanes(
+            config,
+            store,
+            processors,
+            handles,
+            live_source,
+            lane_cancellation,
+            backfills,
+        ))
+        .await
+    })
+    .await
+}
+
+/// Run `lanes` with a set for the cold backfills it spawns, cancelled by the
+/// lanes' own token. Once `lanes` ends, however it ends, the backfills are
+/// cancelled and joined before this returns; a panic of `lanes` resumes
+/// after the join. If this future is dropped instead, the drop guard cancels
+/// them and dropping the set aborts them.
+async fn with_cold_backfills(
+    cancellation: &CancellationToken,
+    lanes: impl AsyncFnOnce(&CancellationToken, &mut ColdBackfills) -> Result<()>,
+) -> Result<()> {
+    use futures::FutureExt as _;
+
+    let lane_cancellation = cancellation.child_token();
+    let _cancel_backfills = lane_cancellation.clone().drop_guard();
+    let mut backfills = ColdBackfills::default();
+    let result = std::panic::AssertUnwindSafe(lanes(&lane_cancellation, &mut backfills))
+        .catch_unwind()
+        .await;
+    lane_cancellation.cancel();
+    let mut still_running = tokio::time::interval_at(
+        tokio::time::Instant::now() + COLD_BACKFILL_STOP_WARNING,
+        COLD_BACKFILL_STOP_WARNING,
+    );
+    loop {
+        let backfill = tokio::select! {
+            backfill = backfills.join_next() => backfill,
+            _ = still_running.tick() => {
+                warn!(
+                    backfills = ?backfills.names.values().collect::<Vec<_>>(),
+                    "cancelled automatic cold backfills are still running; the network lanes wait for them"
+                );
+                continue;
+            }
+        };
+        let Some(backfill) = backfill else {
+            break;
+        };
+        if let Err(error) = backfill
+            && error.is_panic()
+        {
+            warn!(%error, "automatic cold backfill task panicked");
+        }
+    }
+    result.unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+}
+
+/// How often the network lanes name the cancelled cold backfills they still
+/// wait for.
+const COLD_BACKFILL_STOP_WARNING: Duration = Duration::from_secs(10);
+
+#[allow(clippy::too_many_lines)]
+async fn run_network_lanes(
+    config: &Config,
+    store: leani_store_sqlite::SqliteStore,
+    processors: Vec<std::sync::Arc<dyn leani_processor_api::Processor>>,
+    handles: NetworkLaneHandles,
+    live_source: std::sync::Arc<leani_source_p2p::RethP2pSource>,
+    lane_cancellation: &CancellationToken,
+    backfills: &mut ColdBackfills,
 ) -> Result<()> {
     use std::{
         sync::Arc,
@@ -6534,7 +6884,6 @@ async fn run_network_lanes_once(
         },
     )?
     .with_applied_anchors(applied_anchors);
-    let lane_cancellation = cancellation.child_token();
     let overlap_blocks = config.sources.live.handoff_overlap_blocks;
     let overlap_from = selected
         .execution_block_number
@@ -6602,7 +6951,7 @@ async fn run_network_lanes_once(
             crate::config::ProcessorHistoryMode::OnDemand
         ) && configured.start_block <= selected.execution_block_number
     });
-    let backfills = spawn_cold_backfills(
+    spawn_cold_backfills(
         config,
         &store,
         &processors,
@@ -6625,7 +6974,8 @@ async fn run_network_lanes_once(
             )
             .map_err(anyhow::Error::msg)?
         },
-        &lane_cancellation,
+        lane_cancellation,
+        backfills,
     )
     .await?;
     let live_budget = SourceBudget {
@@ -6661,9 +7011,7 @@ async fn run_network_lanes_once(
     );
     let archive_reconciliations =
         run_archive_reconciliations(config, &store, &processors, lane_cancellation.clone());
-    let handoff_store = store.clone();
-    let handoffs =
-        async move { finish_cold_handoffs(&handoff_store, &handoff_runtime, backfills).await };
+    let handoffs = finish_cold_handoffs(&store, &handoff_runtime, &processors, backfills);
     tokio::pin!(live);
     tokio::pin!(finality);
     tokio::pin!(p2p_bridge_updates);
@@ -7095,16 +7443,13 @@ struct ColdHandoffSummary {
 async fn finish_cold_handoffs(
     store: &leani_store_sqlite::SqliteStore,
     live: &leani_runtime::SharedLiveRuntime,
-    backfills: Vec<tokio::task::JoinHandle<Result<leani_store_sqlite::HotColdHandoffRecord>>>,
+    processors: &[std::sync::Arc<dyn leani_processor_api::Processor>],
+    backfills: &mut ColdBackfills,
 ) -> Result<ColdHandoffSummary> {
     let mut records = Vec::with_capacity(backfills.len());
     let mut failed = std::collections::BTreeSet::new();
-    let mut failed_instances = Vec::new();
-    for backfill in backfills {
-        let failure = match backfill
-            .await
-            .context("automatic cold backfill task panicked")?
-        {
+    while let Some(backfill) = backfills.join_next().await {
+        let failure = match backfill.context("automatic cold backfill task panicked")? {
             Ok(record) => {
                 records.push(record);
                 continue;
@@ -7124,24 +7469,32 @@ async fn finish_cold_handoffs(
         live.park_processor_lane(&failure.processor, "hot_cold_handoff_failed")
             .await
             .with_context(|| format!("park the live lane of {}", failure.processor.instance))?;
-        failed.insert(failure.processor.id.to_string());
-        failed_instances.push(failure.processor.instance.to_string());
+        failed.insert(failure.processor.instance.to_string());
     }
-    let reconciliation = live
-        .reconcile_pending()
+    live.reconcile_pending()
         .await
         .context("drain ordered live deltas after hot/cold handoff")?;
-    for (processor, report) in reconciliation.processors {
-        if report.pending != 0 && !failed.contains(&processor) {
+    // Checked per instance: the drain's report counts processors by kind. One
+    // row answers it, where the statistics would scan them all again.
+    for processor in processors {
+        let instance = processor.descriptor().instance.to_string();
+        if failed.contains(&instance) {
+            continue;
+        }
+        let pending = store
+            .pending_deltas(processor.descriptor(), leani_primitives::BlockNumber(0), 1)
+            .await
+            .with_context(|| format!("look for pending deltas of {instance}"))?;
+        if let Some(delta) = pending.first() {
             bail!(
-                "processor {processor} retains {} pending deltas after verified handoff",
-                report.pending
+                "processor {instance} retains pending deltas from block {} after verified handoff",
+                delta.block.number.0
             );
         }
     }
     Ok(ColdHandoffSummary {
         verified: records,
-        failed: failed_instances,
+        failed: failed.into_iter().collect(),
     })
 }
 
@@ -7158,12 +7511,12 @@ async fn spawn_cold_backfills(
     material_coordinator: Option<leani_runtime::HistoricalMaterialCoordinator>,
     pipeline_budget: leani_runtime::HistoricalPipelineBudget,
     cancellation: &CancellationToken,
-) -> Result<Vec<tokio::task::JoinHandle<Result<leani_store_sqlite::HotColdHandoffRecord>>>> {
+    backfills: &mut ColdBackfills,
+) -> Result<()> {
     use leani_primitives::{BlockNumber, BlockRange, ChainId};
     use leani_runtime::{BackfillJob, HistoricalRuntime, HistoricalRuntimeConfig};
     use leani_source_api::SourceBudget;
 
-    let mut tasks = Vec::new();
     let mut startup_permits = material_coordinator
         .as_ref()
         .map(|coordinator| coordinator.startup_batch(processors.len()).into_iter());
@@ -7174,7 +7527,7 @@ async fn spawn_cold_backfills(
             crate::config::ProcessorHistoryMode::OnDemand
         ) {
             info!(
-                processor = %configured.id,
+                processor = %configured.instance,
                 "automatic processor backfill disabled; historical ranges are on demand"
             );
             continue;
@@ -7189,7 +7542,7 @@ async fn spawn_cold_backfills(
                     return Err(error).with_context(|| {
                         format!(
                             "no cold source can satisfy configured live processor {}",
-                            processor.descriptor().id
+                            configured.instance
                         )
                     });
                 }
@@ -7205,18 +7558,26 @@ async fn spawn_cold_backfills(
                 bridge_range,
                 history_anchor.clone(),
             )
-            .with_context(|| format!("construct P2P history bridge for {}", configured.id))?,
+            .with_context(|| format!("construct P2P history bridge for {}", configured.instance))?,
         ));
         let range = BlockRange::new(BlockNumber(configured.start_block), BlockNumber(through))
-            .with_context(|| format!("invalid automatic backfill range for {}", configured.id))?;
+            .with_context(|| {
+                format!(
+                    "invalid automatic backfill range for {}",
+                    configured.instance
+                )
+            })?;
         let overlap = BlockRange::new(
             BlockNumber(overlap_from.max(configured.start_block)),
             BlockNumber(through),
         )?;
+        // Handoff and job IDs name the processor instance, so instances of
+        // one kind never share them. Kinds hold no `:`, so no ID here equals
+        // one an earlier release derived from the kind.
         let handoff_id = format!(
-            "handoff-{}-{}-{}-{}",
+            "handoff:{}:{}:{}-{}",
             config.chain.chain_id,
-            configured.id,
+            configured.instance,
             overlap.start().0,
             through
         );
@@ -7260,7 +7621,7 @@ async fn spawn_cold_backfills(
             }
             Err(error) => {
                 return Err(error).with_context(|| {
-                    format!("construct automatic backfill for {}", configured.id)
+                    format!("construct automatic backfill for {}", configured.instance)
                 });
             }
         };
@@ -7271,8 +7632,8 @@ async fn spawn_cold_backfills(
         };
         let job = match BackfillJob::for_processor(
             format!(
-                "serve-{}-{}-{}-{through}",
-                config.chain.chain_id, configured.id, configured.start_block
+                "automatic:{}:{}:{}-{through}",
+                config.chain.chain_id, configured.instance, configured.start_block
             ),
             processor.as_ref(),
             ChainId(config.chain.chain_id),
@@ -7281,8 +7642,9 @@ async fn spawn_cold_backfills(
         ) {
             Ok(job) => job,
             Err(error) => {
-                return Err(error)
-                    .with_context(|| format!("plan automatic backfill for {}", configured.id));
+                return Err(error).with_context(|| {
+                    format!("plan automatic backfill for {}", configured.instance)
+                });
             }
         };
         let budget = SourceBudget {
@@ -7296,13 +7658,13 @@ async fn spawn_cold_backfills(
             max_in_flight_requests: config.budgets.source_concurrency,
             temporary_disk_bytes: config.budgets.temporary_disk_bytes,
         };
-        let processor_id = configured.id.clone();
+        let processor_id = configured.instance.clone();
         let processor_descriptor = processor.descriptor().clone();
         let handoff_store = store.clone();
         let chain_id = ChainId(config.chain.chain_id);
         let task_cancellation = cancellation.clone();
         let job_id = job.id.clone();
-        tasks.push(tokio::spawn(async move {
+        backfills.spawn(job_id.clone(), async move {
             let report = match runtime.run(job, budget, task_cancellation.clone()).await {
                 Ok(report) => report,
                 Err(leani_runtime::RuntimeError::Cancelled) if task_cancellation.is_cancelled() => {
@@ -7395,9 +7757,9 @@ async fn spawn_cold_backfills(
                 "hot/cold handoff verified"
             );
             Ok(record)
-        }));
+        });
     }
-    Ok(tasks)
+    Ok(())
 }
 
 /// Run the process foundation until an external cancellation request arrives.
@@ -7425,7 +7787,7 @@ mod tests {
     use leani_processor_api::{ArtifactPolicyMode, Processor};
     use leani_testkit::{BlockLocalCounter, fixture_frame};
 
-    use super::*;
+    use super::{shutdown::SHUTDOWN_DEADLINE, *};
 
     #[test]
     fn api_bearer_tokens_are_long_enough_and_never_echoed() {
@@ -7566,7 +7928,7 @@ mod tests {
         // A contradiction with finalized history: one run, then a halt.
         let handles = lane_handles();
         let runs = std::sync::atomic::AtomicUsize::new(0);
-        tokio::time::timeout(
+        let end = tokio::time::timeout(
             Duration::from_mins(10),
             supervise_lane_runs(&handles, || {
                 runs.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -7575,6 +7937,7 @@ mod tests {
         )
         .await
         .expect("the supervisor kept restarting halted network lanes");
+        assert_eq!(end, NetworkLanesEnd::Halted);
         assert_eq!(runs.load(std::sync::atomic::Ordering::SeqCst), 1);
         let supervisor = handles.network_telemetry.snapshot().supervisor;
         assert_eq!(
@@ -7594,7 +7957,7 @@ mod tests {
         // halt.
         let handles = lane_handles();
         let runs = std::sync::atomic::AtomicUsize::new(0);
-        tokio::time::timeout(
+        let end = tokio::time::timeout(
             Duration::from_mins(10),
             supervise_lane_runs(&handles, || {
                 runs.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -7603,6 +7966,7 @@ mod tests {
         )
         .await
         .expect("a persistent contradiction restarted the network lanes forever");
+        assert_eq!(end, NetworkLanesEnd::Halted);
         assert_eq!(runs.load(std::sync::atomic::Ordering::SeqCst), 3);
         assert_eq!(
             handles.network_telemetry.snapshot().supervisor.state,
@@ -7618,9 +7982,10 @@ mod tests {
             }
             async { Err(anyhow::anyhow!("execution peers unavailable")) }
         });
-        tokio::time::timeout(Duration::from_mins(10), supervisor)
+        let end = tokio::time::timeout(Duration::from_mins(10), supervisor)
             .await
             .expect("the supervisor stops once cancelled");
+        assert_eq!(end, NetworkLanesEnd::Cancelled);
         assert_eq!(runs.load(std::sync::atomic::Ordering::SeqCst), 5);
     }
 
@@ -8487,12 +8852,14 @@ mod tests {
             handoff_id: "handoff-failed".to_owned(),
             detail: "automatic cold backfill failed: injected source exhaustion".to_owned(),
         };
-        let backfills = vec![
-            tokio::spawn(async move { Err(anyhow::Error::new(failure)) }),
-            tokio::spawn(async move { Ok(verified_record) }),
-        ];
+        let mut backfills = ColdBackfills::default();
+        backfills.spawn("automatic-failed", async move {
+            Err(anyhow::Error::new(failure))
+        });
+        backfills.spawn("automatic-verified", async move { Ok(verified_record) });
+        let processors: Vec<Arc<dyn Processor>> = vec![failed.clone(), verified.clone()];
 
-        let summary = finish_cold_handoffs(&store, &live, backfills)
+        let summary = finish_cold_handoffs(&store, &live, &processors, &mut backfills)
             .await
             .expect("one processor's failed cold backfill does not fail the other handoffs");
 
@@ -8687,5 +9054,1344 @@ markets = ["ETH/USDT"]
             message.contains("already in use by another Leani process"),
             "{message}"
         );
+    }
+
+    /// Frames `0..=through` of one parent-linked fixture chain.
+    fn fixture_chain(through: u64) -> Vec<leani_primitives::BlockFrame> {
+        let mut parent = leani_primitives::BlockHash::ZERO;
+        (0..=through)
+            .map(|number| {
+                let frame = fixture_frame(number, parent);
+                parent = frame.block.hash;
+                frame
+            })
+            .collect()
+    }
+
+    /// Write `frames` as a local normalized-frame archive and return its
+    /// manifest, so backfills in tests never leave the machine.
+    fn write_frame_archive(directory: &Path, frames: &[leani_primitives::BlockFrame]) -> PathBuf {
+        let mut object = Vec::new();
+        for frame in frames {
+            serde_json::to_writer(&mut object, frame).expect("archive frame");
+            object.push(b'\n');
+        }
+        fs::write(directory.join("frames.jsonl"), &object).expect("archive object");
+        let capabilities = vec![
+            leani_primitives::Capability::Transactions,
+            leani_primitives::Capability::Receipts,
+            leani_primitives::Capability::Logs,
+        ];
+        let manifest = leani_source_archive::ArchiveManifest {
+            format_version: 1,
+            id: "fixture-archive".to_owned(),
+            chain_id: 1,
+            schema_version: "normalized-frame-jsonl.v1".to_owned(),
+            capabilities: capabilities.clone(),
+            complete_capabilities: capabilities,
+            finality: leani_source_api::FinalityModel::Finalized,
+            objects: vec![leani_source_archive::ArchiveObject {
+                from_block: frames.first().expect("archive frames").block.number.0,
+                to_block: frames.last().expect("archive frames").block.number.0,
+                path: "frames.jsonl".to_owned(),
+                blake3: blake3::hash(&object).to_hex().to_string(),
+                bytes: u64::try_from(object.len()).expect("archive object size"),
+            }],
+        };
+        let path = directory.join("manifest.json");
+        fs::write(
+            &path,
+            serde_json::to_vec(&manifest).expect("archive manifest"),
+        )
+        .expect("write archive manifest");
+        path
+    }
+
+    /// The fixture configuration with `archive` as its only history source and
+    /// one processor per `(kind, instance)`.
+    fn archive_config(data_dir: &Path, archive: &Path, processors: &[(&str, &str)]) -> Config {
+        let mut config: Config =
+            toml::from_str(crate::config::VALID_CONFIG_TOML).expect("configuration fixture");
+        config.data_dir = data_dir.to_path_buf();
+        config.budgets.memory_bytes = 64 * 1_024 * 1_024;
+        config.budgets.temporary_disk_bytes = 64 * 1_024 * 1_024;
+        config.sources.history = vec![crate::config::HistorySourceConfig {
+            id: "fixture-archive".to_owned(),
+            kind: crate::config::HistorySourceKind::Archive,
+            priority: 10,
+            trust: crate::config::HistoryTrust::TrustedDataset,
+            chunk_blocks: None,
+            blobs_chunk_blocks: None,
+            batch_rows: None,
+            manifest: Some(archive.to_path_buf()),
+            endpoint: None,
+        }];
+        let template = config.processors[0].clone();
+        config.processors = processors
+            .iter()
+            .map(|(kind, instance)| {
+                let mut configured = template.clone();
+                (*kind).clone_into(&mut configured.id);
+                (*instance).clone_into(&mut configured.instance);
+                configured
+            })
+            .collect();
+        config
+    }
+
+    fn pipeline_budget(config: &Config) -> leani_runtime::HistoricalPipelineBudget {
+        let pipeline = config.budgets.history_pipeline;
+        leani_runtime::HistoricalPipelineBudget::new(
+            pipeline.maximum_active_chunks,
+            historical_map_task_capacity(config),
+            pipeline.maximum_mapped_bytes.bytes(),
+        )
+        .expect("pipeline budget")
+    }
+
+    async fn finalized_head(
+        store: &leani_store_sqlite::SqliteStore,
+        frame: &leani_primitives::BlockFrame,
+    ) {
+        store
+            .store_canonical_anchor(
+                leani_primitives::ChainId(1),
+                frame.block,
+                leani_primitives::Finality::Finalized,
+            )
+            .await
+            .expect("finalized head");
+    }
+
+    async fn wait_for_job_state(
+        store: &leani_store_sqlite::SqliteStore,
+        id: &str,
+        state: leani_store_sqlite::JobState,
+    ) {
+        tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                if store
+                    .job(id)
+                    .await
+                    .expect("job")
+                    .is_some_and(|record| record.state == state)
+                {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("job {id} never reached {state:?}"));
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn two_automatic_instances_of_one_kind_reach_live() {
+        // Audit H19: the handoff and automatic job ids named the processor
+        // kind, so a second instance of a kind collided with the first and
+        // the network lanes failed at every start.
+        use leani_primitives::{BlockNumber, BlockRange, ChainId};
+        use leani_runtime::{SharedLiveRuntime, SharedLiveRuntimeConfig};
+        use leani_source_api::{ChainEvent, LiveStart};
+        use leani_store_sqlite::{HotColdHandoffState, SqliteStore, StoreConfig};
+        use leani_testkit::{
+            LiveStep, ScriptedLiveSource, default_source_budget, fixture_source_descriptor,
+        };
+
+        let directory = tempfile::tempdir().expect("tempdir");
+        let chain = fixture_chain(5);
+        let manifest = write_frame_archive(directory.path(), &chain[1..=4]);
+        let config = archive_config(
+            directory.path(),
+            &manifest,
+            &[
+                ("synthetic-counter", "counter-a"),
+                ("synthetic-counter", "counter-b"),
+            ],
+        );
+        let store = SqliteStore::open(StoreConfig::new(directory.path().join("node.sqlite")))
+            .await
+            .expect("store");
+        let processors = [("counter-a", 0xa0), ("counter-b", 0xb0)]
+            .into_iter()
+            .map(|(instance, settings)| {
+                Arc::new(BlockLocalCounter::default().with_instance(
+                    leani_processor_api::ProcessorInstanceId::new(instance).expect("instance"),
+                    leani_primitives::BlockHash::new([settings; 32]),
+                )) as Arc<dyn Processor>
+            })
+            .collect::<Vec<_>>();
+        // The live lanes retain the overlap up to the finalized anchor.
+        for frame in &chain[3..=4] {
+            store.store_recent_frame(frame).await.expect("recent frame");
+        }
+        let anchor = chain[4].block;
+        let overlap = BlockRange::new(BlockNumber(3), BlockNumber(4)).expect("overlap");
+        // An earlier release named counter-a's unverified handoff by its kind.
+        store
+            .begin_hot_cold_handoff(
+                "handoff-1-synthetic-counter-3-4",
+                processors[0].descriptor(),
+                ChainId(1),
+                overlap,
+                anchor.hash,
+            )
+            .await
+            .expect("earlier handoff");
+        let history_anchor = leani_source_p2p::P2pHistoryAnchor {
+            block: anchor,
+            consensus: leani_primitives::ConsensusAnchor {
+                finality: leani_primitives::Finality::Finalized,
+                execution_block_hash: anchor.hash,
+                beacon_slot: 1,
+                beacon_block_root: [1; 32],
+            },
+        };
+        // The P2P bridge is the last resort; the archive covers the range.
+        let p2p =
+            leani_source_p2p::RethP2pSource::mainnet(leani_source_p2p::RethP2pConfig::default())
+                .expect("execution source");
+        let cancellation = CancellationToken::new();
+        let mut backfills = ColdBackfills::default();
+        spawn_cold_backfills(
+            &config,
+            &store,
+            &processors,
+            4,
+            3,
+            anchor.hash,
+            p2p,
+            history_anchor,
+            None,
+            pipeline_budget(&config),
+            &cancellation,
+            &mut backfills,
+        )
+        .await
+        .expect("each instance starts its own cold backfill");
+        let live = SharedLiveRuntime::new(
+            store.clone(),
+            Arc::new(ScriptedLiveSource::new(
+                fixture_source_descriptor(
+                    "two-instances-live",
+                    BlockRange::new(BlockNumber(0), BlockNumber(5)).expect("range"),
+                ),
+                vec![LiveStep::Event(ChainEvent::Block(Box::new(
+                    chain[5].clone(),
+                )))],
+            )),
+            processors.clone(),
+            SharedLiveRuntimeConfig::default(),
+        )
+        .expect("live runtime");
+        let summary = tokio::time::timeout(
+            Duration::from_secs(30),
+            finish_cold_handoffs(&store, &live, &processors, &mut backfills),
+        )
+        .await
+        .expect("the handoffs finish")
+        .expect("both handoffs verify");
+        assert_eq!(summary.verified.len(), 2);
+        assert!(summary.failed.is_empty(), "{:?}", summary.failed);
+        for processor in &processors {
+            assert_eq!(
+                store
+                    .latest_hot_cold_handoff(processor.descriptor())
+                    .await
+                    .expect("handoff")
+                    .expect("handoff record")
+                    .state,
+                HotColdHandoffState::Verified
+            );
+        }
+        // The kind-named handoff is superseded, not reused.
+        assert_eq!(
+            store
+                .hot_cold_handoff(
+                    "handoff-1-synthetic-counter-3-4",
+                    processors[0].descriptor()
+                )
+                .await
+                .expect("earlier handoff")
+                .expect("earlier handoff record")
+                .state,
+            HotColdHandoffState::Failed
+        );
+
+        // The archive audit reconciles both instances.
+        let audit = CancellationToken::new();
+        let mut reconciliations = tokio::spawn({
+            let config = config.clone();
+            let store = store.clone();
+            let processors = processors.clone();
+            let audit = audit.clone();
+            async move { run_archive_reconciliations(&config, &store, &processors, audit).await }
+        });
+        let reconciled = async {
+            loop {
+                let mut verified = 0;
+                for processor in &processors {
+                    if store
+                        .latest_verified_archive_reconciliation(processor.descriptor())
+                        .await
+                        .expect("archive reconciliation")
+                        .is_some()
+                    {
+                        verified += 1;
+                    }
+                }
+                if verified == processors.len() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        };
+        tokio::select! {
+            result = &mut reconciliations => {
+                panic!("the archive reconciliation lane stopped: {result:?}");
+            }
+            reconciled = tokio::time::timeout(Duration::from_secs(30), reconciled) => {
+                reconciled.expect("both instances reconcile");
+            }
+        }
+        audit.cancel();
+        reconciliations
+            .await
+            .expect("archive reconciliation task")
+            .expect("archive reconciliation lane");
+
+        // Both follow the live chain.
+        live.run(
+            LiveStart::Head,
+            default_source_budget(),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("live run");
+        for processor in &processors {
+            assert_eq!(
+                store
+                    .processor_cursor(processor.descriptor())
+                    .await
+                    .expect("cursor")
+                    .expect("live cursor")
+                    .block_number,
+                BlockNumber(5),
+                "{} did not follow live",
+                processor.descriptor().instance
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_subscription_consumers_are_refused_before_their_stream_exists() {
+        // Task 14 deferred: an invalid consumer ID, or a lease TTL of zero or
+        // beyond an i64 of milliseconds, passed every check until the store
+        // created the consumer, after the subscription's history stream
+        // existed: 500, and the stream stayed.
+        use leani_api::BackfillControl as _;
+
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let chain = fixture_chain(10);
+        let manifest = write_frame_archive(directory.path(), &chain[1..=10]);
+        let processor: Arc<dyn Processor> = Arc::new(BlockLocalCounter::default().with_instance(
+            leani_processor_api::ProcessorInstanceId::new("subscribed-counter").expect("instance"),
+            leani_primitives::BlockHash::new([0x22; 32]),
+        ));
+        let instance = processor.descriptor().instance.to_string();
+        let mut config = archive_config(
+            directory.path(),
+            &manifest,
+            &[("synthetic-counter", instance.as_str())],
+        );
+        config.processors[0].history_mode = crate::config::ProcessorHistoryMode::OnDemand;
+        config.processors[0].history_control =
+            crate::config::ProcessorHistoryControl::ApplicationSubscriptions;
+        let store = leani_store_sqlite::SqliteStore::open(leani_store_sqlite::StoreConfig::new(
+            directory.path().join("node.sqlite"),
+        ))
+        .await
+        .expect("store");
+        finalized_head(&store, &chain[10]).await;
+        let control = NativeBackfillControl::new(
+            config,
+            store.clone(),
+            vec![processor.clone()],
+            CancellationToken::new(),
+            None,
+            None,
+            leani_runtime::HistoricalPipelineBudget::new(1, 1, 1_024).expect("pipeline budget"),
+        );
+        let streams = store
+            .delivery_streams(processor.descriptor())
+            .await
+            .expect("streams")
+            .len();
+        for (key, consumer_id, lease_ttl_seconds, rule) in [
+            ("unportable-consumer", "not portable!", 60, "consumer ID"),
+            ("zero-lease", "destination", 0, "lease TTL"),
+            ("huge-lease", "destination", u64::MAX, "lease TTL"),
+        ] {
+            let refused = control
+                .create_subscription(leani_api::CreateBackfillRequest {
+                    processor: instance.clone(),
+                    from_block: Some(1),
+                    to_block: Some(2.into()),
+                    ranges: Vec::new(),
+                    mode: leani_api::BackfillExecutionMode::FillMissing,
+                    consumer: Some(leani_api::CreateBackfillConsumerRequest {
+                        id: consumer_id.to_owned(),
+                        role: leani_store_sqlite::ConsumerRole::Required,
+                        lease_ttl_seconds,
+                        credential: None,
+                    }),
+                    limits: None,
+                    batching: None,
+                    idempotency_key: key.to_owned(),
+                })
+                .await;
+            assert!(
+                matches!(
+                    &refused,
+                    Err(leani_api::BackfillControlError::Invalid(message))
+                        if message.contains(rule)
+                ),
+                "{key}: {refused:?}"
+            );
+            assert_eq!(
+                store
+                    .delivery_streams(processor.descriptor())
+                    .await
+                    .expect("streams")
+                    .len(),
+                streams,
+                "{key}: the refused subscription left its stream"
+            );
+        }
+    }
+
+    /// A block-local counter whose mapping takes a while, so its work is still
+    /// in flight when a test acts on it.
+    #[derive(Debug)]
+    struct SlowCounter(BlockLocalCounter);
+
+    #[async_trait::async_trait]
+    impl Processor for SlowCounter {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
+        fn descriptor(&self) -> &leani_processor_api::ProcessorDescriptor {
+            self.0.descriptor()
+        }
+
+        async fn map(
+            &self,
+            block: &leani_primitives::BlockFrame,
+        ) -> Result<leani_processor_api::EncodedDelta, leani_processor_api::ProcessorError>
+        {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            self.0.map(block).await
+        }
+
+        async fn reduce(
+            &self,
+            transaction: &mut dyn leani_processor_api::ReducerTransaction,
+            cursor: &leani_primitives::ProcessorCursor,
+            delta: &leani_processor_api::EncodedDelta,
+        ) -> Result<leani_processor_api::DomainChanges, leani_processor_api::ProcessorError>
+        {
+            self.0.reduce(transaction, cursor, delta).await
+        }
+    }
+
+    /// A block-local counter whose mapping panics.
+    #[derive(Debug)]
+    struct PanickingCounter(BlockLocalCounter);
+
+    #[async_trait::async_trait]
+    impl Processor for PanickingCounter {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
+        fn descriptor(&self) -> &leani_processor_api::ProcessorDescriptor {
+            self.0.descriptor()
+        }
+
+        async fn map(
+            &self,
+            _block: &leani_primitives::BlockFrame,
+        ) -> Result<leani_processor_api::EncodedDelta, leani_processor_api::ProcessorError>
+        {
+            panic!("the processor's mapping panicked")
+        }
+
+        async fn reduce(
+            &self,
+            transaction: &mut dyn leani_processor_api::ReducerTransaction,
+            cursor: &leani_primitives::ProcessorCursor,
+            delta: &leani_processor_api::EncodedDelta,
+        ) -> Result<leani_processor_api::DomainChanges, leani_processor_api::ProcessorError>
+        {
+            self.0.reduce(transaction, cursor, delta).await
+        }
+    }
+
+    /// An on-demand node over a local archive of blocks `1..=through`, with a
+    /// finalized head at `through`.
+    async fn on_demand_control(
+        directory: &Path,
+        processor: Arc<dyn Processor>,
+        through: u64,
+    ) -> (leani_store_sqlite::SqliteStore, Arc<NativeBackfillControl>) {
+        let chain = fixture_chain(through);
+        let manifest = write_frame_archive(directory, &chain[1..]);
+        let instance = processor.descriptor().instance.to_string();
+        let mut config = archive_config(
+            directory,
+            &manifest,
+            &[("synthetic-counter", instance.as_str())],
+        );
+        config.processors[0].history_mode = crate::config::ProcessorHistoryMode::OnDemand;
+        let store = leani_store_sqlite::SqliteStore::open(leani_store_sqlite::StoreConfig::new(
+            directory.join("node.sqlite"),
+        ))
+        .await
+        .expect("store");
+        finalized_head(
+            &store,
+            &chain[usize::try_from(through).expect("block index")],
+        )
+        .await;
+        let budget = pipeline_budget(&config);
+        let control = Arc::new(NativeBackfillControl::new(
+            config,
+            store.clone(),
+            vec![processor],
+            CancellationToken::new(),
+            None,
+            None,
+            budget,
+        ));
+        (store, control)
+    }
+
+    fn materialization(instance: &str, key: &str) -> leani_api::CreateMaterializationRequest {
+        leani_api::CreateMaterializationRequest {
+            processor: instance.to_owned(),
+            from_block: Some(1),
+            to_block: Some(4.into()),
+            ranges: Vec::new(),
+            mode: leani_api::BackfillExecutionMode::FillMissing,
+            idempotency_key: key.to_owned(),
+        }
+    }
+
+    #[tokio::test]
+    async fn deleting_a_cancelled_job_leaves_no_record_behind() {
+        // Audit CLI-4: cancel marked the job cancelled at once, and a delete
+        // right after it raced the task, whose own cancellation bookkeeping
+        // then wrote the deleted job's outcome again.
+        use leani_api::BackfillControl as _;
+
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let processor: Arc<dyn Processor> = Arc::new(SlowCounter(BlockLocalCounter::default()));
+        let instance = processor.descriptor().instance.to_string();
+        let (store, control) = on_demand_control(directory.path(), processor, 4).await;
+        let created = control
+            .create_materialization(materialization(&instance, "cancel-then-delete"))
+            .await
+            .expect("materialization");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        control.cancel(&created.id).await.expect("cancel");
+        control.delete(&created.id).await.expect("delete");
+        // The task's mapping takes 300 ms a block; by now it has ended.
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert!(
+            store.job(&created.id).await.expect("job").is_none(),
+            "the deleted job came back"
+        );
+        assert!(
+            store
+                .job(&format!("{}:outcome", created.id))
+                .await
+                .expect("outcome")
+                .is_none(),
+            "the deleted job's outcome came back"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_panicking_historical_job_fails_and_frees_its_slot() {
+        // Review of task 16b: a job's task freed its slot only when it
+        // returned. A panic kept the slot, which counts toward
+        // `source_concurrency`, and left the job running, for good.
+        use leani_api::BackfillControl as _;
+
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let processor: Arc<dyn Processor> =
+            Arc::new(PanickingCounter(BlockLocalCounter::default()));
+        let instance = processor.descriptor().instance.to_string();
+        let (store, control) = on_demand_control(directory.path(), processor, 4).await;
+        let created = control
+            .create_materialization(materialization(&instance, "panics"))
+            .await
+            .expect("materialization");
+        wait_for_job_state(&store, &created.id, leani_store_sqlite::JobState::Failed).await;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !control.tasks.lock().await.is_empty() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the panicked job kept its slot");
+    }
+
+    fn durable_job(
+        processor: &dyn Processor,
+        id: &str,
+        instance: &str,
+        state: leani_store_sqlite::JobState,
+        updated_at_unix_ms: u64,
+    ) -> leani_store_sqlite::JobRecord {
+        let mut job = leani_runtime::BackfillJob::for_processor(
+            id,
+            processor,
+            leani_primitives::ChainId(1),
+            leani_primitives::BlockRange::new(
+                leani_primitives::BlockNumber(1),
+                leani_primitives::BlockNumber(4),
+            )
+            .expect("range"),
+            leani_source_api::VerificationPolicy::TrustedDataset,
+        )
+        .expect("job");
+        instance.clone_into(&mut job.processor_instance);
+        leani_store_sqlite::JobRecord {
+            id: id.to_owned(),
+            kind: job.owner.job_kind().to_owned(),
+            state,
+            payload: serde_json::to_vec(&job).expect("job payload"),
+            checkpoint: None,
+            attempts: 0,
+            updated_at_unix_ms,
+        }
+    }
+
+    #[tokio::test]
+    async fn one_bad_durable_job_does_not_stop_resumption() {
+        // Audit M-N6: the first job the scheduler could not decode or resolve
+        // ended the whole pass, so no job after it ever resumed.
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let processor: Arc<dyn Processor> = Arc::new(BlockLocalCounter::default());
+        let instance = processor.descriptor().instance.to_string();
+        let (store, control) = on_demand_control(directory.path(), processor.clone(), 4).await;
+        let valid = format!("materialization:{instance}:valid");
+        let unreadable = |id: &str, state, updated_at_unix_ms| leani_store_sqlite::JobRecord {
+            payload: b"not a durable job".to_vec(),
+            ..durable_job(processor.as_ref(), id, &instance, state, updated_at_unix_ms)
+        };
+        for record in [
+            unreadable(
+                "materialization:finished-unreadable",
+                leani_store_sqlite::JobState::Completed,
+                1,
+            ),
+            unreadable(
+                "materialization:queued-unreadable",
+                leani_store_sqlite::JobState::Queued,
+                2,
+            ),
+            durable_job(
+                processor.as_ref(),
+                "materialization:removed-processor",
+                "removed-instance",
+                leani_store_sqlite::JobState::Queued,
+                3,
+            ),
+            durable_job(
+                processor.as_ref(),
+                &valid,
+                &instance,
+                leani_store_sqlite::JobState::Queued,
+                4,
+            ),
+        ] {
+            store.save_job(&record).await.expect("durable job");
+        }
+
+        control
+            .resume_durable_jobs()
+            .await
+            .expect("one job never fails the whole pass");
+        wait_for_job_state(&store, &valid, leani_store_sqlite::JobState::Completed).await;
+        assert_eq!(
+            store
+                .job("materialization:removed-processor")
+                .await
+                .expect("job")
+                .expect("record")
+                .state,
+            leani_store_sqlite::JobState::Queued
+        );
+    }
+
+    #[tokio::test]
+    async fn the_durable_job_scheduler_reloads_only_after_a_change() {
+        // Audit M-N6: the scheduler reloaded and decoded every job every
+        // second, whether anything had changed or not.
+        use leani_api::BackfillControl as _;
+
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let processor: Arc<dyn Processor> = Arc::new(BlockLocalCounter::default());
+        let instance = processor.descriptor().instance.to_string();
+        let (store, control) = on_demand_control(directory.path(), processor.clone(), 4).await;
+        let supervisor = tokio::spawn(control.clone().supervise_durable_jobs());
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // A job nothing announced: no change the scheduler knows of.
+        let unannounced = format!("materialization:{instance}:unannounced");
+        store
+            .save_job(&durable_job(
+                processor.as_ref(),
+                &unannounced,
+                &instance,
+                leani_store_sqlite::JobState::Queued,
+                1,
+            ))
+            .await
+            .expect("durable job");
+        tokio::time::sleep(Duration::from_millis(2_500)).await;
+        assert_eq!(
+            store
+                .job(&unannounced)
+                .await
+                .expect("job")
+                .expect("record")
+                .state,
+            leani_store_sqlite::JobState::Queued,
+            "the scheduler reloaded its jobs without a change"
+        );
+
+        // A job the node runs: when it ends, the scheduler looks again.
+        control
+            .create_materialization(materialization(&instance, "announced"))
+            .await
+            .expect("materialization");
+        wait_for_job_state(
+            &store,
+            &unannounced,
+            leani_store_sqlite::JobState::Completed,
+        )
+        .await;
+        control.cancellation.cancel();
+        supervisor.await.expect("scheduler stops");
+    }
+
+    #[tokio::test]
+    async fn a_panicking_network_lane_run_drops_readiness() {
+        // Audit M-N3: a panic unwound out of the lane supervisor and left
+        // readiness as the lanes had last set it.
+        let handles = lane_handles();
+        let supervisor = tokio::spawn({
+            let handles = handles.clone();
+            async move {
+                let runs = handles.clone();
+                supervise_lane_runs(&handles, move || {
+                    let handles = runs.clone();
+                    async move {
+                        handles.readiness.set_live_ready(true);
+                        handles.rpc_readiness.set_live_ready(true);
+                        handles.readiness.set_finality_ready(true);
+                        assert!(handles.readiness.is_ready());
+                        panic!("a bug in the network lanes");
+                    }
+                })
+                .await
+            }
+        });
+        let joined = supervisor.await;
+        assert!(
+            joined.as_ref().is_err_and(tokio::task::JoinError::is_panic),
+            "{joined:?}"
+        );
+        assert!(!handles.readiness.is_ready(), "readiness stayed up");
+        assert!(
+            !handles.rpc_readiness.live_ready(),
+            "RPC readiness stayed up"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_network_lane_backoff_resets_after_a_healthy_run() {
+        // Audit M-N3: the backoff doubled up to a minute and never came back
+        // down, so a node that had run well for days waited a minute to
+        // restart after its next failure.
+        let handles = lane_handles();
+        let starts = std::sync::Mutex::new(Vec::new());
+        tokio::time::timeout(
+            Duration::from_hours(1),
+            supervise_lane_runs(&handles, || {
+                let run = {
+                    let mut starts = starts.lock().expect("run starts");
+                    starts.push(tokio::time::Instant::now());
+                    starts.len()
+                };
+                let cancellation = handles.cancellation.clone();
+                async move {
+                    match run {
+                        1..=4 => {}
+                        // A run that stays up for ten minutes, then fails.
+                        5 => tokio::time::sleep(Duration::from_mins(10)).await,
+                        _ => cancellation.cancel(),
+                    }
+                    Err(anyhow::anyhow!("execution peers unavailable"))
+                }
+            }),
+        )
+        .await
+        .expect("the supervisor stops once cancelled");
+        let starts = starts.into_inner().expect("run starts");
+        let gaps = starts
+            .windows(2)
+            .map(|pair| pair[1] - pair[0])
+            .collect::<Vec<_>>();
+        assert_eq!(
+            gaps,
+            [
+                Duration::from_secs(1),
+                Duration::from_secs(2),
+                Duration::from_secs(4),
+                Duration::from_secs(8),
+                // After the healthy run the backoff starts over.
+                Duration::from_mins(10) + Duration::from_secs(1),
+            ]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_healthy_run_does_not_reset_the_count_of_one_finality_contradiction() {
+        // The backoff reset leaves Task 12's count alone: a contradiction of
+        // the same finalized block after a long run is still the same fault,
+        // because finality has not moved.
+        let handles = lane_handles();
+        let runs = std::sync::atomic::AtomicUsize::new(0);
+        let end = tokio::time::timeout(
+            Duration::from_hours(1),
+            supervise_lane_runs(&handles, || {
+                let run = runs.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                async move {
+                    if run == 2 {
+                        tokio::time::sleep(Duration::from_mins(10)).await;
+                    }
+                    Err(unfinalized_contradiction(2, 0xf2))
+                }
+            }),
+        )
+        .await
+        .expect("the persistent contradiction halts");
+        assert_eq!(end, NetworkLanesEnd::Halted);
+        assert_eq!(runs.load(std::sync::atomic::Ordering::SeqCst), 3);
+        assert_eq!(
+            handles.network_telemetry.snapshot().supervisor.state,
+            leani_source_api::NetworkSupervisorState::Stopped
+        );
+    }
+
+    #[tokio::test]
+    async fn embedded_subscriptions_prune_their_delivery_log() {
+        // Audit M-N4: the embedded runtime never pruned its delivery log, so a
+        // window-mode subscription paused for good once the log filled.
+        use leani_primitives::{ChainId, ProcessorCursor};
+
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let counter = BlockLocalCounter::default().with_delivery_max_bytes(150);
+        let mut lifecycle = counter.descriptor().lifecycle.clone();
+        lifecycle.delivery.pruning.interval_seconds = 1;
+        lifecycle.delivery.pruning.minimum_batch_blocks = 1;
+        lifecycle.delivery.pruning.minimum_batch_changes = 1;
+        lifecycle.delivery.pruning.retain_finalized_blocks = 1;
+        let processor: Arc<dyn Processor> = Arc::new(counter.with_lifecycle(lifecycle));
+        let mut config: Config =
+            toml::from_str(crate::config::VALID_CONFIG_TOML).expect("configuration fixture");
+        config.data_dir = directory.path().to_path_buf();
+        config.processors[0].instance = processor.descriptor().instance.to_string();
+        // Refused at once on loopback, so the lanes keep restarting without
+        // leaving the machine while the store is maintained.
+        config.finality.endpoints =
+            vec![url::Url::parse("http://127.0.0.1:1/").expect("finality endpoint")];
+        let store = leani_store_sqlite::SqliteStore::open(leani_store_sqlite::StoreConfig::new(
+            directory.path().join("leani.sqlite"),
+        ))
+        .await
+        .expect("store");
+        let mut paused = false;
+        for frame in fixture_chain(20).into_iter().skip(1) {
+            let delta = processor.map(&frame).await.expect("map");
+            let applied = store
+                .apply(
+                    processor.as_ref(),
+                    ProcessorCursor {
+                        processor_id: processor.descriptor().id.to_string(),
+                        processor_version: processor.descriptor().version.to_string(),
+                        chain_id: ChainId(1),
+                        block_number: frame.block.number,
+                        block_hash: frame.block.hash,
+                        finality: frame.finality,
+                        sequence: frame.block.number.0,
+                    },
+                    &delta,
+                    &[],
+                )
+                .await;
+            if matches!(
+                applied,
+                Err(leani_store_sqlite::StoreError::DeliveryLimit { .. })
+            ) {
+                paused = true;
+                break;
+            }
+            applied.expect("apply");
+        }
+        assert!(paused, "the delivery log never filled");
+        assert_eq!(
+            store
+                .processor_runtime_state(processor.descriptor())
+                .await
+                .expect("state")
+                .state,
+            leani_store_sqlite::ProcessorRunState::Paused
+        );
+
+        let runtime = spawn_embedded_network_runtime(
+            config,
+            store.clone(),
+            vec![processor.clone()],
+            crate::local_state::lock_runtime_directory(directory.path())
+                .expect("runtime directory lock"),
+            leani_finality_beacon_api::CheckpointOrigin::Operator,
+        )
+        .expect("embedded runtime");
+        let resumed = tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                if store
+                    .processor_runtime_state(processor.descriptor())
+                    .await
+                    .expect("state")
+                    .state
+                    == leani_store_sqlite::ProcessorRunState::Running
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await;
+        runtime.shutdown().await;
+        resumed.expect("pruning the delivery log resumes the subscription's processor");
+    }
+
+    #[tokio::test]
+    async fn no_cold_backfill_outlives_its_network_lane_run() {
+        // Audit M-N1: an early `?` in a network-lane run dropped the handles
+        // of the cold backfills it had spawned, which kept running into the
+        // next run's startup reconciliation.
+        let node = CancellationToken::new();
+        let stopped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let run = with_cold_backfills(&node, async |lane_cancellation, backfills| {
+            let lane_cancellation = lane_cancellation.clone();
+            let stopped = stopped.clone();
+            backfills.spawn("automatic-stopping", async move {
+                lane_cancellation.cancelled().await;
+                // Stopping takes a moment: the backfill saves its checkpoint.
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                stopped.store(true, std::sync::atomic::Ordering::SeqCst);
+                Err(anyhow::anyhow!(
+                    "automatic cold backfill suspended for node shutdown"
+                ))
+            });
+            Err(anyhow::anyhow!(
+                "an early error after the backfills started"
+            ))
+        });
+        let result = tokio::time::timeout(Duration::from_secs(5), run)
+            .await
+            .expect("the run ends");
+        assert!(result.is_err(), "the run's own error is kept");
+        assert!(
+            stopped.load(std::sync::atomic::Ordering::SeqCst),
+            "a cold backfill outlived its network-lane run"
+        );
+        assert!(
+            !node.is_cancelled(),
+            "only the run's own token was cancelled"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_panicking_network_lane_run_still_joins_its_cold_backfills() {
+        // Review of task 16b: a panic in a network-lane run skipped the join.
+        // The drop guard cancelled the run's cold backfills, and dropping
+        // their set aborted them wherever they were, without waiting.
+        let stopped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let run = tokio::spawn({
+            let stopped = stopped.clone();
+            async move {
+                with_cold_backfills(
+                    &CancellationToken::new(),
+                    async move |lane_cancellation, backfills| {
+                        let lane_cancellation = lane_cancellation.clone();
+                        backfills.spawn("automatic-stopping", async move {
+                            lane_cancellation.cancelled().await;
+                            // Stopping takes a moment: the backfill saves its
+                            // checkpoint.
+                            tokio::time::sleep(Duration::from_millis(50)).await;
+                            stopped.store(true, std::sync::atomic::Ordering::SeqCst);
+                            Err(anyhow::anyhow!(
+                                "automatic cold backfill suspended for node shutdown"
+                            ))
+                        });
+                        panic!("the network-lane run panicked after its backfills started")
+                    },
+                )
+                .await
+            }
+        });
+        let ended = tokio::time::timeout(Duration::from_secs(5), run)
+            .await
+            .expect("the run ends");
+        assert!(
+            ended.is_err_and(|error| error.is_panic()),
+            "the panic reaches the supervisor"
+        );
+        assert!(
+            stopped.load(std::sync::atomic::Ordering::SeqCst),
+            "a cold backfill outlived its panicking network-lane run"
+        );
+    }
+
+    /// Log output captured for a test's assertions.
+    #[derive(Clone, Default)]
+    struct CapturedLogs(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl CapturedLogs {
+        fn text(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().expect("captured logs")).into_owned()
+        }
+    }
+
+    impl std::io::Write for CapturedLogs {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .expect("captured logs")
+                .extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_network_lanes_name_a_cold_backfill_that_does_not_stop() {
+        // Review of task 16b: after a network-lane run, the join waits for
+        // every cold backfill without a bound, and one that ignored its
+        // cancellation held up the next run without a word.
+        let logs = CapturedLogs::default();
+        let _logs = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_ansi(false)
+                .with_writer({
+                    let logs = logs.clone();
+                    move || logs.clone()
+                })
+                .finish(),
+        );
+        let node = CancellationToken::new();
+        let release = CancellationToken::new();
+        let run = with_cold_backfills(&node, async |_, backfills| {
+            let release = release.clone();
+            backfills.spawn("automatic:1:stubborn:1-4", async move {
+                release.cancelled().await;
+                Err(anyhow::anyhow!("stopped at last"))
+            });
+            Ok(())
+        });
+        tokio::pin!(run);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(25), &mut run)
+                .await
+                .is_err(),
+            "the join waits for the backfill"
+        );
+        let logged = logs.text();
+        assert!(logged.contains("automatic:1:stubborn:1-4"), "{logged}");
+        release.cancel();
+        run.await.expect("the run's own result");
+    }
+
+    #[tokio::test]
+    async fn a_cold_backfill_started_before_a_setup_error_stays_joinable() {
+        // Audit M-N1: when a later processor's setup failed, the backfills
+        // already started were dropped with the list that held them.
+        let directory = tempfile::tempdir().expect("tempdir");
+        let chain = fixture_chain(4);
+        let manifest = write_frame_archive(directory.path(), &chain[1..=4]);
+        let counter: Arc<dyn Processor> = Arc::new(BlockLocalCounter::default());
+        // The archive serves no headers, which the ledger needs.
+        let ledger: Arc<dyn Processor> = Arc::new(leani_testkit::OrderedLedgerProcessor::named(
+            "header-ledger",
+        ));
+        let config = archive_config(
+            directory.path(),
+            &manifest,
+            &[
+                ("synthetic-counter", counter.descriptor().instance.as_str()),
+                ("header-ledger", ledger.descriptor().instance.as_str()),
+            ],
+        );
+        let store = leani_store_sqlite::SqliteStore::open(leani_store_sqlite::StoreConfig::new(
+            directory.path().join("node.sqlite"),
+        ))
+        .await
+        .expect("store");
+        let anchor = chain[4].block;
+        let lanes = CancellationToken::new();
+        let mut backfills = ColdBackfills::default();
+        let error = spawn_cold_backfills(
+            &config,
+            &store,
+            &[counter, ledger],
+            4,
+            3,
+            anchor.hash,
+            leani_source_p2p::RethP2pSource::mainnet(leani_source_p2p::RethP2pConfig::default())
+                .expect("execution source"),
+            leani_source_p2p::P2pHistoryAnchor {
+                block: anchor,
+                consensus: leani_primitives::ConsensusAnchor {
+                    finality: leani_primitives::Finality::Finalized,
+                    execution_block_hash: anchor.hash,
+                    beacon_slot: 1,
+                    beacon_block_root: [1; 32],
+                },
+            },
+            None,
+            pipeline_budget(&config),
+            &lanes,
+            &mut backfills,
+        )
+        .await
+        .expect_err("the ledger has no cold source");
+        assert!(format!("{error:#}").contains("header-ledger"), "{error:#}");
+        assert_eq!(backfills.len(), 1, "the counter's backfill was dropped");
+        lanes.cancel();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while backfills.join_next().await.is_some() {}
+        })
+        .await
+        .expect("the started backfill stops when its lanes are cancelled");
+    }
+
+    #[test]
+    fn a_standalone_backfill_runs_with_the_configured_historical_pipeline() {
+        // Audit CLI-3: `leani backfill` ran with built-in pipeline defaults
+        // instead of the configured ones the node's own backfills use.
+        let mut config: Config =
+            toml::from_str(crate::config::VALID_CONFIG_TOML).expect("configuration fixture");
+        let pipeline = &mut config.budgets.history_pipeline;
+        pipeline.maximum_active_chunks = 3;
+        pipeline.maximum_mapped_bytes = crate::config::HumanBytes::from_bytes(7 * 1_024 * 1_024);
+        pipeline.commit.maximum_blocks = 11;
+        pipeline.commit.maximum_changes = 13;
+        pipeline.commit.maximum_encoded_bytes = crate::config::HumanBytes::from_bytes(17 * 1_024);
+        pipeline.commit.maximum_delay = crate::config::HumanMilliseconds::from_milliseconds(19);
+        pipeline.commit.target_writer_hold =
+            crate::config::HumanMilliseconds::from_milliseconds(23);
+
+        let runtime = historical_runtime_config(&config, 4);
+
+        assert_eq!(
+            runtime.mapper_concurrency,
+            config.budgets.mapper_concurrency
+        );
+        assert_eq!(runtime.maximum_active_chunks, 3);
+        assert_eq!(runtime.maximum_mapped_bytes, 7 * 1_024 * 1_024);
+        assert_eq!(runtime.commit_maximum_blocks, 11);
+        assert_eq!(runtime.commit_maximum_changes, 13);
+        assert_eq!(runtime.commit_maximum_encoded_bytes, 17 * 1_024);
+        assert_eq!(runtime.commit_maximum_delay, Duration::from_millis(19));
+        assert_eq!(runtime.commit_target_writer_hold, Duration::from_millis(23));
+        // Three attempts per history source on a gap, as the node grants.
+        assert_eq!(runtime.max_attempts, 12);
+    }
+
+    #[tokio::test]
+    async fn a_standalone_backfill_applies_the_configured_historical_pipeline() {
+        // Review of task 16b: the test above checks the helper, not that
+        // `leani backfill` runs with it. A configured pipeline too small for
+        // one mapped delta fails the command only if the command applies it.
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let chain = fixture_chain(4);
+        let manifest = write_frame_archive(directory.path(), &chain[1..]);
+        let mut config = archive_config(
+            directory.path(),
+            &manifest,
+            &[("transaction-stats", "transfers")],
+        );
+        let configured = &mut config.processors[0];
+        "1.0.0".clone_into(&mut configured.version);
+        configured.history_mode = crate::config::ProcessorHistoryMode::OnDemand;
+        configured.settings = toml::from_str(
+            "from = \"0x0000000000000000000000000000000000000001\"\n\
+             to = \"0x0000000000000000000000000000000000000002\"",
+        )
+        .expect("processor settings");
+        config.budgets.history_pipeline.maximum_mapped_bytes =
+            crate::config::HumanBytes::from_bytes(1);
+        let config_path = directory.path().join("leani.toml");
+        std::fs::write(
+            &config_path,
+            toml::to_string(&config).expect("configuration"),
+        )
+        .expect("configuration file");
+
+        let error = backfill(
+            &config_path,
+            "transfers",
+            1,
+            4,
+            &crate::processors::ProcessorRegistry::standard(),
+        )
+        .await
+        .expect_err("no mapped delta fits the configured pipeline");
+        assert!(
+            matches!(
+                error.downcast_ref::<leani_runtime::RuntimeError>(),
+                Some(leani_runtime::RuntimeError::MappedDeltaBudget { limit: 1, .. })
+            ),
+            "{error:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_second_shutdown_signal_exits_at_once() {
+        // Audit M-N2: a second Ctrl-C was ignored while the graceful shutdown
+        // waited.
+        let (signal, signals) = tokio::sync::mpsc::unbounded_channel::<()>();
+        let signals = futures::stream::unfold(signals, |mut signals| async move {
+            signals.recv().await.map(|()| ((), signals))
+        });
+        let cancellation = CancellationToken::new();
+        let (exited, mut exit_code) = tokio::sync::mpsc::unbounded_channel();
+        let forwarder = tokio::spawn(forward_shutdown_signals(
+            signals,
+            cancellation.clone(),
+            move |code| exited.send(code).expect("exit code"),
+        ));
+
+        signal.send(()).expect("first signal");
+        tokio::time::timeout(Duration::from_secs(5), cancellation.cancelled())
+            .await
+            .expect("the first signal starts the shutdown");
+        tokio::task::yield_now().await;
+        assert!(exit_code.try_recv().is_err(), "the first signal exited");
+
+        // Undeliverable once nothing listens for signals any more.
+        let _ = signal.send(());
+        let code = tokio::time::timeout(Duration::from_secs(5), exit_code.recv())
+            .await
+            .expect("the second signal exits at once");
+        // 130, never 0: a forced exit is not a clean one.
+        assert_eq!(code, Some(130), "the second signal did not exit");
+        forwarder.await.expect("signal forwarder");
+    }
+
+    /// A background task that runs until `cancellation`.
+    fn steady_task(cancellation: &CancellationToken) -> impl Future<Output = Result<()>> + use<> {
+        let cancellation = cancellation.clone();
+        async move {
+            cancellation.cancelled().await;
+            Ok(())
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_shutdown_abandons_connections_still_open_at_its_deadline() {
+        // Audit M-N2: the graceful shutdown had no deadline, so one
+        // connection that never closed held the node up forever.
+        let cancellation = CancellationToken::new();
+        let mut background = BackgroundTasks::default();
+        background.spawn("steady", steady_task(&cancellation));
+        cancellation.cancel();
+        let started = tokio::time::Instant::now();
+        // The listeners never finish: a connection stays open.
+        tokio::time::timeout(
+            SHUTDOWN_DEADLINE + Duration::from_secs(1),
+            serve_until_shutdown(std::future::pending(), &mut background, &cancellation),
+        )
+        .await
+        .expect("the shutdown ends at its deadline")
+        .expect("an abandoned connection fails nothing");
+        assert!(started.elapsed() >= SHUTDOWN_DEADLINE);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_background_task_that_ends_shuts_the_node_down() {
+        // Audit M-N3: background tasks were fire-and-forget, so one that
+        // stopped or panicked went unnoticed while the node kept serving.
+        let endings: [(&str, futures::future::BoxFuture<'static, Result<()>>); 3] = [
+            ("stops", Box::pin(async { Ok(()) })),
+            (
+                "fails",
+                Box::pin(async { Err(anyhow::anyhow!("the store went away")) }),
+            ),
+            (
+                "panics",
+                Box::pin(futures::future::lazy(|_| -> Result<()> {
+                    panic!("a bug in a background task")
+                })),
+            ),
+        ];
+        for (name, ending) in endings {
+            let cancellation = CancellationToken::new();
+            let mut background = BackgroundTasks::default();
+            background.spawn("steady", steady_task(&cancellation));
+            background.spawn(name, ending);
+            let error = tokio::time::timeout(
+                Duration::from_mins(1),
+                serve_until_shutdown(steady_task(&cancellation), &mut background, &cancellation),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("the node kept running after `{name}` ended"))
+            .expect_err("a background task that ends is fatal");
+            assert!(
+                cancellation.is_cancelled(),
+                "{name}: the node did not shut down"
+            );
+            assert!(
+                format!("{error:#}").contains(&format!("background task `{name}` ended")),
+                "{error:#}"
+            );
+        }
+
+        // After the shutdown began, a task that fails is only logged.
+        let cancellation = CancellationToken::new();
+        let mut background = BackgroundTasks::default();
+        background.spawn("stopping", {
+            let cancellation = cancellation.clone();
+            async move {
+                cancellation.cancelled().await;
+                Err(anyhow::anyhow!("interrupted by the shutdown"))
+            }
+        });
+        cancellation.cancel();
+        serve_until_shutdown(std::future::ready(Ok(())), &mut background, &cancellation)
+            .await
+            .expect("a failure during the shutdown is not fatal");
     }
 }

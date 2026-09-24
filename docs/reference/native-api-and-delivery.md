@@ -54,7 +54,8 @@ ordinary JSON-RPC calls plus `eth_subscribe`/`eth_unsubscribe` for `newHeads`
 and filtered `logs`. Subscription events are published only after the live
 branch commits; reorged logs are sent with `removed: true` before replacement
 logs. A client that falls behind the bounded event channel is closed with code
-1013 and must reconnect.
+1013 and must reconnect. When the node shuts down, every connection is closed
+with code 1001.
 
 Public aggregate routes:
 
@@ -194,7 +195,9 @@ shared processor coverage cannot silently satisfy another subscription's
 delivery obligation. Completed, failed, and cancelled jobs are terminal and are
 never retried implicitly. After correcting a permanent failure, explicitly
 delete the terminal job before recreating the request; deletion is the retry
-boundary.
+boundary. Deleting a job right after cancelling it waits up to 10 seconds for
+its task to stop, and answers `503 backfill_unavailable`, which is retryable,
+if it has not.
 
 ## 3. Common response model
 
@@ -306,6 +309,8 @@ content-type: application/json
 `position` is `earliest_retained`, `current_head`, or `cursor` with a `cursor`
 field. An old, wrong-store, wrong-instance, or incompatible cursor returns
 `reset_required`; the node never substitutes another position.
+`leaseTtlSeconds` is 1 to 3,153,600,000 (100 years), for a backfill
+subscription's consumer too; another value gets `400`.
 
 A consumer created with a credential needs it on every consumer-scoped call,
 in addition to any bearer token: the lease, change, and acknowledgement
@@ -672,11 +677,13 @@ A browser `EventSource` reconnects on its own and sends the last event's
 `id:`, its cursor, as `Last-Event-ID`; without `after`, the stream resumes
 after that cursor. An explicit `after` takes precedence.
 
-The server sends comments as heartbeats. The SDK reconnects with the last fully
+The server sends comments as heartbeats. When the node shuts down, it ends the
+stream after a whole event, with no error event, and the consumer delivery
+streams after a whole record. The SDK reconnects with the last fully
 yielded cursor, uses exponential backoff with jitter, and treats these
 differently:
 
-- clean server close: reconnect;
+- clean server close, such as the node's shutdown: reconnect;
 - transient network/5xx: reconnect;
 - authentication/validation 4xx: surface error;
 - `reset_required`: stop and require a snapshot/resubscription decision;

@@ -58,7 +58,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use thiserror::Error;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, broadcast};
-use tokio_util::sync::CancellationToken;
+use tokio_util::{sync::CancellationToken, task::TaskTracker};
 
 use browser_guard::guard_browser_requests;
 
@@ -159,6 +159,12 @@ pub struct RpcConfig {
     pub max_log_topic_alternatives: usize,
     pub max_subscriptions_per_connection: usize,
     pub max_websocket_connections: usize,
+    /// Cancelled when the node shuts down: open WebSocket connections then
+    /// get a going-away close frame.
+    pub shutdown: CancellationToken,
+    /// Tracks open WebSocket connections, which outlive their listener's
+    /// graceful shutdown, so the node can wait for their close frames.
+    pub websocket_sessions: TaskTracker,
 }
 
 impl Default for RpcConfig {
@@ -178,6 +184,8 @@ impl Default for RpcConfig {
             max_log_topic_alternatives: DEFAULT_MAX_LOG_TOPIC_ALTERNATIVES,
             max_subscriptions_per_connection: DEFAULT_MAX_SUBSCRIPTIONS_PER_CONNECTION,
             max_websocket_connections: DEFAULT_MAX_WEBSOCKET_CONNECTIONS,
+            shutdown: CancellationToken::new(),
+            websocket_sessions: TaskTracker::new(),
         }
     }
 }
@@ -786,7 +794,10 @@ async fn websocket_upgrade(State(state): State<RpcState>, upgrade: WebSocketUpgr
     };
     upgrade
         .max_message_size(state.config.max_request_bytes)
-        .on_upgrade(move |socket| websocket_session(socket, state, connection))
+        .on_upgrade(move |socket| {
+            let sessions = state.config.websocket_sessions.clone();
+            sessions.track_future(websocket_session(socket, state, connection))
+        })
 }
 
 #[derive(Clone, Debug)]
@@ -796,7 +807,8 @@ enum Subscription {
 }
 
 /// Serve one WebSocket connection. `_connection` holds its connection slot
-/// until the connection closes; its subscriptions go with it.
+/// until the connection closes; its subscriptions go with it. The node's
+/// shutdown closes it as going away.
 async fn websocket_session(
     mut socket: WebSocket,
     state: RpcState,
@@ -807,6 +819,13 @@ async fn websocket_session(
     let mut next_subscription = 1_u64;
     loop {
         tokio::select! {
+            () = state.config.shutdown.cancelled() => {
+                let _ = socket.send(Message::Close(Some(CloseFrame {
+                    code: close_code::AWAY,
+                    reason: "the node is shutting down".into(),
+                }))).await;
+                break;
+            }
             message = socket.next() => {
                 let Some(message) = message else {
                     break;

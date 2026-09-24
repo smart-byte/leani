@@ -74,7 +74,7 @@ verifies the configured weak-subjectivity checkpoint, seeds the finalized
 execution anchor, starts one shared P2P subscription, and launches cold
 backfills for every processor that has a capable history source. A source
 failure drops readiness immediately and the supervisor retries with bounded
-exponential backoff.
+exponential backoff (see [Shutdown and supervision](#shutdown-and-supervision)).
 
 The live lane includes blocks only up to the newest attested head: the
 execution header of a light-client optimistic update that at least two thirds
@@ -306,6 +306,44 @@ finality anchor close to its age limit.
 Filesystem percentage alerts remain the host operator's responsibility because
 the node exports its database/recent-cache byte counts but not host capacity.
 
+## Shutdown and supervision
+
+`serve` stops at Ctrl-C or SIGTERM. Open change streams (SSE) and consumer
+delivery streams (NDJSON) end after a whole event or record, and JSON-RPC
+WebSocket connections get a `1001` going-away close frame; clients reconnect
+from their last cursor as after any closed connection. The node then waits at
+most 10 seconds for open connections and its background work, and at most 5
+more for blocking work such as a file write, abandons whatever is still
+open, and exits 0. A second signal during the first 10 seconds exits at once
+with status 130; startup reconciliation repairs a commit it interrupted (see
+[Crash or interrupted commit](#crash-or-interrupted-commit)).
+`deploy/leani.service` (`TimeoutStopSec`) and `compose.yaml`
+(`stop_grace_period`) allow 30 seconds for the stop; give another container
+setup more than Docker's default 10 seconds.
+
+Background work runs in supervised tasks: the durable backfill and
+raw-history schedulers, the network lane supervisor, artifact compaction,
+query snapshot cleanup, and each processor's delivery pruning and coverage
+compaction. Each runs until the shutdown. A task that stops before it, by
+returning, failing, or panicking, shuts the node down: the log names the task
+in `a background task ended; shutting the node down` at error level, and the
+node exits with status 1 after the same bounded shutdown. The systemd unit
+(`Restart=on-failure`) and `compose.yaml` (`restart: unless-stopped`) start it
+again. A persistent execution P2P source that cannot be built, for example
+for an invalid `sources.live.nat`, stops the node the same way.
+
+The network lane supervisor restarts failed runs of the network lanes
+itself, and drops readiness whenever the lanes do not run, a panic included.
+A failed run restarts after 1 second, and each further failure doubles the
+wait up to a minute; after a run that stayed up for at least a minute, the
+wait starts at 1 second again. A run that ends waits for its cold backfills
+to stop before the next one starts; every 10 seconds of that wait, the log
+names the ones still running in
+`cancelled automatic cold backfills are still running` at warn level. When
+the lanes halt (see
+[Finality contradicts the followed chain](#finality-contradicts-the-followed-chain)),
+they stay stopped and not ready while the node keeps serving what it stored.
+
 ## Checkpoint lifecycle
 
 `finality.checkpoint`, with `finality.checkpoint_slot`, is the trust root, and
@@ -514,6 +552,15 @@ limit the live lane fails, and the supervisor restarts the network lanes from
 a fresh finalized anchor, which lets finality prune again. A node that keeps
 reaching the limit needs working finality, or a hard limit above the
 `rpc.minimum_recent_blocks` window plus the unfinalized tail.
+
+A processor's delivery log is pruned in the background by its
+`delivery.pruning` policy: finalized changes older than its window, and,
+while the log exceeds its byte limit or the processor is paused at it, older
+finalized changes whatever their age, never one a required consumer has not
+acknowledged. A paused processor resumes once the log is below 90 percent of
+its limit. Embedded subscriptions (`leani subscribe` without a node) prune
+the same way while they run, so their built-in processors keep within 64 MiB
+and 24 hours of changes.
 
 ### Parked processor live lane
 

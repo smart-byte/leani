@@ -640,6 +640,8 @@ export interface paths {
          *     delivered sequence through it. A request whose `Sec-Fetch-Site` is
          *     `cross-site` or `same-site` without an allowed `Origin`, such as a
          *     navigation of another site's frame, gets 403 `cross_site_request`.
+         *     When the node shuts down, the stream ends after a whole record;
+         *     reconnect to resume after the acknowledged cursor.
          */
         get: operations["streamLiveDurableConsumer"];
         put?: never;
@@ -773,7 +775,8 @@ export interface paths {
          *     sequence through their acknowledgement boundary. A request whose
          *     `Sec-Fetch-Site` is `cross-site` or `same-site` without an allowed
          *     `Origin`, such as a navigation of another site's frame, gets 403
-         *     `cross_site_request`.
+         *     `cross_site_request`. When the node shuts down, the stream ends after
+         *     a whole record; reconnect to resume after the acknowledged cursor.
          */
         get: operations["streamBackfillConsumer"];
         put?: never;
@@ -2109,7 +2112,9 @@ export interface operations {
         responses: {
             /**
              * @description Resumable SSE stream. The event id is the opaque resume cursor and
-             *     each data field contains one ChangeEnvelope.
+             *     each data field contains one ChangeEnvelope. When the node shuts
+             *     down, the stream ends after a whole event; reconnect after the
+             *     last event's id.
              */
             200: {
                 headers: {
@@ -3226,8 +3231,8 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description Created backfill subscription. */
-            201: {
+            /** @description Backfill subscription accepted; its current status. */
+            202: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -3341,8 +3346,8 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description Created materialization job. */
-            201: {
+            /** @description Materialization job accepted; its current status. */
+            202: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -3456,8 +3461,8 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description Created raw-history job. */
-            201: {
+            /** @description Raw-history job accepted; its current state. */
+            202: {
                 headers: {
                     [name: string]: unknown;
                 };

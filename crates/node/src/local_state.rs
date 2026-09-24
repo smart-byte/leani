@@ -18,6 +18,12 @@ pub(crate) struct ResetAllOptions {
 }
 
 const RUNTIME_LOCK_FILE: &str = ".leani.lock";
+/// Marks a directory `leani subscribe` created for embedded subscription
+/// state, the only kind `leani reset subscription` deletes.
+const SUBSCRIPTION_MARKER_FILE: &str = ".leani-subscription";
+/// Embedded subscriptions' state under a runtime data directory, one locked
+/// directory per subscription.
+const SUBSCRIPTIONS_DIRECTORY: &str = "subscriptions";
 const RUNTIME_STATE_ENTRIES: &[&str] = &[
     "leani.sqlite",
     "leani.sqlite-shm",
@@ -30,7 +36,6 @@ const RUNTIME_STATE_ENTRIES: &[&str] = &[
     "execution-p2p-secret",
     "checkpoint.json",
     leani_finality_beacon_api::FINALITY_ANCHOR_FILE,
-    "subscriptions",
 ];
 
 #[derive(Debug)]
@@ -38,7 +43,85 @@ pub(crate) struct RuntimeDirectoryLock {
     _file: File,
 }
 
+/// Lock `data_dir` for an embedded subscription. A new directory, or the
+/// derived per-subscription directory, is marked as subscription state; an
+/// existing directory with other Leani state, such as a node's `data_dir`,
+/// is never marked, so `leani reset subscription` never deletes it.
+pub(crate) fn lock_subscription_directory(
+    data_dir: &Path,
+    derived: bool,
+) -> Result<RuntimeDirectoryLock> {
+    let adopt = derived || !holds_runtime_state(data_dir);
+    let lock = lock_directory(data_dir)?;
+    if adopt && !is_subscription_directory(data_dir) {
+        let marker = data_dir.join(SUBSCRIPTION_MARKER_FILE);
+        fs::write(&marker, b"Leani embedded subscription state\n")
+            .with_context(|| format!("mark subscription state {}", marker.display()))?;
+    }
+    Ok(lock)
+}
+
+/// Lock marked embedded subscription state to reset it; it stays marked.
+/// The marker is checked again once the lock is held: a node that took the
+/// directory over since the caller last looked removed it.
+pub(crate) fn lock_subscription_state(data_dir: &Path) -> Result<RuntimeDirectoryLock> {
+    let lock = lock_directory(data_dir)?;
+    if !is_subscription_directory(data_dir) {
+        bail!(
+            "refusing to reset {}: it no longer carries its embedded subscription marker, so a node may have taken it over",
+            data_dir.display()
+        );
+    }
+    Ok(lock)
+}
+
+pub(crate) fn is_subscription_directory(data_dir: &Path) -> bool {
+    data_dir.join(SUBSCRIPTION_MARKER_FILE).is_file()
+}
+
+/// Whether `data_dir` already holds a lock file or any known runtime state.
+fn holds_runtime_state(data_dir: &Path) -> bool {
+    std::iter::once(RUNTIME_LOCK_FILE)
+        .chain(RUNTIME_STATE_ENTRIES.iter().copied())
+        .chain(std::iter::once(SUBSCRIPTIONS_DIRECTORY))
+        .any(|entry| fs::symlink_metadata(data_dir.join(entry)).is_ok())
+}
+
+/// Lock `data_dir` for a node. A directory the node takes over becomes node
+/// state, so it loses any embedded subscription marker: `leani reset
+/// subscription` must never delete a node's store.
 pub(crate) fn lock_runtime_directory(data_dir: &Path) -> Result<RuntimeDirectoryLock> {
+    let lock = lock_directory(data_dir)?;
+    let marker = data_dir.join(SUBSCRIPTION_MARKER_FILE);
+    match fs::remove_file(&marker) {
+        Err(error) if error.kind() != io::ErrorKind::NotFound => {
+            Err(error).with_context(|| format!("remove subscription marker {}", marker.display()))
+        }
+        _ => Ok(lock),
+    }
+}
+
+/// Retry `locked` while a lock released just before is still held: a
+/// child process another test spawns keeps the inherited lock until it
+/// execs, for a few milliseconds.
+#[cfg(test)]
+pub(crate) fn after_release<T>(mut locked: impl FnMut() -> Result<T>) -> Result<T> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        match locked() {
+            Err(error)
+                if format!("{error:#}").contains("already in use")
+                    && std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            result => return result,
+        }
+    }
+}
+
+/// Lock `data_dir` without changing what kind of state it holds.
+fn lock_directory(data_dir: &Path) -> Result<RuntimeDirectoryLock> {
     fs::create_dir_all(data_dir)
         .with_context(|| format!("create runtime data directory {}", data_dir.display()))?;
     let path = data_dir.join(RUNTIME_LOCK_FILE);
@@ -147,13 +230,96 @@ fn reset_runtime_directory(
             bail!("full state reset was not confirmed");
         }
     }
-    let _lock = lock_runtime_directory(&target)?;
-    let unknown = remove_known_runtime_state(&target)?;
+    // Resetting keeps what kind of state the directory holds: a marked
+    // subscription directory stays one.
+    let _lock = lock_directory(&target)?;
+    // Each running embedded subscriber holds its directory's lock: take
+    // them all before deleting anything.
+    let subscriptions = target.join(SUBSCRIPTIONS_DIRECTORY);
+    let locked = lock_subscription_directories(&subscriptions)?;
+    let mut unknown = remove_subscription_directories(&subscriptions, locked)?;
+    unknown.extend(remove_known_runtime_state(&target)?);
     for path in unknown {
         eprintln!("leani: preserved unknown entry {}", path.display());
     }
     eprintln!("leani: all local runtime state reset; the next run is cold");
     Ok(true)
+}
+
+/// Lock every embedded subscription directory under `subscriptions`. This
+/// fails, before anything is deleted, while a subscriber runs.
+fn lock_subscription_directories(
+    subscriptions: &Path,
+) -> Result<Vec<(PathBuf, RuntimeDirectoryLock)>> {
+    if !fs::symlink_metadata(subscriptions).is_ok_and(|metadata| metadata.is_dir()) {
+        return Ok(Vec::new());
+    }
+    let mut locked = Vec::new();
+    for entry in fs::read_dir(subscriptions)
+        .with_context(|| format!("read subscription state root {}", subscriptions.display()))?
+    {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let path = entry.path();
+        let lock = lock_directory(&path).with_context(|| {
+            format!(
+                "stop the embedded subscriber using {} before resetting all local state",
+                path.display()
+            )
+        })?;
+        locked.push((path, lock));
+    }
+    Ok(locked)
+}
+
+/// Delete the locked subscription directories, other entries, and then
+/// `subscriptions` itself. A directory that appeared during the reset, as
+/// a subscriber starting now creates, is preserved and returned.
+fn remove_subscription_directories(
+    subscriptions: &Path,
+    locked: Vec<(PathBuf, RuntimeDirectoryLock)>,
+) -> Result<Vec<PathBuf>> {
+    let metadata = match fs::symlink_metadata(subscriptions) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!("inspect subscription state {}", subscriptions.display())
+            });
+        }
+    };
+    if !metadata.is_dir() {
+        // A symlink is removed itself, never followed.
+        fs::remove_file(subscriptions)
+            .with_context(|| format!("remove runtime file {}", subscriptions.display()))?;
+        return Ok(Vec::new());
+    }
+    for (path, lock) in locked {
+        fs::remove_dir_all(&path)
+            .with_context(|| format!("remove subscription state {}", path.display()))?;
+        drop(lock);
+    }
+    let mut preserved = Vec::new();
+    for entry in fs::read_dir(subscriptions)
+        .with_context(|| format!("read subscription state root {}", subscriptions.display()))?
+    {
+        let entry = entry?;
+        let path = entry.path();
+        if entry.file_type()?.is_dir() {
+            preserved.push(path);
+        } else {
+            fs::remove_file(&path)
+                .with_context(|| format!("remove runtime file {}", path.display()))?;
+        }
+    }
+    if preserved.is_empty() {
+        fs::remove_dir(subscriptions).with_context(|| {
+            format!("remove subscription state root {}", subscriptions.display())
+        })?;
+    }
+    Ok(preserved)
 }
 
 pub(crate) fn validated_reset_target(
@@ -226,7 +392,7 @@ pub(crate) fn remove_known_runtime_state(target: &Path) -> Result<Vec<PathBuf>> 
     {
         let entry = entry?;
         let name = entry.file_name();
-        if name == RUNTIME_LOCK_FILE {
+        if name == RUNTIME_LOCK_FILE || name == SUBSCRIPTION_MARKER_FILE {
             continue;
         }
         let Some(name_str) = name.to_str() else {
@@ -274,6 +440,103 @@ mod tests {
         assert!(!data_dir.join("subscriptions").exists());
         assert!(config_path.is_file());
         assert!(working_directory.is_dir());
+    }
+
+    #[test]
+    fn a_full_reset_of_a_subscription_directory_keeps_its_marker() {
+        // Review 2, N3: `reset all` locked its target as a node, which
+        // removes the marker. Its lock file survives the reset, so `leani
+        // subscribe` would never mark the directory again, and `reset
+        // subscription` would refuse it for good.
+        let root = tempfile::tempdir().expect("temporary directory");
+        let working_directory = root.path().join("workspace");
+        fs::create_dir_all(&working_directory).expect("working directory");
+        let feed = root.path().join("feed");
+        drop(lock_subscription_directory(&feed, false).expect("a subscription directory"));
+        fs::write(feed.join("leani.sqlite"), b"feed").expect("feed database");
+
+        assert!(
+            after_release(|| reset_runtime_directory(&feed, None, &working_directory, true))
+                .expect("reset all")
+        );
+        assert!(!feed.join("leani.sqlite").exists());
+        assert!(is_subscription_directory(&feed));
+    }
+
+    #[test]
+    fn subscription_state_locks_only_while_it_is_marked() {
+        // Review 2, N4: the subscription reset checked the marker before its
+        // prompt but locked only after it, so a node that took the directory
+        // over in between left node state that the reset then deleted. The
+        // lock checks the marker again once it holds the directory.
+        let root = tempfile::tempdir().expect("temporary directory");
+        let feed = root.path().join("feed");
+        drop(lock_subscription_directory(&feed, false).expect("a subscription directory"));
+        drop(after_release(|| lock_subscription_state(&feed)).expect("marked state locks"));
+        assert!(is_subscription_directory(&feed));
+        drop(after_release(|| lock_runtime_directory(&feed)).expect("a node takes it over"));
+
+        let error = after_release(|| lock_subscription_state(&feed))
+            .expect_err("node state never locks as a feed");
+        assert!(format!("{error:#}").contains("marker"), "{error:#}");
+    }
+
+    #[test]
+    fn only_new_or_derived_directories_become_subscription_state() {
+        // Audit CLI-7: `reset subscription` deletes only marked directories,
+        // so a node's data_dir must never be marked.
+        let root = tempfile::tempdir().expect("temporary directory");
+        let fresh = root.path().join("fresh");
+        drop(lock_subscription_directory(&fresh, false).expect("a new directory"));
+        assert!(is_subscription_directory(&fresh));
+
+        let node = root.path().join("node");
+        fs::create_dir_all(&node).expect("node directory");
+        fs::write(node.join("leani.sqlite"), b"node").expect("node database");
+        drop(lock_subscription_directory(&node, false).expect("an explicit node directory"));
+        assert!(!is_subscription_directory(&node));
+
+        // An earlier release's derived directory is adopted by its location.
+        let derived = root.path().join("subscriptions/0123456789abcdef");
+        fs::create_dir_all(&derived).expect("derived directory");
+        fs::write(derived.join("leani.sqlite"), b"feed").expect("feed database");
+        drop(lock_subscription_directory(&derived, true).expect("a derived directory"));
+        assert!(is_subscription_directory(&derived));
+    }
+
+    #[test]
+    fn full_reset_refuses_while_an_embedded_subscription_runs() {
+        // Audit CLI-6: `reset all` deleted `subscriptions/` from under a
+        // running embedded subscriber.
+        let root = tempfile::tempdir().expect("temporary directory");
+        let working_directory = root.path().join("workspace");
+        let data_dir = root.path().join("leani-data");
+        let subscription = data_dir.join("subscriptions/0123456789abcdef");
+        fs::create_dir_all(&working_directory).expect("working directory");
+        fs::create_dir_all(&subscription).expect("subscription state");
+        fs::write(data_dir.join("leani.sqlite"), b"node").expect("node database");
+        fs::write(subscription.join("leani.sqlite"), b"subscription").expect("feed database");
+        let running = lock_runtime_directory(&subscription).expect("a running subscriber");
+
+        let error = reset_runtime_directory(&data_dir, None, &working_directory, true)
+            .expect_err("a running subscriber refuses the reset");
+        assert!(format!("{error:#}").contains("in use"), "{error:#}");
+        assert!(data_dir.join("leani.sqlite").is_file());
+        assert!(subscription.join("leani.sqlite").is_file());
+
+        drop(running);
+        // See runtime_directory_lock_excludes_other_process_contexts: a
+        // concurrently spawned child can hold the released lock briefly.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while reset_runtime_directory(&data_dir, None, &working_directory, true).is_err() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the reset proceeds once the subscriber stops"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(!data_dir.join("leani.sqlite").exists());
+        assert!(!data_dir.join("subscriptions").exists());
     }
 
     #[test]

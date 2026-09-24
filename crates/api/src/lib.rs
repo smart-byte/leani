@@ -65,6 +65,7 @@ use leani_store_sqlite::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use thiserror::Error;
+use tokio_util::sync::CancellationToken;
 
 use browser_guard::{RequestPolicy, guard_browser_requests, lowercase_set, normalized_origins};
 
@@ -274,6 +275,10 @@ pub struct ApiConfig {
     pub backfill_control: Option<Arc<dyn BackfillControl>>,
     /// Optional independent raw-history control plane supplied by the node.
     pub raw_history_control: Option<Arc<dyn RawHistoryControl>>,
+    /// Cancelled when the node shuts down: open change and delivery streams
+    /// then end cleanly, so the shutdown need not wait for their clients,
+    /// which reconnect from their last cursor.
+    pub shutdown: CancellationToken,
 }
 
 impl Default for ApiConfig {
@@ -301,6 +306,7 @@ impl Default for ApiConfig {
             application_subscription_processors: BTreeSet::new(),
             backfill_control: None,
             raw_history_control: None,
+            shutdown: CancellationToken::new(),
         }
     }
 }
@@ -349,6 +355,7 @@ impl std::fmt::Debug for ApiConfig {
                 "raw_history_control",
                 &self.raw_history_control.as_ref().map(|_| "[AVAILABLE]"),
             )
+            .field("shutdown", &self.shutdown.is_cancelled())
             .finish()
     }
 }
@@ -4270,6 +4277,7 @@ async fn stream_live_consumer(
         body_stream,
         gzip,
         state.config.live_batch_limits,
+        &state.config.shutdown,
     ));
     response.headers_mut().insert(
         header::CONTENT_TYPE,
@@ -4908,7 +4916,12 @@ async fn stream_backfill_consumer(
     let batch_limits = stream_state.batch_limits;
     let body_stream = stream::once(std::future::ready(Ok::<Bytes, Infallible>(hello)))
         .chain(stream::unfold(stream_state, poll_backfill_consumer));
-    let mut response = Response::new(buffered_delivery_body(body_stream, gzip, batch_limits));
+    let mut response = Response::new(buffered_delivery_body(
+        body_stream,
+        gzip,
+        batch_limits,
+        &state.config.shutdown,
+    ));
     response.headers_mut().insert(
         header::CONTENT_TYPE,
         HeaderValue::from_static("application/x-ndjson"),
@@ -5598,7 +5611,15 @@ struct BufferedDeliveryChunk {
     _byte_permit: tokio::sync::OwnedSemaphorePermit,
 }
 
-fn buffered_delivery_body<S>(source: S, gzip: bool, limits: DeliveryBatchLimits) -> Body
+/// Stream `source`'s NDJSON records as a response body through a bounded
+/// buffer. The node's `shutdown` ends the body after a whole record, with the
+/// gzip trailer, so clients reconnect from their last acknowledged cursor.
+fn buffered_delivery_body<S>(
+    source: S,
+    gzip: bool,
+    limits: DeliveryBatchLimits,
+    shutdown: &CancellationToken,
+) -> Body
 where
     S: Stream<Item = Result<Bytes, Infallible>> + Send + 'static,
 {
@@ -5606,6 +5627,7 @@ where
     let byte_capacity = usize::try_from(limits.maximum_buffered_bytes)
         .expect("validated delivery buffer fits usize");
     let byte_budget = Arc::new(tokio::sync::Semaphore::new(byte_capacity));
+    let source = source.take_until(shutdown.clone().cancelled_owned());
     tokio::spawn(async move {
         futures::pin_mut!(source);
         let mut compressor = DeliveryCompressor::new(gzip);
@@ -7024,8 +7046,12 @@ async fn change_stream(
         .event("hello")
         .json_data(&hello)
         .unwrap_or_else(|_| Event::default().event("error").data("{}"));
+    // The node's shutdown ends the stream after a whole event. An error event
+    // would stop the SDK's subscription; an end makes clients reconnect from
+    // the last event's cursor.
     let poll = stream::once(std::future::ready(Ok(hello_event)))
-        .chain(stream::unfold(stream_state, poll_change));
+        .chain(stream::unfold(stream_state, poll_change))
+        .take_until(state.config.shutdown.clone().cancelled_owned());
     Ok(Sse::new(poll).keep_alive(
         KeepAlive::new()
             .interval(state.config.heartbeat_interval)
@@ -11499,6 +11525,261 @@ mod tests {
         assert_ne!(
             first_transactions["data"][0]["txHash"],
             second_transactions["data"][0]["txHash"]
+        );
+    }
+
+    /// Read what `body` still sends until it ends, which it must within five
+    /// seconds.
+    async fn rest_of_body(
+        mut body: impl Stream<Item = Result<Bytes, axum::Error>> + Unpin,
+        stream: &str,
+    ) -> Vec<u8> {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let mut rest = Vec::new();
+            while let Some(chunk) = body.next().await {
+                rest.extend_from_slice(&chunk.expect("stream bytes"));
+            }
+            rest
+        })
+        .await
+        .unwrap_or_else(|_| panic!("the {stream} stayed open after the node shut down"))
+    }
+
+    #[tokio::test]
+    async fn open_change_streams_end_when_the_node_shuts_down() {
+        // Audit M-N2: the SSE body ignored the node's shutdown, so a graceful
+        // shutdown waited for its client forever.
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = SqliteStore::open(leani_store_sqlite::StoreConfig::new(
+            directory.path().join("node.sqlite"),
+        ))
+        .await
+        .expect("store");
+        // Registered, so its stream waits for changes.
+        let processor = Arc::new(BlobsProcessor::default());
+        store
+            .register_processor(processor.descriptor())
+            .await
+            .expect("register processor");
+        let shutdown = CancellationToken::new();
+        let router = router(
+            store,
+            processor,
+            ApiConfig {
+                shutdown: shutdown.clone(),
+                ..ApiConfig::default()
+            },
+        )
+        .expect("router");
+        let response = router
+            .oneshot(
+                Request::get("/v1/processors/blobs-money/stream")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let mut body = response.into_body().into_data_stream();
+        let hello = tokio::time::timeout(Duration::from_secs(5), body.next())
+            .await
+            .expect("hello in time")
+            .expect("hello frame")
+            .expect("hello bytes");
+        assert!(String::from_utf8_lossy(&hello).contains("event: hello"));
+
+        shutdown.cancel();
+        // It ends after whole events. An error event would stop the SDK's
+        // subscription instead of letting it reconnect.
+        let rest = rest_of_body(body, "change stream").await;
+        let rest = String::from_utf8(rest).expect("UTF-8 events");
+        assert!(!rest.contains("event: error"), "{rest}");
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn open_delivery_streams_end_when_the_node_shuts_down() {
+        // Audit M-N2: the NDJSON delivery bodies ignored the node's shutdown
+        // too. They end after whole records, gzip included.
+        use std::io::Read as _;
+
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = SqliteStore::open(leani_store_sqlite::StoreConfig::new(
+            directory.path().join("node.sqlite"),
+        ))
+        .await
+        .expect("store");
+        let counter = leani_testkit::BlockLocalCounter::default().with_split_delivery();
+        let lifecycle =
+            acknowledged_delivery(counter.descriptor().lifecycle.clone(), "destination");
+        let processor = Arc::new(counter.with_lifecycle(lifecycle));
+        store
+            .register_processor(processor.descriptor())
+            .await
+            .expect("register processor");
+        store
+            .create_consumer_in_stream(
+                processor.descriptor(),
+                &default_delivery_stream_id(processor.descriptor()),
+                "destination",
+                ConsumerRole::Required,
+                ConsumerStartPosition::EarliestRetained,
+                Duration::from_secs(30),
+            )
+            .await
+            .expect("live consumer");
+        let subscription_id = "shutdown-fixture";
+        let history_stream = store
+            .create_backfill_delivery_stream(processor.descriptor(), subscription_id)
+            .await
+            .expect("history stream")
+            .stream_id;
+        store
+            .create_consumer_in_stream(
+                processor.descriptor(),
+                &history_stream,
+                "destination",
+                ConsumerRole::Required,
+                ConsumerStartPosition::EarliestRetained,
+                Duration::from_secs(30),
+            )
+            .await
+            .expect("history consumer");
+        let range = BlockRange::new(BlockNumber(1), BlockNumber(3)).expect("range");
+        let job = leani_store_sqlite::JobRecord {
+            id: subscription_id.to_owned(),
+            kind: "backfill_subscription_job".to_owned(),
+            state: leani_store_sqlite::JobState::Queued,
+            payload: b"api-stream-fixture".to_vec(),
+            checkpoint: None,
+            attempts: 0,
+            updated_at_unix_ms: 1,
+        };
+        store
+            .create_backfill_subscription_job(
+                &leani_store_sqlite::BackfillSubscriptionRecord {
+                    subscription_id: subscription_id.to_owned(),
+                    job_id: job.id.clone(),
+                    processor_instance: processor.descriptor().instance.to_string(),
+                    history_stream_id: history_stream.clone(),
+                    mode: leani_store_sqlite::BackfillSubscriptionMode::FillMissing,
+                    publication_revision: 0,
+                    state: leani_store_sqlite::BackfillSubscriptionState::Queued,
+                    consumer_id: "destination".to_owned(),
+                    ranges: vec![range],
+                    range,
+                    preexisting_coverage: Vec::new(),
+                    captured_finalized_target: BlockNumber(3),
+                    idempotency_key: "shutdown-fixture".to_owned(),
+                    effective_block_limit: 3,
+                    effective_byte_limit: 1024 * 1024,
+                    resume_below_ratio_millionths: 750_000,
+                    delivery_batch_limits: leani_store_sqlite::BackfillDeliveryBatchLimits::default(
+                    ),
+                    initial_sequence: 0,
+                    completion_sequence: None,
+                    processed_work_blocks: 0,
+                },
+                &job,
+                BlockHash::new([4; 32]),
+            )
+            .await
+            .expect("subscription");
+        let control = Arc::new(StaticBackfillControl {
+            status: BackfillStatus {
+                id: subscription_id.to_owned(),
+                owner: HistoricalWorkOwner::Subscription,
+                processor: processor.descriptor().instance.to_string(),
+                delivery_stream_id: Some(history_stream),
+                publication_revision: Some("0".to_owned()),
+                from_block: 1,
+                to_block: 3,
+                ranges: vec![BackfillRange {
+                    from_block: 1,
+                    to_block: 3,
+                }],
+                requested_blocks: 3,
+                processed_blocks: 0,
+                remaining_blocks: 3,
+                captured_finalized_target: Some(3),
+                mode: BackfillExecutionMode::FillMissing,
+                batching: None,
+                state: BackfillState::Running,
+                attempts: 1,
+                updated_at_unix_ms: 1,
+                report: None,
+                last_error: None,
+            },
+        });
+        let shutdown = CancellationToken::new();
+        let app = router_with_processors(
+            store,
+            vec![processor],
+            Vec::new(),
+            ApiConfig {
+                backfill_control: Some(control),
+                live_batch_limits: DeliveryBatchLimits {
+                    compression: DeliveryCompression::Gzip,
+                    ..DeliveryBatchLimits::live_default()
+                },
+                shutdown: shutdown.clone(),
+                ..ApiConfig::default()
+            },
+        )
+        .expect("router");
+        let open = |path: &'static str, gzip: bool| {
+            let app = app.clone();
+            async move {
+                let mut request = Request::get(path);
+                if gzip {
+                    request = request.header(header::ACCEPT_ENCODING, "gzip");
+                }
+                let response = app
+                    .oneshot(request.body(Body::empty()).expect("request"))
+                    .await
+                    .expect("response");
+                assert_eq!(response.status(), StatusCode::OK, "{path}");
+                response
+            }
+        };
+        let live = open(
+            "/v1/processors/synthetic-counter/streams/live/consumers/destination/stream",
+            true,
+        )
+        .await;
+        assert_eq!(live.headers()[header::CONTENT_ENCODING], "gzip");
+        let mut live = live.into_body().into_data_stream();
+        let history = open(
+            "/v1/backfill-subscriptions/shutdown-fixture/consumers/destination/stream",
+            false,
+        )
+        .await;
+        let mut history = history.into_body().into_data_stream();
+        let mut received = Vec::new();
+        assert_eq!(
+            next_ndjson_record(&mut history, &mut received).await["type"],
+            "hello"
+        );
+        let first_live = tokio::time::timeout(Duration::from_secs(5), live.next())
+            .await
+            .expect("live hello in time")
+            .expect("live hello")
+            .expect("live hello bytes");
+
+        shutdown.cancel();
+        let mut compressed = first_live.to_vec();
+        compressed.extend(rest_of_body(live, "live delivery stream").await);
+        let mut records = String::new();
+        flate2::read::GzDecoder::new(compressed.as_slice())
+            .read_to_string(&mut records)
+            .expect("a whole gzip stream, trailer included");
+        let records = records.lines().collect::<Vec<_>>();
+        assert_eq!(records.len(), 1, "{records:?}");
+        assert!(records[0].contains(r#""type":"hello""#), "{records:?}");
+        received.extend(rest_of_body(history, "backfill delivery stream").await);
+        assert!(
+            received.is_empty() || received.ends_with(b"\n"),
+            "a record was cut off: {received:?}"
         );
     }
 

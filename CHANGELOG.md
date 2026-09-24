@@ -471,6 +471,88 @@ record, and documented RPC contracts.
   carries the sync committee's signature; two different ones at one slot are
   ignored. Consensus P2P asks the next peer when one serves a head no newer
   than the published one.
+- Breaking (CLI): an attached `leani subscribe` prints nothing until each
+  stream connection's `hello` shows an Ethereum mainnet node (chain 1)
+  serving the feed's built-in processor, `block-summary` or
+  `uniswap-observations`, under the requested `--processor`. A node for
+  another chain or processor, a stream without a hello, or anything else that
+  answers `/health/live` at the configured `api.bind` now ends the command
+  with an error. Auto mode used to attach to any such listener and print its
+  stream. The startup snapshot also waits for the first hello.
+- Breaking (CLI): `leani reset subscription` resets only a directory marked
+  as embedded subscription state (`.leani-subscription`). `leani subscribe`
+  marks each directory it creates, and marks a subscription's default
+  directory from an earlier release when it next runs, before the store
+  opens. A node command that locks a marked directory (`serve`, `backfill`,
+  `db`, and the e2e runs) removes the marker, since the directory is then
+  node state, and the reset checks the marker again once it holds the lock.
+  An explicit `--data-dir` from an earlier release that already holds state
+  is never marked, because it could be a node's data directory: delete it
+  yourself once it holds only subscription state. `leani reset all` now
+  takes the lock of every embedded subscription under `subscriptions/` first
+  and refuses, deleting nothing, while one runs; a subscription that starts
+  during the reset keeps its directory, and a subscription directory it
+  resets stays marked.
+- `leani subscribe` reports two new row kinds on stdout, so scripts should
+  dispatch on each JSON row's `schema`. An undo of a change this run never
+  saw, because it was applied before the run started or aged out of the last
+  4,096 changes it printed, prints while fresh as a
+  `leani.subscription-undo.v1` row (`--format json`) naming the reverted
+  block and change key. When an attached `--finality finalized` subscription
+  holds 1,024 unfinalized blocks without a finality marker, it drops the
+  oldest; finalized output has a hole there, reported as one
+  `leani.subscription-gap.v1` row (JSON and raw) or `gap` line per run of
+  dropped blocks, `fromBlock` to `toBlock`, right before the next finalized
+  row. A blocks feed reports the same way, with `reason: change_log_pruned`,
+  blocks not yet final whose changes the node pruned before the subscription
+  connected. `--once` ends only after an update, never after an undo or gap
+  row.
+- `serve` shuts down within 15 seconds of Ctrl-C or SIGTERM. Open change
+  streams (SSE) and consumer delivery streams (NDJSON) end after a whole
+  event or record, and JSON-RPC WebSocket connections get a `1001` going-away
+  close frame; clients reconnect from their last cursor as after any closed
+  connection. Connections and background work still open after 10 seconds,
+  and blocking work such as a file write still running 5 seconds later, are
+  abandoned, and the node exits 0. A second signal during the first 10
+  seconds exits at once with status 130. `compose.yaml` now allows the
+  container 30 seconds to stop, as `deploy/leani.service` does, instead of
+  Docker's default 10.
+- Breaking (operators): a background task of `serve` that stops before the
+  shutdown shuts the node down with an error and exit status 1, naming the
+  task: the durable backfill and raw-history schedulers, the network lane
+  supervisor, artifact compaction, query snapshot cleanup, and each
+  processor's delivery pruning and coverage compaction. A panic there used to
+  end the task silently while the node kept running and, for the network
+  lanes, could keep reporting ready. A process manager restarts the node.
+  This includes a persistent execution P2P source that cannot be built, such
+  as for an invalid NAT setting, which used to leave the node up but never
+  ready. Failed network-lane runs still restart in the node, and halted lanes
+  still stay stopped while the node serves.
+- After a network-lane run that stayed up for at least a minute, the next
+  restart waits one second again; the backoff kept doubling up to a minute
+  for the rest of the process. Finality contradictions still halt on their
+  third occurrence for one finalized block, however long the runs between
+  them.
+- Automatic cold backfill jobs are named
+  `automatic:{chain}:{instance}:{start}-{finalized block}`, hot/cold handoffs
+  `handoff:{chain}:{instance}:{from}-{finalized block}`, and archive
+  reconciliations `archive-reconciliation:{instance}:{source}:{from}-{to}`,
+  after the processor instance instead of its kind. Records under the
+  earlier names stay as the history of earlier starts; nothing reads them
+  again, because every start already created new records and resumes from
+  processor coverage, and the first handoff of an instance marks its
+  unverified earlier one failed as superseded. After the upgrade, an
+  automatic backfill job that was interrupted under its earlier name stays
+  `running` in the job list, at most one per instance, and an archive
+  reconciliation that failed under its earlier name is compared once more
+  under its new one.
+- The durable backfill scheduler looks at its jobs at startup, when a job is
+  created, and when a job's task ends, instead of reloading and decoding
+  every job every second. Jobs waiting for storage headroom, and jobs that
+  failed to resume for a store error, are looked at again every 5 seconds.
+- The OpenAPI document gives `202` as the success status of
+  `createBackfillSubscription`, `createMaterializationJob`, and
+  `createRawHistoryJob`, as the node answers; it said `201`.
 
 ### Fixed
 
@@ -944,6 +1026,92 @@ record, and documented RPC contracts.
 - A portable savepoint beyond the physical store budget, like any request the
   budget refuses, answers 507 `physical_storage_limit` with the limit and
   projected bytes in the error details, instead of 500.
+- A reorg no longer ends or silently thins `leani subscribe` output. The
+  store records the undo of an entity a block created as a delete with an
+  empty payload, and the undo of an update as the previous value, never the
+  reverted one. Embedded mode decoded that payload and exited on every reorg
+  of `subscribe blocks` and on every reorg removing a matching swap, and
+  attached mode dropped undos without data. Both now print an undo as the row
+  it reverts, from the last 4,096 changes the run printed, including startup
+  rows, without decoding its payload and however late the undo arrives;
+  `--format raw` prints the undo envelope. An undo of a change the run saw
+  but filtered out, such as another pool's, stays hidden; one of a change it
+  never saw prints the `leani.subscription-undo.v1` row while fresh, which on
+  a node with more pools can name another pool's change.
+- An attached `leani subscribe --finality finalized` no longer misses blocks
+  that were included but not final when it connected. It started at the
+  change head, after those blocks' changes, so finality later released
+  nothing for them. It now replays the node's retained change log and prints
+  every block finalized after it connected; the `hello`'s finalized block
+  marks what was already final and is not printed.
+- `leani subscribe --finality finalized` prints a finalized block however
+  late finality arrives. Finalized rows older than 30 minutes were dropped
+  without a trace, as during a finality delay; the age limit now applies
+  only to included rows, the startup rows, and peer preview rows. A
+  finalized block the node republishes, as a recompute does, prints once.
+- `leani subscribe` exits successfully, instead of panicking, when stdout's
+  reader goes away, as with `| head -1`. Embedded mode still persists its
+  verified anchor on the way out, and its note about that no longer panics
+  when stderr is closed too, as with `2>&1 | head`.
+- `leani subscribe --mode client --endpoint URL`, and auto mode with
+  `--endpoint`, no longer read `./leani.toml` or `--config`, so a broken or
+  unrelated local configuration no longer stops them.
+- The CLI's SSE parser follows the event-stream format: a lone CR ends a
+  line, the last `event` field names the event, a field value loses only one
+  leading space, a field without a colon has an empty value, and a leading
+  byte-order mark is skipped. It scans each byte once instead of rescanning
+  the buffer for every chunk, which was quadratic in the frame size. An
+  `event: error` the node marks `retryable` reconnects from the last cursor
+  instead of ending the subscription.
+- The `leani subscribe` refusal of a changed Uniswap subscription says its
+  state was created with another start block or market set, since a reused
+  `--data-dir` for other markets is refused the same way. The reset command
+  it prints shell-quotes the `--data-dir` and `--config` paths and writes a
+  relative path starting with `-` as `./-…`. For a `--data-dir` without a
+  subscription marker it says to delete the directory instead of printing a
+  reset the command would refuse, and for a path that is not UTF-8 it names
+  the options instead of printing an inexact command.
+- Two automatically backfilled processor instances of one kind, such as two
+  `evm-events` instances, now both reach live. Their hot/cold handoffs and
+  automatic backfill jobs shared IDs derived from the kind, so the second
+  instance's handoff was refused as another instance's and the network lanes
+  failed at every start; with the same start block, the jobs collided too.
+  Their archive reconciliations shared IDs the same way, which failed the
+  network lanes once both were live.
+- A network-lane run that ends early, by an error or a panic after its cold
+  backfills started, cancels those backfills and waits for them before the
+  next run starts; while it waits, the log names the backfills still running
+  every 10 seconds. They kept running unobserved into the next run's startup
+  reconciliation and next backfills.
+- `serve` no longer waits forever at shutdown for clients of open SSE or
+  NDJSON streams, and a second Ctrl-C is no longer ignored.
+- A panic in the network lane supervisor no longer leaves readiness as the
+  lanes last set it: readiness drops however the supervisor stops.
+- Embedded subscriptions (`leani subscribe` without a node) prune their
+  delivery log like the node, and compact the finalized coverage of their
+  block-local processor. They never pruned, so once the log reached its
+  window, 64 MiB or 24 hours of changes, the processor paused and the
+  subscription stopped printing, after about one to two weeks.
+- One unreadable or obsolete durable backfill job, such as one for a
+  processor no longer configured, no longer stops every other job from
+  resuming: the scheduler logs it and continues. Finished, failed, and
+  cancelled jobs are skipped before their records are decoded.
+- `leani backfill` uses the configured `budgets.history_pipeline` settings,
+  and three attempts per history source on a gap, as the node's own
+  backfills do; it used the built-in defaults.
+- A historical job whose task panics is marked failed, with the panic
+  message, and frees its place among the jobs that run at once. It stayed
+  `running` and kept its place until the node restarted.
+- Deleting a historical job right after cancelling it no longer brings the
+  job back: the job's task wrote its cancelled checkpoint and outcome after
+  the deletion. The deletion now waits up to 10 seconds for the task to end,
+  and answers 503 `backfill_unavailable` if it has not.
+- A backfill subscription whose `consumer.id` is not 1-128 portable
+  characters, or whose `leaseTtlSeconds` is 0 or more than 3,153,600,000
+  (100 years), is refused with 400 before its history stream exists; it
+  answered 500 and left the stream behind. Creating a durable consumer
+  applies the same TTL bound; a TTL too large for the store answered 500
+  there too.
 
 ## [0.1.0-rc.1] - 2026-09-20
 

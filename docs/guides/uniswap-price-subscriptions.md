@@ -52,6 +52,16 @@ and SQLite state. It does not touch `leani.toml` or prepared-node state. Stop a
 matching embedded subscriber before resetting it. For a finalized subscription,
 pass `--finality finalized` to both commands.
 
+The reset only removes a directory that `leani subscribe` marked as its own
+state with a `.leani-subscription` file: every directory it creates, and a
+subscription's default directory from an earlier release once that
+subscription runs again. A node that takes over a marked directory, such as
+`leani serve` with that `data_dir`, removes the marker. The reset refuses
+any other directory, such as a node's `data_dir` passed as `--data-dir`. An
+explicit `--data-dir` from an earlier release that already held state is not
+marked; delete it yourself once you have checked that it holds only
+subscription state.
+
 To test the binary with no retained node or subscription state at all, stop
 every Leani process that uses the configured data directory and run:
 
@@ -64,7 +74,8 @@ database and WAL, raw history, processor artifacts, checkpoints, execution-peer
 cache, P2P identity, and every embedded subscription. It preserves
 `leani.toml` and the binary. The command rejects broad targets that contain the
 working directory or configuration; use `--yes` only for intentional scripted
-cold-start tests.
+cold-start tests. It first takes the lock of every embedded subscription under
+the data directory and refuses, deleting nothing, while one is running.
 
 After the light client has verified a newer finality anchor and its
 consensus-committed execution hash, Leani persists that locally verified
@@ -112,6 +123,20 @@ processor that prints a price only after Ethereum consensus has finalized its
 block. The default `included` mode emits head updates and marks undo
 records during a reorg.
 
+An undo repeats the row of the observation it reverts, with
+`"operation": "undo"`, however late it arrives; in raw mode it is the undo
+change envelope, whose `data` is `null` or the previous value, never the
+reverted one. An undo of a change the subscription saw but did not print,
+such as another pool's, stays hidden. An undo of a change it never saw,
+because it was applied before the run started, is a
+`leani.subscription-undo.v1` row naming the reverted `blockNumber`,
+`blockHash`, and change `key` while it is fresh; attached to a node with
+more pools, such a row can name another pool's change. The JSON stream also
+carries `leani.subscription-gap.v1` rows (see
+[the block feed](live-block-subscriptions.md#attach-to-a-prepared-node)), so
+scripts should dispatch on each row's `schema`. `--once` never exits on an
+undo or gap row.
+
 Embedded mode does not bind API or RPC ports, activate unrelated processors, or
 start a historical backfill. It starts from an independently verified finalized
 execution anchor and connects native execution P2P. For an included
@@ -152,7 +177,8 @@ leani subscribe uniswap-v3 ETH/USDC
 
 Auto mode discovers the reachable `api.bind` in `./leani.toml` and attaches;
 otherwise it starts the embedded runtime. Use `--mode client --endpoint URL`
-when attaching to a remote node should be mandatory rather than automatic. The
+when attaching to a remote node should be mandatory rather than automatic;
+with `--endpoint`, neither mode reads a local configuration. The
 client takes a head cursor, reads the node's query-only latest observation for
 an immediate still-fresh included price, then opens SSE and applies the same timestamp
 freshness gate as embedded mode, so retained history and in-progress node
@@ -160,6 +186,19 @@ catch-up are not presented as live prices. Before opening the stream, it reads
 the processor's immutable pool catalog and rejects any requested market that
 the node does not process. Running-node subscriptions never mutate processor
 scope; all clients reuse the configured durable stream.
+
+Nothing prints until the stream's `hello` shows an Ethereum mainnet node
+(chain 1) serving `uniswap-observations` under the requested `--processor`,
+and every reconnect checks it again. A node for another chain or processor,
+or a service that is not a Leani node answering at `api.bind`, ends the command
+with an error instead of printing its stream. A stream error the node marks
+`retryable` reconnects from the last cursor. An attached `--finality finalized`
+subscription replays the node's retained change log and prints each
+observation once the node's finality marker covers its block, however late
+finality arrives, skipping blocks that were already final when it connected;
+the freshness gate applies only to included output. See
+[the block feed](live-block-subscriptions.md#attach-to-a-prepared-node) for
+the gap row it prints when the node stops reporting finality.
 
 The initializer fetches a current majority checkpoint quorum and pins it in a
 compact configuration. It asks before accepting a new trust root and refuses

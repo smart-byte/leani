@@ -77,6 +77,9 @@ const CONSUMER_CREDENTIAL_CONTEXT: &str = "leani 2026-09-24 consumer credential 
 /// Fewest characters a client-chosen consumer credential may hold: nothing
 /// else vouches for its entropy.
 const MINIMUM_CONSUMER_CREDENTIAL_CHARS: usize = 32;
+/// Longest lease TTL a consumer may hold: 100 years. Its milliseconds, and
+/// the expiry of a lease taken now, stay far inside an `i64`.
+const MAXIMUM_CONSUMER_LEASE_TTL: Duration = Duration::from_hours(100 * 365 * 24);
 /// Stable encoding version attached to durable delivery records.
 pub const DELIVERY_ENCODING_VERSION: u16 = 1;
 /// Deferred rows promoted per SQL round trip inside `mark_finalized`.
@@ -2105,6 +2108,24 @@ pub fn validate_consumer_credential(credential: &str) -> Result<(), String> {
             "consumer credential must hold {MINIMUM_CONSUMER_CREDENTIAL_CHARS} to 512 printable \
              ASCII characters without spaces; use a random value such as `openssl rand -hex 32`"
         ));
+    }
+    Ok(())
+}
+
+/// Check a new consumer's ID and lease TTL as creating it does, so a caller
+/// can refuse them before it creates any other state.
+///
+/// # Errors
+///
+/// Returns the rule, as a message for the client, for an ID that is not 1-128
+/// portable characters, or a lease TTL that is zero or longer than 100 years.
+pub fn validate_consumer_registration(consumer_id: &str, ttl: Duration) -> Result<(), String> {
+    if !valid_consumer_id(consumer_id) || ttl.is_zero() || ttl > MAXIMUM_CONSUMER_LEASE_TTL {
+        return Err(
+            "consumer ID must be 1-128 portable characters and lease TTL must be non-zero \
+             and at most 100 years"
+                .to_owned(),
+        );
     }
     Ok(())
 }
@@ -10793,12 +10814,7 @@ impl SqliteStore {
         ttl: Duration,
         credential: Option<&str>,
     ) -> Result<DurableConsumer, StoreError> {
-        if !valid_consumer_id(consumer_id) || ttl.is_zero() {
-            return Err(StoreError::InvalidConfig(
-                "consumer ID must be 1-128 portable characters and lease TTL must be non-zero"
-                    .to_owned(),
-            ));
-        }
+        validate_consumer_registration(consumer_id, ttl).map_err(StoreError::InvalidConfig)?;
         let instance = self.register_processor(descriptor).await?;
         self.validate_delivery_stream(&instance, stream_id).await?;
         let ttl_ms = i64::try_from(ttl.as_millis())
@@ -12042,12 +12058,7 @@ impl SqliteStore {
         acknowledged_sequence: u64,
         ttl: Duration,
     ) -> Result<(), StoreError> {
-        if !valid_consumer_id(consumer_id) || ttl.is_zero() {
-            return Err(StoreError::InvalidConfig(
-                "consumer ID must be 1-128 portable characters and lease TTL must be non-zero"
-                    .to_owned(),
-            ));
-        }
+        validate_consumer_registration(consumer_id, ttl).map_err(StoreError::InvalidConfig)?;
         let instance = self.register_processor(descriptor).await?;
         let stream_id = default_delivery_stream_id(descriptor);
         let _guard = self.inner.writer.lock().await;

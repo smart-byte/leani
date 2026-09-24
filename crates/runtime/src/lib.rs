@@ -803,10 +803,12 @@ pub async fn reconcile_archive_deltas(
     cancellation: CancellationToken,
 ) -> Result<ArchiveReconciliationRecord, RuntimeError> {
     let budget = budget.validate()?;
+    // Keyed by processor instance, so instances of one kind reconcile apart.
+    // Source IDs hold no `:`, so the ID names one instance, source, and range.
     let job = BackfillJob::for_processor(
         format!(
-            "archive-reconciliation-{}-{}-{}-{}",
-            processor.descriptor().id,
+            "archive-reconciliation:{}:{}:{}-{}",
+            processor.descriptor().instance,
             source.descriptor().id,
             range.start().0,
             range.end().0
@@ -9389,8 +9391,8 @@ mod tests {
             RuntimeError::Store(StoreError::ArchiveReconciliationMismatch { .. })
         ));
         let id = format!(
-            "archive-reconciliation-{}-archive-mismatch-4-4",
-            processor.descriptor().id
+            "archive-reconciliation:{}:archive-mismatch:4-4",
+            processor.descriptor().instance
         );
         assert_eq!(
             store

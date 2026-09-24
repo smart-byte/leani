@@ -50,8 +50,18 @@ cryptographic proof simply by subscribing to it. Against a node that publishes
 included blocks, an attached `--finality finalized` subscription prints each
 block once the node's finality marker covers it.
 
-`--once` exits after the first summary, including a labelled preview,
-which is useful for startup timing:
+During a reorg, each reverted block prints again with `"operation": "undo"`
+(an `undo` suffix in the terminal), however late the undo arrives. The undo
+of a block the subscription saw but did not print, such as an older block
+of the embedded startup scan, stays hidden. The undo of a block it never
+saw, because it was applied before the run started, prints as a
+`leani.subscription-undo.v1` row with its `blockNumber`, `blockHash`, and
+change `key` while it is fresh. JSON output mixes such rows, and the gap rows
+described below, with `leani.block-summary.v1` rows, so scripts should
+dispatch on each row's `schema`.
+
+`--once` exits after the first summary, including a labelled preview, which is
+useful for startup timing. An undo or gap row never ends it:
 
 ```bash
 time leani subscribe blocks --once
@@ -103,7 +113,33 @@ leani subscribe blocks
 Auto mode discovers the local config, detects the running API, reads a stable
 latest-block snapshot, and follows its resumable change stream. If no node is
 reachable, the same command starts the embedded runtime. Use `--mode client`
-or `--mode embedded` only when you need to force one behavior.
+or `--mode embedded` only when you need to force one behavior. With
+`--endpoint URL`, client and auto mode attach to that node without reading a
+local configuration.
+
+The subscription prints nothing until the stream's `hello` shows an Ethereum
+mainnet node (chain 1) serving `block-summary` under the requested
+`--processor`, and it checks every reconnect again. A node for another chain
+or processor, or another service answering at `api.bind`, ends the command
+with an error instead of printing its stream. A stream error the node marks
+`retryable` reconnects from the last cursor.
+
+`--finality finalized` replays the node's retained change log, so a block
+that was included but not yet final when the subscription connected still
+prints once finality covers it, however late that is; blocks already final
+at that point are skipped. The subscription holds at most 1,024 unfinalized
+blocks. If the node stops reporting finality for longer, the oldest held
+blocks are dropped. Finalized output then has a hole there, reported as one
+row for the dropped range right before the next finalized row:
+
+```json
+{"schema":"leani.subscription-gap.v1","protocol":"blocks","operation":"gap","fromBlock":25881412,"toBlock":25881420,"timestamp":1788254075,"reason":"finality_gate_full"}
+```
+
+The terminal prints a `gap` line instead. If the node pruned the changes of
+blocks that were not yet final before the subscription connected, those
+blocks are reported the same way with `"reason": "change_log_pruned"`. A gap
+row never ends `--once`.
 
 Reset just the embedded block feed when measuring a true cold start:
 
@@ -112,4 +148,8 @@ leani reset subscription blocks --yes
 ```
 
 The configured node and embedded subscription use separate state directories,
-so both can be tested from the same project directory.
+so both can be tested from the same project directory. A subscription reset
+only removes a directory `leani subscribe` marked as subscription state and
+no node has taken over since (see
+[the Uniswap guide](uniswap-price-subscriptions.md#cli)), and `leani reset all`
+refuses while an embedded subscription is running.
