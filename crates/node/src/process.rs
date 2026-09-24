@@ -3561,8 +3561,13 @@ async fn mainnet_e2e(
             backfill_control: None,
             verified_anchor: None,
             checkpoint_origin: leani_finality_beacon_api::CheckpointOrigin::Operator,
+            attested_heads: leani_source_api::AttestedHeadPublisher::new(),
         };
-        let live_source = execution_p2p_source(&config, handles.network_telemetry.clone())?;
+        let live_source = execution_p2p_source(
+            &config,
+            handles.network_telemetry.clone(),
+            Some(handles.attested_heads.subscribe()),
+        )?;
         tokio::spawn(async move {
             Box::pin(run_network_lanes_once(
                 &config,
@@ -5430,6 +5435,7 @@ async fn serve(path: &Path, registry: &ProcessorRegistry) -> Result<Exit> {
             backfill_control: Some(backfill_control),
             verified_anchor: None,
             checkpoint_origin: leani_finality_beacon_api::CheckpointOrigin::Operator,
+            attested_heads: leani_source_api::AttestedHeadPublisher::new(),
         };
         Some(tokio::spawn(async move {
             Box::pin(supervise_network_lanes(
@@ -5782,6 +5788,9 @@ struct NetworkLaneHandles {
     /// Where `finality.checkpoint` came from: the operator, or an anchor an
     /// embedded subscription verified before.
     checkpoint_origin: leani_finality_beacon_api::CheckpointOrigin,
+    /// Publishes the attested heads the finality lane verifies. The
+    /// execution live source only follows them, through a receiver.
+    attested_heads: leani_source_api::AttestedHeadPublisher,
 }
 
 fn publish_verified_anchor(
@@ -5882,7 +5891,12 @@ pub(crate) fn spawn_embedded_network_runtime(
     let (committed_events, _) = tokio::sync::broadcast::channel(1_024);
     let (verified_anchor, verified_anchor_updates) = tokio::sync::watch::channel(None);
     let network_telemetry = leani_source_api::NetworkTelemetry::default();
-    let execution_source = execution_p2p_source(&config, network_telemetry.clone())?;
+    let attested_heads = leani_source_api::AttestedHeadPublisher::new();
+    let execution_source = execution_p2p_source(
+        &config,
+        network_telemetry.clone(),
+        Some(attested_heads.subscribe()),
+    )?;
     let handles = NetworkLaneHandles {
         readiness: readiness.clone(),
         rpc_readiness: leani_rpc::RpcReadiness::default(),
@@ -5892,6 +5906,7 @@ pub(crate) fn spawn_embedded_network_runtime(
         backfill_control: None,
         verified_anchor: Some(verified_anchor),
         checkpoint_origin,
+        attested_heads,
     };
     let task = tokio::spawn(supervise_network_lanes(
         config,
@@ -5910,9 +5925,13 @@ pub(crate) fn spawn_embedded_network_runtime(
     })
 }
 
+/// The persistent execution P2P source. Live following needs
+/// `attested_heads`, the receiver of the heads the finality lane verifies;
+/// history-only uses, such as the P2P benchmark, pass none.
 pub(crate) fn execution_p2p_source(
     config: &Config,
     network_telemetry: leani_source_api::NetworkTelemetry,
+    attested_heads: Option<leani_source_api::AttestedHeadReceiver>,
 ) -> Result<std::sync::Arc<leani_source_p2p::RethP2pSource>> {
     let nat = leani_source_p2p::parse_nat_resolver(&config.sources.live.nat)?;
     let trusted_peers = config
@@ -5965,9 +5984,11 @@ pub(crate) fn execution_p2p_source(
         network_telemetry,
         ..leani_source_p2p::RethP2pConfig::default()
     };
-    Ok(std::sync::Arc::new(
-        leani_source_p2p::RethP2pSource::mainnet(p2p_config)?,
-    ))
+    let source = leani_source_p2p::RethP2pSource::mainnet(p2p_config)?;
+    Ok(std::sync::Arc::new(match attested_heads {
+        Some(heads) => source.with_attested_heads(heads),
+        None => source,
+    }))
 }
 
 /// Resolve a recent finalized execution anchor through the configured,
@@ -6056,7 +6077,11 @@ async fn supervise_network_lanes(
 ) {
     let live_source = match live_source {
         Some(source) => source,
-        None => match execution_p2p_source(&config, handles.network_telemetry.clone()) {
+        None => match execution_p2p_source(
+            &config,
+            handles.network_telemetry.clone(),
+            Some(handles.attested_heads.subscribe()),
+        ) {
             Ok(source) => source,
             Err(error) => {
                 handles
@@ -6067,31 +6092,65 @@ async fn supervise_network_lanes(
             }
         },
     };
-    let mut retry = std::time::Duration::from_secs(1);
-    while !handles.cancellation.is_cancelled() {
-        handles.readiness.set_live_ready(false);
-        handles.rpc_readiness.set_live_ready(false);
-        handles.readiness.set_finality_ready(false);
-        handles.network_telemetry.supervisor_running();
-        let result = Box::pin(run_network_lanes_once(
+    supervise_lane_runs(&handles, || {
+        Box::pin(run_network_lanes_once(
             &config,
             store.clone(),
             processors.clone(),
             handles.clone(),
             live_source.clone(),
         ))
-        .await;
+    })
+    .await;
+    handles.readiness.set_live_ready(false);
+    handles.rpc_readiness.set_live_ready(false);
+    handles.readiness.set_finality_ready(false);
+    handles.network_telemetry.supervisor_stopped();
+    live_source.shutdown().await;
+}
+
+/// Occurrences of one contradiction between verified finality and retained
+/// unfinalized blocks after which the network lanes halt instead of
+/// restarting again: the restarts before it did not repair it.
+const FINALITY_REORG_HALT_OCCURRENCE: usize = 3;
+
+/// Run the network lanes with `run_once` until cancelled. A failed run
+/// restarts after a bounded exponential backoff, unless it halts (see
+/// [`network_lane_failure`]): the lanes then stay stopped and not ready,
+/// with the error, until the node restarts.
+async fn supervise_lane_runs<F, Fut>(handles: &NetworkLaneHandles, mut run_once: F)
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<()>>,
+{
+    let mut retry = std::time::Duration::from_secs(1);
+    let mut reorgs = FinalityReorgRestarts::default();
+    while !handles.cancellation.is_cancelled() {
+        handles.readiness.set_live_ready(false);
+        handles.rpc_readiness.set_live_ready(false);
+        handles.readiness.set_finality_ready(false);
+        handles.network_telemetry.supervisor_running();
+        let result = run_once().await;
         if handles.cancellation.is_cancelled() {
             break;
         }
-        let failure = match result {
-            Ok(()) => {
-                let failure = "required network lane ended unexpectedly".to_owned();
-                warn!("{failure}");
+        let failure = match network_lane_failure(&result, &mut reorgs) {
+            LaneFailure::Halt(failure) => {
+                tracing::error!(
+                    error = %failure,
+                    "verified finality contradicts the retained canonical chain; network lanes halt until the node restarts"
+                );
+                handles.network_telemetry.supervisor_halted(&failure);
+                break;
+            }
+            LaneFailure::Heal(failure) => {
+                warn!(
+                    error = %failure,
+                    "verified finality contradicts retained unfinalized blocks; restarting the network lanes to revert them"
+                );
                 failure
             }
-            Err(error) => {
-                let failure = format!("{error:#}");
+            LaneFailure::Restart(failure) => {
                 warn!(
                     error = %failure,
                     "required network lane failed closed"
@@ -6108,11 +6167,89 @@ async fn supervise_network_lanes(
             .saturating_mul(2)
             .min(std::time::Duration::from_mins(1));
     }
-    handles.readiness.set_live_ready(false);
-    handles.rpc_readiness.set_live_ready(false);
-    handles.readiness.set_finality_ready(false);
-    handles.network_telemetry.supervisor_stopped();
-    live_source.shutdown().await;
+}
+
+/// How the supervisor handles a failed network-lane run.
+#[derive(Debug, Eq, PartialEq)]
+enum LaneFailure {
+    /// Restart after the backoff.
+    Restart(String),
+    /// Restart after the backoff: startup reverts the retained unfinalized
+    /// blocks that verified finality contradicts.
+    Heal(String),
+    /// Stop, not ready, until the node restarts.
+    Halt(String),
+}
+
+/// The finalized block whose contradiction with retained unfinalized blocks
+/// last restarted the network lanes, and how often it has.
+#[derive(Debug, Default)]
+struct FinalityReorgRestarts {
+    finalized: Option<(leani_primitives::BlockNumber, leani_primitives::BlockHash)>,
+    occurrences: usize,
+}
+
+/// Decide how the supervisor handles `result`, a failed network-lane run.
+///
+/// A contradiction with finalized history halts. A contradiction with
+/// retained unfinalized blocks heals: the restart reverts them. The same one
+/// again, before finality moves to another block, heals again, until its
+/// `FINALITY_REORG_HALT_OCCURRENCE`th occurrence halts, so a persistent fault
+/// cannot restart the lanes forever. Anything else restarts.
+fn network_lane_failure(result: &Result<()>, reorgs: &mut FinalityReorgRestarts) -> LaneFailure {
+    let error = match result {
+        Ok(()) => {
+            return LaneFailure::Restart("required network lane ended unexpectedly".to_owned());
+        }
+        Err(error) => error,
+    };
+    let failure = format!("{error:#}");
+    if network_lane_halts(error) {
+        return LaneFailure::Halt(failure);
+    }
+    let Some(finalized) = finality_reorg(error) else {
+        return LaneFailure::Restart(failure);
+    };
+    reorgs.occurrences = if reorgs.finalized == Some(finalized) {
+        reorgs.occurrences.saturating_add(1)
+    } else {
+        1
+    };
+    reorgs.finalized = Some(finalized);
+    if reorgs.occurrences >= FINALITY_REORG_HALT_OCCURRENCE {
+        return LaneFailure::Halt(format!(
+            "{failure}; it recurred after {} restarts of the network lanes",
+            reorgs.occurrences - 1
+        ));
+    }
+    LaneFailure::Heal(failure)
+}
+
+/// Whether a failed network-lane run must halt rather than restart: verified
+/// finality contradicted finalized canonical history, which no restart
+/// repairs.
+fn network_lane_halts(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref::<leani_runtime::RuntimeError>(),
+            Some(leani_runtime::RuntimeError::FinalityContradiction { .. })
+        )
+    })
+}
+
+/// The finalized block that retained unfinalized blocks contradicted, when
+/// that failed the network-lane run.
+fn finality_reorg(
+    error: &anyhow::Error,
+) -> Option<(leani_primitives::BlockNumber, leani_primitives::BlockHash)> {
+    error.chain().find_map(
+        |cause| match cause.downcast_ref::<leani_runtime::RuntimeError>() {
+            Some(leani_runtime::RuntimeError::FinalityReorg {
+                block, finalized, ..
+            }) => Some((*block, *finalized)),
+            _ => None,
+        },
+    )
 }
 
 #[allow(clippy::too_many_lines)]
@@ -6149,6 +6286,7 @@ async fn run_network_lanes_once(
         backfill_control,
         verified_anchor,
         checkpoint_origin,
+        attested_heads,
     } = handles;
     if config.chain.chain_id != 1 {
         bail!("the direct P2P/finality lane currently supports Ethereum mainnet only");
@@ -6190,7 +6328,10 @@ async fn run_network_lanes_once(
             let mut beacon_config = BeaconApiConfig::mainnet(config.finality.endpoints.clone());
             beacon_config.minimum_agreement = config.finality.minimum_agreement;
             beacon_config.anchor = anchor_file;
-            let source = Arc::new(VerifiedBeaconApi::mainnet(beacon_config)?);
+            // Verified optimistic updates bound what the live lane includes.
+            let source = Arc::new(
+                VerifiedBeaconApi::mainnet(beacon_config)?.with_attested_heads(attested_heads),
+            );
             let probe = source.probe_root(trusted_checkpoint).await;
             if !probe.accepted {
                 bail!(
@@ -6209,7 +6350,9 @@ async fn run_network_lanes_once(
         crate::config::FinalitySourceKind::ConsensusP2p => {
             let mut p2p_config = consensus_p2p_config(&config.finality);
             p2p_config.anchor = anchor_file;
-            let source = Arc::new(VerifiedConsensusP2p::mainnet(p2p_config)?);
+            let source = Arc::new(
+                VerifiedConsensusP2p::mainnet(p2p_config)?.with_attested_heads(attested_heads),
+            );
             let probe = source.probe_checkpoint(trusted_checkpoint).await;
             if !probe.accepted {
                 bail!(
@@ -6261,9 +6404,6 @@ async fn run_network_lanes_once(
             startup_started,
         );
     }
-    store
-        .store_canonical_anchor(chain_id, live_anchor, Finality::Finalized)
-        .await?;
     if let Some(verified_anchor) = &verified_anchor {
         publish_verified_anchor(
             verified_anchor,
@@ -6303,6 +6443,13 @@ async fn run_network_lanes_once(
     if let Some(control) = &backfill_control {
         live_runtime = live_runtime.with_finalized_gap_recovery(control.clone());
     }
+    // Retained unfinalized blocks that do not link to the verified finalized
+    // anchor, such as a branch reorged away during downtime, are reverted
+    // before it is seeded; reconciliation below undoes their coverage.
+    live_runtime
+        .seed_finalized_anchor(live_anchor)
+        .await
+        .context("seed the verified finalized anchor")?;
     // A crash, abort, or lane restart can interrupt a live commit or reorg
     // between its separately committed steps; repair every processor against
     // the canonical chain before any lane or handoff check runs.
@@ -7214,6 +7361,149 @@ mod tests {
     use leani_testkit::{BlockLocalCounter, fixture_frame};
 
     use super::*;
+
+    fn finalized_contradiction() -> anyhow::Error {
+        anyhow::Error::from(leani_runtime::RuntimeError::FinalityContradiction {
+            block: leani_primitives::BlockNumber(2),
+            detail: "the finalized hash is 0xf2…, the canonical hash 0x02…".to_owned(),
+        })
+        .context("finality network lane")
+    }
+
+    fn unfinalized_contradiction(block: u64, finalized: u8) -> anyhow::Error {
+        anyhow::Error::from(leani_runtime::RuntimeError::FinalityReorg {
+            block: leani_primitives::BlockNumber(block),
+            finalized: leani_primitives::BlockHash::new([finalized; 32]),
+            detail: "the finalized hash is 0xf2…, the canonical hash 0x02…".to_owned(),
+        })
+        .context("finality network lane")
+    }
+
+    #[test]
+    fn only_contradictions_of_finalized_history_or_persistent_ones_halt_the_network_lanes() {
+        let mut reorgs = FinalityReorgRestarts::default();
+        // A contradiction with finalized history halts at once.
+        assert!(matches!(
+            network_lane_failure(&Err(finalized_contradiction()), &mut reorgs),
+            LaneFailure::Halt(_)
+        ));
+        // One with retained unfinalized blocks is a reorg the restart
+        // reverts: the lanes restart, twice for the same finalized block,
+        // and halt the third time.
+        for _ in 0..2 {
+            assert!(
+                matches!(
+                    network_lane_failure(&Err(unfinalized_contradiction(2, 0xf2)), &mut reorgs),
+                    LaneFailure::Heal(_)
+                ),
+                "an unfinalized contradiction halted the network lanes"
+            );
+        }
+        // Transient failures in between still restart, and do not reset the
+        // count: finality has not moved.
+        assert!(matches!(
+            network_lane_failure(
+                &Err(anyhow::anyhow!(
+                    "verified Beacon API finality quorum was not accepted"
+                )),
+                &mut reorgs
+            ),
+            LaneFailure::Restart(_)
+        ));
+        let LaneFailure::Halt(failure) =
+            network_lane_failure(&Err(unfinalized_contradiction(2, 0xf2)), &mut reorgs)
+        else {
+            panic!("a persistent contradiction restarted the network lanes a third time");
+        };
+        assert!(failure.contains("after 2 restarts"), "{failure}");
+        // Once finality has moved to another block, a contradiction heals
+        // again.
+        assert!(matches!(
+            network_lane_failure(&Err(unfinalized_contradiction(66, 0xf3)), &mut reorgs),
+            LaneFailure::Heal(_)
+        ));
+        assert!(matches!(
+            network_lane_failure(&Ok(()), &mut reorgs),
+            LaneFailure::Restart(_)
+        ));
+    }
+
+    fn lane_handles() -> NetworkLaneHandles {
+        NetworkLaneHandles {
+            readiness: leani_api::ReadinessHandle::new(true, true),
+            rpc_readiness: leani_rpc::RpcReadiness::default(),
+            committed_events: tokio::sync::broadcast::channel(1).0,
+            network_telemetry: leani_source_api::NetworkTelemetry::default(),
+            cancellation: CancellationToken::new(),
+            backfill_control: None,
+            verified_anchor: None,
+            checkpoint_origin: leani_finality_beacon_api::CheckpointOrigin::Operator,
+            attested_heads: leani_source_api::AttestedHeadPublisher::new(),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_supervisor_stops_restarting_once_the_network_lanes_halt() {
+        // A contradiction with finalized history: one run, then a halt.
+        let handles = lane_handles();
+        let runs = std::sync::atomic::AtomicUsize::new(0);
+        tokio::time::timeout(
+            Duration::from_mins(10),
+            supervise_lane_runs(&handles, || {
+                runs.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                async { Err(finalized_contradiction()) }
+            }),
+        )
+        .await
+        .expect("the supervisor kept restarting halted network lanes");
+        assert_eq!(runs.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let supervisor = handles.network_telemetry.snapshot().supervisor;
+        assert_eq!(
+            supervisor.state,
+            leani_source_api::NetworkSupervisorState::Stopped
+        );
+        assert_eq!(supervisor.retry_in_seconds, None);
+        assert!(
+            supervisor
+                .last_error
+                .is_some_and(|error| error.contains("verified finality contradicts")),
+            "the halt records no explicit error"
+        );
+        assert!(!handles.readiness.is_ready());
+
+        // The same unfinalized contradiction: two healing restarts, then a
+        // halt.
+        let handles = lane_handles();
+        let runs = std::sync::atomic::AtomicUsize::new(0);
+        tokio::time::timeout(
+            Duration::from_mins(10),
+            supervise_lane_runs(&handles, || {
+                runs.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                async { Err(unfinalized_contradiction(2, 0xf2)) }
+            }),
+        )
+        .await
+        .expect("a persistent contradiction restarted the network lanes forever");
+        assert_eq!(runs.load(std::sync::atomic::Ordering::SeqCst), 3);
+        assert_eq!(
+            handles.network_telemetry.snapshot().supervisor.state,
+            leani_source_api::NetworkSupervisorState::Stopped
+        );
+
+        // Anything else keeps restarting until cancelled.
+        let handles = lane_handles();
+        let runs = std::sync::atomic::AtomicUsize::new(0);
+        let supervisor = supervise_lane_runs(&handles, || {
+            if runs.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 4 {
+                handles.cancellation.cancel();
+            }
+            async { Err(anyhow::anyhow!("execution peers unavailable")) }
+        });
+        tokio::time::timeout(Duration::from_mins(10), supervisor)
+            .await
+            .expect("the supervisor stops once cancelled");
+        assert_eq!(runs.load(std::sync::atomic::Ordering::SeqCst), 5);
+    }
 
     #[test]
     fn doctor_warns_when_the_active_finality_anchor_expires_within_three_days() {

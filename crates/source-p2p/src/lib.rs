@@ -43,11 +43,11 @@ use leani_primitives::{
     Withdrawal,
 };
 use leani_source_api::{
-    BlockFrameStream, ChainEvent, ChainEventStream, DataRequest, FinalityModel, HistorySource,
-    LiveSource, LiveStart, NetworkDisconnectReason, NetworkLane, NetworkPeerOrigin,
-    NetworkPeerQualification, NetworkPhase, NetworkSessionTelemetry, NetworkTelemetry,
-    NetworkTelemetrySnapshot, Partitioning, SourceAcquisitionMetrics, SourceBudget, SourceChunk,
-    SourceDescriptor, SourceError, SourcePlan,
+    AttestedHead, AttestedHeadReceiver, BlockFrameStream, ChainEvent, ChainEventStream,
+    DataRequest, FinalityModel, HistorySource, LiveSource, LiveStart, NetworkDisconnectReason,
+    NetworkLane, NetworkPeerOrigin, NetworkPeerQualification, NetworkPhase,
+    NetworkSessionTelemetry, NetworkTelemetry, NetworkTelemetrySnapshot, Partitioning,
+    SourceAcquisitionMetrics, SourceBudget, SourceChunk, SourceDescriptor, SourceError, SourcePlan,
 };
 use reth_chainspec::MAINNET;
 use reth_dns_discovery::{
@@ -134,6 +134,12 @@ const HEAD_POLL_NOT_YET_TOLERANCE: Duration = Duration::from_millis(250);
 // Peers head discovery races for the minimum live head. The block exists, so
 // a few peers answer it; discovery runs on every live-loop iteration.
 const MINIMUM_LIVE_HEAD_PEERS: usize = 3;
+// How long the live lane waits for a sync-committee-attested head above its
+// tip before it reports itself disconnected: four slots, so a missed slot or
+// two, when no block is attested, keeps readiness.
+const ATTESTED_HEAD_GRACE: Duration = Duration::from_secs(48);
+// Headers one request proves of an attested head's ancestry, the ETH limit.
+const MAX_ANCESTRY_HEADERS: u64 = 1_024;
 // A live body or receipt request asks every eligible peer once per wave. After
 // this many waves, or this long, nobody serves the material of that header.
 const MAX_LIVE_MATERIAL_WAVES: usize = 8;
@@ -684,6 +690,10 @@ pub struct RethP2pSource {
     network: Arc<PersistentNetwork>,
     material_tuning: Arc<MaterialBatchTuning>,
     request_metrics: P2pRequestMetrics,
+    /// Sync-committee-attested heads a verified finality source publishes.
+    /// The live lane includes no block above the newest, and none without
+    /// them.
+    attested_heads: Option<AttestedHeadReceiver>,
 }
 
 /// Consensus-verified execution anchor used to prove a historical P2P suffix.
@@ -1924,6 +1934,10 @@ struct HeaderServe {
     peer_id: B512,
     block: u64,
     elapsed: Duration,
+    /// Whether the headers were checked against a verified hash, so they are
+    /// anchored to a consensus-verified block. Only such a reply earns a
+    /// reward or clears a withheld-header strike.
+    anchored: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -2038,8 +2052,9 @@ fn direct_peer_request_limit(total_concurrency: usize, connected_peers: usize) -
         .clamp(1, MAX_MATERIAL_REQUESTS_PER_PEER)
 }
 
-/// The policy of the request for the minimum live head, a block that exists:
-/// a race of `MINIMUM_LIVE_HEAD_PEERS` peers at a time, at live priority.
+/// The policy of a live header request for blocks that exist, such as the
+/// minimum live head or an attested head's ancestry: a race of
+/// `MINIMUM_LIVE_HEAD_PEERS` peers at a time, at live priority.
 const fn minimum_live_head_policy() -> MaterialRequestPolicy {
     MaterialRequestPolicy {
         concurrency: MINIMUM_LIVE_HEAD_PEERS,
@@ -2194,6 +2209,255 @@ impl HeadPollRotation {
     /// moved the lane on, such as a header whose body no peer served.
     const fn serve_failed(&mut self) {
         self.served_at = None;
+    }
+}
+
+/// Settle the header serve of frames that completed, including filtered-log
+/// frames that needed no body or receipts. Only headers anchored to a
+/// verified hash clear their peer's withheld-header strikes; returns whether
+/// the peer earns its held-back reward.
+fn settle_header_serve(pool: &DirectPeerPool, serve: HeaderServe) -> bool {
+    if !serve.anchored {
+        return false;
+    }
+    pool.clear_withheld_header(serve.peer_id);
+    true
+}
+
+/// The hash of a verified expected tip, which is requested by hash.
+fn verified_tip(expected_tip: Option<ExpectedTip>) -> Option<BlockHash> {
+    expected_tip
+        .filter(|tip| tip.trust == ExpectationTrust::Verified)
+        .map(|tip| tip.hash)
+}
+
+/// The ETH request for the live headers `range`, checked against
+/// `expected_tip`.
+///
+/// A verified tip, such as an attested head, a hash its header chain proves,
+/// or the finalized anchor, is requested by its hash, descending. The reply is
+/// then the chain ending at that hash, or nothing when a peer lacks the
+/// block, as an honest peer on another branch does. By number, the hash would
+/// be compared with whatever block a peer holds at that height: an attested
+/// head is not final, so that would ban honest peers after a reorg.
+fn live_header_request(range: BlockRange, expected_tip: Option<ExpectedTip>) -> HeadersRequest {
+    match verified_tip(expected_tip) {
+        Some(hash) => HeadersRequest::falling(
+            BlockHashOrNumber::Hash(B256::from(*hash.as_array())),
+            range.len(),
+        ),
+        None => HeadersRequest::rising(BlockHashOrNumber::Number(range.start().0), range.len()),
+    }
+}
+
+/// Validate a reply to [`live_header_request`] and return its headers,
+/// lowest first. For a request by hash, another header breaks the protocol:
+/// invalid. No header, or fewer than requested, is incomplete: a
+/// disagreement, since the peer may lack the block.
+fn validate_live_headers(
+    range: BlockRange,
+    expected_tip: Option<ExpectedTip>,
+    mut headers: Vec<Header>,
+) -> Result<Vec<Header>, P2pError> {
+    let Some(tip) = verified_tip(expected_tip) else {
+        validate_headers(range, &headers, expected_tip.map(|tip| tip.hash))?;
+        return Ok(headers);
+    };
+    let expected = usize::try_from(range.len()).unwrap_or(usize::MAX);
+    if headers.len() > expected {
+        return Err(P2pError::InvalidResponse(format!(
+            "{} headers for {expected} requested",
+            headers.len()
+        )));
+    }
+    if headers.is_empty() {
+        return Err(P2pError::IncompleteResponse {
+            component: "headers",
+            returned: 0,
+            expected,
+        });
+    }
+    validate_descending_headers(range.end(), tip, &headers)?;
+    if headers.len() < expected {
+        return Err(P2pError::IncompleteResponse {
+            component: "headers",
+            returned: headers.len(),
+            expected,
+        });
+    }
+    headers.reverse();
+    Ok(headers)
+}
+
+/// The block reference of a validated header.
+fn header_block_ref(header: &Header) -> BlockRef {
+    BlockRef {
+        number: BlockNumber(header.number),
+        hash: block_hash(header.hash_slow()),
+        parent_hash: block_hash(header.parent_hash),
+        timestamp: header.timestamp,
+    }
+}
+
+/// Proven headers of consecutive blocks above the live lane's tip, on the
+/// chain of the sync-committee-attested head that proved them: each was
+/// fetched by hash, down from the head's own. Catch-up takes its batches
+/// from them, so they are fetched once. They are invalidated when a batch or
+/// a proof fails, and the next catch-up proves them again from the newest
+/// attested head.
+#[derive(Debug, Default)]
+struct AttestedAncestry {
+    /// The attested head whose header chain proved `headers`.
+    head: Option<AttestedHead>,
+    /// The proven headers, lowest first.
+    headers: VecDeque<Header>,
+    /// The peer that served them.
+    header_peer: Option<B512>,
+    /// Its serve, settled once frames on these headers first complete.
+    serve: Option<HeaderServe>,
+}
+
+impl AttestedAncestry {
+    /// The ancestry `head` proved: `headers`, a validated chain lowest first,
+    /// which `serve` served.
+    fn proven(head: AttestedHead, serve: HeaderServe, headers: Vec<Header>) -> Self {
+        Self {
+            head: Some(head),
+            headers: headers.into(),
+            header_peer: Some(serve.peer_id),
+            serve: Some(serve),
+        }
+    }
+
+    /// The first proven block, if any.
+    fn first(&self) -> Option<u64> {
+        self.headers.front().map(|header| header.number)
+    }
+
+    /// Take the first `count` proven headers, their peer, and its serve if it
+    /// is not settled yet.
+    fn take(&mut self, count: usize) -> (Vec<Header>, Option<B512>, Option<HeaderServe>) {
+        let count = count.min(self.headers.len());
+        (
+            self.headers.drain(..count).collect(),
+            self.header_peer,
+            self.serve.take(),
+        )
+    }
+
+    /// Forget the proven headers: the next catch-up proves them again from
+    /// the newest attested head.
+    fn invalidate(&mut self) {
+        *self = Self::default();
+    }
+}
+
+/// What the live lane fetches next.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LiveStep {
+    /// No attested head is above the tip: include nothing, and wait for the
+    /// next one.
+    Wait,
+    /// The next block is the attested head: poll it, by its hash.
+    Poll {
+        block: BlockNumber,
+        tip: ExpectedTip,
+    },
+    /// Catch up on `range` with the proven headers the ancestry holds.
+    CatchUp { range: BlockRange },
+    /// Prove the attested head's chain down to `from` first.
+    Anchor {
+        from: BlockNumber,
+        head: AttestedHead,
+    },
+}
+
+/// What the live lane at `last` fetches next, with the newest attested head
+/// and the proven ancestry it holds. A block is fetched only up to the
+/// attested head, and only by a verified hash: the head's own, or through
+/// headers its chain proves. `batch_blocks` bounds a catch-up batch.
+fn live_step(
+    last: BlockRef,
+    attested: Option<AttestedHead>,
+    ancestry: &AttestedAncestry,
+    batch_blocks: u64,
+) -> LiveStep {
+    let Some(head) = attested.filter(|head| head.block_number > last.number) else {
+        return LiveStep::Wait;
+    };
+    let next = last.number.0.saturating_add(1);
+    if ancestry.first() == Some(next) {
+        let proven = u64::try_from(ancestry.headers.len()).unwrap_or(u64::MAX);
+        // Never above the newest attested head, even with headers an older
+        // one proved.
+        let end = next
+            .saturating_add(batch_blocks.max(1).min(proven) - 1)
+            .min(head.block_number.0);
+        if let Ok(range) = BlockRange::new(BlockNumber(next), BlockNumber(end)) {
+            return LiveStep::CatchUp { range };
+        }
+    }
+    if head.block_number.0 == next {
+        return LiveStep::Poll {
+            block: BlockNumber(next),
+            tip: ExpectedTip {
+                hash: head.block_hash,
+                trust: ExpectationTrust::Verified,
+            },
+        };
+    }
+    LiveStep::Anchor {
+        from: BlockNumber(next),
+        head,
+    }
+}
+
+/// The header windows that prove an attested head's chain down to `from`:
+/// each is requested by the hash of its top block, the head's own and then
+/// the parent the window above names. Windows hold `MAX_ANCESTRY_HEADERS`,
+/// except the top one, which holds the rest, so the lowest window, which the
+/// lane keeps, is full.
+async fn prove_attested_ancestry<F, Fut>(
+    from: BlockNumber,
+    head: AttestedHead,
+    mut fetch_window: F,
+) -> Result<AttestedAncestry, P2pError>
+where
+    F: FnMut(BlockRange, BlockHash) -> Fut,
+    Fut: Future<Output = Result<(HeaderServe, Vec<Header>), P2pError>>,
+{
+    let total = head
+        .block_number
+        .0
+        .checked_sub(from.0)
+        .ok_or_else(|| {
+            P2pError::InvalidConfig(format!(
+                "attested head {} is below block {}",
+                head.block_number.0, from.0
+            ))
+        })?
+        .saturating_add(1);
+    let mut size = (total - 1) % MAX_ANCESTRY_HEADERS + 1;
+    let mut top = head.block_number.0;
+    let mut top_hash = head.block_hash;
+    loop {
+        let start = top.saturating_sub(size - 1).max(from.0);
+        let range = BlockRange::new(BlockNumber(start), BlockNumber(top))
+            .map_err(|error| P2pError::InvalidConfig(error.to_string()))?;
+        let (serve, headers) = fetch_window(range, top_hash).await?;
+        let Some(lowest) = headers.first() else {
+            return Err(P2pError::IncompleteResponse {
+                component: "headers",
+                returned: 0,
+                expected: 1,
+            });
+        };
+        if start == from.0 {
+            return Ok(AttestedAncestry::proven(head, serve, headers));
+        }
+        top_hash = block_hash(lowest.parent_hash);
+        top = start - 1;
+        size = MAX_ANCESTRY_HEADERS;
     }
 }
 
@@ -3636,9 +3900,14 @@ struct P2pLiveState {
     last: BlockRef,
     queued: VecDeque<BlockFrame>,
     recent: VecDeque<BlockRef>,
-    required_peer_head: BlockNumber,
+    /// The newest sync-committee-attested head: the lane includes no block
+    /// above it.
+    attested: AttestedHeadReceiver,
+    /// Proven hashes of the attested head's ancestry above the tip.
+    ancestry: AttestedAncestry,
     pending_material_attempts: usize,
     head_poll: HeadPollRotation,
+    /// Since when no attested head has been above the tip.
     head_unavailable_since: Option<Instant>,
     /// Since when every head poll's cohort has stayed silent.
     head_poll_silent_since: Option<Instant>,
@@ -3660,7 +3929,7 @@ impl std::fmt::Debug for P2pLiveState {
             .field("last", &self.last)
             .field("queued", &self.queued.len())
             .field("recent", &self.recent.len())
-            .field("required_peer_head", &self.required_peer_head)
+            .field("attested", &self.attested.peek())
             .field("pending_material_attempts", &self.pending_material_attempts)
             .field("head_unavailable_since", &self.head_unavailable_since)
             .field("head_poll_silent_since", &self.head_poll_silent_since)
@@ -3738,6 +4007,28 @@ impl RethP2pSource {
             network,
             material_tuning,
             request_metrics: P2pRequestMetrics::default(),
+            attested_heads: None,
+        })
+    }
+
+    /// Follow the sync-committee-attested heads a verified finality source
+    /// publishes. The live lane includes no block above the newest one, and
+    /// a source without them refuses live subscriptions. The source only
+    /// reads the heads: it cannot publish one.
+    #[must_use]
+    pub fn with_attested_heads(mut self, heads: AttestedHeadReceiver) -> Self {
+        self.attested_heads = Some(heads);
+        self
+    }
+
+    /// The attested heads a live subscription follows. Without them nothing
+    /// bounds what the lane includes, so the subscription fails closed.
+    fn live_attested_heads(&self) -> Result<AttestedHeadReceiver, SourceError> {
+        self.attested_heads.clone().ok_or_else(|| {
+            SourceError::InvalidPlan(
+                "execution P2P live ingestion follows sync-committee-attested heads, but no verified finality source publishes them"
+                    .to_owned(),
+            )
         })
     }
 
@@ -3867,10 +4158,12 @@ impl RethP2pSource {
         let (session, _) = self
             .connect(advertised, NetworkLane::Live, cancellation)
             .await?;
+        // A preview is a peer claim: nothing here is anchored.
         let (head_number, head_hash) = self
             .wait_for_peer_head(
                 &session,
                 BlockNumber(advertised.number.0.saturating_add(1)),
+                None,
                 cancellation,
             )
             .await?;
@@ -4478,38 +4771,16 @@ impl RethP2pSource {
         ))
     }
 
-    #[allow(clippy::too_many_lines)]
-    async fn fetch_verified_range(
+    /// Bodies and receipts of validated live `headers`, which `header_peer`
+    /// served, normalized into frames, with the peers that served them.
+    async fn fetch_verified_material(
         &self,
         session: &P2pSession,
-        range: BlockRange,
-        expected_tip: Option<ExpectedTip>,
+        headers: &[Header],
+        header_peer: B512,
         budget: SourceBudget,
         cancellation: &CancellationToken,
-    ) -> Result<(Vec<BlockFrame>, usize), P2pError> {
-        session.set_range(Some(range));
-        session.set_phase(NetworkPhase::FetchingHeaders);
-        let (header_serve, headers) = match self
-            .fetch_live_headers_from_untried_peers(
-                session,
-                range,
-                expected_tip,
-                None,
-                MaterialRequestPolicy {
-                    concurrency: budget.max_in_flight_requests,
-                    priority: Priority::High,
-                },
-                cancellation,
-            )
-            .await
-        {
-            Ok(headers) => headers,
-            Err(error) => {
-                session.record_error(&error);
-                return Err(error);
-            }
-        };
-        let header_peer = header_serve.peer_id;
+    ) -> Result<(Vec<BlockFrame>, HashSet<B512>), P2pError> {
         let hashes = headers.iter().map(Sealable::hash_slow).collect::<Vec<_>>();
         session.set_phase(NetworkPhase::FetchingBodies);
         // Live material, like the rest of the live lane, may use the request
@@ -4518,7 +4789,7 @@ impl RethP2pSource {
             concurrency: budget.max_in_flight_requests,
             priority: Priority::High,
         };
-        let body_result = if let ([header], [hash]) = (headers.as_slice(), hashes.as_slice()) {
+        let (body_peers, bodies) = if let ([header], [hash]) = (headers, hashes.as_slice()) {
             self.fetch_live_body_from_untried_peers(
                 session,
                 header,
@@ -4528,28 +4799,21 @@ impl RethP2pSource {
                 cancellation,
             )
             .await
-            .map(|(peer, body)| (HashSet::from([peer]), vec![body]))
+            .map(|(peer, body)| (HashSet::from([peer]), vec![body]))?
         } else {
             self.fetch_bodies_batched(
                 &session.fetch,
-                &headers,
+                headers,
                 &hashes,
                 material_policy,
                 cancellation,
             )
-            .await
-        };
-        let (body_peers, bodies) = match body_result {
-            Ok(bodies) => bodies,
-            Err(error) => {
-                session.record_error(&error);
-                return Err(error);
-            }
+            .await?
         };
         let preferred_receipt_peer = body_peers.iter().next().copied();
         session.set_phase(NetworkPhase::FetchingReceipts);
-        let receipt_result = if let ([header], [body], [hash]) =
-            (headers.as_slice(), bodies.as_slice(), hashes.as_slice())
+        let (receipt_peers, receipts) = if let ([header], [body], [hash]) =
+            (headers, bodies.as_slice(), hashes.as_slice())
         {
             self.fetch_live_receipts_from_untried_peers(
                 session,
@@ -4564,32 +4828,22 @@ impl RethP2pSource {
                 cancellation,
             )
             .await
-            .map(|(peer, block_receipts)| (peer.into_iter().collect(), vec![block_receipts]))
+            .map(|(peer, block_receipts)| (peer.into_iter().collect(), vec![block_receipts]))?
         } else {
             self.fetch_receipts_batched(
                 &session.fetch,
-                &headers,
+                headers,
                 &bodies,
                 &hashes,
                 material_policy,
                 cancellation,
             )
-            .await
+            .await?
         };
-        let (receipt_peers, receipts) = match receipt_result {
-            Ok(receipts) => receipts,
-            Err(error) => {
-                session.record_error(&error);
-                return Err(error);
-            }
-        };
-        let frames = normalize_verified(&headers, &bodies, &receipts, budget)?;
-        self.complete_header_serve(session, header_serve).await;
-        session.clear_error();
-        let mut response_peers = HashSet::from([header_peer]);
-        response_peers.extend(body_peers);
+        let frames = normalize_verified(headers, &bodies, &receipts, budget)?;
+        let mut response_peers = body_peers;
         response_peers.extend(receipt_peers);
-        Ok((frames, response_peers.len()))
+        Ok((frames, response_peers))
     }
 
     async fn fetch_requested_live_range(
@@ -4601,17 +4855,6 @@ impl RethP2pSource {
         budget: SourceBudget,
         cancellation: &CancellationToken,
     ) -> Result<(Vec<BlockFrame>, usize), P2pError> {
-        if !header_only_request(request)
-            && !header_and_body_only_request(request)
-            && (sparse_log_scope(request).is_none()
-                || request
-                    .log_fields
-                    .contains(leani_primitives::LogField::TransactionHash))
-        {
-            return self
-                .fetch_verified_range(session, range, expected_tip, budget, cancellation)
-                .await;
-        }
         session.set_range(Some(range));
         session.set_phase(NetworkPhase::FetchingHeaders);
         let (header_serve, headers) = self
@@ -4628,25 +4871,55 @@ impl RethP2pSource {
             )
             .await
             .inspect_err(|error| session.record_error(error))?;
-        let header_peer = header_serve.peer_id;
+        self.fetch_live_range_material(
+            session,
+            range,
+            &headers,
+            header_serve.peer_id,
+            Some(header_serve),
+            request,
+            budget,
+            cancellation,
+        )
+        .await
+    }
+
+    /// The frames of the validated live `headers` of `range`, with the
+    /// material `request` needs. `header_peer` served the headers, and
+    /// `settle`, if any, is its serve, settled once the frames complete.
+    /// Returns the frames and how many peers served them.
+    #[allow(clippy::too_many_arguments)]
+    async fn fetch_live_range_material(
+        &self,
+        session: &P2pSession,
+        range: BlockRange,
+        headers: &[Header],
+        header_peer: B512,
+        settle: Option<HeaderServe>,
+        request: &DataRequest,
+        budget: SourceBudget,
+        cancellation: &CancellationToken,
+    ) -> Result<(Vec<BlockFrame>, usize), P2pError> {
+        session.set_range(Some(range));
         let request = DataRequest {
             range,
             ..request.clone()
         };
         let (frames, mut response_peers) = if header_only_request(&request) {
-            (
-                normalize_verified_headers(&headers, budget)?,
-                HashSet::new(),
-            )
+            (normalize_verified_headers(headers, budget)?, HashSet::new())
         } else if header_and_body_only_request(&request) {
-            self.fetch_live_body_frames(session, &headers, Some(header_peer), budget, cancellation)
+            self.fetch_live_body_frames(session, headers, Some(header_peer), budget, cancellation)
                 .await
                 .inspect_err(|error| session.record_error(error))?
-        } else {
+        } else if sparse_log_scope(&request).is_some()
+            && !request
+                .log_fields
+                .contains(leani_primitives::LogField::TransactionHash)
+        {
             (
                 self.fetch_sparse_live_frames(
                     session,
-                    &headers,
+                    headers,
                     header_peer,
                     &request,
                     budget,
@@ -4656,8 +4929,14 @@ impl RethP2pSource {
                 .inspect_err(|error| session.record_error(error))?,
                 HashSet::new(),
             )
+        } else {
+            self.fetch_verified_material(session, headers, header_peer, budget, cancellation)
+                .await
+                .inspect_err(|error| session.record_error(error))?
         };
-        self.complete_header_serve(session, header_serve).await;
+        if let Some(serve) = settle {
+            self.complete_header_serve(session, serve).await;
+        }
         response_peers.insert(header_peer);
         session.clear_error();
         Ok((frames, response_peers.len()))
@@ -4830,11 +5109,14 @@ impl RethP2pSource {
         Ok(frames.pop())
     }
 
-    #[allow(clippy::too_many_lines)]
+    /// Poll the block `next`, the attested head, from a small cohort of
+    /// peers, and check its header against the head's hash, `expected_tip`.
+    #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
     async fn poll_next_verified_frame(
         &self,
         session: &P2pSession,
         next: BlockNumber,
+        expected_tip: ExpectedTip,
         request: &DataRequest,
         budget: SourceBudget,
         head_poll: &mut HeadPollRotation,
@@ -4847,7 +5129,7 @@ impl RethP2pSource {
             .fetch_live_headers_from_untried_peers(
                 session,
                 range,
-                None,
+                Some(expected_tip),
                 Some(head_poll),
                 MaterialRequestPolicy {
                     concurrency: budget.max_in_flight_requests,
@@ -4987,8 +5269,12 @@ impl RethP2pSource {
                     return Err(error);
                 }
             };
+            // The range ends at `advertised`: a verified tip is its hash.
+            let known = expected_tip
+                .filter(|tip| tip.trust == ExpectationTrust::Verified)
+                .map(|tip| tip.hash);
             if let Err(error) = self
-                .wait_for_peer_head(&session, advertised.number, cancellation)
+                .wait_for_peer_head(&session, advertised.number, known, cancellation)
                 .await
             {
                 if matches!(error, P2pError::Cancelled) {
@@ -5037,10 +5323,13 @@ impl RethP2pSource {
         }
     }
 
+    /// Find a peer head at or above `minimum`, whose hash is `known` when a
+    /// consensus-verified block there is known.
     async fn discover_peer_head(
         &self,
         session: &P2pSession,
         minimum: BlockNumber,
+        known: Option<BlockHash>,
         cancellation: &CancellationToken,
     ) -> Result<(BlockNumber, BlockHash), P2pError> {
         session.set_range(None);
@@ -5075,7 +5364,7 @@ impl RethP2pSource {
         // still pending. Resolving status-only head hashes remains a fallback
         // for peers that cannot serve the minimum by number.
         if let Some(((number, hash), serving_peer)) = self
-            .minimum_live_head(session, minimum, cancellation)
+            .minimum_live_head(session, minimum, known, cancellation)
             .await?
         {
             let validated =
@@ -5200,6 +5489,7 @@ impl RethP2pSource {
         &self,
         session: &P2pSession,
         minimum: BlockNumber,
+        known: Option<BlockHash>,
         cancellation: &CancellationToken,
     ) -> Result<Option<((BlockNumber, BlockHash), B512)>, P2pError> {
         // Some ETH peers expose only a head hash, and the direct status event
@@ -5211,7 +5501,13 @@ impl RethP2pSource {
             .fetch_live_headers_from_untried_peers(
                 session,
                 range,
-                None,
+                // A consensus-verified block at the minimum, such as the
+                // finalized anchor or the attested head, is checked: another
+                // header there is invalid.
+                known.map(|hash| ExpectedTip {
+                    hash,
+                    trust: ExpectationTrust::Verified,
+                }),
                 // The minimum is the verified tip or the block after the
                 // finalized anchor: it exists, so this is no head poll, and an
                 // empty reply is a lagging peer.
@@ -5226,7 +5522,7 @@ impl RethP2pSource {
             Err(_) => return Ok(None),
         };
         // The header is the whole reply. No frame follows it, so it clears no
-        // withheld-header strike.
+        // withheld-header strike, and only an anchored one earns the reward.
         self.reward_header_serve(session, serve).await;
         let header = headers
             .pop()
@@ -5241,13 +5537,14 @@ impl RethP2pSource {
         &self,
         session: &P2pSession,
         minimum: BlockNumber,
+        known: Option<BlockHash>,
         cancellation: &CancellationToken,
     ) -> Result<(BlockNumber, BlockHash), P2pError> {
         let mut attempts = 0_usize;
         loop {
             attempts = attempts.saturating_add(1);
             match self
-                .discover_peer_head(session, minimum, cancellation)
+                .discover_peer_head(session, minimum, known, cancellation)
                 .await
             {
                 Ok(head) => return Ok(head),
@@ -5273,17 +5570,64 @@ impl RethP2pSource {
         }
     }
 
+    /// Prove the chain of the attested `head` down to `from`, keeping the
+    /// lowest window of headers for catch-up (see
+    /// [`prove_attested_ancestry`]).
+    ///
+    /// Each window is requested by the hash of its top block, so a peer that
+    /// serves another header for it breaks the protocol and is banned, while
+    /// one that lacks the block answers with none and is not. The blocks
+    /// exist, so a few peers race for each window, as for the minimum live
+    /// head.
+    async fn anchor_attested_ancestry(
+        &self,
+        session: &P2pSession,
+        from: BlockNumber,
+        head: AttestedHead,
+        cancellation: &CancellationToken,
+    ) -> Result<AttestedAncestry, P2pError> {
+        prove_attested_ancestry(from, head, |range, top_hash| async move {
+            let (serve, headers) = self
+                .fetch_live_headers_from_untried_peers(
+                    session,
+                    range,
+                    Some(ExpectedTip {
+                        hash: top_hash,
+                        trust: ExpectationTrust::Verified,
+                    }),
+                    None,
+                    minimum_live_head_policy(),
+                    cancellation,
+                )
+                .await
+                .inspect_err(|error| session.record_error(error))?;
+            if range.start() > from {
+                // No frame follows a window above the kept one: it clears no
+                // strike, and earns its reward now.
+                self.reward_header_serve(session, serve).await;
+            }
+            Ok((serve, headers))
+        })
+        .await
+    }
+
+    /// Reconstruct the branch that replaces the lane's tip, down from
+    /// `head_hash`: the parent a mismatching frame names. `evidence` is how
+    /// that frame was checked; anchored to an attested head, the branch is
+    /// the verified chain.
     async fn reconstruct_reorg(
         &self,
         state: &P2pLiveState,
         head_number: BlockNumber,
         head_hash: BlockHash,
+        evidence: ExpectationTrust,
     ) -> Result<(Vec<BlockRef>, Vec<BlockFrame>, BlockRef), P2pError> {
         let descending = self
             .fetch_descending_headers(
                 &state.session.fetch,
                 head_number,
                 head_hash,
+                evidence,
                 &state.cancellation,
             )
             .await?;
@@ -5305,10 +5649,9 @@ impl RethP2pSource {
                 .fetch_requested_live_range(
                     &state.session,
                     range,
-                    // The replacement head was discovered from peer claims.
                     Some(ExpectedTip {
                         hash: head_hash,
-                        trust: ExpectationTrust::Unverified,
+                        trust: evidence,
                     }),
                     &state.request,
                     state.budget,
@@ -5334,6 +5677,7 @@ impl RethP2pSource {
         fetch: &C,
         head_number: BlockNumber,
         head_hash: BlockHash,
+        expectation: ExpectationTrust,
         cancellation: &CancellationToken,
     ) -> Result<Vec<Header>, P2pError>
     where
@@ -5360,8 +5704,7 @@ impl RethP2pSource {
                     match validate_descending_headers(head_number, head_hash, &headers) {
                         Ok(()) => return Ok(headers),
                         Err(error) => {
-                            // The replacement head is a peer claim.
-                            if classify_response_failure(&error, ExpectationTrust::Unverified)
+                            if classify_response_failure(&error, expectation)
                                 == ResponseFault::Invalid
                             {
                                 fetch.report_bad_message(peer);
@@ -5615,7 +5958,7 @@ impl RethP2pSource {
     async fn request_live_headers(
         &self,
         lease: DirectPeerLease,
-        range: BlockRange,
+        request: HeadersRequest,
         priority: Priority,
         cancellation: &CancellationToken,
     ) -> (DirectPeerLease, Duration, Result<Vec<Header>, P2pError>) {
@@ -5633,7 +5976,7 @@ impl RethP2pSource {
             Ok(permit) => {
                 let response = request_direct_headers(
                     &lease.peer,
-                    HeadersRequest::rising(BlockHashOrNumber::Number(range.start().0), range.len()),
+                    request,
                     self.config.request_timeout,
                     cancellation,
                     "headers",
@@ -5647,9 +5990,13 @@ impl RethP2pSource {
         (lease, request_started_at.elapsed(), response)
     }
 
-    /// Reward a peer for a live header reply: persisted service evidence and
-    /// Reth reputation.
+    /// Reward a peer for an anchored live header reply: persisted service
+    /// evidence and Reth reputation. Headers checked against no verified hash
+    /// earn nothing: they may be a fabricated chain.
     async fn reward_header_serve(&self, session: &P2pSession, serve: HeaderServe) {
+        if !serve.anchored {
+            return;
+        }
         self.network.peer_store.record_success(
             serve.peer_id,
             PeerMaterialKind::Header,
@@ -5660,20 +6007,21 @@ impl RethP2pSource {
     }
 
     /// The frames on `serve`'s headers completed, with their bodies and
-    /// receipts: the blocks exist. The peer's withheld-header strikes clear,
-    /// and it earns the reward held back for its headers.
+    /// receipts: the blocks exist. For anchored headers, the peer's
+    /// withheld-header strikes clear, and it earns the reward held back for
+    /// its headers.
     async fn complete_header_serve(&self, session: &P2pSession, serve: HeaderServe) {
-        self.network
-            .direct_peers
-            .clear_withheld_header(serve.peer_id);
-        self.reward_header_serve(session, serve).await;
+        if settle_header_serve(&self.network.direct_peers, serve) {
+            self.reward_header_serve(session, serve).await;
+        }
     }
 
     /// Fetch a live header range from the first peer that serves it validly.
     /// With the lane's `head_poll` rotation, the range is the next block at
     /// the head, polled from a small cohort of peers not yet asked for it; a
     /// "not yet" reply then costs a peer nothing until another serves the
-    /// block. Without it, the blocks exist and eligible peers race. The
+    /// block. Without it, the blocks exist and eligible peers race. A verified
+    /// `expected_tip` is requested by hash (see [`live_header_request`]). The
     /// serving peer is rewarded by the caller, once the frames on these
     /// headers complete.
     #[allow(clippy::too_many_lines)]
@@ -5734,7 +6082,13 @@ impl RethP2pSource {
         tried.insert(first.peer.peer_id);
         let mut asked = 1_usize;
         let mut pending = FuturesUnordered::new();
-        pending.push(self.request_live_headers(first, range, policy.priority, cancellation));
+        let request = live_header_request(range, expected_tip);
+        pending.push(self.request_live_headers(
+            first,
+            request.clone(),
+            policy.priority,
+            cancellation,
+        ));
 
         loop {
             while pending.len() < fanout && asked < peer_budget {
@@ -5757,7 +6111,7 @@ impl RethP2pSource {
                 asked = asked.saturating_add(1);
                 pending.push(self.request_live_headers(
                     lease,
-                    range,
+                    request.clone(),
                     policy.priority,
                     cancellation,
                 ));
@@ -5790,7 +6144,7 @@ impl RethP2pSource {
                         asked = asked.saturating_add(1);
                         pending.push(self.request_live_headers(
                             lease,
-                            range,
+                            request.clone(),
                             policy.priority,
                             cancellation,
                         ));
@@ -5823,8 +6177,9 @@ impl RethP2pSource {
             match response {
                 Ok(headers) => {
                     let response_payload_bytes = headers.length();
-                    match validate_headers(range, &headers, expected_tip.map(|tip| tip.hash)) {
-                        Ok(()) => {
+                    let returned = headers.len();
+                    match validate_live_headers(range, expected_tip, headers) {
+                        Ok(headers) => {
                             lease.succeeded();
                             if let Some(rotation) = head_poll.as_deref_mut() {
                                 rotation.record_served(peer_id, Instant::now());
@@ -5833,7 +6188,7 @@ impl RethP2pSource {
                             self.request_metrics.record_header(
                                 false,
                                 usize::try_from(range.len()).unwrap_or(usize::MAX),
-                                headers.len(),
+                                returned,
                                 response_payload_bytes,
                                 elapsed,
                                 P2pRequestOutcome::Succeeded,
@@ -5842,6 +6197,7 @@ impl RethP2pSource {
                                 peer_id,
                                 block: range.end().0,
                                 elapsed,
+                                anchored: expectation == ExpectationTrust::Verified,
                             };
                             return Ok((serve, headers));
                         }
@@ -5850,7 +6206,7 @@ impl RethP2pSource {
                             self.request_metrics.record_header(
                                 false,
                                 usize::try_from(range.len()).unwrap_or(usize::MAX),
-                                headers.len(),
+                                returned,
                                 response_payload_bytes,
                                 elapsed,
                                 P2pRequestOutcome::Failed,
@@ -8307,6 +8663,7 @@ impl LiveSource for RethP2pSource {
                 "execution P2P live source lacks requested finality".to_owned(),
             ));
         }
+        let attested = self.live_attested_heads()?;
         let (anchor, overlap_blocks, retained) = match start {
             LiveStart::Block(block) => (block, 0, None),
             LiveStart::AnchoredOverlap {
@@ -8379,18 +8736,24 @@ impl LiveSource for RethP2pSource {
         } else {
             BlockNumber(anchor.number.0.saturating_add(1))
         };
+        // A retained or cursor tip is no consensus-verified expectation: it
+        // may have been reorged away since. Only the attested head is.
+        let known = attested
+            .peek()
+            .filter(|head| head.block_number == required_peer_head)
+            .map(|head| head.block_hash);
         let (session, last, queued, recent) = if let Some(recent) = retained {
             let (session, _) = self
                 .connect(anchor, NetworkLane::Live, &cancellation)
                 .await?;
-            self.wait_for_peer_head(&session, required_peer_head, &cancellation)
+            self.wait_for_peer_head(&session, required_peer_head, known, &cancellation)
                 .await?;
             (session, anchor, VecDeque::new(), recent)
         } else if overlap_blocks == 0 {
             let (session, _) = self
                 .connect(anchor, NetworkLane::Live, &cancellation)
                 .await?;
-            self.wait_for_peer_head(&session, required_peer_head, &cancellation)
+            self.wait_for_peer_head(&session, required_peer_head, known, &cancellation)
                 .await?;
             (session, anchor, VecDeque::new(), VecDeque::from([anchor]))
         } else {
@@ -8449,7 +8812,8 @@ impl LiveSource for RethP2pSource {
             last,
             queued,
             recent,
-            required_peer_head,
+            attested,
+            ancestry: AttestedAncestry::default(),
             pending_material_attempts: 0,
             head_poll: HeadPollRotation::new(self.config.retry_backoff),
             head_unavailable_since: None,
@@ -8491,245 +8855,291 @@ async fn next_live_event(
             state.disconnect_reported = false;
             return Some((Ok(ChainEvent::Block(Box::new(frame))), state));
         }
-        let (head_number, head_hash) = match state
-            .source
-            .discover_peer_head(
-                &state.session,
-                state.last.number.max(state.required_peer_head),
-                &state.cancellation,
-            )
-            .await
-        {
-            Ok(head) => {
-                state.head_unavailable_since = None;
-                head
-            }
-            Err(P2pError::Cancelled) => return None,
-            Err(error) => {
-                let grace = state
-                    .source
-                    .descriptor
-                    .expected_lag
-                    .max(state.source.config.poll_interval);
+        let batch_blocks = if state.pending_material_attempts == 0 {
+            u64::try_from(state.source.config.material_request_blocks)
+                .expect("material request block bound fits u64")
+        } else {
+            1
+        };
+        let attested = state.attested.latest();
+        match live_step(state.last, attested, &state.ancestry, batch_blocks) {
+            LiveStep::Wait => {
+                // Nothing above the tip is attested yet: include nothing, and
+                // wait for the next attested head, one to two slots.
+                tokio::select! {
+                    () = state.cancellation.cancelled() => return None,
+                    published = state.attested.changed() => {
+                        if !published
+                            && retry_pause(state.source.config.poll_interval, &state.cancellation)
+                                .await
+                                .is_err()
+                        {
+                            return None;
+                        }
+                    }
+                    () = tokio::time::sleep(state.source.config.poll_interval) => {}
+                }
                 let unavailable_for =
                     head_unavailable_for(&mut state.head_unavailable_since, Instant::now());
-                debug!(
-                    required_head = state.last.number.max(state.required_peer_head).0,
-                    ?unavailable_for,
-                    ?grace,
-                    %error,
-                    "live head is temporarily unavailable; retaining the verified tip and retrying peers"
-                );
-                if retry_pause(state.source.config.poll_interval, &state.cancellation)
-                    .await
-                    .is_err()
-                {
-                    return None;
-                }
                 let action = head_unavailable(
                     state.session.manager_is_current().await,
-                    head_unavailable_for(&mut state.head_unavailable_since, Instant::now()),
-                    grace,
+                    unavailable_for,
+                    ATTESTED_HEAD_GRACE,
                 );
                 if action == HeadUnavailable::Retry {
                     continue;
                 }
+                let reason = format!(
+                    "no sync-committee-attested execution head above block {} for {} seconds",
+                    state.last.number.0,
+                    unavailable_for.as_secs()
+                );
+                debug!(%reason, "the live lane is waiting for an attested head");
                 if action == HeadUnavailable::Reconnect {
-                    state.reconnect_error = Some(error.to_string());
+                    state.reconnect_error = Some(reason.clone());
                 }
                 if state.disconnect_reported {
                     continue;
                 }
                 state.disconnect_reported = true;
-                return Some((
-                    Ok(ChainEvent::Disconnected {
-                        reason: error.to_string(),
-                    }),
-                    state,
-                ));
-            }
-        };
-        let next = state.last.number.0.saturating_add(1);
-        if head_number.0 < next {
-            // Peers that answered "not yet" for a block the lane has since
-            // moved past withheld or lagged a block another peer served.
-            for peer_id in state.head_poll.begin_poll(BlockNumber(next)) {
-                state
-                    .source
-                    .network
-                    .direct_peers
-                    .record_material_failure(peer_id, PeerMaterialKind::Header);
-            }
-            match state
-                .source
-                .poll_next_verified_frame(
-                    &state.session,
-                    BlockNumber(next),
-                    &state.request,
-                    state.budget,
-                    &mut state.head_poll,
-                    &state.cancellation,
-                )
-                .await
-            {
-                Ok(Some(frame)) => {
-                    state.pending_material_attempts = 0;
-                    state.head_poll_silent_since = None;
-                    if frame.block.parent_hash != state.last.hash {
-                        // The lane does not go on with this serve: after a
-                        // reorg the block is polled again, and the peers that
-                        // answered "not yet" are judged against that serve.
-                        state.head_poll.serve_failed();
-                        if let Some(event) = reconstruct_reorg_event(&mut state, frame.block).await
-                        {
-                            return Some((Ok(event), state));
-                        }
-                        continue;
-                    }
-                    state.queued.push_back(frame);
-                    continue;
-                }
-                Ok(None) => {
-                    state.pending_material_attempts = 0;
-                    state.head_poll_silent_since = None;
-                    if retry_pause(state.source.config.poll_interval, &state.cancellation)
-                        .await
-                        .is_err()
-                    {
-                        return None;
-                    }
-                }
-                Err(P2pError::Cancelled) => return None,
-                Err(error) => {
-                    state.head_poll.serve_failed();
-                    let manager_current = state.session.manager_is_current().await;
-                    let grace = state
-                        .source
-                        .descriptor
-                        .expected_lag
-                        .max(state.source.config.poll_interval);
-                    let (delay, report) = match head_poll_failure(
-                        &state.source.config,
-                        &mut state.pending_material_attempts,
-                        &mut state.head_poll_silent_since,
-                        Instant::now(),
-                        grace,
-                        &error,
-                        manager_current,
-                    ) {
-                        HeadPollFailure::Retry(delay) => (delay, false),
-                        HeadPollFailure::Report(delay) => (delay, true),
-                        HeadPollFailure::Reconnect => {
-                            let reason = error.to_string();
-                            state.reconnect_error = Some(reason.clone());
-                            return Some((Ok(ChainEvent::Disconnected { reason }), state));
-                        }
-                    };
-                    debug!(
-                        attempt = state.pending_material_attempts,
-                        ?delay,
-                        %error,
-                        "latest execution material is not available yet; retrying on the active peer pool"
-                    );
-                    if retry_pause(delay, &state.cancellation).await.is_err() {
-                        return None;
-                    }
-                    if report && !state.disconnect_reported {
-                        state.disconnect_reported = true;
-                        return Some((
-                            Ok(ChainEvent::Disconnected {
-                                reason: error.to_string(),
-                            }),
-                            state,
-                        ));
-                    }
-                    continue;
-                }
-            }
-            continue;
-        }
-        let end = if state.pending_material_attempts == 0 {
-            head_number.0.min(
-                next.saturating_add(
-                    u64::try_from(state.source.config.material_request_blocks)
-                        .expect("material request block bound fits u64")
-                        .saturating_sub(1),
-                ),
-            )
-        } else {
-            next
-        };
-        let range = match BlockRange::new(BlockNumber(next), BlockNumber(end)) {
-            Ok(range) => range,
-            Err(error) => {
-                state.terminal = true;
-                return Some((Err(SourceError::Protocol(error.to_string())), state));
-            }
-        };
-        // The discovered head is a peer claim: peers that contradict it are
-        // not penalized for it.
-        let expected_tip = (end == head_number.0).then_some(ExpectedTip {
-            hash: head_hash,
-            trust: ExpectationTrust::Unverified,
-        });
-        let frames = state
-            .source
-            .fetch_requested_live_range(
-                &state.session,
-                range,
-                expected_tip,
-                &state.request,
-                state.budget,
-                &state.cancellation,
-            )
-            .await;
-        let (frames, _) = match frames {
-            Ok(result) => {
-                state.pending_material_attempts = 0;
-                result
-            }
-            Err(P2pError::Cancelled) => return None,
-            Err(error) => {
-                let manager_current = state.session.manager_is_current().await;
-                if let Some(delay) = pending_live_material_delay(
-                    &state.source.config,
-                    &mut state.pending_material_attempts,
-                    &error,
-                    false,
-                    manager_current,
-                ) {
-                    debug!(
-                        attempt = state.pending_material_attempts,
-                        ?delay,
-                        %error,
-                        "latest execution material is not available yet; retrying on the active peer pool"
-                    );
-                    if retry_pause(delay, &state.cancellation).await.is_err() {
-                        return None;
-                    }
-                    continue;
-                }
-                let reason = error.to_string();
-                state.reconnect_error = Some(reason.clone());
                 return Some((Ok(ChainEvent::Disconnected { reason }), state));
             }
-        };
-        // A branch that does not extend the tip is reconstructed from where it
-        // forks, not from the head discovered far ahead.
-        if let Some(first) = frames.first()
-            && first.block.parent_hash != state.last.hash
-        {
-            if let Some(event) = reconstruct_reorg_event(&mut state, first.block).await {
-                return Some((Ok(event), state));
+            LiveStep::Anchor { from, head } => {
+                state.head_unavailable_since = None;
+                match state
+                    .source
+                    .anchor_attested_ancestry(&state.session, from, head, &state.cancellation)
+                    .await
+                {
+                    Ok(ancestry) => state.ancestry = ancestry,
+                    Err(P2pError::Cancelled) => return None,
+                    Err(error) => {
+                        // The next attempt proves the chain of the newest
+                        // attested head.
+                        state.ancestry.invalidate();
+                        let manager_current = state.session.manager_is_current().await;
+                        if let Some(delay) = pending_live_material_delay(
+                            &state.source.config,
+                            &mut state.pending_material_attempts,
+                            &error,
+                            false,
+                            manager_current,
+                        ) {
+                            debug!(
+                                attempt = state.pending_material_attempts,
+                                ?delay,
+                                %error,
+                                "the attested head's ancestry is not served yet; retrying on the active peer pool"
+                            );
+                            if retry_pause(delay, &state.cancellation).await.is_err() {
+                                return None;
+                            }
+                            continue;
+                        }
+                        let reason = error.to_string();
+                        state.reconnect_error = Some(reason.clone());
+                        return Some((Ok(ChainEvent::Disconnected { reason }), state));
+                    }
+                }
             }
-            continue;
+            LiveStep::Poll { block, tip } => {
+                state.head_unavailable_since = None;
+                // Peers that answered "not yet" for a block the lane has since
+                // moved past withheld or lagged a block another peer served.
+                for peer_id in state.head_poll.begin_poll(block) {
+                    state
+                        .source
+                        .network
+                        .direct_peers
+                        .record_material_failure(peer_id, PeerMaterialKind::Header);
+                }
+                match state
+                    .source
+                    .poll_next_verified_frame(
+                        &state.session,
+                        block,
+                        tip,
+                        &state.request,
+                        state.budget,
+                        &mut state.head_poll,
+                        &state.cancellation,
+                    )
+                    .await
+                {
+                    Ok(Some(frame)) => {
+                        state.pending_material_attempts = 0;
+                        state.head_poll_silent_since = None;
+                        if frame.block.parent_hash != state.last.hash {
+                            // The lane does not go on with this serve: after a
+                            // reorg the block is polled again, and the peers that
+                            // answered "not yet" are judged against that serve.
+                            // The frame is the attested head itself: verified
+                            // evidence that the tip is no longer its ancestor.
+                            state.head_poll.serve_failed();
+                            if let Some(event) =
+                                reconstruct_reorg_event(&mut state, frame.block, tip.trust).await
+                            {
+                                return Some((Ok(event), state));
+                            }
+                            continue;
+                        }
+                        state.queued.push_back(frame);
+                    }
+                    Ok(None) => {
+                        state.pending_material_attempts = 0;
+                        state.head_poll_silent_since = None;
+                        if retry_pause(state.source.config.poll_interval, &state.cancellation)
+                            .await
+                            .is_err()
+                        {
+                            return None;
+                        }
+                    }
+                    Err(P2pError::Cancelled) => return None,
+                    Err(error) => {
+                        state.head_poll.serve_failed();
+                        let manager_current = state.session.manager_is_current().await;
+                        let grace = state
+                            .source
+                            .descriptor
+                            .expected_lag
+                            .max(state.source.config.poll_interval);
+                        let (delay, report) = match head_poll_failure(
+                            &state.source.config,
+                            &mut state.pending_material_attempts,
+                            &mut state.head_poll_silent_since,
+                            Instant::now(),
+                            grace,
+                            &error,
+                            manager_current,
+                        ) {
+                            HeadPollFailure::Retry(delay) => (delay, false),
+                            HeadPollFailure::Report(delay) => (delay, true),
+                            HeadPollFailure::Reconnect => {
+                                let reason = error.to_string();
+                                state.reconnect_error = Some(reason.clone());
+                                return Some((Ok(ChainEvent::Disconnected { reason }), state));
+                            }
+                        };
+                        debug!(
+                            attempt = state.pending_material_attempts,
+                            ?delay,
+                            %error,
+                            "latest execution material is not available yet; retrying on the active peer pool"
+                        );
+                        if retry_pause(delay, &state.cancellation).await.is_err() {
+                            return None;
+                        }
+                        if report && !state.disconnect_reported {
+                            state.disconnect_reported = true;
+                            return Some((
+                                Ok(ChainEvent::Disconnected {
+                                    reason: error.to_string(),
+                                }),
+                                state,
+                            ));
+                        }
+                    }
+                }
+            }
+            LiveStep::CatchUp { range } => {
+                state.head_unavailable_since = None;
+                // The batch's headers were proven by hash, down from an
+                // attested head.
+                let (headers, header_peer, settle) = state
+                    .ancestry
+                    .take(usize::try_from(range.len()).unwrap_or(usize::MAX));
+                // A proven chain that does not extend the tip shows the tip
+                // is no ancestor of the attested head: verified evidence of
+                // a reorg, reconstructed from where it forks.
+                if let Some(first) = headers.first()
+                    && block_hash(first.parent_hash) != state.last.hash
+                {
+                    debug!(
+                        tip = state.last.number.0,
+                        attested_head = ?state.ancestry.head.map(|head| head.block_number.0),
+                        "the attested head's proven chain does not extend the lane's tip"
+                    );
+                    state.ancestry.invalidate();
+                    let mismatching = header_block_ref(first);
+                    if let Some(event) =
+                        reconstruct_reorg_event(&mut state, mismatching, ExpectationTrust::Verified)
+                            .await
+                    {
+                        return Some((Ok(event), state));
+                    }
+                    continue;
+                }
+                let frames = match header_peer {
+                    Some(header_peer) => {
+                        state
+                            .source
+                            .fetch_live_range_material(
+                                &state.session,
+                                range,
+                                &headers,
+                                header_peer,
+                                settle,
+                                &state.request,
+                                state.budget,
+                                &state.cancellation,
+                            )
+                            .await
+                    }
+                    None => Err(P2pError::IncompleteResponse {
+                        component: "headers",
+                        returned: 0,
+                        expected: headers.len(),
+                    }),
+                };
+                let (frames, _) = match frames {
+                    Ok(result) => {
+                        state.pending_material_attempts = 0;
+                        result
+                    }
+                    Err(P2pError::Cancelled) => return None,
+                    Err(error) => {
+                        // The next attempt proves the chain of the newest
+                        // attested head again: this one may have been
+                        // reorged away.
+                        debug!(
+                            attested_head = ?state.ancestry.head.map(|head| head.block_number.0),
+                            %error,
+                            "catch-up on the attested head's proven chain failed; proving it again"
+                        );
+                        state.ancestry.invalidate();
+                        let manager_current = state.session.manager_is_current().await;
+                        if let Some(delay) = pending_live_material_delay(
+                            &state.source.config,
+                            &mut state.pending_material_attempts,
+                            &error,
+                            false,
+                            manager_current,
+                        ) {
+                            debug!(
+                                attempt = state.pending_material_attempts,
+                                ?delay,
+                                %error,
+                                "latest execution material is not available yet; retrying on the active peer pool"
+                            );
+                            if retry_pause(delay, &state.cancellation).await.is_err() {
+                                return None;
+                            }
+                            continue;
+                        }
+                        let reason = error.to_string();
+                        state.reconnect_error = Some(reason.clone());
+                        return Some((Ok(ChainEvent::Disconnected { reason }), state));
+                    }
+                };
+                // Validated headers linked to the verified tip are the heads
+                // the session observes.
+                if let Some(tip) = frames.last() {
+                    state.session.observe_head(tip.block.number);
+                }
+                state.queued.extend(frames);
+            }
         }
-        // Validated headers linked to the verified tip are the heads the
-        // session observes; the claimed head above them is not.
-        if let Some(tip) = frames.last() {
-            state.session.observe_head(tip.block.number);
-        }
-        state.queued.extend(frames);
     }
 }
 
@@ -9042,16 +9452,19 @@ async fn reconnect_live_session(
     }
 }
 
-/// Reconstruct the reorg that `mismatching` reveals. Returns the event to
-/// emit, or `None` when the lane only retries.
+/// Reconstruct the reorg that `mismatching` reveals. `evidence` is how the
+/// mismatching frame was checked: anchored to an attested head, it proves the
+/// tip was reorged away. Returns the event to emit, or `None` when the lane
+/// only retries.
 async fn reconstruct_reorg_event(
     state: &mut P2pLiveState,
     mismatching: BlockRef,
+    evidence: ExpectationTrust,
 ) -> Option<ChainEvent> {
     let source = state.source.clone();
     let (head_number, head_hash) = reorg_reconstruction_tip(state.last, mismatching);
     let error = match source
-        .reconstruct_reorg(state, head_number, head_hash)
+        .reconstruct_reorg(state, head_number, head_hash, evidence)
         .await
     {
         Ok((reverted, applied, new_tip)) => {
@@ -9060,12 +9473,13 @@ async fn reconstruct_reorg_event(
             }
             state.recent.extend(applied.iter().map(|frame| frame.block));
             state.last = new_tip;
+            state.ancestry = AttestedAncestry::default();
             state.disconnect_reported = false;
             return Some(ChainEvent::Reorg { reverted, applied });
         }
         Err(error) => error,
     };
-    match reorg_failure(&error, &mut state.disconnect_reported) {
+    match reorg_failure(&error, evidence, &mut state.disconnect_reported) {
         ReorgFailure::Reset => {
             state.terminal = true;
             Some(ChainEvent::Reset {
@@ -9116,8 +9530,19 @@ enum ReorgFailure {
 /// window, and a retry otherwise, such as for a peer without the branch or a
 /// timeout. The lane reports itself disconnected once, unless it has already
 /// since its last progress.
-const fn reorg_failure(error: &P2pError, disconnect_reported: &mut bool) -> ReorgFailure {
-    if matches!(error, P2pError::ReorgTooDeep { .. }) {
+///
+/// Only verified `evidence`, a mismatching frame anchored to an attested
+/// head, can prove the branch: a fabricated frame and a fabricated
+/// descending chain that never joins the window would otherwise reset the
+/// lane.
+const fn reorg_failure(
+    error: &P2pError,
+    evidence: ExpectationTrust,
+    disconnect_reported: &mut bool,
+) -> ReorgFailure {
+    if matches!(error, P2pError::ReorgTooDeep { .. })
+        && matches!(evidence, ExpectationTrust::Verified)
+    {
         ReorgFailure::Reset
     } else if *disconnect_reported {
         ReorgFailure::Retry
@@ -12984,6 +13409,29 @@ mod tests {
         assert!(matches!(result, Err(SourceError::InvalidPlan(_))));
     }
 
+    #[tokio::test]
+    async fn live_subscriptions_follow_only_heads_a_finality_source_publishes() {
+        let source = RethP2pSource::mainnet(RethP2pConfig::default()).expect("source");
+        // Without a finality source's heads, nothing bounds what the lane
+        // includes: live subscriptions fail closed, before networking.
+        assert!(
+            matches!(
+                source.live_attested_heads(),
+                Err(SourceError::InvalidPlan(reason)) if reason.contains("attested heads")
+            ),
+            "a live source without attested heads would follow peers"
+        );
+        // With them, the source follows what the finality source publishes,
+        // through a receiver that cannot publish.
+        let heads = leani_source_api::AttestedHeadPublisher::new();
+        let source = source.with_attested_heads(heads.subscribe());
+        let mut following = source.live_attested_heads().expect("attested heads");
+        let chain = header_chain(B256::ZERO, 100..=100, 0);
+        let head = attested(&chain[0], 3);
+        assert!(heads.publish(head));
+        assert_eq!(following.latest(), Some(head));
+    }
+
     #[test]
     fn failed_responses_are_invalid_only_against_verified_expectations() {
         use ExpectationTrust::{Unverified, Verified};
@@ -14122,7 +14570,7 @@ mod tests {
             },
         ] {
             assert_ne!(
-                reorg_failure(&retryable, &mut false),
+                reorg_failure(&retryable, ExpectationTrust::Verified, &mut false),
                 ReorgFailure::Reset,
                 "{retryable}"
             );
@@ -14133,7 +14581,10 @@ mod tests {
         let descending = unrelated.iter().rev().take(65).cloned().collect::<Vec<_>>();
         let too_deep = plan_reorg(&recent, &descending).expect_err("no common block");
         assert!(matches!(too_deep, P2pError::ReorgTooDeep { .. }));
-        assert_eq!(reorg_failure(&too_deep, &mut false), ReorgFailure::Reset);
+        assert_eq!(
+            reorg_failure(&too_deep, ExpectationTrust::Verified, &mut false),
+            ReorgFailure::Reset
+        );
     }
 
     fn receipt(cumulative_gas_used: u64) -> Receipt {
@@ -14755,16 +15206,23 @@ mod tests {
             component: "reorg headers",
         };
         let mut reported = false;
-        assert_eq!(reorg_failure(&timeout, &mut reported), ReorgFailure::Report);
         assert_eq!(
-            reorg_failure(&timeout, &mut reported),
+            reorg_failure(&timeout, ExpectationTrust::Verified, &mut reported),
+            ReorgFailure::Report
+        );
+        assert_eq!(
+            reorg_failure(&timeout, ExpectationTrust::Verified, &mut reported),
             ReorgFailure::Retry,
             "every reorg retry reported the lane disconnected again"
         );
         assert!(reported);
         // A reorg proven deeper than the window still resets.
         assert_eq!(
-            reorg_failure(&P2pError::ReorgTooDeep { maximum: 64 }, &mut reported),
+            reorg_failure(
+                &P2pError::ReorgTooDeep { maximum: 64 },
+                ExpectationTrust::Verified,
+                &mut reported
+            ),
             ReorgFailure::Reset
         );
     }
@@ -14811,5 +15269,458 @@ mod tests {
             pending_live_material_delay(&source.config, &mut 0, &withheld, true, true),
             None
         );
+    }
+
+    /// `header` as a head the sync committee attested at `beacon_slot`.
+    fn attested(header: &Header, beacon_slot: u64) -> AttestedHead {
+        AttestedHead {
+            beacon_slot,
+            beacon_block_root: [0xa7; 32],
+            block_number: BlockNumber(header.number),
+            block_hash: block_hash(header.hash_slow()),
+        }
+    }
+
+    /// A header served by an honest peer on `chain`: `validate_live_headers`
+    /// input for a request by `tip`'s hash, falling, of `range`.
+    fn falling_reply(chain: &[Header], range: BlockRange) -> Vec<Header> {
+        chain
+            .iter()
+            .filter(|header| range.contains(BlockNumber(header.number)))
+            .rev()
+            .cloned()
+            .collect()
+    }
+
+    fn verified(header: &Header) -> ExpectedTip {
+        ExpectedTip {
+            hash: block_hash(header.hash_slow()),
+            trust: ExpectationTrust::Verified,
+        }
+    }
+
+    #[test]
+    fn blocks_above_the_attested_head_are_never_fetched_as_included() {
+        let chain = header_chain(B256::ZERO, 100..=102, 0);
+        let last = block_ref(&chain[1]);
+        let ancestry = AttestedAncestry::default();
+        // With no attested head, or none above the tip, the lane fetches
+        // nothing: a peer's child of the tip, however self-consistent, is
+        // never included.
+        for attested_head in [
+            None,
+            Some(attested(&chain[0], 9)),
+            Some(attested(&chain[1], 10)),
+        ] {
+            assert_eq!(
+                live_step(last, attested_head, &ancestry, 8),
+                LiveStep::Wait,
+                "the lane fetched above {attested_head:?}"
+            );
+        }
+        // Once block 102 is attested, it is polled by the attested hash.
+        let head = attested(&chain[2], 11);
+        let LiveStep::Poll { block, tip } = live_step(last, Some(head), &ancestry, 8) else {
+            panic!("the attested head is not polled");
+        };
+        assert_eq!(block, BlockNumber(102));
+        assert_eq!(
+            tip,
+            ExpectedTip {
+                hash: head.block_hash,
+                trust: ExpectationTrust::Verified
+            }
+        );
+        // A fabricated child served for that hash breaks the protocol: its
+        // peer is invalid, and banned even at the head.
+        let range = BlockRange::single(block);
+        let fabricated = header_chain(chain[1].hash_slow(), 102..=102, 7);
+        let error = validate_live_headers(range, Some(tip), fabricated)
+            .expect_err("another header for the attested hash");
+        assert_eq!(
+            classify_response_failure(&error, tip.trust),
+            ResponseFault::Invalid
+        );
+        assert_eq!(
+            live_header_reply_cost(&error, tip.trust, true),
+            HeaderReplyCost::Ban
+        );
+        assert_eq!(
+            validate_live_headers(range, Some(tip), chain[2..].to_vec()).expect("attested header"),
+            chain[2..]
+        );
+        // Waiting a missed slot or two keeps readiness; four slots without an
+        // attested head report the lane disconnected.
+        assert_eq!(
+            head_unavailable(true, Duration::from_secs(36), ATTESTED_HEAD_GRACE),
+            HeadUnavailable::Retry
+        );
+        assert_eq!(
+            head_unavailable(true, ATTESTED_HEAD_GRACE, ATTESTED_HEAD_GRACE),
+            HeadUnavailable::Report
+        );
+    }
+
+    #[test]
+    fn verified_tips_are_requested_by_hash_so_honest_peers_on_another_branch_are_not_banned() {
+        let chain = header_chain(B256::ZERO, 100..=102, 0);
+        // A sibling of the attested block 102, on a branch an honest peer
+        // follows because the attested head, which is not final, was reorged.
+        let sibling = header_chain(chain[1].hash_slow(), 102..=102, 9);
+        let tip = Some(verified(&chain[2]));
+        // The attested block is requested by its hash, descending, never by
+        // its number: the peer's own block at that number is never compared.
+        for range in [
+            BlockRange::single(BlockNumber(102)),
+            BlockRange::new(BlockNumber(100), BlockNumber(102)).expect("range"),
+        ] {
+            let request = live_header_request(range, tip);
+            assert_eq!(
+                request.start,
+                BlockHashOrNumber::Hash(chain[2].hash_slow()),
+                "{range:?} was requested by number"
+            );
+            assert_eq!(request.direction, HeadersDirection::Falling);
+            assert_eq!(request.limit, range.len());
+        }
+        // The honest peer lacks the attested block and answers with none: a
+        // disagreement, never a ban.
+        let range = BlockRange::single(BlockNumber(102));
+        let empty = validate_live_headers(range, tip, Vec::new()).expect_err("no header");
+        assert_eq!(
+            classify_response_failure(&empty, ExpectationTrust::Verified),
+            ResponseFault::Disagreement
+        );
+        assert_eq!(
+            live_header_reply_cost(&empty, ExpectationTrust::Verified, true),
+            HeaderReplyCost::NotYet
+        );
+        assert_eq!(
+            live_header_reply_cost(&empty, ExpectationTrust::Verified, false),
+            HeaderReplyCost::Cooldown
+        );
+        // Serving its sibling for the requested hash breaks the protocol.
+        let other = validate_live_headers(range, tip, sibling.clone()).expect_err("sibling");
+        assert_eq!(
+            live_header_reply_cost(&other, ExpectationTrust::Verified, false),
+            HeaderReplyCost::Ban
+        );
+        // Unverified tips stay by number, and a mismatch is a disagreement.
+        let claimed = Some(ExpectedTip {
+            hash: block_hash(chain[2].hash_slow()),
+            trust: ExpectationTrust::Unverified,
+        });
+        assert_eq!(
+            live_header_request(range, claimed).start,
+            BlockHashOrNumber::Number(102)
+        );
+        let mismatch = validate_live_headers(range, claimed, sibling).expect_err("mismatch");
+        assert_eq!(
+            classify_response_failure(&mismatch, ExpectationTrust::Unverified),
+            ResponseFault::Disagreement
+        );
+        // A ranged reply by hash comes back lowest first; a short one is
+        // incomplete, and one with more headers than requested is invalid.
+        let whole = BlockRange::new(BlockNumber(100), BlockNumber(102)).expect("range");
+        assert_eq!(
+            validate_live_headers(whole, tip, falling_reply(&chain, whole)).expect("chain"),
+            chain
+        );
+        let short = validate_live_headers(whole, tip, falling_reply(&chain, range))
+            .expect_err("short reply");
+        assert_eq!(
+            classify_response_failure(&short, ExpectationTrust::Verified),
+            ResponseFault::Disagreement
+        );
+        let mut long = falling_reply(&chain, whole);
+        long.push(header_chain(B256::ZERO, 99..=99, 0).remove(0));
+        let long = validate_live_headers(range, tip, long).expect_err("long reply");
+        assert_eq!(
+            classify_response_failure(&long, ExpectationTrust::Verified),
+            ResponseFault::Invalid
+        );
+    }
+
+    fn header_serve(peer: u8, block: u64) -> HeaderServe {
+        HeaderServe {
+            peer_id: B512::from([peer; 64]),
+            block,
+            elapsed: Duration::from_millis(5),
+            anchored: true,
+        }
+    }
+
+    #[test]
+    fn catch_up_batches_come_from_headers_the_attested_head_proved() {
+        let chain = header_chain(B256::ZERO, 100..=140, 0);
+        let last = block_ref(&chain[0]);
+        let head = attested(&chain[40], 20);
+        // Without proven headers, the lane first proves the chain down from
+        // the attested head.
+        let mut ancestry = AttestedAncestry::default();
+        assert_eq!(
+            live_step(last, Some(head), &ancestry, 8),
+            LiveStep::Anchor {
+                from: BlockNumber(101),
+                head
+            }
+        );
+        let serve = header_serve(0x51, 140);
+        ancestry = AttestedAncestry::proven(head, serve, chain[1..].to_vec());
+        assert_eq!(ancestry.head, Some(head));
+        // Batches then come from those headers, which are fetched once. The
+        // serve that proved them is settled with the first frames.
+        assert_eq!(
+            live_step(last, Some(head), &ancestry, 8),
+            LiveStep::CatchUp {
+                range: BlockRange::new(BlockNumber(101), BlockNumber(108)).expect("range")
+            }
+        );
+        let (headers, peer, settle) = ancestry.take(8);
+        assert_eq!(headers, chain[1..=8]);
+        assert_eq!(peer, Some(serve.peer_id));
+        assert!(settle.is_some_and(|settled| settled.peer_id == serve.peer_id));
+        let last = block_ref(&chain[8]);
+        let (_, peer, settle) = ancestry.take(1);
+        assert_eq!(peer, Some(serve.peer_id));
+        assert!(settle.is_none(), "one serve was settled twice");
+        // After a failure, one block at a time.
+        let last = BlockRef {
+            number: BlockNumber(109),
+            ..last
+        };
+        assert_eq!(
+            live_step(last, Some(head), &ancestry, 1),
+            LiveStep::CatchUp {
+                range: BlockRange::single(BlockNumber(110))
+            }
+        );
+        // Never above the newest attested head, even with headers an older
+        // one proved.
+        let lower = attested(&chain[15], 21);
+        assert_eq!(
+            live_step(last, Some(lower), &ancestry, 8),
+            LiveStep::CatchUp {
+                range: BlockRange::new(BlockNumber(110), BlockNumber(115)).expect("range")
+            }
+        );
+        // Invalidated, they are proven again from the newest attested head.
+        ancestry.invalidate();
+        assert_eq!(ancestry.head, None);
+        assert_eq!(
+            live_step(last, Some(head), &ancestry, 8),
+            LiveStep::Anchor {
+                from: BlockNumber(110),
+                head
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn attested_ancestry_windows_walk_down_by_verified_hashes() {
+        let chain = header_chain(B256::ZERO, 1..=3_000, 0);
+        let prove = |from: u64, head: u64| {
+            let chain = chain.clone();
+            async move {
+                let requests = std::sync::Mutex::new(Vec::new());
+                let head = attested(&chain[usize::try_from(head - 1).expect("index")], 30);
+                let proven = prove_attested_ancestry(BlockNumber(from), head, |range, top| {
+                    requests
+                        .lock()
+                        .expect("requests")
+                        .push((range.start().0, range.end().0));
+                    let window = chain
+                        .iter()
+                        .filter(|header| range.contains(BlockNumber(header.number)))
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    // Each window is requested by the hash of its top block.
+                    let proven = window
+                        .last()
+                        .is_some_and(|tip| block_hash(tip.hash_slow()) == top);
+                    async move {
+                        if proven {
+                            Ok((header_serve(0x61, range.end().0), window))
+                        } else {
+                            Err(P2pError::InvalidResponse("unproven window".to_owned()))
+                        }
+                    }
+                })
+                .await;
+                (proven, requests.into_inner().expect("requests"))
+            }
+        };
+        // One block, and exactly one full window.
+        let (proven, requests) = prove(2_000, 2_000).await;
+        assert_eq!(requests, [(2_000, 2_000)]);
+        assert_eq!(proven.expect("proven").first(), Some(2_000));
+        let (proven, requests) = prove(1_000, 2_023).await;
+        assert_eq!(requests, [(1_000, 2_023)]);
+        assert_eq!(proven.expect("proven").headers.len(), 1_024);
+        // One more: the top window holds the rest, so the kept lowest one is
+        // full.
+        let (proven, requests) = prove(1_000, 2_024).await;
+        assert_eq!(requests, [(2_024, 2_024), (1_000, 2_023)]);
+        let proven = proven.expect("proven");
+        assert_eq!((proven.first(), proven.headers.len()), (Some(1_000), 1_024));
+        assert_eq!(
+            proven.head.map(|head| head.block_number),
+            Some(BlockNumber(2_024))
+        );
+        let (proven, requests) = prove(500, 2_548).await;
+        assert_eq!(requests, [(2_548, 2_548), (1_524, 2_547), (500, 1_523)]);
+        assert_eq!(proven.expect("proven").first(), Some(500));
+        // A head below the lane's next block proves nothing.
+        let (proven, requests) = prove(2_001, 2_000).await;
+        assert!(matches!(proven, Err(P2pError::InvalidConfig(_))));
+        assert!(requests.is_empty());
+    }
+
+    #[test]
+    fn a_reorg_of_the_attested_head_during_catch_up_reanchors_without_banning_honest_peers() {
+        // The lane catches up on branch A, proven by attested head A140.
+        let branch_a = header_chain(B256::ZERO, 100..=140, 0);
+        let at_a = |number: u64| &branch_a[usize::try_from(number - 100).expect("index")];
+        let head_a = attested(at_a(140), 40);
+        let mut ancestry =
+            AttestedAncestry::proven(head_a, header_serve(0x71, 140), branch_a[1..].to_vec());
+        let mut recent = branch_a[..=8]
+            .iter()
+            .map(block_ref)
+            .collect::<VecDeque<_>>();
+        let _ = ancestry.take(8);
+        let last = block_ref(at_a(108));
+        // Meanwhile the network reorged below block 105: the newest attested
+        // head is B150, and honest peers follow branch B.
+        let branch_b = header_chain(at_a(104).hash_slow(), 105..=150, 1);
+        let at_b = |number: u64| &branch_b[usize::try_from(number - 105).expect("index")];
+        let head_b = attested(at_b(150), 41);
+        // The next batch still comes from branch A's proven headers. An
+        // honest peer asked for them by hash lacks the reorged blocks and
+        // answers with none: a disagreement, never a ban.
+        let LiveStep::CatchUp { range } = live_step(last, Some(head_b), &ancestry, 8) else {
+            panic!("no catch-up from the proven headers");
+        };
+        assert_eq!(
+            range,
+            BlockRange::new(BlockNumber(109), BlockNumber(116)).expect("range")
+        );
+        let stale = Some(verified(at_a(116)));
+        let empty = validate_live_headers(range, stale, Vec::new()).expect_err("reorged away");
+        assert_ne!(
+            live_header_reply_cost(&empty, ExpectationTrust::Verified, false),
+            HeaderReplyCost::Ban,
+            "an honest peer was banned for a reorged attested block"
+        );
+        // The failed batch invalidates the proof, and the lane proves the
+        // chain of the newest attested head instead.
+        ancestry.invalidate();
+        let LiveStep::Anchor { from, head } = live_step(last, Some(head_b), &ancestry, 8) else {
+            panic!("the lane kept following the reorged branch");
+        };
+        assert_eq!((from, head), (BlockNumber(109), head_b));
+        // Honest peers serve that chain by hash.
+        let window = BlockRange::new(from, head_b.block_number).expect("range");
+        let proven = validate_live_headers(
+            window,
+            Some(verified(at_b(150))),
+            falling_reply(&branch_b, window),
+        )
+        .expect("the attested chain");
+        ancestry = AttestedAncestry::proven(head_b, header_serve(0x72, 150), proven);
+        // Its first block does not extend the tip: verified evidence of the
+        // reorg, reconstructed from the parent it names.
+        let (headers, _, _) = ancestry.take(8);
+        let first = header_block_ref(&headers[0]);
+        assert_ne!(first.parent_hash, last.hash);
+        let (number, hash) = reorg_reconstruction_tip(last, first);
+        assert_eq!(
+            (number, hash),
+            (BlockNumber(108), block_hash(at_b(108).hash_slow()))
+        );
+        let descending = branch_a[..=4]
+            .iter()
+            .chain(&branch_b[..=3])
+            .rev()
+            .cloned()
+            .collect::<Vec<_>>();
+        validate_descending_headers(number, hash, &descending).expect("branch B down to A100");
+        recent.truncate(9);
+        let (ancestor, reverted) = plan_reorg(&recent, &descending).expect("the fork");
+        assert_eq!(ancestor.number, BlockNumber(104));
+        assert_eq!(
+            reverted
+                .iter()
+                .map(|block| block.number.0)
+                .collect::<Vec<_>>(),
+            [108, 107, 106, 105]
+        );
+    }
+
+    #[test]
+    fn only_verified_evidence_resets_the_lane() {
+        let (recent, _) = reorged_live_window();
+        let last = *recent.back().expect("the lane's tip");
+        // A peer fabricates a frame past the tip that does not extend it, and
+        // a descending chain below the parent it names that never joins the
+        // retained window.
+        let fabricated = header_chain(B256::repeat_byte(0x42), 1_000..=1_101, 3);
+        let mismatching = block_ref(&fabricated[101]);
+        let (number, hash) = reorg_reconstruction_tip(last, mismatching);
+        let descending = fabricated[..=100]
+            .iter()
+            .rev()
+            .take(65)
+            .cloned()
+            .collect::<Vec<_>>();
+        validate_descending_headers(number, hash, &descending)
+            .expect("a self-consistent fabrication");
+        let too_deep = plan_reorg(&recent, &descending).expect_err("no common block");
+        assert!(matches!(too_deep, P2pError::ReorgTooDeep { .. }));
+        // Unanchored, that proves nothing: the lane reports once and looks
+        // for the branch again, and never resets.
+        let mut reported = false;
+        assert_eq!(
+            reorg_failure(&too_deep, ExpectationTrust::Unverified, &mut reported),
+            ReorgFailure::Report,
+            "unverified peer material reset the lane"
+        );
+        assert_eq!(
+            reorg_failure(&too_deep, ExpectationTrust::Unverified, &mut reported),
+            ReorgFailure::Retry
+        );
+        // Anchored to an attested head, the same proof resets.
+        assert_eq!(
+            reorg_failure(&too_deep, ExpectationTrust::Verified, &mut reported),
+            ReorgFailure::Reset
+        );
+    }
+
+    #[test]
+    fn only_anchored_headers_clear_withheld_strikes_or_earn_rewards() {
+        let (pool, peers, _receivers) = header_peer_pool(&[0xe7]);
+        let peer_id = peers[0];
+        pool.strike_withheld_header(peer_id);
+        let serve = |anchored| HeaderServe {
+            peer_id,
+            block: 101,
+            elapsed: Duration::from_millis(5),
+            anchored,
+        };
+        // A bloom-negative filtered-log frame completes without a body or
+        // receipts. Its header, checked against no verified hash, may be
+        // fabricated: it clears nothing and earns nothing.
+        assert!(
+            !settle_header_serve(&pool, serve(false)),
+            "an unanchored header earned its reward"
+        );
+        assert_eq!(
+            withheld_strike(&pool, peer_id).0,
+            1,
+            "an unanchored header cleared the strike"
+        );
+        // An anchored one does both.
+        assert!(settle_header_serve(&pool, serve(true)));
+        assert_eq!(withheld_strike(&pool, peer_id).0, 0);
     }
 }

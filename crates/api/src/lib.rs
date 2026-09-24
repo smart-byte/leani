@@ -11030,6 +11030,7 @@ mod tests {
         .expect("store");
         let processor = Arc::new(BlockLocalCounter::default());
         let mut parent = BlockHash::ZERO;
+        let mut hashes = Vec::new();
         for number in 0..=4 {
             let mut frame = fixture_frame(number, parent);
             frame.finality = Finality::Included;
@@ -11053,9 +11054,10 @@ mod tests {
                 .await
                 .expect("apply");
             parent = frame.block.hash;
+            hashes.push(parent);
         }
         store
-            .mark_finalized(processor.descriptor(), BlockNumber(2))
+            .mark_finalized(processor.descriptor(), BlockNumber(2), hashes[2])
             .await
             .expect("mark finalized");
 

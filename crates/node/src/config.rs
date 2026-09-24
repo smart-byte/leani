@@ -1597,7 +1597,7 @@ impl Config {
         {
             errors.push(ValidationError::new(
                 "sources.live/finality",
-                "the P2P live source requires verified beacon_api or consensus_p2p finality",
+                "the P2P live source requires verified beacon_api or consensus_p2p finality: a block is included only once its ancestry reaches an execution header the sync committee attested, which the finality source verifies; set finality.kind, or sources.live.kind = \"disabled\" for finalized-dataset backfills",
             ));
         }
         if self.processors.is_empty() {
@@ -3043,6 +3043,30 @@ verification_segment_blocks = 8192"#,
         config
             .validate()
             .map_or_else(|errors| errors.0, |_| Vec::new())
+    }
+
+    #[test]
+    fn live_following_without_finality_is_refused() {
+        // Without verified finality nothing verifies the attested heads that
+        // bound what the P2P live lane includes.
+        let mut config = config();
+        config.finality.kind = FinalitySourceKind::Disabled;
+        let errors = finality_errors(config.clone());
+        let refusal = errors
+            .iter()
+            .find(|error| error.field == "sources.live/finality")
+            .unwrap_or_else(|| panic!("live following without finality validated: {errors:?}"));
+        assert!(
+            refusal.message.contains("sync committee attested"),
+            "{refusal:?}"
+        );
+        // Disabling live following as well is a finalized-dataset backfill.
+        config.sources.live.kind = LiveSourceKind::Disabled;
+        assert!(
+            finality_errors(config)
+                .iter()
+                .all(|error| error.field != "sources.live/finality")
+        );
     }
 
     #[test]

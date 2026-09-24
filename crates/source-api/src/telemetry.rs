@@ -327,6 +327,18 @@ impl NetworkTelemetry {
         supervisor.updated = Instant::now();
     }
 
+    /// Record a network-lane failure that no retry resolves: the supervisor
+    /// stops with the error, and does not retry.
+    pub fn supervisor_halted(&self, error: impl fmt::Display) {
+        let error = bounded_error(error);
+        let mut supervisor = write_lock(&self.inner.supervisor);
+        supervisor.state = NetworkSupervisorState::Stopped;
+        supervisor.failures = supervisor.failures.saturating_add(1);
+        supervisor.last_error = Some(error);
+        supervisor.retry_at = None;
+        supervisor.updated = Instant::now();
+    }
+
     /// Record one request after it has obtained local scheduler capacity.
     pub fn request_started(&self, queue_wait: Duration) {
         self.inner.requests_started.fetch_add(1, Ordering::Relaxed);

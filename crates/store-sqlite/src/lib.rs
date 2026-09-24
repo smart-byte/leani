@@ -4537,18 +4537,43 @@ impl SqliteStore {
     /// reversed by the normal runtime path, so finalized records older than
     /// the processor's undo safety depth are deleted.
     ///
+    /// `hash` is the finalized block at `through`. Coverage the processor
+    /// holds at that height for another block is never promoted: a
+    /// block-local lane covers each block on its own, so its coverage there
+    /// can belong to another branch.
+    ///
     /// # Errors
     ///
-    /// Returns an error when the height exceeds `SQLite`'s numeric range or the
-    /// update fails.
+    /// Returns [`StoreError::FinalizedCoverageConflict`] when the coverage at
+    /// `through` holds another hash, and an error when the height exceeds
+    /// `SQLite`'s numeric range or the update fails.
     #[allow(clippy::too_many_lines)]
     pub async fn mark_finalized(
         &self,
         descriptor: &ProcessorDescriptor,
         through: BlockNumber,
+        hash: BlockHash,
     ) -> Result<u64, StoreError> {
         let instance = processor_instance(descriptor);
         let _guard = self.inner.writer.lock().await;
+        let covered: Option<Vec<u8>> = sqlx::query_scalar(
+            "SELECT block_hash FROM processor_coverage
+             WHERE instance = ? AND block_number = ?",
+        )
+        .bind(&instance)
+        .bind(u64_i64(through.0, "block_number")?)
+        .fetch_optional(&self.inner.pool)
+        .await?;
+        if let Some(covered) = covered.map(decode_hash).transpose()?
+            && covered != hash
+        {
+            return Err(StoreError::FinalizedCoverageConflict {
+                instance,
+                block: through,
+                finalized: hash,
+                covered,
+            });
+        }
         let cursor = self.processor_cursor_by_instance(&instance).await?;
         let finality_context: Option<Vec<u8>> = sqlx::query_scalar(
             "SELECT encoded_undo FROM undo_journal
@@ -6478,6 +6503,127 @@ impl SqliteStore {
         Ok(())
     }
 
+    /// Revert every retained unfinalized canonical block that is not proven
+    /// to be on the chain of `anchor`, a verified finalized block about to be
+    /// seeded.
+    ///
+    /// A block is proven when parent hashes link it, through consecutive
+    /// canonical rows, to a finalized row or to the anchor's row, if that row
+    /// is the anchor: it is then their ancestor. A block above the anchor is
+    /// also proven when it descends from the anchor's row. Anything else, such
+    /// as a retained tip on a branch the network reorged away while the node
+    /// was down, below an anchor it cannot link to, is reverted as a reorg
+    /// reverts: its canonical row and transaction locators go, and its frame
+    /// stays as a fork candidate. Returns the reverted blocks, highest first.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for corrupt canonical metadata or a database failure.
+    pub async fn revert_unproven_recent_blocks(
+        &self,
+        chain_id: ChainId,
+        anchor: BlockRef,
+    ) -> Result<Vec<BlockRef>, StoreError> {
+        let _guard = self.inner.writer.lock().await;
+        let rows: Vec<(i64, Vec<u8>, Vec<u8>, i64)> = sqlx::query_as(
+            "SELECT block_number, block_hash, parent_hash, timestamp
+             FROM canonical_blocks
+             WHERE chain_id = ? AND finality < ?
+             ORDER BY block_number",
+        )
+        .bind(u64_i64(chain_id.0, "chain_id")?)
+        .bind(finality_i64(Finality::Finalized))
+        .fetch_all(&self.inner.pool)
+        .await?;
+        let unfinalized = rows
+            .into_iter()
+            .map(|(number, hash, parent, timestamp)| {
+                Ok(BlockRef {
+                    number: BlockNumber(i64_u64(number, "canonical block number")?),
+                    hash: decode_hash(hash)?,
+                    parent_hash: decode_hash(parent)?,
+                    timestamp: i64_u64(timestamp, "canonical timestamp")?,
+                })
+            })
+            .collect::<Result<Vec<_>, StoreError>>()?;
+        if unfinalized.is_empty() {
+            return Ok(Vec::new());
+        }
+        let retained = unfinalized
+            .iter()
+            .map(|block| (block.number.0, *block))
+            .collect::<BTreeMap<_, _>>();
+        let anchor_matches = self
+            .canonical_block(chain_id, anchor.number)
+            .await?
+            .is_some_and(|(row, _)| row.hash == anchor.hash);
+        let mut proven = BTreeSet::new();
+        // Ancestors, highest first: a block's child is proven, finalized, or
+        // the matching anchor, and names it as parent.
+        for block in unfinalized.iter().rev() {
+            let child_number = block.number.0.saturating_add(1);
+            let links = if let Some(child) = retained.get(&child_number) {
+                proven.contains(&child_number) && child.parent_hash == block.hash
+            } else {
+                self.canonical_block(chain_id, BlockNumber(child_number))
+                    .await?
+                    .is_some_and(|(child, finality)| {
+                        (finality == Finality::Finalized
+                            || (anchor_matches && child.number == anchor.number))
+                            && child.parent_hash == block.hash
+                    })
+            };
+            if links || (anchor_matches && block.number == anchor.number) {
+                proven.insert(block.number.0);
+            }
+        }
+        // Descendants of the anchor, lowest first.
+        if anchor_matches {
+            for block in unfinalized
+                .iter()
+                .filter(|block| block.number > anchor.number)
+            {
+                let parent_number = block.number.0.saturating_sub(1);
+                let parent = if parent_number == anchor.number.0 {
+                    Some(anchor.hash)
+                } else if let Some(parent) = retained.get(&parent_number) {
+                    proven.contains(&parent_number).then_some(parent.hash)
+                } else {
+                    self.canonical_block(chain_id, BlockNumber(parent_number))
+                        .await?
+                        .filter(|(_, finality)| *finality == Finality::Finalized)
+                        .map(|(parent, _)| parent.hash)
+                };
+                if parent == Some(block.parent_hash) {
+                    proven.insert(block.number.0);
+                }
+            }
+        }
+        let reverted = unfinalized
+            .into_iter()
+            .rev()
+            .filter(|block| !proven.contains(&block.number.0))
+            .collect::<Vec<_>>();
+        if reverted.is_empty() {
+            return Ok(reverted);
+        }
+        let mut transaction = self.inner.pool.begin().await?;
+        for block in &reverted {
+            delete_recent_transaction_locators(&mut transaction, chain_id, *block).await?;
+            sqlx::query(
+                "DELETE FROM canonical_blocks
+                 WHERE chain_id = ? AND block_number = ? AND block_hash = ?",
+            )
+            .bind(u64_i64(chain_id.0, "chain_id")?)
+            .bind(u64_i64(block.number.0, "reverted block_number")?)
+            .bind(block.hash.0.as_slice())
+            .execute(&mut *transaction)
+            .await?;
+        }
+        transaction.commit().await?;
+        Ok(reverted)
+    }
+
     /// Switch the retained canonical recent branch in one transaction.
     ///
     /// Reverted blocks are ordered from old tip toward the ancestor; applied
@@ -6973,9 +7119,19 @@ impl SqliteStore {
 
     /// Mark a hash-bound canonical recent prefix finalized.
     ///
+    /// Only blocks proven to be ancestors of `through` are promoted: the
+    /// parent hashes from `through` down pass through each of them. A block
+    /// below a seeded anchor whose parent is not known yet, or below a hole,
+    /// stays unfinalized; a later finality advance promotes it once it links.
+    /// Promotion by height alone would finalize a block from a branch
+    /// reorged away while the node was down.
+    ///
     /// # Errors
     ///
-    /// Rejects an unknown or contradictory anchor and database failures.
+    /// Rejects an unknown or contradictory anchor, returns
+    /// [`StoreError::UnlinkedFinalizedAncestry`] for a retained block at a
+    /// height the finalized chain passes through that is not its ancestor,
+    /// and database failures.
     pub async fn mark_recent_finalized(
         &self,
         chain_id: ChainId,
@@ -6997,12 +7153,61 @@ impl SqliteStore {
                 through.0
             )));
         }
+        // Walk the parent hashes down from `through`, across finalized rows,
+        // to the lowest unfinalized row. A zero parent is a seeded anchor's
+        // unknown parent: nothing below it is proven yet, and nothing
+        // contradicts it either.
+        let lowest: Option<i64> = sqlx::query_scalar(
+            "SELECT MIN(block_number) FROM canonical_blocks
+             WHERE chain_id = ? AND block_number <= ? AND finality < ?",
+        )
+        .bind(u64_i64(chain_id.0, "chain_id")?)
+        .bind(u64_i64(through.0, "finalized block_number")?)
+        .bind(finality_i64(Finality::Finalized))
+        .fetch_one(&self.inner.pool)
+        .await?;
+        let mut lowest_proven = through.0;
+        if let Some(lowest) = lowest {
+            // Streamed, the walk reads only the rows it passes.
+            let mut rows = sqlx::query_as::<_, (i64, Vec<u8>, Vec<u8>, i64)>(
+                "SELECT block_number, block_hash, parent_hash, finality FROM canonical_blocks
+                 WHERE chain_id = ? AND block_number BETWEEN ? AND ?
+                 ORDER BY block_number DESC",
+            )
+            .bind(u64_i64(chain_id.0, "chain_id")?)
+            .bind(lowest)
+            .bind(u64_i64(through.0, "finalized block_number")?)
+            .fetch(&self.inner.pool);
+            let mut expected = Some((through.0, expected_hash));
+            while let Some((number, hash, parent, finality)) = rows.try_next().await? {
+                let number = i64_u64(number, "canonical block number")?;
+                let Some((height, ancestor)) = expected.filter(|(height, _)| *height == number)
+                else {
+                    // A hole: nothing below it is proven.
+                    break;
+                };
+                if decode_hash(hash)? != ancestor {
+                    if ancestor == BlockHash::ZERO {
+                        break;
+                    }
+                    return Err(StoreError::UnlinkedFinalizedAncestry {
+                        block: BlockNumber(number),
+                        finalized: through,
+                        finalized_row: decode_finality(finality)? == Finality::Finalized,
+                    });
+                }
+                lowest_proven = height;
+                let parent = decode_hash(parent)?;
+                expected = height.checked_sub(1).map(|below| (below, parent));
+            }
+        }
         let result = sqlx::query(
             "UPDATE canonical_blocks SET finality = ?
-             WHERE chain_id = ? AND block_number <= ? AND finality < ?",
+             WHERE chain_id = ? AND block_number BETWEEN ? AND ? AND finality < ?",
         )
         .bind(finality_i64(Finality::Finalized))
         .bind(u64_i64(chain_id.0, "chain_id")?)
+        .bind(u64_i64(lowest_proven, "proven block_number")?)
         .bind(u64_i64(through.0, "finalized block_number")?)
         .bind(finality_i64(Finality::Finalized))
         .execute(&self.inner.pool)
@@ -17924,6 +18129,30 @@ pub enum StoreError {
         "processor instance {instance} coverage contradicts the canonical chain; resetting its live lane cannot repair it, so rebuild it as a replacement processor instance"
     )]
     LiveLaneRequiresRebuild { instance: String },
+    #[error(
+        "processor instance {instance} covers block {} with {covered}, not the finalized {finalized}",
+        block.0
+    )]
+    FinalizedCoverageConflict {
+        instance: String,
+        block: BlockNumber,
+        finalized: BlockHash,
+        covered: BlockHash,
+    },
+    /// A retained canonical block at a height the finalized block's chain
+    /// passes through is another block than its ancestor. `finalized_row`
+    /// says whether that block is itself finalized: then finalized history
+    /// contradicts itself, and no reorg repairs it.
+    #[error(
+        "retained canonical block {} does not link to finalized block {}",
+        block.0,
+        finalized.0
+    )]
+    UnlinkedFinalizedAncestry {
+        block: BlockNumber,
+        finalized: BlockNumber,
+        finalized_row: bool,
+    },
     #[error("processor instance {0} has no committed cursor to checkpoint")]
     NoProcessorCursor(String),
     #[error("recovery checkpoint {checkpoint_id} does not exist for processor instance {instance}")]
@@ -18759,7 +18988,7 @@ mod tests {
         assert_eq!(staged.changes, 0);
 
         store
-            .mark_finalized(&processor.descriptor, frame.block.number)
+            .mark_finalized(&processor.descriptor, frame.block.number, frame.block.hash)
             .await
             .expect("finalize candidate");
         let finalized = store
@@ -18861,7 +19090,11 @@ mod tests {
 
         assert_eq!(
             store
-                .mark_finalized(&processor.descriptor, included.block.number)
+                .mark_finalized(
+                    &processor.descriptor,
+                    included.block.number,
+                    included.block.hash
+                )
                 .await
                 .expect("finality advances while the artifact budget is full"),
             1
@@ -18911,7 +19144,11 @@ mod tests {
             .await
             .expect("reopen with the default artifact budget");
         store
-            .mark_finalized(&processor.descriptor, included.block.number)
+            .mark_finalized(
+                &processor.descriptor,
+                included.block.number,
+                included.block.hash,
+            )
             .await
             .expect("retry promotion");
         let stats = store
@@ -19427,7 +19664,7 @@ mod tests {
         );
 
         store
-            .mark_finalized(&processor.descriptor, BlockNumber(2))
+            .mark_finalized(&processor.descriptor, BlockNumber(2), second.block.hash)
             .await
             .expect("finalize through block 2");
 
@@ -19523,7 +19760,7 @@ mod tests {
         );
 
         store
-            .mark_finalized(&processor.descriptor, BlockNumber(total))
+            .mark_finalized(&processor.descriptor, BlockNumber(total), parent)
             .await
             .expect("finalize everything");
 
@@ -19576,7 +19813,11 @@ mod tests {
         }
 
         store
-            .mark_finalized(&processor.descriptor, BlockNumber(last))
+            .mark_finalized(
+                &processor.descriptor,
+                BlockNumber(last),
+                wide_frame(last, BlockHash::ZERO).block.hash,
+            )
             .await
             .expect("finalize everything");
 
@@ -21463,7 +21704,7 @@ mod tests {
                 .expect("apply included block");
         }
         store
-            .mark_finalized(&processor.descriptor, first.block.number)
+            .mark_finalized(&processor.descriptor, first.block.number, first.block.hash)
             .await
             .expect("finalize block 1");
 
@@ -23554,7 +23795,7 @@ mod tests {
             .expect("apply");
         assert_eq!(
             store
-                .mark_finalized(&processor.descriptor, BlockNumber(1))
+                .mark_finalized(&processor.descriptor, BlockNumber(1), frame.block.hash)
                 .await
                 .expect("finalize"),
             1
@@ -23741,7 +23982,13 @@ mod tests {
             frames.push(current);
             if let Some(through) = number.checked_sub(2).filter(|through| *through > 0) {
                 store
-                    .mark_finalized(&processor.descriptor, BlockNumber(through))
+                    .mark_finalized(
+                        &processor.descriptor,
+                        BlockNumber(through),
+                        frames[usize::try_from(through - 1).expect("frame index")]
+                            .block
+                            .hash,
+                    )
                     .await
                     .expect("finalize");
                 // Two unfinalized blocks, the finalized tip, and four safety
@@ -23809,7 +24056,7 @@ mod tests {
             frames.push(current);
         }
         store
-            .mark_finalized(&processor.descriptor, BlockNumber(3))
+            .mark_finalized(&processor.descriptor, BlockNumber(3), frames[2].block.hash)
             .await
             .expect("finalize");
         assert_eq!(undo_rows(&store, &processor).await, 2);
@@ -23854,12 +24101,12 @@ mod tests {
         transaction.commit().await.expect("commit backlog");
         let through = BlockNumber(u64::try_from(backlog * 2).expect("through"));
         store
-            .mark_finalized(&processor.descriptor, through)
+            .mark_finalized(&processor.descriptor, through, BlockHash::ZERO)
             .await
             .expect("first finality advance");
         assert_eq!(undo_rows(&store, &processor).await, 50);
         store
-            .mark_finalized(&processor.descriptor, through)
+            .mark_finalized(&processor.descriptor, through, BlockHash::ZERO)
             .await
             .expect("second finality advance");
         assert_eq!(undo_rows(&store, &processor).await, 0);
@@ -24778,7 +25025,7 @@ mod tests {
             u64::try_from(held_bytes).expect("held bytes")
         );
         store
-            .mark_finalized(&processor.descriptor, BlockNumber(1))
+            .mark_finalized(&processor.descriptor, BlockNumber(1), block.block.hash)
             .await
             .expect("finalize");
         let stats = store.stats().await.expect("stats after release");
@@ -24868,11 +25115,15 @@ mod tests {
         // Finality below the cursor checkpoints the included cursor; finality
         // reaching it later promotes only the cursor's label.
         store
-            .mark_finalized(&processor.descriptor, BlockNumber(1))
+            .mark_finalized(
+                &processor.descriptor,
+                BlockNumber(1),
+                frame(1, BlockHash::ZERO).block.hash,
+            )
             .await
             .expect("finalize below the cursor");
         store
-            .mark_finalized(&processor.descriptor, BlockNumber(3))
+            .mark_finalized(&processor.descriptor, BlockNumber(3), parent)
             .await
             .expect("finalize the cursor");
         let current = store
@@ -25181,8 +25432,9 @@ mod tests {
             "included rows above the interval",
         )
         .await;
+        let sixth = frame(6, frame(5, parent).block.hash).block.hash;
         store
-            .mark_finalized(descriptor, BlockNumber(6))
+            .mark_finalized(descriptor, BlockNumber(6), sixth)
             .await
             .expect("finalize");
         assert_eq!(
@@ -25676,5 +25928,267 @@ mod tests {
             }
             other => panic!("expected a byte-cap rejection, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn finality_never_promotes_coverage_of_another_block_at_its_height() {
+        let (_directory, store) = store().await;
+        let processor = FixtureProcessor::block_output();
+        let covered = frame(1, BlockHash::ZERO);
+        let delta = processor.map(&covered).await.expect("map");
+        store
+            .apply(&processor, cursor(&processor, &covered, 1), &delta, &[])
+            .await
+            .expect("apply");
+        // Finality names another block at that height. A block-local lane
+        // covers each block on its own, so its coverage there is another
+        // branch's.
+        let finalized = BlockHash::new([0xf1; 32]);
+        match store
+            .mark_finalized(&processor.descriptor, BlockNumber(1), finalized)
+            .await
+        {
+            Err(StoreError::FinalizedCoverageConflict {
+                block,
+                finalized: named,
+                covered: held,
+                ..
+            }) => assert_eq!(
+                (block, named, held),
+                (BlockNumber(1), finalized, covered.block.hash)
+            ),
+            other => panic!("coverage of another block was promoted: {other:?}"),
+        }
+        assert_eq!(
+            store
+                .finalized_through(&processor.descriptor)
+                .await
+                .expect("finalized coverage"),
+            None
+        );
+        store
+            .mark_finalized(&processor.descriptor, BlockNumber(1), covered.block.hash)
+            .await
+            .expect("finalize the covered block");
+        assert_eq!(
+            store
+                .finalized_through(&processor.descriptor)
+                .await
+                .expect("finalized coverage"),
+            Some(BlockNumber(1))
+        );
+    }
+
+    async fn canonical_finality(store: &SqliteStore, number: u64) -> Finality {
+        store
+            .canonical_block(ChainId(1), BlockNumber(number))
+            .await
+            .expect("canonical lookup")
+            .expect("canonical block")
+            .1
+    }
+
+    #[tokio::test]
+    async fn recent_finality_promotes_only_retained_blocks_that_link_to_it() {
+        let (_directory, store) = store().await;
+        // Blocks 1..=3 of a branch retained before a restart, the seeded
+        // finalized anchor 6 above them, and blocks 7..=8 followed from it.
+        for block in [
+            frame(1, BlockHash::ZERO),
+            frame(2, BlockHash::new([1; 32])),
+            frame(3, BlockHash::new([2; 32])),
+        ] {
+            store.store_recent_frame(&block).await.expect("retain");
+        }
+        let anchor = BlockRef {
+            number: BlockNumber(6),
+            hash: BlockHash::new([6; 32]),
+            parent_hash: BlockHash::ZERO,
+            timestamp: 6,
+        };
+        store
+            .store_canonical_anchor(ChainId(1), anchor, Finality::Finalized)
+            .await
+            .expect("seed the anchor");
+        let seventh = frame(7, anchor.hash);
+        let eighth = frame(8, seventh.block.hash);
+        for block in [&seventh, &eighth] {
+            store.store_recent_frame(block).await.expect("retain");
+        }
+        // Promotion by height would finalize blocks 1..=3 too, but nothing
+        // links them to block 8: they stay unfinalized.
+        store
+            .mark_recent_finalized(ChainId(1), BlockNumber(8), eighth.block.hash)
+            .await
+            .expect("finalize the linked blocks");
+        for number in [1, 2, 3] {
+            assert_ne!(
+                canonical_finality(&store, number).await,
+                Finality::Finalized,
+                "block {number} was promoted"
+            );
+        }
+        for number in [7, 8] {
+            assert_eq!(
+                canonical_finality(&store, number).await,
+                Finality::Finalized
+            );
+        }
+
+        // A retained block at a height the finalized chain passes through,
+        // but another block than its ancestor, contradicts it.
+        let (_contradicted_directory, contradicted) = self::store().await;
+        for block in [
+            frame(1, BlockHash::ZERO),
+            frame(2, BlockHash::new([1; 32])),
+            frame(3, BlockHash::new([2; 32])),
+            frame(4, BlockHash::new([0x33; 32])),
+        ] {
+            contradicted
+                .store_recent_frame(&block)
+                .await
+                .expect("retain");
+        }
+        match contradicted
+            .mark_recent_finalized(ChainId(1), BlockNumber(4), BlockHash::new([4; 32]))
+            .await
+        {
+            Err(StoreError::UnlinkedFinalizedAncestry {
+                block,
+                finalized,
+                finalized_row,
+            }) => {
+                assert_eq!((block, finalized), (BlockNumber(3), BlockNumber(4)));
+                assert!(!finalized_row, "block 3 is not finalized");
+            }
+            other => panic!("a contradicting block was finalized: {other:?}"),
+        }
+        for number in 1..=4 {
+            assert_ne!(
+                canonical_finality(&contradicted, number).await,
+                Finality::Finalized,
+                "block {number} was promoted"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn recent_finality_reports_whether_the_unlinked_block_is_finalized() {
+        // A finalized retained block at a height the finalized chain passes
+        // through, but another block than its ancestor: finalized history
+        // contradicts itself, and the store says so.
+        let (_finalized_directory, finalized) = self::store().await;
+        for block in [frame(1, BlockHash::ZERO), frame(2, BlockHash::new([1; 32]))] {
+            finalized.store_recent_frame(&block).await.expect("retain");
+        }
+        finalized
+            .store_canonical_anchor(
+                ChainId(1),
+                frame(3, BlockHash::new([2; 32])).block,
+                Finality::Finalized,
+            )
+            .await
+            .expect("finalized block 3");
+        finalized
+            .store_recent_frame(&frame(4, BlockHash::new([0x33; 32])))
+            .await
+            .expect("retain");
+        match finalized
+            .mark_recent_finalized(ChainId(1), BlockNumber(4), BlockHash::new([4; 32]))
+            .await
+        {
+            Err(StoreError::UnlinkedFinalizedAncestry {
+                block,
+                finalized_row,
+                ..
+            }) => {
+                assert_eq!(block, BlockNumber(3));
+                assert!(finalized_row, "block 3 is finalized");
+            }
+            other => panic!("a contradicting finalized block went unreported: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_seeded_anchor_reverts_only_retained_blocks_it_cannot_prove() {
+        let chain = (1..=5)
+            .scan(BlockHash::ZERO, |parent, number| {
+                let block = frame(number, *parent);
+                *parent = block.block.hash;
+                Some(block)
+            })
+            .collect::<Vec<_>>();
+        let above = BlockRef {
+            number: BlockNumber(9),
+            hash: BlockHash::new([0x99; 32]),
+            parent_hash: BlockHash::ZERO,
+            timestamp: 9,
+        };
+        let (_directory, store) = store().await;
+        for block in &chain {
+            store.store_recent_frame(block).await.expect("retain");
+        }
+        // An anchor the retained chain holds proves its ancestors and its
+        // descendants.
+        assert_eq!(
+            store
+                .revert_unproven_recent_blocks(ChainId(1), chain[2].block)
+                .await
+                .expect("revert"),
+            Vec::new()
+        );
+        // After downtime, an anchor above the tip that nothing links to
+        // proves none of them: every unfinalized block goes, highest first.
+        let reverted = store
+            .revert_unproven_recent_blocks(ChainId(1), above)
+            .await
+            .expect("revert");
+        assert_eq!(
+            reverted
+                .iter()
+                .map(|block| block.number.0)
+                .collect::<Vec<_>>(),
+            [5, 4, 3, 2, 1]
+        );
+        assert!(
+            store
+                .canonical_block(ChainId(1), BlockNumber(3))
+                .await
+                .expect("canonical lookup")
+                .is_none()
+        );
+        // Their frames stay as fork candidates.
+        assert!(
+            store
+                .recent_frame_by_hash(ChainId(1), chain[2].block.hash)
+                .await
+                .expect("frame lookup")
+                .is_some()
+        );
+
+        // Blocks below a finalized block that link to it are its ancestors,
+        // whatever the anchor: only the block above it goes.
+        let (_finalized_directory, finalized_store) = self::store().await;
+        for block in &chain {
+            finalized_store
+                .store_recent_frame(block)
+                .await
+                .expect("retain");
+        }
+        finalized_store
+            .store_canonical_anchor(ChainId(1), chain[3].block, Finality::Finalized)
+            .await
+            .expect("finalize block 4");
+        let reverted = finalized_store
+            .revert_unproven_recent_blocks(ChainId(1), above)
+            .await
+            .expect("revert");
+        assert_eq!(
+            reverted
+                .iter()
+                .map(|block| block.number.0)
+                .collect::<Vec<_>>(),
+            [5]
+        );
     }
 }

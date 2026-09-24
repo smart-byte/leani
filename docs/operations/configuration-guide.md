@@ -232,7 +232,10 @@ zeros. `consensus_p2p` also requires its non-zero finalized beacon slot and a
 `finality.minimum_peers` of at most 24, the consensus peers dialed at once.
 `beacon_api` requires one or more endpoints, each transport listed once, and
 `minimum_agreement` within their count. Disabling finality is suitable for bounded finalized-dataset
-backfills, not verified head following.
+backfills, not verified head following: the live lane includes a block only
+once its ancestry reaches an execution header the sync committee attested,
+which the finality source verifies each slot, so validation refuses
+`sources.live.kind = "p2p"` with `finality.kind = "disabled"`.
 
 ## Processor identity and publication
 

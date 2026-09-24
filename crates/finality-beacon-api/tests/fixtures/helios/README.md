@@ -16,7 +16,7 @@ verifier.
 | `bootstrap.json` | `6a12276c898200089cf8751a938497fd6eb9a711203a385471994d275459a711` | Bootstrap for block root `0x5afc212a7924789b2bc86acad3ab3a6ffb1f6e97253ea50bee7f4f51422c9275`, slot 7,069,376 (sync-committee period 862) |
 | `updates.json` | `c972809bb985889cf51019fe6f6fae764d387e511d1bf47c8e5a6b7b82cc3cdb` | Sync-committee updates for periods 862 to 867 |
 | `finality.json` | `6579adb2c85f974b5d6b887d4f7e36613d0d37c5c9b0dfd7b4f9aff1cef49f43` | Finality update signed at slot 7,109,431, finalizing slot 7,109,344 (execution block 17,923,026) |
-| `optimistic.json` | `b465fbccb939e7f4fcd1782463526e55b53d59b648283ac43e85c6a92240cdc1` | Optimistic update signed at slot 7,109,432; not used by the current tests |
+| `optimistic.json` | `b465fbccb939e7f4fcd1782463526e55b53d59b648283ac43e85c6a92240cdc1` | Optimistic update signed at slot 7,109,432 by 510 of 512 sync-committee members, attesting slot 7,109,431 (execution block 17,923,113) |
 
 ## License
 

@@ -1108,7 +1108,11 @@ async fn accept_existing_delta_variant(
         .await?;
     if mapped.finality == Finality::Finalized {
         store
-            .mark_finalized(processor.descriptor(), mapped.delta.block.number)
+            .mark_finalized(
+                processor.descriptor(),
+                mapped.delta.block.number,
+                mapped.delta.block.hash,
+            )
             .await?;
     }
     Ok(true)
@@ -3612,6 +3616,61 @@ impl SharedLiveRuntime {
         Ok(report)
     }
 
+    /// Seed a verified finalized execution anchor before the live lanes open,
+    /// first reverting every retained unfinalized canonical block that is not
+    /// proven to be on its chain.
+    ///
+    /// After downtime, the retained tip may be on a branch the network
+    /// reorged away, below an anchor it does not link to. Promotion goes by
+    /// height, so finality would otherwise finalize that branch's coverage.
+    /// Such blocks are handled as a reorg: the store reverts their canonical
+    /// rows, and [`Self::reconcile_startup`], which must run next, undoes
+    /// every processor's coverage of them. Returns the reverted blocks,
+    /// highest first.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RuntimeError::FinalityContradiction`] when a finalized
+    /// canonical block holds another hash at the anchor's height, which no
+    /// revert repairs, and store failures.
+    pub async fn seed_finalized_anchor(
+        &self,
+        anchor: BlockRef,
+    ) -> Result<Vec<BlockRef>, RuntimeError> {
+        let chain_id = self.source.descriptor().chain_id;
+        let _lane = self.lane_lock.lock().await;
+        let reverted = self
+            .store
+            .revert_unproven_recent_blocks(chain_id, anchor)
+            .await?;
+        if let (Some(highest), Some(lowest)) = (reverted.first(), reverted.last()) {
+            warn!(
+                finalized_anchor = anchor.number.0,
+                reverted_blocks = reverted.len(),
+                highest_reverted = highest.number.0,
+                lowest_reverted = lowest.number.0,
+                "retained unfinalized blocks do not link to the verified finalized anchor; reverting them as a reorg"
+            );
+        }
+        match self
+            .store
+            .store_canonical_anchor(chain_id, anchor, Finality::Finalized)
+            .await
+        {
+            Ok(()) => Ok(reverted),
+            Err(StoreError::CanonicalConflict { block, stored, .. }) => {
+                Err(RuntimeError::FinalityContradiction {
+                    block,
+                    detail: format!(
+                        "the finalized hash is {}, the finalized canonical hash {stored}",
+                        anchor.hash
+                    ),
+                })
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
     /// Repair what an interrupted commit or reorg left in every processor's
     /// state, then drain like [`Self::reconcile_pending`]. Run it before the
     /// live lanes open.
@@ -5466,7 +5525,7 @@ impl SharedLiveRuntime {
                 .await?;
             if recent.is_some_and(|frame| frame.finality == Finality::Finalized) {
                 self.store
-                    .mark_finalized(processor.descriptor(), delta.block.number)
+                    .mark_finalized(processor.descriptor(), delta.block.number, delta.block.hash)
                     .await?;
             }
             ApplyOutcome::AlreadyApplied
@@ -6257,14 +6316,27 @@ impl FinalityRuntime {
                 FinalityEvent::Safe { .. } => {
                     report.safe_events = report.safe_events.saturating_add(1);
                 }
-                FinalityEvent::Finalized { block_hash, .. } => {
+                FinalityEvent::Finalized {
+                    block_number,
+                    block_hash,
+                    ..
+                } => {
                     let through = self
                         .store
                         .coverage_block_by_hash(self.processor.descriptor(), block_hash)
                         .await?
                         .ok_or(RuntimeError::UnknownFinalizedAnchor(block_hash))?;
+                    if through != block_number {
+                        return Err(RuntimeError::FinalityContradiction {
+                            block: block_number,
+                            detail: format!(
+                                "the processor covers the finalized hash at block {}",
+                                through.0
+                            ),
+                        });
+                    }
                     self.store
-                        .mark_finalized(self.processor.descriptor(), through)
+                        .mark_finalized(self.processor.descriptor(), through, block_hash)
                         .await?;
                     report.finalized_events = report.finalized_events.saturating_add(1);
                     report.finalized_through = Some(
@@ -6337,6 +6409,15 @@ pub struct AppliedFinalityAnchor {
     pub block: BlockRef,
     pub beacon_slot: u64,
     pub beacon_block_root: [u8; 32],
+}
+
+/// A verified finalized execution block, as a finality event names it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FinalizedBlock {
+    number: BlockNumber,
+    hash: BlockHash,
+    beacon_slot: u64,
+    beacon_block_root: [u8; 32],
 }
 
 /// One independently verified finality stream fanned out to recent storage and
@@ -6427,11 +6508,15 @@ impl SharedFinalityRuntime {
     ///
     /// # Errors
     ///
-    /// A verified finalized hash that races ahead of execution ingestion is
-    /// retained and retried until the exact canonical frame arrives.
+    /// A verified finalized block that races ahead of execution ingestion is
+    /// retained and retried until a canonical block at its height arrives.
     ///
     /// Fails closed on a finality contradiction/reset or a store failure
-    /// outside one processor's finality update.
+    /// outside one processor's finality update. A finalized hash that
+    /// contradicts the canonical block at its height, or retained canonical
+    /// blocks that do not link to it, is a [`RuntimeError::FinalityReorg`]
+    /// when those blocks are unfinalized, and a
+    /// [`RuntimeError::FinalityContradiction`] when they are finalized.
     pub async fn run(
         &self,
         checkpoint: ConsensusCheckpoint,
@@ -6449,18 +6534,10 @@ impl SharedFinalityRuntime {
             let event = tokio::select! {
                 () = cancellation.cancelled() => break,
                 _ = retry.tick(), if pending_finalized.is_some() => {
-                    let Some((block_hash, beacon_slot, beacon_block_root)) = pending_finalized else {
+                    let Some(finalized) = pending_finalized else {
                         continue;
                     };
-                    if self
-                        .apply_finalized(
-                            block_hash,
-                            beacon_slot,
-                            beacon_block_root,
-                            &mut report,
-                        )
-                        .await?
-                    {
+                    if self.apply_finalized(finalized, &mut report).await? {
                         pending_finalized = None;
                     }
                     continue;
@@ -6478,15 +6555,19 @@ impl SharedFinalityRuntime {
                     report.safe_events = report.safe_events.saturating_add(1);
                 }
                 FinalityEvent::Finalized {
+                    block_number,
                     block_hash,
                     beacon_slot,
                     beacon_block_root,
                 } => {
-                    pending_finalized = Some((block_hash, beacon_slot, beacon_block_root));
-                    if self
-                        .apply_finalized(block_hash, beacon_slot, beacon_block_root, &mut report)
-                        .await?
-                    {
+                    let finalized = FinalizedBlock {
+                        number: block_number,
+                        hash: block_hash,
+                        beacon_slot,
+                        beacon_block_root,
+                    };
+                    pending_finalized = Some(finalized);
+                    if self.apply_finalized(finalized, &mut report).await? {
                         pending_finalized = None;
                     }
                 }
@@ -6578,17 +6659,15 @@ impl SharedFinalityRuntime {
                         return Ok(report);
                     }
                     _ = retry.tick(), if pending_finalized.is_some() => {
-                        let Some((block_hash, beacon_slot, beacon_block_root)) = pending_finalized else {
+                        let Some(finalized) = pending_finalized else {
                             continue;
                         };
+                        // A contradiction halts the lane: readiness drops
+                        // with the error.
                         if self
-                            .apply_finalized(
-                                block_hash,
-                                beacon_slot,
-                                beacon_block_root,
-                                &mut report,
-                            )
-                            .await?
+                            .apply_finalized(finalized, &mut report)
+                            .await
+                            .inspect_err(|_| signal_readiness(Some(&readiness), false))?
                         {
                             pending_finalized = None;
                         }
@@ -6604,19 +6683,22 @@ impl SharedFinalityRuntime {
                         report.safe_events = report.safe_events.saturating_add(1);
                     }
                     Some(Ok(FinalityEvent::Finalized {
+                        block_number,
                         block_hash,
                         beacon_slot,
                         beacon_block_root,
                     })) => {
-                        pending_finalized = Some((block_hash, beacon_slot, beacon_block_root));
+                        let finalized = FinalizedBlock {
+                            number: block_number,
+                            hash: block_hash,
+                            beacon_slot,
+                            beacon_block_root,
+                        };
+                        pending_finalized = Some(finalized);
                         if self
-                            .apply_finalized(
-                                block_hash,
-                                beacon_slot,
-                                beacon_block_root,
-                                &mut report,
-                            )
-                            .await?
+                            .apply_finalized(finalized, &mut report)
+                            .await
+                            .inspect_err(|_| signal_readiness(Some(&readiness), false))?
                         {
                             pending_finalized = None;
                         }
@@ -6675,23 +6757,20 @@ impl SharedFinalityRuntime {
         Ok(report)
     }
 
+    /// Apply a verified finalized block once the canonical chain reaches its
+    /// height, returning `false` until then: the live lane has not caught up.
     async fn apply_finalized(
         &self,
-        block_hash: BlockHash,
-        beacon_slot: u64,
-        beacon_block_root: [u8; 32],
+        finalized: FinalizedBlock,
         report: &mut SharedFinalityReport,
     ) -> Result<bool, RuntimeError> {
         let chain_id = self.source.descriptor().chain_id;
-        let Some(canonical) = self
-            .store
-            .canonical_block_by_hash(chain_id, block_hash)
-            .await?
-        else {
-            report.deferred_finalized_anchor = Some(block_hash);
+        let Some(canonical) = self.finalize_canonical_prefix(finalized).await? else {
+            report.deferred_finalized_anchor = Some(finalized.hash);
             return Ok(false);
         };
         report.deferred_finalized_anchor = None;
+        let block_hash = finalized.hash;
         for processor in &self.processors {
             let id = processor.descriptor().id.to_string();
             // One processor's failure must not hold back finality or recent
@@ -6724,9 +6803,6 @@ impl SharedFinalityRuntime {
                 }
             }
         }
-        self.store
-            .mark_recent_finalized(chain_id, canonical.number, block_hash)
-            .await?;
         let pruned = self
             .store
             .prune_recent_frames(
@@ -6750,8 +6826,8 @@ impl SharedFinalityRuntime {
         if let Some(sender) = &self.applied_anchors {
             let _ = sender.send(AppliedFinalityAnchor {
                 block: canonical,
-                beacon_slot,
-                beacon_block_root,
+                beacon_slot: finalized.beacon_slot,
+                beacon_block_root: finalized.beacon_block_root,
             });
         }
         if pruned.hard_limit_exceeded {
@@ -6767,6 +6843,57 @@ impl SharedFinalityRuntime {
         Ok(true)
     }
 
+    /// Finalize the retained canonical prefix through a verified finalized
+    /// block, and return the block, or `None` while the canonical chain has
+    /// not reached its height.
+    ///
+    /// The canonical block at that height must be the finalized one, and the
+    /// store promotes only retained blocks that link to it by parent hash. It
+    /// runs before any processor is finalized. A different canonical block
+    /// there, or a retained block at a height the finalized chain passes
+    /// through that is not its ancestor, contradicts finality (see
+    /// [`finality_contradiction`]).
+    async fn finalize_canonical_prefix(
+        &self,
+        finalized: FinalizedBlock,
+    ) -> Result<Option<BlockRef>, RuntimeError> {
+        let chain_id = self.source.descriptor().chain_id;
+        let Some((canonical, finality)) = self
+            .store
+            .canonical_block(chain_id, finalized.number)
+            .await?
+        else {
+            return Ok(None);
+        };
+        if canonical.hash != finalized.hash {
+            return Err(finality_contradiction(
+                finalized,
+                finality == Finality::Finalized,
+                format!(
+                    "the finalized hash is {}, the canonical hash {}",
+                    finalized.hash, canonical.hash
+                ),
+            ));
+        }
+        match self
+            .store
+            .mark_recent_finalized(chain_id, canonical.number, finalized.hash)
+            .await
+        {
+            Ok(_) => Ok(Some(canonical)),
+            Err(StoreError::UnlinkedFinalizedAncestry {
+                block,
+                finalized_row,
+                ..
+            }) => Err(finality_contradiction(
+                finalized,
+                finalized_row,
+                format!("retained canonical block {} is not its ancestor", block.0),
+            )),
+            Err(error) => Err(error.into()),
+        }
+    }
+
     /// Advance one processor's finality to the canonical anchor block.
     ///
     /// Coverage that holds the anchor hash at another height contradicts the
@@ -6774,10 +6901,12 @@ impl SharedFinalityRuntime {
     /// for a lane that is already failed for another reason: the lane fails
     /// with `processor_finality_conflict`, which overrides that earlier reason
     /// and which the store refuses to reset (`live_lane_requires_rebuild`), so
-    /// no later anchor finalizes it through the contradicted height. Any other
-    /// failed lane is skipped until an operator resets it. Other errors, such
-    /// as a transient `mark_finalized` failure, leave the lane as it is for the
-    /// next anchor to retry.
+    /// no later anchor finalizes it through the contradicted height. So is
+    /// coverage of another block at the anchor's height, which a block-local
+    /// lane can hold; deferring it instead would let a later anchor promote
+    /// it by height. Any other failed lane is skipped until an operator resets
+    /// it. Other errors, such as a transient `mark_finalized` failure, leave
+    /// the lane as it is for the next anchor to retry.
     async fn finalize_processor(
         &self,
         processor: &dyn Processor,
@@ -6789,6 +6918,20 @@ impl SharedFinalityRuntime {
             .coverage_block_by_hash(processor.descriptor(), block_hash)
             .await?
         else {
+            if let Some(covered) = self
+                .store
+                .coverage_hash(processor.descriptor(), canonical)
+                .await?
+            {
+                self.store
+                    .fail_processor_live_lane(processor.descriptor(), "processor_finality_conflict")
+                    .await?;
+                return Err(RuntimeError::InvalidReorg(format!(
+                    "processor {} covers block {} as {covered}, not the finalized {block_hash}",
+                    processor.descriptor().id,
+                    canonical.0
+                )));
+            }
             return Ok(ProcessorFinality::Deferred);
         };
         if through != canonical {
@@ -6812,9 +6955,34 @@ impl SharedFinalityRuntime {
             return Ok(ProcessorFinality::LaneFailed);
         }
         self.store
-            .mark_finalized(processor.descriptor(), through)
+            .mark_finalized(processor.descriptor(), through, block_hash)
             .await?;
         Ok(ProcessorFinality::Finalized(through))
+    }
+}
+
+/// The error for verified finality that contradicts a retained canonical
+/// block: finalized, it contradicts finalized history, which halts the live
+/// lane; unfinalized, it is a reorg the live lane did not follow, which a
+/// restart of the network lanes repairs, since startup reverts every
+/// retained unfinalized block that does not link to the verified finalized
+/// anchor.
+fn finality_contradiction(
+    finalized: FinalizedBlock,
+    against_finalized: bool,
+    detail: String,
+) -> RuntimeError {
+    if against_finalized {
+        RuntimeError::FinalityContradiction {
+            block: finalized.number,
+            detail,
+        }
+    } else {
+        RuntimeError::FinalityReorg {
+            block: finalized.number,
+            finalized: finalized.hash,
+            detail,
+        }
     }
 }
 
@@ -6960,6 +7128,25 @@ pub enum RuntimeError {
     },
     #[error("finality source requested checkpoint reset: {0:?}")]
     FinalityReset(ConsensusCheckpoint),
+    /// Verified finality contradicts finalized canonical history. No reorg
+    /// repairs it, so the live lane halts.
+    #[error(
+        "verified finality contradicts finalized canonical history at block {}: {detail}; the live lane halts",
+        block.0
+    )]
+    FinalityContradiction { block: BlockNumber, detail: String },
+    /// Verified finality contradicts retained unfinalized canonical blocks: a
+    /// reorg the live lane did not follow, such as one across a stall. A
+    /// restart of the network lanes reverts them.
+    #[error(
+        "verified finality finalizes block {} as {finalized}, which retained unfinalized blocks contradict: {detail}; the network lanes restart to revert them",
+        block.0
+    )]
+    FinalityReorg {
+        block: BlockNumber,
+        finalized: BlockHash,
+        detail: String,
+    },
     #[error("runtime JSON encoding failed: {0}")]
     Json(#[from] serde_json::Error),
 }
@@ -13557,6 +13744,7 @@ mod tests {
             fixture_source_descriptor("shared-finality", range),
             checkpoint.clone(),
             vec![FinalityStep::Event(FinalityEvent::Finalized {
+                block_number: replacement.block.number,
                 block_hash: replacement.block.hash,
                 beacon_slot: 2,
                 beacon_block_root: [2; 32],
@@ -17836,6 +18024,7 @@ mod tests {
             checkpoint.clone(),
             vec![
                 FinalityStep::Event(FinalityEvent::Finalized {
+                    block_number: frame.block.number,
                     block_hash: frame.block.hash,
                     beacon_slot: 2,
                     beacon_block_root: [2; 32],
@@ -17945,6 +18134,7 @@ mod tests {
         };
         let finalized = |block: &leani_primitives::BlockFrame, slot| {
             FinalityStep::Event(FinalityEvent::Finalized {
+                block_number: block.block.number,
                 block_hash: block.block.hash,
                 beacon_slot: slot,
                 beacon_block_root: [2; 32],
@@ -18069,6 +18259,7 @@ mod tests {
         };
         let finalized = |block: &leani_primitives::BlockFrame, slot| {
             FinalityStep::Event(FinalityEvent::Finalized {
+                block_number: block.block.number,
                 block_hash: block.block.hash,
                 beacon_slot: slot,
                 beacon_block_root: [2; 32],
@@ -18276,6 +18467,7 @@ mod tests {
             fixture_source_descriptor("finality", range),
             checkpoint.clone(),
             vec![FinalityStep::Event(FinalityEvent::Finalized {
+                block_number: second.block.number,
                 block_hash: second.block.hash,
                 beacon_slot: 2,
                 beacon_block_root: [2; 32],
@@ -18345,6 +18537,7 @@ mod tests {
             fixture_source_descriptor("finality", range),
             checkpoint.clone(),
             vec![FinalityStep::Event(FinalityEvent::Finalized {
+                block_number: third.block.number,
                 block_hash: third.block.hash,
                 beacon_slot: 3,
                 beacon_block_root: [3; 32],
@@ -18388,5 +18581,373 @@ mod tests {
         assert_eq!(retry_delay(base, max, 2), Duration::from_millis(20));
         assert_eq!(retry_delay(base, max, 3), max);
         assert_eq!(retry_delay(base, max, 100), max);
+    }
+
+    fn verified_finality_checkpoint() -> ConsensusCheckpoint {
+        ConsensusCheckpoint {
+            beacon_slot: 1,
+            beacon_block_root: [1; 32],
+            execution_block_hash: BlockHash::ZERO,
+            obtained_at_unix_seconds: 1,
+            source: "fixture".to_owned(),
+        }
+    }
+
+    /// Verified finality that emits `steps` for `processors`.
+    fn verified_finality(
+        store: &SqliteStore,
+        processors: &[Arc<dyn Processor>],
+        steps: Vec<FinalityStep>,
+    ) -> SharedFinalityRuntime {
+        SharedFinalityRuntime::new(
+            store.clone(),
+            Arc::new(ScriptedFinalitySource::new(
+                fixture_source_descriptor(
+                    "verified-finality",
+                    BlockRange::new(BlockNumber(0), BlockNumber(9)).expect("range"),
+                ),
+                verified_finality_checkpoint(),
+                steps,
+            )),
+            processors.to_vec(),
+            SharedFinalityRuntimeConfig {
+                minimum_recent_blocks: 1,
+                recent_soft_bytes: 1_000_000_000,
+                recent_hard_bytes: 2_000_000_000,
+            },
+        )
+        .expect("shared finality runtime")
+    }
+
+    fn finalized_at(number: u64, hash: BlockHash) -> FinalityStep {
+        FinalityStep::Event(FinalityEvent::Finalized {
+            block_number: BlockNumber(number),
+            block_hash: hash,
+            beacon_slot: number.saturating_add(1),
+            beacon_block_root: [2; 32],
+        })
+    }
+
+    #[tokio::test]
+    async fn an_unfinalized_contradiction_restarts_the_lanes_and_heals() {
+        let chain = live_blocks(3);
+        let counter = Arc::new(BlockLocalCounter::named("contradicted-counter"));
+        let lanes: Vec<Arc<dyn Processor>> = vec![counter.clone()];
+        let (_directory, store) = store().await;
+        run_live(&scripted_live(&store, &lanes, block_events(&chain)))
+            .await
+            .expect("live run");
+        // Verified finality names another block at height 2 than the one the
+        // lane followed, for example after the lane stalled across a reorg of
+        // an attested head. Waiting cannot change that; a restart can.
+        let finalized = BlockHash::new([0xf2; 32]);
+        let (readiness, ready) = tokio::sync::watch::channel(true);
+        let stopped = tokio::time::timeout(
+            Duration::from_secs(10),
+            verified_finality(&store, &lanes, vec![finalized_at(2, finalized)])
+                .run_resilient_with_readiness(
+                    verified_finality_checkpoint(),
+                    CancellationToken::new(),
+                    readiness,
+                ),
+        )
+        .await
+        .expect("a finality contradiction was deferred");
+        assert!(
+            matches!(
+                stopped,
+                Err(RuntimeError::FinalityReorg {
+                    block: BlockNumber(2),
+                    finalized: hash,
+                    ..
+                }) if hash == finalized
+            ),
+            "{stopped:?}"
+        );
+        assert!(!*ready.borrow(), "the stopped lane still reports ready");
+        let (canonical, finality) = store
+            .canonical_block(ChainId(1), BlockNumber(2))
+            .await
+            .expect("canonical lookup")
+            .expect("canonical block");
+        assert_eq!(canonical.hash, chain[2].block.hash);
+        assert_ne!(finality, Finality::Finalized, "the contradiction promoted");
+        assert_eq!(
+            store
+                .finalized_through(counter.descriptor())
+                .await
+                .expect("finalized coverage"),
+            None
+        );
+
+        // The restart seeds the newly verified finalized anchor, which
+        // reverts the retained blocks that contradict it, and undoes their
+        // coverage. Finality then proceeds.
+        let anchor = BlockRef {
+            number: BlockNumber(2),
+            hash: finalized,
+            parent_hash: BlockHash::ZERO,
+            timestamp: 1,
+        };
+        let restarted = scripted_live(&store, &lanes, Vec::new());
+        assert_eq!(
+            restarted
+                .seed_finalized_anchor(anchor)
+                .await
+                .expect("seed the anchor")
+                .len(),
+            4
+        );
+        restarted
+            .reconcile_startup()
+            .await
+            .expect("startup reconciliation");
+        let report = verified_finality(&store, &lanes, vec![finalized_at(2, finalized)])
+            .run(verified_finality_checkpoint(), CancellationToken::new())
+            .await
+            .expect("finality after the restart");
+        assert_eq!(report.finalized_through, Some(BlockNumber(2)));
+        assert_eq!(
+            store
+                .coverage_block_by_hash(counter.descriptor(), chain[2].block.hash)
+                .await
+                .expect("coverage lookup"),
+            None,
+            "the contradicted block kept its coverage"
+        );
+    }
+
+    #[tokio::test]
+    async fn contradictions_with_finalized_history_halt_and_unfinalized_ones_heal() {
+        let counter = Arc::new(BlockLocalCounter::named("history-counter"));
+        let lanes: Vec<Arc<dyn Processor>> = vec![counter.clone()];
+        let run = |store: &SqliteStore, number: u64, hash: BlockHash| {
+            let finality = verified_finality(store, &lanes, vec![finalized_at(number, hash)]);
+            async move {
+                finality
+                    .run(verified_finality_checkpoint(), CancellationToken::new())
+                    .await
+            }
+        };
+
+        // A finalized canonical block with another hash than finality names.
+        let (_directory, store) = store().await;
+        let chain = live_blocks(2);
+        for frame in &chain {
+            store.store_recent_frame(frame).await.expect("retain");
+        }
+        run(&store, 2, chain[2].block.hash)
+            .await
+            .expect("finalize block 2");
+        let halted = run(&store, 2, BlockHash::new([0xf2; 32])).await;
+        assert!(
+            matches!(
+                halted,
+                Err(RuntimeError::FinalityContradiction {
+                    block: BlockNumber(2),
+                    ..
+                })
+            ),
+            "{halted:?}"
+        );
+        // Seeding such an anchor over it at startup halts too.
+        let seeded = scripted_live(&store, &lanes, Vec::new())
+            .seed_finalized_anchor(BlockRef {
+                number: BlockNumber(2),
+                hash: BlockHash::new([0xf2; 32]),
+                parent_hash: BlockHash::ZERO,
+                timestamp: 1,
+            })
+            .await;
+        assert!(
+            matches!(seeded, Err(RuntimeError::FinalityContradiction { .. })),
+            "{seeded:?}"
+        );
+
+        // A finalized block below the finalized one that is not its ancestor.
+        let (_directory, store) = self::store().await;
+        for frame in [
+            live_fixture(0, BlockHash::ZERO),
+            live_fixture(1, BlockHash::ZERO),
+        ] {
+            store.store_recent_frame(&frame).await.expect("retain");
+        }
+        store
+            .store_canonical_anchor(
+                ChainId(1),
+                BlockRef {
+                    number: BlockNumber(2),
+                    hash: BlockHash::new([0xa2; 32]),
+                    parent_hash: BlockHash::ZERO,
+                    timestamp: 2,
+                },
+                Finality::Finalized,
+            )
+            .await
+            .expect("seed an anchor");
+        let third = live_fixture(3, BlockHash::new([0x33; 32]));
+        store.store_recent_frame(&third).await.expect("retain");
+        let halted = run(&store, 3, third.block.hash).await;
+        assert!(
+            matches!(
+                halted,
+                Err(RuntimeError::FinalityContradiction {
+                    block: BlockNumber(3),
+                    ..
+                })
+            ),
+            "{halted:?}"
+        );
+
+        // An unfinalized block below the finalized one that is not its
+        // ancestor heals.
+        let (_directory, store) = self::store().await;
+        for frame in [
+            live_fixture(0, BlockHash::ZERO),
+            live_fixture(1, BlockHash::ZERO),
+            live_fixture(2, BlockHash::new([0x55; 32])),
+        ] {
+            store.store_recent_frame(&frame).await.expect("retain");
+        }
+        let healed = run(&store, 2, live_fixture(2, BlockHash::ZERO).block.hash).await;
+        assert!(
+            matches!(
+                healed,
+                Err(RuntimeError::FinalityReorg {
+                    block: BlockNumber(2),
+                    ..
+                })
+            ),
+            "{healed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_lane_covering_another_block_at_the_finalized_height_fails_instead_of_deferring() {
+        let chain = live_blocks(3);
+        let counter = Arc::new(BlockLocalCounter::named("stale-coverage-counter"));
+        let lanes: Vec<Arc<dyn Processor>> = vec![counter.clone()];
+        let (_directory, store) = store().await;
+        for frame in &chain {
+            store.store_recent_frame(frame).await.expect("retain");
+        }
+        // The block-local lane covers another block at height 2 than the
+        // canonical one: coverage whose undo never ran.
+        let mut stale = chain[2].clone();
+        stale.block.hash = BlockHash::new([0xee; 32]);
+        for (sequence, frame) in (1..).zip([&chain[0], &chain[1], &stale]) {
+            apply_live_frame(&store, counter.as_ref(), frame, sequence).await;
+        }
+        let report = verified_finality(&store, &lanes, vec![finalized_at(2, chain[2].block.hash)])
+            .run(verified_finality_checkpoint(), CancellationToken::new())
+            .await
+            .expect("finality continues for the others");
+        assert_eq!(report.finalized_through, Some(BlockNumber(2)));
+        assert!(
+            report
+                .failed_processors
+                .contains_key(counter.descriptor().id.as_str()),
+            "the lane deferred: a later anchor would promote its stale coverage by height ({report:?})"
+        );
+        let lane = store
+            .processor_runtime_state(counter.descriptor())
+            .await
+            .expect("state");
+        assert_eq!(lane.state, ProcessorRunState::Failed);
+        assert_eq!(lane.reason.as_deref(), Some("processor_finality_conflict"));
+        assert_eq!(
+            store
+                .finalized_through(counter.descriptor())
+                .await
+                .expect("finalized coverage"),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn a_branch_reorged_away_during_downtime_is_undone_not_finalized() {
+        // The lane followed branch A to block 5 before the node stopped.
+        let branch_a = live_blocks(5);
+        let counter = Arc::new(BlockLocalCounter::named("downtime-counter"));
+        let ledger = Arc::new(OrderedLedgerProcessor::named("downtime-ledger"));
+        let lanes: Vec<Arc<dyn Processor>> = vec![counter.clone(), ledger.clone()];
+        let (_directory, store) = store().await;
+        run_live(&scripted_live(&store, &lanes, block_events(&branch_a)))
+            .await
+            .expect("live run before the downtime");
+        // Meanwhile the network reorged below block 5 and finalized block 8
+        // on branch B, which none of the retained blocks links to.
+        let anchor = BlockRef {
+            number: BlockNumber(8),
+            hash: BlockHash::new([0xb8; 32]),
+            parent_hash: BlockHash::ZERO,
+            timestamp: 1,
+        };
+        let restarted = scripted_live(&store, &lanes, Vec::new());
+        let reverted = restarted
+            .seed_finalized_anchor(anchor)
+            .await
+            .expect("seed the verified finalized anchor");
+        assert_eq!(
+            reverted
+                .iter()
+                .map(|block| block.number.0)
+                .collect::<Vec<_>>(),
+            [5, 4, 3, 2, 1, 0],
+            "branch A is not reverted"
+        );
+        let report = restarted
+            .reconcile_startup()
+            .await
+            .expect("startup reconciliation");
+        // Branch A is undone for every lane, as a reorg undoes it...
+        for lane in &lanes {
+            assert_eq!(
+                report.processors[lane.descriptor().id.as_str()].reverted,
+                6,
+                "{}",
+                lane.descriptor().id
+            );
+            for frame in &branch_a {
+                assert_eq!(
+                    store
+                        .coverage_block_by_hash(lane.descriptor(), frame.block.hash)
+                        .await
+                        .expect("coverage lookup"),
+                    None,
+                    "{} still covers block {}",
+                    lane.descriptor().id,
+                    frame.block.number.0
+                );
+            }
+        }
+        // ...and finality through the anchor finalizes none of it.
+        let finality = verified_finality(&store, &lanes, vec![finalized_at(8, anchor.hash)])
+            .run(verified_finality_checkpoint(), CancellationToken::new())
+            .await
+            .expect("finality run");
+        assert_eq!(finality.finalized_through, Some(BlockNumber(8)));
+        for lane in &lanes {
+            assert_eq!(
+                store
+                    .finalized_through(lane.descriptor())
+                    .await
+                    .expect("finalized coverage"),
+                None,
+                "{}",
+                lane.descriptor().id
+            );
+        }
+        for frame in &branch_a {
+            assert!(
+                store
+                    .canonical_block(ChainId(1), frame.block.number)
+                    .await
+                    .expect("canonical lookup")
+                    .is_none(),
+                "branch A block {} stayed canonical",
+                frame.block.number.0
+            );
+        }
     }
 }

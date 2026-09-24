@@ -994,7 +994,7 @@ pub(crate) async fn run_real_source(
                 );
             }
             let available = BlockRange::new(BlockNumber(available_start), anchor.block.number)?;
-            let persistent = execution_p2p_source(&config, p2p_network_telemetry.clone())?;
+            let persistent = execution_p2p_source(&config, p2p_network_telemetry.clone(), None)?;
             p2p_request_metrics_source = Some(persistent.clone());
             let source = leani_source_p2p::RethP2pHistorySource::from_persistent_source(
                 persistent.as_ref().clone(),

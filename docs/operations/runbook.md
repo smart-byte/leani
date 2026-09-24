@@ -61,6 +61,27 @@ backfills for every processor that has a capable history source. A source
 failure drops readiness immediately and the supervisor retries with bounded
 exponential backoff.
 
+The live lane includes blocks only up to the newest attested head: the
+execution header of a light-client optimistic update that at least two thirds
+of the sync committee signed, which the finality source verifies each slot.
+Included blocks therefore trail the chain tip by one to two slots. When no
+new attested head arrives for four slots, for example while the finality
+transports are down or sync-committee participation stays below two thirds,
+the lane reports itself disconnected and live readiness drops until one does.
+Configuration refuses `sources.live.kind = "p2p"` with
+`finality.kind = "disabled"`, because nothing would verify those heads; use
+`sources.live.kind = "disabled"` for finalized-dataset backfills.
+
+When live readiness drops this way while finality stays ready, run
+`leani source probe finality`. Each Beacon endpoint whose finality verified
+reports its `attested_head`, or in `attested_head_error` why it gave none: it
+served no optimistic update, its update anchors no head, or its update failed
+verification. The lane needs one endpoint that serves
+`/eth/v1/beacon/light_client/optimistic_update`; replace endpoints that serve
+none. With `finality.kind = "consensus_p2p"`, peers must serve the
+`light_client_optimistic_update` request; the debug log names each peer that
+served none.
+
 The network view reports the process-wide execution P2P manager. Live, history,
 and probe requests share its identity, discovery state, peer pool, request
 gate, and Reth reputation state. Each row includes:
@@ -423,6 +444,43 @@ again, across reconnects, until the lanes restart. Stale updates are retried,
 so neither ends the finality stream. An exhausted peer set logs a warning at
 most every five minutes.
 
+### Finality contradicts the followed chain
+
+When verified finality names another block at a height than the retained
+canonical chain holds, or a retained block below the finalized block does not
+link to it, the node neither finalizes either chain nor defers forever.
+
+A contradiction with retained *unfinalized* blocks, for example after the lane
+stalled across a reorg of an attested head, heals itself. The node logs
+`verified finality contradicts retained unfinalized blocks; restarting the
+network lanes to revert them` as a warning and restarts the network lanes
+after the supervisor's backoff. The restart reverts every retained unfinalized
+block that does not link to the newly verified finalized anchor and undoes
+processor coverage of it as a reorg, logging `retained unfinalized blocks do
+not link to the verified finalized anchor; reverting them as a reorg`. Those
+blocks are never finalized; the cold backfill and the live lane fetch the
+finalized chain again.
+
+The network lanes halt instead when the contradiction is with *finalized*
+history, which no revert repairs, or when the same unfinalized contradiction
+comes back a third time before finality moves to another block, so two
+restarts did not repair it. The node then logs `verified finality contradicts
+the retained canonical chain; network lanes halt until the node restarts` at
+error level: readiness stays false, `network.supervisor` reports `stopped`
+with the contradiction as its last error, and nothing retries it. The API
+keeps serving what is stored.
+
+1. Preserve the database and logs. Check the checkpoint provenance and the
+   finality transports: a halt means the node followed another chain than the
+   one consensus finalized and could not revert it, or a trust root is wrong.
+2. If the error says `verified finality contradicts finalized canonical
+   history`, finalized history in the store is wrong and no revert repairs
+   it: rebuild in a new `data_dir`.
+3. If it says the contradiction `recurred after 2 restarts of the network
+   lanes`, restart the node once the finality transports check out: startup
+   reverts the unfinalized blocks as above. If it halts the same way again,
+   rebuild in a new `data_dir`.
+
 ### Storage pressure
 
 Inspect per-processor attribution with `db inspect` and `/metrics`. Prune
@@ -492,7 +550,7 @@ replays from there instead of skipping blocks or failing.
 | `processor_live_delta_conflict` | failed | Investigate before resetting: a pending delta for an applied block carries different content, so the processor's transform is not deterministic or its inputs differed. The applied block stands. Restart the node, whose [startup reconciliation](#crash-or-interrupted-commit) deletes that pending delta, then reset the lane. |
 | `single_block_exceeds_delivery_limit`, `single_delta_exceeds_pending_delta_limit`, `live_gap_marker_exceeds_pending_delta_budget` | failed | Reset after raising the limit. |
 | `live_gap_canonical_identity_changed` and the other `finalized_gap_recovery_*` reasons | failed | Reset after checking the history source against the canonical chain. For an ordered lane, `finalized_gap_recovery_canonical_mismatch` can also mean that the block history returned does not descend from the lane's own last applied block, which is then off the canonical chain: restart the node, whose [startup reconciliation](#crash-or-interrupted-commit) undoes an unfinalized off-chain block, then reset; a finalized one needs a rebuild. |
-| `processor_finality_conflict` | failed | Rebuild the processor as a replacement instance; the reset route refuses this lane with `409 live_lane_requires_rebuild`. The same instance cannot be rebuilt in place today: configure a replacement instance, with a new processor version or configuration, and move to it as in [Processor rebuild or rollback](#processor-rebuild-or-rollback). Its coverage holds a finalized block hash at another height, so it contradicts the canonical chain, and finality stops advancing it. This reason replaces any earlier failure reason. |
+| `processor_finality_conflict` | failed | Rebuild the processor as a replacement instance; the reset route refuses this lane with `409 live_lane_requires_rebuild`. The same instance cannot be rebuilt in place today: configure a replacement instance, with a new processor version or configuration, and move to it as in [Processor rebuild or rollback](#processor-rebuild-or-rollback). Its coverage holds a finalized block hash at another height, or another block at a finalized height, so it contradicts the canonical chain, and finality stops advancing it. This reason replaces any earlier failure reason. |
 
 ### Crash or interrupted commit
 

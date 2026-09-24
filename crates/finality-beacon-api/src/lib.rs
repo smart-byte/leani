@@ -21,21 +21,22 @@ use helios_consensus_core::{
     apply_bootstrap, apply_finality_update, apply_update, calc_sync_period,
     consensus_spec::{ConsensusSpec, MainnetConsensusSpec},
     errors::ConsensusError,
-    types::{Bootstrap, FinalityUpdate, Fork, Forks, LightClientStore, Update},
-    verify_bootstrap, verify_finality_update, verify_update,
+    get_bits,
+    types::{Bootstrap, FinalityUpdate, Fork, Forks, LightClientStore, OptimisticUpdate, Update},
+    verify_bootstrap, verify_finality_update, verify_optimistic_update, verify_update,
 };
 use leani_primitives::{
-    BlockHash, Capability, CapabilitySet, ChainId, SourceId, SourceKind, TrustModel,
+    BlockHash, BlockNumber, Capability, CapabilitySet, ChainId, SourceId, SourceKind, TrustModel,
 };
 use leani_source_api::{
-    ConsensusCheckpoint, FinalityEvent, FinalityEventStream, FinalityModel, FinalitySource,
-    Partitioning, SourceDescriptor, SourceError,
+    AttestedHead, AttestedHeadPublisher, ConsensusCheckpoint, FinalityEvent, FinalityEventStream,
+    FinalityModel, FinalitySource, Partitioning, SourceDescriptor, SourceError,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use tree_hash::TreeHash;
 use url::Url;
 
@@ -65,6 +66,12 @@ const ELECTRA_FORK_EPOCH: u64 = 364_032;
 const MAX_BLOBS_PER_BLOCK_ELECTRA: u64 = 9;
 const MAINNET_BLOB_SCHEDULE: [(u64, u64); 2] = [(412_672, 15), (419_072, 21)];
 pub const DEFAULT_MAX_CHECKPOINT_AGE: Duration = Duration::from_hours(336);
+/// Members of the Ethereum mainnet sync committee.
+const SYNC_COMMITTEE_SIZE: u64 = 512;
+/// Sync-committee signatures an optimistic update needs before its attested
+/// header anchors the live lane: at least two thirds of the committee.
+pub const SYNC_COMMITTEE_SUPERMAJORITY: u64 = (2 * SYNC_COMMITTEE_SIZE).div_ceil(3);
+const OPTIMISTIC_UPDATE_PATH: &str = "eth/v1/beacon/light_client/optimistic_update";
 
 /// Immutable Helios revision used by this adapter.
 pub const HELIOS_REVISION: &str = "204c998a927348e1c000a664f08d5b37b1b0d924";
@@ -228,6 +235,15 @@ pub struct EndpointProbe {
     pub verified: bool,
     pub anchor: Option<VerifiedFinalityAnchor>,
     pub checkpoint_anchor: Option<VerifiedFinalityAnchor>,
+    /// The head of the endpoint's verified optimistic update, if it served
+    /// one that at least two thirds of the sync committee signed.
+    #[serde(default)]
+    pub attested_head: Option<AttestedHead>,
+    /// Why the endpoint's finality verified but its optimistic update gave
+    /// no attested head: it served none, it anchors none, or it failed
+    /// verification.
+    #[serde(default)]
+    pub attested_head_error: Option<String>,
     pub updates_verified: u64,
     pub error: Option<String>,
 }
@@ -241,6 +257,10 @@ pub struct FinalityProbeReport {
     pub minimum_agreement: usize,
     pub accepted: bool,
     pub selected: Option<VerifiedFinalityAnchor>,
+    /// The newest attested head any endpoint verified, the one the live
+    /// lane follows.
+    #[serde(default)]
+    pub attested_head: Option<AttestedHead>,
     pub agreeing_endpoints: usize,
     pub disagreements: Vec<String>,
     pub endpoints: Vec<EndpointProbe>,
@@ -387,6 +407,65 @@ impl MainnetLightClientVerifier {
         self.updates_verified = self.updates_verified.saturating_add(1);
         self.finalized_anchor()
     }
+
+    /// Verify an optimistic update and return the execution block its
+    /// attested header commits to.
+    ///
+    /// The sync aggregate must carry at least
+    /// [`SYNC_COMMITTEE_SUPERMAJORITY`] signatures. Helios then checks the
+    /// aggregate signature over the attested header, with the fork version and
+    /// domain of the signature slot, and the header's execution branch. The
+    /// store is not changed: finality advances only through finality updates.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BeaconApiError::InsufficientParticipation`] for too few
+    /// signatures, [`BeaconApiError::StaleUpdate`] for an update the store has
+    /// passed or cannot verify yet, and a verification error otherwise.
+    pub fn verify_attested_head(
+        &self,
+        update: &OptimisticUpdate<MainnetConsensusSpec>,
+        now: SystemTime,
+    ) -> Result<AttestedHead, BeaconApiError> {
+        let participants =
+            get_bits::<MainnetConsensusSpec>(&update.sync_aggregate.sync_committee_bits);
+        if !has_sync_committee_supermajority(participants) {
+            return Err(BeaconApiError::InsufficientParticipation {
+                participants,
+                required: SYNC_COMMITTEE_SUPERMAJORITY,
+            });
+        }
+        verify_optimistic_update::<MainnetConsensusSpec>(
+            update,
+            verification_slot(now),
+            &self.store,
+            MAINNET_GENESIS_ROOT,
+            &self.forks,
+        )
+        .map_err(|error| {
+            update_error(
+                error.downcast_ref(),
+                error.to_string(),
+                update.signature_slot,
+                now,
+            )
+        })?;
+        let root: [u8; 32] = update.attested_header.beacon().tree_hash_root().into();
+        let attested = anchor_from_header(&update.attested_header, root)?;
+        Ok(AttestedHead {
+            beacon_slot: attested.beacon_slot,
+            beacon_block_root: root,
+            block_number: BlockNumber(attested.execution_block_number),
+            block_hash: attested.execution_block_hash,
+        })
+    }
+}
+
+/// Whether `participants` of the sync committee are at least two thirds of
+/// it, enough for their signature to anchor an attested head.
+#[must_use]
+pub const fn has_sync_committee_supermajority(participants: u64) -> bool {
+    participants >= SYNC_COMMITTEE_SUPERMAJORITY
 }
 
 #[derive(Clone, Debug)]
@@ -399,6 +478,8 @@ pub struct VerifiedBeaconApi {
     clock: Clock,
     verifiers: Arc<tokio::sync::Mutex<VerifierPool>>,
     anchor_writer: AnchorWriter,
+    /// Where every accepted poll publishes its newest verified attested head.
+    attested_heads: Option<AttestedHeadPublisher>,
 }
 
 /// One endpoint's light client.
@@ -503,7 +584,16 @@ impl VerifiedBeaconApi {
             transport,
             clock,
             verifiers: Arc::new(tokio::sync::Mutex::new(VerifierPool::default())),
+            attested_heads: None,
         })
+    }
+
+    /// Publish the attested head of every accepted poll, each slot, to
+    /// `heads`: the execution live lane includes no block above it.
+    #[must_use]
+    pub fn with_attested_heads(mut self, heads: AttestedHeadPublisher) -> Self {
+        self.attested_heads = Some(heads);
+        self
     }
 
     /// Verify all configured endpoints from a checkpoint, or from a newer
@@ -615,6 +705,8 @@ impl VerifiedBeaconApi {
                         verified: true,
                         anchor: Some(result.anchor),
                         checkpoint_anchor: Some(result.checkpoint_anchor),
+                        attested_head: result.attested_head.as_ref().ok().copied(),
+                        attested_head_error: result.attested_head.err(),
                         updates_verified: result.updates_verified,
                         error: None,
                     },
@@ -623,6 +715,8 @@ impl VerifiedBeaconApi {
                         verified: false,
                         anchor: None,
                         checkpoint_anchor: None,
+                        attested_head: None,
+                        attested_head_error: None,
                         updates_verified: 0,
                         error: Some(error.to_string()),
                     },
@@ -672,7 +766,24 @@ impl VerifiedBeaconApi {
         {
             pool.newest_agreed = Some(selected);
         }
+        self.publish_attested_head(&report);
         report
+    }
+
+    /// Publish a poll's attested head. Only a poll whose finality was
+    /// accepted steers the live lane.
+    fn publish_attested_head(&self, report: &FinalityProbeReport) {
+        if let (Some(heads), Some(head)) = (
+            &self.attested_heads,
+            report.attested_head.filter(|_| report.accepted),
+        ) && heads.publish(head)
+        {
+            debug!(
+                beacon_slot = head.beacon_slot,
+                block = head.block_number.0,
+                "published a sync-committee-attested execution head"
+            );
+        }
     }
 
     fn validate_checkpoint(
@@ -797,6 +908,7 @@ async fn next_finality_event(
                     state.last_emitted = Some(anchor);
                     return Some((
                         Ok(FinalityEvent::Finalized {
+                            block_number: BlockNumber(anchor.execution_block_number),
                             block_hash: anchor.execution_block_hash,
                             beacon_slot: anchor.beacon_slot,
                             beacon_block_root: anchor.beacon_block_root,
@@ -831,11 +943,13 @@ async fn next_finality_event(
 struct EndpointSync {
     anchor: VerifiedFinalityAnchor,
     checkpoint_anchor: VerifiedFinalityAnchor,
+    attested_head: Result<AttestedHead, String>,
     updates_verified: u64,
 }
 
 /// Advance one endpoint's verifier: bootstrap it once, then verify the
-/// latest finality update after the sync-committee updates it needs.
+/// latest finality update after the sync-committee updates it needs, and the
+/// latest optimistic update.
 async fn poll_endpoint(
     transport: &Arc<dyn BeaconTransport>,
     endpoint: &Url,
@@ -921,8 +1035,43 @@ async fn poll_endpoint(
     Ok(EndpointSync {
         anchor,
         checkpoint_anchor: verifier.checkpoint_anchor(),
+        attested_head: attested_endpoint_head(transport, endpoint, verifier, clock).await,
         updates_verified: verifier.updates_verified(),
     })
+}
+
+/// Verify an endpoint's latest optimistic update, or say why it gives no
+/// attested head. Either way the endpoint's finality stays in place: the live
+/// lane waits for another endpoint's or the next slot's head.
+async fn attested_endpoint_head(
+    transport: &dyn BeaconTransport,
+    endpoint: &Url,
+    verifier: &MainnetLightClientVerifier,
+    clock: &Clock,
+) -> Result<AttestedHead, String> {
+    let update: OptimisticUpdateResponse<MainnetConsensusSpec> =
+        match get_json(transport, endpoint, OPTIMISTIC_UPDATE_PATH).await {
+            Ok(update) => update,
+            Err(error) => {
+                debug!(%error, "Beacon endpoint served no optimistic update");
+                return Err(format!("served no optimistic update: {error}"));
+            }
+        };
+    verifier
+        .verify_attested_head(&update.data, clock.now())
+        .map_err(|error| {
+            if error.is_unusable_head() {
+                debug!(%error, "Beacon endpoint's optimistic update anchors no head");
+                format!("optimistic update anchors no head: {error}")
+            } else {
+                warn!(
+                    endpoint = %redacted_url(endpoint),
+                    %error,
+                    "Beacon endpoint served an optimistic update that failed verification"
+                );
+                format!("optimistic update failed verification: {error}")
+            }
+        })
 }
 
 /// Check an endpoint's network, then verify its bootstrap for `root`.
@@ -1103,10 +1252,35 @@ fn select_endpoint_agreement(
         minimum_agreement,
         accepted: selected.is_some() && disagreements.is_empty(),
         selected,
+        attested_head: select_attested_head(&endpoints),
         agreeing_endpoints,
         disagreements,
         endpoints,
     }
+}
+
+/// Select the newest attested head any endpoint verified. Endpoints are only
+/// transports: each head carries the signatures of at least two thirds of the
+/// sync committee, so one endpoint suffices and a lagging one never holds the
+/// head back. Two different heads at the newest slot fail closed: no head is
+/// followed from this poll.
+fn select_attested_head(endpoints: &[EndpointProbe]) -> Option<AttestedHead> {
+    let heads = endpoints
+        .iter()
+        .filter_map(|endpoint| endpoint.attested_head)
+        .collect::<Vec<_>>();
+    let newest = heads.iter().copied().max_by_key(|head| head.beacon_slot)?;
+    if heads
+        .iter()
+        .any(|head| head.beacon_slot == newest.beacon_slot && *head != newest)
+    {
+        warn!(
+            beacon_slot = newest.beacon_slot,
+            "verified endpoints returned different attested heads at one slot; no head is followed from this poll"
+        );
+        return None;
+    }
+    Some(newest)
 }
 
 pub fn mainnet_forks() -> Forks {
@@ -1144,6 +1318,12 @@ struct UpdateResponse<S: ConsensusSpec> {
 #[serde(bound = "S: ConsensusSpec")]
 struct FinalityUpdateResponse<S: ConsensusSpec> {
     data: FinalityUpdate<S>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(bound = "S: ConsensusSpec")]
+struct OptimisticUpdateResponse<S: ConsensusSpec> {
+    data: OptimisticUpdate<S>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1205,6 +1385,10 @@ pub enum BeaconApiError {
     Redirect { url: String, status: u16 },
     #[error("light-client update is stale or not yet verifiable: {0}")]
     StaleUpdate(String),
+    #[error(
+        "optimistic update carries {participants} sync-committee signatures; an attested head needs {required}"
+    )]
+    InsufficientParticipation { participants: u64, required: u64 },
 }
 
 impl BeaconApiError {
@@ -1214,6 +1398,17 @@ impl BeaconApiError {
     #[must_use]
     pub const fn is_stale_update(&self) -> bool {
         matches!(self, Self::StaleUpdate(_))
+    }
+
+    /// Whether an optimistic update anchors no head without being evidence
+    /// of a faulty transport: it is stale, or fewer than two thirds of the
+    /// sync committee signed it, as happens while participation is low.
+    #[must_use]
+    pub const fn is_unusable_head(&self) -> bool {
+        matches!(
+            self,
+            Self::StaleUpdate(_) | Self::InsufficientParticipation { .. }
+        )
     }
 }
 
@@ -1249,6 +1444,13 @@ mod tests {
     const BOOTSTRAP_JSON: &str = include_str!("../tests/fixtures/helios/bootstrap.json");
     const UPDATES_JSON: &str = include_str!("../tests/fixtures/helios/updates.json");
     const FINALITY_JSON: &str = include_str!("../tests/fixtures/helios/finality.json");
+    const OPTIMISTIC_JSON: &str = include_str!("../tests/fixtures/helios/optimistic.json");
+    /// The attested header of `optimistic.json`, signed at the next slot.
+    const ATTESTED_SLOT: u64 = 7_109_431;
+    const ATTESTED_BLOCK: u64 = 17_923_113;
+    const ATTESTED_EXECUTION_HASH: B256 =
+        b256!("3c015340e234ff7f8e75ecebb11d45154a394cd896ddcfcfffc941a07b314960");
+    const FINALIZED_BLOCK: u64 = 17_923_026;
 
     /// Serves the vendored Helios mainnet responses and records each request.
     #[derive(Debug, Default)]
@@ -1256,6 +1458,11 @@ mod tests {
         requests: Mutex<Vec<String>>,
         /// Finality responses served instead of `finality.json`, by endpoint.
         finality: Mutex<HashMap<String, String>>,
+        /// Optimistic responses served instead of `optimistic.json`, by
+        /// endpoint.
+        optimistic: Mutex<HashMap<String, String>>,
+        /// Endpoints that serve no optimistic update, answering HTTP 404.
+        no_optimistic: Mutex<Vec<String>>,
         /// Delays before a finality response, by endpoint.
         finality_delays: Mutex<HashMap<String, Duration>>,
         /// Delays before a bootstrap response, by endpoint.
@@ -1353,10 +1560,54 @@ mod tests {
                     .get(endpoint.as_str())
                     .cloned()
                     .unwrap_or_else(|| FINALITY_JSON.to_owned())
+            } else if path_and_query == OPTIMISTIC_UPDATE_PATH {
+                if self
+                    .no_optimistic
+                    .lock()
+                    .expect("endpoints without optimistic updates")
+                    .iter()
+                    .any(|without| without == endpoint.as_str())
+                {
+                    return Err(missing());
+                }
+                self.optimistic
+                    .lock()
+                    .expect("optimistic overrides")
+                    .get(endpoint.as_str())
+                    .cloned()
+                    .unwrap_or_else(|| OPTIMISTIC_JSON.to_owned())
             } else {
                 return Err(missing());
             };
             Ok(body.into_bytes())
+        }
+    }
+
+    /// `optimistic.json` with its attested header or sync aggregate edited.
+    fn edited_optimistic_json(edit: impl FnOnce(&mut serde_json::Value)) -> String {
+        let mut update: serde_json::Value =
+            serde_json::from_str(OPTIMISTIC_JSON).expect("fixture optimistic update");
+        edit(&mut update["data"]);
+        update.to_string()
+    }
+
+    /// A 512-bit sync-committee bitfield with the first `participants` set.
+    fn participation_bits(participants: usize) -> String {
+        let mut bits = [0_u8; 64];
+        for index in 0..participants {
+            bits[index / 8] |= 1 << (index % 8);
+        }
+        format!("0x{}", hex::encode(bits))
+    }
+
+    fn fixture_attested_head() -> AttestedHead {
+        let update: OptimisticUpdateResponse<MainnetConsensusSpec> =
+            serde_json::from_str(OPTIMISTIC_JSON).expect("fixture optimistic update");
+        AttestedHead {
+            beacon_slot: ATTESTED_SLOT,
+            beacon_block_root: update.data.attested_header.beacon().tree_hash_root().into(),
+            block_number: BlockNumber(ATTESTED_BLOCK),
+            block_hash: BlockHash::new(ATTESTED_EXECUTION_HASH.into()),
         }
     }
 
@@ -2109,6 +2360,212 @@ mod tests {
         assert!(!error.is_stale_update(), "{error}");
     }
 
+    fn optimistic_update(encoded: &str) -> OptimisticUpdate<MainnetConsensusSpec> {
+        serde_json::from_str::<OptimisticUpdateResponse<MainnetConsensusSpec>>(encoded)
+            .expect("optimistic update")
+            .data
+    }
+
+    #[test]
+    fn optimistic_updates_anchor_the_attested_execution_head() {
+        let now = UNIX_EPOCH + Duration::from_secs(slot_time(SIGNATURE_SLOT) + 60);
+        let verifier = fixture_verifier(now);
+        // The execution payload of the header the sync committee signed,
+        // proven by the header's execution branch.
+        assert_eq!(
+            verifier
+                .verify_attested_head(&optimistic_update(OPTIMISTIC_JSON), now)
+                .expect("verified optimistic update"),
+            fixture_attested_head()
+        );
+        // Signed ahead of the local clock: retryable, not invalid.
+        let behind = UNIX_EPOCH + Duration::from_secs(slot_time(ATTESTED_SLOT - 10));
+        let error = verifier
+            .verify_attested_head(&optimistic_update(OPTIMISTIC_JSON), behind)
+            .expect_err("signed ahead of the local clock");
+        assert!(error.is_unusable_head(), "{error}");
+        // A header the committee did not sign is invalid.
+        let forged = optimistic_update(&edited_optimistic_json(|data| {
+            data["attested_header"]["beacon"]["proposer_index"] = "1".into();
+        }));
+        let error = verifier
+            .verify_attested_head(&forged, now)
+            .expect_err("forged");
+        assert!(!error.is_unusable_head(), "{error}");
+        // So is an execution payload the signed header does not commit to.
+        let unproven = optimistic_update(&edited_optimistic_json(|data| {
+            data["attested_header"]["execution"]["block_number"] =
+                (ATTESTED_BLOCK + 1).to_string().into();
+        }));
+        let error = verifier
+            .verify_attested_head(&unproven, now)
+            .expect_err("unproven execution payload");
+        assert!(!error.is_unusable_head(), "{error}");
+    }
+
+    #[test]
+    fn attested_heads_need_two_thirds_of_the_sync_committee() {
+        assert_eq!(SYNC_COMMITTEE_SUPERMAJORITY, 342);
+        assert!(has_sync_committee_supermajority(342));
+        assert!(has_sync_committee_supermajority(512));
+        assert!(!has_sync_committee_supermajority(341));
+        assert!(!has_sync_committee_supermajority(1));
+
+        let now = UNIX_EPOCH + Duration::from_secs(slot_time(SIGNATURE_SLOT) + 60);
+        let verifier = fixture_verifier(now);
+        // Helios accepts any number of signatures. 341 of them are refused
+        // before the BLS check, as participation too low to anchor a head,
+        // not as a forgery.
+        let low = optimistic_update(&edited_optimistic_json(|data| {
+            data["sync_aggregate"]["sync_committee_bits"] = participation_bits(341).into();
+        }));
+        let error = verifier
+            .verify_attested_head(&low, now)
+            .expect_err("low participation");
+        assert!(
+            matches!(
+                error,
+                BeaconApiError::InsufficientParticipation {
+                    participants: 341,
+                    required: 342
+                }
+            ),
+            "{error}"
+        );
+        assert!(error.is_unusable_head());
+        // 342 pass the count, and the BLS check decides: the aggregate
+        // signature is over other members.
+        let enough = optimistic_update(&edited_optimistic_json(|data| {
+            data["sync_aggregate"]["sync_committee_bits"] = participation_bits(342).into();
+        }));
+        let error = verifier
+            .verify_attested_head(&enough, now)
+            .expect_err("signature over other members");
+        assert!(matches!(error, BeaconApiError::Verification(_)), "{error}");
+    }
+
+    #[tokio::test]
+    async fn accepted_polls_publish_the_newest_verified_attested_head() {
+        let transport = Arc::new(FixtureTransport::default());
+        {
+            let mut optimistic = transport.optimistic.lock().expect("optimistic overrides");
+            // One endpoint forges its optimistic update, and one serves an
+            // update too few committee members signed.
+            optimistic.insert(
+                "https://b.example/".to_owned(),
+                edited_optimistic_json(|data| {
+                    data["attested_header"]["beacon"]["proposer_index"] = "1".into();
+                }),
+            );
+            optimistic.insert(
+                "https://c.example/".to_owned(),
+                edited_optimistic_json(|data| {
+                    data["sync_aggregate"]["sync_committee_bits"] = participation_bits(341).into();
+                }),
+            );
+        }
+        // And one serves no optimistic update at all.
+        transport
+            .no_optimistic
+            .lock()
+            .expect("endpoints without optimistic updates")
+            .push("https://d.example/".to_owned());
+        let heads = AttestedHeadPublisher::new();
+        let source = fixture_source(
+            &[
+                "https://a.example/",
+                "https://b.example/",
+                "https://c.example/",
+                "https://d.example/",
+            ],
+            &transport,
+            Clock::new(move || UNIX_EPOCH + Duration::from_secs(slot_time(SIGNATURE_SLOT) + 60)),
+            AnchorFile::Disabled,
+        )
+        .with_attested_heads(heads.clone());
+        let mut events = source
+            .subscribe(
+                checkpoint(BOOTSTRAP_ROOT.into(), BOOTSTRAP_SLOT),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("subscribe");
+        match events.next().await {
+            Some(Ok(FinalityEvent::Finalized {
+                block_number,
+                block_hash,
+                beacon_slot,
+                ..
+            })) => {
+                assert_eq!(block_number, BlockNumber(FINALIZED_BLOCK));
+                assert_eq!(beacon_slot, FINALIZED_SLOT);
+                assert_ne!(block_hash, BlockHash::ZERO);
+            }
+            other => panic!("expected a finalized event, got {other:?}"),
+        }
+        assert_eq!(heads.latest(), Some(fixture_attested_head()));
+        assert!(transport.count(OPTIMISTIC_UPDATE_PATH) >= 4);
+        let report = source.probe_root(operator(BOOTSTRAP_ROOT)).await;
+        assert_eq!(report.attested_head, Some(fixture_attested_head()));
+        // Each endpoint whose finality verified reports its head, or why it
+        // gave none.
+        let head_or_reason = |label: &str| {
+            let endpoint = report
+                .endpoints
+                .iter()
+                .find(|endpoint| endpoint.endpoint.starts_with(label))
+                .unwrap_or_else(|| panic!("{label} is not reported: {:?}", report.endpoints));
+            assert!(endpoint.verified, "{endpoint:?}");
+            (endpoint.attested_head, endpoint.attested_head_error.clone())
+        };
+        assert_eq!(
+            head_or_reason("https://a.example"),
+            (Some(fixture_attested_head()), None)
+        );
+        for (label, reason) in [
+            ("https://b.example", "failed verification"),
+            ("https://c.example", "anchors no head"),
+            ("https://d.example", "served no optimistic update"),
+        ] {
+            let (head, error) = head_or_reason(label);
+            assert_eq!(head, None, "{label}");
+            assert!(
+                error.as_deref().is_some_and(|error| error.contains(reason)),
+                "{label} reports no reason: {error:?}"
+            );
+        }
+        let encoded = serde_json::to_string(&report).expect("probe report");
+        assert!(encoded.contains("attested_head_error"), "{encoded}");
+    }
+
+    #[test]
+    fn different_attested_heads_at_one_slot_fail_closed() {
+        let at = |slot: u64, byte: u8| AttestedHead {
+            beacon_slot: slot,
+            beacon_block_root: [byte; 32],
+            block_number: BlockNumber(slot * 2),
+            block_hash: BlockHash::new([byte; 32]),
+        };
+        let serving = |head| EndpointProbe {
+            attested_head: Some(head),
+            ..endpoint("https://a.example", Some(anchor(10, 1)))
+        };
+        // A lagging endpoint never holds the head back.
+        assert_eq!(
+            select_attested_head(&[serving(at(10, 1)), serving(at(12, 2))]),
+            Some(at(12, 2))
+        );
+        // Two signed heads at one slot contradict each other.
+        assert_eq!(
+            select_attested_head(&[serving(at(12, 2)), serving(at(12, 3)), serving(at(10, 1))]),
+            None
+        );
+        assert_eq!(
+            select_attested_head(&[endpoint("https://a.example", None)]),
+            None
+        );
+    }
+
     #[test]
     fn agreement_counts_endpoints_at_or_beyond_a_slot() {
         // An endpoint that already verified the next epoch vouches for the
@@ -2439,6 +2896,8 @@ mod tests {
                 verified: false,
                 anchor: None,
                 checkpoint_anchor: None,
+                attested_head: None,
+                attested_head_error: None,
                 updates_verified: 0,
                 error: Some("unavailable".to_owned()),
             }],
@@ -2472,6 +2931,8 @@ mod tests {
                 beacon_slot: anchor.beacon_slot.saturating_sub(1),
                 ..anchor
             }),
+            attested_head: None,
+            attested_head_error: None,
             updates_verified: u64::from(anchor.is_some()),
             error: anchor.is_none().then(|| "unavailable".to_owned()),
         }

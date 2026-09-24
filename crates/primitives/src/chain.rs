@@ -265,7 +265,9 @@ pub enum Finality {
     /// A peer supplied the block; its connection to the chain is still being
     /// checked. Only the embedded CLI emits this; it is never persisted.
     Preview = 0,
-    /// The block is on the currently followed chain. A reorg can remove it.
+    /// The block is on the currently followed chain: the execution P2P live
+    /// lane verifies its ancestry to an execution header the Ethereum sync
+    /// committee attested. A reorg can remove it.
     Included = 1,
     /// Ethereum consensus has finalized the block.
     Finalized = 2,

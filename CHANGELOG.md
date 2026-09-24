@@ -76,6 +76,36 @@ record, and documented RPC contracts.
   other users can access is restricted to mode 0600 on load, with a warning.
   Creating the identity removes its temporary file on every failure and syncs
   the directory after installing it.
+- An `included` block now has its ancestry verified to an execution header the
+  Ethereum sync committee attested. Post-merge headers carry no seal, so one
+  execution peer could serve a self-consistent child of the tip, with logs of
+  its choosing, and the node applied it as included. Both finality sources now
+  verify the latest light-client optimistic update each slot: at least 342 of
+  the 512 sync-committee members must sign its attested beacon header, whose
+  execution branch proves the execution block number and hash. The live lane
+  fetches nothing above the newest attested head. It requests the head's
+  header, and the header chain below it, by hash, down from the head's own,
+  and catches up with those proven headers, so a peer that serves another
+  header for a requested hash is banned. An attested head is not final: a peer
+  that lacks the block, such as an honest one on another branch after a reorg,
+  is only cooled down, and a catch-up or proof that fails is proven again from
+  the newest attested head, so one reorg of an attested head no longer stalls
+  the lane. A lane reset, a peer reward, and clearing a withheld-header strike
+  now need headers anchored that way, including for filtered-log blocks
+  without matching logs and for head discovery.
+- Verified finality that contradicts the chain the node followed no longer
+  waits forever for a canonical block that never arrives. The finalized block
+  must be the canonical block at its height, only retained blocks that link to
+  it by parent hash are finalized, and a processor's coverage at that height
+  must hold its hash. A contradiction with retained unfinalized blocks, such
+  as after the lane stalled across a reorg, restarts the network lanes, and
+  every start undoes retained unfinalized blocks that do not link to the newly
+  verified finalized anchor as a reorg and never finalizes them. That includes
+  a branch the network reorged away while the node was down. A contradiction
+  with finalized history, or the same unfinalized one recurring a third time
+  before finality moves to another block, halts the network lanes, not ready
+  and not retried, with the error in the log and in `network.supervisor` (see
+  the runbook's "Finality contradicts the followed chain").
 
 ### Changed
 
@@ -222,6 +252,28 @@ record, and documented RPC contracts.
   or half the limit (rounded down) when it is below eight, and a waiting live
   request gets the next free slot first. Qualification never runs at high
   priority.
+- Breaking (`leani-source-api`): `FinalityEvent::Finalized` gains
+  `block_number`, the finalized execution block's number, next to its hash;
+  construct and match it with the new field. The crate adds `AttestedHead`,
+  and `AttestedHeadPublisher` and `AttestedHeadReceiver`, the two ends of a
+  latest-value channel: a finality source publishes the newest verified
+  attested head, and the execution live lane only receives it. It also adds
+  `NetworkTelemetry::supervisor_halted`, and now depends on `tokio` with the
+  `sync` feature only.
+- Breaking (configuration): live following requires verified finality.
+  `sources.live.kind = "p2p"` with `finality.kind = "disabled"` already failed
+  validation; its error now says why: without a finality source nothing
+  verifies the attested heads that bound what the live lane includes. Every
+  shipped profile either enables both or disables both, so none changes.
+- Included blocks trail the chain tip by one to two slots, the time an
+  optimistic update takes to attest the head. The live lane reports itself
+  disconnected, dropping live readiness, when no new attested head arrives for
+  four slots. `source probe finality` reports the selected attested head, and
+  each Beacon endpoint's `attested_head` or, in `attested_head_error`, why it
+  gave none. Attested heads need no agreement between endpoints, since each
+  carries the sync committee's signature; two different ones at one slot are
+  ignored. Consensus P2P asks the next peer when one serves a head no newer
+  than the published one.
 
 ### Fixed
 
@@ -445,15 +497,15 @@ record, and documented RPC contracts.
   others or recent-frame pruning. It is logged, reported under
   `failed_processors` in the shared finality report, and retried at the next
   finalized anchor. A processor whose coverage holds the finalized hash at
-  another height contradicts the canonical chain: its lane fails
-  (`processor_finality_conflict`), and that reason replaces any earlier failure
-  reason. The reset route refuses that lane with
-  `409 live_lane_requires_rebuild`, since only rebuilding the processor as a
-  replacement instance repairs it. Finality skips any failed lane until it is
-  reset, so no later anchor finalizes a contradicted lane through the
-  contradicted height. A gap replay that finds its lane failed meanwhile, for
-  example by finality, leaves the lane failed instead of failing the whole
-  live lane.
+  another height, or another block at the finalized height, contradicts the
+  canonical chain: its lane fails (`processor_finality_conflict`), and that
+  reason replaces any earlier failure reason. The reset route refuses that
+  lane with `409 live_lane_requires_rebuild`, since only rebuilding the
+  processor as a replacement instance repairs it. Finality skips any failed
+  lane until it is reset, so no later anchor finalizes a contradicted lane
+  through the contradicted height. A gap replay that finds its lane failed
+  meanwhile, for example by finality, leaves the lane failed instead of
+  failing the whole live lane.
 - Backfills that reuse retained recent frames read them in bounded batches, one
   query each: at most `budgets.history_pipeline.commit.maximum_blocks` blocks
   and `maximum_mapped_bytes` encoded bytes, each holding an active-chunk slot.
@@ -664,6 +716,10 @@ record, and documented RPC contracts.
   longer opens a store that a running node or another run is using.
 - The execution peer store path is used literally: `%` and `?` in `data_dir`
   no longer open another file.
+- A node restarted after a reorg of its retained unfinalized blocks no longer
+  restarts its network lanes every minute: seeding the finalized anchor
+  failed when a retained block of the reorged branch held its height. Such
+  blocks are now reverted before the anchor is seeded.
 
 ## [0.1.0-rc.1] - 2026-09-20
 

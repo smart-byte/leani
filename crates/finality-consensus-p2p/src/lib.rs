@@ -24,7 +24,7 @@ use discv5::{
 use futures::{AsyncReadExt, AsyncWriteExt, StreamExt, stream};
 use helios_consensus_core::{
     consensus_spec::MainnetConsensusSpec,
-    types::{Bootstrap, FinalityUpdate, Update},
+    types::{Bootstrap, FinalityUpdate, OptimisticUpdate, Update},
 };
 use leani_finality_beacon_api::{
     AnchorFile, AnchorWriter, BeaconApiError, CheckpointOrigin, Clock, DEFAULT_MAX_CHECKPOINT_AGE,
@@ -32,10 +32,12 @@ use leani_finality_beacon_api::{
     VerifiedFinalityAnchor, current_slot, mainnet_fork_digest, resolve_start_anchor,
     verification_slot,
 };
-use leani_primitives::{Capability, CapabilitySet, ChainId, SourceId, SourceKind, TrustModel};
+use leani_primitives::{
+    BlockNumber, Capability, CapabilitySet, ChainId, SourceId, SourceKind, TrustModel,
+};
 use leani_source_api::{
-    ConsensusCheckpoint, FinalityEvent, FinalityEventStream, FinalityModel, FinalitySource,
-    Partitioning, SourceDescriptor, SourceError,
+    AttestedHead, AttestedHeadPublisher, ConsensusCheckpoint, FinalityEvent, FinalityEventStream,
+    FinalityModel, FinalitySource, Partitioning, SourceDescriptor, SourceError,
 };
 use libp2p::{
     Multiaddr, PeerId, StreamProtocol, SwarmBuilder, identity,
@@ -55,6 +57,8 @@ use tracing::{debug, info, warn};
 const BOOTSTRAP_PROTOCOL: &str = "/eth2/beacon_chain/req/light_client_bootstrap/1/ssz_snappy";
 const UPDATE_PROTOCOL: &str = "/eth2/beacon_chain/req/light_client_updates_by_range/1/ssz_snappy";
 const FINALITY_PROTOCOL: &str = "/eth2/beacon_chain/req/light_client_finality_update/1/ssz_snappy";
+const OPTIMISTIC_PROTOCOL: &str =
+    "/eth2/beacon_chain/req/light_client_optimistic_update/1/ssz_snappy";
 const STATUS_PROTOCOL: &str = "/eth2/beacon_chain/req/status/1/ssz_snappy";
 const PING_PROTOCOL: &str = "/eth2/beacon_chain/req/ping/1/ssz_snappy";
 const GOODBYE_PROTOCOL: &str = "/eth2/beacon_chain/req/goodbye/1/ssz_snappy";
@@ -172,6 +176,9 @@ pub struct VerifiedConsensusP2p {
     /// a subscription from the handed-over anchor keeps the operator's trust
     /// root.
     trust: Arc<Mutex<Option<(TrustedCheckpoint, StartAnchor)>>>,
+    /// Where every finality refresh publishes the newest verified attested
+    /// head.
+    attested_heads: Option<AttestedHeadPublisher>,
 }
 
 impl VerifiedConsensusP2p {
@@ -203,6 +210,7 @@ impl VerifiedConsensusP2p {
             banned: Arc::default(),
             anchor_writer: AnchorWriter::new(config.anchor.clone()),
             trust: Arc::default(),
+            attested_heads: None,
             config,
             descriptor: SourceDescriptor {
                 id: SourceId::new("consensus-p2p-light-client")
@@ -220,6 +228,14 @@ impl VerifiedConsensusP2p {
                 priority: 0,
             },
         })
+    }
+
+    /// Publish the attested head of every finality refresh, each slot, to
+    /// `heads`: the execution live lane includes no block above it.
+    #[must_use]
+    pub fn with_attested_heads(mut self, heads: AttestedHeadPublisher) -> Self {
+        self.attested_heads = Some(heads);
+        self
     }
 
     /// Discover peers, perform the required status handshake, and verify a
@@ -354,6 +370,7 @@ async fn next_finality(
             state.last_emitted = Some(anchor);
             return Some((
                 Ok(FinalityEvent::Finalized {
+                    block_number: BlockNumber(anchor.execution_block_number),
                     block_hash: anchor.execution_block_hash,
                     beacon_slot: anchor.beacon_slot,
                     beacon_block_root: anchor.beacon_block_root,
@@ -474,15 +491,86 @@ impl P2pLightClient {
     }
 
     /// Verify the latest finality update from any peer. Every failure here is
-    /// retryable: one stale or invalid peer never ends the stream.
+    /// retryable: one stale or invalid peer never ends the stream. With
+    /// finality verified, the latest optimistic update's attested head is
+    /// published.
     async fn refresh(&mut self) -> Result<VerifiedFinalityAnchor, SourceError> {
-        match self.refresh_once().await {
-            Ok(anchor) => Ok(anchor),
+        let anchor = match self.refresh_once().await {
+            Ok(anchor) => anchor,
             Err(error) => {
                 self.reconnect(error).await?;
-                self.refresh_once().await.map_err(SourceError::Unavailable)
+                self.refresh_once()
+                    .await
+                    .map_err(SourceError::Unavailable)?
+            }
+        };
+        if let Some(heads) = self.source.attested_heads.clone()
+            && let Some(head) = self.attested_head(heads.latest()).await
+            && heads.publish(head)
+        {
+            debug!(
+                beacon_slot = head.beacon_slot,
+                block = head.block_number.0,
+                "published a sync-committee-attested execution head"
+            );
+        }
+        Ok(anchor)
+    }
+
+    /// Verify the latest optimistic update from the first peer that serves
+    /// a usable head newer than `published`. A peer whose update is stale,
+    /// no newer than the published head, or signed by too few of the sync
+    /// committee is skipped; one that fails verification is banned. No head
+    /// leaves the previous one in place: the live lane waits for it.
+    async fn attested_head(&mut self, published: Option<AttestedHead>) -> Option<AttestedHead> {
+        let deadline = tokio::time::Instant::now() + self.network.request_timeout;
+        let mut tried = HashSet::new();
+        while let Ok(Some(peer)) = self.network.next_peer(&mut tried, deadline).await {
+            let update = match self
+                .network
+                .request(peer, LightClientRequest::Optimistic, deadline)
+                .await
+            {
+                Ok(LightClientResponse::Optimistic(update)) => update,
+                Ok(_) => {
+                    self.network.ban(peer, "answered with other material");
+                    continue;
+                }
+                Err(PeerFailure::Unavailable(error)) => {
+                    debug!(%peer, %error, "consensus peer served no optimistic update");
+                    continue;
+                }
+                Err(PeerFailure::Invalid(error)) => {
+                    self.network.ban(peer, error);
+                    continue;
+                }
+            };
+            match self
+                .verifier
+                .verify_attested_head(&update, self.source.clock.now())
+            {
+                Ok(head)
+                    if published
+                        .is_none_or(|published| head.beacon_slot > published.beacon_slot) =>
+                {
+                    return Some(head);
+                }
+                Ok(head) => {
+                    debug!(
+                        %peer,
+                        beacon_slot = head.beacon_slot,
+                        "consensus peer's attested head is no newer than the published one"
+                    );
+                }
+                Err(error) if error.is_unusable_head() => {
+                    debug!(%peer, %error, "consensus peer's optimistic update anchors no head");
+                }
+                Err(error) => {
+                    self.network.ban(peer, error);
+                }
             }
         }
+        None
     }
 
     async fn refresh_once(&mut self) -> Result<VerifiedFinalityAnchor, String> {
@@ -717,6 +805,7 @@ enum LightClientRequest {
     Bootstrap([u8; 32]),
     Update { period: u64 },
     Finality,
+    Optimistic,
 }
 
 /// Decoded, fork-context-checked, but still unverified peer material.
@@ -724,6 +813,7 @@ enum LightClientResponse {
     Bootstrap(Box<Bootstrap<MainnetConsensusSpec>>),
     Update(Box<Update<MainnetConsensusSpec>>),
     Finality(Box<FinalityUpdate<MainnetConsensusSpec>>),
+    Optimistic(Box<OptimisticUpdate<MainnetConsensusSpec>>),
 }
 
 /// Why one peer did not serve usable light-client material.
@@ -874,6 +964,7 @@ impl ConsensusPeers for Libp2pPeers {
                 (UPDATE_PROTOCOL, payload)
             }
             LightClientRequest::Finality => (FINALITY_PROTOCOL, Vec::new()),
+            LightClientRequest::Optimistic => (OPTIMISTIC_PROTOCOL, Vec::new()),
         };
         let response = request_peer(
             &mut self.control,
@@ -885,36 +976,53 @@ impl ConsensusPeers for Libp2pPeers {
         )
         .await
         .map_err(PeerFailure::Unavailable)?;
-        let (material, slot) = match request {
-            LightClientRequest::Bootstrap(_) => {
-                let bootstrap =
-                    Bootstrap::<MainnetConsensusSpec>::from_ssz_bytes(&response.payload).map_err(
-                        |error| PeerFailure::Invalid(format!("invalid bootstrap SSZ: {error:?}")),
-                    )?;
-                let slot = bootstrap.header().beacon().slot;
-                (LightClientResponse::Bootstrap(Box::new(bootstrap)), slot)
-            }
-            LightClientRequest::Update { .. } => {
-                let update = Update::<MainnetConsensusSpec>::from_ssz_bytes(&response.payload)
-                    .map_err(|error| {
-                        PeerFailure::Invalid(format!("invalid light-client update SSZ: {error:?}"))
-                    })?;
-                let slot = update.attested_header().beacon().slot;
-                (LightClientResponse::Update(Box::new(update)), slot)
-            }
-            LightClientRequest::Finality => {
-                let update =
-                    FinalityUpdate::<MainnetConsensusSpec>::from_ssz_bytes(&response.payload)
-                        .map_err(|error| {
-                            PeerFailure::Invalid(format!("invalid finality update SSZ: {error:?}"))
-                        })?;
-                let slot = update.attested_header().beacon().slot;
-                (LightClientResponse::Finality(Box::new(update)), slot)
-            }
-        };
-        validate_context(response.context, slot).map_err(PeerFailure::Invalid)?;
-        Ok(material)
+        decode_light_client_response(request, &response.payload, response.context)
     }
+}
+
+/// Decode a peer's SSZ reply to `request` and check its fork-digest
+/// `context` against the slot of the header it carries. Undecodable or
+/// wrong-fork material is invalid: its peer is banned.
+fn decode_light_client_response(
+    request: LightClientRequest,
+    payload: &[u8],
+    context: Option<[u8; 4]>,
+) -> Result<LightClientResponse, PeerFailure> {
+    let (material, slot) = match request {
+        LightClientRequest::Bootstrap(_) => {
+            let bootstrap =
+                Bootstrap::<MainnetConsensusSpec>::from_ssz_bytes(payload).map_err(|error| {
+                    PeerFailure::Invalid(format!("invalid bootstrap SSZ: {error:?}"))
+                })?;
+            let slot = bootstrap.header().beacon().slot;
+            (LightClientResponse::Bootstrap(Box::new(bootstrap)), slot)
+        }
+        LightClientRequest::Update { .. } => {
+            let update =
+                Update::<MainnetConsensusSpec>::from_ssz_bytes(payload).map_err(|error| {
+                    PeerFailure::Invalid(format!("invalid light-client update SSZ: {error:?}"))
+                })?;
+            let slot = update.attested_header().beacon().slot;
+            (LightClientResponse::Update(Box::new(update)), slot)
+        }
+        LightClientRequest::Finality => {
+            let update = FinalityUpdate::<MainnetConsensusSpec>::from_ssz_bytes(payload).map_err(
+                |error| PeerFailure::Invalid(format!("invalid finality update SSZ: {error:?}")),
+            )?;
+            let slot = update.attested_header().beacon().slot;
+            (LightClientResponse::Finality(Box::new(update)), slot)
+        }
+        LightClientRequest::Optimistic => {
+            let update = OptimisticUpdate::<MainnetConsensusSpec>::from_ssz_bytes(payload)
+                .map_err(|error| {
+                    PeerFailure::Invalid(format!("invalid optimistic update SSZ: {error:?}"))
+                })?;
+            let slot = update.attested_header.beacon().slot;
+            (LightClientResponse::Optimistic(Box::new(update)), slot)
+        }
+    };
+    validate_context(context, slot).map_err(PeerFailure::Invalid)?;
+    Ok(material)
 }
 
 struct P2pNetwork {
@@ -1736,8 +1844,13 @@ mod tests {
         include_str!("../../finality-beacon-api/tests/fixtures/helios/updates.json");
     const FINALITY_JSON: &str =
         include_str!("../../finality-beacon-api/tests/fixtures/helios/finality.json");
+    const OPTIMISTIC_JSON: &str =
+        include_str!("../../finality-beacon-api/tests/fixtures/helios/optimistic.json");
     const BOOTSTRAP_SLOT: u64 = 7_069_376;
     const FINALIZED_SLOT: u64 = 7_109_344;
+    const FINALIZED_BLOCK: u64 = 17_923_026;
+    const ATTESTED_SLOT: u64 = 7_109_431;
+    const ATTESTED_BLOCK: u64 = 17_923_113;
     const SIGNATURE_SLOT: u64 = 7_109_431;
     const SLOTS_PER_PERIOD: u64 = 8_192;
     const SLOT_SECONDS: u64 = 12;
@@ -1804,7 +1917,9 @@ mod tests {
 
     fn fixture_finality(behaviour: Behaviour) -> FinalityUpdate<MainnetConsensusSpec> {
         let data = match behaviour {
-            Behaviour::Honest => fixture_data(FINALITY_JSON),
+            Behaviour::Honest | Behaviour::ForgedOptimistic | Behaviour::LowParticipation => {
+                fixture_data(FINALITY_JSON)
+            }
             // The signed period-867 update served again as an older
             // finality update.
             Behaviour::Stale => {
@@ -1825,11 +1940,35 @@ mod tests {
         serde_json::from_value(data).expect("fixture finality update")
     }
 
+    fn fixture_optimistic(behaviour: Behaviour) -> OptimisticUpdate<MainnetConsensusSpec> {
+        let mut data = fixture_data(OPTIMISTIC_JSON);
+        match behaviour {
+            Behaviour::Honest | Behaviour::Stale => {}
+            // A different attested header than the sync committee signed.
+            Behaviour::Forged | Behaviour::ForgedOptimistic => {
+                data["attested_header"]["beacon"]["proposer_index"] = serde_json::Value::from("1");
+            }
+            // 341 of the 512 members: one short of two thirds.
+            Behaviour::LowParticipation => {
+                let mut bits = [0_u8; 64];
+                bits[..42].fill(0xff);
+                bits[42] = 0x1f;
+                data["sync_aggregate"]["sync_committee_bits"] =
+                    serde_json::Value::from(format!("0x{}", hex::encode(bits)));
+            }
+        }
+        serde_json::from_value(data).expect("fixture optimistic update")
+    }
+
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     enum Behaviour {
         Honest,
         Stale,
         Forged,
+        /// Honest finality, and a forged optimistic update.
+        ForgedOptimistic,
+        /// Honest finality, and an optimistic update too few signed.
+        LowParticipation,
     }
 
     /// A scripted consensus peer set serving the vendored Helios fixtures.
@@ -1936,6 +2075,7 @@ mod tests {
                 LightClientRequest::Bootstrap(root) => format!("bootstrap {}", hex::encode(root)),
                 LightClientRequest::Update { period } => format!("update {period}"),
                 LightClientRequest::Finality => "finality".to_owned(),
+                LightClientRequest::Optimistic => "optimistic".to_owned(),
             };
             self.script
                 .requests
@@ -1966,6 +2106,14 @@ mod tests {
                     Ok(LightClientResponse::Finality(Box::new(fixture_finality(
                         behaviour,
                     ))))
+                }
+                LightClientRequest::Optimistic => {
+                    if behaviour == Behaviour::ForgedOptimistic {
+                        self.script.revealed.send_replace(true);
+                    }
+                    Ok(LightClientResponse::Optimistic(Box::new(
+                        fixture_optimistic(behaviour),
+                    )))
                 }
             }
         }
@@ -2106,6 +2254,247 @@ mod tests {
             report.selected.map(|anchor| anchor.beacon_slot),
             Some(FINALIZED_SLOT)
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn refreshes_publish_the_verified_attested_head() {
+        // Only the peer that forges its optimistic update is connected at
+        // first, so it is asked first; an honest peer connects afterwards.
+        let (script, peers) = Script::new(&[Behaviour::ForgedOptimistic]);
+        let honest = script.late_honest_peer();
+        let heads = AttestedHeadPublisher::new();
+        let source = scripted_source(
+            &script,
+            simulated_clock(slot_time(SIGNATURE_SLOT) + 60),
+            AnchorFile::Disabled,
+            Duration::from_secs(SLOT_SECONDS),
+        )
+        .with_attested_heads(heads.clone());
+        let mut events = source
+            .subscribe(checkpoint(bootstrap_anchor()), CancellationToken::new())
+            .await
+            .expect("subscribe");
+        match events.next().await {
+            Some(Ok(FinalityEvent::Finalized {
+                block_number,
+                beacon_slot,
+                ..
+            })) => {
+                assert_eq!(block_number, BlockNumber(FINALIZED_BLOCK));
+                assert_eq!(beacon_slot, FINALIZED_SLOT);
+            }
+            other => panic!("expected a finalized event, got {other:?}"),
+        }
+        let head = heads.latest().expect("a verified attested head");
+        assert_eq!(
+            (head.beacon_slot, head.block_number),
+            (ATTESTED_SLOT, BlockNumber(ATTESTED_BLOCK))
+        );
+        let requests = script.requests();
+        assert!(
+            requests.contains(&format!("{} optimistic", peers[0]))
+                && requests.contains(&format!("{honest} optimistic")),
+            "{requests:?}"
+        );
+        // The forging peer is banned: later refreshes never ask it again.
+        let before = script.requests().len();
+        let quiet =
+            tokio::time::timeout(Duration::from_secs(3 * SLOT_SECONDS), events.next()).await;
+        assert!(quiet.is_err(), "the stream yielded {quiet:?}");
+        let later = script.requests()[before..].to_vec();
+        assert!(
+            !later.is_empty()
+                && later
+                    .iter()
+                    .all(|request| !request.starts_with(&peers[0].to_string())),
+            "{later:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn low_participation_heads_are_skipped_without_a_ban() {
+        let (script, peers) = Script::new(&[Behaviour::LowParticipation]);
+        let heads = AttestedHeadPublisher::new();
+        let source = scripted_source(
+            &script,
+            simulated_clock(slot_time(SIGNATURE_SLOT) + 60),
+            AnchorFile::Disabled,
+            Duration::from_secs(SLOT_SECONDS),
+        )
+        .with_attested_heads(heads.clone());
+        let mut events = source
+            .subscribe(checkpoint(bootstrap_anchor()), CancellationToken::new())
+            .await
+            .expect("subscribe");
+        assert_eq!(finalized_slot(events.next().await), FINALIZED_SLOT);
+        // Finality advances, but no head does: too few members signed it.
+        assert_eq!(heads.latest(), None);
+        // Low participation is no fault of the peer, so it is asked again.
+        let quiet =
+            tokio::time::timeout(Duration::from_secs(3 * SLOT_SECONDS), events.next()).await;
+        assert!(quiet.is_err(), "the stream yielded {quiet:?}");
+        assert!(script.count(&format!("{} optimistic", peers[0])) >= 2);
+        assert_eq!(heads.latest(), None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn refreshes_skip_heads_no_newer_than_the_published_one() {
+        let (script, _) = Script::new(&[Behaviour::Honest, Behaviour::Honest]);
+        let heads = AttestedHeadPublisher::new();
+        // A head from a later slot is published already, so the fixture's
+        // head is stale for both peers.
+        let newer = AttestedHead {
+            beacon_slot: ATTESTED_SLOT + 1,
+            beacon_block_root: [0x77; 32],
+            block_number: BlockNumber(ATTESTED_BLOCK + 1),
+            block_hash: BlockHash::new([0x77; 32]),
+        };
+        assert!(heads.publish(newer));
+        let source = scripted_source(
+            &script,
+            simulated_clock(slot_time(SIGNATURE_SLOT) + 60),
+            AnchorFile::Disabled,
+            Duration::from_secs(SLOT_SECONDS),
+        )
+        .with_attested_heads(heads.clone());
+        let mut events = source
+            .subscribe(checkpoint(bootstrap_anchor()), CancellationToken::new())
+            .await
+            .expect("subscribe");
+        assert_eq!(finalized_slot(events.next().await), FINALIZED_SLOT);
+        // The refresh went on to the next peer instead of settling for the
+        // first stale head, and banned neither.
+        assert_eq!(
+            script.count("optimistic"),
+            2,
+            "the refresh stopped at the first, stale head"
+        );
+        assert_eq!(heads.latest(), Some(newer));
+        let quiet =
+            tokio::time::timeout(Duration::from_secs(2 * SLOT_SECONDS), events.next()).await;
+        assert!(quiet.is_err(), "the stream yielded {quiet:?}");
+        assert!(script.count("optimistic") >= 4, "a stale peer was banned");
+    }
+
+    /// Encode `update` as the SSZ `LightClientOptimisticUpdate` a peer sends:
+    /// the offset of the attested header, the sync aggregate, and the
+    /// signature slot, then the header: its beacon header, the offset of the
+    /// execution payload header, and the execution branch, then the payload
+    /// header.
+    fn optimistic_ssz(update: &OptimisticUpdate<MainnetConsensusSpec>) -> Vec<u8> {
+        use ssz::Encode as _;
+
+        let header = &update.attested_header;
+        let beacon = header.beacon().as_ssz_bytes();
+        let branch = header
+            .execution_branch()
+            .expect("a Capella header has an execution branch")
+            .as_ssz_bytes();
+        let execution = header
+            .execution()
+            .expect("a Capella header has an execution payload")
+            .as_ssz_bytes();
+        let header_offset = beacon.len() + 4 + branch.len();
+        assert_eq!(header_offset, 244);
+        let mut encoded_header = beacon;
+        encoded_header
+            .extend_from_slice(&u32::try_from(header_offset).expect("offset").to_le_bytes());
+        encoded_header.extend_from_slice(&branch);
+        encoded_header.extend_from_slice(&execution);
+        let aggregate = update.sync_aggregate.as_ssz_bytes();
+        let offset = 4 + aggregate.len() + 8;
+        assert_eq!(offset, 172);
+        let mut encoded = u32::try_from(offset)
+            .expect("offset")
+            .to_le_bytes()
+            .to_vec();
+        encoded.extend_from_slice(&aggregate);
+        encoded.extend_from_slice(&update.signature_slot.to_le_bytes());
+        encoded.extend_from_slice(&encoded_header);
+        encoded
+    }
+
+    /// A verifier synced from the fixtures, as a finality refresh leaves it.
+    fn fixture_verifier(now: SystemTime) -> MainnetLightClientVerifier {
+        let mut verifier = MainnetLightClientVerifier::bootstrap(
+            bootstrap_root(),
+            &fixture_bootstrap(),
+            DEFAULT_MAX_CHECKPOINT_AGE,
+            now,
+        )
+        .expect("verified bootstrap");
+        for period in 862..867 {
+            verifier
+                .apply_update(&fixture_update(period).expect("fixture update"), now)
+                .expect("verified update");
+        }
+        verifier
+            .apply_finality_update(&fixture_finality(Behaviour::Honest), now)
+            .expect("verified finality");
+        verifier
+    }
+
+    #[test]
+    fn optimistic_updates_decode_from_peer_ssz_with_their_fork_context() {
+        let encoded = optimistic_ssz(&fixture_optimistic(Behaviour::Honest));
+        let context = Some(mainnet_fork_digest(ATTESTED_SLOT));
+        let decoded =
+            decode_light_client_response(LightClientRequest::Optimistic, &encoded, context)
+                .map_err(|error| error.to_string())
+                .expect("decoded optimistic update");
+        let LightClientResponse::Optimistic(update) = decoded else {
+            panic!("decoded other material");
+        };
+        // It verifies to the head the Beacon API's JSON of the same update
+        // gives.
+        let now = UNIX_EPOCH + Duration::from_secs(slot_time(SIGNATURE_SLOT) + 60);
+        let verifier = fixture_verifier(now);
+        let head = verifier
+            .verify_attested_head(&update, now)
+            .expect("verified attested head");
+        assert_eq!(
+            head,
+            verifier
+                .verify_attested_head(&fixture_optimistic(Behaviour::Honest), now)
+                .expect("verified JSON update")
+        );
+        assert_eq!(
+            (head.beacon_slot, head.block_number, head.block_hash),
+            (
+                ATTESTED_SLOT,
+                BlockNumber(ATTESTED_BLOCK),
+                BlockHash::new(
+                    b256!("3c015340e234ff7f8e75ecebb11d45154a394cd896ddcfcfffc941a07b314960")
+                        .into()
+                )
+            )
+        );
+        // The wrong fork digest, or none, is invalid material, as is a
+        // payload shorter than the container's fixed part.
+        for context in [Some(mainnet_fork_digest(0)), None] {
+            assert!(matches!(
+                decode_light_client_response(LightClientRequest::Optimistic, &encoded, context),
+                Err(PeerFailure::Invalid(_))
+            ));
+        }
+        assert!(matches!(
+            decode_light_client_response(LightClientRequest::Optimistic, &encoded[..171], context),
+            Err(PeerFailure::Invalid(_))
+        ));
+        // Cutting the payload header's extra data short still decodes, as
+        // another header the committee did not sign: verification refuses
+        // it, and its peer is banned.
+        let Ok(LightClientResponse::Optimistic(cut)) = decode_light_client_response(
+            LightClientRequest::Optimistic,
+            &encoded[..encoded.len() - 1],
+            context,
+        ) else {
+            panic!("a shortened extra data field is valid SSZ");
+        };
+        let error = verifier
+            .verify_attested_head(&cut, now)
+            .expect_err("an unsigned header");
+        assert!(!error.is_unusable_head(), "{error}");
     }
 
     #[tokio::test(start_paused = true)]
