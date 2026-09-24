@@ -6,6 +6,16 @@ info:
     Coverage-aware queries and durable processor changes. All cursors are
     opaque. Ethereum quantities that can exceed JavaScript's safe integer
     range are encoded as unsigned decimal strings.
+
+    Every route answers a `Host` name other than `localhost` and those in
+    `api.allowed_hosts` with 421 `host_not_allowed` (IP addresses pass), and
+    a browser `Origin` other than a loopback one or one in
+    `api.allowed_origins` with 403 `origin_not_allowed`. A GET or HEAD
+    without an `Origin` whose `Sec-Fetch-Site` is `cross-site` or
+    `same-site` and whose `Sec-Fetch-Mode` is not `navigate` gets 403
+    `cross_site_request`. A POST or DELETE needs
+    `content-type: application/json` or `x-leani-request: 1`, and gets 415
+    `unsupported_media_type` otherwise.
 servers:
   - url: http://127.0.0.1:8080
 security:
@@ -218,6 +228,11 @@ paths:
     get:
       summary: Query processor entities
       operationId: queryProcessorEntities
+      description: |
+        Without a cursor, reads current retained output in entity-key order
+        without creating a snapshot; its `nextCursor` continues that read,
+        and later pages see later commits. A cursor from a snapshot reads the
+        snapshot's next page. Create a stable snapshot with POST.
       parameters:
         - $ref: "#/components/parameters/FromBlock"
         - $ref: "#/components/parameters/ToBlock"
@@ -228,6 +243,30 @@ paths:
           in: query
           schema:
             $ref: "#/components/schemas/Cursor"
+      responses:
+        "200":
+          description: A page of current output, or of a snapshot for a snapshot cursor.
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: "#/components/schemas/GenericOutputPage"
+                  - $ref: "#/components/schemas/GenericSnapshotPage"
+        default:
+          $ref: "#/components/responses/Error"
+    post:
+      summary: Snapshot processor entities
+      operationId: createProcessorEntitySnapshot
+      description: |
+        Copies the matching retained output into a stable, short-lived
+        snapshot and returns its first page. Read later pages with GET and the
+        page's `nextCursor`, and release the snapshot when done.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/OutputQuery"
       responses:
         "200":
           description: Stable retained-output snapshot page.
@@ -313,6 +352,8 @@ paths:
     delete:
       summary: Release a processor query snapshot
       operationId: releaseProcessorQuerySnapshot
+      parameters:
+        - $ref: "#/components/parameters/LeaniRequest"
       responses:
         "204":
           description: Snapshot released.
@@ -351,6 +392,8 @@ paths:
     post:
       summary: Restore a processor recovery checkpoint
       operationId: restoreProcessorRecoveryCheckpoint
+      parameters:
+        - $ref: "#/components/parameters/LeaniRequest"
       responses:
         "200":
           description: Private state repaired at the exact current cursor.
@@ -433,6 +476,8 @@ paths:
     delete:
       summary: Delete a processor savepoint
       operationId: deleteProcessorSavepoint
+      parameters:
+        - $ref: "#/components/parameters/LeaniRequest"
       responses:
         "204":
           description: Savepoint explicitly deleted.
@@ -497,6 +542,8 @@ paths:
     delete:
       summary: Revoke a durable consumer
       operationId: revokeDurableConsumer
+      parameters:
+        - $ref: "#/components/parameters/LeaniRequest"
       responses:
         "200":
           description: Consumer explicitly revoked.
@@ -514,6 +561,8 @@ paths:
     post:
       summary: Renew a durable consumer lease
       operationId: renewDurableConsumerLease
+      parameters:
+        - $ref: "#/components/parameters/LeaniRequest"
       responses:
         "200":
           description: Consumer lease renewed without advancing acknowledgement.
@@ -638,6 +687,8 @@ paths:
     post:
       summary: Renew a live-lane consumer lease
       operationId: renewLiveDurableConsumerLease
+      parameters:
+        - $ref: "#/components/parameters/LeaniRequest"
       responses:
         "200":
           description: Renewed live-lane lease.
@@ -646,6 +697,8 @@ paths:
     delete:
       summary: Release a live-lane consumer lease
       operationId: releaseLiveDurableConsumerLease
+      parameters:
+        - $ref: "#/components/parameters/LeaniRequest"
       responses:
         "200":
           description: Released live-lane lease.
@@ -698,6 +751,8 @@ paths:
     post:
       summary: Renew a backfill consumer lease
       operationId: renewBackfillConsumerLease
+      parameters:
+        - $ref: "#/components/parameters/LeaniRequest"
       responses:
         "200":
           description: Renewed backfill lease.
@@ -706,6 +761,8 @@ paths:
     delete:
       summary: Release a backfill consumer lease
       operationId: releaseBackfillConsumerLease
+      parameters:
+        - $ref: "#/components/parameters/LeaniRequest"
       responses:
         "200":
           description: Released backfill lease.
@@ -717,6 +774,8 @@ paths:
     post:
       summary: Reset a processor live lane for replay
       operationId: resetProcessorLiveLane
+      parameters:
+        - $ref: "#/components/parameters/LeaniRequest"
       responses:
         "200":
           description: Paused live-lane reset state.
@@ -739,6 +798,8 @@ paths:
     delete:
       summary: Delete retained processor artifacts
       operationId: deleteProcessorArtifacts
+      parameters:
+        - $ref: "#/components/parameters/LeaniRequest"
       responses:
         "200":
           description: Artifact deletion result.
@@ -786,6 +847,8 @@ paths:
     delete:
       summary: Delete a terminal backfill subscription
       operationId: deleteBackfillSubscription
+      parameters:
+        - $ref: "#/components/parameters/LeaniRequest"
       responses:
         "200":
           description: Deleted backfill subscription.
@@ -797,6 +860,8 @@ paths:
     post:
       summary: Cancel a backfill subscription
       operationId: cancelBackfillSubscription
+      parameters:
+        - $ref: "#/components/parameters/LeaniRequest"
       responses:
         "200":
           description: Cancelled backfill subscription.
@@ -833,6 +898,8 @@ paths:
     delete:
       summary: Delete a terminal materialization job
       operationId: deleteMaterializationJob
+      parameters:
+        - $ref: "#/components/parameters/LeaniRequest"
       responses:
         "200":
           description: Deleted materialization job.
@@ -844,6 +911,8 @@ paths:
     post:
       summary: Cancel a materialization job
       operationId: cancelMaterializationJob
+      parameters:
+        - $ref: "#/components/parameters/LeaniRequest"
       responses:
         "200":
           description: Cancelled materialization job.
@@ -880,6 +949,8 @@ paths:
     delete:
       summary: Delete a terminal raw-history job
       operationId: deleteRawHistoryJob
+      parameters:
+        - $ref: "#/components/parameters/LeaniRequest"
       responses:
         "200":
           description: Deleted raw-history job.
@@ -891,6 +962,8 @@ paths:
     post:
       summary: Cancel a raw-history job
       operationId: cancelRawHistoryJob
+      parameters:
+        - $ref: "#/components/parameters/LeaniRequest"
       responses:
         "200":
           description: Cancelled raw-history job.
@@ -1244,6 +1317,16 @@ components:
         type: string
         minLength: 16
         maxLength: 512
+    LeaniRequest:
+      name: x-leani-request
+      in: header
+      required: false
+      description: |
+        Marks a mutating request without a JSON body as sent by a Leani
+        client. A POST or DELETE needs `content-type: application/json` or
+        this header, and gets HTTP 415 otherwise.
+      schema:
+        const: "1"
     Subscription:
       name: subscription
       in: path
@@ -1617,6 +1700,25 @@ components:
           $ref: "#/components/schemas/SafeInteger"
         finality:
           $ref: "#/components/schemas/Finality"
+    GenericOutputPage:
+      type: object
+      additionalProperties: false
+      required: [data, nextCursor, retainedBounds, coverage]
+      properties:
+        data:
+          type: array
+          items:
+            $ref: "#/components/schemas/GenericOutputEntity"
+        nextCursor:
+          oneOf:
+            - $ref: "#/components/schemas/Cursor"
+            - type: "null"
+        retainedBounds:
+          oneOf:
+            - $ref: "#/components/schemas/OutputBounds"
+            - type: "null"
+        coverage:
+          $ref: "#/components/schemas/ProcessorCoverage"
     GenericSnapshotPage:
       type: object
       additionalProperties: false

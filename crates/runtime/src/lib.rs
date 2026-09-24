@@ -14725,6 +14725,7 @@ mod tests {
         let response = api
             .oneshot(
                 Request::post("/admin/v1/processors/api-reset-ledger/lanes/live/reset")
+                    .header("x-leani-request", "1")
                     .body(Body::empty())
                     .expect("request"),
             )

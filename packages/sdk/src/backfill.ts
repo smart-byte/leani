@@ -442,14 +442,18 @@ export function createBackfillSubscriptionClient(
     credential?: string,
     sessionToken?: string,
   ): Promise<T> => {
+    const headers = requestHeaders(
+      options.token,
+      "application/json",
+      credential,
+      sessionToken,
+    );
     const response = await fetchImpl(new URL(path, baseUrl), {
       method,
-      headers: requestHeaders(
-        options.token,
-        "application/json",
-        credential,
-        sessionToken,
-      ),
+      headers:
+        method === "GET" || body !== undefined
+          ? headers
+          : markLeaniRequest(headers),
       body: body === undefined ? undefined : JSON.stringify(body),
       signal: signal
         ? AbortSignal.any([signal, AbortSignal.timeout(timeoutMs)])
@@ -1329,11 +1333,8 @@ async function openDeliverySession<THello, TRecord>(
       try {
         await fetchImpl(new URL(renewPath, baseUrl), {
           method: "DELETE",
-          headers: requestHeaders(
-            token,
-            "application/json",
-            credential,
-            sessionToken,
+          headers: markLeaniRequest(
+            requestHeaders(token, "application/json", credential, sessionToken),
           ),
         });
       } catch {
@@ -1452,11 +1453,8 @@ async function renewSessionUntilStopped(
     }
     const response = await fetchImpl(new URL(renewPath, baseUrl), {
       method: "POST",
-      headers: requestHeaders(
-        token,
-        "application/json",
-        credential,
-        sessionToken,
+      headers: markLeaniRequest(
+        requestHeaders(token, "application/json", credential, sessionToken),
       ),
       signal: stop,
     });
@@ -1563,6 +1561,12 @@ function requestHeaders(
   if (accept === "application/json") {
     headers.set("content-type", "application/json");
   }
+  return headers;
+}
+
+/** Mark a mutation without a JSON body, which the node otherwise refuses. */
+function markLeaniRequest(headers: Headers): Headers {
+  headers.set("x-leani-request", "1");
   return headers;
 }
 

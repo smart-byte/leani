@@ -16,6 +16,21 @@ publishes them only on loopback. It does not claim live or finality readiness.
 Run a bounded `backfill` command against the same data volume before querying a
 range. Subscriptions remain quiet until a live source commits events.
 
+The profile protects the API with a bearer token from `LEANI_API_TOKEN`:
+`serve` fails to start without one of at least 16 printable ASCII characters
+without spaces, so export it, for example
+`export LEANI_API_TOKEN="$(openssl rand -hex 32)"`, before `docker compose up`,
+which stops with an error when it is unset, or pass it with
+`docker run --env LEANI_API_TOKEN`. The
+container's health check calls `/health/live`, which needs no token. The
+profile opts JSON-RPC, which has no authentication, into its all-interface
+binds with `rpc.allow_unauthenticated_remote`; keep its ports on loopback or
+behind an authenticating proxy. The API answers only `Host` names in
+`api.allowed_hosts`, besides `localhost` and IP addresses; the profile lists
+the compose service name `leani`, so other services can call
+`http://leani:8080`. To add the names your clients use, mount a copy of the
+profile with them over `/etc/leani/node.toml`.
+
 For a direct binary deployment:
 
 1. install the binary as `/usr/local/bin/leani`;
@@ -515,7 +530,8 @@ branch. Its first failure stands: a later failure does not change its reason,
 and a later park does not move its first unapplied block. Only
 `processor_finality_conflict` replaces the reason. A failed lane waits for an
 operator: fix the cause, then call
-`POST /admin/v1/processors/{id}/lanes/live/reset`, which works for every
+`POST /admin/v1/processors/{id}/lanes/live/reset` with the header
+`x-leani-request: 1`, which works for every
 delivery ordering and pauses the lane so that it replays from its first
 unapplied block. A lane that fails again on the same block parks again; it
 does not stop the node.

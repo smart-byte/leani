@@ -461,7 +461,9 @@ to the Leani checkout containing the SDK fixture.
 Start the checked local service with:
 
 ```bash
-docker compose --profile benchmark up -d benchmark-postgres
+# Compose resolves the node's LEANI_API_TOKEN for every service; the
+# database ignores it.
+LEANI_API_TOKEN=unused docker compose --profile benchmark up -d benchmark-postgres
 export LEANI_BENCHMARK_POSTGRES_URL=postgres://leani_benchmark:leani_benchmark@127.0.0.1:55432/leani_benchmark
 scripts/run-controlled-benchmarks.sh delivery-faults
 ```

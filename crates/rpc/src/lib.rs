@@ -4,7 +4,10 @@
 //! cannot be reconstructed from retained material. This is safer than
 //! manufacturing partial blocks or receipts that look like complete RPC data.
 
+mod browser_guard;
+
 use std::{
+    borrow::Cow,
     collections::{BTreeMap, BTreeSet},
     sync::{
         Arc,
@@ -32,7 +35,8 @@ use axum::{
         DefaultBodyLimit, State,
         ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade, close_code},
     },
-    http::StatusCode,
+    http::{StatusCode, header},
+    middleware,
     response::{IntoResponse, Response},
     routing::{get, post},
 };
@@ -51,8 +55,10 @@ use leani_store_sqlite::{SqliteStore, StoreError};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use thiserror::Error;
-use tokio::sync::{Semaphore, broadcast};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, broadcast};
 use tokio_util::sync::CancellationToken;
+
+use browser_guard::guard_browser_requests;
 
 const JSONRPC_VERSION: &str = "2.0";
 const PARSE_ERROR: i64 = -32_700;
@@ -61,6 +67,7 @@ const METHOD_NOT_FOUND: i64 = -32_601;
 const INVALID_PARAMS: i64 = -32_602;
 const INTERNAL_ERROR: i64 = -32_603;
 const DATA_UNAVAILABLE: i64 = -32_004;
+const LIMIT_EXCEEDED: i64 = -32_005;
 
 /// Exact Ethereum JSON-RPC values derivable from one normalized block frame.
 ///
@@ -113,6 +120,21 @@ pub fn rpc_compatibility_snapshot(
     })
 }
 
+/// Default maximum requests in one JSON-RPC batch.
+pub const DEFAULT_MAX_BATCH_REQUESTS: usize = 100;
+/// Default maximum encoded bytes of one JSON-RPC response or batch response.
+pub const DEFAULT_MAX_RESPONSE_BYTES: usize = 16 * 1_024 * 1_024;
+/// Default maximum logs one `eth_getLogs` call returns.
+pub const DEFAULT_MAX_LOG_RESULTS: usize = 10_000;
+/// Default maximum addresses in one log filter.
+pub const DEFAULT_MAX_LOG_ADDRESSES: usize = 1_000;
+/// Default maximum alternatives at one topic position of a log filter.
+pub const DEFAULT_MAX_LOG_TOPIC_ALTERNATIVES: usize = 1_000;
+/// Default maximum live subscriptions on one WebSocket connection.
+pub const DEFAULT_MAX_SUBSCRIPTIONS_PER_CONNECTION: usize = 128;
+/// Default maximum concurrently open WebSocket connections.
+pub const DEFAULT_MAX_WEBSOCKET_CONNECTIONS: usize = 256;
+
 /// RPC transport and readiness settings.
 #[derive(Clone, Debug)]
 pub struct RpcConfig {
@@ -122,6 +144,17 @@ pub struct RpcConfig {
     pub max_log_range: u64,
     pub websocket_enabled: bool,
     pub history: Option<HistoricalRpc>,
+    /// Browser origins, besides loopback ones, allowed to call RPC, as
+    /// lowercase ASCII serializations such as `https://app.example`. Requests
+    /// with any other `Origin` header get HTTP 403.
+    pub allowed_origins: BTreeSet<String>,
+    pub max_batch_requests: usize,
+    pub max_response_bytes: usize,
+    pub max_log_results: usize,
+    pub max_log_addresses: usize,
+    pub max_log_topic_alternatives: usize,
+    pub max_subscriptions_per_connection: usize,
+    pub max_websocket_connections: usize,
 }
 
 impl Default for RpcConfig {
@@ -133,6 +166,14 @@ impl Default for RpcConfig {
             max_log_range: 1_024,
             websocket_enabled: false,
             history: None,
+            allowed_origins: BTreeSet::new(),
+            max_batch_requests: DEFAULT_MAX_BATCH_REQUESTS,
+            max_response_bytes: DEFAULT_MAX_RESPONSE_BYTES,
+            max_log_results: DEFAULT_MAX_LOG_RESULTS,
+            max_log_addresses: DEFAULT_MAX_LOG_ADDRESSES,
+            max_log_topic_alternatives: DEFAULT_MAX_LOG_TOPIC_ALTERNATIVES,
+            max_subscriptions_per_connection: DEFAULT_MAX_SUBSCRIPTIONS_PER_CONNECTION,
+            max_websocket_connections: DEFAULT_MAX_WEBSOCKET_CONNECTIONS,
         }
     }
 }
@@ -577,6 +618,36 @@ struct RpcState {
     blob_schedule: Arc<BlobSchedule>,
     config: RpcConfig,
     committed_events: broadcast::Sender<ChainEvent>,
+    /// One permit per open WebSocket connection, held until it closes.
+    websocket_connections: Arc<Semaphore>,
+}
+
+impl RpcState {
+    fn new(
+        store: SqliteStore,
+        progress: Arc<dyn Processor>,
+        blob_schedule: Arc<BlobSchedule>,
+        mut config: RpcConfig,
+        committed_events: broadcast::Sender<ChainEvent>,
+    ) -> Self {
+        let websocket_connections = Arc::new(Semaphore::new(
+            config.max_websocket_connections.min(Semaphore::MAX_PERMITS),
+        ));
+        // As browsers serialize origins: lowercase, without a trailing slash.
+        config.allowed_origins = config
+            .allowed_origins
+            .iter()
+            .map(|origin| origin.trim_end_matches('/').to_ascii_lowercase())
+            .collect();
+        Self {
+            store,
+            progress,
+            blob_schedule,
+            config,
+            committed_events,
+            websocket_connections,
+        }
+    }
 }
 
 impl std::fmt::Debug for RpcState {
@@ -678,13 +749,7 @@ fn rpc_router(
     assert!(config.max_request_bytes > 0, "body limit must be non-zero");
     assert!(config.max_log_range > 0, "log range must be non-zero");
     let max_request_bytes = config.max_request_bytes;
-    let state = RpcState {
-        store,
-        progress,
-        blob_schedule,
-        config,
-        committed_events,
-    };
+    let state = RpcState::new(store, progress, blob_schedule, config, committed_events);
     let route = if websocket {
         get(websocket_upgrade)
     } else {
@@ -693,6 +758,10 @@ fn rpc_router(
     Router::new()
         .route("/", route)
         .layer(DefaultBodyLimit::max(max_request_bytes))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            guard_browser_requests,
+        ))
         .with_state(state)
 }
 
@@ -704,9 +773,16 @@ async fn health() -> Json<Value> {
 }
 
 async fn websocket_upgrade(State(state): State<RpcState>, upgrade: WebSocketUpgrade) -> Response {
+    let Ok(connection) = state.websocket_connections.clone().try_acquire_owned() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "the WebSocket connection limit is reached; retry later",
+        )
+            .into_response();
+    };
     upgrade
         .max_message_size(state.config.max_request_bytes)
-        .on_upgrade(move |socket| websocket_session(socket, state))
+        .on_upgrade(move |socket| websocket_session(socket, state, connection))
 }
 
 #[derive(Clone, Debug)]
@@ -715,7 +791,13 @@ enum Subscription {
     Logs(ParsedLogFilter),
 }
 
-async fn websocket_session(mut socket: WebSocket, state: RpcState) {
+/// Serve one WebSocket connection. `_connection` holds its connection slot
+/// until the connection closes; its subscriptions go with it.
+async fn websocket_session(
+    mut socket: WebSocket,
+    state: RpcState,
+    _connection: OwnedSemaphorePermit,
+) {
     let mut events = state.committed_events.subscribe();
     let mut subscriptions = BTreeMap::new();
     let mut next_subscription = 1_u64;
@@ -737,7 +819,7 @@ async fn websocket_session(mut socket: WebSocket, state: RpcState) {
                             text.as_str(),
                         ).await;
                         if let Some(response) = response
-                            && send_websocket_json(&mut socket, &response).await.is_err()
+                            && socket.send(Message::Text(response.into())).await.is_err()
                         {
                             break;
                         }
@@ -816,41 +898,27 @@ async fn websocket_dispatch_text(
     subscriptions: &mut BTreeMap<String, Subscription>,
     next_subscription: &mut u64,
     input: &str,
-) -> Option<Value> {
-    let parsed = match serde_json::from_str::<Value>(input) {
-        Ok(value) => value,
-        Err(error) => {
-            return serde_json::to_value(RpcResponse::error(
-                Value::Null,
-                PARSE_ERROR,
-                "Parse error",
-                Some(json!({ "detail": error.to_string() })),
-            ))
-            .ok();
-        }
+) -> Option<String> {
+    let (mut encoder, calls) = match ResponseEncoder::for_message(input, &state.config) {
+        Ok(message) => message,
+        Err(refused) => return Some(refused),
     };
-    if let Value::Array(requests) = parsed {
-        if requests.is_empty() {
-            return serde_json::to_value(RpcResponse::error(
-                Value::Null,
-                INVALID_REQUEST,
-                "Invalid Request",
-                None,
-            ))
-            .ok();
+    for call in calls {
+        if encoder.is_full() {
+            encoder.skip(call);
+        } else if let Some(response) = websocket_dispatch_value(
+            state,
+            subscriptions,
+            next_subscription,
+            call,
+            encoder.remaining(),
+        )
+        .await
+        {
+            encoder.push(response);
         }
-        let mut responses = Vec::with_capacity(requests.len());
-        for request in requests {
-            if let Some(response) =
-                websocket_dispatch_value(state, subscriptions, next_subscription, request).await
-            {
-                responses.push(response);
-            }
-        }
-        (!responses.is_empty()).then_some(Value::Array(responses))
-    } else {
-        websocket_dispatch_value(state, subscriptions, next_subscription, parsed).await
     }
+    encoder.finish()
 }
 
 async fn websocket_dispatch_value(
@@ -858,39 +926,47 @@ async fn websocket_dispatch_value(
     subscriptions: &mut BTreeMap<String, Subscription>,
     next_subscription: &mut u64,
     value: Value,
-) -> Option<Value> {
+    budget: usize,
+) -> Option<RpcResponse> {
     let request = match serde_json::from_value::<RpcRequest>(value) {
         Ok(request) if request.jsonrpc == JSONRPC_VERSION => request,
         _ => {
-            return serde_json::to_value(RpcResponse::error(
+            return Some(RpcResponse::error(
                 Value::Null,
                 INVALID_REQUEST,
                 "Invalid Request",
                 None,
-            ))
-            .ok();
+            ));
         }
     };
     let id = request.id?;
+    let subscription_limit = state.config.max_subscriptions_per_connection;
     let result = match request.method.as_str() {
-        "eth_subscribe" => parse_subscription(request.params.as_ref()).map(|subscription| {
-            let id = format!("0x{:032x}", *next_subscription);
-            *next_subscription = next_subscription.saturating_add(1);
-            subscriptions.insert(id.clone(), subscription);
-            Value::String(id)
-        }),
+        "eth_subscribe" if subscriptions.len() >= subscription_limit => Err(
+            RpcError::limit_exceeded("subscription_limit_exceeded", subscription_limit),
+        ),
+        "eth_subscribe" => {
+            parse_subscription(request.params.as_ref(), &state.config).map(|subscription| {
+                let id = format!("0x{:032x}", *next_subscription);
+                *next_subscription = next_subscription.saturating_add(1);
+                subscriptions.insert(id.clone(), subscription);
+                Value::String(id)
+            })
+        }
         "eth_unsubscribe" => parse_unsubscribe(request.params.as_ref())
             .map(|subscription| Value::Bool(subscriptions.remove(subscription).is_some())),
-        method => dispatch(state, method, request.params).await,
+        method => dispatch(state, method, request.params, budget).await,
     };
-    let response = match result {
+    Some(match result {
         Ok(result) => RpcResponse::success(id, result),
         Err(error) => RpcResponse::error(id, error.code, error.message, error.data),
-    };
-    serde_json::to_value(response).ok()
+    })
 }
 
-fn parse_subscription(params: Option<&Value>) -> Result<Subscription, RpcError> {
+fn parse_subscription(
+    params: Option<&Value>,
+    config: &RpcConfig,
+) -> Result<Subscription, RpcError> {
     let values = params
         .and_then(Value::as_array)
         .ok_or_else(|| RpcError::invalid_params("eth_subscribe expects an array"))?;
@@ -914,7 +990,7 @@ fn parse_subscription(params: Option<&Value>) -> Result<Subscription, RpcError> 
                     "log subscriptions accept only address and topics filters",
                 ));
             }
-            parse_log_filter(Some(&Value::Array(vec![filter]))).map(Subscription::Logs)
+            parse_log_filter(Some(&Value::Array(vec![filter])), config).map(Subscription::Logs)
         }
         "newHeads" | "logs" => Err(RpcError::invalid_params(
             "subscription has an invalid parameter count",
@@ -1005,48 +1081,149 @@ async fn subscription_results(
 }
 
 async fn handle(State(state): State<RpcState>, body: String) -> Response {
-    let parsed = match serde_json::from_str::<Value>(&body) {
-        Ok(value) => value,
-        Err(error) => {
-            return Json(RpcResponse::error(
+    let (mut encoder, calls) = match ResponseEncoder::for_message(&body, &state.config) {
+        Ok(message) => message,
+        Err(refused) => return json_body(refused),
+    };
+    for call in calls {
+        if encoder.is_full() {
+            encoder.skip(call);
+        } else if let Some(response) = dispatch_value(&state, call, encoder.remaining()).await {
+            encoder.push(response);
+        }
+    }
+    encoder
+        .finish()
+        .map_or_else(|| StatusCode::NO_CONTENT.into_response(), json_body)
+}
+
+fn json_body(body: String) -> Response {
+    ([(header::CONTENT_TYPE, "application/json")], body).into_response()
+}
+
+/// Encodes the responses to one message within `max_response_bytes`,
+/// counting a batch's brackets and commas. The response that would pass the
+/// limit, and every later one, becomes a `-32005` error for its request ID;
+/// the calls after it need not run.
+struct ResponseEncoder {
+    limit: usize,
+    batch: bool,
+    bytes: usize,
+    responses: Vec<String>,
+    full: bool,
+}
+
+impl ResponseEncoder {
+    /// An encoder for `input` and the calls it holds: one, or a batch of at
+    /// most `max_batch_requests`. Unparsable input and an empty or oversized
+    /// batch are refused whole, with one encoded error object.
+    fn for_message(input: &str, config: &RpcConfig) -> Result<(Self, Vec<Value>), String> {
+        let parsed = serde_json::from_str::<Value>(input).map_err(|error| {
+            encode_response(&RpcResponse::error(
                 Value::Null,
                 PARSE_ERROR,
                 "Parse error",
                 Some(json!({ "detail": error.to_string() })),
             ))
-            .into_response();
-        }
-    };
-    if let Value::Array(requests) = parsed {
-        if requests.is_empty() {
-            return Json(RpcResponse::error(
+        })?;
+        let (calls, batch) = match parsed {
+            Value::Array(calls) => (calls, true),
+            call => (vec![call], false),
+        };
+        if batch && (calls.is_empty() || calls.len() > config.max_batch_requests) {
+            return Err(encode_response(&RpcResponse::error(
                 Value::Null,
                 INVALID_REQUEST,
                 "Invalid Request",
-                None,
-            ))
-            .into_response();
+                (!calls.is_empty()).then(|| {
+                    json!({
+                        "detail": "batch exceeds the request limit",
+                        "limit": config.max_batch_requests
+                    })
+                }),
+            )));
         }
-        let mut responses = Vec::with_capacity(requests.len());
-        for value in requests {
-            if let Some(response) = dispatch_value(&state, value).await {
-                responses.push(response);
-            }
+        let encoder = Self {
+            limit: config.max_response_bytes,
+            batch,
+            bytes: if batch { 2 } else { 0 },
+            responses: Vec::new(),
+            full: false,
+        };
+        Ok((encoder, calls))
+    }
+
+    fn is_full(&self) -> bool {
+        self.full
+    }
+
+    /// Bytes the next response may still use, after its separating comma.
+    fn remaining(&self) -> usize {
+        let separator = usize::from(self.batch && !self.responses.is_empty());
+        self.limit
+            .saturating_sub(self.bytes.saturating_add(separator))
+    }
+
+    /// Answer a call left unrun because the response is full: nothing for a
+    /// notification, a limit error with a null ID for an invalid request.
+    fn skip(&mut self, call: Value) {
+        let id = match serde_json::from_value::<RpcRequest>(call) {
+            Ok(request) if request.jsonrpc == JSONRPC_VERSION => request.id,
+            _ => Some(Value::Null),
+        };
+        if let Some(id) = id {
+            self.push(response_too_large(id, self.limit));
         }
-        if responses.is_empty() {
-            StatusCode::NO_CONTENT.into_response()
+    }
+
+    fn push(&mut self, response: RpcResponse) {
+        let separator = usize::from(self.batch && !self.responses.is_empty());
+        let encoded = (!self.full)
+            .then(|| encode_response(&response))
+            .filter(|encoded| {
+                self.bytes
+                    .saturating_add(separator)
+                    .saturating_add(encoded.len())
+                    <= self.limit
+            });
+        let encoded = encoded.unwrap_or_else(|| {
+            self.full = true;
+            encode_response(&response_too_large(response.id, self.limit))
+        });
+        self.bytes = self
+            .bytes
+            .saturating_add(separator)
+            .saturating_add(encoded.len());
+        self.responses.push(encoded);
+    }
+
+    fn finish(self) -> Option<String> {
+        if self.responses.is_empty() {
+            None
+        } else if self.batch {
+            Some(format!("[{}]", self.responses.join(",")))
         } else {
-            Json(responses).into_response()
-        }
-    } else {
-        match dispatch_value(&state, parsed).await {
-            Some(response) => Json(response).into_response(),
-            None => StatusCode::NO_CONTENT.into_response(),
+            self.responses.into_iter().next()
         }
     }
 }
 
-async fn dispatch_value(state: &RpcState, value: Value) -> Option<RpcResponse> {
+fn encode_response(response: &RpcResponse) -> String {
+    // Responses hold only JSON values and strings, which always encode.
+    serde_json::to_string(response).unwrap_or_else(|_| {
+        r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32603,"message":"Internal error"}}"#
+            .to_owned()
+    })
+}
+
+fn response_too_large(id: Value, limit: usize) -> RpcResponse {
+    let error = RpcError::limit_exceeded("response_size_limit_exceeded", limit);
+    RpcResponse::error(id, error.code, error.message, error.data)
+}
+
+/// Answer one call. `budget` is the number of response bytes still free;
+/// results that can grow past it stop early.
+async fn dispatch_value(state: &RpcState, value: Value, budget: usize) -> Option<RpcResponse> {
     let request = match serde_json::from_value::<RpcRequest>(value) {
         Ok(request) if request.jsonrpc == JSONRPC_VERSION => request,
         _ => {
@@ -1060,7 +1237,7 @@ async fn dispatch_value(state: &RpcState, value: Value) -> Option<RpcResponse> {
     };
     let id = request.id?;
     Some(
-        match dispatch(state, &request.method, request.params).await {
+        match dispatch(state, &request.method, request.params, budget).await {
             Ok(result) => RpcResponse::success(id, result),
             Err(error) => RpcResponse::error(id, error.code, error.message, error.data),
         },
@@ -1071,6 +1248,7 @@ async fn dispatch(
     state: &RpcState,
     method: &str,
     params: Option<Value>,
+    budget: usize,
 ) -> Result<Value, RpcError> {
     match method {
         "web3_clientVersion" => {
@@ -1147,7 +1325,7 @@ async fn dispatch(
         "eth_getTransactionByHash" => eth_get_transaction_by_hash(state, params).await,
         "eth_getTransactionReceipt" => eth_get_transaction_receipt(state, params).await,
         "eth_config" => eth_config(state, params).await,
-        "eth_getLogs" => eth_get_logs(state, params).await,
+        "eth_getLogs" => eth_get_logs(state, params, budget).await,
         "leani_getCapabilities" => {
             require_no_params(params)?;
             Ok(capabilities(state))
@@ -2099,8 +2277,15 @@ fn u256_to_u128(value: U256) -> Result<u128, RpcError> {
         .map_err(|_| RpcError::data_unavailable_reason("quantity_exceeds_u128"))
 }
 
-async fn eth_get_logs(state: &RpcState, params: Option<Value>) -> Result<Value, RpcError> {
-    let filter = parse_log_filter(params.as_ref())?;
+/// `budget` is the number of response bytes still free: the encoded log
+/// array must fit in it, less the response envelope, which the response
+/// limit checks afterwards.
+async fn eth_get_logs(
+    state: &RpcState,
+    params: Option<Value>,
+    budget: usize,
+) -> Result<Value, RpcError> {
+    let filter = parse_log_filter(params.as_ref(), &state.config)?;
     let recent_bounds = state
         .store
         .recent_canonical_bounds(state.config.chain_id)
@@ -2144,7 +2329,10 @@ async fn eth_get_logs(state: &RpcState, params: Option<Value>) -> Result<Value, 
         recent_bounds.map(BlockRange::end),
     )
     .await?;
+    let max_results = state.config.max_log_results;
     let mut output = Vec::new();
+    // The encoded array's brackets; each log adds its length and a comma.
+    let mut output_bytes = 2_usize;
     for frame in frames {
         let Material::Complete(logs) = &frame.logs else {
             return Err(RpcError::data_unavailable_reason(
@@ -2154,6 +2342,23 @@ async fn eth_get_logs(state: &RpcState, params: Option<Value>) -> Result<Value, 
         for log in logs {
             if !filter.matches(log) {
                 continue;
+            }
+            if output.len() == max_results {
+                return Err(RpcError::too_many_logs(
+                    max_results,
+                    from,
+                    frame.block.number,
+                ));
+            }
+            // Stop building a result the response limit would refuse anyway.
+            output_bytes = output_bytes
+                .saturating_add(usize::from(!output.is_empty()))
+                .saturating_add(rpc_log_json_len(&frame, log, false));
+            if output_bytes > budget {
+                return Err(RpcError::limit_exceeded(
+                    "response_size_limit_exceeded",
+                    state.config.max_response_bytes,
+                ));
             }
             output.push(rpc_log_value(&frame, log, false)?);
         }
@@ -2308,6 +2513,33 @@ fn rpc_log_value(
     }))
 }
 
+/// The encoded length of `rpc_log_value(frame, log, removed)`, counted
+/// without encoding it: its values are hex strings, a list of them, and a
+/// boolean, none of which JSON escapes.
+fn rpc_log_json_len(frame: &BlockFrame, log: &leani_primitives::Log, removed: bool) -> usize {
+    // `"0x…"`
+    let hex_string = |digits: usize| digits.saturating_add(4);
+    let quantity = |value: u64| {
+        hex_string(value.checked_ilog(16).map_or(1, |exponent| {
+            usize::try_from(exponent).map_or(usize::MAX, |exponent| exponent + 1)
+        }))
+    };
+    let topics = log.topics.len();
+    let fields = [
+        r#""address":"#.len() + hex_string(40),
+        r#""topics":[]"#.len() + topics * hex_string(64) + topics.saturating_sub(1),
+        r#""data":"#.len() + hex_string(log.data.len().saturating_mul(2)),
+        r#""blockNumber":"#.len() + quantity(frame.block.number.0),
+        r#""transactionHash":"#.len() + hex_string(64),
+        r#""transactionIndex":"#.len() + quantity(u64::from(log.transaction_index)),
+        r#""blockHash":"#.len() + hex_string(64),
+        r#""logIndex":"#.len() + quantity(u64::from(log.log_index)),
+        r#""removed":"#.len() + if removed { "true" } else { "false" }.len(),
+    ];
+    // Braces, and a comma between fields.
+    fields.iter().sum::<usize>() + 2 + fields.len() - 1
+}
+
 #[derive(Clone, Debug)]
 struct ParsedLogFilter {
     from: Option<BlockNumber>,
@@ -2332,7 +2564,10 @@ impl ParsedLogFilter {
     }
 }
 
-fn parse_log_filter(params: Option<&Value>) -> Result<ParsedLogFilter, RpcError> {
+fn parse_log_filter(
+    params: Option<&Value>,
+    config: &RpcConfig,
+) -> Result<ParsedLogFilter, RpcError> {
     let values = params
         .and_then(Value::as_array)
         .ok_or_else(|| RpcError::invalid_params("eth_getLogs expects one filter object"))?;
@@ -2366,12 +2601,12 @@ fn parse_log_filter(params: Option<&Value>) -> Result<ParsedLogFilter, RpcError>
         .flatten();
     let addresses = object
         .get("address")
-        .map(parse_addresses)
+        .map(|value| parse_addresses(value, config.max_log_addresses))
         .transpose()?
         .unwrap_or_default();
     let topics = object
         .get("topics")
-        .map(parse_topics)
+        .map(|value| parse_topics(value, config.max_log_topic_alternatives))
         .transpose()?
         .unwrap_or_default();
     Ok(ParsedLogFilter {
@@ -2396,11 +2631,15 @@ fn parse_log_block(value: &Value) -> Result<Option<BlockNumber>, RpcError> {
     }
 }
 
-fn parse_addresses(value: &Value) -> Result<Vec<Address>, RpcError> {
+fn parse_addresses(value: &Value, limit: usize) -> Result<Vec<Address>, RpcError> {
     match value {
         Value::String(value) => parse_fixed_hex::<20>(value)
             .map(Address::new)
             .map(|value| vec![value]),
+        Value::Array(values) if values.len() > limit => Err(RpcError::invalid_params_limit(
+            "address filter exceeds the address limit",
+            limit,
+        )),
         Value::Array(values) => values
             .iter()
             .map(|value| {
@@ -2417,7 +2656,7 @@ fn parse_addresses(value: &Value) -> Result<Vec<Address>, RpcError> {
     }
 }
 
-fn parse_topics(value: &Value) -> Result<Vec<Option<Vec<[u8; 32]>>>, RpcError> {
+fn parse_topics(value: &Value, limit: usize) -> Result<Vec<Option<Vec<[u8; 32]>>>, RpcError> {
     let values = value
         .as_array()
         .ok_or_else(|| RpcError::invalid_params("topics must be an array"))?;
@@ -2431,6 +2670,12 @@ fn parse_topics(value: &Value) -> Result<Vec<Option<Vec<[u8; 32]>>>, RpcError> {
         .map(|value| match value {
             Value::Null => Ok(None),
             Value::String(topic) => parse_fixed_hex::<32>(topic).map(|topic| Some(vec![topic])),
+            Value::Array(alternatives) if alternatives.len() > limit => {
+                Err(RpcError::invalid_params_limit(
+                    "topic position exceeds the alternatives limit",
+                    limit,
+                ))
+            }
             Value::Array(alternatives) => alternatives
                 .iter()
                 .map(|topic| {
@@ -2533,14 +2778,19 @@ impl RpcResponse {
         }
     }
 
-    fn error(id: Value, code: i64, message: &'static str, data: Option<Value>) -> Self {
+    fn error(
+        id: Value,
+        code: i64,
+        message: impl Into<Cow<'static, str>>,
+        data: Option<Value>,
+    ) -> Self {
         Self {
             jsonrpc: JSONRPC_VERSION,
             id,
             result: None,
             error: Some(RpcErrorBody {
                 code,
-                message,
+                message: message.into(),
                 data,
             }),
         }
@@ -2550,7 +2800,7 @@ impl RpcResponse {
 #[derive(Debug, serde::Serialize)]
 struct RpcErrorBody {
     code: i64,
-    message: &'static str,
+    message: Cow<'static, str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     data: Option<Value>,
 }
@@ -2558,7 +2808,7 @@ struct RpcErrorBody {
 #[derive(Debug)]
 struct RpcError {
     code: i64,
-    message: &'static str,
+    message: Cow<'static, str>,
     data: Option<Value>,
 }
 
@@ -2569,7 +2819,7 @@ impl From<RpcError> for RpcCompatibilityError {
             .as_ref()
             .and_then(|data| data.get("reason").or_else(|| data.get("detail")))
             .and_then(Value::as_str)
-            .unwrap_or(error.message)
+            .unwrap_or(error.message.as_ref())
             .to_owned();
         Self { reason }
     }
@@ -2579,7 +2829,7 @@ impl RpcError {
     fn method_not_found() -> Self {
         Self {
             code: METHOD_NOT_FOUND,
-            message: "Method not found",
+            message: Cow::Borrowed("Method not found"),
             data: None,
         }
     }
@@ -2587,15 +2837,55 @@ impl RpcError {
     fn invalid_params(detail: &'static str) -> Self {
         Self {
             code: INVALID_PARAMS,
-            message: "Invalid params",
+            message: Cow::Borrowed("Invalid params"),
             data: Some(json!({ "detail": detail })),
+        }
+    }
+
+    fn invalid_params_limit(detail: &'static str, limit: usize) -> Self {
+        Self {
+            code: INVALID_PARAMS,
+            message: Cow::Borrowed("Invalid params"),
+            data: Some(json!({ "detail": detail, "limit": limit })),
+        }
+    }
+
+    fn limit_exceeded(reason: &'static str, limit: usize) -> Self {
+        Self {
+            code: LIMIT_EXCEEDED,
+            message: Cow::Borrowed("Limit exceeded"),
+            data: Some(json!({ "reason": reason, "limit": limit })),
+        }
+    }
+
+    /// More than `limit` logs matched, the one past it in block `at`. The
+    /// message names the range before `at`, which stays within the limit,
+    /// in the form clients split ranges by.
+    fn too_many_logs(limit: usize, from: BlockNumber, at: BlockNumber) -> Self {
+        let message = format!("query returned more than {limit} results");
+        let (message, data) = if at > from {
+            let to = hex_quantity(at.0.saturating_sub(1));
+            (
+                format!(
+                    "{message}. Try with this block range [{}, {to}].",
+                    hex_quantity(from.0)
+                ),
+                json!({ "from": hex_quantity(from.0), "to": to, "limit": limit }),
+            )
+        } else {
+            (message, json!({ "limit": limit }))
+        };
+        Self {
+            code: LIMIT_EXCEEDED,
+            message: Cow::Owned(message),
+            data: Some(data),
         }
     }
 
     fn data_unavailable(method: &str) -> Self {
         Self {
             code: DATA_UNAVAILABLE,
-            message: "Data unavailable",
+            message: Cow::Borrowed("Data unavailable"),
             data: Some(json!({
                 "method": method,
                 "reason": "raw_execution_material_not_retained",
@@ -2607,7 +2897,7 @@ impl RpcError {
     fn data_unavailable_reason(reason: &'static str) -> Self {
         Self {
             code: DATA_UNAVAILABLE,
-            message: "Data unavailable",
+            message: Cow::Borrowed("Data unavailable"),
             data: Some(json!({
                 "reason": reason,
                 "retryable": false
@@ -2618,7 +2908,7 @@ impl RpcError {
     fn store(error: &StoreError) -> Self {
         Self {
             code: INTERNAL_ERROR,
-            message: "Internal error",
+            message: Cow::Borrowed("Internal error"),
             data: Some(json!({ "retryable": true, "detail": error.to_string() })),
         }
     }
@@ -2634,7 +2924,7 @@ impl RpcError {
         };
         Self {
             code: DATA_UNAVAILABLE,
-            message: "Data unavailable",
+            message: Cow::Borrowed("Data unavailable"),
             data: Some(json!({
                 "reason": reason,
                 "retryable": retryable
@@ -2685,14 +2975,154 @@ mod tests {
         let (committed_events, _) = broadcast::channel(8);
         let blobs = Arc::new(BlobsProcessor::default());
         let progress: Arc<dyn Processor> = blobs.clone();
-        let state = RpcState {
-            store: store.clone(),
+        let state = RpcState::new(
+            store.clone(),
             progress,
-            blob_schedule: Arc::new(blobs.schedule().clone()),
-            config: RpcConfig::default(),
+            Arc::new(blobs.schedule().clone()),
+            RpcConfig::default(),
             committed_events,
-        };
+        );
         (state, store, directory)
+    }
+
+    /// Build the HTTP or WebSocket router from `state` with `configure`
+    /// applied to its RPC settings.
+    fn configured_router(
+        state: RpcState,
+        websocket: bool,
+        configure: impl FnOnce(&mut RpcConfig),
+    ) -> Router {
+        let mut config = state.config;
+        configure(&mut config);
+        rpc_router(
+            state.store,
+            state.progress,
+            state.blob_schedule,
+            config,
+            state.committed_events,
+            websocket,
+        )
+    }
+
+    /// One WebSocket text message dispatched on a connection's subscriptions.
+    async fn websocket_call(
+        state: &RpcState,
+        subscriptions: &mut BTreeMap<String, Subscription>,
+        next_subscription: &mut u64,
+        input: &str,
+    ) -> Value {
+        let response = websocket_dispatch_text(state, subscriptions, next_subscription, input)
+            .await
+            .expect("WebSocket response");
+        serde_json::from_str(&response).expect("JSON response")
+    }
+
+    /// Serve `router` on an ephemeral loopback port.
+    async fn serve(router: Router) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener");
+        let address = listener.local_addr().expect("listener address");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router).await.expect("RPC server");
+        });
+        (address, server)
+    }
+
+    /// Open a WebSocket connection, sending `origin` when given.
+    async fn websocket_connect(
+        address: std::net::SocketAddr,
+        origin: Option<&str>,
+    ) -> Result<
+        tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+        tokio_tungstenite::tungstenite::Error,
+    > {
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+        let mut request = format!("ws://{address}/")
+            .into_client_request()
+            .expect("WebSocket request");
+        if let Some(origin) = origin {
+            request
+                .headers_mut()
+                .insert(header::ORIGIN, origin.parse().expect("origin header value"));
+        }
+        connect_async(request).await.map(|(socket, _)| socket)
+    }
+
+    /// The HTTP status of a refused WebSocket handshake.
+    fn refused_handshake_status(error: &tokio_tungstenite::tungstenite::Error) -> u16 {
+        match error {
+            tokio_tungstenite::tungstenite::Error::Http(response) => response.status().as_u16(),
+            other => panic!("expected an HTTP refusal, got {other}"),
+        }
+    }
+
+    /// Send one text message and parse the JSON reply.
+    async fn websocket_round_trip<S>(socket: &mut S, message: String) -> Value
+    where
+        S: futures::Sink<ClientMessage>
+            + futures::Stream<Item = Result<ClientMessage, tokio_tungstenite::tungstenite::Error>>
+            + Unpin,
+        <S as futures::Sink<ClientMessage>>::Error: std::fmt::Debug,
+    {
+        socket
+            .send(ClientMessage::Text(message.into()))
+            .await
+            .expect("send");
+        let reply = socket.next().await.expect("reply").expect("valid reply");
+        serde_json::from_str(reply.to_text().expect("text reply")).expect("JSON reply")
+    }
+
+    /// A frame at `number` whose logs come from one address, each with
+    /// `data_bytes` of data.
+    fn frame_with_logs(
+        number: u64,
+        parent: BlockHash,
+        count: u32,
+        data_bytes: usize,
+    ) -> BlockFrame {
+        let mut frame = fixture_frame(number, parent);
+        frame.logs = Material::Complete(
+            (0..count)
+                .map(|index| leani_primitives::Log {
+                    address: Address::new([0x11; 20]),
+                    topics: vec![[0x22; 32]],
+                    data: vec![0x33; data_bytes],
+                    transaction_hash: Some(TransactionHash::new([0x44; 32])),
+                    transaction_index: 0,
+                    log_index: index,
+                })
+                .collect(),
+        );
+        frame
+    }
+
+    /// POST `body` to an HTTP RPC router with the given headers.
+    async fn post_raw(
+        router: Router,
+        content_type: Option<&str>,
+        origin: Option<&str>,
+        body: String,
+    ) -> (StatusCode, Vec<u8>) {
+        let mut request = Request::post("/");
+        if let Some(content_type) = content_type {
+            request = request.header(header::CONTENT_TYPE, content_type);
+        }
+        if let Some(origin) = origin {
+            request = request.header(header::ORIGIN, origin);
+        }
+        let response = router
+            .oneshot(request.body(Body::from(body)).expect("request"))
+            .await
+            .expect("response");
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        (status, bytes.to_vec())
     }
 
     fn history_source(
@@ -2739,24 +3169,22 @@ mod tests {
         let (state, _store, _directory) = test_state_and_store().await;
         let mut subscriptions = BTreeMap::new();
         let mut next = 1;
-        let subscribed = websocket_dispatch_text(
+        let subscribed = websocket_call(
             &state,
             &mut subscriptions,
             &mut next,
             r#"{"jsonrpc":"2.0","id":1,"method":"eth_subscribe","params":["newHeads"]}"#,
         )
-        .await
-        .expect("subscription response");
+        .await;
         assert_eq!(subscribed["result"], "0x00000000000000000000000000000001");
         assert_eq!(subscriptions.len(), 1);
-        let unsubscribed = websocket_dispatch_text(
+        let unsubscribed = websocket_call(
             &state,
             &mut subscriptions,
             &mut next,
             r#"{"jsonrpc":"2.0","id":2,"method":"eth_unsubscribe","params":["0x00000000000000000000000000000001"]}"#,
         )
-        .await
-        .expect("unsubscribe response");
+        .await;
         assert_eq!(unsubscribed["result"], true);
         assert!(subscriptions.is_empty());
     }
@@ -2790,13 +3218,16 @@ mod tests {
             transaction_index: 0,
             log_index: 0,
         }]);
-        let subscription = parse_subscription(Some(&json!([
-            "logs",
-            {
-                "address": hex_bytes(address.as_array()),
-                "topics": [hex_bytes(&[0x31; 32])]
-            }
-        ])))
+        let subscription = parse_subscription(
+            Some(&json!([
+                "logs",
+                {
+                    "address": hex_bytes(address.as_array()),
+                    "topics": [hex_bytes(&[0x31; 32])]
+                }
+            ])),
+            &state.config,
+        )
         .expect("log subscription");
         let results = subscription_results(
             &state,
@@ -2839,10 +3270,13 @@ mod tests {
 
     #[test]
     fn log_subscriptions_reject_historical_range_fields() {
-        let error = parse_subscription(Some(&json!([
-            "logs",
-            {"fromBlock": "0x1"}
-        ])))
+        let error = parse_subscription(
+            Some(&json!([
+                "logs",
+                {"fromBlock": "0x1"}
+            ])),
+            &RpcConfig::default(),
+        )
         .expect_err("historical subscription filter is rejected");
         assert_eq!(error.code, INVALID_PARAMS);
     }
@@ -3624,5 +4058,455 @@ mod tests {
         assert_eq!(parse_hex_quantity("0x0").expect("zero"), 0);
         assert!(parse_hex_quantity("0x00").is_err());
         assert!(parse_hex_quantity("1").is_err());
+    }
+
+    #[tokio::test]
+    async fn cross_origin_and_non_json_requests_are_refused_before_dispatch() {
+        // Audit probe (H26), inverted: a 3 KB `text/plain` batch sent with a
+        // foreign Origin used to be answered with 4.2 MB of logs.
+        let (state, store, _directory) = test_state_and_store().await;
+        store
+            .store_recent_frame(&frame_with_logs(7, BlockHash::ZERO, 1, 64 * 1_024))
+            .await
+            .expect("recent frame");
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "eth_getLogs",
+            "params": [{"fromBlock": "0x7", "toBlock": "0x7"}]
+        });
+        let body = serde_json::to_string(&vec![request; 32]).expect("batch");
+        let router = configured_router(state, false, |config| {
+            config.allowed_origins = BTreeSet::from(["https://app.example".to_owned()]);
+        });
+        for (content_type, origin, status) in [
+            (
+                Some("text/plain"),
+                Some("https://untrusted.example"),
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                Some("application/json"),
+                Some("https://untrusted.example"),
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                Some("application/json"),
+                Some("null"),
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                Some("application/json"),
+                Some("http://localhost.untrusted.example"),
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                Some("application/json"),
+                Some("http://app.example"),
+                StatusCode::FORBIDDEN,
+            ),
+            (Some("text/plain"), None, StatusCode::UNSUPPORTED_MEDIA_TYPE),
+            (
+                Some("application/x-www-form-urlencoded"),
+                None,
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            ),
+            (None, None, StatusCode::UNSUPPORTED_MEDIA_TYPE),
+        ] {
+            let (actual, _) = post_raw(router.clone(), content_type, origin, body.clone()).await;
+            assert_eq!(actual, status, "{content_type:?} from {origin:?}");
+        }
+        for (content_type, origin) in [
+            ("application/json", None),
+            ("Application/JSON; charset=utf-8", None),
+            ("application/json", Some("http://localhost:5173")),
+            ("application/json", Some("http://127.0.0.1")),
+            ("application/json", Some("https://[::1]:8443")),
+            ("application/json", Some("https://app.example")),
+        ] {
+            let (status, bytes) =
+                post_raw(router.clone(), Some(content_type), origin, body.clone()).await;
+            assert_eq!(status, StatusCode::OK, "{content_type} from {origin:?}");
+            let results: Value = serde_json::from_slice(&bytes).expect("JSON");
+            assert_eq!(results.as_array().expect("batch").len(), 32);
+        }
+    }
+
+    #[tokio::test]
+    async fn cross_origin_websocket_upgrades_are_refused_and_subscriptions_are_bounded() {
+        // Audit probe (H26), inverted: a foreign Origin used to open a
+        // WebSocket and hold 2,048 subscriptions on it.
+        let (state, _store, _directory) = test_state_and_store().await;
+        let (address, server) = serve(configured_router(state, true, |_| {})).await;
+        for origin in ["https://untrusted.example", "null"] {
+            let error = websocket_connect(address, Some(origin))
+                .await
+                .expect_err("a foreign origin is refused");
+            assert_eq!(refused_handshake_status(&error), 403, "{origin}");
+        }
+        let mut socket = websocket_connect(address, Some("http://localhost:3000"))
+            .await
+            .expect("a loopback origin connects");
+        let subscribe =
+            json!({"jsonrpc": "2.0", "id": 1, "method": "eth_subscribe", "params": ["newHeads"]});
+        let oversized = websocket_round_trip(
+            &mut socket,
+            serde_json::to_string(&vec![subscribe.clone(); 2_048]).expect("batch"),
+        )
+        .await;
+        assert_eq!(oversized["error"]["code"], INVALID_REQUEST);
+        let (mut accepted, mut refused) = (0, 0);
+        for _ in 0..2 {
+            let responses = websocket_round_trip(
+                &mut socket,
+                serde_json::to_string(&vec![subscribe.clone(); DEFAULT_MAX_BATCH_REQUESTS])
+                    .expect("batch"),
+            )
+            .await;
+            for response in responses.as_array().expect("batch response") {
+                if response["result"].is_string() {
+                    accepted += 1;
+                } else {
+                    // -32005: limit exceeded.
+                    assert_eq!(response["error"]["code"], -32_005, "{response}");
+                    refused += 1;
+                }
+            }
+        }
+        assert_eq!(DEFAULT_MAX_SUBSCRIPTIONS_PER_CONNECTION, 128);
+        assert_eq!(
+            (accepted, refused),
+            (128, 2 * DEFAULT_MAX_BATCH_REQUESTS - 128)
+        );
+        socket.close(None).await.expect("close");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn websocket_connections_are_capped_and_released_on_disconnect() {
+        let (state, _store, _directory) = test_state_and_store().await;
+        let (address, server) = serve(configured_router(state, true, |config| {
+            config.max_websocket_connections = 2;
+        }))
+        .await;
+        let mut first = websocket_connect(address, None)
+            .await
+            .expect("first connection");
+        let _second = websocket_connect(address, None)
+            .await
+            .expect("second connection");
+        let error = websocket_connect(address, None)
+            .await
+            .expect_err("a third connection is refused");
+        assert_eq!(refused_handshake_status(&error), 503);
+        first.close(None).await.expect("close");
+        while first.next().await.is_some() {}
+        let mut reconnected = None;
+        for _ in 0..100 {
+            match websocket_connect(address, None).await {
+                Ok(socket) => {
+                    reconnected = Some(socket);
+                    break;
+                }
+                Err(error) => {
+                    assert_eq!(refused_handshake_status(&error), 503);
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            }
+        }
+        assert!(
+            reconnected.is_some(),
+            "a closed connection releases its slot"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn websocket_subscriptions_are_capped_per_connection() {
+        let (mut state, _store, _directory) = test_state_and_store().await;
+        state.config.max_subscriptions_per_connection = 2;
+        let mut subscriptions = BTreeMap::new();
+        let mut next = 1;
+        let subscribe =
+            r#"{"jsonrpc":"2.0","id":1,"method":"eth_subscribe","params":["newHeads"]}"#;
+        let first = websocket_call(&state, &mut subscriptions, &mut next, subscribe).await;
+        let second = websocket_call(&state, &mut subscriptions, &mut next, subscribe).await;
+        assert!(first["result"].is_string() && second["result"].is_string());
+        let refused = websocket_call(&state, &mut subscriptions, &mut next, subscribe).await;
+        assert_eq!(refused["error"]["code"], -32_005, "{refused}");
+        assert_eq!(subscriptions.len(), 2);
+        let unsubscribe = json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "eth_unsubscribe",
+            "params": [first["result"]]
+        });
+        let unsubscribed = websocket_call(
+            &state,
+            &mut subscriptions,
+            &mut next,
+            &unsubscribe.to_string(),
+        )
+        .await;
+        assert_eq!(unsubscribed["result"], true);
+        let again = websocket_call(&state, &mut subscriptions, &mut next, subscribe).await;
+        assert!(again["result"].is_string(), "{again}");
+    }
+
+    #[tokio::test]
+    async fn batches_longer_than_the_limit_are_refused_whole() {
+        let (router, _directory) = test_router().await;
+        let request = json!({"jsonrpc": "2.0", "id": 1, "method": "eth_chainId"});
+        assert_eq!(DEFAULT_MAX_BATCH_REQUESTS, 100);
+        let (_, full) = call(
+            router.clone(),
+            Value::Array(vec![request.clone(); DEFAULT_MAX_BATCH_REQUESTS]),
+        )
+        .await;
+        assert_eq!(full.expect("body").as_array().expect("batch").len(), 100);
+        let (status, oversized) = call(
+            router,
+            Value::Array(vec![request; DEFAULT_MAX_BATCH_REQUESTS + 1]),
+        )
+        .await;
+        let oversized = oversized.expect("body");
+        assert_eq!(status, StatusCode::OK);
+        assert!(oversized["id"].is_null(), "{oversized}");
+        assert_eq!(oversized["error"]["code"], INVALID_REQUEST);
+        assert_eq!(oversized["error"]["data"]["limit"], 100);
+    }
+
+    #[tokio::test]
+    async fn responses_past_the_size_limit_become_limit_errors() {
+        let (state, _store, _directory) = test_state_and_store().await;
+        let batch = json!([
+            {"jsonrpc": "2.0", "id": 1, "method": "eth_chainId"},
+            {"jsonrpc": "2.0", "id": 2, "method": "eth_chainId"},
+            {"jsonrpc": "2.0", "id": 3, "method": "eth_chainId"}
+        ]);
+        let single = json!({"jsonrpc": "2.0", "id": 4, "method": "eth_chainId"});
+        let unlimited = configured_router(state.clone(), false, |_| {});
+        let batch_bytes = post_raw(
+            unlimited.clone(),
+            Some("application/json"),
+            None,
+            batch.to_string(),
+        )
+        .await
+        .1
+        .len();
+        let single_bytes = post_raw(
+            unlimited,
+            Some("application/json"),
+            None,
+            single.to_string(),
+        )
+        .await
+        .1
+        .len();
+
+        let at_limit = configured_router(state.clone(), false, |config| {
+            config.max_response_bytes = batch_bytes;
+        });
+        let (_, body) = call(at_limit, batch.clone()).await;
+        let body = body.expect("body");
+        let responses = body.as_array().expect("batch");
+        assert!(
+            responses.iter().all(|response| response["result"] == "0x1"),
+            "{body}"
+        );
+        let below = configured_router(state.clone(), false, |config| {
+            config.max_response_bytes = batch_bytes - 1;
+        });
+        let (_, body) = call(below, batch).await;
+        let body = body.expect("body");
+        let responses = body.as_array().expect("batch");
+        assert_eq!(responses[0]["result"], "0x1");
+        assert_eq!(responses[1]["result"], "0x1");
+        assert_eq!(responses[2]["id"], 3);
+        assert_eq!(responses[2]["error"]["code"], -32_005, "{body}");
+
+        let at_limit = configured_router(state.clone(), false, |config| {
+            config.max_response_bytes = single_bytes;
+        });
+        let (_, body) = call(at_limit, single.clone()).await;
+        assert_eq!(body.expect("body")["result"], "0x1");
+        let below = configured_router(state, false, |config| {
+            config.max_response_bytes = single_bytes - 1;
+        });
+        let (_, body) = call(below, single).await;
+        let body = body.expect("body");
+        assert_eq!(body["id"], 4);
+        assert_eq!(body["error"]["code"], -32_005, "{body}");
+    }
+
+    #[tokio::test]
+    async fn get_logs_results_are_capped_with_a_retry_range() {
+        let (state, store, _directory) = test_state_and_store().await;
+        let seventh = frame_with_logs(7, BlockHash::ZERO, 2, 1);
+        let eighth = frame_with_logs(8, seventh.block.hash, 1, 1);
+        let ninth = frame_with_logs(9, eighth.block.hash, 3, 1);
+        for frame in [&seventh, &eighth, &ninth] {
+            store.store_recent_frame(frame).await.expect("recent frame");
+        }
+        let router = configured_router(state, false, |config| config.max_log_results = 2);
+        let logs = |from: &str, to: &str| {
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "eth_getLogs",
+                "params": [{"fromBlock": from, "toBlock": to}]
+            })
+        };
+        let (_, at_limit) = call(router.clone(), logs("0x7", "0x7")).await;
+        assert_eq!(
+            at_limit.expect("body")["result"]
+                .as_array()
+                .expect("logs")
+                .len(),
+            2
+        );
+        let (_, over) = call(router.clone(), logs("0x7", "0x8")).await;
+        let over = over.expect("body");
+        assert_eq!(over["error"]["code"], -32_005, "{over}");
+        assert_eq!(
+            over["error"]["message"],
+            "query returned more than 2 results. Try with this block range [0x7, 0x7]."
+        );
+        assert_eq!(
+            over["error"]["data"],
+            json!({"from": "0x7", "to": "0x7", "limit": 2})
+        );
+        let (_, single_block) = call(router, logs("0x9", "0x9")).await;
+        let single_block = single_block.expect("body");
+        assert_eq!(single_block["error"]["code"], -32_005, "{single_block}");
+        assert_eq!(
+            single_block["error"]["message"],
+            "query returned more than 2 results"
+        );
+    }
+
+    #[tokio::test]
+    async fn log_filters_cap_addresses_and_topic_alternatives() {
+        let (state, store, _directory) = test_state_and_store().await;
+        store
+            .store_recent_frame(&fixture_frame(7, BlockHash::ZERO))
+            .await
+            .expect("recent frame");
+        let limits = |config: &mut RpcConfig| {
+            config.max_log_addresses = 2;
+            config.max_log_topic_alternatives = 2;
+        };
+        let router = configured_router(state, false, limits);
+        let address = |byte: u8| hex_bytes(&[byte; 20]);
+        let topic = |byte: u8| hex_bytes(&[byte; 32]);
+        for (mut filter, code) in [
+            (json!({"address": [address(1), address(2)]}), None),
+            (
+                json!({"address": [address(1), address(2), address(3)]}),
+                Some(INVALID_PARAMS),
+            ),
+            (json!({"topics": [[topic(1), topic(2)]]}), None),
+            (
+                json!({"topics": [null, [topic(1), topic(2), topic(3)]]}),
+                Some(INVALID_PARAMS),
+            ),
+        ] {
+            filter["fromBlock"] = json!("0x7");
+            filter["toBlock"] = json!("0x7");
+            let (_, body) = call(
+                router.clone(),
+                json!({"jsonrpc": "2.0", "id": 1, "method": "eth_getLogs", "params": [filter]}),
+            )
+            .await;
+            let body = body.expect("body");
+            match code {
+                None => assert_eq!(body["result"], json!([]), "{body}"),
+                Some(code) => assert_eq!(body["error"]["code"], code, "{body}"),
+            }
+        }
+        let mut config = RpcConfig::default();
+        limits(&mut config);
+        let error = parse_subscription(
+            Some(&json!(["logs", {"address": [address(1), address(2), address(3)]}])),
+            &config,
+        )
+        .expect_err("an oversized subscription filter is refused");
+        assert_eq!(error.code, INVALID_PARAMS);
+    }
+
+    #[test]
+    fn log_json_length_is_computed_without_encoding() {
+        let mut frame = fixture_frame(0, BlockHash::ZERO);
+        for (number, data, topics, log_index, transaction_index) in [
+            (0_u64, 0_usize, 0_usize, 0_u32, 0_u32),
+            (7, 1, 1, 15, 16),
+            (19_426_589, 1_000, 4, 255, 4_096),
+            (u64::MAX, 3, 2, u32::MAX, u32::MAX),
+        ] {
+            frame.block.number = BlockNumber(number);
+            let log = leani_primitives::Log {
+                address: Address::new([0x11; 20]),
+                topics: vec![[0x22; 32]; topics],
+                data: vec![0x33; data],
+                transaction_hash: Some(TransactionHash::new([0x44; 32])),
+                transaction_index,
+                log_index,
+            };
+            for removed in [false, true] {
+                let encoded = serde_json::to_string(
+                    &rpc_log_value(&frame, &log, removed).expect("log value"),
+                )
+                .expect("encoded log");
+                assert_eq!(
+                    rpc_log_json_len(&frame, &log, removed),
+                    encoded.len(),
+                    "{encoded}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn get_logs_stops_at_the_remaining_response_budget() {
+        // Review 1, minor 2: a batch's earlier responses use part of the
+        // response limit, so a later `eth_getLogs` gets only what remains.
+        let (state, store, _directory) = test_state_and_store().await;
+        store
+            .store_recent_frame(&frame_with_logs(7, BlockHash::ZERO, 3, 100))
+            .await
+            .expect("recent frame");
+        let params = || Some(json!([{"fromBlock": "0x7", "toBlock": "0x7"}]));
+        let result = eth_get_logs(&state, params(), usize::MAX)
+            .await
+            .expect("logs");
+        let needed = serde_json::to_string(&result).expect("encoded").len();
+        eth_get_logs(&state, params(), needed)
+            .await
+            .expect("exactly enough budget");
+        let error = eth_get_logs(&state, params(), needed - 1)
+            .await
+            .expect_err("one byte short");
+        assert_eq!(error.code, -32_005);
+        assert_eq!(
+            error.data.expect("data")["reason"],
+            "response_size_limit_exceeded"
+        );
+    }
+
+    #[tokio::test]
+    async fn configured_origins_match_in_any_case_and_without_a_trailing_slash() {
+        let (state, _store, _directory) = test_state_and_store().await;
+        let router = configured_router(state, false, |config| {
+            config.allowed_origins = BTreeSet::from(["HTTPS://App.Example/".to_owned()]);
+        });
+        let (status, _) = post_raw(
+            router,
+            Some("application/json"),
+            Some("https://app.example"),
+            json!({"jsonrpc": "2.0", "id": 1, "method": "eth_chainId"}).to_string(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
     }
 }

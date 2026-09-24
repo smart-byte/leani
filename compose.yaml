@@ -4,6 +4,15 @@ services:
       context: .
     restart: unless-stopped
     init: true
+    # The image's /etc/leani/node.toml (deploy/container.toml) reads the API
+    # bearer token from LEANI_API_TOKEN; `serve` refuses to start unless it
+    # holds at least 16 printable ASCII characters. Export it before any
+    # `docker compose` command: Compose resolves it for the whole file.
+    # That file also lists this service's name, `leani`, in api.allowed_hosts,
+    # so other services can call http://leani:8080. To add the host names your
+    # clients use, mount your own copy over /etc/leani/node.toml.
+    environment:
+      LEANI_API_TOKEN: ${LEANI_API_TOKEN:?set LEANI_API_TOKEN to a random value of at least 16 characters}
     ports:
       - "127.0.0.1:8080:8080"
       - "127.0.0.1:8545:8545"

@@ -1139,6 +1139,54 @@ pub struct RpcConfig {
     pub historical_mode: HistoricalMode,
     pub transaction_locator: bool,
     pub minimum_recent_blocks: u64,
+    /// Serve JSON-RPC, which has no authentication, on a non-loopback bind.
+    #[serde(default)]
+    pub allow_unauthenticated_remote: bool,
+    /// Browser origins, besides loopback ones, that may call JSON-RPC.
+    #[serde(default)]
+    pub allowed_origins: Vec<String>,
+    #[serde(default = "default_rpc_max_batch_requests")]
+    pub max_batch_requests: usize,
+    #[serde(default = "default_rpc_max_response_bytes")]
+    pub max_response_bytes: HumanBytes,
+    #[serde(default = "default_rpc_max_log_results")]
+    pub max_log_results: usize,
+    #[serde(default = "default_rpc_max_log_addresses")]
+    pub max_log_addresses: usize,
+    #[serde(default = "default_rpc_max_log_topic_alternatives")]
+    pub max_log_topic_alternatives: usize,
+    #[serde(default = "default_rpc_max_subscriptions_per_connection")]
+    pub max_subscriptions_per_connection: usize,
+    #[serde(default = "default_rpc_max_websocket_connections")]
+    pub max_websocket_connections: usize,
+}
+
+const fn default_rpc_max_batch_requests() -> usize {
+    leani_rpc::DEFAULT_MAX_BATCH_REQUESTS
+}
+
+fn default_rpc_max_response_bytes() -> HumanBytes {
+    HumanBytes(u64::try_from(leani_rpc::DEFAULT_MAX_RESPONSE_BYTES).unwrap_or(u64::MAX))
+}
+
+const fn default_rpc_max_log_results() -> usize {
+    leani_rpc::DEFAULT_MAX_LOG_RESULTS
+}
+
+const fn default_rpc_max_log_addresses() -> usize {
+    leani_rpc::DEFAULT_MAX_LOG_ADDRESSES
+}
+
+const fn default_rpc_max_log_topic_alternatives() -> usize {
+    leani_rpc::DEFAULT_MAX_LOG_TOPIC_ALTERNATIVES
+}
+
+const fn default_rpc_max_subscriptions_per_connection() -> usize {
+    leani_rpc::DEFAULT_MAX_SUBSCRIPTIONS_PER_CONNECTION
+}
+
+const fn default_rpc_max_websocket_connections() -> usize {
+    leani_rpc::DEFAULT_MAX_WEBSOCKET_CONNECTIONS
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
@@ -1154,6 +1202,16 @@ pub struct ApiConfig {
     pub bind: SocketAddr,
     #[serde(default)]
     pub bearer_token_env: Option<String>,
+    /// Serve the API without a bearer token on a non-loopback bind.
+    #[serde(default)]
+    pub allow_unauthenticated_remote: bool,
+    /// `Host` names, besides `localhost`, that requests may address. IP
+    /// addresses, the bind address included, always pass.
+    #[serde(default)]
+    pub allowed_hosts: Vec<String>,
+    /// Browser origins, besides loopback ones, that may call the API.
+    #[serde(default)]
+    pub allowed_origins: Vec<String>,
     #[serde(default)]
     pub delivery: ApiDeliveryConfig,
 }
@@ -1705,9 +1763,104 @@ impl Config {
                 "HTTP RPC, WebSocket RPC, and native API addresses must be distinct",
             ));
         }
+        validate_exposure(&self.api, &self.rpc, &mut errors);
 
         errors
     }
+}
+
+/// Refuse a listener beyond loopback that nothing authenticates unless the
+/// operator opts in, malformed host and origin allowlists, and zero RPC caps.
+fn validate_exposure(api: &ApiConfig, rpc: &RpcConfig, errors: &mut Vec<ValidationError>) {
+    let remote = |bind: SocketAddr| !bind.ip().to_canonical().is_loopback();
+    if remote(api.bind) && api.bearer_token_env.is_none() && !api.allow_unauthenticated_remote {
+        errors.push(ValidationError::new(
+            "api.bind",
+            "a non-loopback bind needs api.bearer_token_env, or api.allow_unauthenticated_remote = true behind an authenticating proxy",
+        ));
+    }
+    for (field, bind) in [
+        ("rpc.http_bind", rpc.http_bind),
+        ("rpc.ws_bind", rpc.ws_bind),
+    ] {
+        if remote(bind) && !rpc.allow_unauthenticated_remote {
+            errors.push(ValidationError::new(
+                field,
+                "JSON-RPC has no authentication; a non-loopback bind needs rpc.allow_unauthenticated_remote = true behind a trusted network or authenticating proxy",
+            ));
+        }
+    }
+    for (index, host) in api.allowed_hosts.iter().enumerate() {
+        if allowed_host(host).is_none() {
+            errors.push(ValidationError::new(
+                format!("api.allowed_hosts[{index}]"),
+                "must be a host name or IP address, without a scheme or port; IPv6 in brackets",
+            ));
+        }
+    }
+    for (field, origins) in [
+        ("api.allowed_origins", &api.allowed_origins),
+        ("rpc.allowed_origins", &rpc.allowed_origins),
+    ] {
+        for (index, origin) in origins.iter().enumerate() {
+            if allowed_origin(origin).is_none() {
+                errors.push(ValidationError::new(
+                    format!("{field}[{index}]"),
+                    "must be an http or https origin such as https://app.example, without a path",
+                ));
+            }
+        }
+    }
+    for (field, value) in [
+        ("rpc.max_batch_requests", rpc.max_batch_requests),
+        (
+            "rpc.max_response_bytes",
+            usize::try_from(rpc.max_response_bytes.bytes()).unwrap_or(usize::MAX),
+        ),
+        ("rpc.max_log_results", rpc.max_log_results),
+        ("rpc.max_log_addresses", rpc.max_log_addresses),
+        (
+            "rpc.max_log_topic_alternatives",
+            rpc.max_log_topic_alternatives,
+        ),
+        (
+            "rpc.max_subscriptions_per_connection",
+            rpc.max_subscriptions_per_connection,
+        ),
+        (
+            "rpc.max_websocket_connections",
+            rpc.max_websocket_connections,
+        ),
+    ] {
+        if value == 0 {
+            errors.push(ValidationError::new(field, "must be greater than zero"));
+        }
+    }
+}
+
+/// An `api.allowed_hosts` entry as the API compares `Host` names: lowercase,
+/// an IPv6 address in brackets. `None` for anything but a bare host name or
+/// address.
+pub(crate) fn allowed_host(value: &str) -> Option<String> {
+    if value.contains('*') {
+        return None;
+    }
+    url::Host::parse(value).ok().map(|host| host.to_string())
+}
+
+/// An allowed-origin entry in the serialization browsers send, such as
+/// `https://app.example`. `None` for anything but an `http` or `https`
+/// origin without credentials, path, query, or fragment.
+pub(crate) fn allowed_origin(value: &str) -> Option<String> {
+    let url = Url::parse(value).ok()?;
+    (matches!(url.scheme(), "http" | "https")
+        && url.has_host()
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.path() == "/"
+        && url.query().is_none()
+        && url.fragment().is_none())
+    .then(|| url.origin().ascii_serialization())
 }
 
 fn validate_history_sources(sources: &[HistorySourceConfig], errors: &mut Vec<ValidationError>) {
@@ -3315,6 +3468,7 @@ markets = ["LINK/ETH"]
             "config/modes/windowed.toml",
             "config/modes/full.toml",
             "config/benchmarks/real-source.toml",
+            "deploy/container.toml",
         ] {
             let path = repository.join(relative);
             Config::load(&path)
@@ -3337,5 +3491,180 @@ markets = ["LINK/ETH"]
             schema["$defs"]["advancedConfig"]["additionalProperties"],
             serde_json::Value::Bool(false)
         );
+    }
+
+    fn error_fields(config: &Config) -> Vec<String> {
+        config
+            .validation_errors()
+            .into_iter()
+            .map(|error| error.field)
+            .collect()
+    }
+
+    #[test]
+    fn non_loopback_binds_need_authentication_or_an_explicit_opt_in() {
+        // Audit M-D7: the container profile served every interface with no
+        // bearer, so publishing its ports exposed the admin routes.
+        for bind in ["0.0.0.0:8080", "[::]:8080", "192.0.2.10:8080"] {
+            let mut config = config();
+            config.api.bind = bind.parse().expect("bind");
+            assert_eq!(error_fields(&config), ["api.bind"], "{bind}");
+            config.api.bearer_token_env = Some("LEANI_API_TOKEN".to_owned());
+            assert!(error_fields(&config).is_empty(), "{bind} with a bearer");
+            config.api.bearer_token_env = None;
+            config.api.allow_unauthenticated_remote = true;
+            assert!(error_fields(&config).is_empty(), "{bind} opted in");
+        }
+        for bind in [
+            "127.0.0.1:18080",
+            "127.0.0.2:8080",
+            "[::1]:8080",
+            "[::ffff:127.0.0.1]:8080",
+        ] {
+            let mut config = config();
+            config.api.bind = bind.parse().expect("bind");
+            assert!(error_fields(&config).is_empty(), "{bind}");
+        }
+
+        let mut config = config();
+        config.rpc.http_bind = "0.0.0.0:8545".parse().expect("bind");
+        config.rpc.ws_bind = "[::]:8546".parse().expect("bind");
+        // JSON-RPC has no bearer, so only the opt-in serves it remotely.
+        config.api.bearer_token_env = Some("LEANI_API_TOKEN".to_owned());
+        assert_eq!(error_fields(&config), ["rpc.http_bind", "rpc.ws_bind"]);
+        config.rpc.allow_unauthenticated_remote = true;
+        assert!(error_fields(&config).is_empty());
+    }
+
+    #[test]
+    fn host_and_origin_allowlists_are_checked_and_normalized() {
+        let mut config = config();
+        config.api.allowed_hosts = [
+            "Leani",
+            "[::1]",
+            "10.0.0.5",
+            "leani:8080",
+            "http://leani",
+            "*",
+            "",
+        ]
+        .map(ToOwned::to_owned)
+        .to_vec();
+        config.api.allowed_origins = [
+            "https://App.Example",
+            "http://localhost:3000/",
+            "https://app.example/path",
+            "null",
+        ]
+        .map(ToOwned::to_owned)
+        .to_vec();
+        config.rpc.allowed_origins = [
+            "https://dapp.example:8443",
+            "ftp://files.example",
+            "https://user@app.example",
+        ]
+        .map(ToOwned::to_owned)
+        .to_vec();
+        assert_eq!(
+            error_fields(&config),
+            [
+                "api.allowed_hosts[3]",
+                "api.allowed_hosts[4]",
+                "api.allowed_hosts[5]",
+                "api.allowed_hosts[6]",
+                "api.allowed_origins[2]",
+                "api.allowed_origins[3]",
+                "rpc.allowed_origins[1]",
+                "rpc.allowed_origins[2]",
+            ]
+        );
+        assert_eq!(allowed_host("Leani").as_deref(), Some("leani"));
+        assert_eq!(allowed_host("[::1]").as_deref(), Some("[::1]"));
+        assert_eq!(
+            allowed_origin("https://App.Example:443/").as_deref(),
+            Some("https://app.example")
+        );
+        assert_eq!(
+            allowed_origin("http://localhost:3000").as_deref(),
+            Some("http://localhost:3000")
+        );
+        // The schema's pattern accepts the scheme in any case too, and both
+        // refuse a query or fragment.
+        assert_eq!(
+            allowed_origin("HTTPS://App.Example").as_deref(),
+            Some("https://app.example")
+        );
+        assert_eq!(allowed_origin("https://app.example?x=1"), None);
+        assert_eq!(allowed_origin("https://app.example#f"), None);
+    }
+
+    #[test]
+    fn rpc_limits_default_to_the_documented_caps_and_must_be_positive() {
+        let config = config();
+        assert_eq!(config.rpc.max_batch_requests, 100);
+        assert_eq!(config.rpc.max_response_bytes.bytes(), 16 * 1_024 * 1_024);
+        assert_eq!(config.rpc.max_log_results, 10_000);
+        assert_eq!(config.rpc.max_log_addresses, 1_000);
+        assert_eq!(config.rpc.max_log_topic_alternatives, 1_000);
+        assert_eq!(config.rpc.max_subscriptions_per_connection, 128);
+        assert_eq!(config.rpc.max_websocket_connections, 256);
+        let mut config = config;
+        config.rpc.max_batch_requests = 0;
+        config.rpc.max_response_bytes = HumanBytes::from_bytes(0);
+        config.rpc.max_log_results = 0;
+        config.rpc.max_log_addresses = 0;
+        config.rpc.max_log_topic_alternatives = 0;
+        config.rpc.max_subscriptions_per_connection = 0;
+        config.rpc.max_websocket_connections = 0;
+        assert_eq!(
+            error_fields(&config),
+            [
+                "rpc.max_batch_requests",
+                "rpc.max_response_bytes",
+                "rpc.max_log_results",
+                "rpc.max_log_addresses",
+                "rpc.max_log_topic_alternatives",
+                "rpc.max_subscriptions_per_connection",
+                "rpc.max_websocket_connections",
+            ]
+        );
+
+        // Ruling R6: every field is in the configuration schema.
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let schema: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(repository.join("config/schema-v1.json")).expect("schema"),
+        )
+        .expect("configuration schema is JSON");
+        for (section, fields) in [
+            (
+                "api",
+                &[
+                    "allow_unauthenticated_remote",
+                    "allowed_hosts",
+                    "allowed_origins",
+                ][..],
+            ),
+            (
+                "rpc",
+                &[
+                    "allow_unauthenticated_remote",
+                    "allowed_origins",
+                    "max_batch_requests",
+                    "max_response_bytes",
+                    "max_log_results",
+                    "max_log_addresses",
+                    "max_log_topic_alternatives",
+                    "max_subscriptions_per_connection",
+                    "max_websocket_connections",
+                ][..],
+            ),
+        ] {
+            for field in fields {
+                assert!(
+                    schema["$defs"][section]["properties"][field].is_object(),
+                    "{section}.{field} is missing from the schema"
+                );
+            }
+        }
     }
 }

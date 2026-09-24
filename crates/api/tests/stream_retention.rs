@@ -50,6 +50,21 @@ async fn get(router: axum::Router, path: &str) -> (u16, Value) {
         serde_json::from_slice(&to_bytes(r.into_body(), usize::MAX).await.unwrap()).unwrap(),
     )
 }
+async fn post(router: axum::Router, path: &str, body: &'static str) -> (u16, Value) {
+    let r = router
+        .oneshot(
+            Request::post(path)
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    (
+        r.status().as_u16(),
+        serde_json::from_slice(&to_bytes(r.into_body(), usize::MAX).await.unwrap()).unwrap(),
+    )
+}
 
 #[tokio::test]
 async fn retained_output_without_delivery_is_queryable_after_restart() {
@@ -70,7 +85,12 @@ async fn retained_output_without_delivery_is_queryable_after_restart() {
     let router =
         router_with_processors(store, vec![processor], vec![], ApiConfig::default()).unwrap();
     let path = "/v1/processors/synthetic-counter/collections/counter.blocks";
-    let (status, first) = get(router.clone(), &format!("{path}/entities?limit=1")).await;
+    let (status, first) = post(
+        router.clone(),
+        &format!("{path}/entities"),
+        r#"{"limit":1}"#,
+    )
+    .await;
     assert_eq!(status, 200, "{first}");
     assert_eq!(first["rowCount"], "2");
     assert_eq!(first["data"].as_array().unwrap().len(), 1);
@@ -121,9 +141,10 @@ async fn explicit_zero_snapshot_boundary_requires_reset_after_pruning() {
     let router =
         router_with_processors(store.clone(), vec![p.clone()], vec![], ApiConfig::default())
             .unwrap();
-    let (_, snapshot) = get(
+    let (_, snapshot) = post(
         router.clone(),
         "/v1/processors/synthetic-counter/collections/counter.blocks/entities",
+        "{}",
     )
     .await;
     let cursor = snapshot["boundaryCursor"].as_str().unwrap();
@@ -207,9 +228,9 @@ async fn snapshot_capacity_returns_retryable_error_and_release_restores_admissio
     };
     let router = router_with_processors(store, vec![processor], vec![], config).unwrap();
     let path = "/v1/processors/synthetic-counter/collections/counter.blocks/entities";
-    let (status, first) = get(router.clone(), path).await;
+    let (status, first) = post(router.clone(), path, "{}").await;
     assert_eq!(status, 200);
-    let (status, error) = get(router.clone(), path).await;
+    let (status, error) = post(router.clone(), path, "{}").await;
     assert_eq!(status, 503);
     assert_eq!(error["error"]["code"], "query_snapshot_capacity");
     assert_eq!(error["error"]["retryable"], true);
@@ -220,13 +241,14 @@ async fn snapshot_capacity_returns_retryable_error_and_release_restores_admissio
             Request::delete(format!(
                 "/v1/processors/synthetic-counter/query-snapshots/{snapshot}"
             ))
+            .header("x-leani-request", "1")
             .body(Body::empty())
             .unwrap(),
         )
         .await
         .unwrap();
     assert_eq!(released.status(), 204);
-    assert_eq!(get(router, path).await.0, 200);
+    assert_eq!(post(router, path, "{}").await.0, 200);
 }
 
 #[tokio::test]

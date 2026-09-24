@@ -30,12 +30,15 @@ application integrations with an independent fallback.
 - Only configured processor material and bounded recent/raw-history profiles
   are queryable. Pruned material must be reacquired.
 - The native browser SDK requires same-origin hosting or an application-owned
-  reverse proxy with an explicit CORS policy.
+  reverse proxy with an explicit CORS policy, and the page's origin in
+  `api.allowed_origins`.
 - Mainnet multi-day soak, chaos, abrupt-power-loss, broad cross-source parity,
   and every advertised host sweep remain release gates for a production claim.
-- API bearer authentication is optional and JSON-RPC has no built-in access
-  control. Non-loopback deployments must use a trusted network or authenticated
-  reverse proxy and must not expose admin/debug endpoints publicly.
+- JSON-RPC has no built-in access control, and the API bearer is the only
+  credential for admin routes. A bind beyond loopback needs the API bearer or
+  an explicit `allow_unauthenticated_remote` opt-in; such deployments must
+  still use a trusted network or authenticated reverse proxy and must not
+  expose admin/debug endpoints publicly.
 
 Treat this page and the [release process](https://leani.dev/docs/contributing/releasing/) as the public scope
 boundary for the current preview.

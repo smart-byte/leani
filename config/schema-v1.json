@@ -537,7 +537,60 @@
         "ws_bind": { "$ref": "#/$defs/socketAddress" },
         "historical_mode": { "enum": ["on_demand", "disabled"] },
         "transaction_locator": { "type": "boolean" },
-        "minimum_recent_blocks": { "$ref": "#/$defs/positiveInteger" }
+        "minimum_recent_blocks": { "$ref": "#/$defs/positiveInteger" },
+        "allow_unauthenticated_remote": {
+          "type": "boolean",
+          "default": false,
+          "description": "Serve JSON-RPC, which has no authentication, on a non-loopback http_bind or ws_bind. Only behind a trusted network or authenticating proxy."
+        },
+        "allowed_origins": {
+          "$ref": "#/$defs/allowedOrigins",
+          "description": "Browser origins, besides loopback ones on any port, that may call JSON-RPC over HTTP or WebSocket. Any other Origin gets HTTP 403."
+        },
+        "max_batch_requests": {
+          "$ref": "#/$defs/positiveInteger",
+          "default": 100,
+          "description": "Most calls in one batch; a longer batch is refused whole with -32600."
+        },
+        "max_response_bytes": {
+          "$ref": "#/$defs/humanBytes",
+          "default": "16MiB",
+          "description": "Most encoded bytes of one response or batch response; each call past it is answered with -32005."
+        },
+        "max_log_results": {
+          "$ref": "#/$defs/positiveInteger",
+          "default": 10000,
+          "description": "Most logs one eth_getLogs call returns; more fail with -32005 and a smaller block range to retry."
+        },
+        "max_log_addresses": {
+          "$ref": "#/$defs/positiveInteger",
+          "default": 1000,
+          "description": "Most addresses in one log filter; more fail with -32602."
+        },
+        "max_log_topic_alternatives": {
+          "$ref": "#/$defs/positiveInteger",
+          "default": 1000,
+          "description": "Most alternatives at one topic position of a log filter; more fail with -32602."
+        },
+        "max_subscriptions_per_connection": {
+          "$ref": "#/$defs/positiveInteger",
+          "default": 128,
+          "description": "Most live subscriptions on one WebSocket connection; more fail with -32005."
+        },
+        "max_websocket_connections": {
+          "$ref": "#/$defs/positiveInteger",
+          "default": 256,
+          "description": "Most open WebSocket connections; a further upgrade gets HTTP 503."
+        }
+      }
+    },
+    "allowedOrigins": {
+      "type": "array",
+      "default": [],
+      "items": {
+        "type": "string",
+        "pattern": "^[Hh][Tt][Tt][Pp][Ss]?://[^/?#@]+/?$",
+        "description": "An http or https origin such as https://app.example, without a path; the scheme and host match in any case"
       }
     },
     "api": {
@@ -547,6 +600,25 @@
       "properties": {
         "bind": { "$ref": "#/$defs/socketAddress" },
         "bearer_token_env": { "type": "string", "minLength": 1 },
+        "allow_unauthenticated_remote": {
+          "type": "boolean",
+          "default": false,
+          "description": "Serve the API on a non-loopback bind without bearer_token_env. Only behind an authenticating proxy."
+        },
+        "allowed_hosts": {
+          "type": "array",
+          "default": [],
+          "description": "Host names, besides localhost, that requests may address. Any other Host name gets HTTP 421; IP addresses always pass.",
+          "items": {
+            "type": "string",
+            "pattern": "^[^:/?#@*\\s]+$|^\\[[0-9A-Fa-f:.]+\\]$",
+            "description": "A host name or IP address without a scheme or port; IPv6 in brackets"
+          }
+        },
+        "allowed_origins": {
+          "$ref": "#/$defs/allowedOrigins",
+          "description": "Browser origins, besides loopback ones on any port, that may call the API. Any other Origin gets HTTP 403."
+        },
         "delivery": {
           "type": "object",
           "additionalProperties": false,

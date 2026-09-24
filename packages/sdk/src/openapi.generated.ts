@@ -237,10 +237,22 @@ export interface paths {
             };
             cookie?: never;
         };
-        /** Query processor entities */
+        /**
+         * Query processor entities
+         * @description Without a cursor, reads current retained output in entity-key order
+         *     without creating a snapshot; its `nextCursor` continues that read,
+         *     and later pages see later commits. A cursor from a snapshot reads the
+         *     snapshot's next page. Create a stable snapshot with POST.
+         */
         get: operations["queryProcessorEntities"];
         put?: never;
-        post?: never;
+        /**
+         * Snapshot processor entities
+         * @description Copies the matching retained output into a stable, short-lived
+         *     snapshot and returns its first page. Read later pages with GET and the
+         *     page's `nextCursor`, and release the snapshot when done.
+         */
+        post: operations["createProcessorEntitySnapshot"];
         delete?: never;
         options?: never;
         head?: never;
@@ -1386,6 +1398,12 @@ export interface components {
             blockTimestamp: components["schemas"]["SafeInteger"];
             finality: components["schemas"]["Finality"];
         };
+        GenericOutputPage: {
+            data: components["schemas"]["GenericOutputEntity"][];
+            nextCursor: components["schemas"]["Cursor"] | null;
+            retainedBounds: components["schemas"]["OutputBounds"] | null;
+            coverage: components["schemas"]["ProcessorCoverage"];
+        };
         GenericSnapshotPage: {
             data: components["schemas"]["GenericOutputEntity"][];
             nextCursor: components["schemas"]["Cursor"] | null;
@@ -1685,6 +1703,12 @@ export interface components {
          *     used instead on the protected listener.
          */
         ConsumerCredential: string;
+        /**
+         * @description Marks a mutating request without a JSON body as sent by a Leani
+         *     client. A POST or DELETE needs `content-type: application/json` or
+         *     this header, and gets HTTP 415 otherwise.
+         */
+        LeaniRequest: "1";
         Subscription: string;
         Identifier: string;
         Block: components["schemas"]["SafeInteger"];
@@ -2017,6 +2041,34 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
+            /** @description A page of current output, or of a snapshot for a snapshot cursor. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["GenericOutputPage"] | components["schemas"]["GenericSnapshotPage"];
+                };
+            };
+            default: components["responses"]["Error"];
+        };
+    };
+    createProcessorEntitySnapshot: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                processor: components["parameters"]["Processor"];
+                collection: components["parameters"]["Collection"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["OutputQuery"];
+            };
+        };
+        responses: {
             /** @description Stable retained-output snapshot page. */
             200: {
                 headers: {
@@ -2115,7 +2167,14 @@ export interface operations {
     releaseProcessorQuerySnapshot: {
         parameters: {
             query?: never;
-            header?: never;
+            header?: {
+                /**
+                 * @description Marks a mutating request without a JSON body as sent by a Leani
+                 *     client. A POST or DELETE needs `content-type: application/json` or
+                 *     this header, and gets HTTP 415 otherwise.
+                 */
+                "x-leani-request"?: components["parameters"]["LeaniRequest"];
+            };
             path: {
                 processor: components["parameters"]["Processor"];
                 snapshot: string;
@@ -2162,7 +2221,14 @@ export interface operations {
     restoreProcessorRecoveryCheckpoint: {
         parameters: {
             query?: never;
-            header?: never;
+            header?: {
+                /**
+                 * @description Marks a mutating request without a JSON body as sent by a Leani
+                 *     client. A POST or DELETE needs `content-type: application/json` or
+                 *     this header, and gets HTTP 415 otherwise.
+                 */
+                "x-leani-request"?: components["parameters"]["LeaniRequest"];
+            };
             path: {
                 processor: components["parameters"]["Processor"];
                 checkpoint: components["schemas"]["SafeInteger"];
@@ -2264,7 +2330,14 @@ export interface operations {
     deleteProcessorSavepoint: {
         parameters: {
             query?: never;
-            header?: never;
+            header?: {
+                /**
+                 * @description Marks a mutating request without a JSON body as sent by a Leani
+                 *     client. A POST or DELETE needs `content-type: application/json` or
+                 *     this header, and gets HTTP 415 otherwise.
+                 */
+                "x-leani-request"?: components["parameters"]["LeaniRequest"];
+            };
             path: {
                 processor: components["parameters"]["Processor"];
                 savepoint: string;
@@ -2362,7 +2435,14 @@ export interface operations {
     revokeDurableConsumer: {
         parameters: {
             query?: never;
-            header?: never;
+            header?: {
+                /**
+                 * @description Marks a mutating request without a JSON body as sent by a Leani
+                 *     client. A POST or DELETE needs `content-type: application/json` or
+                 *     this header, and gets HTTP 415 otherwise.
+                 */
+                "x-leani-request"?: components["parameters"]["LeaniRequest"];
+            };
             path: {
                 processor: components["parameters"]["Processor"];
                 consumer: components["parameters"]["Consumer"];
@@ -2392,6 +2472,12 @@ export interface operations {
                  *     used instead on the protected listener.
                  */
                 "x-leani-consumer-credential"?: components["parameters"]["ConsumerCredential"];
+                /**
+                 * @description Marks a mutating request without a JSON body as sent by a Leani
+                 *     client. A POST or DELETE needs `content-type: application/json` or
+                 *     this header, and gets HTTP 415 otherwise.
+                 */
+                "x-leani-request"?: components["parameters"]["LeaniRequest"];
             };
             path: {
                 processor: components["parameters"]["Processor"];
@@ -2610,6 +2696,12 @@ export interface operations {
                  *     used instead on the protected listener.
                  */
                 "x-leani-consumer-credential"?: components["parameters"]["ConsumerCredential"];
+                /**
+                 * @description Marks a mutating request without a JSON body as sent by a Leani
+                 *     client. A POST or DELETE needs `content-type: application/json` or
+                 *     this header, and gets HTTP 415 otherwise.
+                 */
+                "x-leani-request"?: components["parameters"]["LeaniRequest"];
             };
             path: {
                 processor: components["parameters"]["Processor"];
@@ -2638,6 +2730,12 @@ export interface operations {
                  *     used instead on the protected listener.
                  */
                 "x-leani-consumer-credential"?: components["parameters"]["ConsumerCredential"];
+                /**
+                 * @description Marks a mutating request without a JSON body as sent by a Leani
+                 *     client. A POST or DELETE needs `content-type: application/json` or
+                 *     this header, and gets HTTP 415 otherwise.
+                 */
+                "x-leani-request"?: components["parameters"]["LeaniRequest"];
             };
             path: {
                 processor: components["parameters"]["Processor"];
@@ -2750,6 +2848,12 @@ export interface operations {
                  *     used instead on the protected listener.
                  */
                 "x-leani-consumer-credential"?: components["parameters"]["ConsumerCredential"];
+                /**
+                 * @description Marks a mutating request without a JSON body as sent by a Leani
+                 *     client. A POST or DELETE needs `content-type: application/json` or
+                 *     this header, and gets HTTP 415 otherwise.
+                 */
+                "x-leani-request"?: components["parameters"]["LeaniRequest"];
             };
             path: {
                 subscription: components["parameters"]["Subscription"];
@@ -2778,6 +2882,12 @@ export interface operations {
                  *     used instead on the protected listener.
                  */
                 "x-leani-consumer-credential"?: components["parameters"]["ConsumerCredential"];
+                /**
+                 * @description Marks a mutating request without a JSON body as sent by a Leani
+                 *     client. A POST or DELETE needs `content-type: application/json` or
+                 *     this header, and gets HTTP 415 otherwise.
+                 */
+                "x-leani-request"?: components["parameters"]["LeaniRequest"];
             };
             path: {
                 subscription: components["parameters"]["Subscription"];
@@ -2800,7 +2910,14 @@ export interface operations {
     resetProcessorLiveLane: {
         parameters: {
             query?: never;
-            header?: never;
+            header?: {
+                /**
+                 * @description Marks a mutating request without a JSON body as sent by a Leani
+                 *     client. A POST or DELETE needs `content-type: application/json` or
+                 *     this header, and gets HTTP 415 otherwise.
+                 */
+                "x-leani-request"?: components["parameters"]["LeaniRequest"];
+            };
             path: {
                 processor: components["parameters"]["Processor"];
             };
@@ -2836,7 +2953,14 @@ export interface operations {
     deleteProcessorArtifacts: {
         parameters: {
             query?: never;
-            header?: never;
+            header?: {
+                /**
+                 * @description Marks a mutating request without a JSON body as sent by a Leani
+                 *     client. A POST or DELETE needs `content-type: application/json` or
+                 *     this header, and gets HTTP 415 otherwise.
+                 */
+                "x-leani-request"?: components["parameters"]["LeaniRequest"];
+            };
             path: {
                 processor: components["parameters"]["Processor"];
             };
@@ -2937,7 +3061,14 @@ export interface operations {
     deleteBackfillSubscription: {
         parameters: {
             query?: never;
-            header?: never;
+            header?: {
+                /**
+                 * @description Marks a mutating request without a JSON body as sent by a Leani
+                 *     client. A POST or DELETE needs `content-type: application/json` or
+                 *     this header, and gets HTTP 415 otherwise.
+                 */
+                "x-leani-request"?: components["parameters"]["LeaniRequest"];
+            };
             path: {
                 id: components["parameters"]["Identifier"];
             };
@@ -2958,7 +3089,14 @@ export interface operations {
     cancelBackfillSubscription: {
         parameters: {
             query?: never;
-            header?: never;
+            header?: {
+                /**
+                 * @description Marks a mutating request without a JSON body as sent by a Leani
+                 *     client. A POST or DELETE needs `content-type: application/json` or
+                 *     this header, and gets HTTP 415 otherwise.
+                 */
+                "x-leani-request"?: components["parameters"]["LeaniRequest"];
+            };
             path: {
                 id: components["parameters"]["Identifier"];
             };
@@ -3038,7 +3176,14 @@ export interface operations {
     deleteMaterializationJob: {
         parameters: {
             query?: never;
-            header?: never;
+            header?: {
+                /**
+                 * @description Marks a mutating request without a JSON body as sent by a Leani
+                 *     client. A POST or DELETE needs `content-type: application/json` or
+                 *     this header, and gets HTTP 415 otherwise.
+                 */
+                "x-leani-request"?: components["parameters"]["LeaniRequest"];
+            };
             path: {
                 id: components["parameters"]["Identifier"];
             };
@@ -3059,7 +3204,14 @@ export interface operations {
     cancelMaterializationJob: {
         parameters: {
             query?: never;
-            header?: never;
+            header?: {
+                /**
+                 * @description Marks a mutating request without a JSON body as sent by a Leani
+                 *     client. A POST or DELETE needs `content-type: application/json` or
+                 *     this header, and gets HTTP 415 otherwise.
+                 */
+                "x-leani-request"?: components["parameters"]["LeaniRequest"];
+            };
             path: {
                 id: components["parameters"]["Identifier"];
             };
@@ -3139,7 +3291,14 @@ export interface operations {
     deleteRawHistoryJob: {
         parameters: {
             query?: never;
-            header?: never;
+            header?: {
+                /**
+                 * @description Marks a mutating request without a JSON body as sent by a Leani
+                 *     client. A POST or DELETE needs `content-type: application/json` or
+                 *     this header, and gets HTTP 415 otherwise.
+                 */
+                "x-leani-request"?: components["parameters"]["LeaniRequest"];
+            };
             path: {
                 id: components["parameters"]["Identifier"];
             };
@@ -3160,7 +3319,14 @@ export interface operations {
     cancelRawHistoryJob: {
         parameters: {
             query?: never;
-            header?: never;
+            header?: {
+                /**
+                 * @description Marks a mutating request without a JSON body as sent by a Leani
+                 *     client. A POST or DELETE needs `content-type: application/json` or
+                 *     this header, and gets HTTP 415 otherwise.
+                 */
+                "x-leani-request"?: components["parameters"]["LeaniRequest"];
+            };
             path: {
                 id: components["parameters"]["Identifier"];
             };

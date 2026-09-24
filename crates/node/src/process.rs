@@ -5014,12 +5014,8 @@ async fn serve(path: &Path, registry: &ProcessorRegistry) -> Result<Exit> {
         .api
         .bearer_token_env
         .as_deref()
-        .map(|name| {
-            std::env::var(name)
-                .with_context(|| format!("read API bearer token from environment variable {name}"))
-        })
-        .transpose()?
-        .map(Arc::<str>::from);
+        .map(|name| api_bearer_token(name, std::env::var(name)))
+        .transpose()?;
     let live_required = matches!(
         config.get().sources.live.kind,
         crate::config::LiveSourceKind::P2p
@@ -5354,6 +5350,21 @@ async fn serve(path: &Path, registry: &ProcessorRegistry) -> Result<Exit> {
                 },
             },
             bearer_token,
+            // The bind address, like every IP address, needs no entry.
+            allowed_hosts: config
+                .get()
+                .api
+                .allowed_hosts
+                .iter()
+                .filter_map(|host| crate::config::allowed_host(host))
+                .collect(),
+            allowed_origins: config
+                .get()
+                .api
+                .allowed_origins
+                .iter()
+                .filter_map(|origin| crate::config::allowed_origin(origin))
+                .collect(),
             readiness: readiness.clone(),
             network_telemetry: network_telemetry.clone(),
             on_demand_processors,
@@ -5365,11 +5376,25 @@ async fn serve(path: &Path, registry: &ProcessorRegistry) -> Result<Exit> {
             ..NativeApiConfig::default()
         },
     )?;
+    let rpc_settings = &config.get().rpc;
     let rpc_config = leani_rpc::RpcConfig {
         chain_id: leani_primitives::ChainId(config.get().chain.chain_id),
         readiness: rpc_readiness.clone(),
         websocket_enabled: true,
         history,
+        allowed_origins: rpc_settings
+            .allowed_origins
+            .iter()
+            .filter_map(|origin| crate::config::allowed_origin(origin))
+            .collect(),
+        max_batch_requests: rpc_settings.max_batch_requests,
+        max_response_bytes: usize::try_from(rpc_settings.max_response_bytes.bytes())
+            .unwrap_or(usize::MAX),
+        max_log_results: rpc_settings.max_log_results,
+        max_log_addresses: rpc_settings.max_log_addresses,
+        max_log_topic_alternatives: rpc_settings.max_log_topic_alternatives,
+        max_subscriptions_per_connection: rpc_settings.max_subscriptions_per_connection,
+        max_websocket_connections: rpc_settings.max_websocket_connections,
         ..leani_rpc::RpcConfig::default()
     };
     let rpc_progress = processors
@@ -5759,6 +5784,36 @@ async fn supervise_processor_maintenance(
             }
         }
     }
+}
+
+/// Shortest native API bearer token `serve` accepts.
+const MINIMUM_API_BEARER_TOKEN_CHARS: usize = 16;
+
+/// The native API bearer token read from environment variable `name`. An
+/// unset, non-Unicode, empty, or short value fails startup, as does one with
+/// spaces, control characters, or non-ASCII characters, which no client can
+/// send as a bearer token. No error repeats the value.
+fn api_bearer_token(name: &str, value: Result<String, std::env::VarError>) -> Result<Arc<str>> {
+    let token = match value {
+        Ok(token) => token,
+        Err(std::env::VarError::NotPresent) => {
+            bail!("API bearer token environment variable {name} is not set")
+        }
+        Err(std::env::VarError::NotUnicode(_)) => {
+            bail!("API bearer token environment variable {name} is not valid Unicode")
+        }
+    };
+    if token.chars().count() < MINIMUM_API_BEARER_TOKEN_CHARS {
+        bail!(
+            "API bearer token in environment variable {name} must be at least {MINIMUM_API_BEARER_TOKEN_CHARS} characters"
+        );
+    }
+    if !token.bytes().all(|byte| byte.is_ascii_graphic()) {
+        bail!(
+            "API bearer token in environment variable {name} must be printable ASCII without spaces"
+        );
+    }
+    Ok(Arc::from(token))
 }
 
 #[cfg(unix)]
@@ -7361,6 +7416,60 @@ mod tests {
     use leani_testkit::{BlockLocalCounter, fixture_frame};
 
     use super::*;
+
+    #[test]
+    fn api_bearer_tokens_are_long_enough_and_never_echoed() {
+        // Audit Auth-2: an empty or short token was accepted at startup.
+        for token in ["", " ", "fifteen-chars-x", "short-secret"] {
+            let error = api_bearer_token("LEANI_API_TOKEN", Ok(token.to_owned()))
+                .expect_err("a short token fails startup");
+            assert!(
+                format!("{error:#}").contains("LEANI_API_TOKEN"),
+                "{error:#}"
+            );
+            if !token.trim().is_empty() {
+                assert!(!format!("{error:#}").contains(token), "{error:#}");
+            }
+        }
+        let token = api_bearer_token("LEANI_API_TOKEN", Ok("sixteen-chars-ok".to_owned()))
+            .expect("16 characters are enough");
+        assert_eq!(token.as_ref(), "sixteen-chars-ok");
+
+        let missing = api_bearer_token("LEANI_API_TOKEN", Err(std::env::VarError::NotPresent))
+            .expect_err("an unset variable fails startup");
+        assert!(format!("{missing:#}").contains("LEANI_API_TOKEN"));
+        let binary = api_bearer_token(
+            "LEANI_API_TOKEN",
+            Err(std::env::VarError::NotUnicode("binary-secret-token".into())),
+        )
+        .expect_err("a non-Unicode variable fails startup");
+        assert!(
+            !format!("{binary:#}").contains("binary-secret-token"),
+            "{binary:#}"
+        );
+    }
+
+    #[test]
+    fn api_bearer_tokens_are_printable_ascii_without_spaces() {
+        // Review 1, minor 1: a client cannot send such a token, so it could
+        // never authenticate.
+        for token in [
+            "sixteen chars ok",
+            " sixteen-chars-ok",
+            "sixteen-chars-ok ",
+            "sixteen-chars-ok\t",
+            "sixteen-chars-\u{7f}ok",
+            "sixteen-chars-ök",
+        ] {
+            let error = api_bearer_token("LEANI_API_TOKEN", Ok(token.to_owned()))
+                .expect_err("an unusable token fails startup");
+            let message = format!("{error:#}");
+            assert!(message.contains("LEANI_API_TOKEN"), "{message}");
+            assert!(!message.contains(token.trim()), "{message}");
+        }
+        api_bearer_token("LEANI_API_TOKEN", Ok("0123456789abcdef~!#$%".to_owned()))
+            .expect("printable ASCII is accepted");
+    }
 
     fn finalized_contradiction() -> anyhow::Error {
         anyhow::Error::from(leani_runtime::RuntimeError::FinalityContradiction {

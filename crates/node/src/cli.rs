@@ -58,7 +58,8 @@ pub enum Command {
                 "https://mainnet.checkpoint.sigp.io/",
                 "https://beaconstate-mainnet.chainsafe.io/"
             ],
-            env = "LEANI_CHECKPOINT_URLS"
+            env = "LEANI_CHECKPOINT_URLS",
+            hide_env_values = true
         )]
         checkpoint_url: Vec<url::Url>,
         /// Number of independent checkpoint providers that must agree.
@@ -89,7 +90,7 @@ pub enum Command {
         #[arg(long)]
         processor: Option<String>,
         /// Optional bearer token for a running node.
-        #[arg(long, env = "LEANI_API_TOKEN")]
+        #[arg(long, env = "LEANI_API_TOKEN", hide_env_values = true)]
         token: Option<String>,
         /// Lowest status to print: `included` (default) or `finalized`.
         #[arg(long, value_enum, default_value_t = SubscribeFinality::Included)]
@@ -106,7 +107,8 @@ pub enum Command {
                 "https://mainnet.checkpoint.sigp.io/",
                 "https://beaconstate-mainnet.chainsafe.io/"
             ],
-            env = "LEANI_CHECKPOINT_URLS"
+            env = "LEANI_CHECKPOINT_URLS",
+            hide_env_values = true
         )]
         checkpoint_url: Vec<url::Url>,
         /// Number of independent checkpoint providers that must agree.

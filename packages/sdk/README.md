@@ -56,7 +56,9 @@ replay a change.
 
 The browser build assumes a same-origin deployment or a reverse proxy that
 adds the application's CORS policy. Leani does not enable cross-origin access
-on its native API by default.
+on its native API by default, and refuses a browser origin that is neither
+loopback nor listed in `api.allowed_origins`. The SDK's mutations without a
+JSON body send `x-leani-request: 1`, which the node requires.
 
 Typed subscriptions accept a configured `processor` instance when a kind is
 ambiguous. `blobs.subscribe()` yields a `{ block, transactions }` payload on

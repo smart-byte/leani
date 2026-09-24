@@ -78,6 +78,26 @@ const UNDO_PRUNE_BATCH: i64 = 10_000;
 /// Minimum block distance between automatic recovery checkpoints. Each one
 /// copies the processor's whole working state.
 const AUTOMATIC_CHECKPOINT_INTERVAL_BLOCKS: u64 = 1_000;
+
+/// Retained public output of one collection joined to its block metadata,
+/// from one entity key on, in key order, as query snapshots copy and probe it
+/// and entity pages read it. Parameters: instance, collection, first key,
+/// each `SnapshotBounds` field twice, and the row limit.
+macro_rules! output_rows_sql {
+    () => {
+        "FROM entities AS entity
+         JOIN output_entity_meta AS meta
+           ON meta.instance = entity.instance
+          AND meta.collection = entity.collection
+          AND meta.entity_key = entity.entity_key
+         WHERE entity.instance = ? AND entity.collection = ? AND entity.entity_key >= ?
+           AND (? IS NULL OR meta.block_number >= ?)
+           AND (? IS NULL OR meta.block_number <= ?)
+           AND (? IS NULL OR meta.block_timestamp >= ?)
+           AND (? IS NULL OR meta.block_timestamp <= ?)
+         ORDER BY entity.entity_key LIMIT ?"
+    };
+}
 /// Operator-created portable savepoints retained per processor instance.
 const PORTABLE_SAVEPOINT_LIMIT: u64 = 16;
 /// First schema whose durable cursors and undo records use the
@@ -9828,30 +9848,21 @@ impl SqliteStore {
         // One row past the cap is enough to reject a collection that grew
         // after the probe.
         let copy_limit = i64::try_from(max_rows.saturating_add(1)).unwrap_or(i64::MAX);
-        sqlx::query(
+        sqlx::query(concat!(
             "INSERT INTO query_snapshot_entities(
                 snapshot_id, ordinal, entity_key, value,
                 block_number, block_timestamp, finality
              )
              SELECT ?, ROW_NUMBER() OVER (ORDER BY entity.entity_key) - 1,
                     entity.entity_key, entity.value, meta.block_number,
-                    meta.block_timestamp, meta.finality
-             FROM entities AS entity
-             JOIN output_entity_meta AS meta
-               ON meta.instance = entity.instance
-              AND meta.collection = entity.collection
-              AND meta.entity_key = entity.entity_key
-             WHERE entity.instance = ? AND entity.collection = ?
-               AND (? IS NULL OR meta.block_number >= ?)
-               AND (? IS NULL OR meta.block_number <= ?)
-               AND (? IS NULL OR meta.block_timestamp >= ?)
-               AND (? IS NULL OR meta.block_timestamp <= ?)
-             ORDER BY entity.entity_key
-             LIMIT ?",
-        )
+                    meta.block_timestamp, meta.finality ",
+            output_rows_sql!()
+        ))
         .bind(snapshot_id.as_slice())
         .bind(&instance)
         .bind(collection)
+        // The empty key sorts first: every row.
+        .bind(&[][..])
         .bind(bounds.from_block)
         .bind(bounds.from_block)
         .bind(bounds.to_block)
@@ -10075,22 +10086,12 @@ impl SqliteStore {
         .fetch_all(&self.inner.pool)
         .await?;
         let entities = rows
-            .into_iter()
+            .iter()
             .map(|row| {
-                Ok(QuerySnapshotEntity {
-                    ordinal: i64_u64(row.try_get("ordinal")?, "snapshot entity ordinal")?,
-                    key: row.try_get("entity_key")?,
-                    value: row.try_get("value")?,
-                    block_number: BlockNumber(i64_u64(
-                        row.try_get("block_number")?,
-                        "snapshot entity block",
-                    )?),
-                    block_timestamp: i64_u64(
-                        row.try_get("block_timestamp")?,
-                        "snapshot entity timestamp",
-                    )?,
-                    finality: decode_finality(row.try_get("finality")?)?,
-                })
+                output_row(
+                    row,
+                    i64_u64(row.try_get("ordinal")?, "snapshot entity ordinal")?,
+                )
             })
             .collect::<Result<Vec<_>, StoreError>>()?;
         Ok((snapshot, entities))
@@ -10182,6 +10183,56 @@ impl SqliteStore {
             })
         })
         .transpose()
+    }
+
+    /// Read one page of current public output in entity-key order, from
+    /// `start_key` on, without copying a snapshot. Returns at most `limit`
+    /// rows, numbered from zero, and whether more rows follow.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid limit or query, corrupt metadata, or a
+    /// failed read.
+    pub async fn output_entities_page(
+        &self,
+        descriptor: &ProcessorDescriptor,
+        collection: &str,
+        query: OutputQuery,
+        start_key: &[u8],
+        limit: usize,
+    ) -> Result<(Vec<QuerySnapshotEntity>, bool), StoreError> {
+        if limit == 0 || limit > 10_000 {
+            return Err(StoreError::InvalidConfig(
+                "output page limit must be in 1..=10000".to_owned(),
+            ));
+        }
+        let bounds = SnapshotBounds::new(query.validate()?)?;
+        let rows = sqlx::query(concat!(
+            "SELECT entity.entity_key, entity.value, meta.block_number,
+                    meta.block_timestamp, meta.finality ",
+            output_rows_sql!()
+        ))
+        .bind(processor_instance(descriptor))
+        .bind(collection)
+        .bind(start_key)
+        .bind(bounds.from_block)
+        .bind(bounds.from_block)
+        .bind(bounds.to_block)
+        .bind(bounds.to_block)
+        .bind(bounds.from_timestamp)
+        .bind(bounds.from_timestamp)
+        .bind(bounds.to_timestamp)
+        .bind(bounds.to_timestamp)
+        .bind(usize_i64(limit.saturating_add(1), "output page limit")?)
+        .fetch_all(&self.inner.pool)
+        .await?;
+        let more = rows.len() > limit;
+        let entities = rows
+            .iter()
+            .take(limit)
+            .map(|row| output_row(row, 0))
+            .collect::<Result<Vec<_>, StoreError>>()?;
+        Ok((entities, more))
     }
 
     /// Scan entity keys in deterministic byte order.
@@ -17379,22 +17430,29 @@ const QUERY_SNAPSHOT_PROBE_ROWS: u64 = 1_024;
 
 /// Count and estimated bytes of one keyset chunk of a query snapshot, from
 /// the chunk's first key on. The estimate matches the copy's accounting.
-const QUERY_SNAPSHOT_PROBE: &str =
+const QUERY_SNAPSHOT_PROBE: &str = concat!(
     "SELECT COUNT(*), COALESCE(SUM(bytes), 0), MAX(entity_key) FROM (
         SELECT entity.entity_key,
-               length(entity.value) + length(entity.entity_key) + 128 AS bytes
-        FROM entities AS entity
-        JOIN output_entity_meta AS meta
-          ON meta.instance = entity.instance
-         AND meta.collection = entity.collection
-         AND meta.entity_key = entity.entity_key
-        WHERE entity.instance = ? AND entity.collection = ? AND entity.entity_key >= ?
-          AND (? IS NULL OR meta.block_number >= ?)
-          AND (? IS NULL OR meta.block_number <= ?)
-          AND (? IS NULL OR meta.block_timestamp >= ?)
-          AND (? IS NULL OR meta.block_timestamp <= ?)
-        ORDER BY entity.entity_key LIMIT ?
-     )";
+               length(entity.value) + length(entity.entity_key) + 128 AS bytes ",
+    output_rows_sql!(),
+    ")"
+);
+
+/// One output row selected with the columns of `output_rows_sql!`, which
+/// snapshot pages store unchanged.
+fn output_row(row: &SqliteRow, ordinal: u64) -> Result<QuerySnapshotEntity, StoreError> {
+    Ok(QuerySnapshotEntity {
+        ordinal,
+        key: row.try_get("entity_key")?,
+        value: row.try_get("value")?,
+        block_number: BlockNumber(i64_u64(
+            row.try_get("block_number")?,
+            "output entity block",
+        )?),
+        block_timestamp: i64_u64(row.try_get("block_timestamp")?, "output entity timestamp")?,
+        finality: decode_finality(row.try_get("finality")?)?,
+    })
+}
 
 /// Block and timestamp bounds of a query snapshot, as bound to SQL.
 #[derive(Clone, Copy, Debug)]

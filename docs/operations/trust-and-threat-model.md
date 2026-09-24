@@ -63,12 +63,32 @@ runtime exists.
 - atomic processor state, undo, coverage, change-log, and outbox commits;
 - opaque checksummed cursors bound to store, chain, processor, and version;
 - bounded API pages, request bodies, SSE batches, and source queues;
+- bounded JSON-RPC work: at most 100 calls per batch, 16 MiB per response,
+  10,000 `eth_getLogs` results, 1,000 filter addresses and topic alternatives,
+  128 subscriptions per WebSocket connection, and 256 connections, each
+  configurable;
+- browser isolation for loopback listeners: the native API answers a `Host`
+  that is an IP address, `localhost`, or a name in `api.allowed_hosts` (421
+  otherwise), so a page that points its own name at 127.0.0.1 is refused;
+  both listeners refuse a browser `Origin` that is neither loopback nor
+  allowed (403), on streams and WebSocket upgrades too; the native API also
+  refuses a GET or HEAD that another site's page sends without an `Origin`
+  other than as a navigation, such as an image load, when the browser marks
+  it with Fetch Metadata (403); mutations need a JSON body or
+  `x-leani-request: 1`, and JSON-RPC calls `application/json` (415
+  otherwise), which a cross-site page cannot send without a preflight the
+  node never grants; and only POST creates query snapshots;
+- a native API bind beyond loopback requires a bearer token, and a JSON-RPC
+  bind beyond loopback an explicit opt-in; startup rejects tokens shorter than
+  16 characters or other than printable ASCII without spaces, tokens are
+  compared in constant time, and CLI help never prints the values of
+  `LEANI_API_TOKEN` or `LEANI_CHECKPOINT_URLS`;
 - optional bearer authentication with redacted debug output;
 - random per-consumer bearer credentials stored only as one-way hashes and
   scoped to that processor instance and consumer identity;
 - no CORS layer; administrative routes share the native API listener and its
-  optional bearer authentication, so binding it beyond localhost exposes those
-  routes as well;
+  bearer authentication, so binding it beyond localhost exposes those routes
+  as well;
 - non-root, read-only container profile with all capabilities dropped;
 - fail-closed unsupported RPC responses instead of synthesized partial state.
 
@@ -95,6 +115,17 @@ runtime exists.
   progress, and a stale or incorrectly sourced weak-subjectivity checkpoint
   can select the wrong consensus history;
 - bearer tokens do not provide transport encryption;
+- two kinds of browser GET still reach a loopback API without the bearer
+  token: navigations from another site's page, including into a frame, and
+  subresource loads from browsers that send no Fetch Metadata. The page
+  cannot read either response, and neither creates a query snapshot, but a
+  GET that opens a consumer's live or backfill stream takes that consumer's
+  session lease, which locks the consumer out while the connection stays
+  open. A bearer token protects consumers from such pages, since a browser
+  never adds it on its own; a consumer credential does not yet, because its
+  header is optional. `allow_unauthenticated_remote` and the
+  `allowed_hosts` and `allowed_origins` lists widen what reaches a listener;
+  keep them to what clients need;
 - a malicious or compromised native processor can exhaust resources, disclose
   node secrets, corrupt process memory through unsafe dependencies, or emit
   plausible but false output;

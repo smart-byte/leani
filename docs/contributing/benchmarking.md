@@ -114,7 +114,9 @@ resumes completed cases and refuses ambiguous partial output. The `all` and
 dedicated disposable database:
 
 ```bash
-docker compose --profile benchmark up -d benchmark-postgres
+# Compose resolves the node's LEANI_API_TOKEN for every service; the
+# database ignores it.
+LEANI_API_TOKEN=unused docker compose --profile benchmark up -d benchmark-postgres
 export LEANI_BENCHMARK_POSTGRES_URL=postgres://leani_benchmark:leani_benchmark@127.0.0.1:55432/leani_benchmark
 scripts/run-controlled-benchmarks.sh delivery-faults
 ```
@@ -147,7 +149,7 @@ SDK/PostgreSQL fixture uses a dedicated disposable database because it
 truncates its benchmark tables:
 
 ```bash
-docker compose --profile benchmark up -d benchmark-postgres
+LEANI_API_TOKEN=unused docker compose --profile benchmark up -d benchmark-postgres
 LEANI_BENCHMARK_POSTGRES_URL=postgres://leani_benchmark:leani_benchmark@127.0.0.1:55432/leani_benchmark \
   cargo run -- benchmark --mode end-to-end --profile externalized --destination sdk-postgres \
   --corpus blobs-like --blocks 10000 --warmups 1 --runs 3

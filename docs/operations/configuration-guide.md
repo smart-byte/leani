@@ -113,8 +113,8 @@ root, or selected processor targets. Advanced documents keep every choice explic
 | `sources` | table | Priority-ordered history sources and the optional live source. |
 | `finality` | table | `consensus_p2p`, `beacon_api`, or `disabled`. |
 | `processors` | array | One immutable processor kind/instance contract per entry. |
-| `rpc` | table | HTTP/WS binds and bounded historical lookup behavior. |
-| `api` | table | Native API bind and optional bearer-token environment variable. |
+| `rpc` | table | HTTP/WS binds, browser origins, request and response limits, and bounded historical lookup behavior. |
+| `api` | table | Native API bind, bearer-token environment variable, allowed hosts and browser origins, and delivery batching. |
 
 `budgets.recent_raw_soft_bytes` must not exceed
 `budgets.recent_raw_hard_bytes`. All byte budgets and concurrency values are
@@ -364,16 +364,91 @@ already finalized record no undo.
 Set `api.bearer_token_env` to the name of an environment variable, never a
 token value. When configured, that one bearer protects native read, stream,
 consumer, and management routes on the API listener; operational health,
-metrics, and network-dashboard routes remain unauthenticated. Consumer
-creation can issue a separate credential; subsequent
-renew, read, and acknowledgement calls use
+metrics, and network-dashboard routes remain unauthenticated. `serve` fails
+to start when the variable is unset, holds fewer than 16 characters, or holds
+anything but printable ASCII without spaces, which no client could send; use
+a random value such as `openssl rand -hex 32`. Clients send
+`Authorization: Bearer <token>`, with the scheme in any case, and the node
+compares tokens in constant time. Consumer creation can issue a separate
+credential; subsequent renew, read, and acknowledgement calls use
 `x-leani-consumer-credential`, so one consumer cannot move another
 consumer's cursor.
 
 The native API, HTTP RPC, and WebSocket RPC binds must all differ. RPC has no
-built-in authentication. Put remote listeners behind a TLS/authenticating
-proxy and restrict the unauthenticated operational routes to a monitoring
-network.
+built-in authentication. A bind beyond loopback, such as `0.0.0.0`, fails
+validation unless it is protected or explicitly opted in:
+
+| Listener | Beyond loopback requires |
+|---|---|
+| `api.bind` | `api.bearer_token_env`, or `api.allow_unauthenticated_remote = true` |
+| `rpc.http_bind`, `rpc.ws_bind` | `rpc.allow_unauthenticated_remote = true` |
+
+Opt in only behind a trusted network or an authenticating proxy. Put remote
+listeners behind a TLS/authenticating proxy and restrict the unauthenticated
+operational routes to a monitoring network. The compact configuration has no
+bearer setting, so its `[api] bind` stays on loopback; use the advanced
+schema to serve beyond it.
+
+### Browser access
+
+The listeners refuse most requests a web page could make through a visitor's
+browser:
+
+- The native API answers a `Host` that is an IP address, `localhost`, or a
+  name in `api.allowed_hosts`, and answers any other name with 421. A page
+  that points its own name at 127.0.0.1 still sends that name; an address
+  cannot be repointed, so health probes and scrapers that call the node by
+  IP keep working. List every name clients use to reach the API, such as a
+  compose service name or the name a reverse proxy forwards, without a
+  scheme or port: `allowed_hosts = ["leani", "indexer.internal"]`.
+- Browsers send an `Origin` header on CORS requests, such as `fetch()` calls
+  to another origin, event streams, and WebSocket upgrades, and on POST and
+  DELETE requests. They send none on navigations or on no-cors GET and HEAD
+  requests, such as an image or script load. Both listeners accept requests
+  without an `Origin`, and requests from loopback origins on any port. Any
+  other origin gets 403. A browser application served from another origin,
+  including one behind the same reverse proxy, needs its origin in
+  `api.allowed_origins` or `rpc.allowed_origins`, such as
+  `["https://app.example"]`. The node sets no CORS headers; a cross-origin
+  application still needs a proxy that adds them and allows the
+  `content-type` and `x-leani-request` request headers.
+- The native API refuses, with 403 `cross_site_request`, a GET or HEAD
+  without an `Origin` that the browser's Fetch Metadata marks as coming from
+  another site's page (`Sec-Fetch-Site: cross-site` or `same-site`) and not
+  as a navigation (`Sec-Fetch-Mode` other than `navigate`). Current
+  browsers send Fetch Metadata; the SDK and curl do not, and pass.
+- A native API POST or DELETE needs `content-type: application/json` or the
+  header `x-leani-request: 1`, and gets 415 otherwise. JSON-RPC calls need
+  `content-type: application/json`. The SDK sends both. A cross-site page
+  can send neither without a CORS preflight, which the node never grants.
+- Only `POST /v1/processors/{processor}/collections/{collection}/entities`
+  creates a query snapshot. A GET without a cursor reads current output
+  without one.
+
+What still reaches the native API from a page: navigations from another
+site, including into a frame, and subresource loads from browsers without
+Fetch Metadata. The page cannot read the responses, but a GET that opens a
+consumer's live or backfill stream takes that consumer's session lease.
+Set `api.bearer_token_env` to keep pages from doing that; a browser never
+adds the bearer token on its own.
+
+### JSON-RPC limits
+
+Each limit has a `rpc` setting:
+
+| Setting | Default | When exceeded |
+|---|---|---|
+| `max_batch_requests` | 100 | the batch is refused whole with one `-32600` error |
+| `max_response_bytes` | `16MiB` | each call past the limit is answered with `-32005` |
+| `max_log_results` | 10000 | `eth_getLogs` fails with `-32005` and a smaller block range to retry |
+| `max_log_addresses` | 1000 | the filter fails with `-32602` |
+| `max_log_topic_alternatives` | 1000 | the filter fails with `-32602` |
+| `max_subscriptions_per_connection` | 128 | `eth_subscribe` fails with `-32005` |
+| `max_websocket_connections` | 256 | the WebSocket upgrade gets HTTP 503 |
+
+A closed WebSocket connection releases its slot and its subscriptions.
+
+### Delivery batching
 
 History and live delivery use independent transport limits under
 `api.delivery.history_batches` and `api.delivery.live_batches`. The defaults

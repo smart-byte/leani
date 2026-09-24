@@ -71,6 +71,18 @@ ws_bind = "0.0.0.0:8546"
 historical_mode = "on_demand"
 transaction_locator = false
 minimum_recent_blocks = 128
+# JSON-RPC has no authentication. The container listens on all of its
+# interfaces so published ports work; compose.yaml publishes them on host
+# loopback only. Publish them further only behind an authenticating proxy.
+allow_unauthenticated_remote = true
 
 [api]
 bind = "0.0.0.0:8080"
+# `serve` refuses to start unless LEANI_API_TOKEN holds at least 16
+# printable ASCII characters without spaces, for example from
+# `openssl rand -hex 32`.
+bearer_token_env = "LEANI_API_TOKEN"
+# The compose service name, so other services can call http://leani:8080.
+# Add every other name clients use to reach the API; the API answers other
+# Host names with 421.
+allowed_hosts = ["leani"]

@@ -288,6 +288,58 @@ describe("createLeaniClient", () => {
     );
     expect(await requests[1]?.json()).toEqual({ cursor: "opaque-cursor" });
   });
+
+  test("creates query snapshots by POST and marks body-less mutations", async () => {
+    const requests: Request[] = [];
+    const client = createLeaniClient({
+      baseUrl: "http://node.test",
+      fetch: async (input, init) => {
+        const request = new Request(input, init);
+        requests.push(request);
+        return request.url.includes("/query-snapshots/")
+          ? new Response(null, { status: 204 })
+          : jsonResponse({});
+      },
+    });
+
+    await client.processors.queryEntities("prices-mainnet", "prices", {
+      fromBlock: 10,
+      limit: 25,
+    });
+    await client.processors.queryEntities("prices-mainnet", "prices", {
+      cursor: "next-page",
+      limit: 25,
+    });
+    await client.processors.resetLiveLane("prices-mainnet");
+    await client.processors.consumers.renew(
+      "prices-mainnet",
+      "warehouse",
+      "consumer-secret",
+    );
+    await client.processors.consumers.revoke("prices-mainnet", "warehouse");
+    await client.processors.releaseSnapshot("prices-mainnet", "0".repeat(32));
+
+    expect(requests[0]?.method).toBe("POST");
+    expect(requests[0]?.url).toBe(
+      "http://node.test/v1/processors/prices-mainnet/collections/prices/entities",
+    );
+    expect(requests[0]?.headers.get("content-type")).toBe("application/json");
+    expect(await requests[0]?.json()).toEqual({ fromBlock: 10, limit: 25 });
+    expect(requests[1]?.method).toBe("GET");
+    expect(requests[1]?.url).toBe(
+      "http://node.test/v1/processors/prices-mainnet/collections/prices/entities?limit=25&cursor=next-page",
+    );
+    expect(requests[1]?.headers.get("x-leani-request")).toBeNull();
+    expect(requests.slice(2).map((request) => request.method)).toEqual([
+      "POST",
+      "POST",
+      "DELETE",
+      "DELETE",
+    ]);
+    for (const request of requests.slice(2)) {
+      expect(request.headers.get("x-leani-request")).toBe("1");
+    }
+  });
 });
 
 describe("SSE", () => {

@@ -106,9 +106,81 @@ record, and documented RPC contracts.
   before finality moves to another block, halts the network lanes, not ready
   and not retried, with the error in the log and in `network.supervisor` (see
   the runbook's "Finality contradicts the followed chain").
+- Web pages can no longer read from or change a node's native API or
+  JSON-RPC through the visitor's browser, with the exceptions below. The
+  native API answers a `Host` name other than `localhost` and those in the
+  new `api.allowed_hosts` with 421, so a page that points its own name at
+  127.0.0.1 is refused; IP addresses, which such a page cannot send, pass.
+  Both listeners answer a browser `Origin` other than a loopback one or one
+  listed in the new `api.allowed_origins` and `rpc.allowed_origins` with 403,
+  which guards event streams and WebSocket upgrades too. The native API also
+  answers 403 to a GET or HEAD that another site's page sends without an
+  `Origin` other than as a navigation, such as an image load, when the
+  browser marks it with Fetch Metadata. Mutations need a JSON body or
+  `x-leani-request: 1`, and JSON-RPC calls `application/json`, so a
+  cross-site form or `text/plain` post gets 415. Creating a query snapshot,
+  which counts against a node-wide cap of 32, now takes a POST: any page
+  could fill the cap with GET requests. Navigations from another site,
+  including into a frame, and subresource loads from browsers without Fetch
+  Metadata still reach GET routes. The page cannot read the response, but
+  opening a consumer's stream that way takes its session lease; only a bearer
+  token prevents it.
+- JSON-RPC bounds its work and output. A batch holds at most 100 calls, and
+  a response or batch response at most 16 MiB, with each call past that
+  answered by `-32005`. `eth_getLogs` returns at most 10,000 logs, and a log
+  filter lists at most 1,000 addresses and 1,000 alternatives per topic. A
+  WebSocket connection holds at most 128 subscriptions, and at most 256
+  connections are open. A 3 KB cross-origin batch used to produce a 4.2 MB
+  response, and one connection could hold 2,048 subscriptions.
+- `serve` refuses a native API bind beyond loopback without
+  `api.bearer_token_env`, and JSON-RPC binds beyond loopback, which have no
+  authentication, unless the operator sets `api.allow_unauthenticated_remote`
+  or `rpc.allow_unauthenticated_remote`. The container profile served every
+  interface without a token. The bearer token must hold at least 16
+  printable ASCII characters without spaces and is compared in constant time,
+  the `Bearer` scheme matches in any case, and `--help` no longer prints the
+  values of `LEANI_API_TOKEN` or `LEANI_CHECKPOINT_URLS`, whose provider URLs
+  can carry API keys.
 
 ### Changed
 
+- Breaking for HTTP clients of the native API that do not use the SDK:
+  - A POST or DELETE needs `content-type: application/json` or the header
+    `x-leani-request: 1`; one that sends no JSON body, such as a lease renewal,
+    a snapshot release, a job cancellation, or a live-lane reset, now gets
+    415 `unsupported_media_type` without the header.
+  - `POST /v1/processors/{processor}/collections/{collection}/entities`, with
+    the query as a JSON body, creates a query snapshot and returns its first
+    page. A GET without a cursor no longer creates one: it returns a page of
+    current output (`data`, `nextCursor`, `retainedBounds`, `coverage`), and
+    its `nextCursor` continues that read, which sees later commits. A GET
+    with a snapshot cursor still reads the snapshot's next page.
+  - Requests whose `Host` names neither an IP address, `localhost`, nor a
+    listed name get 421 `host_not_allowed`, and requests from a browser
+    `Origin` that is not loopback or listed get 403 `origin_not_allowed`. List
+    the names and origins clients use in `api.allowed_hosts` and
+    `api.allowed_origins`. A GET or HEAD whose Fetch Metadata marks it as a
+    cross-site or same-site subresource load gets 403 `cross_site_request`.
+- Breaking (configuration): a native API bind beyond loopback needs
+  `api.bearer_token_env` or `api.allow_unauthenticated_remote = true`, and a
+  JSON-RPC HTTP or WebSocket bind beyond loopback needs
+  `rpc.allow_unauthenticated_remote = true`. A configured bearer token shorter
+  than 16 characters, or with spaces or non-ASCII characters, fails startup.
+  `deploy/container.toml` now reads its bearer from `LEANI_API_TOKEN`, opts in
+  to remote JSON-RPC, and lists the compose service name `leani` in
+  `api.allowed_hosts`. `compose.yaml` passes the token through and stops
+  every command, including the benchmark database's, while it is unset.
+- Breaking (JSON-RPC): calls need `content-type: application/json` (415
+  otherwise), browser origins other than loopback need
+  `rpc.allowed_origins` (403 otherwise), and the limits above apply: a longer
+  batch gets one `-32600` error, and an over-limit `eth_getLogs` fails with
+  `-32005` "query returned more than 10000 results. Try with this block
+  range [...]". The `rpc.max_*` settings change each limit. A single block
+  with more matching logs than the limit cannot be read with `eth_getLogs`;
+  raise `rpc.max_log_results` or use `eth_getBlockReceipts`.
+- SDK: `processors.queryEntities()` without a cursor creates its snapshot with
+  the new POST route, and mutations without a JSON body send
+  `x-leani-request: 1`. Update the SDK together with the node.
 - `THIRD_PARTY_LICENSES.txt` is now committed, verified against `Cargo.lock`
   in CI, and linked from the README and site. It adds the Apache-2.0 NOTICE
   files of the Arrow, Parquet, object_store, and Moka dependencies, which the

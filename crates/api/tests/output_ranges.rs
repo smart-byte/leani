@@ -103,6 +103,21 @@ async fn query(app: axum::Router, suffix: &str) -> (u16, Value) {
     (status, serde_json::from_slice(&body).unwrap())
 }
 
+async fn snapshot(app: axum::Router, query: Value) -> (u16, Value) {
+    let response = app
+        .oneshot(
+            Request::post(format!("{COLLECTION}/entities"))
+                .header("content-type", "application/json")
+                .body(Body::from(query.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status().as_u16();
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    (status, serde_json::from_slice(&body).unwrap())
+}
+
 #[tokio::test]
 async fn sparse_coverage_distinguishes_empty_unindexed_and_pruned_ranges() {
     let dir = tempfile::tempdir().unwrap();
@@ -142,7 +157,7 @@ async fn sparse_coverage_distinguishes_empty_unindexed_and_pruned_ranges() {
     }
     let (status, body) = query(app.clone(), "fromBlock=10&toBlock=14").await;
     assert_eq!(status, 200, "{body}");
-    assert_eq!(body["rowCount"], "2");
+    assert_eq!(body["data"].as_array().unwrap().len(), 2);
     assert_eq!(
         body["coverage"]["requested"],
         json!({"fromBlock":10,"toBlock":14})
@@ -182,10 +197,10 @@ async fn block_window_rejects_pruned_output_but_allows_covered_empty_suffix() {
     assert_eq!(body["error"]["code"], "output_not_retained");
     let (status, body) = query(app.clone(), "fromBlock=5&toBlock=6").await;
     assert_eq!(status, 200, "{body}");
-    assert_eq!(body["rowCount"], "1");
+    assert_eq!(body["data"].as_array().unwrap().len(), 1);
     let (status, body) = query(app, "fromBlock=6&toBlock=6").await;
     assert_eq!(status, 200, "{body}");
-    assert_eq!(body["rowCount"], "0");
+    assert_eq!(body["data"], json!([]));
 }
 
 #[tokio::test]
@@ -205,7 +220,7 @@ async fn snapshot_pages_keep_the_resolved_request_across_restart_and_new_commits
         ApiConfig::default(),
     )
     .unwrap();
-    let (status, first) = query(app.clone(), "fromBlock=10&limit=1").await;
+    let (status, first) = snapshot(app.clone(), json!({"fromBlock": 10, "limit": 1})).await;
     assert_eq!(status, 200, "{first}");
     commit(&store, &processor, 15, parent).await;
     drop(app);

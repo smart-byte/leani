@@ -64,7 +64,8 @@ for _ in {1..60}; do
 done
 api_base="http://127.0.0.1:$LEANI_VERIFY_API_PORT/v1/processors/uniswap-v2-sync-30d"
 curl -fsS "$api_base/status" > "$verification_dir/coverage.json"
-curl -fsS "$api_base/collections/uniswap_v2.sync_hourly/entities?limit=3" > "$verification_dir/entities.json"
+curl -fsS -X POST -H 'content-type: application/json' --data '{"limit":3}' \
+  "$api_base/collections/uniswap_v2.sync_hourly/entities" > "$verification_dir/entities.json"
 snapshot_id="$(python3 - "$verification_dir" "$leani_binary" <<'PY'
 from datetime import datetime, timezone
 from pathlib import Path
@@ -86,7 +87,7 @@ report['backfill'] = json.loads((root / 'backfill-attempt.json').read_text())
 print(entities['snapshotId'])
 PY
 )"
-curl -fsS -X DELETE "$api_base/query-snapshots/$snapshot_id" > /dev/null
+curl -fsS -X DELETE -H 'x-leani-request: 1' "$api_base/query-snapshots/$snapshot_id" > /dev/null
 cleanup
 trap - EXIT
 "$leani_binary" --config "$config_path" db verify > "$verification_dir/database-verification.json"

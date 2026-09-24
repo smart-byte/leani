@@ -91,6 +91,33 @@ durable locator and therefore remains recent-only by default.
 
 “On-demand” cannot make every hash-only lookup cheap. Block-number/range queries map naturally to chunked archives. Transaction-hash queries need a locator service or a compact local `tx_hash -> block_number` index.
 
+### Transport rules and limits
+
+HTTP calls need `content-type: application/json`, with any parameters, and
+get HTTP 415 otherwise. A browser `Origin` other than a loopback one
+(`http(s)://localhost`, `127.0.0.1`, or `[::1]` on any port) or one listed
+in `rpc.allowed_origins` gets HTTP 403, on HTTP calls and WebSocket upgrades
+alike; requests without an `Origin` header pass. A cross-site page therefore
+cannot post a `text/plain` batch or open a WebSocket to a loopback node.
+
+| Limit | Default | Setting | When exceeded |
+|---|---|---|---|
+| Calls per batch | 100 | `rpc.max_batch_requests` | one `-32600` error object for the whole batch |
+| Response bytes | 16 MiB | `rpc.max_response_bytes` | `-32005` for the call that passes the limit and every later call in the batch, which do not run |
+| `eth_getLogs` results | 10,000 | `rpc.max_log_results` | `-32005` "query returned more than 10000 results. Try with this block range [0x…, 0x…]." |
+| Filter addresses | 1,000 | `rpc.max_log_addresses` | `-32602` |
+| Alternatives per topic position | 1,000 | `rpc.max_log_topic_alternatives` | `-32602` |
+| Subscriptions per WebSocket connection | 128 | `rpc.max_subscriptions_per_connection` | `-32005` from `eth_subscribe` |
+| WebSocket connections | 256 | `rpc.max_websocket_connections` | HTTP 503 on the upgrade |
+
+The `eth_getLogs` hint names the range from `fromBlock` up to the block
+before the one where the results passed the limit, and `error.data` carries
+it as `from`, `to`, and `limit`. The hint is missing when the first block
+alone has more matching logs than the limit; read that block with
+`eth_getBlockReceipts` or raise the limit. The filter limits also apply to
+`eth_subscribe("logs")` filters. Closing a WebSocket connection frees its
+slot and ends its subscriptions.
+
 ## 3. RPC profiles
 
 ### Minimal

@@ -75,6 +75,7 @@ GET  /v1/processors/{processor}/changes
 GET  /v1/processors/{processor}/stream
 GET  /v1/processors/{processor}/collections
 GET  /v1/processors/{processor}/collections/{collection}/entities
+POST /v1/processors/{processor}/collections/{collection}/entities
 GET  /v1/processors/{processor}/collections/{collection}/entities/{key}
 POST /v1/processors/{processor}/collections/{collection}/query-and-follow
 DELETE /v1/processors/{processor}/query-snapshots/{snapshot}
@@ -265,7 +266,8 @@ the generic query-and-follow operation:
 
 1. `POST
    /v1/processors/{processor}/collections/{collection}/query-and-follow`;
-2. import every page using its opaque `nextCursor`; and
+2. import every page, reading the next one with `GET .../entities?cursor=`
+   and the page's opaque `nextCursor`; and
 3. follow `/v1/processors/{processor}/changes` or `/stream` after the returned
    `boundaryCursor`.
 
@@ -344,14 +346,34 @@ is likewise never invoked after a failed destination commit.
 ### Generic retained queries
 
 Entity queries accept `fromBlock`, `toBlock`, `fromTimestamp`, `toTimestamp`,
-`limit`, and an opaque `cursor`. Entity keys are URL-safe hex. Every result
-contains the processor schema, decoded JSON data, block/timestamp/finality
-metadata, stable snapshot ID, change boundary, retained bounds, and coverage.
+and `limit`. Entity keys are URL-safe hex. Every row contains the processor
+schema, decoded JSON data, and block/timestamp/finality metadata. There are
+two ways to page through a collection:
+
+- `GET .../entities` with the query as URL parameters reads current retained
+  output in entity-key order and creates nothing. Its page holds `data`,
+  `nextCursor`, `retainedBounds`, and `coverage`; pass `nextCursor` as
+  `cursor` to read on. Later pages see later commits: each row appears as it
+  was when its page was read, and a row added behind the read position is
+  not returned.
+- `POST .../entities` with the query as a JSON body copies the matching rows
+  into a stable snapshot that counts against the node-wide snapshot limits,
+  and returns its first page with the snapshot ID, change boundary, row and
+  byte counts, and expiry. `GET .../entities?cursor=` with its `nextCursor`
+  reads the following pages, which stay stable while new blocks commit.
+
+```http
+POST /v1/processors/{processor}/collections/{collection}/entities
+content-type: application/json
+
+{ "fromBlock": 17000000, "toBlock": 17000999, "limit": 500 }
+```
 
 Explicit block bounds require complete processor coverage. Missing blocks return
 HTTP 409 `range_incomplete`, including the requested interval and coverage.
-The resolved block range is kept with the snapshot across pagination and node
-restart. A block-count window uses its retention policy boundary, rather than
+The resolved block range is kept with the cursor, or the snapshot, across
+pagination and node restart, and each GET page checks coverage again. A
+block-count window uses its retention policy boundary, rather than
 the first matching entity, so covered blocks without events remain queryable.
 `retainedBounds` describes the entities present, not the limits of processor
 coverage. Timestamp filters select retained rows; include block bounds when
@@ -366,8 +388,8 @@ The TypeScript SDK's
 snapshot and its `boundaryCursor` in one operation. Continue with
 `client.processors.subscribe(processor, { after: page.boundaryCursor })`.
 
-With delivery disabled, ordinary entity queries still work, but return
-`boundaryCursor: null` and `recovery.follow: null`. Query-and-follow, change-head,
+With delivery disabled, ordinary entity queries still work, and snapshots
+return `boundaryCursor: null` and `recovery.follow: null`. Query-and-follow, change-head,
 change-page, and stream requests return non-retryable HTTP 409
 `delivery_disabled`; enable a delivery policy before subscribing.
 
@@ -375,6 +397,7 @@ Release a no-longer-needed snapshot early:
 
 ```http
 DELETE /v1/processors/{processor}/query-snapshots/{snapshotId}
+x-leani-request: 1
 ```
 
 ### Compact processor artifacts
@@ -993,11 +1016,32 @@ Compatibility rules within `/v1`:
 
 Localhost is the default trust boundary. The current optional API bearer token
 protects all native query, stream, consumer, and `/admin/v1` routes on one
-listener. Consumer credentials additionally fence one consumer's lease and
-cursor; they do not replace the listener bearer when it is configured.
-`/health/live`, `/health/ready`, `/metrics`, `/v1/network/status`, and
-`/debug/network` remain unauthenticated operational routes. The JSON-RPC
-listeners have no built-in authentication.
+listener, and a bind beyond loopback requires it unless
+`api.allow_unauthenticated_remote` is set. Consumer credentials additionally
+fence one consumer's lease and cursor; they do not replace the listener bearer
+when it is configured. `/health/live`, `/health/ready`, `/metrics`,
+`/v1/network/status`, and `/debug/network` remain unauthenticated operational
+routes. The JSON-RPC listeners have no built-in authentication.
+
+Every route, operational ones included, applies these checks, in this order,
+to keep web pages from reading or changing a loopback node:
+
+| Request | Answer |
+|---|---|
+| `Host` name other than `localhost` or one in `api.allowed_hosts`; IP addresses pass | 421 `host_not_allowed` |
+| browser `Origin` other than a loopback one or one in `api.allowed_origins` | 403 `origin_not_allowed` |
+| GET or HEAD without an `Origin`, with `Sec-Fetch-Site: cross-site` or `same-site` and a `Sec-Fetch-Mode` other than `navigate`, such as another page's image load | 403 `cross_site_request` |
+| POST or DELETE without `content-type: application/json` or `x-leani-request: 1` | 415 `unsupported_media_type` |
+
+A request without `Host`, `Origin`, and `Sec-Fetch-*` headers, as the SDK,
+curl, and other non-browser clients send it, passes the first three checks.
+So do navigations, including from another site's page or into a frame, and
+requests from browsers that send no Fetch Metadata. A page cannot read those
+responses, and they create no query snapshot, but a GET that opens a
+consumer's live or backfill stream takes the consumer's session lease; only
+the bearer token keeps pages from doing that. The SDK sends
+`x-leani-request: 1` on its requests without a JSON body; other clients must
+add it, for example `curl -X DELETE -H 'x-leani-request: 1' ...`.
 
 When remotely exposed:
 

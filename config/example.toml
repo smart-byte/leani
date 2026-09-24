@@ -202,10 +202,28 @@ ws_bind = "127.0.0.1:8546"
 historical_mode = "on_demand"
 transaction_locator = false
 minimum_recent_blocks = 128
+# JSON-RPC has no authentication; binds beyond loopback need this opt-in.
+# allow_unauthenticated_remote = true
+# Browser origins, besides loopback ones, that may call JSON-RPC.
+# allowed_origins = ["https://app.example"]
+# Request and response limits, shown with their defaults.
+# max_batch_requests = 100
+# max_response_bytes = "16MiB"
+# max_log_results = 10000
+# max_log_addresses = 1000
+# max_log_topic_alternatives = 1000
+# max_subscriptions_per_connection = 128
+# max_websocket_connections = 256
 
 [api]
 bind = "127.0.0.1:8080"
+# Binds beyond loopback need a bearer token: at least 16 printable ASCII
+# characters without spaces.
 # bearer_token_env = "LEANI_API_TOKEN"
+# Host names, besides localhost, clients use; IP addresses always pass.
+# allowed_hosts = ["indexer.internal"]
+# Browser origins, besides loopback ones, that may call the API.
+# allowed_origins = ["https://app.example"]
 
 [api.delivery.history_batches]
 target_encoded_bytes = "4MiB"

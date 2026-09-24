@@ -123,11 +123,29 @@ describe("backfill subscriptions", () => {
     expect(request?.url).toBe(
       "http://node.test/admin/v1/backfill-subscriptions/repair-1",
     );
+    expect(request?.headers.get("x-leani-request")).toBe("1");
     expect(result).toMatchObject({
       removedDeliveryRecords: 100,
       retainedProcessorOutput: true,
       retainedLiveStream: true,
     });
+  });
+
+  test("body-less cancellation is marked as a Leani request", async () => {
+    let request: Request | undefined;
+    const client = createBackfillSubscriptionClient({
+      baseUrl: "http://node.test",
+      fetch: async (input, init) => {
+        request = new Request(input, init);
+        return Response.json({ id: "repair-1" });
+      },
+    });
+    await client.cancel("repair-1");
+    expect(request?.method).toBe("POST");
+    expect(request?.url).toBe(
+      "http://node.test/admin/v1/backfill-subscriptions/repair-1/cancel",
+    );
+    expect(request?.headers.get("x-leani-request")).toBe("1");
   });
 
   test("creation accepts an atomic finalized upper bound", async () => {
@@ -245,6 +263,7 @@ describe("backfill subscriptions", () => {
     expect(requests[1]?.headers.get("x-leani-consumer-session")).toBe(
       "history-session",
     );
+    expect(requests[1]?.headers.get("x-leani-request")).toBe("1");
   });
 
   test("events convenience flattens history batches intentionally", async () => {
@@ -651,6 +670,7 @@ describe("backfill subscriptions", () => {
     expect(renewals[0]?.headers.get("x-leani-consumer-credential")).toBe(
       "consumer-secret",
     );
+    expect(renewals[0]?.headers.get("x-leani-request")).toBe("1");
   });
 
   test("reset_required terminates the stream with retained bounds", async () => {

@@ -3,6 +3,11 @@ export { LeaniError, type LeaniErrorBody } from "./errors.ts";
 
 export const SDK_VERSION = "0.1.0-rc.1" as const;
 
+/** Sent on mutations without a JSON body, which the node otherwise refuses. */
+const LEANI_REQUEST_HEADER: Readonly<Record<string, string>> = Object.freeze({
+  "x-leani-request": "1",
+});
+
 export type {
   components as OpenApiComponents,
   operations as OpenApiOperations,
@@ -844,12 +849,21 @@ export function createLeaniClient(
         id: string,
         collection: string,
         queryOptions: OutputQueryOptions = {},
-      ) =>
-        get<GenericSnapshotPage<T>>(
-          `v1/processors/${encodeURIComponent(id)}/collections/${encodeURIComponent(collection)}/entities`,
-          outputQueryValues(queryOptions),
-          queryOptions.signal,
-        ),
+      ) => {
+        const path = `v1/processors/${encodeURIComponent(id)}/collections/${encodeURIComponent(collection)}/entities`;
+        // Only POST creates a snapshot; its later pages are read by GET.
+        return queryOptions.cursor === undefined
+          ? post<GenericSnapshotPage<T>>(
+              path,
+              outputQueryBody(queryOptions),
+              queryOptions.signal,
+            )
+          : get<GenericSnapshotPage<T>>(
+              path,
+              outputQueryValues(queryOptions),
+              queryOptions.signal,
+            );
+      },
       queryAndFollow: <T = unknown>(
         id: string,
         collection: string,
@@ -1215,9 +1229,11 @@ async function requestJson<T>(
     headers: headers(
       options,
       "application/json",
-      body === undefined
-        ? extraHeaders
-        : { "content-type": "application/json", ...extraHeaders },
+      body !== undefined
+        ? { "content-type": "application/json", ...extraHeaders }
+        : method === "GET"
+          ? extraHeaders
+          : { ...LEANI_REQUEST_HEADER, ...extraHeaders },
     ),
     body: body === undefined ? undefined : JSON.stringify(body),
     signal: combined,
@@ -1240,7 +1256,7 @@ async function requestVoid(
     : deadline;
   const response = await options.fetch(buildUrl(options, path), {
     method,
-    headers: headers(options, "application/json"),
+    headers: headers(options, "application/json", LEANI_REQUEST_HEADER),
     signal: combined,
   });
   if (!response.ok) {

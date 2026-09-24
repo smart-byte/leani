@@ -1,5 +1,6 @@
 //! Versioned aggregate HTTP query and resumable SSE API.
 
+mod browser_guard;
 mod extension;
 mod extensions;
 
@@ -65,10 +66,15 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use thiserror::Error;
 
+use browser_guard::{RequestPolicy, guard_browser_requests, lowercase_set, normalized_origins};
+
 const API_VERSION: &str = "1";
 const MAX_PAGE_SIZE: usize = 1_000;
 const CONSUMER_CREDENTIAL_HEADER: &str = "x-leani-consumer-credential";
 const CONSUMER_SESSION_HEADER: &str = "x-leani-consumer-session";
+/// First payload byte of a cursor that continues an entity GET without a
+/// snapshot; snapshot page cursors start with 1.
+const OUTPUT_PAGE_CURSOR_VERSION: u8 = 2;
 static REQUEST_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 /// Failure from [`commit_then_ack`].
@@ -247,6 +253,14 @@ pub struct ApiConfig {
     pub query_snapshot_max_total_bytes: u64,
     /// Optional bearer token. Debug output always redacts this value.
     pub bearer_token: Option<Arc<str>>,
+    /// `Host` names, besides `localhost`, that requests may address, without
+    /// a port. Any other name gets HTTP 421; IP addresses always pass, since
+    /// DNS rebinding cannot send one.
+    pub allowed_hosts: BTreeSet<String>,
+    /// Browser origins, besides loopback ones on any port, that may call the
+    /// API, as lowercase ASCII serializations such as `https://app.example`.
+    /// Any other `Origin` gets HTTP 403.
+    pub allowed_origins: BTreeSet<String>,
     pub readiness: ReadinessHandle,
     pub network_telemetry: NetworkTelemetry,
     /// Processor instances whose historical coverage is application-requested
@@ -279,6 +293,8 @@ impl Default for ApiConfig {
             query_snapshot_max_total_snapshots: 32,
             query_snapshot_max_total_bytes: 128 * 1024 * 1024,
             bearer_token: None,
+            allowed_hosts: BTreeSet::new(),
+            allowed_origins: BTreeSet::new(),
             readiness: ReadinessHandle::default(),
             network_telemetry: NetworkTelemetry::default(),
             on_demand_processors: BTreeSet::new(),
@@ -316,6 +332,8 @@ impl std::fmt::Debug for ApiConfig {
                 "bearer_token",
                 &self.bearer_token.as_ref().map(|_| "[REDACTED]"),
             )
+            .field("allowed_hosts", &self.allowed_hosts)
+            .field("allowed_origins", &self.allowed_origins)
             .field("readiness", &self.readiness)
             .field("network_telemetry", &self.network_telemetry)
             .field("on_demand_processors", &self.on_demand_processors)
@@ -1073,7 +1091,14 @@ pub fn router_with_processors(
     config: ApiConfig,
 ) -> Result<Router, ApiError> {
     config.validate()?;
-    let bearer_token = config.bearer_token.clone();
+    let bearer_token = config
+        .bearer_token
+        .as_deref()
+        .map(|token| blake3::hash(token.as_bytes()));
+    let request_policy = Arc::new(RequestPolicy {
+        allowed_hosts: lowercase_set(&config.allowed_hosts),
+        allowed_origins: normalized_origins(&config.allowed_origins),
+    });
     let primary = processors
         .first()
         .cloned()
@@ -1135,7 +1160,7 @@ pub fn router_with_processors(
         )
         .route(
             "/v1/processors/{processor}/collections/{collection}/entities",
-            get(query_output_entities),
+            get(query_output_entities).post(create_output_snapshot),
         )
         .route(
             "/v1/processors/{processor}/collections/{collection}/entities/{key}",
@@ -1289,21 +1314,41 @@ pub fn router_with_processors(
         .route("/debug/network", get(network_dashboard))
         .route("/metrics", get(metrics))
         .with_state(state);
-    Ok(operational.merge(protected))
+    Ok(operational
+        .merge(protected)
+        .layer(middleware::from_fn_with_state(
+            request_policy,
+            guard_browser_requests,
+        )))
 }
 
-async fn authenticate(State(expected): State<Arc<str>>, request: Request, next: Next) -> Response {
+/// Accept a request whose `Authorization` carries the configured token.
+/// Both tokens are compared as BLAKE3 digests, whose equality check is
+/// constant-time, so the time taken does not reveal how much of a guess
+/// matched.
+async fn authenticate(
+    State(expected): State<blake3::Hash>,
+    request: Request,
+    next: Next,
+) -> Response {
     let authorized = request
         .headers()
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Bearer "))
-        .is_some_and(|value| value == expected.as_ref());
+        .and_then(bearer_credentials)
+        .is_some_and(|token| blake3::hash(token.as_bytes()) == expected);
     if authorized {
         next.run(request).await
     } else {
         ApiError::unauthorized().into_response()
     }
+}
+
+/// The token of a `Bearer` authorization, whose scheme is case-insensitive.
+fn bearer_credentials(authorization: &str) -> Option<&str> {
+    let (scheme, token) = authorization.split_once(' ')?;
+    let token = token.trim_start_matches(' ');
+    (scheme.eq_ignore_ascii_case("bearer") && !token.is_empty()).then_some(token)
 }
 
 #[derive(Debug, Serialize)]
@@ -6049,7 +6094,7 @@ struct OutputEntityQuery {
 
 #[derive(Clone, Copy, Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct QueryAndFollowRequest {
+struct OutputQueryRequest {
     from_block: Option<u64>,
     to_block: Option<u64>,
     from_timestamp: Option<u64>,
@@ -6068,8 +6113,8 @@ impl From<&OutputEntityQuery> for OutputQuery {
     }
 }
 
-impl From<QueryAndFollowRequest> for OutputQuery {
-    fn from(value: QueryAndFollowRequest) -> Self {
+impl From<OutputQueryRequest> for OutputQuery {
+    fn from(value: OutputQueryRequest) -> Self {
         Self {
             from_block: value.from_block.map(BlockNumber),
             to_block: value.to_block.map(BlockNumber),
@@ -6126,42 +6171,87 @@ struct GenericSnapshotPage {
     recovery: Value,
 }
 
+/// One page of current retained output, read without a snapshot, so a GET
+/// holds no durable state.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GenericOutputPage {
+    data: Vec<GenericOutputEntity>,
+    next_cursor: Option<String>,
+    retained_bounds: Option<OutputBoundsResponse>,
+    coverage: CoverageResponse,
+}
+
+/// Read current output in entity-key order without a snapshot, or continue
+/// such a read or a snapshot from its cursor. Only POST creates snapshots.
 async fn query_output_entities(
     State(state): State<ApiState>,
     Path((processor, collection)): Path<(String, String)>,
     Query(query): Query<OutputEntityQuery>,
+) -> Result<Response, ApiError> {
+    let processor = configured_processor(&state, &processor)?;
+    ensure_output_retained(processor.as_ref())?;
+    let limit = page_limit(&state, query.limit)?;
+    let Some(cursor) = query.cursor.as_deref() else {
+        let query =
+            resolve_output_query(&state, processor.as_ref(), &collection, (&query).into()).await?;
+        let page =
+            read_output_page(&state, processor, &collection, query, Vec::new(), 0, limit).await?;
+        return Ok(Json(page).into_response());
+    };
+    if page_cursor_version(cursor)? == OUTPUT_PAGE_CURSOR_VERSION {
+        let cursor = decode_output_page_cursor(&state, processor.as_ref(), &collection, cursor)?;
+        let query = OutputQuery {
+            from_block: cursor.from_block.map(BlockNumber),
+            to_block: cursor.to_block.map(BlockNumber),
+            from_timestamp: cursor.from_timestamp,
+            to_timestamp: cursor.to_timestamp,
+        };
+        // Coverage and retention can shrink between pages.
+        let query = resolve_output_query(&state, processor.as_ref(), &collection, query).await?;
+        let page = read_output_page(
+            &state,
+            processor,
+            &collection,
+            query,
+            cursor.start_key,
+            cursor.position,
+            limit,
+        )
+        .await?;
+        return Ok(Json(page).into_response());
+    }
+    let cursor = decode_snapshot_cursor(&state, processor.as_ref(), &collection, cursor)?;
+    let page = read_generic_snapshot_page(
+        &state,
+        processor,
+        &collection,
+        cursor.snapshot_id,
+        Some(cursor.after_ordinal),
+        limit,
+    )
+    .await?;
+    Ok(Json(page).into_response())
+}
+
+/// Create a stable snapshot of the collection and read its first page.
+async fn create_output_snapshot(
+    State(state): State<ApiState>,
+    Path((processor, collection)): Path<(String, String)>,
+    Json(query): Json<OutputQueryRequest>,
 ) -> Result<Json<GenericSnapshotPage>, ApiError> {
     let processor = configured_processor(&state, &processor)?;
     ensure_output_retained(processor.as_ref())?;
     let limit = page_limit(&state, query.limit)?;
-    let page = if let Some(cursor) = query.cursor.as_deref() {
-        let cursor = decode_snapshot_cursor(&state, processor.as_ref(), &collection, cursor)?;
-        read_generic_snapshot_page(
-            &state,
-            processor,
-            &collection,
-            cursor.snapshot_id,
-            Some(cursor.after_ordinal),
-            limit,
-        )
-        .await?
-    } else {
-        create_generic_snapshot_page(
-            &state,
-            processor,
-            &collection,
-            OutputQuery::from(&query),
-            limit,
-        )
-        .await?
-    };
-    Ok(Json(page))
+    Ok(Json(
+        create_generic_snapshot_page(&state, processor, &collection, query.into(), limit).await?,
+    ))
 }
 
 async fn query_and_follow(
     State(state): State<ApiState>,
     Path((processor, collection)): Path<(String, String)>,
-    Json(query): Json<QueryAndFollowRequest>,
+    Json(query): Json<OutputQueryRequest>,
 ) -> Result<Json<GenericSnapshotPage>, ApiError> {
     let processor = configured_processor(&state, &processor)?;
     ensure_output_retained(processor.as_ref())?;
@@ -6213,41 +6303,10 @@ async fn create_generic_snapshot_page(
     state: &ApiState,
     processor: Arc<dyn Processor>,
     collection: &str,
-    mut query: OutputQuery,
+    query: OutputQuery,
     limit: usize,
 ) -> Result<GenericSnapshotPage, ApiError> {
-    let cursor = state.store.processor_cursor(processor.descriptor()).await?;
-    // Resolve open block bounds once. Pagination must continue reporting the
-    // same request even when ingestion advances the processor cursor.
-    if query.from_block.is_some() || query.to_block.is_some() {
-        let from = query.from_block.unwrap_or_else(|| {
-            BlockNumber(processor_start_block(processor.descriptor()))
-                .min(query.to_block.unwrap_or(BlockNumber(u64::MAX)))
-        });
-        let to = query.to_block.unwrap_or_else(|| {
-            cursor
-                .as_ref()
-                .map_or(from, |cursor| cursor.block_number.max(from))
-        });
-        let requested =
-            BlockRange::new(from, to).map_err(|error| ApiError::invalid(&error.to_string()))?;
-        let requested_coverage = coverage(state, processor.as_ref(), Some(requested)).await?;
-        if !requested_coverage.is_complete() {
-            return Err(ApiError::range_incomplete(requested_coverage));
-        }
-        query.from_block = Some(from);
-        query.to_block = Some(to);
-    }
-    let bounds = state
-        .store
-        .output_bounds(processor.descriptor(), collection)
-        .await?;
-    reject_unretained_range(
-        processor.as_ref(),
-        query,
-        bounds,
-        cursor.as_ref().map(|cursor| cursor.block_number),
-    )?;
+    let query = resolve_output_query(state, processor.as_ref(), collection, query).await?;
     let snapshot = state
         .store
         .create_covered_query_snapshot(
@@ -6272,6 +6331,122 @@ async fn create_generic_snapshot_page(
         limit,
     )
     .await
+}
+
+/// Resolve a query's open block bounds against the processor cursor, and
+/// reject a range the processor has not covered or no longer retains.
+async fn resolve_output_query(
+    state: &ApiState,
+    processor: &dyn Processor,
+    collection: &str,
+    mut query: OutputQuery,
+) -> Result<OutputQuery, ApiError> {
+    let cursor = state.store.processor_cursor(processor.descriptor()).await?;
+    // Resolve open block bounds once. Pagination must continue reporting the
+    // same request even when ingestion advances the processor cursor.
+    if query.from_block.is_some() || query.to_block.is_some() {
+        let from = query.from_block.unwrap_or_else(|| {
+            BlockNumber(processor_start_block(processor.descriptor()))
+                .min(query.to_block.unwrap_or(BlockNumber(u64::MAX)))
+        });
+        let to = query.to_block.unwrap_or_else(|| {
+            cursor
+                .as_ref()
+                .map_or(from, |cursor| cursor.block_number.max(from))
+        });
+        let requested =
+            BlockRange::new(from, to).map_err(|error| ApiError::invalid(&error.to_string()))?;
+        let requested_coverage = coverage(state, processor, Some(requested)).await?;
+        if !requested_coverage.is_complete() {
+            return Err(ApiError::range_incomplete(requested_coverage));
+        }
+        query.from_block = Some(from);
+        query.to_block = Some(to);
+    }
+    let bounds = state
+        .store
+        .output_bounds(processor.descriptor(), collection)
+        .await?;
+    reject_unretained_range(
+        processor,
+        query,
+        bounds,
+        cursor.as_ref().map(|cursor| cursor.block_number),
+    )?;
+    Ok(query)
+}
+
+/// Read one page of current output from `start_key` on in entity-key order,
+/// numbering its rows from `position`. Later pages see later commits.
+async fn read_output_page(
+    state: &ApiState,
+    processor: Arc<dyn Processor>,
+    collection: &str,
+    query: OutputQuery,
+    start_key: Vec<u8>,
+    position: u64,
+    limit: usize,
+) -> Result<GenericOutputPage, ApiError> {
+    let (rows, more) = state
+        .store
+        .output_entities_page(processor.descriptor(), collection, query, &start_key, limit)
+        .await?;
+    let next_position = position.saturating_add(u64::try_from(rows.len()).unwrap_or(u64::MAX));
+    let next_cursor = if more {
+        rows.last()
+            .map(|row| {
+                // The next key in byte order: nothing sorts between them.
+                let mut start_key = row.key.clone();
+                start_key.push(0);
+                encode_checksummed(&OutputPageCursor {
+                    version: OUTPUT_PAGE_CURSOR_VERSION,
+                    epoch: state.store.epoch(),
+                    chain_id: state.config.chain_id.0,
+                    processor_instance: processor.descriptor().instance.to_string(),
+                    processor_version: processor.descriptor().version.to_string(),
+                    collection: collection.to_owned(),
+                    from_block: query.from_block.map(|block| block.0),
+                    to_block: query.to_block.map(|block| block.0),
+                    from_timestamp: query.from_timestamp,
+                    to_timestamp: query.to_timestamp,
+                    start_key,
+                    position: next_position,
+                })
+            })
+            .transpose()?
+    } else {
+        None
+    };
+    let data = rows
+        .into_iter()
+        .zip(position..)
+        .map(|(mut row, ordinal)| {
+            row.ordinal = ordinal;
+            render_output_entity(processor.as_ref(), collection, row)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let retained_bounds = state
+        .store
+        .output_bounds(processor.descriptor(), collection)
+        .await?
+        .map(OutputBoundsResponse::from);
+    let requested = query
+        .from_block
+        .zip(query.to_block)
+        .map(|(from, to)| BlockRange::new(from, to))
+        .transpose()
+        .map_err(|error| ApiError::invalid(&error.to_string()))?;
+    let coverage = coverage(state, processor.as_ref(), requested).await?;
+    if requested.is_some() && !coverage.is_complete() {
+        // A reorg may have removed coverage while the page was read.
+        return Err(ApiError::range_incomplete(coverage));
+    }
+    Ok(GenericOutputPage {
+        data,
+        next_cursor,
+        retained_bounds,
+        coverage,
+    })
 }
 
 async fn read_generic_snapshot_page(
@@ -6542,6 +6717,53 @@ fn decode_snapshot_cursor(
     Ok(cursor)
 }
 
+/// Continues an entity GET that reads current output without a snapshot.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct OutputPageCursor {
+    version: u8,
+    epoch: [u8; 16],
+    chain_id: u64,
+    processor_instance: String,
+    processor_version: String,
+    collection: String,
+    from_block: Option<u64>,
+    to_block: Option<u64>,
+    from_timestamp: Option<u64>,
+    to_timestamp: Option<u64>,
+    start_key: Vec<u8>,
+    position: u64,
+}
+
+fn decode_output_page_cursor(
+    state: &ApiState,
+    processor: &dyn Processor,
+    collection: &str,
+    encoded: &str,
+) -> Result<OutputPageCursor, ApiError> {
+    let cursor: OutputPageCursor = decode_checksummed(encoded)?;
+    if cursor.version != OUTPUT_PAGE_CURSOR_VERSION
+        || cursor.epoch != state.store.epoch()
+        || cursor.chain_id != state.config.chain_id.0
+        || cursor.processor_instance != processor.descriptor().instance.as_str()
+        || cursor.processor_version != processor.descriptor().version.to_string()
+        || cursor.collection != collection
+    {
+        return Err(ApiError::cursor(
+            "query cursor belongs to another store, chain, processor, or collection",
+        ));
+    }
+    Ok(cursor)
+}
+
+/// The version that opens a page cursor's payload; postcard encodes the
+/// leading `u8` as its first byte.
+fn page_cursor_version(encoded: &str) -> Result<u8, ApiError> {
+    checksummed_payload(encoded)?
+        .first()
+        .copied()
+        .ok_or_else(|| ApiError::cursor("cursor payload is invalid"))
+}
+
 fn encode_checksummed<T: Serialize>(value: &T) -> Result<String, ApiError> {
     let payload = postcard::to_allocvec(value)
         .map_err(|error| ApiError::internal(&format!("cursor encoding failed: {error}")))?;
@@ -6552,16 +6774,22 @@ fn encode_checksummed<T: Serialize>(value: &T) -> Result<String, ApiError> {
 }
 
 fn decode_checksummed<T: for<'de> Deserialize<'de>>(encoded: &str) -> Result<T, ApiError> {
-    let bytes = hex::decode(encoded).map_err(|_| ApiError::cursor("cursor is not valid hex"))?;
-    let payload_length = bytes
+    postcard::from_bytes(&checksummed_payload(encoded)?)
+        .map_err(|_| ApiError::cursor("cursor payload is invalid"))
+}
+
+fn checksummed_payload(encoded: &str) -> Result<Vec<u8>, ApiError> {
+    let mut payload =
+        hex::decode(encoded).map_err(|_| ApiError::cursor("cursor is not valid hex"))?;
+    let payload_length = payload
         .len()
         .checked_sub(16)
         .ok_or_else(|| ApiError::cursor("cursor is truncated"))?;
-    let (payload, checksum) = bytes.split_at(payload_length);
-    if blake3::hash(payload).as_bytes()[..16] != *checksum {
+    let checksum = payload.split_off(payload_length);
+    if blake3::hash(&payload).as_bytes()[..16] != *checksum {
         return Err(ApiError::cursor("cursor checksum mismatch"));
     }
-    postcard::from_bytes(payload).map_err(|_| ApiError::cursor("cursor payload is invalid"))
+    Ok(payload)
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -7579,7 +7807,7 @@ impl IntoResponse for ApiError {
 mod tests {
     use axum::{
         body::{Body, to_bytes},
-        http::Request,
+        http::{Method, Request},
     };
     use leani_primitives::{Address, ChainId, ProcessorCursor, TransactionHash};
     use tower::ServiceExt;
@@ -9286,6 +9514,7 @@ mod tests {
                     CONSUMER_SESSION_HEADER,
                     session_token.expect("consumer session token"),
                 )
+                .header("x-leani-request", "1")
                 .body(Body::empty())
                 .expect("release request"),
             )
@@ -9646,6 +9875,7 @@ mod tests {
                 .expect("router")
                 .oneshot(
                     Request::post("/admin/v1/processors/contradicted-counter/lanes/live/reset")
+                        .header("x-leani-request", "1")
                         .body(Body::empty())
                         .expect("request"),
                 )
@@ -9760,6 +9990,7 @@ mod tests {
                 Request::delete(
                     "/admin/v1/processors/synthetic-counter/artifacts?fromBlock=1&toBlock=1",
                 )
+                .header("x-leani-request", "1")
                 .body(Body::empty())
                 .expect("request"),
             )
@@ -10207,6 +10438,490 @@ mod tests {
             .await
             .expect("response");
         assert_eq!(authorized.status(), StatusCode::OK);
+    }
+
+    async fn send(router: &Router, request: Request<Body>) -> (StatusCode, Value) {
+        let response = router.clone().oneshot(request).await.expect("response");
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+        )
+    }
+
+    fn get_request(path: &str) -> Request<Body> {
+        Request::get(path).body(Body::empty()).expect("request")
+    }
+
+    async fn blobs_router(config: ApiConfig) -> (Router, tempfile::TempDir) {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = SqliteStore::open(leani_store_sqlite::StoreConfig::new(
+            directory.path().join("node.sqlite"),
+        ))
+        .await
+        .expect("store");
+        let router = router(store, Arc::new(BlobsProcessor::default()), config).expect("router");
+        (router, directory)
+    }
+
+    #[tokio::test]
+    async fn requests_need_an_allowed_host_and_origin() {
+        // Audit H25: with no Host or Origin check, a page that rebinds its own
+        // name to 127.0.0.1, or any cross-site page, could call the API.
+        let (router, _directory) = blobs_router(ApiConfig {
+            allowed_hosts: BTreeSet::from(["leani".to_owned()]),
+            allowed_origins: BTreeSet::from(["https://app.example".to_owned()]),
+            ..ApiConfig::default()
+        })
+        .await;
+        let with_host = |host: &str| {
+            Request::get("/health/live")
+                .header(header::HOST, host)
+                .body(Body::empty())
+                .expect("request")
+        };
+        for host in [
+            "rebound.example:8080",
+            "leani.rebound.example",
+            "localhost.rebound.example:8080",
+            "127.0.0.1.rebound.example",
+            "[::1].rebound.example",
+            // Spellings that name loopback without being a listed name or an
+            // address in canonical form.
+            "localhost.",
+            "127.0.0.1.",
+            "0x7f.0.0.1",
+            "[::1%25lo]",
+        ] {
+            let (status, body) = send(&router, with_host(host)).await;
+            assert_eq!(status, StatusCode::MISDIRECTED_REQUEST, "{host}");
+            assert_eq!(body["error"]["code"], "host_not_allowed", "{host}");
+        }
+        // No rebinding sends an address, so health probes and scrapers may
+        // call the node by any IP.
+        for host in [
+            "localhost:8080",
+            "LOCALHOST",
+            "127.0.0.1:18080",
+            "10.0.0.5:8080",
+            "[::1]:8080",
+            "[::1]",
+            "[2001:db8::1]:8080",
+            "leani:8080",
+            "Leani",
+        ] {
+            assert_eq!(
+                send(&router, with_host(host)).await.0,
+                StatusCode::OK,
+                "{host}"
+            );
+        }
+        // An absolute request target names the host as well.
+        let (status, _) = send(&router, get_request("http://rebound.example/health/live")).await;
+        assert_eq!(status, StatusCode::MISDIRECTED_REQUEST);
+
+        let with_origin = |path: &str, origin: &str| {
+            Request::get(path)
+                .header(header::ORIGIN, origin)
+                .body(Body::empty())
+                .expect("request")
+        };
+        for origin in [
+            "https://evil.example",
+            "null",
+            "http://localhost.evil.example",
+            "http://app.example",
+        ] {
+            for path in ["/v1/status", "/health/live"] {
+                let (status, body) = send(&router, with_origin(path, origin)).await;
+                assert_eq!(status, StatusCode::FORBIDDEN, "{origin} {path}");
+                assert_eq!(
+                    body["error"]["code"], "origin_not_allowed",
+                    "{origin} {path}"
+                );
+            }
+            // An EventSource stream is a GET too; only its Origin guards it.
+            let stream = router
+                .clone()
+                .oneshot(with_origin("/v1/processors/blobs-money/stream", origin))
+                .await
+                .expect("stream response");
+            assert_eq!(stream.status(), StatusCode::FORBIDDEN, "{origin}");
+            // A mutation that passes the content-type rule is still refused.
+            let snapshot =
+                Request::post("/v1/processors/blobs-money/collections/blobs.blocks/entities")
+                    .header(header::ORIGIN, origin)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("x-leani-request", "1")
+                    .body(Body::from("{}"))
+                    .expect("request");
+            let (status, body) = send(&router, snapshot).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{origin} snapshot");
+            assert_eq!(body["error"]["code"], "origin_not_allowed", "{origin}");
+        }
+        for origin in [
+            "http://localhost:5173",
+            "http://127.0.0.1",
+            "https://[::1]:8443",
+            "https://app.example",
+        ] {
+            let (status, _) = send(&router, with_origin("/v1/status", origin)).await;
+            assert_eq!(status, StatusCode::OK, "{origin}");
+        }
+    }
+
+    #[tokio::test]
+    async fn mutations_need_a_json_content_type_or_the_leani_request_header() {
+        // Audit H25: body-less mutations went through as simple cross-site
+        // requests, which carry no preflight.
+        let (router, _directory) = blobs_router(ApiConfig::default()).await;
+        let release = |headers: &[(&str, &str)]| {
+            let mut request = Request::delete(
+                "/v1/processors/blobs-money/query-snapshots/00000000000000000000000000000000",
+            );
+            for (name, value) in headers {
+                request = request.header(*name, *value);
+            }
+            request.body(Body::empty()).expect("request")
+        };
+        let refused: [&[(&str, &str)]; 6] = [
+            &[],
+            &[("content-type", "text/plain")],
+            &[("content-type", "application/x-www-form-urlencoded")],
+            &[("content-type", "multipart/form-data; boundary=x")],
+            &[("x-leani-request", "0")],
+            &[("x-leani-request", "true")],
+        ];
+        for headers in refused {
+            let (status, body) = send(&router, release(headers)).await;
+            assert_eq!(status, StatusCode::UNSUPPORTED_MEDIA_TYPE, "{headers:?}");
+            assert_eq!(
+                body["error"]["code"], "unsupported_media_type",
+                "{headers:?}"
+            );
+        }
+        let accepted: [&[(&str, &str)]; 3] = [
+            &[("x-leani-request", "1")],
+            &[("content-type", "application/json")],
+            &[("content-type", "Application/JSON; charset=utf-8")],
+        ];
+        for headers in accepted {
+            let (status, body) = send(&router, release(headers)).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{headers:?}: {body}");
+        }
+        let reset = Request::post("/admin/v1/processors/blobs-money/lanes/live/reset")
+            .body(Body::empty())
+            .expect("request");
+        assert_eq!(
+            send(&router, reset).await.0,
+            StatusCode::UNSUPPORTED_MEDIA_TYPE
+        );
+        assert_eq!(
+            send(&router, get_request("/v1/status")).await.0,
+            StatusCode::OK
+        );
+    }
+
+    #[tokio::test]
+    async fn only_post_creates_query_snapshots() {
+        // Audit M-A1: every cursorless entity GET created a durable snapshot
+        // against a node-wide cap, so any page could fill it with GETs.
+        use leani_primitives::ProcessorCursor;
+        use leani_testkit::{BlockLocalCounter, fixture_frame};
+
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = SqliteStore::open(leani_store_sqlite::StoreConfig::new(
+            directory.path().join("snapshots.sqlite"),
+        ))
+        .await
+        .expect("store");
+        let processor = Arc::new(BlockLocalCounter::default());
+        let mut parent = BlockHash::ZERO;
+        for number in 1..=3 {
+            let frame = fixture_frame(number, parent);
+            let delta = processor.map(&frame).await.expect("map");
+            let descriptor = processor.descriptor();
+            store
+                .apply(
+                    processor.as_ref(),
+                    ProcessorCursor {
+                        processor_id: descriptor.id.to_string(),
+                        processor_version: descriptor.version.to_string(),
+                        chain_id: frame.chain_id,
+                        block_number: frame.block.number,
+                        block_hash: frame.block.hash,
+                        finality: frame.finality,
+                        sequence: number,
+                    },
+                    &delta,
+                    &[],
+                )
+                .await
+                .expect("apply");
+            parent = frame.block.hash;
+        }
+        let configured: Arc<dyn Processor> = processor;
+        let router = router_with_processors(
+            store,
+            vec![configured],
+            Vec::new(),
+            ApiConfig {
+                query_snapshot_max_total_snapshots: 1,
+                ..ApiConfig::default()
+            },
+        )
+        .expect("router");
+        let path = "/v1/processors/synthetic-counter/collections/counter.blocks/entities";
+
+        // Cursorless GETs page through current output without a snapshot.
+        for _ in 0..2 {
+            let (mut keys, mut ordinals) = (Vec::new(), Vec::new());
+            let mut next = format!("{path}?limit=2");
+            loop {
+                let (status, page) = send(&router, get_request(&next)).await;
+                assert_eq!(status, StatusCode::OK, "{page}");
+                assert!(page.get("snapshotId").is_none(), "{page}");
+                for entity in page["data"].as_array().expect("data") {
+                    keys.push(entity["key"].clone());
+                    ordinals.push(entity["ordinal"].clone());
+                }
+                match page["nextCursor"].as_str() {
+                    Some(cursor) => next = format!("{path}?cursor={cursor}"),
+                    None => break,
+                }
+            }
+            assert_eq!(keys.len(), 3);
+            assert_eq!(ordinals, [json!("0"), json!("1"), json!("2")]);
+        }
+
+        // POST creates the snapshot, against the node-wide cap.
+        let create = || {
+            Request::post(path)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"limit":2}"#))
+                .expect("request")
+        };
+        let (status, first) = send(&router, create()).await;
+        assert_eq!(status, StatusCode::OK, "{first}");
+        assert_eq!(first["rowCount"], "3");
+        let (status, full) = send(&router, create()).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{full}");
+        assert_eq!(full["error"]["code"], "query_snapshot_capacity");
+        // Its later pages are read by GET.
+        let next = first["nextCursor"].as_str().expect("next cursor");
+        let (status, second) = send(&router, get_request(&format!("{path}?cursor={next}"))).await;
+        assert_eq!(status, StatusCode::OK, "{second}");
+        assert_eq!(second["snapshotId"], first["snapshotId"]);
+        assert_eq!(second["data"].as_array().expect("data").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn bearer_scheme_is_case_insensitive_and_the_token_exact() {
+        // Audit Auth-1.
+        let (router, _directory) = blobs_router(ApiConfig {
+            bearer_token: Some(Arc::from("very-secret-token")),
+            ..ApiConfig::default()
+        })
+        .await;
+        let status = |authorization: &'static str| {
+            let router = router.clone();
+            async move {
+                let request = Request::get("/v1/status")
+                    .header(header::AUTHORIZATION, authorization)
+                    .body(Body::empty())
+                    .expect("request");
+                send(&router, request).await.0
+            }
+        };
+        for authorization in [
+            "Bearer very-secret-token",
+            "bearer very-secret-token",
+            "BEARER very-secret-token",
+            "Bearer  very-secret-token",
+        ] {
+            assert_eq!(
+                status(authorization).await,
+                StatusCode::OK,
+                "{authorization}"
+            );
+        }
+        for authorization in [
+            "Bearer very-secret-toke",
+            "Bearer very-secret-token-",
+            "Bearer VERY-SECRET-TOKEN",
+            "Basic very-secret-token",
+            "Bearervery-secret-token",
+            "Bearer",
+            "Bearer ",
+            "very-secret-token",
+        ] {
+            assert_eq!(
+                status(authorization).await,
+                StatusCode::UNAUTHORIZED,
+                "{authorization}"
+            );
+        }
+    }
+
+    fn with_headers(method: &Method, path: &str, headers: &[(&str, &str)]) -> Request<Body> {
+        let mut request = Request::builder().method(method.clone()).uri(path);
+        for (name, value) in headers {
+            request = request.header(*name, *value);
+        }
+        request.body(Body::empty()).expect("request")
+    }
+
+    /// Headers a browser sends when a cross-site page loads an image.
+    const CROSS_SITE_IMAGE: [(&str, &str); 3] = [
+        ("sec-fetch-site", "cross-site"),
+        ("sec-fetch-mode", "no-cors"),
+        ("sec-fetch-dest", "image"),
+    ];
+
+    #[tokio::test]
+    async fn cross_site_subresource_requests_are_refused() {
+        // Audit H25, review 1: a no-cors GET such as an image load carries no
+        // `Origin`; only its Fetch Metadata tells it apart from a navigation.
+        let (router, _directory) = blobs_router(ApiConfig::default()).await;
+        for path in [
+            "/v1/status",
+            "/health/live",
+            // Both routes take a durable consumer's session lease.
+            "/v1/processors/blobs-money/streams/live/consumers/destination/stream",
+            "/v1/backfill-subscriptions/repair-1/consumers/destination/stream",
+        ] {
+            for method in [Method::GET, Method::HEAD] {
+                let (status, body) =
+                    send(&router, with_headers(&method, path, &CROSS_SITE_IMAGE)).await;
+                assert_eq!(status, StatusCode::FORBIDDEN, "{method} {path}");
+                if method == Method::GET {
+                    assert_eq!(body["error"]["code"], "cross_site_request", "{path}");
+                }
+            }
+        }
+        // Another port on localhost is the same site, not the same origin.
+        let same_site_script = [
+            ("sec-fetch-site", "same-site"),
+            ("sec-fetch-mode", "no-cors"),
+            ("sec-fetch-dest", "script"),
+        ];
+        assert_eq!(
+            send(
+                &router,
+                with_headers(&Method::GET, "/v1/status", &same_site_script)
+            )
+            .await
+            .0,
+            StatusCode::FORBIDDEN
+        );
+        let allowed: [&[(&str, &str)]; 6] = [
+            // The SDK, curl, and other clients send no Fetch Metadata.
+            &[],
+            // A link followed from another site, or a typed address.
+            &[
+                ("sec-fetch-site", "cross-site"),
+                ("sec-fetch-mode", "navigate"),
+                ("sec-fetch-dest", "document"),
+            ],
+            &[
+                ("sec-fetch-site", "none"),
+                ("sec-fetch-mode", "navigate"),
+                ("sec-fetch-dest", "document"),
+            ],
+            // The node's own pages, such as the network dashboard.
+            &[
+                ("sec-fetch-site", "same-origin"),
+                ("sec-fetch-mode", "cors"),
+                ("sec-fetch-dest", "empty"),
+            ],
+            &[
+                ("sec-fetch-site", "same-origin"),
+                ("sec-fetch-mode", "no-cors"),
+                ("sec-fetch-dest", "image"),
+            ],
+            // A CORS request carries an `Origin`, which the Origin check
+            // judges.
+            &[
+                ("origin", "http://localhost:5173"),
+                ("sec-fetch-site", "same-site"),
+                ("sec-fetch-mode", "cors"),
+                ("sec-fetch-dest", "empty"),
+            ],
+        ];
+        for headers in allowed {
+            assert_eq!(
+                send(&router, with_headers(&Method::GET, "/v1/status", headers))
+                    .await
+                    .0,
+                StatusCode::OK,
+                "{headers:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_cross_site_image_cannot_take_a_consumer_session() {
+        // Audit H25, review 1: opening a consumer's live stream takes its
+        // session lease, so an image on any page could lock the consumer out.
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = SqliteStore::open(leani_store_sqlite::StoreConfig::new(
+            directory.path().join("node.sqlite"),
+        ))
+        .await
+        .expect("store");
+        let counter = leani_testkit::BlockLocalCounter::default().with_split_delivery();
+        let lifecycle =
+            acknowledged_delivery(counter.descriptor().lifecycle.clone(), "destination");
+        let processor = Arc::new(counter.with_lifecycle(lifecycle));
+        store
+            .register_processor(processor.descriptor())
+            .await
+            .expect("register processor");
+        store
+            .create_consumer_in_stream(
+                processor.descriptor(),
+                &default_delivery_stream_id(processor.descriptor()),
+                "destination",
+                ConsumerRole::Required,
+                ConsumerStartPosition::EarliestRetained,
+                Duration::from_secs(30),
+            )
+            .await
+            .expect("consumer");
+        let configured: Arc<dyn Processor> = processor;
+        let app = router_with_processors(store, vec![configured], Vec::new(), ApiConfig::default())
+            .expect("router");
+        let path = "/v1/processors/synthetic-counter/streams/live/consumers/destination/stream";
+        // The image's response stays open, as a real image load would.
+        let image = app
+            .clone()
+            .oneshot(with_headers(&Method::GET, path, &CROSS_SITE_IMAGE))
+            .await
+            .expect("image response");
+        assert_eq!(image.status(), StatusCode::FORBIDDEN);
+        let consumer = app
+            .oneshot(Request::get(path).body(Body::empty()).expect("request"))
+            .await
+            .expect("consumer response");
+        assert_eq!(consumer.status(), StatusCode::OK);
+        drop(image);
+    }
+
+    #[tokio::test]
+    async fn configured_origins_match_without_a_trailing_slash() {
+        let (router, _directory) = blobs_router(ApiConfig {
+            allowed_origins: BTreeSet::from(["HTTPS://App.Example/".to_owned()]),
+            ..ApiConfig::default()
+        })
+        .await;
+        let request = Request::get("/v1/status")
+            .header(header::ORIGIN, "https://app.example")
+            .body(Body::empty())
+            .expect("request");
+        assert_eq!(send(&router, request).await.0, StatusCode::OK);
     }
 
     #[tokio::test]
