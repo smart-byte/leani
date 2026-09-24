@@ -216,6 +216,50 @@ record, and documented RPC contracts.
   range [...]". The `rpc.max_*` settings change each limit. A single block
   with more matching logs than the limit cannot be read with `eth_getLogs`;
   raise `rpc.max_log_results` or use `eth_getBlockReceipts`.
+- Breaking (JSON-RPC): block lookups answer `null` only for a block number
+  above the node's head: its newest canonical block, or the block its
+  progress processor has reached when that is higher. A block at or below the
+  head that neither the recent window nor on-demand history serves now fails
+  with `-32004` (`block_not_retained`, or the history source's reason)
+  instead of `null`, and so does a block hash that the recent window lacks
+  when no history block-hash lookup is configured, and `latest` on a node
+  that retains no block. This covers `eth_getBlockByNumber`,
+  `eth_getBlockByHash`, `eth_getBlockReceipts`,
+  `eth_getBlockTransactionCountBy*`, and `eth_getTransactionByBlock*AndIndex`.
+  Ethereum clients read `null` as "no such block", so a reorg checker
+  concluded that a block below the retained window had been reorged out.
+  Clients that took `null` for "not available here" must handle `-32004`. A
+  block number above the head that no history source covers now reads as
+  `null` instead of failing with `no_viable_historical_source`.
+- Breaking (JSON-RPC): requests and parameters follow the JSON-RPC 2.0 and
+  Ethereum specifications more closely:
+  - A call with `"id": null` gets a response with a `null` ID; it was taken
+    for a notification and got none. An object, array, or boolean `id` gets
+    `-32600` instead of being echoed.
+  - A QUANTITY must be `0x` and hexadecimal digits without leading zeros:
+    `0x+1` got through, and now gets `-32602` like `0x01`.
+  - The `finalized` and `safe` block tags name the node's verified finalized
+    head, and `earliest` names block 0, wherever a block number is accepted,
+    `eth_getLogs` bounds included; they got `-32602`. `safe` is the finalized
+    head, which is never newer than the safe block other clients report.
+    `pending` gets `-32004` (`pending_block_unavailable`): Leani builds no
+    pending block.
+  - An empty topic alternatives array, `[]`, matches any topic at its
+    position in `eth_getLogs` and `eth_subscribe("logs")` filters, as in geth
+    and reth; it matched nothing.
+  - A request body that is not valid UTF-8 gets a `-32700` parse error with
+    HTTP 200 instead of a plain-text HTTP 400, and a body over 1 MiB gets
+    HTTP 413 with a JSON-RPC `-32005` error (`request_size_limit_exceeded`)
+    instead of plain text.
+  - An `eth_getLogs` call refused for the batch's remaining response budget
+    ends the batch like any response past `rpc.max_response_bytes`: every
+    later call gets `-32005` without running. Later calls used to run.
+  - `eth_config` picks the current fork by the retained head block's
+    timestamp only. Without a retained head frame it fails with `-32004`
+    (`eth_config_head_timestamp_unavailable`) instead of picking the fork by
+    the progress processor's block number, or the newest scheduled fork on an
+    empty node, and a head older than the first scheduled fork fails with
+    `eth_config_head_predates_schedule`.
 - SDK: `processors.queryEntities()` without a cursor creates its snapshot with
   the new POST route, and mutations without a JSON body send
   `x-leani-request: 1`. Update the SDK together with the node.
@@ -796,11 +840,22 @@ record, and documented RPC contracts.
   block's timestamp, from the same schedule and fee function as `blobs-money`,
   instead of with Cancun's parameters for every fork. Prague and later
   receipts were wrong at non-trivial excess blob gas: 107,610,112 under Prague
-  costs 2,150,273,305 wei per blob gas, not 99,710,729,314,173. A blob receipt
-  whose block no scheduled fork covers, or whose header lacks excess blob gas,
-  fails with `-32004` (`blob_gas_price_schedule_unavailable` or
-  `header_excess_blob_gas_missing`) instead of carrying a Cancun price.
-  `leani conformance rpc` prices blob receipts the same way.
+  costs 2,150,273,305 wei per blob gas, not 99,710,729,314,173. When a block
+  with a blob transaction cannot be priced, every receipt of that block, the
+  receipts of its other transactions included, fails with `-32004` instead of
+  carrying a Cancun price: `blob_gas_price_schedule_unavailable` when no
+  scheduled fork covers the block's timestamp or the schedule is for another
+  chain, `header_excess_blob_gas_missing` when the header lacks excess blob
+  gas, and `quantity_exceeds_u128` when the price does not fit in 128 bits,
+  which only a forged excess blob gas reaches. A node on a chain other than
+  Mainnet without a blobs processor prices with the checked Mainnet
+  schedule, so there the receipts of every block with a blob transaction
+  fail. `leani conformance rpc` prices blob receipts the same way.
+- `eth_getLogs` with `blockHash` returns only the logs of the block with that
+  hash. It resolved the hash to a block number and then read the block at
+  that number, so a reorg in between, or on-demand history holding another
+  block at that height, answered with another block's logs. Such a call now
+  fails with `-32004` (`block_hash_not_retained`).
 - A request slot freed just after a waiting execution P2P request found none
   free no longer leaves that request waiting for the next release. Background
   peer qualification, with its limit of 32, no longer holds every slot while

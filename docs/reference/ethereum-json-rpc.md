@@ -43,13 +43,31 @@ response is the machine-readable authority for a running node.
 `current`, `next`, and `last` fork configurations with JSON-number blob
 parameters, chain ID, fork hash, precompiles, and system contracts. Its
 checked Mainnet schedule uses exact activation timestamps; it does not call an
-upstream configuration RPC.
+upstream configuration RPC. `current` is the fork active at the timestamp of
+the newest retained canonical block, the head `eth_blockNumber` reports.
+Forks activate by timestamp, so a node that retains no head frame, such as an
+empty one or one that has only backfilled, fails with `-32004`
+(`eth_config_head_timestamp_unavailable`) instead of choosing a fork by block
+number or taking the newest one. A head older than the first scheduled fork
+fails with `eth_config_head_predates_schedule`, and a node whose chain the
+schedule is not for fails with `eth_config_chain_schedule_unavailable`.
 
 Blob transaction receipts report `blobGasPrice` as the protocol blob base fee
 of the fork active at the block's timestamp, from the same schedule and fee
-function as the `blobs-money` processor. A blob receipt whose block no
-scheduled fork covers fails with `-32004`
-(`blob_gas_price_schedule_unavailable`) rather than carrying a guessed price.
+function as the `blobs-money` processor. Receipts are built for a whole block,
+so when that price cannot be computed, every receipt of a block with a blob
+transaction fails with `-32004`, the receipts of its other transactions
+included, from `eth_getBlockReceipts` and `eth_getTransactionReceipt` alike,
+rather than carrying a guessed price. `error.data.reason` says why:
+
+- `blob_gas_price_schedule_unavailable`: no scheduled fork covers the block's
+  timestamp, or the schedule is for another chain. A node on a chain other
+  than Mainnet without a blobs processor uses the checked Mainnet schedule, so
+  the receipts of every block with a blob transaction fail this way.
+- `header_excess_blob_gas_missing`: the block header has no excess blob gas.
+- `quantity_exceeds_u128`: the price does not fit in 128 bits. Only an excess
+  blob gas that no valid chain reaches, as a forged header may claim, gets
+  there.
 
 For a number/range request outside the recent window, the router selects the
 lowest-priority viable `HistorySource`, enforces finality/trust and hard
@@ -91,6 +109,59 @@ durable locator and therefore remains recent-only by default.
 
 “On-demand” cannot make every hash-only lookup cheap. Block-number/range queries map naturally to chunked archives. Transaction-hash queries need a locator service or a compact local `tx_hash -> block_number` index.
 
+### Requests, block tags, and missing blocks
+
+A call whose `id` is `null` gets a response with a `null` ID; only a call
+without an `id` member is a notification. An `id` that is an object, an
+array, or a boolean gets `-32600` with a `null` ID.
+
+Block numbers and transaction indexes are QUANTITY values: `0x` and one or
+more hexadecimal digits, without leading zeros except in `0x0`, at most 64
+bits. Anything else, such as `0x+1`, `0x01`, or `0x`, gets `-32602`.
+
+Wherever a block number is accepted, including `fromBlock` and `toBlock` of
+`eth_getLogs`, these tags are too:
+
+| Tag | Block |
+|---|---|
+| `latest` | the newest retained canonical block |
+| `finalized` | the newest canonical block the node has verified as finalized |
+| `safe` | the same block as `finalized` |
+| `earliest` | block 0 |
+| `pending` | none: Leani builds no pending block, so `-32004` (`pending_block_unavailable`) |
+
+Until the node has verified a finalized block, `finalized` and `safe` fail
+with `-32004` (`finalized_block_unavailable`). Leani does not track the
+justified checkpoint that execution clients call safe, so `safe` names the
+finalized head, which is never newer. A client that waits for `safe` blocks
+to avoid reorgs therefore stays safe, but it sees an older block than other
+clients report.
+
+Block lookups return `null` only for a block number above the node's head:
+its newest canonical block, or the block its progress processor has reached
+when that is higher. Ethereum clients read `null` as "no such block", and a
+reorg checker concludes that a block which turned `null` was reorged out.
+So a block at or below the head that neither the recent window nor
+on-demand history serves fails with `-32004` instead: `block_not_retained`,
+or the history source's reason when history was asked. A block hash that
+the recent window does not hold fails with `block_not_retained` unless
+on-demand history offers a block-hash lookup, in which case `null` means
+that lookup does not know the hash. This applies to `eth_getBlockByNumber`,
+`eth_getBlockByHash`, `eth_getBlockReceipts`,
+`eth_getBlockTransactionCountBy*`, and
+`eth_getTransactionByBlock*AndIndex`, which still returns `null` for an
+index past the last transaction of a block it serves. `latest` fails with
+`block_not_retained` on a node that retains no block. `earliest` names
+block 0, so it fails the same way unless block 0 is retained or history
+serves it.
+
+`eth_getLogs` with `blockHash` returns only logs of the block with that
+hash. If a reorg replaces that block between resolving the hash and reading
+the block, the call fails with `-32004` rather than return the
+replacement's logs, as it does once the reorg has happened
+(`block_hash_not_retained`). An empty alternatives array at a topic
+position, `[]`, matches any topic there, as `null` does.
+
 ### Transport rules and limits
 
 HTTP calls need `content-type: application/json`, with any parameters, and
@@ -100,10 +171,16 @@ in `rpc.allowed_origins` gets HTTP 403, on HTTP calls and WebSocket upgrades
 alike; requests without an `Origin` header pass. A cross-site page therefore
 cannot post a `text/plain` batch or open a WebSocket to a loopback node.
 
+A request body that is not valid UTF-8 JSON gets HTTP 200 with a `-32700`
+parse error and a `null` ID. A body over 1 MiB gets HTTP 413 with a JSON-RPC
+error, not plain text: `-32005` with a `null` ID, and `error.data` holding
+`reason` `request_size_limit_exceeded` and the `limit` in bytes.
+
 | Limit | Default | Setting | When exceeded |
 |---|---|---|---|
+| Request body or WebSocket message | 1 MiB | — | HTTP 413 with a `-32005` error; a longer WebSocket message ends the connection |
 | Calls per batch | 100 | `rpc.max_batch_requests` | one `-32600` error object for the whole batch |
-| Response bytes | 16 MiB | `rpc.max_response_bytes` | `-32005` for the call that passes the limit and every later call in the batch, which do not run |
+| Response bytes | 16 MiB | `rpc.max_response_bytes` | `-32005` for the call that passes the limit, or whose `eth_getLogs` result would, and for every later call in the batch, which do not run |
 | `eth_getLogs` results | 10,000 | `rpc.max_log_results` | `-32005` "query returned more than 10000 results. Try with this block range [0x…, 0x…]." |
 | Filter addresses | 1,000 | `rpc.max_log_addresses` | `-32602` |
 | Alternatives per topic position | 1,000 | `rpc.max_log_topic_alternatives` | `-32602` |

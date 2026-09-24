@@ -56,9 +56,9 @@ pub fn fake_exponential(
 /// # Errors
 ///
 /// Returns an invariant error for a zero update fraction or when a 256-bit
-/// intermediate would overflow, which takes an excess of about 145 update
-/// fractions, far beyond any fee a block could charge. Either way the
-/// expansion ends within about 410 iterations for `u64` inputs.
+/// intermediate would overflow. At the scheduled update fractions that takes
+/// an excess of about 145 fractions, far beyond any fee a block could charge,
+/// and either way the expansion ends within about 410 iterations.
 pub fn get_blob_base_fee(
     excess_blob_gas: u64,
     update_fraction: u64,
@@ -124,6 +124,12 @@ mod tests {
                 "update fraction {update_fraction}, excess {excess_blob_gas}"
             );
         }
+    }
+
+    #[test]
+    fn hostile_excess_blob_gas_fails_instead_of_overflowing() {
+        // No valid chain reaches this excess; a hostile header can claim it.
+        assert!(get_blob_base_fee(u64::MAX, 3_338_477).is_err());
     }
 
     #[test]

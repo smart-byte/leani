@@ -31,8 +31,10 @@ use alloy_rpc_types_eth::{
 };
 use axum::{
     Json, Router,
+    body::Bytes,
     extract::{
         DefaultBodyLimit, State,
+        rejection::BytesRejection,
         ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade, close_code},
     },
     http::{StatusCode, header},
@@ -68,6 +70,8 @@ const INVALID_PARAMS: i64 = -32_602;
 const INTERNAL_ERROR: i64 = -32_603;
 const DATA_UNAVAILABLE: i64 = -32_004;
 const LIMIT_EXCEEDED: i64 = -32_005;
+/// The `-32005` reason of a response past `max_response_bytes`.
+const RESPONSE_SIZE_LIMIT_EXCEEDED: &str = "response_size_limit_exceeded";
 
 /// Exact Ethereum JSON-RPC values derivable from one normalized block frame.
 ///
@@ -899,7 +903,7 @@ async fn websocket_dispatch_text(
     next_subscription: &mut u64,
     input: &str,
 ) -> Option<String> {
-    let (mut encoder, calls) = match ResponseEncoder::for_message(input, &state.config) {
+    let (mut encoder, calls) = match ResponseEncoder::for_message(input.as_bytes(), &state.config) {
         Ok(message) => message,
         Err(refused) => return Some(refused),
     };
@@ -928,16 +932,13 @@ async fn websocket_dispatch_value(
     value: Value,
     budget: usize,
 ) -> Option<RpcResponse> {
-    let request = match serde_json::from_value::<RpcRequest>(value) {
-        Ok(request) if request.jsonrpc == JSONRPC_VERSION => request,
-        _ => {
-            return Some(RpcResponse::error(
-                Value::Null,
-                INVALID_REQUEST,
-                "Invalid Request",
-                None,
-            ));
-        }
+    let Some(request) = RpcRequest::parse(value) else {
+        return Some(RpcResponse::error(
+            Value::Null,
+            INVALID_REQUEST,
+            "Invalid Request",
+            None,
+        ));
     };
     let id = request.id?;
     let subscription_limit = state.config.max_subscriptions_per_connection;
@@ -1080,7 +1081,11 @@ async fn subscription_results(
     }
 }
 
-async fn handle(State(state): State<RpcState>, body: String) -> Response {
+async fn handle(State(state): State<RpcState>, body: Result<Bytes, BytesRejection>) -> Response {
+    let body = match body {
+        Ok(body) => body,
+        Err(rejection) => return refused_body(&rejection, state.config.max_request_bytes),
+    };
     let (mut encoder, calls) = match ResponseEncoder::for_message(&body, &state.config) {
         Ok(message) => message,
         Err(refused) => return json_body(refused),
@@ -1101,10 +1106,30 @@ fn json_body(body: String) -> Response {
     ([(header::CONTENT_TYPE, "application/json")], body).into_response()
 }
 
+/// Answer a body that could not be read with a JSON-RPC error instead of
+/// axum's plain text: HTTP 413 and `-32005` past `max_request_bytes`, the
+/// rejection's status and `-32700` otherwise.
+fn refused_body(rejection: &BytesRejection, max_request_bytes: usize) -> Response {
+    let status = rejection.status();
+    let response = if status == StatusCode::PAYLOAD_TOO_LARGE {
+        let error = RpcError::limit_exceeded("request_size_limit_exceeded", max_request_bytes);
+        RpcResponse::error(Value::Null, error.code, error.message, error.data)
+    } else {
+        RpcResponse::error(
+            Value::Null,
+            PARSE_ERROR,
+            "Parse error",
+            Some(json!({ "detail": rejection.body_text() })),
+        )
+    };
+    (status, json_body(encode_response(&response))).into_response()
+}
+
 /// Encodes the responses to one message within `max_response_bytes`,
 /// counting a batch's brackets and commas. The response that would pass the
 /// limit, and every later one, becomes a `-32005` error for its request ID;
-/// the calls after it need not run.
+/// the calls after it need not run. A call that stops early because its
+/// result would pass the limit, as `eth_getLogs` does, counts as passing it.
 struct ResponseEncoder {
     limit: usize,
     batch: bool,
@@ -1115,10 +1140,10 @@ struct ResponseEncoder {
 
 impl ResponseEncoder {
     /// An encoder for `input` and the calls it holds: one, or a batch of at
-    /// most `max_batch_requests`. Unparsable input and an empty or oversized
-    /// batch are refused whole, with one encoded error object.
-    fn for_message(input: &str, config: &RpcConfig) -> Result<(Self, Vec<Value>), String> {
-        let parsed = serde_json::from_str::<Value>(input).map_err(|error| {
+    /// most `max_batch_requests`. Input that is not UTF-8 JSON, and an empty
+    /// or oversized batch, are refused whole, with one encoded error object.
+    fn for_message(input: &[u8], config: &RpcConfig) -> Result<(Self, Vec<Value>), String> {
+        let parsed = serde_json::from_slice::<Value>(input).map_err(|error| {
             encode_response(&RpcResponse::error(
                 Value::Null,
                 PARSE_ERROR,
@@ -1167,16 +1192,20 @@ impl ResponseEncoder {
     /// Answer a call left unrun because the response is full: nothing for a
     /// notification, a limit error with a null ID for an invalid request.
     fn skip(&mut self, call: Value) {
-        let id = match serde_json::from_value::<RpcRequest>(call) {
-            Ok(request) if request.jsonrpc == JSONRPC_VERSION => request.id,
-            _ => Some(Value::Null),
-        };
+        let id = RpcRequest::parse(call).map_or(Some(Value::Null), |request| request.id);
         if let Some(id) = id {
             self.push(response_too_large(id, self.limit));
         }
     }
 
     fn push(&mut self, response: RpcResponse) {
+        let stopped_at_limit = response
+            .error
+            .as_ref()
+            .and_then(|error| error.data.as_ref())
+            .and_then(|data| data.get("reason"))
+            .and_then(Value::as_str)
+            .is_some_and(|reason| reason == RESPONSE_SIZE_LIMIT_EXCEEDED);
         let separator = usize::from(self.batch && !self.responses.is_empty());
         let encoded = (!self.full)
             .then(|| encode_response(&response))
@@ -1195,6 +1224,7 @@ impl ResponseEncoder {
             .saturating_add(separator)
             .saturating_add(encoded.len());
         self.responses.push(encoded);
+        self.full |= stopped_at_limit;
     }
 
     fn finish(self) -> Option<String> {
@@ -1217,23 +1247,20 @@ fn encode_response(response: &RpcResponse) -> String {
 }
 
 fn response_too_large(id: Value, limit: usize) -> RpcResponse {
-    let error = RpcError::limit_exceeded("response_size_limit_exceeded", limit);
+    let error = RpcError::limit_exceeded(RESPONSE_SIZE_LIMIT_EXCEEDED, limit);
     RpcResponse::error(id, error.code, error.message, error.data)
 }
 
 /// Answer one call. `budget` is the number of response bytes still free;
 /// results that can grow past it stop early.
 async fn dispatch_value(state: &RpcState, value: Value, budget: usize) -> Option<RpcResponse> {
-    let request = match serde_json::from_value::<RpcRequest>(value) {
-        Ok(request) if request.jsonrpc == JSONRPC_VERSION => request,
-        _ => {
-            return Some(RpcResponse::error(
-                Value::Null,
-                INVALID_REQUEST,
-                "Invalid Request",
-                None,
-            ));
-        }
+    let Some(request) = RpcRequest::parse(value) else {
+        return Some(RpcResponse::error(
+            Value::Null,
+            INVALID_REQUEST,
+            "Invalid Request",
+            None,
+        ));
     };
     let id = request.id?;
     Some(
@@ -1359,21 +1386,15 @@ async fn eth_config(state: &RpcState, params: Option<Value>) -> Result<Value, Rp
     } else {
         None
     };
-    let cursor = if head_timestamp.is_none() {
-        state
-            .store
-            .processor_cursor(state.progress.descriptor())
-            .await
-            .map_err(|error| RpcError::store(&error))?
-    } else {
-        None
-    };
-    let current = head_timestamp
-        .and_then(|timestamp| schedule.fork_at_timestamp(timestamp))
-        .or_else(|| cursor.and_then(|cursor| schedule.fork_at_block(cursor.block_number.0)))
-        // An empty node still knows its checked, current chain configuration.
-        .or_else(|| schedule.forks.last())
-        .ok_or_else(|| RpcError::data_unavailable_reason("eth_config_schedule_empty"))?;
+    // Forks activate by timestamp, the selection `parameters_at_timestamp`
+    // prices blob gas with. Without the head's, a block number or the newest
+    // fork would be a guess, wrong across an activation.
+    let timestamp = head_timestamp.ok_or_else(|| {
+        RpcError::data_unavailable_reason("eth_config_head_timestamp_unavailable")
+    })?;
+    let current = schedule
+        .fork_at_timestamp(timestamp)
+        .ok_or_else(|| RpcError::data_unavailable_reason("eth_config_head_predates_schedule"))?;
     let current_index = schedule
         .forks
         .iter()
@@ -1766,6 +1787,8 @@ async fn eth_get_transaction_receipt(
 #[derive(Clone, Copy, Debug)]
 enum BlockSelector {
     Latest,
+    /// The verified finalized head, which `finalized` and `safe` name.
+    Finalized,
     Number(BlockNumber),
     Hash(BlockHash),
 }
@@ -1835,8 +1858,13 @@ fn parse_block_selector(value: &Value) -> Result<BlockSelector, RpcError> {
         .ok_or_else(|| RpcError::invalid_params("block selector must be a string"))?;
     match value {
         "latest" => Ok(BlockSelector::Latest),
-        "earliest" | "pending" | "safe" | "finalized" => Err(RpcError::invalid_params(
-            "this block tag is unavailable for the retained recent window",
+        // Leani does not track the justified checkpoint other clients call
+        // safe; the finalized head is never newer, so it is safe too.
+        "finalized" | "safe" => Ok(BlockSelector::Finalized),
+        "earliest" => Ok(BlockSelector::Number(BlockNumber(0))),
+        // Leani builds no pending block.
+        "pending" => Err(RpcError::data_unavailable_reason(
+            "pending_block_unavailable",
         )),
         value => parse_hex_quantity(value)
             .map(BlockNumber)
@@ -1844,6 +1872,9 @@ fn parse_block_selector(value: &Value) -> Result<BlockSelector, RpcError> {
     }
 }
 
+/// Resolve a canonical block by number or tag. `None`, which callers answer
+/// with `null`, only for a block above the head: a block at or below it
+/// exists, so one the node cannot serve is an error, never `null`.
 async fn resolve_canonical_frame(
     state: &RpcState,
     selector: BlockSelector,
@@ -1859,6 +1890,7 @@ async fn resolve_canonical_frame(
                 .map(BlockRange::end),
             false,
         ),
+        BlockSelector::Finalized => (Some(finalized_head(state).await?), true),
         BlockSelector::Number(number) => (Some(number), true),
         BlockSelector::Hash(_) => {
             return Err(RpcError::invalid_params(
@@ -1867,29 +1899,70 @@ async fn resolve_canonical_frame(
         }
     };
     let Some(number) = number else {
-        return Ok(None);
+        return Err(RpcError::data_unavailable_reason("block_not_retained"));
     };
     let recent = state
         .store
         .recent_frame(state.config.chain_id, number)
         .await
         .map_err(|error| RpcError::store(&error))?;
-    if recent.is_some() || !on_demand {
+    if recent.is_some() {
         return Ok(recent);
     }
-    let Some(history) = &state.config.history else {
-        return Ok(None);
+    let unavailable = match &state.config.history {
+        Some(history) if on_demand => match history
+            .fetch(
+                state.config.chain_id,
+                BlockRange::single(number),
+                required,
+                FilterSet::default(),
+            )
+            .await
+        {
+            Ok(mut frames) => return Ok(frames.pop()),
+            // No source covers the block, which may not exist yet.
+            Err(HistoricalRpcError::Unavailable) => {
+                RpcError::history(HistoricalRpcError::Unavailable)
+            }
+            Err(error) => return Err(RpcError::history(error)),
+        },
+        _ => RpcError::data_unavailable_reason("block_not_retained"),
     };
-    let mut frames = history
-        .fetch(
-            state.config.chain_id,
-            BlockRange::single(number),
-            required,
-            FilterSet::default(),
-        )
+    if above_known_head(state, number).await? {
+        Ok(None)
+    } else {
+        Err(unavailable)
+    }
+}
+
+/// The verified finalized head: the newest canonical block that verified
+/// finality has reached.
+async fn finalized_head(state: &RpcState) -> Result<BlockNumber, RpcError> {
+    state
+        .store
+        .finalized_canonical_head(state.config.chain_id)
         .await
-        .map_err(RpcError::history)?;
-    Ok(frames.pop())
+        .map_err(|error| RpcError::store(&error))?
+        .map(|head| head.number)
+        .ok_or_else(|| RpcError::data_unavailable_reason("finalized_block_unavailable"))
+}
+
+/// Whether `number` is above every block this node knows to exist: its
+/// canonical head, and the block its progress processor has reached.
+async fn above_known_head(state: &RpcState, number: BlockNumber) -> Result<bool, RpcError> {
+    let tip = state
+        .store
+        .canonical_tip(state.config.chain_id)
+        .await
+        .map_err(|error| RpcError::store(&error))?
+        .map(|tip| tip.number);
+    let cursor = state
+        .store
+        .processor_cursor(state.progress.descriptor())
+        .await
+        .map_err(|error| RpcError::store(&error))?
+        .map(|cursor| cursor.block_number);
+    Ok(tip.max(cursor).is_some_and(|head| number > head))
 }
 
 async fn resolve_any_frame(
@@ -1916,12 +1989,16 @@ async fn resolve_hash_frame(
     if recent.is_some() {
         return Ok(recent);
     }
-    let Some(history) = &state.config.history else {
-        return Ok(None);
+    // Without a hash lookup the hash may name any block, one at or below the
+    // head included; only a lookup that does not know it answers `null`.
+    let Some(history) = state
+        .config
+        .history
+        .as_ref()
+        .filter(|history| history.supports_block_hash_lookup(state.config.chain_id, required))
+    else {
+        return Err(RpcError::data_unavailable_reason("block_not_retained"));
     };
-    if !history.supports_block_hash_lookup(state.config.chain_id, required) {
-        return Ok(None);
-    }
     history
         .block_by_hash(state.config.chain_id, hash, required)
         .await
@@ -2301,13 +2378,10 @@ async fn eth_get_logs(
         (block.number, block.number)
     } else {
         let latest = recent_bounds.map(BlockRange::end);
-        let from = filter.from.or(latest).ok_or_else(|| {
-            RpcError::data_unavailable_reason("latest_block_unavailable_for_open_log_range")
-        })?;
-        let to = filter.to.or(latest).ok_or_else(|| {
-            RpcError::data_unavailable_reason("latest_block_unavailable_for_open_log_range")
-        })?;
-        (from, to)
+        (
+            log_range_bound(state, filter.from, latest).await?,
+            log_range_bound(state, filter.to, latest).await?,
+        )
     };
     if from > to {
         return Err(RpcError::invalid_params(
@@ -2329,6 +2403,15 @@ async fn eth_get_logs(
         recent_bounds.map(BlockRange::end),
     )
     .await?;
+    // The hash was resolved to a number before the block was read; a reorg in
+    // between, or history holding another block there, must not answer with
+    // another block's logs.
+    if filter
+        .block_hash
+        .is_some_and(|hash| frames.iter().any(|frame| frame.block.hash != hash))
+    {
+        return Err(RpcError::data_unavailable_reason("block_hash_not_retained"));
+    }
     let max_results = state.config.max_log_results;
     let mut output = Vec::new();
     // The encoded array's brackets; each log adds its length and a comma.
@@ -2356,7 +2439,7 @@ async fn eth_get_logs(
                 .saturating_add(rpc_log_json_len(&frame, log, false));
             if output_bytes > budget {
                 return Err(RpcError::limit_exceeded(
-                    "response_size_limit_exceeded",
+                    RESPONSE_SIZE_LIMIT_EXCEEDED,
                     state.config.max_response_bytes,
                 ));
             }
@@ -2364,6 +2447,25 @@ async fn eth_get_logs(
         }
     }
     Ok(Value::Array(output))
+}
+
+/// The block a `fromBlock` or `toBlock` bound names; an absent bound is
+/// `latest`.
+async fn log_range_bound(
+    state: &RpcState,
+    bound: Option<BlockSelector>,
+    latest: Option<BlockNumber>,
+) -> Result<BlockNumber, RpcError> {
+    match bound.unwrap_or(BlockSelector::Latest) {
+        BlockSelector::Latest => latest.ok_or_else(|| {
+            RpcError::data_unavailable_reason("latest_block_unavailable_for_open_log_range")
+        }),
+        BlockSelector::Finalized => finalized_head(state).await,
+        BlockSelector::Number(number) => Ok(number),
+        BlockSelector::Hash(_) => Err(RpcError::invalid_params(
+            "fromBlock and toBlock must be block numbers or tags",
+        )),
+    }
 }
 
 async fn resolve_log_frames(
@@ -2542,8 +2644,8 @@ fn rpc_log_json_len(frame: &BlockFrame, log: &leani_primitives::Log, removed: bo
 
 #[derive(Clone, Debug)]
 struct ParsedLogFilter {
-    from: Option<BlockNumber>,
-    to: Option<BlockNumber>,
+    from: Option<BlockSelector>,
+    to: Option<BlockSelector>,
     block_hash: Option<BlockHash>,
     addresses: Vec<Address>,
     topics: Vec<Option<Vec<[u8; 32]>>>,
@@ -2591,14 +2693,12 @@ fn parse_log_filter(
     }
     let from = object
         .get("fromBlock")
-        .map(parse_log_block)
-        .transpose()?
-        .flatten();
+        .map(parse_block_selector)
+        .transpose()?;
     let to = object
         .get("toBlock")
-        .map(parse_log_block)
-        .transpose()?
-        .flatten();
+        .map(parse_block_selector)
+        .transpose()?;
     let addresses = object
         .get("address")
         .map(|value| parse_addresses(value, config.max_log_addresses))
@@ -2616,19 +2716,6 @@ fn parse_log_filter(
         addresses,
         topics,
     })
-}
-
-fn parse_log_block(value: &Value) -> Result<Option<BlockNumber>, RpcError> {
-    let value = value
-        .as_str()
-        .ok_or_else(|| RpcError::invalid_params("block selector must be a string"))?;
-    match value {
-        "latest" => Ok(None),
-        "earliest" | "pending" | "safe" | "finalized" => Err(RpcError::invalid_params(
-            "this block tag is unavailable for bounded recent logs",
-        )),
-        value => parse_hex_quantity(value).map(BlockNumber).map(Some),
-    }
 }
 
 fn parse_addresses(value: &Value, limit: usize) -> Result<Vec<Address>, RpcError> {
@@ -2669,6 +2756,8 @@ fn parse_topics(value: &Value, limit: usize) -> Result<Vec<Option<Vec<[u8; 32]>>
         .iter()
         .map(|value| match value {
             Value::Null => Ok(None),
+            // No alternatives is a wildcard too, as in geth and reth.
+            Value::Array(alternatives) if alternatives.is_empty() => Ok(None),
             Value::String(topic) => parse_fixed_hex::<32>(topic).map(|topic| Some(vec![topic])),
             Value::Array(alternatives) if alternatives.len() > limit => {
                 Err(RpcError::invalid_params_limit(
@@ -2728,7 +2817,11 @@ fn parse_hex_quantity(value: &str) -> Result<u64, RpcError> {
     let digits = value
         .strip_prefix("0x")
         .ok_or_else(|| RpcError::invalid_params("quantity must start with 0x"))?;
-    if digits.is_empty() || (digits.len() > 1 && digits.starts_with('0')) {
+    // `from_str_radix` alone would also take a leading `+`.
+    if digits.is_empty()
+        || (digits.len() > 1 && digits.starts_with('0'))
+        || !digits.bytes().all(|digit| digit.is_ascii_hexdigit())
+    {
         return Err(RpcError::invalid_params(
             "quantity must use canonical hexadecimal encoding",
         ));
@@ -2751,11 +2844,35 @@ fn processor_start_block(descriptor: &ProcessorDescriptor) -> u64 {
 #[derive(Debug, Deserialize)]
 struct RpcRequest {
     jsonrpc: String,
-    #[serde(default)]
+    /// `None` only when the member is absent, for a notification: a `null`
+    /// ID is `Some(Value::Null)` and gets a response.
+    #[serde(default, deserialize_with = "present_value")]
     id: Option<Value>,
     method: String,
     #[serde(default)]
     params: Option<Value>,
+}
+
+impl RpcRequest {
+    /// `call` as a JSON-RPC 2.0 request, or `None` when it is invalid. An ID,
+    /// when present, is a string, a number, or `null`.
+    fn parse(call: Value) -> Option<Self> {
+        serde_json::from_value::<Self>(call).ok().filter(|request| {
+            request.jsonrpc == JSONRPC_VERSION
+                && matches!(
+                    request.id,
+                    None | Some(Value::Null | Value::String(_) | Value::Number(_))
+                )
+        })
+    }
+}
+
+/// Deserialize a member that is present, `null` included, as `Some`.
+fn present_value<'de, D>(deserializer: D) -> Result<Option<Value>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Value::deserialize(deserializer).map(Some)
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -3002,6 +3119,48 @@ mod tests {
             state.committed_events,
             websocket,
         )
+    }
+
+    /// An HTTP router whose progress processor committed block `number`
+    /// while no frame is retained, as after a backfill.
+    async fn router_with_cursor_only(number: u64) -> (Router, tempfile::TempDir) {
+        use leani_testkit::BlockLocalCounter;
+
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = SqliteStore::open(leani_store_sqlite::StoreConfig::new(
+            directory.path().join("cursor-only.sqlite"),
+        ))
+        .await
+        .expect("store");
+        let counter = BlockLocalCounter::default();
+        let frame = fixture_frame(number, BlockHash::ZERO);
+        let delta = counter.map(&frame).await.expect("delta");
+        store
+            .apply(
+                &counter,
+                leani_primitives::ProcessorCursor {
+                    processor_id: counter.descriptor().id.to_string(),
+                    processor_version: counter.descriptor().version.to_string(),
+                    chain_id: ChainId(1),
+                    block_number: frame.block.number,
+                    block_hash: frame.block.hash,
+                    finality: Finality::Finalized,
+                    sequence: number,
+                },
+                &delta,
+                &[],
+            )
+            .await
+            .expect("apply");
+        let (committed_events, _) = broadcast::channel(8);
+        let router = http_router_with_progress(
+            store,
+            Arc::new(counter),
+            Arc::new(BlobSchedule::mainnet()),
+            RpcConfig::default(),
+            committed_events,
+        );
+        (router, directory)
     }
 
     /// One WebSocket text message dispatched on a connection's subscriptions.
@@ -3350,24 +3509,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn eth_config_uses_current_checked_schedule_when_the_store_is_empty() {
+    async fn eth_config_selects_the_fork_by_the_head_timestamp_or_fails_closed() {
+        // Carried from Task 9: without a retained head frame, `eth_config`
+        // chose the fork by the progress cursor's block number; on an empty
+        // node, or before the first scheduled fork, it answered with the last
+        // scheduled fork.
+        let config = json!({"jsonrpc": "2.0", "id": 1, "method": "eth_config"});
         let (router, _directory) = test_router().await;
-        let (_, body) = call(
-            router.clone(),
-            json!({"jsonrpc":"2.0","id":1,"method":"eth_config"}),
-        )
-        .await;
-        let result = body.expect("body")["result"].clone();
-        assert_eq!(result["current"]["activationTime"], 1_767_747_671_u64);
-        assert_eq!(result["current"]["forkId"], "0x07c9462e");
-        assert_eq!(result["current"]["blobSchedule"]["target"], 14);
-        assert_eq!(
-            result["current"]["precompiles"]["P256VERIFY"],
-            "0x0000000000000000000000000000000000000100"
+        assert_unavailable(
+            call(router.clone(), config.clone()).await.1,
+            "eth_config_head_timestamp_unavailable",
         );
-        assert!(result["next"].is_null());
-        assert!(result["last"].is_null());
-
         let (_, invalid) = call(
             router,
             json!({
@@ -3379,6 +3531,38 @@ mod tests {
         )
         .await;
         assert_eq!(invalid.expect("body")["error"]["code"], INVALID_PARAMS);
+
+        // Pectra's first block by number, with no known timestamp.
+        let (router, _cursor_directory) = router_with_cursor_only(22_431_084).await;
+        assert_unavailable(
+            call(router, config.clone()).await.1,
+            "eth_config_head_timestamp_unavailable",
+        );
+
+        // One second before Dencun no fork is scheduled.
+        let (router, store, _directory) = test_router_and_store().await;
+        let mut early = fixture_frame(19_426_588, BlockHash::ZERO);
+        early.block.timestamp = 1_710_338_134;
+        store
+            .store_recent_frame(&early)
+            .await
+            .expect("recent frame");
+        assert_unavailable(
+            call(router.clone(), config.clone()).await.1,
+            "eth_config_head_predates_schedule",
+        );
+        // A head at Prague's activation time is Prague, whatever its number.
+        let mut prague = fixture_frame(19_426_589, early.block.hash);
+        prague.block.timestamp = 1_746_612_311;
+        store
+            .store_recent_frame(&prague)
+            .await
+            .expect("recent frame");
+        let (_, body) = call(router, config).await;
+        assert_eq!(
+            body.expect("body")["result"]["current"]["forkId"],
+            "0xc376cf8b"
+        );
     }
 
     #[tokio::test]
@@ -3391,6 +3575,9 @@ mod tests {
         ))
         .await
         .expect("store");
+        let mut head = fixture_frame(19_426_589, BlockHash::ZERO);
+        head.block.timestamp = 1_710_338_135;
+        store.store_recent_frame(&head).await.expect("head frame");
         let progress: Arc<dyn Processor> = Arc::new(BlockLocalCounter::default());
         let (committed_events, _) = broadcast::channel(8);
         let router = http_router_with_progress(
@@ -4508,5 +4695,554 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::OK);
+    }
+
+    /// A JSON-RPC 2.0 call of `method` with `params` and ID 1.
+    fn rpc_call(method: &str, params: Value) -> Value {
+        let mut call = json!({"jsonrpc": "2.0", "id": 1, "method": method});
+        call["params"] = params;
+        call
+    }
+
+    /// Assert a `-32004` error with `reason`.
+    fn assert_unavailable(body: Option<Value>, reason: &str) {
+        let body = body.expect("body");
+        assert_eq!(body["error"]["code"], DATA_UNAVAILABLE, "{body}");
+        assert_eq!(body["error"]["data"]["reason"], reason, "{body}");
+    }
+
+    #[tokio::test]
+    async fn null_ids_are_answered_and_other_id_types_are_refused() {
+        // Audit JSON-RPC-1 and 2: `"id": null` was taken for a notification
+        // and got no response, while object, array, and boolean IDs were
+        // echoed. An ID must be a string, a number, or null.
+        let (state, _store, _directory) = test_state_and_store().await;
+        let router = configured_router(state.clone(), false, |_| {});
+        let chain_id = |id: Value| json!({"jsonrpc": "2.0", "id": id, "method": "eth_chainId"});
+        let answered = json!({"jsonrpc": "2.0", "id": null, "result": "0x1"});
+        let (status, body) = call(router.clone(), chain_id(Value::Null)).await;
+        assert_eq!((status, body), (StatusCode::OK, Some(answered.clone())));
+        for id in [json!({"id": 1}), json!([1]), json!(true), json!(false)] {
+            let (_, body) = call(router.clone(), chain_id(id.clone())).await;
+            let body = body.expect("an invalid ID is answered");
+            assert!(body["id"].is_null(), "{id}: {body}");
+            assert_eq!(body["error"]["code"], INVALID_REQUEST, "{id}: {body}");
+        }
+        // The same in a batch, where a notification still gets no response.
+        let (_, body) = call(
+            router,
+            json!([
+                chain_id(Value::Null),
+                {"jsonrpc": "2.0", "method": "eth_chainId"},
+                chain_id(json!(true)),
+                chain_id(json!("text"))
+            ]),
+        )
+        .await;
+        let body = body.expect("body");
+        let responses = body.as_array().expect("batch");
+        assert_eq!(responses.len(), 3, "{body}");
+        assert_eq!(responses[0], answered);
+        assert_eq!(responses[1]["error"]["code"], INVALID_REQUEST, "{body}");
+        assert_eq!(responses[2]["id"], "text", "{body}");
+        // A call left unrun past the response limit is answered too.
+        let full = configured_router(state.clone(), false, |config| {
+            config.max_response_bytes = 1;
+        });
+        let (_, body) = call(full, json!([chain_id(json!(1)), chain_id(Value::Null)])).await;
+        let body = body.expect("body");
+        let responses = body.as_array().expect("batch");
+        assert_eq!(responses.len(), 2, "{body}");
+        assert!(responses[1]["id"].is_null(), "{body}");
+        assert_eq!(responses[1]["error"]["code"], LIMIT_EXCEEDED, "{body}");
+        // WebSocket calls follow the same rules.
+        let mut subscriptions = BTreeMap::new();
+        let mut next = 1;
+        let response = websocket_dispatch_text(
+            &state,
+            &mut subscriptions,
+            &mut next,
+            &chain_id(Value::Null).to_string(),
+        )
+        .await
+        .map(|response| serde_json::from_str::<Value>(&response).expect("JSON"));
+        assert_eq!(response, Some(answered));
+        let refused = websocket_call(
+            &state,
+            &mut subscriptions,
+            &mut next,
+            &chain_id(json!([1])).to_string(),
+        )
+        .await;
+        assert_eq!(refused["error"]["code"], INVALID_REQUEST, "{refused}");
+    }
+
+    #[tokio::test]
+    async fn quantities_are_canonical_hexadecimal_digits() {
+        // Audit JSON-RPC-3: `u64::from_str_radix` accepts a leading `+`.
+        for (quantity, value) in [
+            ("0x0", 0),
+            ("0x7", 7),
+            ("0xa", 10),
+            ("0xA", 10),
+            ("0xffffffffffffffff", u64::MAX),
+        ] {
+            assert_eq!(parse_hex_quantity(quantity).expect(quantity), value);
+        }
+        for quantity in [
+            "0x+1",
+            "0x+0",
+            "0x-1",
+            "0x",
+            "0x 1",
+            "0x1 ",
+            "0x1_0",
+            "0xg",
+            "0X1",
+            "+0x1",
+            "0x01",
+            "0x10000000000000000",
+        ] {
+            assert!(parse_hex_quantity(quantity).is_err(), "{quantity}");
+        }
+        let (router, store, _directory) = test_router_and_store().await;
+        store
+            .store_recent_frame(&fixture_frame(7, BlockHash::ZERO))
+            .await
+            .expect("recent frame");
+        let (_, body) = call(
+            router,
+            rpc_call(
+                "eth_getLogs",
+                json!([{"fromBlock": "0x+7", "toBlock": "0x7"}]),
+            ),
+        )
+        .await;
+        let body = body.expect("body");
+        assert_eq!(body["error"]["code"], INVALID_PARAMS, "{body}");
+    }
+
+    #[tokio::test]
+    async fn finalized_and_safe_name_the_finalized_head() {
+        // Audit JSON-RPC-4: every block tag but `latest` got -32602.
+        let (router, store, _directory) = test_router_and_store().await;
+        let mut head = with_log(rpc_frame(9), 9);
+        head.finality = Finality::Included;
+        store.store_recent_frame(&head).await.expect("head frame");
+        assert_unavailable(
+            call(
+                router.clone(),
+                rpc_call("eth_getBlockByNumber", json!(["finalized", false])),
+            )
+            .await
+            .1,
+            "finalized_block_unavailable",
+        );
+        let finalized = with_log(rpc_frame(8), 8);
+        for frame in [with_log(rpc_frame(7), 7), finalized.clone()] {
+            store
+                .store_recent_frame(&frame)
+                .await
+                .expect("recent frame");
+        }
+        for tag in ["finalized", "safe"] {
+            let (_, body) = call(
+                router.clone(),
+                rpc_call("eth_getBlockByNumber", json!([tag, false])),
+            )
+            .await;
+            let body = body.expect("body");
+            assert_eq!(
+                body["result"]["hash"],
+                hex_bytes(finalized.block.hash.as_array()),
+                "{tag}: {body}"
+            );
+            for method in [
+                "eth_getBlockReceipts",
+                "eth_getBlockTransactionCountByNumber",
+            ] {
+                let (_, body) = call(router.clone(), rpc_call(method, json!([tag]))).await;
+                let body = body.expect("body");
+                assert!(body.get("error").is_none(), "{method}({tag}): {body}");
+            }
+        }
+        let (_, body) = call(
+            router.clone(),
+            rpc_call("eth_getBlockByNumber", json!(["latest", false])),
+        )
+        .await;
+        assert_eq!(body.expect("body")["result"]["number"], "0x9");
+        let log_blocks = |body: Option<Value>| {
+            let body = body.expect("body");
+            body["result"]
+                .as_array()
+                .unwrap_or_else(|| panic!("logs: {body}"))
+                .iter()
+                .map(|log| log["blockNumber"].clone())
+                .collect::<Vec<_>>()
+        };
+        let (_, body) = call(
+            router.clone(),
+            rpc_call(
+                "eth_getLogs",
+                json!([{"fromBlock": "0x7", "toBlock": "safe"}]),
+            ),
+        )
+        .await;
+        assert_eq!(log_blocks(body), [json!("0x7"), json!("0x8")]);
+        let (_, body) = call(
+            router.clone(),
+            rpc_call("eth_getLogs", json!([{"fromBlock": "finalized"}])),
+        )
+        .await;
+        assert_eq!(log_blocks(body), [json!("0x8"), json!("0x9")]);
+        // `earliest` is block 0, which is not retained, and no pending block
+        // exists.
+        for (tag, reason) in [
+            ("earliest", "block_not_retained"),
+            ("pending", "pending_block_unavailable"),
+        ] {
+            assert_unavailable(
+                call(
+                    router.clone(),
+                    rpc_call("eth_getBlockByNumber", json!([tag, false])),
+                )
+                .await
+                .1,
+                reason,
+            );
+        }
+        assert_unavailable(
+            call(
+                router,
+                rpc_call(
+                    "eth_getLogs",
+                    json!([{"fromBlock": "0x7", "toBlock": "pending"}]),
+                ),
+            )
+            .await
+            .1,
+            "pending_block_unavailable",
+        );
+    }
+
+    #[tokio::test]
+    async fn unreadable_bodies_are_answered_with_json_rpc_errors() {
+        // Audit JSON-RPC-5: invalid UTF-8 got HTTP 400 and an oversized body
+        // HTTP 413, each with a plain-text body.
+        let (state, _store, _directory) = test_state_and_store().await;
+        let limit = 256;
+        let router = configured_router(state, false, |config| {
+            config.max_request_bytes = limit;
+        });
+        let post = |body: Vec<u8>| {
+            let router = router.clone();
+            async move {
+                let response = router
+                    .oneshot(
+                        Request::post("/")
+                            .header(header::CONTENT_TYPE, "application/json")
+                            .body(Body::from(body))
+                            .expect("request"),
+                    )
+                    .await
+                    .expect("response");
+                let status = response.status();
+                let content_type = response.headers().get(header::CONTENT_TYPE).cloned();
+                let bytes = to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .expect("body");
+                (
+                    status,
+                    content_type,
+                    serde_json::from_slice::<Value>(&bytes).ok(),
+                )
+            }
+        };
+        let mut invalid = br#"{"jsonrpc":"2.0","id":1,"method":"eth_chainId","params":[""#.to_vec();
+        invalid.extend_from_slice(b"\xff\"]}");
+        let (status, _, body) = post(invalid).await;
+        assert_eq!(status, StatusCode::OK);
+        let body = body.expect("a JSON-RPC error body");
+        assert!(body["id"].is_null(), "{body}");
+        assert_eq!(body["error"]["code"], PARSE_ERROR, "{body}");
+
+        let request = json!({"jsonrpc": "2.0", "id": 1, "method": "eth_chainId"}).to_string();
+        let padded = |length: usize| format!("{request:<length$}").into_bytes();
+        let (status, _, body) = post(padded(limit)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body.expect("body")["result"], "0x1");
+        let (status, content_type, body) = post(padded(limit + 1)).await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(
+            content_type.as_ref().and_then(|value| value.to_str().ok()),
+            Some("application/json")
+        );
+        assert_eq!(
+            body,
+            Some(json!({
+                "jsonrpc": "2.0",
+                "id": null,
+                "error": {
+                    "code": LIMIT_EXCEEDED,
+                    "message": "Limit exceeded",
+                    "data": {"reason": "request_size_limit_exceeded", "limit": limit}
+                }
+            }))
+        );
+    }
+
+    #[tokio::test]
+    async fn block_hash_logs_come_from_the_requested_block() {
+        // Audit JSON-RPC-6: `blockHash` was resolved to a number and the logs
+        // were read by number, so a reorg in between, or history holding
+        // another block at that height, answered with another block's logs.
+        let (mut state, store, _directory) = test_state_and_store().await;
+        let retained = with_log(fixture_frame(7, BlockHash::ZERO), 7);
+        store
+            .store_recent_frame(&retained)
+            .await
+            .expect("recent frame");
+        // Block 5 is canonical by its seeded hash; history serves another
+        // block 5.
+        let seeded = leani_primitives::BlockRef {
+            number: BlockNumber(5),
+            hash: BlockHash::new([0xab; 32]),
+            parent_hash: BlockHash::ZERO,
+            timestamp: 1_700_000_005,
+        };
+        store
+            .store_canonical_anchor(ChainId(1), seeded, Finality::Finalized)
+            .await
+            .expect("canonical anchor");
+        state.config.history = Some(test_history(vec![history_source(
+            "historical-logs",
+            BlockRange::single(BlockNumber(5)),
+            CapabilitySet::of(Capability::Logs),
+            0,
+            vec![with_log(fixture_frame(5, BlockHash::ZERO), 5)],
+        )]));
+        let router = configured_router(state, false, |_| {});
+        let logs = |hash: BlockHash| {
+            rpc_call(
+                "eth_getLogs",
+                json!([{"blockHash": hex_bytes(hash.as_array())}]),
+            )
+        };
+        let (_, body) = call(router.clone(), logs(retained.block.hash)).await;
+        let body = body.expect("body");
+        assert_eq!(
+            body["result"][0]["blockHash"],
+            hex_bytes(retained.block.hash.as_array()),
+            "{body}"
+        );
+        assert_unavailable(
+            call(router, logs(seeded.hash)).await.1,
+            "block_hash_not_retained",
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn only_blocks_above_the_head_read_as_null() {
+        // Audit M-A6: a block the node could not serve read as `null`, which
+        // clients take for "no such block": a reorg checker concluded that a
+        // block below the retained window had been reorged out.
+        let unknown_hash = hex_bytes(&[0xee; 32]);
+        let null = json!({"jsonrpc": "2.0", "id": 1, "result": null});
+        let (state, store, _directory) = test_state_and_store().await;
+        let router = configured_router(state.clone(), false, |_| {});
+        // With nothing retained, not even `latest` reads as null.
+        assert_unavailable(
+            call(
+                router.clone(),
+                rpc_call("eth_getBlockByNumber", json!(["latest", false])),
+            )
+            .await
+            .1,
+            "block_not_retained",
+        );
+        for number in [8, 9] {
+            store
+                .store_recent_frame(&rpc_frame(number))
+                .await
+                .expect("recent frame");
+        }
+        for (method, params) in [
+            ("eth_getBlockByNumber", json!(["0x3", false])),
+            ("eth_getBlockByHash", json!([unknown_hash, false])),
+            ("eth_getBlockReceipts", json!(["0x3"])),
+            ("eth_getBlockReceipts", json!([unknown_hash])),
+            ("eth_getBlockTransactionCountByNumber", json!(["0x3"])),
+            ("eth_getBlockTransactionCountByHash", json!([unknown_hash])),
+            (
+                "eth_getTransactionByBlockNumberAndIndex",
+                json!(["0x3", "0x0"]),
+            ),
+            (
+                "eth_getTransactionByBlockHashAndIndex",
+                json!([unknown_hash, "0x0"]),
+            ),
+        ] {
+            assert_unavailable(
+                call(router.clone(), rpc_call(method, params)).await.1,
+                "block_not_retained",
+            );
+        }
+        for (method, params) in [
+            ("eth_getBlockByNumber", json!(["0xa", false])),
+            ("eth_getBlockReceipts", json!(["0xa"])),
+            ("eth_getBlockTransactionCountByNumber", json!(["0xa"])),
+            (
+                "eth_getTransactionByBlockNumberAndIndex",
+                json!(["0xa", "0x0"]),
+            ),
+        ] {
+            let (_, body) = call(router.clone(), rpc_call(method, params)).await;
+            assert_eq!(body, Some(null.clone()), "{method}");
+        }
+
+        // History without a hash lookup cannot resolve a hash either. A
+        // number history cannot serve reads as null only above the head.
+        let mut with_history = state;
+        with_history.config.history = Some(test_history(vec![history_source(
+            "numbered-history",
+            BlockRange::single(BlockNumber(1)),
+            rpc_block_capabilities(),
+            0,
+            Vec::new(),
+        )]));
+        let router = configured_router(with_history, false, |_| {});
+        assert_unavailable(
+            call(
+                router.clone(),
+                rpc_call("eth_getBlockByHash", json!([unknown_hash, false])),
+            )
+            .await
+            .1,
+            "block_not_retained",
+        );
+        let (_, body) = call(
+            router.clone(),
+            rpc_call("eth_getBlockByNumber", json!(["0xa", false])),
+        )
+        .await;
+        assert_eq!(body, Some(null.clone()));
+        assert_unavailable(
+            call(
+                router,
+                rpc_call("eth_getBlockByNumber", json!(["0x3", false])),
+            )
+            .await
+            .1,
+            "no_viable_historical_source",
+        );
+
+        // A block the progress processor committed exists, although no
+        // frame is retained.
+        let (router, _cursor_directory) = router_with_cursor_only(20).await;
+        assert_unavailable(
+            call(
+                router.clone(),
+                rpc_call("eth_getBlockByNumber", json!([hex_quantity(20), false])),
+            )
+            .await
+            .1,
+            "block_not_retained",
+        );
+        let (_, body) = call(
+            router,
+            rpc_call("eth_getBlockByNumber", json!([hex_quantity(21), false])),
+        )
+        .await;
+        assert_eq!(body, Some(null));
+    }
+
+    #[tokio::test]
+    async fn empty_topic_alternatives_match_any_topic() {
+        // Audit M-A7: `[]` at a topic position matched nothing; geth and reth
+        // read it as a wildcard, like `null`.
+        let (router, store, _directory) = test_router_and_store().await;
+        store
+            .store_recent_frame(&frame_with_logs(7, BlockHash::ZERO, 2, 1))
+            .await
+            .expect("recent frame");
+        for topics in [
+            json!([[]]),
+            json!([null]),
+            json!([[hex_bytes(&[0x22; 32])]]),
+        ] {
+            let (_, body) = call(
+                router.clone(),
+                rpc_call(
+                    "eth_getLogs",
+                    json!([{"fromBlock": "0x7", "toBlock": "0x7", "topics": topics}]),
+                ),
+            )
+            .await;
+            let body = body.expect("body");
+            assert_eq!(
+                body["result"].as_array().map(Vec::len),
+                Some(2),
+                "{topics}: {body}"
+            );
+        }
+        let Subscription::Logs(filter) = parse_subscription(
+            Some(&json!(["logs", {"topics": [[]]}])),
+            &RpcConfig::default(),
+        )
+        .expect("log subscription") else {
+            panic!("a log subscription");
+        };
+        let frame = frame_with_logs(7, BlockHash::ZERO, 1, 1);
+        let logs = complete(&frame.logs, "logs").expect("logs");
+        assert!(filter.matches(&logs[0]));
+    }
+
+    #[tokio::test]
+    async fn a_log_query_past_the_response_budget_ends_the_batch() {
+        // Task 13 review minor: `eth_getLogs` refused for the remaining
+        // response budget answered -32005, but the calls after it still ran.
+        let (state, store, _directory) = test_state_and_store().await;
+        store
+            .store_recent_frame(&frame_with_logs(7, BlockHash::ZERO, 3, 1_000))
+            .await
+            .expect("recent frame");
+        let router = configured_router(state, false, |config| {
+            config.max_response_bytes = 1_000;
+        });
+        let (_, body) = call(
+            router,
+            json!([
+                rpc_call("eth_getLogs", json!([{"fromBlock": "0x7", "toBlock": "0x7"}])),
+                {"jsonrpc": "2.0", "id": 2, "method": "eth_chainId"}
+            ]),
+        )
+        .await;
+        let body = body.expect("body");
+        let responses = body.as_array().expect("batch");
+        assert_eq!(
+            responses[0]["error"]["data"]["reason"], "response_size_limit_exceeded",
+            "{body}"
+        );
+        assert_eq!(responses[1]["id"], 2, "{body}");
+        assert_eq!(responses[1]["error"]["code"], LIMIT_EXCEEDED, "{body}");
+    }
+
+    #[tokio::test]
+    async fn blob_gas_priced_past_u128_fails_the_block_receipts() {
+        // Task 9 review minor: a hostile header's excess blob gas prices blob
+        // gas past `u128`; the block's receipts fail closed rather than carry
+        // a clipped price.
+        let (router, store, _directory) = test_router_and_store().await;
+        let frame = blob_receipt_frame(1_710_338_135, 400_000_000);
+        store
+            .store_recent_frame(&frame)
+            .await
+            .expect("recent frame");
+        assert_unavailable(
+            Some(block_receipts(router, &frame).await),
+            "quantity_exceeds_u128",
+        );
     }
 }
