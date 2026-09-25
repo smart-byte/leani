@@ -179,8 +179,12 @@ networking, and unrelated processors remain available.
 
 `[[sources.history]]` requires `id`, `kind`, `priority`, and `trust`.
 Supported kinds are `xatu`, `era_e`, `parquet`, and `archive`. `archive`
-requires `manifest`; `era_e` alone accepts an `http`, `https`, or `file`
-`endpoint` ending in `/`.
+requires `manifest`; `era_e` alone accepts an `https` or `file` `endpoint`
+ending in `/`. A plain `http` endpoint is accepted on loopback, or elsewhere
+only with `allow_insecure_http = true` on that source, which accepts a mirror
+whose catalog and archive bytes anyone on the path can replace. `xatu`
+sources are Ethereum mainnet only: another `chain.chain_id` fails
+validation.
 
 Xatu additionally accepts three acquisition-tuning controls. `chunk_blocks`
 sets the generic header, transaction, and log span, while

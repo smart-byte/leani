@@ -644,6 +644,7 @@ impl HistoryStore {
     }
 
     /// Mark queued or resumable work running and increment its attempt count.
+    /// Its last error stays visible until the run commits a segment.
     ///
     /// # Errors
     ///
@@ -673,6 +674,21 @@ impl HistoryStore {
             Some(error),
         )
         .await?;
+        required_job(self, id).await
+    }
+
+    /// Record why a job is waiting for its sources while it stays running and
+    /// resumable.
+    ///
+    /// # Errors
+    ///
+    /// Terminal and unknown jobs cannot wait.
+    pub async fn wait_raw_history_job(
+        &self,
+        id: &RawHistoryJobId,
+        error: &str,
+    ) -> Result<RawHistoryJob, HistoryStoreError> {
+        transition_nonterminal(self, id, RawHistoryJobState::Running, Some(error)).await?;
         required_job(self, id).await
     }
 
@@ -971,8 +987,7 @@ async fn transition_running(
     let now = unix_ms()?;
     let result = sqlx::query(
         "UPDATE raw_history_jobs
-         SET state = 'running', attempts = attempts + 1, last_error = NULL,
-             updated_at_unix_ms = ?
+         SET state = 'running', attempts = attempts + 1, updated_at_unix_ms = ?
          WHERE job_id = ? AND state IN ('queued', 'running', 'storage_backpressured')",
     )
     .bind(u64_i64(now, "job update time")?)

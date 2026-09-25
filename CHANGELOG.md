@@ -179,6 +179,37 @@ record, and documented RPC contracts.
   token and the consumer's credential guard: browsers send it only to HTTPS,
   loopback, and `localhost` URLs, so a node served over plain HTTP by
   another name or address gets none.
+- EraE history no longer trusts more of its mirror than it must. A plain
+  `http` mirror is accepted only on loopback, or with the new
+  `sources.history[].allow_insecure_http = true`; redirects are not followed.
+  The checksum catalog is read with a 16 MiB cap as it streams in, and a
+  range response with a cap at the requested length. Each batch's byte
+  ranges are checked against the remaining input budget before they are
+  requested, an e2store record may not declare more bytes than its indexed
+  extent holds, and a block's compressed header, body, and receipts are
+  decompressed through one shared cap, the frame budget, at most 32 MiB. Each
+  normalized frame is checked against the frame budget before it is queued,
+  as the other sources check theirs; EraE never checked it. Errors, logs, and
+  frame provenance show the mirror as `scheme://host[:port]/…/<file>`, so
+  credentials in the mirror URL's userinfo, query, or path are not printed.
+- Xatu history reads are pinned to the object version seen at HEAD: every
+  range request carries `If-Match` with the object's ETag, so an object
+  rewritten mid-read fails the chunk, which is retried, instead of decoding
+  one version's pages with another's footer. `If-Match` never matches a weak
+  ETag, so an object without a strong ETag is refused as a schema drift, on
+  which a backfill tries its next configured source, and `leani source probe
+  xatu` flags it. A range response of another length is refused too, and a
+  Parquet footer whose metadata range exceeds 64 MiB is refused before it is
+  requested.
+- Every byte a Xatu read requests, its Parquet footers and the gaps merged
+  between column chunks included, counts against the source budget's
+  `max_input_bytes` for the chunk, and is charged before it is requested;
+  ranges are merged across a gap only while the budget covers it. Only the
+  selected column chunks counted, after the footer was read, so a 1 KiB
+  budget let one merged request download 128 KiB. A chunk's `fetched_bytes`
+  reports the requested bytes; it reported the selected ones.
+- A local archive refuses an object path that crosses a symbolic link below
+  the manifest's directory, and checks an object's size before reading it.
 
 ### Changed
 
@@ -553,6 +584,41 @@ record, and documented RPC contracts.
 - The OpenAPI document gives `202` as the success status of
   `createBackfillSubscription`, `createMaterializationJob`, and
   `createRawHistoryJob`, as the node answers; it said `201`.
+- Breaking (configuration): a plain `http` eraE `endpoint` off loopback
+  needs `allow_insecure_http = true` on its history source, which is only
+  valid for `era_e` sources. `leani source probe erae --endpoint` accepts
+  `https`, `file`, and loopback `http` mirrors. A `xatu` history source on a
+  chain other than Ethereum mainnet fails validation, and
+  `XatuHistoryConfig::public`, `XatuCatalogConfig::public`, and
+  `XatuCatalog::new` refuse any network but `mainnet`: Xatu projections stamp
+  every frame as chain 1.
+- EraE plans that need receipts or logs before Byzantium (block 4,370,000)
+  fail with an error that says so. Earlier receipts carry an intermediate
+  state root instead of a status, which frames cannot represent, so these
+  plans used to succeed and then fail every chunk. Header and body requests
+  from genesis still plan.
+- EraE frames label their checks honestly: `header_hash` is not checked (the
+  hash is computed from the archived header, and nothing anchors it to
+  consensus), `withdrawals_root` is unavailable before Shanghai, and the
+  object identity no longer records the catalog's SHA-256 as a checksum,
+  since sparse reads never recompute it. The catalog digest stays the
+  object's version.
+- Local archive frames must carry the manifest's chain and finality, and
+  report only the checks the archive made: the object's BLAKE3 digest, and
+  the parent link to the previous frame of the same object. A frame's own
+  verification claims and consensus anchor are dropped, and the trust of its
+  earlier provenance is capped at the archive's `trusted_dataset`.
+- Xatu blob frames declare their logs a partial projection. Their receipts
+  carry no logs, so a log requirement can no longer be met through those
+  receipts.
+- Xatu decodes each projected column by a declared encoding that fixes the
+  Arrow types it may arrive as. Hashes, addresses, and byte strings are
+  `0x`-prefixed hexadecimal text, or raw bytes in a fixed-width binary column
+  of exactly their size; text is no longer taken for raw bytes because of its
+  length or its lack of a `0x` prefix. A column of another type fails the
+  object before any row is decoded, as a schema drift; it failed as a
+  corrupt frame at the first value decoded. A table missing a projected
+  column still fails as a corrupt frame.
 
 ### Fixed
 
@@ -1112,6 +1178,51 @@ record, and documented RPC contracts.
   answered 500 and left the stream behind. Creating a durable consumer
   applies the same TTL bound; a TTL too large for the store answered 500
   there too.
+- A long-running EraE source sees eras its mirror publishes after it
+  started: the checksum catalog is fetched again after 10 minutes, and a plan
+  that asks past the cached catalog refetches it once the catalog is 30
+  seconds old. Each refetch that still lacks the range doubles that interval,
+  up to 10 minutes, and a refetch that brings new eras starts it over; a
+  mirror that has not published the range is no longer polled every 30
+  seconds. Refetches send the catalog's `ETag` and `Last-Modified`, so an
+  unchanged catalog costs a 304. A chunk already planned opens from the
+  cached catalog whatever its age, so a failed refresh no longer fails it.
+- A raw-history job waits for a range that only lagging sources lack, those
+  with a non-zero expected lag such as an EraE catalog that has not caught
+  up, instead of failing: it stays running, with the reasons in
+  `last_error`, which a new run keeps until it commits a segment. It fails
+  once the range has been missing for four times the longest expected lag,
+  and at least 24 hours, since the node first saw it missing; a new job
+  under the same ID starts that clock again. A source whose advertised range
+  does not cover the range, such as a local archive of older blocks, is
+  passed over. A range missing inside the advertised range of a source
+  without expected lag, such as a gap in a local archive, still fails the
+  job at once, and another source's lag no longer hides a terminal error.
+- A backfill whose source fails with a schema drift, such as a Xatu column of
+  another type or an object without a strong ETag, tries its next configured
+  source, and fails only when none can serve the range. The drift failed the
+  backfill.
+- Xatu history reads keep to the source budget's `max_in_flight_requests`
+  (`budgets.source_concurrency` in the node). They used `object_store`'s
+  default of up to 10 range requests at once.
+- A Xatu transaction projection that no filter narrows must hold every
+  transaction the beacon payload counts, with indices `0..count`; a filtered
+  one may be shorter, but never longer or outside the payload. A block whose
+  rows were only partly exported was accepted with transactions missing.
+- The Xatu blobs projection proves each block's withdrawals from the global
+  withdrawal index before it derives the block's execution size: between two
+  slots with rows the indices must continue exactly, so a slot between them
+  without rows had none. The nearest slots with rows before and after the
+  chunk prove its edges the same way, and a slot with 16 rows, the most a
+  payload holds, lacks none. An edge they do not prove, a jump in the
+  indices, such as a partly exported slot, or more than 16 rows in one
+  payload leaves the chunk incomplete. A slot without rows was taken as a
+  block without withdrawals, and a partly exported slot passed, both
+  understating the size.
+- Xatu log projections accept logs without topics (`LOG0`), whether the
+  export leaves `topic0` null, empty, or NUL-padded; one such log aborted the
+  whole chunk. A topic after an absent one is refused as corrupt instead of
+  being dropped.
 
 ## [0.1.0-rc.1] - 2026-09-20
 

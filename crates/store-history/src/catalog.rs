@@ -1168,6 +1168,14 @@ impl PendingSegment {
             .execute(&mut *transaction)
             .await?;
             if owner.kind == SegmentOwnerKind::RawHistoryJob {
+                // The job progressed, so whatever held it up has cleared.
+                sqlx::query(
+                    "UPDATE raw_history_jobs SET last_error = NULL
+                     WHERE job_id = ? AND state IN ('queued', 'running', 'storage_backpressured')",
+                )
+                .bind(&owner.owner_id)
+                .execute(&mut *transaction)
+                .await?;
                 crate::job::refresh_job_progress_tx(
                     &mut transaction,
                     &crate::RawHistoryJobId::new(owner.owner_id.clone())?,

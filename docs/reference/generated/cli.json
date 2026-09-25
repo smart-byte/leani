@@ -1122,7 +1122,7 @@
                     "id": "network",
                     "long": "network",
                     "short": null,
-                    "help": "Xatu network catalog",
+                    "help": "Xatu network catalog; only mainnet is supported",
                     "required": false,
                     "action": "Set",
                     "defaultValues": [
@@ -1520,7 +1520,7 @@
                     "id": "endpoint",
                     "long": "endpoint",
                     "short": null,
-                    "help": "Override the public mainnet archive base URL",
+                    "help": "Override the public mainnet archive base URL with an https, file, or loopback http URL",
                     "required": false,
                     "action": "Set",
                     "defaultValues": [],

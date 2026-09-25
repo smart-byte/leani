@@ -6,6 +6,7 @@
 
 use std::{
     fs,
+    io::Read,
     path::{Component, Path, PathBuf},
     sync::Arc,
     time::Duration,
@@ -14,8 +15,9 @@ use std::{
 use async_trait::async_trait;
 use futures::stream;
 use leani_primitives::{
-    BlockFrame, BlockNumber, BlockRange, Capability, CapabilitySet, ChainId, ObjectIdentity,
-    Provenance, SourceId, SourceKind, TrustModel,
+    BlockFrame, BlockNumber, BlockRange, Capability, CapabilitySet, ChainId, CheckStatus, Finality,
+    ObjectIdentity, Provenance, SourceId, SourceKind, TrustModel, VerificationCheck,
+    VerificationReport,
 };
 use leani_source_api::{
     BlockFrameStream, DataRequest, FinalityModel, HistorySource, Partitioning, SourceBudget,
@@ -293,21 +295,11 @@ impl HistorySource for LocalArchiveSource {
         if cancellation.is_cancelled() {
             return Err(SourceError::Cancelled);
         }
-        let path = self.root.join(&object.path);
-        let source_id = self.descriptor.id.clone();
-        let source_schema = self.descriptor.schema_version.clone();
-        let source_trust = self.descriptor.trust;
+        let root = self.root.clone();
+        let descriptor = self.descriptor.clone();
         let chunk_range = chunk.range;
         let frames = tokio::task::spawn_blocking(move || {
-            read_object(
-                &path,
-                &object,
-                chunk_range,
-                budget,
-                &source_id,
-                &source_schema,
-                source_trust,
-            )
+            read_object(&root, &object, chunk_range, budget, &descriptor)
         })
         .await
         .map_err(|error| {
@@ -320,24 +312,67 @@ impl HistorySource for LocalArchiveSource {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+/// Open an object below `root`, refusing a path that crosses a symbolic
+/// link below it, so a manifest cannot reach files outside the archive.
+fn open_object(root: &Path, relative: &Path) -> Result<(PathBuf, fs::File), SourceError> {
+    let mut path = root.to_path_buf();
+    for component in relative.components() {
+        path.push(component);
+        let metadata = fs::symlink_metadata(&path).map_err(|error| {
+            SourceError::Unavailable(format!("read {}: {error}", path.display()))
+        })?;
+        if metadata.file_type().is_symlink() {
+            return Err(SourceError::InvalidPlan(format!(
+                "archive object path {} crosses a symbolic link",
+                relative.display()
+            )));
+        }
+    }
+    let file = fs::File::open(&path)
+        .map_err(|error| SourceError::Unavailable(format!("read {}: {error}", path.display())))?;
+    Ok((path, file))
+}
+
+#[allow(clippy::too_many_lines)]
 fn read_object(
-    path: &Path,
+    root: &Path,
     object: &ValidatedObject,
     range: BlockRange,
     budget: SourceBudget,
-    source_id: &SourceId,
-    schema: &str,
-    trust: TrustModel,
+    descriptor: &SourceDescriptor,
 ) -> Result<Vec<BlockFrame>, SourceError> {
-    let bytes = fs::read(path)
-        .map_err(|error| SourceError::Unavailable(format!("read {}: {error}", path.display())))?;
+    // The manifest declares the chain and finality of everything in the
+    // archive; a frame that claims otherwise is corrupt.
+    let finality = match descriptor.finality {
+        FinalityModel::Finalized => Finality::Finalized,
+        FinalityModel::Included => Finality::Included,
+        FinalityModel::None => {
+            return Err(SourceError::InvalidPlan(
+                "the archive manifest declares no finality".to_owned(),
+            ));
+        }
+    };
+    let (path, file) = open_object(root, &object.path)?;
+    let unavailable = |error: std::io::Error| {
+        SourceError::Unavailable(format!("read {}: {error}", path.display()))
+    };
+    let size_mismatch = |observed: u64| {
+        SourceError::CorruptFrame(format!(
+            "archive object size mismatch: expected {}, observed {observed}",
+            object.bytes
+        ))
+    };
+    let size = file.metadata().map_err(unavailable)?.len();
+    if size != object.bytes {
+        return Err(size_mismatch(size));
+    }
+    let mut bytes = Vec::with_capacity(usize::try_from(object.bytes).unwrap_or(0));
+    file.take(object.bytes)
+        .read_to_end(&mut bytes)
+        .map_err(unavailable)?;
     let observed_bytes = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
     if observed_bytes != object.bytes {
-        return Err(SourceError::CorruptFrame(format!(
-            "archive object size mismatch: expected {}, observed {observed_bytes}",
-            object.bytes
-        )));
+        return Err(size_mismatch(observed_bytes));
     }
     if *blake3::hash(&bytes).as_bytes() != object.checksum {
         return Err(SourceError::CorruptFrame(
@@ -360,6 +395,20 @@ fn read_object(
         if !range.contains(frame.block.number) {
             continue;
         }
+        if frame.chain_id != descriptor.chain_id {
+            return Err(SourceError::CorruptFrame(format!(
+                "archive frame {} names chain {}, but the manifest chain is {}",
+                frame.block.number.0, frame.chain_id.0, descriptor.chain_id.0
+            )));
+        }
+        if frame.finality != finality {
+            return Err(SourceError::CorruptFrame(format!(
+                "archive frame {} is {}, but the manifest declares {} blocks",
+                frame.block.number.0,
+                frame.finality.name(),
+                finality.name()
+            )));
+        }
         frame
             .validate_shape()
             .map_err(|error| SourceError::CorruptFrame(error.to_owned()))?;
@@ -372,16 +421,30 @@ fn read_object(
             });
         }
         frame_bytes = frame_bytes.saturating_add(estimated);
+        // The archive checks its object's digest and, below, the parent
+        // links between its frames. A frame's own verification claims and
+        // consensus anchor came from whoever wrote it, and so does the trust
+        // of its earlier provenance.
+        frame.verification = VerificationReport {
+            dataset_checksum: VerificationCheck {
+                status: CheckStatus::Verified,
+                detail: Some("BLAKE3 of the archive object matches its manifest".to_owned()),
+            },
+            ..VerificationReport::default()
+        };
+        for provenance in &mut frame.provenance {
+            provenance.trust = provenance.trust.min(descriptor.trust);
+        }
         frame.provenance.push(Provenance {
-            source_id: source_id.clone(),
+            source_id: descriptor.id.clone(),
             source_kind: SourceKind::HistoryArchive,
-            trust,
+            trust: descriptor.trust,
             range: Some(range),
             object: Some(ObjectIdentity {
                 locator: path.display().to_string(),
                 version: None,
                 checksum: Some(object.checksum),
-                schema: Some(schema.to_owned()),
+                schema: Some(descriptor.schema_version.clone()),
             }),
             observed_at_unix_ms: 0,
             projection: Vec::new(),
@@ -406,14 +469,16 @@ fn read_object(
     if observed_frames != range.len() {
         return Err(SourceError::MissingRange(range));
     }
-    for pair in frames.windows(2) {
-        if pair[1].block.number.0 != pair[0].block.number.0.saturating_add(1)
-            || pair[1].block.parent_hash != pair[0].block.hash
+    for index in 1..frames.len() {
+        let (previous, current) = (&frames[index - 1], &frames[index]);
+        if current.block.number.0 != previous.block.number.0.saturating_add(1)
+            || current.block.parent_hash != previous.block.hash
         {
             return Err(SourceError::CorruptFrame(
                 "archive frames are not a contiguous parent-linked sequence".to_owned(),
             ));
         }
+        frames[index].verification.parent_continuity = VerificationCheck::VERIFIED;
     }
     Ok(frames)
 }
@@ -423,7 +488,7 @@ mod tests {
     use std::io::Write;
 
     use futures::StreamExt;
-    use leani_primitives::{BlockHash, Finality};
+    use leani_primitives::{BlockHash, CheckStatus, Finality, VerificationCheck};
     use leani_source_api::{FieldProjection, FilterSet, VerificationPolicy};
 
     use super::*;
@@ -542,6 +607,266 @@ mod tests {
         assert!(output.into_iter().all(|frame| frame.is_ok()));
     }
 
+    /// Write `frames` as one object and a manifest for it under `directory`,
+    /// with the object at `object_path`.
+    fn write_archive(
+        directory: &Path,
+        object_path: &str,
+        frames: &[BlockFrame],
+        finality: FinalityModel,
+    ) -> PathBuf {
+        let mut object = Vec::new();
+        for frame in frames {
+            object.extend_from_slice(&serde_json::to_vec(frame).expect("JSON"));
+            object.push(b'\n');
+        }
+        let path = directory.join(object_path);
+        fs::create_dir_all(path.parent().expect("object directory")).expect("directory");
+        fs::write(&path, &object).expect("write object");
+        let manifest = ArchiveManifest {
+            format_version: 1,
+            id: "local-fixture".to_owned(),
+            chain_id: 1,
+            schema_version: "normalized-frame-jsonl.v1".to_owned(),
+            capabilities: vec![Capability::Transactions],
+            complete_capabilities: vec![Capability::Transactions],
+            finality,
+            objects: vec![ArchiveObject {
+                from_block: frames[0].block.number.0,
+                to_block: frames[frames.len() - 1].block.number.0,
+                path: object_path.to_owned(),
+                blake3: blake3::hash(&object).to_hex().to_string(),
+                bytes: u64::try_from(object.len()).expect("size"),
+            }],
+        };
+        let manifest_path = directory.join("manifest.json");
+        fs::write(
+            &manifest_path,
+            serde_json::to_vec(&manifest).expect("manifest"),
+        )
+        .expect("write manifest");
+        manifest_path
+    }
+
+    async fn read_archive(
+        manifest: &Path,
+        range: BlockRange,
+        minimum_finality: Finality,
+    ) -> Result<Vec<BlockFrame>, SourceError> {
+        let source = LocalArchiveSource::open_manifest(manifest)?;
+        let plan = source
+            .plan(&DataRequest {
+                chain_id: ChainId(1),
+                range,
+                required: CapabilitySet::of(Capability::Transactions),
+                allow_filtered: false,
+                projection: FieldProjection::default(),
+                log_fields: leani_primitives::LogFieldSet::NONE,
+                filters: FilterSet::default(),
+                minimum_finality,
+                verification_policy: VerificationPolicy::TrustedDataset,
+            })
+            .await?;
+        let mut frames = Vec::new();
+        for chunk in &plan.chunks {
+            let mut stream = source
+                .open(
+                    chunk,
+                    SourceBudget {
+                        max_input_bytes: 1_000_000,
+                        max_frame_bytes: 100_000,
+                        max_frames: 10,
+                        max_buffered_frames: 2,
+                        max_in_flight_requests: 1,
+                        temporary_disk_bytes: 0,
+                    },
+                    CancellationToken::new(),
+                )
+                .await?;
+            while let Some(frame) = stream.next().await {
+                frames.push(frame?);
+            }
+        }
+        Ok(frames)
+    }
+
+    fn blocks_one_and_two() -> (BlockFrame, BlockFrame) {
+        let first = frame(1, BlockHash::ZERO);
+        let second = frame(2, first.block.hash);
+        (first, second)
+    }
+
+    #[tokio::test]
+    async fn frames_must_carry_the_manifest_chain_and_finality() {
+        let range = BlockRange::new(BlockNumber(1), BlockNumber(2)).expect("range");
+        // Audit History-5: each frame's own chain and finality were trusted.
+        let (first, mut foreign) = blocks_one_and_two();
+        foreign.chain_id = ChainId(5);
+        let directory = tempfile::tempdir().expect("tempdir");
+        let manifest = write_archive(
+            directory.path(),
+            "frames.jsonl",
+            &[first, foreign],
+            FinalityModel::Finalized,
+        );
+        assert!(matches!(
+            read_archive(&manifest, range, Finality::Finalized).await,
+            Err(SourceError::CorruptFrame(_))
+        ));
+
+        let (first, mut included) = blocks_one_and_two();
+        included.finality = Finality::Included;
+        let directory = tempfile::tempdir().expect("tempdir");
+        let manifest = write_archive(
+            directory.path(),
+            "frames.jsonl",
+            &[first, included],
+            FinalityModel::Finalized,
+        );
+        assert!(matches!(
+            read_archive(&manifest, range, Finality::Finalized).await,
+            Err(SourceError::CorruptFrame(_))
+        ));
+
+        // An archive of included blocks cannot vouch for finality.
+        let (first, second) = blocks_one_and_two();
+        let directory = tempfile::tempdir().expect("tempdir");
+        let manifest = write_archive(
+            directory.path(),
+            "frames.jsonl",
+            &[first, second],
+            FinalityModel::Included,
+        );
+        assert!(matches!(
+            read_archive(&manifest, range, Finality::Included).await,
+            Err(SourceError::CorruptFrame(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn frames_report_only_the_checks_the_archive_made() {
+        let (first, mut second) = blocks_one_and_two();
+        second.verification = leani_primitives::VerificationReport {
+            header_hash: VerificationCheck::VERIFIED,
+            parent_continuity: VerificationCheck::VERIFIED,
+            transactions_root: VerificationCheck::VERIFIED,
+            receipts_root: VerificationCheck::VERIFIED,
+            withdrawals_root: VerificationCheck::VERIFIED,
+            dataset_checksum: VerificationCheck::NOT_CHECKED,
+            consensus_anchor: Some(leani_primitives::ConsensusAnchor {
+                finality: Finality::Finalized,
+                execution_block_hash: second.block.hash,
+                beacon_slot: 7,
+                beacon_block_root: [7; 32],
+            }),
+        };
+        second.provenance.push(Provenance {
+            source_id: SourceId::new("upstream").expect("source ID"),
+            source_kind: SourceKind::ExecutionP2p,
+            trust: TrustModel::ProtocolVerified,
+            range: None,
+            object: None,
+            observed_at_unix_ms: 0,
+            projection: Vec::new(),
+        });
+        let directory = tempfile::tempdir().expect("tempdir");
+        let manifest = write_archive(
+            directory.path(),
+            "frames.jsonl",
+            &[first, second],
+            FinalityModel::Finalized,
+        );
+        let frames = read_archive(
+            &manifest,
+            BlockRange::new(BlockNumber(1), BlockNumber(2)).expect("range"),
+            Finality::Finalized,
+        )
+        .await
+        .expect("frames");
+        // Audit History-5: the object's own verification claims were
+        // passed through.
+        let checks = &frames[1].verification;
+        for (name, check) in [
+            ("header hash", &checks.header_hash),
+            ("transactions root", &checks.transactions_root),
+            ("receipts root", &checks.receipts_root),
+            ("withdrawals root", &checks.withdrawals_root),
+        ] {
+            assert_eq!(check.status, CheckStatus::NotChecked, "{name}");
+        }
+        assert_eq!(checks.consensus_anchor, None);
+        assert_eq!(checks.dataset_checksum.status, CheckStatus::Verified);
+        assert_eq!(checks.parent_continuity.status, CheckStatus::Verified);
+        assert_eq!(
+            frames[0].verification.parent_continuity.status,
+            CheckStatus::NotChecked,
+            "the first frame's parent is outside the object"
+        );
+        assert!(
+            frames[1]
+                .provenance
+                .iter()
+                .all(|entry| entry.trust <= TrustModel::TrustedDataset),
+            "{:?}",
+            frames[1].provenance
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn objects_behind_symbolic_links_are_refused() {
+        let range = BlockRange::new(BlockNumber(1), BlockNumber(2)).expect("range");
+        let (first, second) = blocks_one_and_two();
+        let outside = tempfile::tempdir().expect("outside");
+        write_archive(
+            outside.path(),
+            "frames.jsonl",
+            &[first, second],
+            FinalityModel::Finalized,
+        );
+        let directory = tempfile::tempdir().expect("tempdir");
+        let (first, second) = blocks_one_and_two();
+        let manifest = write_archive(
+            directory.path(),
+            "frames.jsonl",
+            &[first, second],
+            FinalityModel::Finalized,
+        );
+        read_archive(&manifest, range, Finality::Finalized)
+            .await
+            .expect("a regular object");
+
+        // Audit History-5: the object path followed a symbolic link out of
+        // the archive directory.
+        fs::remove_file(directory.path().join("frames.jsonl")).expect("remove object");
+        std::os::unix::fs::symlink(
+            outside.path().join("frames.jsonl"),
+            directory.path().join("frames.jsonl"),
+        )
+        .expect("symlinked object");
+        assert!(matches!(
+            read_archive(&manifest, range, Finality::Finalized).await,
+            Err(SourceError::InvalidPlan(detail)) if detail.contains("symbolic link")
+        ));
+
+        // A linked directory on the way to the object is refused as well.
+        let directory = tempfile::tempdir().expect("tempdir");
+        let (first, second) = blocks_one_and_two();
+        let manifest = write_archive(
+            directory.path(),
+            "nested/frames.jsonl",
+            &[first, second],
+            FinalityModel::Finalized,
+        );
+        fs::remove_dir_all(directory.path().join("nested")).expect("remove directory");
+        std::os::unix::fs::symlink(outside.path(), directory.path().join("nested"))
+            .expect("symlinked directory");
+        assert!(matches!(
+            read_archive(&manifest, range, Finality::Finalized).await,
+            Err(SourceError::InvalidPlan(detail)) if detail.contains("symbolic link")
+        ));
+    }
+
     #[test]
     fn rejects_parent_traversal_before_reading_objects() {
         let directory = tempfile::tempdir().expect("tempdir");
@@ -564,5 +889,100 @@ mod tests {
         let path = directory.path().join("manifest.json");
         fs::write(&path, serde_json::to_vec(&manifest).expect("JSON")).expect("write");
         assert!(LocalArchiveSource::open_manifest(path).is_err());
+    }
+
+    /// The source budget's counters, each tripped at `open`: bytes acquired
+    /// from the object, bytes of each frame, and frames emitted.
+    #[tokio::test]
+    async fn budget_contract_names_each_exceeded_counter() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let (mut first, second) = blocks_one_and_two();
+        first.withdrawals =
+            leani_primitives::Material::Complete(vec![leani_primitives::Withdrawal {
+                index: 0,
+                validator_index: 1,
+                address: leani_primitives::Address::new([0; 20]),
+                amount_gwei: 1,
+            }]);
+        let manifest = write_archive(
+            directory.path(),
+            "frames.jsonl",
+            &[first.clone(), second],
+            FinalityModel::Finalized,
+        );
+        let source = LocalArchiveSource::open_manifest(&manifest).expect("source");
+        let plan = source
+            .plan(&DataRequest {
+                chain_id: ChainId(1),
+                range: BlockRange::new(BlockNumber(1), BlockNumber(2)).expect("range"),
+                required: CapabilitySet::of(Capability::Transactions),
+                allow_filtered: false,
+                projection: FieldProjection::default(),
+                log_fields: leani_primitives::LogFieldSet::NONE,
+                filters: FilterSet::default(),
+                minimum_finality: Finality::Finalized,
+                verification_policy: VerificationPolicy::TrustedDataset,
+            })
+            .await
+            .expect("plan");
+        let object_bytes = plan.chunks[0].estimated_bytes.expect("object size");
+        let budget = SourceBudget {
+            max_input_bytes: 1_000_000,
+            max_frame_bytes: 100_000,
+            max_frames: 10,
+            max_buffered_frames: 2,
+            max_in_flight_requests: 1,
+            temporary_disk_bytes: 0,
+        };
+        for (counter, budget, expected) in [
+            ("none", budget, None),
+            (
+                "acquired",
+                SourceBudget {
+                    max_input_bytes: object_bytes - 1,
+                    ..budget
+                },
+                Some("input_bytes"),
+            ),
+            (
+                "frame",
+                SourceBudget {
+                    max_frame_bytes: first.estimated_heap_bytes() - 1,
+                    ..budget
+                },
+                Some("frame_bytes"),
+            ),
+            (
+                "emitted",
+                SourceBudget {
+                    max_frames: 1,
+                    ..budget
+                },
+                Some("frames"),
+            ),
+        ] {
+            let outcome: Result<Vec<BlockFrame>, SourceError> = match source
+                .open(&plan.chunks[0], budget, CancellationToken::new())
+                .await
+            {
+                Ok(stream) => stream.collect::<Vec<_>>().await.into_iter().collect(),
+                Err(error) => Err(error),
+            };
+            match (outcome, expected) {
+                (Ok(frames), None) => assert_eq!(frames.len(), 2, "{counter}"),
+                (
+                    Err(SourceError::BudgetExceeded {
+                        resource,
+                        limit,
+                        observed,
+                    }),
+                    Some(expected),
+                ) => {
+                    assert_eq!(resource, expected, "{counter}");
+                    assert!(observed > limit, "{counter}: {observed} <= {limit}");
+                }
+                (outcome, _) => panic!("{counter}: {:?}", outcome.map(|frames| frames.len())),
+            }
+        }
     }
 }

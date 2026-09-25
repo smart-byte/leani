@@ -654,7 +654,7 @@ pub enum SourceCommand {
 pub enum ProbeSource {
     /// Inspect the configured Xatu catalog.
     Xatu {
-        /// Xatu network catalog.
+        /// Xatu network catalog; only mainnet is supported.
         #[arg(long, default_value = "mainnet")]
         network: String,
         /// First execution block in the inclusive probe range.
@@ -735,7 +735,8 @@ pub enum ProbeSource {
         /// Last execution block in the inclusive probe range.
         #[arg(long)]
         to_block: u64,
-        /// Override the public mainnet archive base URL.
+        /// Override the public mainnet archive base URL with an https, file,
+        /// or loopback http URL.
         #[arg(long)]
         endpoint: Option<url::Url>,
         /// Maximum sparse archive and normalized bytes.

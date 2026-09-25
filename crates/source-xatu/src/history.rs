@@ -42,9 +42,13 @@ pub struct XatuHistoryConfig {
 impl XatuHistoryConfig {
     /// Public mainnet defaults with 1,000-block independently retryable chunks.
     ///
+    /// Xatu history is Ethereum mainnet only: its projections stamp every
+    /// frame as chain 1.
+    ///
     /// # Errors
     ///
-    /// Returns an error for an invalid portable Xatu network name.
+    /// Returns an error for an invalid Xatu network name, or for any network
+    /// but `mainnet`.
     pub fn public(network: impl Into<String>) -> Result<Self, XatuError> {
         Ok(Self {
             catalog: XatuCatalogConfig::public(network)?,
@@ -73,8 +77,8 @@ impl XatuHistorySource {
     ///
     /// # Errors
     ///
-    /// Returns an error for zero chunk size or an invalid object-store
-    /// configuration.
+    /// Returns an error for zero chunk size, a catalog for any network but
+    /// `mainnet`, or an invalid object-store configuration.
     pub fn new(config: XatuHistoryConfig) -> Result<Self, XatuError> {
         if config.chunk_blocks == 0
             || !config
@@ -663,14 +667,30 @@ fn source_error(error: XatuError) -> SourceError {
             observed: actual,
         },
         XatuError::ObjectStore(detail) => SourceError::Unavailable(detail),
-        error @ XatuError::IncompleteRange { range, .. } => SourceError::IncompleteRange {
+        error @ (XatuError::IncompleteRange { range, .. }
+        | XatuError::IncompleteWithdrawals { range, .. }) => SourceError::IncompleteRange {
             range,
             detail: error.to_string(),
         },
         XatuError::Data(detail) => SourceError::CorruptFrame(detail),
-        XatuError::Schema { table, missing } => {
-            SourceError::Protocol(format!("Xatu {table} schema is missing {missing:?}"))
-        }
+        // A schema drift, or an object that cannot be pinned, does not clear
+        // on retry.
+        XatuError::Schema { table, missing } => SourceError::SchemaDrift {
+            expected: format!("Xatu {table} columns {missing:?}"),
+            actual: "an object without them".to_owned(),
+        },
+        XatuError::ColumnType {
+            table,
+            column,
+            actual,
+        } => SourceError::SchemaDrift {
+            expected: format!("the declared encoding of Xatu {table} column {column}"),
+            actual: format!("Arrow {actual}"),
+        },
+        error @ XatuError::Unpinned { .. } => SourceError::SchemaDrift {
+            expected: "an object with a strong ETag".to_owned(),
+            actual: error.to_string(),
+        },
         other => SourceError::Protocol(other.to_string()),
     }
 }
@@ -902,6 +922,50 @@ mod tests {
                 .iter()
                 .any(|operation| operation.reader == PhysicalReader::Receipt)
         );
+    }
+
+    #[test]
+    fn schema_drift_is_not_retried() {
+        // Review M1: a permanent column-type or missing-column drift mapped to
+        // a retryable protocol error.
+        let drifts = [
+            XatuError::ColumnType {
+                table: XatuTable::CanonicalExecutionBlock,
+                column: "extra_data".to_owned(),
+                actual: "Int64".to_owned(),
+            },
+            XatuError::Schema {
+                table: XatuTable::CanonicalExecutionBlock,
+                missing: vec!["block_hash".to_owned()],
+            },
+        ];
+        for drift in drifts {
+            let error = source_error(drift);
+            assert!(
+                matches!(error, SourceError::SchemaDrift { .. }),
+                "{error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn xatu_history_is_mainnet_only() {
+        // Audit History-3: every frame is stamped as chain 1, whatever the
+        // catalog network.
+        assert!(matches!(
+            XatuHistoryConfig::public("sepolia"),
+            Err(XatuError::UnsupportedNetwork(network)) if network == "sepolia"
+        ));
+        assert!(matches!(
+            crate::XatuCatalogConfig::public("holesky"),
+            Err(XatuError::UnsupportedNetwork(_))
+        ));
+        let mut config = XatuHistoryConfig::public("mainnet").expect("mainnet");
+        config.catalog.network = "hoodi".to_owned();
+        assert!(matches!(
+            XatuHistorySource::new(config),
+            Err(XatuError::UnsupportedNetwork(_))
+        ));
     }
 
     #[tokio::test]

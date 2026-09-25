@@ -1,8 +1,14 @@
-use std::{collections::BTreeSet, sync::Arc};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use futures::StreamExt;
 use leani_primitives::{BlockNumber, BlockRange, Finality, TrustModel};
-use leani_source_api::{DataRequest, HistorySource, SourceBudget, SourceError, VerificationPolicy};
+use leani_source_api::{
+    DataRequest, HistorySource, SourceBudget, SourceDescriptor, SourceError, VerificationPolicy,
+};
 use serde::Serialize;
 use thiserror::Error;
 use tokio::sync::Mutex;
@@ -138,6 +144,13 @@ pub enum RawHistoryRunError {
     Store(#[from] HistoryStoreError),
 }
 
+/// A range that only lagging sources lack is retried for at least this long,
+/// which covers a dataset published in daily partitions, such as Xatu.
+const LAG_RETRY_FLOOR: Duration = Duration::from_hours(24);
+/// A lagging source also gets this many of its expected lags to publish a
+/// range.
+const LAG_RETRY_EXPECTED_LAGS: u32 = 4;
+
 /// Resumable segment-boundary acquisition executor for durable raw jobs.
 #[derive(Clone, Debug)]
 pub struct RawHistoryRunner {
@@ -145,6 +158,17 @@ pub struct RawHistoryRunner {
     sources: RawHistorySourceSet,
     source_budget: SourceBudget,
     active: Arc<Mutex<BTreeSet<RawHistoryJobId>>>,
+    lagging: Arc<std::sync::Mutex<BTreeMap<RawHistoryJobId, LagClock>>>,
+}
+
+/// When this process first found a job's range missing from lagging sources.
+#[derive(Clone, Copy, Debug)]
+struct LagClock {
+    /// Tells the job from an earlier one under the same ID.
+    created_at_unix_ms: u64,
+    /// The first block of the range that the lagging sources lack.
+    start: BlockNumber,
+    since: Instant,
 }
 
 impl RawHistoryRunner {
@@ -166,7 +190,56 @@ impl RawHistoryRunner {
             sources,
             source_budget,
             active: Arc::new(Mutex::new(BTreeSet::new())),
+            lagging: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
         })
+    }
+
+    /// When this process first found `job`'s range starting at `start`
+    /// missing from lagging sources.
+    fn lagging_since(&self, job: &RawHistoryJob, start: BlockNumber) -> Instant {
+        let mut lagging = self
+            .lagging
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match lagging.get(&job.id) {
+            Some(clock)
+                if clock.created_at_unix_ms == job.created_at_unix_ms && clock.start == start =>
+            {
+                clock.since
+            }
+            _ => {
+                let since = Instant::now();
+                lagging.insert(
+                    job.id.clone(),
+                    LagClock {
+                        created_at_unix_ms: job.created_at_unix_ms,
+                        start,
+                        since,
+                    },
+                );
+                since
+            }
+        }
+    }
+
+    fn clear_lagging(&self, id: &RawHistoryJobId) {
+        self.lagging
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(id);
+    }
+
+    /// Move the first sight of `id`'s lagging range `by` into the past.
+    #[cfg(test)]
+    fn backdate_lag(&self, id: &RawHistoryJobId, by: Duration) {
+        if let Some(clock) = self
+            .lagging
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get_mut(id)
+        {
+            clock.since = clock.since.checked_sub(by).expect("backdated instant");
+        }
     }
 
     #[must_use]
@@ -193,6 +266,14 @@ impl RawHistoryRunner {
             }
         }
         let result = Box::pin(self.run_exclusive(id, cancellation)).await;
+        // Only a job that still waits for its sources keeps its lag clock.
+        if !matches!(
+            result,
+            Ok(RawHistoryRunOutcome::Interrupted(_))
+                | Err(RawHistoryRunError::SourcesUnavailable { .. })
+        ) {
+            self.clear_lagging(id);
+        }
         self.active.lock().await.remove(id);
         result
     }
@@ -288,7 +369,10 @@ impl RawHistoryRunner {
             loop {
                 let range = prefix(remaining, blocks)?;
                 match Box::pin(self.acquire_segment(&job, range, cancellation.clone())).await {
-                    Ok(()) => break,
+                    Ok(()) => {
+                        self.clear_lagging(id);
+                        break;
+                    }
                     Err(AcquireError::Resize) if blocks > 1 => {
                         blocks = blocks.div_ceil(2);
                     }
@@ -311,21 +395,10 @@ impl RawHistoryRunner {
                             .await?;
                         return Err(error.into());
                     }
-                    Err(AcquireError::Sources {
-                        reasons,
-                        retryable: true,
-                    }) => {
-                        return Err(RawHistoryRunError::SourcesUnavailable { range, reasons });
-                    }
-                    Err(AcquireError::Sources {
-                        reasons,
-                        retryable: false,
-                    }) => {
-                        let error = RawHistoryRunError::NoCompatibleSource { range, reasons };
-                        self.store
-                            .fail_raw_history_job(id, &error.to_string())
-                            .await?;
-                        return Err(error);
+                    Err(AcquireError::Sources { reasons, retry }) => {
+                        return Err(self
+                            .handle_source_failures(&job, range, reasons, retry)
+                            .await?);
                     }
                     Err(AcquireError::Resize) => {
                         let error = HistoryStoreError::InvalidJob(format!(
@@ -339,6 +412,44 @@ impl RawHistoryRunner {
                 }
             }
         }
+    }
+
+    /// Keep a job waiting while its sources can still deliver `range`, with
+    /// their reasons as its last error, or fail it.
+    async fn handle_source_failures(
+        &self,
+        job: &RawHistoryJob,
+        range: BlockRange,
+        mut reasons: Vec<String>,
+        retry: SourceRetry,
+    ) -> Result<RawHistoryRunError, HistoryStoreError> {
+        let id = &job.id;
+        let exhausted = match retry {
+            SourceRetry::Transient => false,
+            SourceRetry::Lagging { limit } => {
+                let exhausted = self.lagging_since(job, range.start()).elapsed() >= limit;
+                if exhausted {
+                    reasons.push(format!(
+                        "the range stayed unpublished past its {} hour retry bound",
+                        limit.as_secs() / 3_600
+                    ));
+                }
+                exhausted
+            }
+            SourceRetry::Terminal => true,
+        };
+        if exhausted {
+            let error = RawHistoryRunError::NoCompatibleSource { range, reasons };
+            self.store
+                .fail_raw_history_job(id, &error.to_string())
+                .await?;
+            return Ok(error);
+        }
+        let error = RawHistoryRunError::SourcesUnavailable { range, reasons };
+        self.store
+            .wait_raw_history_job(id, &error.to_string())
+            .await?;
+        Ok(error)
     }
 
     async fn handle_storage_limit(
@@ -380,12 +491,27 @@ impl RawHistoryRunner {
             verification_policy: verification_policy(job.spec.verification),
         };
         let mut reasons = Vec::new();
-        let mut retryable = false;
+        let mut retry = None;
         for source in self.sources.sources() {
             if cancellation.is_cancelled() {
                 return Err(AcquireError::Interrupted);
             }
             let descriptor = source.descriptor();
+            // A source that does not advertise the whole range cannot serve
+            // it, so its miss says nothing about the range: an archive of
+            // older blocks does not fail a range that a catalog has yet to
+            // publish. A hole inside an advertised range still counts.
+            if let Some(advertised) = descriptor.range.filter(|advertised| {
+                !advertised.contains(range.start()) || !advertised.contains(range.end())
+            }) {
+                reasons.push(format!(
+                    "{}: advertises blocks {} to {} only",
+                    descriptor.id,
+                    advertised.start().0,
+                    advertised.end().0
+                ));
+                continue;
+            }
             if descriptor.chain_id != job.spec.chain_id
                 || !descriptor.finality.supports(Finality::Finalized)
                 || !descriptor
@@ -412,7 +538,7 @@ impl RawHistoryRunner {
                     continue;
                 }
                 Err(error) => {
-                    retryable |= source_error_retryable(&error);
+                    retry = Some(SourceRetry::of(descriptor, &error).or(retry));
                     reasons.push(format!("{}: {error}", descriptor.id));
                     continue;
                 }
@@ -430,15 +556,18 @@ impl RawHistoryRunner {
                 Ok(()) => return Ok(()),
                 Err(AcquireError::Sources {
                     reasons: mut errors,
-                    retryable: source_retryable,
+                    retry: source_retry,
                 }) => {
                     reasons.append(&mut errors);
-                    retryable |= source_retryable;
+                    retry = Some(source_retry.or(retry));
                 }
                 Err(other) => return Err(other),
             }
         }
-        Err(AcquireError::Sources { reasons, retryable })
+        Err(AcquireError::Sources {
+            reasons,
+            retry: retry.unwrap_or(SourceRetry::Terminal),
+        })
     }
 
     #[allow(clippy::too_many_lines)]
@@ -563,9 +692,57 @@ enum AcquireError {
     Resize,
     Sources {
         reasons: Vec<String>,
-        retryable: bool,
+        retry: SourceRetry,
     },
     Store(HistoryStoreError),
+}
+
+/// Whether the sources that failed a range may still deliver it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SourceRetry {
+    /// A transport failure, which can clear.
+    Transient,
+    /// A source cannot deliver the range, or failed it for good.
+    Terminal,
+    /// Only lagging sources lack the range; retry it for `limit`.
+    Lagging { limit: Duration },
+}
+
+impl SourceRetry {
+    fn of(descriptor: &SourceDescriptor, error: &SourceError) -> Self {
+        match error {
+            SourceError::Disconnected(_)
+            | SourceError::Unavailable(_)
+            | SourceError::Protocol(_) => Self::Transient,
+            // A source that publishes with a delay, such as an eraE catalog,
+            // may cover the range later.
+            SourceError::MissingRange(_) | SourceError::IncompleteRange { .. }
+                if !descriptor.expected_lag.is_zero() =>
+            {
+                Self::Lagging {
+                    limit: descriptor
+                        .expected_lag
+                        .saturating_mul(LAG_RETRY_EXPECTED_LAGS)
+                        .max(LAG_RETRY_FLOOR),
+                }
+            }
+            _ => Self::Terminal,
+        }
+    }
+
+    /// Combine two sources' failures. A transport failure keeps the range
+    /// retryable, and a terminal failure outranks lag, so a lagging source
+    /// cannot hide another source's error.
+    fn or(self, other: Option<Self>) -> Self {
+        match (self, other) {
+            (Self::Transient, _) | (_, Some(Self::Transient)) => Self::Transient,
+            (Self::Terminal, _) | (_, Some(Self::Terminal)) => Self::Terminal,
+            (Self::Lagging { limit }, Some(Self::Lagging { limit: other })) => Self::Lagging {
+                limit: limit.max(other),
+            },
+            (lagging @ Self::Lagging { .. }, None) => lagging,
+        }
+    }
 }
 
 impl From<HistoryStoreError> for AcquireError {
@@ -580,16 +757,9 @@ fn source_attempt_error(source: &Arc<dyn HistorySource>, error: &SourceError) ->
     } else {
         AcquireError::Sources {
             reasons: vec![format!("{}: {error}", source.descriptor().id)],
-            retryable: source_error_retryable(error),
+            retry: SourceRetry::of(source.descriptor(), error),
         }
     }
-}
-
-const fn source_error_retryable(error: &SourceError) -> bool {
-    matches!(
-        error,
-        SourceError::Disconnected(_) | SourceError::Unavailable(_) | SourceError::Protocol(_)
-    )
 }
 
 async fn abort_pending(pending: &mut Option<PendingSegment>) -> Result<(), HistoryStoreError> {
@@ -912,6 +1082,203 @@ mod tests {
         );
     }
 
+    /// A source that publishes ranges some time after they finalize, as an
+    /// eraE catalog or a Xatu table does.
+    fn lagging_descriptor(id: &str, range: BlockRange) -> leani_source_api::SourceDescriptor {
+        let mut descriptor = fixture_source_descriptor(id, range);
+        descriptor.expected_lag = std::time::Duration::from_hours(2);
+        descriptor
+    }
+
+    /// A source whose only chunk covers `range` and fails with `error`.
+    fn failing_source(
+        descriptor: leani_source_api::SourceDescriptor,
+        range: BlockRange,
+        error: SourceError,
+    ) -> Arc<ScriptedHistorySource> {
+        let schema_version = descriptor.schema_version.clone();
+        Arc::new(ScriptedHistorySource::new(
+            descriptor,
+            vec![ScriptedChunk {
+                range,
+                schema_version,
+                estimated_bytes: None,
+                steps: vec![HistoryStep::Error(error)],
+            }],
+        ))
+    }
+
+    async fn run_new_job(
+        store: &HistoryStore,
+        name: &str,
+        range: BlockRange,
+        sources: Vec<Arc<dyn HistorySource>>,
+    ) -> (
+        Result<RawHistoryRunOutcome, RawHistoryRunError>,
+        RawHistoryJob,
+    ) {
+        let sources = RawHistorySourceSet::new(sources).expect("source set");
+        let id = RawHistoryJobId::new(name).expect("job ID");
+        store
+            .create_raw_history_job(id.clone(), spec(range, sources.policy_digest()))
+            .await
+            .expect("create");
+        let runner =
+            RawHistoryRunner::new(store.clone(), sources, default_source_budget()).expect("runner");
+        let outcome = Box::pin(runner.run(&id, CancellationToken::new())).await;
+        let job = store
+            .raw_history_job(&id)
+            .await
+            .expect("inspect")
+            .expect("job");
+        (outcome, job)
+    }
+
+    #[tokio::test]
+    async fn ranges_a_lagging_source_has_not_published_yet_leave_the_job_running() {
+        let directory = tempdir().expect("temporary directory");
+        let store = HistoryStore::open(config(directory.path()))
+            .await
+            .expect("store");
+        let range = BlockRange::new(BlockNumber(500), BlockNumber(502)).expect("range");
+        // The catalog lists only the first block so far.
+        let lagging_catalog = Arc::new(ScriptedHistorySource::from_frames(
+            lagging_descriptor("lagging-catalog", range),
+            frames(500, 500),
+        ));
+        let lagging_table = failing_source(
+            lagging_descriptor("lagging-table", range),
+            range,
+            SourceError::IncompleteRange {
+                range,
+                detail: "the dataset has not covered the range yet".to_owned(),
+            },
+        );
+        for (name, source) in [
+            (
+                "raw-lagging-catalog",
+                lagging_catalog as Arc<dyn HistorySource>,
+            ),
+            ("raw-lagging-table", lagging_table),
+        ] {
+            let (outcome, job) = run_new_job(&store, name, range, vec![source]).await;
+            // Audit M-H5: lag was a terminal job failure.
+            assert!(
+                matches!(outcome, Err(RawHistoryRunError::SourcesUnavailable { .. })),
+                "{name}: {outcome:?}"
+            );
+            assert_eq!(job.state, RawHistoryJobState::Running, "{name}");
+            // Review I1: the job showed no reason while it waited.
+            assert!(
+                job.last_error
+                    .as_deref()
+                    .is_some_and(|error| error.contains("lagging-")),
+                "{name}: {:?}",
+                job.last_error
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_lagging_range_fails_its_job_after_the_retry_bound() {
+        let directory = tempdir().expect("temporary directory");
+        let store = HistoryStore::open(config(directory.path()))
+            .await
+            .expect("store");
+        let range = BlockRange::new(BlockNumber(800), BlockNumber(802)).expect("range");
+        let source = Arc::new(ScriptedHistorySource::from_frames(
+            lagging_descriptor("stale-catalog", range),
+            frames(800, 800),
+        ));
+        let sources = source_set(source);
+        let id = RawHistoryJobId::new("raw-lag-bound").expect("job ID");
+        store
+            .create_raw_history_job(id.clone(), spec(range, sources.policy_digest()))
+            .await
+            .expect("create");
+        let runner =
+            RawHistoryRunner::new(store.clone(), sources, default_source_budget()).expect("runner");
+        assert!(matches!(
+            Box::pin(runner.run(&id, CancellationToken::new())).await,
+            Err(RawHistoryRunError::SourcesUnavailable { .. })
+        ));
+        // Two hours of expected lag leave the range the 24-hour floor.
+        runner.backdate_lag(&id, std::time::Duration::from_hours(23));
+        assert!(matches!(
+            Box::pin(runner.run(&id, CancellationToken::new())).await,
+            Err(RawHistoryRunError::SourcesUnavailable { .. })
+        ));
+        // Review I1: the range was retried forever.
+        runner.backdate_lag(&id, std::time::Duration::from_hours(2));
+        match Box::pin(runner.run(&id, CancellationToken::new())).await {
+            Err(RawHistoryRunError::NoCompatibleSource { reasons, .. }) => assert!(
+                reasons.iter().any(|reason| reason.contains("retry bound")),
+                "{reasons:?}"
+            ),
+            other => panic!("the lagging range was retried past its bound: {other:?}"),
+        }
+        assert_eq!(
+            store
+                .raw_history_job(&id)
+                .await
+                .expect("inspect")
+                .expect("job")
+                .state,
+            RawHistoryJobState::Failed
+        );
+    }
+
+    #[tokio::test]
+    async fn a_range_missing_from_a_source_without_lag_fails_the_job() {
+        let directory = tempdir().expect("temporary directory");
+        let store = HistoryStore::open(config(directory.path()))
+            .await
+            .expect("store");
+        let range = BlockRange::new(BlockNumber(600), BlockNumber(602)).expect("range");
+        // A local archive with a hole never fills it.
+        let archive = Arc::new(ScriptedHistorySource::from_frames(
+            fixture_source_descriptor("static-archive", range),
+            frames(600, 600),
+        ));
+        let (outcome, job) = run_new_job(&store, "raw-static-gap", range, vec![archive]).await;
+        assert!(
+            matches!(outcome, Err(RawHistoryRunError::NoCompatibleSource { .. })),
+            "{outcome:?}"
+        );
+        assert_eq!(job.state, RawHistoryJobState::Failed);
+    }
+
+    #[tokio::test]
+    async fn one_source_lagging_does_not_hide_another_source_failing() {
+        let directory = tempdir().expect("temporary directory");
+        let store = HistoryStore::open(config(directory.path()))
+            .await
+            .expect("store");
+        let range = BlockRange::new(BlockNumber(700), BlockNumber(702)).expect("range");
+        let lagging = Arc::new(ScriptedHistorySource::from_frames(
+            lagging_descriptor("a-lagging", range),
+            frames(700, 700),
+        ));
+        let corrupt = failing_source(
+            fixture_source_descriptor("b-corrupt", range),
+            range,
+            SourceError::CorruptFrame("receipts root mismatch".to_owned()),
+        );
+        let (outcome, job) = run_new_job(&store, "raw-masked", range, vec![lagging, corrupt]).await;
+        match outcome {
+            Err(RawHistoryRunError::NoCompatibleSource { reasons, .. }) => {
+                assert!(
+                    reasons
+                        .iter()
+                        .any(|reason| reason.contains("receipts root mismatch")),
+                    "{reasons:?}"
+                );
+            }
+            other => panic!("the corrupt source's failure was masked: {other:?}"),
+        }
+        assert_eq!(job.state, RawHistoryJobState::Failed);
+    }
+
     #[tokio::test]
     async fn transient_source_outage_leaves_job_running_for_supervisor_retry() {
         let directory = tempdir().expect("temporary directory");
@@ -951,6 +1318,159 @@ mod tests {
                 .expect("job")
                 .state,
             RawHistoryJobState::Running
+        );
+    }
+
+    #[tokio::test]
+    async fn a_source_that_does_not_advertise_the_range_leaves_a_lagging_range_waiting() {
+        let directory = tempdir().expect("temporary directory");
+        let store = HistoryStore::open(config(directory.path()))
+            .await
+            .expect("store");
+        let range = BlockRange::new(BlockNumber(500), BlockNumber(502)).expect("range");
+        // The catalog lists only the first block so far.
+        let catalog = Arc::new(ScriptedHistorySource::from_frames(
+            lagging_descriptor("lagging-catalog", range),
+            frames(500, 500),
+        ));
+        // A local archive of older blocks, which has no expected lag.
+        let older = BlockRange::new(BlockNumber(100), BlockNumber(102)).expect("older range");
+        let archive = Arc::new(ScriptedHistorySource::from_frames(
+            fixture_source_descriptor("older-archive", older),
+            frames(100, 102),
+        ));
+        let (outcome, job) =
+            run_new_job(&store, "raw-older-archive", range, vec![catalog, archive]).await;
+        // Review 2: the archive's miss past its manifest was terminal, and
+        // failed the job while the catalog was still catching up.
+        assert!(
+            matches!(outcome, Err(RawHistoryRunError::SourcesUnavailable { .. })),
+            "{outcome:?}"
+        );
+        assert_eq!(job.state, RawHistoryJobState::Running);
+        assert!(
+            job.last_error
+                .as_deref()
+                .is_some_and(|error| error.contains("lagging-catalog")),
+            "{:?}",
+            job.last_error
+        );
+    }
+
+    #[tokio::test]
+    async fn a_hole_inside_a_source_range_without_lag_still_fails_a_lagging_range() {
+        let directory = tempdir().expect("temporary directory");
+        let store = HistoryStore::open(config(directory.path()))
+            .await
+            .expect("store");
+        let range = BlockRange::new(BlockNumber(510), BlockNumber(512)).expect("range");
+        let catalog = Arc::new(ScriptedHistorySource::from_frames(
+            lagging_descriptor("lagging-catalog", range),
+            frames(510, 510),
+        ));
+        // The archive advertises the range, but lacks two of its blocks.
+        let archive = Arc::new(ScriptedHistorySource::from_frames(
+            fixture_source_descriptor("holed-archive", range),
+            frames(510, 510),
+        ));
+        let (outcome, job) =
+            run_new_job(&store, "raw-holed-archive", range, vec![catalog, archive]).await;
+        assert!(
+            matches!(outcome, Err(RawHistoryRunError::NoCompatibleSource { .. })),
+            "{outcome:?}"
+        );
+        assert_eq!(job.state, RawHistoryJobState::Failed);
+    }
+
+    #[tokio::test]
+    async fn a_recreated_job_does_not_inherit_the_lag_clock_of_its_predecessor() {
+        let directory = tempdir().expect("temporary directory");
+        let store = HistoryStore::open(config(directory.path()))
+            .await
+            .expect("store");
+        let range = BlockRange::new(BlockNumber(1_000), BlockNumber(1_002)).expect("range");
+        let sources = source_set(Arc::new(ScriptedHistorySource::from_frames(
+            lagging_descriptor("slow-catalog", range),
+            frames(1_000, 1_000),
+        )));
+        let digest = sources.policy_digest();
+        let id = RawHistoryJobId::new("raw-reused-id").expect("job ID");
+        let runner =
+            RawHistoryRunner::new(store.clone(), sources, default_source_budget()).expect("runner");
+        store
+            .create_raw_history_job(id.clone(), spec(range, digest))
+            .await
+            .expect("create");
+        assert!(matches!(
+            Box::pin(runner.run(&id, CancellationToken::new())).await,
+            Err(RawHistoryRunError::SourcesUnavailable { .. })
+        ));
+        runner.backdate_lag(&id, std::time::Duration::from_hours(25));
+        // The operator replaces the job while the runner is not running it.
+        store.cancel_raw_history_job(&id).await.expect("cancel");
+        store.delete_raw_history_job(&id).await.expect("delete");
+        // A later creation time tells the jobs apart.
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        store
+            .create_raw_history_job(id.clone(), spec(range, digest))
+            .await
+            .expect("recreate");
+        // Review 2: the new job inherited the old job's lag clock and failed
+        // on its first run.
+        let outcome = Box::pin(runner.run(&id, CancellationToken::new())).await;
+        assert!(
+            matches!(outcome, Err(RawHistoryRunError::SourcesUnavailable { .. })),
+            "{outcome:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_waiting_job_keeps_its_reason_until_a_segment_commits() {
+        let directory = tempdir().expect("temporary directory");
+        let store = HistoryStore::open(config(directory.path()))
+            .await
+            .expect("store");
+        let range = BlockRange::new(BlockNumber(900), BlockNumber(902)).expect("range");
+        let descriptor = lagging_descriptor("slow-catalog", range);
+        let (outcome, waiting) = run_new_job(
+            &store,
+            "raw-visible-reason",
+            range,
+            vec![Arc::new(ScriptedHistorySource::from_frames(
+                descriptor.clone(),
+                frames(900, 900),
+            ))],
+        )
+        .await;
+        assert!(matches!(
+            outcome,
+            Err(RawHistoryRunError::SourcesUnavailable { .. })
+        ));
+        assert!(waiting.last_error.is_some());
+        // Review 2: every start cleared the reason, so a status read during
+        // the run showed none.
+        let started = store
+            .start_raw_history_job(&waiting.id)
+            .await
+            .expect("start");
+        assert_eq!(started.last_error, waiting.last_error);
+        // The catalog now lists the whole range.
+        let runner = RawHistoryRunner::new(
+            store.clone(),
+            source_set(Arc::new(ScriptedHistorySource::from_frames(
+                descriptor,
+                frames(900, 902),
+            ))),
+            default_source_budget(),
+        )
+        .expect("runner");
+        let outcome = Box::pin(runner.run(&waiting.id, CancellationToken::new())).await;
+        let Ok(RawHistoryRunOutcome::Complete(job)) = outcome else {
+            panic!("the published range completes the job: {outcome:?}");
+        };
+        assert_eq!(
+            job.last_error, None,
+            "a committed segment clears the reason"
         );
     }
 }

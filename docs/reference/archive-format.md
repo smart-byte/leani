@@ -57,12 +57,20 @@ Each non-empty object line is one JSON-encoded `BlockFrame`. Objects must:
 - have the exact declared byte length and BLAKE3 digest;
 - contain exactly one frame per block in their declared range;
 - be ordered, contiguous, and parent-linked;
-- match the manifest chain and declared material capabilities.
+- match the manifest chain, finality, and declared material capabilities;
+- be reached without crossing a symbolic link below the manifest's
+  directory.
 
 Reads enforce the normal source byte, frame, and frame-count budgets. The
 adapter verifies the complete object before yielding frames and adds immutable
 object identity to frame provenance. A missing line, checksum mismatch,
-truncated frame, parent mismatch, schema mismatch, or range gap fails closed.
+truncated frame, parent mismatch, schema mismatch, chain or finality
+mismatch, or range gap fails closed.
+
+Frames report only the checks the archive made: the object's BLAKE3 digest,
+and the parent link to the previous frame of the same object. A frame's own
+verification claims and consensus anchor are dropped, and the trust of its
+earlier provenance is capped at `trusted_dataset`.
 
 The archive is a trusted-dataset source, not automatically a cryptographic raw
 history source. An EraE adapter must additionally decode raw bodies/receipts,

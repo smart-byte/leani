@@ -501,6 +501,11 @@ pub struct HistorySourceConfig {
     pub manifest: Option<PathBuf>,
     #[serde(default)]
     pub endpoint: Option<Url>,
+    /// Accept a plain `http` eraE endpoint off loopback. Its catalog and
+    /// archive bytes then travel unauthenticated, so anyone on the path can
+    /// replace them.
+    #[serde(default)]
+    pub allow_insecure_http: bool,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
@@ -1454,7 +1459,7 @@ impl Config {
             "sources.history",
             &mut errors,
         );
-        validate_history_sources(&self.sources.history, &mut errors);
+        validate_history_sources(&self.sources.history, self.chain.chain_id, &mut errors);
         if matches!(self.sources.live.kind, LiveSourceKind::P2p)
             && self.sources.live.minimum_peers == 0
         {
@@ -1863,7 +1868,12 @@ pub(crate) fn allowed_origin(value: &str) -> Option<String> {
     .then(|| url.origin().ascii_serialization())
 }
 
-fn validate_history_sources(sources: &[HistorySourceConfig], errors: &mut Vec<ValidationError>) {
+#[allow(clippy::too_many_lines)]
+fn validate_history_sources(
+    sources: &[HistorySourceConfig],
+    chain_id: u64,
+    errors: &mut Vec<ValidationError>,
+) {
     for (index, source) in sources.iter().enumerate() {
         match source.kind {
             HistorySourceKind::Archive if source.manifest.is_none() => {
@@ -1890,6 +1900,15 @@ fn validate_history_sources(sources: &[HistorySourceConfig], errors: &mut Vec<Va
                             "eraE endpoints must use http, https, or file",
                         ));
                     }
+                    if endpoint.scheme() == "http"
+                        && !source.allow_insecure_http
+                        && !leani_source_erae::is_loopback(endpoint)
+                    {
+                        errors.push(ValidationError::new(
+                            format!("sources.history[{index}].endpoint"),
+                            "plain http eraE endpoints are accepted only on loopback; use https, or set allow_insecure_http = true to accept an unauthenticated mirror",
+                        ));
+                    }
                     if !endpoint.path().ends_with('/') {
                         errors.push(ValidationError::new(
                             format!("sources.history[{index}].endpoint"),
@@ -1905,6 +1924,18 @@ fn validate_history_sources(sources: &[HistorySourceConfig], errors: &mut Vec<Va
                 ));
             }
             _ => {}
+        }
+        if source.allow_insecure_http && !matches!(source.kind, HistorySourceKind::EraE) {
+            errors.push(ValidationError::new(
+                format!("sources.history[{index}].allow_insecure_http"),
+                "is only valid for an eraE source",
+            ));
+        }
+        if matches!(source.kind, HistorySourceKind::Xatu) && chain_id != 1 {
+            errors.push(ValidationError::new(
+                format!("sources.history[{index}].kind"),
+                "Xatu history supports Ethereum mainnet (chain 1) only",
+            ));
         }
         if matches!(source.kind, HistorySourceKind::Xatu) {
             for (field, blocks) in [
@@ -3151,6 +3182,61 @@ verification_segment_blocks = 8192"#,
         for field in ["chunk_blocks", "blobs_chunk_blocks", "batch_rows"] {
             assert!(errors.iter().any(|error| error.field.ends_with(field)));
         }
+    }
+
+    fn erae_source(extra: &str) -> HistorySourceConfig {
+        toml::from_str(&format!(
+            "id = \"erae\"\nkind = \"era_e\"\npriority = 20\ntrust = \"trusted_dataset\"\n{extra}"
+        ))
+        .expect("eraE source")
+    }
+
+    #[test]
+    fn erae_mirrors_use_https_unless_on_loopback_or_opted_in() {
+        // Audit M-H3: a plain-http mirror was accepted anywhere.
+        let mut config = config();
+        config
+            .sources
+            .history
+            .push(erae_source("endpoint = \"http://mirror.example/erae/\""));
+        assert_eq!(error_fields(&config), ["sources.history[1].endpoint"]);
+
+        for loopback in ["http://127.0.0.1:8080/erae/", "http://localhost/erae/"] {
+            config.sources.history[1] = erae_source(&format!("endpoint = \"{loopback}\""));
+            assert!(error_fields(&config).is_empty(), "{loopback}");
+        }
+        config.sources.history[1] =
+            erae_source("endpoint = \"http://mirror.example/erae/\"\nallow_insecure_http = true");
+        assert!(error_fields(&config).is_empty(), "an explicit opt-in");
+
+        // The opt-in only means something for an eraE mirror.
+        config.sources.history[0] = toml::from_str(
+            "id = \"xatu\"\nkind = \"xatu\"\npriority = 10\ntrust = \"trusted_dataset\"\nallow_insecure_http = true",
+        )
+        .expect("Xatu source");
+        assert_eq!(
+            error_fields(&config),
+            ["sources.history[0].allow_insecure_http"]
+        );
+
+        // Ruling R6: the new field is in the configuration schema.
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let schema: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(repository.join("config/schema-v1.json")).expect("schema"),
+        )
+        .expect("configuration schema is JSON");
+        assert!(
+            schema["$defs"]["historySource"]["properties"]["allow_insecure_http"].is_object(),
+            "sources.history.allow_insecure_http is missing from the schema"
+        );
+    }
+
+    #[test]
+    fn xatu_history_sources_are_mainnet_only() {
+        // Audit History-3: Xatu stamps every frame as chain 1.
+        let mut config = config();
+        config.chain.chain_id = 11_155_111;
+        assert_eq!(error_fields(&config), ["sources.history[0].kind"]);
     }
 
     #[test]

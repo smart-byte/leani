@@ -267,7 +267,8 @@
           "enum": ["trusted_dataset", "verified_material"]
         },
         "manifest": { "type": "string" },
-        "endpoint": { "type": "string", "format": "uri" }
+        "endpoint": { "type": "string", "format": "uri" },
+        "allow_insecure_http": { "type": "boolean" }
       }
     },
     "liveSource": {

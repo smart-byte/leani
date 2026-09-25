@@ -4105,6 +4105,7 @@ pub(crate) fn configured_history_sources(
                 if let Some(endpoint) = &configured.endpoint {
                     erae.base_url = endpoint.clone();
                 }
+                erae.allow_insecure_http = configured.allow_insecure_http;
                 std::sync::Arc::new(EraeSource::new(erae)?)
             }
             crate::config::HistorySourceKind::Parquet => continue,
@@ -4221,6 +4222,7 @@ fn configured_rpc_history_sources(
                 if let Some(endpoint) = &source.endpoint {
                     erae.base_url = endpoint.clone();
                 }
+                erae.allow_insecure_http = source.allow_insecure_http;
                 sources.push(std::sync::Arc::new(EraeSource::new(erae)?));
             }
             crate::config::HistorySourceKind::Parquet => {}
@@ -9125,6 +9127,7 @@ markets = ["ETH/USDT"]
             batch_rows: None,
             manifest: Some(archive.to_path_buf()),
             endpoint: None,
+            allow_insecure_http: false,
         }];
         let template = config.processors[0].clone();
         config.processors = processors

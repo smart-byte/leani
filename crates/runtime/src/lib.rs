@@ -7016,6 +7016,9 @@ fn retryable_finality_source_error(error: &SourceError) -> bool {
     )
 }
 
+/// Whether another configured source may still serve a range that `error`
+/// failed. Schema drift, such as a Xatu column of another type or an object
+/// without a strong `ETag`, is terminal for its own source only.
 fn failover_source_error(error: &SourceError) -> bool {
     retryable_source_error(error)
         || matches!(
@@ -7023,6 +7026,7 @@ fn failover_source_error(error: &SourceError) -> bool {
             SourceError::MissingRange(_)
                 | SourceError::IncompleteRange { .. }
                 | SourceError::MissingMaterial { .. }
+                | SourceError::SchemaDrift { .. }
         )
 }
 
@@ -13470,6 +13474,75 @@ mod tests {
             "only the gap whose primary read failed falls over"
         );
         assert_eq!(report.final_coverage, ranges);
+    }
+
+    #[tokio::test]
+    async fn schema_drift_fails_over_to_the_next_source() {
+        let range = BlockRange::new(BlockNumber(1), BlockNumber(2)).expect("range");
+        let drift = || {
+            let mut descriptor = fixture_source_descriptor("drifted-history", range);
+            descriptor.priority = 0;
+            let schema_version = descriptor.schema_version.clone();
+            Arc::new(ScriptedHistorySource::new(
+                descriptor,
+                vec![ScriptedChunk {
+                    range,
+                    schema_version,
+                    estimated_bytes: None,
+                    steps: vec![HistoryStep::Error(SourceError::SchemaDrift {
+                        expected: "an object with a strong ETag".to_owned(),
+                        actual: "a weak ETag".to_owned(),
+                    })],
+                }],
+            )) as Arc<dyn HistorySource>
+        };
+        let mut fallback_descriptor = fixture_source_descriptor("fallback-history", range);
+        fallback_descriptor.priority = 1;
+        let fallback: Arc<dyn HistorySource> = Arc::new(ScriptedHistorySource::from_frames(
+            fallback_descriptor,
+            frames(range),
+        ));
+        let config = HistoricalRuntimeConfig {
+            mapper_concurrency: 1,
+            max_attempts: 3,
+            retry_base: Duration::from_millis(1),
+            retry_max: Duration::from_millis(1),
+            ..HistoricalRuntimeConfig::default()
+        };
+        for (name, sources, served) in [
+            ("drift-with-fallback", vec![drift(), fallback], true),
+            ("drift-alone", vec![drift()], false),
+        ] {
+            let processor = Arc::new(BlockLocalCounter::default());
+            let (_directory, store) = store().await;
+            let runtime = HistoricalRuntime::new_with_sources(
+                store,
+                sources,
+                processor.clone(),
+                config.clone(),
+            )
+            .expect("runtime");
+            let job = BackfillJob::for_processor_ranges(
+                name,
+                processor.as_ref(),
+                ChainId(1),
+                vec![range],
+                VerificationPolicy::CompleteCryptographic,
+            )
+            .expect("job");
+            let result = runtime
+                .run(job, default_source_budget(), CancellationToken::new())
+                .await;
+            if served {
+                // Review 2: a schema drift failed the backfill although
+                // another configured source could serve the range.
+                let report = result.expect("the fallback source serves the range");
+                assert_eq!(report.final_coverage, vec![range]);
+            } else {
+                let error = result.expect_err("no source can serve the range");
+                assert!(error.to_string().contains("schema changed"), "{error}");
+            }
+        }
     }
 
     #[tokio::test]
