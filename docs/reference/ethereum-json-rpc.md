@@ -113,7 +113,15 @@ durable locator and therefore remains recent-only by default.
 
 A call whose `id` is `null` gets a response with a `null` ID; only a call
 without an `id` member is a notification. An `id` that is an object, an
-array, or a boolean gets `-32600` with a `null` ID.
+array, or a boolean gets `-32600` with a `null` ID. A call must be a JSON
+object: an array in its place, such as `["2.0", 1, "eth_chainId"]`, gets
+`-32600` with a `null` ID too.
+
+A notification runs like any other call, side effects included, and gets
+no response, as JSON-RPC 2.0 requires: an `eth_unsubscribe` notification
+ends its subscription, and an `eth_subscribe` notification opens one whose
+ID the client never learns. A batch answers only its calls with IDs, and a
+batch of only notifications gets no response at all (HTTP 204).
 
 Block numbers and transaction indexes are QUANTITY values: `0x` and one or
 more hexadecimal digits, without leading zeros except in `0x0`, at most 64
@@ -180,12 +188,14 @@ error, not plain text: `-32005` with a `null` ID, and `error.data` holding
 |---|---|---|---|
 | Request body or WebSocket message | 1 MiB | — | HTTP 413 with a `-32005` error; a longer WebSocket message ends the connection |
 | Calls per batch | 100 | `rpc.max_batch_requests` | one `-32600` error object for the whole batch |
-| Response bytes | 16 MiB | `rpc.max_response_bytes` | `-32005` for the call that passes the limit, or whose `eth_getLogs` result would, and for every later call in the batch, which do not run |
+| Response bytes | 16 MiB | `rpc.max_response_bytes` | `-32005` for the call that passes the limit, or whose `eth_getLogs` result would, and for every later call in the batch, which do not run; later notifications still run |
 | `eth_getLogs` results | 10,000 | `rpc.max_log_results` | `-32005` "query returned more than 10000 results. Try with this block range [0x…, 0x…]." |
 | Filter addresses | 1,000 | `rpc.max_log_addresses` | `-32602` |
 | Alternatives per topic position | 1,000 | `rpc.max_log_topic_alternatives` | `-32602` |
 | Subscriptions per WebSocket connection | 128 | `rpc.max_subscriptions_per_connection` | `-32005` from `eth_subscribe` |
 | WebSocket connections | 256 | `rpc.max_websocket_connections` | HTTP 503 on the upgrade |
+| Subscription notifications of one chain event, per connection | 16 MiB | `rpc.max_subscription_event_bytes` | the connection is closed with code `1008` |
+| Unsent subscription notifications, per connection | 16 MiB | `rpc.max_subscription_event_bytes` | the connection is closed with code `1013` |
 
 The `eth_getLogs` hint names the range from `fromBlock` up to the block
 before the one where the results passed the limit, and `error.data` carries
@@ -194,6 +204,28 @@ alone has more matching logs than the limit; read that block with
 `eth_getBlockReceipts` or raise the limit. The filter limits also apply to
 `eth_subscribe("logs")` filters. Closing a WebSocket connection frees its
 slot and ends its subscriptions.
+
+The subscriptions of one WebSocket connection share an output budget per
+chain event: the notifications that one block, or one reorg with its
+removed and replacement logs, produces for the connection may take at most
+`rpc.max_subscription_event_bytes` encoded bytes. The node serializes a log
+or head once, however many of the connection's subscriptions it matches,
+but each notification counts in full. A connection whose subscriptions
+pass the budget is closed with code `1008` (policy violation), without that
+event's notifications, and with a close reason that names the setting. Its
+subscriptions would pass the budget again on a like block, so reconnect
+with fewer or narrower subscriptions, or spread them over several
+connections.
+
+The node also holds at most `rpc.max_subscription_event_bytes` of a
+connection's notifications unsent. A client that reads more slowly than
+its subscriptions produce notifications is closed with code `1013` (try
+again later), as it is when it falls behind the node's bounded event
+channel, and may reconnect. Notifications still unsent when a connection
+is closed are dropped, and a connection that cannot take its close frame
+within a second is dropped without one. Other connections are unaffected.
+A call's response is sent before the connection's next message is read,
+so a client that stops reading stops being answered too.
 
 ## 3. RPC profiles
 

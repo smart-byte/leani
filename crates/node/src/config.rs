@@ -1164,6 +1164,8 @@ pub struct RpcConfig {
     pub max_subscriptions_per_connection: usize,
     #[serde(default = "default_rpc_max_websocket_connections")]
     pub max_websocket_connections: usize,
+    #[serde(default = "default_rpc_max_subscription_event_bytes")]
+    pub max_subscription_event_bytes: HumanBytes,
 }
 
 const fn default_rpc_max_batch_requests() -> usize {
@@ -1192,6 +1194,10 @@ const fn default_rpc_max_subscriptions_per_connection() -> usize {
 
 const fn default_rpc_max_websocket_connections() -> usize {
     leani_rpc::DEFAULT_MAX_WEBSOCKET_CONNECTIONS
+}
+
+fn default_rpc_max_subscription_event_bytes() -> HumanBytes {
+    HumanBytes(u64::try_from(leani_rpc::DEFAULT_MAX_SUBSCRIPTION_EVENT_BYTES).unwrap_or(u64::MAX))
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
@@ -1835,6 +1841,10 @@ fn validate_exposure(api: &ApiConfig, rpc: &RpcConfig, errors: &mut Vec<Validati
         (
             "rpc.max_websocket_connections",
             rpc.max_websocket_connections,
+        ),
+        (
+            "rpc.max_subscription_event_bytes",
+            usize::try_from(rpc.max_subscription_event_bytes.bytes()).unwrap_or(usize::MAX),
         ),
     ] {
         if value == 0 {
@@ -3694,6 +3704,10 @@ markets = ["LINK/ETH"]
         assert_eq!(config.rpc.max_log_topic_alternatives, 1_000);
         assert_eq!(config.rpc.max_subscriptions_per_connection, 128);
         assert_eq!(config.rpc.max_websocket_connections, 256);
+        assert_eq!(
+            config.rpc.max_subscription_event_bytes.bytes(),
+            16 * 1_024 * 1_024
+        );
         let mut config = config;
         config.rpc.max_batch_requests = 0;
         config.rpc.max_response_bytes = HumanBytes::from_bytes(0);
@@ -3702,6 +3716,7 @@ markets = ["LINK/ETH"]
         config.rpc.max_log_topic_alternatives = 0;
         config.rpc.max_subscriptions_per_connection = 0;
         config.rpc.max_websocket_connections = 0;
+        config.rpc.max_subscription_event_bytes = HumanBytes::from_bytes(0);
         assert_eq!(
             error_fields(&config),
             [
@@ -3712,6 +3727,7 @@ markets = ["LINK/ETH"]
                 "rpc.max_log_topic_alternatives",
                 "rpc.max_subscriptions_per_connection",
                 "rpc.max_websocket_connections",
+                "rpc.max_subscription_event_bytes",
             ]
         );
 
@@ -3742,6 +3758,7 @@ markets = ["LINK/ETH"]
                     "max_log_topic_alternatives",
                     "max_subscriptions_per_connection",
                     "max_websocket_connections",
+                    "max_subscription_event_bytes",
                 ][..],
             ),
         ] {

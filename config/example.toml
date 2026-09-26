@@ -214,6 +214,7 @@ minimum_recent_blocks = 128
 # max_log_topic_alternatives = 1000
 # max_subscriptions_per_connection = 128
 # max_websocket_connections = 256
+# max_subscription_event_bytes = "16MiB"
 
 [api]
 bind = "127.0.0.1:8080"

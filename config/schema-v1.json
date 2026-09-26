@@ -582,6 +582,11 @@
           "$ref": "#/$defs/positiveInteger",
           "default": 256,
           "description": "Most open WebSocket connections; a further upgrade gets HTTP 503."
+        },
+        "max_subscription_event_bytes": {
+          "$ref": "#/$defs/humanBytes",
+          "default": "16MiB",
+          "description": "Most encoded bytes of subscription notifications one chain event may produce for one WebSocket connection, and that a connection may leave unread. A connection past the first is closed with 1008, past the second with 1013."
         }
       }
     },

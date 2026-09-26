@@ -53,9 +53,15 @@ The current binary serves all three listeners. The WebSocket endpoint accepts
 ordinary JSON-RPC calls plus `eth_subscribe`/`eth_unsubscribe` for `newHeads`
 and filtered `logs`. Subscription events are published only after the live
 branch commits; reorged logs are sent with `removed: true` before replacement
-logs. A client that falls behind the bounded event channel is closed with code
-1013 and must reconnect. When the node shuts down, every connection is closed
-with code 1001.
+logs. A client that falls behind the bounded event channel, or leaves more than
+`rpc.max_subscription_event_bytes` of notifications unread, is closed with code
+1013 and must reconnect. `eth_subscribe` limits apply per connection: at most
+`rpc.max_subscriptions_per_connection` subscriptions, whose notifications for
+one block or reorg may take at most `rpc.max_subscription_event_bytes`. A
+connection past that is closed with code 1008; reconnect with fewer or
+narrower subscriptions, or spread them over several connections. When the node
+shuts down, every connection is closed with code 1001. See
+[Ethereum JSON-RPC limits](https://leani.dev/docs/reference/ethereum-json-rpc/#transport-rules-and-limits).
 
 Public aggregate routes:
 

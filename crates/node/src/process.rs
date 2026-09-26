@@ -5595,6 +5595,10 @@ async fn serve(path: &Path, registry: &ProcessorRegistry) -> Result<Exit> {
         max_log_topic_alternatives: rpc_settings.max_log_topic_alternatives,
         max_subscriptions_per_connection: rpc_settings.max_subscriptions_per_connection,
         max_websocket_connections: rpc_settings.max_websocket_connections,
+        max_subscription_event_bytes: usize::try_from(
+            rpc_settings.max_subscription_event_bytes.bytes(),
+        )
+        .unwrap_or(usize::MAX),
         shutdown: cancellation.clone(),
         websocket_sessions: websocket_sessions.clone(),
         ..leani_rpc::RpcConfig::default()

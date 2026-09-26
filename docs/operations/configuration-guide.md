@@ -469,8 +469,12 @@ Each limit has a `rpc` setting:
 | `max_log_topic_alternatives` | 1000 | the filter fails with `-32602` |
 | `max_subscriptions_per_connection` | 128 | `eth_subscribe` fails with `-32005` |
 | `max_websocket_connections` | 256 | the WebSocket upgrade gets HTTP 503 |
+| `max_subscription_event_bytes` | `16MiB` | a WebSocket connection whose subscriptions produce more notification bytes for one chain event is closed with `1008`, and one that leaves more unread with `1013` |
 
 A closed WebSocket connection releases its slot and its subscriptions.
+Each open connection holds at most `max_subscription_event_bytes` of
+notifications and one response to a call waiting to be sent, so all
+connections together hold at most `max_websocket_connections` times that.
 
 ### Delivery batching
 

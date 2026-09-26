@@ -42,10 +42,13 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use futures::StreamExt;
+use futures::{
+    SinkExt, StreamExt,
+    stream::{SplitSink, SplitStream},
+};
 use leani_primitives::{
-    Address, BlockFrame, BlockHash, BlockNumber, BlockRange, Capability, CapabilitySet, ChainId,
-    FilterScope, Finality, Material, TopicFilter, TransactionHash, TrustModel,
+    Address, BlockFrame, BlockHash, BlockNumber, BlockRange, BlockRef, Capability, CapabilitySet,
+    ChainId, FilterScope, Finality, Material, TopicFilter, TransactionHash, TrustModel,
 };
 use leani_processor_api::{Processor, ProcessorDescriptor, StartPoint};
 use leani_processor_blobs::{BlobFork, BlobSchedule, BlobsProcessor, get_blob_base_fee};
@@ -57,7 +60,7 @@ use leani_store_sqlite::{SqliteStore, StoreError};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use thiserror::Error;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, broadcast};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, broadcast, mpsc};
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 
 use browser_guard::guard_browser_requests;
@@ -138,6 +141,10 @@ pub const DEFAULT_MAX_LOG_TOPIC_ALTERNATIVES: usize = 1_000;
 pub const DEFAULT_MAX_SUBSCRIPTIONS_PER_CONNECTION: usize = 128;
 /// Default maximum concurrently open WebSocket connections.
 pub const DEFAULT_MAX_WEBSOCKET_CONNECTIONS: usize = 256;
+/// Default maximum encoded bytes of the subscription notifications one chain
+/// event produces for one WebSocket connection, and of those a connection
+/// holds unsent.
+pub const DEFAULT_MAX_SUBSCRIPTION_EVENT_BYTES: usize = 16 * 1_024 * 1_024;
 
 /// RPC transport and readiness settings.
 #[derive(Clone, Debug)]
@@ -159,6 +166,10 @@ pub struct RpcConfig {
     pub max_log_topic_alternatives: usize,
     pub max_subscriptions_per_connection: usize,
     pub max_websocket_connections: usize,
+    /// Encoded bytes of subscription notifications that one chain event may
+    /// produce for one WebSocket connection, and that the connection may
+    /// hold unsent. A connection past either is closed.
+    pub max_subscription_event_bytes: usize,
     /// Cancelled when the node shuts down: open WebSocket connections then
     /// get a going-away close frame.
     pub shutdown: CancellationToken,
@@ -184,6 +195,7 @@ impl Default for RpcConfig {
             max_log_topic_alternatives: DEFAULT_MAX_LOG_TOPIC_ALTERNATIVES,
             max_subscriptions_per_connection: DEFAULT_MAX_SUBSCRIPTIONS_PER_CONNECTION,
             max_websocket_connections: DEFAULT_MAX_WEBSOCKET_CONNECTIONS,
+            max_subscription_event_bytes: DEFAULT_MAX_SUBSCRIPTION_EVENT_BYTES,
             shutdown: CancellationToken::new(),
             websocket_sessions: TaskTracker::new(),
         }
@@ -806,114 +818,255 @@ enum Subscription {
     Logs(ParsedLogFilter),
 }
 
+/// How long a connection being closed may take to accept its close frame
+/// before it is dropped; one that stopped reading never does.
+const WEBSOCKET_CLOSE_TIMEOUT: Duration = Duration::from_secs(1);
+
 /// Serve one WebSocket connection. `_connection` holds its connection slot
-/// until the connection closes; its subscriptions go with it. The node's
-/// shutdown closes it as going away.
-async fn websocket_session(
-    mut socket: WebSocket,
-    state: RpcState,
-    _connection: OwnedSemaphorePermit,
-) {
+/// until the connection closes; its subscriptions and unsent messages go
+/// with it. The node's shutdown closes it as going away.
+async fn websocket_session(socket: WebSocket, state: RpcState, _connection: OwnedSemaphorePermit) {
+    let (mut sink, stream) = socket.split();
+    let (outbox, mut queue) = Outbox::new(state.config.max_subscription_event_bytes);
+    let close = tokio::select! {
+        close = serve_websocket(&state, stream, outbox) => close,
+        () = send_queued(&mut sink, &mut queue) => None,
+        () = state.config.shutdown.cancelled() => Some(CloseFrame {
+            code: close_code::AWAY,
+            reason: "the node is shutting down".into(),
+        }),
+    };
+    // The close frame goes next: messages still queued are dropped.
+    drop(queue);
+    if let Some(close) = close {
+        let _ = tokio::time::timeout(
+            WEBSOCKET_CLOSE_TIMEOUT,
+            sink.send(Message::Close(Some(close))),
+        )
+        .await;
+    }
+}
+
+/// Answer a connection's calls and queue its subscription notifications
+/// until it ends, returning the frame to close it with, if any.
+async fn serve_websocket(
+    state: &RpcState,
+    mut stream: SplitStream<WebSocket>,
+    outbox: Outbox,
+) -> Option<CloseFrame> {
     let mut events = state.committed_events.subscribe();
     let mut subscriptions = BTreeMap::new();
     let mut next_subscription = 1_u64;
     loop {
         tokio::select! {
-            () = state.config.shutdown.cancelled() => {
-                let _ = socket.send(Message::Close(Some(CloseFrame {
-                    code: close_code::AWAY,
-                    reason: "the node is shutting down".into(),
-                }))).await;
-                break;
-            }
-            message = socket.next() => {
-                let Some(message) = message else {
-                    break;
-                };
-                let Ok(message) = message else {
-                    break;
-                };
-                match message {
-                    Message::Text(text) => {
-                        let response = websocket_dispatch_text(
-                            &state,
-                            &mut subscriptions,
-                            &mut next_subscription,
-                            text.as_str(),
-                        ).await;
-                        if let Some(response) = response
-                            && socket.send(Message::Text(response.into())).await.is_err()
-                        {
-                            break;
-                        }
-                    }
-                    Message::Ping(payload) => {
-                        if socket.send(Message::Pong(payload)).await.is_err() {
-                            break;
-                        }
-                    }
-                    Message::Pong(_) => {}
-                    Message::Close(_) => break,
+            message = outbox.next_message(&mut stream) => {
+                let (message, room) = message?;
+                let response = match message {
+                    Message::Text(text) => websocket_dispatch_text(
+                        state,
+                        &mut subscriptions,
+                        &mut next_subscription,
+                        text.as_str(),
+                    )
+                    .await
+                    .map(|response| Message::Text(response.into())),
+                    Message::Ping(payload) => Some(Message::Pong(payload)),
+                    Message::Pong(_) => None,
+                    Message::Close(_) => return None,
                     Message::Binary(_) => {
-                        let _ = socket.send(Message::Close(Some(CloseFrame {
+                        return Some(CloseFrame {
                             code: close_code::UNSUPPORTED,
                             reason: "JSON-RPC messages must be UTF-8 text".into(),
-                        }))).await;
-                        break;
+                        });
                     }
+                };
+                if let Some(response) = response {
+                    outbox.respond(response, room);
                 }
             }
-            event = events.recv() => {
-                match event {
-                    Ok(event) => {
-                        match websocket_event_messages(&state, &subscriptions, &event).await {
-                            Ok(messages) => {
-                                let mut failed = false;
-                                for message in messages {
-                                    if send_websocket_json(&mut socket, &message).await.is_err() {
-                                        failed = true;
-                                        break;
-                                    }
-                                }
-                                if failed {
-                                    break;
-                                }
-                            }
-                            Err(error) => {
-                                let reason = error
-                                    .data
-                                    .as_ref()
-                                    .and_then(|data| data.get("reason"))
-                                    .and_then(Value::as_str)
-                                    .unwrap_or("subscription material unavailable");
-                                let _ = socket.send(Message::Close(Some(CloseFrame {
-                                    code: close_code::ERROR,
-                                    reason: reason.to_owned().into(),
-                                }))).await;
-                                break;
-                            }
-                        }
+            event = events.recv() => match event {
+                Ok(event) => {
+                    if let Err(close) =
+                        queue_notifications(state, &subscriptions, &event, &outbox).await
+                    {
+                        return Some(close);
                     }
-                    Err(broadcast::error::RecvError::Lagged(_)) => {
-                        let _ = socket.send(Message::Close(Some(CloseFrame {
-                            code: close_code::AGAIN,
-                            reason: "subscription event buffer overflow; reconnect".into(),
-                        }))).await;
-                        break;
-                    }
-                    Err(broadcast::error::RecvError::Closed) => break,
                 }
-            }
+                Err(broadcast::error::RecvError::Lagged(_)) => {
+                    return Some(CloseFrame {
+                        code: close_code::AGAIN,
+                        reason: "subscription event buffer overflow; reconnect".into(),
+                    });
+                }
+                Err(broadcast::error::RecvError::Closed) => return None,
+            },
         }
     }
 }
 
-async fn send_websocket_json(
-    socket: &mut WebSocket,
-    value: &impl serde::Serialize,
-) -> Result<(), axum::Error> {
-    let encoded = serde_json::to_string(value).map_err(axum::Error::new)?;
-    socket.send(Message::Text(encoded.into())).await
+/// Send a connection's queued messages in order, until sending fails.
+async fn send_queued(
+    sink: &mut SplitSink<WebSocket, Message>,
+    queue: &mut mpsc::UnboundedReceiver<Queued>,
+) {
+    while let Some((message, _room)) = queue.recv().await {
+        if sink.send(message.into_message()).await.is_err() {
+            return;
+        }
+    }
+}
+
+/// A queued message and the room it takes in the queue until it is sent.
+type Queued = (Outgoing, OwnedSemaphorePermit);
+
+/// A WebSocket connection's queue of messages to send. It holds at most one
+/// response to a call: the next call is read once the response to the last
+/// one is sent, so a client that stops reading stops being answered. Chain
+/// events queue subscription notifications whether the client reads them or
+/// not, within `limit` encoded bytes: an event whose notifications pass
+/// `limit` by themselves, or find no room left in the queue, closes the
+/// connection instead.
+struct Outbox {
+    /// Bounded not by the channel but by the room its messages hold.
+    queue: mpsc::UnboundedSender<Queued>,
+    /// Room for one response.
+    responses: Arc<Semaphore>,
+    /// Room for `limit` bytes of notifications.
+    notifications: Arc<Semaphore>,
+    limit: usize,
+}
+
+impl Outbox {
+    fn new(limit: usize) -> (Self, mpsc::UnboundedReceiver<Queued>) {
+        let (queue, queued) = mpsc::unbounded_channel();
+        let outbox = Self {
+            queue,
+            responses: Arc::new(Semaphore::new(1)),
+            notifications: Arc::new(Semaphore::new(limit.min(Semaphore::MAX_PERMITS))),
+            limit,
+        };
+        (outbox, queued)
+    }
+
+    /// The connection's next message, read once the queue has room for a
+    /// response to it; `None` once the connection ends.
+    async fn next_message(
+        &self,
+        stream: &mut SplitStream<WebSocket>,
+    ) -> Option<(Message, OwnedSemaphorePermit)> {
+        let room = Arc::clone(&self.responses).acquire_owned().await.ok()?;
+        let message = stream.next().await?.ok()?;
+        Some((message, room))
+    }
+
+    fn respond(&self, response: Message, room: OwnedSemaphorePermit) {
+        // Sending fails only once the session ends, dropping its queue.
+        let _ = self.queue.send((Outgoing::Message(response), room));
+    }
+
+    /// Queue the notification of `result` for `subscription`, adding its
+    /// bytes to `event_bytes`, those of its chain event's notifications.
+    fn notify(
+        &self,
+        subscription: &str,
+        result: &Arc<str>,
+        event_bytes: &mut usize,
+    ) -> Result<(), CloseFrame> {
+        let bytes = notification_len(subscription, result);
+        *event_bytes = event_bytes.saturating_add(bytes);
+        if *event_bytes > self.limit {
+            return Err(event_budget_close(self.limit));
+        }
+        let room = u32::try_from(bytes)
+            .ok()
+            .and_then(|bytes| {
+                Arc::clone(&self.notifications)
+                    .try_acquire_many_owned(bytes)
+                    .ok()
+            })
+            .ok_or_else(|| slow_client_close(self.limit))?;
+        let notification = Outgoing::Notification {
+            subscription: subscription.to_owned(),
+            result: Arc::clone(result),
+        };
+        let _ = self.queue.send((notification, room));
+        Ok(())
+    }
+}
+
+/// The frame closing a connection whose subscriptions matched more than
+/// `limit` bytes of notifications in one chain event. They would again on a
+/// like event, so this is a policy violation rather than a passing state.
+fn event_budget_close(limit: usize) -> CloseFrame {
+    CloseFrame {
+        code: close_code::POLICY,
+        reason: format!(
+            "notifications of one chain event exceed rpc.max_subscription_event_bytes ({limit})"
+        )
+        .into(),
+    }
+}
+
+/// The frame closing a connection that left `limit` bytes of notifications
+/// unread. It may keep up after reconnecting, so this asks it to try again.
+fn slow_client_close(limit: usize) -> CloseFrame {
+    CloseFrame {
+        code: close_code::AGAIN,
+        reason: format!(
+            "client too slow: unsent notifications exceed rpc.max_subscription_event_bytes ({limit})"
+        )
+        .into(),
+    }
+}
+
+/// A message waiting in a connection's queue.
+enum Outgoing {
+    Message(Message),
+    /// A subscription notification, encoded when it is sent. Its result is
+    /// shared with the connection's other notifications of the same head or
+    /// log.
+    Notification {
+        subscription: String,
+        result: Arc<str>,
+    },
+}
+
+impl Outgoing {
+    fn into_message(self) -> Message {
+        match self {
+            Self::Message(message) => message,
+            Self::Notification {
+                subscription,
+                result,
+            } => Message::Text(notification_text(&subscription, &result).into()),
+        }
+    }
+}
+
+/// A subscription notification's text around its subscription ID and its
+/// result. Subscription IDs are hexadecimal and need no escaping.
+const NOTIFICATION_PARTS: [&str; 3] = [
+    r#"{"jsonrpc":"2.0","method":"eth_subscription","params":{"subscription":""#,
+    r#"","result":"#,
+    "}}",
+];
+
+fn notification_len(subscription: &str, result: &str) -> usize {
+    NOTIFICATION_PARTS
+        .iter()
+        .map(|part| part.len())
+        .sum::<usize>()
+        + subscription.len()
+        + result.len()
+}
+
+fn notification_text(subscription: &str, result: &str) -> String {
+    let [open, middle, close] = NOTIFICATION_PARTS;
+    let mut text = String::with_capacity(notification_len(subscription, result));
+    for part in [open, subscription, middle, result, close] {
+        text.push_str(part);
+    }
+    text
 }
 
 async fn websocket_dispatch_text(
@@ -927,7 +1080,7 @@ async fn websocket_dispatch_text(
         Err(refused) => return Some(refused),
     };
     for call in calls {
-        if encoder.is_full() {
+        if encoder.skips(&call) {
             encoder.skip(call);
         } else if let Some(response) = websocket_dispatch_value(
             state,
@@ -959,7 +1112,6 @@ async fn websocket_dispatch_value(
             None,
         ));
     };
-    let id = request.id?;
     let subscription_limit = state.config.max_subscriptions_per_connection;
     let result = match request.method.as_str() {
         "eth_subscribe" if subscriptions.len() >= subscription_limit => Err(
@@ -977,10 +1129,8 @@ async fn websocket_dispatch_value(
             .map(|subscription| Value::Bool(subscriptions.remove(subscription).is_some())),
         method => dispatch(state, method, request.params, budget).await,
     };
-    Some(match result {
-        Ok(result) => RpcResponse::success(id, result),
-        Err(error) => RpcResponse::error(id, error.code, error.message, error.data),
-    })
+    // A notification runs like any call; only its response is left out.
+    request.id.map(|id| RpcResponse::answer(id, result))
 }
 
 fn parse_subscription(
@@ -1035,68 +1185,135 @@ fn parse_unsubscribe(params: Option<&Value>) -> Result<&str, RpcError> {
         .ok_or_else(|| RpcError::invalid_params("subscription ID must be a string"))
 }
 
-async fn websocket_event_messages(
+/// Queue the notifications `event` produces for a connection's
+/// `subscriptions`, one at a time: a head or log is encoded once, however
+/// many subscriptions it matches. A reorg's removed logs come first. Fails
+/// with the frame to close the connection with when the event's material is
+/// unavailable, or when its notifications pass the outbox's limits.
+async fn queue_notifications(
     state: &RpcState,
     subscriptions: &BTreeMap<String, Subscription>,
     event: &ChainEvent,
-) -> Result<Vec<Value>, RpcError> {
-    let mut messages = Vec::new();
-    for (subscription_id, subscription) in subscriptions {
-        let results = subscription_results(state, subscription, event).await?;
-        messages.extend(results.into_iter().map(|result| {
-            json!({
-                "jsonrpc": JSONRPC_VERSION,
-                "method": "eth_subscription",
-                "params": {
-                    "subscription": subscription_id,
-                    "result": result
-                }
-            })
-        }));
+    outbox: &Outbox,
+) -> Result<(), CloseFrame> {
+    if subscriptions.is_empty() {
+        return Ok(());
     }
-    Ok(messages)
+    let heads = subscriptions
+        .iter()
+        .filter(|(_, subscription)| matches!(subscription, Subscription::NewHeads))
+        .map(|(id, _)| id.as_str())
+        .collect::<Vec<_>>();
+    let logs = subscriptions
+        .iter()
+        .filter_map(|(id, subscription)| match subscription {
+            Subscription::Logs(filter) => Some((id.as_str(), filter)),
+            Subscription::NewHeads => None,
+        })
+        .collect::<Vec<_>>();
+    let (reverted, applied) = match event {
+        ChainEvent::Block(frame) => (Vec::new(), std::slice::from_ref(frame.as_ref())),
+        ChainEvent::Reorg { applied, .. } if logs.is_empty() => (Vec::new(), applied.as_slice()),
+        ChainEvent::Reorg { reverted, applied } => (
+            reverted_frames(state, reverted)
+                .await
+                .map_err(|error| unavailable_close(&error))?,
+            applied.as_slice(),
+        ),
+        ChainEvent::Disconnected { .. } => {
+            return Err(unavailable_close(&RpcError::data_unavailable_reason(
+                "live_subscription_disconnected",
+            )));
+        }
+        ChainEvent::Reset { .. } => {
+            return Err(unavailable_close(&RpcError::data_unavailable_reason(
+                "live_subscription_reset",
+            )));
+        }
+    };
+    let mut bytes = 0;
+    for frame in &reverted {
+        queue_log_notifications(frame, &logs, true, outbox, &mut bytes)?;
+    }
+    for frame in applied {
+        if !heads.is_empty() {
+            let head = rpc_header(frame)
+                .and_then(serialize_rpc)
+                .map_err(|error| unavailable_close(&error))?;
+            let head: Arc<str> = Arc::from(head.to_string());
+            for subscription in &heads {
+                outbox.notify(subscription, &head, &mut bytes)?;
+            }
+        }
+        queue_log_notifications(frame, &logs, false, outbox, &mut bytes)?;
+    }
+    Ok(())
 }
 
-async fn subscription_results(
+/// The retained frames of a reorg's reverted blocks.
+async fn reverted_frames(
     state: &RpcState,
-    subscription: &Subscription,
-    event: &ChainEvent,
-) -> Result<Vec<Value>, RpcError> {
-    match (subscription, event) {
-        (Subscription::NewHeads, ChainEvent::Block(frame)) => {
-            Ok(vec![serialize_rpc(rpc_header(frame)?)?])
-        }
-        (Subscription::NewHeads, ChainEvent::Reorg { applied, .. }) => applied
+    reverted: &[BlockRef],
+) -> Result<Vec<BlockFrame>, RpcError> {
+    let mut frames = Vec::with_capacity(reverted.len());
+    for block in reverted {
+        frames.push(
+            state
+                .store
+                .recent_frame_by_hash(state.config.chain_id, block.hash)
+                .await
+                .map_err(|error| RpcError::store(&error))?
+                .ok_or_else(|| {
+                    RpcError::data_unavailable_reason("reverted_subscription_frame_missing")
+                })?,
+        );
+    }
+    Ok(frames)
+}
+
+/// Queue the notifications of `frame`'s logs for the log `subscriptions`
+/// they match, marked `removed` for a reverted block.
+fn queue_log_notifications(
+    frame: &BlockFrame,
+    subscriptions: &[(&str, &ParsedLogFilter)],
+    removed: bool,
+    outbox: &Outbox,
+    event_bytes: &mut usize,
+) -> Result<(), CloseFrame> {
+    if subscriptions.is_empty() {
+        return Ok(());
+    }
+    let logs = complete(&frame.logs, "complete_logs_not_retained")
+        .map_err(|error| unavailable_close(&error))?;
+    for log in logs {
+        let mut matching = subscriptions
             .iter()
-            .map(|frame| rpc_header(frame).and_then(serialize_rpc))
-            .collect(),
-        (Subscription::Logs(filter), ChainEvent::Block(frame)) => {
-            subscription_log_values(frame, filter, false)
+            .filter(|(_, filter)| filter.matches(log))
+            .peekable();
+        if matching.peek().is_none() {
+            continue;
         }
-        (Subscription::Logs(filter), ChainEvent::Reorg { reverted, applied }) => {
-            let mut results = Vec::new();
-            for block in reverted {
-                let frame = state
-                    .store
-                    .recent_frame_by_hash(state.config.chain_id, block.hash)
-                    .await
-                    .map_err(|error| RpcError::store(&error))?
-                    .ok_or_else(|| {
-                        RpcError::data_unavailable_reason("reverted_subscription_frame_missing")
-                    })?;
-                results.extend(subscription_log_values(&frame, filter, true)?);
-            }
-            for frame in applied {
-                results.extend(subscription_log_values(frame, filter, false)?);
-            }
-            Ok(results)
+        let result =
+            rpc_log_value(frame, log, removed).map_err(|error| unavailable_close(&error))?;
+        let result: Arc<str> = Arc::from(result.to_string());
+        for (subscription, _) in matching {
+            outbox.notify(subscription, &result, event_bytes)?;
         }
-        (_, ChainEvent::Disconnected { .. }) => Err(RpcError::data_unavailable_reason(
-            "live_subscription_disconnected",
-        )),
-        (_, ChainEvent::Reset { .. }) => {
-            Err(RpcError::data_unavailable_reason("live_subscription_reset"))
-        }
+    }
+    Ok(())
+}
+
+/// The frame closing a connection whose subscriptions cannot be served.
+fn unavailable_close(error: &RpcError) -> CloseFrame {
+    let reason = error
+        .data
+        .as_ref()
+        .and_then(|data| data.get("reason"))
+        .and_then(Value::as_str)
+        .unwrap_or("subscription material unavailable");
+    CloseFrame {
+        code: close_code::ERROR,
+        reason: reason.to_owned().into(),
     }
 }
 
@@ -1110,7 +1327,7 @@ async fn handle(State(state): State<RpcState>, body: Result<Bytes, BytesRejectio
         Err(refused) => return json_body(refused),
     };
     for call in calls {
-        if encoder.is_full() {
+        if encoder.skips(&call) {
             encoder.skip(call);
         } else if let Some(response) = dispatch_value(&state, call, encoder.remaining()).await {
             encoder.push(response);
@@ -1147,8 +1364,9 @@ fn refused_body(rejection: &BytesRejection, max_request_bytes: usize) -> Respons
 /// Encodes the responses to one message within `max_response_bytes`,
 /// counting a batch's brackets and commas. The response that would pass the
 /// limit, and every later one, becomes a `-32005` error for its request ID;
-/// the calls after it need not run. A call that stops early because its
-/// result would pass the limit, as `eth_getLogs` does, counts as passing it.
+/// the calls after it do not run, except notifications, which need no room
+/// in it. A call that stops early because its result would pass the limit,
+/// as `eth_getLogs` does, counts as passing it.
 struct ResponseEncoder {
     limit: usize,
     batch: bool,
@@ -1197,8 +1415,13 @@ impl ResponseEncoder {
         Ok((encoder, calls))
     }
 
-    fn is_full(&self) -> bool {
-        self.full
+    /// Whether `call` is left unrun: once the response is full, every call
+    /// but a notification is.
+    fn skips(&self, call: &Value) -> bool {
+        let notification = call
+            .as_object()
+            .is_some_and(|call| !call.contains_key("id"));
+        self.full && !notification
     }
 
     /// Bytes the next response may still use, after its separating comma.
@@ -1218,13 +1441,7 @@ impl ResponseEncoder {
     }
 
     fn push(&mut self, response: RpcResponse) {
-        let stopped_at_limit = response
-            .error
-            .as_ref()
-            .and_then(|error| error.data.as_ref())
-            .and_then(|data| data.get("reason"))
-            .and_then(Value::as_str)
-            .is_some_and(|reason| reason == RESPONSE_SIZE_LIMIT_EXCEEDED);
+        let stopped_at_limit = response.over_budget;
         let separator = usize::from(self.batch && !self.responses.is_empty());
         let encoded = (!self.full)
             .then(|| encode_response(&response))
@@ -1281,13 +1498,9 @@ async fn dispatch_value(state: &RpcState, value: Value, budget: usize) -> Option
             None,
         ));
     };
-    let id = request.id?;
-    Some(
-        match dispatch(state, &request.method, request.params, budget).await {
-            Ok(result) => RpcResponse::success(id, result),
-            Err(error) => RpcResponse::error(id, error.code, error.message, error.data),
-        },
-    )
+    let result = dispatch(state, &request.method, request.params, budget).await;
+    // A notification runs like any call; only its response is left out.
+    request.id.map(|id| RpcResponse::answer(id, result))
 }
 
 async fn dispatch(
@@ -2457,8 +2670,7 @@ async fn eth_get_logs(
                 .saturating_add(usize::from(!output.is_empty()))
                 .saturating_add(rpc_log_json_len(&frame, log, false));
             if output_bytes > budget {
-                return Err(RpcError::limit_exceeded(
-                    RESPONSE_SIZE_LIMIT_EXCEEDED,
+                return Err(RpcError::over_response_budget(
                     state.config.max_response_bytes,
                 ));
             }
@@ -2599,18 +2811,6 @@ fn historical_log_filters(range: BlockRange, filter: &ParsedLogFilter) -> Filter
         },
         ..FilterSet::default()
     }
-}
-
-fn subscription_log_values(
-    frame: &BlockFrame,
-    filter: &ParsedLogFilter,
-    removed: bool,
-) -> Result<Vec<Value>, RpcError> {
-    let logs = complete(&frame.logs, "complete_logs_not_retained")?;
-    logs.iter()
-        .filter(|log| filter.matches(log))
-        .map(|log| rpc_log_value(frame, log, removed))
-        .collect()
 }
 
 fn rpc_log_value(
@@ -2876,6 +3076,11 @@ impl RpcRequest {
     /// `call` as a JSON-RPC 2.0 request, or `None` when it is invalid. An ID,
     /// when present, is a string, a number, or `null`.
     fn parse(call: Value) -> Option<Self> {
+        // Serde also reads a struct from an array of its fields, such as
+        // `["2.0", 1, "eth_chainId"]`, which is not a request object.
+        if !call.is_object() {
+            return None;
+        }
         serde_json::from_value::<Self>(call).ok().filter(|request| {
             request.jsonrpc == JSONRPC_VERSION
                 && matches!(
@@ -2902,6 +3107,9 @@ struct RpcResponse {
     result: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<RpcErrorBody>,
+    /// The call stopped because its result would pass the response budget.
+    #[serde(skip)]
+    over_budget: bool,
 }
 
 impl RpcResponse {
@@ -2911,6 +3119,7 @@ impl RpcResponse {
             id,
             result: Some(result),
             error: None,
+            over_budget: false,
         }
     }
 
@@ -2929,6 +3138,18 @@ impl RpcResponse {
                 message: message.into(),
                 data,
             }),
+            over_budget: false,
+        }
+    }
+
+    /// The response to the call with `id` that ended with `result`.
+    fn answer(id: Value, result: Result<Value, RpcError>) -> Self {
+        match result {
+            Ok(result) => Self::success(id, result),
+            Err(error) => Self {
+                over_budget: error.over_budget,
+                ..Self::error(id, error.code, error.message, error.data)
+            },
         }
     }
 }
@@ -2946,6 +3167,9 @@ struct RpcError {
     code: i64,
     message: Cow<'static, str>,
     data: Option<Value>,
+    /// The call stopped because its result would pass the response budget,
+    /// which leaves no room for the calls after it.
+    over_budget: bool,
 }
 
 impl From<RpcError> for RpcCompatibilityError {
@@ -2967,6 +3191,7 @@ impl RpcError {
             code: METHOD_NOT_FOUND,
             message: Cow::Borrowed("Method not found"),
             data: None,
+            over_budget: false,
         }
     }
 
@@ -2975,6 +3200,7 @@ impl RpcError {
             code: INVALID_PARAMS,
             message: Cow::Borrowed("Invalid params"),
             data: Some(json!({ "detail": detail })),
+            over_budget: false,
         }
     }
 
@@ -2983,6 +3209,7 @@ impl RpcError {
             code: INVALID_PARAMS,
             message: Cow::Borrowed("Invalid params"),
             data: Some(json!({ "detail": detail, "limit": limit })),
+            over_budget: false,
         }
     }
 
@@ -2991,6 +3218,16 @@ impl RpcError {
             code: LIMIT_EXCEEDED,
             message: Cow::Borrowed("Limit exceeded"),
             data: Some(json!({ "reason": reason, "limit": limit })),
+            over_budget: false,
+        }
+    }
+
+    /// The call stopped because its result would pass what is left of the
+    /// `limit` of response bytes.
+    fn over_response_budget(limit: usize) -> Self {
+        Self {
+            over_budget: true,
+            ..Self::limit_exceeded(RESPONSE_SIZE_LIMIT_EXCEEDED, limit)
         }
     }
 
@@ -3015,6 +3252,7 @@ impl RpcError {
             code: LIMIT_EXCEEDED,
             message: Cow::Owned(message),
             data: Some(data),
+            over_budget: false,
         }
     }
 
@@ -3027,6 +3265,7 @@ impl RpcError {
                 "reason": "raw_execution_material_not_retained",
                 "retryable": false
             })),
+            over_budget: false,
         }
     }
 
@@ -3038,6 +3277,7 @@ impl RpcError {
                 "reason": reason,
                 "retryable": false
             })),
+            over_budget: false,
         }
     }
 
@@ -3046,6 +3286,7 @@ impl RpcError {
             code: INTERNAL_ERROR,
             message: Cow::Borrowed("Internal error"),
             data: Some(json!({ "retryable": true, "detail": error.to_string() })),
+            over_budget: false,
         }
     }
 
@@ -3065,6 +3306,7 @@ impl RpcError {
                 "reason": reason,
                 "retryable": retryable
             })),
+            over_budget: false,
         }
     }
 }
@@ -3365,6 +3607,40 @@ mod tests {
         .await;
         assert_eq!(unsubscribed["result"], true);
         assert!(subscriptions.is_empty());
+    }
+
+    /// The notifications `event` queues for a connection's `subscriptions`,
+    /// in order, or the frame that closes the connection instead.
+    async fn queued_notifications(
+        state: &RpcState,
+        subscriptions: &BTreeMap<String, Subscription>,
+        event: &ChainEvent,
+    ) -> Result<Vec<Value>, CloseFrame> {
+        let (outbox, mut queue) = Outbox::new(state.config.max_subscription_event_bytes);
+        queue_notifications(state, subscriptions, event, &outbox).await?;
+        let mut notifications = Vec::new();
+        while let Ok((message, _room)) = queue.try_recv() {
+            let Message::Text(text) = message.into_message() else {
+                panic!("notifications are text messages");
+            };
+            notifications.push(serde_json::from_str(text.as_str()).expect("JSON notification"));
+        }
+        Ok(notifications)
+    }
+
+    /// The results `event` notifies `subscription` of, when it is its
+    /// connection's only one.
+    async fn subscription_results(
+        state: &RpcState,
+        subscription: &Subscription,
+        event: &ChainEvent,
+    ) -> Result<Vec<Value>, CloseFrame> {
+        let subscriptions = BTreeMap::from([("0x1".to_owned(), subscription.clone())]);
+        Ok(queued_notifications(state, &subscriptions, event)
+            .await?
+            .into_iter()
+            .map(|notification| notification["params"]["result"].clone())
+            .collect())
     }
 
     #[tokio::test]
@@ -5263,5 +5539,462 @@ mod tests {
             Some(block_receipts(router, &frame).await),
             "quantity_exceeds_u128",
         );
+    }
+
+    /// A JSON-RPC 2.0 notification: a call of `method` without an ID.
+    fn rpc_notification(method: &str, params: Value) -> Value {
+        let mut notification = json!({"jsonrpc": "2.0", "method": method});
+        notification["params"] = params;
+        notification
+    }
+
+    #[tokio::test]
+    async fn an_unsubscribe_notification_runs_without_a_response() {
+        // Audit F6 probe `audit_probe_unsubscribe_notification_is_not_executed`,
+        // inverted: a call without an ID was dropped before it ran, so an
+        // `eth_unsubscribe` notification left its subscription active.
+        let (state, _store, _directory) = test_state_and_store().await;
+        let mut subscriptions = BTreeMap::from([("0x1".to_owned(), Subscription::NewHeads)]);
+        let mut next = 2;
+        let response = websocket_dispatch_value(
+            &state,
+            &mut subscriptions,
+            &mut next,
+            rpc_notification("eth_unsubscribe", json!(["0x1"])),
+            state.config.max_response_bytes,
+        )
+        .await;
+        assert!(response.is_none());
+        assert!(subscriptions.is_empty(), "{subscriptions:?}");
+    }
+
+    #[tokio::test]
+    async fn notifications_run_and_only_calls_are_answered() {
+        // Audit F6: notifications were never run, in batches too.
+        let (mut state, store, _directory) = test_state_and_store().await;
+        let mut subscriptions = BTreeMap::from([
+            ("0x1".to_owned(), Subscription::NewHeads),
+            ("0x2".to_owned(), Subscription::NewHeads),
+        ]);
+        let mut next = 3;
+        let batch = json!([
+            rpc_notification("eth_unsubscribe", json!(["0x1"])),
+            {"jsonrpc": "2.0", "id": 7, "method": "eth_chainId"},
+            rpc_notification("eth_subscribe", json!(["newHeads"])),
+        ]);
+        let answered =
+            websocket_call(&state, &mut subscriptions, &mut next, &batch.to_string()).await;
+        assert_eq!(
+            answered,
+            json!([{"jsonrpc": "2.0", "id": 7, "result": "0x1"}])
+        );
+        assert_eq!(
+            subscriptions.keys().collect::<Vec<_>>(),
+            ["0x00000000000000000000000000000003", "0x2"]
+        );
+        // A message of notifications only runs them and gets no reply.
+        for message in [
+            rpc_notification("eth_unsubscribe", json!(["0x2"])),
+            json!([rpc_notification(
+                "eth_unsubscribe",
+                json!(["0x00000000000000000000000000000003"])
+            )]),
+        ] {
+            let reply = websocket_dispatch_text(
+                &state,
+                &mut subscriptions,
+                &mut next,
+                &message.to_string(),
+            )
+            .await;
+            assert_eq!(reply, None, "{message}");
+        }
+        assert!(subscriptions.is_empty(), "{subscriptions:?}");
+        // Once a call fills the response, later calls get -32005 without
+        // running, but notifications, which need no room in it, still run.
+        store
+            .store_recent_frame(&frame_with_logs(7, BlockHash::ZERO, 3, 1_000))
+            .await
+            .expect("recent frame");
+        state.config.max_response_bytes = 1_000;
+        subscriptions.insert("0x4".to_owned(), Subscription::NewHeads);
+        let batch = json!([
+            rpc_call("eth_getLogs", json!([{"fromBlock": "0x7", "toBlock": "0x7"}])),
+            rpc_notification("eth_unsubscribe", json!(["0x4"])),
+            {"jsonrpc": "2.0", "id": 2, "method": "eth_chainId"},
+        ]);
+        let answered =
+            websocket_call(&state, &mut subscriptions, &mut next, &batch.to_string()).await;
+        let responses = answered.as_array().expect("batch");
+        assert_eq!(responses.len(), 2, "{answered}");
+        assert_eq!(responses[0]["error"]["code"], LIMIT_EXCEEDED, "{answered}");
+        assert_eq!(responses[1]["id"], 2, "{answered}");
+        assert_eq!(responses[1]["error"]["code"], LIMIT_EXCEEDED, "{answered}");
+        assert!(subscriptions.is_empty(), "{subscriptions:?}");
+    }
+
+    #[tokio::test]
+    async fn calls_must_be_objects() {
+        // Task 15 review minor: serde reads a struct from an array of its
+        // fields too, so `[["2.0", 1, "eth_chainId"]]` ran as a call.
+        let (state, _store, _directory) = test_state_and_store().await;
+        let refused = json!({
+            "jsonrpc": "2.0",
+            "id": null,
+            "error": {"code": INVALID_REQUEST, "message": "Invalid Request"}
+        });
+        let router = configured_router(state.clone(), false, |_| {});
+        let (_, body) = call(router, json!([["2.0", 1, "eth_chainId"]])).await;
+        assert_eq!(body, Some(json!([refused.clone()])));
+        let answered = websocket_call(
+            &state,
+            &mut BTreeMap::new(),
+            &mut 1,
+            r#"[["2.0", 1, "eth_chainId"], ["2.0", "eth_chainId"]]"#,
+        )
+        .await;
+        assert_eq!(answered, json!([refused.clone(), refused]));
+    }
+
+    #[test]
+    fn only_a_typed_budget_stop_ends_the_batch() {
+        // Task 15 review minor: the encoder took any error whose
+        // `data.reason` read `response_size_limit_exceeded` for a call that
+        // stopped at the response budget, and ended the batch there.
+        let (mut encoder, _) = ResponseEncoder::for_message(
+            br#"[{"jsonrpc":"2.0","id":1,"method":"eth_chainId"},{"jsonrpc":"2.0","id":2,"method":"eth_chainId"}]"#,
+            &RpcConfig::default(),
+        )
+        .expect("batch");
+        encoder.push(RpcResponse::error(
+            json!(1),
+            LIMIT_EXCEEDED,
+            "Limit exceeded",
+            Some(json!({"reason": RESPONSE_SIZE_LIMIT_EXCEEDED, "limit": 1})),
+        ));
+        encoder.push(RpcResponse::success(json!(2), json!("0x1")));
+        let body: Value =
+            serde_json::from_str(&encoder.finish().expect("body")).expect("JSON body");
+        assert_eq!(body[1], json!({"jsonrpc": "2.0", "id": 2, "result": "0x1"}));
+    }
+
+    /// Read `socket` until the server closes it, returning the close frame
+    /// and the bytes of the text messages before it.
+    async fn read_until_closed<S>(
+        socket: &mut S,
+    ) -> (tokio_tungstenite::tungstenite::protocol::CloseFrame, usize)
+    where
+        S: futures::Stream<Item = Result<ClientMessage, tokio_tungstenite::tungstenite::Error>>
+            + Unpin,
+    {
+        let mut received = 0;
+        loop {
+            let message = tokio::time::timeout(Duration::from_secs(5), socket.next())
+                .await
+                .unwrap_or_else(|_| {
+                    panic!("still open after {received} bytes of messages and 5 idle seconds")
+                });
+            match message {
+                Some(Ok(ClientMessage::Text(text))) => received += text.len(),
+                Some(Ok(ClientMessage::Close(Some(frame)))) => return (frame, received),
+                other => panic!("expected a close frame after {received} bytes: {other:?}"),
+            }
+        }
+    }
+
+    /// Connect a WebSocket client with a small receive buffer, which stops
+    /// taking data soon after it stops reading.
+    async fn small_buffer_websocket(
+        address: std::net::SocketAddr,
+    ) -> tokio_tungstenite::WebSocketStream<tokio::net::TcpStream> {
+        let socket = tokio::net::TcpSocket::new_v4().expect("socket");
+        socket
+            .set_recv_buffer_size(4_096)
+            .expect("receive buffer size");
+        let stream = socket.connect(address).await.expect("TCP connection");
+        tokio_tungstenite::client_async(format!("ws://{address}/"), stream)
+            .await
+            .expect("WebSocket connection")
+            .0
+    }
+
+    /// A subscription to every log.
+    fn subscribe_to_logs() -> String {
+        json!({"jsonrpc": "2.0", "id": 1, "method": "eth_subscribe", "params": ["logs", {}]})
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn subscription_output_per_chain_event_stays_within_its_budget() {
+        // Audit F2 probe `audit_probe_subscription_output_bypasses_limits`,
+        // inverted: with responses capped at 1 KiB and `eth_getLogs` at one
+        // log, 128 subscriptions to every log turned one block with two
+        // 1 KiB logs into 256 notifications of 647,648 bytes.
+        let (state, _store, _directory) = test_state_and_store().await;
+        let events = state.committed_events.clone();
+        let budget = 64 * 1_024;
+        let (address, server) = serve(configured_router(state, true, |config| {
+            config.max_response_bytes = 1_024;
+            config.max_log_results = 1;
+            config.max_subscription_event_bytes = budget;
+        }))
+        .await;
+        let mut greedy = websocket_connect(address, None).await.expect("connect");
+        for _ in 0..DEFAULT_MAX_SUBSCRIPTIONS_PER_CONNECTION {
+            let subscribed = websocket_round_trip(&mut greedy, subscribe_to_logs()).await;
+            assert!(subscribed["result"].is_string(), "{subscribed}");
+        }
+        let mut modest = websocket_connect(address, None).await.expect("connect");
+        let subscription =
+            websocket_round_trip(&mut modest, subscribe_to_logs()).await["result"].clone();
+        events
+            .send(ChainEvent::Block(Box::new(frame_with_logs(
+                1,
+                BlockHash::ZERO,
+                2,
+                1_024,
+            ))))
+            .expect("publish the block");
+
+        // The greedy connection is closed, as a policy violation naming the
+        // limit, with nothing past the budget sent.
+        let (close, received) = read_until_closed(&mut greedy).await;
+        assert!(received <= budget, "{received} bytes sent");
+        assert_eq!(u16::from(close.code), 1008, "{close:?}");
+        assert!(
+            close.reason.contains("rpc.max_subscription_event_bytes"),
+            "{close:?}"
+        );
+        // The other connection gets its two notifications and stays open.
+        for index in 0..2 {
+            let notification = modest.next().await.expect("notification").expect("valid");
+            let notification: Value =
+                serde_json::from_str(notification.to_text().expect("text")).expect("JSON");
+            assert_eq!(notification["params"]["subscription"], subscription);
+            assert_eq!(
+                notification["params"]["result"]["logIndex"],
+                hex_quantity(index)
+            );
+        }
+        let chain_id = json!({"jsonrpc": "2.0", "id": 2, "method": "eth_chainId"});
+        assert_eq!(
+            websocket_round_trip(&mut modest, chain_id.to_string()).await["result"],
+            "0x1"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn a_client_that_stops_reading_is_closed_before_its_output_grows_past_the_budget() {
+        // Audit F2: a connection that stopped reading held its slot, and
+        // every notification it could not take, for good.
+        let (mut state, _store, _directory) = test_state_and_store().await;
+        state.committed_events = broadcast::channel(1_024).0;
+        let events = state.committed_events.clone();
+        let (address, server) = serve(configured_router(state, true, |config| {
+            config.max_websocket_connections = 1;
+            config.max_subscription_event_bytes = 256 * 1_024;
+        }))
+        .await;
+        let mut stalled = small_buffer_websocket(address).await;
+        let subscribed = websocket_round_trip(&mut stalled, subscribe_to_logs()).await;
+        assert!(subscribed["result"].is_string(), "{subscribed}");
+        // About 40 KiB of notifications per block, none of them read.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        let mut number = 1;
+        let _replacement = loop {
+            // Fails once the stalled connection is closed and no longer
+            // receives blocks.
+            let _ = events.send(ChainEvent::Block(Box::new(frame_with_logs(
+                number,
+                BlockHash::ZERO,
+                16,
+                1_024,
+            ))));
+            number += 1;
+            match websocket_connect(address, None).await {
+                Ok(socket) => break socket,
+                Err(error) => {
+                    assert_eq!(refused_handshake_status(&error), 503);
+                    assert!(
+                        tokio::time::Instant::now() < deadline,
+                        "the stalled connection still holds its slot after {number} blocks"
+                    );
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            }
+        };
+        drop(stalled);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn a_disconnect_frees_the_connection_while_its_messages_wait() {
+        // A client that disconnects while its messages wait to be sent, and
+        // while a call of it waits for room for its response, frees its
+        // connection slot.
+        let (mut state, _store, _directory) = test_state_and_store().await;
+        state.committed_events = broadcast::channel(1_024).0;
+        let events = state.committed_events.clone();
+        let (address, server) = serve(configured_router(state, true, |config| {
+            config.max_websocket_connections = 1;
+            config.max_subscription_event_bytes = 64 * 1_024 * 1_024;
+        }))
+        .await;
+        let mut stalled = small_buffer_websocket(address).await;
+        let subscribed = websocket_round_trip(&mut stalled, subscribe_to_logs()).await;
+        assert!(subscribed["result"].is_string(), "{subscribed}");
+        // About 16 MiB of notifications, more than the connection can buffer.
+        for number in 1..=400 {
+            events
+                .send(ChainEvent::Block(Box::new(frame_with_logs(
+                    number,
+                    BlockHash::ZERO,
+                    16,
+                    1_024,
+                ))))
+                .expect("publish a block");
+            tokio::task::yield_now().await;
+        }
+        let chain_id = json!({"jsonrpc": "2.0", "id": 2, "method": "eth_chainId"}).to_string();
+        for _ in 0..2 {
+            stalled
+                .send(ClientMessage::Text(chain_id.clone().into()))
+                .await
+                .expect("send a call");
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        drop(stalled);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            match websocket_connect(address, None).await {
+                Ok(_) => break,
+                Err(error) => {
+                    assert_eq!(refused_handshake_status(&error), 503);
+                    assert!(
+                        tokio::time::Instant::now() < deadline,
+                        "the closed connection still holds its slot"
+                    );
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            }
+        }
+        server.abort();
+    }
+
+    /// Take the notifications waiting in `queue`, returning their encoded
+    /// bytes.
+    fn send_all(queue: &mut mpsc::UnboundedReceiver<Queued>) -> usize {
+        let mut bytes = 0;
+        while let Ok((message, _room)) = queue.try_recv() {
+            let Message::Text(text) = message.into_message() else {
+                panic!("notifications are text messages");
+            };
+            bytes += text.len();
+        }
+        bytes
+    }
+
+    /// A connection's only subscription, to every log.
+    fn every_log(config: &RpcConfig) -> BTreeMap<String, Subscription> {
+        let filter = parse_log_filter(Some(&json!([{}])), config).expect("filter");
+        BTreeMap::from([("0x1".to_owned(), Subscription::Logs(filter))])
+    }
+
+    #[tokio::test]
+    async fn a_log_is_encoded_once_for_every_subscription_it_matches() {
+        // Audit F2: 128 subscriptions to every log encoded each log 128
+        // times, all at once.
+        let (state, _store, _directory) = test_state_and_store().await;
+        let Subscription::Logs(filter) = every_log(&state.config)["0x1"].clone() else {
+            panic!("a log subscription");
+        };
+        let mut subscriptions = (0..128_u64)
+            .map(|id| (format!("0x{id:032x}"), Subscription::Logs(filter.clone())))
+            .collect::<BTreeMap<_, _>>();
+        subscriptions.insert("0xff".to_owned(), Subscription::NewHeads);
+        subscriptions.insert("0xfe".to_owned(), Subscription::NewHeads);
+        let mut block = rpc_frame(9);
+        block.logs = frame_with_logs(9, BlockHash::ZERO, 2, 1_024).logs;
+        let (outbox, mut queue) = Outbox::new(DEFAULT_MAX_SUBSCRIPTION_EVENT_BYTES);
+        queue_notifications(
+            &state,
+            &subscriptions,
+            &ChainEvent::Block(Box::new(block)),
+            &outbox,
+        )
+        .await
+        .expect("notifications");
+        let mut results = Vec::new();
+        while let Ok((message, _room)) = queue.try_recv() {
+            let Outgoing::Notification { result, .. } = message else {
+                panic!("a notification");
+            };
+            results.push(result);
+        }
+        // The head's two notifications come first, then the logs', each
+        // notification of a head or log sharing one encoding of it.
+        assert_eq!(results.len(), 2 + 2 * 128);
+        for shared in [&results[..2], &results[2..130], &results[130..]] {
+            assert!(shared.iter().all(|result| Arc::ptr_eq(result, &shared[0])));
+        }
+        assert!(!Arc::ptr_eq(&results[2], &results[130]));
+    }
+
+    #[tokio::test]
+    async fn notifications_past_the_room_in_the_queue_close_the_connection() {
+        // Audit F2: notifications a connection could not take piled up
+        // without a bound.
+        let (state, _store, _directory) = test_state_and_store().await;
+        let subscriptions = every_log(&state.config);
+        let block = |number| {
+            ChainEvent::Block(Box::new(frame_with_logs(number, BlockHash::ZERO, 2, 1_024)))
+        };
+        let (outbox, mut queue) = Outbox::new(usize::MAX);
+        queue_notifications(&state, &subscriptions, &block(1), &outbox)
+            .await
+            .expect("notifications");
+        let event = send_all(&mut queue);
+
+        // Room for one and a half blocks: a second block's notifications
+        // find too little room while the first's are unsent, and never
+        // take more room than there is.
+        let limit = event + event / 2;
+        let (outbox, mut queue) = Outbox::new(limit);
+        queue_notifications(&state, &subscriptions, &block(2), &outbox)
+            .await
+            .expect("room for one block");
+        let close = queue_notifications(&state, &subscriptions, &block(3), &outbox)
+            .await
+            .expect_err("too little room for another");
+        assert_eq!(close.code, close_code::AGAIN);
+        assert!(
+            close
+                .reason
+                .as_str()
+                .contains("rpc.max_subscription_event_bytes"),
+            "{close:?}"
+        );
+        assert!(send_all(&mut queue) <= limit);
+        // Sent notifications free their room.
+        queue_notifications(&state, &subscriptions, &block(4), &outbox)
+            .await
+            .expect("room once sent");
+        assert_eq!(send_all(&mut queue), event);
+
+        // One event whose notifications pass the limit by themselves.
+        let (outbox, _queue) = Outbox::new(event - 1);
+        let close = queue_notifications(&state, &subscriptions, &block(5), &outbox)
+            .await
+            .expect_err("past the budget");
+        assert_eq!(close.code, close_code::POLICY);
+        // Both reasons fit a close frame, whose reason takes at most 123
+        // bytes, for any limit.
+        for close in [
+            event_budget_close(usize::MAX),
+            slow_client_close(usize::MAX),
+        ] {
+            assert!(close.reason.as_str().len() <= 123, "{close:?}");
+        }
     }
 }

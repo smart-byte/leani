@@ -131,6 +131,16 @@ record, and documented RPC contracts.
   WebSocket connection holds at most 128 subscriptions, and at most 256
   connections are open. A 3 KB cross-origin batch used to produce a 4.2 MB
   response, and one connection could hold 2,048 subscriptions.
+- JSON-RPC WebSocket subscriptions bound their output too. The notifications
+  one block or reorg produces for one connection may take at most 16 MiB
+  (`rpc.max_subscription_event_bytes`), and a connection holds at most as
+  much unsent; past either, the node closes that connection (see Changed).
+  Notifications are queued one at a time, and a log or head matching several
+  of a connection's subscriptions is serialized once for all of them. With
+  responses capped at 1 KiB and `eth_getLogs` at one log, 128 subscriptions
+  used to turn one block with two 1 KiB logs into 256 notifications of
+  647,648 bytes, all built before the first was sent, and a connection that
+  stopped reading held its slot, and a block's notifications, for good.
 - `serve` refuses a native API bind beyond loopback without
   `api.bearer_token_env`, and JSON-RPC binds beyond loopback, which have no
   authentication, unless the operator sets `api.allow_unauthenticated_remote`
@@ -291,6 +301,13 @@ record, and documented RPC contracts.
     the progress processor's block number, or the newest scheduled fork on an
     empty node, and a head older than the first scheduled fork fails with
     `eth_config_head_predates_schedule`.
+- Breaking (JSON-RPC): the node closes a WebSocket connection whose
+  subscriptions produce more than `rpc.max_subscription_event_bytes` (16 MiB)
+  of notifications for one block or reorg, with code 1008 and none of that
+  event's notifications, and one that leaves that much unread, with code
+  1013. The close reason names the setting, and notifications still unsent
+  are dropped. Reconnect and subscribe again; after a 1008, with fewer or
+  narrower subscriptions per connection. Other connections are unaffected.
 - SDK: `processors.queryEntities()` without a cursor creates its snapshot with
   the new POST route, and mutations without a JSON body send
   `x-leani-request: 1`. Update the SDK together with the node.
@@ -1049,6 +1066,14 @@ record, and documented RPC contracts.
   that number, so a reorg in between, or on-demand history holding another
   block at that height, answered with another block's logs. Such a call now
   fails with `-32004` (`block_hash_not_retained`).
+- JSON-RPC notifications, calls without an `id`, run as JSON-RPC 2.0
+  requires. Both dispatchers dropped them before running them, so an
+  `eth_unsubscribe` notification left its subscription open and sending.
+  They still get no response, and a batch of only notifications still gets
+  none (HTTP 204). Notifications in a batch also run after its response is
+  full, while later calls with IDs still get `-32005` without running.
+- A JSON-RPC call written as an array of its fields, such as
+  `["2.0", 1, "eth_chainId"]`, gets `-32600` instead of running.
 - A request slot freed just after a waiting execution P2P request found none
   free no longer leaves that request waiting for the next release. Background
   peer qualification, with its limit of 32, no longer holds every slot while
