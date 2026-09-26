@@ -40,8 +40,10 @@ pub struct EventOutput {
     pub collection: String,
     pub kind: String,
     /// Field names used to construct a deterministic key. Empty uses
-    /// transaction hash plus log index. A key holds its newest event by
-    /// block number, transaction index, and log index.
+    /// transaction hash plus log index, which no other event shares. A key
+    /// from these fields can repeat across blocks, so any keyed output makes
+    /// the processor reduce blocks in chain order, and a key holds its
+    /// newest event.
     #[serde(default)]
     pub key_fields: Vec<String>,
     /// Optional canonical-block timestamp bucket.
@@ -163,6 +165,22 @@ impl EvmEventsProcessor {
         let version = Version::new(1, 1, 0);
         let config_hash = BlockHash::new(*blake3::hash(&normalized).as_bytes());
         let topics = parsed.iter().map(|event| event.topic0).collect();
+        // A configured key can repeat across blocks, so which event it holds
+        // depends on the order its blocks reduce in, and an undo restores the
+        // value from before the block. Keyed output is therefore ordered, and
+        // its live lane waits for its history. The default key is unique to
+        // one event, so keyless output stays block-local.
+        let (mode, delivery_ordering) = if parsed
+            .iter()
+            .any(|event| !event.output.key_fields.is_empty())
+        {
+            (ReductionMode::OrderedState, DeliveryOrdering::Canonical)
+        } else {
+            (
+                ReductionMode::BlockLocal,
+                DeliveryOrdering::BlockVersionedIdempotent,
+            )
+        };
         let descriptor = ProcessorDescriptor {
             instance: ProcessorInstanceId::legacy(&id, &version, config_hash)
                 .map_err(|error| input_error(error.to_string()))?,
@@ -185,8 +203,8 @@ impl EvmEventsProcessor {
                 },
                 minimum_finality: Finality::Included,
             }],
-            mode: ReductionMode::BlockLocal,
-            delivery_ordering: DeliveryOrdering::BlockVersionedIdempotent,
+            mode,
+            delivery_ordering,
             publication: PublicationPolicy::IncludedAndFinalized,
             lifecycle: LifecyclePolicies::from_legacy(RetentionPolicy::FullOutputHistory),
             schemas: ProcessorSchemas {
@@ -344,7 +362,8 @@ impl Processor for EvmEventsProcessor {
         let delta: EventDelta = postcard::from_bytes(&delta.payload)
             .map_err(|error| ProcessorError::DeltaPayload(error.to_string()))?;
         // Each emitted change must match its key's net mutation in the block,
-        // so a key keeps only its last event, in log order.
+        // so a key keeps only its last event, in log order. Keyed blocks
+        // reduce in chain order, so that event is the key's newest.
         let mut last_event = BTreeMap::new();
         for (index, event) in delta.events.iter().enumerate() {
             last_event.insert((&event.collection, &event.key), index);
@@ -353,15 +372,6 @@ impl Processor for EvmEventsProcessor {
         for (index, event) in delta.events.iter().enumerate() {
             if last_event.get(&(&event.collection, &event.key)) != Some(&index) {
                 continue;
-            }
-            // Hot and cold lanes apply blocks concurrently, so only an event
-            // at or after the stored one's chain position replaces it.
-            if let Some(stored) = transaction.get(&event.collection, &event.key).await? {
-                let stored: DecodedEvent = postcard::from_bytes(&stored)
-                    .map_err(|error| ProcessorError::State(error.to_string()))?;
-                if chain_position(&stored) > chain_position(&event.entity) {
-                    continue;
-                }
             }
             let payload = postcard::to_allocvec(&event.entity)
                 .map_err(|error| ProcessorError::State(error.to_string()))?;
@@ -635,10 +645,6 @@ fn decode_word(kind: AbiKind, word: [u8; 32]) -> Result<String, String> {
     }
 }
 
-fn chain_position(event: &DecodedEvent) -> (BlockNumber, u32, u32) {
-    (event.block_number, event.transaction_index, event.log_index)
-}
-
 fn output_key(event: &ParsedEvent, entity: &DecodedEvent) -> Result<Vec<u8>, ProcessorError> {
     if event.output.key_fields.is_empty() {
         let mut key = Vec::with_capacity(36);
@@ -743,7 +749,7 @@ fn input_error(detail: impl Into<String>) -> ProcessorError {
 #[cfg(test)]
 mod tests {
     use leani_primitives::{BlockRef, ChainId, Log, Material, TransactionHash, VerificationReport};
-    use leani_store_sqlite::{ChangeDirection, SqliteStore, StoreConfig};
+    use leani_store_sqlite::{ChangeDirection, SqliteStore, StoreConfig, StoreError};
     use leani_testkit::{MemoryReducer, fixture_frame};
 
     use super::*;
@@ -1107,24 +1113,74 @@ mod tests {
         assert_eq!(stored_transfer(&store, &processor, &key).await, None);
     }
 
+    #[test]
+    fn keyed_outputs_reduce_in_chain_order_and_keyless_ones_stay_block_local() {
+        // Audit finding F1: a `key_fields` key repeats across blocks, but
+        // block-local reduction let the hot and cold lanes apply its blocks
+        // in any order, and an undo then restored a stale preimage.
+        let output = |collection: &str, key_fields: &[&str]| EventOutput {
+            collection: collection.to_owned(),
+            kind: collection.to_owned(),
+            key_fields: key_fields.iter().map(|field| (*field).to_owned()).collect(),
+            bucket_seconds: None,
+        };
+        let ordering = |transfer_keys: &[&str]| {
+            let processor = EvmEventsProcessor::new(EvmEventsConfig {
+                start_block: BlockNumber(1),
+                addresses: Vec::new(),
+                events: vec![
+                    EventDefinition {
+                        abi: "event Transfer(address indexed from, address indexed to, uint256 value)"
+                            .to_owned(),
+                        output: output("events.transfers", transfer_keys),
+                    },
+                    EventDefinition {
+                        abi: "event Approval(address indexed owner, address indexed spender, uint256 value)"
+                            .to_owned(),
+                        output: output("events.approvals", &[]),
+                    },
+                ],
+            })
+            .expect("processor");
+            (
+                processor.descriptor.mode,
+                processor.descriptor.delivery_ordering,
+            )
+        };
+        // One keyed output orders the whole processor.
+        assert_eq!(
+            ordering(&["to"]),
+            (ReductionMode::OrderedState, DeliveryOrdering::Canonical)
+        );
+        assert_eq!(
+            ordering(&[]),
+            (
+                ReductionMode::BlockLocal,
+                DeliveryOrdering::BlockVersionedIdempotent
+            )
+        );
+    }
+
     #[tokio::test]
-    async fn an_older_block_does_not_overwrite_a_newer_keyed_event() {
-        // Audit probe (M-P2): hot and cold lanes apply block-local blocks
-        // concurrently, and the last block applied won.
+    async fn a_keyed_instance_stored_as_block_local_is_refused() {
+        // The ordering is part of the stored descriptor, though not of the
+        // instance ID or its hashes: a keyed instance that an earlier build
+        // registered block-local no longer matches its descriptor.
         let processor = processor();
-        let key = transfer_key(&processor).await;
+        let mut block_local = processor.descriptor().clone();
+        block_local.mode = ReductionMode::BlockLocal;
+        block_local.delivery_ordering = DeliveryOrdering::BlockVersionedIdempotent;
         let directory = tempfile::tempdir().expect("directory");
         let store = open_store(&directory).await;
-        let older = transfer_frame(1, BlockHash::ZERO, transfers(&[2]));
-        let newer = transfer_frame(2, older.block.hash, transfers(&[4]));
-        apply(&store, &processor, &newer).await;
-        apply(&store, &processor, &older).await;
-        let latest = stored_transfer(&store, &processor, &key)
+        store
+            .register_processor(&block_local)
             .await
-            .expect("latest transfer");
-        assert_eq!(latest.block_number, BlockNumber(2));
-        assert_eq!(latest.values["value"], "4");
-        assert_eq!(applied_changes(&store, &processor, 1).await, 0);
+            .expect("register the block-local descriptor");
+        let error = store
+            .register_processor(processor.descriptor())
+            .await
+            .expect_err("another ordering conflicts with the stored descriptor");
+        assert!(matches!(error, StoreError::ProcessorIdentity(_)), "{error}");
     }
 
     #[tokio::test]

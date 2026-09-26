@@ -3312,6 +3312,37 @@ async fn map_conformance_frames(
     Ok(deltas)
 }
 
+/// Refuse a backfill of an ordered processor that does not continue its
+/// applied history: the store moves an ordered processor's cursor to each
+/// block it applies, so a range with a hole below it, or below applied
+/// blocks, would reduce its history out of chain order.
+async fn require_ordered_backfill_start(
+    store: &leani_store_sqlite::SqliteStore,
+    processor: &dyn leani_processor_api::Processor,
+    configured: &ProcessorConfig,
+    from: u64,
+) -> Result<()> {
+    if processor.descriptor().mode != leani_processor_api::ReductionMode::OrderedState {
+        return Ok(());
+    }
+    let applied = store.processor_cursor(processor.descriptor()).await?;
+    let next = applied.as_ref().map_or(configured.start_block, |cursor| {
+        cursor.block_number.0.saturating_add(1)
+    });
+    if from != next {
+        let progress = applied.map_or_else(
+            || "has applied no block yet".to_owned(),
+            |cursor| format!("has applied through block {}", cursor.block_number.0),
+        );
+        bail!(
+            "processor {} is ordered: its history applies contiguously from start_block {} upward, and it {progress}; start this backfill at block {next}",
+            configured.instance,
+            configured.start_block
+        );
+    }
+    Ok(())
+}
+
 async fn backfill(
     config_path: &Path,
     processor_id: &str,
@@ -3362,6 +3393,7 @@ async fn backfill(
         config.data_dir.join("leani.sqlite"),
     ))
     .await?;
+    require_ordered_backfill_start(&store, processor.as_ref(), configured, from).await?;
     // The configured pipeline, as the node's on-demand backfills use it.
     let runtime_config = historical_runtime_config(&config, sources.len());
     let runtime = HistoricalRuntime::new_with_sources(
@@ -10279,6 +10311,81 @@ markets = ["ETH/USDT"]
             ),
             "{error:#}"
         );
+    }
+
+    #[tokio::test]
+    async fn an_ordered_backfill_continues_where_its_history_ends() {
+        // Review of task 24: the store moves an ordered processor's cursor to
+        // every block it applies, so a range with a hole below it, or below
+        // blocks already applied, reduced its history out of chain order.
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let chain = fixture_chain(6);
+        let manifest = write_frame_archive(directory.path(), &chain[1..]);
+        let mut config = archive_config(
+            directory.path(),
+            &manifest,
+            &[("transaction-stats", "transfers")],
+        );
+        let configured = &mut config.processors[0];
+        "1.0.0".clone_into(&mut configured.version);
+        configured.history_mode = crate::config::ProcessorHistoryMode::OnDemand;
+        configured.settings = toml::from_str(
+            "from = \"0x0000000000000000000000000000000000000001\"\n\
+             to = \"0x0000000000000000000000000000000000000002\"",
+        )
+        .expect("processor settings");
+        let config_path = directory.path().join("leani.toml");
+        std::fs::write(
+            &config_path,
+            toml::to_string(&config).expect("configuration"),
+        )
+        .expect("configuration file");
+
+        // With nothing applied, history starts at the start block, 1.
+        let error = backfill_after_release(&config_path, 2, 3)
+            .await
+            .expect_err("a range above the start block leaves a hole");
+        assert!(
+            error.to_string().contains("start this backfill at block 1"),
+            "{error:#}"
+        );
+        backfill_after_release(&config_path, 1, 3)
+            .await
+            .expect("the range from the start block");
+        // A hole above the applied blocks, a range below them, and a rerun
+        // from the start all start somewhere other than block 4.
+        for (from, to) in [(5, 6), (2, 4), (1, 6)] {
+            let error = backfill_after_release(&config_path, from, to)
+                .await
+                .expect_err("a range that does not continue the applied blocks");
+            assert!(
+                error.to_string().contains("start this backfill at block 4"),
+                "{from}..={to}: {error:#}"
+            );
+        }
+        backfill_after_release(&config_path, 4, 6)
+            .await
+            .expect("the range that continues the applied blocks");
+    }
+
+    /// `leani backfill` of the `transfers` instance, retried while its data
+    /// directory is still locked: as `local_state::after_release` says, a
+    /// child process another test spawns keeps a just-released lock until
+    /// it execs.
+    async fn backfill_after_release(config_path: &Path, from: u64, to: u64) -> Result<Exit> {
+        let registry = crate::processors::ProcessorRegistry::standard();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            match backfill(config_path, "transfers", from, to, &registry).await {
+                Err(error)
+                    if format!("{error:#}").contains("already in use")
+                        && std::time::Instant::now() < deadline =>
+                {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                result => return result,
+            }
+        }
     }
 
     #[tokio::test]

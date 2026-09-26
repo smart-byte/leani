@@ -41,7 +41,7 @@ bound; blobs.money's own formula still clamps the fee to the reserve.
 
 ## evm-events 1.1.0
 
-A block-local declarative event decoder. Configuration supplies contract
+A declarative event decoder. Configuration supplies contract
 addresses, static Solidity event ABI fragments, and output mappings. The
 factory parses and validates the ABI before a source is opened, derives exact
 topic-zero signatures, pushes address/topic predicates into capable sources,
@@ -62,13 +62,25 @@ topics or data do not decode as that event, such as an ERC-721 `Transfer`
 other than 0 or 1, is not that event: it is skipped rather than failing the
 block, and the block's mapped delta counts the skipped logs.
 
-With `key_fields`, a block emits one change per key, for its last event. When
-the processor stores output entities (`[processors.output] mode` other than
-`none`), an entity holds the newest event for its key by block number,
-transaction index, and log index, even when the hot and cold lanes apply
-blocks out of order: an older event never replaces the stored newer one and
-emits no change. The comparison needs the stored entity, so with
-`mode = "none"` events are published in the order blocks apply.
+Without `key_fields`, an event's key is its transaction hash and log index,
+which no other event shares, so the processor is block-local: its history and
+live blocks apply independently. A `key_fields` key can repeat across blocks,
+and its entity holds the key's newest event, so any keyed output makes the
+processor ordered, like `erc20-balances` (`ordered_state` reduction and
+`canonical` delivery ordering). It reduces blocks strictly in chain order: a
+block emits one change per key, for its last event, and undoing a block
+restores the key's event from before it. Its live lane therefore waits for its
+cold backfill, holding live blocks as pending deltas within
+`[budgets] pending_delta_bytes` until history reaches them. Consumers read a
+keyed instance's stream through the generic consumer routes. Application
+subscriptions and `POST /admin/v1/materialization-jobs` require a block-local
+processor, so they refuse a keyed instance. With `history_mode = "on_demand"`,
+its history comes from the `backfill` command instead, which applies an
+ordered processor's history contiguously from `start_block` upward: each range
+must start at the block after the last one applied, and the command refuses
+any other start. Finalized-coverage compaction is block-local only, so a keyed
+instance keeps one coverage row per block it applies, without bound, as other
+ordered processors do.
 
 `publish = "finalized_only"` holds included-block changes in the store until
 verified finality promotes them. The stream then contains only finalized

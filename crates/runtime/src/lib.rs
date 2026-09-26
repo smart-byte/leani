@@ -1120,6 +1120,34 @@ async fn accept_existing_delta_variant(
     Ok(true)
 }
 
+/// Pending rows read to find one block's delta. The store has no lookup by
+/// block, but `pending_deltas` orders rows by height, then hash, from the
+/// block's height, so rows at that height come first. A reorg deletes the
+/// reverted blocks' rows, so a height holds one row unless branches race. A
+/// row the scan misses leaves the conflict error, so the bound fails safe.
+const PENDING_ROWS_AT_ONE_HEIGHT: usize = 16;
+
+/// Whether the delta pending for `mapped`'s block is one of its finality
+/// variants.
+async fn pending_finality_variant(
+    store: &SqliteStore,
+    processor: &dyn Processor,
+    mapped: &MappedFrame,
+) -> Result<bool, RuntimeError> {
+    Ok(store
+        .pending_deltas(
+            processor.descriptor(),
+            mapped.delta.block.number,
+            PENDING_ROWS_AT_ONE_HEIGHT,
+        )
+        .await?
+        .iter()
+        .any(|pending| {
+            pending.block == mapped.delta.block
+                && mapped.equivalent_checksums.contains(&pending.checksum)
+        }))
+}
+
 /// Test-only crash points between the separately committed steps of a live
 /// commit or reorg. A test arms a point for one processor instance and block,
 /// and the runtime then fails there once with an error no lane isolates, so
@@ -1189,13 +1217,19 @@ async fn commit_mapped_delta(
         .persist_delta(processor.descriptor(), &mapped.delta)
         .await
     {
-        if matches!(error, StoreError::ConflictingPendingDelta(_)) {
-            tokio::task::yield_now().await;
-            if accept_existing_delta_variant(store, processor, mapped).await? {
-                return Ok(ApplyOutcome::AlreadyApplied);
-            }
+        if !matches!(error, StoreError::ConflictingPendingDelta(_)) {
+            return Err(error.into());
         }
-        return Err(error.into());
+        tokio::task::yield_now().await;
+        if accept_existing_delta_variant(store, processor, mapped).await? {
+            return Ok(ApplyOutcome::AlreadyApplied);
+        }
+        // A live lane can hold the block's delta mapped with the other
+        // finality, as an ordered one does until history reaches the block.
+        // The apply replaces it.
+        if !pending_finality_variant(store, processor, mapped).await? {
+            return Err(error.into());
+        }
     }
     #[cfg(test)]
     failpoints::hit(
@@ -4599,10 +4633,38 @@ impl SharedLiveRuntime {
             finality,
             sequence: prior.map_or(1, |cursor| cursor.sequence.saturating_add(1)),
         };
-        self.store
+        match self
+            .store
             .apply(processor, cursor, delta, &self.config.sink_ids)
             .await
-            .map_err(Into::into)
+        {
+            // History can apply the block, mapped with the other finality,
+            // between a drain's or gap replay's read of this delta and its
+            // apply. Unlike `accept_existing_delta_variant`, this path has no
+            // mapped frame, only the delta, so the processor's own finality
+            // variants decide. Unlike `clear_applied_pending_variant`, it has
+            // nothing to clean up: the apply that won removed the block's
+            // pending row and recorded its coverage and finality.
+            Err(error @ StoreError::ConflictingApply { .. }) => {
+                if let Some(applied) = self
+                    .store
+                    .applied_delta_checksum(
+                        processor.descriptor(),
+                        delta.block.number,
+                        delta.block.hash,
+                    )
+                    .await?
+                    && processor
+                        .finality_variant_checksums(delta)?
+                        .contains(&applied)
+                {
+                    Ok(ApplyOutcome::AlreadyApplied)
+                } else {
+                    Err(error.into())
+                }
+            }
+            applied => applied.map_err(Into::into),
+        }
     }
 
     async fn apply_recovered_delta(
@@ -5508,13 +5570,19 @@ impl SharedLiveRuntime {
                 .recent_frame(delta.chain_id, delta.block.number)
                 .await?
                 .filter(|frame| frame.block == delta.block);
+            // The retained frame's variants hold for this delta only if it is
+            // one of them: a held delta with other content is a conflict even
+            // when the frame maps to the applied delta, so a non-deterministic
+            // mapper stays visible.
             if !equivalent_checksums.contains(&stored_checksum)
                 && let Some(frame) = &recent
             {
                 let (_, mapped_checksums) = map_with_finality_variants(processor, frame).await?;
-                equivalent_checksums.extend(mapped_checksums);
-                equivalent_checksums.sort_unstable();
-                equivalent_checksums.dedup();
+                if mapped_checksums.contains(&delta.checksum) {
+                    equivalent_checksums.extend(mapped_checksums);
+                    equivalent_checksums.sort_unstable();
+                    equivalent_checksums.dedup();
+                }
             }
             if !equivalent_checksums.contains(&stored_checksum) {
                 return Err(StoreError::ConflictingApply {
@@ -7714,22 +7782,7 @@ mod tests {
             &self,
             delta: &EncodedDelta,
         ) -> Result<Vec<BlockHash>, ProcessorError> {
-            delta.validate(self.descriptor())?;
-            let mut checksums = Vec::with_capacity(2);
-            for finality in [Finality::Included, Finality::Finalized] {
-                let mut payload = delta.payload.clone();
-                let encoded_finality = payload
-                    .last_mut()
-                    .ok_or_else(|| ProcessorError::DeltaPayload("missing finality".to_owned()))?;
-                *encoded_finality = finality as u8;
-                checksums.push(
-                    EncodedDelta::new(self.descriptor(), delta.chain_id, delta.block, payload)
-                        .checksum,
-                );
-            }
-            checksums.sort_unstable();
-            checksums.dedup();
-            Ok(checksums)
+            finality_byte_variants(self.descriptor(), delta)
         }
 
         async fn reduce(
@@ -7739,6 +7792,117 @@ mod tests {
             _delta: &EncodedDelta,
         ) -> Result<leani_processor_api::DomainChanges, ProcessorError> {
             Ok(leani_processor_api::DomainChanges::default())
+        }
+    }
+
+    /// The checksums of `delta` with each finality in its last payload byte,
+    /// where the finality-sensitive test processors record the frame's.
+    fn finality_byte_variants(
+        descriptor: &ProcessorDescriptor,
+        delta: &EncodedDelta,
+    ) -> Result<Vec<BlockHash>, ProcessorError> {
+        delta.validate(descriptor)?;
+        let mut checksums = Vec::with_capacity(2);
+        for finality in [Finality::Included, Finality::Finalized] {
+            let mut payload = delta.payload.clone();
+            let encoded_finality = payload
+                .last_mut()
+                .ok_or_else(|| ProcessorError::DeltaPayload("missing finality".to_owned()))?;
+            *encoded_finality = finality as u8;
+            checksums
+                .push(EncodedDelta::new(descriptor, delta.chain_id, delta.block, payload).checksum);
+        }
+        checksums.sort_unstable();
+        checksums.dedup();
+        Ok(checksums)
+    }
+
+    /// `FinalitySensitiveCounter` without its finality-variant hook, so only
+    /// its block's retained frame shows two of its deltas to be finality
+    /// variants.
+    #[derive(Debug, Default)]
+    struct HooklessFinalityCounter {
+        inner: FinalitySensitiveCounter,
+    }
+
+    #[async_trait]
+    impl Processor for HooklessFinalityCounter {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
+        fn descriptor(&self) -> &ProcessorDescriptor {
+            self.inner.descriptor()
+        }
+
+        async fn map(
+            &self,
+            block: &leani_primitives::BlockFrame,
+        ) -> Result<EncodedDelta, ProcessorError> {
+            self.inner.map(block).await
+        }
+
+        async fn reduce(
+            &self,
+            transaction: &mut dyn leani_processor_api::ReducerTransaction,
+            cursor: &ProcessorCursor,
+            delta: &EncodedDelta,
+        ) -> Result<leani_processor_api::DomainChanges, ProcessorError> {
+            self.inner.reduce(transaction, cursor, delta).await
+        }
+    }
+
+    /// `FinalitySensitiveCounter`'s ordered twin: its ledger delta records the
+    /// frame's finality as well, as `uniswap-latest`'s delta does.
+    #[derive(Debug, Default)]
+    struct FinalitySensitiveLedger {
+        inner: OrderedLedgerProcessor,
+    }
+
+    #[async_trait]
+    impl Processor for FinalitySensitiveLedger {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
+        fn descriptor(&self) -> &ProcessorDescriptor {
+            self.inner.descriptor()
+        }
+
+        async fn map(
+            &self,
+            block: &leani_primitives::BlockFrame,
+        ) -> Result<EncodedDelta, ProcessorError> {
+            let mut payload = self.inner.map(block).await?.payload;
+            payload.push(block.finality as u8);
+            Ok(EncodedDelta::new(
+                self.descriptor(),
+                block.chain_id,
+                block.block,
+                payload,
+            ))
+        }
+
+        fn finality_variant_checksums(
+            &self,
+            delta: &EncodedDelta,
+        ) -> Result<Vec<BlockHash>, ProcessorError> {
+            finality_byte_variants(self.descriptor(), delta)
+        }
+
+        async fn reduce(
+            &self,
+            transaction: &mut dyn leani_processor_api::ReducerTransaction,
+            cursor: &ProcessorCursor,
+            delta: &EncodedDelta,
+        ) -> Result<leani_processor_api::DomainChanges, ProcessorError> {
+            delta.validate(self.descriptor())?;
+            let mut payload = delta.payload.clone();
+            payload
+                .pop()
+                .ok_or_else(|| ProcessorError::DeltaPayload("missing finality".to_owned()))?;
+            let ledger = EncodedDelta::new(self.descriptor(), delta.chain_id, delta.block, payload);
+            self.inner.reduce(transaction, cursor, &ledger).await
         }
     }
 
@@ -18099,6 +18263,936 @@ mod tests {
                 .state,
             ProcessorRunState::Running
         );
+    }
+
+    /// One step of a keyed `evm-events` interleaving (audit finding F1).
+    #[derive(Clone, Copy, Debug)]
+    enum Keyed {
+        /// The live source delivers canonical blocks `.0..=.1` as included.
+        Live(u64, u64),
+        /// The cold lane backfills finalized history from block 1 through this
+        /// block, then the live lane drains what that released, as after a
+        /// hot/cold handoff.
+        History(u64),
+        /// Verified finality promotes the canonical chain through this block.
+        Finalize(u64),
+        /// The live tip reorgs from block `.0` onto `.1` replacement blocks.
+        Reorg(u64, u64),
+        /// The live source delivers this canonical block again.
+        Redeliver(u64),
+        /// The node restarts over the same store file and reconciles it.
+        Restart,
+    }
+
+    /// Block `number` of the keyed interleaving chain, keyed by recipient
+    /// `0xaa` or `0xbb`. A replacement block moves only `0xbb`, so nothing in
+    /// a replacement branch restores `0xaa`.
+    fn keyed_frame(
+        topic: [u8; 32],
+        number: u64,
+        parent: BlockHash,
+        replacement: bool,
+    ) -> leani_primitives::BlockFrame {
+        let height = u8::try_from(number).expect("small height");
+        let tag = if replacement { 0xc0 | height } else { height };
+        let transfers: &[(u8, u8)] = match (number, replacement) {
+            (_, true) => &[(0xbb, 9)],
+            (1, false) => &[(0xaa, 1)],
+            (2, false) => &[(0xaa, 2), (0xbb, 2)],
+            (3, false) => &[(0xbb, 3)],
+            (4, false) => &[(0xaa, 4)],
+            // One key twice in a block (audit finding H21).
+            _ => &[(0xbb, 5), (0xaa, 6), (0xaa, 7)],
+        };
+        let word = |byte: u8| {
+            let mut word = [0_u8; 32];
+            word[12..].fill(byte);
+            word
+        };
+        let mut frame = included_frame(number, parent);
+        frame.block.hash = BlockHash::new([tag; 32]);
+        frame.logs = Material::Complete(
+            transfers
+                .iter()
+                .zip(0..)
+                .map(|(&(to, value), log_index)| {
+                    let mut data = vec![0_u8; 32];
+                    data[31] = value;
+                    leani_primitives::Log {
+                        address: leani_primitives::Address::new([0x11; 20]),
+                        topics: vec![topic, word(0x22), word(to)],
+                        data,
+                        transaction_hash: Some(leani_primitives::TransactionHash::new([tag; 32])),
+                        transaction_index: 0,
+                        log_index,
+                    }
+                })
+                .collect(),
+        );
+        frame
+    }
+
+    fn height(number: u64) -> usize {
+        usize::try_from(number).expect("height")
+    }
+
+    /// The highest block of the keyed interleaving chain's live source.
+    const KEYED_LAST_HEIGHT: u64 = 9;
+
+    /// Each entity as its JSON without the finality label, which records
+    /// the lane that applied its block.
+    fn entity_views(
+        processor: &dyn Processor,
+        collection: &str,
+        rows: Vec<(Vec<u8>, Vec<u8>)>,
+    ) -> BTreeMap<Vec<u8>, serde_json::Value> {
+        rows.into_iter()
+            .map(|(key, value)| {
+                let mut entity = processor
+                    .entity_json(collection, &key, &value)
+                    .expect("render entity")
+                    .expect("entity JSON");
+                entity
+                    .as_object_mut()
+                    .expect("entity object")
+                    .remove("finality");
+                (key, entity)
+            })
+            .collect()
+    }
+
+    /// `recipient@block=value` per entity.
+    fn entity_summary(view: &BTreeMap<Vec<u8>, serde_json::Value>) -> String {
+        view.values()
+            .map(|entity| {
+                let to = entity["values"]["to"]
+                    .as_str()
+                    .and_then(|to| to.get(40..))
+                    .unwrap_or("?");
+                let value = entity["values"]["value"].as_str().unwrap_or("?");
+                format!("{to}@{}={value}", entity["blockNumber"])
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    /// A keyed and a keyless `evm-events` instance driven through the live,
+    /// cold, and finality lanes over one store file.
+    struct KeyedRun {
+        _directory: tempfile::TempDir,
+        path: std::path::PathBuf,
+        store: SqliteStore,
+        /// Each processor with its output collection; the keyed one first.
+        processors: Vec<(Arc<dyn Processor>, &'static str)>,
+        topic: [u8; 32],
+        /// The canonical chain from block 1.
+        chain: Vec<leani_primitives::BlockFrame>,
+        /// The live lane's retained tip, and the last block history delivered.
+        tip: u64,
+        history: u64,
+        jobs: u64,
+        /// Where a processor covered the canonical chain, but its output
+        /// differed from reducing that chain strictly in order.
+        divergences: Vec<String>,
+    }
+
+    impl KeyedRun {
+        async fn open() -> Self {
+            use leani_processor_evm_events::{
+                EventDefinition, EventOutput, EvmEventsConfig, EvmEventsProcessor,
+            };
+
+            let events = |collection: &'static str, key_fields: &[&str]| {
+                let processor: Arc<dyn Processor> = Arc::new(
+                    EvmEventsProcessor::new(EvmEventsConfig {
+                        start_block: BlockNumber(1),
+                        addresses: vec![leani_primitives::Address::new([0x11; 20])],
+                        events: vec![EventDefinition {
+                            abi: "event Transfer(address indexed from, address indexed to, uint256 value)"
+                                .to_owned(),
+                            output: EventOutput {
+                                collection: collection.to_owned(),
+                                kind: collection.to_owned(),
+                                key_fields: key_fields
+                                    .iter()
+                                    .map(|field| (*field).to_owned())
+                                    .collect(),
+                                bucket_seconds: None,
+                            },
+                        }],
+                    })
+                    .expect("processor"),
+                );
+                (processor, collection)
+            };
+            let processors = vec![events("events.latest", &["to"]), events("events.log", &[])];
+            // The requirement's topic filter holds the event's topic zero.
+            let topic =
+                processors[0].0.descriptor().requirements[0].filter.topics[0].alternatives[0];
+            let mut chain = Vec::new();
+            let mut parent = BlockHash::ZERO;
+            for number in 1..=5 {
+                let frame = keyed_frame(topic, number, parent, false);
+                parent = frame.block.hash;
+                chain.push(frame);
+            }
+            let directory = tempfile::tempdir().expect("tempdir");
+            let path = directory.path().join("keyed.sqlite");
+            let store = SqliteStore::open(leani_store_sqlite::StoreConfig::new(&path))
+                .await
+                .expect("store");
+            Self {
+                _directory: directory,
+                path,
+                store,
+                processors,
+                topic,
+                chain,
+                tip: 0,
+                history: 0,
+                jobs: 0,
+                divergences: Vec::new(),
+            }
+        }
+
+        fn frame(&self, number: u64) -> leani_primitives::BlockFrame {
+            self.chain[height(number) - 1].clone()
+        }
+
+        fn live(&self, steps: Vec<LiveStep>) -> SharedLiveRuntime {
+            SharedLiveRuntime::new(
+                self.store.clone(),
+                Arc::new(ScriptedLiveSource::new(
+                    fixture_source_descriptor(
+                        "keyed-live",
+                        BlockRange::new(BlockNumber(1), BlockNumber(KEYED_LAST_HEIGHT))
+                            .expect("range"),
+                    ),
+                    steps,
+                )),
+                self.processors
+                    .iter()
+                    .map(|(processor, _)| processor.clone())
+                    .collect(),
+                SharedLiveRuntimeConfig::default(),
+            )
+            .expect("live runtime")
+        }
+
+        async fn deliver(&self, numbers: std::ops::RangeInclusive<u64>) {
+            let steps = numbers
+                .map(|number| LiveStep::Event(ChainEvent::Block(Box::new(self.frame(number)))))
+                .collect();
+            run_live(&self.live(steps)).await.expect("live run");
+        }
+
+        async fn step(&mut self, step: Keyed) {
+            match step {
+                Keyed::Live(from, to) => {
+                    self.deliver(from..=to).await;
+                    self.tip = self.tip.max(to);
+                }
+                Keyed::Redeliver(number) => self.deliver(number..=number).await,
+                Keyed::History(through) => self.backfill(through).await,
+                Keyed::Finalize(number) => self.finalize(number).await,
+                Keyed::Reorg(from, length) => self.reorg(from, length).await,
+                Keyed::Restart => {
+                    // A new process: the reopened store and fresh runtime
+                    // objects reconcile before the lanes open.
+                    self.store =
+                        SqliteStore::open(leani_store_sqlite::StoreConfig::new(&self.path))
+                            .await
+                            .expect("reopen store");
+                    self.live(Vec::new())
+                        .reconcile_startup()
+                        .await
+                        .expect("startup reconciliation");
+                }
+            }
+            self.compare(step).await;
+        }
+
+        async fn backfill(&mut self, through: u64) {
+            for (processor, _) in &self.processors {
+                self.jobs += 1;
+                self.history_run(processor, through, self.jobs)
+                    .await
+                    .expect("history run");
+            }
+            self.history = self.history.max(through);
+            self.live(Vec::new())
+                .reconcile_pending()
+                .await
+                .expect("drain after the handoff");
+        }
+
+        /// One processor's cold backfill job over finalized blocks
+        /// `1..=through`.
+        async fn history_run(
+            &self,
+            processor: &Arc<dyn Processor>,
+            through: u64,
+            job: u64,
+        ) -> Result<BackfillReport, RuntimeError> {
+            let range = BlockRange::new(BlockNumber(1), BlockNumber(through)).expect("range");
+            let frames = self
+                .chain
+                .iter()
+                .take(height(through))
+                .map(|frame| {
+                    let mut frame = frame.clone();
+                    frame.finality = Finality::Finalized;
+                    frame
+                })
+                .collect();
+            let job = BackfillJob::for_processor(
+                format!("keyed-history-{job}"),
+                processor.as_ref(),
+                ChainId(1),
+                range,
+                VerificationPolicy::CompleteCryptographic,
+            )
+            .expect("history job");
+            HistoricalRuntime::new(
+                self.store.clone(),
+                Arc::new(ScriptedHistorySource::from_frames(
+                    fixture_source_descriptor("keyed-history", range),
+                    frames,
+                )),
+                processor.clone(),
+                HistoricalRuntimeConfig {
+                    mapper_concurrency: 2,
+                    ..HistoricalRuntimeConfig::default()
+                },
+            )
+            .expect("history runtime")
+            .run(job, default_source_budget(), CancellationToken::new())
+            .await
+        }
+
+        async fn finalize(&self, number: u64) {
+            let block = self.frame(number).block;
+            let checkpoint = ConsensusCheckpoint {
+                beacon_slot: 1,
+                beacon_block_root: [1; 32],
+                execution_block_hash: BlockHash::ZERO,
+                obtained_at_unix_seconds: 1,
+                source: "fixture".to_owned(),
+            };
+            SharedFinalityRuntime::new(
+                self.store.clone(),
+                Arc::new(ScriptedFinalitySource::new(
+                    fixture_source_descriptor("keyed-finality", BlockRange::single(block.number)),
+                    checkpoint.clone(),
+                    vec![FinalityStep::Event(FinalityEvent::Finalized {
+                        block_number: block.number,
+                        block_hash: block.hash,
+                        beacon_slot: number,
+                        beacon_block_root: [2; 32],
+                    })],
+                )),
+                self.processors
+                    .iter()
+                    .map(|(processor, _)| processor.clone())
+                    .collect(),
+                SharedFinalityRuntimeConfig::default(),
+            )
+            .expect("finality runtime")
+            .run(checkpoint, CancellationToken::new())
+            .await
+            .expect("finality run");
+        }
+
+        async fn reorg(&mut self, from: u64, length: u64) {
+            let reverted = (from..=self.tip)
+                .rev()
+                .map(|number| self.frame(number).block)
+                .collect();
+            self.chain.truncate(height(from) - 1);
+            for number in from..from + length {
+                let parent = self.chain.last().expect("reorg ancestor").block.hash;
+                self.chain
+                    .push(keyed_frame(self.topic, number, parent, true));
+            }
+            let applied = self.chain[height(from) - 1..].to_vec();
+            run_live(&self.live(vec![LiveStep::Event(ChainEvent::Reorg {
+                reverted,
+                applied,
+            })]))
+            .await
+            .expect("reorg");
+            self.tip = from + length - 1;
+        }
+
+        /// The canonical chain as far as either lane delivered it.
+        fn known_chain(&self) -> &[leani_primitives::BlockFrame] {
+            &self.chain[..height(self.tip.max(self.history))]
+        }
+
+        /// Whether `processor` covers exactly the known chain: each of its
+        /// blocks, and nothing above it.
+        async fn covers_known_chain(&self, processor: &dyn Processor) -> bool {
+            let known = self.known_chain();
+            let heights = known.iter().map(|frame| Some(frame.block.hash));
+            let above = std::iter::repeat_n(None, height(KEYED_LAST_HEIGHT) - known.len());
+            for (number, expected) in (1..).zip(heights.chain(above)) {
+                if self
+                    .store
+                    .coverage_hash(processor.descriptor(), BlockNumber(number))
+                    .await
+                    .expect("coverage")
+                    != expected
+                {
+                    return false;
+                }
+            }
+            true
+        }
+
+        /// Once a processor covers exactly the known canonical chain, its
+        /// output must equal that chain reduced strictly in order.
+        async fn compare(&mut self, after: Keyed) {
+            use leani_processor_api::ReducerTransaction as _;
+
+            let mut divergences = Vec::new();
+            for (processor, collection) in &self.processors {
+                if !self.covers_known_chain(processor.as_ref()).await {
+                    continue;
+                }
+                let mut sequential = leani_testkit::MemoryReducer::default();
+                for (sequence, frame) in (1..).zip(self.known_chain()) {
+                    let delta = processor.map(frame).await.expect("map");
+                    let cursor = ProcessorCursor {
+                        processor_id: processor.descriptor().id.to_string(),
+                        processor_version: processor.descriptor().version.to_string(),
+                        chain_id: frame.chain_id,
+                        block_number: frame.block.number,
+                        block_hash: frame.block.hash,
+                        finality: frame.finality,
+                        sequence,
+                    };
+                    processor
+                        .reduce(&mut sequential, &cursor, &delta)
+                        .await
+                        .expect("sequential reduction");
+                }
+                let expected = entity_views(
+                    processor.as_ref(),
+                    collection,
+                    sequential
+                        .scan_prefix(collection, &[], 1_000)
+                        .await
+                        .expect("sequential entities"),
+                );
+                let actual = entity_views(
+                    processor.as_ref(),
+                    collection,
+                    self.store
+                        .scan_entities(processor.descriptor(), collection, None, 1_000)
+                        .await
+                        .expect("entities"),
+                );
+                if actual != expected {
+                    divergences.push(format!(
+                        "after {after:?}, {collection} holds [{}], sequential reduction [{}]",
+                        entity_summary(&actual),
+                        entity_summary(&expected)
+                    ));
+                }
+            }
+            self.divergences.extend(divergences);
+        }
+
+        /// Every lane ends on exactly the known canonical chain with nothing
+        /// held, finalized through `finalized` (keyed lane first), and the
+        /// keyed output is `output`, an absolute anchor independent of the
+        /// sequential reference.
+        async fn check_end(&mut self, output: &str, finalized: [u64; 2]) {
+            let mut divergences = Vec::new();
+            for ((processor, collection), finalized) in self.processors.iter().zip(finalized) {
+                let descriptor = processor.descriptor();
+                if !self.covers_known_chain(processor.as_ref()).await
+                    || !self
+                        .store
+                        .pending_deltas(descriptor, BlockNumber(0), 1)
+                        .await
+                        .expect("pending deltas")
+                        .is_empty()
+                    || self
+                        .store
+                        .processor_runtime_state(descriptor)
+                        .await
+                        .expect("state")
+                        .state
+                        != ProcessorRunState::Running
+                {
+                    divergences.push(format!("{collection} did not catch up"));
+                }
+                let through = self
+                    .store
+                    .finalized_through(descriptor)
+                    .await
+                    .expect("finalized coverage");
+                if through != Some(BlockNumber(finalized)) {
+                    divergences.push(format!(
+                        "{collection} is finalized through {through:?}, not block {finalized}"
+                    ));
+                }
+            }
+            let (processor, collection) = &self.processors[0];
+            let actual = entity_summary(&entity_views(
+                processor.as_ref(),
+                collection,
+                self.store
+                    .scan_entities(processor.descriptor(), collection, None, 1_000)
+                    .await
+                    .expect("entities"),
+            ));
+            if actual != output {
+                divergences.push(format!("{collection} ends as [{actual}], not [{output}]"));
+            }
+            self.divergences.extend(divergences);
+        }
+    }
+
+    /// Run `script`, which must end with the keyed output `output` and the
+    /// keyed and keyless lanes finalized through `finalized`.
+    async fn run_keyed(script: &[Keyed], output: &str, finalized: [u64; 2]) -> KeyedRun {
+        let mut run = KeyedRun::open().await;
+        for step in script {
+            run.step(*step).await;
+        }
+        run.check_end(output, finalized).await;
+        run
+    }
+
+    #[tokio::test]
+    async fn keyed_evm_events_keep_late_history_across_a_live_undo() {
+        // Audit probe (F1, `audit_probe_late_history_disappears_after_live_undo`),
+        // inverted and driven through the lanes: live block 4 moved key 0xaa
+        // before history delivered block 2's older 0xaa event. The block-local
+        // reducer skipped that event but covered block 2, so undoing block 4
+        // restored the key's value from before block 2: none. It must hold
+        // block 2's event.
+        let run = run_keyed(
+            &[Keyed::Live(3, 4), Keyed::History(2), Keyed::Reorg(4, 0)],
+            "bb@3=3 aa@2=2",
+            [2, 2],
+        )
+        .await;
+        assert_eq!(run.divergences, Vec::<String>::new());
+    }
+
+    #[tokio::test]
+    async fn keyed_evm_events_match_sequential_reduction_in_every_interleaving() {
+        use Keyed::{Finalize, History, Live, Redeliver, Reorg, Restart};
+
+        // Each script with its keyed output and the keyed and keyless lanes'
+        // finalized coverage at the end. History finalizes what it applies;
+        // only verified finality promotes a live block.
+        let scripts: [(&str, &[Keyed], &str, [u64; 2]); 8] = [
+            (
+                "preimage present",
+                &[History(1), Live(3, 4), History(2), Reorg(4, 0)],
+                "bb@3=3 aa@2=2",
+                [2, 2],
+            ),
+            (
+                "undo of held live blocks",
+                &[Live(3, 5), Reorg(4, 1), History(2)],
+                "bb@4=9 aa@2=2",
+                [2, 2],
+            ),
+            (
+                "history between live blocks, then an undo of two",
+                &[Live(3, 4), History(2), Live(5, 5), Reorg(4, 1)],
+                "bb@4=9 aa@2=2",
+                [2, 2],
+            ),
+            (
+                // History applies the keyed lane's held block 3; the keyless
+                // lane applied it live.
+                "history into the held live blocks",
+                &[Live(3, 5), History(3), Reorg(4, 1)],
+                "bb@4=9 aa@2=2",
+                [3, 2],
+            ),
+            (
+                "finality before history",
+                &[
+                    Live(3, 4),
+                    Finalize(3),
+                    History(2),
+                    Reorg(4, 1),
+                    Finalize(4),
+                ],
+                "bb@4=9 aa@2=2",
+                [4, 4],
+            ),
+            (
+                "duplicate delivery",
+                &[
+                    Live(3, 4),
+                    Redeliver(4),
+                    History(2),
+                    History(2),
+                    Redeliver(3),
+                    Reorg(4, 1),
+                    Redeliver(4),
+                ],
+                "bb@4=9 aa@2=2",
+                [2, 2],
+            ),
+            (
+                "restarts",
+                &[Live(3, 5), Restart, History(2), Restart, Reorg(4, 0)],
+                "bb@3=3 aa@2=2",
+                [2, 2],
+            ),
+            (
+                "in order",
+                &[History(2), Live(3, 5), Finalize(4), Reorg(5, 1)],
+                "bb@5=9 aa@4=4",
+                [4, 4],
+            ),
+        ];
+        let mut divergences = Vec::new();
+        for (name, script, output, finalized) in scripts {
+            let run = run_keyed(script, output, finalized).await;
+            divergences.extend(
+                run.divergences
+                    .into_iter()
+                    .map(|divergence| format!("{name}: {divergence}")),
+            );
+        }
+        assert!(divergences.is_empty(), "{}", divergences.join("\n"));
+    }
+
+    #[tokio::test]
+    async fn history_still_refuses_a_held_delta_with_other_content() {
+        // The overlap acceptance takes only a finality variant of history's
+        // delta. A held delta with other content still conflicts, and stays.
+        let run = KeyedRun::open().await;
+        let (keyed, _) = &run.processors[0];
+        let held = EncodedDelta::new(
+            keyed.descriptor(),
+            ChainId(1),
+            run.frame(3).block,
+            vec![0xee; 32],
+        );
+        run.store
+            .persist_delta(keyed.descriptor(), &held)
+            .await
+            .expect("hold other content");
+        let error = run
+            .history_run(keyed, 3, 1)
+            .await
+            .expect_err("other content conflicts");
+        assert!(
+            matches!(
+                error,
+                RuntimeError::Store(StoreError::ConflictingPendingDelta(BlockNumber(3)))
+            ),
+            "{error}"
+        );
+        let pending = run
+            .store
+            .pending_deltas(keyed.descriptor(), BlockNumber(3), 1)
+            .await
+            .expect("pending deltas");
+        assert_eq!(
+            pending.first().map(|delta| delta.checksum),
+            Some(held.checksum)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_held_delta_with_other_content_still_conflicts_with_the_applied_block() {
+        // The drain acceptance takes only a finality variant of the applied
+        // delta. Block 1 mapped from other logs conflicts, and a drain that
+        // meets it fails the lane.
+        let run = KeyedRun::open().await;
+        let (keyed, _) = &run.processors[0];
+        let mut finalized = run.frame(1);
+        finalized.finality = Finality::Finalized;
+        apply_live_frame(&run.store, keyed.as_ref(), &finalized, 1).await;
+        let mut other = run.frame(1);
+        other.logs = keyed_frame(run.topic, 1, BlockHash::ZERO, true).logs;
+        let held = keyed.map(&other).await.expect("map other logs");
+        let error = run
+            .live(Vec::new())
+            .apply_delta(keyed.as_ref(), &held, Finality::Included)
+            .await
+            .expect_err("other content conflicts");
+        assert!(
+            matches!(
+                error,
+                RuntimeError::Store(StoreError::ConflictingApply {
+                    block: BlockNumber(1)
+                })
+            ),
+            "{error}"
+        );
+        run.store
+            .persist_delta(keyed.descriptor(), &held)
+            .await
+            .expect("hold other content");
+        run.live(Vec::new())
+            .reconcile_pending()
+            .await
+            .expect("the conflict fails only its lane");
+        let state = run
+            .store
+            .processor_runtime_state(keyed.descriptor())
+            .await
+            .expect("state");
+        assert_eq!(state.state, ProcessorRunState::Failed);
+        assert_eq!(
+            state.reason.as_deref(),
+            Some("processor_live_delta_conflict")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_retained_frame_does_not_settle_a_held_delta_with_other_content() {
+        // With the block's frame retained, the drain took the frame's mapped
+        // variants as the held delta's, so a held delta with other content was
+        // deleted as already applied whenever the frame mapped to the applied
+        // delta, and a non-deterministic mapper went unseen.
+        let run = KeyedRun::open().await;
+        let (keyed, _) = &run.processors[0];
+        run.store
+            .store_recent_frame(&run.frame(1))
+            .await
+            .expect("retain block 1");
+        let mut finalized = run.frame(1);
+        finalized.finality = Finality::Finalized;
+        apply_live_frame(&run.store, keyed.as_ref(), &finalized, 1).await;
+        let applied = keyed.map(&finalized).await.expect("map the applied block");
+        let mut other = run.frame(1);
+        other.logs = keyed_frame(run.topic, 1, BlockHash::ZERO, true).logs;
+        let held = keyed.map(&other).await.expect("map other logs");
+        run.store
+            .persist_delta(keyed.descriptor(), &held)
+            .await
+            .expect("hold other content");
+        run.live(Vec::new())
+            .reconcile_pending()
+            .await
+            .expect("the conflict fails only its lane");
+
+        // As the conflict route does: the lane fails at the block with its
+        // gap there, the applied block stands, and the held delta stays until
+        // startup reconciliation deletes it.
+        assert_parked_at(
+            &run.store,
+            keyed.as_ref(),
+            run.frame(1).block,
+            ProcessorRunState::Failed,
+            "processor_live_delta_conflict",
+        )
+        .await;
+        assert_eq!(
+            run.store
+                .applied_delta_checksum(keyed.descriptor(), BlockNumber(1), run.frame(1).block.hash)
+                .await
+                .expect("applied checksum"),
+            Some(applied.checksum)
+        );
+        let pending = run
+            .store
+            .pending_deltas(keyed.descriptor(), BlockNumber(1), 1)
+            .await
+            .expect("pending deltas");
+        assert_eq!(
+            pending.first().map(|delta| delta.checksum),
+            Some(held.checksum)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_retained_frame_settles_a_held_finality_variant_without_a_hook() {
+        // A processor whose delta records finality but lacks the hook shows a
+        // held included delta to be the applied finalized one's variant only
+        // through the block's retained frame, of whose variants both are.
+        let processor = Arc::new(HooklessFinalityCounter::default());
+        let (_directory, store) = store().await;
+        let included = live_fixture(0, BlockHash::ZERO);
+        store
+            .store_recent_frame(&included)
+            .await
+            .expect("retain block 0");
+        let mut finalized = included.clone();
+        finalized.finality = Finality::Finalized;
+        apply_live_frame(&store, processor.as_ref(), &finalized, 1).await;
+        let held = processor
+            .map(&included)
+            .await
+            .expect("map the included block");
+        store
+            .persist_delta(processor.descriptor(), &held)
+            .await
+            .expect("hold the included variant");
+        let processors: Vec<Arc<dyn Processor>> = vec![processor.clone()];
+        SharedLiveRuntime::new(
+            store.clone(),
+            Arc::new(ScriptedLiveSource::new(
+                fixture_source_descriptor("hookless-live", BlockRange::single(BlockNumber(0))),
+                Vec::new(),
+            )),
+            processors,
+            SharedLiveRuntimeConfig::default(),
+        )
+        .expect("live runtime")
+        .reconcile_pending()
+        .await
+        .expect("the variant settles");
+        assert_eq!(
+            store
+                .processor_stats(processor.descriptor())
+                .await
+                .expect("statistics")
+                .pending_deltas,
+            0
+        );
+        assert_eq!(
+            store
+                .processor_runtime_state(processor.descriptor())
+                .await
+                .expect("state")
+                .state,
+            ProcessorRunState::Running
+        );
+    }
+
+    #[tokio::test]
+    async fn an_ordered_lane_that_records_finality_hands_its_held_blocks_to_history() {
+        // `uniswap-latest` class: an ordered processor whose delta records
+        // the frame's finality. Its live lane holds blocks 2 and 3 as
+        // included deltas until history reaches them; history maps them
+        // finalized, and storing its delta beside a held one failed the cold
+        // backfill at block 2.
+        let chain = live_blocks(4);
+        let ledger = Arc::new(FinalitySensitiveLedger::default());
+        let processors: Vec<Arc<dyn Processor>> = vec![ledger.clone()];
+        let (_directory, store) = store().await;
+        let live = |frames: &[leani_primitives::BlockFrame]| {
+            SharedLiveRuntime::new(
+                store.clone(),
+                Arc::new(ScriptedLiveSource::new(
+                    e2e_descriptor(
+                        "finality-ledger-live",
+                        BlockRange::new(BlockNumber(0), BlockNumber(4)).expect("range"),
+                    ),
+                    block_events(frames),
+                )),
+                processors.clone(),
+                SharedLiveRuntimeConfig::default(),
+            )
+            .expect("live runtime")
+        };
+        run_live(&live(&chain[2..=3])).await.expect("live run");
+        assert_eq!(
+            store
+                .processor_stats(ledger.descriptor())
+                .await
+                .expect("statistics")
+                .pending_deltas,
+            2
+        );
+
+        let history = BlockRange::new(BlockNumber(0), BlockNumber(3)).expect("history range");
+        let finalized = chain[..=3]
+            .iter()
+            .map(|frame| {
+                let mut frame = frame.clone();
+                frame.finality = Finality::Finalized;
+                frame
+            })
+            .collect();
+        HistoricalRuntime::new(
+            store.clone(),
+            Arc::new(ScriptedHistorySource::from_frames(
+                e2e_descriptor("finality-ledger-history", history),
+                finalized,
+            )),
+            ledger.clone(),
+            HistoricalRuntimeConfig {
+                mapper_concurrency: 2,
+                ..HistoricalRuntimeConfig::default()
+            },
+        )
+        .expect("history runtime")
+        .run(
+            BackfillJob::for_processor(
+                "finality-ledger-history",
+                ledger.as_ref(),
+                ChainId(1),
+                history,
+                VerificationPolicy::CompleteCryptographic,
+            )
+            .expect("history job"),
+            default_source_budget(),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("history passes the held blocks");
+        live(&[]).reconcile_pending().await.expect("drain");
+        // Caught up: the next live block applies at once.
+        run_live(&live(&chain[4..])).await.expect("next live block");
+
+        let cursor = store
+            .processor_cursor(ledger.descriptor())
+            .await
+            .expect("cursor")
+            .expect("ledger cursor");
+        assert_eq!(cursor.block_hash, chain[4].block.hash);
+        let statistics = store
+            .processor_stats(ledger.descriptor())
+            .await
+            .expect("statistics");
+        assert_eq!(
+            (statistics.applied_blocks, statistics.pending_deltas),
+            (5, 0)
+        );
+        assert_eq!(
+            store
+                .finalized_through(ledger.descriptor())
+                .await
+                .expect("finalized coverage"),
+            Some(BlockNumber(3))
+        );
+        assert_eq!(
+            store
+                .processor_runtime_state(ledger.descriptor())
+                .await
+                .expect("state")
+                .state,
+            ProcessorRunState::Running
+        );
+    }
+
+    #[tokio::test]
+    async fn a_held_delta_whose_block_history_applied_meanwhile_is_already_applied() {
+        // A drain can read an ordered lane's held included delta just before
+        // history applies that block, mapped finalized. Its apply then meets
+        // the other finality variant: the block is applied, and the lane must
+        // not fail on a conflict.
+        let run = KeyedRun::open().await;
+        let (keyed, _) = &run.processors[0];
+        let mut finalized = run.frame(1);
+        finalized.finality = Finality::Finalized;
+        apply_live_frame(&run.store, keyed.as_ref(), &finalized, 1).await;
+        let held = keyed
+            .map(&run.frame(1))
+            .await
+            .expect("map the included block");
+        let outcome = run
+            .live(Vec::new())
+            .apply_delta(keyed.as_ref(), &held, Finality::Included)
+            .await
+            .expect("the finalized variant is applied");
+        assert!(matches!(outcome, ApplyOutcome::AlreadyApplied));
     }
 
     #[tokio::test]

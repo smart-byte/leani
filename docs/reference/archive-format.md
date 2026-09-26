@@ -88,6 +88,9 @@ leani backfill \
 
 The runtime records coverage and discards input frames after reduction. Only
 processor output, undo/change journals, and job metadata remain in SQLite.
+An ordered processor such as `erc20-balances` applies its history
+contiguously from `start_block` upward, so `--from` must be its `start_block`
+or the block after the last one it applied.
 
 When `rpc.historical_mode = "on_demand"`, the same source can answer bounded
 historical RPC without importing frames into SQLite. Exact block and receipt

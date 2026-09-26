@@ -381,6 +381,31 @@ record, and documented RPC contracts.
   processor's state and delivery history, raw history, and the P2P identity.
   The ERC-20 entity and change schemas are now `erc20.balance.entity.v2` and
   `erc20.balance.change.v2`, and both processors use delta schema 2.
+- Breaking for keyed `evm-events` consumers and operators: `evm-events` 1.1.0
+  with `key_fields` is an ordered processor (see Fixed). It declares
+  `ordered_state` reduction and `canonical` delivery ordering, like
+  `erc20-balances`, and its live lane waits for its cold backfill, holding
+  live blocks as pending deltas until history reaches them. Without
+  `key_fields` it stays block-local, with `block_versioned_idempotent`
+  delivery. Consumers of a keyed instance read its canonical stream through
+  the generic consumer routes, not the session-fenced `/streams/live/…`
+  routes. Application subscriptions and
+  `POST /admin/v1/materialization-jobs` refuse a keyed instance, and its
+  on-demand `backfill` ranges apply contiguously from `start_block` upward.
+  Finalized-coverage compaction is block-local only, so a keyed instance keeps
+  one coverage row per block it applies, without bound. The ordering is part
+  of the stored processor descriptor, not of the instance ID or the
+  configuration and code hashes, so the node refuses a keyed instance that a
+  store registered block-local (`processor instance … conflicts with its
+  stored descriptor`); rebuild it under a new `instance` as above.
+- Breaking: `leani backfill` of an ordered processor, such as
+  `erc20-balances`, `transaction-stats`, `uniswap-latest`, or keyed
+  `evm-events`, must start at the block after the last one the processor
+  applied, or at its `start_block` when it has applied none, and refuses any
+  other start with the block to use. The store moves an ordered processor's
+  cursor to every block it applies, so a range with a hole below it, or below
+  blocks already applied, reduced its history out of chain order. Rerun an
+  interrupted backfill from the block the refusal names.
 - `blobs-money` 1.5.0 changes stored output from Fusaka on (see Fixed).
   Rebuild existing instances the same way: set `version = "1.5.0"` and
   configure a new `instance`, which indexes from its `start_block`; the node
@@ -944,14 +969,34 @@ record, and documented RPC contracts.
   configuration declares that ledger complete.
 - `evm-events` outputs with `key_fields` no longer fail a block that changes
   an existing key twice (`change … has 0 matching state mutations`): a block
-  emits one change per key, for its last event. When the processor stores
-  output entities (`[processors.output] mode` other than `none`), a keyed
-  entity now holds the newest event by block number, transaction index, and
-  log index, even when the hot and cold lanes apply blocks out of order;
-  before, the block applied last won. An older event no longer replaces a
-  stored newer one and emits no change. With `mode = "none"` no entity is
-  stored to compare against, so events are published in the order blocks
-  apply.
+  emits one change per key, for its last event.
+- Keyed `evm-events` output follows the canonical chain. It was reduced
+  block-locally, so the hot and cold lanes applied a key's blocks in either
+  order: the block applied last won, and undoing a block restored the key as
+  it was when that block applied. When history delivered an older block after
+  a newer live one, undoing the live block deleted the key, or restored a
+  stale event, instead of restoring the older block's event. Keyed output now
+  reduces blocks in chain order (see Changed), so a key holds its newest event
+  and an undo restores the one before it.
+- The hot/cold handoff of an ordered processor whose mapped delta records
+  finality, `uniswap-latest` since rc.1 and now keyed `evm-events`, no longer
+  fails at the first block its live lane holds as a pending delta. The live
+  lane maps that block as included and history as finalized, so storing
+  history's delta beside the held one conflicted and failed the cold backfill;
+  history now applies its own delta, which replaces the held one. The same
+  acceptance fixes a block-local live commit that raced history's
+  store-then-apply of the same block, which failed the whole live run. A
+  drain or gap replay that finds the other finality applied meanwhile counts
+  the block as applied instead of failing the lane with
+  `processor_live_delta_conflict`. That holds for processors that override
+  `finality_variant_checksums`, as every built-in processor whose delta
+  records finality does.
+- A pending delta whose content differs from its block's applied delta now
+  fails the lane with `processor_live_delta_conflict` even while the block's
+  frame is retained. The drain deleted it as a finality variant whenever the
+  retained frame mapped to the applied delta, without comparing the pending
+  delta itself, so a non-deterministic mapper went unseen. A pending delta
+  that is one of the frame's finality variants is still cleared.
 - `evm-events` accepts the included and finalized deltas of one block as
   equivalent on replay. Its entities carry the block's finality, and the
   processor only accepted the exact checksum, so replaying a block whose
