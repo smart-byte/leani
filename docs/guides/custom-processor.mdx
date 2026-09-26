@@ -78,7 +78,10 @@ leani-processor-api = { path = "../../crates/processor-api" }
 ```
 
 Those paths are relative to `examples/custom-node/Cargo.toml`. Use paths to the
-same checkout in your own project; the alpha's crates are not yet published.
+same checkout in your own project. The `leani` node crate is not published,
+and a processor must implement the traits of the `leani-processor-api` that
+`leani` builds on, so take all three from the checkout, although
+`leani-primitives` and `leani-processor-api` are also on crates.io.
 The complete manifest also includes the serialization, Tokio, and Axum
 dependencies used below.
 

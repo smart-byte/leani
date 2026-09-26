@@ -249,9 +249,11 @@ The live/archive overlap may map the same canonical block at different
 finality levels. The runtime validates all finality-only checksum variants,
 keeps the strongest stored finality, and removes the redundant pending delta.
 Any difference that cannot be reproduced by changing finality still fails
-closed as a real transform or source conflict. Restart recovery performs this
-local reconciliation before opening any network lane, so archive availability
-or a slow P2P catch-up cannot delay cleanup. `processors[].pendingDeltas`
+closed as a real transform or source conflict. At a restart, startup
+reconciliation instead deletes every pending delta for a block the processor
+already applied, without comparing it, before opening any network lane, so
+archive availability or a slow P2P catch-up cannot delay cleanup; its warning
+counts them in `discarded_pending_deltas`. `processors[].pendingDeltas`
 exposes any durable rows that remain afterward.
 
 `finality.kind = "consensus_p2p"` is the self-contained profile. Configure both
@@ -388,8 +390,10 @@ An anchor verified from another checkpoint is never used: changing
 `finality.checkpoint` re-anchors the node on the new root, and the node logs a
 warning naming both roots. `leani doctor` reports the mismatch too. The one
 exception is an embedded subscription (`leani subscribe` without a running
-node): its checkpoint is an anchor it verified itself before, so a persisted
-anchor at a later slot replaces it.
+node) that reuses its cached checkpoint, `checkpoint.json`, which holds an
+anchor the subscription verified itself on an earlier run: a persisted anchor
+at a later slot replaces it. A checkpoint from a provider quorum that the
+subscription has just accepted follows the rule above.
 
 The bootstrap is still verified against the anchor's block root, and the
 configured checkpoint's own age is not checked. A missing, corrupt, or
@@ -462,8 +466,9 @@ artifact segments need no rewrite. The rewrite also turns on SQLite
 incremental auto-vacuum, which new stores have from creation, so pages freed by
 pruning return to the filesystem. A store created before auto-vacuum was
 enabled logs a warning at every start and never shrinks below its high-water
-mark; run `db compact` on it once. Schedule it only with sufficient free disk,
-because the vacuum rewrites the whole database, and lower ingestion load.
+mark; run `db compact` on it once. Like every `leani db` command, it runs only
+while the node is stopped, and it needs free disk for a second copy of the
+database, because the vacuum rewrites the whole database.
 `db prune-changes` is lease-aware; expired consumers must perform the
 documented snapshot/reset flow.
 
@@ -548,7 +553,7 @@ change history only through `db prune-changes`, respecting active leases.
 Never evict rollback data required by unfinalized blocks. Add capacity or stop
 included advancement before the hard limit. If the database file stays at its
 high-water mark after pruning, check the startup log for the auto-vacuum
-warning and run `db compact` once.
+warning, stop the node, and run `db compact` once.
 
 Retained recent frames are the reorg and replay input, so the node never drops
 an unfinalized one to make room. When they reach
@@ -647,8 +652,8 @@ does not stop the node.
 A reorg never leaves a parked lane's first unapplied block on a block the
 chain no longer has. A reorg that replaces blocks at or below it moves it down
 to the first replacement block, so the lane replays the whole new branch. A
-reorg without a replacement branch moves it onto the new tip, which the lane
-has applied: a paused lane resumes at once, and a failed lane's first
+reorg without a replacement branch moves it onto the new tip. When the lane
+has applied that tip, a paused lane resumes at once, and a failed lane's first
 unapplied block moves onto the new tip's successor once that block arrives. If
 the lane never applied the new tip, such as the finalized anchor the node
 seeds after downtime, a paused block-local lane's gap simply completes, while
@@ -673,7 +678,7 @@ replays from there instead of skipping blocks or failing.
 | `processor_live_mapping_failed` | failed | Reset after fixing the processor or its input. Mapping the block, or checking a pending delta's finality variants, failed. |
 | `processor_live_delta_conflict` | failed | Investigate before resetting: a pending delta for an applied block carries different content, so the processor's transform is not deterministic or its inputs differed. The applied block stands. Restart the node, whose [startup reconciliation](#crash-or-interrupted-commit) deletes that pending delta, then reset the lane. |
 | `single_block_exceeds_delivery_limit`, `single_delta_exceeds_pending_delta_limit`, `live_gap_marker_exceeds_pending_delta_budget` | failed | Reset after raising the limit. |
-| `live_gap_canonical_identity_changed` and the other `finalized_gap_recovery_*` reasons | failed | Reset after checking the history source against the canonical chain. For an ordered lane, `finalized_gap_recovery_canonical_mismatch` can also mean that the block history returned does not descend from the lane's own last applied block, which is then off the canonical chain: restart the node, whose [startup reconciliation](#crash-or-interrupted-commit) undoes an unfinalized off-chain block, then reset; a finalized one needs a rebuild. |
+| `live_gap_canonical_identity_changed` and the other `finalized_gap_recovery_*` reasons | failed | Reset after checking the history source against the canonical chain. For an ordered lane, `finalized_gap_recovery_canonical_mismatch` can also mean that the block history returned does not descend from the lane's own last applied block, which is then off the canonical chain: restart the node, whose [startup reconciliation](#crash-or-interrupted-commit) undoes an unfinalized off-chain block, then reset. The lane then waits in `operator_reset_pending_replay` until the automatic cold backfill of the next start fills the undone heights, so restart the node once more; an on-demand processor waits for a backfill request instead. A finalized off-chain block needs a rebuild. |
 | `processor_finality_conflict` | failed | Rebuild the processor as a replacement instance; the reset route refuses this lane with `409 live_lane_requires_rebuild`. The same instance cannot be rebuilt in place today: configure a replacement instance, with a new processor version or configuration, and move to it as in [Processor rebuild or rollback](#processor-rebuild-or-rollback). Its coverage holds a finalized block hash at another height, or another block at a finalized height, so it contradicts the canonical chain, and finality stops advancing it. This reason replaces any earlier failure reason. |
 
 ### Crash or interrupted commit
@@ -723,9 +728,13 @@ with its next block: a paused lane commits that block as usual, so the store's
 refusal parks the lane there, or applies it once capacity has freed up. A
 failed lane records that block, which a block-local lane has not applied or
 which follows an ordered lane's last applied block, so a reset replays from
-there. A failed ordered lane still behind its history records nothing: it
-waits for its history, and startup reconciliation records its first
-unapplied block once that block is among the retained frames.
+there. A failed ordered lane still behind its history records nothing, and
+its history cannot apply while it is failed. Startup reconciliation records
+its first unapplied block, the one after its cursor, only while that block is
+among the retained frames. Once finality has pruned it, nothing records it:
+the reset route refuses the lane with `400 invalid_request`, since it has no
+durable live gap, and only rebuilding the processor as a replacement instance
+recovers it, as in [Processor rebuild or rollback](#processor-rebuild-or-rollback).
 
 A paused or failed lane whose first unapplied block is already recorded
 replays from there as usual, and a lane failed for another reason, such as

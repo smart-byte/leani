@@ -4673,9 +4673,10 @@ impl RethP2pSource {
                 .discovery_addr(discovery_addr)
                 .disable_tx_gossip(true)
                 .mainnet_boot_nodes()
-                // The pinned Reth DNS decoder reads only the first byte segment of a DNS TXT
-                // record. Mainnet's EIP-1459 tree contains multi-segment
-                // records, so use the segment-joining seeder below instead.
+                // Leani's own EIP-1459 seeder below decodes the DNS tree and
+                // admits its records through the peer manager (ADR 0015). It
+                // joins multi-segment TXT records, which Reth 2.4.1 read only
+                // in part; the pinned Reth resolver joins them too.
                 .disable_dns_discovery()
                 .peer_config(peers)
                 .sessions_config(sessions)

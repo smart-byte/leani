@@ -63,7 +63,7 @@ narrower subscriptions, or spread them over several connections. When the node
 shuts down, every connection is closed with code 1001. See
 [Ethereum JSON-RPC limits](https://leani.dev/docs/reference/ethereum-json-rpc/#transport-rules-and-limits).
 
-Public aggregate routes:
+Aggregate routes:
 
 ```text
 GET  /health/live
@@ -113,11 +113,15 @@ GET  /v1/q/uniswap/pools/{address}
 ```
 
 Health distinguishes process/store liveness from required live/finality
-readiness and processor range coverage. The operational routes are not behind
-the optional API bearer token so a protected local supervisor can probe them.
-Neither health route scans store tables: liveness runs a trivial SQLite query,
-and readiness adds in-memory actor state. `/metrics` and `/v1/network/status`
-reuse store row and byte counts for up to 10 seconds.
+readiness and processor range coverage. The operational routes, `/health/*`,
+`/debug/network`, `/metrics`, and `/v1/network/status`, are not behind the
+optional API bearer token so a protected local supervisor can probe them.
+When a bearer token is configured, every other route above, reads and writes
+alike, needs it, as the `/admin/v1` routes below do: `/v1` names the API
+version, not a public tier. Neither health route scans store tables: liveness
+runs a trivial SQLite query, and readiness adds in-memory actor state.
+`/metrics` and `/v1/network/status` reuse store row and byte counts for up to
+10 seconds.
 ERC-20 and Uniswap streams share the generic processor cursor contract; their
 typed queries and changes encode large quantities as lossless decimal strings.
 The `/query/*` subtree is supplied by the selected processor's optional native
@@ -212,18 +216,20 @@ Every processor query includes coverage:
 ```ts
 export interface ProcessorCoverage {
   chainId: number;
+  chainFinalizedHead: {
+    number: number;
+    hash: `0x${string}`;
+  } | null;
   requested?: {
     fromBlock: number;
     toBlock: number;
-  };
+  } | null;
   available: Array<{
     fromBlock: number;
     toBlock: number;
     finality: "preview" | "included" | "finalized";
   }>;
   configuredStartBlock: number;
-  historicalTargetBlock: number | null;
-  liveHeadBlock: number | null;
   processedThrough: number | null;
   finalizedThrough: number | null;
   complete: boolean;
@@ -233,9 +239,13 @@ export interface ProcessorCoverage {
     | "catching_up"
     | "live"
     | "degraded"
+    | "paused"
     | "failed";
 }
 ```
+
+`paused` and `failed` report the processor's live lane; `/v1/network/status`
+gives its `pauseReason` and first unapplied block (`liveGap`).
 
 Every `available` interval is inclusive and has one exact finality for every
 block it contains. Intervals split at both coverage gaps and finality
@@ -245,18 +255,10 @@ rather than treating `finalizedThrough` as a contiguous watermark.
 lower gaps or non-finalized coverage can still exist.
 
 For a block-local processor, `available` can contain several intervals while a
-backfill and head follower operate concurrently. `processedThrough` is only set
-when the complete interval begins at the configured start and has no gaps.
-
-For an ordered-state processor, coverage also reports:
-
-```ts
-export interface OrderedStateCoverage {
-  reduceCursor: BlockCursor | null;
-  pendingThrough: number | null;
-  seededFromCheckpoint: boolean;
-}
-```
+backfill and head follower operate concurrently. `processedThrough` is the
+last block of the newest interval, even when earlier ones leave gaps;
+`complete` says whether the requested range, or the range from the configured
+start to the processor's cursor, has none.
 
 All list responses use opaque pagination cursors:
 
@@ -758,18 +760,7 @@ software could theoretically implement:
 {
   "chainId": 1,
   "ethereumRpc": {
-    "http": "http://127.0.0.1:8545",
-    "webSocket": "ws://127.0.0.1:8546",
     "methods": {
-      "eth_getBlockByNumber": {
-        "recent": true,
-        "historical": "on_demand_by_number"
-      },
-      "eth_getTransactionByHash": {
-        "recent": true,
-        "historical": false,
-        "reason": "transaction_locator_disabled"
-      },
       "eth_call": {
         "supported": false,
         "reason": "evm_state_unavailable"
@@ -781,6 +772,8 @@ software could theoretically implement:
       "id": "blobs-money",
       "instance": "blobs-production",
       "version": "1.5.0",
+      "codeHash": "0x...",
+      "configHash": "0x...",
       "genericApi": "processor-v1",
       "changeSchema": "blobs-money.change.v1",
       "queryExtensions": [
@@ -812,9 +805,10 @@ describes optional typed read wrappers. Applications should persist or select
 the processor instance and use `basePath`; aliases are conveniences and may be
 absent when several instances use the same extension.
 
-Also expose an equivalent custom JSON-RPC method,
-`leani_getCapabilities`, so an Ethereum-library integration can inspect the
-endpoint without knowing the aggregate API port.
+`ethereumRpc` names only `eth_call`, which the node never serves. The
+JSON-RPC method `leani_getCapabilities` reports the support and coverage of
+each RPC method on the RPC listener itself, so an Ethereum-library integration
+can inspect the endpoint without knowing the aggregate API port.
 
 ## 7. Blobs API
 
@@ -986,8 +980,8 @@ for await (const event of node.blobs.subscribe({
 ```
 
 The change stream currently publishes every retained finality transition.
-Consumers inspect or filter `event.finality`; `SubscribeOptions` contains only
-`after` and `signal`.
+Consumers inspect or filter `event.finality`; `SubscribeOptions` has no
+finality filter, only `after`, `signal`, `onHello`, and `idleTimeoutMs`.
 
 Core client modules:
 
@@ -1020,7 +1014,9 @@ and a capabilities `basePath` such as `/v1/q/my-protocol/summary` both keep a
 prefixed base URL's prefix. Schemes, protocol-relative paths, segments that
 decode to `.` or `..`, backslashes, encoded slashes, backslashes, and percent
 signs, and control characters are rejected before the bearer token is
-attached, and redirects are refused rather than followed.
+attached, and redirects are refused rather than followed. A custom extension
+whose path parameter can hold an encoded `/` or `%` must take that value in
+the query string, through `request`'s `params`, instead.
 Built-in query namespaces use this same primitive.
 
 SDK responsibilities:
@@ -1091,11 +1087,13 @@ Localhost is the default trust boundary. The current optional API bearer token
 protects all native query, stream, consumer, and `/admin/v1` routes on one
 listener, and a bind beyond loopback requires it unless
 `api.allow_unauthenticated_remote` is set. A consumer's credential, when it
-has one, is required as well on every consumer-scoped route, streams
-included, and fences that consumer's lease and cursor; it does not replace
-the listener bearer when one is configured. `/health/live`, `/health/ready`, `/metrics`,
-`/v1/network/status`, and `/debug/network` remain unauthenticated operational
-routes. The JSON-RPC listeners have no built-in authentication.
+has one, is required as well on that consumer's delivery routes, its lease,
+change, and acknowledgement routes and its streams, and fences that
+consumer's lease and cursor; it does not replace the listener bearer when one
+is configured. Listing, inspecting, and revoking consumers need only the
+bearer. `/health/live`, `/health/ready`, `/metrics`, `/v1/network/status`, and
+`/debug/network` remain unauthenticated operational routes. The JSON-RPC
+listeners have no built-in authentication.
 
 Every route, operational ones included, applies these checks, in this order,
 to keep web pages from reading or changing a loopback node:
@@ -1108,8 +1106,10 @@ to keep web pages from reading or changing a loopback node:
 | request to a consumer's live or backfill `stream` route without an allowed `Origin`, with `Sec-Fetch-Site: cross-site` or `same-site` in any mode, navigations included | 403 `cross_site_request` |
 | POST or DELETE without `content-type: application/json` or `x-leani-request: 1` | 415 `unsupported_media_type` |
 
-A request without `Host`, `Origin`, and `Sec-Fetch-*` headers, as the SDK,
-curl, and other non-browser clients send it, passes the first four checks.
+The SDK, curl, and other non-browser clients send no `Origin` or
+`Sec-Fetch-*` headers, and their `Host` is the name or address in the URL
+they use, so their requests pass the first four checks whenever that is an IP
+address, `localhost`, or a name in `api.allowed_hosts`.
 So do navigations to other routes, including from another site's page or
 into a frame, and requests from browsers that send no Fetch Metadata. A page
 cannot read those responses, and they create no query snapshot. Opening a
@@ -1194,8 +1194,8 @@ blobs.money continues to own:
 
 ### Cutover sequence
 
-1. Publish the shared `@smart-byte/leani-sdk` package and replace the application-local
-   client once their contracts match.
+1. Replace the application-local client with the published
+   `@smart-byte/leani-sdk` package once their contracts match.
 2. Start Leani from application-requested ranges derived from PostgreSQL state.
 3. Compare Leani output with existing `blocks` and `blob_transactions`.
 4. Run the native consumer into shadow PostgreSQL tables.

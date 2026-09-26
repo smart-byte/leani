@@ -106,7 +106,8 @@ impl ProcessorInstanceId {
     ///
     /// Returns [`ProcessorInstanceIdError`] when the derived key is not a
     /// valid instance ID: the version carries `+` build metadata, or the ID
-    /// and version together exceed the 192-byte limit.
+    /// and version together exceed 126 bytes, since the key adds `@`, `:`,
+    /// and the 64-digit configuration hash within the 192-byte limit.
     pub fn legacy(
         id: &ProcessorId,
         version: &Version,

@@ -118,7 +118,7 @@ prepare_output_directory() {
 
 require_postgres() {
   [ -n "${LEANI_BENCHMARK_POSTGRES_URL:-}" ] || fail \
-    "SDK/PostgreSQL cases require LEANI_BENCHMARK_POSTGRES_URL; start the dedicated benchmark-postgres Compose profile first"
+    "SDK/PostgreSQL cases require LEANI_BENCHMARK_POSTGRES_URL; start the dedicated benchmark-postgres Compose profile first, with LEANI_API_TOKEN set because Compose resolves it for every service: LEANI_API_TOKEN=unused docker compose --profile benchmark up -d benchmark-postgres"
   command -v bun >/dev/null 2>&1 || fail "SDK/PostgreSQL cases require Bun"
 }
 

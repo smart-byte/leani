@@ -28,10 +28,14 @@ the node what delivery history a required consumer still fences from pruning.
 
 ## Leases and reset requirements
 
-A durable consumer has a stable ID, a credential, a role, an acknowledgement,
-and a finite lease. Active SDK iterators renew their lease. If a best-effort
-consumer falls behind retained history, the stream emits `reset_required` with
-coverage hints rather than skipping invisibly.
+A durable consumer has a stable ID, a role, an acknowledgement, and a finite
+lease. One created through the consumer API also has a credential, which its
+delivery calls carry, and a backfill subscription's consumer can have one;
+one declared in the node configuration has none. An acknowledgement cannot
+pass what the node delivered to that consumer. Active SDK iterators renew
+their lease. If a best-effort consumer falls behind retained history, the
+stream emits `reset_required` with coverage hints rather than skipping
+invisibly.
 
 ## Query then follow
 

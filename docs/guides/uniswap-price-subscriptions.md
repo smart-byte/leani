@@ -133,7 +133,7 @@ because it was applied before the run started, is a
 `blockHash`, and change `key` while it is fresh; attached to a node with
 more pools, such a row can name another pool's change. The JSON stream also
 carries `leani.subscription-gap.v1` rows (see
-[the block feed](live-block-subscriptions.md#attach-to-a-prepared-node)), so
+[the block feed](/docs/guides/live-block-subscriptions/#attach-to-a-prepared-node)), so
 scripts should dispatch on each row's `schema`. `--once` never exits on an
 undo or gap row.
 
@@ -197,7 +197,7 @@ subscription replays the node's retained change log and prints each
 observation once the node's finality marker covers its block, however late
 finality arrives, skipping blocks that were already final when it connected;
 the freshness gate applies only to included output. See
-[the block feed](live-block-subscriptions.md#attach-to-a-prepared-node) for
+[the block feed](/docs/guides/live-block-subscriptions/#attach-to-a-prepared-node) for
 the gap row it prints when the node stops reporting finality.
 
 The initializer fetches a current majority checkpoint quorum and pins it in a
@@ -234,18 +234,20 @@ execution P2P with an opportunistic minimum of one peer and a 16-peer healthy
 target, locally verified Beacon finality over the `endpoints` transport pool,
 which `leani init` fills with the ordinary PublicNode
 (`https://ethereum-beacon-api.publicnode.com/`) and Lodestar
-(`https://lodestar-mainnet.chainsafe.io/`) Beacon API endpoints, Xatu history
-fallback, bounded 512 MiB memory and 2 GiB temporary-disk budgets, on-demand
-Uniswap history, included/finalized publication, a 256 block undo window,
-64 MiB/24 hour delivery retention, ephemeral P2P listener ports, RPC on
-`18545`/`18546`, and the native API on `18080`. Pool addresses, fee tiers, and
-the earliest processor block come from the same built-in market catalog as
-`subscribe`: `ETH/USDC` starts at its pool's creation block, 12,376,729, and
-`ETH/USDT` and `WBTC/ETH` at the Uniswap V3 factory deployment block,
-12,369,621, which no pool predates. The start block is part of the
-processor's identity, so a release that moves one makes the node refuse the
-state it kept and name the ways to move on (see the changelog). Operators who
-need to tune any of these can use the full configuration schema instead. The pinned checkpoint is the trust root; Beacon
+(`https://lodestar-mainnet.chainsafe.io/`) Beacon API endpoints and the
+responding checkpoint providers that serve the Beacon light-client API, Xatu
+history fallback, bounded 512 MiB memory and 2 GiB temporary-disk budgets,
+on-demand Uniswap history, included/finalized publication, undo records kept
+until 256 blocks past finality, 64 MiB/24 hour delivery retention, ephemeral
+P2P listener ports, RPC on `18545`/`18546`, and the native API on `18080`.
+Pool addresses, fee tiers, and the earliest processor block come from the
+same built-in market catalog as `subscribe`: `ETH/USDC` starts at its pool's
+creation block, 12,376,729, and `ETH/USDT` and `WBTC/ETH` at the Uniswap V3
+factory deployment block, 12,369,621, which no pool predates. The start block
+is part of the processor's identity, so a release that moves one makes the
+node refuse the state it kept and name the ways to move on (see the
+changelog). Operators who need to tune any of these can use the full
+configuration schema instead. The pinned checkpoint is the trust root; Beacon
 API endpoints only transport untrusted consensus data and never provide
 execution blocks or Uniswap observations. Leani queries those transports
 concurrently and verifies their responses locally. After the first verified
@@ -256,7 +258,7 @@ finality wins, and finality never moves backwards. The node needs the pinned
 checkpoint only for its first start: it then keeps the newest verified
 finality anchor in `data_dir` and restarts from it, so the checkpoint does not
 expire while the node keeps verifying finality (see the runbook's
-[checkpoint lifecycle](../operations/runbook.md#checkpoint-lifecycle)).
+[checkpoint lifecycle](/docs/operations/runbook/#checkpoint-lifecycle)).
 
 ## TypeScript SDK
 

@@ -102,9 +102,11 @@ collection = "weth.transfers"
 kind = "weth.transfer"
 ```
 
-Backfills resume from committed coverage, and historical Parquet material is
-discarded after each commit. A backfill can run while the live lane already
-follows the head. See the
+The node's backfills resume from committed coverage, and historical Parquet
+material is discarded after each commit. An interrupted `leani backfill` of an
+ordered processor, such as `erc20-balances`, reruns from the block after the
+last one it applied, which the command names when it refuses another start.
+A backfill can run while the live lane already follows the head. See the
 [bounded Mainnet guide](https://leani.dev/docs/getting-started/bounded-mainnet/),
 the [processor catalog](https://leani.dev/docs/reference/processors/), and
 [backfill while following live](https://leani.dev/docs/guides/backfill-while-following-live/).

@@ -20,8 +20,8 @@ query need and has its own budget.
 | Output | Entities served by generic or processor-owned queries | latest, window, full, or none |
 | Artifacts | Compact immutable results reusable for replay/export | bounded retention or none |
 | Delivery | Ordered change history for external consumers | best effort, until acknowledged, or none |
-| Checkpoints | Recovery points for processor state | automatic, at most once per 1,000 finalized blocks, with a finite keep count |
-| Undo | Unfinalized branch replacement | bounded by a reorg safety depth |
+| Checkpoints | Recovery points for processor state | automatic, at most once per 1,000 finalized blocks and when a historical job completes, with a finite keep count |
+| Undo | Unfinalized branch replacement | every unfinalized block, plus a safety depth past finality |
 | Raw history | Reusable normalized source material | explicitly enabled, segmented, and bounded |
 
 The policies are orthogonal. An externalized processor can retain durable state

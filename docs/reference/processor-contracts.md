@@ -254,8 +254,9 @@ block hash with a canonical block-number index; the query extension exposes
 receipts.
 
 The compact `[blocks]` preset supplies the standard checkpointed lifecycle,
-full query output, 64 MiB/24 hour delivery window, and 256-block included-block undo
-window. Advanced configurations can override those policies explicitly.
+full query output, 64 MiB/24 hour delivery window, and undo records kept until
+256 blocks past finality. Advanced configurations can override those policies
+explicitly.
 
 ## uniswap-observations 2.1.0 / uniswap-latest 2.0.0
 

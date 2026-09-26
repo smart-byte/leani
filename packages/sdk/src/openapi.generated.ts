@@ -929,6 +929,11 @@ export interface paths {
          *     with a credential from before that rule. The credential enters the
          *     request's idempotency identity, an unkeyed BLAKE3 hash of the whole
          *     request that the node keeps, so use a random one.
+         *
+         *     A range that starts past the node's finalized head gets 409
+         *     `range_after_finalized_head`, and one that only ends past it
+         *     `history_not_finalized`. Their `details.currentFinalizedHead` holds
+         *     the head's `number` and its `hash` as `0x` hex.
          */
         post: operations["createBackfillSubscription"];
         delete?: never;
@@ -986,7 +991,13 @@ export interface paths {
         /** List materialization jobs */
         get: operations["listMaterializationJobs"];
         put?: never;
-        /** Create a materialization job */
+        /**
+         * Create a materialization job
+         * @description A range that starts past the node's finalized head gets 409
+         *     `range_after_finalized_head`, and one that only ends past it
+         *     `history_not_finalized`. Their `details.currentFinalizedHead` holds
+         *     the head's `number` and its `hash` as `0x` hex.
+         */
         post: operations["createMaterializationJob"];
         delete?: never;
         options?: never;
@@ -1357,7 +1368,6 @@ export interface components {
         /** @example -1000000000000000000 */
         SignedDecimalQuantity: string;
         Hash32: string;
-        ByteArray32: number[];
         Address: string;
         /** @description Store-, chain-, and processor-bound opaque value. */
         Cursor: string;
@@ -1463,8 +1473,12 @@ export interface components {
             /** @description Highest covered block recorded as finalized. This is not a contiguous-coverage guarantee; lower gaps or non-finalized blocks can exist. Inspect available intervals for exact finalized coverage. */
             finalizedThrough: components["schemas"]["SafeInteger"] | null;
             complete: boolean;
-            /** @enum {string} */
-            state: "starting" | "backfilling" | "catching_up" | "live" | "degraded" | "failed";
+            /**
+             * @description `paused` and `failed` report the processor's live lane;
+             *     `/v1/network/status` gives its `pauseReason`.
+             * @enum {string}
+             */
+            state: "starting" | "backfilling" | "catching_up" | "live" | "degraded" | "paused" | "failed";
         };
         ChainFinalizedHead: {
             number: components["schemas"]["SafeInteger"];
@@ -1551,15 +1565,23 @@ export interface components {
             /**
              * @description A random secret of 32 to 512 printable ASCII characters without
              *     spaces, such as `openssl rand -hex 32`. Only a hash keyed with the
-             *     node's secret is stored. Every consumer-scoped request then needs
-             *     it. An existing consumer ID gets 409 `consumer_exists` whatever
-             *     the credential.
+             *     node's secret is stored. The consumer's lease, change,
+             *     acknowledgement, and stream requests then need it; listing,
+             *     inspecting, and revoking consumers need only the bearer token.
+             *     These bounds apply to a new consumer: the node checks the ID
+             *     first, so an existing consumer ID gets 409 `consumer_exists`
+             *     whatever the credential, even one outside them.
              */
             credential: string;
         };
         DurableConsumer: {
             id: string;
             processorInstance: string;
+            /**
+             * @description The delivery stream this consumer reads: the processor's live or
+             *     canonical stream, or a backfill subscription's history stream.
+             */
+            streamId: string;
             /** @enum {string} */
             role: "required" | "best_effort";
             /** @enum {string} */
@@ -1572,6 +1594,11 @@ export interface components {
             deliveredSequence: components["schemas"]["DecimalQuantity"];
             acknowledgedCursor: components["schemas"]["Cursor"];
             deliveredCursor: components["schemas"]["Cursor"];
+            /**
+             * @description How many stream sessions have taken this consumer's lease; each
+             *     new session fences the one before it. `0` before the first.
+             */
+            leaseGeneration: components["schemas"]["DecimalQuantity"];
             leaseTtlMs: components["schemas"]["DecimalQuantity"];
             leaseExpiresAtUnixMs: components["schemas"]["DecimalQuantity"];
             leaseActive: boolean;
@@ -1586,8 +1613,8 @@ export interface components {
             checkpointId: components["schemas"]["SafeInteger"];
             processorInstance: string;
             blockNumber: components["schemas"]["SafeInteger"];
-            blockHash: components["schemas"]["ByteArray32"];
-            stateChecksum: components["schemas"]["ByteArray32"];
+            blockHash: components["schemas"]["Hash32"];
+            stateChecksum: components["schemas"]["Hash32"];
             stateBytes: components["schemas"]["SafeInteger"];
             createdAtUnixMs: components["schemas"]["SafeInteger"];
         };
@@ -1603,8 +1630,8 @@ export interface components {
             savepointId: string;
             processorInstance: string;
             blockNumber: components["schemas"]["SafeInteger"];
-            blockHash: components["schemas"]["ByteArray32"];
-            stateChecksum: components["schemas"]["ByteArray32"];
+            blockHash: components["schemas"]["Hash32"];
+            stateChecksum: components["schemas"]["Hash32"];
             stateBytes: components["schemas"]["SafeInteger"];
             createdAtUnixMs: components["schemas"]["SafeInteger"];
         };

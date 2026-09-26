@@ -52,8 +52,11 @@ redirects: a 3xx answer rejects with the non-retryable `redirect_refused`, with
 the target in `details.location`, so configure the final URL as `baseUrl`.
 Every request path resolves under the base URL's path, one starting with `/`
 included. A path segment that decodes to `.` or `..`, or holds a backslash, an
-encoded slash or backslash, or an encoded percent sign, and a control character
-anywhere in the path, are refused before any request.
+encoded slash or backslash (`%2F`, `%5C`), or an encoded percent sign (`%25`),
+and a control character anywhere in the path, are refused before any request.
+`request()` applies the same rule to a custom query extension's path, so a
+path parameter whose value can hold `/` or `%` must move to the query string,
+`request()`'s `params`.
 
 Typed subscriptions accept `processor` to select a configured instance, for
 example `leani.blobs.subscribe({ processor: "blobs-production" })`. The blobs
@@ -87,8 +90,11 @@ holds; one that fails otherwise, or keeps failing until the lease would lapse,
 ends the session at once, and the iterator throws its error. The lanes of
 `subscribe()` reconnect after either, and after any other retryable error. A
 stream record over 65 MiB fails the session with a non-retryable
-`invalid_response` error; request smaller batches with
-`batching.maximumEncodedBytes`. Always close delivery sessions in `finally`. Commit
+`invalid_response` error. A backfill stream can request smaller batches with
+`batching.maximumEncodedBytes`; `streamLive()` takes no batching option, so a
+live stream's batches follow the node's
+`api.delivery.live_batches.maximum_encoded_bytes`. Always close delivery
+sessions in `finally`. Commit
 idempotent destination writes before acknowledging a batch. Acknowledge a
 batch's boundary, never a change's own cursor: the node refuses one inside a
 live block or a history progress unit. A backfill session's `deliveryBatches()`

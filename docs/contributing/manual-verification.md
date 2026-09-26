@@ -109,15 +109,16 @@ FROM=$((TO - 9999))
 echo "Testing blocks $FROM through $TO"
 ```
 
-Set the configured processor start to the numeric value printed as `FROM`:
+In the copied `blobs-money` entry, set the processor start to the numeric
+value printed as `FROM`, and keep the entry's other fields and policy tables:
 
 ```toml
 [[processors]]
 id = "blobs-money"
+instance = "blobs-production"
 version = "1.5.0"
 start_block = 0 # Replace 0 with the numeric FROM value printed above.
 publish = "included_and_finalized"
-retention = "full_output_history"
 ```
 
 `serve` uses this configured value. The finite `e2e mainnet` command overrides
@@ -366,7 +367,9 @@ than `eth_subscribe`.
 
 This mode isolates free public datasets from P2P and head following. Copy
 `deploy/container.toml` to `config/manual-history.toml`, then configure local
-bind addresses and a fresh data directory, relative to the configuration file:
+bind addresses, a fresh data directory, relative to the configuration file,
+and the processor start; keep the other settings and the processor's policy
+tables as copied:
 
 ```toml
 data_dir = "../data/manual-history-10k"
@@ -384,10 +387,10 @@ minimum_agreement = 1
 
 [[processors]]
 id = "blobs-money"
+instance = "blobs-container"
 version = "1.5.0"
 start_block = 0 # Replace 0 with the numeric FROM value printed above.
 publish = "included_and_finalized"
-retention = "full_output_history"
 
 [rpc]
 http_bind = "127.0.0.1:8545"

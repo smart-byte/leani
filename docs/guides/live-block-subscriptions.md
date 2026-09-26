@@ -151,5 +151,5 @@ The configured node and embedded subscription use separate state directories,
 so both can be tested from the same project directory. A subscription reset
 only removes a directory `leani subscribe` marked as subscription state and
 no node has taken over since (see
-[the Uniswap guide](uniswap-price-subscriptions.md#cli)), and `leani reset all`
+[the Uniswap guide](/docs/guides/uniswap-price-subscriptions/#cli)), and `leani reset all`
 refuses while an embedded subscription is running.

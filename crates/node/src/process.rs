@@ -6069,8 +6069,11 @@ const MINIMUM_API_BEARER_TOKEN_CHARS: usize = 16;
 
 /// The native API bearer token read from environment variable `name`. An
 /// unset, non-Unicode, empty, or short value fails startup, as does one with
-/// spaces, control characters, or non-ASCII characters, which no client can
-/// send as a bearer token. No error repeats the value.
+/// spaces, control characters, or non-ASCII characters. Leading or trailing
+/// whitespace, other control characters, and non-ASCII characters could never
+/// authenticate through an HTTP header; interior spaces and tabs could, but are
+/// refused as well, so a token is one printable ASCII word. No error repeats
+/// the value.
 fn api_bearer_token(name: &str, value: Result<String, std::env::VarError>) -> Result<Arc<str>> {
     let token = match value {
         Ok(token) => token,
@@ -8020,8 +8023,9 @@ mod tests {
 
     #[test]
     fn api_bearer_tokens_are_printable_ascii_without_spaces() {
-        // Review 1, minor 1: a client cannot send such a token, so it could
-        // never authenticate.
+        // Review 1, minor 1: a token is printable ASCII without spaces. Most of
+        // these could never authenticate; the interior spaces could, and are
+        // refused all the same.
         for token in [
             "sixteen chars ok",
             " sixteen-chars-ok",

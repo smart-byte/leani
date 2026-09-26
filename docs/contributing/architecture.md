@@ -436,51 +436,16 @@ Proposed compatibility path:
 
 Full compatibility is not an MVP dependency. The architecture should make adapters possible, but it should not make `sf.ethereum.type.v2.Block`, Firehose cursor internals, or the Substreams Wasm ABI the project's foundational representation. Ethereum packages can reasonably assume richer executed-block data than receipts provide.
 
-## 12. Example manifest
+## 12. Example configuration
 
-Illustrative only:
-
-```toml
-manifest_version = 1
-
-[chain]
-name = "ethereum-mainnet"
-chain_id = 1
-
-[history]
-backends = ["xatu", "erae"]
-start_block = 19426589
-
-[live]
-backend = "p2p"
-finality_source = "beacon-api"
-reorg_window_blocks = 128
-
-[budgets]
-temporary_disk = "5 GiB"
-recent_raw = "1 GiB"
-memory = "1 GiB"
-
-[[processors]]
-id = "blobs-money"
-version = "0.1.0"
-requires = ["HEADER", "TRANSACTIONS", "RECEIPTS"]
-retention = "full-output-history"
-publish = "included_and_finalized"
-
-[processors.sink]
-kind = "embedded"
-
-[[sinks]]
-kind = "postgres"
-processor = "blobs-money"
-enabled = false
-
-[rpc]
-recent_window_blocks = 128
-historical_mode = "on-demand"
-transaction_locator_index = false
-```
+A node reads strict, versioned TOML, whose machine-readable schema is
+`config/schema-v1.json`. `config/example.toml` is a complete advanced
+document, `config/modes/` holds the checked operating profiles, and
+`config/defaults/ethereum-mainnet.toml` is what a compact document expands
+to. Tests load every shipped configuration and hold the schema to the
+configuration types, so these files, not an illustration, show the current
+shape. The [configuration guide](/docs/operations/configuration-guide/)
+explains each section.
 
 ## 13. Execution networking
 

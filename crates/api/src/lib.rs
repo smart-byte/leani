@@ -2265,7 +2265,7 @@ fn backfill_error(error: BackfillControlError) -> ApiError {
                 "requestedToBlock": requested,
                 "currentFinalizedHead": {
                     "number": finalized,
-                    "hash": finalized_hash,
+                    "hash": hash_hex(finalized_hash),
                 },
                 "suggestedToBlock": finalized,
                 "action": "clamp_and_retry"
@@ -2287,7 +2287,7 @@ fn backfill_error(error: BackfillControlError) -> ApiError {
                 "requestedFromBlock": requested,
                 "currentFinalizedHead": {
                     "number": finalized,
-                    "hash": finalized_hash,
+                    "hash": hash_hex(finalized_hash),
                 }
             }));
             error
@@ -6107,7 +6107,35 @@ async fn list_output_collections(
 
 #[derive(Clone, Debug, Serialize)]
 struct RecoveryCheckpointList {
-    data: Vec<RecoveryCheckpoint>,
+    data: Vec<RecoveryCheckpointResponse>,
+}
+
+/// A recovery checkpoint on the wire. Its hashes are `0x` hex, like every
+/// other hash the API returns; the store type serializes them as byte arrays.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RecoveryCheckpointResponse {
+    checkpoint_id: u64,
+    processor_instance: String,
+    block_number: u64,
+    block_hash: String,
+    state_checksum: String,
+    state_bytes: u64,
+    created_at_unix_ms: u64,
+}
+
+impl From<RecoveryCheckpoint> for RecoveryCheckpointResponse {
+    fn from(checkpoint: RecoveryCheckpoint) -> Self {
+        Self {
+            checkpoint_id: checkpoint.checkpoint_id,
+            processor_instance: checkpoint.processor_instance,
+            block_number: checkpoint.block_number.0,
+            block_hash: hash_hex(checkpoint.block_hash),
+            state_checksum: hash_hex(checkpoint.state_checksum),
+            state_bytes: checkpoint.state_bytes,
+            created_at_unix_ms: checkpoint.created_at_unix_ms,
+        }
+    }
 }
 
 async fn list_recovery_checkpoints(
@@ -6119,7 +6147,10 @@ async fn list_recovery_checkpoints(
         data: state
             .store
             .recovery_checkpoints(processor.descriptor())
-            .await?,
+            .await?
+            .into_iter()
+            .map(RecoveryCheckpointResponse::from)
+            .collect(),
     }))
 }
 
@@ -6155,7 +6186,35 @@ struct RecoveryRestoreResponse {
 
 #[derive(Clone, Debug, Serialize)]
 struct PortableSavepointList {
-    data: Vec<PortableSavepoint>,
+    data: Vec<PortableSavepointResponse>,
+}
+
+/// A portable savepoint on the wire, with `0x` hex hashes like a recovery
+/// checkpoint's.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PortableSavepointResponse {
+    savepoint_id: String,
+    processor_instance: String,
+    block_number: u64,
+    block_hash: String,
+    state_checksum: String,
+    state_bytes: u64,
+    created_at_unix_ms: u64,
+}
+
+impl From<PortableSavepoint> for PortableSavepointResponse {
+    fn from(savepoint: PortableSavepoint) -> Self {
+        Self {
+            savepoint_id: savepoint.savepoint_id,
+            processor_instance: savepoint.processor_instance,
+            block_number: savepoint.block_number.0,
+            block_hash: hash_hex(savepoint.block_hash),
+            state_checksum: hash_hex(savepoint.state_checksum),
+            state_bytes: savepoint.state_bytes,
+            created_at_unix_ms: savepoint.created_at_unix_ms,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -6173,7 +6232,10 @@ async fn list_portable_savepoints(
         data: state
             .store
             .portable_savepoints(processor.descriptor())
-            .await?,
+            .await?
+            .into_iter()
+            .map(PortableSavepointResponse::from)
+            .collect(),
     }))
 }
 
@@ -6181,13 +6243,13 @@ async fn create_portable_savepoint(
     State(state): State<ApiState>,
     Path(processor): Path<String>,
     Json(request): Json<CreateSavepointRequest>,
-) -> Result<(StatusCode, Json<PortableSavepoint>), ApiError> {
+) -> Result<(StatusCode, Json<PortableSavepointResponse>), ApiError> {
     let processor = configured_processor(&state, &processor)?;
     let savepoint = state
         .store
         .create_portable_savepoint(processor.descriptor(), &request.id)
         .await?;
-    Ok((StatusCode::CREATED, Json(savepoint)))
+    Ok((StatusCode::CREATED, Json(savepoint.into())))
 }
 
 async fn export_portable_savepoint(
@@ -11559,6 +11621,118 @@ mod tests {
         assert_eq!(status, StatusCode::INSUFFICIENT_STORAGE, "{body}");
         assert_eq!(body["error"]["code"], "physical_storage_limit");
         assert_eq!(body["error"]["retryable"], false);
+    }
+
+    #[tokio::test]
+    async fn checkpoint_and_savepoint_hashes_are_hex_strings() {
+        // Task 22: every other API hash is `0x` hex, but recovery checkpoints
+        // and portable savepoints sent `blockHash` and `stateChecksum` as
+        // arrays of 32 integers.
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = SqliteStore::open(leani_store_sqlite::StoreConfig::new(
+            directory.path().join("node.sqlite"),
+        ))
+        .await
+        .expect("store");
+        let processor = Arc::new(leani_testkit::BlockLocalCounter::default());
+        apply_finalized_blocks(&store, processor.as_ref(), 1..=1).await;
+        let descriptor = processor.descriptor().clone();
+        let configured: Arc<dyn Processor> = processor;
+        let app = router_with_processors(
+            store.clone(),
+            vec![configured],
+            Vec::new(),
+            ApiConfig::default(),
+        )
+        .expect("router");
+
+        let checkpoint = store
+            .recovery_checkpoints(&descriptor)
+            .await
+            .expect("checkpoints")
+            .first()
+            .cloned()
+            .expect("the finalized block's automatic checkpoint");
+        let (status, checkpoints) = send(
+            &app,
+            get_request("/v1/processors/synthetic-counter/checkpoints"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{checkpoints}");
+        let listed = &checkpoints["data"][0];
+        assert_eq!(
+            listed["blockHash"],
+            hash_hex(checkpoint.block_hash),
+            "{listed}"
+        );
+        assert_eq!(
+            listed["stateChecksum"],
+            hash_hex(checkpoint.state_checksum),
+            "{listed}"
+        );
+        assert_eq!(listed["blockNumber"], 1, "{listed}");
+        assert_eq!(listed["checkpointId"], checkpoint.checkpoint_id, "{listed}");
+
+        let (status, created) = send(
+            &app,
+            Request::post("/v1/processors/synthetic-counter/savepoints")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(json!({ "id": "hex-hashes" }).to_string()))
+                .expect("savepoint request"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{created}");
+        let savepoint = store
+            .portable_savepoints(&descriptor)
+            .await
+            .expect("savepoints")
+            .first()
+            .cloned()
+            .expect("the created savepoint");
+        let (status, savepoints) = send(
+            &app,
+            get_request("/v1/processors/synthetic-counter/savepoints"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{savepoints}");
+        for body in [&created, &savepoints["data"][0]] {
+            assert_eq!(body["savepointId"], "hex-hashes", "{body}");
+            assert_eq!(body["blockHash"], hash_hex(savepoint.block_hash), "{body}");
+            assert_eq!(
+                body["stateChecksum"],
+                hash_hex(savepoint.state_checksum),
+                "{body}"
+            );
+            assert_eq!(body["blockNumber"], 1, "{body}");
+        }
+    }
+
+    #[test]
+    fn finalized_head_error_details_carry_a_hex_hash() {
+        // Task 22: the finalized head in these refusals' details was an array
+        // of 32 integers, unlike every other API hash.
+        let finalized_hash = BlockHash::new([0xab; 32]);
+        for error in [
+            BackfillControlError::HistoryNotFinalized {
+                requested: 11,
+                finalized: 10,
+                finalized_hash,
+            },
+            BackfillControlError::RangeAfterFinalizedHead {
+                requested: 11,
+                finalized: 10,
+                finalized_hash,
+            },
+        ] {
+            let error = backfill_error(error);
+            let details = error.details.expect("finalized head details");
+            assert_eq!(
+                details["currentFinalizedHead"],
+                json!({ "number": 10, "hash": format!("0x{}", "ab".repeat(32)) }),
+                "{} {details}",
+                error.code
+            );
+        }
     }
 
     #[tokio::test]

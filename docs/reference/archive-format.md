@@ -28,6 +28,9 @@ trust = "trusted_dataset"
 manifest = "./archives/mainnet/manifest.json"
 ```
 
+A relative `manifest` path is relative to the directory of the configuration
+file, not the working directory the node starts in.
+
 Manifest:
 
 ```json
@@ -95,8 +98,9 @@ leani backfill \
 The runtime records coverage and discards input frames after reduction. Only
 processor output, undo/change journals, and job metadata remain in SQLite.
 An ordered processor such as `erc20-balances` applies its history
-contiguously from `start_block` upward, so `--from` must be its `start_block`
-or the block after the last one it applied.
+contiguously from `start_block` upward, so `--from` must be the block after
+the last one it applied, or its `start_block` when it has applied none; the
+command refuses any other start and names the block to use.
 
 When `rpc.historical_mode = "on_demand"`, the same source can answer bounded
 historical RPC without importing frames into SQLite. Exact block and receipt

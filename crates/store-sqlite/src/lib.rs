@@ -12043,11 +12043,15 @@ impl SqliteStore {
     }
 
     /// Legacy create/renew helper retained for callers migrating to the
-    /// explicit consumer API.
+    /// explicit consumer API. It creates a missing consumer as `required`.
     ///
     /// # Errors
     ///
-    /// Returns an error for invalid input or a failed write.
+    /// Returns [`StoreError::InvalidConfig`] for an invalid consumer ID or
+    /// lease TTL, and when it would create a `required` consumer on a live
+    /// stream that does not retain delivery until acknowledged;
+    /// [`StoreError::Numeric`] when the lease expiry does not fit; and store
+    /// failures.
     pub async fn renew_consumer_lease(
         &self,
         descriptor: &ProcessorDescriptor,

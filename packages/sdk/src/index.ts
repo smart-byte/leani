@@ -149,6 +149,7 @@ export interface ProcessorCoverage {
     | "catching_up"
     | "live"
     | "degraded"
+    | "paused"
     | "failed";
 }
 

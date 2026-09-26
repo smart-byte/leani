@@ -919,6 +919,11 @@ paths:
         with a credential from before that rule. The credential enters the
         request's idempotency identity, an unkeyed BLAKE3 hash of the whole
         request that the node keeps, so use a random one.
+
+        A range that starts past the node's finalized head gets 409
+        `range_after_finalized_head`, and one that only ends past it
+        `history_not_finalized`. Their `details.currentFinalizedHead` holds
+        the head's `number` and its `hash` as `0x` hex.
       responses:
         "202":
           description: Backfill subscription accepted; its current status.
@@ -970,6 +975,11 @@ paths:
     post:
       summary: Create a materialization job
       operationId: createMaterializationJob
+      description: |
+        A range that starts past the node's finalized head gets 409
+        `range_after_finalized_head`, and one that only ends past it
+        `history_not_finalized`. Their `details.currentFinalizedHead` holds
+        the head's `number` and its `hash` as `0x` hex.
       responses:
         "202":
           description: Materialization job accepted; its current status.
@@ -1485,14 +1495,6 @@ components:
     Hash32:
       type: string
       pattern: "^0x[0-9a-f]{64}$"
-    ByteArray32:
-      type: array
-      minItems: 32
-      maxItems: 32
-      items:
-        type: integer
-        minimum: 0
-        maximum: 255
     Address:
       type: string
       pattern: "^0x[0-9a-f]{40}$"
@@ -1718,8 +1720,11 @@ components:
         complete:
           type: boolean
         state:
+          description: |
+            `paused` and `failed` report the processor's live lane;
+            `/v1/network/status` gives its `pauseReason`.
           type: string
-          enum: [starting, backfilling, catching_up, live, degraded, failed]
+          enum: [starting, backfilling, catching_up, live, degraded, paused, failed]
     ChainFinalizedHead:
       type: object
       additionalProperties: false
@@ -1916,9 +1921,12 @@ components:
           description: |
             A random secret of 32 to 512 printable ASCII characters without
             spaces, such as `openssl rand -hex 32`. Only a hash keyed with the
-            node's secret is stored. Every consumer-scoped request then needs
-            it. An existing consumer ID gets 409 `consumer_exists` whatever
-            the credential.
+            node's secret is stored. The consumer's lease, change,
+            acknowledgement, and stream requests then need it; listing,
+            inspecting, and revoking consumers need only the bearer token.
+            These bounds apply to a new consumer: the node checks the ID
+            first, so an existing consumer ID gets 409 `consumer_exists`
+            whatever the credential, even one outside them.
           type: string
           minLength: 32
           maxLength: 512
@@ -1928,11 +1936,16 @@ components:
       type: object
       additionalProperties: false
       required:
-        [id, processorInstance, role, state, acknowledgedSequence, deliveredSequence, acknowledgedCursor, deliveredCursor, leaseTtlMs, leaseExpiresAtUnixMs, leaseActive, lagChanges, lagBlocks, lagBytes, lagAgeMs, createdAtUnixMs, updatedAtUnixMs]
+        [id, processorInstance, streamId, role, state, acknowledgedSequence, deliveredSequence, acknowledgedCursor, deliveredCursor, leaseGeneration, leaseTtlMs, leaseExpiresAtUnixMs, leaseActive, lagChanges, lagBlocks, lagBytes, lagAgeMs, createdAtUnixMs, updatedAtUnixMs]
       properties:
         id:
           type: string
         processorInstance:
+          type: string
+        streamId:
+          description: |
+            The delivery stream this consumer reads: the processor's live or
+            canonical stream, or a backfill subscription's history stream.
           type: string
         role:
           type: string
@@ -1951,6 +1964,11 @@ components:
           $ref: "#/components/schemas/Cursor"
         deliveredCursor:
           $ref: "#/components/schemas/Cursor"
+        leaseGeneration:
+          description: |
+            How many stream sessions have taken this consumer's lease; each
+            new session fences the one before it. `0` before the first.
+          $ref: "#/components/schemas/DecimalQuantity"
         leaseTtlMs:
           $ref: "#/components/schemas/DecimalQuantity"
         leaseExpiresAtUnixMs:
@@ -1982,9 +2000,9 @@ components:
         blockNumber:
           $ref: "#/components/schemas/SafeInteger"
         blockHash:
-          $ref: "#/components/schemas/ByteArray32"
+          $ref: "#/components/schemas/Hash32"
         stateChecksum:
-          $ref: "#/components/schemas/ByteArray32"
+          $ref: "#/components/schemas/Hash32"
         stateBytes:
           $ref: "#/components/schemas/SafeInteger"
         createdAtUnixMs:
@@ -2020,9 +2038,9 @@ components:
         blockNumber:
           $ref: "#/components/schemas/SafeInteger"
         blockHash:
-          $ref: "#/components/schemas/ByteArray32"
+          $ref: "#/components/schemas/Hash32"
         stateChecksum:
-          $ref: "#/components/schemas/ByteArray32"
+          $ref: "#/components/schemas/Hash32"
         stateBytes:
           $ref: "#/components/schemas/SafeInteger"
         createdAtUnixMs:

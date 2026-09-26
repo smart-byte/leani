@@ -160,8 +160,11 @@ plan RAM for about `maximum_active_chunks` × 450 MiB during Xatu backfills.
 
 `[budgets.history_material]` is the sole budget for shared immutable source
 frames and acquisition reorder buffers. Chunks read ahead of the one a job is
-reading can use at most half of its `memory_bytes`, so size it to at least
-twice the largest expected frame. `[budgets.history_pipeline]` is
+reading reserve memory only up to half of its `memory_bytes`, so size it to at
+least twice the largest expected frame. The half is checked as each frame is
+reserved: a chunk that another job joins, or that its reading job pauses and
+leaves while others wait for it, becomes read-ahead with the frames it already
+holds, so read-ahead can hold more than half. `[budgets.history_pipeline]` is
 separate: `maximum_active_chunks` caps physical history reads node-wide and
 `maximum_mapped_bytes` caps processor-owned mapped deltas across every active
 job. Its nested `commit` table flushes a contiguous SQLite transaction at the
@@ -286,7 +289,7 @@ advanced configurations leave it unset by default.
 Finality checkpoints are bootstrap trust anchors, not evergreen config
 defaults. The first start needs a checkpoint at most 14 days old; later starts
 bootstrap from the newest verified anchor the node persisted (see the
-runbook's [checkpoint lifecycle](runbook.md#checkpoint-lifecycle)).
+runbook's [checkpoint lifecycle](/docs/operations/runbook/#checkpoint-lifecycle)).
 Enabled finality requires a recent 32-byte checkpoint root other than all
 zeros. `consensus_p2p` also requires its non-zero finalized beacon slot and a
 `finality.minimum_peers` of at most 24, the consensus peers dialed at once.
@@ -427,8 +430,8 @@ token value. When configured, that one bearer protects native read, stream,
 consumer, and management routes on the API listener; operational health,
 metrics, and network-dashboard routes remain unauthenticated. `serve` fails
 to start when the variable is unset, holds fewer than 16 characters, or holds
-anything but printable ASCII without spaces, which no client could send; use
-a random value such as `openssl rand -hex 32`. Clients send
+anything but printable ASCII without spaces; use a random value such as
+`openssl rand -hex 32`. Clients send
 `Authorization: Bearer <token>`, with the scheme in any case, and the node
 compares tokens in constant time. A consumer created through the API carries
 its own credential, and a backfill subscription's consumer can; a new one
@@ -528,6 +531,9 @@ Each limit has a `rpc` setting:
 | `max_subscription_event_bytes` | `16MiB` | a WebSocket connection whose subscriptions produce more notification bytes for one chain event is closed with `1008`, and one that leaves more unread with `1013` |
 
 A closed WebSocket connection releases its slot and its subscriptions.
+Notifications are queued one at a time, so while earlier ones are still
+unsent, a connection can be closed with `1013` before one event's
+notifications pass the limit that would close it with `1008`.
 Each open connection holds at most `max_subscription_event_bytes` of
 notifications and one response to a call waiting to be sent, so all
 connections together hold at most `max_websocket_connections` times that.
@@ -550,9 +556,17 @@ smaller effective limits; those values are persisted with the subscription and
 returned by its status endpoint. `maximum_buffered_batches` and
 `maximum_buffered_bytes` independently cap the per-connection encoder queue;
 backpressure stops the encoder producer before either bound is exceeded.
+SDK delivery sessions refuse an NDJSON record over 65 MiB with a
+non-retryable `invalid_response` error. A record carries up to
+`maximum_encoded_bytes` of changes plus its own fields, so for SDK clients
+keep each lane's `maximum_encoded_bytes` at or below 64 MiB; raising it, and
+`maximum_buffered_bytes` with it, beyond that lets a record exceed what the
+SDK accepts.
 Opening a history stream may request only stricter byte/event/block/delay
 limits through query parameters; these are connection-local and do not mutate
-the durable subscription. The SDK's `latency`, `balanced`, and `throughput`
+the durable subscription. A live stream, including one the SDK's
+`streamLive()` opens, takes no such parameters and uses `live_batches` as
+configured. The SDK's `latency`, `balanced`, and `throughput`
 profiles are convenience functions that expand to those concrete numbers and
 are resent after reconnect.
 `compression = "gzip"` is negotiated through

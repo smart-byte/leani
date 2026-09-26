@@ -221,9 +221,12 @@ The node also holds at most `rpc.max_subscription_event_bytes` of a
 connection's notifications unsent. A client that reads more slowly than
 its subscriptions produce notifications is closed with code `1013` (try
 again later), as it is when it falls behind the node's bounded event
-channel, and may reconnect. Notifications still unsent when a connection
-is closed are dropped, and a connection that cannot take its close frame
-within a second is dropped without one. Other connections are unaffected.
+channel, and may reconnect. Notifications are queued one at a time, so while
+earlier ones are still unsent, a connection can get `1013` before one event's
+notifications pass the budget that would close it with `1008`. Notifications
+still unsent when a connection is closed are dropped, and a connection that
+cannot take its close frame within a second is dropped without one. Other
+connections are unaffected.
 A call's response is sent before the connection's next message is read,
 so a client that stops reading stops being answered too.
 

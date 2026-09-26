@@ -33,10 +33,12 @@ backoff. Corrupt data, schema/plan/budget failures, processor failures, and
 store failures fail closed. Cancellation is durable and propagated to the
 source.
 
-The Xatu adapter implements the same history contract for the blobs projection.
-It chunks by 1,000 execution blocks and derives required UTC beacon partitions
-from execution-block timestamps, keeping Xatu-specific dates out of the
-generic scheduler contract.
+The Xatu adapter implements the same history contract. It chunks the blobs
+projection by 8,000 execution blocks and its other projections by 1,000
+(`blobs_chunk_blocks` and `chunk_blocks`, multiples of Xatu's 1,000-block
+partitions), and derives required UTC beacon partitions from execution-block
+timestamps, keeping Xatu-specific dates out of the generic scheduler
+contract.
 
 ## Consequences
 
@@ -44,9 +46,10 @@ Source download and mapping can run concurrently within explicit item and byte
 limits. Commits remain serialized by the store. A crash after a processor
 commit but before the job checkpoint merely causes an idempotent retry.
 
-The current adapter materializes at most one 1,000-block projected Xatu chunk
-before streaming its normalized frames. Future sources may stream directly;
-the runtime contract and budgets are unchanged.
+The current adapter materializes at most one projected Xatu chunk, 8,000
+blocks for the blobs projection and 1,000 for the others by default, before
+streaming its normalized frames. Future sources may stream directly; the
+runtime contract and budgets are unchanged.
 
 ## Evidence
 

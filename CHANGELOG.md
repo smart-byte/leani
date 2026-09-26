@@ -50,14 +50,18 @@ record, and documented RPC contracts.
   receipt request, including the receipts of filtered-log subscriptions, now
   gives up after eight waves across the peer pool or a minute, even inside a
   wave. The lane then reports itself disconnected, which clears readiness,
-  and asks another peer for the header. The peer that served the header
-  takes a strike: it is not asked for headers for a cooldown that grows with
-  each strike, up to 30 seconds, and ranks after other peers until a block
-  whose header it served completes. A header it serves in the meantime lifts
-  neither, and nothing is banned or stored. A live header also earns its
-  peer's stored service evidence and Reth reputation only once its body and
-  receipts arrive. The lane used to retry forever while still reporting itself
-  ready, and to reward the header first.
+  and asks another peer for the header. Once a wave has found no peer serving
+  the material, the peer that served the header takes a strike; a minute that
+  runs out during the first wave ends the request as a timeout, without one.
+  A struck peer is not asked for headers for a cooldown that grows with each
+  strike, up to 30 seconds, and ranks after other peers until a block whose
+  header it served completes. A header it serves in the meantime lifts
+  neither, and nothing is banned or stored. A live header that a frame
+  follows also earns its peer's stored service evidence and Reth reputation
+  only once that frame completes, with its body and receipts when the frame
+  needs them; a header that no frame follows, such as the minimum live head
+  the lane starts from, earns them at once. The lane used to retry forever
+  while still reporting itself ready, and to reward the header first.
 - One execution peer serving a forged segment of the history bridge's header
   proof no longer blocks the bridge. The proof is checked from the finalized
   anchor down, each segment against the parent that the proven segment above
@@ -235,6 +239,9 @@ record, and documented RPC contracts.
   any request, and so is a control character anywhere in the path. An ID such
   as `..` or `../../other` resolved to another route, directly or through a
   proxy that decodes `%2F` first. No Leani ID contains these characters.
+  `request()` applies the same rule to a custom query extension's path, so a
+  path parameter whose value can hold `/` or `%`, sent as `%2F` or `%25`,
+  must move to the query string, `request()`'s `params`.
 - Publication runs in protected GitHub environments: `release-npm`,
   `release-crates`, `release-ghcr`, `release-github`, and `site-production`.
   Build and test jobs run with a read-only token and no secrets or OIDC
@@ -362,9 +369,9 @@ record, and documented RPC contracts.
     subscription's status when an unchanged backfill request is submitted
     again. A credential stored before the upgrade that begins or ends with
     whitespace cannot be sent as it is, since HTTP trims header values, and
-    one with a control character cannot be sent at all; now that the header
-    is mandatory, revoke such a consumer and create it again with a new
-    credential.
+    one with a control character other than a tab cannot be sent at all; now
+    that the header is mandatory, revoke such a consumer and create it again
+    with a new credential.
   - An acknowledgement needs a cursor this consumer was delivered (409
     `acknowledgement_beyond_delivered`, with `deliveredSequence` in the error
     details). On a live stream it must also end a block's commit, as every
@@ -417,11 +424,18 @@ record, and documented RPC contracts.
   to go unnoticed until the next record arrived. Lease renewals,
   acknowledgements, lease releases, and `changes()` observe `timeoutMs` too.
   The lanes of `subscribe()` reconnect after each of these. A stream record
-  over 65 MiB fails the session with a non-retryable `invalid_response` error;
-  request smaller batches with `batching.maximumEncodedBytes`.
+  over 65 MiB fails the session with a non-retryable `invalid_response` error.
+  A backfill stream can request smaller batches with
+  `batching.maximumEncodedBytes`; `streamLive()` takes no batching option, so
+  a live stream needs the node's
+  `api.delivery.live_batches.maximum_encoded_bytes` at 64 MiB or below.
 - SDK: the package requires Node 20.3 or later, the first with
   `AbortSignal.any`, adds a `default` export condition beside `import`, and
   embeds the TypeScript sources in its source maps.
+- Breaking (SDK): the TypeScript SDK is published on npm as
+  `@smart-byte/leani-sdk`, with the `@smart-byte/leani-sdk/backfill` entry
+  point. The `v0.1.0-rc.1` sources and documentation called it `@leani/sdk`,
+  a name that was never published; import the new name.
 - The PostgreSQL example keys applied changes and its stored cursor by the
   durable consumer's stream too. A node whose store is replaced numbers its
   changes from the start again, which the example took for changes it had
@@ -449,8 +463,9 @@ record, and documented RPC contracts.
 - Breaking (`leani-processor-api`): `ProcessorInstanceId::legacy` returns
   `Result<ProcessorInstanceId, ProcessorInstanceIdError>` instead of panicking
   when the derived key is invalid, which happens for a version with `+` build
-  metadata or when the ID and version exceed 192 bytes together. Decoding a
-  descriptor without an `instance` reports that as an error.
+  metadata or when the ID and version together exceed 126 bytes: the key adds
+  `@`, `:`, and the 64-digit configuration hash, and may hold 192 bytes.
+  Decoding a descriptor without an `instance` reports that as an error.
 - Breaking (`leani-primitives`, `leani-processor-api`): decoding validates
   values the way their constructors do. A `BlockRange` whose end precedes its
   start, `CapabilitySet` or `LogFieldSet` bits that name no capability or log
@@ -545,11 +560,13 @@ record, and documented RPC contracts.
 
   1. Start the node with a new `data_dir`. Nothing is deleted, and the old
      directory stays usable with the previous binary as a rollback.
-  2. Replace the compact document with an advanced configuration, as expanded
-     in `config/defaults/ethereum-mainnet.toml`, whose `uniswap-observations`
-     `[[processors]]` entry names a new `instance`. The node keeps its raw
-     history, P2P identity, and embedded subscriptions; the old instance's rows
-     stay in the store.
+  2. Replace the compact document with an advanced configuration whose
+     `uniswap-observations` `[[processors]]` entry, like the example in
+     `docs/reference/processor-contracts.md`, names a new `instance`, lists
+     your markets' pools (the Uniswap guide lists the built-in ones), and
+     starts at block 12,369,621, or at 12,376,729 for ETH/USDC alone. The node
+     keeps its raw history, P2P identity, and embedded subscriptions; the old
+     instance's rows stay in the store.
   3. For a subscription, `leani reset subscription uniswap-v3 <markets> --yes`,
      with the subscription's `--finality`, `--data-dir`, and `--config`
      options, deletes only that subscription's state. The refusal prints this
@@ -703,6 +720,20 @@ record, and documented RPC contracts.
 - The OpenAPI document gives `202` as the success status of
   `createBackfillSubscription`, `createMaterializationJob`, and
   `createRawHistoryJob`, as the node answers; it said `201`.
+- Breaking (native API): recovery checkpoints and portable savepoints
+  (`GET /v1/processors/{processor}/checkpoints`, and `GET` and `POST`
+  `/v1/processors/{processor}/savepoints`) send `blockHash` and
+  `stateChecksum` as `0x`-prefixed hexadecimal strings, like every other hash
+  the API returns, and so does `details.currentFinalizedHead.hash` in the
+  `409 history_not_finalized` and `range_after_finalized_head` refusals; each
+  was an array of 32 integers. Clients that read the arrays must read hex.
+  The OpenAPI `RecoveryCheckpoint` and `PortableSavepoint` schemas now use
+  `Hash32`, the `ByteArray32` schema is gone, and the SDK's generated types
+  follow.
+- The OpenAPI document lists what the node already sent: a durable
+  consumer's `streamId` and `leaseGeneration`, and `paused` among the
+  coverage `state` values, which the SDK's `ProcessorCoverage` type lists
+  too.
 - Breaking (configuration): a plain `http` eraE `endpoint` off loopback
   needs `allow_insecure_http = true` on its history source, which is only
   valid for `era_e` sources. `leani source probe erae --endpoint` accepts
@@ -747,8 +778,9 @@ record, and documented RPC contracts.
   ranges before it fetches the batch, fetching fewer blocks at a time down
   to one, Xatu for the selected columns of each Parquet row group before it
   requests them, execution P2P for each window of frames it builds, and
-  retained raw history for each stored record. The error's text names the
-  node's `budgets.memory_bytes`.
+  retained raw history for each stored record. The error's text names where
+  to raise it: `budgets.memory_bytes` for a node, and `--max-input-bytes` for
+  `leani source probe`.
 - Each history source read may hold up to `budgets.memory_bytes` of raw input
   at once: backfill and CLI backfill chunks, archive reconciliation, the live
   lane, and raw-history job reads, and a historical RPC request up to
@@ -766,6 +798,15 @@ record, and documented RPC contracts.
   the object's length and digest first, then stream its frames a line at a
   time from the same open file, hashing it again as they go; they held the
   whole object's requested frames until its digest verified.
+- A local archive object whose frames skip a block of the requested range,
+  repeat one, or stop short of its end now fails its read as corrupt
+  (`CorruptFrame`), as frames out of order already did; a frame count that
+  did not match the range failed as a missing range. A backfill reading such
+  an object therefore fails instead of trying its next configured source,
+  and archive reconciliation fails, which restarts the network lanes,
+  instead of waiting for the archive to fill the range. Blocks that no
+  manifest object covers are still a missing range.
+  `docs/reference/archive-format.md` lists the checks.
 - The retained raw-history store opens whatever state its segments are in. At
   startup it checks only that each catalogued segment file exists with its
   closed length, and it verifies a segment's whole-file checksum when it
@@ -1017,10 +1058,13 @@ record, and documented RPC contracts.
 - A paused processor lane that resumes no longer replays retained frames
   filtered for the processors that stayed live meanwhile. Live-gap replay
   treats such a frame as missing: it recovers a finalized block from the
-  configured history source. At an unfinalized block, as for a block that was
-  never retained, only that processor's lane pauses
-  (`unfinalized_gap_waiting_for_finality`); the first drain after finality
-  reaches the block recovers it from history, with no operator reset. A
+  configured history source, and without one only that processor's lane
+  pauses (`finalized_gap_waiting_for_history_source`). At an unfinalized
+  block, as for a block that was never retained, only that processor's lane
+  pauses (`unfinalized_gap_waiting_for_finality`); the first drain after
+  finality reaches the block recovers it from history, with no operator
+  reset. Ordered replay treats such a frame the same way; it failed the lane
+  at once, even at a finalized block that history could serve. A
   mapping failure during block-local gap replay now also fails only that
   processor's lane (`processor_live_mapping_failed`), as ordered replay already
   did, instead of stopping shared live ingestion. The replay-miss log is now
@@ -1078,10 +1122,10 @@ record, and documented RPC contracts.
   block-local lane skipped the replacement blocks below its gap, or, after a
   reorg to a shorter branch, resumed with a hole. A reorg without a
   replacement branch no longer leaves a parked lane's gap on a block the chain
-  no longer has: the gap moves onto the new tip, which the lane has applied,
-  so a paused lane resumes at once, and a failed lane's gap moves onto the
-  tip's successor once that block arrives, where a reset replays it. Before,
-  a block-local lane skipped the next block or failed
+  no longer has: the gap moves onto the new tip. When the lane has applied
+  that tip, a paused lane resumes at once, and a failed lane's gap moves onto
+  the tip's successor once that block arrives, where a reset replays it.
+  Before, a block-local lane skipped the next block or failed
   (`live_gap_canonical_identity_changed`), and an ordered lane stalled. A gap
   found off the canonical chain, as earlier versions could leave one, moves
   back to the last canonical block the lane applied, instead of being
@@ -1140,17 +1184,24 @@ record, and documented RPC contracts.
   keeps only the one mapped block whose commit was refused. Once it commits,
   the job resumes from its durable progress and reads and maps the blocks it
   dropped again.
-- Chunks that a backfill opens ahead of the one it is reading can use at most
-  half of `budgets.history_material.memory_bytes`. The rest stays free for
-  chunks being read. Before, read-ahead chunks could fill the whole budget
-  while the chunk the job needed next waited for memory, and the job stalled
-  for good.
+- Chunks that a backfill opens ahead of the one it is reading reserve memory
+  only up to half of `budgets.history_material.memory_bytes`. The rest stays
+  free for chunks being read. Before, read-ahead chunks could fill the whole
+  budget while the chunk the job needed next waited for memory, and the job
+  stalled for good. The half is checked as each frame is reserved, so it is
+  not strict: a chunk that another job joins, or that its reading job pauses
+  and leaves while others wait for it, becomes read-ahead with the frames it
+  already holds.
 - A historical backfill no longer stalls when shared material memory, or room
   in a shared read's frame buffer, is freed just as its reader finds it full.
   The reader now registers for the wakeup before it checks.
 - A history source that panics while streaming fails its read with a
   retryable source error. Its backfills retry, on another source when one is
-  configured. Before, every backfill waiting on that read hung.
+  configured. Before, every backfill waiting on that read hung. This holds
+  for reads through the shared material coordinator, as with the default
+  `budgets.history_material.mode`; with `mode = "disabled"`, and in
+  `leani backfill`, backfills read their sources directly, and a panic still
+  ends the backfill's task.
 - Transient history-source errors are retried per gap, not per job, and a gap
   that committed blocks before failing starts a fresh retry budget. A long
   backfill with a few scattered transient errors no longer fails. Each gap is
@@ -1168,7 +1219,9 @@ record, and documented RPC contracts.
   chain before its lanes open, and logs what it repaired; see
   [Crash or interrupted commit](docs/operations/runbook.md#crash-or-interrupted-commit).
   A lane the store pauses or fails at its delivery limit, for example in a
-  cold-backfill commit, now records where it stopped, even without a restart.
+  cold-backfill commit, now records where it stopped at its next live block,
+  without a restart: a paused lane when the store refuses that block too, and
+  a failed lane unless it is an ordered lane still behind its history.
 - An ordered lane's replay onto a finalized anchor that the node seeded without
   a parent hash now checks that the block descends from the lane's cursor. The
   parent comes from the block's retained frame, or else from the frame that
@@ -1231,7 +1284,10 @@ record, and documented RPC contracts.
   frame is retained. The drain deleted it as a finality variant whenever the
   retained frame mapped to the applied delta, without comparing the pending
   delta itself, so a non-deterministic mapper went unseen. A pending delta
-  that is one of the frame's finality variants is still cleared.
+  that is one of the frame's finality variants is still cleared. A restart
+  still deletes a pending delta for a block the lane applied without
+  comparing it: startup reconciliation counts it in
+  `discarded_pending_deltas` and fails no lane.
 - `evm-events` accepts the included and finalized deltas of one block as
   equivalent on replay. Its entities carry the block's finality, and the
   processor only accepted the exact checksum, so replaying a block whose
@@ -1312,9 +1368,11 @@ record, and documented RPC contracts.
   three eligible peers at a time instead of up to 32, and an empty reply there
   cools the peer's header lane.
 - A head poll whose last peer times out, or cannot take the request, no longer
-  reports the live lane disconnected: the next poll asks other peers. Once no
-  polled peer has answered for the head grace, 12 seconds by default, the lane
-  reports itself disconnected, once, and keeps polling.
+  reports the live lane disconnected: the next poll asks other peers. Once
+  every poll has ended that way for the head grace, 12 seconds by default,
+  the lane reports itself disconnected, once, and keeps polling. A poll counts
+  by its last peer, so another peer's empty answer in the same poll does not
+  end the wait.
 - The live execution P2P lane reconnects after the zero-peer watchdog stops
   the network manager (`sources.live.peer_recovery_timeout_seconds`, five
   minutes by default): its reconnection rebuilds the manager. The lane kept
@@ -1402,7 +1460,9 @@ record, and documented RPC contracts.
   late finality arrives. Finalized rows older than 30 minutes were dropped
   without a trace, as during a finality delay; the age limit now applies
   only to included rows, the startup rows, and peer preview rows. A
-  finalized block the node republishes, as a recompute does, prints once.
+  finalized block the node republishes, as a recompute does, prints once
+  while its change is among the last 4,096 the run remembers, about 13.7
+  hours of a block feed.
 - `leani subscribe` exits successfully, instead of panicking, when stdout's
   reader goes away, as with `| head -1`. Embedded mode still persists its
   verified anchor on the way out, and its note about that no longer panics
@@ -1465,7 +1525,9 @@ record, and documented RPC contracts.
   (100 years), is refused with 400 before its history stream exists; it
   answered 500 and left the stream behind. Creating a durable consumer
   applies the same TTL bound; a TTL too large for the store answered 500
-  there too.
+  there too, and one from 100 years up to about 292 million years, where the
+  store's millisecond lease expiry overflows, was accepted and now gets 400.
+  Existing consumers keep their TTL.
 - A long-running EraE source sees eras its mirror publishes after it
   started: the checksum catalog is fetched again after 10 minutes, and a plan
   that asks past the cached catalog refetches it once the catalog is 30

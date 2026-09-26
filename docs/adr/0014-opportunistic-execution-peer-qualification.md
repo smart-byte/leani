@@ -57,12 +57,14 @@ commitments, and receipts are checked against both the receipt root and body.
   the minimum live head. An empty reply to them cools the peer's lane;
 - when no peer serves the body or receipts of a validated live header within
   eight waves across the pool, or a minute, the header is given up and asked
-  of another peer. The peer that served it takes a withheld-header strike: it
-  is not asked for headers for a cooldown that grows with each strike, up to
-  30 seconds, and ranks after other header peers until a frame on one of its
-  headers completes. Its header successes lift neither, and nothing is banned
-  or persisted. A live header earns its peer's service evidence and
-  reputation only once the frame completes;
+  of another peer. Unless the minute ran out during the first wave, the peer
+  that served it takes a withheld-header strike: it is not asked for headers
+  for a cooldown that grows with each strike, up to 30 seconds, and ranks
+  after other header peers until a frame on one of its headers completes. Its
+  header successes lift neither, and nothing is banned or persisted. A live
+  header that a frame follows earns its peer's service evidence and
+  reputation only once that frame completes; one that no frame follows, such
+  as the minimum live head, earns them at once;
 - qualification probes each peer with real requests at the current target,
   never from its handshake head, and compares targets by block number and
   hash. Lagging and timed-out probes are not persisted as failures and never

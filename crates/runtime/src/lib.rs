@@ -4365,7 +4365,8 @@ impl SharedLiveRuntime {
             // A failed lane, or one parked at a gap, is not committed directly,
             // whatever its mode or delivery ordering: its gap replay covers the
             // block, and a lane failed elsewhere (such as by finality) stays
-            // frozen. It is not mapped again until it is available.
+            // frozen. Until it is available, it is mapped only to move its gap
+            // onto a reorg's replacement branch.
             if self
                 .store
                 .processor_runtime_state(processor.descriptor())
@@ -4897,9 +4898,9 @@ impl SharedLiveRuntime {
     /// Keep a failed lane's marker on the first block it has not applied.
     ///
     /// A failed lane is not replayed, but a reorg without a replacement branch
-    /// leaves its marker on the new tip, which the lane has applied. Once the
-    /// tip's canonical successor is retained, the marker moves onto it, so an
-    /// operator reset replays from there.
+    /// leaves its marker on the new tip. When the lane has applied that tip,
+    /// the marker moves onto the tip's canonical successor once that block is
+    /// retained, so an operator reset replays from there.
     async fn follow_failed_lane_marker(
         &self,
         processor: &dyn Processor,
