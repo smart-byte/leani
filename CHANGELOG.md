@@ -661,6 +661,64 @@ record, and documented RPC contracts.
   object before any row is decoded, as a schema drift; it failed as a
   corrupt frame at the first value decoded. A table missing a projected
   column still fails as a corrupt frame.
+- Breaking (`leani-source-api`): `SourceBudget` gains `max_resident_bytes`,
+  the bytes of raw input one open may hold in memory at once, beside
+  `max_input_bytes`, what it may acquire over its life. `validate` rejects
+  zero for it, like the other limits; construct budgets with the new field.
+  Every source enforces it and names it `resident_bytes` when exceeded: a
+  local archive for each line of its object, EraE for each batch of byte
+  ranges before it fetches the batch, fetching fewer blocks at a time down
+  to one, Xatu for the selected columns of each Parquet row group before it
+  requests them, execution P2P for each window of frames it builds, and
+  retained raw history for each stored record. The error's text names the
+  node's `budgets.memory_bytes`.
+- Each history source read may hold up to `budgets.memory_bytes` of raw input
+  at once: backfill and CLI backfill chunks, archive reconciliation, the live
+  lane, and raw-history job reads, and a historical RPC request up to
+  `memory_bytes` divided by `budgets.source_concurrency`, as before. What a
+  read may acquire over its life is unchanged: `budgets.temporary_disk_bytes`
+  for backfill and reconciliation reads, `memory_bytes` for the live lane,
+  and `raw_history.maximum_segment_logical_bytes` for raw-history job reads.
+  The bound is
+  per read: the node runs up to `budgets.history_pipeline.maximum_active_chunks`
+  backfill reads, one reconciliation read, the live lane, and one read per
+  running raw-history job at once, and decoded data has its own budgets, so
+  plan RAM for their sum; the configuration guide has mainnet sizing. A read
+  that would hold more fails with a `resident_bytes` budget error, and a
+  backfill then tries its next configured source. Local archive reads verify
+  the object's length and digest first, then stream its frames a line at a
+  time from the same open file, hashing it again as they go; they held the
+  whole object's requested frames until its digest verified.
+- The retained raw-history store opens whatever state its segments are in. At
+  startup it checks only that each catalogued segment file exists with its
+  closed length, and it verifies a segment's whole-file checksum when it
+  first reads it. A segment that fails either check leaves the catalog, so its
+  blocks read as missing; its file moves to `raw-history/quarantine/`, and
+  each raw-history job that owned it says so in `last_error`: a completed job
+  returns to the queue and acquires the blocks again, and a failed or
+  cancelled one keeps the error it ended with. A segment whose file is gone
+  at startup leaves the catalog the same way, unless most files are gone, as
+  when a volume is not mounted yet or a restore is still running: then every
+  row stays, the node logs a warning, and the startup recovery report counts
+  them as `unavailable_segments`. A file that disappears while the node runs
+  fails its reads, which fall back to other sources, and keeps its row until
+  the next start. One corrupt or missing segment refused the whole store, and
+  so did a store over its budget, which now opens and admits no new segment
+  until it is back under. The quarantine keeps at most 1 GiB, or the largest
+  segment `raw_history.maximum_segment_physical_bytes` admits when that is
+  larger, deleting the files quarantined longest ago first but never the
+  newest; it was never collected. The node logs the recovery report at
+  startup.
+- Admission to the retained raw-history store reserves the catalog rows a
+  segment adds: 64 KiB for its own rows and 512 bytes per locator row, one
+  per block with block-hash locators and 256 per block with transaction-hash
+  locators. A segment with more transactions still publishes its extra rows,
+  so the catalog can exceed `maximum_physical_bytes` by one segment's extra
+  rows, which the next admission counts. Only 64 KiB was accounted, and
+  locators not at all, so a transaction-indexed store could outgrow its
+  budget without limit. A job checks its next segment's admission before it
+  opens a source, so a job paused at its storage limit no longer downloads
+  that segment again each time the node resumes it, every five seconds.
 
 ### Fixed
 
@@ -1261,13 +1319,28 @@ record, and documented RPC contracts.
   with a non-zero expected lag such as an EraE catalog that has not caught
   up, instead of failing: it stays running, with the reasons in
   `last_error`, which a new run keeps until it commits a segment. It fails
-  once the range has been missing for four times the longest expected lag,
-  and at least 24 hours, since the node first saw it missing; a new job
-  under the same ID starts that clock again. A source whose advertised range
-  does not cover the range, such as a local archive of older blocks, is
-  passed over. A range missing inside the advertised range of a source
-  without expected lag, such as a gap in a local archive, still fails the
-  job at once, and another source's lag no longer hides a terminal error.
+  once it has gone without progress for four times the longest expected lag,
+  and at least 24 hours, counted from the newest segment it retained or else
+  from its creation. Both are persisted, so node restarts do not start the
+  count again, and a new job under the same ID counts from its own creation.
+  A transport failure, such as an unreachable second mirror, keeps the job
+  waiting for at most 72 hours without progress, or the lag bound when that
+  is longer, and then fails it with the reasons in `last_error`; it kept the
+  job waiting forever. That count includes time the node was down or the job
+  paused at its storage limit, so either bound fails a job only once the
+  running node has itself seen the range fail for an hour without committing
+  a segment; a restart gives the sources that hour again, and frames a source
+  delivers without a commit do not. A source
+  whose advertised range does not cover the
+  range, such as a local archive of older blocks, is passed over. A range
+  missing inside the advertised range of a source without expected lag, such
+  as a gap in a local archive, still fails the job at once, and another
+  source's lag no longer hides a terminal error.
+- A backfill whose source read exceeds a source budget, such as the memory a
+  Xatu row group needs, tries its next configured source, and fails only
+  when none can serve the range; it failed at once. Archive reconciliation
+  logs the error and retries the range later instead of ending the network
+  lanes.
 - A backfill whose source fails with a schema drift, such as a Xatu column of
   another type or an object without a strong ETag, tries its next configured
   source, and fails only when none can serve the range. The drift failed the
@@ -1293,6 +1366,41 @@ record, and documented RPC contracts.
   export leaves `topic0` null, empty, or NUL-padded; one such log aborted the
   whole chunk. A topic after an absent one is refused as corrupt instead of
   being dropped.
+- Lookups in retained raw history, such as RPC block and transaction lookups
+  served from retained segments, verify a segment's whole-file checksum once
+  per process, when the node writes the segment or first reads it, and then
+  read one record, checked against its own checksum. Every lookup hashed the
+  whole segment, 512 MiB by default, on an async runtime thread. Segment
+  reads, writes, and fsyncs now run on blocking threads.
+- A raw-history segment whose publication fails after its file closed no
+  longer leaves the file and its reservation behind until a restart. Jobs
+  whose ranges overlap share segments: before each acquisition a job adopts
+  the compatible segments other jobs retained since its last one, and a job
+  that publishes the same material another job has just published adopts
+  that segment once it verifies; one that fails verification is quarantined,
+  and one whose file is gone dropped, and the new copy published in its
+  place. It failed durably on the catalog's unique material identity. A job
+  adopting other jobs' segments skips one whose file is gone, and forgets it
+  when nothing owns it, so deleting and re-creating the jobs that own lost
+  blocks acquires them again. A segment file no catalog row claims, such as
+  one a failed quarantine left behind, moves to the quarantine when a job
+  writes the same segment again; it failed the job with a path collision.
+- The retained raw-history source reports transient store failures, such as
+  I/O errors, a busy catalog, a catalog disk that fails or fills up, or an
+  exhausted connection pool, as unavailable, so reads retry or fail over;
+  every failure but an unknown segment was reported as corrupt material. A
+  segment that fails verification during a read reports its blocks missing,
+  which another source may serve, even when its file cannot be moved to the
+  quarantine, and the node logs a warning. One segment's first verification
+  no longer holds up first reads of other segments.
+- The raw-history catalog opens its SQLite file by name: a data directory
+  path containing `%` or `?` was parsed as a URL and opened another file, or
+  none.
+- A failed processor-artifact segment write removes its partial files, and
+  the tiered artifact sink clears a range's stale partial files before it
+  writes the range again, never those of a write still running for a caller
+  that stopped waiting. A failed write blocked every retry of its range until
+  a restart.
 
 ## [0.1.0-rc.1] - 2026-09-20
 

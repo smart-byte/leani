@@ -562,6 +562,60 @@ its limit. Embedded subscriptions (`leani subscribe` without a node) prune
 the same way while they run, so their built-in processors keep within 64 MiB
 and 24 hours of changes.
 
+Retained raw history has its own `[raw_history]` budgets. A raw-history store
+over either of them, for example after lowering one, still opens and serves
+its segments, but admits no new segment. A job created with
+`segment.onLimit: pause` waits at the storage limit, with the budget named in
+`lastError`, and resumes once the node runs with a larger budget; one created
+with `fail` fails.
+
+### Retained raw-history segment failure
+
+The node verifies each retained segment's whole-file checksum the first time
+it reads the segment after starting, and each block's record checksum on
+every read. At startup it only checks that each segment file exists with its
+closed length, and logs what it recovered. A segment that fails never stops
+the node: it leaves the catalog, so its blocks read as missing and RPC and
+backfills use another source, its file moves to
+`data_dir/raw-history/quarantine` with a `.corrupt` suffix, and the node logs
+a warning. A segment whose file is missing at startup leaves the catalog the
+same way. A closed file no catalog row claims, left by a crash before its
+publication committed, moves to the quarantine with an `.orphan` suffix.
+
+1. Check the raw-history jobs: each job that owned the segment names it and
+   its blocks in `lastError`. A running job acquires those blocks again, and
+   a completed one returns to the queue and does too. A failed or cancelled
+   job keeps the error it ended with.
+2. Check the disk and filesystem before trusting the node with more writes:
+   a corrupt segment usually means a failing disk.
+3. The quarantine keeps at most 1 GiB, or one segment of
+   `raw_history.maximum_segment_physical_bytes` when that is larger. Past
+   that, the files quarantined longest ago are deleted first, at startup and
+   after each new quarantine, but the newest is always kept. Copy a file
+   elsewhere to keep it for inspection; delete the others whenever you like.
+
+### Retained raw-history segments unavailable
+
+When more than half of the catalogued segment files are missing at startup,
+as when the volume holding `data_dir/raw-history/segments` is not mounted yet
+or a restore is still running, the node takes the directory as unavailable
+rather than emptied. It keeps every catalog row, logs a warning, and counts
+them as `unavailable_segments` in its startup recovery log. A segment file
+that disappears while the node runs is treated the same way. Reads of those
+segments fail and fall back to other sources, and the jobs that own them do
+not acquire them again. Do not create raw-history jobs until the directory
+is back: a new job drops the rows of the missing segments nothing owns, and
+may replace others with segments it acquires itself.
+
+1. Mount or restore the directory, then restart the node: the segments whose
+   rows were kept serve again. A returning file whose row a new job dropped
+   meanwhile is quarantined as an orphan.
+2. If the files are gone for good, delete every raw-history job that owns
+   them, cancelling running ones first, then create each again with the same
+   request. The new job skips a segment whose file is gone, removes its
+   catalog row once nothing owns it, which also frees its share of the
+   budgets, and acquires the blocks from its sources.
+
 ### Parked processor live lane
 
 A failure that belongs to one processor parks only that processor's live

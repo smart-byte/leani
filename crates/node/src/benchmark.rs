@@ -1405,17 +1405,7 @@ const fn build_profile() -> &'static str {
 }
 
 fn configured_real_source_budget(config: &Config, range: BlockRange) -> SourceBudget {
-    SourceBudget {
-        max_input_bytes: config.budgets.temporary_disk_bytes,
-        max_frame_bytes: config.budgets.memory_bytes.min(32 * 1_024 * 1_024),
-        max_frames: range.len(),
-        max_buffered_frames: config
-            .budgets
-            .mapper_concurrency
-            .max(config.budgets.source_concurrency),
-        max_in_flight_requests: config.budgets.source_concurrency,
-        temporary_disk_bytes: config.budgets.temporary_disk_bytes,
-    }
+    crate::process::historical_source_budget(config, range)
 }
 
 fn configured_real_runtime(config: &Config) -> HistoricalRuntimeConfig {
@@ -5933,6 +5923,7 @@ fn source_budget(blocks: u64) -> SourceBudget {
         max_buffered_frames: 64,
         max_in_flight_requests: 8,
         temporary_disk_bytes: 0,
+        max_resident_bytes: 64 * 1_024 * 1_024 * 1_024,
     }
 }
 

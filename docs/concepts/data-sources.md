@@ -83,6 +83,9 @@ is downloaded. Every requested byte, footers and merged gaps included, counts
 against the source budget's `max_input_bytes` for the whole chunk, and is
 charged before it is requested. A chunk's `fetched_bytes` reports those
 bytes, and its `projected_compressed_bytes` the selected column chunks alone.
+The reader holds one row group's selected columns at a time, so an object
+whose largest such row group exceeds the budget's `max_resident_bytes` is
+refused before any column is requested.
 At most the source budget's `max_in_flight_requests` requests are in flight
 per object, and the node sets it from `budgets.source_concurrency`.
 
@@ -414,15 +417,44 @@ weak-subjectivity checkpoint boundary.
 A raw-history job retries a range that only lagging sources lack, those with
 a non-zero expected lag, such as an EraE catalog that has not caught up. It
 keeps their reasons in the job's `last_error` while it waits, until it
-commits a segment, and fails once the range has been missing for four times
-the longest expected lag, and at least 24 hours, since the node first saw it
-missing; a restart starts that clock again, and so does a new job under the
-same ID. A source whose advertised range does not cover the range, such as a
-local archive of older blocks, is passed over. A range missing inside the
-advertised range of a source without expected lag, such as a gap in a local
-archive, fails the job at once, and so does a terminal error, such as a
-schema drift, from any source that could serve it, which another source's lag
-no longer hides. A transport failure keeps the job waiting.
+commits a segment, and fails once it has gone without progress for four
+times the longest expected lag, and at least 24 hours. That time counts from
+the newest segment the job retained, or else from its creation, both kept in
+the catalog, so restarting the node does not start it again; a new job under
+the same ID counts from its own creation. A transport failure, such as an
+unreachable mirror, also keeps the job waiting, for at most 72 hours without
+progress, or the lag bound when that is longer; then the job fails with the
+reasons in `last_error`. Those hours include time the node was down or the
+job paused at its storage limit, so either bound fails a job only once the
+running node has itself seen the range fail for an hour without committing
+a segment; after a restart the sources get that hour again, and frames a
+source delivers without a commit do not restart it. A source whose
+advertised range does not cover the
+range, such as a local archive of older blocks, is passed over. A range
+missing inside the advertised range of a source without expected lag, such as
+a gap in a local archive, fails the job at once, and so does a terminal
+error, such as a schema drift, from any source that could serve it, which
+another source's lag no longer hides.
+
+Retained raw history is itself a source. The node verifies a segment's
+whole-file BLAKE3 checksum once per process, when it writes the segment or
+when it first reads it after a restart, and each block read checks its own
+record's checksum against the segment's seek directory; segment reads never
+run on the async runtime's threads. A segment that fails either check leaves
+the catalog, so its blocks read as missing and another source serves them;
+its file moves to `raw-history/quarantine/`. Each raw-history job that owned
+it records why in `last_error`, and acquires the blocks again: a running job
+next, and a completed one once it is back in the queue. A segment whose file
+is missing when the node starts leaves the catalog the same way, unless most
+files are missing, which the node takes as a segment directory not yet
+available and keeps their rows; a file that disappears while the node runs
+fails its reads, which fall back to other sources, until the file returns. A
+job adopting retained segments skips one whose file is gone, and removes its
+row once nothing owns it.
+Jobs whose ranges overlap share segments: before each acquisition a job
+adopts the compatible segments other jobs retained, and a job that publishes
+a segment another job has just published adopts that one, once it verifies,
+instead of failing.
 
 An operator must be able to choose:
 

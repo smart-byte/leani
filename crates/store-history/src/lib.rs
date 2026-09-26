@@ -11,9 +11,10 @@ mod segment;
 mod source;
 
 pub use catalog::{
-    BlockHashLocator, HistoryStore, HistoryStoreConfig, HistoryStoreError, HistoryStoreStats,
-    PendingSegment, RecoveryReport, SegmentOwner, SegmentOwnerClaim, SegmentOwnerKind,
-    SegmentRecord, SegmentReservation, StorageBudget, TransactionLocator,
+    BlockHashLocator, DEFAULT_QUARANTINE_MAXIMUM_BYTES, HistoryStore, HistoryStoreConfig,
+    HistoryStoreError, HistoryStoreStats, PendingSegment, RecoveryReport, SegmentOwner,
+    SegmentOwnerClaim, SegmentOwnerKind, SegmentRecord, SegmentReservation, StorageBudget,
+    TransactionLocator,
 };
 pub use job::{
     RawHistoryIndexPolicy, RawHistoryJob, RawHistoryJobDeletion, RawHistoryJobId,

@@ -879,7 +879,8 @@ async fn read_projected(
     let schema = builder.metadata().file_metadata().schema_descr();
     let root_indices = selected_root_indices(schema, columns)?;
     validate_column_types(object.table, builder.schema(), columns)?;
-    let projected_compressed_bytes = projected_compressed_bytes(builder.metadata(), &root_indices);
+    let (projected_compressed_bytes, largest_row_group) =
+        projected_compressed_bytes(builder.metadata(), &root_indices);
     // Refuse the object before any column is requested when the selected
     // column chunks alone exceed what the budget has left.
     let needed = input.used().saturating_add(projected_compressed_bytes);
@@ -888,6 +889,15 @@ async fn read_projected(
             resource: "input_bytes",
             actual: needed,
             limit: budget.max_input_bytes,
+        });
+    }
+    // The reader fetches, and holds, one row group's selected columns at a
+    // time.
+    if largest_row_group > budget.max_resident_bytes {
+        return Err(XatuError::Budget {
+            resource: "resident_bytes",
+            actual: largest_row_group,
+            limit: budget.max_resident_bytes,
         });
     }
     let projection = ProjectionMask::roots(schema, root_indices);
@@ -953,16 +963,26 @@ fn selected_root_indices(
         .collect()
 }
 
-fn projected_compressed_bytes(metadata: &ParquetMetaData, root_indices: &[usize]) -> u64 {
+/// The selected columns' compressed bytes across all row groups, and in the
+/// largest row group.
+fn projected_compressed_bytes(metadata: &ParquetMetaData, root_indices: &[usize]) -> (u64, u64) {
     let roots = root_indices.iter().copied().collect::<BTreeSet<_>>();
     let schema = metadata.file_metadata().schema_descr();
     metadata
         .row_groups()
         .iter()
-        .flat_map(|group| group.columns().iter().enumerate())
-        .filter(|(leaf, _)| roots.contains(&schema.get_column_root_idx(*leaf)))
-        .map(|(_, column)| u64::try_from(column.compressed_size()).unwrap_or(0))
-        .sum()
+        .map(|group| {
+            group
+                .columns()
+                .iter()
+                .enumerate()
+                .filter(|(leaf, _)| roots.contains(&schema.get_column_root_idx(*leaf)))
+                .map(|(_, column)| u64::try_from(column.compressed_size()).unwrap_or(0))
+                .fold(0_u64, u64::saturating_add)
+        })
+        .fold((0, 0), |(total, largest), group| {
+            (total.saturating_add(group), largest.max(group))
+        })
 }
 
 #[derive(Clone, Debug)]
@@ -2622,10 +2642,16 @@ mod tests {
     /// One uncompressed Parquet row group without dictionaries or statistics,
     /// so objects with equally wide values share one byte layout.
     fn parquet_object(columns: Vec<(&str, ArrayRef)>) -> Bytes {
+        parquet_object_in_row_groups(columns, 1024 * 1024)
+    }
+
+    /// An object whose row groups hold at most `rows` rows each.
+    fn parquet_object_in_row_groups(columns: Vec<(&str, ArrayRef)>, rows: usize) -> Bytes {
         let batch = RecordBatch::try_from_iter(columns).expect("batch");
         let properties = WriterProperties::builder()
             .set_dictionary_enabled(false)
             .set_statistics_enabled(EnabledStatistics::None)
+            .set_max_row_group_row_count(Some(rows))
             .build();
         let mut bytes = Vec::new();
         let mut writer =
@@ -2657,6 +2683,7 @@ mod tests {
             max_buffered_frames: 16,
             max_in_flight_requests,
             temporary_disk_bytes: 1,
+            max_resident_bytes: 64 << 20,
         }
     }
 
@@ -3997,6 +4024,97 @@ mod tests {
         assert_eq!(metrics.fetched_bytes, requested);
         assert_eq!(used, requested);
         assert!(metrics.projected_compressed_bytes < requested);
+    }
+
+    #[tokio::test]
+    async fn a_row_group_must_fit_the_resident_budget() {
+        let store = Arc::new(RecordingStore::default());
+        let numbers = (0..2_048_u64).collect::<Vec<_>>();
+        let object = stored_object(
+            &store,
+            parquet_object(vec![
+                (
+                    "block_number",
+                    Arc::new(UInt64Array::from(numbers.clone())) as ArrayRef,
+                ),
+                ("gas_used", Arc::new(UInt64Array::from(numbers)) as ArrayRef),
+            ]),
+        )
+        .await;
+        let mut budget = test_budget(4);
+        budget.max_resident_bytes = 1_024;
+        let error = read_projected(
+            Arc::clone(&store) as Arc<dyn ObjectStore>,
+            &object,
+            &["block_number", "gas_used"],
+            budget,
+            8_192,
+            &mut 0,
+            &CancellationToken::new(),
+            rows,
+        )
+        .await
+        .expect_err("the row group's columns exceed what one read may hold");
+        // Review I1: a row group was bounded only by what the open may
+        // acquire in total.
+        assert!(
+            matches!(
+                error,
+                XatuError::Budget {
+                    resource: "resident_bytes",
+                    limit: 1_024,
+                    ..
+                }
+            ),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn row_groups_are_held_one_at_a_time() {
+        let store = Arc::new(RecordingStore::default());
+        let numbers = (0..2_048_u64).collect::<Vec<_>>();
+        let object = stored_object(
+            &store,
+            parquet_object_in_row_groups(
+                vec![
+                    (
+                        "block_number",
+                        Arc::new(UInt64Array::from(numbers.clone())) as ArrayRef,
+                    ),
+                    ("gas_used", Arc::new(UInt64Array::from(numbers)) as ArrayRef),
+                ],
+                1_024,
+            ),
+        )
+        .await;
+        let read = |budget| {
+            let store = Arc::clone(&store) as Arc<dyn ObjectStore>;
+            let object = object.clone();
+            async move {
+                read_projected(
+                    store,
+                    &object,
+                    &["block_number", "gas_used"],
+                    budget,
+                    8_192,
+                    &mut 0,
+                    &CancellationToken::new(),
+                    rows,
+                )
+                .await
+            }
+        };
+        let whole = read(test_budget(4)).await.expect("read");
+        // A batch never spans row groups.
+        assert_eq!(whole.batches, 2);
+        // Review 2 A: room for the larger row group, less than both.
+        let mut budget = test_budget(4);
+        budget.max_resident_bytes = whole.projected_compressed_bytes - 1;
+        let held = read(budget)
+            .await
+            .expect("each row group fits what one read may hold");
+        assert_eq!(held.rows_scanned, 2_048);
     }
 
     #[tokio::test]

@@ -212,6 +212,40 @@ impl DirectoryEntry {
     }
 }
 
+/// Partial files a writer created, removed if it is dropped unpublished, so
+/// a failed write never blocks the next attempt at its range.
+#[derive(Debug, Default)]
+struct PartialFiles(Vec<PathBuf>);
+
+impl Drop for PartialFiles {
+    fn drop(&mut self) {
+        for path in &self.0 {
+            // Best effort: the sink removes what stays before it next writes
+            // this range, and at startup.
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+/// Remove the partial files an interrupted write of `final_path` left.
+///
+/// # Errors
+///
+/// Fails when a partial file exists and cannot be removed.
+pub(crate) fn remove_stale_partials(final_path: &Path) -> Result<(), ArtifactSegmentError> {
+    for path in [
+        sibling_path(final_path, "partial"),
+        sibling_path(final_path, "directory.partial"),
+    ] {
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(())
+}
+
 /// Bounded writer for one contiguous immutable artifact segment.
 #[derive(Debug)]
 pub struct ArtifactSegmentWriter {
@@ -220,6 +254,9 @@ pub struct ArtifactSegmentWriter {
     directory_path: PathBuf,
     output: BufWriter<File>,
     directory: BufWriter<File>,
+    /// Declared after the writers, so their handles close before it removes
+    /// the partial files.
+    partials: PartialFiles,
     descriptor: ArtifactSegmentDescriptor,
     processor: ProcessorDescriptor,
     compression: ArtifactCompression,
@@ -261,14 +298,17 @@ impl ArtifactSegmentWriter {
         }
         let partial_path = sibling_path(&final_path, "partial");
         let directory_path = sibling_path(&final_path, "directory.partial");
+        let mut partials = PartialFiles::default();
         let output = OpenOptions::new()
             .create_new(true)
             .write(true)
             .open(&partial_path)?;
+        partials.0.push(partial_path.clone());
         let directory = OpenOptions::new()
             .create_new(true)
             .write(true)
             .open(&directory_path)?;
+        partials.0.push(directory_path.clone());
         let descriptor = ArtifactSegmentDescriptor::new(processor, chain_id, range);
         let descriptor_bytes = postcard::to_allocvec(&descriptor)
             .map_err(|error| ArtifactSegmentError::Encoding(error.to_string()))?;
@@ -289,6 +329,7 @@ impl ArtifactSegmentWriter {
             final_path,
             partial_path,
             directory_path,
+            partials,
             output,
             directory: BufWriter::new(directory),
             descriptor,
@@ -443,6 +484,7 @@ impl ArtifactSegmentWriter {
         std::fs::rename(&self.partial_path, &self.final_path)?;
         sync_parent(&self.final_path)?;
         std::fs::remove_file(&self.directory_path)?;
+        self.partials.0.clear();
         Ok(ArtifactSegmentMetadata {
             descriptor: self.descriptor,
             compression: self.compression,
@@ -999,6 +1041,64 @@ mod tests {
             ArtifactSegmentReader::open(&path, processor.descriptor()),
             Err(ArtifactSegmentError::ContentChecksum)
         ));
+    }
+
+    #[test]
+    fn an_abandoned_publication_leaves_no_partial_files() {
+        let processor = BlockLocalCounter::default();
+        let range = BlockRange::new(BlockNumber(1), BlockNumber(3)).expect("range");
+        let deltas = deltas(&processor, range);
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("abandoned.artifacts");
+        let partial = sibling_path(&path, "partial");
+        let directory_partial = sibling_path(&path, "directory.partial");
+        let mut writer = ArtifactSegmentWriter::create(
+            &path,
+            processor.descriptor(),
+            ChainId(1),
+            range,
+            ArtifactCompression::None,
+            limits(),
+        )
+        .expect("writer");
+        writer.append(&deltas[0]).expect("append first");
+        assert!(partial.exists() && directory_partial.exists());
+        drop(writer);
+        // Audit M-H10: a failed write left its partial files, and the next
+        // attempt at the same range collided with them.
+        assert!(!partial.exists(), "the partial segment stayed behind");
+        assert!(!directory_partial.exists(), "the partial directory stayed");
+        let mut retry = ArtifactSegmentWriter::create(
+            &path,
+            processor.descriptor(),
+            ChainId(1),
+            range,
+            ArtifactCompression::None,
+            limits(),
+        )
+        .expect("a retry after an abandoned write");
+        for delta in &deltas {
+            retry.append(delta).expect("append");
+        }
+        retry.finish().expect("finish retry");
+
+        // A publication that fails halfway through creating its files
+        // removes the one it created.
+        let blocked = directory.path().join("blocked.artifacts");
+        std::fs::write(sibling_path(&blocked, "directory.partial"), b"stale")
+            .expect("stale directory partial");
+        assert!(
+            ArtifactSegmentWriter::create(
+                &blocked,
+                processor.descriptor(),
+                ChainId(1),
+                range,
+                ArtifactCompression::None,
+                limits(),
+            )
+            .is_err()
+        );
+        assert!(!sibling_path(&blocked, "partial").exists());
     }
 
     #[test]

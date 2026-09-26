@@ -128,6 +128,7 @@ pub struct AcquisitionBudgetShape {
     pub max_buffered_frames: usize,
     pub max_in_flight_requests: usize,
     pub temporary_disk_bytes: u64,
+    pub max_resident_bytes: u64,
 }
 
 impl From<SourceBudget> for AcquisitionBudgetShape {
@@ -139,6 +140,7 @@ impl From<SourceBudget> for AcquisitionBudgetShape {
             max_buffered_frames: budget.max_buffered_frames,
             max_in_flight_requests: budget.max_in_flight_requests,
             temporary_disk_bytes: budget.temporary_disk_bytes,
+            max_resident_bytes: budget.max_resident_bytes,
         }
     }
 }

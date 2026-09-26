@@ -952,23 +952,36 @@ async fn next_stream_frame(
         state.observed_input_bytes = state.index.initial_input_bytes;
     }
     let buffered = u64::try_from(state.budget.max_buffered_frames).unwrap_or(u64::MAX);
-    let batch_end = state
+    let mut batch_end = state
         .end
         .min(state.next.saturating_add(buffered.saturating_sub(1)));
-    let range = BlockRange::new(BlockNumber(state.next), BlockNumber(batch_end))
-        .map_err(|error| SourceError::InvalidPlan(error.to_string()))?;
     let started = Instant::now();
-    let (mut frames, input_bytes) = read_sparse_batch(
-        &state.source,
-        &state.object,
-        &state.index,
-        range,
-        state.required,
-        state.budget,
-        state.observed_input_bytes,
-        &state.cancellation,
-    )
-    .await?;
+    let (mut frames, input_bytes) = loop {
+        let range = BlockRange::new(BlockNumber(state.next), BlockNumber(batch_end))
+            .map_err(|error| SourceError::InvalidPlan(error.to_string()))?;
+        match read_sparse_batch(
+            &state.source,
+            &state.object,
+            &state.index,
+            range,
+            state.required,
+            state.budget,
+            state.observed_input_bytes,
+            &state.cancellation,
+        )
+        .await
+        {
+            // A batch too large to hold is refused before it is fetched, so
+            // fewer blocks are tried, down to one.
+            Err(SourceError::BudgetExceeded {
+                resource: "resident_bytes",
+                ..
+            }) if batch_end > state.next => {
+                batch_end = state.next + (batch_end - state.next) / 2;
+            }
+            batch => break batch?,
+        }
+    };
     state
         .source
         .record_decoded_batch(&frames, started.elapsed());
@@ -1047,6 +1060,8 @@ async fn read_sparse_batch(
         budget.max_input_bytes,
         "input_bytes",
     )?;
+    // The fetched batch is held whole until it decodes.
+    enforce_budget(input_bytes, budget.max_resident_bytes, "resident_bytes")?;
     let mut fetched = Vec::with_capacity(intervals.len());
     for (start, end) in intervals {
         let bytes = source.read_range(object, start, end, cancellation).await?;
@@ -2055,6 +2070,7 @@ mod tests {
             max_buffered_frames: 16,
             max_in_flight_requests: 1,
             temporary_disk_bytes: 1,
+            max_resident_bytes: max_input_bytes,
         }
     }
 
@@ -2886,6 +2902,81 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn a_batch_too_large_to_hold_is_fetched_in_smaller_batches() {
+        let directory = tempfile::tempdir().expect("directory");
+        let body = BlockBody {
+            withdrawals: Some(alloy_eips::eip4895::Withdrawals::new(vec![
+                alloy_eips::eip4895::Withdrawal {
+                    index: 0,
+                    validator_index: 1,
+                    address: AlloyAddress::ZERO,
+                    amount: 1,
+                },
+            ])),
+            ..BlockBody::default()
+        };
+        let compressed =
+            |bytes: &[u8]| reth_era::common::compression::snappy_compress(bytes).expect("compress");
+        let mut parent_hash = alloy_primitives::B256::ZERO;
+        let mut blocks = Vec::new();
+        for number in 0..2 {
+            let header = Header {
+                number,
+                parent_hash,
+                base_fee_per_gas: Some(1),
+                withdrawals_root: body.calculate_withdrawals_root(),
+                ..Header::default()
+            };
+            parent_hash = header.hash_slow();
+            blocks.push(vec![
+                (COMPRESSED_HEADER, compressed(&alloy_rlp::encode(&header))),
+                (COMPRESSED_BODY, compressed(&alloy_rlp::encode(&body))),
+            ]);
+        }
+        // A block's records, each behind its eight-byte header.
+        let largest_block = blocks
+            .iter()
+            .map(|block| {
+                block
+                    .iter()
+                    .map(|(_, payload)| 8 + u64::try_from(payload.len()).expect("size"))
+                    .sum::<u64>()
+            })
+            .max()
+            .expect("blocks");
+        let name = format!(
+            "mainnet-00000-{}.erae",
+            hex::encode(&parent_hash.as_slice()[..4])
+        );
+        std::fs::write(directory.path().join(&name), erae_object(0, &blocks))
+            .expect("write object");
+        write_catalog(directory.path(), &[&name]);
+        let source = file_source(directory.path());
+        let plan = source
+            .plan(&request(range(0, 1), headers_and_bodies()))
+            .await
+            .expect("plan");
+        // Room for one block's records at a time, not both.
+        let frames = source
+            .open(
+                &plan.chunks[0],
+                SourceBudget {
+                    max_resident_bytes: largest_block,
+                    ..budget(1 << 20, 1 << 20)
+                },
+                CancellationToken::new(),
+            )
+            .await
+            .expect("open")
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()
+            .expect("the blocks are fetched a batch at a time");
+        assert_eq!(frames.len(), 2);
+    }
+
     /// A `file:` mirror holding era zero as one valid block with a
     /// withdrawal, named after the block's hash, and the sizes of its
     /// decompressed header and body.
@@ -2985,6 +3076,16 @@ mod tests {
         for (counter, budget, expected) in [
             ("none", budget(1 << 20, 1 << 20), None),
             ("acquired", budget(100, 1 << 20), Some("input_bytes")),
+            // Review I1: a fetched batch was bounded only by what the open
+            // may acquire in total.
+            (
+                "held",
+                SourceBudget {
+                    max_resident_bytes: 1,
+                    ..budget(1 << 20, 1 << 20)
+                },
+                Some("resident_bytes"),
+            ),
             (
                 "decoded",
                 budget(1 << 20, decoded - 1),

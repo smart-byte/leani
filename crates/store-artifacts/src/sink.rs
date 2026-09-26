@@ -13,7 +13,7 @@ use tokio::sync::Mutex;
 
 use crate::{
     ArtifactCompression, ArtifactSegmentError, ArtifactSegmentLimits, ArtifactSegmentReader,
-    ArtifactSegmentWriter,
+    ArtifactSegmentWriter, segment::remove_stale_partials,
 };
 
 /// Result of durably retaining one contiguous finalized artifact batch.
@@ -295,7 +295,7 @@ impl ArtifactBatchSink for ArtifactSegmentSink {
         } = validate_batch(descriptor, deltas)?;
         let instance = descriptor.instance.to_string();
         let key = (instance.clone(), range.start().0, range.end().0);
-        let mut state = self.state.lock().await;
+        let state = self.state.clone().lock_owned().await;
         if let Some(entry) = state.entries.get(&key) {
             validate_entry_identity(
                 entry,
@@ -341,27 +341,38 @@ impl ArtifactBatchSink for ArtifactSegmentSink {
         let deltas_owned = deltas.to_vec();
         let compression = self.config.compression;
         let path_owned = path.clone();
-        let task = tokio::task::spawn_blocking(move || {
-            if path_owned.exists() {
-                let reader = ArtifactSegmentReader::open(&path_owned, &descriptor_owned)?;
-                reader.verify()?;
-                if reader.metadata().records_checksum != records_checksum {
-                    return Err(ArtifactSegmentError::RecordsChecksum);
+        // The sink's lock goes with the write and comes back when it ends, so
+        // a caller that stops waiting cannot let a retry of the range remove
+        // the partial files of a write still running.
+        let (mut state, task) = tokio::task::spawn_blocking(move || {
+            let write = || {
+                if path_owned.exists() {
+                    let reader = ArtifactSegmentReader::open(&path_owned, &descriptor_owned)?;
+                    reader.verify()?;
+                    if reader.metadata().records_checksum != records_checksum {
+                        return Err(ArtifactSegmentError::RecordsChecksum);
+                    }
+                    return Ok(reader.metadata().clone());
                 }
-                return Ok(reader.metadata().clone());
-            }
-            let mut writer = ArtifactSegmentWriter::create(
-                &path_owned,
-                &descriptor_owned,
-                chain_id,
-                range,
-                compression,
-                limits,
-            )?;
-            for delta in &deltas_owned {
-                writer.append(delta)?;
-            }
-            writer.finish()
+                // An earlier write of this range may have left its partial
+                // files; this sink's lock is held, so none belongs to a live
+                // one.
+                remove_stale_partials(&path_owned)?;
+                let mut writer = ArtifactSegmentWriter::create(
+                    &path_owned,
+                    &descriptor_owned,
+                    chain_id,
+                    range,
+                    compression,
+                    limits,
+                )?;
+                for delta in &deltas_owned {
+                    writer.append(delta)?;
+                }
+                writer.finish()
+            };
+            let written = write();
+            (state, written)
         })
         .await
         .map_err(|error| ArtifactSinkError::Task(error.to_string()))?;
@@ -892,6 +903,104 @@ mod tests {
         );
     }
 
+    fn partial_files(root: &Path) -> Vec<PathBuf> {
+        let mut paths = Vec::new();
+        collect_partial_paths(root, &mut paths).expect("scan partial files");
+        paths
+    }
+
+    #[tokio::test]
+    async fn a_failed_write_leaves_no_partial_files_and_its_retry_succeeds() {
+        let processor = BlockLocalCounter::default();
+        let all = deltas(
+            &processor,
+            BlockRange::new(BlockNumber(1), BlockNumber(8)).expect("range"),
+        );
+        let measured = {
+            let directory = tempfile::tempdir().expect("tempdir");
+            let sink = ArtifactSegmentSink::open(directory.path(), config()).expect("sink");
+            sink.retain_finalized_batch(processor.descriptor(), &all[..4])
+                .await
+                .expect("measure one segment")
+                .physical_bytes
+        };
+        // Room for one segment and not for a second.
+        let limit = measured + 100;
+        let directory = tempfile::tempdir().expect("tempdir");
+        let sink = ArtifactSegmentSink::open(
+            directory.path(),
+            ArtifactSegmentSinkConfig {
+                compression: ArtifactCompression::Snappy,
+                limits: ArtifactSegmentLimits {
+                    maximum_artifact_logical_bytes: 1024 * 1024,
+                    maximum_segment_logical_bytes: 16 * 1024 * 1024,
+                    maximum_segment_physical_bytes: limit,
+                },
+                maximum_retained_physical_bytes: limit,
+            },
+        )
+        .expect("sink");
+        sink.retain_finalized_batch(processor.descriptor(), &all[..4])
+            .await
+            .expect("retain first");
+        assert!(
+            sink.retain_finalized_batch(processor.descriptor(), &all[4..])
+                .await
+                .is_err(),
+            "the second segment does not fit"
+        );
+        // Audit M-H10: the failed write left its partial files behind.
+        assert_eq!(partial_files(directory.path()), Vec::<PathBuf>::new());
+        assert!(
+            sink.remove_exact(
+                processor.descriptor().instance.as_str(),
+                BlockRange::new(BlockNumber(1), BlockNumber(4)).expect("range"),
+            )
+            .await
+            .expect("free the room")
+        );
+        let retried = sink
+            .retain_finalized_batch(processor.descriptor(), &all[4..])
+            .await
+            .expect("the retry after a failed write succeeds");
+        assert!(retried.newly_retained);
+    }
+
+    #[tokio::test]
+    async fn stale_partial_files_do_not_block_a_publication() {
+        let processor = BlockLocalCounter::default();
+        let range = BlockRange::new(BlockNumber(1), BlockNumber(4)).expect("range");
+        let all = deltas(&processor, range);
+        let directory = tempfile::tempdir().expect("tempdir");
+        let sink = ArtifactSegmentSink::open(directory.path(), config()).expect("sink");
+        let path = directory
+            .path()
+            .join(contract_directory_name(processor.descriptor()))
+            .join("00000000000000000001-00000000000000000004.artifacts");
+        std::fs::create_dir_all(path.parent().expect("processor directory"))
+            .expect("processor directory");
+        let name = path
+            .file_name()
+            .expect("file name")
+            .to_string_lossy()
+            .into_owned();
+        // What an interrupted write in this process left behind.
+        std::fs::write(path.with_file_name(format!("{name}.partial")), b"stale")
+            .expect("stale partial");
+        std::fs::write(
+            path.with_file_name(format!("{name}.directory.partial")),
+            b"stale",
+        )
+        .expect("stale directory partial");
+        // Audit M-H10: the leftovers blocked every retry until a restart.
+        let retained = sink
+            .retain_finalized_batch(processor.descriptor(), &all)
+            .await
+            .expect("a publication over stale partial files");
+        assert!(retained.newly_retained);
+        assert_eq!(partial_files(directory.path()), Vec::<PathBuf>::new());
+    }
+
     #[tokio::test]
     async fn restart_removes_orphan_partial_publications_before_budget_admission() {
         let processor = BlockLocalCounter::default();
@@ -912,7 +1021,8 @@ mod tests {
         )
         .expect("writer");
         writer.append(&all[0]).expect("append first artifact");
-        drop(writer);
+        // A crash runs no destructor, so its partial files stay behind.
+        std::mem::forget(writer);
 
         let partial = path.with_file_name(format!(
             "{}.partial",

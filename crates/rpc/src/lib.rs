@@ -531,6 +531,7 @@ impl HistoricalRpc {
             max_buffered_frames: self.config.max_buffered_frames,
             max_in_flight_requests: self.config.max_in_flight_requests,
             temporary_disk_bytes: self.config.temporary_disk_bytes,
+            max_resident_bytes: self.config.max_input_bytes,
         };
         let mut frames = Vec::with_capacity(
             usize::try_from(frame_limit).map_err(|_| HistoricalRpcError::Invalid)?,

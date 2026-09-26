@@ -75,6 +75,72 @@ fn historical_map_task_capacity(config: &Config) -> usize {
     }
 }
 
+/// Per-open limits for a historical source read over `range`. The read may
+/// acquire up to the temporary-disk budget over its life, and hold up to the
+/// memory budget of raw input at once.
+pub(crate) fn historical_source_budget(
+    config: &Config,
+    range: leani_primitives::BlockRange,
+) -> leani_source_api::SourceBudget {
+    leani_source_api::SourceBudget {
+        max_input_bytes: config.budgets.temporary_disk_bytes,
+        max_frame_bytes: config.budgets.memory_bytes.min(32 * 1_024 * 1_024),
+        max_frames: range.len(),
+        max_buffered_frames: config
+            .budgets
+            .mapper_concurrency
+            .max(config.budgets.source_concurrency),
+        max_in_flight_requests: config.budgets.source_concurrency,
+        temporary_disk_bytes: config.budgets.temporary_disk_bytes,
+        max_resident_bytes: config.budgets.memory_bytes,
+    }
+}
+
+/// Limits for the live lane's subscription, which may also hold up to the
+/// memory budget of raw input at once.
+pub(crate) fn live_source_budget(config: &Config) -> leani_source_api::SourceBudget {
+    leani_source_api::SourceBudget {
+        max_input_bytes: config.budgets.memory_bytes,
+        max_frame_bytes: config.budgets.memory_bytes.min(32 * 1_024 * 1_024),
+        max_frames: 64,
+        max_buffered_frames: 64,
+        max_in_flight_requests: config.budgets.source_concurrency,
+        temporary_disk_bytes: config.budgets.temporary_disk_bytes,
+        max_resident_bytes: config.budgets.memory_bytes,
+    }
+}
+
+/// Limits for a raw-history job's source reads: one segment's worth each,
+/// holding up to the memory budget of raw input at once.
+pub(crate) fn raw_history_source_budget(config: &Config) -> leani_source_api::SourceBudget {
+    let raw = config.raw_history;
+    leani_source_api::SourceBudget {
+        max_input_bytes: raw.maximum_segment_logical_bytes.bytes(),
+        max_frame_bytes: raw.maximum_frame_logical_bytes.bytes(),
+        max_frames: raw.maximum_source_frames,
+        max_buffered_frames: raw.maximum_buffered_frames,
+        max_in_flight_requests: config.budgets.source_concurrency,
+        temporary_disk_bytes: config.budgets.temporary_disk_bytes,
+        max_resident_bytes: config.budgets.memory_bytes,
+    }
+}
+
+/// Log what opening the raw-history store recovered. Retained segments it
+/// dropped or found unavailable warn: their blocks are not served from it.
+fn log_raw_history_recovery(recovery: leani_store_history::RecoveryReport) {
+    if recovery.quarantined_corrupt_files > 0
+        || recovery.missing_segments > 0
+        || recovery.unavailable_segments > 0
+    {
+        warn!(
+            ?recovery,
+            "raw-history store opened without some retained segments"
+        );
+    } else if recovery != leani_store_history::RecoveryReport::default() {
+        info!(?recovery, "raw-history store recovered interrupted work");
+    }
+}
+
 pub(crate) fn configured_store_config(
     config: &Config,
     path: impl Into<std::path::PathBuf>,
@@ -945,18 +1011,7 @@ impl NativeBackfillControl {
     }
 
     fn source_budget(&self, range: leani_primitives::BlockRange) -> leani_source_api::SourceBudget {
-        leani_source_api::SourceBudget {
-            max_input_bytes: self.config.budgets.temporary_disk_bytes,
-            max_frame_bytes: self.config.budgets.memory_bytes.min(32 * 1_024 * 1_024),
-            max_frames: range.len(),
-            max_buffered_frames: self
-                .config
-                .budgets
-                .mapper_concurrency
-                .max(self.config.budgets.source_concurrency),
-            max_in_flight_requests: self.config.budgets.source_concurrency,
-            temporary_disk_bytes: self.config.budgets.temporary_disk_bytes,
-        }
+        historical_source_budget(&self.config, range)
     }
 
     async fn flush_tiered_artifacts(
@@ -3352,7 +3407,6 @@ async fn backfill(
 ) -> Result<Exit> {
     use leani_primitives::{BlockNumber, BlockRange, ChainId};
     use leani_runtime::{BackfillJob, HistoricalRuntime};
-    use leani_source_api::SourceBudget;
     use leani_store_sqlite::SqliteStore;
 
     let config = Config::load(config_path)
@@ -3412,17 +3466,7 @@ async fn backfill(
     let report = runtime
         .run(
             job,
-            SourceBudget {
-                max_input_bytes: config.budgets.temporary_disk_bytes,
-                max_frame_bytes: config.budgets.memory_bytes.min(32 * 1_024 * 1_024),
-                max_frames: range.len(),
-                max_buffered_frames: config
-                    .budgets
-                    .mapper_concurrency
-                    .max(config.budgets.source_concurrency),
-                max_in_flight_requests: config.budgets.source_concurrency,
-                temporary_disk_bytes: config.budgets.temporary_disk_bytes,
-            },
+            historical_source_budget(&config, range),
             CancellationToken::new(),
         )
         .await?;
@@ -3573,6 +3617,7 @@ async fn fixture_e2e(data_dir: &Path, blocks: u64, report: Option<&Path>) -> Res
                 max_buffered_frames: 8,
                 max_in_flight_requests: 1,
                 temporary_disk_bytes: 64 * 1_024 * 1_024,
+                max_resident_bytes: 64 * 1_024 * 1_024,
             },
             CancellationToken::new(),
         )
@@ -4477,6 +4522,7 @@ async fn probe_erae(
                 max_buffered_frames: buffered.max(1),
                 max_in_flight_requests: 1,
                 temporary_disk_bytes: 1,
+                max_resident_bytes: max_input_bytes,
             },
             CancellationToken::new(),
         )
@@ -4625,6 +4671,7 @@ async fn probe_p2p(config_path: &Path, options: P2pProbeOptions) -> Result<Exit>
                 max_buffered_frames: buffered_frames,
                 max_in_flight_requests: 3,
                 temporary_disk_bytes: 1,
+                max_resident_bytes: options.max_input_bytes,
             },
             CancellationToken::new(),
         )
@@ -4811,6 +4858,7 @@ async fn probe_xatu(options: XatuProbeOptions) -> Result<Exit> {
                     max_buffered_frames: options.concurrency,
                     max_in_flight_requests: options.concurrency,
                     temporary_disk_bytes: 1,
+                    max_resident_bytes: options.max_input_bytes,
                 },
                 options.batch_rows,
                 CancellationToken::new(),
@@ -5240,20 +5288,14 @@ async fn serve(path: &Path, registry: &ProcessorRegistry) -> Result<Exit> {
             });
             store_config.reader_connections = raw.reader_connections;
             let raw_store = leani_store_history::HistoryStore::open(store_config).await?;
+            log_raw_history_recovery(raw_store.recovery_report());
             let source_set =
                 leani_store_history::RawHistorySourceSet::new(external_history_sources.clone())
                     .map_err(anyhow::Error::msg)?;
             let runner = leani_store_history::RawHistoryRunner::new(
                 raw_store.clone(),
                 source_set,
-                leani_source_api::SourceBudget {
-                    max_input_bytes: raw.maximum_segment_logical_bytes.bytes(),
-                    max_frame_bytes: raw.maximum_frame_logical_bytes.bytes(),
-                    max_frames: raw.maximum_source_frames,
-                    max_buffered_frames: raw.maximum_buffered_frames,
-                    max_in_flight_requests: config.get().budgets.source_concurrency,
-                    temporary_disk_bytes: config.get().budgets.temporary_disk_bytes,
-                },
+                raw_history_source_budget(config.get()),
             )
             .map_err(anyhow::Error::msg)?;
             let retained = config
@@ -6727,7 +6769,7 @@ async fn run_network_lanes(
         SharedFinalityRuntime, SharedFinalityRuntimeConfig, SharedLiveRuntime,
         SharedLiveRuntimeConfig,
     };
-    use leani_source_api::{ConsensusCheckpoint, FinalitySource, SourceBudget};
+    use leani_source_api::{ConsensusCheckpoint, FinalitySource};
     use leani_source_p2p::P2pHistoryAnchor;
 
     let NetworkLaneHandles {
@@ -7016,14 +7058,7 @@ async fn run_network_lanes(
         backfills,
     )
     .await?;
-    let live_budget = SourceBudget {
-        max_input_bytes: config.budgets.memory_bytes,
-        max_frame_bytes: config.budgets.memory_bytes.min(32 * 1_024 * 1_024),
-        max_frames: 64,
-        max_buffered_frames: 64,
-        max_in_flight_requests: config.budgets.source_concurrency,
-        temporary_disk_bytes: config.budgets.temporary_disk_bytes,
-    };
+    let live_budget = live_source_budget(config);
     let (live_ready, mut live_ready_updates) = tokio::sync::watch::channel(false);
     let handoff_runtime = live_runtime.clone();
     let live_start = retained_live_start(
@@ -7289,7 +7324,7 @@ async fn run_archive_reconciliations(
 ) -> Result<()> {
     use leani_primitives::{BlockNumber, BlockRange, ChainId};
     use leani_runtime::{RuntimeError, reconcile_archive_deltas};
-    use leani_source_api::{SourceBudget, SourceError};
+    use leani_source_api::SourceError;
     use leani_store_sqlite::{ArchiveReconciliationState, HotColdHandoffState, StoreError};
 
     let chain_id = ChainId(config.chain.chain_id);
@@ -7347,17 +7382,7 @@ async fn run_archive_reconciliations(
                         )
                     },
                 )?;
-            let budget = SourceBudget {
-                max_input_bytes: config.budgets.temporary_disk_bytes,
-                max_frame_bytes: config.budgets.memory_bytes.min(32 * 1_024 * 1_024),
-                max_frames: range.len(),
-                max_buffered_frames: config
-                    .budgets
-                    .mapper_concurrency
-                    .max(config.budgets.source_concurrency),
-                max_in_flight_requests: config.budgets.source_concurrency,
-                temporary_disk_bytes: config.budgets.temporary_disk_bytes,
-            };
+            let budget = historical_source_budget(config, range);
             let mut reconciled = None;
             for source in sources {
                 let result = reconcile_archive_deltas(
@@ -7383,6 +7408,17 @@ async fn run_archive_reconciliations(
                         break;
                     }
                     Err(RuntimeError::Cancelled) if cancellation.is_cancelled() => return Ok(()),
+                    // Another source, or a larger budget, may serve the range.
+                    Err(RuntimeError::Source(error @ SourceError::BudgetExceeded { .. })) => {
+                        warn!(
+                            processor = %processor.descriptor().id,
+                            source = %source.descriptor().id,
+                            from = range.start().0,
+                            to = range.end().0,
+                            %error,
+                            "archive reconciliation read exceeded its source budget"
+                        );
+                    }
                     Err(
                         RuntimeError::Source(
                             SourceError::MissingRange(_)
@@ -7553,7 +7589,6 @@ async fn spawn_cold_backfills(
 ) -> Result<()> {
     use leani_primitives::{BlockNumber, BlockRange, ChainId};
     use leani_runtime::{BackfillJob, HistoricalRuntime, HistoricalRuntimeConfig};
-    use leani_source_api::SourceBudget;
 
     let mut startup_permits = material_coordinator
         .as_ref()
@@ -7685,17 +7720,7 @@ async fn spawn_cold_backfills(
                 });
             }
         };
-        let budget = SourceBudget {
-            max_input_bytes: config.budgets.temporary_disk_bytes,
-            max_frame_bytes: config.budgets.memory_bytes.min(32 * 1_024 * 1_024),
-            max_frames: range.len(),
-            max_buffered_frames: config
-                .budgets
-                .mapper_concurrency
-                .max(config.budgets.source_concurrency),
-            max_in_flight_requests: config.budgets.source_concurrency,
-            temporary_disk_bytes: config.budgets.temporary_disk_bytes,
-        };
+        let budget = historical_source_budget(config, range);
         let processor_id = configured.instance.clone();
         let processor_descriptor = processor.descriptor().clone();
         let handoff_store = store.clone();
@@ -7826,6 +7851,131 @@ mod tests {
     use leani_testkit::{BlockLocalCounter, fixture_frame};
 
     use super::{shutdown::SHUTDOWN_DEADLINE, *};
+
+    #[test]
+    fn history_reads_acquire_by_disk_and_hold_by_memory() {
+        let mut config: Config =
+            toml::from_str(crate::config::VALID_CONFIG_TOML).expect("configuration fixture");
+        config.budgets.memory_bytes = 64 * 1_024 * 1_024;
+        config.budgets.temporary_disk_bytes = 2 * 1_024 * 1_024 * 1_024;
+        config.budgets.history_pipeline.maximum_active_chunks = 4;
+        let range = leani_primitives::BlockRange::new(
+            leani_primitives::BlockNumber(1),
+            leani_primitives::BlockNumber(10),
+        )
+        .expect("range");
+        let budget = historical_source_budget(&config, range);
+        // Review I1: a read that streamed more than the memory budget in
+        // total failed.
+        assert_eq!(budget.max_input_bytes, config.budgets.temporary_disk_bytes);
+        // Review 2 A: each read may hold the whole memory budget at once,
+        // whichever lane it serves; a share of it failed real mainnet Xatu
+        // row groups.
+        for (lane, resident) in [
+            ("backfill", budget.max_resident_bytes),
+            ("live", live_source_budget(&config).max_resident_bytes),
+            (
+                "raw history",
+                raw_history_source_budget(&config).max_resident_bytes,
+            ),
+        ] {
+            assert_eq!(resident, config.budgets.memory_bytes, "{lane}");
+        }
+        assert!(budget.max_frame_bytes <= budget.max_resident_bytes);
+        assert_eq!(budget.max_frames, 10);
+    }
+
+    #[tokio::test]
+    async fn an_archive_read_may_acquire_more_than_memory_bytes() {
+        use futures::StreamExt as _;
+        use leani_source_api::HistorySource as _;
+
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let chain = fixture_chain(64);
+        let manifest = write_frame_archive(directory.path(), &chain[1..]);
+        let object = fs::metadata(directory.path().join("frames.jsonl"))
+            .expect("archive object")
+            .len();
+        let longest_line = chain[1..]
+            .iter()
+            .map(|frame| serde_json::to_vec(frame).expect("archive frame").len() + 1)
+            .max()
+            .expect("archive frames");
+        let longest_line = u64::try_from(longest_line).expect("line length");
+        let mut config: Config =
+            toml::from_str(crate::config::VALID_CONFIG_TOML).expect("configuration fixture");
+        // Room for two lines at once, far less than the object, and more
+        // disk than it.
+        config.budgets.memory_bytes = 2 * longest_line;
+        config.budgets.temporary_disk_bytes = object * 4;
+        assert!(object > config.budgets.memory_bytes);
+        let range = leani_primitives::BlockRange::new(
+            leani_primitives::BlockNumber(1),
+            leani_primitives::BlockNumber(64),
+        )
+        .expect("range");
+        let source =
+            leani_source_archive::LocalArchiveSource::open_manifest(&manifest).expect("archive");
+        let plan = source
+            .plan(&leani_source_api::DataRequest {
+                chain_id: leani_primitives::ChainId(1),
+                range,
+                required: leani_primitives::CapabilitySet::of(
+                    leani_primitives::Capability::Transactions,
+                ),
+                allow_filtered: false,
+                projection: leani_source_api::FieldProjection::default(),
+                log_fields: leani_primitives::LogFieldSet::NONE,
+                filters: leani_source_api::FilterSet::default(),
+                minimum_finality: leani_primitives::Finality::Finalized,
+                verification_policy: leani_source_api::VerificationPolicy::TrustedDataset,
+            })
+            .await
+            .expect("plan");
+        let read = |budget| {
+            let source = &source;
+            let plan = &plan;
+            async move {
+                let mut frames = 0_u64;
+                for chunk in &plan.chunks {
+                    let mut stream = source.open(chunk, budget, CancellationToken::new()).await?;
+                    while let Some(frame) = stream.next().await {
+                        frame?;
+                        frames += 1;
+                    }
+                }
+                Ok::<_, leani_source_api::SourceError>(frames)
+            }
+        };
+        // Review I1: the read was refused for acquiring more than
+        // `memory_bytes`, though it held one line at a time. Review 2 A: a
+        // line within `memory_bytes` failed against a share of it.
+        assert_eq!(
+            read(historical_source_budget(&config, range))
+                .await
+                .expect("one line at a time fits the memory budget"),
+            64
+        );
+        // A line larger than the memory budget fails the read, naming it.
+        config.budgets.memory_bytes = longest_line - 1;
+        let error = read(historical_source_budget(&config, range))
+            .await
+            .expect_err("a line exceeds the memory budget");
+        assert!(
+            matches!(
+                error,
+                leani_source_api::SourceError::BudgetExceeded {
+                    resource: "resident_bytes",
+                    ..
+                }
+            ),
+            "{error}"
+        );
+        assert!(
+            error.to_string().contains("budgets.memory_bytes"),
+            "{error}"
+        );
+    }
 
     #[test]
     fn api_bearer_tokens_are_long_enough_and_never_echoed() {
@@ -9357,6 +9507,28 @@ markets = ["ETH/USDT"]
                 .state,
             HotColdHandoffState::Failed
         );
+
+        // Review 2 N5: an archive read over its memory budget ended the
+        // reconciliation lane, and with it the network lanes.
+        let mut starved = config.clone();
+        starved.budgets.memory_bytes = 64;
+        let starved_audit = CancellationToken::new();
+        let starved_reconciliations = tokio::spawn({
+            let store = store.clone();
+            let processors = processors.clone();
+            let audit = starved_audit.clone();
+            async move { run_archive_reconciliations(&starved, &store, &processors, audit).await }
+        });
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(
+            !starved_reconciliations.is_finished(),
+            "a budget failure ended the reconciliation lane"
+        );
+        starved_audit.cancel();
+        starved_reconciliations
+            .await
+            .expect("archive reconciliation task")
+            .expect("a budget failure leaves the lane waiting");
 
         // The archive audit reconciles both instances.
         let audit = CancellationToken::new();

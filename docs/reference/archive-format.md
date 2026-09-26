@@ -61,11 +61,17 @@ Each non-empty object line is one JSON-encoded `BlockFrame`. Objects must:
 - be reached without crossing a symbolic link below the manifest's
   directory.
 
-Reads enforce the normal source byte, frame, and frame-count budgets. The
-adapter verifies the complete object before yielding frames and adds immutable
-object identity to frame provenance. A missing line, checksum mismatch,
-truncated frame, parent mismatch, schema mismatch, chain or finality
-mismatch, or range gap fails closed.
+Reads enforce the normal source byte, frame, and frame-count budgets, and
+hold one line at a time. The adapter verifies the complete object's length
+and BLAKE3 digest before it yields any frame; a length or checksum mismatch
+fails the read then. It then streams the frames from the same open file,
+hashing it again as it goes, and adds immutable object identity to their
+provenance. A structural failure, such as a truncated frame, a block out of
+order, missing, or repeated, a parent mismatch, a schema mismatch, or a
+chain or finality mismatch, fails the read as corrupt where it is found,
+after the frames before it may already have been applied; a later source or
+a rerun resumes after them. An object edited in place between the two passes
+fails with the checksum error only after its frames.
 
 Frames report only the checks the archive made: the object's BLAKE3 digest,
 and the parent link to the previous frame of the same object. A frame's own

@@ -991,6 +991,7 @@ mod tests {
                         max_buffered_frames: 8,
                         max_in_flight_requests: 1,
                         temporary_disk_bytes: 0,
+                        max_resident_bytes: 64 * 1024 * 1024,
                     },
                     CancellationToken::new(),
                 )

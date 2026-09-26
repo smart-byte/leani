@@ -2199,14 +2199,7 @@ fn address_matches(address: Address, expected: &str) -> bool {
 }
 
 fn embedded_snapshot_budget(config: &Config) -> SourceBudget {
-    SourceBudget {
-        max_input_bytes: config.budgets.memory_bytes,
-        max_frame_bytes: config.budgets.memory_bytes.min(32 * 1_024 * 1_024),
-        max_frames: 64,
-        max_buffered_frames: 64,
-        max_in_flight_requests: config.budgets.source_concurrency,
-        temporary_disk_bytes: config.budgets.temporary_disk_bytes,
-    }
+    crate::process::live_source_budget(config)
 }
 
 async fn preview_head_snapshot(

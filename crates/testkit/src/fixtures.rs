@@ -84,6 +84,7 @@ pub const fn default_source_budget() -> SourceBudget {
         max_buffered_frames: 2,
         max_in_flight_requests: 1,
         temporary_disk_bytes: 0,
+        max_resident_bytes: 1024 * 1024,
     }
 }
 

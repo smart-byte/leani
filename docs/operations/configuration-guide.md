@@ -123,6 +123,36 @@ limit. Live ingestion enforces the hard limit as it retains each frame: at the
 limit it waits, with live readiness down, until finality prunes (see the
 operations runbook's storage pressure section).
 
+Two budgets bound a history source read's input. `budgets.temporary_disk_bytes`
+bounds what one read may acquire over its life: the objects, byte ranges,
+and responses it fetches, and the frames it builds from them. A read that
+would acquire more fails with an `input_bytes` budget error, and a local
+archive object larger than it is refused before it is read.
+`budgets.memory_bytes` bounds the raw input one read holds in memory at once:
+one line of a local archive object, which it verifies whole and then reads a
+line at a time; the selected columns of one Xatu Parquet row group; one batch
+of EraE byte ranges, fetched a few blocks at a time when a batch would not
+fit; one window of execution P2P frames; or one retained raw-history record.
+Its frames may be at most `memory_bytes`, or 32 MiB when that is less. A read
+that would hold more fails with a `resident_bytes` budget error naming
+`budgets.memory_bytes`, and a backfill then tries its next configured source.
+A historical RPC request, which holds everything it returns, may acquire and
+hold at most `memory_bytes` divided by `budgets.source_concurrency`.
+Raw-history jobs acquire one segment's worth per read,
+`raw_history.maximum_segment_logical_bytes`.
+
+The bound is per read, not for the node. At once, the node runs up to
+`budgets.history_pipeline.maximum_active_chunks` backfill reads, one archive
+reconciliation read, the live lane, and one read per running raw-history
+job, and each may hold up to `memory_bytes`. What a read decodes is not
+counted here: decoded frames and mapped deltas have the
+`budgets.history_material` and pipeline budgets below, and `memory_bytes` is
+not a process RSS limit. On mainnet, a Xatu read of a 2023–24 transaction
+object, 1,000 blocks around blocks 18,000,000 to 19,430,000, holds about
+80–110 MiB of compressed columns and decodes about 230–340 MiB. Keep
+`memory_bytes` above the largest of those, as the shipped 512 MiB is, and
+plan RAM for about `maximum_active_chunks` × 450 MiB during Xatu backfills.
+
 `[budgets.history_material]` is the sole budget for shared immutable source
 frames and acquisition reorder buffers. Chunks read ahead of the one a job is
 reading can use at most half of its `memory_bytes`, so size it to at least
@@ -166,6 +196,26 @@ cycle are explicit. Only processors using `artifacts.mode = "full"` are
 eligible in the first tiered implementation; rolling windows remain in
 SQLite. Segment bytes do not receive a second budget: they count against the
 same `[budgets.store].maximum_physical_bytes` ceiling.
+
+`[raw_history]` keeps finalized source frames in checksummed segment files
+under `data_dir/raw-history`, beside their own catalog. `maximum_logical_bytes`
+caps the frames retained, and `maximum_physical_bytes` the bytes on disk:
+segments, the partial files of segments being written, the catalog and its
+write-ahead log, and quarantined files. Before a segment is written, its
+maximum size and the catalog rows it will add are reserved: a fixed 64 KiB,
+and 512 bytes per locator row, one per block with block-hash locators and 256
+per block with transaction-hash locators. A segment with more transactions
+still publishes its extra rows, so the catalog can exceed
+`maximum_physical_bytes` by that one segment's extra rows, which the next
+segment's admission counts. Reads of `maximum_segment_logical_bytes`, one
+segment's worth, feed a raw-history job. A store already over either budget,
+for example after lowering it, still opens and serves its history, but
+admits no new segment until it is back under: its jobs pause at the storage
+limit, or fail when created with `segment.onLimit: fail`. A segment that
+fails verification moves to `data_dir/raw-history/quarantine`, which keeps
+at most 1 GiB, or one segment of `maximum_segment_physical_bytes` when that
+is larger: past that, the longest-quarantined files are deleted first, but
+never the newest (see the operations runbook).
 
 `[budgets.delivery]` supplies the shared delivery envelope above independent
 per-stream limits. `maximum_retained_bytes` caps exact delivery payload bytes

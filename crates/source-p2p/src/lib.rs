@@ -10855,6 +10855,14 @@ fn push_normalized_frame(
             observed: *total_bytes,
         }));
     }
+    // A window's frames, built from its peer responses, are held together.
+    if *total_bytes > budget.max_resident_bytes {
+        return Err(P2pError::Source(SourceError::BudgetExceeded {
+            resource: "resident_bytes",
+            limit: budget.max_resident_bytes,
+            observed: *total_bytes,
+        }));
+    }
     output.push(frame);
     Ok(())
 }
@@ -11443,12 +11451,51 @@ mod tests {
                 max_buffered_frames: 2,
                 max_in_flight_requests: 1,
                 temporary_disk_bytes: 1,
+                max_resident_bytes: 1_000_000,
             },
         )
         .expect("normalize");
         assert_eq!(frames.len(), 2);
         assert_eq!(frames[1].block.parent_hash, frames[0].block.hash);
         assert!(frames.iter().all(|frame| frame.validate_shape().is_ok()));
+    }
+
+    #[test]
+    fn a_normalized_window_must_fit_the_resident_budget() {
+        let (_, headers, bodies, receipts) = empty_fixture();
+        let budget = SourceBudget {
+            max_input_bytes: 1_000_000,
+            max_frame_bytes: 1_000_000,
+            max_frames: 2,
+            max_buffered_frames: 2,
+            max_in_flight_requests: 1,
+            temporary_disk_bytes: 1,
+            max_resident_bytes: 1_000_000,
+        };
+        let frames = normalize_verified(&headers, &bodies, &receipts, budget).expect("normalize");
+        let one_frame = frames[0].estimated_heap_bytes();
+        let error = normalize_verified(
+            &headers,
+            &bodies,
+            &receipts,
+            SourceBudget {
+                max_resident_bytes: one_frame,
+                ..budget
+            },
+        )
+        .expect_err("a window of two frames exceeds one frame's worth");
+        // Review I1: a window of peer responses was bounded only by what the
+        // open may acquire in total.
+        assert!(
+            matches!(
+                error,
+                P2pError::Source(SourceError::BudgetExceeded {
+                    resource: "resident_bytes",
+                    ..
+                })
+            ),
+            "{error:?}"
+        );
     }
 
     #[test]
@@ -11475,6 +11522,7 @@ mod tests {
                 max_buffered_frames: 2,
                 max_in_flight_requests: 1,
                 temporary_disk_bytes: 0,
+                max_resident_bytes: 1_000_000,
             },
         )
         .expect("header frames");
@@ -11519,6 +11567,7 @@ mod tests {
                 max_buffered_frames: 2,
                 max_in_flight_requests: 1,
                 temporary_disk_bytes: 0,
+                max_resident_bytes: 1_000_000,
             },
         )
         .expect("header and body frames");
@@ -11577,6 +11626,7 @@ mod tests {
                 max_buffered_frames: 2,
                 max_in_flight_requests: 1,
                 temporary_disk_bytes: 1,
+                max_resident_bytes: 1_000_000,
             },
         )
         .expect("filtered normalization");
@@ -11884,6 +11934,7 @@ mod tests {
                 max_buffered_frames: 2,
                 max_in_flight_requests: 1,
                 temporary_disk_bytes: 1,
+                max_resident_bytes: 1_000_000,
             },
         )
         .expect("normalize");
@@ -13373,6 +13424,7 @@ mod tests {
                     max_buffered_frames: 1,
                     max_in_flight_requests: 1,
                     temporary_disk_bytes: 1,
+                    max_resident_bytes: 1,
                 },
                 CancellationToken::new(),
             )
@@ -13402,6 +13454,7 @@ mod tests {
                     max_buffered_frames: 1,
                     max_in_flight_requests: 1,
                     temporary_disk_bytes: 1,
+                    max_resident_bytes: 1,
                 },
                 CancellationToken::new(),
             )

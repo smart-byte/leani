@@ -235,12 +235,32 @@ impl SourcePlan {
 /// Hard per-open resource limits enforced by source adapters.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct SourceBudget {
+    /// Bytes one open may acquire over its life: object and byte-range reads,
+    /// downloaded responses, decoded records, and the normalized frames it
+    /// builds.
     pub max_input_bytes: u64,
     pub max_frame_bytes: u64,
     pub max_frames: u64,
     pub max_buffered_frames: usize,
     pub max_in_flight_requests: usize,
     pub temporary_disk_bytes: u64,
+    /// Bytes of raw input one open may hold in memory at once before it
+    /// decodes them: the selected columns of a Parquet row group, a batch of
+    /// byte ranges fetched from an era file, one line of a JSON-lines object,
+    /// one stored record, or one window of peer responses.
+    pub max_resident_bytes: u64,
+}
+
+/// Where a Leani node, or its source probes, raise the limit a budget error
+/// names.
+fn budget_hint(resource: &str) -> &'static str {
+    match resource {
+        "resident_bytes" => {
+            "; raise the resident budget: a Leani node sets it from budgets.memory_bytes, \
+             and leani source probe from --max-input-bytes"
+        }
+        _ => "",
+    }
 }
 
 impl SourceBudget {
@@ -255,6 +275,7 @@ impl SourceBudget {
             || self.max_frames == 0
             || self.max_buffered_frames == 0
             || self.max_in_flight_requests == 0
+            || self.max_resident_bytes == 0
         {
             Err(SourceError::InvalidBudget)
         } else {
@@ -590,7 +611,10 @@ pub enum SourceError {
     SchemaDrift { expected: String, actual: String },
     #[error("source frame is corrupt: {0}")]
     CorruptFrame(String),
-    #[error("source resource budget exceeded: {resource}, limit {limit}, observed {observed}")]
+    #[error(
+        "source resource budget exceeded: {resource}, limit {limit}, observed {observed}{}",
+        budget_hint(resource)
+    )]
     BudgetExceeded {
         resource: &'static str,
         limit: u64,
@@ -611,6 +635,21 @@ pub enum SourceError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resident_budget_errors_say_where_to_raise_the_budget() {
+        let error = SourceError::BudgetExceeded {
+            resource: "resident_bytes",
+            limit: 1,
+            observed: 2,
+        }
+        .to_string();
+        // Review 3 (5): the hint named only the node's setting, which the
+        // source probes do not use.
+        for knob in ["budgets.memory_bytes", "--max-input-bytes"] {
+            assert!(error.contains(knob), "{error}");
+        }
+    }
 
     fn head(beacon_slot: u64, block: u64, marker: u8) -> AttestedHead {
         AttestedHead {

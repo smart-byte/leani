@@ -7095,6 +7095,8 @@ fn failover_source_error(error: &SourceError) -> bool {
                 | SourceError::IncompleteRange { .. }
                 | SourceError::MissingMaterial { .. }
                 | SourceError::SchemaDrift { .. }
+                // Another source may serve the range within the budget.
+                | SourceError::BudgetExceeded { .. }
         )
 }
 
@@ -9428,6 +9430,7 @@ mod tests {
             max_buffered_frames: 64,
             max_in_flight_requests: 4,
             temporary_disk_bytes: 1,
+            max_resident_bytes: 256 * 1_024 * 1_024,
         }
     }
 
@@ -13705,6 +13708,79 @@ mod tests {
             } else {
                 let error = result.expect_err("no source can serve the range");
                 assert!(error.to_string().contains("schema changed"), "{error}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn budget_failures_fail_over_to_the_next_source() {
+        let range = BlockRange::new(BlockNumber(1), BlockNumber(2)).expect("range");
+        let starved = || {
+            let mut descriptor = fixture_source_descriptor("starved-history", range);
+            descriptor.priority = 0;
+            let schema_version = descriptor.schema_version.clone();
+            Arc::new(ScriptedHistorySource::new(
+                descriptor,
+                vec![ScriptedChunk {
+                    range,
+                    schema_version,
+                    estimated_bytes: None,
+                    steps: vec![HistoryStep::Error(SourceError::BudgetExceeded {
+                        resource: "resident_bytes",
+                        limit: 1,
+                        observed: 2,
+                    })],
+                }],
+            )) as Arc<dyn HistorySource>
+        };
+        let mut fallback_descriptor = fixture_source_descriptor("fallback-history", range);
+        fallback_descriptor.priority = 1;
+        let fallback: Arc<dyn HistorySource> = Arc::new(ScriptedHistorySource::from_frames(
+            fallback_descriptor,
+            frames(range),
+        ));
+        let config = HistoricalRuntimeConfig {
+            mapper_concurrency: 1,
+            max_attempts: 3,
+            retry_base: Duration::from_millis(1),
+            retry_max: Duration::from_millis(1),
+            ..HistoricalRuntimeConfig::default()
+        };
+        for (name, sources, served) in [
+            ("starved-with-fallback", vec![starved(), fallback], true),
+            ("starved-alone", vec![starved()], false),
+        ] {
+            let processor = Arc::new(BlockLocalCounter::default());
+            let (_directory, store) = store().await;
+            let runtime = HistoricalRuntime::new_with_sources(
+                store,
+                sources,
+                processor.clone(),
+                config.clone(),
+            )
+            .expect("runtime");
+            let job = BackfillJob::for_processor_ranges(
+                name,
+                processor.as_ref(),
+                ChainId(1),
+                vec![range],
+                VerificationPolicy::CompleteCryptographic,
+            )
+            .expect("job");
+            let result = runtime
+                .run(job, default_source_budget(), CancellationToken::new())
+                .await;
+            if served {
+                // Review 2 N5: a read over its budget failed the backfill
+                // although another configured source could serve the range.
+                let report = result.expect("the fallback source serves the range");
+                assert_eq!(report.final_coverage, vec![range]);
+            } else {
+                let error = result.expect_err("no source can serve the range");
+                assert!(
+                    error.to_string().contains("budgets.memory_bytes"),
+                    "{error}"
+                );
             }
         }
     }
