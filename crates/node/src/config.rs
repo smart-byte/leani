@@ -497,6 +497,8 @@ pub struct HistorySourceConfig {
     /// Parquet rows decoded per bounded Arrow batch by Xatu.
     #[serde(default)]
     pub batch_rows: Option<usize>,
+    /// An archive source's manifest. [`Config::load`] resolves a relative
+    /// path against the configuration file's directory.
     #[serde(default)]
     pub manifest: Option<PathBuf>,
     #[serde(default)]
@@ -513,6 +515,8 @@ pub struct HistorySourceConfig {
 pub enum HistorySourceKind {
     Xatu,
     EraE,
+    /// No source reads it. Decoded only so validation can refuse it and
+    /// name `xatu`, which reads public Parquet history.
     Parquet,
     Archive,
 }
@@ -861,8 +865,10 @@ pub struct OutputPolicyConfig {
     pub mode: OutputPolicyMode,
     #[serde(default)]
     pub window: Option<OutputWindowConfig>,
-    #[serde(default)]
-    pub finalized_only: bool,
+    /// Never applied. Decoded only so validation can refuse it and name
+    /// `publish = "finalized_only"`, which publishes only finalized blocks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finalized_only: Option<bool>,
 }
 
 impl From<OutputPolicyConfig> for OutputPolicy {
@@ -875,7 +881,7 @@ impl From<OutputPolicyConfig> for OutputPolicy {
                 max_rows: window.max_rows,
                 max_bytes: window.max_bytes.map(HumanBytes::bytes),
             }),
-            finalized_only: value.finalized_only,
+            finalized_only: false,
         }
     }
 }
@@ -1142,7 +1148,10 @@ pub struct RpcConfig {
     pub http_bind: SocketAddr,
     pub ws_bind: SocketAddr,
     pub historical_mode: HistoricalMode,
-    pub transaction_locator: bool,
+    /// Deprecated and ignored: nothing ever read it. Still accepted so
+    /// existing configurations load, with a warning.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transaction_locator: Option<bool>,
     pub minimum_recent_blocks: u64,
     /// Serve JSON-RPC, which has no authentication, on a non-loopback bind.
     #[serde(default)]
@@ -1357,13 +1366,34 @@ impl ValidatedConfig {
 
 impl Config {
     /// Read TOML without opening the configured data directory or any network
-    /// connection.
+    /// connection. Relative paths in the file, its `data_dir` and archive
+    /// `manifest`s, are resolved against the directory of the file at `path`.
     ///
     /// # Errors
     ///
     /// Returns [`ConfigError`] when the file cannot be read or its TOML does
     /// not match the strict schema.
     pub fn load(path: &Path) -> Result<Self, ConfigError> {
+        let working_directory = std::env::current_dir().ok();
+        let (config, warnings) = Self::load_with_warnings(path, working_directory.as_deref())?;
+        if !warnings.is_empty() {
+            // Commands such as `subscribe` read the same file several times.
+            static WARNED: std::sync::Once = std::sync::Once::new();
+            WARNED.call_once(|| {
+                for warning in &warnings {
+                    tracing::warn!(config = %path.display(), "{warning}");
+                }
+            });
+        }
+        Ok(config)
+    }
+
+    /// [`Self::load`], returning the warnings it logs instead: deprecated
+    /// settings, and state a relative path left under `working_directory`.
+    pub(crate) fn load_with_warnings(
+        path: &Path,
+        working_directory: Option<&Path>,
+    ) -> Result<(Self, Vec<String>), ConfigError> {
         let input = fs::read_to_string(path).map_err(|source| ConfigError::Read {
             path: path.to_path_buf(),
             source,
@@ -1376,7 +1406,7 @@ impl Config {
         let is_starter = document
             .as_table()
             .is_some_and(|table| table.contains_key("network"));
-        if is_starter {
+        let mut config = if is_starter {
             let starter =
                 toml::from_str::<StarterConfig>(&input).map_err(|source| ConfigError::Parse {
                     path: path.to_path_buf(),
@@ -1385,13 +1415,44 @@ impl Config {
             starter.expand().map_err(|detail| ConfigError::Expand {
                 path: path.to_path_buf(),
                 detail,
-            })
+            })?
         } else {
-            toml::from_str(&input).map_err(|source| ConfigError::Parse {
+            toml::from_str::<Self>(&input).map_err(|source| ConfigError::Parse {
                 path: path.to_path_buf(),
                 source,
-            })
+            })?
+        };
+        // Every relative path in the file is relative to the file.
+        let written = std::mem::take(&mut config.data_dir);
+        config.data_dir = resolve_relative_to_file(path, &written);
+        for source in &mut config.sources.history {
+            if let Some(manifest) = source.manifest.as_mut() {
+                *manifest = resolve_relative_to_file(path, manifest);
+            }
         }
+        let mut warnings = config.deprecation_warnings();
+        if let Some(working_directory) = working_directory
+            && written.is_relative()
+            && !written.as_os_str().is_empty()
+        {
+            warnings.extend(state_left_behind(
+                &beneath(working_directory, &written),
+                &config.data_dir,
+            ));
+        }
+        Ok((config, warnings))
+    }
+
+    /// Deprecated settings this configuration still carries, which the node
+    /// ignores.
+    #[must_use]
+    pub fn deprecation_warnings(&self) -> Vec<String> {
+        let mut warnings = Vec::new();
+        if self.rpc.transaction_locator.is_some() {
+            warnings
+                .push("rpc.transaction_locator is deprecated and ignored; remove it".to_owned());
+        }
+        warnings
     }
 
     /// Perform validation that requires no I/O.
@@ -1683,6 +1744,12 @@ impl Config {
             &mut errors,
         );
         for (index, processor) in self.processors.iter().enumerate() {
+            if processor.output.finalized_only.is_some() {
+                errors.push(ValidationError::new(
+                    format!("processors[{index}].output.finalized_only"),
+                    "was never applied and is no longer accepted; remove it, and set publish = \"finalized_only\" to publish only finalized blocks",
+                ));
+            }
             if processor.require_retained_input && !self.raw_history.enabled {
                 errors.push(ValidationError::new(
                     format!("processors[{index}].require_retained_input"),
@@ -1778,6 +1845,45 @@ impl Config {
 
         errors
     }
+}
+
+/// Where a path written in the configuration file at `file` points. A
+/// relative path is beside the file, not under whatever working directory
+/// the node started in. A file named without a directory is in the working
+/// directory already, and an empty path stays empty for validation to
+/// report.
+fn resolve_relative_to_file(file: &Path, path: &Path) -> PathBuf {
+    match file.parent() {
+        Some(directory) if !directory.as_os_str().is_empty() && !path.as_os_str().is_empty() => {
+            beneath(directory, path)
+        }
+        _ => path.to_path_buf(),
+    }
+}
+
+/// `path` under `directory`, without a leading `./`; an absolute `path`
+/// stays as it is.
+fn beneath(directory: &Path, path: &Path) -> PathBuf {
+    directory.join(path.strip_prefix(".").unwrap_or(path))
+}
+
+/// A relative `data_dir` was under the working directory before it was
+/// beside its configuration file. Name both directories while Leani state,
+/// a node store or embedded subscriptions, is at the old one and not at the
+/// new one.
+fn state_left_behind(previous: &Path, current: &Path) -> Option<String> {
+    let holds_state = |directory: &Path| {
+        ["leani.sqlite", "subscriptions"]
+            .iter()
+            .any(|entry| directory.join(entry).exists())
+    };
+    (holds_state(previous) && !holds_state(current)).then(|| {
+        format!(
+            "data_dir {} holds no Leani state, but {} does: a relative data_dir is now relative to the configuration file, not to the working directory; move that state, or set data_dir to its absolute path",
+            current.display(),
+            previous.display()
+        )
+    })
 }
 
 /// Refuse a listener beyond loopback that nothing authenticates unless the
@@ -1885,6 +1991,12 @@ fn validate_history_sources(
     errors: &mut Vec<ValidationError>,
 ) {
     for (index, source) in sources.iter().enumerate() {
+        if matches!(source.kind, HistorySourceKind::Parquet) {
+            errors.push(ValidationError::new(
+                format!("sources.history[{index}].kind"),
+                "`parquet` sources are not implemented, and the node skipped them; use `xatu` for public Parquet history, `era_e`, or `archive`",
+            ));
+        }
         match source.kind {
             HistorySourceKind::Archive if source.manifest.is_none() => {
                 errors.push(ValidationError::new(
@@ -2674,12 +2786,14 @@ verification_segment_blocks = 8192
 http_bind = "127.0.0.1:8545"
 ws_bind = "127.0.0.1:8546"
 historical_mode = "on_demand"
-transaction_locator = false
 minimum_recent_blocks = 128
 
 [api]
 bind = "127.0.0.1:8080"
 "#;
+
+#[cfg(test)]
+mod schema_parity;
 
 #[cfg(test)]
 mod tests {
@@ -3769,5 +3883,229 @@ markets = ["LINK/ETH"]
                 );
             }
         }
+    }
+
+    #[test]
+    fn transaction_locator_is_optional_and_ignored_with_a_warning() {
+        // Audit Config-6: `rpc.transaction_locator` was required, yet nothing
+        // read it.
+        let without = VALID_CONFIG_TOML;
+        assert!(!without.contains("transaction_locator"));
+        let config: Config = toml::from_str(without).expect("the locator is optional");
+        assert!(error_fields(&config).is_empty());
+        assert!(config.deprecation_warnings().is_empty());
+        for value in [true, false] {
+            let with = without.replace(
+                "minimum_recent_blocks = 128",
+                &format!("minimum_recent_blocks = 128\ntransaction_locator = {value}"),
+            );
+            let config: Config = toml::from_str(&with).expect("an existing configuration loads");
+            assert!(error_fields(&config).is_empty(), "{value}");
+            assert_eq!(
+                config.deprecation_warnings(),
+                ["rpc.transaction_locator is deprecated and ignored; remove it"],
+                "{value}"
+            );
+        }
+    }
+
+    fn toml_string(path: &Path) -> String {
+        toml::Value::String(path.display().to_string()).to_string()
+    }
+
+    #[test]
+    fn a_relative_data_dir_is_beside_its_configuration_file() {
+        // Audit Config-8: a relative `data_dir` named a directory under
+        // whatever working directory the node started in.
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let directory = temp.path().join("node");
+        fs::create_dir_all(&directory).expect("configuration directory");
+        let advanced = directory.join("advanced.toml");
+        fs::write(&advanced, VALID_CONFIG_TOML).expect("advanced configuration");
+        assert_eq!(
+            Config::load(&advanced).expect("advanced").data_dir,
+            directory.join("data")
+        );
+
+        // The compact form's default `data_dir` is `./data` too.
+        let compact = directory.join("compact.toml");
+        fs::write(
+            &compact,
+            format!(
+                "config_version = 1\nnetwork = \"ethereum-mainnet\"\n\n[finality]\ncheckpoint = \"0x{}\"\ncheckpoint_slot = 1\nendpoints = [\"https://beacon.example/\"]\n\n[blocks]\n",
+                "11".repeat(32)
+            ),
+        )
+        .expect("compact configuration");
+        assert_eq!(
+            Config::load(&compact).expect("compact").data_dir,
+            directory.join("data")
+        );
+
+        fs::write(
+            &advanced,
+            VALID_CONFIG_TOML.replace("data_dir = \"./data\"", "data_dir = \"../state\""),
+        )
+        .expect("parent-relative configuration");
+        assert_eq!(
+            Config::load(&advanced).expect("parent-relative").data_dir,
+            directory.join("../state")
+        );
+
+        let absolute = temp.path().join("elsewhere");
+        fs::write(
+            &advanced,
+            VALID_CONFIG_TOML.replace(
+                "data_dir = \"./data\"",
+                &format!("data_dir = {}", toml_string(&absolute)),
+            ),
+        )
+        .expect("absolute configuration");
+        assert_eq!(
+            Config::load(&advanced).expect("absolute").data_dir,
+            absolute
+        );
+    }
+
+    #[test]
+    fn data_dir_resolution_keeps_what_needs_no_directory() {
+        // A configuration named without a directory is in the working
+        // directory already.
+        assert_eq!(
+            resolve_relative_to_file(Path::new("leani.toml"), Path::new("./data")),
+            Path::new("./data")
+        );
+        assert_eq!(
+            resolve_relative_to_file(Path::new("/etc/leani/node.toml"), Path::new("./data")),
+            Path::new("/etc/leani/data")
+        );
+        assert_eq!(
+            resolve_relative_to_file(Path::new("/etc/leani/node.toml"), Path::new("state")),
+            Path::new("/etc/leani/state")
+        );
+        assert_eq!(
+            resolve_relative_to_file(
+                Path::new("/etc/leani/node.toml"),
+                Path::new("/var/lib/leani")
+            ),
+            Path::new("/var/lib/leani")
+        );
+        // Validation still reports an empty `data_dir`.
+        assert_eq!(
+            resolve_relative_to_file(Path::new("/etc/leani/node.toml"), Path::new("")),
+            Path::new("")
+        );
+    }
+
+    #[test]
+    fn output_finalized_only_is_refused_in_favour_of_publish() {
+        // Audit: nothing read `[processors.output] finalized_only`.
+        for value in [true, false] {
+            let stale = VALID_CONFIG_TOML.replace(
+                "[processors.output]\nmode = \"full\"",
+                &format!("[processors.output]\nmode = \"full\"\nfinalized_only = {value}"),
+            );
+            let config: Config = toml::from_str(&stale).expect("the key still decodes");
+            let errors = config.validation_errors();
+            assert!(
+                errors.iter().any(|error| {
+                    error.field == "processors[0].output.finalized_only"
+                        && error.message.contains("publish = \"finalized_only\"")
+                }),
+                "{value}: {errors:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn parquet_history_sources_are_refused() {
+        // Audit: a `parquet` source validated, and the node then skipped it.
+        let mut config = config();
+        config.sources.history.push(
+            toml::from_str(
+                "id = \"parquet\"\nkind = \"parquet\"\npriority = 20\ntrust = \"trusted_dataset\"",
+            )
+            .expect("parquet source"),
+        );
+        let errors = config.validation_errors();
+        assert!(
+            errors.iter().any(|error| {
+                error.field == "sources.history[1].kind" && error.message.contains("`xatu`")
+            }),
+            "{errors:?}"
+        );
+    }
+
+    fn acknowledged_consumer(lease_ttl: &str) -> Config {
+        toml::from_str(&VALID_CONFIG_TOML.replace(
+            "[processors.delivery]\nmode = \"window\"",
+            &format!(
+                "[processors.delivery]\nmode = \"until_acknowledged\"\n\n[[processors.delivery.consumers]]\nid = \"destination\"\nrequired = true\nlease_ttl = \"{lease_ttl}\""
+            ),
+        ))
+        .expect("consumer configuration")
+    }
+
+    #[test]
+    fn consumer_lease_ttls_over_100_years_fail_validation() {
+        // Task 16b: `doctor` accepted a lease TTL the store refuses at
+        // `serve`.
+        assert!(error_fields(&acknowledged_consumer("36500d")).is_empty());
+        let errors = acknowledged_consumer("36501d").validation_errors();
+        assert!(
+            errors.iter().any(|error| {
+                error.field == "processors[0]" && error.message.contains("at most 100 years")
+            }),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn state_left_under_the_working_directory_is_named_when_data_dir_moves() {
+        // Review of Task 19: a relative `data_dir` was under the working
+        // directory before, so an upgraded node may find its state there.
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let working = temp.path().join("working");
+        fs::create_dir_all(working.join("data")).expect("previous data directory");
+        fs::write(working.join("data/leani.sqlite"), b"").expect("previous store");
+        let node = temp.path().join("node");
+        fs::create_dir_all(&node).expect("configuration directory");
+        let config_path = node.join("leani.toml");
+        fs::write(&config_path, VALID_CONFIG_TOML).expect("configuration");
+        let warnings = |path: &Path| {
+            Config::load_with_warnings(path, Some(&working))
+                .expect("configuration loads")
+                .1
+        };
+
+        let (config, found) =
+            Config::load_with_warnings(&config_path, Some(&working)).expect("configuration loads");
+        assert_eq!(config.data_dir, node.join("data"));
+        let [warning] = found.as_slice() else {
+            panic!("one warning: {found:?}");
+        };
+        for named in [node.join("data"), working.join("data")] {
+            assert!(warning.contains(&named.display().to_string()), "{warning}");
+        }
+
+        // Embedded subscription state left behind counts too.
+        fs::remove_file(working.join("data/leani.sqlite")).expect("remove previous store");
+        fs::create_dir_all(working.join("data/subscriptions")).expect("previous subscriptions");
+        assert_eq!(warnings(&config_path).len(), 1);
+
+        // Nothing is said once state is beside the configuration...
+        fs::create_dir_all(node.join("data/subscriptions")).expect("moved subscriptions");
+        assert!(warnings(&config_path).is_empty());
+        // ...or for an absolute `data_dir`.
+        fs::remove_dir_all(node.join("data")).expect("remove moved state");
+        fs::write(
+            &config_path,
+            VALID_CONFIG_TOML.replace(
+                "data_dir = \"./data\"",
+                &format!("data_dir = {}", toml_string(&node.join("data"))),
+            ),
+        )
+        .expect("absolute configuration");
+        assert!(warnings(&config_path).is_empty());
     }
 }

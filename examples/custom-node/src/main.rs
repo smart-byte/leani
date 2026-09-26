@@ -442,7 +442,7 @@ mod tests {
             output: leani::config::OutputPolicyConfig {
                 mode: leani_processor_api::OutputPolicyMode::Full,
                 window: None,
-                finalized_only: false,
+                finalized_only: None,
             },
             delivery: leani::config::DeliveryPolicyConfig {
                 mode: leani_processor_api::DeliveryPolicyMode::Window,

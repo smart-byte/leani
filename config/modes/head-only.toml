@@ -91,7 +91,6 @@ key_fields = []
 http_bind = "127.0.0.1:8545"
 ws_bind = "127.0.0.1:8546"
 historical_mode = "on_demand"
-transaction_locator = false
 minimum_recent_blocks = 128
 
 [api]

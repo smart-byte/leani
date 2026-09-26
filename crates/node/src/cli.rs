@@ -46,9 +46,9 @@ pub enum Command {
         /// Optional protocol targets; Uniswap requires one or more markets such as `ETH/USDC`.
         #[arg(num_args = 0.., value_name = "TARGET")]
         targets: Vec<String>,
-        /// Data directory written to the generated configuration.
-        #[arg(long, default_value = "./data")]
-        data_dir: PathBuf,
+        /// Data directory for the generated configuration [default: `data` beside it].
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
         /// Checkpoint provider used for weak-subjectivity quorum (repeatable or comma-delimited).
         #[arg(
             long,

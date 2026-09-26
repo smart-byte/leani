@@ -235,12 +235,10 @@
             "id": "data_dir",
             "long": "data-dir",
             "short": null,
-            "help": "Data directory written to the generated configuration",
+            "help": "Data directory for the generated configuration [default: `data` beside it]",
             "required": false,
             "action": "Set",
-            "defaultValues": [
-              "./data"
-            ],
+            "defaultValues": [],
             "possibleValues": []
           },
           {

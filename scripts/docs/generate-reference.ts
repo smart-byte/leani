@@ -115,7 +115,7 @@ function schemaKind(root: JsonObject, schema: JsonObject): string {
 
 function schemaConstraints(schema: JsonObject): JsonObject {
   return Object.fromEntries(
-    ['default', 'minimum', 'maximum', 'minLength', 'maxLength', 'minItems', 'maxItems', 'pattern', 'format']
+    ['default', 'minimum', 'maximum', 'multipleOf', 'minLength', 'maxLength', 'minItems', 'maxItems', 'pattern', 'format']
       .filter((key) => key in schema)
       .map((key) => [key, schema[key]]),
   );
@@ -126,6 +126,9 @@ async function configReference(repositoryRoot: string): Promise<JsonObject> {
   const fields: JsonObject[] = [];
   const fieldIndexes = new Map<string, number>();
   const visit = (schema: JsonObject, path: string, required: boolean): void => {
+    // Deprecated fields stay in the schema so existing files validate, but
+    // the reference no longer offers them.
+    if (schema.deprecated === true) return;
     const resolved = resolveSchema(root, schema);
     const field = {
       path,

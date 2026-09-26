@@ -25,8 +25,8 @@ use leani_primitives::{
 use leani_processor_api::{
     ArtifactPolicyMode, ChangeOperation, CheckpointPolicyMode, DeliveryLimitAction,
     DeliveryOrdering, DeliveryPolicyMode, DomainChange, EncodedDelta, LifecyclePolicies,
-    OutputPolicyMode, Processor, ProcessorDescriptor, ProcessorError, PublicationPolicy,
-    ReducerTransaction, ReductionMode, StartPoint, UndoPolicyMode,
+    MAXIMUM_CONSUMER_LEASE_TTL, OutputPolicyMode, Processor, ProcessorDescriptor, ProcessorError,
+    PublicationPolicy, ReducerTransaction, ReductionMode, StartPoint, UndoPolicyMode,
 };
 use leani_store_artifacts::{
     ArtifactBatchReceipt, ArtifactBatchSink, ArtifactCompression, ArtifactSegmentLimits,
@@ -77,9 +77,6 @@ const CONSUMER_CREDENTIAL_CONTEXT: &str = "leani 2026-09-24 consumer credential 
 /// Fewest characters a client-chosen consumer credential may hold: nothing
 /// else vouches for its entropy.
 const MINIMUM_CONSUMER_CREDENTIAL_CHARS: usize = 32;
-/// Longest lease TTL a consumer may hold: 100 years. Its milliseconds, and
-/// the expiry of a lease taken now, stay far inside an `i64`.
-const MAXIMUM_CONSUMER_LEASE_TTL: Duration = Duration::from_hours(100 * 365 * 24);
 /// Stable encoding version attached to durable delivery records.
 pub const DELIVERY_ENCODING_VERSION: u16 = 1;
 /// Deferred rows promoted per SQL round trip inside `mark_finalized`.

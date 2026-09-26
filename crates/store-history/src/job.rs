@@ -76,7 +76,10 @@ pub enum StorageLimitAction {
 #[serde(rename_all = "snake_case")]
 pub enum RawHistoryRetention {
     Full,
-    Window { blocks: u64 },
+    /// No job owns a rolling window yet: creating a job refuses it.
+    Window {
+        blocks: u64,
+    },
 }
 
 /// Optional locator families built in later RPC phases.
@@ -85,6 +88,7 @@ pub enum RawHistoryRetention {
 pub struct RawHistoryIndexPolicy {
     pub block_hash: bool,
     pub transaction_hash: bool,
+    /// No log index exists: creating a job refuses `true`.
     pub logs: bool,
 }
 
@@ -244,7 +248,13 @@ impl RawHistoryJobSpec {
         }
         if self.indexes.logs {
             return Err(HistoryStoreError::InvalidJob(
-                "raw log indexes are not implemented; use receipt scans or disable indexes.logs"
+                "log indexes are not supported; set \"logs\": false in \"indexes\": logs are read from the retained receipts"
+                    .to_owned(),
+            ));
+        }
+        if matches!(self.retention, RawHistoryRetention::Window { .. }) {
+            return Err(HistoryStoreError::InvalidJob(
+                "window retention is not supported: a job keeps the segments it retains until it is deleted; use \"retention\": \"full\""
                     .to_owned(),
             ));
         }
@@ -306,11 +316,6 @@ impl RawHistoryJobSpec {
         {
             return Err(HistoryStoreError::InvalidJob(
                 "segment limits and target block span must be non-zero".to_owned(),
-            ));
-        }
-        if matches!(self.retention, RawHistoryRetention::Window { blocks: 0 }) {
-            return Err(HistoryStoreError::InvalidJob(
-                "window retention must keep at least one block".to_owned(),
             ));
         }
         let required_trust = match self.verification {
@@ -1415,6 +1420,38 @@ mod tests {
             .await
             .expect_err("pre-Merge range must be rejected");
         assert!(error.to_string().contains("starts at Merge block 15537394"));
+    }
+
+    #[tokio::test]
+    async fn window_retention_and_log_indexes_are_refused_with_their_replacement() {
+        // Audit: window retention passed this validation and the node then
+        // refused every such job, and log indexes were "not implemented".
+        let directory = tempdir().expect("temporary directory");
+        let store = HistoryStore::open(config(directory.path()))
+            .await
+            .expect("store");
+        let range = || vec![BlockRange::new(BlockNumber(1), BlockNumber(3)).expect("range")];
+        let mut window = spec(range());
+        window.retention = RawHistoryRetention::Window { blocks: 64 };
+        let error = store
+            .create_raw_history_job(RawHistoryJobId::new("window").expect("ID"), window)
+            .await
+            .expect_err("window retention is refused");
+        assert!(matches!(error, HistoryStoreError::InvalidJob(_)), "{error}");
+        assert!(
+            error.to_string().contains("\"retention\": \"full\""),
+            "{error}"
+        );
+
+        let mut logs = spec(range());
+        logs.indexes.logs = true;
+        let error = store
+            .create_raw_history_job(RawHistoryJobId::new("logs").expect("ID"), logs)
+            .await
+            .expect_err("log indexes are refused");
+        assert!(matches!(error, HistoryStoreError::InvalidJob(_)), "{error}");
+        assert!(error.to_string().contains("\"logs\": false"), "{error}");
+        assert!(store.raw_history_jobs().await.expect("jobs").is_empty());
     }
 
     #[tokio::test]

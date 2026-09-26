@@ -52,10 +52,12 @@ Copy the operational template:
 cp config/example.toml config/manual-mainnet.toml
 ```
 
-Edit at least these fields:
+Edit at least these fields. A relative `data_dir` is relative to the
+configuration file, so from `config/` this names the `data/manual-mainnet`
+directory created above:
 
 ```toml
-data_dir = "./data/manual-mainnet"
+data_dir = "../data/manual-mainnet"
 
 [finality]
 kind = "consensus_p2p"
@@ -364,10 +366,10 @@ than `eth_subscribe`.
 
 This mode isolates free public datasets from P2P and head following. Copy
 `deploy/container.toml` to `config/manual-history.toml`, then configure local
-bind addresses and a fresh data directory:
+bind addresses and a fresh data directory, relative to the configuration file:
 
 ```toml
-data_dir = "./data/manual-history-10k"
+data_dir = "../data/manual-history-10k"
 
 [sources.live]
 kind = "disabled"
@@ -391,7 +393,6 @@ retention = "full_output_history"
 http_bind = "127.0.0.1:8545"
 ws_bind = "127.0.0.1:8546"
 historical_mode = "on_demand"
-transaction_locator = false
 minimum_recent_blocks = 128
 
 [api]
@@ -478,7 +479,9 @@ work, so the result answers “how fast can the node index and deliver this
 processor output to an immediately acknowledging consumer?”
 
 Run benchmarks with the release binary, a fresh data directory, and an
-immutable report path:
+immutable report path. Like a node, the benchmark holds its data directory,
+execution P2P peer store and identity included, so it refuses a directory
+that a running node or another benchmark holds:
 
 ```bash
 ./target/release/leani \

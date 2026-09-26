@@ -73,7 +73,6 @@ change_kind = "example.block_summary"
 http_bind = "127.0.0.1:9545"
 ws_bind = "127.0.0.1:9546"
 historical_mode = "on_demand"
-transaction_locator = false
 minimum_recent_blocks = 128
 
 [api]

@@ -18,7 +18,12 @@
       "properties": {
         "config_version": { "const": 1 },
         "network": { "const": "ethereum-mainnet" },
-        "data_dir": { "type": "string", "minLength": 1, "default": "./data" },
+        "data_dir": {
+          "type": "string",
+          "minLength": 1,
+          "default": "./data",
+          "description": "Writable node state. A relative path is relative to the directory of this configuration file."
+        },
         "finality": { "$ref": "#/$defs/starterFinality" },
         "blocks": { "$ref": "#/$defs/starterBlocks" },
         "uniswap": { "$ref": "#/$defs/starterUniswap" },
@@ -79,7 +84,11 @@
       ],
       "properties": {
         "config_version": { "const": 1 },
-        "data_dir": { "type": "string", "minLength": 1 },
+        "data_dir": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Writable node state. A relative path is relative to the directory of this configuration file."
+        },
         "chain": { "$ref": "#/$defs/chain" },
         "raw_history": { "$ref": "#/$defs/rawHistory" },
         "artifact_storage": { "$ref": "#/$defs/artifactStorage" },
@@ -256,7 +265,7 @@
       "properties": {
         "id": { "type": "string", "minLength": 1 },
         "kind": {
-          "enum": ["xatu", "era_e", "parquet", "archive"]
+          "enum": ["xatu", "era_e", "archive"]
         },
         "priority": {
           "type": "integer",
@@ -266,7 +275,27 @@
         "trust": {
           "enum": ["trusted_dataset", "verified_material"]
         },
-        "manifest": { "type": "string" },
+        "chunk_blocks": {
+          "$ref": "#/$defs/positiveInteger",
+          "multipleOf": 1000,
+          "default": 1000,
+          "description": "Xatu only: blocks per acquisition chunk for headers, transactions, and logs, a multiple of Xatu's 1,000-block partitions."
+        },
+        "blobs_chunk_blocks": {
+          "$ref": "#/$defs/positiveInteger",
+          "multipleOf": 1000,
+          "default": 8000,
+          "description": "Xatu only: blocks per acquisition chunk for the blobs projection, a multiple of 1,000."
+        },
+        "batch_rows": {
+          "$ref": "#/$defs/positiveInteger",
+          "default": 8192,
+          "description": "Xatu only: Parquet rows decoded per bounded Arrow batch."
+        },
+        "manifest": {
+          "type": "string",
+          "description": "Archive only: the archive manifest. A relative path is relative to the directory of this configuration file."
+        },
         "endpoint": { "type": "string", "format": "uri" },
         "allow_insecure_http": { "type": "boolean" }
       }
@@ -393,7 +422,8 @@
         "max_rows": { "$ref": "#/$defs/positiveInteger" },
         "max_bytes": { "$ref": "#/$defs/humanBytes" }
       },
-      "minProperties": 1
+      "minProperties": 1,
+      "maxProperties": 1
     },
     "outputPolicy": {
       "type": "object",
@@ -401,8 +431,34 @@
       "required": ["mode"],
       "properties": {
         "mode": { "enum": ["none", "latest", "window", "full"] },
-        "window": { "$ref": "#/$defs/outputWindow" },
-        "finalized_only": { "type": "boolean" }
+        "window": { "$ref": "#/$defs/outputWindow" }
+      }
+    },
+    "artifactWindow": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Exactly one limit.",
+      "properties": {
+        "max_blocks": { "$ref": "#/$defs/positiveInteger" },
+        "max_age": { "$ref": "#/$defs/humanDuration" },
+        "max_bytes": { "$ref": "#/$defs/humanBytes" }
+      },
+      "minProperties": 1,
+      "maxProperties": 1
+    },
+    "artifactPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "mode": {
+          "enum": ["none", "window", "full"],
+          "default": "none",
+          "description": "Retention of immutable finalized map results, independent of queryable output and delivery."
+        },
+        "window": {
+          "$ref": "#/$defs/artifactWindow",
+          "description": "Required in window mode, and only valid there."
+        }
       }
     },
     "consumer": {
@@ -412,7 +468,10 @@
       "properties": {
         "id": { "type": "string", "minLength": 1, "maxLength": 128 },
         "required": { "type": "boolean" },
-        "lease_ttl": { "$ref": "#/$defs/humanDuration" }
+        "lease_ttl": {
+          "$ref": "#/$defs/humanDuration",
+          "description": "From one second to 100 years."
+        }
       }
     },
     "deliveryPruning": {
@@ -504,6 +563,7 @@
           ]
         },
         "state": { "$ref": "#/$defs/statePolicy" },
+        "artifacts": { "$ref": "#/$defs/artifactPolicy" },
         "output": { "$ref": "#/$defs/outputPolicy" },
         "delivery": { "$ref": "#/$defs/deliveryPolicy" },
         "checkpoint": { "$ref": "#/$defs/checkpointPolicy" },
@@ -530,14 +590,17 @@
         "http_bind",
         "ws_bind",
         "historical_mode",
-        "transaction_locator",
         "minimum_recent_blocks"
       ],
       "properties": {
         "http_bind": { "$ref": "#/$defs/socketAddress" },
         "ws_bind": { "$ref": "#/$defs/socketAddress" },
         "historical_mode": { "enum": ["on_demand", "disabled"] },
-        "transaction_locator": { "type": "boolean" },
+        "transaction_locator": {
+          "type": "boolean",
+          "deprecated": true,
+          "description": "Deprecated and ignored: nothing reads it. Still accepted so existing configurations load, with a warning; remove it."
+        },
         "minimum_recent_blocks": { "$ref": "#/$defs/positiveInteger" },
         "allow_unauthenticated_remote": {
           "type": "boolean",

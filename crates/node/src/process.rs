@@ -2446,15 +2446,6 @@ impl leani_api::RawHistoryControl for NativeRawHistoryControl {
         &self,
         request: leani_api::CreateRawHistoryJobRequest,
     ) -> Result<leani_store_history::RawHistoryJob, leani_api::RawHistoryControlError> {
-        if matches!(
-            request.retention,
-            leani_store_history::RawHistoryRetention::Window { .. }
-        ) {
-            return Err(leani_api::RawHistoryControlError::Invalid(
-                "finite raw-history jobs currently require full retention; rolling window ownership is a separate post-RH2 policy"
-                    .to_owned(),
-            ));
-        }
         let ranges = request
             .ranges
             .iter()
@@ -2683,6 +2674,19 @@ mod raw_history_control_tests {
             control.create(incompatible).await,
             Err(leani_api::RawHistoryControlError::ProfileIncompatible(_))
         ));
+        // The job's own validation refuses the retention no job supports.
+        let mut window = request.clone();
+        window.idempotency_key = "window-job".to_owned();
+        window.retention = RawHistoryRetention::Window { blocks: 64 };
+        let refused = control.create(window).await;
+        assert!(
+            matches!(
+                &refused,
+                Err(leani_api::RawHistoryControlError::Invalid(message))
+                    if message.contains("\"retention\": \"full\"")
+            ),
+            "{refused:?}"
+        );
         let created = control.create(request).await.expect("create");
         let id = created.id;
         let complete = tokio::time::timeout(Duration::from_secs(2), async {
@@ -4185,6 +4189,7 @@ pub(crate) fn configured_history_sources(
                 erae.allow_insecure_http = configured.allow_insecure_http;
                 std::sync::Arc::new(EraeSource::new(erae)?)
             }
+            // Validation refuses `parquet` sources.
             crate::config::HistorySourceKind::Parquet => continue,
         };
         let descriptor = source.descriptor();
@@ -4302,6 +4307,7 @@ fn configured_rpc_history_sources(
                 erae.allow_insecure_http = source.allow_insecure_http;
                 sources.push(std::sync::Arc::new(EraeSource::new(erae)?));
             }
+            // Validation refuses `parquet` sources.
             crate::config::HistorySourceKind::Parquet => {}
         }
     }
@@ -5100,10 +5106,13 @@ fn finality_anchor_warnings(config: &Config, now: SystemTime) -> Vec<String> {
 }
 
 fn doctor(path: &Path, json: bool, registry: &ProcessorRegistry) -> Result<Exit> {
-    let config = Config::load(path)?;
+    // The report carries what loading would log.
+    let working_directory = std::env::current_dir().ok();
+    let (config, load_warnings) = Config::load_with_warnings(path, working_directory.as_deref())?;
     let mut errors = config.validation_errors();
     errors.extend(registry.validation_errors(&config));
-    let warnings = finality_anchor_warnings(&config, SystemTime::now());
+    let mut warnings = finality_anchor_warnings(&config, SystemTime::now());
+    warnings.extend(load_warnings);
     let report = DoctorReport {
         project: leani_primitives::PROJECT_NAME,
         version: env!("CARGO_PKG_VERSION"),
@@ -9293,6 +9302,35 @@ markets = ["ETH/USDT"]
         )
         .expect("write archive manifest");
         path
+    }
+
+    #[test]
+    fn a_relative_archive_manifest_is_beside_its_configuration_file() {
+        // Review of Task 19: `manifest` resolved against the working
+        // directory, while `data_dir` in the same file resolved against the
+        // file's directory.
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let node = directory.path().join("node");
+        let archive = node.join("archives");
+        fs::create_dir_all(&archive).expect("archive directory");
+        let manifest = write_frame_archive(&archive, &fixture_chain(3));
+        let config_path = node.join("leani.toml");
+        fs::write(
+            &config_path,
+            crate::config::VALID_CONFIG_TOML.replace(
+                "id = \"xatu\"\nkind = \"xatu\"",
+                "id = \"fixture-archive\"\nkind = \"archive\"\nmanifest = \"./archives/manifest.json\"",
+            ),
+        )
+        .expect("configuration");
+        let config = Config::load(&config_path).expect("configuration loads");
+        assert_eq!(
+            config.sources.history[0].manifest.as_deref(),
+            Some(manifest.as_path())
+        );
+        let sources = configured_rpc_history_sources(&config)
+            .expect("the manifest beside the configuration opens");
+        assert_eq!(sources.len(), 1);
     }
 
     /// The fixture configuration with `archive` as its only history source and

@@ -19,7 +19,7 @@ Measure acquisition, isolated materialization, durable delivery, or their
 combined path against deterministic streaming corpora. `blobs-like` runs the
 production blobs transform and `uniswap-like` runs the block-local WETH/USDC
 observation transform; zero/sparse/dense remain control and limit shapes.
-Reports are immutable and versioned. Report v19 records the stage and product
+Reports are immutable and versioned. Report v20 records the stage and product
 profile independently, declares destination/query row semantics, verifies
 canonical logical output bytes, attributes logical storage layers, and reports
 final node/destination physical bytes plus `storageAmplificationMilli` (the
@@ -69,6 +69,20 @@ report verifies independent history/live digests and durable cursors and
 records live commit-latency percentiles. Summary reports stay compact;
 high-frequency resource samples are written only when `--samples-report` is
 supplied, as immutable NDJSON with a content hash recorded in the summary.
+
+The summary reports the minimum, median, and maximum of the measured runs'
+elapsed time and block rate. Below 10 runs, which cannot support a tail
+estimate, `statistics` is `min_median_max` and the p95 fields are null. From
+10 runs, `statistics` is `min_median_max_p95`, and the p95 fields describe the
+slow tail, interpolated between runs: `p95ElapsedMilliseconds` is the time 95%
+of runs stayed within, and `p95BlocksPerSecondMilli` the rate 95% of runs
+reached, the 5th percentile of per-run rates. `peakRssMeasurement` says how
+`peakRssBytes` was measured. `linux_vm_hwm` is the kernel's resident
+high-water mark, `VmHWM`, reset as each run's sampling starts, so it misses no
+spike. `sampled_rss`, on macOS or where Linux cannot reset `VmHWM`, is the
+largest resident-set sample taken every `--sample-interval-ms`, so a spike
+between samples escapes it; a summary over runs measured both ways reports
+`sampled_rss`.
 
 For consumer-neutral delivery capacity, use `--mode end-to-end --profile
 externalized --destination rust-http`. With the default zero consumer delay,

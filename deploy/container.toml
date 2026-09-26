@@ -69,7 +69,6 @@ verification_segment_blocks = 8192
 http_bind = "0.0.0.0:8545"
 ws_bind = "0.0.0.0:8546"
 historical_mode = "on_demand"
-transaction_locator = false
 minimum_recent_blocks = 128
 # JSON-RPC has no authentication. The container listens on all of its
 # interfaces so published ports work; compose.yaml publishes them on host

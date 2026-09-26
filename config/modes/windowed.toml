@@ -53,7 +53,6 @@ mode = "durable"
 
 [processors.output]
 mode = "window"
-finalized_only = true
 
 [processors.output.window]
 max_blocks = 216000
@@ -85,7 +84,6 @@ bucket_seconds = 3600
 http_bind = "127.0.0.1:8545"
 ws_bind = "127.0.0.1:8546"
 historical_mode = "on_demand"
-transaction_locator = false
 minimum_recent_blocks = 128
 
 [api]

@@ -17,7 +17,8 @@ use crate::{
 pub(crate) struct InitOptions {
     pub protocol: SubscribeProtocol,
     pub targets: Vec<String>,
-    pub data_dir: PathBuf,
+    /// `--data-dir`; `None` for `./data` beside the configuration.
+    pub data_dir: Option<PathBuf>,
     pub checkpoint_urls: Vec<Url>,
     pub checkpoint_quorum: usize,
     pub accept_checkpoint: bool,
@@ -50,7 +51,11 @@ pub(crate) async fn init(options: InitOptions) -> Result<Exit> {
                 .collect::<Vec<_>>()
         }
     };
-    let runtime_data_dir = absolute_path(&options.working_directory, &options.data_dir);
+    let (data_dir, runtime_data_dir) = init_data_dir(
+        &config_path,
+        options.data_dir.as_deref(),
+        &options.working_directory,
+    );
     let checkpoint = initialize_checkpoint(
         options.checkpoint_urls,
         options.checkpoint_quorum,
@@ -60,14 +65,11 @@ pub(crate) async fn init(options: InitOptions) -> Result<Exit> {
     .await?;
     let endpoints = starter_finality_endpoints(checkpoint.beacon_api_endpoints)?;
     let config = match options.protocol {
-        SubscribeProtocol::Blocks => StarterConfig::blocks(
-            options.data_dir,
-            checkpoint.root,
-            checkpoint.slot,
-            endpoints,
-        ),
+        SubscribeProtocol::Blocks => {
+            StarterConfig::blocks(data_dir, checkpoint.root, checkpoint.slot, endpoints)
+        }
         SubscribeProtocol::UniswapV3 => StarterConfig::uniswap(
-            options.data_dir,
+            data_dir,
             market_names.clone(),
             checkpoint.root,
             checkpoint.slot,
@@ -112,6 +114,27 @@ pub(crate) fn starter_finality_endpoints(responding: Vec<Url>) -> Result<Vec<Url
         }
     }
     Ok(endpoints)
+}
+
+/// The `data_dir` to write into the new configuration, and the directory it
+/// names. A relative `data_dir` in the file is beside it, while a relative
+/// `--data-dir`, like any path flag, is under the working directory: the
+/// flag is written as given only where the two coincide.
+fn init_data_dir(
+    config_path: &Path,
+    requested: Option<&Path>,
+    working_directory: &Path,
+) -> (PathBuf, PathBuf) {
+    let directory = config_path.parent().unwrap_or(working_directory);
+    let Some(requested) = requested else {
+        return (PathBuf::from("./data"), directory.join("data"));
+    };
+    let prepared = absolute_path(working_directory, requested);
+    if requested.is_relative() && directory != working_directory {
+        (prepared.clone(), prepared)
+    } else {
+        (requested.to_path_buf(), prepared)
+    }
 }
 
 fn absolute_path(working_directory: &Path, path: &Path) -> PathBuf {
@@ -166,6 +189,45 @@ mod tests {
                 "https://lodestar-mainnet.chainsafe.io/",
                 "https://beacon.example/",
             ]
+        );
+    }
+
+    #[test]
+    fn init_prepares_the_data_dir_its_configuration_names() {
+        // Audit Config-8: a configuration's relative `data_dir` is beside the
+        // file, so `init` must write, and use, a `data_dir` that names the
+        // directory it prepares.
+        let working = Path::new("/work");
+        let data_dirs = |config: &str, requested: Option<&str>| {
+            let (written, prepared) =
+                init_data_dir(Path::new(config), requested.map(Path::new), working);
+            (
+                written.display().to_string(),
+                prepared.display().to_string(),
+            )
+        };
+        // By default, `./data` beside the configuration, wherever it is.
+        assert_eq!(
+            data_dirs("/etc/leani/node.toml", None),
+            ("./data".to_owned(), "/etc/leani/data".to_owned())
+        );
+        assert_eq!(
+            data_dirs("/work/leani.toml", None),
+            ("./data".to_owned(), "/work/data".to_owned())
+        );
+        // A relative `--data-dir`, like any path flag, is under the working
+        // directory; beside a configuration elsewhere it is written absolute.
+        assert_eq!(
+            data_dirs("/work/leani.toml", Some("state")),
+            ("state".to_owned(), "/work/state".to_owned())
+        );
+        assert_eq!(
+            data_dirs("/etc/leani/node.toml", Some("state")),
+            ("/work/state".to_owned(), "/work/state".to_owned())
+        );
+        assert_eq!(
+            data_dirs("/etc/leani/node.toml", Some("/srv/leani")),
+            ("/srv/leani".to_owned(), "/srv/leani".to_owned())
         );
     }
 

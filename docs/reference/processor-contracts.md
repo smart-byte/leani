@@ -103,7 +103,6 @@ mode = "none"
 
 [processors.output]
 mode = "window"
-finalized_only = true
 
 [processors.output.window]
 max_blocks = 216000

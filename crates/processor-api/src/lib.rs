@@ -11,9 +11,9 @@ pub use contract::{
 pub use descriptor::{
     ArtifactPolicy, ArtifactPolicyMode, ArtifactWindow, CheckpointPolicy, CheckpointPolicyMode,
     DataRequirement, DeliveryLimitAction, DeliveryOrdering, DeliveryPolicy, DeliveryPolicyMode,
-    DeliveryPruningPolicy, DurableConsumerPolicy, LifecyclePolicies, OutputPolicy,
-    OutputPolicyMode, OutputWindow, ProcessorDescriptor, ProcessorId, ProcessorIdError,
-    ProcessorInstanceId, ProcessorInstanceIdError, ProcessorSchemas, PublicationPolicy,
-    ReductionMode, RetentionPolicy, StartPoint, StatePolicy, StatePolicyMode, UndoPolicy,
-    UndoPolicyMode,
+    DeliveryPruningPolicy, DurableConsumerPolicy, LifecyclePolicies, MAXIMUM_CONSUMER_LEASE_TTL,
+    OutputPolicy, OutputPolicyMode, OutputWindow, ProcessorDescriptor, ProcessorId,
+    ProcessorIdError, ProcessorInstanceId, ProcessorInstanceIdError, ProcessorSchemas,
+    PublicationPolicy, ReductionMode, RetentionPolicy, StartPoint, StatePolicy, StatePolicyMode,
+    UndoPolicy, UndoPolicyMode,
 };

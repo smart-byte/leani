@@ -719,6 +719,76 @@ record, and documented RPC contracts.
   budget without limit. A job checks its next segment's admission before it
   opens a source, so a job paused at its storage limit no longer downloads
   that segment again each time the node resumes it, every five seconds.
+- Breaking (configuration): relative paths in a configuration file, its
+  `data_dir` and an archive source's `manifest`, are relative to the
+  directory of that file, not to the working directory the node starts in.
+  A node started with `--config /etc/leani/node.toml` and
+  `data_dir = "./data"` now uses `/etc/leani/data`. State derived from
+  `data_dir` moves with it: `leani subscribe` keeps its embedded state under
+  `<data_dir>/subscriptions/<hash>`, and `leani reset` resolves the same
+  directories, so a `leani --config elsewhere/… subscribe` starts cold after
+  the upgrade. Before upgrading, make a relative `data_dir` absolute, or move
+  the data directory beside the configuration file; otherwise the node
+  starts on an empty directory. When a relative `data_dir` names a directory
+  without a node store or embedded subscriptions while the same spelling
+  under the working directory has them, the node warns once at startup, and
+  `leani doctor` reports it, naming both directories; it still starts. A
+  compact configuration's default `data_dir`, `./data`, is beside the file
+  too. `leani init` writes `./data` and prepares that directory beside the
+  configuration it creates, wherever `--config` puts it; its `--data-dir`,
+  like any path flag, is relative to the working directory, and is written
+  absolute when the configuration is elsewhere. Path flags such as
+  `--config` and the `--data-dir` of other commands are unchanged.
+- Breaking (configuration): validation refuses options the node ignored.
+  `[processors.output] finalized_only` was never applied; remove it, and set
+  `publish = "finalized_only"` to publish only finalized blocks, as the
+  shipped profiles and examples that set it already did. A `sources.history`
+  entry of `kind = "parquet"` was skipped, since no source reads it; use
+  `xatu` for public Parquet history, `era_e`, or `archive`. The
+  configuration schema no longer offers either. The node now always leaves
+  the lifecycle's `OutputPolicy::finalized_only`, which nothing reads,
+  false. An instance that set it, from a configuration file or through
+  `leani subscribe --finality finalized`, keeps its state, and the store
+  updates its stored descriptor in place. But the recovery checkpoints and
+  portable savepoints it wrote before the upgrade are bound to the old
+  descriptor: they can no longer be restored or exported, and answer 409
+  `savepoint_invalid`. Backfill such an instance again, or use the
+  checkpoints and savepoints it takes after the upgrade. For Rust embedders
+  of the `leani` crate, `OutputPolicyConfig::finalized_only` is an
+  `Option<bool>` that must be `None`.
+- `rpc.transaction_locator` is optional, deprecated, and ignored: nothing
+  ever read it. A configuration that sets it still loads, and the node warns
+  once in its log and in `leani doctor`; remove it. The shipped
+  configurations and the configuration reference no longer list it.
+  `RpcConfig::transaction_locator` is an `Option<bool>`.
+- Breaking (`leani-processor-api`): the new `MAXIMUM_CONSUMER_LEASE_TTL`
+  (100 years) is the longest lease TTL of a durable consumer, and the store
+  uses it. `LifecyclePolicies::validate` refuses a consumer lease TTL over it,
+  as well as zero, with "delivery consumer lease TTLs must be non-zero and at
+  most 100 years"; an invalid or duplicate consumer ID now gets "delivery
+  consumers need unique portable IDs". `leani doctor` refuses such a
+  `lease_ttl` with the message `serve` gives.
+- Raw-history jobs refuse window retention and log indexes when they are
+  created, with a 400 that names the replacement: `"retention": "full"`, and
+  `"logs": false` in `indexes`, since logs are read from the retained
+  receipts. The node refused both before, window retention without saying
+  what to use instead, and log indexes as "not implemented".
+- Benchmark reports are v20, and real-source reports v8. A summary of fewer
+  than 10 measured runs reports their minimum, median, and maximum, with
+  `statistics: "min_median_max"` and null p95 fields; the nearest-rank p95 of
+  three runs was the slowest run's time and the fastest run's rate. From 10
+  runs, `statistics` is `min_median_max_p95`, and both p95 fields describe
+  the slow tail, interpolated between runs: the elapsed time 95% of runs
+  stayed within, and the block rate 95% of runs reached. Medians of an even
+  number of runs are the mean of the middle two. On Linux, peak RSS is the
+  kernel's high-water mark, `VmHWM`, reset as each run's sampling starts;
+  elsewhere it is the largest periodic sample, and `peakRssMeasurement`
+  (`linux_vm_hwm` or `sampled_rss`) says which. It was the largest `VmRSS`
+  sample, which misses spikes between samples.
+- `leani benchmark real-source` holds its data directory, as a node does,
+  before it opens anything there, the execution P2P peer store and identity
+  of a `p2p-only` run included. It refuses a directory that a running node or
+  another benchmark holds; it used both files without the lock.
 
 ### Fixed
 
@@ -1401,6 +1471,14 @@ record, and documented RPC contracts.
   writes the range again, never those of a write still running for a caller
   that stopped waiting. A failed write blocked every retry of its range until
   a restart.
+- The configuration schema, `config/schema-v1.json`, describes every
+  configuration field again. It lacked `processors[].artifacts` and the Xatu
+  `chunk_blocks`, `blobs_chunk_blocks`, and `batch_rows`, while refusing
+  unknown properties, so the shipped `config/example.toml` failed it. Tests
+  now compare the schema with the configuration types field by field and
+  value by value, and check that every shipped configuration loads, uses only
+  schema keys, and, apart from the two checkpoint templates, validates. An
+  output window allows exactly one limit, as validation already required.
 
 ## [0.1.0-rc.1] - 2026-09-20
 

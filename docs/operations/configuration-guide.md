@@ -9,10 +9,13 @@ audience:
 status: preview
 ---
 
-Leani reads strict, versioned TOML. Unknown fields are errors. Version 1 has
-two first-class document shapes: a compact processor-oriented setup with sane
-network defaults, and the fully explicit advanced schema. Both become the same
-validated runtime configuration. The machine-readable contract is rendered in
+Leani reads strict, versioned TOML. Unknown fields are errors. Relative paths
+in a configuration file, such as `data_dir` or an archive source's
+`manifest`, are relative to that file; path flags on the command line stay
+relative to the working directory. Version 1 has two first-class document
+shapes: a compact processor-oriented setup with sane network defaults, and
+the fully explicit advanced schema. Both become the same validated runtime
+configuration. The machine-readable contract is rendered in
 the [configuration field reference](https://leani.dev/docs/reference/configuration/); six
 complete advanced lifecycle profiles are checked under `config/modes`.
 
@@ -36,8 +39,10 @@ least two of the three defaults, to agree on one finalized slot and root, and
 fails closed if a responding provider reports another root at that slot. It
 shows every provider's answer, asks before accepting the checkpoint, writes
 `leani.toml`, and never overwrites an existing file. A global `--config PATH` selects another output
-path. The generated document contains only the choices an operator normally
-needs:
+path. The node keeps its state in `data`, beside the configuration file,
+unless `--data-dir` names another directory; like any path flag, a relative
+`--data-dir` is relative to the working directory. The generated document
+contains only the choices an operator normally needs:
 
 ```toml
 config_version = 1
@@ -106,7 +111,7 @@ root, or selected processor targets. Advanced documents keep every choice explic
 | Field | Type | Meaning |
 |---|---|---|
 | `config_version` | integer | Must be `1`. |
-| `data_dir` | path | Writable node state. Use a distinct directory per deployment or test. |
+| `data_dir` | path | Writable node state. Use a distinct directory per deployment or test. A relative path is relative to the directory of the configuration file, not the working directory. |
 | `chain` | table | Portable name and non-zero EIP-155 `chain_id`. |
 | `artifact_storage` | table | Physical backend and bounded compaction policy for retained processor artifacts. |
 | `budgets` | table | Hard memory, temporary disk, pending-delta, recent-input, and concurrency limits. |
@@ -228,7 +233,8 @@ networking, and unrelated processors remain available.
 ## Sources and finality
 
 `[[sources.history]]` requires `id`, `kind`, `priority`, and `trust`.
-Supported kinds are `xatu`, `era_e`, `parquet`, and `archive`. `archive`
+Supported kinds are `xatu`, `era_e`, and `archive`. `xatu` reads public
+Parquet history; validation refuses `parquet`, which no source reads. `archive`
 requires `manifest`; `era_e` alone accepts an `https` or `file` `endpoint`
 ending in `/`. A plain `http` endpoint is accepted on loopback, or elsewhere
 only with `allow_insecure_http = true` on that source, which accepts a mirror
@@ -356,11 +362,10 @@ explicit artifact deletion operation.
 - `window`: retain the declared block, wall-clock age, row, or byte window;
 - `full`: retain all selected queryable output.
 
-`window` requires exactly one non-empty `[processors.output.window]` table.
-Supported limits are `max_blocks`, `max_age`, `max_rows`, and `max_bytes`;
-multiple limits are allowed and pruning uses the first exceeded safe boundary.
-`finalized_only = true` prevents unfinalized output from satisfying historical
-queries.
+`window` requires a `[processors.output.window]` table with exactly one
+limit: `max_blocks`, `max_age`, `max_rows`, or `max_bytes`. Validation
+refuses `[processors.output] finalized_only`, which was never applied; to
+publish only finalized blocks, set `publish = "finalized_only"`.
 
 ### Delivery
 
@@ -370,7 +375,8 @@ queries.
 `h`, and `d` strings.
 
 `until_acknowledged` requires at least one required
-`[[processors.delivery.consumers]]`. Required consumers protect pruning until
+`[[processors.delivery.consumers]]`, each with a `lease_ttl` from one second
+to 100 years. Required consumers protect pruning until
 they are explicitly expired/reset; a temporarily lapsed lease does not
 silently advance the watermark. `on_limit` is `pause`, `fail`, or
 `expire_and_reset`. Paused instances automatically resume after
@@ -525,6 +531,14 @@ A closed WebSocket connection releases its slot and its subscriptions.
 Each open connection holds at most `max_subscription_event_bytes` of
 notifications and one response to a call waiting to be sent, so all
 connections together hold at most `max_websocket_connections` times that.
+At the defaults that is 256 × (16 MiB + 16 MiB) = 8 GiB, since a response
+may take `max_response_bytes`. To bound it lower, allow fewer connections
+with `max_websocket_connections`, or lower `max_subscription_event_bytes` and
+`max_response_bytes`.
+
+`rpc.transaction_locator` is deprecated and ignored: nothing reads it. The
+node still accepts it, with a warning in its log and in `leani doctor`;
+remove it.
 
 ### Delivery batching
 

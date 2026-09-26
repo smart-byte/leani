@@ -251,6 +251,9 @@ pub struct OutputPolicy {
     pub mode: OutputPolicyMode,
     #[serde(default)]
     pub window: Option<OutputWindow>,
+    /// Ignored; kept for descriptor compatibility. To publish only finalized
+    /// blocks, use [`PublicationPolicy::FinalizedOnly`]
+    /// (`publish = "finalized_only"`).
     #[serde(default)]
     pub finalized_only: bool,
 }
@@ -344,11 +347,18 @@ pub enum DeliveryOrdering {
     BlockVersionedIdempotent,
 }
 
+/// Longest lease TTL a durable consumer may hold: 100 years. Its
+/// milliseconds, and the expiry of a lease taken now, stay far inside an
+/// `i64`.
+pub const MAXIMUM_CONSUMER_LEASE_TTL: std::time::Duration =
+    std::time::Duration::from_hours(100 * 365 * 24);
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct DurableConsumerPolicy {
     pub id: String,
     pub required: bool,
+    /// Between one second and [`MAXIMUM_CONSUMER_LEASE_TTL`].
     pub lease_ttl_seconds: u64,
 }
 
@@ -538,10 +548,15 @@ impl LifecyclePolicies {
                     .id
                     .bytes()
                     .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
-                || consumer.lease_ttl_seconds == 0
                 || !consumer_ids.insert(&consumer.id)
             {
-                return Err("delivery consumers need unique portable IDs and positive lease TTLs");
+                return Err("delivery consumers need unique portable IDs");
+            }
+            if consumer.lease_ttl_seconds == 0
+                || std::time::Duration::from_secs(consumer.lease_ttl_seconds)
+                    > MAXIMUM_CONSUMER_LEASE_TTL
+            {
+                return Err("delivery consumer lease TTLs must be non-zero and at most 100 years");
             }
             if consumer.required
                 && !matches!(self.delivery.mode, DeliveryPolicyMode::UntilAcknowledged)
@@ -1189,6 +1204,32 @@ mod tests {
             lifecycle.validate(PublicationPolicy::FinalizedOnly),
             Err("artifact window must declare exactly one block, age, or byte limit")
         );
+    }
+
+    #[test]
+    fn consumer_lease_ttls_are_bounded_like_the_store_bounds_them() {
+        // Task 16b: validation refused only a zero TTL, and the store then
+        // refused one over 100 years.
+        assert_eq!(
+            MAXIMUM_CONSUMER_LEASE_TTL.as_secs(),
+            100 * 365 * 24 * 60 * 60
+        );
+        let mut lifecycle = LifecyclePolicies::default();
+        lifecycle.delivery.mode = DeliveryPolicyMode::UntilAcknowledged;
+        lifecycle.delivery.consumers = vec![DurableConsumerPolicy {
+            id: "destination".to_owned(),
+            required: true,
+            lease_ttl_seconds: 100 * 365 * 24 * 60 * 60,
+        }];
+        assert_eq!(lifecycle.validate(PublicationPolicy::FinalizedOnly), Ok(()));
+        for lease_ttl_seconds in [100 * 365 * 24 * 60 * 60 + 1, u64::MAX, 0] {
+            lifecycle.delivery.consumers[0].lease_ttl_seconds = lease_ttl_seconds;
+            assert_eq!(
+                lifecycle.validate(PublicationPolicy::FinalizedOnly),
+                Err("delivery consumer lease TTLs must be non-zero and at most 100 years"),
+                "{lease_ttl_seconds}"
+            );
+        }
     }
 
     #[test]
