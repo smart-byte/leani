@@ -30,6 +30,8 @@ jobs:
         os: [ubuntu-24.04, macos-15]
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
       - name: Format
         if: runner.os == 'Linux'
         run: cargo fmt --all --check
@@ -47,6 +49,8 @@ jobs:
         working-directory: packages/sdk
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
         with:
           bun-version-file: packages/sdk/.bun-version
@@ -64,6 +68,8 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
       - name: Parse observability contracts
         run: >-
           ruby -e 'require "json"; require "yaml";
@@ -73,6 +79,8 @@ jobs:
         run: scripts/check-doc-links.rb
       - name: Validate release and Homebrew packaging
         run: scripts/test-release-packaging.sh
+      - name: Match the container Rust image to rust-toolchain.toml
+        run: ruby scripts/check-container-toolchain.rb
       - name: Validate release CI requirements
         run: ruby scripts/test-release-ci.rb
       - name: Validate artifact privacy checks
@@ -90,6 +98,8 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
       - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
         with:
           command: check

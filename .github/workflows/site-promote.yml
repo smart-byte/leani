@@ -9,24 +9,29 @@ on:
         type: string
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: site-production-promotion
   cancel-in-progress: false
 
 jobs:
-  promote:
-    name: Fast-forward site-production
+  validate:
+    name: Validate and build the release site
     runs-on: ubuntu-24.04
-    environment: site-production
+    permissions:
+      contents: read
     env:
       RELEASE_TAG: ${{ inputs.release_tag }}
+    outputs:
+      commit: ${{ steps.release.outputs.commit }}
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           fetch-depth: 0
+          persist-credentials: false
       - name: Validate release tag
+        id: release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -42,6 +47,7 @@ jobs:
             git merge-base --is-ancestor refs/remotes/origin/site-production "$RELEASE_TAG^{commit}"
           fi
           git checkout --detach "$RELEASE_TAG^{commit}"
+          echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
         with:
           bun-version-file: site/.bun-version
@@ -61,7 +67,29 @@ jobs:
           bun run build
           bun run size:check
           bun run search:check
+
+  # The only job with a write token. It runs no project code; it only moves
+  # site-production to the release commit that the validate job built.
+  promote:
+    name: Fast-forward site-production
+    needs: validate
+    runs-on: ubuntu-24.04
+    environment: site-production
+    permissions:
+      contents: write
+    steps:
       - name: Promote exact release commit
+        env:
+          GH_TOKEN: ${{ secrets.SITE_PROMOTION_TOKEN || github.token }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          RELEASE_COMMIT: ${{ needs.validate.outputs.commit }}
         run: |
-          release_commit=$(git rev-parse "$RELEASE_TAG^{commit}")
-          git push origin "$release_commit:refs/heads/site-production"
+          test "$(gh api "repos/$GITHUB_REPOSITORY/commits/$RELEASE_TAG" --jq .sha)" = "$RELEASE_COMMIT"
+          if gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/site-production" --silent; then
+            # force=false makes GitHub refuse anything but a fast-forward.
+            gh api --method PATCH "repos/$GITHUB_REPOSITORY/git/refs/heads/site-production" \
+              -f sha="$RELEASE_COMMIT" -F force=false --silent
+          else
+            gh api --method POST "repos/$GITHUB_REPOSITORY/git/refs" \
+              -f ref=refs/heads/site-production -f sha="$RELEASE_COMMIT" --silent
+          fi

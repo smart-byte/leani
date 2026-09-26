@@ -23,7 +23,6 @@ on:
 
 permissions:
   contents: read
-  actions: read
 
 concurrency:
   group: container-${{ github.ref }}
@@ -46,6 +45,7 @@ jobs:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           fetch-depth: 0
+          persist-credentials: false
       - name: Verify publication history
         run: scripts/check-publication.rb HEAD
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
@@ -112,18 +112,18 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
-  publish:
-    name: Publish immutable GHCR image
+  validate:
+    name: Validate image publication
     if: ${{ inputs.publish == true }}
     runs-on: ubuntu-24.04
     permissions:
       contents: read
-      packages: write
       actions: read
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           fetch-depth: 0
+          persist-credentials: false
       - name: Verify publication history
         run: scripts/check-publication.rb HEAD
       - name: Require a matching release tag
@@ -150,6 +150,22 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           CANDIDATE_RUN_ID: ${{ inputs.candidate_run_id }}
         run: ruby scripts/check-release-ci.rb --container
+
+  # The only job that can push images or sign attestations. It publishes the
+  # images that a successful candidate run built, ran, and scanned, without
+  # rebuilding them.
+  publish:
+    name: Publish immutable GHCR image
+    needs: validate
+    if: ${{ inputs.publish == true }}
+    runs-on: ubuntu-24.04
+    environment: release-ghcr
+    permissions:
+      packages: write
+      actions: read
+      id-token: write
+      attestations: write
+    steps:
       - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
         with:
           pattern: leani-container-*
@@ -161,8 +177,9 @@ jobs:
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          password: ${{ github.token }}
       - name: Push verified images and assemble the multiarchitecture tag
+        id: push
         env:
           IMAGE_TAG: ${{ inputs.image_tag }}
         run: |
@@ -176,7 +193,69 @@ jobs:
             docker tag leani:scan "$image:$IMAGE_TAG-$arch"
             docker push "$image:$IMAGE_TAG-$arch"
             docker image inspect "$image:$IMAGE_TAG-$arch" --format '{{index .RepoDigests 0}}' > "$arch.digest"
+            echo "$arch-digest=$(cut -d@ -f2 "$arch.digest")" >> "$GITHUB_OUTPUT"
           done
           docker buildx imagetools create --tag "$image:$IMAGE_TAG" \
             "$(cat amd64.digest)" "$(cat arm64.digest)"
           docker buildx imagetools inspect "$image:$IMAGE_TAG"
+          index_digest=$(docker buildx imagetools inspect "$image:$IMAGE_TAG" --format '{{json .Manifest}}' | jq -r .digest)
+          echo "image=$image" >> "$GITHUB_OUTPUT"
+          echo "index-digest=$index_digest" >> "$GITHUB_OUTPUT"
+      # A registry attestation takes exactly one subject, so the index and each
+      # architecture's image get their own; either kind of pin can be verified.
+      - name: Attest the multiarchitecture image provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ steps.push.outputs.image }}
+          subject-digest: ${{ steps.push.outputs.index-digest }}
+          push-to-registry: true
+          create-storage-record: false
+      - name: Attest the amd64 image provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ steps.push.outputs.image }}
+          subject-digest: ${{ steps.push.outputs.amd64-digest }}
+          push-to-registry: true
+          create-storage-record: false
+      - name: Attest the arm64 image provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ steps.push.outputs.image }}
+          subject-digest: ${{ steps.push.outputs.arm64-digest }}
+          push-to-registry: true
+          create-storage-record: false
+      # Attach each image's CycloneDX inventory to its digest; the candidate
+      # run's copy expires with its artifacts.
+      - name: Attest the amd64 image SBOM
+        uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v4.2.1
+        with:
+          subject-name: ${{ steps.push.outputs.image }}
+          subject-digest: ${{ steps.push.outputs.amd64-digest }}
+          sbom-path: images/leani-container-amd64/leani-container-amd64.cdx.json
+          push-to-registry: true
+          create-storage-record: false
+      - name: Attest the arm64 image SBOM
+        uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v4.2.1
+        with:
+          subject-name: ${{ steps.push.outputs.image }}
+          subject-digest: ${{ steps.push.outputs.arm64-digest }}
+          sbom-path: images/leani-container-arm64/leani-container-arm64.cdx.json
+          push-to-registry: true
+          create-storage-record: false
+      - name: Record published digests
+        env:
+          IMAGE: ${{ steps.push.outputs.image }}
+          IMAGE_TAG: ${{ inputs.image_tag }}
+          INDEX_DIGEST: ${{ steps.push.outputs.index-digest }}
+          AMD64_DIGEST: ${{ steps.push.outputs.amd64-digest }}
+          ARM64_DIGEST: ${{ steps.push.outputs.arm64-digest }}
+        run: |
+          {
+            echo "### Published $IMAGE"
+            echo
+            echo "| Tag | Digest |"
+            echo "| --- | --- |"
+            echo "| \`$IMAGE_TAG\` (both architectures) | \`$INDEX_DIGEST\` |"
+            echo "| \`$IMAGE_TAG-amd64\` | \`$AMD64_DIGEST\` |"
+            echo "| \`$IMAGE_TAG-arm64\` | \`$ARM64_DIGEST\` |"
+          } >> "$GITHUB_STEP_SUMMARY"

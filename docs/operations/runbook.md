@@ -303,6 +303,13 @@ load `observability/prometheus/alerts.yaml` into the Prometheus-compatible rule
 evaluator. The checked rules cover missing scrapes, required-component
 readiness, stalled processor/finality cursors, a non-draining outbox, and a
 finality anchor close to its age limit.
+The stalled-cursor rules apply only where the profile requires the live
+source (`leani_live_required`) or finality (`leani_finality_required`), so a
+historical-only node whose backfill has finished does not alert. They join
+processor series to those gauges on the scrape target's `job` and `instance`
+labels. Keep `honor_labels` disabled, the default, for the Leani scrape job:
+Prometheus then stores each processor's own `instance` label as
+`exported_instance`.
 Filesystem percentage alerts remain the host operator's responsibility because
 the node exports its database/recent-cache byte counts but not host capacity.
 

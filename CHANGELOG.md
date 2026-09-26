@@ -235,6 +235,32 @@ record, and documented RPC contracts.
   any request, and so is a control character anywhere in the path. An ID such
   as `..` or `../../other` resolved to another route, directly or through a
   proxy that decodes `%2F` first. No Leani ID contains these characters.
+- Publication runs in protected GitHub environments: `release-npm`,
+  `release-crates`, `release-ghcr`, `release-github`, and `site-production`.
+  Build and test jobs run with a read-only token and no secrets or OIDC
+  token, and upload what they tested; the publish job downloads it and only
+  publishes. Only publish jobs may request write permissions,
+  `id-token: write` included, or read secrets, and no checkout keeps its
+  credentials. The npm and crates.io jobs used to test and publish in one job
+  holding an OIDC token. The crates.io job packages the tested commit again
+  without compiling and publishes with `cargo publish --no-verify` only if it
+  produced exactly the tested archives, byte for byte. No other publish job
+  checks out the repository, npm publishes the local archive file, and no
+  workflow runs on `pull_request_target` or `workflow_run`. Site promotion
+  builds with a read-only token and moves `site-production` from a separate
+  job. `scripts/check-release-ci.rb --workflows` enforces this layout in CI.
+  Maintainers must create the environments, move or delete the repository
+  secrets `NPM_TOKEN` and `CARGO_REGISTRY_TOKEN`, and add the rulesets listed
+  in the release process before the next publication.
+- Release archives, the multiarchitecture container image, and each
+  architecture's image carry signed build provenance, and each image's
+  CycloneDX SBOM is attested to its digest. A release candidate without the
+  node's SBOM, `leani.cdx.json`, is not published. The container publication
+  summary lists the image digests. The Dockerfile pins its base images by
+  digest, and CI requires its Rust image to match `rust-toolchain.toml`.
+  Dependabot proposes weekly updates for GitHub Actions, Cargo, Bun, and
+  those images, and a weekly workflow runs the cargo-deny advisory check and
+  `bun audit`.
 
 ### Changed
 
@@ -840,6 +866,19 @@ record, and documented RPC contracts.
   before it opens anything there, the execution P2P peer store and identity
   of a `p2p-only` run included. It refuses a directory that a running node or
   another benchmark holds; it used both files without the lock.
+- A production site build fails unless its documentation ref,
+  `LEANI_DOCS_REF` or else the commit's exact release tag, is `v` followed by
+  the workspace version. A stale Cloudflare `LEANI_DOCS_REF` used to publish
+  links into an earlier release. Previews derive the ref from their branch;
+  unset the preview `LEANI_DOCS_REF` in Cloudflare.
+- `LeaniProcessorStalled` and `LeaniFinalityStalled` fire only on nodes that
+  require the live source or finality (`leani_live_required` or
+  `leani_finality_required` is 1). A historical-only node stops advancing once
+  its backfill completes and no longer alerts. The rules join on the scrape
+  target's `job` and `instance` labels.
+- Linux release archives must not need a glibc newer than 2.39; their build
+  checks the binaries' `GLIBC_` symbol versions. The install guide lists the
+  supported distributions.
 
 ### Fixed
 
@@ -1554,6 +1593,18 @@ record, and documented RPC contracts.
   events that make no progress still back off. Closing a lane of the backfill
   client's `subscribe()` no longer rethrows the caller's abort reason when it
   is not an `AbortError`.
+- The Homebrew formula renderer stops on a missing, duplicated, or malformed
+  archive checksum. It rendered an empty `sha256` and exited successfully,
+  because the lookup failed inside `sed`'s arguments.
+- A site build on a commit that carries only an SDK tag stays a preview. The
+  SDK tag used to switch the build into production mode and fail it.
+- The docs watch check waits until a sentinel page proves that the dev server
+  sees docs changes, then gives each step ten measured round trips (20 to 60
+  seconds), and reports the last response, the probe files, and Astro's
+  output when a step times out. It starts Astro in the foreground on a free
+  port without its lock file: Astro 7 detached the server when it detected an
+  AI agent, so the check left it running, and the next run found it and
+  failed.
 
 ## [0.1.0-rc.1] - 2026-09-20
 
