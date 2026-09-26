@@ -201,6 +201,53 @@ describe("backfill subscriptions", () => {
     ]);
   });
 
+  test("NDJSON parser reads a large record split into small chunks in linear time", async () => {
+    // Review: every chunk rescanned the whole buffered record.
+    const payload = "x".repeat(8 * 1024 * 1024);
+    const encoded = new TextEncoder().encode(
+      `${JSON.stringify({ type: "batch", payload })}\n`,
+    );
+    let offset = 0;
+    const body = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        if (offset >= encoded.length) {
+          controller.close();
+          return;
+        }
+        controller.enqueue(encoded.slice(offset, offset + 1024));
+        offset += 1024;
+      },
+    });
+    const started = performance.now();
+    const records: unknown[] = [];
+    for await (const record of parseNdjson(body)) {
+      records.push(record);
+    }
+    expect(performance.now() - started).toBeLessThan(1_000);
+    expect(records).toHaveLength(1);
+    expect((records[0] as { payload: string }).payload.length).toBe(payload.length);
+  });
+
+  test("NDJSON parser refuses a record over 65 MiB", async () => {
+    // Review: a record without its newline grew the buffer without bound.
+    const chunk = new Uint8Array(1024 * 1024).fill(0x78);
+    let sent = 0;
+    const body = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        if (sent++ < 70) {
+          controller.enqueue(chunk);
+        } else {
+          controller.close();
+        }
+      },
+    });
+    await expect(parseNdjson(body).next()).rejects.toMatchObject({
+      name: "LeaniError",
+      code: "invalid_response",
+      retryable: false,
+    });
+  });
+
   test("client opens a fenced session without exposing its token", async () => {
     const requests: Request[] = [];
     const client = createBackfillSubscriptionClient({
@@ -723,7 +770,7 @@ describe("backfill subscriptions", () => {
             start(controller) {
               controller.enqueue(
                 encoder.encode(
-                  '{"type":"hello","sessionToken":"live-session","leaseTtlMs":"180"}\n',
+                  '{"type":"hello","sessionToken":"live-session","leaseTtlMs":"180","heartbeatIntervalMs":"15000"}\n',
                 ),
               );
               setTimeout(() => {

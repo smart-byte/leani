@@ -685,13 +685,19 @@ after that cursor. An explicit `after` takes precedence.
 
 The server sends comments as heartbeats. When the node shuts down, it ends the
 stream after a whole event, with no error event, and the consumer delivery
-streams after a whole record. The SDK reconnects with the last fully
-yielded cursor, uses exponential backoff with jitter, and treats these
-differently:
+streams after a whole record. An `error` event carries the error body below
+and ends the stream; its `retryable` says whether reconnecting can help. A
+stored change the node cannot render is not retryable. The SDK reconnects
+with the last fully yielded cursor, uses exponential backoff with jitter, and
+treats these differently:
 
 - clean server close, such as the node's shutdown: reconnect;
 - transient network/5xx: reconnect;
-- authentication/validation 4xx: surface error;
+- no bytes, keep-alive comments included, for `idleTimeoutMs`: reconnect;
+- `error` event with `retryable: true`: reconnect, and after five in a row
+  without a new change, surface the last one;
+- `error` event with `retryable: false`: surface error;
+- authentication/validation 4xx, or a redirect: surface error;
 - `reset_required`: stop and require a snapshot/resubscription decision;
 - abort signal: stop without error.
 
@@ -1008,12 +1014,14 @@ select the desired canonical `basePath` from `client.capabilities()` and pass
 it through `queryBasePaths` when constructing the client. This keeps typed
 responses while making the processor instance explicit.
 
-`request<T>` is the safe primitive for custom query extensions. Relative paths
-such as `v1/processors/<instance>/query/summary` preserve any base-URL path;
-root paths such as `/v1/q/my-protocol/summary` target the configured origin.
-Schemes, protocol-relative paths, and cross-origin resolution are rejected
-before the bearer token is attached. Built-in query namespaces use this same
-primitive.
+`request<T>` is the safe primitive for custom query extensions. Every path
+resolves under the base URL's path: `v1/processors/<instance>/query/summary`
+and a capabilities `basePath` such as `/v1/q/my-protocol/summary` both keep a
+prefixed base URL's prefix. Schemes, protocol-relative paths, segments that
+decode to `.` or `..`, backslashes, encoded slashes, backslashes, and percent
+signs, and control characters are rejected before the bearer token is
+attached, and redirects are refused rather than followed.
+Built-in query namespaces use this same primitive.
 
 SDK responsibilities:
 

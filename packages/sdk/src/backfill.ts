@@ -1,11 +1,21 @@
-import { LeaniError, responseError } from "./errors.ts";
-export { LeaniError } from "./errors.ts";
+import { LeaniError, TransportError, responseError } from "./errors.ts";
+export { LeaniError, TransportError } from "./errors.ts";
 import type {
   ChangeEnvelope,
   DurableConsumer,
   FetchLike,
   ProcessorSummary,
 } from "./index.ts";
+import {
+  concatBytes,
+  idleWatchdog,
+  readChunks,
+  readJson,
+  readText,
+  resolveUnder,
+  send,
+  withDeadline,
+} from "./transport.ts";
 
 export type BackfillExecutionMode = "fill_missing" | "recompute";
 export type BackfillState =
@@ -464,21 +474,19 @@ export function createBackfillSubscriptionClient(
       credential,
       sessionToken,
     );
-    const response = await fetchImpl(new URL(path, baseUrl), {
+    const response = await send(fetchImpl, resolveUnder(baseUrl, path), {
       method,
       headers:
         method === "GET" || body !== undefined
           ? headers
           : markLeaniRequest(headers),
       body: body === undefined ? undefined : JSON.stringify(body),
-      signal: signal
-        ? AbortSignal.any([signal, AbortSignal.timeout(timeoutMs)])
-        : AbortSignal.timeout(timeoutMs),
-    });
+      signal: withDeadline(signal, timeoutMs),
+    }, signal);
     if (!response.ok) {
       throw await responseError(response);
     }
-    return (await response.json()) as T;
+    return readJson<T>(response, signal);
   };
 
   return Object.freeze({
@@ -639,30 +647,21 @@ export function createBackfillSubscriptionClient(
       } = {},
     ) => {
       const path = consumerPath(subscription, consumer, "changes");
-      const url = new URL(path, baseUrl);
-      if (changeOptions.limit !== undefined) {
-        url.searchParams.set(
-          "limit",
-          String(assertPositiveInteger(changeOptions.limit, "limit")),
-        );
-      }
-      return fetchImpl(url, {
-        headers: requestHeaders(
-          options.token,
-          "application/json",
-          changeOptions.credential,
-        ),
-        signal: changeOptions.signal,
-      }).then(async (response) => {
-        if (!response.ok) {
-          throw await responseError(response);
-        }
-        return (await response.json()) as {
-          data: ChangeEnvelope<T>[];
-          nextCursor: string | null;
-          coverage: unknown;
-        };
-      });
+      const query =
+        changeOptions.limit === undefined
+          ? ""
+          : `?limit=${assertPositiveInteger(changeOptions.limit, "limit")}`;
+      return requestJson<{
+        data: ChangeEnvelope<T>[];
+        nextCursor: string | null;
+        coverage: unknown;
+      }>(
+        "GET",
+        `${path}${query}`,
+        undefined,
+        changeOptions.signal,
+        changeOptions.credential,
+      );
     },
     stream: <T>(
       subscription: string,
@@ -677,6 +676,7 @@ export function createBackfillSubscriptionClient(
         fetchImpl,
         baseUrl,
         options.token,
+        timeoutMs,
         subscription,
         consumer,
         streamOptions.credential,
@@ -692,6 +692,7 @@ export function createBackfillSubscriptionClient(
         fetchImpl,
         baseUrl,
         options.token,
+        timeoutMs,
         processor,
         consumer,
         streamOptions.credential,
@@ -702,6 +703,7 @@ export function createBackfillSubscriptionClient(
         fetchImpl,
         baseUrl,
         options.token,
+        timeoutMs,
         request,
       ),
   });
@@ -724,6 +726,7 @@ async function openMultiLaneDelivery<T>(
   fetchImpl: FetchLike,
   baseUrl: URL,
   token: string | undefined,
+  timeoutMs: number,
   request: MultiLaneSubscriptionRequest,
 ): Promise<MultiLaneDelivery<T>> {
   const processor = assertIdentity(request.processor, "processor");
@@ -747,6 +750,7 @@ async function openMultiLaneDelivery<T>(
           fetchImpl,
           baseUrl,
           token,
+          timeoutMs,
           processor,
           consumer,
           request.credential,
@@ -760,6 +764,7 @@ async function openMultiLaneDelivery<T>(
           fetchImpl,
           baseUrl,
           token,
+          timeoutMs,
           subscriptionId,
           consumer,
           request.credential,
@@ -1045,8 +1050,10 @@ function reconnectingLaneConnection<
       closed = true;
       stop.abort();
       await session.close();
+      // A stopped reconnect rejects with the abort reason, which may be the
+      // caller's own, of any type.
       await reconnectTask?.catch((error: unknown) => {
-        if (!isAbortError(error)) throw error;
+        if (!reconnectSignal.aborted) throw error;
       });
     },
   };
@@ -1076,28 +1083,18 @@ function validateReplacementHello<
   }
 }
 
+/**
+ * Classified by where the failure came from, never by its message: the SDK
+ * reports every failure below HTTP as a retryable TransportError, and a
+ * caller's abort, a stream record, or a local check is never retried.
+ */
 function isRetryableDeliveryDisconnect(error: unknown): boolean {
-  if (isAbortError(error) || error instanceof BackfillStreamError) return false;
-  if (error instanceof LeaniError) {
-    return error.retryable || error.code === "consumer_session_active" ||
-      error.code === "consumer_session_lost";
-  }
-  if (!(error instanceof Error)) return false;
-  if (
-    error.name === "consumer_session_active" ||
-    error.name === "consumer_session_lost"
-  ) {
-    return true;
-  }
-  if (error.name === "NetworkError" || error.name === "TimeoutError") return true;
   return (
-    error.name === "TypeError" &&
-    /fetch|network|load failed|socket|connection/i.test(error.message)
+    error instanceof LeaniError &&
+    (error.retryable ||
+      error.code === "consumer_session_active" ||
+      error.code === "consumer_session_lost")
   );
-}
-
-function isAbortError(error: unknown): boolean {
-  return error instanceof Error && error.name === "AbortError";
 }
 
 async function waitForReconnectDelay(
@@ -1190,6 +1187,7 @@ async function openBackfillStream<T>(
   fetchImpl: FetchLike,
   baseUrl: URL,
   token: string | undefined,
+  timeoutMs: number,
   subscription: string,
   consumer: string,
   credential: string | undefined,
@@ -1203,6 +1201,7 @@ async function openBackfillStream<T>(
     fetchImpl,
     baseUrl,
     token,
+    timeoutMs,
     backfillStreamPath(subscription, consumer, batching),
     consumerPath(subscription, consumer, "ack"),
     consumerPath(subscription, consumer, "lease"),
@@ -1248,6 +1247,7 @@ async function openLiveStream<T>(
   fetchImpl: FetchLike,
   baseUrl: URL,
   token: string | undefined,
+  timeoutMs: number,
   processor: string,
   consumer: string,
   credential: string | undefined,
@@ -1257,6 +1257,7 @@ async function openLiveStream<T>(
     fetchImpl,
     baseUrl,
     token,
+    timeoutMs,
     liveConsumerPath(processor, consumer, "stream"),
     liveConsumerPath(processor, consumer, "ack"),
     liveConsumerPath(processor, consumer, "lease"),
@@ -1270,6 +1271,7 @@ async function openDeliverySession<THello, TRecord>(
   fetchImpl: FetchLike,
   baseUrl: URL,
   token: string | undefined,
+  timeoutMs: number,
   streamPath: string,
   acknowledgePath: string,
   renewPath: string,
@@ -1277,97 +1279,136 @@ async function openDeliverySession<THello, TRecord>(
   signal: AbortSignal | undefined,
   streamKind: "backfill" | "live",
 ): Promise<DeliverySession<THello, TRecord>> {
-  const connectionStop = new AbortController();
-  const stopFromCaller = () => connectionStop.abort(signal?.reason);
+  const connection = new AbortController();
+  // A connection that fails on its own, rather than through the caller's
+  // abort or close(), keeps the failure for the iterator and acknowledge().
+  let failure: unknown;
+  const fail = (error: unknown): void => {
+    if (connection.signal.aborted) {
+      return;
+    }
+    failure = error;
+    connection.abort(error);
+  };
+  const stopFromCaller = () => connection.abort(signal?.reason);
+  signal?.addEventListener("abort", stopFromCaller, { once: true });
   if (signal?.aborted) {
     stopFromCaller();
-  } else {
-    signal?.addEventListener("abort", stopFromCaller, { once: true });
   }
-  const response = await fetchImpl(new URL(streamPath, baseUrl), {
-    headers: requestHeaders(token, "application/x-ndjson", credential),
-    signal: connectionStop.signal,
-  });
-  if (!response.ok) {
-    signal?.removeEventListener("abort", stopFromCaller);
-    throw await responseError(response);
-  }
-  if (!response.body) {
-    signal?.removeEventListener("abort", stopFromCaller);
-    throw new BackfillStreamError({
-      type: "error",
-      code: "stream_body_missing",
-      message: `${streamKind} stream response has no body`,
-      earliestAvailableSequence: null,
-      latestAvailableSequence: null,
-    });
-  }
-  const records = parseNdjson(response.body, connectionStop.signal);
-  const first = await records.next();
-  if (first.done) {
-    connectionStop.abort();
-    signal?.removeEventListener("abort", stopFromCaller);
-    throw streamProtocolError(streamKind, "stream ended before its hello record");
-  }
-  const firstType = (first.value as { type?: unknown }).type;
-  if (firstType === "error" || firstType === "reset_required") {
-    connectionStop.abort();
-    signal?.removeEventListener("abort", stopFromCaller);
-    throw new BackfillStreamError(
-      first.value as BackfillStreamFailure | BackfillStreamReset,
+  // Until its hello arrives, the stream may stay silent as long as a JSON
+  // request may take; afterwards, for three heartbeat intervals.
+  let watchdog = idleWatchdog(timeoutMs, () =>
+    fail(
+      new TransportError(
+        `${streamKind} stream sent no hello within ${timeoutMs} ms`,
+      ),
+    ));
+  let records: AsyncGenerator<unknown> | undefined;
+  let wireHello: SessionStreamHello & Record<string, unknown>;
+  let sessionToken: string;
+  let leaseTtlMs: number;
+  let heartbeatIntervalMs: number;
+  try {
+    watchdog.arm();
+    const response = await send(fetchImpl, resolveUnder(baseUrl, streamPath), {
+      headers: requestHeaders(token, "application/x-ndjson", credential),
+      signal: connection.signal,
+    }, signal);
+    if (!response.ok) {
+      throw await responseError(response);
+    }
+    if (!response.body) {
+      throw new BackfillStreamError({
+        type: "error",
+        code: "stream_body_missing",
+        message: `${streamKind} stream response has no body`,
+        earliestAvailableSequence: null,
+        latestAvailableSequence: null,
+      });
+    }
+    records = ndjsonRecords(response.body, connection.signal, () =>
+      watchdog.arm());
+    const first = await records.next();
+    if (first.done) {
+      throw streamProtocolError(streamKind, "stream ended before its hello record");
+    }
+    const firstType = (first.value as { type?: unknown }).type;
+    if (firstType === "error" || firstType === "reset_required") {
+      throw new BackfillStreamError(
+        first.value as BackfillStreamFailure | BackfillStreamReset,
+      );
+    }
+    if (firstType !== "hello") {
+      throw streamProtocolError(streamKind, "first stream record is not hello");
+    }
+    wireHello = first.value as SessionStreamHello & Record<string, unknown>;
+    sessionToken = assertIdentity(
+      wireHello.sessionToken,
+      "stream hello sessionToken",
     );
-  }
-  if (firstType !== "hello") {
-    connectionStop.abort();
+    leaseTtlMs = parseHelloDuration(wireHello.leaseTtlMs, "leaseTtlMs");
+    heartbeatIntervalMs = parseHelloDuration(
+      wireHello.heartbeatIntervalMs,
+      "heartbeatIntervalMs",
+    );
+  } catch (error) {
+    connection.abort();
     signal?.removeEventListener("abort", stopFromCaller);
-    throw streamProtocolError(streamKind, "first stream record is not hello");
+    await records?.return(undefined).catch(() => undefined);
+    throw failure ?? error;
+  } finally {
+    watchdog.disarm();
   }
-  const wireHello = first.value as SessionStreamHello &
-    Record<string, unknown>;
-  const sessionToken = assertIdentity(
-    wireHello.sessionToken,
-    "stream hello sessionToken",
-  );
-  const leaseTtlMs = parseLeaseTtl(wireHello.leaseTtlMs);
+  const stream = records;
   const { sessionToken: _sessionToken, ...publicHello } = wireHello;
-  const renewalStop = new AbortController();
-  let renewalError: unknown;
+  const idleMs = 3 * heartbeatIntervalMs;
+  watchdog = idleWatchdog(idleMs, () =>
+    fail(
+      new TransportError(`${streamKind} stream sent nothing for ${idleMs} ms`),
+    ));
+  const renewal = new AbortController();
   const renewalTask = renewSessionUntilStopped(
     fetchImpl,
     baseUrl,
     token,
+    timeoutMs,
     renewPath,
     credential,
     sessionToken,
     leaseTtlMs,
-    renewalStop.signal,
+    renewal.signal,
   ).catch((error: unknown) => {
-    if (!renewalStop.signal.aborted) {
-      renewalError = error;
+    // A lease that cannot be renewed ends the connection at once instead of
+    // at the next record, which may never come.
+    if (!renewal.signal.aborted) {
+      fail(error);
     }
   });
   let iteratorClaimed = false;
   let closeTask: Promise<void> | undefined;
   const close = (): Promise<void> => {
     closeTask ??= (async () => {
-      renewalStop.abort();
-      connectionStop.abort();
+      renewal.abort();
+      watchdog.disarm();
+      connection.abort();
       signal?.removeEventListener("abort", stopFromCaller);
       try {
-        await records.return(undefined);
+        await stream.return(undefined);
       } catch (error) {
-        if (!connectionStop.signal.aborted) {
+        if (!connection.signal.aborted) {
           throw error;
         }
       }
       await renewalTask;
       try {
-        await fetchImpl(new URL(renewPath, baseUrl), {
+        const released = await send(fetchImpl, resolveUnder(baseUrl, renewPath), {
           method: "DELETE",
           headers: markLeaniRequest(
             requestHeaders(token, "application/json", credential, sessionToken),
           ),
-        });
+          signal: AbortSignal.timeout(timeoutMs),
+        }, undefined);
+        void released.body?.cancel().catch(() => undefined);
       } catch {
         // The lease also expires and is passively released when the stream
         // disconnects. Explicit release only makes clean reconnect immediate.
@@ -1382,14 +1423,25 @@ async function openDeliverySession<THello, TRecord>(
     iteratorClaimed = true;
     try {
       while (true) {
-        if (renewalError !== undefined) {
-          throw renewalError;
-        }
-        const next = await records.next();
-        if (next.done) {
-          if (renewalError !== undefined) {
-            throw renewalError;
+        let next: IteratorResult<unknown>;
+        // Only a pending read counts silence, not the time the application
+        // spends on a record.
+        watchdog.arm();
+        try {
+          next = await stream.next();
+        } catch (error) {
+          // The caller's abort and close() end the iteration quietly.
+          if (failure === undefined && connection.signal.aborted) {
+            return;
           }
+          throw failure ?? error;
+        } finally {
+          watchdog.disarm();
+        }
+        if (failure !== undefined) {
+          throw failure;
+        }
+        if (next.done) {
           return;
         }
         const record = next.value as
@@ -1420,11 +1472,13 @@ async function openDeliverySession<THello, TRecord>(
       if (closeTask !== undefined) {
         throw new TypeError("delivery session is closed");
       }
-      if (renewalError !== undefined) {
-        throw renewalError;
+      if (failure !== undefined) {
+        throw failure;
       }
-      const acknowledge = await fetchImpl(
-        new URL(acknowledgePath, baseUrl),
+      const caller = acknowledgeOptions?.signal;
+      const acknowledge = await send(
+        fetchImpl,
+        resolveUnder(baseUrl, acknowledgePath),
         {
           method: "POST",
           headers: requestHeaders(
@@ -1434,13 +1488,14 @@ async function openDeliverySession<THello, TRecord>(
             sessionToken,
           ),
           body: JSON.stringify({ cursor: assertIdentity(cursor, "cursor") }),
-          signal: acknowledgeOptions?.signal,
+          signal: withDeadline(caller, timeoutMs),
         },
+        caller,
       );
       if (!acknowledge.ok) {
         throw await responseError(acknowledge);
       }
-      return (await acknowledge.json()) as DurableConsumer;
+      return readJson<DurableConsumer>(acknowledge, caller);
     },
     close,
     [Symbol.asyncIterator]: iterate,
@@ -1464,12 +1519,14 @@ interface SessionStreamHello {
   type: "hello";
   sessionToken: string;
   leaseTtlMs: string;
+  heartbeatIntervalMs: string;
 }
 
 async function renewSessionUntilStopped(
   fetchImpl: FetchLike,
   baseUrl: URL,
   token: string | undefined,
+  timeoutMs: number,
   renewPath: string,
   credential: string | undefined,
   sessionToken: string,
@@ -1477,86 +1534,145 @@ async function renewSessionUntilStopped(
   stop: AbortSignal,
 ): Promise<void> {
   const intervalMs = Math.max(50, Math.floor(leaseTtlMs / 3));
+  const firstRetryMs = Math.max(10, Math.floor(intervalMs / 10));
+  // The node renewed the lease no earlier than the request that renewed it.
+  let renewedAt = performance.now();
+  let delayMs = intervalMs;
+  let retryMs = firstRetryMs;
   while (!stop.aborted) {
-    await abortableDelay(intervalMs, stop);
+    await abortableDelay(delayMs, stop);
     if (stop.aborted) {
       return;
     }
-    const response = await fetchImpl(new URL(renewPath, baseUrl), {
-      method: "POST",
-      headers: markLeaniRequest(
-        requestHeaders(token, "application/json", credential, sessionToken),
-      ),
-      signal: stop,
-    });
-    if (!response.ok) {
-      throw await responseError(response);
+    const attemptedAt = performance.now();
+    const leaseLeftMs = renewedAt + leaseTtlMs - attemptedAt;
+    try {
+      const response = await send(fetchImpl, resolveUnder(baseUrl, renewPath), {
+        method: "POST",
+        headers: markLeaniRequest(
+          requestHeaders(token, "application/json", credential, sessionToken),
+        ),
+        // An answer after the lease lapsed could not keep it.
+        signal: withDeadline(
+          stop,
+          Math.max(1, Math.min(timeoutMs, Math.floor(leaseLeftMs))),
+        ),
+      }, stop);
+      if (!response.ok) {
+        throw await responseError(response);
+      }
+      await readText(response, stop);
+      renewedAt = attemptedAt;
+      delayMs = intervalMs;
+      retryMs = firstRetryMs;
+    } catch (error) {
+      // Retry a transient failure, with backoff, while the lease holds.
+      const retryable = error instanceof LeaniError && error.retryable;
+      if (
+        stop.aborted ||
+        !retryable ||
+        renewedAt + leaseTtlMs - performance.now() <= retryMs
+      ) {
+        throw error;
+      }
+      delayMs = retryMs;
+      retryMs *= 2;
     }
-    await response.arrayBuffer();
   }
 }
 
 function abortableDelay(delayMs: number, signal: AbortSignal): Promise<void> {
   return new Promise((resolve) => {
-    const timeout = setTimeout(resolve, delayMs);
-    signal.addEventListener(
-      "abort",
-      () => {
-        clearTimeout(timeout);
-        resolve();
-      },
-      { once: true },
-    );
+    const finish = () => {
+      clearTimeout(timeout);
+      signal.removeEventListener("abort", finish);
+      resolve();
+    };
+    const timeout = setTimeout(finish, delayMs);
+    signal.addEventListener("abort", finish, { once: true });
   });
 }
 
-function parseLeaseTtl(value: string): number {
-  const ttl = Number(value);
-  if (!Number.isSafeInteger(ttl) || ttl <= 0) {
-    throw new TypeError("stream hello contains an invalid leaseTtlMs");
+function parseHelloDuration(value: string, field: string): number {
+  const milliseconds = Number(value);
+  if (!Number.isSafeInteger(milliseconds) || milliseconds <= 0) {
+    throw new TypeError(`stream hello contains an invalid ${field}`);
   }
-  return ttl;
+  return milliseconds;
 }
 
 export async function* parseNdjson(
   body: ReadableStream<Uint8Array>,
   signal?: AbortSignal,
 ): AsyncGenerator<unknown> {
-  const reader = body.getReader();
-  const cancel = () => { void reader.cancel().catch(() => {}); };
-  signal?.addEventListener("abort", cancel, { once: true });
-  if (signal?.aborted) cancel();
+  yield* ndjsonRecords(body, signal);
+}
+
+/**
+ * The largest NDJSON record the client buffers: the node's default buffer
+ * for a batch's changes, 64 MiB, and room for the batch's own fields.
+ */
+const MAX_NDJSON_RECORD_BYTES = 65 * 1024 * 1024;
+
+const LINE_FEED = 0x0a;
+
+/**
+ * Split NDJSON records at line feeds, scanning each byte once. A line feed is
+ * ASCII, so a scan by byte never splits a UTF-8 character.
+ */
+async function* ndjsonRecords(
+  body: ReadableStream<Uint8Array>,
+  signal: AbortSignal | undefined,
+  onChunk?: () => void,
+): AsyncGenerator<unknown> {
   const decoder = new TextDecoder();
-  let buffer = "";
-  try {
-    while (true) {
-      if (signal?.aborted) {
-        throw signal.reason ?? new DOMException("aborted", "AbortError");
+  // The bytes received so far of the record in progress.
+  let pending: Uint8Array[] = [];
+  let pendingBytes = 0;
+  for await (const chunk of readChunks(body, signal, onChunk)) {
+    let lineStart = 0;
+    let newline = chunk.indexOf(LINE_FEED);
+    while (newline >= 0) {
+      const tail = chunk.subarray(lineStart, newline);
+      if (pendingBytes + tail.length > MAX_NDJSON_RECORD_BYTES) {
+        throw ndjsonRecordTooLarge();
       }
-      const { done, value } = await reader.read();
-      buffer += decoder.decode(value, { stream: !done });
-      let newline = buffer.indexOf("\n");
-      while (newline >= 0) {
-        const line = buffer.slice(0, newline).trim();
-        buffer = buffer.slice(newline + 1);
-        if (line) {
-          yield JSON.parse(line) as unknown;
-        }
-        newline = buffer.indexOf("\n");
+      const line = decoder
+        .decode(concatBytes(pending, pendingBytes, tail))
+        .trim();
+      pending = [];
+      pendingBytes = 0;
+      lineStart = newline + 1;
+      if (line) {
+        yield JSON.parse(line) as unknown;
       }
-      if (done) {
-        const finalLine = buffer.trim();
-        if (finalLine) {
-          yield JSON.parse(finalLine) as unknown;
-        }
-        return;
-      }
+      newline = chunk.indexOf(LINE_FEED, lineStart);
     }
-  } finally {
-    signal?.removeEventListener("abort", cancel);
-    await reader.cancel().catch(() => {});
-    reader.releaseLock();
+    const rest = chunk.subarray(lineStart);
+    if (rest.length > 0) {
+      pendingBytes += rest.length;
+      if (pendingBytes > MAX_NDJSON_RECORD_BYTES) {
+        throw ndjsonRecordTooLarge();
+      }
+      pending.push(rest);
+    }
   }
+  if (signal?.aborted) {
+    throw signal.reason ?? new DOMException("aborted", "AbortError");
+  }
+  const finalLine = decoder
+    .decode(concatBytes(pending, pendingBytes, new Uint8Array()))
+    .trim();
+  if (finalLine) {
+    yield JSON.parse(finalLine) as unknown;
+  }
+}
+
+function ndjsonRecordTooLarge(): LeaniError {
+  return new LeaniError(
+    `NDJSON record exceeds ${MAX_NDJSON_RECORD_BYTES} bytes`,
+    { status: 200, code: "invalid_response", retryable: false },
+  );
 }
 
 function normalizeBaseUrl(value: string | URL): URL {

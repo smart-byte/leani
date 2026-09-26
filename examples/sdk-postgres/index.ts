@@ -21,10 +21,12 @@ class PostgresDestination implements Destination<unknown> {
   ) {}
 
   async migrate(): Promise<void> {
+    // `stream` scopes sequences: a replaced node store numbers them anew.
     await this.sql`
       create table if not exists leani_applied_changes (
         processor text not null,
         network text not null,
+        stream text not null,
         sequence numeric(20, 0) not null,
         cursor text not null,
         operation text not null,
@@ -32,22 +34,24 @@ class PostgresDestination implements Destination<unknown> {
         entity_key text,
         payload jsonb,
         block_number bigint,
-        primary key (processor, network, sequence)
+        primary key (processor, network, stream, sequence)
       )
     `;
     await this.sql`
       create table if not exists leani_cursors (
         processor text not null,
         network text not null,
+        stream text not null,
         cursor text not null,
         sequence numeric(20, 0) not null,
         updated_at timestamptz not null default now(),
-        primary key (processor, network)
+        primary key (processor, network, stream)
       )
     `;
   }
 
   async transaction(
+    stream: string,
     work: (transaction: DestinationTransaction<unknown>) => Promise<void>,
   ): Promise<void> {
     await this.sql.begin(async (sql) => {
@@ -55,25 +59,26 @@ class PostgresDestination implements Destination<unknown> {
         apply: async (change: ChangeEnvelope<unknown>) => {
           await sql`
             insert into leani_applied_changes (
-              processor, network, sequence, cursor, operation, kind,
+              processor, network, stream, sequence, cursor, operation, kind,
               entity_key, payload, block_number
             ) values (
-              ${this.processor}, ${this.network}, ${change.sequence},
+              ${this.processor}, ${this.network}, ${stream}, ${change.sequence},
               ${change.cursor}, ${change.operation}, ${change.kind},
               ${change.key}, ${JSON.stringify(change.data)}::jsonb,
               ${change.block?.number ?? null}
             )
-            on conflict (processor, network, sequence) do nothing
+            on conflict (processor, network, stream, sequence) do nothing
           `;
         },
         storeLeaniCursor: async (cursor: string, sequence: string) => {
           await sql`
             insert into leani_cursors (
-              processor, network, cursor, sequence, updated_at
+              processor, network, stream, cursor, sequence, updated_at
             ) values (
-              ${this.processor}, ${this.network}, ${cursor}, ${sequence}, now()
+              ${this.processor}, ${this.network}, ${stream}, ${cursor},
+              ${sequence}, now()
             )
-            on conflict (processor, network) do update set
+            on conflict (processor, network, stream) do update set
               cursor = excluded.cursor,
               sequence = excluded.sequence,
               updated_at = excluded.updated_at

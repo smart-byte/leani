@@ -4,6 +4,7 @@ import {
   createLeaniClient,
   isResetRequired,
   type ChangeEnvelope,
+  type DurableConsumer,
 } from "@smart-byte/leani-sdk";
 
 export interface DestinationTransaction<T> {
@@ -14,7 +15,15 @@ export interface DestinationTransaction<T> {
 }
 
 export interface Destination<T> {
-  transaction(work: (transaction: DestinationTransaction<T>) => Promise<void>): Promise<void>;
+  /**
+   * `stream` names the durable consumer in the node's store. Sequences are
+   * unique only within it: a node whose store is replaced numbers its
+   * changes anew, and its consumer is created again.
+   */
+  transaction(
+    stream: string,
+    work: (transaction: DestinationTransaction<T>) => Promise<void>,
+  ): Promise<void>;
 }
 
 export interface ConsumerOptions {
@@ -33,15 +42,16 @@ export async function consumeDurably<T>(
   const leani = createLeaniClient({ baseUrl: options.baseUrl });
   const consumers = leani.processors.consumers;
 
+  let consumer: DurableConsumer;
   try {
-    await consumers.inspect(options.processor, options.consumer, {
+    consumer = await consumers.inspect(options.processor, options.consumer, {
       signal: options.signal,
     });
   } catch (error) {
     if (!(error instanceof LeaniError) || error.status !== 404) throw error;
     // Only an until_acknowledged stream accepts a required consumer that
     // fences pruning; a window stream prunes by its own limits.
-    await consumers.create(options.processor, {
+    consumer = await consumers.create(options.processor, {
       id: options.consumer,
       role: "best_effort",
       start: { position: "earliest_retained" },
@@ -50,6 +60,9 @@ export async function consumeDurably<T>(
       signal: options.signal,
     });
   }
+  // The consumer's creation identifies the store it lives in.
+  const stream =
+    `${consumer.processorInstance}/${consumer.id}@${consumer.createdAtUnixMs}`;
 
   while (!options.signal?.aborted) {
     const page = await consumers.changes<T>(
@@ -84,7 +97,7 @@ export async function consumeDurably<T>(
         { signal: options.signal },
       );
 
-      await destination.transaction(async (transaction) => {
+      await destination.transaction(stream, async (transaction) => {
         await transaction.apply(change);
         await transaction.storeLeaniCursor(change.cursor, change.sequence);
       });

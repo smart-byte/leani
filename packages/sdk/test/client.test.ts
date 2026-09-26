@@ -42,14 +42,17 @@ function change(sequence: string, cursor = `cursor-${sequence}`): ChangeEnvelope
 }
 
 describe("createLeaniClient", () => {
-  test("normalizes the base URL and exposes a version", () => {
+  test("normalizes the base URL and exposes the package version", async () => {
     const client = createLeaniClient({
       baseUrl: "http://127.0.0.1:8080/prefix",
       fetch: async () => jsonResponse({}),
     });
 
     expect(client.baseUrl.href).toBe("http://127.0.0.1:8080/prefix/");
-    expect(SDK_VERSION).toBe("0.1.0-rc.1");
+    const manifest = JSON.parse(
+      await Bun.file(new URL("../package.json", import.meta.url)).text(),
+    ) as { version: string };
+    expect<string>(SDK_VERSION).toBe(manifest.version);
   });
 
   test("extension requests preserve base paths without leaking credentials", async () => {
@@ -72,7 +75,9 @@ describe("createLeaniClient", () => {
     expect(requests[0]?.url).toBe(
       "http://node.test/prefix/v1/custom?included=1",
     );
-    expect(requests[1]?.url).toBe("http://node.test/v1/custom?enabled=true");
+    expect(requests[1]?.url).toBe(
+      "http://node.test/prefix/v1/custom?enabled=true",
+    );
     expect(requests[0]?.headers.get("authorization")).toBe("Bearer secret");
     await expect(
       client.request("https://attacker.invalid/steal"),
@@ -174,8 +179,8 @@ describe("createLeaniClient", () => {
     });
 
     expect(requests).toEqual([
-      "http://node.test/v1/processors/blobs-production/query/blocks/10",
-      "http://node.test/v1/processors/blobs-production/query/transactions?blockNumber=10&limit=1&cursor=next-page",
+      "http://node.test/prefix/v1/processors/blobs-production/query/blocks/10",
+      "http://node.test/prefix/v1/processors/blobs-production/query/transactions?blockNumber=10&limit=1&cursor=next-page",
     ]);
   });
 
@@ -382,6 +387,47 @@ describe("SSE", () => {
       messages.push(message);
     }
     expect(messages).toEqual([{ data: "first\nsecond" }]);
+  });
+
+  /** One `data:` line of `bytes` bytes, sent in `chunk`-byte pieces. */
+  function chunkedEvent(bytes: number, chunk: number, terminated: boolean) {
+    const encoded = new TextEncoder().encode(
+      `data: ${"x".repeat(bytes - 6)}${terminated ? "\n\n" : ""}`,
+    );
+    let offset = 0;
+    return new ReadableStream<Uint8Array>({
+      pull(controller) {
+        if (offset >= encoded.length) {
+          controller.close();
+          return;
+        }
+        controller.enqueue(encoded.slice(offset, offset + chunk));
+        offset += chunk;
+      },
+    });
+  }
+
+  test("scans a large event split into many chunks in linear time", async () => {
+    // Audit SDK-5: every chunk rescanned the whole buffered event, so this
+    // took seconds instead of milliseconds.
+    const started = performance.now();
+    const messages = [];
+    for await (const message of parseSse(chunkedEvent(4 * 1024 * 1024, 2048, true))) {
+      messages.push(message);
+    }
+    expect(performance.now() - started).toBeLessThan(1_000);
+    expect(messages).toHaveLength(1);
+    expect(messages[0]?.data?.length).toBe(4 * 1024 * 1024 - 6);
+  });
+
+  test("refuses an event larger than 8 MiB", async () => {
+    // Audit SDK-5: an event without its blank line grew without bound.
+    const events = parseSse(chunkedEvent(9 * 1024 * 1024, 64 * 1024, false));
+    await expect(events.next()).rejects.toMatchObject({
+      name: "LeaniError",
+      code: "invalid_response",
+      retryable: false,
+    });
   });
 
   test("stream surfaces hello via onHello and does not yield it", async () => {

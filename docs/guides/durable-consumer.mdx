@@ -21,7 +21,8 @@ acknowledgement advances retention and delivery state.
    restart.
 2. Poll retained changes under a lease.
 3. Apply one change idempotently and store its cursor in the same destination
-   transaction.
+   transaction. Key both by the consumer's stream as well as the sequence: a
+   node whose store is replaced numbers its changes from the start again.
 4. Commit the destination transaction.
 5. Acknowledge that cursor to Leani. If this request is lost, accept the same
    change again and rely on idempotent application.

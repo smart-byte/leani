@@ -1,6 +1,21 @@
-import { LeaniError, responseError, errorFromBody } from "./errors.ts";
-export { LeaniError, type LeaniErrorBody } from "./errors.ts";
+import {
+  LeaniError,
+  TransportError,
+  responseError,
+  errorFromBody,
+} from "./errors.ts";
+import {
+  concatBytes,
+  idleWatchdog,
+  readChunks,
+  readJson,
+  resolveUnder,
+  send,
+  withDeadline,
+} from "./transport.ts";
+export { LeaniError, TransportError, type LeaniErrorBody } from "./errors.ts";
 
+// Kept literal for toolchain compatibility; tests pin it to package.json.
 export const SDK_VERSION = "0.1.0-rc.1" as const;
 
 /** Sent on mutations without a JSON body, which the node otherwise refuses. */
@@ -505,6 +520,12 @@ export interface SubscribeOptions {
   signal?: AbortSignal;
   /** Receives the connection handshake frame; called once per (re)connect. */
   onHello?: (hello: StreamHello) => void;
+  /**
+   * Reconnect when the stream sends nothing, not even the node's 15-second
+   * keep-alive comments, for this long while the loop waits for a change.
+   * Defaults to 60,000 ms.
+   */
+  idleTimeoutMs?: number;
 }
 
 /** Select a configured instance when more than one processor has this kind. */
@@ -1194,13 +1215,7 @@ function buildUrl(
   path: string,
   query?: Record<string, QueryValue>,
 ): URL {
-  if (/^[a-z][a-z0-9+.-]*:/i.test(path) || path.startsWith("//")) {
-    throw new TypeError("request path must not contain an origin or URL scheme");
-  }
-  const url = new URL(path, options.baseUrl);
-  if (url.origin !== options.baseUrl.origin) {
-    throw new TypeError("request path must resolve to the configured Leani origin");
-  }
+  const url = resolveUnder(options.baseUrl, path);
   if (query) {
     for (const [key, value] of Object.entries(query)) {
       if (value !== undefined) {
@@ -1220,11 +1235,7 @@ async function requestJson<T>(
   signal?: AbortSignal,
   extraHeaders?: Record<string, string>,
 ): Promise<T> {
-  const deadline = AbortSignal.timeout(options.timeoutMs);
-  const combined = signal
-    ? AbortSignal.any([signal, deadline])
-    : deadline;
-  const response = await options.fetch(buildUrl(options, path, query), {
+  const response = await send(options.fetch, buildUrl(options, path, query), {
     method,
     headers: headers(
       options,
@@ -1236,12 +1247,12 @@ async function requestJson<T>(
           : { ...LEANI_REQUEST_HEADER, ...extraHeaders },
     ),
     body: body === undefined ? undefined : JSON.stringify(body),
-    signal: combined,
-  });
+    signal: withDeadline(signal, options.timeoutMs),
+  }, signal);
   if (!response.ok) {
     throw await responseError(response);
   }
-  return (await response.json()) as T;
+  return readJson<T>(response, signal);
 }
 
 async function requestVoid(
@@ -1250,32 +1261,53 @@ async function requestVoid(
   path: string,
   signal?: AbortSignal,
 ): Promise<void> {
-  const deadline = AbortSignal.timeout(options.timeoutMs);
-  const combined = signal
-    ? AbortSignal.any([signal, deadline])
-    : deadline;
-  const response = await options.fetch(buildUrl(options, path), {
+  const response = await send(options.fetch, buildUrl(options, path), {
     method,
     headers: headers(options, "application/json", LEANI_REQUEST_HEADER),
-    signal: combined,
-  });
+    signal: withDeadline(signal, options.timeoutMs),
+  }, signal);
   if (!response.ok) {
     throw await responseError(response);
   }
 }
+
+/** The default `idleTimeoutMs`: four of the node's keep-alive intervals. */
+const DEFAULT_SSE_IDLE_TIMEOUT_MS = 60_000;
+
+/**
+ * Retryable `error` events in a row, with no new change between them, after
+ * which a subscription throws the last one instead of reconnecting again.
+ */
+const MAX_ERROR_EVENT_RETRIES = 5;
 
 async function* subscribeProcessor<T>(
   options: ResolvedOptions,
   processor: string,
   subscribeOptions: SubscribeOptions,
 ): AsyncGenerator<ChangeEnvelope<T>> {
+  const signal = subscribeOptions.signal;
+  const idleTimeoutMs =
+    subscribeOptions.idleTimeoutMs ?? DEFAULT_SSE_IDLE_TIMEOUT_MS;
+  if (!Number.isSafeInteger(idleTimeoutMs) || idleTimeoutMs <= 0) {
+    throw new TypeError("idleTimeoutMs must be a positive safe integer");
+  }
   let after = subscribeOptions.after;
   let lastSequence: string | undefined;
   let delayMs = options.reconnect.initialDelayMs;
-  while (!subscribeOptions.signal?.aborted) {
-    let response: Response;
+  let errorEventsWithoutProgress = 0;
+  while (!signal?.aborted) {
+    const connection = new AbortController();
+    const connectionSignal = signal
+      ? AbortSignal.any([signal, connection.signal])
+      : connection.signal;
+    const watchdog = idleWatchdog(idleTimeoutMs, () =>
+      connection.abort(
+        new TransportError(`SSE stream sent nothing for ${idleTimeoutMs} ms`),
+      ));
     try {
-      response = await options.fetch(
+      watchdog.arm();
+      const response = await send(
+        options.fetch,
         buildUrl(
           options,
           `v1/processors/${encodeURIComponent(processor)}/stream`,
@@ -1283,77 +1315,90 @@ async function* subscribeProcessor<T>(
         ),
         {
           headers: headers(options, "text/event-stream"),
-          signal: subscribeOptions.signal,
+          signal: connectionSignal,
         },
+        signal,
       );
-    } catch (error) {
-      if (subscribeOptions.signal?.aborted) {
-        return;
-      }
-      await abortableDelay(
-        jitter(delayMs, options.reconnect.jitter),
-        subscribeOptions.signal,
-      );
-      delayMs = Math.min(delayMs * 2, options.reconnect.maxDelayMs);
-      continue;
-    }
-    if (!response.ok) {
-      const error = await responseError(response);
-      if (!error.retryable) {
-        throw error;
-      }
-      await abortableDelay(jitter(delayMs, options.reconnect.jitter), subscribeOptions.signal);
-      delayMs = Math.min(delayMs * 2, options.reconnect.maxDelayMs);
-      continue;
-    }
-    if (!response.body) {
-      throw new LeaniError("stream response has no body", {
-        status: response.status,
-        code: "internal",
-        retryable: true,
-      });
-    }
-    delayMs = options.reconnect.initialDelayMs;
-    try {
-      for await (const message of parseSse(response.body, subscribeOptions.signal)) {
-        if (!message.data) {
-          continue;
+      if (!response.ok) {
+        const error = await responseError(response);
+        if (!error.retryable) {
+          throw error;
         }
-        if (message.event === "hello") {
-          subscribeOptions.onHello?.(JSON.parse(message.data) as StreamHello);
-          continue;
-        }
-        if (message.event === "error") {
-          throw errorFromBody(200, JSON.parse(message.data));
-        }
-        const change = JSON.parse(message.data) as ChangeEnvelope<T>;
-        validateChangeEnvelope(change);
-        if (change.operation === "reset_required") {
-          throw new ResetRequiredError(change as ChangeEnvelope);
-        }
+      } else if (!response.body) {
+        throw new LeaniError("stream response has no body", {
+          status: response.status,
+          code: "internal",
+          retryable: true,
+        });
+      } else {
+        // A stream that opens ends the backoff of earlier failures.
+        delayMs = options.reconnect.initialDelayMs;
+        const messages = sseMessages(
+          readChunks(response.body, connectionSignal, watchdog.arm),
+          signal,
+        );
+        for await (const message of messages) {
+          if (!message.data) {
+            continue;
+          }
+          if (message.event === "hello") {
+            subscribeOptions.onHello?.(JSON.parse(message.data) as StreamHello);
+            continue;
+          }
+          if (message.event === "error") {
+            const error = errorFromBody(200, JSON.parse(message.data));
+            errorEventsWithoutProgress += 1;
+            if (
+              !error.retryable ||
+              errorEventsWithoutProgress > MAX_ERROR_EVENT_RETRIES
+            ) {
+              throw error;
+            }
+            // The node ends the stream after an error event. Opening the
+            // stream reset the backoff, so it grows with these events.
+            delayMs = Math.min(
+              options.reconnect.initialDelayMs *
+                2 ** (errorEventsWithoutProgress - 1),
+              options.reconnect.maxDelayMs,
+            );
+            break;
+          }
+          const change = JSON.parse(message.data) as ChangeEnvelope<T>;
+          validateChangeEnvelope(change);
+          if (change.operation === "reset_required") {
+            throw new ResetRequiredError(change as ChangeEnvelope);
+          }
 
-        if (
-          lastSequence !== undefined &&
-          compareSequences(change.sequence, lastSequence) <= 0
-        ) {
-          continue;
+          if (
+            lastSequence !== undefined &&
+            compareSequences(change.sequence, lastSequence) <= 0
+          ) {
+            continue;
+          }
+          lastSequence = change.sequence;
+          after = change.cursor;
+          errorEventsWithoutProgress = 0;
+          // The time the application spends on a change is not silence.
+          watchdog.disarm();
+          yield change;
+          watchdog.arm();
         }
-        lastSequence = change.sequence;
-        after = change.cursor;
-        yield change;
       }
     } catch (error) {
-      if (subscribeOptions.signal?.aborted) return;
-      if (!(error instanceof StreamReadError)) throw error;
-      // Resume only transport failures; malformed events and user callbacks
-      // must fail visibly instead of entering an endless reconnect loop.
+      if (signal?.aborted) return;
+      // Resume only transport failures; malformed events, terminal errors,
+      // and user callbacks must fail visibly instead of reconnecting forever.
+      if (!(error instanceof TransportError)) throw error;
+    } finally {
+      watchdog.disarm();
+      connection.abort();
     }
-    if (subscribeOptions.signal?.aborted) {
+    if (signal?.aborted) {
       break;
     }
     await abortableDelay(
       jitter(delayMs, options.reconnect.jitter),
-      subscribeOptions.signal,
+      signal,
     );
     delayMs = Math.min(delayMs * 2, options.reconnect.maxDelayMs);
   }
@@ -1365,89 +1410,85 @@ interface SseMessage {
   data?: string;
 }
 
-class StreamReadError extends Error {}
+/** The largest SSE event the client buffers before it fails the stream. */
+const MAX_SSE_EVENT_BYTES = 8 * 1024 * 1024;
+
+const LINE_FEED = 0x0a;
+const CARRIAGE_RETURN = 0x0d;
 
 export async function* parseSse(
   body: ReadableStream<Uint8Array>,
   signal?: AbortSignal,
 ): AsyncGenerator<SseMessage> {
-  const reader = body.getReader();
+  yield* sseMessages(readChunks(body, signal), signal);
+}
+
+/**
+ * Split SSE events at blank lines, scanning each byte once. Line endings are
+ * ASCII, so a scan by byte never splits a UTF-8 character.
+ */
+async function* sseMessages(
+  chunks: AsyncIterable<Uint8Array>,
+  signal: AbortSignal | undefined,
+): AsyncGenerator<SseMessage> {
   const decoder = new TextDecoder();
-  let buffer = "";
-  const cancel = () => { void reader.cancel().catch(() => undefined); };
-  signal?.addEventListener("abort", cancel, { once: true });
-  if (signal?.aborted) cancel();
-  try {
-    while (true) {
-      const { done, value } = await reader.read().catch((cause: unknown) => {
-        throw new StreamReadError("SSE connection interrupted", { cause });
-      });
-      buffer += decoder.decode(value, { stream: !done });
-      let boundary = findSseFrameBoundary(buffer, done);
-      while (boundary) {
-        if (signal?.aborted) return;
-        const frame = buffer.slice(0, boundary.index);
-        buffer = buffer.slice(boundary.index + boundary.length);
-        const parsed = parseSseFrame(frame);
-        if (parsed) {
-          yield parsed;
-        }
-        boundary = findSseFrameBoundary(buffer, done);
+  // The bytes received so far of the event in progress.
+  let pending: Uint8Array[] = [];
+  let pendingBytes = 0;
+  let lineEmpty = true;
+  let afterCarriageReturn = false;
+  for await (const chunk of chunks) {
+    let eventStart = 0;
+    for (let index = 0; index < chunk.length; index += 1) {
+      const byte = chunk[index];
+      if (byte === LINE_FEED && afterCarriageReturn) {
+        // The second half of a CRLF, which chunks may split.
+        afterCarriageReturn = false;
+        continue;
       }
-      if (done) {
-        // Only a blank line completes an SSE event. Discard a partial final
-        // frame so reconnect resumes from the last fully delivered cursor.
-        break;
+      afterCarriageReturn = byte === CARRIAGE_RETURN;
+      if (byte !== LINE_FEED && byte !== CARRIAGE_RETURN) {
+        lineEmpty = false;
+        continue;
+      }
+      if (!lineEmpty) {
+        lineEmpty = true;
+        continue;
+      }
+      // A blank line completes the event.
+      const tail = chunk.subarray(eventStart, index);
+      eventStart = index + 1;
+      if (pendingBytes + tail.length > MAX_SSE_EVENT_BYTES) {
+        throw sseEventTooLarge();
+      }
+      const event = concatBytes(pending, pendingBytes, tail);
+      pending = [];
+      pendingBytes = 0;
+      if (signal?.aborted) return;
+      const parsed = parseSseFrame(decoder.decode(event));
+      if (parsed) {
+        yield parsed;
       }
     }
-  } finally {
-    signal?.removeEventListener("abort", cancel);
-    await reader.cancel().catch(() => undefined);
-    reader.releaseLock();
+    const rest = chunk.subarray(eventStart);
+    if (rest.length > 0) {
+      pendingBytes += rest.length;
+      if (pendingBytes > MAX_SSE_EVENT_BYTES) {
+        throw sseEventTooLarge();
+      }
+      pending.push(rest);
+    }
   }
+  // Only a blank line completes an SSE event. A partial final event is
+  // discarded, so a reconnect resumes from the last complete one.
 }
 
-function findSseFrameBoundary(
-  buffer: string,
-  endOfStream: boolean,
-): { index: number; length: number } | null {
-  for (let index = 0; index < buffer.length; index += 1) {
-    const firstLength = sseLineEndingLength(buffer, index, endOfStream);
-    if (firstLength === 0) {
-      continue;
-    }
-    const secondLength = sseLineEndingLength(
-      buffer,
-      index + firstLength,
-      endOfStream,
-    );
-    if (secondLength > 0) {
-      return { index, length: firstLength + secondLength };
-    }
-    index += firstLength - 1;
-  }
-  return null;
-}
-
-function sseLineEndingLength(
-  buffer: string,
-  index: number,
-  endOfStream: boolean,
-): number {
-  const character = buffer[index];
-  if (character === "\n") {
-    return 1;
-  }
-  if (character !== "\r") {
-    return 0;
-  }
-  if (buffer[index + 1] === "\n") {
-    return 2;
-  }
-  if (index + 1 < buffer.length || endOfStream) {
-    return 1;
-  }
-  return 0;
+function sseEventTooLarge(): LeaniError {
+  return new LeaniError(`SSE event exceeds ${MAX_SSE_EVENT_BYTES} bytes`, {
+    status: 200,
+    code: "invalid_response",
+    retryable: false,
+  });
 }
 
 function parseSseFrame(frame: string): SseMessage | undefined {

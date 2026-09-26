@@ -11,7 +11,7 @@ generated: true
 
 import ReferenceTable from '@docs/components/docs/ReferenceTable.astro';
 
-The public package is `@smart-byte/leani-sdk`, for Node 20+ and Bun 1.2+. In a source
+The public package is `@smart-byte/leani-sdk`, for Node 20.3+ and Bun 1.2+. In a source
 checkout, run `bun install --cwd packages/sdk` and `bun run --cwd packages/sdk build`.
 The [query/follow guide](/docs/guides/query-then-follow/) includes an executable
 client, a matching node config, and pagination/reset handling.
@@ -34,9 +34,26 @@ Pass an `AbortSignal` to cancel an idle subscription; breaking out of the loop
 also cancels its response body. Transport disconnects reconnect from the last
 yielded cursor. Protocol errors and expired history require application action.
 An incomplete final event is discarded before reconnecting. Retryable HTTP
-errors, including rate limiting, use the configured reconnect backoff.
+errors, including rate limiting, use the configured reconnect backoff, and so
+do `error` events marked `retryable`; after five of them in a row without a new
+change, the subscription throws the last one. A stream that sends nothing, not
+even the node's 15-second keep-alive comments, for `idleTimeoutMs` (default
+60,000) while the loop waits reconnects too. An event over 8 MiB fails the
+subscription with a non-retryable `invalid_response` error.
 This print-only example does not maintain state; stateful consumers must apply
 undo mutations too.
+
+A request that fails below HTTP rejects with `TransportError`, a `LeaniError`
+with `status` 0, `code: "transport"`, `retryable: true`, and the runtime's error
+as `cause`: a refused or reset connection, a response body that breaks off, a
+passed deadline, or a silent stream. Aborting your own signal rejects with its
+reason instead, and the SDK never retries it. The SDK does not follow
+redirects: a 3xx answer rejects with the non-retryable `redirect_refused`, with
+the target in `details.location`, so configure the final URL as `baseUrl`.
+Every request path resolves under the base URL's path, one starting with `/`
+included. A path segment that decodes to `.` or `..`, or holds a backslash, an
+encoded slash or backslash, or an encoded percent sign, and a control character
+anywhere in the path, are refused before any request.
 
 Typed subscriptions accept `processor` to select a configured instance, for
 example `leani.blobs.subscribe({ processor: "blobs-production" })`. The blobs
@@ -59,9 +76,19 @@ when delivery is disabled.
 
 Durable live/history sessions live in `@smart-byte/leani-sdk/backfill`. Construct them with
 `createBackfillSubscriptionClient({ baseUrl, token, fetch, timeoutMs })`; both
-entry points use the same `LeaniError` class and HTTP error fields (`status`,
-`code`, `retryable`, `requestId`). The deadline applies to JSON requests, not to
-established streams. Always close delivery sessions in `finally`. Commit
+entry points use the same `LeaniError` and `TransportError` classes and HTTP
+error fields (`status`, `code`, `retryable`, `requestId`). The deadline applies
+to JSON requests, lease renewals, and acknowledgements, and to a stream until
+its hello arrives. An established stream that sends nothing, heartbeats
+included, for three `heartbeatIntervalMs` while its iterator waits fails with a
+`TransportError`; time spent handling a record does not count. A lease renewal
+that fails with a retryable error is retried with backoff while the lease
+holds; one that fails otherwise, or keeps failing until the lease would lapse,
+ends the session at once, and the iterator throws its error. The lanes of
+`subscribe()` reconnect after either, and after any other retryable error. A
+stream record over 65 MiB fails the session with a non-retryable
+`invalid_response` error; request smaller batches with
+`batching.maximumEncodedBytes`. Always close delivery sessions in `finally`. Commit
 idempotent destination writes before acknowledging a batch. Acknowledge a
 batch's boundary, never a change's own cursor: the node refuses one inside a
 live block or a history progress unit. A backfill session's `deliveryBatches()`

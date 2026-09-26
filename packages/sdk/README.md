@@ -29,10 +29,13 @@ const summary = await leani.request<Summary>(
 );
 ```
 
-The client rejects absolute and protocol-relative URLs before attaching a
-bearer token. Prefer the canonical instance-scoped `basePath` from capability
-discovery; short aliases may be absent when several instances share one
-extension.
+The client rejects absolute and protocol-relative URLs, path segments that
+decode to `.` or `..`, backslashes, encoded slashes, backslashes, and percent
+signs, and control characters before attaching a bearer token. Every path
+resolves under the base URL's path, one starting with `/` included, and the SDK
+does not follow redirects. Prefer the canonical instance-scoped `basePath` from
+capability discovery; short aliases may be absent when several instances share
+one extension.
 
 When an alias is absent, pass the discovered canonical path to the typed
 helper instead of giving up its response types:
@@ -79,7 +82,9 @@ with `boundaryCursor` and `recovery.follow` set to `null`. `queryAndFollow()`
 requires delivery and otherwise returns HTTP 409 `delivery_disabled`.
 
 Both package entry points use `LeaniError` for HTTP failures, including status,
-code, retryability, and request ID. ResetRequiredError is a LeaniError with
+code, retryability, and request ID. A failure below HTTP, such as a refused or
+reset connection or a silent stream, is a retryable `TransportError`, a
+`LeaniError` with status 0. ResetRequiredError is a LeaniError with
 `code: "cursor_expired"`; rebuild application state from a fresh snapshot.
 
 ## License

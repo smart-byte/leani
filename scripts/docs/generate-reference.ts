@@ -177,6 +177,7 @@ async function configReference(repositoryRoot: string): Promise<JsonObject> {
 
 async function sdkReference(repositoryRoot: string): Promise<JsonObject> {
   const ts = siteRequire(repositoryRoot)('typescript') as any;
+  const packageName = (await readJson(resolve(repositoryRoot, 'packages/sdk/package.json'))).name as string;
   const methods: JsonObject[] = [];
   const types: JsonObject[] = [];
   for (const module of ['index', 'backfill', 'errors']) {
@@ -203,10 +204,11 @@ async function sdkReference(repositoryRoot: string): Promise<JsonObject> {
       if (ts.isInterfaceDeclaration(statement) && ['LeaniClient', 'BackfillSubscriptionClient'].includes(name)) {
         visit(statement.members, module === 'backfill' ? 'backfill' : '');
       }
+      const entryPoint = module === 'backfill' ? `${packageName}/backfill` : packageName;
       if (ts.isInterfaceDeclaration(statement) || ts.isTypeAliasDeclaration(statement)) {
-        types.push({ name, module: module === 'backfill' ? '@smart-byte/leani-sdk/backfill' : '@smart-byte/leani-sdk', signature: statement.getText(file) });
+        types.push({ name, module: entryPoint, signature: statement.getText(file) });
       } else if (ts.isFunctionDeclaration(statement) && module !== 'errors') {
-        types.push({ name, module: module === 'backfill' ? '@smart-byte/leani-sdk/backfill' : '@smart-byte/leani-sdk',
+        types.push({ name, module: entryPoint,
           signature: source.slice(statement.getStart(file), statement.body?.pos ?? statement.end).trim() + ';' });
       }
     }

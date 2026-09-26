@@ -217,7 +217,9 @@ paths:
             Resumable SSE stream. The event id is the opaque resume cursor and
             each data field contains one ChangeEnvelope. When the node shuts
             down, the stream ends after a whole event; reconnect after the
-            last event's id.
+            last event's id. An `error` event carries an ErrorBody and ends
+            the stream; reconnect only when its `retryable` is true. A stored
+            change the node cannot render is not retryable.
           content:
             text/event-stream:
               schema:

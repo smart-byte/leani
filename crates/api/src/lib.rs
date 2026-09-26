@@ -4464,6 +4464,10 @@ async fn poll_live_consumer(
     if stream_state.terminal {
         return None;
     }
+    // The heartbeat is due one interval after the previous record. Any
+    // processor's commit wakes this stream, so a fresh interval per wake-up
+    // would starve an idle stream of heartbeats on a busy node.
+    let heartbeat_due = tokio::time::Instant::now() + stream_state.state.config.heartbeat_interval;
     loop {
         if let Some((first, block_records)) = whole_live_block(
             &stream_state.fetched,
@@ -4655,7 +4659,7 @@ async fn poll_live_consumer(
             Ok(_) => {
                 tokio::select! {
                     () = stream_state.state.store.wait_for_delivery_changes() => {}
-                    () = tokio::time::sleep(stream_state.state.config.heartbeat_interval) => {
+                    () = tokio::time::sleep_until(heartbeat_due) => {
                         if !live_stream_session_is_current(&stream_state).await {
                             stream_state.terminal = true;
                             return Some((
@@ -4940,6 +4944,9 @@ async fn poll_backfill_consumer(
     if stream_state.terminal {
         return None;
     }
+    // Due one interval after the previous record, however often other
+    // streams' changes or acknowledgements wake this one.
+    let heartbeat_due = tokio::time::Instant::now() + stream_state.state.config.heartbeat_interval;
     loop {
         if let Some(completion_sequence) = stream_state.completion_sequence {
             let acknowledged = stream_state
@@ -4960,7 +4967,7 @@ async fn poll_backfill_consumer(
             }
             tokio::select! {
                 () = stream_state.state.store.wait_for_delivery_capacity_change() => {}
-                () = tokio::time::sleep(stream_state.state.config.heartbeat_interval) => {
+                () = tokio::time::sleep_until(heartbeat_due) => {
                     if !backfill_stream_session_is_current(&stream_state).await {
                         stream_state.terminal = true;
                         return Some((
@@ -5096,20 +5103,21 @@ async fn poll_backfill_consumer(
                     stream_state.terminal = true;
                     return Some((Ok(ndjson_failure(code, message, None, None)), stream_state));
                 }
-                let batch_pending = stream_state.pending_batch.is_some();
-                let wait = stream_state.pending_batch.as_ref().map_or(
-                    stream_state.state.config.heartbeat_interval,
-                    |batch| {
-                        stream_state
+                let batch_due = stream_state.pending_batch.as_ref().map(|batch| {
+                    tokio::time::Instant::now()
+                        + stream_state
                             .batch_limits
                             .maximum_delay
                             .saturating_sub(batch.started.elapsed())
-                    },
-                );
+                });
+                // A pending batch waits for its delay, which may be longer
+                // than a client's idle limit, so heartbeats keep their
+                // schedule meanwhile. They leave the batch as it is.
+                let wake_at = batch_due.map_or(heartbeat_due, |due| due.min(heartbeat_due));
                 tokio::select! {
                     () = stream_state.state.store.wait_for_delivery_changes() => {}
-                    () = tokio::time::sleep(wait) => {
-                        if batch_pending {
+                    () = tokio::time::sleep_until(wake_at) => {
+                        if batch_due.is_some_and(|due| due <= tokio::time::Instant::now()) {
                             continue;
                         }
                         if !backfill_stream_session_is_current(&stream_state).await {
@@ -7216,11 +7224,14 @@ fn change_envelope_with_stream(
     record: ChangeRecord,
 ) -> Result<ChangeEnvelope, ApiError> {
     let cursor = if let Some(stream_id) = stream_id {
-        encode_stream_cursor(state, processor, stream_id, record.cursor.sequence)?
+        encode_stream_cursor(state, processor, stream_id, record.cursor.sequence)
     } else {
-        encode_change_cursor(state, processor, &record.cursor)?
+        encode_change_cursor(state, processor, &record.cursor)
     };
-    render_change_envelope(processor, cursor, record)
+    // Rendering a stored change fails the same way on every attempt.
+    cursor
+        .and_then(|cursor| render_change_envelope(processor, cursor, record))
+        .map_err(ApiError::not_retryable)
 }
 
 /// Render one stored change with the same stable envelope used by the HTTP
@@ -7243,8 +7254,11 @@ pub fn change_envelope_json(
         processor_id: processor.descriptor().instance.to_string(),
         processor_version: processor.descriptor().version.to_string(),
         sequence: record.cursor.sequence,
-    })?;
-    serde_json::to_value(render_change_envelope(processor, cursor, record)?).map_err(ApiError::from)
+    })
+    .map_err(ApiError::not_retryable)?;
+    let envelope =
+        render_change_envelope(processor, cursor, record).map_err(ApiError::not_retryable)?;
+    serde_json::to_value(envelope).map_err(ApiError::from)
 }
 
 #[allow(clippy::too_many_lines)]
@@ -7816,6 +7830,13 @@ impl ApiError {
         Self::new(StatusCode::INTERNAL_SERVER_ERROR, "internal", message, true)
     }
 
+    /// The same error, marked as one a retry would repeat, such as stored
+    /// data the node cannot decode or render.
+    fn not_retryable(mut self) -> Self {
+        self.retryable = false;
+        self
+    }
+
     fn new(status: StatusCode, code: &'static str, message: &str, retryable: bool) -> Self {
         Self {
             status,
@@ -7982,6 +8003,11 @@ impl From<StoreError> for ApiError {
             | StoreError::ConflictingArtifact(_)) => {
                 Self::conflict("artifact_replay_conflict", &matched.to_string())
             }
+            // Stored data that fails to decode fails the same way on retry.
+            matched @ (StoreError::Invariant(_)
+            | StoreError::Encoding(_)
+            | StoreError::Numeric(_)
+            | StoreError::Json(_)) => Self::internal(&matched.to_string()).not_retryable(),
             other => Self::internal(&other.to_string()),
         }
     }
@@ -7989,13 +8015,13 @@ impl From<StoreError> for ApiError {
 
 impl From<serde_json::Error> for ApiError {
     fn from(error: serde_json::Error) -> Self {
-        Self::internal(&error.to_string())
+        Self::internal(&error.to_string()).not_retryable()
     }
 }
 
 impl From<std::fmt::Error> for ApiError {
     fn from(error: std::fmt::Error) -> Self {
-        Self::internal(&error.to_string())
+        Self::internal(&error.to_string()).not_retryable()
     }
 }
 
@@ -10151,6 +10177,516 @@ mod tests {
             .await
             .expect("replacement response");
         assert_eq!(replacement.status(), StatusCode::OK);
+    }
+
+    /// The heartbeat interval of the heartbeat schedule tests.
+    const SHORT_HEARTBEAT: Duration = Duration::from_millis(300);
+
+    /// Wake every waiting delivery stream several times per `SHORT_HEARTBEAT`,
+    /// as other processors' commits and acknowledgements do, until aborted.
+    fn wake_delivery_streams(store: SqliteStore) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            let other = leani_testkit::BlockLocalCounter::named("other-counter");
+            store
+                .register_processor(other.descriptor())
+                .await
+                .expect("register the other processor");
+            let stream_id = default_delivery_stream_id(other.descriptor());
+            for number in 1.. {
+                // A published change wakes the streams waiting for changes,
+                // and a prune those waiting for delivery capacity.
+                apply_finalized_blocks(&store, &other, number..=number).await;
+                store
+                    .prune_changes_before_in_stream(other.descriptor(), &stream_id, 0)
+                    .await
+                    .expect("prune nothing");
+                tokio::time::sleep(SHORT_HEARTBEAT / 6).await;
+            }
+        })
+    }
+
+    /// Read a delivery stream's next record while other streams' wake-ups
+    /// keep arriving, allowing two heartbeat intervals.
+    async fn next_record_while_others_wake(
+        store: &SqliteStore,
+        body: &mut (impl Stream<Item = Result<Bytes, axum::Error>> + Unpin),
+        buffered: &mut Vec<u8>,
+    ) -> Value {
+        let waker = wake_delivery_streams(store.clone());
+        let record =
+            tokio::time::timeout(SHORT_HEARTBEAT * 2, next_ndjson_record(body, buffered)).await;
+        waker.abort();
+        record.expect("a record within two heartbeat intervals")
+    }
+
+    #[tokio::test]
+    async fn live_consumer_stream_heartbeats_on_schedule_while_other_processors_publish() {
+        // Every processor's commit woke the idle stream, which then restarted
+        // its full heartbeat interval: on a busy node it never sent one, and
+        // the SDK's idle watchdog would reconnect it.
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = SqliteStore::open(leani_store_sqlite::StoreConfig::new(
+            directory.path().join("node.sqlite"),
+        ))
+        .await
+        .expect("store");
+        let counter = leani_testkit::BlockLocalCounter::default().with_split_delivery();
+        let lifecycle =
+            acknowledged_delivery(counter.descriptor().lifecycle.clone(), "destination");
+        let processor = Arc::new(counter.with_lifecycle(lifecycle));
+        store
+            .register_processor(processor.descriptor())
+            .await
+            .expect("register processor");
+        store
+            .create_consumer_in_stream(
+                processor.descriptor(),
+                &default_delivery_stream_id(processor.descriptor()),
+                "destination",
+                ConsumerRole::Required,
+                ConsumerStartPosition::EarliestRetained,
+                Duration::from_secs(30),
+            )
+            .await
+            .expect("consumer");
+        let app = router_with_processors(
+            store.clone(),
+            vec![processor],
+            Vec::new(),
+            ApiConfig {
+                heartbeat_interval: SHORT_HEARTBEAT,
+                ..ApiConfig::default()
+            },
+        )
+        .expect("router");
+        let response = app
+            .oneshot(
+                Request::get(
+                    "/v1/processors/synthetic-counter/streams/live/consumers/destination/stream",
+                )
+                .body(Body::empty())
+                .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let mut body = response.into_body().into_data_stream();
+        let mut buffered = Vec::new();
+        assert_eq!(
+            next_ndjson_record(&mut body, &mut buffered).await["type"],
+            "hello"
+        );
+        let record = next_record_while_others_wake(&store, &mut body, &mut buffered).await;
+        assert_eq!(record["type"], "heartbeat", "{record}");
+    }
+
+    /// What the history stream of `history_stream_router` has published.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum HistoryFixture {
+        /// Nothing yet; the subscription still runs.
+        Waiting,
+        /// Block 1's progress unit, a batch pending for `PENDING_BATCH_DELAY`.
+        Pending,
+        /// Block 1's progress unit and the completion.
+        Completed,
+    }
+
+    /// Longer than three `SHORT_HEARTBEAT`s, the SDK's idle limit.
+    const PENDING_BATCH_DELAY: Duration = Duration::from_secs(3);
+
+    /// Serve the history stream of a backfill subscription over block 1.
+    #[allow(clippy::too_many_lines)]
+    async fn history_stream_router(store: &SqliteStore, fixture: HistoryFixture) -> Router {
+        use leani_testkit::{BlockLocalCounter, fixture_frame};
+
+        let processor = Arc::new(BlockLocalCounter::default().with_split_delivery());
+        store
+            .register_processor(processor.descriptor())
+            .await
+            .expect("register processor");
+        let subscription_id = "heartbeat-fixture";
+        let stream_id = store
+            .create_backfill_delivery_stream(processor.descriptor(), subscription_id)
+            .await
+            .expect("history stream")
+            .stream_id;
+        store
+            .create_consumer_in_stream(
+                processor.descriptor(),
+                &stream_id,
+                "destination",
+                ConsumerRole::Required,
+                ConsumerStartPosition::EarliestRetained,
+                Duration::from_secs(30),
+            )
+            .await
+            .expect("consumer");
+        let range =
+            leani_primitives::BlockRange::new(BlockNumber(1), BlockNumber(1)).expect("range");
+        let completed = fixture == HistoryFixture::Completed;
+        if fixture != HistoryFixture::Waiting {
+            let job = leani_store_sqlite::JobRecord {
+                id: subscription_id.to_owned(),
+                kind: "backfill_subscription_job".to_owned(),
+                state: leani_store_sqlite::JobState::Queued,
+                payload: b"heartbeat-fixture".to_vec(),
+                checkpoint: None,
+                attempts: 0,
+                updated_at_unix_ms: 1,
+            };
+            store
+                .create_backfill_subscription_job(
+                    &leani_store_sqlite::BackfillSubscriptionRecord {
+                        subscription_id: subscription_id.to_owned(),
+                        job_id: job.id.clone(),
+                        processor_instance: processor.descriptor().instance.to_string(),
+                        history_stream_id: stream_id.clone(),
+                        mode: leani_store_sqlite::BackfillSubscriptionMode::FillMissing,
+                        publication_revision: 0,
+                        state: leani_store_sqlite::BackfillSubscriptionState::Queued,
+                        consumer_id: "destination".to_owned(),
+                        ranges: vec![range],
+                        range,
+                        preexisting_coverage: Vec::new(),
+                        captured_finalized_target: BlockNumber(1),
+                        idempotency_key: "heartbeat-fixture".to_owned(),
+                        effective_block_limit: 1,
+                        effective_byte_limit: 1024 * 1024,
+                        resume_below_ratio_millionths: 750_000,
+                        delivery_batch_limits:
+                            leani_store_sqlite::BackfillDeliveryBatchLimits::default(),
+                        initial_sequence: 0,
+                        completion_sequence: None,
+                        processed_work_blocks: 0,
+                    },
+                    &job,
+                    BlockHash::new([4; 32]),
+                )
+                .await
+                .expect("subscription");
+            let frame = fixture_frame(1, BlockHash::ZERO);
+            let delta = processor.map(&frame).await.expect("map");
+            store
+                .apply_with_change_publication_to_stream(
+                    processor.as_ref(),
+                    ProcessorCursor {
+                        chain_id: frame.chain_id,
+                        processor_id: processor.descriptor().id.to_string(),
+                        processor_version: processor.descriptor().version.to_string(),
+                        block_number: frame.block.number,
+                        block_hash: frame.block.hash,
+                        finality: Finality::Finalized,
+                        sequence: 1,
+                    },
+                    &delta,
+                    &[],
+                    true,
+                    &stream_id,
+                )
+                .await
+                .expect("history apply");
+        }
+        if completed {
+            store
+                .append_backfill_completion(
+                    processor.descriptor(),
+                    &stream_id,
+                    ChainId(1),
+                    BlockNumber(1),
+                )
+                .await
+                .expect("completion");
+        }
+        let control = Arc::new(StaticBackfillControl {
+            status: BackfillStatus {
+                id: subscription_id.to_owned(),
+                owner: HistoricalWorkOwner::Subscription,
+                processor: processor.descriptor().instance.to_string(),
+                delivery_stream_id: Some(stream_id),
+                publication_revision: Some("0".to_owned()),
+                from_block: 1,
+                to_block: 1,
+                ranges: vec![BackfillRange {
+                    from_block: 1,
+                    to_block: 1,
+                }],
+                requested_blocks: 1,
+                processed_blocks: u64::from(completed),
+                remaining_blocks: u64::from(!completed),
+                captured_finalized_target: Some(1),
+                mode: BackfillExecutionMode::FillMissing,
+                batching: None,
+                state: if completed {
+                    BackfillState::Draining
+                } else {
+                    BackfillState::Running
+                },
+                attempts: 1,
+                updated_at_unix_ms: 1,
+                report: None,
+                last_error: None,
+            },
+        });
+        router_with_processors(
+            store.clone(),
+            vec![processor],
+            Vec::new(),
+            ApiConfig {
+                backfill_control: Some(control),
+                heartbeat_interval: SHORT_HEARTBEAT,
+                history_batch_limits: DeliveryBatchLimits {
+                    maximum_delay: PENDING_BATCH_DELAY,
+                    ..DeliveryBatchLimits::history_default()
+                },
+                ..ApiConfig::default()
+            },
+        )
+        .expect("router")
+    }
+
+    const HEARTBEAT_HISTORY_STREAM: &str =
+        "/v1/backfill-subscriptions/heartbeat-fixture/consumers/destination/stream";
+
+    #[tokio::test]
+    async fn waiting_history_stream_heartbeats_on_schedule_while_other_processors_publish() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = SqliteStore::open(leani_store_sqlite::StoreConfig::new(
+            directory.path().join("node.sqlite"),
+        ))
+        .await
+        .expect("store");
+        let response = history_stream_router(&store, HistoryFixture::Waiting)
+            .await
+            .oneshot(
+                Request::get(HEARTBEAT_HISTORY_STREAM)
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let mut body = response.into_body().into_data_stream();
+        let mut buffered = Vec::new();
+        assert_eq!(
+            next_ndjson_record(&mut body, &mut buffered).await["type"],
+            "hello"
+        );
+        let record = next_record_while_others_wake(&store, &mut body, &mut buffered).await;
+        assert_eq!(record["type"], "heartbeat", "{record}");
+    }
+
+    #[tokio::test]
+    async fn completed_history_stream_heartbeats_on_schedule_while_capacity_changes() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = SqliteStore::open(leani_store_sqlite::StoreConfig::new(
+            directory.path().join("node.sqlite"),
+        ))
+        .await
+        .expect("store");
+        let response = history_stream_router(&store, HistoryFixture::Completed)
+            .await
+            .oneshot(
+                Request::get(HEARTBEAT_HISTORY_STREAM)
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let mut body = response.into_body().into_data_stream();
+        let mut buffered = Vec::new();
+        for expected in ["hello", "batch", "backfill_complete"] {
+            let record = next_ndjson_record(&mut body, &mut buffered).await;
+            assert_eq!(record["type"], expected, "{record}");
+        }
+        // The stream now waits for the completion's acknowledgement.
+        let record = next_record_while_others_wake(&store, &mut body, &mut buffered).await;
+        assert_eq!(record["type"], "heartbeat", "{record}");
+    }
+
+    #[tokio::test]
+    async fn pending_history_batch_does_not_hold_back_heartbeats() {
+        // A batch below its target waited for its delay without heartbeats,
+        // so a `maximumDelayMs` over three heartbeat intervals tripped the
+        // SDK's idle limit on every connection.
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = SqliteStore::open(leani_store_sqlite::StoreConfig::new(
+            directory.path().join("node.sqlite"),
+        ))
+        .await
+        .expect("store");
+        let response = history_stream_router(&store, HistoryFixture::Pending)
+            .await
+            .oneshot(
+                Request::get(HEARTBEAT_HISTORY_STREAM)
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let mut body = response.into_body().into_data_stream();
+        let mut buffered = Vec::new();
+        assert_eq!(
+            next_ndjson_record(&mut body, &mut buffered).await["type"],
+            "hello"
+        );
+        let opened = Instant::now();
+        let record = tokio::time::timeout(
+            SHORT_HEARTBEAT * 2,
+            next_ndjson_record(&mut body, &mut buffered),
+        )
+        .await
+        .expect("a heartbeat while the batch is pending");
+        assert_eq!(record["type"], "heartbeat", "{record}");
+        // Heartbeats neither flush nor reorder the batch: it follows at its
+        // own deadline.
+        let batch = loop {
+            let record = next_ndjson_record(&mut body, &mut buffered).await;
+            if record["type"] != "heartbeat" {
+                break record;
+            }
+        };
+        assert_eq!(batch["type"], "batch", "{batch}");
+        assert!(opened.elapsed() >= PENDING_BATCH_DELAY / 2);
+    }
+
+    /// A counter whose stored changes cannot be rendered as JSON.
+    #[derive(Debug)]
+    struct UnrenderableCounter(leani_testkit::BlockLocalCounter);
+
+    #[async_trait]
+    impl Processor for UnrenderableCounter {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
+        fn descriptor(&self) -> &ProcessorDescriptor {
+            self.0.descriptor()
+        }
+
+        async fn map(
+            &self,
+            block: &leani_primitives::BlockFrame,
+        ) -> Result<leani_processor_api::EncodedDelta, leani_processor_api::ProcessorError>
+        {
+            self.0.map(block).await
+        }
+
+        async fn reduce(
+            &self,
+            transaction: &mut dyn leani_processor_api::ReducerTransaction,
+            cursor: &ProcessorCursor,
+            delta: &leani_processor_api::EncodedDelta,
+        ) -> Result<leani_processor_api::DomainChanges, leani_processor_api::ProcessorError>
+        {
+            self.0.reduce(transaction, cursor, delta).await
+        }
+
+        fn change_json(
+            &self,
+            _change: &leani_processor_api::DomainChange,
+        ) -> Result<Option<Value>, leani_processor_api::ProcessorError> {
+            Err(leani_processor_api::ProcessorError::Invariant(
+                "stored change has an unknown layout".to_owned(),
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn changes_that_cannot_be_rendered_are_not_retryable() {
+        // Audit M-D3: rendering a stored change fails the same way on every
+        // attempt. Marked retryable, it would make the SDK reconnect forever.
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = SqliteStore::open(leani_store_sqlite::StoreConfig::new(
+            directory.path().join("node.sqlite"),
+        ))
+        .await
+        .expect("store");
+        let processor = Arc::new(UnrenderableCounter(
+            leani_testkit::BlockLocalCounter::default(),
+        ));
+        store
+            .register_processor(processor.descriptor())
+            .await
+            .expect("register processor");
+        apply_finalized_blocks(&store, processor.as_ref(), 1..=1).await;
+        let app = router_with_processors(store, vec![processor], Vec::new(), ApiConfig::default())
+            .expect("router");
+
+        let page = app
+            .clone()
+            .oneshot(
+                Request::get("/v1/processors/synthetic-counter/changes")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(page.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let page: Value = serde_json::from_slice(
+            &to_bytes(page.into_body(), usize::MAX)
+                .await
+                .expect("error body"),
+        )
+        .expect("error JSON");
+        assert_eq!(page["error"]["retryable"], false, "{page}");
+
+        let stream = app
+            .oneshot(
+                Request::get("/v1/processors/synthetic-counter/stream")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(stream.status(), StatusCode::OK);
+        let mut body = stream.into_body().into_data_stream();
+        let mut text = String::new();
+        let error = loop {
+            if let Some(start) = text.find("event: error\n")
+                && let Some(end) = text[start..].find("\n\n")
+            {
+                let frame = &text[start..start + end];
+                let data = frame
+                    .lines()
+                    .find_map(|line| line.strip_prefix("data: "))
+                    .expect("error data");
+                break serde_json::from_str::<Value>(data).expect("error JSON");
+            }
+            let chunk = tokio::time::timeout(Duration::from_secs(5), body.next())
+                .await
+                .expect("SSE frame in time")
+                .expect("SSE frame")
+                .expect("SSE bytes");
+            text.push_str(std::str::from_utf8(&chunk).expect("UTF-8 frame"));
+        };
+        assert_eq!(error["error"]["retryable"], false, "{error}");
+    }
+
+    #[tokio::test]
+    async fn stored_data_that_cannot_be_decoded_is_not_retryable() {
+        for error in [
+            StoreError::Invariant("stored hash is not 32 bytes".to_owned()),
+            StoreError::Encoding("unknown durable layout".to_owned()),
+            StoreError::Numeric("sequence"),
+            StoreError::Json(serde_json::from_str::<Value>("{").expect_err("truncated JSON")),
+        ] {
+            let error = ApiError::from(error);
+            assert_eq!(error.status, StatusCode::INTERNAL_SERVER_ERROR);
+            assert!(!error.retryable, "{}", error.message);
+        }
+        // A failed read may succeed when retried, SQLite's own failures
+        // included: this one cannot open a directory as a database.
+        assert!(ApiError::from(StoreError::Io(std::io::Error::other("disk busy"))).retryable);
+        let directory = tempfile::tempdir().expect("tempdir");
+        let sqlite = SqliteStore::open(leani_store_sqlite::StoreConfig::new(
+            directory.path().to_path_buf(),
+        ))
+        .await
+        .expect_err("a directory is not a database");
+        assert!(matches!(sqlite, StoreError::Sqlx(_)), "{sqlite}");
+        assert!(ApiError::from(sqlite).retryable);
     }
 
     #[tokio::test]

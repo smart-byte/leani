@@ -220,6 +220,21 @@ record, and documented RPC contracts.
   reports the requested bytes; it reported the selected ones.
 - A local archive refuses an object path that crosses a symbolic link below
   the manifest's directory, and checks an object's size before reading it.
+- Breaking (SDK): both SDK clients refuse redirects instead of following them,
+  which could send the bearer token, a consumer credential, or a session token
+  to another origin. A 3xx answer rejects with a non-retryable `LeaniError`
+  with code `redirect_refused`, its status, and the `Location` in its message
+  and in `details.location`; so does an answer that a custom `fetch` reached
+  by following a redirect. `subscribe()` throws it at once instead of
+  retrying. Configure the final URL as `baseUrl`.
+- Breaking (SDK): request paths stay under the base URL's path. A path that
+  starts with `/`, such as a capabilities `basePath`, is joined under a
+  prefixed `baseUrl` instead of addressing the origin's root. A path segment
+  that decodes to `.` or `..`, or that holds a backslash, an encoded slash or
+  backslash, or an encoded percent sign, is refused with a `TypeError` before
+  any request, and so is a control character anywhere in the path. An ID such
+  as `..` or `../../other` resolved to another route, directly or through a
+  proxy that decodes `%2F` first. No Leani ID contains these characters.
 
 ### Changed
 
@@ -349,6 +364,42 @@ record, and documented RPC contracts.
   including batches without changes and the completion, in the shape of the
   unified history lane. `events()` is unchanged and carries no boundary; do
   not acknowledge a change's own cursor.
+- Breaking (SDK): a request that fails below HTTP rejects with the new
+  `TransportError`: a `LeaniError` with `status` 0, `code: "transport"`,
+  `retryable: true`, and the runtime's error as `cause`. That covers a refused
+  or reset connection, a response body that breaks off, a passed deadline,
+  and a silent stream. Both clients rejected with the runtime's own error, a
+  `TypeError`, an `Error`, or a `TimeoutError`, and the delivery lanes
+  recognized few of them by their message: Bun's refused connections and
+  socket resets, and Node's `terminated`, ended a lane instead of
+  reconnecting it. The lanes now reconnect after any retryable `LeaniError`.
+  An abort of the caller's own signal is passed through unchanged, and never
+  retried.
+- Breaking (SDK): `subscribe()` reconnects after an `error` event marked
+  `retryable`, from the last yielded cursor and with the reconnect backoff;
+  it threw every error event. After five retryable error events in a row
+  without a new change, it throws the last one. It also reconnects when the
+  stream stays silent, the node's 15-second keep-alive comments included, for
+  the new `idleTimeoutMs` option, 60 seconds by default.
+- Breaking (SDK): a delivery session from `stream()`, `streamLive()`, or
+  `subscribe()` fails with a `TransportError` when its stream sends nothing,
+  heartbeats included, for three `heartbeatIntervalMs` while the iterator
+  waits, or sends no hello within `timeoutMs`. A lease renewal that fails
+  with a retryable error is retried with backoff while the lease holds. One
+  that fails otherwise, or keeps failing until the lease would lapse, ends the
+  session at once, and the iterator throws its error; the first failure used
+  to go unnoticed until the next record arrived. Lease renewals,
+  acknowledgements, lease releases, and `changes()` observe `timeoutMs` too.
+  The lanes of `subscribe()` reconnect after each of these. A stream record
+  over 65 MiB fails the session with a non-retryable `invalid_response` error;
+  request smaller batches with `batching.maximumEncodedBytes`.
+- SDK: the package requires Node 20.3 or later, the first with
+  `AbortSignal.any`, adds a `default` export condition beside `import`, and
+  embeds the TypeScript sources in its source maps.
+- The PostgreSQL example keys applied changes and its stored cursor by the
+  durable consumer's stream too. A node whose store is replaced numbers its
+  changes from the start again, which the example took for changes it had
+  already applied. Drop the example's two tables before running it again.
 - `THIRD_PARTY_LICENSES.txt` is now committed, verified against `Cargo.lock`
   in CI, and linked from the README and site. It adds the Apache-2.0 NOTICE
   files of the Arrow, Parquet, object_store, and Moka dependencies, which the
@@ -1479,6 +1530,30 @@ record, and documented RPC contracts.
   value by value, and check that every shipped configuration loads, uses only
   schema keys, and, apart from the two checkpoint templates, validates. An
   output window allows exactly one limit, as validation already required.
+- Delivery streams heartbeat on schedule while other processors publish. An
+  idle live or backfill consumer stream restarted its heartbeat interval
+  whenever another processor's commit or another consumer's acknowledgement
+  woke it, so on a busy node it sent none. A backfill stream also sent none
+  while a batch waited for its `maximumDelayMs`. Each now sends one at most
+  `heartbeatIntervalMs` after its previous record; a heartbeat leaves a
+  waiting batch as it is.
+- A stored change the node cannot render, or stored data it cannot decode,
+  now fails with `retryable: false`, on the changes page, in the SSE `error`
+  event, and on every other route. A retry fails the same way, but these
+  errors were marked retryable.
+- The SDK's delivery sessions no longer leave an abort listener behind for
+  each lease renewal, or on the caller's signal for each session that fails
+  to open.
+- The SDK's SSE and NDJSON parsers scan each received byte once; they
+  rescanned the whole buffered event or record for every chunk. An SSE event
+  over 8 MiB fails the subscription, and a delivery record over 65 MiB the
+  session, with a non-retryable `invalid_response` error instead of growing
+  the buffer without bound.
+- SDK `subscribe()` resets its reconnect backoff once a stream opens, so a
+  quiet but healthy stream reconnects promptly after earlier failures; error
+  events that make no progress still back off. Closing a lane of the backfill
+  client's `subscribe()` no longer rethrows the caller's abort reason when it
+  is not an `AbortError`.
 
 ## [0.1.0-rc.1] - 2026-09-20
 
