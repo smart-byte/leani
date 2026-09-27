@@ -694,6 +694,9 @@ describe("paths under a prefixed base URL", () => {
       () => client.request("v1/%2e%2e%2fadmin"),
       () => client.request("v1/%252e%252e/admin"),
       () => client.request("v1/.\t./admin"),
+      // Final review B6: so may a control character a proxy decodes.
+      () => client.request("v1/.%09./admin"),
+      () => client.request("v1/..%00/admin"),
       () => client.request("v1/..%5Cadmin"),
       () => client.request("v1/%c0%ae%c0%ae/admin"),
       () => client.processors.status("../../../other"),

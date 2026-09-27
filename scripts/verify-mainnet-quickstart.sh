@@ -65,7 +65,7 @@ done
 api_base="http://127.0.0.1:$LEANI_VERIFY_API_PORT/v1/processors/uniswap-v2-sync-30d"
 curl -fsS "$api_base/status" > "$verification_dir/coverage.json"
 curl -fsS -X POST -H 'content-type: application/json' --data '{"limit":3}' \
-  "$api_base/collections/uniswap_v2.sync_hourly/entities" > "$verification_dir/entities.json"
+  "$api_base/collections/uniswap_v2.sync/entities" > "$verification_dir/entities.json"
 snapshot_id="$(python3 - "$verification_dir" "$leani_binary" <<'PY'
 from datetime import datetime, timezone
 from pathlib import Path

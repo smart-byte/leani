@@ -81,6 +81,8 @@ jobs:
         run: scripts/test-release-packaging.sh
       - name: Match the container Rust image to rust-toolchain.toml
         run: ruby scripts/check-container-toolchain.rb
+      - name: Match documented SDK installs to the SDK package version
+        run: ruby scripts/check-sdk-pins.rb
       - name: Validate release CI requirements
         run: ruby scripts/test-release-ci.rb
       - name: Validate artifact privacy checks

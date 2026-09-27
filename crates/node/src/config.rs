@@ -1868,19 +1868,19 @@ fn beneath(directory: &Path, path: &Path) -> PathBuf {
 }
 
 /// A relative `data_dir` was under the working directory before it was
-/// beside its configuration file. Name both directories while Leani state,
-/// a node store or embedded subscriptions, is at the old one and not at the
-/// new one.
+/// beside its configuration file. Name both directories, and each piece of
+/// Leani state, the node store or embedded subscriptions, that is at the old
+/// one and not at the new one.
 fn state_left_behind(previous: &Path, current: &Path) -> Option<String> {
-    let holds_state = |directory: &Path| {
-        ["leani.sqlite", "subscriptions"]
-            .iter()
-            .any(|entry| directory.join(entry).exists())
-    };
-    (holds_state(previous) && !holds_state(current)).then(|| {
+    let left = ["leani.sqlite", "subscriptions/"]
+        .into_iter()
+        .filter(|entry| previous.join(entry).exists() && !current.join(entry).exists())
+        .collect::<Vec<_>>();
+    (!left.is_empty()).then(|| {
         format!(
-            "data_dir {} holds no Leani state, but {} does: a relative data_dir is now relative to the configuration file, not to the working directory; move that state, or set data_dir to its absolute path",
+            "data_dir {} holds no {}, but {} does: a relative data_dir is now relative to the configuration file, not to the working directory; move that state, or set data_dir to its absolute path",
             current.display(),
+            left.join(" or "),
             previous.display()
         )
     })
@@ -4087,6 +4087,18 @@ markets = ["LINK/ETH"]
         for named in [node.join("data"), working.join("data")] {
             assert!(warning.contains(&named.display().to_string()), "{warning}");
         }
+        assert!(warning.contains("leani.sqlite"), "{warning}");
+
+        // Final review B5: state at the new directory masked the store left
+        // at the old one.
+        fs::create_dir_all(node.join("data/subscriptions")).expect("moved subscriptions");
+        let found = warnings(&config_path);
+        let [warning] = found.as_slice() else {
+            panic!("one warning: {found:?}");
+        };
+        assert!(warning.contains("leani.sqlite"), "{warning}");
+        assert!(!warning.contains("subscriptions"), "{warning}");
+        fs::remove_dir_all(node.join("data")).expect("remove moved state");
 
         // Embedded subscription state left behind counts too.
         fs::remove_file(working.join("data/leani.sqlite")).expect("remove previous store");

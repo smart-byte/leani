@@ -11,6 +11,8 @@ import {
   parseSse,
   SDK_VERSION,
   type ChangeEnvelope,
+  type DurableConsumer,
+  type ProcessorCoverage,
   type StreamHello,
 } from "../src/index.ts";
 
@@ -107,6 +109,60 @@ describe("createLeaniClient", () => {
     });
     controller.abort(new Error("cancelled"));
     await expect(request).rejects.toThrow("cancelled");
+  });
+
+  test("decodes consumers and coverage as the node sends them", async () => {
+    // Final review B7: the hand-written types lagged the wire. A consumer
+    // names its stream and lease generation, and coverage without a
+    // requested range sends `requested: null`.
+    const consumer: DurableConsumer = {
+      id: "destination",
+      processorInstance: "blobs-production",
+      streamId: "blobs-production:live",
+      role: "required",
+      state: "active",
+      acknowledgedSequence: "3",
+      deliveredSequence: "4",
+      acknowledgedCursor: "cursor-3",
+      deliveredCursor: "cursor-4",
+      leaseGeneration: "2",
+      leaseTtlMs: "60000",
+      leaseExpiresAtUnixMs: "0",
+      leaseActive: false,
+      lagChanges: "1",
+      lagBlocks: "1",
+      lagBytes: "64",
+      lagAgeMs: "0",
+      createdAtUnixMs: "1",
+      updatedAtUnixMs: "2",
+    };
+    const coverage: ProcessorCoverage = {
+      chainId: 1,
+      chainFinalizedHead: null,
+      requested: null,
+      available: [],
+      configuredStartBlock: 19_426_589,
+      processedThrough: null,
+      finalizedThrough: null,
+      complete: false,
+      state: "starting",
+    };
+    const client = createLeaniClient({
+      baseUrl: "http://node.test",
+      fetch: async (input) =>
+        jsonResponse(
+          new Request(input).url.endsWith("/status") ? coverage : consumer,
+        ),
+    });
+
+    const inspected = await client.processors.consumers.inspect(
+      "blobs-production",
+      "destination",
+    );
+    expect(inspected.streamId).toBe("blobs-production:live");
+    expect(inspected.leaseGeneration).toBe("2");
+    const status = await client.processors.status("blobs-production");
+    expect(status.requested).toBeNull();
   });
 
   test("encodes blob queries and authorization without leaking abstractions", async () => {

@@ -12,9 +12,9 @@ status: preview
 import { Aside } from '@astrojs/starlight/components';
 import CodeExample from '@docs/components/docs/CodeExample.astro';
 
-Index 1,000 Ethereum Mainnet blocks and query the last Uniswap V2 pool-reserve
-observation in each hour. This uses public Xatu data, needs no API key, and
-stops after a finite range.
+Index 1,000 Ethereum Mainnet blocks and query every Uniswap V2 pool-reserve
+observation in them, each stamped with its hour. This uses public Xatu data,
+needs no API key, and stops after a finite range.
 
 First [install from source](/docs/getting-started/install/) so `leani` and
 `LEANI_SOURCE` are available in your terminal. The commands below copy a complete
@@ -28,14 +28,17 @@ from another terminal:
 
 <CodeExample example="bounded-mainnet-query" />
 
-Expect five hourly entities for this range; `limit=3` returns only the first
-page. Follow `nextCursor` to read the rest. Entities are ordered by their keys,
-so sort by `bucketStartTimestamp` when drawing a time series.
+Expect one entity per `Sync` event in the range; `limit=3` returns only the
+first page. Follow `nextCursor` to read the rest. Entities are ordered by their
+keys, a transaction hash and log index, so sort by `blockNumber` and `logIndex`
+when drawing a time series.
 
 Each entity contains `values.reserve0` (USDC, six decimals) and
 `values.reserve1` (WETH, eighteen decimals). These are exact integer strings.
-The processor retains the last `Sync` observation per hourly bucket; it does
-not return every swap or an hourly average price.
+`bucketStartTimestamp` names the hour of the event's block, for grouping
+observations by hour; the processor computes no hourly aggregate or average
+price. The profile keeps a window of about 30 days of blocks and prunes older
+observations.
 
 ## Check coverage
 
@@ -47,8 +50,8 @@ independent finality verification disabled.
 Try an explicit range query, then one outside your indexed interval:
 
 ```bash
-curl -s 'http://127.0.0.1:8080/v1/processors/uniswap-v2-sync-30d/collections/uniswap_v2.sync_hourly/entities?fromBlock=17000000&toBlock=17000999'
-curl -s 'http://127.0.0.1:8080/v1/processors/uniswap-v2-sync-30d/collections/uniswap_v2.sync_hourly/entities?fromBlock=17001000&toBlock=17001999'
+curl -s 'http://127.0.0.1:8080/v1/processors/uniswap-v2-sync-30d/collections/uniswap_v2.sync/entities?fromBlock=17000000&toBlock=17000999'
+curl -s 'http://127.0.0.1:8080/v1/processors/uniswap-v2-sync-30d/collections/uniswap_v2.sync/entities?fromBlock=17001000&toBlock=17001999'
 ```
 
 The first should return retained entities with complete requested coverage.

@@ -53,8 +53,9 @@ module ReleaseWorkflowPolicy
     "docker build" => /\bdocker\s+(?:buildx\s+)?build\b/,
   }.freeze
   # One npm command: the words after `npm` up to a shell separator. npm reads
-  # options before its subcommand, so `publish` may follow any of them.
-  NPM_COMMAND = /(?<![\w.\/-])npm\s+([^;&|]*)/
+  # options before its subcommand, so `publish` may follow any of them. npm
+  # run by path, such as `/usr/bin/npm`, counts too.
+  NPM_COMMAND = /(?<![\w.-])npm\s+([^;&|]*)/
   SECRET_EXPRESSION = /\$\{\{[^}]*\bsecrets\b/
   # Both run with the base repository's token, secrets, and cache scope on
   # behalf of code or events that a pull request controls.
@@ -209,7 +210,12 @@ module ReleaseWorkflowPolicy
   # npm publish of a directory packs it again and runs its lifecycle scripts,
   # and a URL fetches something other than the tested archive. The archive
   # must be the word right after `publish`, so no option value can pose as it.
+  # npm reads `user/repo#ref` as a hosted repository and `@scope/name` as a
+  # package, so a word with `/`, `@`, or `#` must be an explicit path.
   def self.local_archive?(word)
-    word.to_s.end_with?(".tgz") && !word.start_with?("-") && !word.include?(":")
+    word = word.to_s
+    return false unless word.end_with?(".tgz") && !word.start_with?("-") && !word.include?(":")
+
+    word.start_with?("./", "../", "/", "~/", "$") || !word.match?(%r{[/@#]})
   end
 end

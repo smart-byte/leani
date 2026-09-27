@@ -387,8 +387,9 @@ minimum_agreement = 1
 
 [[processors]]
 id = "blobs-money"
-instance = "blobs-container"
+instance = "blobs-container-1-5"
 version = "1.5.0"
+history_mode = "on_demand"
 start_block = 0 # Replace 0 with the numeric FROM value printed above.
 publish = "included_and_finalized"
 

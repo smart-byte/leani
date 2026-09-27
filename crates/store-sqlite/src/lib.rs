@@ -143,6 +143,10 @@ pub struct StoreConfig {
     pub delivery_budget: DeliveryStorageBudget,
     pub artifact_budget: ArtifactStorageBudget,
     pub artifact_segments: Option<ArtifactSegmentStorageConfig>,
+    /// Processors the opener registers next. [`SqliteStore::open`] refuses,
+    /// before it upgrades an older schema, a store that holds one of them
+    /// under an identity registration would refuse.
+    pub processors: Vec<ProcessorDescriptor>,
 }
 
 /// Optional lower tier for immutable finalized processor artifacts.
@@ -236,6 +240,7 @@ impl StoreConfig {
             delivery_budget: DeliveryStorageBudget::default(),
             artifact_budget: ArtifactStorageBudget::default(),
             artifact_segments: None,
+            processors: Vec::new(),
         }
     }
 
@@ -263,6 +268,14 @@ impl StoreConfig {
         artifact_segments: ArtifactSegmentStorageConfig,
     ) -> Self {
         self.artifact_segments = Some(artifact_segments);
+        self
+    }
+
+    /// Name the processors the opener registers next; see
+    /// [`Self::processors`].
+    #[must_use]
+    pub fn with_processors(mut self, processors: Vec<ProcessorDescriptor>) -> Self {
+        self.processors = processors;
         self
     }
 }
@@ -1948,10 +1961,7 @@ async fn migrate(pool: &SqlitePool) -> Result<(), StoreError> {
             .ok_or_else(|| {
                 StoreError::InvalidConfig("database has no schema version".to_owned())
             })?;
-    let bytes: [u8; 4] = encoded
-        .try_into()
-        .map_err(|_| StoreError::Invariant("schema_version must contain four bytes".to_owned()))?;
-    let version = u32::from_be_bytes(bytes);
+    let version = decode_schema_version(encoded)?;
     if version == CURRENT_SCHEMA_VERSION {
         transaction.commit().await?;
         return Ok(());
@@ -2011,6 +2021,132 @@ async fn migrate(pool: &SqlitePool) -> Result<(), StoreError> {
     if version <= 2 {
         rebuild_recent_transaction_locators(pool).await?;
     }
+    Ok(())
+}
+
+fn decode_schema_version(encoded: Vec<u8>) -> Result<u32, StoreError> {
+    let bytes: [u8; 4] = encoded
+        .try_into()
+        .map_err(|_| StoreError::Invariant("schema_version must contain four bytes".to_owned()))?;
+    Ok(u32::from_be_bytes(bytes))
+}
+
+/// The schema an existing database records, or `None` for one without
+/// `node_meta`, which [`migrate`] bootstraps when empty and refuses
+/// otherwise.
+async fn stored_schema_version(
+    connection: &mut SqliteConnection,
+) -> Result<Option<u32>, StoreError> {
+    let has_node_meta: bool = sqlx::query_scalar(
+        "SELECT EXISTS (
+           SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'node_meta'
+         )",
+    )
+    .fetch_one(&mut *connection)
+    .await?;
+    if !has_node_meta {
+        return Ok(None);
+    }
+    let encoded: Option<Vec<u8>> =
+        sqlx::query_scalar("SELECT value FROM node_meta WHERE key = 'schema_version'")
+            .fetch_optional(&mut *connection)
+            .await?;
+    encoded.map(decode_schema_version).transpose()
+}
+
+/// Refuse, before [`migrate`] upgrades it, an existing store at `path` with
+/// an older schema that holds one of `processors` under an identity
+/// registration would refuse. The upgrade cannot be undone, so a store
+/// refused after it no longer opens with the binary that wrote it. Reads
+/// through its own read-only connection and applies registration's rule,
+/// [`check_stored_identity`].
+async fn refuse_conflicting_upgrade(
+    path: &Path,
+    busy_timeout: Duration,
+    processors: &[ProcessorDescriptor],
+) -> Result<(), StoreError> {
+    if processors.is_empty() || !path.is_file() {
+        return Ok(());
+    }
+    let mut connection = SqliteConnectOptions::new()
+        .filename(path)
+        .read_only(true)
+        .busy_timeout(busy_timeout)
+        .connect()
+        .await?;
+    let refusal = conflicting_upgrade(&mut connection, processors).await;
+    connection.close().await?;
+    refusal
+}
+
+async fn conflicting_upgrade(
+    connection: &mut SqliteConnection,
+    processors: &[ProcessorDescriptor],
+) -> Result<(), StoreError> {
+    // Current stores are not upgraded, and older unsupported ones are
+    // refused before anything changes.
+    let upgraded = OLDEST_UPGRADABLE_SCHEMA_VERSION..CURRENT_SCHEMA_VERSION;
+    if !stored_schema_version(connection)
+        .await?
+        .is_some_and(|version| upgraded.contains(&version))
+    {
+        return Ok(());
+    }
+    for descriptor in processors {
+        let stored: Option<String> = sqlx::query_scalar(
+            "SELECT descriptor_json FROM processor_instances WHERE instance = ?",
+        )
+        .bind(processor_instance(descriptor))
+        .fetch_optional(&mut *connection)
+        .await?;
+        if let Some(stored) = stored {
+            check_stored_identity(&stored, descriptor)?;
+        }
+    }
+    Ok(())
+}
+
+/// Copy the store behind `connection` to `destination` at its schema; see
+/// [`SqliteStore::backup`].
+async fn backup_store(
+    connection: &mut SqliteConnection,
+    destination: &Path,
+) -> Result<(), StoreError> {
+    let version = stored_schema_version(connection).await?.ok_or_else(|| {
+        StoreError::InvalidConfig("database is not a Leani store: it has no node_meta".to_owned())
+    })?;
+    if version > CURRENT_SCHEMA_VERSION {
+        return Err(StoreError::InvalidConfig(format!(
+            "database schema {version} is newer than supported schema {CURRENT_SCHEMA_VERSION}"
+        )));
+    }
+    let segment_catalog: bool = sqlx::query_scalar(
+        "SELECT EXISTS (
+           SELECT 1 FROM sqlite_master
+           WHERE type = 'table' AND name = 'processor_artifact_segments'
+         )",
+    )
+    .fetch_one(&mut *connection)
+    .await?;
+    if segment_catalog {
+        let segments: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM processor_artifact_segments")
+            .fetch_one(&mut *connection)
+            .await?;
+        if segments > 0 {
+            return Err(StoreError::ArtifactSegmentBackupUnsupported {
+                segments: i64_u64(segments, "artifact segment count")?,
+            });
+        }
+    }
+    if let Some(parent) = destination.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)?;
+    }
+    let escaped = destination.to_string_lossy().replace('\'', "''");
+    sqlx::query(&format!("VACUUM INTO '{escaped}'"))
+        .execute(&mut *connection)
+        .await?;
     Ok(())
 }
 
@@ -2158,10 +2294,14 @@ const EMPTY_DELIVERY_STREAM_STATS: DeliveryStreamStats = DeliveryStreamStats {
 impl SqliteStore {
     /// Open a WAL-mode store and apply embedded migrations.
     ///
+    /// Before it upgrades an existing store with an older schema, it refuses
+    /// the store when it holds one of [`StoreConfig::processors`] under an
+    /// identity registration would refuse, and leaves it at its schema.
+    ///
     /// # Errors
     ///
     /// Fails before returning if the path, `SQLite` settings, or migration is
-    /// invalid.
+    /// invalid, or with [`StoreError::ProcessorIdentity`] for that refusal.
     #[allow(clippy::too_many_lines)]
     pub async fn open(config: StoreConfig) -> Result<Self, StoreError> {
         if config.reader_connections == 0 {
@@ -2197,6 +2337,7 @@ impl SqliteStore {
                 "artifact retained and pending budgets must be greater than zero".to_owned(),
             ));
         }
+        refuse_conflicting_upgrade(&config.path, config.busy_timeout, &config.processors).await?;
         let artifact_segments = config
             .artifact_segments
             .map(|segments| {
@@ -2434,11 +2575,7 @@ impl SqliteStore {
         let Some((stored, runtime_state, default_stream)) = row else {
             return Ok(None);
         };
-        let stored: ProcessorDescriptor = serde_json::from_str(&stored)?;
-        let identical = stored == *descriptor;
-        if !identical && !same_processor_identity(&stored, descriptor) {
-            return Err(StoreError::ProcessorIdentity(instance));
-        }
+        let identical = check_stored_identity(&stored, descriptor)?;
         Ok(Some(StoredRegistration {
             identical,
             runtime_state,
@@ -2522,11 +2659,7 @@ impl SqliteStore {
         .bind(&instance)
         .fetch_one(&self.inner.pool)
         .await?;
-        let stored: ProcessorDescriptor = serde_json::from_str(&stored)?;
-        if stored != *descriptor && !same_processor_identity(&stored, descriptor) {
-            return Err(StoreError::ProcessorIdentity(instance));
-        }
-        if stored != *descriptor {
+        if !check_stored_identity(&stored, descriptor)? {
             sqlx::query("UPDATE processor_instances SET descriptor_json = ? WHERE instance = ?")
                 .bind(descriptor_json)
                 .bind(&instance)
@@ -13526,37 +13659,38 @@ impl SqliteStore {
         Ok(())
     }
 
-    /// Checkpoint the WAL and create a consistent `SQLite` backup using
-    /// `VACUUM INTO`.
+    /// Create a consistent backup of the store file at `path`, WAL included,
+    /// using `VACUUM INTO`.
+    ///
+    /// The store is read through a read-only connection and never opened as
+    /// a store, so nothing upgrades it: the backup keeps the store's schema,
+    /// and a store with an older one stays usable by the binary that wrote
+    /// it. Stop every writer first.
     ///
     /// # Errors
     ///
-    /// Returns an error when the destination already exists or the checkpoint
-    /// or backup operation fails.
-    pub async fn backup(&self, destination: &Path) -> Result<(), StoreError> {
+    /// Returns an error when `path` holds no store, its schema is newer than
+    /// this binary supports, it references processor artifact segments that
+    /// a `SQLite` backup would omit, the destination already exists, or the
+    /// backup operation fails.
+    pub async fn backup(path: &Path, destination: &Path) -> Result<(), StoreError> {
         if destination.exists() {
             return Err(StoreError::DestinationExists(destination.to_path_buf()));
         }
-        if let Some(storage) = &self.inner.artifact_segments {
-            let segments = storage.sink.stats().await.segments;
-            if segments > 0 {
-                return Err(StoreError::ArtifactSegmentBackupUnsupported { segments });
-            }
+        if !path.is_file() {
+            return Err(StoreError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("no node store at {}", path.display()),
+            )));
         }
-        if let Some(parent) = destination.parent()
-            && !parent.as_os_str().is_empty()
-        {
-            std::fs::create_dir_all(parent)?;
-        }
-        let _guard = self.inner.writer.lock().await;
-        sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
-            .execute(&self.inner.pool)
+        let mut connection = SqliteConnectOptions::new()
+            .filename(path)
+            .read_only(true)
+            .connect()
             .await?;
-        let escaped = destination.to_string_lossy().replace('\'', "''");
-        sqlx::query(&format!("VACUUM INTO '{escaped}'"))
-            .execute(&self.inner.pool)
-            .await?;
-        Ok(())
+        let backup = backup_store(&mut connection, destination).await;
+        connection.close().await?;
+        backup
     }
 
     /// Run a truncating WAL checkpoint and reclaim free pages.
@@ -16524,6 +16658,25 @@ fn same_processor_identity(stored: &ProcessorDescriptor, configured: &ProcessorD
     normalized == *configured
 }
 
+/// Registration's identity rule: `configured` may differ from the descriptor
+/// stored under its instance, `stored_json`, only in lifecycle policy.
+/// Returns whether the two are identical.
+fn check_stored_identity(
+    stored_json: &str,
+    configured: &ProcessorDescriptor,
+) -> Result<bool, StoreError> {
+    let stored: ProcessorDescriptor = serde_json::from_str(stored_json)?;
+    if stored == *configured {
+        return Ok(true);
+    }
+    if same_processor_identity(&stored, configured) {
+        return Ok(false);
+    }
+    Err(StoreError::ProcessorIdentity(processor_instance(
+        configured,
+    )))
+}
+
 #[must_use]
 pub fn default_delivery_stream_id(descriptor: &ProcessorDescriptor) -> String {
     let suffix = match descriptor.delivery_ordering {
@@ -19173,7 +19326,7 @@ mod tests {
         );
         store.verify().await.expect("verify tiered store");
         assert!(matches!(
-            store.backup(&directory.path().join("unsafe.sqlite")).await,
+            SqliteStore::backup(store.path(), &directory.path().join("unsafe.sqlite")).await,
             Err(StoreError::ArtifactSegmentBackupUnsupported { segments: 2 })
         ));
         assert_eq!(
@@ -22069,7 +22222,9 @@ mod tests {
             .expect("recent frame");
         let original_epoch = store.epoch();
         let backup = directory.path().join("backup.sqlite");
-        store.backup(&backup).await.expect("backup");
+        SqliteStore::backup(store.path(), &backup)
+            .await
+            .expect("backup");
         drop(store);
 
         let restored = SqliteStore::open(StoreConfig::new(backup))
@@ -26320,6 +26475,142 @@ mod tests {
                 .map(|cursor| cursor.block_number),
             Some(BlockNumber(1))
         );
+    }
+
+    /// The blobs processor of the container profile under `instance`, at
+    /// version 1.`minor`.0, whose code hash changes with the version.
+    fn container_blobs(instance: &str, minor: u8) -> ProcessorDescriptor {
+        let mut descriptor = FixtureProcessor::new().descriptor;
+        descriptor.id = ProcessorId::new("blobs-money").expect("id");
+        descriptor.instance = ProcessorInstanceId::new(instance).expect("instance");
+        descriptor.version = Version::new(1, u64::from(minor), 0);
+        descriptor.code_hash = BlockHash::new([minor; 32]);
+        descriptor
+    }
+
+    /// A store at `path` in the rc.1 layout, schema 21, holding `processors`.
+    async fn rc1_store(path: &Path, processors: &[ProcessorDescriptor]) {
+        let store = SqliteStore::open(StoreConfig::new(path))
+            .await
+            .expect("open fresh store");
+        for descriptor in processors {
+            store
+                .register_processor(descriptor)
+                .await
+                .expect("register as rc.1 did");
+        }
+        sqlx::raw_sql(
+            "DROP INDEX IF EXISTS processor_coverage_by_hash;
+             DROP INDEX IF EXISTS processor_coverage_finalized;
+             DROP INDEX IF EXISTS finalized_coverage_segments_by_hash;
+             DROP TABLE IF EXISTS node_secrets;
+             UPDATE node_meta SET value = X'00000015' WHERE key = 'schema_version';",
+        )
+        .execute(&store.inner.pool)
+        .await
+        .expect("rewind to schema 21");
+        store.inner.pool.close().await;
+    }
+
+    /// The schema of the store file at `path`, read without opening it as a
+    /// store.
+    async fn schema_on_disk(path: &Path) -> u32 {
+        let mut connection = SqliteConnectOptions::new()
+            .filename(path)
+            .read_only(true)
+            .connect()
+            .await
+            .expect("read-only connection");
+        let encoded: Vec<u8> =
+            sqlx::query_scalar("SELECT value FROM node_meta WHERE key = 'schema_version'")
+                .fetch_one(&mut connection)
+                .await
+                .expect("schema version");
+        connection.close().await.expect("close");
+        u32::from_be_bytes(encoded.try_into().expect("four bytes"))
+    }
+
+    #[tokio::test]
+    async fn an_identity_refusal_leaves_an_older_store_at_its_schema() {
+        // Final review U2: the upgrade to the current schema ran before
+        // registration refused the processor, so the refused store no longer
+        // opened with the binary that wrote it.
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("node.sqlite");
+        rc1_store(&path, &[container_blobs("blobs-container", 4)]).await;
+
+        let error = SqliteStore::open(
+            StoreConfig::new(&path).with_processors(vec![container_blobs("blobs-container", 5)]),
+        )
+        .await
+        .expect_err("a new version under the stored instance is refused");
+        assert!(
+            matches!(&error, StoreError::ProcessorIdentity(instance) if instance == "blobs-container"),
+            "{error}"
+        );
+        assert_eq!(
+            schema_on_disk(&path).await,
+            21,
+            "the refused store was upgraded"
+        );
+
+        // A lifecycle-only change keeps the identity, and a new instance
+        // leaves the stored one alone: both upgrade.
+        let mut relaxed = container_blobs("blobs-container", 4);
+        relaxed.lifecycle.checkpoint.keep = 7;
+        let upgraded = SqliteStore::open(
+            StoreConfig::new(&path)
+                .with_processors(vec![relaxed, container_blobs("blobs-container-1-5", 5)]),
+        )
+        .await
+        .expect("the stored identity and a new instance upgrade");
+        assert_eq!(
+            upgraded.stats().await.expect("stats").schema_version,
+            CURRENT_SCHEMA_VERSION
+        );
+    }
+
+    #[tokio::test]
+    async fn a_backup_leaves_an_older_store_and_its_copy_at_their_schema() {
+        // Final review U2: `leani db backup` opened the store with
+        // migrations, so backing up before an upgrade performed it.
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("node.sqlite");
+        rc1_store(&path, &[container_blobs("blobs-container", 4)]).await;
+        let backup = directory.path().join("backup.sqlite");
+
+        SqliteStore::backup(&path, &backup)
+            .await
+            .expect("back up an older store");
+        assert_eq!(schema_on_disk(&path).await, 21, "the source was upgraded");
+        assert_eq!(schema_on_disk(&backup).await, 21, "the backup was upgraded");
+        assert!(matches!(
+            SqliteStore::backup(&path, &backup).await,
+            Err(StoreError::DestinationExists(_))
+        ));
+
+        // A store from a newer binary is refused, and left as it is.
+        let newer = directory.path().join("newer.sqlite");
+        rc1_store(&newer, &[]).await;
+        let mut connection = SqliteConnectOptions::new()
+            .filename(&newer)
+            .connect()
+            .await
+            .expect("connection");
+        sqlx::query("UPDATE node_meta SET value = X'00000018' WHERE key = 'schema_version'")
+            .execute(&mut connection)
+            .await
+            .expect("schema 24");
+        connection.close().await.expect("close");
+        let refused = SqliteStore::backup(&newer, &directory.path().join("newer-backup.sqlite"))
+            .await
+            .expect_err("a newer schema is refused");
+        assert!(
+            refused.to_string().contains("newer than supported"),
+            "{refused}"
+        );
+        assert!(!directory.path().join("newer-backup.sqlite").exists());
+        assert_eq!(schema_on_disk(&newer).await, 24);
     }
 
     #[tokio::test]

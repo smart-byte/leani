@@ -137,7 +137,7 @@ export interface ProcessorCoverage {
   requested?: {
     fromBlock: number;
     toBlock: number;
-  };
+  } | null;
   available: CoverageInterval[];
   configuredStartBlock: number;
   processedThrough: number | null;
@@ -287,12 +287,16 @@ export interface CreateConsumerOptions {
 export interface DurableConsumer {
   id: string;
   processorInstance: string;
+  /** The delivery stream this consumer reads. */
+  streamId: string;
   role: ConsumerRole;
   state: ConsumerState;
   acknowledgedSequence: string;
   deliveredSequence: string;
   acknowledgedCursor: string;
   deliveredCursor: string;
+  /** Stream sessions that have taken the lease; `"0"` before the first. */
+  leaseGeneration: string;
   leaseTtlMs: string;
   leaseExpiresAtUnixMs: string;
   leaseActive: boolean;

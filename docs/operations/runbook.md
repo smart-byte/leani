@@ -13,8 +13,24 @@ status: preview
 `deploy/container.toml` is a safe historical-only profile. It starts the query
 API plus HTTP and WebSocket RPC on all container interfaces, but Docker Compose
 publishes them only on loopback. It does not claim live or finality readiness.
-Run a bounded `backfill` command against the same data volume before querying a
-range. Subscriptions remain quiet until a live source commits events.
+Its processor uses on-demand history, so nothing is indexed until you run a
+bounded `backfill` against the same data volume. `serve` holds the data
+directory's lock, and a backfill beside it fails with `runtime data directory
+/var/lib/leani is already in use by another Leani process`, so stop the service
+first. `docker compose run` mounts the service's volume, and its arguments
+replace the image's `serve` command, so name the profile with `--config`:
+
+```bash
+docker compose stop leani
+docker compose run --rm leani backfill --config /etc/leani/node.toml \
+  --processor blobs-money --from 19426589 --to 19427588
+docker compose start leani
+```
+
+Keep `LEANI_API_TOKEN` exported for these commands too: Compose resolves it
+for every command. The processor starts at block 19,426,589 and is
+block-local, so later ranges may follow in any order. Then query the range.
+Subscriptions remain quiet until a live source commits events.
 
 The profile protects the API with a bearer token from `LEANI_API_TOKEN`:
 `serve` fails to start without one of at least 16 printable ASCII characters
@@ -30,6 +46,22 @@ behind an authenticating proxy. The API answers only `Host` names in
 the compose service name `leani`, so other services can call
 `http://leani:8080`. To add the names your clients use, mount a copy of the
 profile with them over `/etc/leani/node.toml`.
+
+The profile runs `blobs-money` as the instance `blobs-container-1-5`. A new
+processor version that changes the processor's identity takes a new instance
+ID, because the store refuses another version under an instance it holds.
+Version 0.1.0-rc.1 ran `blobs-money` 1.4.0 as `blobs-container`, so on a
+volume from rc.1 the new image starts beside that instance and leaves it
+inert: nothing indexes or serves it, but its rows stay in the volume and
+count toward `[budgets.store] maximum_physical_bytes`. For a clean slate,
+remove the volume with `docker compose down -v` before
+`docker compose up --build`, or restore a snapshot of the volume.
+
+The profile runs at most two history chunks at once
+(`[budgets.history_pipeline] maximum_active_chunks = 2`): a Xatu backfill
+holds about 450 MiB per active chunk, so two fit its 1 GiB `memory_bytes`
+budget and leave the rest of the compose file's 2 GiB container limit to the
+node.
 
 For a direct binary deployment:
 
@@ -390,10 +422,11 @@ An anchor verified from another checkpoint is never used: changing
 `finality.checkpoint` re-anchors the node on the new root, and the node logs a
 warning naming both roots. `leani doctor` reports the mismatch too. The one
 exception is an embedded subscription (`leani subscribe` without a running
-node) that reuses its cached checkpoint, `checkpoint.json`, which holds an
-anchor the subscription verified itself on an earlier run: a persisted anchor
-at a later slot replaces it. A checkpoint from a provider quorum that the
-subscription has just accepted follows the rule above.
+node) that reuses a cached checkpoint, `checkpoint.json`, whose trust is
+`locally_verified`: an anchor the subscription verified itself on an earlier
+run. A persisted anchor at a later slot replaces it. A checkpoint from a
+provider quorum follows the rule above, whether the subscription has just
+accepted it or reuses it from the cache with trust `provider_quorum`.
 
 The bootstrap is still verified against the anchor's block root, and the
 configured checkpoint's own age is not checked. A missing, corrupt, or
@@ -437,8 +470,9 @@ their index, such as `finality.endpoints[1]`.
 
 Stop the node and any embedded subscription or standalone backfill using this
 data directory before running `leani db` commands (including `inspect`, `verify`,
-and `backup`). They open the store with migrations enabled and therefore take
-the same `.leani.lock` as other writers. Use the API and `/metrics` for inspection
+and `backup`). They take the same `.leani.lock` as other writers, and every
+one but `backup` opens the store with migrations enabled, which upgrades a
+store from an earlier release. Use the API and `/metrics` for inspection
 while the node is running.
 
 Create a consistent backup after stopping those writers:
@@ -448,8 +482,14 @@ leani db backup /backups/leani-$(date +%s).sqlite \
   --config /etc/leani/node.toml
 ```
 
-That command is intentionally SQLite-only. When
-`artifact_storage.backend = "tiered_segments"` and any segments exist, it
+`db backup` reads the store through a read-only connection and never
+upgrades it: the backup keeps the store's schema, so the backup of a store
+from an earlier release restores with that release's binary. It refuses a
+store whose schema is newer than the binary supports, and a data directory
+without a store.
+
+That command is intentionally SQLite-only. When any processor artifact
+segments exist, as with `artifact_storage.backend = "tiered_segments"`, it
 fails before writing a backup rather than producing an incomplete restore.
 Until a versioned bundle-backup command ships, stop the node and snapshot the
 complete `data_dir` (SQLite database/WAL plus `processor-artifacts`) or use an
@@ -508,6 +548,27 @@ material fails verification, asks the next one, and neither asks nor dials it
 again, across reconnects, until the lanes restart. Stale updates are retried,
 so neither ends the finality stream. An exhausted peer set logs a warning at
 most every five minutes.
+
+### Live lane disconnected during a finality apply
+
+Symptom: right after finality advances, the live lane reports itself
+disconnected with `no sync-committee-attested execution head above block …
+for … seconds`, live readiness drops, and no block is included, although the
+finality sources are healthy. It is most likely every 1,000 finalized blocks,
+when each processor with automatic checkpoints copies its whole state into a
+recovery checkpoint, and with large processor states.
+
+Cause: both finality sources verify and publish attested heads only while
+the node reads their finality stream, and the node applies each verified
+finality update, checkpoints included, before it reads the next. An apply that
+takes longer than about 36 seconds leaves the live lane without a new attested
+head for its 48-second grace, four slots.
+
+What to expect: nothing is lost or reverted. When the apply completes, the
+next attested head arrives, the lane catches up on the blocks produced
+meanwhile, and readiness returns. This is a known limitation of this
+release; a later release publishes attested heads independently of finality
+applies.
 
 ### Finality contradicts the followed chain
 
@@ -770,3 +831,10 @@ Processor code/config identities create separate immutable instances. Backfill
 the replacement instance in parallel, compare coverage and outputs, then move
 consumers. Rollback selects the prior binary/store pair or restores its backup;
 it never mutates a newer instance in place.
+
+A store upgrades to the binary's schema on the first start that opens it, and
+the upgrade cannot be undone. A start that the store refuses for a processor
+under an existing instance ID (`processor instance … conflicts with its stored
+descriptor`) refuses before that upgrade, so the store stays usable by the
+binary that wrote it. ADR 0018, `docs/adr/0018-forward-only-store-migrations.md`
+in the repository, records this policy.

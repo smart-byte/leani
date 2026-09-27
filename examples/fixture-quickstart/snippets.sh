@@ -31,7 +31,7 @@ leani serve
 # Run this in a second terminal after `serve` starts.
 # docs:start bounded-mainnet-query
 curl -s \
-  'http://127.0.0.1:8080/v1/processors/uniswap-v2-sync-30d/collections/uniswap_v2.sync_hourly/entities?limit=3'
+  'http://127.0.0.1:8080/v1/processors/uniswap-v2-sync-30d/collections/uniswap_v2.sync/entities?limit=3'
 curl -s \
   'http://127.0.0.1:8080/v1/processors/uniswap-v2-sync-30d/status'
 # docs:end bounded-mainnet-query

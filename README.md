@@ -74,7 +74,8 @@ and attaches to it instead of starting its own runtime. Guides:
 ## Index history without an archive node
 
 Backfill a block range from public Xatu datasets, then query the result. The
-`windowed` profile decodes Uniswap V2 `Sync` events into hourly aggregates:
+`windowed` profile decodes each Uniswap V2 `Sync` event, stamped with its
+hour, and keeps a 30-day window of them:
 
 ```bash
 cp config/modes/windowed.toml leani.toml
@@ -83,7 +84,7 @@ leani serve
 ```
 
 ```bash
-curl -s 'http://127.0.0.1:8080/v1/processors/uniswap-v2-sync-30d/collections/uniswap_v2.sync_hourly/entities?limit=3'
+curl -s 'http://127.0.0.1:8080/v1/processors/uniswap-v2-sync-30d/collections/uniswap_v2.sync/entities?limit=3'
 ```
 
 Any contract event can be indexed from its ABI alone. The complete
@@ -137,8 +138,11 @@ answering wrongly. See the [method matrix](docs/reference/ethereum-json-rpc.md).
 
 ## TypeScript SDK
 
+Install the SDK version that matches your node release; npm's `latest` tag
+can lag behind a prerelease node:
+
 ```bash
-bun add @smart-byte/leani-sdk
+bun add @smart-byte/leani-sdk@0.1.0-rc.1
 ```
 
 ```ts

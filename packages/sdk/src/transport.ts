@@ -1,19 +1,22 @@
 import { LeaniError, TransportError } from "./errors.ts";
 import type { FetchLike } from "./index.ts";
 
+const CONTROL_CHARACTER = /[\u0000-\u001f\u007f]/;
+
 /**
  * Resolve `path` under `base`, including its path: a leading slash, as in a
  * capabilities `basePath`, stays under a prefixed base URL. A proxy may decode
  * a segment before it resolves dot segments, so a segment that decodes to `.`
  * or `..`, or contains a separator, raw or percent-encoded, or an encoded
  * percent sign, is refused before any request. So are control characters,
- * which URL parsing drops. No Leani ID contains any of them.
+ * raw or percent-encoded, which URL parsing, or a proxy after decoding, may
+ * drop. No Leani ID contains any of them.
  */
 export function resolveUnder(base: URL, path: string): URL {
   if (/^[a-z][a-z0-9+.-]*:/i.test(path) || path.startsWith("//")) {
     throw new TypeError("request path must not contain an origin or URL scheme");
   }
-  if (/[\u0000-\u001f\u007f]/.test(path)) {
+  if (CONTROL_CHARACTER.test(path)) {
     throw new TypeError("request path must not contain control characters");
   }
   const relative = path.replace(/^\/+/, "");
@@ -25,6 +28,9 @@ export function resolveUnder(base: URL, path: string): URL {
       );
     }
     const decoded = decodeSegment(segment);
+    if (CONTROL_CHARACTER.test(decoded)) {
+      throw new TypeError("request path must not contain encoded control characters");
+    }
     if (decoded === "." || decoded === "..") {
       throw new TypeError(
         'request path must not contain a "." or ".." segment, such as an ID of "." or ".."',

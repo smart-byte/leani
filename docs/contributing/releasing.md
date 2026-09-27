@@ -12,14 +12,21 @@ status: preview
 2. Run the Rust, SDK, dependency-policy, and publication checks from a clean
    checkout. Test restart, replay, and backup/restore with the packaged binary.
 3. Update `CHANGELOG.md`, OpenAPI/SDK compatibility tables, durable schema
-   versions, and processor version declarations.
+   versions, and processor version declarations. When the SDK version in
+   `packages/sdk/package.json` changes, pin every documented SDK install, such
+   as the `bun add` commands in `README.md` and the install guide, to that
+   exact version in the same commit. CI's `scripts/check-sdk-pins.rb` fails
+   on a documented install that names another version, a range, a tag, or
+   none.
 4. Build Linux and macOS `x86_64` and `aarch64` artifacts and both Linux container
    architectures from the same reviewed commit.
 5. Verify checksums and a clean-host smoke test.
 6. Create an annotated semantic-version tag. Release candidates use
    `-rc.N`; a stable release requires every artifact listed above.
-7. On the first container release, check that
-   `docker buildx imagetools inspect ghcr.io/smart-byte/leani:<version>` lists
+7. On the first container release, make the `leani` GHCR package public in
+   its package settings: GitHub creates it private, and pulling the
+   documented image fails until then. Then check that
+   `docker buildx imagetools inspect ghcr.io/smart-byte/leani:v<version>` lists
    the per-architecture digests that the publication summary shows and the job
    attested. A runner that pushes each architecture as a one-entry index would
    attest those index digests instead of the images.
@@ -341,4 +348,7 @@ dynamic processor loading; custom native processors are compiled into a node.
 
 Rollback means deploying the previous binary with a store format it supports
 or restoring the pre-migration backup. Every irreversible migration must be
-preceded by a tested export/rebuild path and an ADR.
+preceded by a tested export/rebuild path and an ADR. Store migrations are
+forward only, and a start the store refuses for a processor identity leaves
+an older store at its schema; ADR 0018 records the schema 22 and 23
+migrations and this policy.

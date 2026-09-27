@@ -1196,7 +1196,7 @@
                     "id": "max_input_bytes",
                     "long": "max-input-bytes",
                     "short": null,
-                    "help": "Maximum projected compressed Parquet bytes",
+                    "help": "Maximum bytes the projection fetches in all, Parquet footers and merged gaps included, and the most it holds at once",
                     "required": false,
                     "action": "Set",
                     "defaultValues": [

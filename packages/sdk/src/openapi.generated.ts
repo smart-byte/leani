@@ -459,12 +459,13 @@ export interface paths {
             query?: never;
             header?: {
                 /**
-                 * @description The consumer's credential. A consumer created with one needs it on
-                 *     every consumer-scoped request, in addition to any bearer token, and
-                 *     gets 403 `forbidden` without it or with another; the node compares
-                 *     it in constant time. A consumer without one, such as a configured
-                 *     consumer, takes none. Credentials created before 32 characters were
-                 *     required keep working.
+                 * @description The consumer's credential. A consumer created with one needs it, in
+                 *     addition to any bearer token, on its lease, change, acknowledgement,
+                 *     and stream requests, and gets 403 `forbidden` without it or with
+                 *     another; the node compares it in constant time. Listing, inspecting,
+                 *     and revoking consumers need only the bearer token. A consumer without
+                 *     one, such as a configured consumer, takes none. Credentials created
+                 *     before 32 characters were required keep working.
                  */
                 "x-leani-consumer-credential"?: components["parameters"]["ConsumerCredential"];
             };
@@ -494,12 +495,13 @@ export interface paths {
             query?: never;
             header?: {
                 /**
-                 * @description The consumer's credential. A consumer created with one needs it on
-                 *     every consumer-scoped request, in addition to any bearer token, and
-                 *     gets 403 `forbidden` without it or with another; the node compares
-                 *     it in constant time. A consumer without one, such as a configured
-                 *     consumer, takes none. Credentials created before 32 characters were
-                 *     required keep working.
+                 * @description The consumer's credential. A consumer created with one needs it, in
+                 *     addition to any bearer token, on its lease, change, acknowledgement,
+                 *     and stream requests, and gets 403 `forbidden` without it or with
+                 *     another; the node compares it in constant time. Listing, inspecting,
+                 *     and revoking consumers need only the bearer token. A consumer without
+                 *     one, such as a configured consumer, takes none. Credentials created
+                 *     before 32 characters were required keep working.
                  */
                 "x-leani-consumer-credential"?: components["parameters"]["ConsumerCredential"];
             };
@@ -524,12 +526,13 @@ export interface paths {
             query?: never;
             header?: {
                 /**
-                 * @description The consumer's credential. A consumer created with one needs it on
-                 *     every consumer-scoped request, in addition to any bearer token, and
-                 *     gets 403 `forbidden` without it or with another; the node compares
-                 *     it in constant time. A consumer without one, such as a configured
-                 *     consumer, takes none. Credentials created before 32 characters were
-                 *     required keep working.
+                 * @description The consumer's credential. A consumer created with one needs it, in
+                 *     addition to any bearer token, on its lease, change, acknowledgement,
+                 *     and stream requests, and gets 403 `forbidden` without it or with
+                 *     another; the node compares it in constant time. Listing, inspecting,
+                 *     and revoking consumers need only the bearer token. A consumer without
+                 *     one, such as a configured consumer, takes none. Credentials created
+                 *     before 32 characters were required keep working.
                  */
                 "x-leani-consumer-credential"?: components["parameters"]["ConsumerCredential"];
             };
@@ -619,12 +622,13 @@ export interface paths {
             query?: never;
             header?: {
                 /**
-                 * @description The consumer's credential. A consumer created with one needs it on
-                 *     every consumer-scoped request, in addition to any bearer token, and
-                 *     gets 403 `forbidden` without it or with another; the node compares
-                 *     it in constant time. A consumer without one, such as a configured
-                 *     consumer, takes none. Credentials created before 32 characters were
-                 *     required keep working.
+                 * @description The consumer's credential. A consumer created with one needs it, in
+                 *     addition to any bearer token, on its lease, change, acknowledgement,
+                 *     and stream requests, and gets 403 `forbidden` without it or with
+                 *     another; the node compares it in constant time. Listing, inspecting,
+                 *     and revoking consumers need only the bearer token. A consumer without
+                 *     one, such as a configured consumer, takes none. Credentials created
+                 *     before 32 characters were required keep working.
                  */
                 "x-leani-consumer-credential"?: components["parameters"]["ConsumerCredential"];
             };
@@ -657,12 +661,13 @@ export interface paths {
             query?: never;
             header?: {
                 /**
-                 * @description The consumer's credential. A consumer created with one needs it on
-                 *     every consumer-scoped request, in addition to any bearer token, and
-                 *     gets 403 `forbidden` without it or with another; the node compares
-                 *     it in constant time. A consumer without one, such as a configured
-                 *     consumer, takes none. Credentials created before 32 characters were
-                 *     required keep working.
+                 * @description The consumer's credential. A consumer created with one needs it, in
+                 *     addition to any bearer token, on its lease, change, acknowledgement,
+                 *     and stream requests, and gets 403 `forbidden` without it or with
+                 *     another; the node compares it in constant time. Listing, inspecting,
+                 *     and revoking consumers need only the bearer token. A consumer without
+                 *     one, such as a configured consumer, takes none. Credentials created
+                 *     before 32 characters were required keep working.
                  */
                 "x-leani-consumer-credential"?: components["parameters"]["ConsumerCredential"];
             };
@@ -693,12 +698,13 @@ export interface paths {
             query?: never;
             header?: {
                 /**
-                 * @description The consumer's credential. A consumer created with one needs it on
-                 *     every consumer-scoped request, in addition to any bearer token, and
-                 *     gets 403 `forbidden` without it or with another; the node compares
-                 *     it in constant time. A consumer without one, such as a configured
-                 *     consumer, takes none. Credentials created before 32 characters were
-                 *     required keep working.
+                 * @description The consumer's credential. A consumer created with one needs it, in
+                 *     addition to any bearer token, on its lease, change, acknowledgement,
+                 *     and stream requests, and gets 403 `forbidden` without it or with
+                 *     another; the node compares it in constant time. Listing, inspecting,
+                 *     and revoking consumers need only the bearer token. A consumer without
+                 *     one, such as a configured consumer, takes none. Credentials created
+                 *     before 32 characters were required keep working.
                  */
                 "x-leani-consumer-credential"?: components["parameters"]["ConsumerCredential"];
             };
@@ -724,12 +730,13 @@ export interface paths {
             query?: never;
             header?: {
                 /**
-                 * @description The consumer's credential. A consumer created with one needs it on
-                 *     every consumer-scoped request, in addition to any bearer token, and
-                 *     gets 403 `forbidden` without it or with another; the node compares
-                 *     it in constant time. A consumer without one, such as a configured
-                 *     consumer, takes none. Credentials created before 32 characters were
-                 *     required keep working.
+                 * @description The consumer's credential. A consumer created with one needs it, in
+                 *     addition to any bearer token, on its lease, change, acknowledgement,
+                 *     and stream requests, and gets 403 `forbidden` without it or with
+                 *     another; the node compares it in constant time. Listing, inspecting,
+                 *     and revoking consumers need only the bearer token. A consumer without
+                 *     one, such as a configured consumer, takes none. Credentials created
+                 *     before 32 characters were required keep working.
                  */
                 "x-leani-consumer-credential"?: components["parameters"]["ConsumerCredential"];
             };
@@ -754,12 +761,13 @@ export interface paths {
             query?: never;
             header?: {
                 /**
-                 * @description The consumer's credential. A consumer created with one needs it on
-                 *     every consumer-scoped request, in addition to any bearer token, and
-                 *     gets 403 `forbidden` without it or with another; the node compares
-                 *     it in constant time. A consumer without one, such as a configured
-                 *     consumer, takes none. Credentials created before 32 characters were
-                 *     required keep working.
+                 * @description The consumer's credential. A consumer created with one needs it, in
+                 *     addition to any bearer token, on its lease, change, acknowledgement,
+                 *     and stream requests, and gets 403 `forbidden` without it or with
+                 *     another; the node compares it in constant time. Listing, inspecting,
+                 *     and revoking consumers need only the bearer token. A consumer without
+                 *     one, such as a configured consumer, takes none. Credentials created
+                 *     before 32 characters were required keep working.
                  */
                 "x-leani-consumer-credential"?: components["parameters"]["ConsumerCredential"];
             };
@@ -792,12 +800,13 @@ export interface paths {
             query?: never;
             header?: {
                 /**
-                 * @description The consumer's credential. A consumer created with one needs it on
-                 *     every consumer-scoped request, in addition to any bearer token, and
-                 *     gets 403 `forbidden` without it or with another; the node compares
-                 *     it in constant time. A consumer without one, such as a configured
-                 *     consumer, takes none. Credentials created before 32 characters were
-                 *     required keep working.
+                 * @description The consumer's credential. A consumer created with one needs it, in
+                 *     addition to any bearer token, on its lease, change, acknowledgement,
+                 *     and stream requests, and gets 403 `forbidden` without it or with
+                 *     another; the node compares it in constant time. Listing, inspecting,
+                 *     and revoking consumers need only the bearer token. A consumer without
+                 *     one, such as a configured consumer, takes none. Credentials created
+                 *     before 32 characters were required keep working.
                  */
                 "x-leani-consumer-credential"?: components["parameters"]["ConsumerCredential"];
             };
@@ -828,12 +837,13 @@ export interface paths {
             query?: never;
             header?: {
                 /**
-                 * @description The consumer's credential. A consumer created with one needs it on
-                 *     every consumer-scoped request, in addition to any bearer token, and
-                 *     gets 403 `forbidden` without it or with another; the node compares
-                 *     it in constant time. A consumer without one, such as a configured
-                 *     consumer, takes none. Credentials created before 32 characters were
-                 *     required keep working.
+                 * @description The consumer's credential. A consumer created with one needs it, in
+                 *     addition to any bearer token, on its lease, change, acknowledgement,
+                 *     and stream requests, and gets 403 `forbidden` without it or with
+                 *     another; the node compares it in constant time. Listing, inspecting,
+                 *     and revoking consumers need only the bearer token. A consumer without
+                 *     one, such as a configured consumer, takes none. Credentials created
+                 *     before 32 characters were required keep working.
                  */
                 "x-leani-consumer-credential"?: components["parameters"]["ConsumerCredential"];
             };
@@ -1841,12 +1851,13 @@ export interface components {
         Collection: string;
         Consumer: string;
         /**
-         * @description The consumer's credential. A consumer created with one needs it on
-         *     every consumer-scoped request, in addition to any bearer token, and
-         *     gets 403 `forbidden` without it or with another; the node compares
-         *     it in constant time. A consumer without one, such as a configured
-         *     consumer, takes none. Credentials created before 32 characters were
-         *     required keep working.
+         * @description The consumer's credential. A consumer created with one needs it, in
+         *     addition to any bearer token, on its lease, change, acknowledgement,
+         *     and stream requests, and gets 403 `forbidden` without it or with
+         *     another; the node compares it in constant time. Listing, inspecting,
+         *     and revoking consumers need only the bearer token. A consumer without
+         *     one, such as a configured consumer, takes none. Credentials created
+         *     before 32 characters were required keep working.
          */
         ConsumerCredential: string;
         /**
@@ -2649,12 +2660,13 @@ export interface operations {
             query?: never;
             header?: {
                 /**
-                 * @description The consumer's credential. A consumer created with one needs it on
-                 *     every consumer-scoped request, in addition to any bearer token, and
-                 *     gets 403 `forbidden` without it or with another; the node compares
-                 *     it in constant time. A consumer without one, such as a configured
-                 *     consumer, takes none. Credentials created before 32 characters were
-                 *     required keep working.
+                 * @description The consumer's credential. A consumer created with one needs it, in
+                 *     addition to any bearer token, on its lease, change, acknowledgement,
+                 *     and stream requests, and gets 403 `forbidden` without it or with
+                 *     another; the node compares it in constant time. Listing, inspecting,
+                 *     and revoking consumers need only the bearer token. A consumer without
+                 *     one, such as a configured consumer, takes none. Credentials created
+                 *     before 32 characters were required keep working.
                  */
                 "x-leani-consumer-credential"?: components["parameters"]["ConsumerCredential"];
                 /**
@@ -2691,12 +2703,13 @@ export interface operations {
             };
             header?: {
                 /**
-                 * @description The consumer's credential. A consumer created with one needs it on
-                 *     every consumer-scoped request, in addition to any bearer token, and
-                 *     gets 403 `forbidden` without it or with another; the node compares
-                 *     it in constant time. A consumer without one, such as a configured
-                 *     consumer, takes none. Credentials created before 32 characters were
-                 *     required keep working.
+                 * @description The consumer's credential. A consumer created with one needs it, in
+                 *     addition to any bearer token, on its lease, change, acknowledgement,
+                 *     and stream requests, and gets 403 `forbidden` without it or with
+                 *     another; the node compares it in constant time. Listing, inspecting,
+                 *     and revoking consumers need only the bearer token. A consumer without
+                 *     one, such as a configured consumer, takes none. Credentials created
+                 *     before 32 characters were required keep working.
                  */
                 "x-leani-consumer-credential"?: components["parameters"]["ConsumerCredential"];
             };
@@ -2729,12 +2742,13 @@ export interface operations {
             query?: never;
             header?: {
                 /**
-                 * @description The consumer's credential. A consumer created with one needs it on
-                 *     every consumer-scoped request, in addition to any bearer token, and
-                 *     gets 403 `forbidden` without it or with another; the node compares
-                 *     it in constant time. A consumer without one, such as a configured
-                 *     consumer, takes none. Credentials created before 32 characters were
-                 *     required keep working.
+                 * @description The consumer's credential. A consumer created with one needs it, in
+                 *     addition to any bearer token, on its lease, change, acknowledgement,
+                 *     and stream requests, and gets 403 `forbidden` without it or with
+                 *     another; the node compares it in constant time. Listing, inspecting,
+                 *     and revoking consumers need only the bearer token. A consumer without
+                 *     one, such as a configured consumer, takes none. Credentials created
+                 *     before 32 characters were required keep working.
                  */
                 "x-leani-consumer-credential"?: components["parameters"]["ConsumerCredential"];
             };
@@ -2833,12 +2847,13 @@ export interface operations {
             query?: never;
             header?: {
                 /**
-                 * @description The consumer's credential. A consumer created with one needs it on
-                 *     every consumer-scoped request, in addition to any bearer token, and
-                 *     gets 403 `forbidden` without it or with another; the node compares
-                 *     it in constant time. A consumer without one, such as a configured
-                 *     consumer, takes none. Credentials created before 32 characters were
-                 *     required keep working.
+                 * @description The consumer's credential. A consumer created with one needs it, in
+                 *     addition to any bearer token, on its lease, change, acknowledgement,
+                 *     and stream requests, and gets 403 `forbidden` without it or with
+                 *     another; the node compares it in constant time. Listing, inspecting,
+                 *     and revoking consumers need only the bearer token. A consumer without
+                 *     one, such as a configured consumer, takes none. Credentials created
+                 *     before 32 characters were required keep working.
                  */
                 "x-leani-consumer-credential"?: components["parameters"]["ConsumerCredential"];
             };
@@ -2865,12 +2880,13 @@ export interface operations {
             query?: never;
             header?: {
                 /**
-                 * @description The consumer's credential. A consumer created with one needs it on
-                 *     every consumer-scoped request, in addition to any bearer token, and
-                 *     gets 403 `forbidden` without it or with another; the node compares
-                 *     it in constant time. A consumer without one, such as a configured
-                 *     consumer, takes none. Credentials created before 32 characters were
-                 *     required keep working.
+                 * @description The consumer's credential. A consumer created with one needs it, in
+                 *     addition to any bearer token, on its lease, change, acknowledgement,
+                 *     and stream requests, and gets 403 `forbidden` without it or with
+                 *     another; the node compares it in constant time. Listing, inspecting,
+                 *     and revoking consumers need only the bearer token. A consumer without
+                 *     one, such as a configured consumer, takes none. Credentials created
+                 *     before 32 characters were required keep working.
                  */
                 "x-leani-consumer-credential"?: components["parameters"]["ConsumerCredential"];
             };
@@ -2897,12 +2913,13 @@ export interface operations {
             query?: never;
             header?: {
                 /**
-                 * @description The consumer's credential. A consumer created with one needs it on
-                 *     every consumer-scoped request, in addition to any bearer token, and
-                 *     gets 403 `forbidden` without it or with another; the node compares
-                 *     it in constant time. A consumer without one, such as a configured
-                 *     consumer, takes none. Credentials created before 32 characters were
-                 *     required keep working.
+                 * @description The consumer's credential. A consumer created with one needs it, in
+                 *     addition to any bearer token, on its lease, change, acknowledgement,
+                 *     and stream requests, and gets 403 `forbidden` without it or with
+                 *     another; the node compares it in constant time. Listing, inspecting,
+                 *     and revoking consumers need only the bearer token. A consumer without
+                 *     one, such as a configured consumer, takes none. Credentials created
+                 *     before 32 characters were required keep working.
                  */
                 "x-leani-consumer-credential"?: components["parameters"]["ConsumerCredential"];
                 /**
@@ -2935,12 +2952,13 @@ export interface operations {
             query?: never;
             header?: {
                 /**
-                 * @description The consumer's credential. A consumer created with one needs it on
-                 *     every consumer-scoped request, in addition to any bearer token, and
-                 *     gets 403 `forbidden` without it or with another; the node compares
-                 *     it in constant time. A consumer without one, such as a configured
-                 *     consumer, takes none. Credentials created before 32 characters were
-                 *     required keep working.
+                 * @description The consumer's credential. A consumer created with one needs it, in
+                 *     addition to any bearer token, on its lease, change, acknowledgement,
+                 *     and stream requests, and gets 403 `forbidden` without it or with
+                 *     another; the node compares it in constant time. Listing, inspecting,
+                 *     and revoking consumers need only the bearer token. A consumer without
+                 *     one, such as a configured consumer, takes none. Credentials created
+                 *     before 32 characters were required keep working.
                  */
                 "x-leani-consumer-credential"?: components["parameters"]["ConsumerCredential"];
                 /**
@@ -2973,12 +2991,13 @@ export interface operations {
             query?: never;
             header?: {
                 /**
-                 * @description The consumer's credential. A consumer created with one needs it on
-                 *     every consumer-scoped request, in addition to any bearer token, and
-                 *     gets 403 `forbidden` without it or with another; the node compares
-                 *     it in constant time. A consumer without one, such as a configured
-                 *     consumer, takes none. Credentials created before 32 characters were
-                 *     required keep working.
+                 * @description The consumer's credential. A consumer created with one needs it, in
+                 *     addition to any bearer token, on its lease, change, acknowledgement,
+                 *     and stream requests, and gets 403 `forbidden` without it or with
+                 *     another; the node compares it in constant time. Listing, inspecting,
+                 *     and revoking consumers need only the bearer token. A consumer without
+                 *     one, such as a configured consumer, takes none. Credentials created
+                 *     before 32 characters were required keep working.
                  */
                 "x-leani-consumer-credential"?: components["parameters"]["ConsumerCredential"];
             };
@@ -3005,12 +3024,13 @@ export interface operations {
             query?: never;
             header?: {
                 /**
-                 * @description The consumer's credential. A consumer created with one needs it on
-                 *     every consumer-scoped request, in addition to any bearer token, and
-                 *     gets 403 `forbidden` without it or with another; the node compares
-                 *     it in constant time. A consumer without one, such as a configured
-                 *     consumer, takes none. Credentials created before 32 characters were
-                 *     required keep working.
+                 * @description The consumer's credential. A consumer created with one needs it, in
+                 *     addition to any bearer token, on its lease, change, acknowledgement,
+                 *     and stream requests, and gets 403 `forbidden` without it or with
+                 *     another; the node compares it in constant time. Listing, inspecting,
+                 *     and revoking consumers need only the bearer token. A consumer without
+                 *     one, such as a configured consumer, takes none. Credentials created
+                 *     before 32 characters were required keep working.
                  */
                 "x-leani-consumer-credential"?: components["parameters"]["ConsumerCredential"];
             };
@@ -3037,12 +3057,13 @@ export interface operations {
             query?: never;
             header?: {
                 /**
-                 * @description The consumer's credential. A consumer created with one needs it on
-                 *     every consumer-scoped request, in addition to any bearer token, and
-                 *     gets 403 `forbidden` without it or with another; the node compares
-                 *     it in constant time. A consumer without one, such as a configured
-                 *     consumer, takes none. Credentials created before 32 characters were
-                 *     required keep working.
+                 * @description The consumer's credential. A consumer created with one needs it, in
+                 *     addition to any bearer token, on its lease, change, acknowledgement,
+                 *     and stream requests, and gets 403 `forbidden` without it or with
+                 *     another; the node compares it in constant time. Listing, inspecting,
+                 *     and revoking consumers need only the bearer token. A consumer without
+                 *     one, such as a configured consumer, takes none. Credentials created
+                 *     before 32 characters were required keep working.
                  */
                 "x-leani-consumer-credential"?: components["parameters"]["ConsumerCredential"];
             };
@@ -3069,12 +3090,13 @@ export interface operations {
             query?: never;
             header?: {
                 /**
-                 * @description The consumer's credential. A consumer created with one needs it on
-                 *     every consumer-scoped request, in addition to any bearer token, and
-                 *     gets 403 `forbidden` without it or with another; the node compares
-                 *     it in constant time. A consumer without one, such as a configured
-                 *     consumer, takes none. Credentials created before 32 characters were
-                 *     required keep working.
+                 * @description The consumer's credential. A consumer created with one needs it, in
+                 *     addition to any bearer token, on its lease, change, acknowledgement,
+                 *     and stream requests, and gets 403 `forbidden` without it or with
+                 *     another; the node compares it in constant time. Listing, inspecting,
+                 *     and revoking consumers need only the bearer token. A consumer without
+                 *     one, such as a configured consumer, takes none. Credentials created
+                 *     before 32 characters were required keep working.
                  */
                 "x-leani-consumer-credential"?: components["parameters"]["ConsumerCredential"];
                 /**
@@ -3107,12 +3129,13 @@ export interface operations {
             query?: never;
             header?: {
                 /**
-                 * @description The consumer's credential. A consumer created with one needs it on
-                 *     every consumer-scoped request, in addition to any bearer token, and
-                 *     gets 403 `forbidden` without it or with another; the node compares
-                 *     it in constant time. A consumer without one, such as a configured
-                 *     consumer, takes none. Credentials created before 32 characters were
-                 *     required keep working.
+                 * @description The consumer's credential. A consumer created with one needs it, in
+                 *     addition to any bearer token, on its lease, change, acknowledgement,
+                 *     and stream requests, and gets 403 `forbidden` without it or with
+                 *     another; the node compares it in constant time. Listing, inspecting,
+                 *     and revoking consumers need only the bearer token. A consumer without
+                 *     one, such as a configured consumer, takes none. Credentials created
+                 *     before 32 characters were required keep working.
                  */
                 "x-leani-consumer-credential"?: components["parameters"]["ConsumerCredential"];
                 /**

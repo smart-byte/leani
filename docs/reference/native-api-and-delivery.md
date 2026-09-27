@@ -256,7 +256,7 @@ lower gaps or non-finalized coverage can still exist.
 
 For a block-local processor, `available` can contain several intervals while a
 backfill and head follower operate concurrently. `processedThrough` is the
-last block of the newest interval, even when earlier ones leave gaps;
+last block of the highest interval, even when earlier ones leave gaps;
 `complete` says whether the requested range, or the range from the configured
 start to the processor's cursor, has none.
 

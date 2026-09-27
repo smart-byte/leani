@@ -675,7 +675,8 @@ pub enum ProbeSource {
         /// Maximum simultaneous footer requests.
         #[arg(long, default_value_t = 4)]
         concurrency: usize,
-        /// Maximum projected compressed Parquet bytes.
+        /// Maximum bytes the projection fetches in all, Parquet footers and
+        /// merged gaps included, and the most it holds at once.
         #[arg(long, default_value_t = 268_435_456)]
         max_input_bytes: u64,
         /// Arrow rows decoded in one bounded batch.

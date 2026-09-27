@@ -49,7 +49,9 @@ pub use anchor::{
     read_finality_anchor, resolve_start_anchor, slot_unix_seconds,
 };
 use http::{BeaconTransport, HttpTransport};
-pub use http::{endpoint_labels, normalized_endpoint, read_response, redacted_url, request_label};
+pub use http::{
+    endpoint_labels, normalized_endpoint, read_response, redacted_url, request_label, request_url,
+};
 
 pub const MAINNET_GENESIS_TIME: u64 = 1_606_824_023;
 pub const MAINNET_GENESIS_ROOT: B256 =
@@ -1392,6 +1394,26 @@ pub enum BeaconApiError {
 }
 
 impl BeaconApiError {
+    /// Scrub from a server's error detail what `endpoint` keeps secret: each
+    /// non-empty base-path segment, the raw query and each query value, and
+    /// the username and password become `…`. The server may echo the
+    /// request's path and query, where providers put API keys.
+    #[must_use]
+    pub fn redacting(self, endpoint: &Url) -> Self {
+        match self {
+            Self::Status {
+                url,
+                status,
+                detail,
+            } => Self::Status {
+                url,
+                status,
+                detail: http::redact_endpoint(&detail, endpoint),
+            },
+            other => other,
+        }
+    }
+
     /// Whether an update was refused only because it is older than the
     /// verified store or ahead of the local clock. Such an update is not
     /// evidence of a faulty transport; retry later or elsewhere.
@@ -2713,8 +2735,9 @@ mod tests {
     }
 
     /// Serve one HTTP/1.1 exchange on 127.0.0.1 with a canned `response`.
-    /// The handle yields whether a client connected within a second.
-    async fn loopback_server(response: String) -> (Url, tokio::task::JoinHandle<bool>) {
+    /// The handle yields the request line of a client that connected within
+    /// a second.
+    async fn loopback_server(response: String) -> (Url, tokio::task::JoinHandle<Option<String>>) {
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -2725,7 +2748,7 @@ mod tests {
             let Ok(Ok((mut stream, _))) =
                 tokio::time::timeout(Duration::from_secs(1), listener.accept()).await
             else {
-                return false;
+                return None;
             };
             let mut request = Vec::new();
             let mut buffer = [0_u8; 1_024];
@@ -2737,12 +2760,81 @@ mod tests {
             }
             let _ = stream.write_all(response.as_bytes()).await;
             let _ = stream.shutdown().await;
-            true
+            let request = String::from_utf8_lossy(&request);
+            Some(request.lines().next().unwrap_or_default().to_owned())
         });
         (
             Url::parse(&format!("http://{address}/")).expect("loopback URL"),
             served,
         )
+    }
+
+    fn loopback_transport() -> HttpTransport {
+        HttpTransport {
+            client: http::client_builder(Duration::from_secs(5))
+                .no_proxy()
+                .build()
+                .expect("client"),
+        }
+    }
+
+    #[tokio::test]
+    async fn endpoint_query_keys_reach_every_request() {
+        // Final review B3: joining the request path dropped the endpoint's
+        // query, so a provider keyed by `?apikey=` never authenticated.
+        let answer = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}";
+        let (origin, served) = loopback_server(answer.to_owned()).await;
+        let endpoint = origin.join("?apikey=k").expect("keyed endpoint");
+        loopback_transport()
+            .get(&endpoint, "eth/v1/beacon/genesis")
+            .await
+            .expect("keyed request");
+        assert_eq!(
+            served.await.expect("server").as_deref(),
+            Some("GET /eth/v1/beacon/genesis?apikey=k HTTP/1.1")
+        );
+        // A request with its own query keeps both.
+        let (origin, served) = loopback_server(answer.to_owned()).await;
+        let endpoint = origin.join("?apikey=k").expect("keyed endpoint");
+        loopback_transport()
+            .get(
+                &endpoint,
+                "eth/v1/beacon/light_client/updates?start_period=1&count=1",
+            )
+            .await
+            .expect("keyed request with a query");
+        assert_eq!(
+            served.await.expect("server").as_deref(),
+            Some(
+                "GET /eth/v1/beacon/light_client/updates?start_period=1&count=1&apikey=k HTTP/1.1"
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn error_bodies_do_not_echo_endpoint_secrets() {
+        // Final review B2: the status detail kept up to 512 characters of
+        // the server's body, which may echo the request's path and query.
+        let body = "Cannot GET /hunter5/eth/v1/beacon/genesis?apikey=hunter2";
+        let (origin, _served) = loopback_server(format!(
+            "HTTP/1.1 404 Not Found\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        ))
+        .await;
+        let endpoint = origin.join("hunter5/?apikey=hunter2").expect("endpoint");
+        let error = loopback_transport()
+            .get(&endpoint, "eth/v1/beacon/genesis")
+            .await
+            .expect_err("not found");
+        let rendered = error.to_string();
+        assert!(
+            matches!(error, BeaconApiError::Status { status: 404, .. }),
+            "{rendered}"
+        );
+        assert!(rendered.contains("Cannot GET"), "{rendered}");
+        for secret in ["hunter5", "hunter2"] {
+            assert!(!rendered.contains(secret), "{rendered}");
+        }
     }
 
     #[tokio::test]
@@ -2796,7 +2888,7 @@ mod tests {
             "{error}"
         );
         assert!(
-            !contacted.await.expect("redirect target"),
+            contacted.await.expect("redirect target").is_none(),
             "the redirect target was contacted"
         );
     }

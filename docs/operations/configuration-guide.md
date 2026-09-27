@@ -313,9 +313,14 @@ start_block = 12965000
 publish = "included_and_finalized"
 ```
 
-Changing processor code, semantic version, settings, start point, or source
-identity creates a new immutable processor instance. It does not mutate an
-existing cursor namespace.
+Processor code, semantic version, settings, start point, and source identity
+are part of an instance's immutable identity. The node refuses a change to any
+of them under an `instance` its store holds (`processor instance … conflicts
+with its stored descriptor`), before it upgrades an older store, so it never
+mutates an existing cursor namespace. Give the changed processor a new
+`instance` ID: it indexes from its `start_block` beside the old instance,
+whose rows stay in the store. Lifecycle policies, such as retention and delivery
+limits, are not part of the identity and can change in place.
 
 Publication values are:
 

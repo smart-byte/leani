@@ -62,11 +62,13 @@ For Rust applications, see [build a custom node](/docs/guides/custom-processor/)
 Install with `brew install smart-byte/tap/leani`, or choose a matching
 archive from the [GitHub releases](https://github.com/smart-byte/leani/releases).
 Verify the archive's published checksum before running it. Containers use
-`ghcr.io/smart-byte/leani:<version>`; pin the release's digest for deployment.
+`ghcr.io/smart-byte/leani:v<version>`, such as `leani:v0.1.0-rc.1`; pin the
+release's digest for deployment.
 
 The Linux archives need glibc 2.39 or newer: Ubuntu 24.04, Debian 13, Fedora
 40, RHEL 10 and its rebuilds, or a later release of these. On an older or
 musl-based distribution, run the container image or build from source.
 For this preview, select the `v0.1.0-rc.1` binary release and install the matching
-SDK with `bun add @smart-byte/leani-sdk@0.1.0-rc.1`. Prerelease SDKs use npm's `next` tag.
+SDK with `bun add @smart-byte/leani-sdk@0.1.0-rc.1`. Prerelease SDKs use npm's `next` tag,
+so an install without the exact version resolves `latest`, which may not match your node.
 Keep binary, SDK, and configuration versions aligned with the release you selected.

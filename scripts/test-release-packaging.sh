@@ -117,3 +117,28 @@ reject_toolchain "a second, mismatched Rust stage" mixed.Dockerfile rust-toolcha
 reject_toolchain "a Dockerfile without a Rust stage" no-rust.Dockerfile rust-toolchain.toml
 reject_toolchain "a floating toolchain channel" matching.Dockerfile floating-toolchain.toml
 echo "container toolchain check rejects 4 mismatches"
+
+# Documented SDK installs must pin the SDK package's exact version.
+printf '{ "name": "@smart-byte/leani-sdk", "version": "1.2.3-rc.4" }\n' > "$work_directory/package.json"
+printf '```bash\nbun add @smart-byte/leani-sdk@1.2.3-rc.4\n```\n' > "$work_directory/pinned.md"
+printf 'Install it with `npm install @smart-byte/leani-sdk@1.2.3-rc.4`.\n' > "$work_directory/prose.md"
+printf 'bun add @smart-byte/leani-sdk\n' > "$work_directory/unpinned.md"
+printf 'bun add @smart-byte/leani-sdk@1.2.3-rc.3\n' > "$work_directory/stale.md"
+printf 'bun add @smart-byte/leani-sdk@^1.2.3-rc.4\n' > "$work_directory/range.md"
+printf 'npm i @smart-byte/leani-sdk@next\n' > "$work_directory/tag.md"
+printf 'Import `@smart-byte/leani-sdk` after installing it.\n' > "$work_directory/no-install.md"
+
+ruby scripts/check-sdk-pins.rb \
+  "$work_directory/package.json" "$work_directory/pinned.md" "$work_directory/prose.md"
+reject_pins() {
+  if ruby scripts/check-sdk-pins.rb "$work_directory/package.json" "$work_directory/$2" 2>/dev/null; then
+    echo "SDK pin check accepted $1" >&2
+    exit 1
+  fi
+}
+reject_pins "an install without a version" unpinned.md
+reject_pins "another version" stale.md
+reject_pins "a version range" range.md
+reject_pins "a distribution tag" tag.md
+reject_pins "documentation without an install" no-install.md
+echo "SDK pin check rejects 5 unpinned installs"

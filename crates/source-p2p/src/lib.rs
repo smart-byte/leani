@@ -3909,7 +3909,8 @@ struct P2pLiveState {
     head_poll: HeadPollRotation,
     /// Since when no attested head has been above the tip.
     head_unavailable_since: Option<Instant>,
-    /// Since when every head poll's cohort has stayed silent.
+    /// Since when every head poll's cohort has stayed silent, counted from
+    /// the lane's last progress at the earliest.
     head_poll_silent_since: Option<Instant>,
     reconnect_error: Option<String>,
     /// Whether the lane has reported itself disconnected since it last
@@ -8851,9 +8852,10 @@ async fn next_live_event(
             while state.recent.len() > state.source.config.max_reorg_depth.saturating_add(1) {
                 state.recent.pop_front();
             }
-            // Progress: the lane reports itself disconnected again, once,
-            // after its next failure.
-            state.disconnect_reported = false;
+            note_live_progress(
+                &mut state.disconnect_reported,
+                &mut state.head_poll_silent_since,
+            );
             return Some((Ok(ChainEvent::Block(Box::new(frame))), state));
         }
         let batch_blocks = if state.pending_material_attempts == 0 {
@@ -9328,6 +9330,14 @@ fn head_poll_failure(
     }
 }
 
+/// The live lane made progress: it emitted a block or reorg, or reconnected.
+/// It reports itself disconnected again, once, after its next failure, and a
+/// silent head poll starts the grace of [`head_poll_failure`] afresh.
+const fn note_live_progress(disconnect_reported: &mut bool, silent_since: &mut Option<Instant>) {
+    *disconnect_reported = false;
+    *silent_since = None;
+}
+
 /// The pause before another wave of a live body or receipt request whose last
 /// wave found no peer serving the material, or `None` once the request has
 /// run `MAX_LIVE_MATERIAL_WAVES` waves or `LIVE_MATERIAL_TIMEOUT`: no peer
@@ -9432,7 +9442,10 @@ async fn reconnect_live_session(
                 state.session.set_range(None);
                 state.session.set_phase(NetworkPhase::FollowingHead);
                 state.head_unavailable_since = None;
-                state.disconnect_reported = false;
+                note_live_progress(
+                    &mut state.disconnect_reported,
+                    &mut state.head_poll_silent_since,
+                );
                 return Ok(());
             }
             Err(P2pError::Cancelled) => return Err(P2pError::Cancelled),
@@ -9475,7 +9488,10 @@ async fn reconstruct_reorg_event(
             state.recent.extend(applied.iter().map(|frame| frame.block));
             state.last = new_tip;
             state.ancestry = AttestedAncestry::default();
-            state.disconnect_reported = false;
+            note_live_progress(
+                &mut state.disconnect_reported,
+                &mut state.head_poll_silent_since,
+            );
             return Some(ChainEvent::Reorg { reverted, applied });
         }
         Err(error) => error,
@@ -15224,6 +15240,53 @@ mod tests {
         assert_eq!(
             poll_failed(started + grace * 3, &silent, false),
             HeadPollFailure::Reconnect
+        );
+    }
+
+    #[test]
+    fn live_progress_restarts_the_head_poll_silence_clock() {
+        // Final review B1: only an answered head poll ended a silence, so
+        // after a catch-up that followed a silent poll, the next silent poll
+        // reported the lane disconnected at once and cleared readiness.
+        let config = RethP2pConfig::default();
+        let source = RethP2pSource::mainnet(config.clone()).expect("source");
+        let grace = source.descriptor.expected_lag.max(config.poll_interval);
+        let silent = P2pError::Timeout {
+            component: "headers",
+        };
+        let started = Instant::now();
+        let mut attempts = 0;
+        let mut silent_since = None;
+        let mut disconnect_reported = true;
+        assert!(matches!(
+            head_poll_failure(
+                &config,
+                &mut attempts,
+                &mut silent_since,
+                started,
+                grace,
+                &silent,
+                true
+            ),
+            HeadPollFailure::Retry(_)
+        ));
+        // The lane emits the blocks of a catch-up.
+        note_live_progress(&mut disconnect_reported, &mut silent_since);
+        assert!(!disconnect_reported);
+        assert!(
+            matches!(
+                head_poll_failure(
+                    &config,
+                    &mut attempts,
+                    &mut silent_since,
+                    started + grace + Duration::from_secs(1),
+                    grace,
+                    &silent,
+                    true
+                ),
+                HeadPollFailure::Retry(_)
+            ),
+            "the first silent poll after progress reported the lane disconnected"
         );
     }
 

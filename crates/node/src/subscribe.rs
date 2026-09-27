@@ -42,7 +42,9 @@ use crate::{
     },
     config::{Config, FinalitySourceKind},
     local_state,
-    process::{Exit, configured_store_config, spawn_embedded_network_runtime},
+    process::{
+        Exit, configured_store_config, processor_descriptors, spawn_embedded_network_runtime,
+    },
     processors::ProcessorRegistry,
     uniswap_markets::{
         MARKET_CATALOG, Market, Token, UNISWAP_V3_FACTORY_BLOCK, processor_config, resolve_markets,
@@ -950,11 +952,12 @@ async fn subscribe_embedded(
         .first()
         .cloned()
         .context("subscription processor was not instantiated")?;
-    let store = SqliteStore::open(configured_store_config(
-        &config,
-        data_dir.join("leani.sqlite"),
-    ))
-    .await?;
+    let store = SqliteStore::open(
+        configured_store_config(&config, data_dir.join("leani.sqlite"))
+            .with_processors(processor_descriptors(&processors)),
+    )
+    .await
+    .map_err(|error| explain_subscription_refusal(error, options, markets))?;
     store
         .register_processor(processor.descriptor())
         .await
@@ -1952,7 +1955,8 @@ async fn fetch_checkpoint(
     })
 }
 
-/// Decode a provider response read with a size cap, refusing redirects.
+/// Decode a provider response read with a size cap, refusing redirects. An
+/// error body keeps none of the provider's secrets.
 async fn read_provider_json<T: serde::de::DeserializeOwned>(
     response: reqwest::Response,
     provider: &Url,
@@ -1964,7 +1968,8 @@ async fn read_provider_json<T: serde::de::DeserializeOwned>(
     );
     let body =
         leani_finality_beacon_api::read_response(response, &label, MAX_CHECKPOINT_RESPONSE_BYTES)
-            .await?;
+            .await
+            .map_err(|error| error.redacting(provider))?;
     serde_json::from_slice(&body).context("decode the checkpoint provider response")
 }
 
@@ -1974,12 +1979,14 @@ fn normalized_checkpoint_root(root: &str) -> Result<String> {
     Ok(format!("0x{}", hex::encode(root)))
 }
 
+/// The URL of `suffix` below `provider`, keeping its last path segment and
+/// the API key in its query string.
 fn provider_url(provider: &Url, suffix: &str) -> Result<Url> {
-    let mut provider = provider.clone();
-    if !provider.path().ends_with('/') {
-        provider.set_path(&format!("{}/", provider.path()));
-    }
-    provider.join(suffix).context("construct checkpoint URL")
+    leani_finality_beacon_api::request_url(
+        &leani_finality_beacon_api::normalized_endpoint(provider),
+        suffix,
+    )
+    .context("construct checkpoint URL")
 }
 
 /// The checkpoint summary shown before an operator accepts a new trust root:
@@ -6366,6 +6373,47 @@ mod tests {
             0,
             "the redirect target was contacted"
         );
+    }
+
+    #[test]
+    fn checkpoint_provider_urls_keep_their_query_key() {
+        // Final review B3: joining the request path dropped a provider's
+        // `?key=` API key.
+        let provider = Url::parse("https://provider.example/base?key=k").expect("provider");
+        assert_eq!(
+            provider_url(&provider, "eth/v1/beacon/headers/finalized")
+                .expect("provider URL")
+                .as_str(),
+            "https://provider.example/base/eth/v1/beacon/headers/finalized?key=k"
+        );
+    }
+
+    #[tokio::test]
+    async fn checkpoint_provider_errors_do_not_echo_its_secrets() {
+        // Final review B2: a provider's error body may echo the request's
+        // path and query, where the API key is.
+        let body = "Cannot GET /hunter5/checkpointz/v1/beacon/slots?apikey=hunter2";
+        let (origin, _served) = loopback_server(
+            format!(
+                "HTTP/1.1 404 Not Found\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            ),
+            2,
+        )
+        .await;
+        let provider = origin.join("hunter5/?apikey=hunter2").expect("provider");
+        let client = checkpoint_client_builder()
+            .no_proxy()
+            .build()
+            .expect("client");
+        let error = fetch_checkpoint(&client, provider, "loopback".to_owned())
+            .await
+            .expect_err("missing checkpoint");
+        let rendered = format!("{error:#}");
+        assert!(rendered.contains("HTTP 404"), "{rendered}");
+        for secret in ["hunter5", "hunter2"] {
+            assert!(!rendered.contains(secret), "{rendered}");
+        }
     }
 
     #[tokio::test]

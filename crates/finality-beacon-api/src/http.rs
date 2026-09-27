@@ -31,6 +31,55 @@ pub fn redacted_url(url: &Url) -> String {
     rendered
 }
 
+/// The URL of a request to `path_and_query` below `endpoint`. Joining a path
+/// drops the endpoint's query, where providers put API keys, so it is
+/// appended after the request's own query.
+///
+/// # Errors
+///
+/// Fails when `path_and_query` does not join onto `endpoint`.
+pub fn request_url(endpoint: &Url, path_and_query: &str) -> Result<Url, url::ParseError> {
+    let mut url = endpoint.join(path_and_query)?;
+    if let Some(key) = endpoint.query().filter(|query| !query.is_empty()) {
+        let query = match url.query().filter(|own| !own.is_empty()) {
+            Some(own) => format!("{own}&{key}"),
+            None => key.to_owned(),
+        };
+        url.set_query(Some(&query));
+    }
+    Ok(url)
+}
+
+/// `text` with each secret `endpoint` may carry replaced by `…`: every
+/// non-empty base-path segment, the raw query and each query value, the
+/// username, and the password. A server's error body may echo the request's
+/// path and query.
+pub(crate) fn redact_endpoint(text: &str, endpoint: &Url) -> String {
+    let mut secrets = endpoint
+        .path_segments()
+        .into_iter()
+        .flatten()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    if let Some(query) = endpoint.query() {
+        secrets.push(query.to_owned());
+        secrets.extend(
+            query
+                .split('&')
+                .filter_map(|pair| pair.split_once('=').map(|(_, value)| value.to_owned())),
+        );
+        secrets.extend(endpoint.query_pairs().map(|(_, value)| value.into_owned()));
+    }
+    secrets.push(endpoint.username().to_owned());
+    secrets.extend(endpoint.password().map(str::to_owned));
+    // Longest first, so no shorter secret leaves pieces of a longer one.
+    secrets.retain(|secret| !secret.is_empty());
+    secrets.sort_by_key(|secret| std::cmp::Reverse(secret.len()));
+    secrets.iter().fold(text.to_owned(), |text, secret| {
+        text.replace(secret.as_str(), "…")
+    })
+}
+
 /// Render a request to `path_and_query` below `endpoint` for errors: the
 /// redacted endpoint plus the API path, which is never secret.
 #[must_use]
@@ -97,7 +146,7 @@ pub(crate) struct HttpTransport {
 #[async_trait]
 impl BeaconTransport for HttpTransport {
     async fn get(&self, endpoint: &Url, path_and_query: &str) -> Result<Vec<u8>, BeaconApiError> {
-        let url = endpoint.join(path_and_query).map_err(BeaconApiError::Url)?;
+        let url = request_url(endpoint, path_and_query).map_err(BeaconApiError::Url)?;
         let label = request_label(endpoint, path_and_query);
         let response =
             self.client
@@ -108,7 +157,9 @@ impl BeaconTransport for HttpTransport {
                     url: label.clone(),
                     source: source.without_url(),
                 })?;
-        read_response(response, &label, MAX_RESPONSE_BYTES).await
+        read_response(response, &label, MAX_RESPONSE_BYTES)
+            .await
+            .map_err(|error| error.redacting(endpoint))
     }
 }
 

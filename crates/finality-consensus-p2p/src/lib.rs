@@ -522,10 +522,22 @@ impl P2pLightClient {
     /// no newer than the published head, or signed by too few of the sync
     /// committee is skipped; one that fails verification is banned. No head
     /// leaves the previous one in place: the live lane waits for it.
+    ///
+    /// Only the first peer is waited for. Once every connected peer was
+    /// tried, the refresh ends instead of waiting out the request deadline
+    /// for another: the next refresh asks again.
     async fn attested_head(&mut self, published: Option<AttestedHead>) -> Option<AttestedHead> {
         let deadline = tokio::time::Instant::now() + self.network.request_timeout;
         let mut tried = HashSet::new();
-        while let Ok(Some(peer)) = self.network.next_peer(&mut tried, deadline).await {
+        loop {
+            let wait_until = if tried.is_empty() {
+                deadline
+            } else {
+                tokio::time::Instant::now()
+            };
+            let Ok(Some(peer)) = self.network.next_peer(&mut tried, wait_until).await else {
+                break;
+            };
             let update = match self
                 .network
                 .request(peer, LightClientRequest::Optimistic, deadline)
@@ -2357,11 +2369,20 @@ mod tests {
             Duration::from_secs(SLOT_SECONDS),
         )
         .with_attested_heads(heads.clone());
+        let started = tokio::time::Instant::now();
         let mut events = source
             .subscribe(checkpoint(bootstrap_anchor()), CancellationToken::new())
             .await
             .expect("subscribe");
         assert_eq!(finalized_slot(events.next().await), FINALIZED_SLOT);
+        // Final review B4: once every peer was tried, the refresh waited out
+        // the request timeout for another to connect; two such refreshes
+        // outlast the attested-head grace.
+        assert!(
+            started.elapsed() < ConsensusP2pConfig::default().request_timeout,
+            "the refresh waited {:?} after trying every peer",
+            started.elapsed()
+        );
         // The refresh went on to the next peer instead of settling for the
         // first stale head, and banned neither.
         assert_eq!(

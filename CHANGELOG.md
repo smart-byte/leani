@@ -6,6 +6,50 @@ record, and documented RPC contracts.
 
 ## [Unreleased]
 
+### Upgrading from 0.1.0-rc.1
+
+Take these steps in order; each links to the entries below that detail it.
+
+1. Stop the node and every `leani subscribe` run on the data directory, then
+   copy `data_dir` or run `leani db backup` with the rc.1 binary. The first
+   start upgrades the store from schema 21 to 23, which cannot be undone
+   ([schema](#rc1-schema)).
+2. Fix the configuration:
+   - a relative `data_dir` or archive `manifest` now resolves beside the
+     configuration file ([paths](#rc1-paths));
+   - fix or remove the options validation now refuses
+     ([ignored options](#rc1-refused-options),
+     [state modes](#rc1-state-modes), [finality](#rc1-finality-options),
+     [eraE](#rc1-erae-http));
+   - set `api.bearer_token_env` for a native API bound beyond loopback
+     ([binds](#rc1-binds));
+   - list the names and browser origins your clients use in
+     `api.allowed_hosts`, `api.allowed_origins`, and `rpc.allowed_origins`
+     ([browsers](#rc1-browsers));
+   - opt JSON-RPC bound beyond loopback in with
+     `rpc.allow_unauthenticated_remote` ([binds](#rc1-binds));
+   - no persisted finality anchor exists yet, so the first start needs a
+     `finality.checkpoint` at most 14 days old ([anchor](#rc1-finality-anchor)).
+3. Rebuild each changed processor under a new `instance`:
+   `erc20-balances` and `evm-events` at 1.1.0 ([rebuild](#rc1-rebuild)),
+   keyed `evm-events` stored block-local ([keyed](#rc1-keyed-evm-events)),
+   `blobs-money` at 1.5.0 ([blobs](#rc1-blobs-money)), and a compact
+   `[uniswap]` node or `leani subscribe uniswap-v3` with ETH/USDT or WBTC/ETH
+   ([Uniswap](#rc1-uniswap)). The container profile brings its renamed
+   instance ([container](#rc1-container)), and the `windowed` profile its new
+   output ([windowed](#rc1-windowed)). A refused start leaves the store
+   unchanged.
+4. Upgrade the SDK with the node, by exact version:
+   `bun add @smart-byte/leani-sdk@<version>` ([SDK](#rc1-sdk)).
+5. Update HTTP and JSON-RPC clients that do not use the SDK: a JSON body or
+   `x-leani-request: 1` on mutations, POST to create query snapshots
+   ([HTTP](#rc1-http-clients)), consumer credentials and acknowledgements
+   ([consumers](#rc1-consumers)), hex hashes ([hashes](#rc1-hex-hashes)), and
+   the JSON-RPC changes ([JSON-RPC](#rc1-json-rpc)).
+6. After the first start, expect consumer sessions to reconnect with new
+   tokens ([consumers](#rc1-consumers)), and run `leani db compact` once
+   while the node is stopped ([compact](#rc1-compact)).
+
 ### Security
 
 - Updated Reth's transitive `imbl` dependency to 7.0.2 and
@@ -26,7 +70,10 @@ record, and documented RPC contracts.
   prompt show endpoint and provider URLs as `scheme://host[:port]`, with `/…`
   in place of a path, so API keys in userinfo, query strings, or paths are not
   printed. Request errors add the API path, and endpoints that would show
-  alike carry their index, such as `finality.endpoints[1]`.
+  alike carry their index, such as `finality.endpoints[1]`. The part of an
+  error body they keep, which a server may echo the request's path and query
+  into, shows each segment of the endpoint's path, its query string and
+  values, and its userinfo as `…`.
 - A persisted finality anchor replaces the configured `finality.checkpoint`
   only when it was verified from that checkpoint. An anchor from another
   trust root is ignored with a warning, and `leani doctor` reports it, so
@@ -60,8 +107,11 @@ record, and documented RPC contracts.
   follows also earns its peer's stored service evidence and Reth reputation
   only once that frame completes, with its body and receipts when the frame
   needs them; a header that no frame follows, such as the minimum live head
-  the lane starts from, earns them at once. The lane used to retry forever
-  while still reporting itself ready, and to reward the header first.
+  the lane starts from, earns them at once, but only when anchored: its hash
+  known from verified finality or an attested head, such as the verified
+  tip. The block after the finalized anchor, fetched by number, earns
+  nothing. The lane used to retry forever while still reporting itself
+  ready, and to reward the header first.
 - One execution peer serving a forged segment of the history bridge's header
   proof no longer blocks the bridge. The proof is checked from the finalized
   anchor down, each segment against the parent that the proven segment above
@@ -110,8 +160,9 @@ record, and documented RPC contracts.
   before finality moves to another block, halts the network lanes, not ready
   and not retried, with the error in the log and in `network.supervisor` (see
   the runbook's "Finality contradicts the followed chain").
-- Web pages can no longer read from or change a node's native API or
-  JSON-RPC through the visitor's browser, with the exceptions below. The
+- <a id="rc1-browsers"></a>Web pages can no longer read from or change a
+  node's native API or JSON-RPC through the visitor's browser, with the
+  exceptions below. The
   native API answers a `Host` name other than `localhost` and those in the
   new `api.allowed_hosts` with 421, so a page that points its own name at
   127.0.0.1 is refused; IP addresses, which such a page cannot send, pass.
@@ -236,7 +287,8 @@ record, and documented RPC contracts.
   prefixed `baseUrl` instead of addressing the origin's root. A path segment
   that decodes to `.` or `..`, or that holds a backslash, an encoded slash or
   backslash, or an encoded percent sign, is refused with a `TypeError` before
-  any request, and so is a control character anywhere in the path. An ID such
+  any request, and so is a control character anywhere in the path, raw or
+  percent-encoded, which a proxy may drop after decoding. An ID such
   as `..` or `../../other` resolved to another route, directly or through a
   proxy that decodes `%2F` first. No Leani ID contains these characters.
   `request()` applies the same rule to a custom query extension's path, so a
@@ -255,7 +307,10 @@ record, and documented RPC contracts.
   checks out the repository, npm publishes the local archive file, and no
   workflow runs on `pull_request_target` or `workflow_run`. Site promotion
   builds with a read-only token and moves `site-production` from a separate
-  job. `scripts/check-release-ci.rb --workflows` enforces this layout in CI.
+  job. `scripts/check-release-ci.rb --workflows` enforces this layout in CI,
+  including for npm run by its path, and accepts as the published archive
+  only an explicit path or a plain file name: npm reads `user/repo#ref` as a
+  repository and `@scope/name` as a package.
   Maintainers must create the environments, move or delete the repository
   secrets `NPM_TOKEN` and `CARGO_REGISTRY_TOKEN`, and add the rulesets listed
   in the release process before the next publication.
@@ -271,7 +326,8 @@ record, and documented RPC contracts.
 
 ### Changed
 
-- Breaking for HTTP clients of the native API that do not use the SDK:
+- <a id="rc1-http-clients"></a>Breaking for HTTP clients of the native API
+  that do not use the SDK:
   - A POST or DELETE needs `content-type: application/json` or the header
     `x-leani-request: 1`; one that sends no JSON body, such as a lease renewal,
     a snapshot release, a job cancellation, or a live-lane reset, now gets
@@ -288,8 +344,9 @@ record, and documented RPC contracts.
     the names and origins clients use in `api.allowed_hosts` and
     `api.allowed_origins`. A GET or HEAD whose Fetch Metadata marks it as a
     cross-site or same-site subresource load gets 403 `cross_site_request`.
-- Breaking (configuration): a native API bind beyond loopback needs
-  `api.bearer_token_env` or `api.allow_unauthenticated_remote = true`, and a
+- <a id="rc1-binds"></a>Breaking (configuration): a native API bind beyond
+  loopback needs `api.bearer_token_env` or
+  `api.allow_unauthenticated_remote = true`, and a
   JSON-RPC HTTP or WebSocket bind beyond loopback needs
   `rpc.allow_unauthenticated_remote = true`. A configured bearer token shorter
   than 16 characters, or with spaces or non-ASCII characters, fails startup.
@@ -297,12 +354,13 @@ record, and documented RPC contracts.
   to remote JSON-RPC, and lists the compose service name `leani` in
   `api.allowed_hosts`. `compose.yaml` passes the token through and stops
   every command, including the benchmark database's, while it is unset.
-- Breaking (JSON-RPC): calls need `content-type: application/json` (415
-  otherwise), browser origins other than loopback need
-  `rpc.allowed_origins` (403 otherwise), and the limits above apply: a longer
-  batch gets one `-32600` error, and an over-limit `eth_getLogs` fails with
-  `-32005` "query returned more than 10000 results. Try with this block
-  range [...]". The `rpc.max_*` settings change each limit. A single block
+- <a id="rc1-json-rpc"></a>Breaking (JSON-RPC): calls need
+  `content-type: application/json` (415 otherwise), browser origins other
+  than loopback need `rpc.allowed_origins` (403 otherwise), and the limits
+  above apply: a longer batch gets one `-32600` error, and an over-limit
+  `eth_getLogs` fails with `-32005` "query returned more than 10000 results.
+  Try with this block range [...]". The `rpc.max_*` settings change each
+  limit. A single block
   with more matching logs than the limit cannot be read with `eth_getLogs`;
   raise `rpc.max_log_results` or use `eth_getBlockReceipts`.
 - Breaking (JSON-RPC): block lookups answer `null` only for a block number
@@ -331,8 +389,9 @@ record, and documented RPC contracts.
     head, and `earliest` names block 0, wherever a block number is accepted,
     `eth_getLogs` bounds included; they got `-32602`. `safe` is the finalized
     head, which is never newer than the safe block other clients report.
-    `pending` gets `-32004` (`pending_block_unavailable`): Leani builds no
-    pending block.
+    Until the node has verified finality, `finalized` and `safe` get `-32004`
+    (`finalized_block_unavailable`). `pending` gets `-32004`
+    (`pending_block_unavailable`): Leani builds no pending block.
   - An empty topic alternatives array, `[]`, matches any topic at its
     position in `eth_getLogs` and `eth_subscribe("logs")` filters, as in geth
     and reth; it matched nothing.
@@ -359,7 +418,7 @@ record, and documented RPC contracts.
 - SDK: `processors.queryEntities()` without a cursor creates its snapshot with
   the new POST route, and mutations without a JSON body send
   `x-leani-request: 1`. Update the SDK together with the node.
-- Breaking for durable consumers of the native API:
+- <a id="rc1-consumers"></a>Breaking for durable consumers of the native API:
   - A consumer created with a credential needs `x-leani-consumer-credential`
     on each of its lease, change, acknowledgement, and stream requests (403
     otherwise). A new credential needs 32 to 512 printable ASCII characters
@@ -432,10 +491,15 @@ record, and documented RPC contracts.
 - SDK: the package requires Node 20.3 or later, the first with
   `AbortSignal.any`, adds a `default` export condition beside `import`, and
   embeds the TypeScript sources in its source maps.
-- Breaking (SDK): the TypeScript SDK is published on npm as
-  `@smart-byte/leani-sdk`, with the `@smart-byte/leani-sdk/backfill` entry
+- <a id="rc1-sdk"></a>Breaking (SDK): the TypeScript SDK is published on npm
+  as `@smart-byte/leani-sdk`, with the `@smart-byte/leani-sdk/backfill` entry
   point. The `v0.1.0-rc.1` sources and documentation called it `@leani/sdk`,
-  a name that was never published; import the new name.
+  a name that was never published; import the new name. Install the SDK
+  version that matches the node release by its exact version, as the README
+  and the install guide now do: prereleases are published under npm's `next`
+  tag, and `latest` stays on `0.1.0-rc.1`, which does not work with this
+  node. CI checks that every documented install pins the SDK package's
+  version.
 - The PostgreSQL example keys applied changes and its stored cursor by the
   durable consumer's stream too. A node whose store is replaced numbers its
   changes from the start again, which the example took for changes it had
@@ -445,14 +509,24 @@ record, and documented RPC contracts.
   files of the Arrow, Parquet, object_store, and Moka dependencies, which the
   generated listing previously omitted. The Homebrew package now also installs
   Leani's own `LICENSE`, and the container image declares OCI license metadata.
-- Node stores move to schema 23. Schema 22 adds coverage lookup indexes.
-  Schema 23 adds a random per-store secret, drawn once from the operating
-  system, for session tokens and consumer credential hashes; keys the stored
-  credential hashes with it, so existing credentials keep working; and starts
-  every consumer's delivered sequence at its stream head, so acknowledgements
-  of changes delivered before the upgrade still pass. A schema-21 or -22
-  store upgrades in place on its next start; earlier binaries then refuse
-  it, so keep a backup if you might roll back. A backup holds the secret.
+- <a id="rc1-schema"></a>Node stores move to schema 23. Schema 22 adds
+  coverage lookup indexes. Schema 23 adds a random per-store secret, drawn
+  once from the operating system, for session tokens and consumer credential
+  hashes; keys the stored credential hashes with it, so existing credentials
+  keep working; and starts every consumer's delivered sequence at its stream
+  head, so acknowledgements of changes delivered before the upgrade still
+  pass. A schema-21 or -22 store upgrades in place on its next start; earlier
+  binaries then refuse it, so keep a backup if you might roll back. A backup
+  holds the secret. Before it upgrades an older store, a command that
+  registers processors, `serve`, `backfill`, the runtime of
+  `leani subscribe`, or `leani e2e mainnet --resume`, reads the store
+  without writing and refuses a processor the store holds under another
+  identity, as registration does (`processor instance … conflicts with its
+  stored descriptor`); the refused store stays at its schema, so the
+  previous binary still opens it. `leani db backup` copies the store at its
+  schema and never upgrades it, refuses a schema newer than the binary
+  supports, and refuses a data directory without a store instead of
+  creating one. See ADR 0018.
 - Breaking for processor authors (`leani-processor-api`):
   `DataRequirement::validate_frame` is stricter for requirements with
   `allow_filtered`. Each filtered component that can supply a required
@@ -477,8 +551,9 @@ record, and documented RPC contracts.
   `BlockRange::checked_len` returns `None` for it. The new
   `FilterScope::covers` and `FilterScope::covers_at` check whether material
   filtered by one scope is complete for another filter.
-- `erc20-balances` 1.1.0 and `evm-events` 1.1.0 change stored output (see
-  Fixed). Existing instances need a rebuild: set `version = "1.1.0"` and
+- <a id="rc1-rebuild"></a>`erc20-balances` 1.1.0 and `evm-events` 1.1.0
+  change stored output (see Fixed). Existing instances need a rebuild: set
+  `version = "1.1.0"` and
   configure a new `instance`, which indexes from its `start_block`. The node
   refuses the new version under an existing instance ID (`processor instance
   … conflicts with its stored descriptor`), and a 1.1.0 binary cannot run a
@@ -490,8 +565,9 @@ record, and documented RPC contracts.
   processor's state and delivery history, raw history, and the P2P identity.
   The ERC-20 entity and change schemas are now `erc20.balance.entity.v2` and
   `erc20.balance.change.v2`, and both processors use delta schema 2.
-- Breaking for keyed `evm-events` consumers and operators: `evm-events` 1.1.0
-  with `key_fields` is an ordered processor (see Fixed). It declares
+- <a id="rc1-keyed-evm-events"></a>Breaking for keyed `evm-events` consumers
+  and operators: `evm-events` 1.1.0 with `key_fields` is an ordered processor
+  (see Fixed). It declares
   `ordered_state` reduction and `canonical` delivery ordering, like
   `erc20-balances`, and its live lane waits for its cold backfill, holding
   live blocks as pending deltas until history reaches them. Without
@@ -515,16 +591,48 @@ record, and documented RPC contracts.
   cursor to every block it applies, so a range with a hole below it, or below
   blocks already applied, reduced its history out of chain order. Rerun an
   interrupted backfill from the block the refusal names.
-- `blobs-money` 1.5.0 changes stored output from Fusaka on (see Fixed).
-  Rebuild existing instances the same way: set `version = "1.5.0"` and
-  configure a new `instance`, which indexes from its `start_block`; the node
-  refuses 1.5.0 under a 1.4.0 instance ID. Entity, change, and delta schemas
-  are unchanged.
+- <a id="rc1-blobs-money"></a>`blobs-money` 1.5.0 changes stored output from
+  Fusaka on (see Fixed). Rebuild existing instances the same way: set
+  `version = "1.5.0"` and configure a new `instance`, which indexes from its
+  `start_block`; the node refuses 1.5.0 under a 1.4.0 instance ID. Entity,
+  change, and delta schemas are unchanged.
+- <a id="rc1-container"></a>Breaking (container): `deploy/container.toml`
+  runs `blobs-money` 1.5.0 as the new instance `blobs-container-1-5`, so
+  clients that name it by instance, in API routes or stream IDs, use the new
+  name, and its data is indexed afresh. The profile kept rc.1's
+  `blobs-container` instance at the new version, which the store refuses, so
+  the container restarted without end and its upgraded volume opened with
+  neither image. On an rc.1 volume, the new image starts beside the earlier
+  instance, whose rows stay inert and count toward
+  `[budgets.store] maximum_physical_bytes`. For a clean slate, run
+  `docker compose down -v` before `docker compose up --build`, which deletes
+  the volume, or restore a snapshot of it. The profile also caps
+  `[budgets.history_pipeline] maximum_active_chunks` at 2: a Xatu backfill
+  holds about 450 MiB per active chunk, and four would outgrow its 1 GiB
+  memory budget and the compose file's 2 GiB container limit. The container
+  profile's processor now uses on-demand history, so the documented bounded
+  backfill works: with automatic history and live following disabled,
+  nothing indexed it, and `leani backfill` refused it
+  (`automatic_job_owns_history`). History mode is not part of the
+  processor's identity, so the instance is unchanged. The runbook gives the
+  compose commands, which stop the service first because it holds the data
+  directory's lock.
+- <a id="rc1-windowed"></a>Breaking (profiles): the `windowed` profile's
+  `uniswap-v2-sync-30d` keeps every Uniswap V2 `Sync` event, stamped with its
+  hour, in `uniswap_v2.sync`, instead of the last one per hour in
+  `uniswap_v2.sync_hourly`. Keyed `evm-events` output is ordered since 1.1.0,
+  so the profile had lost its bounded window: materialization jobs refused
+  it, a rerun of the quickstart backfill was refused, and its coverage never
+  compacted. Its keyless output is block-local again. A store that holds the
+  profile's `evm-events` 1.0.0 instance from 0.1.0-rc.1 refuses the new one,
+  as for any instance above: rebuild it under a new `instance` or in a new
+  `data_dir`.
 - ERC-20 balances gain `incompleteFrom` (`null`, or the block from which the
   token/holder pair is no longer derived) in the typed query, the change JSON,
   the OpenAPI `Erc20Balance` schema, and the SDK `Erc20Balance` type.
-- Breaking (`leani-processor-api`): `LifecyclePolicies::validate` rejects
-  `StatePolicyMode::Ephemeral` for every publication policy, and
+- <a id="rc1-state-modes"></a>Breaking (`leani-processor-api`):
+  `LifecyclePolicies::validate` rejects `StatePolicyMode::Ephemeral` for
+  every publication policy, and
   `StatePolicyMode::Checkpointed` unless the checkpoint policy is
   `automatic`. The store persists processor state in every mode, and only the
   checkpoint policy takes checkpoints, so these modes promised behavior that
@@ -543,11 +651,12 @@ record, and documented RPC contracts.
   request accepts filtered material), or for finality it does not reach. The
   generated Uniswap-like corpus emits V3 `Swap` logs with sender and
   recipient topics, which changes its frame digests.
-- The built-in `ETH/USDT` and `WBTC/ETH` Uniswap V3 markets start at the V3
-  factory deployment block 12,369,621 instead of 12,376,729, the creation
-  block of the USDC/WETH 0.05% pool, which both pools may predate. No V3 pool
-  predates the factory, so this is a safe lower bound. `ETH/USDC` keeps its
-  exact creation block, so an ETH/USDC-only starter is unchanged.
+- <a id="rc1-uniswap"></a>The built-in `ETH/USDT` and `WBTC/ETH` Uniswap V3
+  markets start at the V3 factory deployment block 12,369,621 instead of
+  12,376,729, the creation block of the USDC/WETH 0.05% pool, which both
+  pools may predate. No V3 pool predates the factory, so this is a safe lower
+  bound. `ETH/USDC` keeps its exact creation block, so an ETH/USDC-only
+  starter is unchanged.
 
   Affected are compact `[uniswap]` nodes and `leani subscribe uniswap-v3`
   subscriptions whose markets include `ETH/USDT` or `WBTC/ETH`. Their data
@@ -558,8 +667,9 @@ record, and documented RPC contracts.
   descriptor` (`cli-uniswap-v3-prices` for a subscription). The node prints
   the routes for that refusal before the message. In order of preference:
 
-  1. Start the node with a new `data_dir`. Nothing is deleted, and the old
-     directory stays usable with the previous binary as a rollback.
+  1. Start the node with a new `data_dir`. Nothing is deleted, and the
+     refusal leaves the old store at its schema, so the old directory stays
+     usable with the previous binary as a rollback.
   2. Replace the compact document with an advanced configuration whose
      `uniswap-observations` `[[processors]]` entry, like the example in
      `docs/reference/processor-contracts.md`, names a new `instance`, lists
@@ -592,8 +702,9 @@ record, and documented RPC contracts.
   `leani source probe finality` and the benchmark's history probe start from
   the persisted anchor by the same rules but never write it.
   `leani reset all` removes the file.
-- Configuration validation rejects `finality.minimum_peers` above 24, the
-  consensus P2P peer set; an all-zero `finality.checkpoint`; and
+- <a id="rc1-finality-options"></a>Configuration validation rejects
+  `finality.minimum_peers` above 24, the consensus P2P peer set; an all-zero
+  `finality.checkpoint`; and
   `finality.endpoints` that name one transport twice, even with different
   letter case, default port, trailing slash, credentials, or query string.
 - `leani init`, and `leani subscribe` without a configuration, use the
@@ -637,7 +748,10 @@ record, and documented RPC contracts.
   gave none. Attested heads need no agreement between endpoints, since each
   carries the sync committee's signature; two different ones at one slot are
   ignored. Consensus P2P asks the next peer when one serves a head no newer
-  than the published one.
+  than the published one, and ends the refresh once it has asked every
+  connected peer, instead of waiting out the 15-second request timeout for
+  another to connect: two such waits outlasted the four-slot grace and
+  reported the lane disconnected.
 - Breaking (CLI): an attached `leani subscribe` prints nothing until each
   stream connection's `hello` shows an Ethereum mainnet node (chain 1)
   serving the feed's built-in processor, `block-summary` or
@@ -660,10 +774,10 @@ record, and documented RPC contracts.
   and refuses, deleting nothing, while one runs; a subscription that starts
   during the reset keeps its directory, and a subscription directory it
   resets stays marked.
-- `leani subscribe` reports two new row kinds on stdout, so scripts should
-  dispatch on each JSON row's `schema`. An undo of a change this run never
-  saw, because it was applied before the run started or aged out of the last
-  4,096 changes it printed, prints while fresh as a
+- Breaking (CLI): `leani subscribe` reports two new row kinds on stdout, so
+  scripts should dispatch on each JSON row's `schema`. An undo of a change
+  this run never saw, because it was applied before the run started or aged
+  out of the last 4,096 changes it printed, prints while fresh as a
   `leani.subscription-undo.v1` row (`--format json`) naming the reverted
   block and change key. When an attached `--finality finalized` subscription
   holds 1,024 unfinalized blocks without a finality marker, it drops the
@@ -720,11 +834,11 @@ record, and documented RPC contracts.
 - The OpenAPI document gives `202` as the success status of
   `createBackfillSubscription`, `createMaterializationJob`, and
   `createRawHistoryJob`, as the node answers; it said `201`.
-- Breaking (native API): recovery checkpoints and portable savepoints
-  (`GET /v1/processors/{processor}/checkpoints`, and `GET` and `POST`
-  `/v1/processors/{processor}/savepoints`) send `blockHash` and
-  `stateChecksum` as `0x`-prefixed hexadecimal strings, like every other hash
-  the API returns, and so does `details.currentFinalizedHead.hash` in the
+- <a id="rc1-hex-hashes"></a>Breaking (native API): recovery checkpoints and
+  portable savepoints (`GET /v1/processors/{processor}/checkpoints`, and
+  `GET` and `POST` `/v1/processors/{processor}/savepoints`) send `blockHash`
+  and `stateChecksum` as `0x`-prefixed hexadecimal strings, like every other
+  hash the API returns, and so does `details.currentFinalizedHead.hash` in the
   `409 history_not_finalized` and `range_after_finalized_head` refusals; each
   was an array of 32 integers. Clients that read the arrays must read hex.
   The OpenAPI `RecoveryCheckpoint` and `PortableSavepoint` schemas now use
@@ -732,11 +846,14 @@ record, and documented RPC contracts.
   follow.
 - The OpenAPI document lists what the node already sent: a durable
   consumer's `streamId` and `leaseGeneration`, and `paused` among the
-  coverage `state` values, which the SDK's `ProcessorCoverage` type lists
-  too.
-- Breaking (configuration): a plain `http` eraE `endpoint` off loopback
-  needs `allow_insecure_http = true` on its history source, which is only
-  valid for `era_e` sources. `leani source probe erae --endpoint` accepts
+  coverage `state` values. The SDK's `DurableConsumer` type gains both
+  fields, its `ProcessorCoverage` type lists `paused`, and its
+  `ProcessorCoverage.requested` may be `null`, as the node sends it for a
+  status without a requested range.
+- <a id="rc1-erae-http"></a>Breaking (configuration): a plain `http` eraE
+  `endpoint` off loopback needs `allow_insecure_http = true` on its history
+  source, which is only valid for `era_e` sources.
+  `leani source probe erae --endpoint` accepts
   `https`, `file`, and loopback `http` mirrors. A `xatu` history source on a
   chain other than Ethereum mainnet fails validation, and
   `XatuHistoryConfig::public`, `XatuCatalogConfig::public`, and
@@ -837,41 +954,44 @@ record, and documented RPC contracts.
   budget without limit. A job checks its next segment's admission before it
   opens a source, so a job paused at its storage limit no longer downloads
   that segment again each time the node resumes it, every five seconds.
-- Breaking (configuration): relative paths in a configuration file, its
-  `data_dir` and an archive source's `manifest`, are relative to the
-  directory of that file, not to the working directory the node starts in.
-  A node started with `--config /etc/leani/node.toml` and
+- <a id="rc1-paths"></a>Breaking (configuration): relative paths in a
+  configuration file, its `data_dir` and an archive source's `manifest`, are
+  relative to the directory of that file, not to the working directory the
+  node starts in. A node started with `--config /etc/leani/node.toml` and
   `data_dir = "./data"` now uses `/etc/leani/data`. State derived from
   `data_dir` moves with it: `leani subscribe` keeps its embedded state under
   `<data_dir>/subscriptions/<hash>`, and `leani reset` resolves the same
   directories, so a `leani --config elsewhere/… subscribe` starts cold after
   the upgrade. Before upgrading, make a relative `data_dir` absolute, or move
   the data directory beside the configuration file; otherwise the node
-  starts on an empty directory. When a relative `data_dir` names a directory
-  without a node store or embedded subscriptions while the same spelling
-  under the working directory has them, the node warns once at startup, and
-  `leani doctor` reports it, naming both directories; it still starts. A
+  starts on an empty directory. When the same spelling under the working
+  directory holds a node store (`leani.sqlite`) or embedded subscriptions
+  (`subscriptions/`) that the `data_dir` beside the configuration lacks, the
+  node warns once at startup, and `leani doctor` reports it, naming both
+  directories and each entry left behind; it still starts. A
   compact configuration's default `data_dir`, `./data`, is beside the file
   too. `leani init` writes `./data` and prepares that directory beside the
   configuration it creates, wherever `--config` puts it; its `--data-dir`,
   like any path flag, is relative to the working directory, and is written
   absolute when the configuration is elsewhere. Path flags such as
   `--config` and the `--data-dir` of other commands are unchanged.
-- Breaking (configuration): validation refuses options the node ignored.
-  `[processors.output] finalized_only` was never applied; remove it, and set
-  `publish = "finalized_only"` to publish only finalized blocks, as the
-  shipped profiles and examples that set it already did. A `sources.history`
+- <a id="rc1-refused-options"></a>Breaking (configuration): validation
+  refuses options the node ignored. `[processors.output] finalized_only` was
+  never applied; remove it, and set `publish = "finalized_only"` to publish
+  only finalized blocks, as the shipped profiles and examples that set it
+  already did. A `sources.history`
   entry of `kind = "parquet"` was skipped, since no source reads it; use
   `xatu` for public Parquet history, `era_e`, or `archive`. The
   configuration schema no longer offers either. The node now always leaves
   the lifecycle's `OutputPolicy::finalized_only`, which nothing reads,
   false. An instance that set it, from a configuration file or through
   `leani subscribe --finality finalized`, keeps its state, and the store
-  updates its stored descriptor in place. But the recovery checkpoints and
-  portable savepoints it wrote before the upgrade are bound to the old
-  descriptor: they can no longer be restored or exported, and answer 409
-  `savepoint_invalid`. Backfill such an instance again, or use the
-  checkpoints and savepoints it takes after the upgrade. For Rust embedders
+  updates its stored descriptor in place. But what it wrote before the
+  upgrade is bound to the old descriptor: its recovery checkpoints can no
+  longer be restored, and its portable savepoints, which are export-only, can
+  no longer be exported; both answer 409 `savepoint_invalid`. Backfill such
+  an instance again, or use the checkpoints and savepoints it takes after
+  the upgrade. For Rust embedders
   of the `leani` crate, `OutputPolicyConfig::finalized_only` is an
   `Option<bool>` that must be `None`.
 - `rpc.transaction_locator` is optional, deprecated, and ignored: nothing
@@ -923,12 +1043,13 @@ record, and documented RPC contracts.
 
 ### Fixed
 
-- Verified finality no longer stops about 14 days after the configured
-  checkpoint's slot. Beacon API finality keeps one bootstrapped light client
-  per endpoint and advances it with each finality update, plus the
-  sync-committee update when a period ends. It no longer verifies the whole
-  chain again from the checkpoint, including its age check, on every
-  12-second poll. Every start and network lane restart, with either finality
+- <a id="rc1-finality-anchor"></a>Verified finality no longer stops about 14
+  days after the configured checkpoint's slot. Beacon API finality keeps one
+  bootstrapped light client per endpoint and advances it with each finality
+  update, plus the sync-committee update when a period ends. It no longer
+  verifies the whole chain again from the checkpoint, including its age
+  check, on every 12-second poll. Every start and network lane restart, with
+  either finality
   source, bootstraps from the persisted anchor when that is newer than the
   configured checkpoint and younger than 14 days, so the configured
   checkpoint's age no longer matters after the first start. A corrupt or
@@ -944,7 +1065,11 @@ record, and documented RPC contracts.
   endpoint no longer holds finality back, readiness no longer drops at epoch
   transitions, and finality never moves backwards.
 - A Beacon API endpoint without a trailing slash keeps its last path segment:
-  `https://host/beacon` is queried as `https://host/beacon/eth/v1/...`.
+  `https://host/beacon` is queried as `https://host/beacon/eth/v1/...`. An
+  endpoint's query string, such as a provider's `?apikey=` key, now reaches
+  every request after the request's own query, and so does a checkpoint
+  provider's for `leani init` and `leani subscribe`; it was dropped, so such
+  providers never authenticated.
 - One invalid or stale peer no longer ends consensus P2P finality and restarts
   every lane. A peer whose light-client material fails verification is
   banned, and neither asked nor dialed again across reconnects until the
@@ -955,10 +1080,11 @@ record, and documented RPC contracts.
 - The consensus P2P Status message advertises the checkpoint's finalized
   epoch rounded up, so a checkpoint whose epoch-boundary slot was skipped
   advertises its own epoch, with a head slot at or after that epoch's start.
-- New node stores enable SQLite incremental auto-vacuum, so pruning shrinks
-  the database file and storage admission recovers instead of staying at the
-  high-water mark. Existing stores log a warning at startup until one
-  `leani db compact` converts them.
+- <a id="rc1-compact"></a>New node stores enable SQLite incremental
+  auto-vacuum, so pruning shrinks the database file and storage admission
+  recovers instead of staying at the high-water mark. Existing stores log a
+  warning at startup until one `leani db compact`, run while the node is
+  stopped, converts them.
 - The node database path is used literally: `%` and `?` in `data_dir` no
   longer make SQLite open a different file.
 - A new store's schema is created in one transaction, so an interrupted first
@@ -986,8 +1112,10 @@ record, and documented RPC contracts.
   records, so reorgs undo as before. A backlog from earlier versions drains
   by at most 10,000 records per finality advance.
 - Automatic recovery checkpoints are taken at most once per 1,000 finalized
-  blocks instead of on every finalized block and finality event, and they
-  stream processor state instead of loading it whole. `keep` is unchanged. A
+  blocks instead of on every finalized block and finality event. A
+  checkpoint still encodes the processor's whole state in memory before it
+  stores it, so its peak memory is about the state's encoded size, which
+  SQLite's blob limit of about 1 GB caps. `keep` is unchanged. A
   completed historical job also checkpoints its processor at rest, and a
   restore accepts a checkpoint whose block was finalized after it was taken.
   A restore still needs a checkpoint at the current cursor, so between
@@ -997,9 +1125,10 @@ record, and documented RPC contracts.
   as raising a limit: their identity is the processor contract without its
   lifecycle policies. Snapshots written by earlier versions stay valid while
   the descriptor is unchanged.
-- Each processor instance keeps at most 16 portable savepoints, and a new one
-  is admitted against the physical store budget. The API answers a full quota
-  with `409 savepoint_limit`.
+- Breaking (native API): each processor instance keeps at most 16 portable
+  savepoints, and a new one is admitted against the physical store budget.
+  The API answers a full quota with `409 savepoint_limit`; delete a savepoint
+  before creating another.
 - Coverage that arrives out of order, such as an older backfill range that
   finishes after a newer one, is now owned and therefore compacted. Adjacent
   owner ranges coalesce.
@@ -1014,10 +1143,11 @@ record, and documented RPC contracts.
   until `limit` rows survive the reducer's own uncommitted deletes, so pages
   are no longer short and an uncommitted key no longer skips ahead of unread
   committed keys.
-- A `required` consumer is rejected on a live stream whose delivery mode is
-  not `until_acknowledged`, where it would pin window retention indefinitely.
-  Backfill streams still accept it. Consumers registered earlier keep their
-  role, and re-creating one still returns `409 consumer_exists`. A store that
+- Breaking (native API): a `required` consumer is rejected with 400 on a live
+  stream whose delivery mode is not `until_acknowledged`, where it would pin
+  window retention indefinitely. Backfill streams still accept it. Consumers
+  registered earlier keep their role, and re-creating one still returns
+  `409 consumer_exists`. A store that
   holds such consumers logs a startup warning listing them: revoke each one
   (`DELETE /v1/processors/{processor}/consumers/{consumer}`) and register a
   `best_effort` consumer under a new ID, or switch the processor to
@@ -1104,7 +1234,10 @@ record, and documented RPC contracts.
   (`hot_cold_handoff_failed`); the other handoffs and live lanes continue. A
   block-local lane replays and resumes at once. An ordered lane resumes once a
   later backfill passes its gap: ordered replay now moves past a parked block
-  that history has already applied, instead of waiting for it forever.
+  that history has already applied, instead of waiting for it forever. A lane
+  that is already paused, failed, or at a gap, or that has no retained frame
+  yet, is not parked; its cold range stays uncovered until the next start's
+  backfill, and the log says which happened.
 - A lane whose gap crosses the finalized anchor the node seeds at startup no
   longer fails the whole live lane on every restart. The seeded canonical row
   has no parent hash until the block's frame arrives; retaining that frame now
@@ -1320,9 +1453,10 @@ record, and documented RPC contracts.
   reports the block's `blobBaseFee` and `blobEthBurned` and the transaction's
   `blobEthBurned` and `ethBurned` as mismatches wherever the reserve binds,
   until blobs.money charges the protocol fee too.
-- JSON-RPC receipts price blob gas (`blobGasPrice`) with the fork active at the
-  block's timestamp, from the same schedule and fee function as `blobs-money`,
-  instead of with Cancun's parameters for every fork. Prague and later
+- Breaking (JSON-RPC): receipts price blob gas (`blobGasPrice`) with the fork
+  active at the block's timestamp, from the same schedule and fee function as
+  `blobs-money`, instead of with Cancun's parameters for every fork. Prague
+  and later
   receipts were wrong at non-trivial excess blob gas: 107,610,112 under Prague
   costs 2,150,273,305 wei per blob gas, not 99,710,729,314,173. When a block
   with a blob transaction cannot be priced, every receipt of that block, the
@@ -1369,8 +1503,9 @@ record, and documented RPC contracts.
   cools the peer's header lane.
 - A head poll whose last peer times out, or cannot take the request, no longer
   reports the live lane disconnected: the next poll asks other peers. Once
-  every poll has ended that way for the head grace, 12 seconds by default,
-  the lane reports itself disconnected, once, and keeps polling. A poll counts
+  every poll since the lane's last progress has ended that way for the head
+  grace, 12 seconds by default, the lane reports itself disconnected, once,
+  and keeps polling. A poll counts
   by its last peer, so another peer's empty answer in the same poll does not
   end the wait.
 - The live execution P2P lane reconnects after the zero-peer watchdog stops

@@ -64,7 +64,10 @@ commitments, and receipts are checked against both the receipt root and body.
   header successes lift neither, and nothing is banned or persisted. A live
   header that a frame follows earns its peer's service evidence and
   reputation only once that frame completes; one that no frame follows, such
-  as the minimum live head, earns them at once;
+  as the minimum live head, earns them at once, but only when anchored (its
+  hash known from verified finality or an attested head, such as the
+  verified tip); the block after the finalized anchor, fetched by number,
+  earns nothing;
 - qualification probes each peer with real requests at the current target,
   never from its handshake head, and compares targets by block number and
   hash. Lagging and timed-out probes are not persisted as failures and never

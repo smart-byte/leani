@@ -178,6 +178,19 @@ pub(crate) fn configured_store_config(
     store
 }
 
+/// The descriptors a command registers after it opens the store, for
+/// [`leani_store_sqlite::StoreConfig::with_processors`]: an older store that
+/// holds one of them under an identity registration would refuse is then
+/// refused before its upgrade.
+pub(crate) fn processor_descriptors(
+    processors: &[std::sync::Arc<dyn leani_processor_api::Processor>],
+) -> Vec<leani_processor_api::ProcessorDescriptor> {
+    processors
+        .iter()
+        .map(|processor| processor.descriptor().clone())
+        .collect()
+}
+
 fn config_for_processor_descriptor<'a>(
     config: &'a Config,
     descriptor: &leani_processor_api::ProcessorDescriptor,
@@ -3402,6 +3415,28 @@ async fn require_ordered_backfill_start(
     Ok(())
 }
 
+/// The configured processor that `leani backfill --processor processor_id`
+/// runs: one whose history the node owns and materializes on demand. The
+/// node's own automatic job owns an automatic processor's history, and
+/// application subscriptions own theirs.
+fn backfill_processor_config<'a>(
+    config: &'a Config,
+    processor_id: &str,
+) -> Result<&'a ProcessorConfig> {
+    let configured = select_processor_config(config, processor_id)?;
+    if configured.history_control != crate::config::ProcessorHistoryControl::NodeOwned {
+        bail!(
+            "processor {processor_id} history is owned by application subscriptions; create a backfill subscription through the API"
+        );
+    }
+    if configured.history_mode != crate::config::ProcessorHistoryMode::OnDemand {
+        bail!(
+            "automatic_job_owns_history: processor {processor_id} uses automatic history; configure on_demand for explicit materialization ranges"
+        );
+    }
+    Ok(configured)
+}
+
 async fn backfill(
     config_path: &Path,
     processor_id: &str,
@@ -3418,17 +3453,7 @@ async fn backfill(
         .validate()
         .map_err(|errors| anyhow::anyhow!(errors))?
         .into_inner();
-    let configured = select_processor_config(&config, processor_id)?;
-    if configured.history_control != crate::config::ProcessorHistoryControl::NodeOwned {
-        bail!(
-            "processor {processor_id} history is owned by application subscriptions; create a backfill subscription through the API"
-        );
-    }
-    if configured.history_mode != crate::config::ProcessorHistoryMode::OnDemand {
-        bail!(
-            "automatic_job_owns_history: processor {processor_id} uses automatic history; configure on_demand for explicit materialization ranges"
-        );
-    }
+    let configured = backfill_processor_config(&config, processor_id)?;
     let processor = registry.instantiate(configured, config.chain.chain_id)?;
     let range = BlockRange::new(BlockNumber(from), BlockNumber(to))?;
     let (sources, verification_policy) =
@@ -3446,11 +3471,12 @@ async fn backfill(
         "starting processor historical backfill"
     );
     let _data_dir_lock = crate::local_state::lock_runtime_directory(&config.data_dir)?;
-    let store = SqliteStore::open(configured_store_config(
-        &config,
-        config.data_dir.join("leani.sqlite"),
-    ))
-    .await?;
+    let store = SqliteStore::open(
+        configured_store_config(&config, config.data_dir.join("leani.sqlite"))
+            .with_processors(vec![processor.descriptor().clone()]),
+    )
+    .await
+    .map_err(crate::uniswap_markets::explain_compact_refusal)?;
     require_ordered_backfill_start(&store, processor.as_ref(), configured, from).await?;
     // The configured pipeline, as the node's on-demand backfills use it.
     let runtime_config = historical_runtime_config(&config, sources.len());
@@ -3776,7 +3802,12 @@ async fn mainnet_e2e(
         })?;
     }
 
-    let store = SqliteStore::open(configured_store_config(&config, &database_path)).await?;
+    // A resumed run registers its processors in the store it reopens.
+    let store = SqliteStore::open(
+        configured_store_config(&config, &database_path)
+            .with_processors(processor_descriptors(&processors)),
+    )
+    .await?;
     let readiness = ReadinessHandle::new(true, true);
     let rpc_readiness = leani_rpc::RpcReadiness::default();
     let network_telemetry = leani_source_api::NetworkTelemetry::default();
@@ -4327,6 +4358,22 @@ async fn db(command: DbCommand, config_path: &Path, registry: &ProcessorRegistry
         .into_inner();
     let _data_dir_lock = crate::local_state::lock_runtime_directory(&config.data_dir)?;
     let database_path = config.data_dir.join("leani.sqlite");
+    // A backup copies the store at its schema. Opening it as a store would
+    // first upgrade an older one, which cannot be undone.
+    if let DbCommand::Backup { destination } = &command {
+        SqliteStore::backup(&database_path, destination)
+            .await
+            .with_context(|| format!("back up store {}", database_path.display()))?;
+        println!(
+            "{}",
+            serde_json::json!({
+                "ok": true,
+                "database": database_path.display().to_string(),
+                "backup": destination.display().to_string()
+            })
+        );
+        return Ok(Exit::Success);
+    }
     let store = SqliteStore::open(configured_store_config(&config, &database_path))
         .await
         .with_context(|| format!("open store {}", database_path.display()))?;
@@ -4358,17 +4405,7 @@ async fn db(command: DbCommand, config_path: &Path, registry: &ProcessorRegistry
                 })
             );
         }
-        DbCommand::Backup { destination } => {
-            store.backup(&destination).await?;
-            println!(
-                "{}",
-                serde_json::json!({
-                    "ok": true,
-                    "database": database_path.display().to_string(),
-                    "backup": destination.display().to_string()
-                })
-            );
-        }
+        DbCommand::Backup { .. } => unreachable!("a backup returns before the store opens"),
         DbCommand::Compact => {
             store.compact().await?;
             println!(
@@ -5194,11 +5231,12 @@ async fn serve(path: &Path, registry: &ProcessorRegistry) -> Result<Exit> {
     let assembly = registry.instantiate_all_with_extensions(config.get())?;
     let processors = assembly.processors;
     let query_extensions = assembly.query_extensions;
-    let store = SqliteStore::open(configured_store_config(
-        config.get(),
-        config.get().data_dir.join("leani.sqlite"),
-    ))
-    .await?;
+    let store = SqliteStore::open(
+        configured_store_config(config.get(), config.get().data_dir.join("leani.sqlite"))
+            .with_processors(processor_descriptors(&processors)),
+    )
+    .await
+    .map_err(crate::uniswap_markets::explain_compact_refusal)?;
     for processor in &processors {
         // Configured consumers reference the processor's default delivery
         // stream. A new store has neither record until the processor is
@@ -5208,12 +5246,7 @@ async fn serve(path: &Path, registry: &ProcessorRegistry) -> Result<Exit> {
         store
             .register_processor(processor.descriptor())
             .await
-            .map_err(|error| {
-                crate::uniswap_markets::explain_compact_refusal(
-                    error,
-                    &processor.descriptor().instance,
-                )
-            })?;
+            .map_err(crate::uniswap_markets::explain_compact_refusal)?;
         for configured_consumer in &processor.descriptor().lifecycle.delivery.consumers {
             let role = if configured_consumer.required {
                 leani_store_sqlite::ConsumerRole::Required
@@ -7181,7 +7214,7 @@ async fn run_network_lanes(
                             failed = ?summary.failed,
                             overlap_from,
                             overlap_to = selected.execution_block_number,
-                            "hot/cold handoffs finished with failures; the failed processors stay parked while the others follow live"
+                            "hot/cold handoffs finished with failures; the others follow live"
                         );
                     }
                     Err(error) => break Err(error.context("hot/cold handoff failed closed")),
@@ -7516,7 +7549,8 @@ impl std::error::Error for ColdHandoffFailure {}
 #[derive(Debug)]
 struct ColdHandoffSummary {
     verified: Vec<leani_store_sqlite::HotColdHandoffRecord>,
-    /// Instances whose backfill or verification failed; their lanes are parked.
+    /// Instances whose backfill or verification failed; their running lanes
+    /// are parked where a retained frame allowed it.
     failed: Vec<String>,
 }
 
@@ -7524,8 +7558,10 @@ struct ColdHandoffSummary {
 /// drain the ordered live deltas they released.
 ///
 /// A processor whose backfill or verification failed has its handoff marked
-/// failed and its live lane parked; the other processors' handoffs and live
-/// lanes continue. Any other error fails the network lanes as before.
+/// failed and its live lane parked, unless the lane is already paused,
+/// failed, or at a gap, or no frame is retained yet; the other processors'
+/// handoffs and live lanes continue. Any other error fails the network lanes
+/// as before.
 async fn finish_cold_handoffs(
     store: &leani_store_sqlite::SqliteStore,
     live: &leani_runtime::SharedLiveRuntime,
@@ -7542,19 +7578,31 @@ async fn finish_cold_handoffs(
             }
             Err(error) => error.downcast::<ColdHandoffFailure>()?,
         };
-        warn!(
-            processor = %failure.processor.instance,
-            handoff = %failure.handoff_id,
-            detail = %failure.detail,
-            "hot/cold handoff failed for one processor; its live lane is parked while the others continue"
-        );
         store
             .fail_hot_cold_handoff(&failure.handoff_id, &failure.processor, &failure.detail)
             .await
             .with_context(|| format!("record the failed handoff {}", failure.handoff_id))?;
-        live.park_processor_lane(&failure.processor, "hot_cold_handoff_failed")
+        let parked = live
+            .park_processor_lane(&failure.processor, "hot_cold_handoff_failed")
             .await
             .with_context(|| format!("park the live lane of {}", failure.processor.instance))?;
+        if parked {
+            warn!(
+                processor = %failure.processor.instance,
+                handoff = %failure.handoff_id,
+                detail = %failure.detail,
+                "hot/cold handoff failed for one processor; its live lane is parked while the others continue"
+            );
+        } else {
+            warn!(
+                processor = %failure.processor.instance,
+                handoff = %failure.handoff_id,
+                detail = %failure.detail,
+                "hot/cold handoff failed for one processor, whose live lane was not parked: \
+                 already paused, failed, or at a gap, or no retained frame yet; its cold range \
+                 stays uncovered until the next start's backfill"
+            );
+        }
         failed.insert(failure.processor.instance.to_string());
     }
     live.reconcile_pending()
@@ -9022,7 +9070,7 @@ mod tests {
         let live = SharedLiveRuntime::new(
             store.clone(),
             Arc::new(ScriptedLiveSource::new(
-                live_descriptor,
+                live_descriptor.clone(),
                 vec![LiveStep::Event(ChainEvent::Block(Box::new(
                     chain[3].clone(),
                 )))],
@@ -9125,6 +9173,87 @@ mod tests {
                 .state,
             ProcessorRunState::Paused
         );
+
+        // Final review B9: without a retained frame the lane is not parked,
+        // and the log said it was.
+        let logs = CapturedLogs::default();
+        let _logs = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_ansi(false)
+                .with_writer({
+                    let logs = logs.clone();
+                    move || logs.clone()
+                })
+                .finish(),
+        );
+        let bare = SqliteStore::open(StoreConfig::new(directory.path().join("bare.sqlite")))
+            .await
+            .expect("store without retained frames");
+        let unparked = Arc::new(OrderedLedgerProcessor::named("handoff-unparked-ledger"));
+        let bare_live = SharedLiveRuntime::new(
+            bare.clone(),
+            Arc::new(ScriptedLiveSource::new(live_descriptor, Vec::new())),
+            vec![unparked.clone()],
+            SharedLiveRuntimeConfig::default(),
+        )
+        .expect("live runtime");
+        bare_live
+            .reconcile_pending()
+            .await
+            .expect("startup reconciliation");
+        bare.begin_hot_cold_handoff(
+            "handoff-unparked",
+            unparked.descriptor(),
+            ChainId(1),
+            overlap,
+            chain[2].block.hash,
+        )
+        .await
+        .expect("begin handoff");
+        let failure = ColdHandoffFailure {
+            processor: unparked.descriptor().clone(),
+            handoff_id: "handoff-unparked".to_owned(),
+            detail: "automatic cold backfill failed: injected source exhaustion".to_owned(),
+        };
+        let mut backfills = ColdBackfills::default();
+        backfills.spawn("automatic-unparked", async move {
+            Err(anyhow::Error::new(failure))
+        });
+        let processors: Vec<Arc<dyn Processor>> = vec![unparked.clone()];
+        let summary = finish_cold_handoffs(&bare, &bare_live, &processors, &mut backfills)
+            .await
+            .expect("a failed cold backfill without a retained frame");
+        assert_eq!(
+            summary.failed,
+            vec![unparked.descriptor().instance.to_string()]
+        );
+        assert_eq!(
+            bare.hot_cold_handoff("handoff-unparked", unparked.descriptor())
+                .await
+                .expect("handoff")
+                .expect("record")
+                .state,
+            HotColdHandoffState::Failed
+        );
+        assert_eq!(
+            bare.processor_runtime_state(unparked.descriptor())
+                .await
+                .expect("state")
+                .state,
+            ProcessorRunState::Running
+        );
+        assert!(
+            bare.live_lane_gap(unparked.descriptor())
+                .await
+                .expect("gap")
+                .is_none()
+        );
+        let logged = logs.text();
+        assert!(
+            logged.contains("its cold range stays uncovered until the next start's backfill"),
+            "{logged}"
+        );
+        assert!(!logged.contains("lane is parked"), "{logged}");
     }
 
     #[tokio::test]
@@ -9191,6 +9320,143 @@ markets = ["ETH/USDT"]
         );
         assert!(message.contains("a new `data_dir`"), "{message}");
         assert!(message.contains("a new `instance`"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn the_windowed_profile_materializes_and_compacts_its_window() {
+        // Final review U5: keyed evm-events output is ordered, so the
+        // profile's processor refused materialization jobs and a rerun of
+        // the quickstart backfill, and its coverage never compacted.
+        use leani_api::BackfillControl as _;
+
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let config = Config::load(&repository.join("config/modes/windowed.toml"))
+            .expect("windowed profile")
+            .validate()
+            .expect("valid windowed profile")
+            .into_inner();
+        let processors = ProcessorRegistry::standard()
+            .instantiate_all(&config)
+            .expect("windowed processors");
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let store = leani_store_sqlite::SqliteStore::open(leani_store_sqlite::StoreConfig::new(
+            directory.path().join("node.sqlite"),
+        ))
+        .await
+        .expect("store");
+        assert_eq!(
+            maintained_processors(&config, &processors).len(),
+            processors.len(),
+            "a profile processor's coverage is never compacted"
+        );
+        for (processor, configured) in processors.iter().zip(&config.processors) {
+            store
+                .register_processor(processor.descriptor())
+                .await
+                .expect("register");
+            store
+                .compact_finalized_coverage(
+                    processor.descriptor(),
+                    leani_primitives::BlockNumber(configured.start_block),
+                    configured.coverage.verification_segment_blocks,
+                    1,
+                )
+                .await
+                .expect("finalized coverage compacts");
+            // The quickstart backfill runs again over its own range.
+            require_ordered_backfill_start(
+                &store,
+                processor.as_ref(),
+                configured,
+                configured.start_block + 500,
+            )
+            .await
+            .expect("a backfill reruns from any block");
+        }
+        let control = NativeBackfillControl::new(
+            config.clone(),
+            store.clone(),
+            processors.clone(),
+            CancellationToken::new(),
+            None,
+            None,
+            leani_runtime::HistoricalPipelineBudget::new(1, 1, 1_024).expect("pipeline budget"),
+        );
+        for configured in &config.processors {
+            let accepted = control
+                .create_materialization(leani_api::CreateMaterializationRequest {
+                    processor: configured.instance.clone(),
+                    from_block: Some(configured.start_block),
+                    to_block: Some((configured.start_block + 999).into()),
+                    ranges: Vec::new(),
+                    mode: leani_api::BackfillExecutionMode::FillMissing,
+                    idempotency_key: "quickstart".to_owned(),
+                })
+                .await;
+            // The job is valid; it waits only for a finalized head.
+            assert!(
+                matches!(&accepted, Err(leani_api::BackfillControlError::Unavailable(message))
+                    if message.contains("finalized head")),
+                "{accepted:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_container_profile_backfills_its_processor_on_demand() {
+        // Final review ruling on report concern 5: the profile kept automatic
+        // history with live following disabled, so nothing indexed its
+        // processor, and `leani backfill` refused it as
+        // `automatic_job_owns_history`.
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let config = Config::load(&repository.join("deploy/container.toml"))
+            .expect("container profile")
+            .validate()
+            .expect("valid container profile")
+            .into_inner();
+        // The runbook's command, after the image's entrypoint.
+        let cli = Cli::try_parse_from([
+            "leani",
+            "backfill",
+            "--config",
+            "/etc/leani/node.toml",
+            "--processor",
+            "blobs-money",
+            "--from",
+            "19426589",
+            "--to",
+            "19427588",
+        ])
+        .expect("the documented backfill command parses");
+        assert_eq!(
+            cli.config.as_deref(),
+            Some(Path::new("/etc/leani/node.toml"))
+        );
+        let Command::Backfill {
+            processor,
+            from,
+            to,
+        } = cli.command
+        else {
+            panic!("the documented command is a backfill");
+        };
+        let configured = backfill_processor_config(&config, &processor)
+            .expect("backfill accepts the container profile's processor");
+        assert_eq!(configured.instance, "blobs-container-1-5");
+        assert!(configured.start_block <= from && from <= to);
+
+        // History mode is node policy, not processor identity: the store
+        // accepts the same instance either way.
+        let registry = ProcessorRegistry::standard();
+        let on_demand = registry
+            .instantiate(configured, config.chain.chain_id)
+            .expect("on-demand processor");
+        let mut automatic = configured.clone();
+        automatic.history_mode = crate::config::ProcessorHistoryMode::Automatic;
+        let automatic = registry
+            .instantiate(&automatic, config.chain.chain_id)
+            .expect("automatic processor");
+        assert_eq!(on_demand.descriptor(), automatic.descriptor());
     }
 
     #[test]

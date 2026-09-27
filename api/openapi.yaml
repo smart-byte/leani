@@ -1412,12 +1412,13 @@ components:
       in: header
       required: false
       description: |
-        The consumer's credential. A consumer created with one needs it on
-        every consumer-scoped request, in addition to any bearer token, and
-        gets 403 `forbidden` without it or with another; the node compares
-        it in constant time. A consumer without one, such as a configured
-        consumer, takes none. Credentials created before 32 characters were
-        required keep working.
+        The consumer's credential. A consumer created with one needs it, in
+        addition to any bearer token, on its lease, change, acknowledgement,
+        and stream requests, and gets 403 `forbidden` without it or with
+        another; the node compares it in constant time. Listing, inspecting,
+        and revoking consumers need only the bearer token. A consumer without
+        one, such as a configured consumer, takes none. Credentials created
+        before 32 characters were required keep working.
       schema:
         type: string
         minLength: 16

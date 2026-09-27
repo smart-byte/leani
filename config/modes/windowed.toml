@@ -74,10 +74,12 @@ addresses = ["0xB4e16d0168e52d35CaCD2c6185b44281Ec28C9Dc"]
 [[processors.settings.events]]
 abi = "event Sync(uint112 reserve0, uint112 reserve1)"
 
+# One entity per event, stamped with its hour. Without `key_fields` the
+# processor stays block-local, so on-demand backfills and the window's
+# coverage compaction apply; keyed output would make it ordered.
 [processors.settings.events.output]
-collection = "uniswap_v2.sync_hourly"
+collection = "uniswap_v2.sync"
 kind = "uniswap_v2.sync"
-key_fields = ["_bucket_start"]
 bucket_seconds = 3600
 
 [rpc]
