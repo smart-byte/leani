@@ -147,6 +147,26 @@ pub const DEFAULT_MAX_WEBSOCKET_CONNECTIONS: usize = 256;
 /// holds unsent.
 pub const DEFAULT_MAX_SUBSCRIPTION_EVENT_BYTES: usize = 16 * 1_024 * 1_024;
 
+/// Default encoded payload allowance shared by all WebSocket connections.
+pub const DEFAULT_MAX_OUTBOUND_BYTES: usize = 64 * 1_024 * 1_024;
+
+/// Global outbound payload permits, shared across listeners and connections.
+#[derive(Clone, Debug)]
+pub struct RpcOutboundBudget(Arc<Semaphore>);
+
+impl RpcOutboundBudget {
+    #[must_use]
+    pub fn new(bytes: usize) -> Self {
+        Self(Arc::new(Semaphore::new(bytes.min(Semaphore::MAX_PERMITS))))
+    }
+}
+
+impl Default for RpcOutboundBudget {
+    fn default() -> Self {
+        Self::new(DEFAULT_MAX_OUTBOUND_BYTES)
+    }
+}
+
 /// RPC transport and readiness settings.
 #[derive(Clone, Debug)]
 pub struct RpcConfig {
@@ -171,6 +191,8 @@ pub struct RpcConfig {
     /// produce for one WebSocket connection, and that the connection may
     /// hold unsent. A connection past either is closed.
     pub max_subscription_event_bytes: usize,
+    /// Shared payload budget. Clone the config when serving multiple listeners.
+    pub outbound_budget: RpcOutboundBudget,
     /// Cancelled when the node shuts down: open WebSocket connections then
     /// get a going-away close frame.
     pub shutdown: CancellationToken,
@@ -197,6 +219,7 @@ impl Default for RpcConfig {
             max_subscriptions_per_connection: DEFAULT_MAX_SUBSCRIPTIONS_PER_CONNECTION,
             max_websocket_connections: DEFAULT_MAX_WEBSOCKET_CONNECTIONS,
             max_subscription_event_bytes: DEFAULT_MAX_SUBSCRIPTION_EVENT_BYTES,
+            outbound_budget: RpcOutboundBudget::default(),
             shutdown: CancellationToken::new(),
             websocket_sessions: TaskTracker::new(),
         }
@@ -863,7 +886,11 @@ const WEBSOCKET_CLOSE_TIMEOUT: Duration = Duration::from_secs(1);
 /// with it. The node's shutdown closes it as going away.
 async fn websocket_session(socket: WebSocket, state: RpcState, _connection: OwnedSemaphorePermit) {
     let (mut sink, stream) = socket.split();
-    let (outbox, mut queue) = Outbox::new(state.config.max_subscription_event_bytes);
+    let (outbox, mut queue) = Outbox::with_budget(
+        state.config.max_subscription_event_bytes,
+        state.config.max_response_bytes,
+        state.config.outbound_budget.clone(),
+    );
     let close = tokio::select! {
         close = serve_websocket(&state, stream, outbox) => close,
         () = send_queued(&mut sink, &mut queue) => None,
@@ -896,7 +923,12 @@ async fn serve_websocket(
     loop {
         tokio::select! {
             message = outbox.next_message(&mut stream) => {
-                let (message, room) = message?;
+                let (message, connection) = message?;
+                // Acquire after the receive branch wins the select: cancelling
+                // a pending acquisition must not discard a consumed request.
+                let Ok(bytes) = u32::try_from(outbox.response_limit) else { return Some(global_budget_close()); };
+                let Ok(global) = Arc::clone(&outbox.global.0).acquire_many_owned(bytes).await else { return None; };
+                let room = QueueRoom { _connection: connection, global };
                 let response = match message {
                     Message::Text(text) => websocket_dispatch_text(
                         state,
@@ -916,8 +948,9 @@ async fn serve_websocket(
                         });
                     }
                 };
-                if let Some(response) = response {
-                    outbox.respond(response, room);
+                if let Some(response) = response
+                    && outbox.respond(response, room).is_err() {
+                    return Some(global_budget_close());
                 }
             }
             event = events.recv() => match event {
@@ -946,14 +979,30 @@ async fn send_queued(
     queue: &mut mpsc::UnboundedReceiver<Queued>,
 ) {
     while let Some((message, _room)) = queue.recv().await {
-        if sink.send(message.into_message()).await.is_err() {
+        if !matches!(
+            tokio::time::timeout(Duration::from_secs(30), sink.send(message.into_message())).await,
+            Ok(Ok(()))
+        ) {
             return;
         }
     }
 }
 
+fn global_budget_close() -> CloseFrame {
+    CloseFrame {
+        code: close_code::AGAIN,
+        reason: "rpc.max_outbound_bytes exhausted; reconnect".into(),
+    }
+}
+
 /// A queued message and the room it takes in the queue until it is sent.
-type Queued = (Outgoing, OwnedSemaphorePermit);
+type Queued = (Outgoing, QueueRoom);
+
+/// Both permits stay held while the sink is sending, including slow sends.
+struct QueueRoom {
+    _connection: OwnedSemaphorePermit,
+    global: OwnedSemaphorePermit,
+}
 
 /// A WebSocket connection's queue of messages to send. It holds at most one
 /// response to a call: the next call is read once the response to the last
@@ -969,16 +1018,33 @@ struct Outbox {
     responses: Arc<Semaphore>,
     /// Room for `limit` bytes of notifications.
     notifications: Arc<Semaphore>,
+    global: RpcOutboundBudget,
+    response_limit: usize,
     limit: usize,
 }
 
 impl Outbox {
+    #[cfg(test)]
     fn new(limit: usize) -> (Self, mpsc::UnboundedReceiver<Queued>) {
+        Self::with_budget(
+            limit,
+            DEFAULT_MAX_RESPONSE_BYTES,
+            RpcOutboundBudget::default(),
+        )
+    }
+
+    fn with_budget(
+        limit: usize,
+        response_limit: usize,
+        global: RpcOutboundBudget,
+    ) -> (Self, mpsc::UnboundedReceiver<Queued>) {
         let (queue, queued) = mpsc::unbounded_channel();
         let outbox = Self {
             queue,
             responses: Arc::new(Semaphore::new(1)),
             notifications: Arc::new(Semaphore::new(limit.min(Semaphore::MAX_PERMITS))),
+            global,
+            response_limit,
             limit,
         };
         (outbox, queued)
@@ -995,9 +1061,25 @@ impl Outbox {
         Some((message, room))
     }
 
-    fn respond(&self, response: Message, room: OwnedSemaphorePermit) {
-        // Sending fails only once the session ends, dropping its queue.
+    fn respond(&self, response: Message, mut room: QueueRoom) -> Result<(), ()> {
+        let bytes = match &response {
+            Message::Text(text) => text.len(),
+            Message::Binary(bytes) | Message::Ping(bytes) | Message::Pong(bytes) => bytes.len(),
+            Message::Close(_) => 125,
+        };
+        if bytes > room.global.num_permits() {
+            // Even a minimal protocol error can exceed an unusually small
+            // per-response limit. Account for its actual queued bytes too.
+            let extra = u32::try_from(bytes - room.global.num_permits()).map_err(|_| ())?;
+            let permit = Arc::clone(&self.global.0)
+                .try_acquire_many_owned(extra)
+                .map_err(|_| ())?;
+            room.global.merge(permit);
+        }
+        let unused = room.global.num_permits().saturating_sub(bytes);
+        drop(room.global.split(unused));
         let _ = self.queue.send((Outgoing::Message(response), room));
+        Ok(())
     }
 
     /// Queue the notification of `result` for `subscription`, adding its
@@ -1021,6 +1103,13 @@ impl Outbox {
                     .ok()
             })
             .ok_or_else(|| slow_client_close(self.limit))?;
+        let global = Arc::clone(&self.global.0)
+            .try_acquire_many_owned(u32::try_from(bytes).map_err(|_| global_budget_close())?)
+            .map_err(|_| global_budget_close())?;
+        let room = QueueRoom {
+            _connection: room,
+            global,
+        };
         let notification = Outgoing::Notification {
             subscription: subscription.to_owned(),
             result: Arc::clone(result),
@@ -3659,7 +3748,11 @@ mod tests {
         subscriptions: &BTreeMap<String, Subscription>,
         event: &ChainEvent,
     ) -> Result<Vec<Value>, CloseFrame> {
-        let (outbox, mut queue) = Outbox::new(state.config.max_subscription_event_bytes);
+        let (outbox, mut queue) = Outbox::with_budget(
+            state.config.max_subscription_event_bytes,
+            state.config.max_response_bytes,
+            state.config.outbound_budget.clone(),
+        );
         queue_notifications(state, subscriptions, event, &outbox).await?;
         let mut notifications = Vec::new();
         while let Ok((message, _room)) = queue.try_recv() {
@@ -6175,6 +6268,26 @@ mod tests {
                 assert!(response.get("error").is_some(), "{response}");
             }
         }
+    }
+
+    #[tokio::test]
+    async fn websocket_connections_share_a_budget_and_release_it_on_disconnect() {
+        let result: Arc<str> = Arc::from("{}");
+        let bytes = notification_len("0x1", &result);
+        let budget = RpcOutboundBudget::new(bytes * 2);
+        let (first, first_queue) = Outbox::with_budget(bytes * 8, bytes, budget.clone());
+        let (second, mut second_queue) = Outbox::with_budget(bytes * 8, bytes, budget.clone());
+        first.notify("0x1", &result, &mut 0).unwrap();
+        second.notify("0x1", &result, &mut 0).unwrap();
+        assert_eq!(budget.0.available_permits(), 0);
+        let close = second.notify("0x1", &result, &mut 0).unwrap_err();
+        assert_eq!(close.code, close_code::AGAIN);
+        assert!(close.reason.contains("max_outbound_bytes"));
+        drop(first_queue);
+        assert_eq!(budget.0.available_permits(), bytes);
+        second.notify("0x1", &result, &mut 0).unwrap();
+        assert_eq!(send_all(&mut second_queue), bytes * 2);
+        assert_eq!(budget.0.available_permits(), bytes * 2);
     }
 
     #[tokio::test]

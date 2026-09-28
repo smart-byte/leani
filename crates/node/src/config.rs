@@ -1175,6 +1175,8 @@ pub struct RpcConfig {
     pub max_websocket_connections: usize,
     #[serde(default = "default_rpc_max_subscription_event_bytes")]
     pub max_subscription_event_bytes: HumanBytes,
+    #[serde(default = "default_rpc_max_outbound_bytes")]
+    pub max_outbound_bytes: HumanBytes,
 }
 
 const fn default_rpc_max_batch_requests() -> usize {
@@ -1203,6 +1205,10 @@ const fn default_rpc_max_subscriptions_per_connection() -> usize {
 
 const fn default_rpc_max_websocket_connections() -> usize {
     leani_rpc::DEFAULT_MAX_WEBSOCKET_CONNECTIONS
+}
+
+fn default_rpc_max_outbound_bytes() -> HumanBytes {
+    HumanBytes(u64::try_from(leani_rpc::DEFAULT_MAX_OUTBOUND_BYTES).unwrap_or(u64::MAX))
 }
 
 fn default_rpc_max_subscription_event_bytes() -> HumanBytes {
@@ -1927,6 +1933,14 @@ fn validate_exposure(api: &ApiConfig, rpc: &RpcConfig, errors: &mut Vec<Validati
                 ));
             }
         }
+    }
+    if rpc.max_outbound_bytes.bytes() < rpc.max_response_bytes.bytes()
+        || rpc.max_outbound_bytes.bytes() > u64::from(u32::MAX)
+    {
+        errors.push(ValidationError::new(
+            "rpc.max_outbound_bytes",
+            "must be at least max_response_bytes and at most 4294967295 bytes",
+        ));
     }
     for (field, value) in [
         ("rpc.max_batch_requests", rpc.max_batch_requests),

@@ -533,19 +533,21 @@ Each limit has a `rpc` setting:
 | `max_log_topic_alternatives` | 1000 | the filter fails with `-32602` |
 | `max_subscriptions_per_connection` | 128 | `eth_subscribe` fails with `-32005` |
 | `max_websocket_connections` | 256 | the WebSocket upgrade gets HTTP 503 |
+| `max_outbound_bytes` | `64MiB` | shared across WebSocket listeners and connections; response work waits for capacity, and notifications close the connection with `1013` when no room remains |
 | `max_subscription_event_bytes` | `16MiB` | a WebSocket connection whose subscriptions produce more notification bytes for one chain event is closed with `1008`, and one that leaves more unread with `1013` |
 
 A closed WebSocket connection releases its slot and its subscriptions.
 Notifications are queued one at a time, so while earlier ones are still
 unsent, a connection can be closed with `1013` before one event's
 notifications pass the limit that would close it with `1008`.
-Each open connection holds at most `max_subscription_event_bytes` of
-notifications and one response to a call waiting to be sent, so all
-connections together hold at most `max_websocket_connections` times that.
-At the defaults that is 256 × (16 MiB + 16 MiB) = 8 GiB, since a response
-may take `max_response_bytes`. To bound it lower, allow fewer connections
-with `max_websocket_connections`, or lower `max_subscription_event_bytes` and
-`max_response_bytes`.
+Each connection retains its own notification limit and one response slot.
+All WebSocket listeners share `max_outbound_bytes` of queued or sending
+payloads (64 MiB by default). Response encoding reserves capacity first;
+notifications acquire capacity before entering the queue. Sending, closing,
+and cancellation release it. A write that remains blocked for 30 seconds
+closes the connection. These are encoded-payload limits, not total process
+RSS limits. `max_outbound_bytes` must be at least `max_response_bytes` and
+at most 4,294,967,295 bytes.
 
 `rpc.transaction_locator` is deprecated and ignored: nothing reads it. The
 node still accepts it, with a warning in its log and in `leani doctor`;

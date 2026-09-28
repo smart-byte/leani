@@ -646,6 +646,11 @@
           "default": 256,
           "description": "Most open WebSocket connections; a further upgrade gets HTTP 503."
         },
+        "max_outbound_bytes": {
+          "$ref": "#/$defs/humanBytes",
+          "default": "64MiB",
+          "description": "Outbound WebSocket payload budget shared across connections and listeners; at least max_response_bytes."
+        },
         "max_subscription_event_bytes": {
           "$ref": "#/$defs/humanBytes",
           "default": "16MiB",

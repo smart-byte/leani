@@ -5736,6 +5736,9 @@ async fn serve(path: &Path, registry: &ProcessorRegistry) -> Result<Exit> {
         max_log_results: rpc_settings.max_log_results,
         max_log_addresses: rpc_settings.max_log_addresses,
         max_log_topic_alternatives: rpc_settings.max_log_topic_alternatives,
+        outbound_budget: leani_rpc::RpcOutboundBudget::new(
+            usize::try_from(rpc_settings.max_outbound_bytes.bytes()).unwrap_or(usize::MAX),
+        ),
         max_subscriptions_per_connection: rpc_settings.max_subscriptions_per_connection,
         max_websocket_connections: rpc_settings.max_websocket_connections,
         max_subscription_event_bytes: usize::try_from(
