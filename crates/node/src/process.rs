@@ -5289,6 +5289,15 @@ async fn serve(path: &Path, registry: &ProcessorRegistry) -> Result<Exit> {
     use leani_store_sqlite::SqliteStore;
 
     let config = Config::load(path)?.validate()?;
+    // Refuse on the environment before opening the store: opening migrates
+    // it, and a refused start must leave an older release able to open it.
+    let bearer_token = config
+        .get()
+        .api
+        .bearer_token_env
+        .as_deref()
+        .map(|name| api_bearer_token(name, std::env::var(name)))
+        .transpose()?;
     let _data_dir_lock = crate::local_state::lock_runtime_directory(&config.get().data_dir)?;
     let assembly = registry.instantiate_all_with_extensions(config.get())?;
     let processors = assembly.processors;
@@ -5348,13 +5357,6 @@ async fn serve(path: &Path, registry: &ProcessorRegistry) -> Result<Exit> {
             }
         }
     }
-    let bearer_token = config
-        .get()
-        .api
-        .bearer_token_env
-        .as_deref()
-        .map(|name| api_bearer_token(name, std::env::var(name)))
-        .transpose()?;
     let live_required = matches!(
         config.get().sources.live.kind,
         crate::config::LiveSourceKind::P2p

@@ -94,6 +94,26 @@ fn live(api: u16) -> bool {
         && response.starts_with("HTTP/1.1 200")
 }
 
+#[test]
+fn a_missing_api_token_refuses_before_the_store_opens() {
+    // Opening the store migrates an rc.1 volume, which the rc.1 image then
+    // refuses. A start refused for its token must not have touched it.
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let (config_path, _) = container_config(directory.path(), None);
+    let output = Command::new(env!("CARGO_BIN_EXE_leani"))
+        .arg("--config")
+        .arg(&config_path)
+        .arg("serve")
+        .env_remove("LEANI_API_TOKEN")
+        .stdin(Stdio::null())
+        .output()
+        .expect("run leani serve");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{stderr}");
+    assert!(stderr.contains("LEANI_API_TOKEN"), "{stderr}");
+    assert!(!directory.path().join("data/leani.sqlite").exists());
+}
+
 #[tokio::test]
 #[allow(clippy::too_many_lines)]
 async fn the_container_profile_starts_beside_the_instance_an_earlier_release_left() {
