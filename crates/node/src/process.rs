@@ -7180,6 +7180,7 @@ async fn run_network_lanes(
     tokio::pin!(handoffs);
     let mut handoffs_verified = false;
     let mut handoffs_finished = false;
+    let mut live_finished = false;
     let result = loop {
         tokio::select! {
             () = cancellation.cancelled() => break Ok(()),
@@ -7216,6 +7217,7 @@ async fn run_network_lanes(
                 }
             }
             result = &mut live => {
+                live_finished = true;
                 readiness.set_live_ready(false);
                 rpc_readiness.set_live_ready(false);
                 break result
@@ -7266,9 +7268,20 @@ async fn run_network_lanes(
         }
     };
     lane_cancellation.cancel();
-    if !handoffs_finished {
-        let _ = handoffs.as_mut().await;
-    }
+    // A suspended live commit holds the lane lock that handoff reconciliation
+    // and parking take, so drive both to completion rather than handoffs alone.
+    tokio::join!(
+        async {
+            if !live_finished {
+                let _ = live.as_mut().await;
+            }
+        },
+        async {
+            if !handoffs_finished {
+                let _ = handoffs.as_mut().await;
+            }
+        },
+    );
     readiness.set_live_ready(false);
     rpc_readiness.set_live_ready(false);
     readiness.set_finality_ready(false);
