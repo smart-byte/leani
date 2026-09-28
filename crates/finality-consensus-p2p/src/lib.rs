@@ -30,7 +30,7 @@ use leani_finality_beacon_api::{
     AnchorFile, AnchorWriter, BeaconApiError, CheckpointOrigin, Clock, DEFAULT_MAX_CHECKPOINT_AGE,
     HELIOS_REVISION, MainnetLightClientVerifier, StartAnchor, TrustedCheckpoint,
     VerifiedFinalityAnchor, current_slot, mainnet_fork_digest, resolve_start_anchor,
-    verification_slot,
+    signed_implausibly_ahead, verification_slot,
 };
 use leani_primitives::{
     BlockNumber, Capability, CapabilitySet, ChainId, SourceId, SourceKind, TrustModel,
@@ -615,10 +615,18 @@ impl P2pLightClient {
                 }
             };
             let signature_slot = *update.signature_slot();
-            if signature_slot > verification_slot(self.source.clock.now()) {
-                errors.push(format!(
-                    "{peer}: finality update signed at slot {signature_slot} is ahead of the local clock"
-                ));
+            let now = self.source.clock.now();
+            if signature_slot > verification_slot(now) {
+                let error = format!(
+                    "finality update signed at slot {signature_slot} is ahead of the local clock"
+                );
+                // A little early is a skewed clock; an epoch beyond it is a
+                // claim no honest peer makes, so the peer is not asked again.
+                errors.push(if signed_implausibly_ahead(signature_slot, now) {
+                    self.network.ban(peer, error)
+                } else {
+                    format!("{peer}: {error}")
+                });
                 continue;
             }
             // The update's signature may need the next sync committees.

@@ -1177,10 +1177,21 @@ pub fn verification_slot(now: SystemTime) -> u64 {
     current_slot(now).saturating_add(CLOCK_SKEW_SLOTS)
 }
 
+/// Slots past [`verification_slot`] an update is merely early by: one epoch.
+const EARLY_UPDATE_SLOTS: u64 = 32;
+
+/// Whether an update signed at `signature_slot` is ahead of any honest
+/// clock, more than an epoch past [`verification_slot`]. Such a slot is the
+/// sender's own claim, so the update is fabricated rather than stale.
+#[must_use]
+pub fn signed_implausibly_ahead(signature_slot: u64, now: SystemTime) -> bool {
+    signature_slot > verification_slot(now).saturating_add(EARLY_UPDATE_SLOTS)
+}
+
 /// Classify a verification failure. An update the store already passed, one
-/// signed ahead of the local clock, or one from a period the store cannot
-/// verify yet is stale. Any other failure, including slots that are
-/// inconsistent within the update, is invalid.
+/// signed a little ahead of the local clock, or one from a period the store
+/// cannot verify yet is stale. Any other failure, including slots that are
+/// inconsistent within the update or implausibly far ahead, is invalid.
 fn update_error(
     kind: Option<&ConsensusError>,
     error: String,
@@ -1191,7 +1202,10 @@ fn update_error(
         Some(ConsensusError::NotRelevant | ConsensusError::InvalidPeriod) => {
             BeaconApiError::StaleUpdate(error)
         }
-        Some(ConsensusError::InvalidTimestamp) if signature_slot > verification_slot(now) => {
+        Some(ConsensusError::InvalidTimestamp)
+            if signature_slot > verification_slot(now)
+                && !signed_implausibly_ahead(signature_slot, now) =>
+        {
             BeaconApiError::StaleUpdate(error)
         }
         _ => BeaconApiError::Verification(error),
@@ -2380,6 +2394,24 @@ mod tests {
             .apply_finality_update(&forged.data, now)
             .expect_err("forged");
         assert!(!error.is_stale_update(), "{error}");
+    }
+
+    #[test]
+    fn an_update_signed_an_epoch_past_the_clock_is_invalid_not_stale() {
+        let now = UNIX_EPOCH + Duration::from_secs(MAINNET_GENESIS_TIME + 12 * 1_000_000);
+        let early = verification_slot(now) + 1;
+        let fabricated = verification_slot(now) + EARLY_UPDATE_SLOTS + 1;
+        let classify = |slot| {
+            update_error(
+                Some(&ConsensusError::InvalidTimestamp),
+                "timestamp".to_owned(),
+                slot,
+                now,
+            )
+        };
+        assert!(classify(early).is_stale_update());
+        assert!(!classify(fabricated).is_stale_update());
+        assert!(signed_implausibly_ahead(u64::MAX, now));
     }
 
     fn optimistic_update(encoded: &str) -> OptimisticUpdate<MainnetConsensusSpec> {
