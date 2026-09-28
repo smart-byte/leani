@@ -2143,10 +2143,23 @@ async fn backup_store(
     {
         std::fs::create_dir_all(parent)?;
     }
-    let escaped = destination.to_string_lossy().replace('\'', "''");
+    // A lossy path would write elsewhere than the existence check looked.
+    let escaped = destination
+        .to_str()
+        .ok_or_else(|| StoreError::InvalidConfig("backup path must be valid UTF-8".to_owned()))?
+        .replace('\'', "''");
     sqlx::query(&format!("VACUUM INTO '{escaped}'"))
         .execute(&mut *connection)
         .await?;
+    // SQLite does not sync what VACUUM INTO writes, and the next start
+    // migrates the original for good: make the copy durable first.
+    std::fs::File::open(destination)?.sync_all()?;
+    #[cfg(unix)]
+    std::fs::File::open(match destination.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    })?
+    .sync_all()?;
     Ok(())
 }
 
@@ -12175,8 +12188,8 @@ impl SqliteStore {
         )
     }
 
-    /// Legacy create/renew helper retained for callers migrating to the
-    /// explicit consumer API. It creates a missing consumer as `required`.
+    /// Test-only create/renew helper. It creates a missing consumer as
+    /// `required` and sets its sequences without the acknowledgement rules.
     ///
     /// # Errors
     ///
@@ -12185,6 +12198,7 @@ impl SqliteStore {
     /// stream that does not retain delivery until acknowledged;
     /// [`StoreError::Numeric`] when the lease expiry does not fit; and store
     /// failures.
+    #[cfg(test)]
     pub async fn renew_consumer_lease(
         &self,
         descriptor: &ProcessorDescriptor,
@@ -12538,8 +12552,8 @@ impl SqliteStore {
             .execute(&mut *transaction)
             .await?;
         let low_water = descriptor.lifecycle.delivery.max_bytes.saturating_mul(9) / 10;
-        if i64_u64(live_bytes, "delivery live bytes")? <= low_water {
-            sqlx::query(
+        let resumed = i64_u64(live_bytes, "delivery live bytes")? <= low_water
+            && sqlx::query(
                 "UPDATE processor_runtime_state
                  SET state = 'running', reason = NULL, updated_at_unix_ms = ?
                  WHERE instance = ? AND state = 'paused'",
@@ -12547,10 +12561,15 @@ impl SqliteStore {
             .bind(now_i64()?)
             .bind(&instance)
             .execute(&mut *transaction)
-            .await?;
-        }
+            .await?
+            .rows_affected()
+                > 0;
         transaction.commit().await?;
-        self.inner.delivery_capacity_changed.notify_waiters();
+        // Waking for a no-op let two paused processors at their limit wake
+        // each other's maintenance in a loop.
+        if result.rows_affected() > 0 || resumed {
+            self.inner.delivery_capacity_changed.notify_waiters();
+        }
         Ok(ChangePruneOutcome {
             requested_before,
             effective_before: effective,
@@ -22204,6 +22223,22 @@ mod tests {
             .await
             .expect_err("changed execution material must fail closed");
         assert!(matches!(error, StoreError::Invariant(_)));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_backup_refuses_a_path_it_cannot_name_exactly() {
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let (directory, store) = store().await;
+        let backup = directory
+            .path()
+            .join(std::ffi::OsStr::from_bytes(b"backup-\xff.sqlite"));
+        let error = SqliteStore::backup(store.path(), &backup)
+            .await
+            .expect_err("a lossy path names another file");
+        assert!(matches!(error, StoreError::InvalidConfig(_)), "{error}");
+        assert!(!directory.path().join("backup-\u{fffd}.sqlite").exists());
     }
 
     #[tokio::test]
