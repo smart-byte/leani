@@ -3163,6 +3163,18 @@ mod tests {
         )
         .unwrap();
         assert_eq!(output[&42][0].topics, vec![[0; 32]]);
+        let zero_text = format!("0x{}", "0".repeat(64));
+        let output = parse_block_42_logs(
+            &log_batch([
+                text_topic(Some(&zero_text)),
+                text_topic(None),
+                text_topic(None),
+                text_topic(None),
+            ]),
+            &FilterSet::default(),
+        )
+        .unwrap();
+        assert_eq!(output[&42][0].topics, vec![[0; 32]]);
         assert!(
             parse_block_42_logs(
                 &log_batch([

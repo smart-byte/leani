@@ -161,7 +161,7 @@ impl StarterConfig {
         .map_err(|error| format!("built-in Ethereum Mainnet defaults are invalid: {error}"))?;
         let processor = match (self.blocks, self.uniswap) {
             (Some(_), None) => Ok(crate::block_summaries::processor_config(
-                "block-summary-1-2",
+                crate::block_summaries::COMPACT_INSTANCE,
                 false,
             )),
             (None, Some(uniswap)) => {
@@ -3681,6 +3681,10 @@ markets = ["LINK/ETH"]
         let config = starter.expand().expect("expand blocks config");
         assert_eq!(config.processors.len(), 1);
         assert_eq!(config.processors[0].id, "block-summary");
+        assert_eq!(
+            config.processors[0].instance,
+            crate::block_summaries::COMPACT_INSTANCE
+        );
         assert_eq!(config.processors[0].version, "1.2.0");
         assert!(config.processors[0].settings.is_empty());
     }
@@ -3840,6 +3844,14 @@ markets = ["LINK/ETH"]
             config.rpc.max_subscription_event_bytes.bytes(),
             16 * 1_024 * 1_024
         );
+        assert_eq!(config.rpc.max_outbound_bytes.bytes(), 64 * 1_024 * 1_024);
+        // The shared budget holds one whole response and fits tokio's permits.
+        let mut bounded = config.clone();
+        bounded.rpc.max_outbound_bytes =
+            HumanBytes::from_bytes(bounded.rpc.max_response_bytes.bytes() - 1);
+        assert_eq!(error_fields(&bounded), ["rpc.max_outbound_bytes"]);
+        bounded.rpc.max_outbound_bytes = HumanBytes::from_bytes(u64::from(u32::MAX) + 1);
+        assert_eq!(error_fields(&bounded), ["rpc.max_outbound_bytes"]);
         let mut config = config;
         config.rpc.max_batch_requests = 0;
         config.rpc.max_response_bytes = HumanBytes::from_bytes(0);

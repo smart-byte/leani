@@ -651,6 +651,59 @@ fn the_shipped_file_walk_skips_state_and_build_directories() {
     assert_eq!(found, [temp.path().join("profiles/node.toml")]);
 }
 
+/// Violations of one top-level branch. A failed `oneOf` only reports that no
+/// branch matched, which hides the offending member.
+fn branch_errors(schema: &Value, branch: &str, value: &Value) -> Vec<String> {
+    let mut branch_schema = schema.clone();
+    let root = branch_schema.as_object_mut().expect("schema object");
+    root.remove("oneOf");
+    root.insert("$ref".to_owned(), format!("#/$defs/{branch}").into());
+    jsonschema::options()
+        .should_validate_formats(true)
+        .build(&branch_schema)
+        .expect("branch schema")
+        .iter_errors(value)
+        .map(|error| format!("as {branch}, {}: {error}", error.instance_path()))
+        .collect()
+}
+
+#[test]
+fn compact_configurations_validate_against_json_schema() {
+    // No shipped file uses the compact shape; `leani init` writes it.
+    let schema = Schema::load(&repository());
+    let validator = jsonschema::options()
+        .should_validate_formats(true)
+        .build(&schema.0)
+        .expect("valid configuration schema");
+    let checkpoint = format!("0x{}", "11".repeat(32));
+    let endpoints = vec![url::Url::parse("https://beacon.example/").expect("URL")];
+    for starter in [
+        StarterConfig::blocks(
+            PathBuf::from("./data"),
+            checkpoint.clone(),
+            15_000_000,
+            endpoints.clone(),
+        ),
+        StarterConfig::uniswap(
+            PathBuf::from("./data"),
+            vec!["ETH/USDC".to_owned()],
+            checkpoint.clone(),
+            15_000_000,
+            endpoints.clone(),
+        ),
+    ] {
+        let encoded = toml::to_string_pretty(&starter).expect("compact TOML");
+        let document = toml::from_str::<toml::Value>(&encoded).expect("compact document");
+        let value = serde_json::to_value(&document).expect("JSON configuration");
+        let errors = branch_errors(&schema.0, "starterConfig", &value);
+        assert!(
+            validator.is_valid(&value) && errors.is_empty(),
+            "{encoded}\n{}",
+            errors.join("\n")
+        );
+    }
+}
+
 #[test]
 fn shipped_configurations_load_and_validate_against_json_schema() {
     // Audit Config-1: nothing checked the shipped files against the schema,
@@ -715,10 +768,13 @@ fn shipped_configurations_load_and_validate_against_json_schema() {
             .build(&schema_value)
             .expect("valid configuration schema");
         let value = serde_json::to_value(&document).expect("JSON configuration");
-        let found = validator
+        let mut found = validator
             .iter_errors(&value)
             .map(|error| format!("{}: {error}", error.instance_path()))
             .collect::<Vec<_>>();
+        if !found.is_empty() {
+            found.extend(branch_errors(&schema_value, "advancedConfig", &value));
+        }
         problems.extend(
             found
                 .into_iter()
