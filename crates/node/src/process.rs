@@ -11157,7 +11157,21 @@ markets = ["ETH/USDT"]
         )
         .await
         .unwrap();
+        // A wrong prefix gets axum's empty 404; the error must still say so.
+        let wrong = endpoint.join("../elsewhere/").unwrap();
+        let error = backfill::run(
+            Path::new("unused-remote-config"),
+            &instance,
+            1,
+            4,
+            Some(&wrong),
+            Some(token),
+            &ProcessorRegistry::standard(),
+        )
+        .await
+        .unwrap_err();
         server.abort();
+        assert!(format!("{error:#}").contains("404"), "{error:#}");
         assert_eq!(result.unwrap(), Exit::Success);
         assert_eq!(
             store

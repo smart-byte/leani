@@ -6,7 +6,7 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use tokio_util::sync::CancellationToken;
-use tracing::info;
+use tracing::{info, warn};
 
 use super::{
     Exit, NativeBackfillControl, OnDemandP2pBridge, ShutdownSignals, backfill_processor_config,
@@ -64,6 +64,10 @@ fn api_url(endpoint: &url::Url, id: Option<&str>) -> Result<url::Url> {
     Ok(url)
 }
 
+/// Attempts per API call; the create request's idempotency key makes a
+/// repeated create return the job the node already accepted.
+const API_ATTEMPTS: u32 = 5;
+
 async fn response_json(mut response: reqwest::Response) -> Result<serde_json::Value> {
     let status = response.status();
     let mut bytes = Vec::new();
@@ -77,12 +81,51 @@ async fn response_json(mut response: reqwest::Response) -> Result<serde_json::Va
         }
         bytes.extend_from_slice(&chunk);
     }
-    let value: serde_json::Value =
-        serde_json::from_slice(&bytes).context("decode backfill API response")?;
     if !status.is_success() {
-        bail!("backfill API returned {status}: {value}");
+        // Error bodies need not be JSON: a wrong prefix gets an empty 404.
+        let body = String::from_utf8_lossy(&bytes);
+        let body = body.chars().take(512).collect::<String>();
+        bail!("backfill API returned {status}: {body}");
     }
-    Ok(value)
+    serde_json::from_slice(&bytes).context("decode backfill API response")
+}
+
+/// Send `request`, retrying transport errors and 5xx answers with backoff.
+async fn call(request: impl Fn() -> reqwest::RequestBuilder) -> Result<serde_json::Value> {
+    let mut delay = Duration::from_millis(500);
+    for attempt in 1..API_ATTEMPTS {
+        match request().send().await {
+            Ok(response) if !response.status().is_server_error() => {
+                return response_json(response).await;
+            }
+            Ok(response) => {
+                warn!(attempt, status = %response.status(), "backfill API call failed; retrying");
+            }
+            Err(error) => {
+                warn!(attempt, error = %error.without_url(), "backfill API call failed; retrying");
+            }
+        }
+        tokio::time::sleep(delay).await;
+        delay = (delay * 2).min(Duration::from_secs(8));
+    }
+    response_json(
+        request()
+            .send()
+            .await
+            .map_err(reqwest::Error::without_url)?,
+    )
+    .await
+}
+
+/// A plain-HTTP endpoint that is not a loopback name or address.
+fn cleartext_remote(endpoint: &url::Url) -> bool {
+    endpoint.scheme() == "http"
+        && match endpoint.host() {
+            Some(url::Host::Domain(name)) => !name.eq_ignore_ascii_case("localhost"),
+            Some(url::Host::Ipv4(address)) => !address.is_loopback(),
+            Some(url::Host::Ipv6(address)) => !address.is_loopback(),
+            None => true,
+        }
 }
 
 async fn remote(
@@ -93,6 +136,9 @@ async fn remote(
     to: u64,
 ) -> Result<Exit> {
     let collection = api_url(endpoint, None)?;
+    if token.is_some() && cleartext_remote(endpoint) {
+        warn!("sending the API bearer token over plain HTTP to a non-loopback endpoint");
+    }
     let mut headers = reqwest::header::HeaderMap::new();
     headers.insert(
         "x-leani-request",
@@ -123,21 +169,29 @@ async fn remote(
         mode: leani_api::BackfillExecutionMode::FillMissing,
         idempotency_key: format!("cli-{identity}"),
     };
-    let mut status = response_json(
-        client
-            .post(collection)
-            .json(&request)
-            .send()
-            .await
-            .map_err(reqwest::Error::without_url)?,
-    )
-    .await?;
+    // Listen before submitting: Ctrl-C during the request must still cancel
+    // the job the node creates, rather than kill the process.
+    let mut signals = ShutdownSignals::new()?;
+    let mut interrupted = false;
+    let create = call(|| client.post(collection.clone()).json(&request));
+    tokio::pin!(create);
+    let mut status = loop {
+        tokio::select! {
+            status = &mut create => break status?,
+            signal = signals.recv() => {
+                signal?;
+                if interrupted {
+                    bail!("backfill interrupted before the node confirmed the job");
+                }
+                interrupted = true;
+            }
+        }
+    };
     let id = status["id"]
         .as_str()
         .context("backfill API response omitted job ID")?
         .to_owned();
     let job = api_url(endpoint, Some(&id))?;
-    let mut signals = ShutdownSignals::new()?;
     loop {
         match status["state"].as_str() {
             Some("completed") => {
@@ -148,24 +202,29 @@ async fn remote(
             Some(_) => {}
             None => bail!("backfill API response omitted job state"),
         }
+        if interrupted {
+            let mut cancel = job.clone();
+            cancel
+                .path_segments_mut()
+                .map_err(|()| anyhow::anyhow!("invalid job URL"))?
+                .push("cancel");
+            status = call(|| client.post(cancel.clone())).await?;
+            // The job may have completed before the cancel arrived.
+            if status["state"].as_str() == Some("completed") {
+                println!("{}", serde_json::to_string_pretty(&status)?);
+                return Ok(Exit::Success);
+            }
+            bail!("backfill cancelled: {status}");
+        }
         tokio::select! {
-            () = tokio::time::sleep(Duration::from_millis(500)) => {},
+            () = tokio::time::sleep(Duration::from_millis(500)) => {
+                status = call(|| client.get(job.clone())).await?;
+            },
             signal = signals.recv() => {
                 signal?;
-                let mut cancel = job.clone();
-                cancel.path_segments_mut().map_err(|()| anyhow::anyhow!("invalid job URL"))?.push("cancel");
-                response_json(client.post(cancel).send().await.map_err(reqwest::Error::without_url)?).await?;
-                bail!("backfill cancelled");
+                interrupted = true;
             }
         }
-        status = response_json(
-            client
-                .get(job.clone())
-                .send()
-                .await
-                .map_err(reqwest::Error::without_url)?,
-        )
-        .await?;
     }
 }
 
@@ -338,4 +397,60 @@ async fn standalone(
     }
     println!("{}", serde_json::to_string_pretty(&report)?);
     Ok(Exit::Success)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    #[test]
+    fn only_non_loopback_plain_http_is_cleartext() {
+        for (url, cleartext) in [
+            ("http://127.0.0.1:1/", false),
+            ("http://[::1]:1/", false),
+            ("http://LocalHost/", false),
+            ("http://node.internal/", true),
+            ("http://10.0.0.1/", true),
+            ("https://node.internal/", false),
+        ] {
+            let url = url::Url::parse(url).unwrap();
+            assert_eq!(super::cleartext_remote(&url), cleartext, "{url}");
+        }
+    }
+
+    #[tokio::test]
+    async fn api_calls_retry_server_errors() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counted = calls.clone();
+        let router = axum::Router::new().route(
+            "/",
+            axum::routing::get(move || {
+                let calls = counted.clone();
+                async move {
+                    if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                        (
+                            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                            "busy".to_owned(),
+                        )
+                    } else {
+                        (
+                            axum::http::StatusCode::OK,
+                            r#"{"state":"running"}"#.to_owned(),
+                        )
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let client = reqwest::Client::new();
+        let value = super::call(|| client.get(&url)).await.unwrap();
+        server.abort();
+        assert_eq!(value["state"], "running");
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
 }
