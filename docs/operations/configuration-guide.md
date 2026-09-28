@@ -547,7 +547,10 @@ leani backfill --endpoint http://127.0.0.1:18080 \
 
 The command sends an authenticated materialization request and waits for its
 status. `LEANI_API_TOKEN` supplies the token without putting it in shell
-arguments. An optional endpoint path prefix is preserved. Ctrl-C cancels
+arguments. The token travels in an `Authorization` header, so across hosts use
+HTTPS, for example through a TLS-terminating reverse proxy; plain HTTP suits
+loopback or a private container network, and the command warns when it sends
+the token over plain HTTP beyond loopback. An optional endpoint path prefix is preserved. Ctrl-C cancels
 the submitted job. Without `--endpoint`, stop any process holding the data
 directory before starting standalone backfill. Ctrl-C cancels a standalone
 run, so the next `serve` does not resume it; a second Ctrl-C exits at once.
