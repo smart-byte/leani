@@ -7,7 +7,7 @@
     },
     {
       "id": "block-summary",
-      "description": "Verified Ethereum block summaries with transaction counts"
+      "description": "Ethereum block summaries with transaction counts, from verified or dataset-declared blocks"
     },
     {
       "id": "erc20-balances",
