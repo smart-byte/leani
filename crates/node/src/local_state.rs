@@ -132,14 +132,31 @@ fn lock_directory(data_dir: &Path) -> Result<RuntimeDirectoryLock> {
         .write(true)
         .open(&path)
         .with_context(|| format!("open runtime lock {}", path.display()))?;
-    file.try_lock().with_context(|| {
-        format!(
-            "runtime data directory {} is already in use by another Leani process",
-            data_dir.display()
-        )
-    })?;
-    Ok(RuntimeDirectoryLock { _file: file })
+    // A child forked by another thread holds a copy of the descriptor, and
+    // so the lock, until it execs: a lock this process just released can
+    // still look busy for a moment. Another process holds it far longer.
+    // ponytail: bounded sleep-retry, fine for startup and CLI paths.
+    let deadline = std::time::Instant::now() + LOCK_RETRY;
+    loop {
+        match file.try_lock() {
+            Err(std::fs::TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            result => {
+                result.with_context(|| {
+                    format!(
+                        "runtime data directory {} is already in use by another Leani process",
+                        data_dir.display()
+                    )
+                })?;
+                return Ok(RuntimeDirectoryLock { _file: file });
+            }
+        }
+    }
 }
+
+/// How long a busy runtime directory lock is retried before it is refused.
+const LOCK_RETRY: std::time::Duration = std::time::Duration::from_millis(500);
 
 pub(crate) fn configured_path(
     requested: Option<&Path>,
@@ -419,6 +436,23 @@ pub(crate) fn remove_known_runtime_state(target: &Path) -> Result<Vec<PathBuf>> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_lock_released_a_moment_later_is_taken_and_a_held_one_refused() {
+        // A forked child keeps a released lock for a moment; see lock_directory.
+        let directory = tempfile::tempdir().unwrap();
+        let held = lock_directory(directory.path()).unwrap();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            drop(held);
+        });
+        let _taken = lock_directory(directory.path()).expect("released within the retry");
+        release.join().unwrap();
+        assert!(
+            lock_directory(directory.path()).is_err(),
+            "a held lock stays busy"
+        );
+    }
 
     #[test]
     fn full_reset_removes_only_the_data_root_and_preserves_configuration() {
