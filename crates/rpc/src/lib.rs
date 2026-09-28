@@ -147,17 +147,77 @@ pub const DEFAULT_MAX_WEBSOCKET_CONNECTIONS: usize = 256;
 /// holds unsent.
 pub const DEFAULT_MAX_SUBSCRIPTION_EVENT_BYTES: usize = 16 * 1_024 * 1_024;
 
-/// Default encoded payload allowance shared by all WebSocket connections.
+/// Default encoded bytes of subscription notifications that all WebSocket
+/// connections together may hold queued or sending.
 pub const DEFAULT_MAX_OUTBOUND_BYTES: usize = 64 * 1_024 * 1_024;
 
-/// Global outbound payload permits, shared across listeners and connections.
+/// How long a connection may keep more than a quarter of its notification
+/// room queued before it is closed as a reader slower than its subscriptions.
+const SLOW_READER_GRACE: Duration = Duration::from_secs(30);
+
+/// How long a notification waits for the room that closing the connection
+/// holding the most of the shared budget frees.
+const EVICTION_WAIT: Duration = Duration::from_secs(2);
+
+/// A send may take this long, plus the time its payload needs at
+/// [`MINIMUM_SEND_RATE`]: a stalled reader times out, a slow one does not.
+const SEND_TIMEOUT: Duration = Duration::from_secs(30);
+const MINIMUM_SEND_RATE: u64 = 64 * 1_024;
+
+/// Queued subscription notification bytes shared across listeners and
+/// connections. Responses to calls do not use it: each connection holds at
+/// most one, and reads its next call only once that one is sent. When the
+/// budget runs out, the connection holding the most of it is closed, not the
+/// one that happens to notify next.
 #[derive(Clone, Debug)]
-pub struct RpcOutboundBudget(Arc<Semaphore>);
+pub struct RpcOutboundBudget {
+    permits: Arc<Semaphore>,
+    connections: Arc<std::sync::Mutex<Vec<std::sync::Weak<ConnectionShare>>>>,
+}
 
 impl RpcOutboundBudget {
     #[must_use]
     pub fn new(bytes: usize) -> Self {
-        Self(Arc::new(Semaphore::new(bytes.min(Semaphore::MAX_PERMITS))))
+        Self {
+            permits: Arc::new(Semaphore::new(bytes.min(Semaphore::MAX_PERMITS))),
+            connections: Arc::default(),
+        }
+    }
+
+    fn register(&self, share: &Arc<ConnectionShare>) {
+        let mut connections = self
+            .connections
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        connections.retain(|connection| connection.strong_count() > 0);
+        connections.push(Arc::downgrade(share));
+    }
+
+    /// The open connection with the most notification bytes queued.
+    fn laggard(&self) -> Option<Arc<ConnectionShare>> {
+        self.connections
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .filter_map(std::sync::Weak::upgrade)
+            .max_by_key(|connection| connection.queued())
+    }
+}
+
+/// What the shared budget sees of one connection.
+#[derive(Debug)]
+struct ConnectionShare {
+    /// Room for the connection's queued notifications.
+    notifications: Arc<Semaphore>,
+    capacity: usize,
+    /// Cancelled to close the connection for holding the most of the budget.
+    evicted: CancellationToken,
+}
+
+impl ConnectionShare {
+    fn queued(&self) -> usize {
+        self.capacity
+            .saturating_sub(self.notifications.available_permits())
     }
 }
 
@@ -191,7 +251,8 @@ pub struct RpcConfig {
     /// produce for one WebSocket connection, and that the connection may
     /// hold unsent. A connection past either is closed.
     pub max_subscription_event_bytes: usize,
-    /// Shared payload budget. Clone the config when serving multiple listeners.
+    /// Shared notification budget. Clone the config when serving multiple
+    /// listeners.
     pub outbound_budget: RpcOutboundBudget,
     /// Cancelled when the node shuts down: open WebSocket connections then
     /// get a going-away close frame.
@@ -888,12 +949,13 @@ async fn websocket_session(socket: WebSocket, state: RpcState, _connection: Owne
     let (mut sink, stream) = socket.split();
     let (outbox, mut queue) = Outbox::with_budget(
         state.config.max_subscription_event_bytes,
-        state.config.max_response_bytes,
         state.config.outbound_budget.clone(),
     );
+    let evicted = outbox.share.evicted.clone();
     let close = tokio::select! {
         close = serve_websocket(&state, stream, outbox) => close,
         () = send_queued(&mut sink, &mut queue) => None,
+        () = evicted.cancelled() => Some(global_budget_close()),
         () = state.config.shutdown.cancelled() => Some(CloseFrame {
             code: close_code::AWAY,
             reason: "the node is shutting down".into(),
@@ -923,12 +985,7 @@ async fn serve_websocket(
     loop {
         tokio::select! {
             message = outbox.next_message(&mut stream) => {
-                let (message, connection) = message?;
-                // Acquire after the receive branch wins the select: cancelling
-                // a pending acquisition must not discard a consumed request.
-                let Ok(bytes) = u32::try_from(outbox.response_limit) else { return Some(global_budget_close()); };
-                let Ok(global) = Arc::clone(&outbox.global.0).acquire_many_owned(bytes).await else { return None; };
-                let room = QueueRoom { _connection: connection, global };
+                let (message, room) = message?;
                 let response = match message {
                     Message::Text(text) => websocket_dispatch_text(
                         state,
@@ -948,9 +1005,8 @@ async fn serve_websocket(
                         });
                     }
                 };
-                if let Some(response) = response
-                    && outbox.respond(response, room).is_err() {
-                    return Some(global_budget_close());
+                if let Some(response) = response {
+                    outbox.respond(response, room);
                 }
             }
             event = events.recv() => match event {
@@ -979,8 +1035,11 @@ async fn send_queued(
     queue: &mut mpsc::UnboundedReceiver<Queued>,
 ) {
     while let Some((message, _room)) = queue.recv().await {
+        let message = message.into_message();
+        let bytes = u64::try_from(message_len(&message)).unwrap_or(u64::MAX);
+        let deadline = SEND_TIMEOUT + Duration::from_secs(bytes / MINIMUM_SEND_RATE);
         if !matches!(
-            tokio::time::timeout(Duration::from_secs(30), sink.send(message.into_message())).await,
+            tokio::time::timeout(deadline, sink.send(message)).await,
             Ok(Ok(()))
         ) {
             return;
@@ -988,20 +1047,29 @@ async fn send_queued(
     }
 }
 
+fn message_len(message: &Message) -> usize {
+    match message {
+        Message::Text(text) => text.len(),
+        Message::Binary(bytes) | Message::Ping(bytes) | Message::Pong(bytes) => bytes.len(),
+        Message::Close(_) => 125,
+    }
+}
+
 fn global_budget_close() -> CloseFrame {
     CloseFrame {
         code: close_code::AGAIN,
-        reason: "rpc.max_outbound_bytes exhausted; reconnect".into(),
+        reason: "holding the most of rpc.max_outbound_bytes; reconnect".into(),
     }
 }
 
 /// A queued message and the room it takes in the queue until it is sent.
 type Queued = (Outgoing, QueueRoom);
 
-/// Both permits stay held while the sink is sending, including slow sends.
+/// The permits stay held while the sink is sending, including slow sends.
+/// A response holds only its connection's response slot.
 struct QueueRoom {
     _connection: OwnedSemaphorePermit,
-    global: OwnedSemaphorePermit,
+    _global: Option<OwnedSemaphorePermit>,
 }
 
 /// A WebSocket connection's queue of messages to send. It holds at most one
@@ -1010,42 +1078,45 @@ struct QueueRoom {
 /// events queue subscription notifications whether the client reads them or
 /// not, within `limit` encoded bytes: an event whose notifications pass
 /// `limit` by themselves, or find no room left in the queue, closes the
-/// connection instead.
+/// connection instead, and so does keeping more than a quarter of `limit`
+/// queued for [`SLOW_READER_GRACE`].
 struct Outbox {
     /// Bounded not by the channel but by the room its messages hold.
     queue: mpsc::UnboundedSender<Queued>,
     /// Room for one response.
     responses: Arc<Semaphore>,
-    /// Room for `limit` bytes of notifications.
-    notifications: Arc<Semaphore>,
+    share: Arc<ConnectionShare>,
     global: RpcOutboundBudget,
-    response_limit: usize,
     limit: usize,
+    /// Since when more than a quarter of the notification room is queued.
+    backlog_since: std::sync::Mutex<Option<tokio::time::Instant>>,
 }
 
 impl Outbox {
     #[cfg(test)]
     fn new(limit: usize) -> (Self, mpsc::UnboundedReceiver<Queued>) {
-        Self::with_budget(
-            limit,
-            DEFAULT_MAX_RESPONSE_BYTES,
-            RpcOutboundBudget::default(),
-        )
+        Self::with_budget(limit, RpcOutboundBudget::default())
     }
 
     fn with_budget(
         limit: usize,
-        response_limit: usize,
         global: RpcOutboundBudget,
     ) -> (Self, mpsc::UnboundedReceiver<Queued>) {
         let (queue, queued) = mpsc::unbounded_channel();
+        let capacity = limit.min(Semaphore::MAX_PERMITS);
+        let share = Arc::new(ConnectionShare {
+            notifications: Arc::new(Semaphore::new(capacity)),
+            capacity,
+            evicted: CancellationToken::new(),
+        });
+        global.register(&share);
         let outbox = Self {
             queue,
             responses: Arc::new(Semaphore::new(1)),
-            notifications: Arc::new(Semaphore::new(limit.min(Semaphore::MAX_PERMITS))),
+            share,
             global,
-            response_limit,
             limit,
+            backlog_since: std::sync::Mutex::new(None),
         };
         (outbox, queued)
     }
@@ -1061,30 +1132,20 @@ impl Outbox {
         Some((message, room))
     }
 
-    fn respond(&self, response: Message, mut room: QueueRoom) -> Result<(), ()> {
-        let bytes = match &response {
-            Message::Text(text) => text.len(),
-            Message::Binary(bytes) | Message::Ping(bytes) | Message::Pong(bytes) => bytes.len(),
-            Message::Close(_) => 125,
-        };
-        if bytes > room.global.num_permits() {
-            // Even a minimal protocol error can exceed an unusually small
-            // per-response limit. Account for its actual queued bytes too.
-            let extra = u32::try_from(bytes - room.global.num_permits()).map_err(|_| ())?;
-            let permit = Arc::clone(&self.global.0)
-                .try_acquire_many_owned(extra)
-                .map_err(|_| ())?;
-            room.global.merge(permit);
-        }
-        let unused = room.global.num_permits().saturating_sub(bytes);
-        drop(room.global.split(unused));
-        let _ = self.queue.send((Outgoing::Message(response), room));
-        Ok(())
+    fn respond(&self, response: Message, room: OwnedSemaphorePermit) {
+        // Sending fails only once the session ends, dropping its queue.
+        let _ = self.queue.send((
+            Outgoing::Message(response),
+            QueueRoom {
+                _connection: room,
+                _global: None,
+            },
+        ));
     }
 
     /// Queue the notification of `result` for `subscription`, adding its
     /// bytes to `event_bytes`, those of its chain event's notifications.
-    fn notify(
+    async fn notify(
         &self,
         subscription: &str,
         result: &Arc<str>,
@@ -1095,27 +1156,65 @@ impl Outbox {
         if *event_bytes > self.limit {
             return Err(event_budget_close(self.limit));
         }
-        let room = u32::try_from(bytes)
-            .ok()
-            .and_then(|bytes| {
-                Arc::clone(&self.notifications)
-                    .try_acquire_many_owned(bytes)
-                    .ok()
-            })
-            .ok_or_else(|| slow_client_close(self.limit))?;
-        let global = Arc::clone(&self.global.0)
-            .try_acquire_many_owned(u32::try_from(bytes).map_err(|_| global_budget_close())?)
-            .map_err(|_| global_budget_close())?;
-        let room = QueueRoom {
-            _connection: room,
-            global,
-        };
+        let permits = u32::try_from(bytes).map_err(|_| slow_client_close(self.limit))?;
+        let room = Arc::clone(&self.share.notifications)
+            .try_acquire_many_owned(permits)
+            .map_err(|_| slow_client_close(self.limit))?;
+        self.check_backlog()?;
+        let global = self.global_room(permits).await?;
         let notification = Outgoing::Notification {
             subscription: subscription.to_owned(),
             result: Arc::clone(result),
         };
-        let _ = self.queue.send((notification, room));
+        let _ = self.queue.send((
+            notification,
+            QueueRoom {
+                _connection: room,
+                _global: Some(global),
+            },
+        ));
         Ok(())
+    }
+
+    /// Close a connection that kept more than a quarter of its notification
+    /// room queued for [`SLOW_READER_GRACE`]: its subscriptions produce more
+    /// than it reads, so it would pin that memory indefinitely.
+    fn check_backlog(&self) -> Result<(), CloseFrame> {
+        let mut since = self
+            .backlog_since
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.share.queued() <= self.share.capacity / 4 {
+            *since = None;
+            return Ok(());
+        }
+        let started = *since.get_or_insert_with(tokio::time::Instant::now);
+        if started.elapsed() > SLOW_READER_GRACE {
+            return Err(backlog_close());
+        }
+        Ok(())
+    }
+
+    /// Room in the shared budget. When it is gone, the connection holding the
+    /// most of it is closed, unless that is this one, and the notification
+    /// waits briefly for what it frees.
+    async fn global_room(&self, permits: u32) -> Result<OwnedSemaphorePermit, CloseFrame> {
+        if let Ok(global) = Arc::clone(&self.global.permits).try_acquire_many_owned(permits) {
+            return Ok(global);
+        }
+        match self.global.laggard() {
+            Some(laggard) if !Arc::ptr_eq(&laggard, &self.share) => laggard.evicted.cancel(),
+            _ => return Err(global_budget_close()),
+        }
+        match tokio::time::timeout(
+            EVICTION_WAIT,
+            Arc::clone(&self.global.permits).acquire_many_owned(permits),
+        )
+        .await
+        {
+            Ok(Ok(global)) => Ok(global),
+            _ => Err(global_budget_close()),
+        }
     }
 }
 
@@ -1129,6 +1228,15 @@ fn event_budget_close(limit: usize) -> CloseFrame {
             "notifications of one chain event exceed rpc.max_subscription_event_bytes ({limit})"
         )
         .into(),
+    }
+}
+
+/// The frame closing a connection that kept a notification backlog for
+/// [`SLOW_READER_GRACE`]. It may keep up after reconnecting.
+fn backlog_close() -> CloseFrame {
+    CloseFrame {
+        code: close_code::AGAIN,
+        reason: "client too slow: notifications stayed queued for 30 s; reconnect".into(),
     }
 }
 
@@ -1358,7 +1466,7 @@ async fn queue_notifications(
     };
     let mut bytes = 0;
     for frame in &reverted {
-        queue_log_notifications(frame, &logs, true, outbox, &mut bytes)?;
+        queue_log_notifications(frame, &logs, true, outbox, &mut bytes).await?;
     }
     for frame in applied {
         if !heads.is_empty() {
@@ -1367,10 +1475,10 @@ async fn queue_notifications(
                 .map_err(|error| unavailable_close(&error))?;
             let head: Arc<str> = Arc::from(head.to_string());
             for subscription in &heads {
-                outbox.notify(subscription, &head, &mut bytes)?;
+                outbox.notify(subscription, &head, &mut bytes).await?;
             }
         }
-        queue_log_notifications(frame, &logs, false, outbox, &mut bytes)?;
+        queue_log_notifications(frame, &logs, false, outbox, &mut bytes).await?;
     }
     Ok(())
 }
@@ -1398,7 +1506,7 @@ async fn reverted_frames(
 
 /// Queue the notifications of `frame`'s logs for the log `subscriptions`
 /// they match, marked `removed` for a reverted block.
-fn queue_log_notifications(
+async fn queue_log_notifications(
     frame: &BlockFrame,
     subscriptions: &[(&str, &ParsedLogFilter)],
     removed: bool,
@@ -1411,18 +1519,21 @@ fn queue_log_notifications(
     let logs = complete(&frame.logs, "complete_logs_not_retained")
         .map_err(|error| unavailable_close(&error))?;
     for log in logs {
-        let mut matching = subscriptions
+        // Collected: a borrowing iterator held across the await below would
+        // keep the session future from being `Send`.
+        let matching = subscriptions
             .iter()
             .filter(|(_, filter)| filter.matches(log))
-            .peekable();
-        if matching.peek().is_none() {
+            .map(|(subscription, _)| *subscription)
+            .collect::<Vec<_>>();
+        if matching.is_empty() {
             continue;
         }
         let result =
             rpc_log_value(frame, log, removed).map_err(|error| unavailable_close(&error))?;
         let result: Arc<str> = Arc::from(result.to_string());
-        for (subscription, _) in matching {
-            outbox.notify(subscription, &result, event_bytes)?;
+        for subscription in matching {
+            outbox.notify(subscription, &result, event_bytes).await?;
         }
     }
     Ok(())
@@ -3759,7 +3870,6 @@ mod tests {
     ) -> Result<Vec<Value>, CloseFrame> {
         let (outbox, mut queue) = Outbox::with_budget(
             state.config.max_subscription_event_bytes,
-            state.config.max_response_bytes,
             state.config.outbound_budget.clone(),
         );
         queue_notifications(state, subscriptions, event, &outbox).await?;
@@ -6415,23 +6525,71 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn websocket_connections_share_a_budget_and_release_it_on_disconnect() {
+    async fn a_full_shared_budget_closes_the_connection_holding_the_most() {
         let result: Arc<str> = Arc::from("{}");
         let bytes = notification_len("0x1", &result);
-        let budget = RpcOutboundBudget::new(bytes * 2);
-        let (first, first_queue) = Outbox::with_budget(bytes * 8, bytes, budget.clone());
-        let (second, mut second_queue) = Outbox::with_budget(bytes * 8, bytes, budget.clone());
-        first.notify("0x1", &result, &mut 0).unwrap();
-        second.notify("0x1", &result, &mut 0).unwrap();
-        assert_eq!(budget.0.available_permits(), 0);
-        let close = second.notify("0x1", &result, &mut 0).unwrap_err();
-        assert_eq!(close.code, close_code::AGAIN);
-        assert!(close.reason.contains("max_outbound_bytes"));
-        drop(first_queue);
-        assert_eq!(budget.0.available_permits(), bytes);
-        second.notify("0x1", &result, &mut 0).unwrap();
+        let budget = RpcOutboundBudget::new(bytes * 4);
+        let (first, first_queue) = Outbox::with_budget(bytes * 8, budget.clone());
+        let (second, mut second_queue) = Outbox::with_budget(bytes * 8, budget.clone());
+        for _ in 0..3 {
+            first.notify("0x1", &result, &mut 0).await.unwrap();
+        }
+        second.notify("0x1", &result, &mut 0).await.unwrap();
+        assert_eq!(budget.permits.available_permits(), 0);
+        // The laggard is closed, not the connection that notifies next. Its
+        // session then drops its queue, which frees the room.
+        let evicted = first.share.evicted.clone();
+        let session = tokio::spawn(async move {
+            evicted.cancelled().await;
+            drop(first_queue);
+        });
+        second.notify("0x1", &result, &mut 0).await.unwrap();
+        session.await.unwrap();
+        assert!(first.share.evicted.is_cancelled());
+        assert!(!second.share.evicted.is_cancelled());
         assert_eq!(send_all(&mut second_queue), bytes * 2);
-        assert_eq!(budget.0.available_permits(), bytes * 2);
+        assert_eq!(budget.permits.available_permits(), bytes * 4);
+        // A connection that holds the most itself is the one closed.
+        for _ in 0..4 {
+            second.notify("0x1", &result, &mut 0).await.unwrap();
+        }
+        let close = second.notify("0x1", &result, &mut 0).await.unwrap_err();
+        assert_eq!(close.code, close_code::AGAIN);
+        assert!(close.reason.contains("max_outbound_bytes"), "{close:?}");
+    }
+
+    #[tokio::test]
+    async fn responses_never_take_the_shared_notification_budget() {
+        // Final review: responses reserved max_response_bytes each from the
+        // shared budget, so four slow calls closed every subscriber.
+        let budget = RpcOutboundBudget::new(1);
+        let (outbox, mut queue) = Outbox::with_budget(1_024, budget.clone());
+        let room = Arc::clone(&outbox.responses).acquire_owned().await.unwrap();
+        outbox.respond(Message::Text("x".repeat(4_096).into()), room);
+        assert_eq!(budget.permits.available_permits(), 1);
+        assert!(queue.try_recv().is_ok());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_notification_backlog_kept_past_its_grace_closes_the_connection() {
+        let result: Arc<str> = Arc::from("{}");
+        let bytes = notification_len("0x1", &result);
+        let (outbox, mut queue) = Outbox::with_budget(bytes * 8, RpcOutboundBudget::default());
+        // Past a quarter of the room, unread.
+        for _ in 0..3 {
+            outbox.notify("0x1", &result, &mut 0).await.unwrap();
+        }
+        tokio::time::advance(SLOW_READER_GRACE).await;
+        outbox.notify("0x1", &result, &mut 0).await.unwrap();
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let close = outbox.notify("0x1", &result, &mut 0).await.unwrap_err();
+        assert_eq!(close.code, close_code::AGAIN);
+        assert!(close.reason.contains("stayed queued"), "{close:?}");
+        // A reader that catches up starts the grace afresh.
+        send_all(&mut queue);
+        outbox.notify("0x1", &result, &mut 0).await.unwrap();
+        tokio::time::advance(SLOW_READER_GRACE * 2).await;
+        outbox.notify("0x1", &result, &mut 0).await.unwrap();
     }
 
     #[tokio::test]

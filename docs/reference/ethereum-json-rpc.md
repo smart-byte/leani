@@ -211,7 +211,8 @@ error, not plain text: `-32005` with a `null` ID, and `error.data` holding
 | WebSocket connections | 256 | `rpc.max_websocket_connections` | HTTP 503 on the upgrade |
 | Subscription notifications of one chain event, per connection | 16 MiB | `rpc.max_subscription_event_bytes` | the connection is closed with code `1008` |
 | Unsent subscription notifications, per connection | 16 MiB | `rpc.max_subscription_event_bytes` | the connection is closed with code `1013` |
-| Queued or sending WebSocket payloads, all connections | 64 MiB | `rpc.max_outbound_bytes` | a response waits for room; a notification closes its connection with code `1013` |
+| Queued or sending notifications, all WebSocket connections | 64 MiB | `rpc.max_outbound_bytes` | the connection holding the most is closed with code `1013` |
+| Notifications kept queued past a quarter of `rpc.max_subscription_event_bytes`, per connection | 30 s | — | the connection is closed with code `1013` |
 
 The `eth_getLogs` hint names the range from `fromBlock` up to the block
 before the one where the results passed the limit, and `error.data` carries

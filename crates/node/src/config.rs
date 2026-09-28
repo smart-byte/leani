@@ -1934,12 +1934,13 @@ fn validate_exposure(api: &ApiConfig, rpc: &RpcConfig, errors: &mut Vec<Validati
             }
         }
     }
-    if rpc.max_outbound_bytes.bytes() < rpc.max_response_bytes.bytes()
+    // One connection's full notification room must fit the shared budget.
+    if rpc.max_outbound_bytes.bytes() < rpc.max_subscription_event_bytes.bytes()
         || rpc.max_outbound_bytes.bytes() > u64::from(u32::MAX)
     {
         errors.push(ValidationError::new(
             "rpc.max_outbound_bytes",
-            "must be at least max_response_bytes and at most 4294967295 bytes",
+            "must be at least max_subscription_event_bytes and at most 4294967295 bytes",
         ));
     }
     for (field, value) in [
@@ -3845,10 +3846,11 @@ markets = ["LINK/ETH"]
             16 * 1_024 * 1_024
         );
         assert_eq!(config.rpc.max_outbound_bytes.bytes(), 64 * 1_024 * 1_024);
-        // The shared budget holds one whole response and fits tokio's permits.
+        // The shared budget holds one connection's whole notification room
+        // and fits tokio's permits.
         let mut bounded = config.clone();
         bounded.rpc.max_outbound_bytes =
-            HumanBytes::from_bytes(bounded.rpc.max_response_bytes.bytes() - 1);
+            HumanBytes::from_bytes(bounded.rpc.max_subscription_event_bytes.bytes() - 1);
         assert_eq!(error_fields(&bounded), ["rpc.max_outbound_bytes"]);
         bounded.rpc.max_outbound_bytes = HumanBytes::from_bytes(u64::from(u32::MAX) + 1);
         assert_eq!(error_fields(&bounded), ["rpc.max_outbound_bytes"]);

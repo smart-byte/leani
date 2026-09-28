@@ -214,7 +214,8 @@ minimum_recent_blocks = 128
 # max_subscriptions_per_connection = 128
 # max_websocket_connections = 256
 # max_subscription_event_bytes = "16MiB"
-# Shared by all WebSocket connections and listeners; at least max_response_bytes.
+# Queued notifications of all WebSocket connections; at least
+# max_subscription_event_bytes.
 # max_outbound_bytes = "64MiB"
 
 [api]

@@ -1067,9 +1067,12 @@ Take these steps in order; each links to the entries below that detail it.
   projections, while rejecting partial or narrower coverage. Canonical head
   reporting no longer falls back to one processor's cursor or a fabricated
   genesis height; an unknown head returns `canonical_head_unknown`.
-- WebSocket connections and listeners share a 64 MiB outbound payload budget
-  by default (`rpc.max_outbound_bytes`), alongside per-connection limits.
-  Response work reserves room before encoding; blocked writes time out.
+- WebSocket connections and listeners share a 64 MiB budget for queued
+  notifications (`rpc.max_outbound_bytes`). When it runs out, the connection
+  holding the most of it is closed with `1013`, not the next to notify;
+  responses to calls never use it. A connection keeping more than a quarter
+  of its notification room queued for 30 s is closed as a slow reader, and a
+  send may take 30 s plus its payload at 64 KiB/s.
 - Shipped configurations are validated with a standard JSON Schema validator,
   including types, bounds, patterns and exact `oneOf` semantics. The Serde
   field/enum parity probe remains a separate contract check.
