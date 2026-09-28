@@ -1085,6 +1085,8 @@ Take these steps in order; each links to the entries below that detail it.
   Advanced configurations must use version 1.2.0 with a new instance to
   rebuild existing summaries. Compact `[blocks]` configurations use the new
   instance `block-summary-1-2`, preserving the old instance's stored rows.
+  Dataset rows carry no block size, so `sizeBytes` is `null` for them; the
+  live lane's overlap with a Xatu backfill matches those summaries.
   `leani subscribe blocks` keys its state directory by this version, so it
   starts cold; run `leani reset subscription blocks` with the rc.1 binary
   first to remove the old directory. Xatu history now expects its daily

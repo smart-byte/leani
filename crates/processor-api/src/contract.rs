@@ -248,8 +248,9 @@ pub trait Processor: Send + Sync {
     /// payload embeds finality may override this by decoding the validated
     /// delta, rebuilding every finality variant, and returning those checksums.
     /// This hook lets restart recovery prove equivalence after the raw input
-    /// frame has been pruned; it must never broaden equivalence to other
-    /// payload fields.
+    /// frame has been pruned. Beyond finality, it may only add the variant
+    /// without a field a trusted source cannot supply, never broaden
+    /// equivalence to other payload fields.
     ///
     /// # Errors
     ///

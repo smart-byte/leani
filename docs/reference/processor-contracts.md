@@ -252,7 +252,11 @@ execution-block size when available, and finality. Blocks come from verified
 material or, under the trusted-dataset policy, from Xatu's dataset-declared
 header and transaction projections, whose body indices and payload
 transaction count must agree. Dataset rows carry no execution-block size, so
-`sizeBytes` is `null` for them. Summaries are retained by
+`sizeBytes` is `null` for them. A block a dataset summarized first matches the
+same block from verified material, as when the live lane overlaps a Xatu
+backfill, and keeps `null`. The reverse, remapping a block that verified
+material summarized from a dataset, as a recompute may, is refused as a
+conflicting apply. Summaries are retained by
 block hash with a canonical block-number index; the query extension exposes
 `/latest` and `/blocks/{number}`. It never executes the EVM and does not request
 receipts.

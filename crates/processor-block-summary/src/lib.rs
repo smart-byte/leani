@@ -197,15 +197,22 @@ impl Processor for BlockSummaryProcessor {
         delta.validate(&self.descriptor)?;
         let decoded: BlockSummaryEntity = postcard::from_bytes(&delta.payload)
             .map_err(|error| ProcessorError::DeltaPayload(error.to_string()))?;
-        let mut checksums = Vec::with_capacity(2);
-        for finality in [Finality::Included, Finality::Finalized] {
-            let mut entity = decoded.clone();
-            entity.finality = finality;
-            let payload = postcard::to_allocvec(&entity)
-                .map_err(|error| ProcessorError::DeltaPayload(error.to_string()))?;
-            checksums.push(
-                EncodedDelta::new(&self.descriptor, delta.chain_id, delta.block, payload).checksum,
-            );
+        let mut checksums = Vec::with_capacity(4);
+        // Dataset rows carry no execution-block size. A block a dataset
+        // summarized first matches the same block from verified material,
+        // such as the live lane's handoff overlap after a Xatu backfill.
+        for size_bytes in [decoded.size_bytes, None] {
+            for finality in [Finality::Included, Finality::Finalized] {
+                let mut entity = decoded.clone();
+                entity.finality = finality;
+                entity.size_bytes = size_bytes;
+                let payload = postcard::to_allocvec(&entity)
+                    .map_err(|error| ProcessorError::DeltaPayload(error.to_string()))?;
+                checksums.push(
+                    EncodedDelta::new(&self.descriptor, delta.chain_id, delta.block, payload)
+                        .checksum,
+                );
+            }
         }
         checksums.sort_unstable();
         checksums.dedup();
@@ -490,6 +497,22 @@ mod tests {
             processor.map(&projected).await.unwrap().payload,
             expected.payload
         );
+        // Verified material with an exact size is equivalent to a summary a
+        // dataset applied first without one, never to another block's.
+        let mut sized = complete.clone();
+        if let Material::Complete(header) = &mut sized.header {
+            header.size_bytes = Some(1_234);
+        }
+        let sized = processor.map(&sized).await.unwrap();
+        assert_ne!(sized.checksum, expected.checksum);
+        let variants = processor.finality_variant_checksums(&sized).unwrap();
+        assert!(variants.contains(&expected.checksum));
+        let mut other = complete.clone();
+        if let Material::Complete(header) = &mut other.header {
+            header.gas_used = Some(1);
+        }
+        let other = processor.map(&other).await.unwrap();
+        assert!(!variants.contains(&other.checksum));
         if let Material::Filtered { value, .. } = &mut projected.transactions {
             value.pop();
         }
