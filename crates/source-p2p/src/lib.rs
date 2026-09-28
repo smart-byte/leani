@@ -4283,7 +4283,7 @@ impl RethP2pSource {
         cancellation: &CancellationToken,
     ) -> Result<BlockFrame, P2pError> {
         let (mut frames, _) = self
-            .fetch_live_body_frames(session, headers, preferred_peer, budget, cancellation)
+            .fetch_live_body_frames(session, headers, preferred_peer, true, budget, cancellation)
             .await?;
         let mut frame = frames.pop().ok_or_else(|| {
             P2pError::InvalidResponse("peer preview request returned no frame".to_owned())
@@ -4797,6 +4797,7 @@ impl RethP2pSource {
                 header,
                 *hash,
                 Some(header_peer),
+                false,
                 material_policy,
                 cancellation,
             )
@@ -4910,9 +4911,16 @@ impl RethP2pSource {
         let (frames, mut response_peers) = if header_only_request(&request) {
             (normalize_verified_headers(headers, budget)?, HashSet::new())
         } else if header_and_body_only_request(&request) {
-            self.fetch_live_body_frames(session, headers, Some(header_peer), budget, cancellation)
-                .await
-                .inspect_err(|error| session.record_error(error))?
+            self.fetch_live_body_frames(
+                session,
+                headers,
+                Some(header_peer),
+                false,
+                budget,
+                cancellation,
+            )
+            .await
+            .inspect_err(|error| session.record_error(error))?
         } else if sparse_log_scope(&request).is_some()
             && !request
                 .log_fields
@@ -4949,6 +4957,7 @@ impl RethP2pSource {
         session: &P2pSession,
         headers: &[Header],
         preferred_peer: Option<B512>,
+        unanchored: bool,
         budget: SourceBudget,
         cancellation: &CancellationToken,
     ) -> Result<(Vec<BlockFrame>, HashSet<B512>), P2pError> {
@@ -4964,6 +4973,7 @@ impl RethP2pSource {
                 header,
                 *hash,
                 preferred_peer,
+                unanchored,
                 policy,
                 cancellation,
             )
@@ -5155,7 +5165,14 @@ impl RethP2pSource {
         }
         if header_and_body_only_request(request) {
             let (mut frames, _) = self
-                .fetch_live_body_frames(session, &[header], Some(header_peer), budget, cancellation)
+                .fetch_live_body_frames(
+                    session,
+                    &[header],
+                    Some(header_peer),
+                    false,
+                    budget,
+                    cancellation,
+                )
                 .await
                 .inspect_err(|error| session.record_error(error))?;
             self.complete_header_serve(session, header_serve).await;
@@ -5194,6 +5211,7 @@ impl RethP2pSource {
                 &header,
                 hash,
                 Some(header_peer),
+                false,
                 material_policy,
                 cancellation,
             )
@@ -6318,10 +6336,12 @@ impl RethP2pSource {
     }
 
     /// Give up the header of a live material request that no peer served
-    /// within its bound: its peer may have made the block up, so it takes a
-    /// withheld-header strike, without a ban.
+    /// within its bound. The peer of an unanchored header may have made the
+    /// block up, so it takes a withheld-header strike, without a ban.
     fn give_up_live_material(&self, bound: &LiveMaterialBound) -> P2pError {
-        if let Some(peer_id) = bound.header_peer {
+        if bound.unanchored
+            && let Some(peer_id) = bound.header_peer
+        {
             self.network.direct_peers.strike_withheld_header(peer_id);
         }
         withheld_live_material(bound.component, bound.block, bound.waves)
@@ -6345,16 +6365,19 @@ impl RethP2pSource {
     /// one serves the body, within `MAX_LIVE_MATERIAL_WAVES` waves and
     /// `LIVE_MATERIAL_TIMEOUT`, which also ends a wave in progress. Past that
     /// bound the header is given up, and its peer struck.
+    #[allow(clippy::too_many_arguments)]
     async fn fetch_live_body_from_untried_peers(
         &self,
         session: &P2pSession,
         header: &Header,
         hash: B256,
         header_peer: Option<B512>,
+        unanchored: bool,
         policy: MaterialRequestPolicy,
         cancellation: &CancellationToken,
     ) -> Result<(B512, BlockBody), P2pError> {
         let mut bound = LiveMaterialBound::new("bodies", header.number, header_peer);
+        bound.unanchored = unanchored;
         let deadline = bound.deadline();
         let waves = self.live_body_waves(session, header, hash, &mut bound, policy, cancellation);
         let outcome = tokio::time::timeout_at(deadline, waves).await;
@@ -9391,6 +9414,10 @@ struct LiveMaterialBound {
     block: u64,
     /// The peer that served the header.
     header_peer: Option<B512>,
+    /// Whether that header was only a peer claim. A header checked against a
+    /// verified hash proves its block exists, so withheld material is not its
+    /// peer's fault.
+    unanchored: bool,
     started: Instant,
     waves: usize,
 }
@@ -9401,6 +9428,7 @@ impl LiveMaterialBound {
             component,
             block,
             header_peer,
+            unanchored: false,
             started: Instant::now(),
             waves: 0,
         }
@@ -15367,7 +15395,8 @@ mod tests {
         ));
         assert_eq!(strikes(), 0);
         // After a wave in which no peer served the body, the header is given
-        // up, and its peer struck.
+        // up. A header checked against a verified hash proves its block
+        // exists, so its peer is not struck.
         bound.waves = 1;
         let withheld = source.live_material_deadline_passed(&bound);
         assert!(
@@ -15380,6 +15409,10 @@ mod tests {
             ),
             "{withheld}"
         );
+        assert_eq!(strikes(), 0);
+        // A peer claim may have made the block up: its peer is struck.
+        bound.unanchored = true;
+        source.live_material_deadline_passed(&bound);
         assert_eq!(strikes(), 1);
         // The lane does not wait that out: it reports itself disconnected.
         assert_eq!(
