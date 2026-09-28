@@ -95,6 +95,11 @@ const GENERIC_BEACON_BLOCK_COLUMNS: &[&str] = &[
     "execution_payload_block_number",
     "execution_payload_parent_hash",
     "execution_payload_transactions_count",
+    "execution_payload_gas_limit",
+    "execution_payload_gas_used",
+    "execution_payload_base_fee_per_gas",
+    "execution_payload_blob_gas_used",
+    "execution_payload_excess_blob_gas",
 ];
 const GENERIC_TRANSACTION_COLUMNS: &[&str] = &[
     "block_number",
@@ -1069,6 +1074,11 @@ struct GenericBeaconBlockRow {
     parent_hash: BlockHash,
     timestamp: u64,
     transaction_count: u32,
+    gas_limit: u64,
+    gas_used: u64,
+    base_fee_per_gas: Quantity,
+    blob_gas_used: Option<u64>,
+    excess_blob_gas: Option<u64>,
 }
 
 fn parse_generic_execution_blocks(
@@ -1125,6 +1135,24 @@ fn parse_generic_beacon_blocks(
                     "execution_payload_transactions_count",
                     row,
                 )?,
+                gas_limit: required_u64(batch, "execution_payload_gas_limit", row)?,
+                gas_used: required_u64(batch, "execution_payload_gas_used", row)?,
+                base_fee_per_gas: required_quantity_le(
+                    batch,
+                    "execution_payload_base_fee_per_gas",
+                    row,
+                )?,
+                // Before Mainnet Dencun these columns use zero defaults,
+                // but the execution header has no blob fields.
+                blob_gas_used: (required_u64(batch, "slot_start_date_time", row)? >= 1_710_338_135)
+                    .then(|| optional_u64(batch, "execution_payload_blob_gas_used", row))
+                    .transpose()?
+                    .flatten(),
+                excess_blob_gas: (required_u64(batch, "slot_start_date_time", row)?
+                    >= 1_710_338_135)
+                    .then(|| optional_u64(batch, "execution_payload_excess_blob_gas", row))
+                    .transpose()?
+                    .flatten(),
             },
             "generic beacon block",
         )?;
@@ -1327,11 +1355,11 @@ fn normalize_generic_frames(
                     transactions_root: None,
                     receipts_root: None,
                     withdrawals_root: None,
-                    gas_limit: None,
-                    gas_used: None,
-                    base_fee_per_gas: None,
-                    blob_gas_used: None,
-                    excess_blob_gas: None,
+                    gas_limit: Some(beacon.gas_limit),
+                    gas_used: Some(beacon.gas_used),
+                    base_fee_per_gas: Some(beacon.base_fee_per_gas),
+                    blob_gas_used: beacon.blob_gas_used,
+                    excess_blob_gas: beacon.excess_blob_gas,
                     size_bytes: None,
                     transaction_count: Some(beacon.transaction_count),
                     consensus_size_bytes: None,
@@ -2948,6 +2976,11 @@ mod tests {
                     parent_hash: BlockHash::ZERO,
                     timestamp: 1_700_000_000,
                     transaction_count,
+                    gas_limit: 30_000_000,
+                    gas_used: 21_000,
+                    base_fee_per_gas: quantity_from_u64(7),
+                    blob_gas_used: None,
+                    excess_blob_gas: None,
                 },
             )]),
             transactions: BTreeMap::from([(

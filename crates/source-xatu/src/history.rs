@@ -23,7 +23,7 @@ use crate::{
     projection::{GenericProjectionKind, generic_log_columns},
 };
 
-const SCHEMA_VERSION: &str = "xatu.history.v3";
+const SCHEMA_VERSION: &str = "xatu.history.v4";
 const PHYSICAL_PARTITION_BLOCKS: u64 = 1_000;
 // Execution parent hashes are supplied by Beacon execution payloads.
 const MAINNET_MERGE_BLOCK: u64 = 15_537_394;
@@ -109,6 +109,8 @@ impl XatuHistorySource {
         let capabilities = CapabilitySet::from_iter([
             Capability::Header,
             Capability::Transactions,
+            Capability::Body,
+            Capability::Calldata,
             Capability::Receipts,
             Capability::Logs,
         ]);
@@ -125,7 +127,8 @@ impl XatuHistorySource {
                 partitioning: Partitioning::SourceDefined(
                     "xatu-projection-aware-block-span".to_owned(),
                 ),
-                expected_lag: Duration::from_mins(15),
+                // Nominal daily export cadence; actual availability is table-specific.
+                expected_lag: Duration::from_hours(24),
                 schema_version: SCHEMA_VERSION.to_owned(),
                 priority: config.priority,
             },
@@ -576,6 +579,11 @@ fn physical_plan(mode: ProjectionMode, request: &DataRequest) -> Vec<PhysicalPla
                 "execution_payload_block_number",
                 "execution_payload_parent_hash",
                 "execution_payload_transactions_count",
+                "execution_payload_gas_limit",
+                "execution_payload_gas_used",
+                "execution_payload_base_fee_per_gas",
+                "execution_payload_blob_gas_used",
+                "execution_payload_excess_blob_gas",
             ],
             vec!["UTC date partitions derived from selected execution blocks".to_owned()],
         ),

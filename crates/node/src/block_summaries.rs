@@ -24,7 +24,7 @@ mod tests {
         let configured = processor_config("demo-blocks", false);
         assert_eq!(configured.id, "block-summary");
         assert_eq!(configured.instance, "demo-blocks");
-        assert_eq!(configured.version, "1.1.0");
+        assert_eq!(configured.version, "1.2.0");
         assert_eq!(configured.history_mode, ProcessorHistoryMode::OnDemand);
         assert!(configured.settings.is_empty());
     }

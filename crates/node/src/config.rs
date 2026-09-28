@@ -161,7 +161,7 @@ impl StarterConfig {
         .map_err(|error| format!("built-in Ethereum Mainnet defaults are invalid: {error}"))?;
         let processor = match (self.blocks, self.uniswap) {
             (Some(_), None) => Ok(crate::block_summaries::processor_config(
-                "block-summary",
+                "block-summary-1-2",
                 false,
             )),
             (None, Some(uniswap)) => {
@@ -3663,7 +3663,7 @@ markets = ["LINK/ETH"]
         let config = starter.expand().expect("expand blocks config");
         assert_eq!(config.processors.len(), 1);
         assert_eq!(config.processors[0].id, "block-summary");
-        assert_eq!(config.processors[0].version, "1.1.0");
+        assert_eq!(config.processors[0].version, "1.2.0");
         assert!(config.processors[0].settings.is_empty());
     }
 

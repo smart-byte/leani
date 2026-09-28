@@ -33,7 +33,8 @@ Take these steps in order; each links to the entries below that detail it.
 3. Rebuild each changed processor under a new `instance`:
    `erc20-balances` and `evm-events` at 1.1.0 ([rebuild](#rc1-rebuild)),
    keyed `evm-events` stored block-local ([keyed](#rc1-keyed-evm-events)),
-   `blobs-money` at 1.5.0 ([blobs](#rc1-blobs-money)), and a compact
+   `blobs-money` at 1.5.0 ([blobs](#rc1-blobs-money)), `block-summary`
+   at 1.2.0 (compact `[blocks]` selects a new instance automatically), and a compact
    `[uniswap]` node or `leani subscribe uniswap-v3` with ETH/USDT or WBTC/ETH
    ([Uniswap](#rc1-uniswap)). The container profile brings its renamed
    instance ([container](#rc1-container)), and the `windowed` profile its new
@@ -1049,6 +1050,13 @@ Take these steps in order; each links to the entries below that detail it.
 - Shipped configurations are validated with a standard JSON Schema validator,
   including types, bounds, patterns and exact `oneOf` semantics. The Serde
   field/enum parity probe remains a separate contract check.
+- `block-summary` 1.2.0 accepts trusted dataset projections with full gas
+  fields and a checked transaction count. Xatu keeps this material marked
+  dataset-declared; it does not advertise cryptographically complete bodies.
+  Advanced configurations must use version 1.2.0 with a new instance to
+  rebuild existing summaries. Compact `[blocks]` configurations use the new
+  instance `block-summary-1-2`, preserving the old instance's stored rows.
+
 
 - <a id="rc1-finality-anchor"></a>Verified finality no longer stops about 14
   days after the configured checkpoint's slot. Beacon API finality keeps one
