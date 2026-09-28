@@ -547,7 +547,14 @@ The command sends an authenticated materialization request and waits for its
 status. `LEANI_API_TOKEN` supplies the token without putting it in shell
 arguments. An optional endpoint path prefix is preserved. Ctrl-C cancels
 the submitted job. Without `--endpoint`, stop any process holding the data
-directory before starting standalone backfill.
+directory before starting standalone backfill. Ctrl-C cancels a standalone
+run, so the next `serve` does not resume it; a second Ctrl-C exits at once.
+
+A standalone job is named by processor, chain and range. When an earlier run
+of the same range recorded another verification policy, for example before
+`raw_history` was enabled, the store refuses the new input as a different
+job. Delete the earlier one with `DELETE /admin/v1/materialization-jobs/{id}`,
+or submit through `--endpoint`, which uses a fresh key per submission.
 
 Xatu exports have table-specific coverage. In particular, a recent beacon
 file does not prove that the execution-transaction file needed for receipts

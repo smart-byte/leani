@@ -251,6 +251,13 @@ async fn standalone(
     let _data_dir_lock = crate::local_state::lock_runtime_directory(&config.data_dir).context(
         "stop the node before standalone backfill, or pass --endpoint to submit to its API",
     )?;
+    let store = SqliteStore::open(
+        configured_store_config(&config, config.data_dir.join("leani.sqlite"))
+            .with_processors(vec![processor.descriptor().clone()]),
+    )
+    .await
+    .map_err(crate::uniswap_markets::explain_compact_refusal)?;
+    require_ordered_backfill_start(&store, processor.as_ref(), configured, from).await?;
     let cancellation = CancellationToken::new();
     let mut signals = ShutdownSignals::new()?;
     let bridge = if matches!(config.sources.live.kind, crate::config::LiveSourceKind::P2p)
@@ -319,22 +326,22 @@ async fn standalone(
         source_ids = ?source_ids,
         "starting processor historical backfill"
     );
-    let store = SqliteStore::open(
-        configured_store_config(&config, config.data_dir.join("leani.sqlite"))
-            .with_processors(vec![processor.descriptor().clone()]),
-    )
-    .await
-    .map_err(crate::uniswap_markets::explain_compact_refusal)?;
     if let Some(bridge) = &bridge {
+        // As the node seeds it: retained blocks the anchor does not prove are
+        // reverted first, and the next serve's startup reconciliation undoes
+        // any processor coverage of them.
+        let chain_id = ChainId(config.chain.chain_id);
+        store
+            .revert_unproven_recent_blocks(chain_id, bridge.anchor.block)
+            .await?;
         store
             .store_canonical_anchor(
-                ChainId(config.chain.chain_id),
+                chain_id,
                 bridge.anchor.block,
                 leani_primitives::Finality::Finalized,
             )
             .await?;
     }
-    require_ordered_backfill_start(&store, processor.as_ref(), configured, from).await?;
     // The configured pipeline, as the node's on-demand backfills use it.
     let runtime_config = historical_runtime_config(&config, sources.len());
     let (pipeline_budget, material_coordinator) = historical_services(&config)?;
@@ -349,8 +356,9 @@ async fn standalone(
         Some(coordinator) => runtime.with_material_coordinator(coordinator),
         None => runtime,
     };
+    let job_id = format!("{processor_id}-{}-{from}-{to}", config.chain.chain_id);
     let job = BackfillJob::for_processor(
-        format!("{processor_id}-{}-{from}-{to}", config.chain.chain_id),
+        job_id.clone(),
         processor.as_ref(),
         ChainId(config.chain.chain_id),
         range,
@@ -362,17 +370,39 @@ async fn standalone(
         cancellation.clone(),
     );
     tokio::pin!(operation);
+    let mut interrupted = false;
     let result = tokio::select! {
         result = &mut operation => result,
-        signal = signals.recv() => {
-            cancellation.cancel();
-            signal?;
-            operation.await
+        signal = signals.recv() => match signal {
+            Ok(()) => {
+                interrupted = true;
+                cancellation.cancel();
+                tokio::select! {
+                    result = &mut operation => result,
+                    _ = signals.recv() => std::process::exit(130),
+                }
+            }
+            Err(error) => {
+                warn!(%error, "the shutdown signal handler stopped; the backfill continues");
+                operation.await
+            }
         }
     };
     cancellation.cancel();
     if let Some(bridge) = &bridge {
-        let _ = tokio::time::timeout(Duration::from_secs(5), bridge.source.shutdown()).await;
+        // Bounded inside; it flushes the peer store before closing the pool.
+        bridge.source.shutdown().await;
+    }
+    if interrupted && let Some(mut record) = store.job(&job_id).await? {
+        // A suspended record would make the next serve resume a backfill the
+        // operator stopped.
+        if matches!(
+            record.state,
+            leani_store_sqlite::JobState::Queued | leani_store_sqlite::JobState::Running
+        ) {
+            record.state = leani_store_sqlite::JobState::Cancelled;
+            store.save_job(&record).await?;
+        }
     }
     let report = result?;
     if config.artifact_storage.backend == ArtifactStorageBackend::TieredSegments
