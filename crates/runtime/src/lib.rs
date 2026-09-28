@@ -1927,7 +1927,9 @@ impl HistoricalRuntime {
                         () = tokio::time::sleep(delay) => {}
                     }
                 }
-                Err(error @ RuntimeError::Cancelled) => {
+                // The material coordinator reports a lane restart as a
+                // cancelled source: suspend and resume, never fail.
+                Err(RuntimeError::Cancelled | RuntimeError::Source(SourceError::Cancelled)) => {
                     self.save_checkpoint(
                         &job,
                         &job_payload,
@@ -1936,7 +1938,7 @@ impl HistoricalRuntime {
                         &checkpoint,
                     )
                     .await?;
-                    return Err(error);
+                    return Err(RuntimeError::Cancelled);
                 }
                 Err(
                     error @ RuntimeError::Store(
@@ -13306,6 +13308,65 @@ mod tests {
         assert_eq!(resumed_stats.entities, range.len());
         assert_eq!(resumed_stats.changes, 0);
         assert_eq!(resumed_stats.history_delivery_retained_bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn a_source_reporting_cancellation_suspends_the_job_instead_of_failing_it() {
+        // A lane restart surfaces as SourceError::Cancelled from the material
+        // coordinator; saving Failed parked the lane and was never resumed.
+        let range = BlockRange::new(BlockNumber(1), BlockNumber(3)).expect("range");
+        let descriptor = fixture_source_descriptor("cancelled", range);
+        let source: Arc<dyn HistorySource> = Arc::new(ScriptedHistorySource::new(
+            descriptor.clone(),
+            vec![ScriptedChunk {
+                range,
+                schema_version: descriptor.schema_version,
+                estimated_bytes: None,
+                steps: vec![HistoryStep::Error(SourceError::Cancelled)],
+            }],
+        ));
+        let processor = Arc::new(BlockLocalCounter::default());
+        let (_directory, store) = store().await;
+        let runtime = HistoricalRuntime::new_with_sources(
+            store.clone(),
+            vec![source],
+            processor.clone(),
+            HistoricalRuntimeConfig {
+                mapper_concurrency: 1,
+                max_attempts: 3,
+                retry_base: Duration::from_millis(1),
+                retry_max: Duration::from_millis(1),
+                ..HistoricalRuntimeConfig::default()
+            },
+        )
+        .expect("runtime");
+        let error = runtime
+            .run(
+                BackfillJob {
+                    id: "cancelled-source".to_owned(),
+                    owner: HistoricalJobOwner::Materialization,
+                    processor_instance: processor.descriptor().instance.to_string(),
+                    mode: BackfillMode::FillMissing,
+                    delivery_stream_id: None,
+                    ranges: vec![range],
+                    request: request(range),
+                    sink_ids: Vec::new(),
+                },
+                default_source_budget(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect_err("a cancelled source ends the run");
+        assert!(matches!(error, RuntimeError::Cancelled), "{error:?}");
+        assert_eq!(
+            store
+                .job("cancelled-source")
+                .await
+                .expect("job")
+                .expect("durable job")
+                .state,
+            JobState::Running
+        );
     }
 
     #[tokio::test]
