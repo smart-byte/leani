@@ -12,3 +12,24 @@ condition = "AND"
 paths = ['''^site/src/data/processors/uniswap-latest\.json$''']
 regexTarget = "secret"
 regexes = ['''^0x88e6a0c2ddd26feeb64f039a2c41296fcb3f5640$''']
+
+[[rules.allowlists]]
+description = "RFC 6455 sample WebSocket key in the serve shutdown test"
+condition = "AND"
+paths = ['''^crates/node/tests/serve_shutdown\.rs$''']
+regexTarget = "secret"
+regexes = ['''^dGhlIHNhbXBsZSBub25jZQ==$''']
+
+[[rules.allowlists]]
+description = "Fixture consumer credential in store-sqlite tests"
+condition = "AND"
+paths = ['''^crates/store-sqlite/src/lib\.rs$''']
+regexTarget = "secret"
+regexes = ['''^consumer-a-0123456789-abcdef-secret$''']
+
+[[rules.allowlists]]
+description = "Beacon API path passed beside a redaction secret, not a credential"
+condition = "AND"
+paths = ['''^crates/finality-beacon-api/src/lib\.rs$''']
+regexTarget = "secret"
+regexes = ['''^eth/v1/beacon/genesis$''']
