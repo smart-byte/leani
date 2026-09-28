@@ -740,6 +740,21 @@ async fn canonical_head(state: &RpcState) -> Result<Option<BlockRef>, RpcError> 
         .map_err(|error| RpcError::store(&error))
 }
 
+/// The head `eth_blockNumber` and `latest` report: the canonical tip, or,
+/// when finalized coverage reaches higher or no tip is known, as on a node
+/// without live following, the highest block the progress processor has
+/// finalized. Finalized blocks are canonical, so the head never names a block
+/// a reorg could remove. `None` before the node knows any block.
+async fn reported_head(state: &RpcState) -> Result<Option<BlockNumber>, RpcError> {
+    let tip = canonical_head(state).await?.map(|head| head.number);
+    let finalized = state
+        .store
+        .finalized_through(state.progress.descriptor())
+        .await
+        .map_err(|error| RpcError::store(&error))?;
+    Ok(tip.max(finalized))
+}
+
 /// Dynamically shared live readiness for JSON-RPC metadata.
 #[derive(Clone, Debug, Default)]
 pub struct RpcReadiness(Arc<AtomicBool>);
@@ -1763,26 +1778,27 @@ async fn dispatch(
         }
         "eth_blockNumber" => {
             require_no_params(params)?;
-            let head = canonical_head(state)
-                .await?
-                .ok_or_else(|| RpcError::data_unavailable_reason("canonical_head_unknown"))?;
-            Ok(Value::String(hex_quantity(head.number.0)))
+            // Every Ethereum client answers with a number; libraries, proxies
+            // and health checks read an error as a node that is down.
+            let head = reported_head(state).await?;
+            Ok(Value::String(hex_quantity(head.map_or(0, |head| head.0))))
         }
 
         "eth_syncing" => {
             require_no_params(params)?;
-            let head = canonical_head(state).await?;
-            if state.config.readiness.live_ready() && head.is_some() {
+            let canonical = canonical_head(state).await?;
+            if state.config.readiness.live_ready() && canonical.is_some() {
                 Ok(Value::Bool(false))
             } else {
-                let current = head.map_or(0, |head| head.number.0);
+                let current = reported_head(state).await?.map_or(0, |head| head.0);
+                let starting = processor_start_block(state.progress.descriptor()).min(current);
                 Ok(json!({
-                    "startingBlock": hex_quantity(processor_start_block(state.progress.descriptor())),
+                    "startingBlock": hex_quantity(starting),
                     "currentBlock": hex_quantity(current),
                     "highestBlock": hex_quantity(current),
                     "leani": {
                         "liveReady": false,
-                        "reason": if head.is_some() { "live_head_not_anchored" } else { "canonical_head_unknown" }
+                        "reason": if canonical.is_some() { "live_head_not_anchored" } else { "canonical_head_unknown" }
                     }
                 }))
             }
@@ -2334,7 +2350,7 @@ async fn resolve_canonical_frame(
     required: CapabilitySet,
 ) -> Result<Option<BlockFrame>, RpcError> {
     let (number, on_demand) = match selector {
-        BlockSelector::Latest => (canonical_head(state).await?.map(|head| head.number), true),
+        BlockSelector::Latest => (reported_head(state).await?, true),
         BlockSelector::Finalized => (Some(finalized_head(state).await?), true),
         BlockSelector::Number(number) => (Some(number), true),
         BlockSelector::Hash(_) => {
@@ -2395,12 +2411,7 @@ async fn finalized_head(state: &RpcState) -> Result<BlockNumber, RpcError> {
 /// Whether `number` is above every block this node knows to exist: its
 /// canonical head, and the block its progress processor has reached.
 async fn above_known_head(state: &RpcState, number: BlockNumber) -> Result<bool, RpcError> {
-    let tip = state
-        .store
-        .canonical_tip(state.config.chain_id)
-        .await
-        .map_err(|error| RpcError::store(&error))?
-        .map(|tip| tip.number);
+    let tip = reported_head(state).await?;
     let cursor = state
         .store
         .processor_cursor(state.progress.descriptor())
@@ -2822,7 +2833,7 @@ async fn eth_get_logs(
             .ok_or_else(|| RpcError::data_unavailable_reason("block_hash_not_retained"))?;
         (block.number, block.number)
     } else {
-        let latest = canonical_head(state).await?.map(|head| head.number);
+        let latest = reported_head(state).await?;
         (
             log_range_bound(state, filter.from, latest).await?,
             log_range_bound(state, filter.to, latest).await?,
@@ -2926,9 +2937,9 @@ async fn resolve_log_frames(
     {
         return read_recent_frames(state, range).await;
     }
-    if canonical_head(state)
+    if reported_head(state)
         .await?
-        .is_some_and(|head| range.end() > head.number)
+        .is_some_and(|head| range.end() > head)
     {
         return Err(RpcError::data_unavailable_reason(
             "requested_log_range_exceeds_known_head",
@@ -4022,10 +4033,8 @@ mod tests {
             json!({"jsonrpc":"2.0","id":2,"method":"eth_blockNumber"}),
         )
         .await;
-        assert_eq!(
-            block.expect("body")["error"]["data"]["reason"],
-            "canonical_head_unknown"
-        );
+        // An empty node answers like a fresh Ethereum client, never with an error.
+        assert_eq!(block.expect("body")["result"], "0x0");
     }
 
     #[tokio::test]
@@ -6399,6 +6408,37 @@ mod tests {
             assert!(close.reason.as_str().len() <= 123, "{close:?}");
         }
     }
+    #[tokio::test]
+    async fn a_node_without_a_canonical_tip_reports_its_finalized_coverage() {
+        // A historical-only profile records no canonical head. Its finalized
+        // processor coverage is canonical, and it is what the node serves.
+        let (router, _directory) = router_with_cursor_only(22_431_084).await;
+        let (_, block) = call(
+            router.clone(),
+            json!({"jsonrpc":"2.0","id":1,"method":"eth_blockNumber"}),
+        )
+        .await;
+        assert_eq!(block.expect("body")["result"], hex_quantity(22_431_084));
+        let (_, syncing) = call(
+            router,
+            json!({"jsonrpc":"2.0","id":2,"method":"eth_syncing"}),
+        )
+        .await;
+        let syncing = syncing.expect("body")["result"].clone();
+        assert_eq!(syncing["currentBlock"], hex_quantity(22_431_084));
+        let quantity = |field: &str| {
+            u64::from_str_radix(
+                syncing[field].as_str().unwrap().trim_start_matches("0x"),
+                16,
+            )
+            .unwrap()
+        };
+        assert!(
+            quantity("startingBlock") <= quantity("currentBlock"),
+            "{syncing}"
+        );
+    }
+
     #[tokio::test]
     async fn canonical_head_survives_without_raw_frames_or_processor_progress() {
         let (router, store, _directory) = test_router_and_store().await;

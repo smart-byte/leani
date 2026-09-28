@@ -79,11 +79,15 @@ without upstream access when their scope and fields cover the query. Decoded
 processor entities alone are not a lossless raw-log store: enable on-demand
 history or retain suitable raw material for historical RPC.
 
-`eth_blockNumber`, `latest`, and `eth_syncing.currentBlock` use canonical
-metadata independently of processor progress and raw-frame pruning. When no
-head is known, `eth_blockNumber` returns `-32004` with reason
-`canonical_head_unknown`. A known local head can lag while disconnected;
-consult `eth_syncing` before treating it as the network tip.
+`eth_blockNumber`, `latest`, and `eth_syncing.currentBlock` report the
+canonical tip, independently of raw-frame pruning, or the highest block the
+progress processor has finalized when that is higher or no tip is known, as
+on a node without live following. Finalized blocks are canonical, so the
+head never names a block a reorg could remove. A node that knows no block
+reports `0x0`, as a fresh Ethereum client does; `eth_blockNumber` never
+fails for want of a head. A reported head can lag the network, while
+disconnected or on a historical-only node; consult `eth_syncing`, which
+reports `liveReady: false` then, before treating it as the network tip.
 
 For a number/range request outside the recent window, the router selects the
 lowest-priority viable `HistorySource`, enforces finality/trust and hard
@@ -98,7 +102,7 @@ durable locator and therefore remains recent-only by default.
 | `web3_clientVersion` | Exact | Local | — |
 | `net_version` | Exact | Local | — |
 | `eth_chainId` | Exact | Local | — |
-| `eth_blockNumber` | Exact for the known canonical chain | Canonical metadata | Returns `canonical_head_unknown` before a head is known; never substitutes a processor cursor |
+| `eth_blockNumber` | Exact for the known canonical chain | Canonical tip or finalized coverage | `0x0` before any block is known; never an unfinalized processor cursor |
 | `eth_syncing` | Exact for this node | Canonical head and live readiness | A disconnected or historical-only node does not claim live readiness |
 | `eth_getBlockByNumber` | Exact with body source | Recent/on-demand | Historical latency depends on backend |
 | `eth_getBlockByHash` | Exact with locator | Recent; optional index | Hash-to-chunk lookup otherwise expensive |
@@ -148,7 +152,7 @@ Wherever a block number is accepted, including `fromBlock` and `toBlock` of
 
 | Tag | Block |
 |---|---|
-| `latest` | the newest block in canonical metadata, as reported by `eth_blockNumber` |
+| `latest` | the head `eth_blockNumber` reports |
 | `finalized` | the newest canonical block the node has verified as finalized |
 | `safe` | the same block as `finalized` |
 | `earliest` | block 0 |

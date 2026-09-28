@@ -384,11 +384,11 @@ Take these steps in order; each links to the entries below that detail it.
   block number above the head that no history source covers now reads as
   `null` instead of failing with `no_viable_historical_source`.
 - Breaking (JSON-RPC): `eth_blockNumber`, `latest` and
-  `eth_syncing.currentBlock` report the head in the node's canonical
-  metadata, never a processor's cursor or block 0. Until a head is known,
-  `eth_blockNumber` fails with `-32004` (`canonical_head_unknown`). Nothing
-  records a head on a node without live following, such as the shipped
-  historical-only profiles, so there the error persists.
+  `eth_syncing.currentBlock` report the canonical tip, or the highest block
+  the progress processor has finalized when that is higher or no tip is
+  known, as on the shipped historical-only profiles. They no longer report
+  an unfinalized processor cursor. A node that knows no block reports `0x0`,
+  and `eth_syncing` keeps `startingBlock` at or below `currentBlock`.
 - Breaking (JSON-RPC): requests and parameters follow the JSON-RPC 2.0 and
   Ethereum specifications more closely:
   - A call with `"id": null` gets a response with a `null` ID; it was taken
@@ -1065,8 +1065,9 @@ Take these steps in order; each links to the entries below that detail it.
   considers the bridge before refusing a processor with no static source.
 - `eth_getLogs` accepts predicate-complete trusted Xatu and retained raw-log
   projections, while rejecting partial or narrower coverage. Canonical head
-  reporting no longer falls back to one processor's cursor or a fabricated
-  genesis height; an unknown head returns `canonical_head_unknown`.
+  reporting uses canonical metadata or finalized coverage, never an
+  unfinalized processor cursor, and `eth_blockNumber` never fails for want
+  of a head.
 - WebSocket connections and listeners share a 64 MiB budget for queued
   notifications (`rpc.max_outbound_bytes`). When it runs out, the connection
   holding the most of it is closed with `1013`, not the next to notify;
