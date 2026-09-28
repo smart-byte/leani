@@ -68,53 +68,67 @@ fn api_url(endpoint: &url::Url, id: Option<&str>) -> Result<url::Url> {
 /// repeated create return the job the node already accepted.
 const API_ATTEMPTS: u32 = 5;
 
-async fn response_json(mut response: reqwest::Response) -> Result<serde_json::Value> {
+/// Pause between status polls of a submitted job.
+const POLL_INTERVAL: Duration = Duration::from_millis(500);
+
+/// Why one request/response exchange failed.
+enum Failure {
+    /// The connection failed, before or after the response headers: a retry
+    /// may succeed.
+    Transport(anyhow::Error),
+    Final(anyhow::Error),
+}
+
+/// Send `request` and read its whole body.
+async fn exchange(
+    request: reqwest::RequestBuilder,
+) -> Result<(reqwest::StatusCode, Vec<u8>), Failure> {
+    let transport = |error: reqwest::Error| Failure::Transport(error.without_url().into());
+    let mut response = request.send().await.map_err(transport)?;
     let status = response.status();
     let mut bytes = Vec::new();
-    while let Some(chunk) = response
-        .chunk()
-        .await
-        .map_err(reqwest::Error::without_url)?
-    {
+    while let Some(chunk) = response.chunk().await.map_err(transport)? {
         if bytes.len().saturating_add(chunk.len()) > 1_048_576 {
-            bail!("backfill API response exceeds 1 MiB");
+            return Err(Failure::Final(anyhow::anyhow!(
+                "backfill API response exceeds 1 MiB"
+            )));
         }
         bytes.extend_from_slice(&chunk);
     }
+    Ok((status, bytes))
+}
+
+fn decode(status: reqwest::StatusCode, bytes: &[u8]) -> Result<serde_json::Value> {
     if !status.is_success() {
         // Error bodies need not be JSON: a wrong prefix gets an empty 404.
-        let body = String::from_utf8_lossy(&bytes);
+        let body = String::from_utf8_lossy(bytes);
         let body = body.chars().take(512).collect::<String>();
         bail!("backfill API returned {status}: {body}");
     }
-    serde_json::from_slice(&bytes).context("decode backfill API response")
+    serde_json::from_slice(bytes).context("decode backfill API response")
 }
 
-/// Send `request`, retrying transport errors and 5xx answers with backoff.
+/// Send `request`, retrying transport failures, including a body cut short,
+/// and 5xx answers with backoff.
 async fn call(request: impl Fn() -> reqwest::RequestBuilder) -> Result<serde_json::Value> {
     let mut delay = Duration::from_millis(500);
-    for attempt in 1..API_ATTEMPTS {
-        match request().send().await {
-            Ok(response) if !response.status().is_server_error() => {
-                return response_json(response).await;
+    let mut attempt = 1;
+    loop {
+        let last = attempt == API_ATTEMPTS;
+        match exchange(request()).await {
+            Ok((status, _)) if status.is_server_error() && !last => {
+                warn!(attempt, %status, "backfill API call failed; retrying");
             }
-            Ok(response) => {
-                warn!(attempt, status = %response.status(), "backfill API call failed; retrying");
+            Ok((status, bytes)) => return decode(status, &bytes),
+            Err(Failure::Transport(error)) if !last => {
+                warn!(attempt, error = %error, "backfill API call failed; retrying");
             }
-            Err(error) => {
-                warn!(attempt, error = %error.without_url(), "backfill API call failed; retrying");
-            }
+            Err(Failure::Transport(error) | Failure::Final(error)) => return Err(error),
         }
         tokio::time::sleep(delay).await;
         delay = (delay * 2).min(Duration::from_secs(8));
+        attempt += 1;
     }
-    response_json(
-        request()
-            .send()
-            .await
-            .map_err(reqwest::Error::without_url)?,
-    )
-    .await
 }
 
 /// A plain-HTTP endpoint that is not a loopback name or address.
@@ -134,6 +148,26 @@ async fn remote(
     processor: &str,
     from: u64,
     to: u64,
+) -> Result<Exit> {
+    // Listen before submitting: Ctrl-C during the request must still cancel
+    // the job the node creates, rather than kill the process.
+    let mut signals = ShutdownSignals::new()?;
+    let (interrupt, interrupts) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(
+        async move { while signals.recv().await.is_ok() && interrupt.send(()).is_ok() {} },
+    );
+    remote_with_interrupts(endpoint, token, processor, from, to, interrupts).await
+}
+
+/// [`remote`], cancelling the job on the first of `interrupts`. Every wait,
+/// for a request or between polls, also waits for them.
+async fn remote_with_interrupts(
+    endpoint: &url::Url,
+    token: Option<&str>,
+    processor: &str,
+    from: u64,
+    to: u64,
+    mut interrupts: tokio::sync::mpsc::UnboundedReceiver<()>,
 ) -> Result<Exit> {
     let collection = api_url(endpoint, None)?;
     if token.is_some() && cleartext_remote(endpoint) {
@@ -169,17 +203,15 @@ async fn remote(
         mode: leani_api::BackfillExecutionMode::FillMissing,
         idempotency_key: format!("cli-{identity}"),
     };
-    // Listen before submitting: Ctrl-C during the request must still cancel
-    // the job the node creates, rather than kill the process.
-    let mut signals = ShutdownSignals::new()?;
     let mut interrupted = false;
     let create = call(|| client.post(collection.clone()).json(&request));
     tokio::pin!(create);
+    // The create keeps running on a first interrupt: its job ID is what the
+    // cancellation names.
     let mut status = loop {
         tokio::select! {
             status = &mut create => break status?,
-            signal = signals.recv() => {
-                signal?;
+            Some(()) = interrupts.recv() => {
                 if interrupted {
                     bail!("backfill interrupted before the node confirmed the job");
                 }
@@ -208,7 +240,12 @@ async fn remote(
                 .path_segments_mut()
                 .map_err(|()| anyhow::anyhow!("invalid job URL"))?
                 .push("cancel");
-            status = call(|| client.post(cancel.clone())).await?;
+            status = tokio::select! {
+                status = call(|| client.post(cancel.clone())) => status?,
+                Some(()) = interrupts.recv() => {
+                    bail!("backfill interrupted again before the node confirmed its cancellation");
+                }
+            };
             // The job may have completed before the cancel arrived.
             if status["state"].as_str() == Some("completed") {
                 println!("{}", serde_json::to_string_pretty(&status)?);
@@ -217,13 +254,16 @@ async fn remote(
             bail!("backfill cancelled: {status}");
         }
         tokio::select! {
-            () = tokio::time::sleep(Duration::from_millis(500)) => {
-                status = call(|| client.get(job.clone())).await?;
-            },
-            signal = signals.recv() => {
-                signal?;
+            () = tokio::time::sleep(POLL_INTERVAL) => {}
+            Some(()) = interrupts.recv() => {
                 interrupted = true;
+                continue;
             }
+        }
+        // An interrupt drops a status request still in flight and cancels.
+        tokio::select! {
+            polled = call(|| client.get(job.clone())) => status = polled?,
+            Some(()) = interrupts.recv() => interrupted = true,
         }
     }
 }
@@ -449,6 +489,81 @@ mod tests {
             let url = url::Url::parse(url).unwrap();
             assert_eq!(super::cleartext_remote(&url), cleartext, "{url}");
         }
+    }
+
+    #[tokio::test]
+    async fn api_calls_retry_a_body_cut_short() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            for body in [&br#"{"sta"#[..], &br#"{"state":"running"}"#[..]] {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = [0_u8; 1_024];
+                let _ = stream.read(&mut request).await.unwrap();
+                // The first answer promises more body than it sends.
+                let head = b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 19\r\nconnection: close\r\n\r\n";
+                stream.write_all(head).await.unwrap();
+                stream.write_all(body).await.unwrap();
+            }
+        });
+        let client = reqwest::Client::new();
+        let value = super::call(|| client.get(&url)).await.unwrap();
+        server.await.unwrap();
+        assert_eq!(value["state"], "running");
+    }
+
+    #[tokio::test]
+    async fn an_interrupt_during_a_stalled_status_request_cancels_the_job() {
+        let polled = Arc::new(tokio::sync::Notify::new());
+        let cancelled = Arc::new(AtomicUsize::new(0));
+        let (polled_route, cancelled_route) = (polled.clone(), cancelled.clone());
+        let router = axum::Router::new()
+            .route(
+                "/admin/v1/materialization-jobs",
+                axum::routing::post(|| async {
+                    axum::Json(serde_json::json!({"id": "job-1", "state": "running"}))
+                }),
+            )
+            .route(
+                "/admin/v1/materialization-jobs/job-1",
+                axum::routing::get(move || {
+                    let polled = polled_route.clone();
+                    async move {
+                        polled.notify_one();
+                        // A node that never answers its status.
+                        std::future::pending::<()>().await;
+                    }
+                }),
+            )
+            .route(
+                "/admin/v1/materialization-jobs/job-1/cancel",
+                axum::routing::post(move || {
+                    let cancelled = cancelled_route.clone();
+                    async move {
+                        cancelled.fetch_add(1, Ordering::SeqCst);
+                        axum::Json(serde_json::json!({"id": "job-1", "state": "cancelled"}))
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint =
+            url::Url::parse(&format!("http://{}/", listener.local_addr().unwrap())).unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let (interrupt, interrupts) = tokio::sync::mpsc::unbounded_channel();
+        let run = tokio::spawn(async move {
+            super::remote_with_interrupts(&endpoint, None, "blocks", 1, 2, interrupts).await
+        });
+        polled.notified().await;
+        interrupt.send(()).unwrap();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), run)
+            .await
+            .expect("the interrupt ends the stalled poll")
+            .unwrap();
+        server.abort();
+        assert!(format!("{:#}", result.unwrap_err()).contains("cancelled"));
+        assert_eq!(cancelled.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
