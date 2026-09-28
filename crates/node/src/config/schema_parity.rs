@@ -493,74 +493,6 @@ fn compare(
     }
 }
 
-/// Every key, required member, and enum value of `value` that `node` does
-/// not allow. A `oneOf` counts its best-matching branch.
-fn violations(
-    schema: &Schema,
-    node: &Value,
-    value: &toml::Value,
-    path: &str,
-    found: &mut Vec<String>,
-) {
-    let node = schema.resolve(node);
-    if let Some(branches) = node.get("oneOf").and_then(Value::as_array) {
-        let best = branches
-            .iter()
-            .map(|branch| {
-                let mut branch_found = Vec::new();
-                violations(schema, branch, value, path, &mut branch_found);
-                branch_found
-            })
-            .min_by_key(Vec::len)
-            .unwrap_or_default();
-        found.extend(best);
-    }
-    match value {
-        toml::Value::Table(table) => {
-            for name in node
-                .get("required")
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-                .filter_map(Value::as_str)
-            {
-                if !table.contains_key(name) {
-                    found.push(format!("{}: required by the schema", member(path, name)));
-                }
-            }
-            let properties = node.get("properties").and_then(Value::as_object);
-            for (key, child) in table {
-                let field = member(path, key);
-                match properties.and_then(|properties| properties.get(key)) {
-                    Some(property) => violations(schema, property, child, &field, found),
-                    None if node.get("additionalProperties") == Some(&Value::Bool(false)) => {
-                        found.push(format!("{field}: not in the schema"));
-                    }
-                    None => {}
-                }
-            }
-        }
-        toml::Value::Array(items) => {
-            if let Some(item) = node.get("items") {
-                for (index, element) in items.iter().enumerate() {
-                    violations(schema, item, element, &format!("{path}[{index}]"), found);
-                }
-            }
-        }
-        scalar => {
-            let scalar = serde_json::to_value(scalar).expect("TOML scalars are JSON");
-            let allowed = node
-                .get("enum")
-                .and_then(Value::as_array)
-                .is_none_or(|values| values.contains(&scalar))
-                && node.get("const").is_none_or(|constant| *constant == scalar);
-            if !allowed {
-                found.push(format!("{path}: {scalar} is not a value the schema allows"));
-            }
-        }
-    }
-}
-
 /// Every TOML file under `directory` that is a node configuration: one that
 /// states its `config_version`, which both configuration shapes require.
 /// Node state and build output are not shipped files.
@@ -720,7 +652,7 @@ fn the_shipped_file_walk_skips_state_and_build_directories() {
 }
 
 #[test]
-fn shipped_configurations_load_and_use_only_schema_keys() {
+fn shipped_configurations_load_and_validate_against_json_schema() {
     // Audit Config-1: nothing checked the shipped files against the schema,
     // and the example used properties it refused.
     let repository = repository();
@@ -769,12 +701,24 @@ fn shipped_configurations_load_and_use_only_schema_keys() {
         }
         let source = fs::read_to_string(path).expect("configuration");
         let document = toml::from_str::<toml::Value>(&source).expect("configuration TOML");
-        let mut found = Vec::new();
-        violations(&schema, &schema.0, &document, "", &mut found);
+        let mut schema_value = schema.0.clone();
         if name == "config/defaults/ethereum-mainnet.toml" {
-            // Compact expansion adds the selected processor to these defaults.
-            found.retain(|violation| violation != "processors: required by the schema");
+            // This is the sole incomplete template: compact expansion supplies
+            // processors. Relax only that required member, not its schema.
+            schema_value["$defs"]["advancedConfig"]["required"]
+                .as_array_mut()
+                .unwrap()
+                .retain(|field| field != "processors");
         }
+        let validator = jsonschema::options()
+            .should_validate_formats(true)
+            .build(&schema_value)
+            .expect("valid configuration schema");
+        let value = serde_json::to_value(&document).expect("JSON configuration");
+        let found = validator
+            .iter_errors(&value)
+            .map(|error| format!("{}: {error}", error.instance_path()))
+            .collect::<Vec<_>>();
         problems.extend(
             found
                 .into_iter()
@@ -786,4 +730,31 @@ fn shipped_configurations_load_and_use_only_schema_keys() {
         "shipped configurations disagree with the schema:\n{}",
         problems.join("\n")
     );
+}
+
+#[test]
+fn schema_validation_checks_scalar_constraints_and_exactly_one_branch() {
+    use serde_json::json;
+    let schema = Schema::load(&repository());
+    let mut source: Value = serde_json::to_value(
+        toml::from_str::<toml::Value>(
+            &fs::read_to_string(repository().join("config/example.toml")).unwrap(),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let validator = jsonschema::validator_for(&schema.0).unwrap();
+    assert!(validator.is_valid(&source));
+    for invalid in [json!("many"), json!(0), json!(-1)] {
+        source["rpc"]["max_websocket_connections"] = invalid;
+        assert!(!validator.is_valid(&source));
+    }
+    let exact =
+        jsonschema::validator_for(&json!({"oneOf": [{"type": "integer"}, {"type": "number"}]}))
+            .unwrap();
+    assert!(!exact.is_valid(&json!(1)), "two matches must fail oneOf");
+    let constraints = jsonschema::validator_for(&json!({"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string", "pattern": "^0x[0-9a-f]{2}$"}})).unwrap();
+    for invalid in [json!([]), json!(["bad"]), json!(["0x12", "0x12"])] {
+        assert!(!constraints.is_valid(&invalid));
+    }
 }

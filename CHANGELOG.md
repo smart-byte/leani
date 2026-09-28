@@ -1043,6 +1043,10 @@ Take these steps in order; each links to the entries below that detail it.
 
 ### Fixed
 
+- Shipped configurations are validated with a standard JSON Schema validator,
+  including types, bounds, patterns and exact `oneOf` semantics. The Serde
+  field/enum parity probe remains a separate contract check.
+
 - <a id="rc1-finality-anchor"></a>Verified finality no longer stops about 14
   days after the configured checkpoint's slot. Beacon API finality keeps one
   bootstrapped light client per endpoint and advances it with each finality

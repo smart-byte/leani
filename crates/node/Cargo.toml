@@ -57,6 +57,7 @@ tracing-subscriber.workspace = true
 url.workspace = true
 
 [dev-dependencies]
+jsonschema = { version = "0.58.1", default-features = false }
 tokio = { workspace = true, features = ["test-util"] }
 
 [lints]
