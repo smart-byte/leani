@@ -4682,6 +4682,60 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn logs_refuse_history_that_does_not_link_to_the_recent_window() {
+        for below in [true, false] {
+            let (mut state, store, _directory) = test_state_and_store().await;
+            let mut parent = BlockHash::ZERO;
+            let frames = (0_u8..=4)
+                .map(|number| {
+                    let frame = with_log(fixture_frame(u64::from(number), parent), number);
+                    parent = frame.block.hash;
+                    frame
+                })
+                .collect::<Vec<_>>();
+            for frame in &frames[2..=3] {
+                store.store_recent_frame(frame).await.unwrap();
+            }
+            store
+                .store_canonical_anchor(ChainId(1), frames[4].block, Finality::Finalized)
+                .await
+                .unwrap();
+            // History from another branch on one side of the recent window.
+            let mut served = frames.clone();
+            if below {
+                served[0].block.hash = BlockHash::new([0xa0; 32]);
+                served[1].block.hash = BlockHash::new([0xa1; 32]);
+                served[1].block.parent_hash = served[0].block.hash;
+            } else {
+                served[4].block.parent_hash = BlockHash::new([0xa3; 32]);
+            }
+            state.config.history = Some(test_history(vec![history_source(
+                "forked-history",
+                BlockRange::new(BlockNumber(0), BlockNumber(4)).unwrap(),
+                CapabilitySet::of(Capability::Logs),
+                0,
+                served,
+            )]));
+            let router = http_router_with_progress(
+                state.store,
+                state.progress,
+                state.blob_schedule,
+                state.config,
+                state.committed_events,
+            );
+            let (_, response) = call(
+                router,
+                json!({
+                    "jsonrpc":"2.0", "id":1, "method":"eth_getLogs",
+                    "params":[{"fromBlock":"0x0", "toBlock":"latest"}]
+                }),
+            )
+            .await;
+            assert_unavailable(response, "historical_recent_handoff_mismatch");
+        }
+    }
+
     fn rpc_frame(number: u64) -> BlockFrame {
         rpc_frame_with_header(&ConsensusHeader {
             number,
@@ -6268,15 +6322,47 @@ mod tests {
         descriptor.capabilities = CapabilitySet::of(Capability::Logs);
         descriptor.complete_capabilities = CapabilitySet::NONE;
         descriptor.trust = TrustModel::TrustedDataset;
-        for (completeness, scope, accepted) in [
-            (Completeness::DatasetDeclared, FilterScope::default(), true),
-            (Completeness::Partial, FilterScope::default(), false),
+        let trusted = VerificationPolicy::TrustedDataset;
+        for (completeness, scope, policy, accepted) in [
+            (
+                Completeness::DatasetDeclared,
+                FilterScope::default(),
+                trusted,
+                true,
+            ),
+            (
+                Completeness::Partial,
+                FilterScope::default(),
+                trusted,
+                false,
+            ),
             (
                 Completeness::DatasetDeclared,
                 FilterScope {
                     addresses: vec![Address::new([0xff; 20])],
                     ..FilterScope::default()
                 },
+                trusted,
+                false,
+            ),
+            // Narrower on a topic: logs with other first topics are missing.
+            (
+                Completeness::DatasetDeclared,
+                FilterScope {
+                    topics: vec![TopicFilter {
+                        position: 0,
+                        alternatives: vec![[0x99; 32]],
+                    }],
+                    ..FilterScope::default()
+                },
+                trusted,
+                false,
+            ),
+            // Dataset claims never satisfy the cryptographic policy.
+            (
+                Completeness::DatasetDeclared,
+                FilterScope::default(),
+                VerificationPolicy::CompleteCryptographic,
                 false,
             ),
         ] {
@@ -6294,7 +6380,19 @@ mod tests {
                     steps: vec![HistoryStep::Frame(Box::new(frame.clone()))],
                 }],
             ));
-            state.config.history = Some(test_history(vec![source]));
+            state.config.history = Some(
+                HistoricalRpc::new(
+                    vec![source],
+                    HistoricalRpcConfig {
+                        verification_policy: policy,
+                        max_input_bytes: 1_000_000,
+                        max_frame_bytes: 500_000,
+                        temporary_disk_bytes: 1_000_000,
+                        ..HistoricalRpcConfig::default()
+                    },
+                )
+                .expect("historical RPC"),
+            );
             let router = http_router_with_progress(
                 state.store.clone(),
                 state.progress.clone(),
