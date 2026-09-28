@@ -1781,12 +1781,7 @@ impl leani_api::BackfillControl for NativeBackfillControl {
         let requested_blocks = ranges
             .iter()
             .fold(0_u64, |total, range| total.saturating_add(range.len()));
-        let (_, verification_policy) = configured_history_sources(
-            &self.config,
-            processor.as_ref(),
-            self.raw_history_store.as_ref(),
-        )
-        .map_err(|error| leani_api::BackfillControlError::Invalid(error.to_string()))?;
+        let (_, verification_policy) = self.history_sources(processor.as_ref(), range).await?;
         let mut job = leani_runtime::BackfillJob::for_processor_ranges(
             id.clone(),
             processor.as_ref(),
@@ -11053,6 +11048,10 @@ markets = ["ETH/USDT"]
         ))
         .await
         .unwrap();
+        store
+            .store_canonical_anchor(ChainId(1), block, Finality::Finalized)
+            .await
+            .unwrap();
         let control = NativeBackfillControl::new(
             config.clone(),
             store,
@@ -11087,6 +11086,20 @@ markets = ["ETH/USDT"]
             cli_sources[0].plan(&request).await.unwrap(),
             api_sources[0].plan(&request).await.unwrap()
         );
+        // The API admits the same bridge-only job instead of refusing it.
+        let created = leani_api::BackfillControl::create_materialization(
+            &control,
+            leani_api::CreateMaterializationRequest {
+                processor: "blocks-test".to_owned(),
+                from_block: Some(26_000_001),
+                to_block: Some(26_000_005.into()),
+                ranges: Vec::new(),
+                mode: leani_api::BackfillExecutionMode::FillMissing,
+                idempotency_key: "bridge-only-api-job".to_owned(),
+            },
+        )
+        .await;
+        assert!(created.is_ok(), "{created:?}");
     }
 
     #[tokio::test]
