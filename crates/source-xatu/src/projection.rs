@@ -2376,8 +2376,8 @@ fn fixed_bytes_at<const N: usize>(
     decode_fixed_bytes(value, context)
 }
 
-/// A topic, or `None` for a log without it: a null, an empty value, or the
-/// NUL padding a `ClickHouse` `FixedString` holds for an empty string.
+/// A topic, or `None` for an absent topic: null, empty text, `0x`, or
+/// either empty representation with `ClickHouse` `FixedString` NUL padding.
 fn optional_topic(
     batch: &RecordBatch,
     name: &str,
@@ -2388,7 +2388,13 @@ fn optional_topic(
         return Ok(None);
     }
     let raw = matches!(array.data_type(), DataType::FixedSizeBinary(32));
-    if !raw && binary_at(array, row)?.iter().all(|byte| *byte == 0) {
+    let value = binary_at(array, row)?;
+    if !raw
+        && (value.iter().all(|byte| *byte == 0)
+            || value
+                .strip_prefix(b"0x")
+                .is_some_and(|rest| rest.iter().all(|byte| *byte == 0)))
+    {
         return Ok(None);
     }
     fixed_bytes_at(array, row, &format!("{name} at row {row}")).map(Some)
@@ -3052,8 +3058,21 @@ mod tests {
         let nul_padded: ArrayRef = Arc::new(
             FixedSizeBinaryArray::try_from_iter([[0_u8; 66]].into_iter()).expect("NUL topic"),
         );
+        let mut padded_hex = [0_u8; 66];
+        padded_hex[..2].copy_from_slice(b"0x");
+        let padded_hex: ArrayRef =
+            Arc::new(FixedSizeBinaryArray::try_from_iter([padded_hex].into_iter()).unwrap());
         for (name, topic0) in [
             ("null topic0", text_topic(None)),
+            (
+                "empty hexadecimal topic0 from public Xatu",
+                text_topic(Some("0x")),
+            ),
+            ("NUL-padded empty hexadecimal topic0", padded_hex),
+            (
+                "binary empty hexadecimal topic0",
+                Arc::new(BinaryArray::from_vec(vec![b"0x"])) as ArrayRef,
+            ),
             ("empty topic0", text_topic(Some(""))),
             ("NUL-padded FixedString topic0", nul_padded),
         ] {
@@ -3099,6 +3118,30 @@ mod tests {
         )
         .expect("a topic filter skips LOG0 rows");
         assert!(output.is_empty());
+    }
+
+    #[test]
+    fn a_zero_topic_is_present_but_malformed_short_hex_is_rejected() {
+        let raw: ArrayRef =
+            Arc::new(FixedSizeBinaryArray::try_from_iter([[0_u8; 32]].into_iter()).unwrap());
+        let output = parse_block_42_logs(
+            &log_batch([raw, text_topic(None), text_topic(None), text_topic(None)]),
+            &FilterSet::default(),
+        )
+        .unwrap();
+        assert_eq!(output[&42][0].topics, vec![[0; 32]]);
+        assert!(
+            parse_block_42_logs(
+                &log_batch([
+                    text_topic(Some("0x00")),
+                    text_topic(None),
+                    text_topic(None),
+                    text_topic(None)
+                ]),
+                &FilterSet::default()
+            )
+            .is_err()
+        );
     }
 
     #[test]

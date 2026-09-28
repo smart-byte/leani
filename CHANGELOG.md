@@ -1043,6 +1043,9 @@ Take these steps in order; each links to the entries below that detail it.
 
 ### Fixed
 
+- Xatu LOG0 rows also accept the public dataset's empty hexadecimal topic
+  sentinel (`0x`), including NUL-padded strings. A real 32-byte zero topic
+  remains a topic, and malformed short hexadecimal values still fail.
 - Shipped configurations are validated with a standard JSON Schema validator,
   including types, bounds, patterns and exact `oneOf` semantics. The Serde
   field/enum parity probe remains a separate contract check.
