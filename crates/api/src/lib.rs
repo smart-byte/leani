@@ -4228,6 +4228,14 @@ async fn stream_live_consumer(
         .store
         .acquire_consumer_session_in_stream(processor.descriptor(), &stream_id, &consumer)
         .await?;
+    // Guard at once: an error before the stream starts must release the
+    // exclusive lease instead of holding it until its TTL.
+    let lease_guard = ConsumerSessionGuard {
+        store: state.store.clone(),
+        stream_id: stream_id.clone(),
+        consumer_id: consumer.clone(),
+        generation: lease.generation,
+    };
     let session_token = encode_consumer_session_token(
         &state,
         processor.as_ref(),
@@ -4264,12 +4272,7 @@ async fn stream_live_consumer(
         fetched_through_head: false,
         gzip,
         terminal: false,
-        lease: ConsumerSessionGuard {
-            store: state.store.clone(),
-            stream_id,
-            consumer_id: consumer,
-            generation: lease.generation,
-        },
+        lease: lease_guard,
     };
     let body_stream = stream::once(std::future::ready(Ok::<Bytes, Infallible>(hello)))
         .chain(stream::unfold(stream_state, poll_live_consumer));
@@ -4860,6 +4863,14 @@ async fn stream_backfill_consumer(
         .store
         .acquire_consumer_session_in_stream(processor.descriptor(), &stream_id, &consumer)
         .await?;
+    // Guard at once: an error before the stream starts must release the
+    // exclusive lease instead of holding it until its TTL.
+    let lease_guard = ConsumerSessionGuard {
+        store: state.store.clone(),
+        stream_id: stream_id.clone(),
+        consumer_id: consumer.clone(),
+        generation: lease.generation,
+    };
     let session_token = encode_consumer_session_token(
         &state,
         processor.as_ref(),
@@ -4910,12 +4921,7 @@ async fn stream_backfill_consumer(
         pending_completion: None,
         completion_sequence: None,
         terminal: false,
-        lease: ConsumerSessionGuard {
-            store: state.store.clone(),
-            stream_id,
-            consumer_id: consumer,
-            generation: lease.generation,
-        },
+        lease: lease_guard,
     };
     let batch_limits = stream_state.batch_limits;
     let body_stream = stream::once(std::future::ready(Ok::<Bytes, Infallible>(hello)))
