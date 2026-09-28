@@ -536,8 +536,10 @@ Take these steps in order; each links to the entries below that detail it.
   `leani subscribe`, or `leani e2e mainnet --resume`, reads the store
   without writing and refuses a processor the store holds under another
   identity, as registration does (`processor instance … conflicts with its
-  stored descriptor`); the refused store stays at its schema, so the
-  previous binary still opens it. `leani db backup` copies the store at its
+  stored descriptor`), and a configured consumer whose stored role differs;
+  the refused store stays at its schema, so the previous binary still opens
+  it. `serve` also checks its bearer token and JSON-RPC history sources
+  before it opens the store. `leani db backup` copies the store at its
   schema and never upgrades it, refuses a schema newer than the binary
   supports, and refuses a data directory without a store instead of
   creating one. See ADR 0018.

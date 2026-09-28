@@ -50,7 +50,11 @@ Store migrations are forward only.
   registration's identity rule to each processor it will register. A
   processor the store holds under a conflicting identity is refused with
   registration's error, and the store keeps its schema. The rule stays in one
-  place, `check_stored_identity`; only lifecycle policy may differ.
+  place, `check_stored_identity`; only lifecycle policy may differ. A
+  configured durable consumer whose stored role differs, which `serve` also
+  refuses, is refused the same way.
+- `serve` resolves its bearer token and its JSON-RPC history sources before
+  it opens the store, so a start refused for them leaves the store as it was.
 - `leani db backup` never opens the store as a store. It copies the file at
   its schema with `VACUUM INTO` through a read-only connection, refuses a
   schema newer than the binary supports, and refuses a store that references
@@ -77,6 +81,7 @@ Store tests cover the upgrade and rollback paths:
 `schema_21_stores_upgrade_in_place_with_coverage_indexes`,
 `schema_22_stores_upgrade_with_delivered_watermarks_and_a_node_secret`,
 `an_identity_refusal_leaves_an_older_store_at_its_schema`,
+`a_consumer_role_refusal_leaves_an_older_store_at_its_schema`,
 `a_backup_leaves_an_older_store_and_its_copy_at_their_schema`, and
 `backup_reopens_as_a_complete_verified_restore`. The node test
 `the_container_profile_starts_beside_the_instance_an_earlier_release_left`

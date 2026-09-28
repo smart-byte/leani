@@ -2102,6 +2102,28 @@ async fn conflicting_upgrade(
         if let Some(stored) = stored {
             check_stored_identity(&stored, descriptor)?;
         }
+        // `serve` refuses a configured consumer whose stored role differs;
+        // refuse it here too, before the upgrade makes the refusal permanent.
+        for consumer in &descriptor.lifecycle.delivery.consumers {
+            let stored: Option<String> = sqlx::query_scalar(
+                "SELECT role FROM durable_consumers WHERE stream_id = ? AND consumer_id = ?",
+            )
+            .bind(default_delivery_stream_id(descriptor))
+            .bind(&consumer.id)
+            .fetch_optional(&mut *connection)
+            .await?;
+            let configured = if consumer.required {
+                "required"
+            } else {
+                "best_effort"
+            };
+            if let Some(stored) = stored.filter(|stored| stored != configured) {
+                return Err(StoreError::InvalidConfig(format!(
+                    "durable consumer {} for processor instance {} has role {stored}, but the configuration makes it {configured}; the store was left at its schema",
+                    consumer.id, descriptor.instance
+                )));
+            }
+        }
     }
     Ok(())
 }
@@ -26525,6 +26547,15 @@ mod tests {
 
     /// A store at `path` in the rc.1 layout, schema 21, holding `processors`.
     async fn rc1_store(path: &Path, processors: &[ProcessorDescriptor]) {
+        rc1_store_with_consumer(path, processors, None).await;
+    }
+
+    /// [`rc1_store`], with `consumer` created on the first processor.
+    async fn rc1_store_with_consumer(
+        path: &Path,
+        processors: &[ProcessorDescriptor],
+        consumer: Option<(&str, ConsumerRole)>,
+    ) {
         let store = SqliteStore::open(StoreConfig::new(path))
             .await
             .expect("open fresh store");
@@ -26533,6 +26564,18 @@ mod tests {
                 .register_processor(descriptor)
                 .await
                 .expect("register as rc.1 did");
+        }
+        if let Some((id, role)) = consumer {
+            store
+                .create_consumer(
+                    &processors[0],
+                    id,
+                    role,
+                    ConsumerStartPosition::EarliestRetained,
+                    Duration::from_mins(1),
+                )
+                .await
+                .expect("consumer as rc.1 kept it");
         }
         sqlx::raw_sql(
             "DROP INDEX IF EXISTS processor_coverage_by_hash;
@@ -26602,6 +26645,37 @@ mod tests {
         assert_eq!(
             upgraded.stats().await.expect("stats").schema_version,
             CURRENT_SCHEMA_VERSION
+        );
+    }
+
+    #[tokio::test]
+    async fn a_consumer_role_refusal_leaves_an_older_store_at_its_schema() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("node.sqlite");
+        let stored = container_blobs("blobs-container", 4);
+        rc1_store_with_consumer(
+            &path,
+            std::slice::from_ref(&stored),
+            Some(("app", ConsumerRole::BestEffort)),
+        )
+        .await;
+        let mut configured = stored.clone();
+        configured.lifecycle.delivery.consumers = vec![DurableConsumerPolicy {
+            id: "app".to_owned(),
+            required: true,
+            lease_ttl_seconds: 60,
+        }];
+        let error = SqliteStore::open(StoreConfig::new(&path).with_processors(vec![configured]))
+            .await
+            .expect_err("a changed consumer role is refused");
+        assert!(
+            error.to_string().contains("has role best_effort"),
+            "{error}"
+        );
+        assert_eq!(
+            schema_on_disk(&path).await,
+            21,
+            "the refused store was upgraded"
         );
     }
 
