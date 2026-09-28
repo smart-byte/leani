@@ -44,7 +44,8 @@ response is the machine-readable authority for a running node.
 parameters, chain ID, fork hash, precompiles, and system contracts. Its
 checked Mainnet schedule uses exact activation timestamps; it does not call an
 upstream configuration RPC. `current` is the fork active at the timestamp of
-the newest retained canonical block, the head `eth_blockNumber` reports.
+the newest retained raw canonical block. This timestamp can be unavailable
+even when `eth_blockNumber` knows a newer canonical anchor.
 Forks activate by timestamp, so a node that retains no head frame, such as an
 empty one or one that has only backfilled, fails with `-32004`
 (`eth_config_head_timestamp_unavailable`) instead of choosing a fork by block
@@ -69,6 +70,21 @@ rather than carrying a guessed price. `error.data.reason` says why:
   blob gas that no valid chain reaches, as a forged header may claim, gets
   there.
 
+`eth_getLogs` can use Xatu's predicate-complete projection under the
+trusted-dataset policy. Every requested block and required log field must be
+present; a partial projection, a narrower address/topic scope, or a broken
+parent link fails explicitly. Complete-cryptographic policy still requires
+complete material. Retained raw-log projections can serve the same requests
+without upstream access when their scope and fields cover the query. Decoded
+processor entities alone are not a lossless raw-log store: enable on-demand
+history or retain suitable raw material for historical RPC.
+
+`eth_blockNumber`, `latest`, and `eth_syncing.currentBlock` use canonical
+metadata independently of processor progress and raw-frame pruning. When no
+head is known, `eth_blockNumber` returns `-32004` with reason
+`canonical_head_unknown`. A known local head can lag while disconnected;
+consult `eth_syncing` before treating it as the network tip.
+
 For a number/range request outside the recent window, the router selects the
 lowest-priority viable `HistorySource`, enforces finality/trust and hard
 byte/frame/concurrency/timeout limits, validates ordered parent-linked frames,
@@ -82,8 +98,8 @@ durable locator and therefore remains recent-only by default.
 | `web3_clientVersion` | Exact | Local | — |
 | `net_version` | Exact | Local | — |
 | `eth_chainId` | Exact | Local | — |
-| `eth_blockNumber` | Exact | Live source | Defines the included head |
-| `eth_syncing` | Exact for this node | Local progress | Report both cold reducer and hot source |
+| `eth_blockNumber` | Exact for the known canonical chain | Canonical metadata | Returns `canonical_head_unknown` before a head is known; never substitutes a processor cursor |
+| `eth_syncing` | Exact for this node | Canonical head and live readiness | A disconnected or historical-only node does not claim live readiness |
 | `eth_getBlockByNumber` | Exact with body source | Recent/on-demand | Historical latency depends on backend |
 | `eth_getBlockByHash` | Exact with locator | Recent; optional index | Hash-to-chunk lookup otherwise expensive |
 | `eth_getBlockTransactionCount*` | Exact with body | Recent/on-demand | — |
@@ -132,7 +148,7 @@ Wherever a block number is accepted, including `fromBlock` and `toBlock` of
 
 | Tag | Block |
 |---|---|
-| `latest` | the newest retained canonical block |
+| `latest` | the newest block in canonical metadata, as reported by `eth_blockNumber` |
 | `finalized` | the newest canonical block the node has verified as finalized |
 | `safe` | the same block as `finalized` |
 | `earliest` | block 0 |
@@ -145,9 +161,8 @@ finalized head, which is never newer. A client that waits for `safe` blocks
 to avoid reorgs therefore stays safe, but it sees an older block than other
 clients report.
 
-Block lookups return `null` only for a block number above the node's head:
-its newest canonical block, or the block its progress processor has reached
-when that is higher. Ethereum clients read `null` as "no such block", and a
+Block lookups return `null` only for a number above every block the node
+knows exists: its canonical tip and the progress processor's indexed height. Ethereum clients read `null` as "no such block", and a
 reorg checker concludes that a block which turned `null` was reorged out.
 So a block at or below the head that neither the recent window nor
 on-demand history serves fails with `-32004` instead: `block_not_retained`,
@@ -158,10 +173,10 @@ that lookup does not know the hash. This applies to `eth_getBlockByNumber`,
 `eth_getBlockByHash`, `eth_getBlockReceipts`,
 `eth_getBlockTransactionCountBy*`, and
 `eth_getTransactionByBlock*AndIndex`, which still returns `null` for an
-index past the last transaction of a block it serves. `latest` fails with
-`block_not_retained` on a node that retains no block. `earliest` names
-block 0, so it fails the same way unless block 0 is retained or history
-serves it.
+index past the last transaction of a block it serves. `latest` resolves the
+canonical tip and may fetch its raw material on demand; without a known tip
+it fails with `block_not_retained`. `earliest` names block 0, so it requires
+retained or historical material for block 0.
 
 `eth_getLogs` with `blockHash` returns only logs of the block with that
 hash. If a reorg replaces that block between resolving the hash and reading

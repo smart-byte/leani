@@ -48,7 +48,8 @@ use futures::{
 };
 use leani_primitives::{
     Address, BlockFrame, BlockHash, BlockNumber, BlockRange, BlockRef, Capability, CapabilitySet,
-    ChainId, FilterScope, Finality, Material, TopicFilter, TransactionHash, TrustModel,
+    ChainId, Completeness, FilterScope, Finality, Material, TopicFilter, TransactionHash,
+    TrustModel,
 };
 use leani_processor_api::{Processor, ProcessorDescriptor, StartPoint};
 use leani_processor_blobs::{BlobFork, BlobSchedule, BlobsProcessor, get_blob_base_fee};
@@ -300,22 +301,9 @@ impl HistoricalRpc {
     }
 
     fn supports(&self, chain_id: ChainId, required: CapabilitySet) -> bool {
-        let policy_trust = match self.config.verification_policy {
-            VerificationPolicy::CompleteCryptographic => TrustModel::ProtocolVerified,
-            VerificationPolicy::TrustedDataset => TrustModel::TrustedDataset,
-            VerificationPolicy::BestEffort => TrustModel::Untrusted,
-        };
-        let minimum_trust = self.config.minimum_trust.max(policy_trust);
-        self.sources.iter().any(|source| {
-            let descriptor = source.descriptor();
-            descriptor.chain_id == chain_id
-                && descriptor
-                    .complete_capabilities
-                    .with_derivable()
-                    .contains_all(required)
-                && descriptor.finality.supports(Finality::Finalized)
-                && descriptor.trust >= minimum_trust
-        })
+        self.sources
+            .iter()
+            .any(|source| self.source_supports(source.as_ref(), chain_id, required))
     }
 
     fn supports_block_hash_lookup(&self, chain_id: ChainId, required: CapabilitySet) -> bool {
@@ -344,11 +332,15 @@ impl HistoricalRpc {
             VerificationPolicy::BestEffort => TrustModel::Untrusted,
         };
         let descriptor = source.descriptor();
+        let capabilities = if required == CapabilitySet::of(Capability::Logs)
+            && self.config.verification_policy == VerificationPolicy::TrustedDataset
+        {
+            descriptor.capabilities
+        } else {
+            descriptor.complete_capabilities
+        };
         descriptor.chain_id == chain_id
-            && descriptor
-                .complete_capabilities
-                .with_derivable()
-                .contains_all(required)
+            && capabilities.with_derivable().contains_all(required)
             && descriptor.finality.supports(Finality::Finalized)
             && descriptor.trust >= self.config.minimum_trust.max(policy_trust)
     }
@@ -462,7 +454,10 @@ impl HistoricalRpc {
             chain_id,
             range,
             required,
-            allow_filtered: false,
+            // A logs response needs every match of its predicate, not full
+            // execution bodies. Dataset claims remain explicitly trusted.
+            allow_filtered: required == CapabilitySet::of(Capability::Logs)
+                && self.config.verification_policy == VerificationPolicy::TrustedDataset,
             projection: FieldProjection::default(),
             log_fields: leani_primitives::LogFieldSet::ALL,
             filters,
@@ -599,7 +594,14 @@ fn validate_historical_frames(
         if frame.chain_id != request.chain_id
             || frame.block.number != BlockNumber(expected_number)
             || !frame.finality.satisfies(request.minimum_finality)
-            || !frame.capabilities().satisfies(request.required, false)
+            || !frame
+                .capabilities()
+                .satisfies(request.required, request.allow_filtered)
+        {
+            return Err(HistoricalRpcError::Invalid);
+        }
+        if request.required.contains(Capability::Logs)
+            && logs_cover(frame, &request.filters.scope, request.allow_filtered).is_none()
         {
             return Err(HistoricalRpcError::Invalid);
         }
@@ -619,6 +621,39 @@ fn validate_historical_frames(
         }
     }
     Ok(())
+}
+
+/// All logs matching `filter`, including explicitly trusted dataset
+/// projections. A partial or narrower projection must never look empty.
+fn logs_cover<'a>(
+    frame: &'a BlockFrame,
+    filter: &FilterScope,
+    allow_dataset: bool,
+) -> Option<&'a Vec<leani_primitives::Log>> {
+    match &frame.logs {
+        Material::Complete(logs) => Some(logs),
+        Material::Filtered {
+            value,
+            scope,
+            completeness,
+        } if scope.covers_at(filter, frame.block.number)
+            && (matches!(completeness, Completeness::VerifiedPredicate)
+                || (allow_dataset && matches!(completeness, Completeness::DatasetDeclared))) =>
+        {
+            Some(value)
+        }
+        _ => None,
+    }
+}
+
+/// Canonical metadata survives raw-frame pruning and is independent of
+/// which processor the node uses to describe indexing progress.
+async fn canonical_head(state: &RpcState) -> Result<Option<BlockRef>, RpcError> {
+    state
+        .store
+        .canonical_tip(state.config.chain_id)
+        .await
+        .map_err(|error| RpcError::store(&error))
 }
 
 /// Dynamically shared live readiness for JSON-RPC metadata.
@@ -1528,41 +1563,26 @@ async fn dispatch(
         }
         "eth_blockNumber" => {
             require_no_params(params)?;
-            let recent = state
-                .store
-                .recent_canonical_bounds(state.config.chain_id)
-                .await
-                .map_err(|error| RpcError::store(&error))?;
-            let cursor = state
-                .store
-                .processor_cursor(state.progress.descriptor())
-                .await
-                .map_err(|error| RpcError::store(&error))?;
-            Ok(Value::String(hex_quantity(
-                recent.map(BlockRange::end).map_or_else(
-                    || cursor.map_or(0, |cursor| cursor.block_number.0),
-                    |block| block.0,
-                ),
-            )))
+            let head = canonical_head(state)
+                .await?
+                .ok_or_else(|| RpcError::data_unavailable_reason("canonical_head_unknown"))?;
+            Ok(Value::String(hex_quantity(head.number.0)))
         }
+
         "eth_syncing" => {
             require_no_params(params)?;
-            if state.config.readiness.live_ready() {
+            let head = canonical_head(state).await?;
+            if state.config.readiness.live_ready() && head.is_some() {
                 Ok(Value::Bool(false))
             } else {
-                let cursor = state
-                    .store
-                    .processor_cursor(state.progress.descriptor())
-                    .await
-                    .map_err(|error| RpcError::store(&error))?;
-                let current = cursor.map_or(0, |cursor| cursor.block_number.0);
+                let current = head.map_or(0, |head| head.number.0);
                 Ok(json!({
                     "startingBlock": hex_quantity(processor_start_block(state.progress.descriptor())),
                     "currentBlock": hex_quantity(current),
                     "highestBlock": hex_quantity(current),
                     "leani": {
                         "liveReady": false,
-                        "reason": "live_head_not_anchored"
+                        "reason": if head.is_some() { "live_head_not_anchored" } else { "canonical_head_unknown" }
                     }
                 }))
             }
@@ -2114,15 +2134,7 @@ async fn resolve_canonical_frame(
     required: CapabilitySet,
 ) -> Result<Option<BlockFrame>, RpcError> {
     let (number, on_demand) = match selector {
-        BlockSelector::Latest => (
-            state
-                .store
-                .recent_canonical_bounds(state.config.chain_id)
-                .await
-                .map_err(|error| RpcError::store(&error))?
-                .map(BlockRange::end),
-            false,
-        ),
+        BlockSelector::Latest => (canonical_head(state).await?.map(|head| head.number), true),
         BlockSelector::Finalized => (Some(finalized_head(state).await?), true),
         BlockSelector::Number(number) => (Some(number), true),
         BlockSelector::Hash(_) => {
@@ -2610,7 +2622,7 @@ async fn eth_get_logs(
             .ok_or_else(|| RpcError::data_unavailable_reason("block_hash_not_retained"))?;
         (block.number, block.number)
     } else {
-        let latest = recent_bounds.map(BlockRange::end);
+        let latest = canonical_head(state).await?.map(|head| head.number);
         (
             log_range_bound(state, filter.from, latest).await?,
             log_range_bound(state, filter.to, latest).await?,
@@ -2650,11 +2662,12 @@ async fn eth_get_logs(
     // The encoded array's brackets; each log adds its length and a comma.
     let mut output_bytes = 2_usize;
     for frame in frames {
-        let Material::Complete(logs) = &frame.logs else {
-            return Err(RpcError::data_unavailable_reason(
-                "complete_logs_not_retained",
-            ));
-        };
+        let scope = historical_log_filters(BlockRange::single(frame.block.number), &filter).scope;
+        let allow_dataset = state.config.history.as_ref().is_some_and(|history| {
+            history.config.verification_policy == VerificationPolicy::TrustedDataset
+        });
+        let logs = logs_cover(&frame, &scope, allow_dataset)
+            .ok_or_else(|| RpcError::data_unavailable_reason("complete_logs_not_retained"))?;
         for log in logs {
             if !filter.matches(log) {
                 continue;
@@ -2713,7 +2726,10 @@ async fn resolve_log_frames(
     {
         return read_recent_frames(state, range).await;
     }
-    if recent_latest.is_some_and(|latest| range.end() > latest) {
+    if canonical_head(state)
+        .await?
+        .is_some_and(|head| range.end() > head.number)
+    {
         return Err(RpcError::data_unavailable_reason(
             "requested_log_range_exceeds_known_head",
         ));
@@ -2726,7 +2742,9 @@ async fn resolve_log_frames(
     let history_end = recent_earliest.map_or(range.end(), |earliest| {
         BlockNumber(range.end().0.min(earliest.0.saturating_sub(1)))
     });
-    let mut frames = if range.start() <= history_end {
+    let mut frames = if range.start() <= history_end
+        && recent_earliest.is_none_or(|earliest| range.start() < earliest)
+    {
         let historical_range = BlockRange::new(range.start(), history_end)
             .map_err(|_| RpcError::data_unavailable_reason("historical_log_range_invalid"))?;
         history
@@ -2760,6 +2778,30 @@ async fn resolve_log_frames(
             }
             frames.extend(recent);
         }
+    }
+    if let Some(latest) = recent_latest
+        && range.end() > latest
+    {
+        let start = range.start().max(BlockNumber(latest.0.saturating_add(1)));
+        let suffix_range = BlockRange::new(start, range.end())
+            .map_err(|_| RpcError::data_unavailable_reason("historical_log_range_invalid"))?;
+        let suffix = history
+            .fetch(
+                state.config.chain_id,
+                suffix_range,
+                CapabilitySet::of(Capability::Logs),
+                historical_log_filters(suffix_range, filter),
+            )
+            .await
+            .map_err(RpcError::history)?;
+        if let (Some(prior), Some(next)) = (frames.last(), suffix.first())
+            && next.block.parent_hash != prior.block.hash
+        {
+            return Err(RpcError::data_unavailable_reason(
+                "historical_recent_handoff_mismatch",
+            ));
+        }
+        frames.extend(suffix);
     }
     if u64::try_from(frames.len()).unwrap_or(u64::MAX) != range.len() {
         return Err(RpcError::data_unavailable_reason(
@@ -3768,7 +3810,10 @@ mod tests {
             json!({"jsonrpc":"2.0","id":2,"method":"eth_blockNumber"}),
         )
         .await;
-        assert_eq!(block.expect("body")["result"], "0x0");
+        assert_eq!(
+            block.expect("body")["error"]["data"]["reason"],
+            "canonical_head_unknown"
+        );
     }
 
     #[tokio::test]
@@ -4480,6 +4525,59 @@ mod tests {
         assert_eq!(logs.len(), 3);
         assert_eq!(logs[0]["blockNumber"], "0x1");
         assert_eq!(logs[2]["blockNumber"], "0x3");
+    }
+
+    #[tokio::test]
+    async fn latest_logs_join_history_on_both_sides_of_the_recent_window() {
+        // A canonical anchor can advance without retaining its raw frame.
+        // Exercise a historical prefix and the genesis boundary separately.
+        for recent_start in [0, 2] {
+            let (mut state, store, _directory) = test_state_and_store().await;
+            let mut parent = BlockHash::ZERO;
+            let frames = (0_u8..=4)
+                .map(|number| {
+                    let frame = with_log(fixture_frame(u64::from(number), parent), number);
+                    parent = frame.block.hash;
+                    frame
+                })
+                .collect::<Vec<_>>();
+            for frame in &frames[recent_start..=3] {
+                store.store_recent_frame(frame).await.unwrap();
+            }
+            store
+                .store_canonical_anchor(ChainId(1), frames[4].block, Finality::Finalized)
+                .await
+                .unwrap();
+            state.config.history = Some(test_history(vec![history_source(
+                "history-around-recent",
+                BlockRange::new(BlockNumber(0), BlockNumber(4)).unwrap(),
+                CapabilitySet::of(Capability::Logs),
+                0,
+                frames,
+            )]));
+            let router = http_router_with_progress(
+                state.store,
+                state.progress,
+                state.blob_schedule,
+                state.config,
+                state.committed_events,
+            );
+            let (_, response) = call(
+                router,
+                json!({
+                    "jsonrpc":"2.0", "id":1, "method":"eth_getLogs",
+                    "params":[{"fromBlock":"0x0", "toBlock":"latest"}]
+                }),
+            )
+            .await;
+            let response = response.unwrap();
+            let logs = response["result"]
+                .as_array()
+                .unwrap_or_else(|| panic!("{response}"));
+            assert_eq!(logs.len(), 5);
+            assert_eq!(logs[0]["blockNumber"], "0x0");
+            assert_eq!(logs[4]["blockNumber"], "0x4");
+        }
     }
 
     fn rpc_frame(number: u64) -> BlockFrame {
@@ -5996,6 +6094,190 @@ mod tests {
             slow_client_close(usize::MAX),
         ] {
             assert!(close.reason.as_str().len() <= 123, "{close:?}");
+        }
+    }
+    #[tokio::test]
+    async fn canonical_head_survives_without_raw_frames_or_processor_progress() {
+        let (router, store, _directory) = test_router_and_store().await;
+        let block = fixture_frame(26_000_000, BlockHash::ZERO).block;
+        store
+            .store_canonical_anchor(ChainId(1), block, Finality::Finalized)
+            .await
+            .unwrap();
+        let (_, response) = call(
+            router.clone(),
+            json!({"jsonrpc":"2.0","id":1,"method":"eth_blockNumber"}),
+        )
+        .await;
+        assert_eq!(response.unwrap()["result"], "0x18cba80");
+        let (_, syncing) = call(
+            router,
+            json!({"jsonrpc":"2.0","id":2,"method":"eth_syncing"}),
+        )
+        .await;
+        assert_eq!(syncing.unwrap()["result"]["currentBlock"], "0x18cba80");
+    }
+
+    #[tokio::test]
+    async fn historical_logs_accept_only_projections_covering_the_entire_query() {
+        let (mut state, _store, _directory) = test_state_and_store().await;
+        let mut frame = with_log(fixture_frame(9, BlockHash::ZERO), 1);
+        frame.finality = Finality::Finalized;
+        let range = BlockRange::single(frame.block.number);
+        let values = frame.logs.as_complete().unwrap().clone();
+        let mut descriptor = fixture_source_descriptor("xatu-shaped-logs", range);
+        descriptor.capabilities = CapabilitySet::of(Capability::Logs);
+        descriptor.complete_capabilities = CapabilitySet::NONE;
+        descriptor.trust = TrustModel::TrustedDataset;
+        for (completeness, scope, accepted) in [
+            (Completeness::DatasetDeclared, FilterScope::default(), true),
+            (Completeness::Partial, FilterScope::default(), false),
+            (
+                Completeness::DatasetDeclared,
+                FilterScope {
+                    addresses: vec![Address::new([0xff; 20])],
+                    ..FilterScope::default()
+                },
+                false,
+            ),
+        ] {
+            frame.logs = Material::Filtered {
+                value: values.clone(),
+                scope,
+                completeness,
+            };
+            let source = Arc::new(ScriptedHistorySource::new(
+                descriptor.clone(),
+                vec![ScriptedChunk {
+                    range,
+                    schema_version: descriptor.schema_version.clone(),
+                    estimated_bytes: None,
+                    steps: vec![HistoryStep::Frame(Box::new(frame.clone()))],
+                }],
+            ));
+            state.config.history = Some(test_history(vec![source]));
+            let router = http_router_with_progress(
+                state.store.clone(),
+                state.progress.clone(),
+                state.blob_schedule.clone(),
+                state.config.clone(),
+                state.committed_events.clone(),
+            );
+            let (_, response) = call(router, json!({"jsonrpc":"2.0","id":1,"method":"eth_getLogs","params":[{"fromBlock":"0x9","toBlock":"0x9"}]})).await;
+            let response = response.unwrap();
+            if accepted {
+                assert_eq!(
+                    response["result"].as_array().unwrap().len(),
+                    1,
+                    "{response}"
+                );
+            } else {
+                assert!(response.get("error").is_some(), "{response}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn retained_dataset_logs_are_served_without_an_upstream_source() {
+        use leani_store_history::{
+            Compression, HistoryStore, HistoryStoreConfig, RawHistoryMaterialProfile,
+            RetainedHistorySource, RetainedHistorySourceConfig, SegmentDescriptor, SegmentId,
+            SegmentOwnerClaim, SegmentOwnerKind, SegmentReservation, VerificationClass,
+        };
+        for addresses in [Vec::new(), vec![Address::new([0x11; 20])]] {
+            let directory = tempfile::tempdir().unwrap();
+            let raw = HistoryStore::open(HistoryStoreConfig::new(directory.path()))
+                .await
+                .unwrap();
+            let mut frame = with_log(fixture_frame(9, BlockHash::ZERO), 7);
+            frame.finality = Finality::Finalized;
+            let values = frame.logs.as_complete().unwrap().clone();
+            frame.logs = Material::Filtered {
+                value: values,
+                scope: FilterScope {
+                    addresses: addresses.clone(),
+                    ..FilterScope::default()
+                },
+                completeness: Completeness::DatasetDeclared,
+            };
+            let material = RawHistoryMaterialProfile {
+                allow_filtered: true,
+                filters: FilterSet {
+                    scope: FilterScope {
+                        addresses: addresses.clone(),
+                        ..FilterScope::default()
+                    },
+                    ..FilterSet::default()
+                },
+                ..RawHistoryMaterialProfile::default()
+            };
+            let mut pending = raw
+                .begin_segment(
+                    SegmentId::new("rpc-retained-logs").unwrap(),
+                    SegmentDescriptor {
+                        chain_id: ChainId(1),
+                        range: BlockRange::single(frame.block.number),
+                        material_shape: material.shape_id(),
+                        present_capabilities: frame.capabilities().present,
+                        complete_capabilities: frame.capabilities().complete,
+                        verification: VerificationClass::TrustedDataset,
+                        trust: TrustModel::TrustedDataset,
+                    },
+                    Compression::Snappy,
+                    SegmentReservation::new(1_048_576, 1_048_576),
+                )
+                .await
+                .unwrap();
+            pending.append(&frame).unwrap();
+            pending
+                .commit(&[SegmentOwnerClaim {
+                    kind: SegmentOwnerKind::OperatorPin,
+                    owner_id: "logs".to_owned(),
+                }])
+                .await
+                .unwrap();
+            let source = RetainedHistorySource::new(
+                raw,
+                RetainedHistorySourceConfig::local(
+                    ChainId(1),
+                    material.shape_id(),
+                    CapabilitySet::of(Capability::Logs),
+                    VerificationClass::TrustedDataset,
+                    TrustModel::TrustedDataset,
+                )
+                .unwrap()
+                .with_material_profile(material),
+            )
+            .unwrap();
+            let (mut state, _store, _directory) = test_state_and_store().await;
+            state.config.history = Some(test_history(vec![Arc::new(source)]));
+            let router = http_router_with_progress(
+                state.store,
+                state.progress,
+                state.blob_schedule,
+                state.config,
+                state.committed_events,
+            );
+            let (_, body) = call(router.clone(), json!({"jsonrpc":"2.0","id":1,"method":"eth_getLogs","params":[{"fromBlock":"0x9","toBlock":"0x9","address":hex_bytes(&[0x11; 20])}]})).await;
+            let body = body.unwrap();
+            assert_eq!(
+                body["result"]
+                    .as_array()
+                    .unwrap_or_else(|| panic!("{body}"))
+                    .len(),
+                1
+            );
+            assert_eq!(body["result"][0]["data"], "0x07");
+            let (_, all_logs) = call(router, json!({"jsonrpc":"2.0","id":2,"method":"eth_getLogs","params":[{"fromBlock":"0x9","toBlock":"0x9"}]})).await;
+            let all_logs = all_logs.unwrap();
+            if addresses.is_empty() {
+                assert_eq!(all_logs["result"].as_array().unwrap().len(), 1);
+            } else {
+                assert_eq!(
+                    all_logs["error"]["code"], DATA_UNAVAILABLE,
+                    "an address-specific retained segment cannot answer an all-pools query: {all_logs}"
+                );
+            }
         }
     }
 }

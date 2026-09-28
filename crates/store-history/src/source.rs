@@ -39,6 +39,7 @@ pub struct RetainedHistorySourceConfig {
     pub trust: TrustModel,
     pub priority: u16,
     pub required_profile: RawHistoryProfile,
+    pub material_profile: Option<RawHistoryMaterialProfile>,
 }
 
 impl RetainedHistorySourceConfig {
@@ -76,7 +77,16 @@ impl RetainedHistorySourceConfig {
             trust,
             priority: 0,
             required_profile: RawHistoryProfile::ProcessorReuse,
+            material_profile: None,
         })
+    }
+
+    /// Describe the shape so a narrower log predicate can reuse its frames.
+    /// Construction verifies that this profile hashes to `material_shape`.
+    #[must_use]
+    pub fn with_material_profile(mut self, profile: RawHistoryMaterialProfile) -> Self {
+        self.material_profile = Some(profile);
+        self
     }
 
     #[must_use]
@@ -147,6 +157,10 @@ impl RetainedHistorySource {
         config: RetainedHistorySourceConfig,
     ) -> Result<Self, SourceError> {
         if config.chain_id.0 == 0
+            || config
+                .material_profile
+                .as_ref()
+                .is_some_and(|profile| profile.shape_id() != config.material_shape)
             || config.capabilities == CapabilitySet::NONE
             || config.capabilities.contains(Capability::Mempool)
             || (config.log_fields != LogFieldSet::NONE
@@ -168,7 +182,15 @@ impl RetainedHistorySource {
             // authoritative exact cover check.
             range: None,
             capabilities: config.capabilities,
-            complete_capabilities: config.capabilities,
+            complete_capabilities: if config
+                .material_profile
+                .as_ref()
+                .is_some_and(|profile| profile.allow_filtered)
+            {
+                CapabilitySet::NONE
+            } else {
+                config.capabilities
+            },
             trust: config.trust,
             finality: FinalityModel::Finalized,
             partitioning: Partitioning::SourceDefined("raw-segment".to_owned()),
@@ -216,11 +238,15 @@ impl RetainedHistorySource {
             {
                 continue;
             }
-            available = available.union(descriptor.complete_capabilities.with_derivable());
-            if descriptor
-                .complete_capabilities
-                .with_derivable()
-                .contains_all(request.required)
+            let supplied = if request.allow_filtered
+                && request.verification_policy != VerificationPolicy::CompleteCryptographic
+            {
+                descriptor.present_capabilities.with_derivable()
+            } else {
+                descriptor.complete_capabilities.with_derivable()
+            };
+            available = available.union(supplied);
+            if supplied.contains_all(request.required)
                 && descriptor.verification >= required_verification
                 && descriptor.trust >= required_trust
                 && descriptor.trust >= self.config.trust
@@ -236,6 +262,27 @@ impl RetainedHistorySource {
             )
         });
         Ok((compatible, available))
+    }
+
+    fn material_covers(&self, request: &DataRequest) -> bool {
+        if self.config.material_shape == MaterialShapeId::COMPLETE_EXECUTION
+            || RawHistoryMaterialProfile::from_request(request).shape_id()
+                == self.config.material_shape
+        {
+            return true;
+        }
+        // Scope inclusion is sufficient for logs when every requested field
+        // is retained. Other material keeps its exact shape requirement.
+        let Some(profile) = &self.config.material_profile else {
+            return false;
+        };
+        request.required == CapabilitySet::of(Capability::Logs)
+            && request.allow_filtered
+            && profile.log_fields.contains_all(request.log_fields)
+            && profile.projection.log_fields.is_empty()
+            && profile.filters.senders.is_empty()
+            && profile.filters.recipients.is_empty()
+            && profile.filters.scope.covers(&request.filters.scope)
     }
 
     fn compatible_lookup_segment(&self, record: &SegmentRecord, required: CapabilitySet) -> bool {
@@ -411,6 +458,7 @@ impl HistorySource for RetainedHistorySource {
         Ok(sliced)
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn plan(&self, request: &DataRequest) -> Result<SourcePlan, SourceError> {
         if request.chain_id != self.config.chain_id {
             return Err(SourceError::MissingRange(request.range));
@@ -427,10 +475,7 @@ impl HistorySource for RetainedHistorySource {
                 available: self.config.capabilities.with_derivable().bits(),
             });
         }
-        if self.config.material_shape != MaterialShapeId::COMPLETE_EXECUTION
-            && RawHistoryMaterialProfile::from_request(request).shape_id()
-                != self.config.material_shape
-        {
+        if !self.material_covers(request) {
             return Err(SourceError::MissingMaterial {
                 gaps: vec![request.range],
                 required: request.required.bits(),
@@ -455,10 +500,12 @@ impl HistorySource for RetainedHistorySource {
         let mut chunks = Vec::with_capacity(selected.len());
         let mut physical_plan = Vec::with_capacity(selected.len());
         let mut estimated_bytes = Some(0_u64);
+        let mut supplied = CapabilitySet::ALL;
         let mut complete = CapabilitySet::ALL;
         let mut trust = self.config.trust;
         for (record, range) in selected {
             let descriptor = &record.metadata.descriptor;
+            supplied = supplied.intersection(descriptor.present_capabilities.with_derivable());
             complete = complete.intersection(descriptor.complete_capabilities.with_derivable());
             trust = trust.min(descriptor.trust);
             let estimate = record
@@ -480,7 +527,16 @@ impl HistorySource for RetainedHistorySource {
                 )],
                 estimated_bytes: estimate,
                 trust: descriptor.trust,
-                completeness: "complete retained frame".to_owned(),
+                completeness: if descriptor
+                    .complete_capabilities
+                    .with_derivable()
+                    .contains_all(request.required)
+                {
+                    "complete retained frame"
+                } else {
+                    "filtered retained frame; consumer validates predicate completeness"
+                }
+                .to_owned(),
                 derived: false,
             });
             chunks.push(SourceChunk {
@@ -503,7 +559,7 @@ impl HistorySource for RetainedHistorySource {
             chunks,
             estimated_bytes,
             estimated_lag: Duration::ZERO,
-            supplied: complete,
+            supplied,
             complete,
             trust,
             schema_version: RETAINED_SCHEMA_VERSION.to_owned(),

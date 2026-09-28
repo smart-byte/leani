@@ -4251,7 +4251,11 @@ pub(crate) fn configured_history_sources(
                     leani_store_history::VerificationClass::TrustedDataset,
                     leani_primitives::TrustModel::TrustedDataset,
                 )
-                .map(|config| config.with_log_fields(log_fields))
+                .map(|config| {
+                    config
+                        .with_log_fields(log_fields)
+                        .with_material_profile(material.clone())
+                })
                 .map_err(anyhow::Error::msg)?,
             )
             .map_err(anyhow::Error::msg)?,
@@ -4288,6 +4292,54 @@ pub(crate) fn configured_history_sources(
         );
     }
     Ok((selected, policy))
+}
+
+fn retained_rpc_log_sources(
+    chain_id: leani_primitives::ChainId,
+    store: &leani_store_history::HistoryStore,
+    processors: &[Arc<dyn leani_processor_api::Processor>],
+) -> Result<Vec<Arc<dyn leani_source_api::HistorySource>>> {
+    use leani_primitives::{Capability, CapabilitySet, LogFieldSet, TrustModel};
+    use leani_store_history::{
+        RawHistoryMaterialProfile, RetainedHistorySource, RetainedHistorySourceConfig,
+        VerificationClass,
+    };
+    let mut profiles = vec![RawHistoryMaterialProfile {
+        allow_filtered: true,
+        ..RawHistoryMaterialProfile::default()
+    }];
+    for processor in processors {
+        if processor
+            .descriptor()
+            .requirements
+            .iter()
+            .any(|requirement| requirement.capabilities.contains(Capability::Logs))
+        {
+            let profile = processor_raw_material_profile(processor.as_ref());
+            if profile.allow_filtered && profile.log_fields.contains_all(LogFieldSet::ALL) {
+                profiles.push(profile);
+            }
+        }
+    }
+    let mut shapes = std::collections::BTreeSet::new();
+    let mut sources = Vec::new();
+    for profile in profiles {
+        let shape = profile.shape_id();
+        if !shapes.insert(shape.0) {
+            continue;
+        }
+        let config = RetainedHistorySourceConfig::local(
+            chain_id,
+            shape,
+            CapabilitySet::of(Capability::Logs),
+            VerificationClass::TrustedDataset,
+            TrustModel::TrustedDataset,
+        )?
+        .with_material_profile(profile);
+        sources.push(Arc::new(RetainedHistorySource::new(store.clone(), config)?)
+            as Arc<dyn leani_source_api::HistorySource>);
+    }
+    Ok(sources)
 }
 
 fn configured_rpc_history_sources(
@@ -5409,6 +5461,13 @@ async fn serve(path: &Path, registry: &ProcessorRegistry) -> Result<Exit> {
         );
         if let Some(retained) = retained_history_source {
             rpc_sources.push(retained);
+        }
+        if let Some(raw) = &raw_history_store {
+            rpc_sources.extend(retained_rpc_log_sources(
+                leani_primitives::ChainId(config.get().chain.chain_id),
+                raw,
+                &processors,
+            )?);
         }
         rpc_sources.extend(external_history_sources);
         Some(
