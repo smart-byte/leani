@@ -533,12 +533,14 @@ impl VerifierPool {
         self.newest_agreed = None;
         self.endpoints = (0..endpoints).map(|_| EndpointVerifier::Idle).collect();
     }
+}
 
-    fn any_ready(&self) -> bool {
-        self.endpoints
-            .iter()
-            .any(|endpoint| matches!(endpoint, EndpointVerifier::Ready(_)))
-    }
+/// Whether any endpoint verified a finality anchor in `report`.
+fn verified_any(report: &FinalityProbeReport) -> bool {
+    report
+        .endpoints
+        .iter()
+        .any(|endpoint| endpoint.anchor.is_some())
 }
 
 impl VerifiedBeaconApi {
@@ -605,8 +607,9 @@ impl VerifiedBeaconApi {
     }
 
     /// Follow `checkpoint` and poll every endpoint once. When no endpoint
-    /// serves a bootstrap for a persisted start anchor, fall back to the
-    /// checkpoint itself.
+    /// verifies finality from a persisted start anchor, try the checkpoint
+    /// itself, and keep it only if it verifies anything: past its age limit it
+    /// never will, and the persisted anchor exists to outlive it.
     async fn start_and_poll(
         &self,
         checkpoint: TrustedCheckpoint,
@@ -614,15 +617,25 @@ impl VerifiedBeaconApi {
         let mut pool = self.verifiers.lock().await;
         let mut start = self.follow(&mut pool, checkpoint);
         let mut report = self.poll(&mut pool).await;
-        if !report.accepted && start.persisted && !pool.any_ready() {
+        // An endpoint that bootstraps the persisted root but never verifies
+        // finality must not hold the fallback off.
+        if !report.accepted && start.persisted && !verified_any(&report) {
             warn!(
                 beacon_slot = start.slot,
-                "no endpoint served a bootstrap for the persisted finality anchor; bootstrapping from the configured checkpoint"
+                "no endpoint verified finality from the persisted finality anchor; trying the configured checkpoint"
             );
             let checkpoint = pool.checkpoint.unwrap_or(checkpoint);
-            start = StartAnchor::configured(checkpoint);
-            pool.restart(checkpoint, start, self.config.endpoints.len());
-            report = self.poll(&mut pool).await;
+            let configured = StartAnchor::configured(checkpoint);
+            pool.restart(checkpoint, configured, self.config.endpoints.len());
+            let fallback = self.poll(&mut pool).await;
+            if fallback.accepted || verified_any(&fallback) {
+                start = configured;
+                report = fallback;
+            } else {
+                // A transient outage verifies nothing either way: follow the
+                // persisted anchor again, which a later poll may reach.
+                pool.restart(checkpoint, start, self.config.endpoints.len());
+            }
         }
         drop(pool);
         self.persist(&report, start).await;
@@ -1961,6 +1974,46 @@ mod tests {
             transport.count(&format!("bootstrap/{:#x}", B256::from([0x66; 32]))),
             2
         );
+    }
+
+    #[tokio::test]
+    async fn an_outage_at_startup_keeps_the_persisted_anchor() {
+        // The configured checkpoint is past its age limit and served by no
+        // endpoint, which the persisted anchor exists to outlive. An outage
+        // at startup verified nothing either way, and fell back to it for good.
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join(FINALITY_ANCHOR_FILE);
+        persist_finality_anchor(
+            &path,
+            &PersistedFinalityAnchor {
+                anchor: bootstrap_anchor(),
+                checkpoint_root: UNSERVED_ROOT,
+            },
+        )
+        .expect("persist anchor");
+        let transport = Arc::new(FixtureTransport::default());
+        transport
+            .unavailable
+            .lock()
+            .expect("unavailable endpoints")
+            .push("https://a.example/".to_owned());
+        let source = fixture_source(
+            &["https://a.example/"],
+            &transport,
+            Clock::new(move || {
+                UNIX_EPOCH + Duration::from_secs(slot_time(BOOTSTRAP_SLOT) + 13 * DAY)
+            }),
+            read_write(&path),
+        );
+        assert!(!source.probe_root(operator(UNSERVED_ROOT)).await.accepted);
+        transport
+            .unavailable
+            .lock()
+            .expect("unavailable endpoints")
+            .clear();
+        let report = source.probe_root(operator(UNSERVED_ROOT)).await;
+        assert!(report.accepted, "{:?}", report.disagreements);
+        assert_eq!(report.checkpoint_root, <[u8; 32]>::from(BOOTSTRAP_ROOT));
     }
 
     #[tokio::test]

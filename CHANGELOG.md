@@ -1107,8 +1107,10 @@ Take these steps in order; each links to the entries below that detail it.
   configured checkpoint and younger than 14 days, so the configured
   checkpoint's age no longer matters after the first start. A corrupt or
   unreadable anchor file falls back to the configured checkpoint with a
-  warning, and so does a persisted anchor whose bootstrap no endpoint or peer
-  serves. A Beacon API endpoint that is down at start or bootstraps slowly
+  warning. So does a persisted anchor from which no Beacon API endpoint
+  verifies finality at start, or whose bootstrap no peer serves, but only
+  if the configured checkpoint then verifies: an outage at start keeps the
+  persisted anchor. A Beacon API endpoint that is down at start or bootstraps slowly
   bootstraps later from the newest agreed anchor, so it can join after the
   configured checkpoint ages out; its bootstrap is no longer cancelled by the
   agreement grace period.
