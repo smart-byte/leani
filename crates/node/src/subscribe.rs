@@ -6782,7 +6782,7 @@ mod tests {
         assert!(local_state::is_subscription_directory(&target));
         assert!(!target.join("checkpoint.json").exists());
         assert!(sibling.join("checkpoint.json").is_file());
-        assert!(reset_subscription_directory(&target, None, root.path(), true).is_ok());
+        reset_subscription_directory(&target, None, root.path(), true).expect("reset again");
         assert!(reset_subscription_directory(root.path(), None, root.path(), true).is_err());
     }
 
