@@ -24,7 +24,7 @@ replace the image's `serve` command, so name the profile with `--config`:
 docker compose stop leani
 docker compose run --rm leani backfill --config /etc/leani/node.toml \
   --processor blobs-money --from 19426589 --to 19427588
-docker compose start leani
+docker compose up -d leani
 ```
 
 Keep `LEANI_API_TOKEN` exported for these commands too: Compose resolves it
@@ -509,9 +509,11 @@ complete `data_dir` (SQLite database/WAL plus `processor-artifacts`) or use an
 atomic filesystem/volume snapshot.
 
 Verify the backup using an otherwise identical config whose `data_dir` points
-to an isolated directory. Never overwrite the active database. Stop the
-service, move the active database aside, copy the verified backup into place,
-then start the previous compatible binary. Retain the moved database until
+to an isolated directory, with the binary that will open it: a newer binary
+upgrades the copy. Never overwrite the active database. Stop the service, move
+the active database aside with its `leani.sqlite-wal` and `leani.sqlite-shm`
+files, since SQLite would replay a leftover WAL onto the restored copy, copy
+the verified backup into place, then start the previous compatible binary. Retain the moved database until
 coverage, processor counts, cursors, and subscriptions are verified.
 
 `db compact` checkpoints the WAL and vacuums the active database; immutable

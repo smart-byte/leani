@@ -65,8 +65,9 @@ rolling back means restoring the pre-upgrade backup with the previous binary
 and losing what the node indexed since; the upgraded store itself cannot be
 downgraded.
 
-The preflight costs one read-only connection and one point lookup per
-configured processor, and only when the store's schema is older than the
+The preflight opens one read-only connection whenever an existing store is
+opened with configured processors, to read its schema version, and adds one
+point lookup per configured processor only when that schema is older than the
 binary's. Other `leani db` commands, such as `inspect`, `verify`, and
 `compact`, still upgrade the store they open.
 
@@ -90,5 +91,6 @@ run on the data directory, then copy the data directory or run
 the schema. Tiered artifact segments need a copy of the whole data directory.
 Rebuild processors whose identity changed under new `instance` IDs; the old
 instances' rows stay in the store and count toward its physical budget. To
-roll back after the upgrade, stop the node, move the upgraded store aside,
-and restore the backup with the rc.1 binary.
+roll back after the upgrade, stop the node, move the upgraded store aside
+with its `-wal` and `-shm` files, and restore the backup with the rc.1
+binary.

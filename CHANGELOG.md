@@ -11,8 +11,10 @@ record, and documented RPC contracts.
 Take these steps in order; each links to the entries below that detail it.
 
 1. Stop the node and every `leani subscribe` run on the data directory, then
-   copy `data_dir` or run `leani db backup` with the rc.1 binary. The first
-   start upgrades the store from schema 21 to 23, which cannot be undone
+   copy `data_dir`. `leani db backup` with the rc.1 binary copies only the
+   node store, not the `subscriptions/` stores. Verify a backup with the rc.1
+   binary: opening it with the new one upgrades the copy. The first start
+   upgrades the store from schema 21 to 23, which cannot be undone
    ([schema](#rc1-schema)).
 2. Fix the configuration:
    - a relative `data_dir` or archive `manifest` now resolves beside the
@@ -34,7 +36,9 @@ Take these steps in order; each links to the entries below that detail it.
    `erc20-balances` and `evm-events` at 1.1.0 ([rebuild](#rc1-rebuild)),
    keyed `evm-events` stored block-local ([keyed](#rc1-keyed-evm-events)),
    `blobs-money` at 1.5.0 ([blobs](#rc1-blobs-money)), `block-summary`
-   at 1.2.0 (compact `[blocks]` selects a new instance automatically), and a compact
+   at 1.2.0 ([blocks](#rc1-block-summary); compact `[blocks]` selects a new
+   instance automatically, and `leani subscribe blocks` starts cold in a new
+   state directory), and a compact
    `[uniswap]` node or `leani subscribe uniswap-v3` with ETH/USDT or WBTC/ETH
    ([Uniswap](#rc1-uniswap)). The container profile brings its renamed
    instance ([container](#rc1-container)), and the `windowed` profile its new
@@ -371,7 +375,7 @@ Take these steps in order; each links to the entries below that detail it.
   with `-32004` (`block_not_retained`, or the history source's reason)
   instead of `null`, and so does a block hash that the recent window lacks
   when no history block-hash lookup is configured, and `latest` on a node
-  that retains no block. This covers `eth_getBlockByNumber`,
+  that knows no canonical head. This covers `eth_getBlockByNumber`,
   `eth_getBlockByHash`, `eth_getBlockReceipts`,
   `eth_getBlockTransactionCountBy*`, and `eth_getTransactionByBlock*AndIndex`.
   Ethereum clients read `null` as "no such block", so a reorg checker
@@ -379,6 +383,12 @@ Take these steps in order; each links to the entries below that detail it.
   Clients that took `null` for "not available here" must handle `-32004`. A
   block number above the head that no history source covers now reads as
   `null` instead of failing with `no_viable_historical_source`.
+- Breaking (JSON-RPC): `eth_blockNumber`, `latest` and
+  `eth_syncing.currentBlock` report the head in the node's canonical
+  metadata, never a processor's cursor or block 0. Until a head is known,
+  `eth_blockNumber` fails with `-32004` (`canonical_head_unknown`). Nothing
+  records a head on a node without live following, such as the shipped
+  historical-only profiles, so there the error persists.
 - Breaking (JSON-RPC): requests and parameters follow the JSON-RPC 2.0 and
   Ethereum specifications more closely:
   - A call with `"id": null` gets a response with a `null` ID; it was taken
@@ -517,7 +527,10 @@ Take these steps in order; each links to the entries below that detail it.
   keep working; and starts every consumer's delivered sequence at its stream
   head, so acknowledgements of changes delivered before the upgrade still
   pass. A schema-21 or -22 store upgrades in place on its next start; earlier
-  binaries then refuse it, so keep a backup if you might roll back. A backup
+  binaries then refuse it, so keep a backup if you might roll back. To roll
+  back, move `leani.sqlite` aside with its `-wal` and `-shm` files before
+  restoring the backup: SQLite replays a leftover WAL onto the restored
+  copy. A backup
   holds the secret. Before it upgrades an older store, a command that
   registers processors, `serve`, `backfill`, the runtime of
   `leani subscribe`, or `leani e2e mainnet --resume`, reads the store
@@ -600,10 +613,9 @@ Take these steps in order; each links to the entries below that detail it.
 - <a id="rc1-container"></a>Breaking (container): `deploy/container.toml`
   runs `blobs-money` 1.5.0 as the new instance `blobs-container-1-5`, so
   clients that name it by instance, in API routes or stream IDs, use the new
-  name, and its data is indexed afresh. The profile kept rc.1's
-  `blobs-container` instance at the new version, which the store refuses, so
-  the container restarted without end and its upgraded volume opened with
-  neither image. On an rc.1 volume, the new image starts beside the earlier
+  name, and its data is indexed afresh. The store refuses 1.5.0 under rc.1's
+  `blobs-container` instance, which would keep the container from starting on
+  an rc.1 volume. On an rc.1 volume, the new image starts beside the earlier
   instance, whose rows stay inert and count toward
   `[budgets.store] maximum_physical_bytes`. For a clean slate, run
   `docker compose down -v` before `docker compose up --build`, which deletes
@@ -621,10 +633,10 @@ Take these steps in order; each links to the entries below that detail it.
 - <a id="rc1-windowed"></a>Breaking (profiles): the `windowed` profile's
   `uniswap-v2-sync-30d` keeps every Uniswap V2 `Sync` event, stamped with its
   hour, in `uniswap_v2.sync`, instead of the last one per hour in
-  `uniswap_v2.sync_hourly`. Keyed `evm-events` output is ordered since 1.1.0,
-  so the profile had lost its bounded window: materialization jobs refused
-  it, a rerun of the quickstart backfill was refused, and its coverage never
-  compacted. Its keyless output is block-local again. A store that holds the
+  `uniswap_v2.sync_hourly`. Keyed `evm-events` output is ordered since 1.1.0
+  ([keyed](#rc1-keyed-evm-events)), which would cost the profile its bounded
+  window: materialization jobs, reruns of the quickstart backfill and
+  coverage compaction need block-local output, which keyless output keeps. A store that holds the
   profile's `evm-events` 1.0.0 instance from 0.1.0-rc.1 refuses the new one,
   as for any instance above: rebuild it under a new `instance` or in a new
   `data_dir`.
@@ -1061,12 +1073,18 @@ Take these steps in order; each links to the entries below that detail it.
 - Shipped configurations are validated with a standard JSON Schema validator,
   including types, bounds, patterns and exact `oneOf` semantics. The Serde
   field/enum parity probe remains a separate contract check.
-- `block-summary` 1.2.0 accepts trusted dataset projections with full gas
+- <a id="rc1-block-summary"></a>`block-summary` 1.2.0 accepts trusted dataset projections with full gas
   fields and a checked transaction count. Xatu keeps this material marked
   dataset-declared; it does not advertise cryptographically complete bodies.
   Advanced configurations must use version 1.2.0 with a new instance to
   rebuild existing summaries. Compact `[blocks]` configurations use the new
   instance `block-summary-1-2`, preserving the old instance's stored rows.
+  `leani subscribe blocks` keys its state directory by this version, so it
+  starts cold; run `leani reset subscription blocks` with the rc.1 binary
+  first to remove the old directory. Xatu history now expects its daily
+  export cadence (24 hours, from 15 minutes): a missing or incomplete
+  partition is retried for up to 96 hours before its job fails, and the
+  planner ranks Xatu after sources that expect a shorter lag.
 
 - <a id="rc1-finality-anchor"></a>Verified finality no longer stops about 14
   days after the configured checkpoint's slot. Beacon API finality keeps one
