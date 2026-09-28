@@ -21,9 +21,9 @@ curl --fail --silent --show-error --location \
   "https://github.com/EmbarkStudios/cargo-about/releases/download/$version/$package.tar.gz" \
   --output "$work_directory/$package.tar.gz"
 if command -v sha256sum >/dev/null 2>&1; then
-  printf '%s  %s\n' "$checksum" "$work_directory/$package.tar.gz" | sha256sum --check
+  printf '%s  %s\n' "$checksum" "$work_directory/$package.tar.gz" | sha256sum -c -
 else
-  printf '%s  %s\n' "$checksum" "$work_directory/$package.tar.gz" | shasum -a 256 --check
+  printf '%s  %s\n' "$checksum" "$work_directory/$package.tar.gz" | shasum -a 256 -c -
 fi
 tar -xzf "$work_directory/$package.tar.gz" -C "$work_directory"
 mkdir -p "$1"
