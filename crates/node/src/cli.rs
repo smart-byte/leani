@@ -138,6 +138,12 @@ pub enum Command {
         from: u64,
         #[arg(long)]
         to: u64,
+        /// Submit to an already running node, preserving an optional URL prefix.
+        #[arg(long)]
+        endpoint: Option<url::Url>,
+        /// Bearer token for a running node.
+        #[arg(long, env = "LEANI_API_TOKEN", hide_env_values = true)]
+        token: Option<String>,
     },
     /// Inspect or probe configured data sources.
     Source {

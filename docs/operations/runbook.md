@@ -32,6 +32,19 @@ for every command. The processor starts at block 19,426,589 and is
 block-local, so later ranges may follow in any order. Then query the range.
 Subscriptions remain quiet until a live source commits events.
 
+A live-enabled node with a verified finalized head also accepts the CLI over
+its native API, without stopping it:
+
+```bash
+leani backfill --endpoint http://127.0.0.1:18080 \
+  --processor blobs-money --from 19426589 --to 19427588
+```
+
+The standalone form attaches the same verified P2P history fallback when
+`sources.live.kind = "p2p"`; the historical-only container profile above
+leaves P2P disabled. Use a live-enabled configuration when missing Xatu
+partitions must be recovered from peers.
+
 The profile protects the API with a bearer token from `LEANI_API_TOKEN`:
 `serve` fails to start without one of at least 16 printable ASCII characters
 without spaces, so export it, for example

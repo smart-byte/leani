@@ -526,6 +526,36 @@ embedded subscriptions. This also applies when both locations have state.
 Set an absolute path to select the intended store, or move the old state.
 Equivalent paths and symlink aliases of the same directory are accepted.
 
+### Historical CLI and node backfill
+
+`leani backfill --processor INSTANCE --from N --to M` uses the same history
+source assembly, configured pipeline, material coordinator and verified P2P
+fallback as node jobs. When live P2P is enabled, the standalone command
+verifies the configured finality anchor and opens its own persistent peer
+pool. It checks the finalized upper bound and honors
+`sources.live.history_fallback_blocks`. No live listeners or processors are
+started. Disabled P2P and retained-input-only policies remain in force.
+
+To use a running node and its existing peer pool:
+
+```bash
+leani backfill --endpoint http://127.0.0.1:18080 \
+  --processor INSTANCE --from N --to M
+```
+
+The command sends an authenticated materialization request and waits for its
+status. `LEANI_API_TOKEN` supplies the token without putting it in shell
+arguments. An optional endpoint path prefix is preserved. Ctrl-C cancels
+the submitted job. Without `--endpoint`, stop any process holding the data
+directory before starting standalone backfill.
+
+Xatu exports have table-specific coverage. In particular, a recent beacon
+file does not prove that the execution-transaction file needed for receipts
+has been published. Missing or incomplete partitions can fall back to the
+verified P2P bridge; dataset-only configurations need another available
+history source. Finality or peer failures are reported rather than silently
+removing the configured bridge.
+
 ### JSON-RPC limits
 
 Each limit has a `rpc` setting:

@@ -930,6 +930,26 @@
             "possibleValues": []
           },
           {
+            "id": "endpoint",
+            "long": "endpoint",
+            "short": null,
+            "help": "Submit to an already running node, preserving an optional URL prefix",
+            "required": false,
+            "action": "Set",
+            "defaultValues": [],
+            "possibleValues": []
+          },
+          {
+            "id": "token",
+            "long": "token",
+            "short": null,
+            "help": "Bearer token for a running node",
+            "required": false,
+            "action": "Set",
+            "defaultValues": [],
+            "possibleValues": []
+          },
+          {
             "id": "config",
             "long": "config",
             "short": null,

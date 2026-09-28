@@ -1,5 +1,6 @@
 //! Process-wide diagnostics, structured logging, cancellation, and exit policy.
 
+mod backfill;
 mod shutdown;
 
 use std::{
@@ -364,39 +365,15 @@ impl NativeBackfillControl {
         ),
         leani_api::BackfillControlError,
     > {
-        let (mut sources, verification_policy) =
-            configured_history_sources(&self.config, processor, self.raw_history_store.as_ref())
-                .map_err(|error| leani_api::BackfillControlError::Invalid(error.to_string()))?;
-        let configured = config_for_processor_descriptor(&self.config, processor.descriptor())
-            .map_err(|error| leani_api::BackfillControlError::Invalid(error.to_string()))?;
-        if configured.require_retained_input {
-            return Ok((sources, verification_policy));
-        }
-        let Some(bridge) = self.p2p_bridge.read().await.clone() else {
-            return Ok((sources, verification_policy));
-        };
-        let through = bridge.anchor.block.number.0;
-        let bridge_start = self
-            .config
-            .sources
-            .live
-            .history_fallback_start(through, configured.start_block);
-        if requested.end().0 < bridge_start || requested.start().0 > through {
-            return Ok((sources, verification_policy));
-        }
-        let available = leani_primitives::BlockRange::new(
-            leani_primitives::BlockNumber(bridge_start),
-            leani_primitives::BlockNumber(through),
+        let bridge = self.p2p_bridge.read().await.clone();
+        history_sources_with_bridge(
+            &self.config,
+            processor,
+            self.raw_history_store.as_ref(),
+            bridge.as_ref(),
+            requested,
         )
-        .map_err(|error| leani_api::BackfillControlError::Internal(error.to_string()))?;
-        let source = leani_source_p2p::RethP2pHistorySource::from_live_source(
-            bridge.source,
-            available,
-            bridge.anchor,
-        )
-        .map_err(|error| leani_api::BackfillControlError::Internal(error.to_string()))?;
-        sources.push(Arc::new(source));
-        Ok((sources, verification_policy))
+        .map_err(|error| leani_api::BackfillControlError::Invalid(error.to_string()))
     }
 
     fn processor(
@@ -3001,7 +2978,20 @@ pub async fn run_cli_with_registry(cli: Cli, registry: &ProcessorRegistry) -> Re
             processor,
             from,
             to,
-        } => backfill(&config_path, &processor, from, to, registry).await,
+            endpoint,
+            token,
+        } => {
+            backfill::run(
+                &config_path,
+                &processor,
+                from,
+                to,
+                endpoint.as_ref(),
+                token.as_deref(),
+                registry,
+            )
+            .await
+        }
         Command::Source {
             command: SourceCommand::Probe { source },
         } => probe_source(source, &config_path).await,
@@ -3435,93 +3425,6 @@ fn backfill_processor_config<'a>(
         );
     }
     Ok(configured)
-}
-
-async fn backfill(
-    config_path: &Path,
-    processor_id: &str,
-    from: u64,
-    to: u64,
-    registry: &ProcessorRegistry,
-) -> Result<Exit> {
-    use leani_primitives::{BlockNumber, BlockRange, ChainId};
-    use leani_runtime::{BackfillJob, HistoricalRuntime};
-    use leani_store_sqlite::SqliteStore;
-
-    let config = Config::load(config_path)
-        .with_context(|| format!("load configuration {}", config_path.display()))?
-        .validate()
-        .map_err(|errors| anyhow::anyhow!(errors))?
-        .into_inner();
-    let configured = backfill_processor_config(&config, processor_id)?;
-    let processor = registry.instantiate(configured, config.chain.chain_id)?;
-    let range = BlockRange::new(BlockNumber(from), BlockNumber(to))?;
-    let (sources, verification_policy) =
-        configured_history_sources(&config, processor.as_ref(), None)?;
-    let source_ids = sources
-        .iter()
-        .map(|source| source.descriptor().id.to_string())
-        .collect::<Vec<_>>();
-    info!(
-        processor = %processor.descriptor().instance,
-        requested_from = from,
-        requested_to = to,
-        requested_blocks = range.len(),
-        source_ids = ?source_ids,
-        "starting processor historical backfill"
-    );
-    let _data_dir_lock = crate::local_state::lock_runtime_directory(&config.data_dir)?;
-    let store = SqliteStore::open(
-        configured_store_config(&config, config.data_dir.join("leani.sqlite"))
-            .with_processors(vec![processor.descriptor().clone()]),
-    )
-    .await
-    .map_err(crate::uniswap_markets::explain_compact_refusal)?;
-    require_ordered_backfill_start(&store, processor.as_ref(), configured, from).await?;
-    // The configured pipeline, as the node's on-demand backfills use it.
-    let runtime_config = historical_runtime_config(&config, sources.len());
-    let runtime = HistoricalRuntime::new_with_sources(
-        store.clone(),
-        sources,
-        processor.clone(),
-        runtime_config,
-    )?;
-    let job = BackfillJob::for_processor(
-        format!("{processor_id}-{}-{from}-{to}", config.chain.chain_id),
-        processor.as_ref(),
-        ChainId(config.chain.chain_id),
-        range,
-        verification_policy,
-    )?;
-    let report = runtime
-        .run(
-            job,
-            historical_source_budget(&config, range),
-            CancellationToken::new(),
-        )
-        .await?;
-    if config.artifact_storage.backend == ArtifactStorageBackend::TieredSegments
-        && processor.descriptor().lifecycle.artifacts.mode
-            == leani_processor_api::ArtifactPolicyMode::Full
-    {
-        let compacted = NativeBackfillControl::flush_tiered_artifacts(
-            &store,
-            processor.descriptor(),
-            &[range],
-            config.artifact_storage.maximum_segments_per_cycle,
-        )
-        .await?;
-        info!(
-            processor_instance = %processor.descriptor().instance,
-            segments = compacted.segments,
-            artifacts = compacted.artifacts,
-            logical_bytes = compacted.logical_bytes,
-            reclaimed_inline_bytes = compacted.inline_payload_bytes_reclaimed,
-            "flushed CLI backfill artifacts to segments"
-        );
-    }
-    println!("{}", serde_json::to_string_pretty(&report)?);
-    Ok(Exit::Success)
 }
 
 async fn e2e(
@@ -4132,8 +4035,122 @@ fn processor_raw_material_profile(
     }
 }
 
-#[allow(clippy::too_many_lines)]
+fn historical_services(
+    config: &Config,
+) -> Result<(
+    leani_runtime::HistoricalPipelineBudget,
+    Option<leani_runtime::HistoricalMaterialCoordinator>,
+)> {
+    let history_pipeline = config.budgets.history_pipeline;
+    let pipeline_budget = leani_runtime::HistoricalPipelineBudget::new(
+        history_pipeline.maximum_active_chunks,
+        historical_map_task_capacity(config),
+        history_pipeline.maximum_mapped_bytes.bytes(),
+    )
+    .map_err(anyhow::Error::msg)?;
+    let history_material = config.budgets.history_material;
+    let material_coordinator = match history_material.mode {
+        HistoryMaterialCoordinatorMode::Disabled => None,
+        HistoryMaterialCoordinatorMode::Observe | HistoryMaterialCoordinatorMode::Enabled => {
+            let mode = match history_material.mode {
+                HistoryMaterialCoordinatorMode::Observe => {
+                    leani_runtime::HistoricalMaterialCoordinatorMode::Observe
+                }
+                HistoryMaterialCoordinatorMode::Enabled => {
+                    leani_runtime::HistoricalMaterialCoordinatorMode::Enabled
+                }
+                HistoryMaterialCoordinatorMode::Disabled => unreachable!(),
+            };
+            Some(
+                leani_runtime::HistoricalMaterialCoordinator::new_with_pipeline_budget(
+                    leani_runtime::HistoricalMaterialCoordinatorConfig {
+                        mode,
+                        memory_bytes: history_material.memory_bytes.bytes(),
+                        maximum_buffered_frames_per_acquisition: history_material
+                            .maximum_buffered_frames_per_acquisition,
+                        minimum_physical_chunk_blocks: history_material
+                            .minimum_physical_chunk_blocks,
+                        maximum_overfetch_ratio: history_material.maximum_overfetch_ratio,
+                    },
+                    &pipeline_budget,
+                )
+                .map_err(anyhow::Error::msg)?,
+            )
+        }
+    };
+    Ok((pipeline_budget, material_coordinator))
+}
+
+/// Static source discovery used by diagnostics and explicitly static runs.
 pub(crate) fn configured_history_sources(
+    config: &Config,
+    processor: &dyn leani_processor_api::Processor,
+    raw_history_store: Option<&leani_store_history::HistoryStore>,
+) -> Result<(
+    Vec<Arc<dyn leani_source_api::HistorySource>>,
+    leani_source_api::VerificationPolicy,
+)> {
+    let (sources, policy) = configured_history_candidates(config, processor, raw_history_store)?;
+    require_history_sources(&sources, processor)?;
+    Ok((sources, policy))
+}
+
+fn require_history_sources(
+    sources: &[Arc<dyn leani_source_api::HistorySource>],
+    processor: &dyn leani_processor_api::Processor,
+) -> Result<()> {
+    if sources.is_empty() {
+        bail!(
+            "no implemented history source can satisfy processor {}; configure compatible history or enable P2P with verified finality",
+            processor.descriptor().id
+        );
+    }
+    Ok(())
+}
+
+/// The same source assembly for standalone CLI, API jobs and automatic
+/// backfill. The bridge is added before deciding that no source is viable.
+fn history_sources_with_bridge(
+    config: &Config,
+    processor: &dyn leani_processor_api::Processor,
+    raw_history_store: Option<&leani_store_history::HistoryStore>,
+    bridge: Option<&OnDemandP2pBridge>,
+    requested: leani_primitives::BlockRange,
+) -> Result<(
+    Vec<Arc<dyn leani_source_api::HistorySource>>,
+    leani_source_api::VerificationPolicy,
+)> {
+    let (mut sources, policy) =
+        configured_history_candidates(config, processor, raw_history_store)?;
+    let configured = config_for_processor_descriptor(config, processor.descriptor())?;
+    if !configured.require_retained_input
+        && let Some(bridge) = bridge
+    {
+        let through = bridge.anchor.block.number.0;
+        let start = config
+            .sources
+            .live
+            .history_fallback_start(through, configured.start_block);
+        if requested.end().0 >= start && requested.start().0 <= through {
+            let available = leani_primitives::BlockRange::new(
+                leani_primitives::BlockNumber(start),
+                bridge.anchor.block.number,
+            )?;
+            sources.push(Arc::new(
+                leani_source_p2p::RethP2pHistorySource::from_live_source(
+                    bridge.source.clone(),
+                    available,
+                    bridge.anchor.clone(),
+                )?,
+            ));
+        }
+    }
+    require_history_sources(&sources, processor)?;
+    Ok((sources, policy))
+}
+
+#[allow(clippy::too_many_lines)]
+fn configured_history_candidates(
     config: &Config,
     processor: &dyn leani_processor_api::Processor,
     raw_history_store: Option<&leani_store_history::HistoryStore>,
@@ -4283,13 +4300,6 @@ pub(crate) fn configured_history_sources(
             );
         }
         policy = VerificationPolicy::TrustedDataset;
-    }
-    if selected.is_empty() {
-        bail!(
-            "no implemented history source can satisfy processor {} capabilities {:?}",
-            processor.descriptor().id,
-            required
-        );
     }
     Ok((selected, policy))
 }
@@ -5487,43 +5497,7 @@ async fn serve(path: &Path, registry: &ProcessorRegistry) -> Result<Exit> {
     } else {
         None
     };
-    let history_pipeline = config.get().budgets.history_pipeline;
-    let pipeline_budget = leani_runtime::HistoricalPipelineBudget::new(
-        history_pipeline.maximum_active_chunks,
-        historical_map_task_capacity(config.get()),
-        history_pipeline.maximum_mapped_bytes.bytes(),
-    )
-    .map_err(anyhow::Error::msg)?;
-    let history_material = config.get().budgets.history_material;
-    let material_coordinator = match history_material.mode {
-        HistoryMaterialCoordinatorMode::Disabled => None,
-        HistoryMaterialCoordinatorMode::Observe | HistoryMaterialCoordinatorMode::Enabled => {
-            let mode = match history_material.mode {
-                HistoryMaterialCoordinatorMode::Observe => {
-                    leani_runtime::HistoricalMaterialCoordinatorMode::Observe
-                }
-                HistoryMaterialCoordinatorMode::Enabled => {
-                    leani_runtime::HistoricalMaterialCoordinatorMode::Enabled
-                }
-                HistoryMaterialCoordinatorMode::Disabled => unreachable!(),
-            };
-            Some(
-                leani_runtime::HistoricalMaterialCoordinator::new_with_pipeline_budget(
-                    leani_runtime::HistoricalMaterialCoordinatorConfig {
-                        mode,
-                        memory_bytes: history_material.memory_bytes.bytes(),
-                        maximum_buffered_frames_per_acquisition: history_material
-                            .maximum_buffered_frames_per_acquisition,
-                        minimum_physical_chunk_blocks: history_material
-                            .minimum_physical_chunk_blocks,
-                        maximum_overfetch_ratio: history_material.maximum_overfetch_ratio,
-                    },
-                    &pipeline_budget,
-                )
-                .map_err(anyhow::Error::msg)?,
-            )
-        }
-    };
+    let (pipeline_budget, material_coordinator) = historical_services(config.get())?;
     let backfill_control = Arc::new(NativeBackfillControl::new(
         config.get().clone(),
         store.clone(),
@@ -6441,6 +6415,21 @@ pub(crate) fn execution_p2p_source(
 pub(crate) async fn verified_p2p_history_anchor(
     config: &Config,
 ) -> Result<leani_source_p2p::P2pHistoryAnchor> {
+    p2p_history_anchor(
+        config,
+        leani_finality_beacon_api::AnchorFile::ReadOnly(
+            config
+                .data_dir
+                .join(leani_finality_beacon_api::FINALITY_ANCHOR_FILE),
+        ),
+    )
+    .await
+}
+
+async fn p2p_history_anchor(
+    config: &Config,
+    anchor_file: leani_finality_beacon_api::AnchorFile,
+) -> Result<leani_source_p2p::P2pHistoryAnchor> {
     use leani_finality_beacon_api::{BeaconApiConfig, VerifiedBeaconApi, parse_checkpoint_root};
     use leani_finality_consensus_p2p::VerifiedConsensusP2p;
     use leani_primitives::{BlockHash, BlockNumber, BlockRef, ConsensusAnchor, Finality};
@@ -6453,11 +6442,6 @@ pub(crate) async fn verified_p2p_history_anchor(
         slot: (config.finality.checkpoint_slot > 0).then_some(config.finality.checkpoint_slot),
         origin: leani_finality_beacon_api::CheckpointOrigin::Operator,
     };
-    let anchor_file = leani_finality_beacon_api::AnchorFile::ReadOnly(
-        config
-            .data_dir
-            .join(leani_finality_beacon_api::FINALITY_ANCHOR_FILE),
-    );
     let selected = match config.finality.kind {
         crate::config::FinalitySourceKind::BeaconApi => {
             let mut finality = BeaconApiConfig::mainnet(config.finality.endpoints.clone());
@@ -7710,7 +7694,7 @@ async fn spawn_cold_backfills(
     backfills: &mut ColdBackfills,
 ) -> Result<()> {
     use leani_primitives::{BlockNumber, BlockRange, ChainId};
-    use leani_runtime::{BackfillJob, HistoricalRuntime, HistoricalRuntimeConfig};
+    use leani_runtime::{BackfillJob, HistoricalRuntime};
 
     let mut startup_permits = material_coordinator
         .as_ref()
@@ -7730,38 +7714,16 @@ async fn spawn_cold_backfills(
         if configured.start_block > through {
             continue;
         }
-        let (mut source, verification_policy) =
-            match configured_history_sources(config, processor.as_ref(), None) {
-                Ok(source) => source,
-                Err(error) => {
-                    return Err(error).with_context(|| {
-                        format!(
-                            "no cold source can satisfy configured live processor {}",
-                            configured.instance
-                        )
-                    });
-                }
-            };
-        let bridge_start = config
-            .sources
-            .live
-            .history_fallback_start(through, configured.start_block);
-        let bridge_range = BlockRange::new(BlockNumber(bridge_start), BlockNumber(through))?;
-        source.push(std::sync::Arc::new(
-            leani_source_p2p::RethP2pHistorySource::from_live_source(
-                p2p_source.clone(),
-                bridge_range,
-                history_anchor.clone(),
-            )
-            .with_context(|| format!("construct P2P history bridge for {}", configured.instance))?,
-        ));
-        let range = BlockRange::new(BlockNumber(configured.start_block), BlockNumber(through))
-            .with_context(|| {
-                format!(
-                    "invalid automatic backfill range for {}",
-                    configured.instance
-                )
-            })?;
+        let range = BlockRange::new(BlockNumber(configured.start_block), BlockNumber(through))?;
+        let bridge = OnDemandP2pBridge {
+            source: p2p_source.clone(),
+            anchor: history_anchor.clone(),
+        };
+        let (source, verification_policy) =
+            history_sources_with_bridge(config, processor.as_ref(), None, Some(&bridge), range)
+                .with_context(|| {
+                    format!("construct history sources for {}", configured.instance)
+                })?;
         let overlap = BlockRange::new(
             BlockNumber(overlap_from.max(configured.start_block)),
             BlockNumber(through),
@@ -7785,26 +7747,12 @@ async fn spawn_cold_backfills(
                 anchor_hash,
             )
             .await?;
-        let history_pipeline = config.budgets.history_pipeline;
+        let runtime_config = historical_runtime_config(config, source.len());
         let runtime = match HistoricalRuntime::new_with_sources(
             store.clone(),
             source,
             processor.clone(),
-            HistoricalRuntimeConfig {
-                mapper_concurrency: config.budgets.mapper_concurrency,
-                maximum_active_chunks: history_pipeline.maximum_active_chunks,
-                maximum_mapped_bytes: history_pipeline.maximum_mapped_bytes.bytes(),
-                commit_maximum_blocks: history_pipeline.commit.maximum_blocks,
-                commit_maximum_changes: history_pipeline.commit.maximum_changes,
-                commit_maximum_encoded_bytes: history_pipeline.commit.maximum_encoded_bytes.bytes(),
-                commit_maximum_delay: Duration::from_millis(
-                    history_pipeline.commit.maximum_delay.milliseconds(),
-                ),
-                commit_target_writer_hold: Duration::from_millis(
-                    history_pipeline.commit.target_writer_hold.milliseconds(),
-                ),
-                ..HistoricalRuntimeConfig::default()
-            },
+            runtime_config,
         ) {
             Ok(runtime) => {
                 let runtime = runtime.with_pipeline_budget(pipeline_budget.clone());
@@ -9498,6 +9446,7 @@ markets = ["ETH/USDT"]
             processor,
             from,
             to,
+            ..
         } = cli.command
         else {
             panic!("the documented command is a backfill");
@@ -10723,11 +10672,11 @@ markets = ["ETH/USDT"]
         let chain = fixture_chain(4);
         let manifest = write_frame_archive(directory.path(), &chain[1..=4]);
         let counter: Arc<dyn Processor> = Arc::new(BlockLocalCounter::default());
-        // The archive serves no headers, which the ledger needs.
+        // A retained-only ledger has no raw store. The bridge cannot override this policy.
         let ledger: Arc<dyn Processor> = Arc::new(leani_testkit::OrderedLedgerProcessor::named(
             "header-ledger",
         ));
-        let config = archive_config(
+        let mut config = archive_config(
             directory.path(),
             &manifest,
             &[
@@ -10735,6 +10684,7 @@ markets = ["ETH/USDT"]
                 ("header-ledger", ledger.descriptor().instance.as_str()),
             ],
         );
+        config.processors[1].require_retained_input = true;
         let store = leani_store_sqlite::SqliteStore::open(leani_store_sqlite::StoreConfig::new(
             directory.path().join("node.sqlite"),
         ))
@@ -10824,6 +10774,8 @@ markets = ["ETH/USDT"]
             &manifest,
             &[("transaction-stats", "transfers")],
         );
+        config.sources.live.kind = crate::config::LiveSourceKind::Disabled;
+        config.finality.kind = crate::config::FinalitySourceKind::Disabled;
         let configured = &mut config.processors[0];
         "1.0.0".clone_into(&mut configured.version);
         configured.history_mode = crate::config::ProcessorHistoryMode::OnDemand;
@@ -10841,11 +10793,13 @@ markets = ["ETH/USDT"]
         )
         .expect("configuration file");
 
-        let error = backfill(
+        let error = backfill::run(
             &config_path,
             "transfers",
             1,
             4,
+            None,
+            None,
             &crate::processors::ProcessorRegistry::standard(),
         )
         .await
@@ -10872,6 +10826,8 @@ markets = ["ETH/USDT"]
             &manifest,
             &[("transaction-stats", "transfers")],
         );
+        config.sources.live.kind = crate::config::LiveSourceKind::Disabled;
+        config.finality.kind = crate::config::FinalitySourceKind::Disabled;
         let configured = &mut config.processors[0];
         "1.0.0".clone_into(&mut configured.version);
         configured.history_mode = crate::config::ProcessorHistoryMode::OnDemand;
@@ -10922,7 +10878,7 @@ markets = ["ETH/USDT"]
         let registry = crate::processors::ProcessorRegistry::standard();
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         loop {
-            match backfill(config_path, "transfers", from, to, &registry).await {
+            match backfill::run(config_path, "transfers", from, to, None, None, &registry).await {
                 Err(error)
                     if format!("{error:#}").contains("already in use")
                         && std::time::Instant::now() < deadline =>
@@ -11049,5 +11005,142 @@ markets = ["ETH/USDT"]
         serve_until_shutdown(std::future::ready(Ok(())), &mut background, &cancellation)
             .await
             .expect("a failure during the shutdown is not fatal");
+    }
+    #[tokio::test]
+    async fn cli_and_node_assemble_the_same_verified_bridge_even_without_static_sources() {
+        use leani_primitives::{BlockNumber, BlockRange, ChainId, ConsensusAnchor, Finality};
+        let directory = tempfile::tempdir().unwrap();
+        let mut config: Config = toml::from_str(crate::config::VALID_CONFIG_TOML).unwrap();
+        config.data_dir = directory.path().to_path_buf();
+        config.sources.history.clear();
+        config.processors = vec![crate::block_summaries::processor_config(
+            "blocks-test",
+            false,
+        )];
+        config.processors[0].start_block = 26_000_000;
+        let processor = ProcessorRegistry::standard()
+            .instantiate(&config.processors[0], 1)
+            .unwrap();
+        let block =
+            leani_testkit::fixture_frame(26_000_010, leani_primitives::BlockHash::ZERO).block;
+        let bridge = OnDemandP2pBridge {
+            source: execution_p2p_source(
+                &config,
+                leani_source_api::NetworkTelemetry::default(),
+                None,
+            )
+            .unwrap()
+            .as_ref()
+            .clone(),
+            anchor: leani_source_p2p::P2pHistoryAnchor {
+                block,
+                consensus: ConsensusAnchor {
+                    finality: Finality::Finalized,
+                    execution_block_hash: block.hash,
+                    beacon_slot: 1,
+                    beacon_block_root: [1; 32],
+                },
+            },
+        };
+        let range = BlockRange::new(BlockNumber(26_000_001), BlockNumber(26_000_005)).unwrap();
+        let (cli_sources, cli_policy) =
+            history_sources_with_bridge(&config, processor.as_ref(), None, Some(&bridge), range)
+                .unwrap();
+        let store = leani_store_sqlite::SqliteStore::open(leani_store_sqlite::StoreConfig::new(
+            directory.path().join("node.sqlite"),
+        ))
+        .await
+        .unwrap();
+        let control = NativeBackfillControl::new(
+            config.clone(),
+            store,
+            vec![processor.clone()],
+            CancellationToken::new(),
+            None,
+            None,
+            pipeline_budget(&config),
+        );
+        control
+            .update_p2p_bridge(bridge.source, bridge.anchor)
+            .await;
+        let (api_sources, api_policy) = control
+            .history_sources(processor.as_ref(), range)
+            .await
+            .unwrap();
+        assert_eq!(cli_policy, api_policy);
+        assert_eq!(cli_sources.len(), 1);
+        let request = leani_source_api::DataRequest {
+            chain_id: ChainId(1),
+            range,
+            required: processor.descriptor().requirements[0].capabilities,
+            allow_filtered: true,
+            projection: leani_source_api::FieldProjection::default(),
+            log_fields: leani_primitives::LogFieldSet::NONE,
+            filters: leani_source_api::FilterSet::default(),
+            minimum_finality: Finality::Finalized,
+            verification_policy: cli_policy,
+        };
+        assert_eq!(cli_sources[0].descriptor(), api_sources[0].descriptor());
+        assert_eq!(
+            cli_sources[0].plan(&request).await.unwrap(),
+            api_sources[0].plan(&request).await.unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn cli_remote_backfill_uses_the_real_authenticated_node_api() {
+        let directory = tempfile::tempdir().unwrap();
+        let processor: Arc<dyn Processor> = Arc::new(BlockLocalCounter::default());
+        let instance = processor.descriptor().instance.to_string();
+        let (store, control) = on_demand_control(directory.path(), processor.clone(), 4).await;
+        let token = "backfill-test-token-at-least-16-chars";
+        let api = leani_api::router_with_processors(
+            store.clone(),
+            vec![processor.clone()],
+            Vec::new(),
+            leani_api::ApiConfig {
+                bearer_token: Some(Arc::from(token)),
+                backfill_control: Some(control.clone()),
+                ..leani_api::ApiConfig::default()
+            },
+        )
+        .unwrap();
+        let router = axum::Router::new().nest("/prefix", api);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = url::Url::parse(&format!(
+            "http://{}/prefix/",
+            listener.local_addr().unwrap()
+        ))
+        .unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        let result = tokio::time::timeout(
+            Duration::from_secs(15),
+            backfill::run(
+                Path::new("unused-remote-config"),
+                &instance,
+                1,
+                4,
+                Some(&endpoint),
+                Some(token),
+                &ProcessorRegistry::standard(),
+            ),
+        )
+        .await
+        .unwrap();
+        server.abort();
+        assert_eq!(result.unwrap(), Exit::Success);
+        assert_eq!(
+            store
+                .processor_cursor(processor.descriptor())
+                .await
+                .unwrap()
+                .unwrap()
+                .block_number
+                .0,
+            4
+        );
+        control.cancellation.cancel();
     }
 }

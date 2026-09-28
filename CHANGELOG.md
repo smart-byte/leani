@@ -1046,6 +1046,11 @@ Take these steps in order; each links to the entries below that detail it.
 - Xatu LOG0 rows also accept the public dataset's empty hexadecimal topic
   sentinel (`0x`), including NUL-padded strings. A real 32-byte zero topic
   remains a topic, and malformed short hexadecimal values still fail.
+- CLI backfill and node jobs share source assembly, history pipeline budgets,
+  and the verified P2P bridge. Standalone backfill initializes finality and
+  the peer pool when configured; `backfill --endpoint URL` submits through
+  the authenticated node API and waits for completion. Source selection
+  considers the bridge before refusing a processor with no static source.
 - `eth_getLogs` accepts predicate-complete trusted Xatu and retained raw-log
   projections, while rejecting partial or narrower coverage. Canonical head
   reporting no longer falls back to one processor's cursor or a fabricated
@@ -1062,7 +1067,6 @@ Take these steps in order; each links to the entries below that detail it.
   Advanced configurations must use version 1.2.0 with a new instance to
   rebuild existing summaries. Compact `[blocks]` configurations use the new
   instance `block-summary-1-2`, preserving the old instance's stored rows.
-
 
 - <a id="rc1-finality-anchor"></a>Verified finality no longer stops about 14
   days after the configured checkpoint's slot. Beacon API finality keeps one
