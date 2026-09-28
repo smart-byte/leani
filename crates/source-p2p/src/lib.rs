@@ -8964,7 +8964,11 @@ async fn next_live_event(
                         }
                         let reason = error.to_string();
                         state.reconnect_error = Some(reason.clone());
-                        return Some((Ok(ChainEvent::Disconnected { reason }), state));
+                        if let Some(event) =
+                            report_disconnect(&mut state.disconnect_reported, reason)
+                        {
+                            return Some((Ok(event), state));
+                        }
                     }
                 }
             }
@@ -9044,7 +9048,12 @@ async fn next_live_event(
                             HeadPollFailure::Reconnect => {
                                 let reason = error.to_string();
                                 state.reconnect_error = Some(reason.clone());
-                                return Some((Ok(ChainEvent::Disconnected { reason }), state));
+                                if let Some(event) =
+                                    report_disconnect(&mut state.disconnect_reported, reason)
+                                {
+                                    return Some((Ok(event), state));
+                                }
+                                continue;
                             }
                         };
                         debug!(
@@ -9155,7 +9164,12 @@ async fn next_live_event(
                         }
                         let reason = error.to_string();
                         state.reconnect_error = Some(reason.clone());
-                        return Some((Ok(ChainEvent::Disconnected { reason }), state));
+                        if let Some(event) =
+                            report_disconnect(&mut state.disconnect_reported, reason)
+                        {
+                            return Some((Ok(event), state));
+                        }
+                        continue;
                     }
                 };
                 // Validated headers linked to the verified tip are the heads
@@ -9353,12 +9367,17 @@ fn head_poll_failure(
     }
 }
 
-/// The live lane made progress: it emitted a block or reorg, or reconnected.
-/// It reports itself disconnected again, once, after its next failure, and a
-/// silent head poll starts the grace of [`head_poll_failure`] afresh.
+/// The live lane made progress: it emitted a block or reorg. It reports
+/// itself disconnected again, once, after its next failure, and a silent head
+/// poll starts the grace of [`head_poll_failure`] afresh.
 const fn note_live_progress(disconnect_reported: &mut bool, silent_since: &mut Option<Instant>) {
     *disconnect_reported = false;
     *silent_since = None;
+}
+
+/// A disconnect to report, once per outage: `None` when it already was.
+fn report_disconnect(disconnect_reported: &mut bool, reason: String) -> Option<ChainEvent> {
+    (!std::mem::replace(disconnect_reported, true)).then_some(ChainEvent::Disconnected { reason })
 }
 
 /// The pause before another wave of a live body or receipt request whose last
@@ -9470,10 +9489,9 @@ async fn reconnect_live_session(
                 state.session.set_range(None);
                 state.session.set_phase(NetworkPhase::FollowingHead);
                 state.head_unavailable_since = None;
-                note_live_progress(
-                    &mut state.disconnect_reported,
-                    &mut state.head_poll_silent_since,
-                );
+                // Not progress: an outage that keeps failing after reconnects
+                // stays reported once, until a block or reorg follows.
+                state.head_poll_silent_since = None;
                 return Ok(());
             }
             Err(P2pError::Cancelled) => return Err(P2pError::Cancelled),
@@ -15301,6 +15319,9 @@ mod tests {
         // The lane emits the blocks of a catch-up.
         note_live_progress(&mut disconnect_reported, &mut silent_since);
         assert!(!disconnect_reported);
+        // One report per outage, however often the lane reconnects meanwhile.
+        assert!(report_disconnect(&mut disconnect_reported, "down".to_owned()).is_some());
+        assert!(report_disconnect(&mut disconnect_reported, "still down".to_owned()).is_none());
         assert!(
             matches!(
                 head_poll_failure(
