@@ -564,6 +564,19 @@ again, across reconnects, until the lanes restart. Stale updates are retried,
 so neither ends the finality stream. An exhausted peer set logs a warning at
 most every five minutes.
 
+### Network fork this release does not support
+
+Each release verifies the consensus forks it knows; Glamsterdam's Gloas is
+not among them yet. Once mainnet activates a fork a release does not know,
+finality stays unavailable and the live lane stops, fail-closed: consensus
+peers answer with a fork digest the node does not know, which it logs once as
+`consensus peers serve a fork this release cannot verify`, and a Beacon API
+endpoint fails with an error naming the fork, such as
+``serves `gloas` light-client data``. No peer is banned for it. Upgrade to a
+release that supports the fork before its mainnet activation. Upgraded
+within 14 days, the node resumes from its persisted finality anchor; later,
+it needs a fresh `finality.checkpoint`.
+
 ### Live lane disconnected during a finality apply
 
 Symptom: right after finality advances, the live lane reports itself

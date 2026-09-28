@@ -29,8 +29,8 @@ use helios_consensus_core::{
 use leani_finality_beacon_api::{
     AnchorFile, AnchorWriter, BeaconApiError, CheckpointOrigin, Clock, DEFAULT_MAX_CHECKPOINT_AGE,
     HELIOS_REVISION, MainnetLightClientVerifier, StartAnchor, TrustedCheckpoint,
-    VerifiedFinalityAnchor, current_slot, mainnet_fork_digest, resolve_start_anchor,
-    signed_implausibly_ahead, verification_slot,
+    VerifiedFinalityAnchor, current_slot, known_mainnet_fork_digests, mainnet_fork_digest,
+    resolve_start_anchor, signed_implausibly_ahead, verification_slot,
 };
 use leani_primitives::{
     BlockNumber, Capability, CapabilitySet, ChainId, SourceId, SourceKind, TrustModel,
@@ -1002,12 +1002,28 @@ impl ConsensusPeers for Libp2pPeers {
 
 /// Decode a peer's SSZ reply to `request` and check its fork-digest
 /// `context` against the slot of the header it carries. Undecodable or
-/// wrong-fork material is invalid: its peer is banned.
+/// wrong-fork material is invalid: its peer is banned. A digest of no fork
+/// this release knows is checked first: after a network fork this release
+/// does not support, every honest peer answers so, and none is banned.
 fn decode_light_client_response(
     request: LightClientRequest,
     payload: &[u8],
     context: Option<[u8; 4]>,
 ) -> Result<LightClientResponse, PeerFailure> {
+    if let Some(received) = context
+        && !known_mainnet_fork_digests().contains(&received)
+    {
+        static WARNED: std::sync::Once = std::sync::Once::new();
+        WARNED.call_once(|| {
+            warn!(
+                digest = ?received,
+                "consensus peers serve a fork this release cannot verify; the network may have forked, so upgrade Leani"
+            );
+        });
+        return Err(PeerFailure::Unavailable(format!(
+            "peer serves fork digest {received:02x?}, unknown to this release; upgrade Leani if the network forked"
+        )));
+    }
     let (material, slot) = match request {
         LightClientRequest::Bootstrap(_) => {
             let bootstrap =
@@ -2510,6 +2526,19 @@ mod tests {
             decode_light_client_response(LightClientRequest::Optimistic, &encoded[..171], context),
             Err(PeerFailure::Invalid(_))
         ));
+        // A digest of no known fork is what every honest peer sends after a
+        // fork this release does not support: unavailable, never banned,
+        // even when its material does not decode.
+        for payload in [&encoded[..], &encoded[..171]] {
+            assert!(matches!(
+                decode_light_client_response(
+                    LightClientRequest::Optimistic,
+                    payload,
+                    Some([0xde, 0xad, 0xbe, 0xef])
+                ),
+                Err(PeerFailure::Unavailable(_))
+            ));
+        }
         // Cutting the payload header's extra data short still decodes, as
         // another header the committee did not sign: verification refuses
         // it, and its peer is banned.

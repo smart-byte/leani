@@ -1096,6 +1096,12 @@ Take these steps in order; each links to the entries below that detail it.
   partition is retried for up to 96 hours before its job fails, and the
   planner ranks Xatu after sources that expect a shorter lag.
 
+- A network fork this release does not know, such as Glamsterdam's Gloas
+  before a release supports it, is reported as one: consensus peers that
+  answer with an unknown fork digest are skipped rather than banned, with a
+  warning to upgrade, and a Beacon API endpoint serving an unknown fork's
+  light-client data fails with an error naming it. Finality stays
+  unavailable, fail-closed, until Leani is upgraded.
 - <a id="rc1-finality-anchor"></a>Verified finality no longer stops about 14
   days after the configured checkpoint's slot. Beacon API finality keeps one
   bootstrapped light client per endpoint and advances it with each finality

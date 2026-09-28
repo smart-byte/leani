@@ -122,6 +122,54 @@ pub fn mainnet_fork_digest(slot: u64) -> [u8; 4] {
     [digest[0], digest[1], digest[2], digest[3]]
 }
 
+/// Every fork digest mainnet uses under the schedule this release knows,
+/// its consensus forks and its blob-parameter-only forks. A peer on any
+/// other digest is on a fork this release cannot verify.
+#[must_use]
+pub fn known_mainnet_fork_digests() -> Vec<[u8; 4]> {
+    let forks = mainnet_forks();
+    [
+        forks.genesis,
+        forks.altair,
+        forks.bellatrix,
+        forks.capella,
+        forks.deneb,
+        forks.electra,
+        forks.fulu,
+    ]
+    .iter()
+    .map(|fork| fork.epoch)
+    .chain(MAINNET_BLOB_SCHEDULE.iter().map(|(epoch, _)| *epoch))
+    .map(|epoch| mainnet_fork_digest(epoch * SLOTS_PER_EPOCH))
+    .collect()
+}
+
+/// Consensus fork names whose light-client data this release verifies.
+const KNOWN_FORK_NAMES: [&str; 7] = [
+    "phase0",
+    "altair",
+    "bellatrix",
+    "capella",
+    "deneb",
+    "electra",
+    "fulu",
+];
+
+/// The fork a Beacon API response names, when this release cannot verify
+/// it. Versioned responses carry `version`, alone or in each list item.
+fn unsupported_fork(bytes: &[u8]) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_slice(bytes).ok()?;
+    let items = match &value {
+        serde_json::Value::Array(items) => items.iter().collect(),
+        item => vec![item],
+    };
+    items
+        .into_iter()
+        .filter_map(|item| item["version"].as_str())
+        .find(|version| !KNOWN_FORK_NAMES.contains(version))
+        .map(str::to_owned)
+}
+
 /// Parse a `0x`-prefixed 32-byte checkpoint root.
 ///
 /// # Errors
@@ -1145,9 +1193,12 @@ async fn get_json<T: DeserializeOwned>(
     path_and_query: &str,
 ) -> Result<T, BeaconApiError> {
     let bytes = transport.get(endpoint, path_and_query).await?;
-    serde_json::from_slice(&bytes).map_err(|source| BeaconApiError::Decode {
-        url: request_label(endpoint, path_and_query),
-        source,
+    serde_json::from_slice(&bytes).map_err(|source| {
+        let url = request_label(endpoint, path_and_query);
+        match unsupported_fork(&bytes) {
+            Some(version) => BeaconApiError::UnsupportedFork { url, version },
+            None => BeaconApiError::Decode { url, source },
+        }
     })
 }
 
@@ -1391,6 +1442,10 @@ pub enum BeaconApiError {
         #[source]
         source: serde_json::Error,
     },
+    #[error(
+        "beacon API {url} serves `{version}` light-client data, a fork this release cannot verify; the network may have forked, so upgrade Leani"
+    )]
+    UnsupportedFork { url: String, version: String },
     #[error("expected Ethereum mainnet but endpoint reports genesis validators root {0:#x}")]
     WrongNetwork(B256),
     #[error("light-client proof verification failed: {0}")]
@@ -3191,6 +3246,25 @@ mod tests {
         }))
         .expect("standard genesis response");
         assert_eq!(response.data.genesis_validators_root, MAINNET_GENESIS_ROOT);
+    }
+
+    #[test]
+    fn an_unknown_fork_is_named_and_known_digests_cover_the_schedule() {
+        assert_eq!(
+            unsupported_fork(br#"{"version":"gloas","data":{}}"#),
+            Some("gloas".to_owned())
+        );
+        assert_eq!(unsupported_fork(br#"{"version":"fulu","data":{}}"#), None);
+        assert_eq!(
+            unsupported_fork(br#"[{"version":"fulu"},{"version":"gloas"}]"#),
+            Some("gloas".to_owned())
+        );
+        assert_eq!(unsupported_fork(b"not json"), None);
+        let known = known_mainnet_fork_digests();
+        for slot in [0, FULU_FORK_EPOCH * 32, MAINNET_BLOB_SCHEDULE[1].0 * 32 + 1] {
+            assert!(known.contains(&mainnet_fork_digest(slot)), "slot {slot}");
+        }
+        assert!(!known.contains(&[0xde, 0xad, 0xbe, 0xef]));
     }
 
     #[test]
