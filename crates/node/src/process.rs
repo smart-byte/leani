@@ -5284,8 +5284,9 @@ async fn serve(path: &Path, registry: &ProcessorRegistry) -> Result<Exit> {
     use leani_store_sqlite::SqliteStore;
 
     let config = Config::load(path)?.validate()?;
-    // Refuse on the environment before opening the store: opening migrates
-    // it, and a refused start must leave an older release able to open it.
+    // Refuse on the environment and configuration before opening the store:
+    // opening migrates it, and a refused start must leave an older release
+    // able to open it.
     let bearer_token = config
         .get()
         .api
@@ -5293,6 +5294,15 @@ async fn serve(path: &Path, registry: &ProcessorRegistry) -> Result<Exit> {
         .as_deref()
         .map(|name| api_bearer_token(name, std::env::var(name)))
         .transpose()?;
+    let rpc_history_enabled = matches!(
+        config.get().rpc.historical_mode,
+        crate::config::HistoricalMode::OnDemand
+    );
+    let external_history_sources = if rpc_history_enabled || config.get().raw_history.enabled {
+        configured_rpc_history_sources(config.get())?
+    } else {
+        Vec::new()
+    };
     let _data_dir_lock = crate::local_state::lock_runtime_directory(&config.get().data_dir)?;
     let assembly = registry.instantiate_all_with_extensions(config.get())?;
     let processors = assembly.processors;
@@ -5365,15 +5375,6 @@ async fn serve(path: &Path, registry: &ProcessorRegistry) -> Result<Exit> {
     let network_telemetry = leani_source_api::NetworkTelemetry::default();
     let (committed_events, _) = tokio::sync::broadcast::channel(1_024);
     let cancellation = CancellationToken::new();
-    let rpc_history_enabled = matches!(
-        config.get().rpc.historical_mode,
-        crate::config::HistoricalMode::OnDemand
-    );
-    let external_history_sources = if rpc_history_enabled || config.get().raw_history.enabled {
-        configured_rpc_history_sources(config.get())?
-    } else {
-        Vec::new()
-    };
     let (raw_history_control, retained_history_source, raw_history_store) =
         if config.get().raw_history.enabled {
             let raw = config.get().raw_history;
