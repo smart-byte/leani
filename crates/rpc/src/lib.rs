@@ -2909,14 +2909,23 @@ async fn read_recent_frames(
             .map_err(|_| RpcError::data_unavailable_reason("log_range_exceeds_platform"))?,
     );
     for number in range.iter() {
-        frames.push(
-            state
-                .store
-                .recent_frame(state.config.chain_id, number)
-                .await
-                .map_err(|error| RpcError::store(&error))?
-                .ok_or_else(|| RpcError::data_unavailable_reason("recent_frame_missing"))?,
-        );
+        let frame = state
+            .store
+            .recent_frame(state.config.chain_id, number)
+            .await
+            .map_err(|error| RpcError::store(&error))?
+            .ok_or_else(|| RpcError::data_unavailable_reason("recent_frame_missing"))?;
+        // Each block is its own read: a reorg committed between two of them
+        // would otherwise mix both branches into one successful answer.
+        if frames
+            .last()
+            .is_some_and(|prior: &BlockFrame| frame.block.parent_hash != prior.block.hash)
+        {
+            return Err(RpcError::data_unavailable_reason(
+                "recent_reorg_during_read",
+            ));
+        }
+        frames.push(frame);
     }
     Ok(frames)
 }
@@ -4681,6 +4690,19 @@ mod tests {
         })
     }
 
+    /// The next block after `parent`, linked by hash in its header too.
+    fn rpc_frame_after(parent: &BlockFrame) -> BlockFrame {
+        let number = parent.block.number.0 + 1;
+        let mut frame = rpc_frame_with_header(&ConsensusHeader {
+            number,
+            parent_hash: B256::from(*parent.block.hash.as_array()),
+            timestamp: 1_700_000_000 + number,
+            ..Default::default()
+        });
+        frame.block.parent_hash = parent.block.hash;
+        frame
+    }
+
     fn rpc_frame_with_header(header: &ConsensusHeader) -> BlockFrame {
         let hash = header.hash_slow();
         let mut frame = fixture_frame(header.number, BlockHash::ZERO);
@@ -5192,6 +5214,28 @@ mod tests {
     }
 
     /// Assert a `-32004` error with `reason`.
+    #[tokio::test]
+    async fn recent_logs_refuse_frames_from_two_branches() {
+        let (router, store, _directory) = test_router_and_store().await;
+        let first = fixture_frame(26_000_000, BlockHash::ZERO);
+        // What a reorg committed between the two per-block reads leaves.
+        let other_branch = fixture_frame(26_000_001, BlockHash::new([7; 32]));
+        for frame in [&first, &other_branch] {
+            store.store_recent_frame(frame).await.expect("recent frame");
+        }
+        let (_, body) = call(
+            router,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "eth_getLogs",
+                "params": [{"fromBlock": "0x18cba80", "toBlock": "0x18cba81"}]
+            }),
+        )
+        .await;
+        assert_unavailable(body, "recent_reorg_during_read");
+    }
+
     fn assert_unavailable(body: Option<Value>, reason: &str) {
         let body = body.expect("body");
         assert_eq!(body["error"]["code"], DATA_UNAVAILABLE, "{body}");
@@ -5313,7 +5357,10 @@ mod tests {
     async fn finalized_and_safe_name_the_finalized_head() {
         // Audit JSON-RPC-4: every block tag but `latest` got -32602.
         let (router, store, _directory) = test_router_and_store().await;
-        let mut head = with_log(rpc_frame(9), 9);
+        // A parent-linked window, as the live lane retains it.
+        let seventh = with_log(rpc_frame(7), 7);
+        let finalized = with_log(rpc_frame_after(&seventh), 8);
+        let mut head = with_log(rpc_frame_after(&finalized), 9);
         head.finality = Finality::Included;
         store.store_recent_frame(&head).await.expect("head frame");
         assert_unavailable(
@@ -5325,8 +5372,7 @@ mod tests {
             .1,
             "finalized_block_unavailable",
         );
-        let finalized = with_log(rpc_frame(8), 8);
-        for frame in [with_log(rpc_frame(7), 7), finalized.clone()] {
+        for frame in [seventh, finalized.clone()] {
             store
                 .store_recent_frame(&frame)
                 .await
