@@ -520,11 +520,13 @@ session lease. A consumer's credential keeps pages from opening its stream,
 and `api.bearer_token_env` keeps them from opening any; a browser adds
 neither header on its own.
 
-When upgrading a relative `data_dir`, Leani refuses to open another location
-if its former working-directory location still contains a database or
-embedded subscriptions. This also applies when both locations have state.
-Set an absolute path to select the intended store, or move the old state.
-Equivalent paths and symlink aliases of the same directory are accepted.
+When upgrading a relative `data_dir`, Leani refuses to start if its former
+working-directory location contains a database or embedded subscriptions
+while the location beside the configuration holds none: it would otherwise
+start on an empty store. Move the old state, or set an absolute path to
+select the intended store. When both locations hold state, it uses the one
+beside the configuration and warns, naming both. Equivalent paths and
+symlink aliases of the same directory count as one.
 
 ### Historical CLI and node backfill
 

@@ -977,10 +977,12 @@ Take these steps in order; each links to the entries below that detail it.
   directories, so a `leani --config elsewhere/… subscribe` starts cold after
   the upgrade. Before upgrading, make a relative `data_dir` absolute, or move
   the data directory beside the configuration file. If the former location
-  still holds a node store (`leani.sqlite`) or embedded subscriptions, loading
-  the configuration refuses to select a different directory, including when
-  both directories contain state. Set an absolute `data_dir` to make the
-  choice explicit. Equivalent paths and symlink aliases are accepted. A
+  still holds a node store (`leani.sqlite`) or embedded subscriptions and the
+  directory beside the configuration holds none, loading the configuration
+  refuses rather than start on an empty store. When both hold state, the node
+  uses the one beside the configuration and warns once, naming both, and
+  `leani doctor` reports it. Set an absolute `data_dir` to make the choice
+  explicit. Equivalent paths and symlink aliases are accepted. A
   compact configuration's default `data_dir`, `./data`, is beside the file
   too. `leani init` writes `./data` and prepares that directory beside the
   configuration it creates, wherever `--config` puts it; its `--data-dir`,
