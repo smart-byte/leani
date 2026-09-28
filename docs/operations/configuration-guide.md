@@ -520,6 +520,12 @@ session lease. A consumer's credential keeps pages from opening its stream,
 and `api.bearer_token_env` keeps them from opening any; a browser adds
 neither header on its own.
 
+When upgrading a relative `data_dir`, Leani refuses to open another location
+if its former working-directory location still contains a database or
+embedded subscriptions. This also applies when both locations have state.
+Set an absolute path to select the intended store, or move the old state.
+Equivalent paths and symlink aliases of the same directory are accepted.
+
 ### JSON-RPC limits
 
 Each limit has a `rpc` setting:

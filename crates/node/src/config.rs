@@ -1378,7 +1378,8 @@ impl Config {
     /// # Errors
     ///
     /// Returns [`ConfigError`] when the file cannot be read or its TOML does
-    /// not match the strict schema.
+    /// not match the strict schema, or a relative data directory would
+    /// silently select a different store from an existing working-directory store.
     pub fn load(path: &Path) -> Result<Self, ConfigError> {
         let working_directory = std::env::current_dir().ok();
         let (config, warnings) = Self::load_with_warnings(path, working_directory.as_deref())?;
@@ -1394,8 +1395,8 @@ impl Config {
         Ok(config)
     }
 
-    /// [`Self::load`], returning the warnings it logs instead: deprecated
-    /// settings, and state a relative path left under `working_directory`.
+    /// [`Self::load`], returning deprecation warnings instead of logging them.
+    /// Existing state under `working_directory` must be explicitly disambiguated.
     pub(crate) fn load_with_warnings(
         path: &Path,
         working_directory: Option<&Path>,
@@ -1436,15 +1437,12 @@ impl Config {
                 *manifest = resolve_relative_to_file(path, manifest);
             }
         }
-        let mut warnings = config.deprecation_warnings();
+        let warnings = config.deprecation_warnings();
         if let Some(working_directory) = working_directory
             && written.is_relative()
             && !written.as_os_str().is_empty()
         {
-            warnings.extend(state_left_behind(
-                &beneath(working_directory, &written),
-                &config.data_dir,
-            ));
+            check_data_directory(&beneath(working_directory, &written), &config.data_dir)?;
         }
         Ok((config, warnings))
     }
@@ -1873,22 +1871,24 @@ fn beneath(directory: &Path, path: &Path) -> PathBuf {
     directory.join(path.strip_prefix(".").unwrap_or(path))
 }
 
-/// A relative `data_dir` was under the working directory before it was
-/// beside its configuration file. Name both directories, and each piece of
-/// Leani state, the node store or embedded subscriptions, that is at the old
-/// one and not at the new one.
-fn state_left_behind(previous: &Path, current: &Path) -> Option<String> {
-    let left = ["leani.sqlite", "subscriptions/"]
-        .into_iter()
-        .filter(|entry| previous.join(entry).exists() && !current.join(entry).exists())
-        .collect::<Vec<_>>();
-    (!left.is_empty()).then(|| {
-        format!(
-            "data_dir {} holds no {}, but {} does: a relative data_dir is now relative to the configuration file, not to the working directory; move that state, or set data_dir to its absolute path",
-            current.display(),
-            left.join(" or "),
-            previous.display()
-        )
+/// Refuse to choose a different store implicitly during a relative-path
+/// upgrade. An explicit absolute path disambiguates the operator's choice.
+fn check_data_directory(previous: &Path, current: &Path) -> Result<(), ConfigError> {
+    // Canonicalization recognizes `.`/`..` and symlink aliases of existing
+    // directories. If the old directory has state it necessarily exists.
+    if previous == current
+        || fs::canonicalize(previous)
+            .ok()
+            .is_some_and(|old| fs::canonicalize(current).is_ok_and(|new| old == new))
+        || !["leani.sqlite", "subscriptions"]
+            .iter()
+            .any(|entry| previous.join(entry).exists())
+    {
+        return Ok(());
+    }
+    Err(ConfigError::AmbiguousDataDirectory {
+        previous: previous.to_path_buf(),
+        current: current.to_path_buf(),
     })
 }
 
@@ -2689,6 +2689,10 @@ fn unique_non_empty_ids<'a>(
 
 #[derive(Debug, Error)]
 pub enum ConfigError {
+    #[error(
+        "relative data_dir resolves to {current}, but previous working-directory location {previous} contains Leani state; refusing to open or create a different store; set data_dir to the intended absolute path"
+    )]
+    AmbiguousDataDirectory { previous: PathBuf, current: PathBuf },
     #[error("failed to read configuration at {path}: {source}")]
     Read {
         path: PathBuf,
@@ -4075,63 +4079,65 @@ markets = ["LINK/ETH"]
     }
 
     #[test]
-    fn state_left_under_the_working_directory_is_named_when_data_dir_moves() {
-        // Review of Task 19: a relative `data_dir` was under the working
-        // directory before, so an upgraded node may find its state there.
+    fn relative_data_dir_refuses_old_state_even_when_both_locations_have_state() {
         let temp = tempfile::tempdir().expect("temporary directory");
         let working = temp.path().join("working");
-        fs::create_dir_all(working.join("data")).expect("previous data directory");
-        fs::write(working.join("data/leani.sqlite"), b"").expect("previous store");
         let node = temp.path().join("node");
-        fs::create_dir_all(&node).expect("configuration directory");
-        let config_path = node.join("leani.toml");
-        fs::write(&config_path, VALID_CONFIG_TOML).expect("configuration");
-        let warnings = |path: &Path| {
-            Config::load_with_warnings(path, Some(&working))
-                .expect("configuration loads")
-                .1
-        };
-
-        let (config, found) =
-            Config::load_with_warnings(&config_path, Some(&working)).expect("configuration loads");
-        assert_eq!(config.data_dir, node.join("data"));
-        let [warning] = found.as_slice() else {
-            panic!("one warning: {found:?}");
-        };
-        for named in [node.join("data"), working.join("data")] {
-            assert!(warning.contains(&named.display().to_string()), "{warning}");
-        }
-        assert!(warning.contains("leani.sqlite"), "{warning}");
-
-        // Final review B5: state at the new directory masked the store left
-        // at the old one.
-        fs::create_dir_all(node.join("data/subscriptions")).expect("moved subscriptions");
-        let found = warnings(&config_path);
-        let [warning] = found.as_slice() else {
-            panic!("one warning: {found:?}");
-        };
-        assert!(warning.contains("leani.sqlite"), "{warning}");
-        assert!(!warning.contains("subscriptions"), "{warning}");
-        fs::remove_dir_all(node.join("data")).expect("remove moved state");
-
-        // Embedded subscription state left behind counts too.
-        fs::remove_file(working.join("data/leani.sqlite")).expect("remove previous store");
-        fs::create_dir_all(working.join("data/subscriptions")).expect("previous subscriptions");
-        assert_eq!(warnings(&config_path).len(), 1);
-
-        // Nothing is said once state is beside the configuration...
-        fs::create_dir_all(node.join("data/subscriptions")).expect("moved subscriptions");
-        assert!(warnings(&config_path).is_empty());
-        // ...or for an absolute `data_dir`.
-        fs::remove_dir_all(node.join("data")).expect("remove moved state");
+        fs::create_dir_all(working.join("data")).unwrap();
+        fs::create_dir_all(&node).unwrap();
+        let path = node.join("leani.toml");
+        fs::write(&path, VALID_CONFIG_TOML).unwrap();
+        fs::write(working.join("data/leani.sqlite"), b"old store").unwrap();
+        let load = || Config::load_with_warnings(&path, Some(&working));
+        assert!(matches!(
+            load(),
+            Err(ConfigError::AmbiguousDataDirectory { .. })
+        ));
+        assert!(!node.join("data").exists(), "refusal creates no state");
+        fs::create_dir_all(node.join("data")).unwrap();
+        fs::write(node.join("data/leani.sqlite"), b"other store").unwrap();
+        assert!(matches!(
+            load(),
+            Err(ConfigError::AmbiguousDataDirectory { .. })
+        ));
+        assert_eq!(
+            fs::read(working.join("data/leani.sqlite")).unwrap(),
+            b"old store"
+        );
+        assert_eq!(
+            fs::read(node.join("data/leani.sqlite")).unwrap(),
+            b"other store"
+        );
+        fs::remove_file(working.join("data/leani.sqlite")).unwrap();
+        fs::create_dir_all(working.join("data/subscriptions")).unwrap();
+        assert!(load().is_err(), "embedded subscription state also counts");
         fs::write(
-            &config_path,
+            &path,
             VALID_CONFIG_TOML.replace(
                 "data_dir = \"./data\"",
                 &format!("data_dir = {}", toml_string(&node.join("data"))),
             ),
         )
-        .expect("absolute configuration");
-        assert!(warnings(&config_path).is_empty());
+        .unwrap();
+        assert!(
+            load().is_ok(),
+            "absolute path explicitly selects a location"
+        );
+    }
+
+    #[test]
+    fn data_directory_aliases_are_not_ambiguous() {
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("data");
+        fs::create_dir_all(&data).unwrap();
+        fs::write(data.join("leani.sqlite"), b"state").unwrap();
+        assert!(check_data_directory(&data, &data.join(".")).is_ok());
+        assert!(check_data_directory(&data, &data.join("../data")).is_ok());
+        #[cfg(unix)]
+        {
+            let alias = temp.path().join("alias");
+            std::os::unix::fs::symlink(&data, &alias).unwrap();
+            assert!(check_data_directory(&data, &alias).is_ok());
+        }
     }
 }
