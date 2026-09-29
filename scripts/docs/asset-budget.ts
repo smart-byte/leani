@@ -32,7 +32,11 @@ function enforce(name: string, actual: number, maximum: number): void {
   }
 }
 
-const assets = await collect(dist);
+const allAssets = await collect(dist);
+// Agent-facing llms.txt exports never load in a browser, so they get their own budget.
+const isLlmsText = (asset: Asset) => /^(_llms-txt\/|llms[^/]*\.txt$)/.test(asset.path);
+const assets = allAssets.filter((asset) => !isLlmsText(asset));
+const llmsText = allAssets.filter(isLlmsText);
 const html = assets.filter((asset) => extname(asset.path) === '.html');
 const landing = await readFile(resolve(dist, 'index.html'), 'utf8');
 const entryScripts = Array.from(landing.matchAll(/<script[^>]+src="([^"]+)"/g), (match) =>
@@ -45,6 +49,7 @@ const landingScriptBytes = entryScripts.reduce((sum, path) => {
 }, 0);
 
 enforce('complete static site', assets.reduce((sum, asset) => sum + asset.bytes, 0), 5 * 1024 * 1024);
+enforce('llms.txt exports', llmsText.reduce((sum, asset) => sum + asset.bytes, 0), 2 * 1024 * 1024);
 enforce('all JavaScript including Pagefind', total(assets, ['.js']), 768 * 1024);
 enforce('all CSS including Pagefind', total(assets, ['.css']), 256 * 1024);
 enforce('all webfonts', total(assets, ['.woff', '.woff2']), 512 * 1024);
