@@ -37,7 +37,7 @@ curl -s \
 # docs:end bounded-mainnet-query
 
 # docs:start live-block-first-run
-leani subscribe blocks --once
+leani subscribe blocks
 # docs:end live-block-first-run
 
 # docs:start live-block-node

@@ -49,7 +49,7 @@ export const examples = [
   {
     id: 'live-block-first-run',
     title: 'Follow Ethereum blocks',
-    description: 'Start the embedded P2P subscription and inspect a labelled first result.',
+    description: 'Start the embedded P2P subscription and follow labelled live blocks.',
     language: 'shell',
     source: { file: 'examples/fixture-quickstart/snippets.sh', region: 'live-block-first-run' },
     surfaces: ['docs', 'landing'],
