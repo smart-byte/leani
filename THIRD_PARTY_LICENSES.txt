@@ -8752,7 +8752,7 @@ alloy-genesis 2.4.1 — https://github.com/alloy-rs/alloy
 alloy-hardforks 0.4.7 — https://github.com/alloy-rs/hardforks
 alloy-network-primitives 1.8.3 — https://github.com/alloy-rs/alloy
 alloy-network-primitives 2.4.1 — https://github.com/alloy-rs/alloy
-alloy-primitives 1.6.1 — https://github.com/alloy-rs/core
+alloy-primitives 1.7.3 — https://github.com/alloy-rs/core
 alloy-rlp-derive 0.3.16 — https://github.com/alloy-rs/rlp
 alloy-rlp 0.3.16 — https://github.com/alloy-rs/rlp
 alloy-rpc-types-admin 2.4.1 — https://github.com/alloy-rs/alloy
