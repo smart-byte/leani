@@ -23,6 +23,12 @@ updates:
       - /site
     schedule:
       interval: weekly
+    # TypeScript 5 provides the JavaScript compiler API required by
+    # openapi-typescript and Astro; the native CLI is tracked separately
+    # through @typescript/native. Review compiler API migrations explicitly.
+    ignore:
+      - dependency-name: "typescript"
+        update-types: ["version-update:semver-major"]
   # Refreshes the Dockerfile's digest-pinned base images. CI rejects a rust
   # tag update until rust-toolchain.toml moves to the same version with it.
   - package-ecosystem: docker
