@@ -7237,9 +7237,9 @@ anstyle-parse 1.0.0 — https://github.com/rust-cli/anstyle.git
 anstyle-query 1.1.5 — https://github.com/rust-cli/anstyle.git
 anstyle-wincon 3.0.11 — https://github.com/rust-cli/anstyle.git
 anstyle 1.0.14 — https://github.com/rust-cli/anstyle.git
-clap 4.6.5 — https://github.com/clap-rs/clap
-clap_builder 4.6.5 — https://github.com/clap-rs/clap
-clap_derive 4.6.4 — https://github.com/clap-rs/clap
+clap 4.6.7 — https://github.com/clap-rs/clap
+clap_builder 4.6.7 — https://github.com/clap-rs/clap
+clap_derive 4.6.7 — https://github.com/clap-rs/clap
 clap_lex 1.1.0 — https://github.com/clap-rs/clap
 colorchoice 1.0.5 — https://github.com/rust-cli/anstyle.git
 is_terminal_polyfill 1.70.2 — https://github.com/polyfill-rs/is_terminal_polyfill
