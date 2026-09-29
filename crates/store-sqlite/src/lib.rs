@@ -22681,7 +22681,7 @@ mod tests {
                 "session-owner",
                 ConsumerRole::Required,
                 ConsumerStartPosition::EarliestRetained,
-                Duration::from_millis(100),
+                Duration::from_secs(30),
             )
             .await
             .expect("consumer");
@@ -22701,7 +22701,17 @@ mod tests {
                 .expect("current session")
         );
 
-        tokio::time::sleep(Duration::from_millis(120)).await;
+        // Expire the persisted lease directly so runner load cannot expire the
+        // replacement while this test checks stale generations and delivery.
+        sqlx::query(
+            "UPDATE durable_consumers SET lease_expires_at_unix_ms = 0
+             WHERE stream_id = ? AND consumer_id = ?",
+        )
+        .bind(&stream_id)
+        .bind("session-owner")
+        .execute(&store.inner.pool)
+        .await
+        .expect("expire first session");
         assert!(
             !store
                 .consumer_session_is_current_in_stream(
