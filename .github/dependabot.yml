@@ -10,6 +10,13 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    # These packages share Arrow and ObjectStore types across crate boundaries.
+    groups:
+      arrow-parquet:
+        patterns:
+          - "arrow-*"
+          - "parquet"
+          - "object_store"
   - package-ecosystem: bun
     directories:
       - /packages/sdk

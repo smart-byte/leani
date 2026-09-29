@@ -44,8 +44,8 @@ alloy-rlp = "0.3.16"
 alloy-rpc-types-eth = "2.3.0"
 anyhow = "1.0"
 async-trait = "0.1"
-arrow-array = "59.2.0"
-arrow-schema = "59.2.0"
+arrow-array = "60.0.0"
+arrow-schema = "60.0.0"
 axum = { version = "0.8", features = ["ws"] }
 blake3 = "1.8"
 bytes = "1.11"
@@ -69,11 +69,9 @@ libp2p = { version = "0.56.0", default-features = false, features = [
 ] }
 libp2p-stream = "0.4.0-alpha"
 # Keep this aligned with Parquet's object_store major/minor to avoid two
-# incompatible ObjectStore trait identities. The object_store 0.13 XML
-# advisory exceptions and Leani's narrow HTTP call-path are documented in
-# deny.toml.
-object_store = { version = "0.13.2", default-features = false, features = ["http"] }
-parquet = { version = "59.2.0", default-features = false, features = [
+# incompatible ObjectStore trait identities.
+object_store = { version = "0.14.2", default-features = false, features = ["http"] }
+parquet = { version = "60.0.0", default-features = false, features = [
   "arrow",
   "object_store",
   "snap",

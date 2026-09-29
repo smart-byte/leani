@@ -2620,7 +2620,7 @@ mod tests {
             let Some(GetRange::Bounded(range)) = options.range.clone() else {
                 let mut result = self.inner.get_opts(location, options).await?;
                 if self.weak_e_tags {
-                    result.meta.e_tag = result.meta.e_tag.map(|tag| format!("W/\"{tag}\""));
+                    result.meta.e_tag = result.meta.e_tag.map(|tag| format!("W/{tag}"));
                 }
                 return Ok(result);
             };
