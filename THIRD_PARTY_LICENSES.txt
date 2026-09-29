@@ -8854,7 +8854,7 @@ leani-store-sqlite 0.1.0-rc.1 — https://github.com/smart-byte/leani
 alloy-consensus-any 1.8.3 — https://github.com/alloy-rs/alloy
 alloy-consensus-any 2.4.1 — https://github.com/alloy-rs/alloy
 alloy-consensus 1.8.3 — https://github.com/alloy-rs/alloy
-alloy-consensus 2.4.1 — https://github.com/alloy-rs/alloy
+alloy-consensus 2.5.0 — https://github.com/alloy-rs/alloy
 alloy-core 1.6.1 — https://github.com/alloy-rs/core
 alloy-eip2124 0.2.0 — https://github.com/alloy-rs/eips
 alloy-eip2930 0.2.3 — https://github.com/alloy-rs/eips
@@ -8885,7 +8885,7 @@ alloy-sol-macro-input 1.6.1 — https://github.com/alloy-rs/core
 alloy-sol-macro 1.6.1 — https://github.com/alloy-rs/core
 alloy-sol-types 1.6.1 — https://github.com/alloy-rs/core
 alloy-tx-macros 1.8.3 — https://github.com/alloy-rs/alloy
-alloy-tx-macros 2.4.1 — https://github.com/alloy-rs/alloy
+alloy-tx-macros 2.5.0 — https://github.com/alloy-rs/alloy
 alloy 1.8.3 — https://github.com/alloy-rs/alloy
 aquamarine 0.6.0 — https://github.com/mersinvald/aquamarine
 base256emoji 1.0.2 — https://github.com/Jorropo/base256emoji/
@@ -9219,7 +9219,7 @@ MIT License (MIT)
 ==============================================================================
 adler2 2.0.1 — https://github.com/oyvindln/adler2
 alloy-chains 0.2.36 — https://github.com/alloy-rs/chains
-alloy-trie 0.9.5 — https://github.com/alloy-rs/trie
+alloy-trie 0.9.8 — https://github.com/alloy-rs/trie
 anyhow 1.0.104 — https://github.com/dtolnay/anyhow
 async-io 2.6.0 — https://github.com/smol-rs/async-io
 async-trait 0.1.91 — https://github.com/dtolnay/async-trait
