@@ -6,7 +6,7 @@ const sharedLayers = [
   { name: 'Block envelope', level: 168, id: 'normalize', number: '01' },
 ];
 const processorLayers = [
-  { name: 'reduce()', level: 26, id: 'reduce' },
+  { name: 'reduce()', level: 30, id: 'reduce' },
   { name: 'map()', level: 66, id: 'map' },
 ];
 const initialStage = pipelineStages[2];
@@ -32,9 +32,9 @@ const initialStage = pipelineStages[2];
         <div class="floor-cross cross-a"></div><div class="floor-cross cross-b"></div><div class="floor-cross cross-c"></div><div class="floor-cross cross-d"></div>
         <svg class="rails" viewBox="0 0 860 480" fill="none">
           <defs><linearGradient id="pipeline-rail-gradient"><stop stop-color="#466b58"/><stop offset="1" stop-color="#3ee07f"/></linearGradient></defs>
-          <g class="rail-bed"><path d="M110 100H218Q250 100 250 132V208Q250 240 282 240H430"/><path d="M110 380H288Q320 380 320 348V272Q320 240 352 240H430"/><path d="M430 240H755"/></g>
-          <g class="rail-line"><path d="M110 100H218Q250 100 250 132V208Q250 240 282 240H430"/><path d="M110 380H288Q320 380 320 348V272Q320 240 352 240H430"/><path d="M430 240H755"/></g>
-          <g class="rail-ticks"><path d="M110 100H218Q250 100 250 132V208Q250 240 282 240H430"/><path d="M110 380H288Q320 380 320 348V272Q320 240 352 240H430"/><path d="M430 240H755"/></g>
+          <g class="rail-bed"><path d="M110 100H218Q250 100 250 132V208Q250 240 282 240H430"/><path d="M110 380H218Q250 380 250 348V272Q250 240 282 240H430"/><path d="M430 240H755"/></g>
+          <g class="rail-line"><path d="M110 100H218Q250 100 250 132V208Q250 240 282 240H430"/><path d="M110 380H218Q250 380 250 348V272Q250 240 282 240H430"/><path d="M430 240H755"/></g>
+          <g class="rail-ticks"><path d="M110 100H218Q250 100 250 132V208Q250 240 282 240H430"/><path d="M110 380H218Q250 380 250 348V272Q250 240 282 240H430"/><path d="M430 240H755"/></g>
         </svg>
         <div class="source archive">
           {[0, 1, 2, 3].map((level) => <div class="archive-slab" style={`--level: ${level}`}><span></span><span></span><span></span></div>)}
@@ -47,7 +47,7 @@ const initialStage = pipelineStages[2];
           <div class="source-caption mono">LIVE HEAD</div>
         </div>
         {lanes.map((lane) => [0, 1, 2].map((index) => (
-          <div class={`packet packet-${lane}`} style={`--delay: ${-index * 2 - (lane === 'live' ? 1 : 0)}s; --position: ${18 + index * 28}%`}>
+          <div class={`packet packet-${lane}`} style={`--delay: ${-index * 2 - (lane === 'live' ? 1 : 0)}s; --position: ${18 + index * 28 - (lane === 'live' ? 14 : 0)}%`}>
             <div class="cube"></div>
           </div>
         )))}
@@ -285,10 +285,12 @@ const initialStage = pipelineStages[2];
   .gem-top { width: 28px; height: 27px; background: linear-gradient(90deg, #91ffb9 50%, #3d9c63 50%); clip-path: polygon(50% 0, 100% 76%, 50% 100%, 0 76%); }
   .gem-bottom { width: 28px; height: 14px; margin-top: -2px; background: linear-gradient(90deg, #59c883 50%, #246b40 50%); clip-path: polygon(0 0, 50% 35%, 100% 0, 50% 100%); }
   /* Opacity animation on a 3D parent flattens its faces, even at opacity: 1.
-     Keep packets solid; their paths start and end inside the source/core/state. */
-  .packet { position: absolute; left: 0; top: 0; width: 18px; height: 18px; offset-rotate: 0deg; offset-distance: var(--position); transform: translateZ(18px); animation: travel 6s linear infinite; animation-delay: var(--delay); }
+     Keep packets solid; their paths start and end inside the source/core/state.
+     Packets ride on the rail, below the lowest processor layer, so they slide
+     under the modules instead of cutting through them. */
+  .packet { position: absolute; left: 0; top: 0; width: 18px; height: 18px; offset-rotate: 0deg; offset-distance: var(--position); transform: translateZ(12px); animation: travel 6s linear infinite; animation-delay: var(--delay); }
   .packet-history { --cube-top: #b4d4bf; --cube-front: #537660; --cube-side: #385842; offset-path: path('M110 100H218Q250 100 250 132V208Q250 240 282 240H430'); }
-  .packet-live { --cube-top: #91ffb9; --cube-front: #37b86b; --cube-side: #22763e; offset-path: path('M110 380H288Q320 380 320 348V272Q320 240 352 240H430'); }
+  .packet-live { --cube-top: #91ffb9; --cube-front: #37b86b; --cube-side: #22763e; offset-path: path('M110 380H218Q250 380 250 348V272Q250 240 282 240H430'); }
   .packet-output { --cube-top: #b6ffce; --cube-front: #3ee07f; --cube-side: #248f4c; offset-path: path('M475 240H755'); }
   /* Three visible faces, with sides generated in CSS to keep the diagram lean. */
   .cube { --size: 18px; width: var(--size); height: var(--size); position: relative; background: var(--cube-top); border: 1px solid #bcffd35e; transform: translateZ(calc(var(--size) / 2)); }
@@ -341,6 +343,8 @@ const initialStage = pipelineStages[2];
   .module-edge { position: absolute; width: 114px; height: 7px; top: 84px; transform-origin: top; transform: rotateX(-90deg); background: #183224; border: 1px solid color-mix(in srgb, var(--processor-color) 50%, #1b3021); }
   .module-title { display: block; position: absolute; left: 10px; top: 8px; font-size: 17px; font-weight: 700; color: var(--processor-color); }
   .module-method { position: absolute; left: 10px; bottom: 9px; font-size: 14px; color: #e8f9ee; }
+  /* The map() module above covers each reduce() title, leaving only clipped letters; its name already labels the stack. */
+  .reduce .module-title { visibility: hidden; }
   .module-led { position: absolute; right: 10px; bottom: 16px; width: 5px; height: 5px; background: var(--processor-color); box-shadow: 0 0 9px var(--processor-color); animation: compute 3s ease-in-out infinite; animation-delay: calc(var(--module) * -0.7s); }
   .map .processor-module::after { content: ''; position: absolute; left: 56px; top: 42px; width: 1px; height: 40px; transform-origin: top; transform: rotateX(-90deg); background: color-mix(in srgb, var(--processor-color) 50%, transparent); pointer-events: none; }
   .map .processor-module::before { content: ''; position: absolute; left: 53px; top: 39px; width: 7px; height: 7px; background: var(--processor-color); transform: translateZ(-20px); animation: delta-pass 3.2s linear infinite; animation-delay: calc(var(--module) * -0.8s); pointer-events: none; }
