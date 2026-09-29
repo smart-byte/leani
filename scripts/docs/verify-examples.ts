@@ -37,7 +37,7 @@ if (process.argv.includes('--typescript')) {
       .filter((example) => example.verifier.kind === 'typescript')
       .map((example) => example.verifier.project),
   );
-  const tsc = resolve(repositoryRoot, 'site/node_modules/.bin/tsc');
+  const tsc = resolve(repositoryRoot, 'site/node_modules/@typescript/native/bin/tsc');
   for (const project of projects) {
     const process = Bun.spawn([tsc, '-p', resolve(repositoryRoot, project), '--noEmit'], {
       cwd: repositoryRoot,
