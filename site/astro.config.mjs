@@ -22,9 +22,7 @@ export default defineConfig({
         },
         {
           find: /^@astrojs\/starlight\/components$/,
-          replacement: fileURLToPath(
-            new URL('./node_modules/@astrojs/starlight/components.ts', import.meta.url),
-          ),
+          replacement: fileURLToPath(import.meta.resolve('@astrojs/starlight/components')),
         },
       ],
     },
@@ -91,7 +89,6 @@ export default defineConfig({
       components: {
         Banner: './src/components/docs/PreviewBanner.astro',
         EditLink: './src/components/docs/EditLink.astro',
-        MobileMenuToggle: './src/components/docs/MobileMenuToggle.astro',
         Pagination: './src/components/docs/Pagination.astro',
         Sidebar: './src/components/docs/Sidebar.astro',
       },
