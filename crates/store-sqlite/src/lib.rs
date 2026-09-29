@@ -2166,11 +2166,11 @@ async fn backup_store(
         std::fs::create_dir_all(parent)?;
     }
     // A lossy path would write elsewhere than the existence check looked.
-    let escaped = destination
+    let path = destination
         .to_str()
-        .ok_or_else(|| StoreError::InvalidConfig("backup path must be valid UTF-8".to_owned()))?
-        .replace('\'', "''");
-    sqlx::query(&format!("VACUUM INTO '{escaped}'"))
+        .ok_or_else(|| StoreError::InvalidConfig("backup path must be valid UTF-8".to_owned()))?;
+    sqlx::query("VACUUM INTO ?")
+        .bind(path)
         .execute(&mut *connection)
         .await?;
     // SQLite does not sync what VACUUM INTO writes, and the next start
@@ -13780,9 +13780,12 @@ impl SqliteStore {
             ));
         }
         let _guard = self.inner.writer.lock_history().await;
-        sqlx::query(&format!("PRAGMA incremental_vacuum({maximum_pages})"))
-            .execute(&self.inner.pool)
-            .await?;
+        // SQLite PRAGMA syntax requires a literal; this value is a validated u32.
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "PRAGMA incremental_vacuum({maximum_pages})"
+        )))
+        .execute(&self.inner.pool)
+        .await?;
         Ok(())
     }
 
@@ -14179,7 +14182,7 @@ impl ReducerOverlay {
     /// committed key before it has been read.
     async fn scan_merged_prefix(
         &self,
-        queries: [&str; 2],
+        queries: [&'static str; 2],
         scope: &str,
         prefix: &[u8],
         limit: usize,
@@ -18102,9 +18105,11 @@ async fn table_count(pool: &SqlitePool, table: &str) -> Result<u64, StoreError> 
     if !TABLES.contains(&table) {
         return Err(StoreError::Invariant("invalid count table".to_owned()));
     }
-    let count: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table}"))
-        .fetch_one(pool)
-        .await?;
+    // The identifier has been checked against the fixed table allow-list above.
+    let count: i64 =
+        sqlx::query_scalar(sqlx::AssertSqlSafe(format!("SELECT COUNT(*) FROM {table}")))
+            .fetch_one(pool)
+            .await?;
     i64_u64(count, "table count")
 }
 
@@ -26309,14 +26314,17 @@ mod tests {
         assert_eq!(store.statistics_scans() - before, 4);
     }
 
-    async fn query_plan(store: &SqliteStore, statement: &str) -> Vec<String> {
-        sqlx::query(&format!("EXPLAIN QUERY PLAN {statement}"))
-            .fetch_all(&store.inner.pool)
-            .await
-            .expect("query plan")
-            .iter()
-            .map(|row| row.try_get("detail").expect("plan detail"))
-            .collect()
+    async fn query_plan(store: &SqliteStore, statement: &'static str) -> Vec<String> {
+        // This helper receives only the fixed coverage-probe SQL constants.
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "EXPLAIN QUERY PLAN {statement}"
+        )))
+        .fetch_all(&store.inner.pool)
+        .await
+        .expect("query plan")
+        .iter()
+        .map(|row| row.try_get("detail").expect("plan detail"))
+        .collect()
     }
 
     #[tokio::test]
