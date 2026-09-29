@@ -1,6 +1,6 @@
 //! Command-line contract.
 
-use std::path::PathBuf;
+use std::{path::PathBuf, time::Duration};
 
 use clap::{Parser, Subcommand, ValueEnum};
 
@@ -39,6 +39,11 @@ pub enum Command {
     /// Start configured sources, processors, stores, and serving endpoints.
     Serve,
     /// Create a compact configuration for a built-in processor.
+    #[command(after_help = "Examples:
+  leani init blocks
+  leani init uniswap-v3 ETH/USDC --data-dir data
+
+Without a terminal, pass --yes only after the user has approved the checkpoint providers.")]
     Init {
         /// Processor preset to configure.
         #[arg(value_enum)]
@@ -70,6 +75,15 @@ pub enum Command {
         yes: bool,
     },
     /// Stream live processor output from an embedded runtime or a running node.
+    #[command(after_help = "Examples:
+  leani subscribe blocks
+  leani subscribe blocks --finality finalized
+  leani subscribe uniswap-v3 ETH/USDC --json
+  leani subscribe blocks --json --once --timeout 5m
+  leani subscribe blocks --once --finality preview
+
+Exit codes: 0 success or stopped, 124 --timeout elapsed before --once was
+satisfied, 130 interrupted before --once was satisfied.")]
     Subscribe {
         /// Built-in subscription feed to activate.
         #[arg(value_enum)]
@@ -80,6 +94,9 @@ pub enum Command {
         /// Rendering contract for stdout.
         #[arg(long, value_enum, default_value_t = SubscribeFormat::Pretty)]
         format: SubscribeFormat,
+        /// Shorthand for `--format json`.
+        #[arg(long, conflicts_with = "format")]
+        json: bool,
         /// Where the subscription processor should run.
         #[arg(long, value_enum, default_value_t = SubscribeMode::Auto)]
         mode: SubscribeMode,
@@ -92,7 +109,8 @@ pub enum Command {
         /// Optional bearer token for a running node.
         #[arg(long, env = "LEANI_API_TOKEN", hide_env_values = true)]
         token: Option<String>,
-        /// Lowest status to print: `included` (default) or `finalized`.
+        /// Lowest status that counts as a result: `preview`, `included`
+        /// (default), or `finalized`.
         #[arg(long, value_enum, default_value_t = SubscribeFinality::Included)]
         finality: SubscribeFinality,
         /// Finality transport for the embedded runtime.
@@ -123,6 +141,10 @@ pub enum Command {
         /// Exit after the first matching update.
         #[arg(long)]
         once: bool,
+        /// Stop after this long, e.g. `90s`, `5m`, or `300` (seconds); with
+        /// `--once`, exit 124 if nothing matched.
+        #[arg(long, value_name = "DURATION", value_parser = parse_duration)]
+        timeout: Option<Duration>,
     },
     /// Reset reconstructible local runtime state for cold-start testing.
     Reset {
@@ -130,14 +152,20 @@ pub enum Command {
         command: ResetCommand,
     },
     /// Process a historical block range and then exit.
+    #[command(after_help = "Examples:
+  leani backfill --from-block 17000000 --to-block 17000999
+  leani backfill --processor weth-transfers --from-block 17000000 --to-block 17000009
+  leani backfill --endpoint http://127.0.0.1:18080 --from-block 17000000 --to-block 17000999")]
     Backfill {
-        /// Configured processor ID.
-        #[arg(long, default_value = "blobs-money")]
-        processor: String,
+        /// Configured processor instance or kind [default: the only configured processor].
         #[arg(long)]
-        from: u64,
-        #[arg(long)]
-        to: u64,
+        processor: Option<String>,
+        /// First block of the range, inclusive.
+        #[arg(long, visible_alias = "from")]
+        from_block: u64,
+        /// Last block of the range, inclusive.
+        #[arg(long, visible_alias = "to")]
+        to_block: u64,
         /// Submit to an already running node, preserving an optional URL prefix.
         #[arg(long)]
         endpoint: Option<url::Url>,
@@ -151,11 +179,13 @@ pub enum Command {
         command: SourceCommand,
     },
     /// Compare normalized source exports or render exact RPC response vectors.
+    #[command(hide = true)]
     Conformance {
         #[command(subcommand)]
         command: ConformanceCommand,
     },
     /// Run a reproducible historical throughput and storage measurement.
+    #[command(hide = true)]
     Benchmark {
         /// Optional benchmark orchestration command.
         #[command(subcommand)]
@@ -276,6 +306,7 @@ pub enum Command {
         samples_report: Option<PathBuf>,
     },
     /// Run explicit end-to-end verification gates.
+    #[command(hide = true)]
     E2e {
         #[command(subcommand)]
         command: E2eCommand,
@@ -285,6 +316,15 @@ pub enum Command {
         #[command(subcommand)]
         command: DbCommand,
     },
+}
+
+/// A duration such as `30s`, `5m`, or `1h30m`; a bare number counts
+/// seconds, as `timeout(1)` does.
+fn parse_duration(value: &str) -> Result<Duration, humantime::DurationError> {
+    value.parse::<u64>().map_or_else(
+        |_| humantime::parse_duration(value),
+        |seconds| Ok(Duration::from_secs(seconds)),
+    )
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -310,11 +350,15 @@ pub enum SubscribeMode {
     Embedded,
 }
 
-/// Lowest chain-confidence status a subscription prints.
+/// Lowest chain-confidence status that counts as a subscription result.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 pub enum SubscribeFinality {
+    /// Like `included`, but an unverified peer preview from embedded startup
+    /// also counts, so `--once` can return it. Fastest first output.
+    Preview,
     /// Print blocks as soon as they are on the followed chain; a reorg can
-    /// still remove them. Embedded startup may print a peer preview first.
+    /// still remove them. While following, embedded startup may show labelled
+    /// peer previews first; they never satisfy `--once`.
     Included,
     /// Print blocks only after Ethereum consensus has finalized them.
     Finalized,
@@ -844,6 +888,19 @@ mod tests {
         assert_eq!(finality_source, SubscribeFinalitySource::P2p);
         assert_eq!(checkpoint_url.len(), 2);
         assert_eq!(checkpoint_quorum, 2);
+    }
+
+    #[test]
+    fn timeouts_take_units_or_bare_seconds() {
+        for (value, seconds) in [("300", 300), ("90s", 90), ("5m", 300), ("1h30m", 5_400)] {
+            assert_eq!(
+                parse_duration(value).unwrap(),
+                Duration::from_secs(seconds),
+                "{value}"
+            );
+        }
+        assert!(parse_duration("5 minutes please").is_err());
+        assert!(parse_duration("-1").is_err());
     }
 
     #[test]

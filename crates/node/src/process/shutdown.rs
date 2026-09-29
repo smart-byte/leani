@@ -140,7 +140,7 @@ pub(super) async fn forward_shutdown_signals(
 
 /// Ctrl-C, and SIGTERM on Unix. Each [`Self::recv`] waits for the next one,
 /// so a second signal is not missed while the first is handled.
-pub(super) struct ShutdownSignals {
+pub(crate) struct ShutdownSignals {
     #[cfg(unix)]
     interrupt: tokio::signal::unix::Signal,
     #[cfg(unix)]
@@ -149,7 +149,7 @@ pub(super) struct ShutdownSignals {
 
 impl ShutdownSignals {
     #[cfg(unix)]
-    pub(super) fn new() -> std::io::Result<Self> {
+    pub(crate) fn new() -> std::io::Result<Self> {
         use tokio::signal::unix::{SignalKind, signal};
 
         Ok(Self {
@@ -160,12 +160,12 @@ impl ShutdownSignals {
 
     #[cfg(not(unix))]
     #[allow(clippy::unnecessary_wraps)]
-    pub(super) fn new() -> std::io::Result<Self> {
+    pub(crate) fn new() -> std::io::Result<Self> {
         Ok(Self {})
     }
 
     #[cfg(unix)]
-    pub(super) async fn recv(&mut self) -> std::io::Result<()> {
+    pub(crate) async fn recv(&mut self) -> std::io::Result<()> {
         tokio::select! {
             received = self.interrupt.recv() => received,
             received = self.terminate.recv() => received,
@@ -174,7 +174,7 @@ impl ShutdownSignals {
     }
 
     #[cfg(not(unix))]
-    pub(super) async fn recv(&mut self) -> std::io::Result<()> {
+    pub(crate) async fn recv(&mut self) -> std::io::Result<()> {
         tokio::signal::ctrl_c().await
     }
 

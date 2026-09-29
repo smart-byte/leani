@@ -263,9 +263,9 @@ impl ProcessorRegistry {
             .ok_or_else(|| ProcessorRegistryError::Unknown(configured.id.clone()))?;
         let components = factory
             .create(configured, ProcessorFactoryContext { chain_id })
-            .map_err(|source| ProcessorRegistryError::Factory {
+            .map_err(|error| ProcessorRegistryError::Factory {
                 id: configured.id.clone(),
-                source,
+                error,
             })?;
         validate_instance(configured, components.processor.as_ref())?;
         Ok(components)
@@ -339,11 +339,10 @@ pub enum ProcessorRegistryError {
     Duplicate(String),
     #[error("processor `{0}` is not registered in this node binary")]
     Unknown(String),
-    #[error("processor `{id}` configuration is invalid: {source}")]
+    #[error("processor `{id}` configuration is invalid: {error}")]
     Factory {
         id: String,
-        #[source]
-        source: ProcessorFactoryError,
+        error: ProcessorFactoryError,
     },
     #[error("processor `{id}` descriptor is inconsistent: {message}")]
     Descriptor { id: String, message: String },

@@ -69,7 +69,7 @@ LEANI_EVENTS_DIR="$(mktemp -d)"
 cp "$LEANI_SOURCE/examples/weth-transfers/node.toml" "$LEANI_EVENTS_DIR/leani.toml"
 cd "$LEANI_EVENTS_DIR"
 leani doctor --json
-leani backfill --processor weth-transfers --from 17000000 --to 17000009
+leani backfill --processor weth-transfers --from-block 17000000 --to-block 17000009
 leani serve
 ```
 

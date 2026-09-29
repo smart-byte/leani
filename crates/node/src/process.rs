@@ -20,9 +20,8 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
-use self::shutdown::{
-    BackgroundTasks, ShutdownSignals, forward_shutdown_signals, serve_until_shutdown,
-};
+pub(crate) use self::shutdown::ShutdownSignals;
+use self::shutdown::{BackgroundTasks, forward_shutdown_signals, serve_until_shutdown};
 
 use crate::{
     benchmark::{BenchmarkOptions, RealSourceBenchmarkOptions},
@@ -37,11 +36,22 @@ use crate::{
     processors::ProcessorRegistry,
 };
 
+/// Process outcome; each maps to a distinct exit code so scripts and agents
+/// can tell failures apart without parsing stderr.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Exit {
+    /// 0.
     Success,
-    InvalidConfiguration,
+    /// 1: a runtime failure.
     Failure,
+    /// 3: `doctor` found the configuration unreadable or invalid. Exit 2 is
+    /// clap's usage error.
+    InvalidConfiguration,
+    /// 124, as `timeout(1)`: `subscribe --once` ran out of time.
+    TimedOut,
+    /// 130, as a shell after SIGINT: `subscribe --once` was stopped by a
+    /// signal before it printed a match.
+    Interrupted,
 }
 
 pub(crate) fn select_processor_config<'a>(
@@ -2817,8 +2827,10 @@ impl From<Exit> for ExitCode {
     fn from(value: Exit) -> Self {
         match value {
             Exit::Success => Self::SUCCESS,
-            Exit::InvalidConfiguration => Self::from(2),
             Exit::Failure => Self::FAILURE,
+            Exit::InvalidConfiguration => Self::from(3),
+            Exit::TimedOut => Self::from(124),
+            Exit::Interrupted => Self::from(130),
         }
     }
 }
@@ -2901,6 +2913,7 @@ pub async fn run_cli_with_registry(cli: Cli, registry: &ProcessorRegistry) -> Re
             protocol,
             targets,
             format,
+            json,
             mode,
             endpoint,
             processor,
@@ -2912,6 +2925,7 @@ pub async fn run_cli_with_registry(cli: Cli, registry: &ProcessorRegistry) -> Re
             yes,
             data_dir,
             once,
+            timeout,
         } => {
             let processor = processor.unwrap_or_else(|| match protocol {
                 SubscribeProtocol::Blocks => "block-summary".to_owned(),
@@ -2921,7 +2935,11 @@ pub async fn run_cli_with_registry(cli: Cli, registry: &ProcessorRegistry) -> Re
                 crate::subscribe::SubscribeOptions {
                     protocol,
                     targets,
-                    format,
+                    format: if json {
+                        crate::cli::SubscribeFormat::Json
+                    } else {
+                        format
+                    },
                     mode,
                     endpoint,
                     processor,
@@ -2933,6 +2951,7 @@ pub async fn run_cli_with_registry(cli: Cli, registry: &ProcessorRegistry) -> Re
                     accept_checkpoint: yes,
                     data_dir,
                     once,
+                    timeout,
                     requested_config,
                     working_directory,
                 },
@@ -2971,16 +2990,16 @@ pub async fn run_cli_with_registry(cli: Cli, registry: &ProcessorRegistry) -> Re
         },
         Command::Backfill {
             processor,
-            from,
-            to,
+            from_block,
+            to_block,
             endpoint,
             token,
         } => {
             backfill::run(
                 &config_path,
-                &processor,
-                from,
-                to,
+                processor.as_deref(),
+                from_block,
+                to_block,
                 endpoint.as_ref(),
                 token.as_deref(),
                 registry,
@@ -5202,7 +5221,29 @@ fn finality_anchor_warnings(config: &Config, now: SystemTime) -> Vec<String> {
 fn doctor(path: &Path, json: bool, registry: &ProcessorRegistry) -> Result<Exit> {
     // The report carries what loading would log.
     let working_directory = std::env::current_dir().ok();
-    let (config, load_warnings) = Config::load_with_warnings(path, working_directory.as_deref())?;
+    let (config, load_warnings) =
+        match Config::load_with_warnings(path, working_directory.as_deref()) {
+            Ok(loaded) => loaded,
+            Err(error) => {
+                let error = format!("{:#}", anyhow::Error::from(error));
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "project": leani_primitives::PROJECT_NAME,
+                            "version": env!("CARGO_PKG_VERSION"),
+                            "config_path": path.display().to_string(),
+                            "valid": false,
+                            "errors": [{ "field": "config", "message": error }],
+                            "warnings": [],
+                        }))?
+                    );
+                } else {
+                    eprintln!("error: {error}");
+                }
+                return Ok(Exit::InvalidConfiguration);
+            }
+        };
     let mut errors = config.validation_errors();
     errors.extend(registry.validation_errors(&config));
     let mut warnings = finality_anchor_warnings(&config, SystemTime::now());
@@ -9443,9 +9484,9 @@ markets = ["ETH/USDT"]
             "/etc/leani/node.toml",
             "--processor",
             "blobs-money",
-            "--from",
+            "--from-block",
             "19426589",
-            "--to",
+            "--to-block",
             "19427588",
         ])
         .expect("the documented backfill command parses");
@@ -9454,13 +9495,13 @@ markets = ["ETH/USDT"]
             Some(Path::new("/etc/leani/node.toml"))
         );
         let Command::Backfill {
-            processor,
-            from,
-            to,
+            processor: Some(processor),
+            from_block: from,
+            to_block: to,
             ..
         } = cli.command
         else {
-            panic!("the documented command is a backfill");
+            panic!("the documented command is a backfill with a processor");
         };
         let configured = backfill_processor_config(&config, &processor)
             .expect("backfill accepts the container profile's processor");
@@ -10806,7 +10847,7 @@ markets = ["ETH/USDT"]
 
         let error = backfill::run(
             &config_path,
-            "transfers",
+            Some("transfers"),
             1,
             4,
             None,
@@ -10889,7 +10930,17 @@ markets = ["ETH/USDT"]
         let registry = crate::processors::ProcessorRegistry::standard();
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         loop {
-            match backfill::run(config_path, "transfers", from, to, None, None, &registry).await {
+            match backfill::run(
+                config_path,
+                Some("transfers"),
+                from,
+                to,
+                None,
+                None,
+                &registry,
+            )
+            .await
+            {
                 Err(error)
                     if format!("{error:#}").contains("already in use")
                         && std::time::Instant::now() < deadline =>
@@ -11148,7 +11199,7 @@ markets = ["ETH/USDT"]
             Duration::from_secs(15),
             backfill::run(
                 Path::new("unused-remote-config"),
-                &instance,
+                Some(&instance),
                 1,
                 4,
                 Some(&endpoint),
@@ -11162,7 +11213,7 @@ markets = ["ETH/USDT"]
         let wrong = endpoint.join("../elsewhere/").unwrap();
         let error = backfill::run(
             Path::new("unused-remote-config"),
-            &instance,
+            Some(&instance),
             1,
             4,
             Some(&wrong),

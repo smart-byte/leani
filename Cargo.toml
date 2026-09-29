@@ -58,6 +58,7 @@ helios-consensus-core = { git = "https://github.com/a16z/helios", rev = "204c998
 hex = "0.4"
 hickory-resolver = "0.26.1"
 http = "1.3"
+humantime = "2.4"
 indexmap = { version = "2.12", features = ["serde"] }
 libp2p = { version = "0.56.0", default-features = false, features = [
   "noise",

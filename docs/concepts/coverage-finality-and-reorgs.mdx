@@ -19,7 +19,7 @@ Every record carries one of three statuses:
 
 | Status | Meaning |
 |---|---|
-| `preview` | A peer supplied the block; nothing verified connects it to the chain yet. Only the embedded CLI prints this during startup. |
+| `preview` | A peer supplied the block; nothing verified connects it to the chain yet. Only the embedded CLI prints this during startup, and `--once` returns it only with `--finality preview`. |
 | `included` | The block's ancestry is verified to an execution header the Ethereum sync committee attested. A reorg can still remove it. |
 | `finalized` | Ethereum consensus has finalized the block. |
 

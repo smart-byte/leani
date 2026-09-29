@@ -23,7 +23,7 @@ replace the image's `serve` command, so name the profile with `--config`:
 ```bash
 docker compose stop leani
 docker compose run --rm leani backfill --config /etc/leani/node.toml \
-  --processor blobs-money --from 19426589 --to 19427588
+  --processor blobs-money --from-block 19426589 --to-block 19427588
 docker compose up -d leani
 ```
 
@@ -37,7 +37,7 @@ its native API, without stopping it:
 
 ```bash
 leani backfill --endpoint http://127.0.0.1:18080 \
-  --processor blobs-money --from 19426589 --to 19427588
+  --processor blobs-money --from-block 19426589 --to-block 19427588
 ```
 
 The standalone form attaches the same verified P2P history fallback when

@@ -287,8 +287,8 @@ cargo run -p leani-custom-example --release -- \
   --config examples/custom-node/node.toml \
   backfill \
   --processor example-block-summary \
-  --from 19426589 \
-  --to 19426688
+  --from-block 19426589 \
+  --to-block 19426688
 ```
 
 Start the query service:

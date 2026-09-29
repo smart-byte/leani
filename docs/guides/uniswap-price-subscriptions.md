@@ -144,7 +144,8 @@ subscription it also fetches one root-checked current head block and can print
 matching swaps while the durable anchored lane catches up. Such output says
 `preview` in the terminal and `finality: "preview"` in JSON: commitment checks
 alone do not prove canonical ancestry. Output from the configured processor
-lane says `included` or `finalized`. `--once` may exit on a preview; use
+lane says `included` or `finalized`. `--once` hides previews and waits for
+the first `included` update unless you pass `--finality preview`; use
 `--finality finalized` to wait for a block Ethereum consensus has finalized.
 Finalized output
 still waits for the fully joined path. Its small SQLite store, locally verified

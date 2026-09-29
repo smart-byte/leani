@@ -2713,13 +2713,13 @@ pub enum ConfigError {
         "relative data_dir resolves to {current} beside the configuration, which holds no Leani state, but {previous} under the working directory does; move that state beside the configuration, or set data_dir to the intended absolute path"
     )]
     AmbiguousDataDirectory { previous: PathBuf, current: PathBuf },
-    #[error("failed to read configuration at {path}: {source}")]
+    #[error("failed to read configuration at {path}")]
     Read {
         path: PathBuf,
         #[source]
         source: std::io::Error,
     },
-    #[error("failed to parse configuration at {path}: {source}")]
+    #[error("failed to parse configuration at {path}")]
     Parse {
         path: PathBuf,
         #[source]

@@ -57,10 +57,10 @@ ON execution_peer_quality(chain_id, last_body_success_unix_ms DESC);
 pub enum ExecutionPeerStoreError {
     #[error("execution peer store path has no parent: {0}")]
     MissingParent(PathBuf),
-    #[error("create execution peer store directory {path}: {source}")]
+    #[error("create execution peer store directory {path}: {error}")]
     CreateDirectory {
         path: PathBuf,
-        source: std::io::Error,
+        error: std::io::Error,
     },
     #[error("unsupported execution peer store schema {observed}; expected {expected}")]
     UnsupportedSchema { observed: i64, expected: i64 },
@@ -690,10 +690,10 @@ async fn open_database(path: &Path, create: bool) -> Result<SqlitePool, Executio
         .parent()
         .ok_or_else(|| ExecutionPeerStoreError::MissingParent(path.to_path_buf()))?;
     if create {
-        std::fs::create_dir_all(parent).map_err(|source| {
+        std::fs::create_dir_all(parent).map_err(|error| {
             ExecutionPeerStoreError::CreateDirectory {
                 path: parent.to_path_buf(),
-                source,
+                error,
             }
         })?;
     }

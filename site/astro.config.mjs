@@ -59,9 +59,9 @@ export default defineConfig({
           details: [
             'Leani is alpha software built from source; the `leani` CLI is the primary interface.',
             '',
-            '- `leani subscribe blocks` follows Ethereum Mainnet blocks over P2P with no API key and runs until interrupted. Add `--once` to exit after the first result and `--format json` for NDJSON on stdout; progress goes to stderr.',
+            '- `leani subscribe blocks` follows Ethereum Mainnet blocks over P2P with no API key and runs until interrupted. Add `--json` for NDJSON on stdout (progress goes to stderr), `--once` to exit after the first verified result, and `--timeout 5m` to bound the run; an unsatisfied `--once` exits 124 on timeout.',
             '- First use asks the user to accept a checkpoint, the trust anchor for verification. Without a terminal the command fails unless `--yes` is passed. Agents should pass `--yes` only after the user has approved the checkpoint.',
-            '- Rows are labelled `preview`, `included` (can still be reorged), or `finalized`. JSON output mixes row schemas, so dispatch on each row\'s `schema` field.',
+            '- Rows are labelled `preview` (unverified peer data shown during embedded startup), `included` (can still be reorged), or `finalized`. `--once` never returns a preview unless `--finality preview` is passed. JSON output mixes row schemas, so dispatch on each row\'s `schema` field.',
             '- `leani init blocks` then `leani serve` runs a reusable node: HTTP API at http://127.0.0.1:18080, JSON-RPC subset at http://127.0.0.1:18545.',
           ].join('\n'),
           promote: DOC_STARTER_PAGES.map((page) => page.id),

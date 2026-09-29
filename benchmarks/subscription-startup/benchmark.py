@@ -77,6 +77,13 @@ def command_output(command: list[str]) -> str | None:
         return None
 
 
+def once_arguments(binary: Path) -> list[str]:
+    """Let `--once` end on the first peer preview, as it did by default before
+    `--finality preview` existed; newer binaries wait for a verified row."""
+    help_text = command_output([str(binary), "subscribe", "--help"]) or ""
+    return ["--once", "--finality", "preview"] if "- preview:" in help_text else ["--once"]
+
+
 def binary_metadata(path: Path) -> dict[str, str | None]:
     return {
         "path": str(path),
@@ -115,6 +122,8 @@ def manifest_for(
                 "--format",
                 "pretty",
                 "--once",
+                "--finality",
+                "preview",
                 "--yes",
                 "--data-dir",
                 "<data-directory>",
@@ -234,7 +243,7 @@ def run_once(
         "embedded",
         "--format",
         "pretty",
-        "--once",
+        *once_arguments(binary),
         "--yes",
         "--data-dir",
         str(data_directory),
