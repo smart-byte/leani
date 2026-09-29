@@ -3,11 +3,14 @@ import starlight from '@astrojs/starlight';
 import starlightLlmsTxt from 'starlight-llms-txt';
 import { fileURLToPath } from 'node:url';
 import { DOC_SECTIONS, DOC_SECTION_LABELS, DOC_STARTER_PAGES } from './src/lib/docs';
+import { SOCIAL_IMAGE } from './src/lib/social';
+
+const site = 'https://leani.dev';
 
 const repositoryRoot = fileURLToPath(new URL('../', import.meta.url));
 
 export default defineConfig({
-  site: 'https://leani.dev',
+  site,
   vite: {
     resolve: {
       // MDX resolves bare imports from the canonical root docs directory,
@@ -43,6 +46,13 @@ export default defineConfig({
         alt: 'Leani',
       },
       pagefind: true,
+      // Starlight already declares a large Twitter card; give it the image.
+      head: [
+        ['og:image', new URL(SOCIAL_IMAGE.path, site).href],
+        ['og:image:width', String(SOCIAL_IMAGE.width)],
+        ['og:image:height', String(SOCIAL_IMAGE.height)],
+        ['og:image:alt', SOCIAL_IMAGE.alt],
+      ].map(([property, content]) => ({ tag: 'meta', attrs: { property, content } })),
       plugins: [
         // Serves /llms.txt, /llms-full.txt, and /llms-small.txt for AI agents.
         starlightLlmsTxt({

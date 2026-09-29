@@ -20,3 +20,11 @@ test('interactive widgets use scoped selectors and semantic copy controls', () =
   expect(hero).toContain('e.preventDefault()');
   expect(hero).not.toContain('api.github.com');
 });
+
+test('the share card image matches its declared size', async () => {
+  const { SOCIAL_IMAGE } = await import('../src/lib/social');
+  const png = readFileSync(new URL(`../public${SOCIAL_IMAGE.path}`, import.meta.url));
+  // A PNG's IHDR chunk stores width and height as big-endian u32 at bytes 16 and 20.
+  expect(png.subarray(1, 4).toString()).toBe('PNG');
+  expect([png.readUInt32BE(16), png.readUInt32BE(20)]).toEqual([SOCIAL_IMAGE.width, SOCIAL_IMAGE.height]);
+});
