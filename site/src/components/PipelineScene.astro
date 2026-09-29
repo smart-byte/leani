@@ -1,6 +1,6 @@
 ---
 import { pipelineStages, pipelineProcessors } from '../data/pipeline';
-const lanes = ['history', 'live', 'output'];
+const inputLanes = ['history', 'live'];
 const sharedLayers = [
   { name: 'Validation', level: 116, id: 'validate', number: '02' },
   { name: 'Block envelope', level: 168, id: 'normalize', number: '01' },
@@ -46,11 +46,18 @@ const initialStage = pipelineStages[2];
           <div class="live-gem"><div class="gem-top"></div><div class="gem-bottom"></div></div>
           <div class="source-caption mono">LIVE HEAD</div>
         </div>
-        {lanes.map((lane) => [0, 1, 2].map((index) => (
+        {inputLanes.map((lane) => [0, 1, 2].map((index) => (
           <div class={`packet packet-${lane}`} style={`--delay: ${-index * 2 - (lane === 'live' ? 1 : 0)}s; --position: ${18 + index * 28 - (lane === 'live' ? 14 : 0)}%`}>
             <div class="cube"></div>
           </div>
         )))}
+        <div class="handoff-gate"></div>
+        <div class="handoff-label mono">exact handoff</div>
+        {pipelineProcessors.map((processor, index) => (
+          <div class="packet packet-output" style={`--slot: ${index}; --position: ${20 + index * 20}%; --processor-color: ${processor.color}`}>
+            <div class="cube"></div>
+          </div>
+        ))}
         <div class="processor">
           <div class="processor-foundation"><span class="mono">leani_</span><div class="pins pins-left"></div><div class="pins pins-right"></div></div>
           {processorLayers.map(({ name, level, id }) => (
@@ -255,7 +262,11 @@ const initialStage = pipelineStages[2];
   [aria-pressed='true'] .play-icon { display: block; }
   .viewport { height: 660px; position: relative; isolation: isolate; background: radial-gradient(ellipse at 54% 48%, #14362255, transparent 57%); overflow: hidden; }
   .camera { --scene-scale: 1; position: absolute; width: 860px; height: 480px; left: 50%; top: 57%; margin: -240px 0 0 -430px; transform: scale(var(--scene-scale)); perspective: 1800px; }
-  .world { width: 100%; height: 100%; position: relative; transform-style: preserve-3d; transform: rotateX(calc(55deg + var(--tilt-x, 0deg))) rotateZ(calc(-30deg + var(--tilt-z, 0deg))); transition: transform 600ms cubic-bezier(0.2, 0.65, 0.3, 1); }
+  /* One beat per second: a block reaches the core, its output leaves
+     --process later, and lands --output-travel after that, committing one
+     state cell. Inputs run a 6s loop of 6 blocks, outputs a 4s loop of one
+     block per processor, state cells a 9s loop of 9 cells. */
+  .world { --process: 0.4s; width: 100%; height: 100%; position: relative; transform-style: preserve-3d; transform: rotateX(calc(55deg + var(--tilt-x, 0deg))) rotateZ(calc(-30deg + var(--tilt-z, 0deg))); transition: transform 600ms cubic-bezier(0.2, 0.65, 0.3, 1); }
   /* Only 3D groups preserve depth. SVG rails and plate artwork stay flat
      within their own plane so their children paint consistently across engines. */
   .source, .packet, .cube, .processor, .processor-layer, .processor-module, .state-bank, .state-cell { transform-style: preserve-3d; }
@@ -291,7 +302,11 @@ const initialStage = pipelineStages[2];
   .packet { position: absolute; left: 0; top: 0; width: 18px; height: 18px; offset-rotate: 0deg; offset-distance: var(--position); transform: translateZ(12px); animation: travel 6s linear infinite; animation-delay: var(--delay); }
   .packet-history { --cube-top: #b4d4bf; --cube-front: #537660; --cube-side: #385842; offset-path: path('M110 100H218Q250 100 250 132V208Q250 240 282 240H430'); }
   .packet-live { --cube-top: #91ffb9; --cube-front: #37b86b; --cube-side: #22763e; offset-path: path('M110 380H218Q250 380 250 348V272Q250 240 282 240H430'); }
-  .packet-output { --cube-top: #b6ffce; --cube-front: #3ee07f; --cube-side: #248f4c; offset-path: path('M475 240H755'); }
+  .packet-output { --cube-top: var(--processor-color); --cube-front: color-mix(in srgb, var(--processor-color) 62%, #0b110e); --cube-side: color-mix(in srgb, var(--processor-color) 42%, #0b110e); width: 10px; height: 10px; transform: translateZ(8px); offset-path: path('M475 240H755'); animation-duration: 4s; animation-delay: calc(var(--process) + var(--slot) * 1s - 4s); }
+  .packet-output .cube { --size: 10px; }
+  /* Blocks from both lanes pass the junction about 2.1s before they reach the core. */
+  .handoff-gate { position: absolute; left: 275px; top: 233px; width: 14px; height: 14px; border: 1px solid #9dffc0; border-radius: 3px; transform: translateZ(3px) rotate(45deg); opacity: 0.25; animation: handoff 1s ease-out infinite; animation-delay: -0.1s; pointer-events: none; }
+  .handoff-label { position: absolute; left: 118px; top: 232px; transform: translateZ(1px); font-size: 13px; letter-spacing: 0.04em; color: #a7c0af; pointer-events: none; }
   /* Three visible faces, with sides generated in CSS to keep the diagram lean. */
   .cube { --size: 18px; width: var(--size); height: var(--size); position: relative; background: var(--cube-top); border: 1px solid #bcffd35e; transform: translateZ(calc(var(--size) / 2)); }
   .cube::before, .cube::after { content: ''; position: absolute; inset: -1px; border: 1px solid #bcffd35e; backface-visibility: hidden; }
@@ -305,6 +320,7 @@ const initialStage = pipelineStages[2];
   .pins-left { left: -10px; }.pins-right { right: -10px; }
   .processor-layer { position: absolute; inset: 0; transform: translateZ(var(--height)); animation: layer-breathe 6s ease-in-out infinite; }
   .plate-surface { position: absolute; inset: 0; border: 1px solid #6aaa80; border-radius: 5px; background: linear-gradient(145deg, #243f2edb, #102219f2); }
+  .normalize .plate-surface::after { content: ''; position: absolute; inset: -1px; border: 1px solid #c4ffd9; border-radius: inherit; box-shadow: 0 0 24px #3ee07f66, inset 0 0 22px #3ee07f26; opacity: 0; animation: arrive 1s ease-out infinite; pointer-events: none; }
   .normalize .plate-surface { border-color: #85e9a6; background: linear-gradient(145deg, #33543fdc, #193723ed); box-shadow: 0 0 30px #3ee07f14, inset 0 0 25px #3ee07f10; }
   .plate-edge { position: absolute; background: #142c1d; border: 1px solid #416e50; }
   .edge-front { width: 244px; height: 8px; top: 184px; transform-origin: top; transform: rotateX(-90deg); }
@@ -321,7 +337,7 @@ const initialStage = pipelineStages[2];
   .state-bank { position: absolute; left: 686px; top: 173px; width: 138px; height: 138px; }
   .state-base { position: absolute; inset: -8px; border: 1px solid #4ca66a; border-radius: 6px; background: #142e1e; transform: translateZ(5px); box-shadow: 0 6px 0 #102319, 0 7px 0 #365c43; }
   .state-base > span { position: absolute; bottom: -28px; width: 100%; text-align: center; color: #b9dcc4; font-size: 13px; letter-spacing: 0.07em; }
-  .state-cell { --cube-top: #78e99c; --cube-front: #36a55d; --cube-side: #206a3b; position: absolute; left: calc(8px + var(--col) * 43px); top: calc(8px + var(--row) * 43px); transform: translateZ(27px); animation: commit 6s ease-in-out infinite; animation-delay: calc(var(--cell) * -0.65s); }
+  .state-cell { --cube-top: #78e99c; --cube-front: #36a55d; --cube-side: #206a3b; position: absolute; left: calc(8px + var(--col) * 43px); top: calc(8px + var(--row) * 43px); transform: translateZ(27px); animation: commit 9s ease-out infinite; animation-delay: calc(var(--process) + var(--cell) * 1s - 9s); }
   .state-cell .cube { --size: 35px; }
   .raw-path { position: absolute; left: 505px; top: 375px; border-left: 1px dashed #53705d; padding: 12px; transform: translateZ(1px); font-size: 13px; color: #a7c0af; }
   .raw-path span { display: block; }
@@ -388,7 +404,9 @@ const initialStage = pipelineStages[2];
   @keyframes delta-pass { 0% { transform: translateZ(-5px); opacity: 0; } 15%, 85% { opacity: 1; } 100% { transform: translateZ(-36px); opacity: 0; } }
   @keyframes intake { 0%, 100% { opacity: 0; transform: translateZ(178px) scale(1); } 20% { opacity: 0.8; } 65% { opacity: 0; transform: translateZ(200px) scale(1.15); } }
   @keyframes broadcast { 0% { transform: translateZ(12px) scale(0.65); opacity: 0; } 15% { opacity: 0.8; } 100% { transform: translateZ(80px) scale(1.4); opacity: 0; } }
-  @keyframes commit { 0%, 65%, 100% { transform: translateZ(27px); } 78% { transform: translateZ(42px); } 88% { transform: translateZ(25px); } }
+  @keyframes commit { 0%, 18%, 100% { transform: translateZ(27px); } 6% { transform: translateZ(44px); } 13% { transform: translateZ(25px); } }
+  @keyframes arrive { 0% { opacity: 0.85; } 55%, 100% { opacity: 0; } }
+  @keyframes handoff { 0% { opacity: 1; box-shadow: 0 0 12px #3ee07f; } 60%, 100% { opacity: 0.25; box-shadow: none; } }
   @keyframes discard { 0% { transform: translate3d(0, 0, 28px); opacity: 0; } 15% { opacity: 0.65; } 100% { transform: translate3d(45px, 65px, 1px) scale(0.2); opacity: 0; } }
   @media (max-width: 1000px) {
     .viewport { height: 570px; }
@@ -434,7 +452,7 @@ const initialStage = pipelineStages[2];
   }
   @media (prefers-reduced-motion: reduce) {
     .world, .plate-surface, .module-surface { transition: none; }
-    .world * { animation: none !important; }
-    .emitter-signal, .intake-ring, .raw-fragment { display: none; }
+    .world *, .world *::before, .world *::after { animation: none !important; }
+    .emitter-signal, .intake-ring, .raw-fragment, .normalize .plate-surface::after { display: none; }
   }
 </style>
