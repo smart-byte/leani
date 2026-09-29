@@ -214,6 +214,7 @@ and the [architecture notes](docs/contributing/architecture.md).
 
 - [leani.dev/docs](https://leani.dev/docs/): quickstart, guides, CLI, configuration, HTTP API, and SDK references.
 - [`docs/`](docs/): the Markdown sources, including [ADRs](docs/adr/README.md).
+- [AI agents](https://leani.dev/docs/guides/ai-agents/): the [`skills/leani`](skills/leani/SKILL.md) agent skill (`/plugin marketplace add smart-byte/leani` in Claude Code) and [llms.txt](https://leani.dev/llms.txt).
 - [CHANGELOG.md](CHANGELOG.md) and [SECURITY.md](SECURITY.md).
 
 ## Contributing

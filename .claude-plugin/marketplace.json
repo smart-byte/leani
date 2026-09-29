@@ -1,0 +1,19 @@
+{
+  "name": "leani",
+  "description": "Agent skill for running and querying the Leani Ethereum indexing node",
+  "owner": {
+    "name": "Smart Byte"
+  },
+  "plugins": [
+    {
+      "name": "leani",
+      "source": "./",
+      "description": "Teaches coding agents to follow, index, and query Ethereum data with the leani CLI and node",
+      "license": "MIT",
+      "homepage": "https://leani.dev",
+      "repository": "https://github.com/smart-byte/leani",
+      "strict": false,
+      "skills": ["./skills/leani"]
+    }
+  ]
+}

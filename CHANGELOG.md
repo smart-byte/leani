@@ -329,6 +329,14 @@ Take these steps in order; each links to the entries below that detail it.
   those images, and a weekly workflow runs the cargo-deny advisory check and
   `bun audit`.
 
+### Added
+
+- An [Agent Skills](https://agentskills.io) skill in `skills/leani`, installable
+  in Claude Code with `/plugin marketplace add smart-byte/leani`. It teaches
+  coding agents the CLI's trust, finality, and exit-code rules, and how to
+  configure built-in processors such as `evm-events`. See
+  [Use Leani with AI agents](docs/guides/ai-agents.md).
+
 ### Changed
 
 - CLI changes for scripts and coding agents:
