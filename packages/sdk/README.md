@@ -90,3 +90,8 @@ reset connection or a silent stream, is a retryable `TransportError`, a
 ## License
 
 [MIT](LICENSE).
+
+Development uses the TypeScript 7 native compiler through `@typescript/native`.
+The pinned `typescript` 5.9 package supplies the JavaScript compiler API required
+by `openapi-typescript`; build and typecheck scripts invoke the native compiler
+explicitly so installing both packages cannot change which compiler runs.
