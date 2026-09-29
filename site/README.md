@@ -20,6 +20,11 @@ Brand exports come from `src/assets/leani-mark.svg`. Run `bun run brand:update`
 after changing it to regenerate the SVG favicon, ICO, Apple touch icon, and
 social-media avatar under `public`.
 
+The pinned `typescript` 5.9 package provides the JavaScript compiler API used
+by Astro and the executable documentation generator. TypeScript examples use
+the native TypeScript 7 compiler through `@typescript/native`. Keep these
+dependencies separate until the API consumers support a newer compiler API.
+
 Use `bun run check`, `bun run examples:check`, and `bun run build` before review.
 `bun run docs:watch-check` verifies that the dev server picks up added, edited,
 renamed, and deleted docs. It runs its own foreground dev server on a free
