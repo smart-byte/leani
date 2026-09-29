@@ -33,7 +33,9 @@ export default defineConfig({
       // required for reliable add/rename/delete discovery across this boundary
       // on macOS; edits alone work with Vite's default watcher.
       fs: { allow: [repositoryRoot] },
-      watch: { usePolling: true, interval: 250 },
+      // Astro rewrites its content store through temporary files and rename.
+      // Normalize those atomic writes into change events while polling.
+      watch: { usePolling: process.platform === 'darwin', interval: 250, atomic: true },
     },
   },
   integrations: [
