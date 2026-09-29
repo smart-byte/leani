@@ -155,7 +155,7 @@ impl BeaconTransport for HttpTransport {
                 .await
                 .map_err(|source| BeaconApiError::Request {
                     url: label.clone(),
-                    source: source.without_url(),
+                    error: source.without_url(),
                 })?;
         read_response(response, &label, MAX_RESPONSE_BYTES)
             .await
@@ -203,7 +203,7 @@ pub async fn read_response(
         .await
         .map_err(|source| BeaconApiError::Request {
             url: label.to_owned(),
-            source: source.without_url(),
+            error: source.without_url(),
         })?
     {
         let room = limit.saturating_sub(body.len());

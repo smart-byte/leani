@@ -43,8 +43,10 @@ leani subscribe blocks --format json |
 Embedded startup can print a header-commitment-checked peer preview before the
 verified processor lane is ready. Those rows say `preview`; JSON reports
 `finality: "preview"`. Rows from the verified lane say `included` or
-`finalized`. In embedded mode, use `--finality finalized` when the first result
-must be a block Ethereum consensus has finalized. Attached output follows the
+`finalized`. Previews show progress while following, but they are not
+results: `--once` hides them and waits for the first `included` row unless you
+pass `--finality preview`. In embedded mode, use `--finality finalized` when
+the first result must be a block Ethereum consensus has finalized. Attached output follows the
 node's configured source trust; a dataset's finality label does not become a
 cryptographic proof simply by subscribing to it. Against a node that publishes
 included blocks, an attached `--finality finalized` subscription prints each
@@ -60,11 +62,20 @@ change `key` while it is fresh. JSON output mixes such rows, and the gap rows
 described below, with `leani.block-summary.v1` rows, so scripts should
 dispatch on each row's `schema`.
 
-`--once` exits after the first summary, including a labelled preview, which is
-useful for startup timing. An undo or gap row never ends it:
+`--once` exits after the first summary that meets `--finality`, so by default
+after the first verified `included` row. A cold start can take minutes; bound
+it with `--timeout`, which exits 124 when nothing matched in time. An undo or
+gap row never ends `--once`:
 
 ```bash
-time leani subscribe blocks --once
+leani subscribe blocks --json --once --timeout 5m
+```
+
+`--finality preview` also lets an unverified peer preview end `--once`, the
+fastest first output, which is useful for startup timing:
+
+```bash
+time leani subscribe blocks --once --finality preview
 ```
 
 ## Attach to a prepared node

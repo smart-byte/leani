@@ -385,6 +385,21 @@
             ]
           },
           {
+            "id": "json",
+            "long": "json",
+            "short": null,
+            "help": "Shorthand for `--format json`",
+            "required": false,
+            "action": "SetTrue",
+            "defaultValues": [
+              "false"
+            ],
+            "possibleValues": [
+              "true",
+              "false"
+            ]
+          },
+          {
             "id": "mode",
             "long": "mode",
             "short": null,
@@ -434,13 +449,14 @@
             "id": "finality",
             "long": "finality",
             "short": null,
-            "help": "Lowest status to print: `included` (default) or `finalized`",
+            "help": "Lowest status that counts as a result: `preview`, `included` (default), or `finalized`",
             "required": false,
             "action": "Set",
             "defaultValues": [
               "included"
             ],
             "possibleValues": [
+              "preview",
               "included",
               "finalized"
             ]
@@ -526,6 +542,16 @@
               "true",
               "false"
             ]
+          },
+          {
+            "id": "timeout",
+            "long": "timeout",
+            "short": null,
+            "help": "Stop after this long, e.g. `90s`, `5m`, or `300` (seconds); with `--once`, exit 124 if nothing matched",
+            "required": false,
+            "action": "Set",
+            "defaultValues": [],
+            "possibleValues": []
           },
           {
             "id": "config",
@@ -774,6 +800,7 @@
                   "included"
                 ],
                 "possibleValues": [
+                  "preview",
                   "included",
                   "finalized"
                 ]
@@ -895,35 +922,33 @@
       {
         "name": "backfill",
         "about": "Process a historical block range and then exit",
-        "usage": "Usage: leani backfill [OPTIONS] --from <FROM> --to <TO>",
+        "usage": "Usage: leani backfill [OPTIONS] --from-block <FROM_BLOCK> --to-block <TO_BLOCK>",
         "arguments": [
           {
             "id": "processor",
             "long": "processor",
             "short": null,
-            "help": "Configured processor ID",
+            "help": "Configured processor instance or kind [default: the only configured processor]",
             "required": false,
             "action": "Set",
-            "defaultValues": [
-              "blobs-money"
-            ],
+            "defaultValues": [],
             "possibleValues": []
           },
           {
-            "id": "from",
-            "long": "from",
+            "id": "from_block",
+            "long": "from-block",
             "short": null,
-            "help": null,
+            "help": "First block of the range, inclusive",
             "required": true,
             "action": "Set",
             "defaultValues": [],
             "possibleValues": []
           },
           {
-            "id": "to",
-            "long": "to",
+            "id": "to_block",
+            "long": "to-block",
             "short": null,
-            "help": null,
+            "help": "Last block of the range, inclusive",
             "required": true,
             "action": "Set",
             "defaultValues": [],

@@ -266,8 +266,7 @@ fn client_mode_with_an_endpoint_needs_no_local_config() {
             "client",
             "--endpoint",
             &node.url(),
-            "--format",
-            "json",
+            "--json",
             "--once",
         ],
     ));
@@ -324,4 +323,69 @@ fn auto_mode_refuses_a_node_serving_another_chain() {
     assert!(!run.status.success(), "{}", run.stdout);
     assert!(run.stdout.is_empty(), "{}", run.stdout);
     assert!(run.stderr.contains("chain 5"), "{}", run.stderr);
+}
+
+/// A node that accepts connections and never answers, so no update ever
+/// arrives. The receiver hears of each connection.
+fn silent_node() -> (String, std::sync::mpsc::Receiver<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("loopback listener");
+    let url = format!(
+        "http://{}/",
+        listener.local_addr().expect("listener address")
+    );
+    let (connected, connections) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        let mut held = Vec::new();
+        for stream in listener.incoming().flatten() {
+            held.push(stream);
+            let _ = connected.send(());
+        }
+    });
+    (url, connections)
+}
+
+#[test]
+fn a_timeout_ends_a_follow_but_fails_an_unsatisfied_once() {
+    let (node, _connections) = silent_node();
+    let directory = tempfile::tempdir().expect("working directory");
+    for (once, code) in [(true, 124), (false, 0)] {
+        let mut arguments = vec![
+            "blocks",
+            "--mode",
+            "client",
+            "--endpoint",
+            &node,
+            "--json",
+            "--timeout",
+            "1s",
+        ];
+        if once {
+            arguments.push("--once");
+        }
+        let run = finish(subscribe(directory.path(), &arguments));
+        assert_eq!(run.status.code(), Some(code), "once={once}: {}", run.stderr);
+        assert!(run.stdout.is_empty(), "{}", run.stdout);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn sigterm_stops_an_unsatisfied_once_as_interrupted() {
+    let (node, connections) = silent_node();
+    let directory = tempfile::tempdir().expect("working directory");
+    let child = subscribe(
+        directory.path(),
+        &["blocks", "--mode", "client", "--endpoint", &node, "--once"],
+    );
+    // Its first request comes after the signal handlers are installed.
+    connections
+        .recv_timeout(Duration::from_mins(1))
+        .expect("leani subscribe connects");
+    let killed = Command::new("kill")
+        .args(["-TERM", &child.id().to_string()])
+        .status()
+        .expect("send SIGTERM");
+    assert!(killed.success());
+    let run = finish(child);
+    assert_eq!(run.status.code(), Some(130), "{}", run.stderr);
 }

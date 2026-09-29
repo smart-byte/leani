@@ -139,6 +139,7 @@ pub(crate) struct SubscribeOptions {
     pub accept_checkpoint: bool,
     pub data_dir: Option<PathBuf>,
     pub once: bool,
+    pub timeout: Option<Duration>,
     pub requested_config: Option<PathBuf>,
     pub working_directory: PathBuf,
 }
@@ -649,28 +650,114 @@ pub(crate) async fn subscribe(
         }
     };
 
-    let outcome = match (options.mode, endpoint) {
-        (SubscribeMode::Client, endpoint) => {
-            let endpoint = endpoint
-                .context("client mode needs --endpoint or a local leani.toml with api.bind")?;
-            subscribe_attached(&options, &markets, endpoint).await
-        }
-        (SubscribeMode::Auto, Some(endpoint))
-            if options.endpoint.is_some() || endpoint_is_reachable(&options, &endpoint).await =>
-        {
-            subscribe_attached(&options, &markets, endpoint).await
-        }
-        (SubscribeMode::Auto | SubscribeMode::Embedded, _) => {
-            Box::pin(subscribe_embedded(
-                &options,
-                &markets,
-                configured_path.as_deref(),
-                registry,
-            ))
-            .await
+    let stop = Stop::new(options.timeout);
+    let run = async {
+        match (options.mode, endpoint) {
+            (SubscribeMode::Client, endpoint) => {
+                let endpoint = endpoint
+                    .context("client mode needs --endpoint or a local leani.toml with api.bind")?;
+                subscribe_attached(&options, &markets, endpoint, &stop).await
+            }
+            (SubscribeMode::Auto, Some(endpoint))
+                if options.endpoint.is_some()
+                    || endpoint_is_reachable(&options, &endpoint).await =>
+            {
+                subscribe_attached(&options, &markets, endpoint, &stop).await
+            }
+            (SubscribeMode::Auto | SubscribeMode::Embedded, _) => {
+                Box::pin(subscribe_embedded(
+                    &options,
+                    &markets,
+                    configured_path.as_deref(),
+                    registry,
+                    &stop,
+                ))
+                .await
+            }
         }
     };
+    // The loops end themselves at their next wait once stopped; this bounds
+    // a stop that arrives while startup blocks elsewhere, as in checkpoint
+    // fetches.
+    let outcome = tokio::select! {
+        outcome = run => outcome,
+        () = async {
+            stop.requested().await;
+            tokio::time::sleep(STOP_GRACE).await;
+        } => Ok(stop.exit(options.once)),
+    };
     finish_subscription(outcome)
+}
+
+/// How long a stopped subscription may take to reach a wait point and shut
+/// down before it is abandoned.
+const STOP_GRACE: Duration = Duration::from_secs(10);
+
+/// Why a [`Stop`] fired.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StopReason {
+    Signal,
+    Timeout,
+}
+
+/// Ends a subscription early: when `--timeout` elapses, or, once
+/// [`Self::catch_signals`] ran, at the first SIGINT or SIGTERM.
+#[derive(Clone, Default)]
+struct Stop {
+    token: tokio_util::sync::CancellationToken,
+    reason: std::sync::Arc<std::sync::OnceLock<StopReason>>,
+}
+
+impl Stop {
+    fn new(timeout: Option<Duration>) -> Self {
+        let stop = Self::default();
+        if let Some(timeout) = timeout {
+            let timed = stop.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(timeout).await;
+                timed.fire(StopReason::Timeout);
+            });
+        }
+        stop
+    }
+
+    /// Turn SIGINT and SIGTERM into a graceful stop for the rest of the run,
+    /// so a signal between two waits is not lost; a second signal exits at
+    /// once, as `serve` does. Called after the blocking checkpoint prompt,
+    /// where the default action must still end the process at once.
+    fn catch_signals(&self) -> Result<()> {
+        let mut signals =
+            crate::process::ShutdownSignals::new().context("install shutdown signal handlers")?;
+        let signalled = self.clone();
+        tokio::spawn(async move {
+            if signals.recv().await.is_ok() {
+                signalled.fire(StopReason::Signal);
+                if signals.recv().await.is_ok() {
+                    std::process::exit(130);
+                }
+            }
+        });
+        Ok(())
+    }
+
+    fn fire(&self, reason: StopReason) {
+        let _ = self.reason.set(reason);
+        self.token.cancel();
+    }
+
+    async fn requested(&self) {
+        self.token.cancelled().await;
+    }
+
+    /// The exit of a subscription this stopped. Stopping ends a follow
+    /// successfully, but leaves `--once` unsatisfied.
+    fn exit(&self, once: bool) -> Exit {
+        match (once, self.reason.get()) {
+            (false, _) | (true, None) => Exit::Success,
+            (true, Some(StopReason::Signal)) => Exit::Interrupted,
+            (true, Some(StopReason::Timeout)) => Exit::TimedOut,
+        }
+    }
 }
 
 /// A reader that closed stdout, as `| head -1` does, ends the subscription
@@ -775,6 +862,7 @@ pub(crate) async fn initialize_checkpoint(
             accept_checkpoint,
             data_dir: Some(data_dir.to_path_buf()),
             once: false,
+            timeout: None,
             requested_config: None,
             working_directory: data_dir.to_path_buf(),
         },
@@ -918,6 +1006,7 @@ async fn subscribe_embedded(
     markets: &[Market],
     config_path: Option<&Path>,
     registry: &ProcessorRegistry,
+    stop: &Stop,
 ) -> Result<Exit> {
     let data_dir = subscription_data_dir(options, markets, config_path)?;
     fs::create_dir_all(&data_dir)
@@ -928,6 +1017,7 @@ async fn subscribe_embedded(
         local_state::lock_subscription_directory(&data_dir, options.data_dir.is_none())?;
     let (config, checkpoint_origin) =
         embedded_config(options, markets, config_path, &data_dir).await?;
+    stop.catch_signals()?;
     if let Some(peer_store) = merge_local_execution_peer_stores(
         config_path,
         &data_dir,
@@ -1008,8 +1098,7 @@ async fn subscribe_embedded(
     let startup_started = Instant::now();
     let mut next_startup_status = Duration::from_secs(15);
     let mut announced_ready = false;
-    let mut snapshot_pending =
-        options.finality == SubscribeFinality::Included && options.format != SubscribeFormat::Raw;
+    let mut snapshot_pending = shows_previews(options);
     // A peer preview can outrun the durable runtime's anchored overlap.
     // Retain both its identities and ordered block context through readiness so
     // later overlap commits confirm the preview instead of regressing stdout.
@@ -1121,10 +1210,7 @@ async fn subscribe_embedded(
         }
         if !announced_ready {
             tokio::select! {
-                result = tokio::signal::ctrl_c() => {
-                    result.context("install Ctrl-C handler")?;
-                    return Ok(Exit::Success);
-                }
+                () = stop.requested() => return Ok(stop.exit(options.once)),
                 changed = runtime.verified_anchor.changed() => {
                     changed.context("verified anchor channel closed")?;
                     persist_current_verified_anchor(&runtime, &data_dir, &config)?;
@@ -1307,10 +1393,7 @@ async fn subscribe_embedded(
             continue;
         }
         tokio::select! {
-            result = tokio::signal::ctrl_c() => {
-                result.context("install Ctrl-C handler")?;
-                return Ok(Exit::Success);
-            }
+            () = stop.requested() => return Ok(stop.exit(options.once)),
             changed = runtime.verified_anchor.changed() => {
                 changed.context("verified anchor channel closed")?;
                 persist_current_verified_anchor(&runtime, &data_dir, &config)?;
@@ -1509,7 +1592,8 @@ fn subscription_data_dir_for(
         hasher.update(pool.as_bytes());
     }
     hasher.update(match finality {
-        SubscribeFinality::Included => b"included",
+        // Previews come from the same lane's startup; they share its state.
+        SubscribeFinality::Preview | SubscribeFinality::Included => b"included",
         SubscribeFinality::Finalized => b"finalized",
     });
     Ok(root.join(&hasher.finalize().to_hex()[..16]))
@@ -2528,7 +2612,7 @@ fn render_durable_change(
     }
     let shown = match options.finality {
         // An included row is a live update; a stale one is catch-up.
-        SubscribeFinality::Included => {
+        SubscribeFinality::Preview | SubscribeFinality::Included => {
             update_is_fresh(SubscribeFinality::Included, record.block.timestamp, now)
         }
         // A finalized row prints however late finality arrives.
@@ -2897,9 +2981,21 @@ fn readable_timestamp(timestamp: u64) -> Result<String> {
     Ok(timestamp.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
 }
 
+/// Whether embedded startup fetches and prints unverified peer previews.
+/// They show early progress while following, but a `--once` result must
+/// meet `--finality`, so it counts them only when `preview` asked for them.
+fn shows_previews(options: &SubscribeOptions) -> bool {
+    options.format != SubscribeFormat::Raw
+        && match options.finality {
+            SubscribeFinality::Preview => true,
+            SubscribeFinality::Included => !options.once,
+            SubscribeFinality::Finalized => false,
+        }
+}
+
 fn update_is_fresh(finality: SubscribeFinality, timestamp: u64, now: u64) -> bool {
     let maximum_age = match finality {
-        SubscribeFinality::Included => INCLUDED_UPDATE_MAX_AGE,
+        SubscribeFinality::Preview | SubscribeFinality::Included => INCLUDED_UPDATE_MAX_AGE,
         SubscribeFinality::Finalized => FINALIZED_UPDATE_MAX_AGE,
     };
     now.saturating_sub(timestamp) <= maximum_age.as_secs()
@@ -3018,12 +3114,10 @@ async fn connect_attached_stream(
     options: &SubscribeOptions,
     stream_url: Url,
     backoff: Duration,
+    stop: &Stop,
 ) -> Result<AttachedStreamConnection> {
     let response = tokio::select! {
-        result = tokio::signal::ctrl_c() => {
-            result.context("install Ctrl-C handler")?;
-            return Ok(AttachedStreamConnection::Interrupted);
-        }
+        () = stop.requested() => return Ok(AttachedStreamConnection::Interrupted),
         response = tokio::time::timeout(
             ATTACHED_CONNECT_TIMEOUT,
             authorized(client.get(stream_url), options.token.as_deref()).send(),
@@ -3035,7 +3129,7 @@ async fn connect_attached_stream(
             ATTACHED_CONNECT_TIMEOUT.as_secs(),
             backoff.as_secs()
         );
-        if wait_for_reconnect(backoff).await? {
+        if wait_for_reconnect(backoff, stop).await {
             return Ok(AttachedStreamConnection::Interrupted);
         }
         return Ok(AttachedStreamConnection::Retry);
@@ -3061,7 +3155,7 @@ async fn connect_attached_stream(
         "leani: stream connection failed ({error}); reconnecting in {}s",
         backoff.as_secs()
     );
-    if wait_for_reconnect(backoff).await? {
+    if wait_for_reconnect(backoff, stop).await {
         return Ok(AttachedStreamConnection::Interrupted);
     }
     Ok(AttachedStreamConnection::Retry)
@@ -3072,7 +3166,9 @@ async fn subscribe_attached(
     options: &SubscribeOptions,
     markets: &[Market],
     endpoint: Url,
+    stop: &Stop,
 ) -> Result<Exit> {
+    stop.catch_signals()?;
     let client = reqwest::Client::builder()
         .connect_timeout(ATTACHED_CONNECT_TIMEOUT)
         .build()
@@ -3084,10 +3180,7 @@ async fn subscribe_attached(
         attached_start_cursor(&client, options, markets, &endpoint).await
     };
     let (cursor, snapshot) = tokio::select! {
-        result = tokio::signal::ctrl_c() => {
-            result.context("install Ctrl-C handler")?;
-            return Ok(Exit::Success);
-        }
+        () = stop.requested() => return Ok(stop.exit(options.once)),
         result = startup => result?,
     };
     announce_attached(options.protocol, &endpoint, markets);
@@ -3102,14 +3195,15 @@ async fn subscribe_attached(
         if let Some(cursor) = &state.cursor {
             stream_url.query_pairs_mut().append_pair("after", cursor);
         }
-        let response = match connect_attached_stream(&client, options, stream_url, backoff).await? {
-            AttachedStreamConnection::Connected(response) => response,
-            AttachedStreamConnection::Retry => {
-                backoff = backoff.saturating_mul(2).min(Duration::from_secs(30));
-                continue;
-            }
-            AttachedStreamConnection::Interrupted => return Ok(Exit::Success),
-        };
+        let response =
+            match connect_attached_stream(&client, options, stream_url, backoff, stop).await? {
+                AttachedStreamConnection::Connected(response) => response,
+                AttachedStreamConnection::Retry => {
+                    backoff = backoff.saturating_mul(2).min(Duration::from_secs(30));
+                    continue;
+                }
+                AttachedStreamConnection::Interrupted => return Ok(stop.exit(options.once)),
+            };
         let mut bytes = response.bytes_stream();
         let mut buffer = EventBuffer::default();
         // Every connection identifies the node again before its changes count.
@@ -3117,10 +3211,7 @@ async fn subscribe_attached(
         let mut retry = None;
         loop {
             let chunk = tokio::select! {
-                result = tokio::signal::ctrl_c() => {
-                    result.context("install Ctrl-C handler")?;
-                    return Ok(Exit::Success);
-                }
+                () = stop.requested() => return Ok(stop.exit(options.once)),
                 chunk = tokio::time::timeout(ATTACHED_STREAM_STALL_TIMEOUT, bytes.next()) => {
                     if let Ok(chunk) = chunk {
                         chunk
@@ -3173,8 +3264,8 @@ async fn subscribe_attached(
                 backoff.as_secs()
             );
         }
-        if wait_for_reconnect(backoff).await? {
-            return Ok(Exit::Success);
+        if wait_for_reconnect(backoff, stop).await {
+            return Ok(stop.exit(options.once));
         }
         backoff = backoff.saturating_mul(2).min(Duration::from_secs(30));
     }
@@ -3663,13 +3754,12 @@ fn validate_market_scope(markets: &[Market], configured: &[ConfiguredPool]) -> R
     bail!("{subject} {verb} not processed by this node.\nConfigured markets: {available}")
 }
 
-async fn wait_for_reconnect(delay: Duration) -> Result<bool> {
+/// Wait `delay` before a reconnect. Returns whether the subscription was
+/// stopped instead.
+async fn wait_for_reconnect(delay: Duration, stop: &Stop) -> bool {
     tokio::select! {
-        result = tokio::signal::ctrl_c() => {
-            result.context("install Ctrl-C handler")?;
-            Ok(true)
-        }
-        () = tokio::time::sleep(delay) => Ok(false),
+        () = stop.requested() => true,
+        () = tokio::time::sleep(delay) => false,
     }
 }
 
@@ -3727,8 +3817,8 @@ fn render_attached(
     };
     let item = item.filter(|item| match options.finality {
         // An included row is a live update; a stale one is the node
-        // catching up.
-        SubscribeFinality::Included => {
+        // catching up. A node never streams previews.
+        SubscribeFinality::Preview | SubscribeFinality::Included => {
             update_is_fresh(SubscribeFinality::Included, item.timestamp(), now)
         }
         // A finalized row prints however late finality arrives. Blocks final
@@ -4094,8 +4184,35 @@ mod tests {
             accept_checkpoint: true,
             data_dir: None,
             once: true,
+            timeout: None,
             requested_config: None,
             working_directory: PathBuf::from("."),
+        }
+    }
+
+    #[test]
+    fn once_counts_unverified_previews_only_when_asked() {
+        use SubscribeFinality::{Finalized, Included, Preview};
+        use SubscribeFormat::{Json, Pretty, Raw};
+
+        let mut options = subscribe_options(Vec::new());
+        for (finality, once, format, shown) in [
+            // Following shows early previews; `--once` waits for verified rows.
+            (Included, false, Json, true),
+            (Included, true, Json, false),
+            (Preview, true, Json, true),
+            (Preview, false, Pretty, true),
+            (Finalized, false, Json, false),
+            (Preview, true, Raw, false),
+        ] {
+            options.finality = finality;
+            options.once = once;
+            options.format = format;
+            assert_eq!(
+                super::shows_previews(&options),
+                shown,
+                "{finality:?} once={once} {format:?}"
+            );
         }
     }
 

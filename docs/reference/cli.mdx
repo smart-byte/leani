@@ -15,4 +15,17 @@ import ReferenceTable from '@docs/components/docs/ReferenceTable.astro';
 The tracked CLI fixture is rendered by a Rust test from the actual Clap command
 tree. The Bun-only site consumes that reviewed fixture without compiling Leani.
 
+## Exit codes
+
+| Code | Meaning |
+| --- | --- |
+| 0 | Success. A `subscribe` stopped by a signal or `--timeout` also exits 0, unless `--once` had not printed a match yet. |
+| 1 | Runtime failure. |
+| 2 | Usage error: an unknown command, flag, or value. |
+| 3 | `doctor` found the configuration unreadable or invalid. |
+| 124 | `subscribe --once` reached `--timeout` before a match. |
+| 130 | `subscribe --once` was stopped by SIGINT or SIGTERM before a match, or a second signal cut a shutdown short. |
+
+## Commands
+
 <ReferenceTable kind="cli" />

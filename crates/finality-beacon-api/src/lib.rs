@@ -1197,7 +1197,7 @@ async fn get_json<T: DeserializeOwned>(
         let url = request_label(endpoint, path_and_query);
         match unsupported_fork(&bytes) {
             Some(version) => BeaconApiError::UnsupportedFork { url, version },
-            None => BeaconApiError::Decode { url, source },
+            None => BeaconApiError::Decode { url, error: source },
         }
     })
 }
@@ -1424,23 +1424,18 @@ pub enum BeaconApiError {
     HttpClient(reqwest::Error),
     #[error("invalid endpoint URL: {0}")]
     Url(url::ParseError),
-    #[error("beacon API request failed for {url}: {source}")]
-    Request {
-        url: String,
-        #[source]
-        source: reqwest::Error,
-    },
+    #[error("beacon API request failed for {url}: {error}")]
+    Request { url: String, error: reqwest::Error },
     #[error("beacon API {url} returned HTTP {status}: {detail}")]
     Status {
         url: String,
         status: u16,
         detail: String,
     },
-    #[error("cannot decode beacon API response from {url}: {source}")]
+    #[error("cannot decode beacon API response from {url}: {error}")]
     Decode {
         url: String,
-        #[source]
-        source: serde_json::Error,
+        error: serde_json::Error,
     },
     #[error(
         "beacon API {url} serves `{version}` light-client data, a fork this release cannot verify; the network may have forked, so upgrade Leani"

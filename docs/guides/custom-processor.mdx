@@ -42,7 +42,7 @@ cp "$LEANI_SOURCE/examples/custom-node/node.toml" "$LEANI_CUSTOM_DIR/leani.toml"
 cd "$LEANI_CUSTOM_DIR"
 "$LEANI_CUSTOM_BIN" doctor --json
 "$LEANI_CUSTOM_BIN" backfill \
-  --processor example-block-summary-local --from 19426589 --to 19426591
+  --processor example-block-summary-local --from-block 19426589 --to-block 19426591
 "$LEANI_CUSTOM_BIN" serve
 ```
 

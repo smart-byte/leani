@@ -530,9 +530,10 @@ symlink aliases of the same directory count as one.
 
 ### Historical CLI and node backfill
 
-`leani backfill --processor INSTANCE --from N --to M` uses the same history
-source assembly, configured pipeline, material coordinator and verified P2P
-fallback as node jobs. When live P2P is enabled, the standalone command
+`leani backfill --processor INSTANCE --from-block N --to-block M` uses the
+same history source assembly, configured pipeline, material coordinator and
+verified P2P fallback as node jobs. `--processor` defaults to the
+configuration's only processor. When live P2P is enabled, the standalone command
 verifies the configured finality anchor and opens its own persistent peer
 pool. It checks the finalized upper bound and honors
 `sources.live.history_fallback_blocks`. No live listeners or processors are
@@ -542,7 +543,7 @@ To use a running node and its existing peer pool:
 
 ```bash
 leani backfill --endpoint http://127.0.0.1:18080 \
-  --processor INSTANCE --from N --to M
+  --processor INSTANCE --from-block N --to-block M
 ```
 
 The command sends an authenticated materialization request and waits for its

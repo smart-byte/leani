@@ -128,7 +128,8 @@ runtime exists.
 - live following adds one to two slots of latency, and stops, reporting not
   ready, while the finality source verifies no attested head;
 - the embedded CLI still prints `preview` blocks that one peer supplied before
-  the anchored lane is ready; they are never stored or applied;
+  the anchored lane is ready; they are never stored or applied, and
+  `subscribe --once` returns one only with `--finality preview`;
 - native consensus and execution P2P peer availability can prevent timely
   progress, and a stale or incorrectly sourced weak-subjectivity checkpoint
   can select the wrong consensus history;

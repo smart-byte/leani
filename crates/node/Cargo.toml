@@ -21,6 +21,7 @@ clap.workspace = true
 futures.workspace = true
 flate2.workspace = true
 hex.workspace = true
+humantime.workspace = true
 leani-api = { path = "../api" }
 leani-finality-beacon-api = { path = "../finality-beacon-api" }
 leani-finality-consensus-p2p = { path = "../finality-consensus-p2p" }

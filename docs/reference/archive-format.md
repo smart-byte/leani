@@ -91,8 +91,8 @@ Backfill any configured processor:
 ```text
 leani backfill \
   --processor erc20-balances \
-  --from 12345678 \
-  --to 12346677
+  --from-block 12345678 \
+  --to-block 12346677
 ```
 
 The runtime records coverage and discards input frames after reduction. Only

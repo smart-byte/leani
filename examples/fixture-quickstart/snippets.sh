@@ -24,7 +24,7 @@ cp "$LEANI_SOURCE/config/modes/windowed.toml" "$LEANI_HISTORY_DIR/leani.toml"
 cd "$LEANI_HISTORY_DIR"
 leani doctor --json
 leani backfill \
-  --processor uniswap-v2-sync-30d --from 17000000 --to 17000999
+  --processor uniswap-v2-sync-30d --from-block 17000000 --to-block 17000999
 leani serve
 # docs:end bounded-mainnet-quickstart
 

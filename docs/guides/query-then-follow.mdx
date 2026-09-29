@@ -34,7 +34,7 @@ LEANI_SDK_DIR="$(mktemp -d)"
 cp "$LEANI_SOURCE/examples/sdk-stream/node.toml" "$LEANI_SDK_DIR/leani.toml"
 cd "$LEANI_SDK_DIR"
 leani doctor --json
-leani backfill --processor usdc-weth-latest --from 17000000 --to 17000999
+leani backfill --processor usdc-weth-latest --from-block 17000000 --to-block 17000999
 leani serve
 ```
 

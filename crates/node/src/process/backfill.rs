@@ -22,7 +22,7 @@ use crate::{
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn run(
     config_path: &Path,
-    processor: &str,
+    processor: Option<&str>,
     from: u64,
     to: u64,
     endpoint: Option<&url::Url>,
@@ -33,10 +33,35 @@ pub(super) async fn run(
         leani_primitives::BlockNumber(from),
         leani_primitives::BlockNumber(to),
     )?;
+    let processor = match processor {
+        Some(processor) => processor.to_owned(),
+        None => only_configured_processor(&Config::load(config_path).with_context(|| {
+            format!(
+                "--processor is required without a readable {}",
+                config_path.display()
+            )
+        })?)?,
+    };
     if let Some(endpoint) = endpoint {
-        return remote(endpoint, token, processor, from, to).await;
+        return remote(endpoint, token, &processor, from, to).await;
     }
-    Box::pin(standalone(config_path, processor, from, to, registry)).await
+    Box::pin(standalone(config_path, &processor, from, to, registry)).await
+}
+
+/// The default `--processor`: the instance of a configuration's only processor.
+fn only_configured_processor(config: &Config) -> Result<String> {
+    match config.processors.as_slice() {
+        [only] => Ok(only.instance.clone()),
+        processors => bail!(
+            "the configuration enables {} processors; pass --processor with one of [{}]",
+            processors.len(),
+            processors
+                .iter()
+                .map(|processor| processor.instance.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
 }
 
 fn api_url(endpoint: &url::Url, id: Option<&str>) -> Result<url::Url> {
@@ -475,6 +500,23 @@ mod tests {
         Arc,
         atomic::{AtomicUsize, Ordering},
     };
+
+    #[test]
+    fn backfill_defaults_to_the_only_configured_processor() {
+        let repository = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let mut config =
+            crate::config::Config::load(&repository.join("config/modes/windowed.toml")).unwrap();
+        let only = config.processors[0].instance.clone();
+        assert_eq!(super::only_configured_processor(&config).unwrap(), only);
+
+        let mut second = config.processors[0].clone();
+        second.instance = "second".to_owned();
+        config.processors.push(second);
+        let error = super::only_configured_processor(&config)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(&format!("[{only}, second]")), "{error}");
+    }
 
     #[test]
     fn only_non_loopback_plain_http_is_cleartext() {

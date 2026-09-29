@@ -79,7 +79,7 @@ hour, and keeps a 30-day window of them:
 
 ```bash
 cp config/modes/windowed.toml leani.toml
-leani backfill --processor uniswap-v2-sync-30d --from 17000000 --to 17000999
+leani backfill --processor uniswap-v2-sync-30d --from-block 17000000 --to-block 17000999
 leani serve
 ```
 

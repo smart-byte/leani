@@ -331,6 +331,23 @@ Take these steps in order; each links to the entries below that detail it.
 
 ### Changed
 
+- CLI changes for scripts and coding agents:
+  - `leani doctor` exits 3, not 2, for an unreadable or invalid
+    configuration; 2 stays clap's usage error. `doctor --json` prints a
+    report with `valid: false` for an unreadable file too.
+  - `leani subscribe --once` stopped by a signal before a match exits 130,
+    not 0. New `--timeout DURATION` (`90s`, `5m`, or bare seconds) bounds a
+    subscription; an unsatisfied `--once` then exits 124.
+  - `leani subscribe --once` no longer ends on an unverified peer `preview`:
+    it hides previews and waits for the first row that meets `--finality`,
+    by default `included`. The new `--finality preview` restores the fast
+    path; previews still show while following without `--once`. `--json` is shorthand for `--format json`.
+  - `leani backfill` takes `--from-block`/`--to-block` (the old `--from`/`--to`
+    still work), and `--processor` defaults to the configuration's only
+    processor instead of `blobs-money`.
+  - `benchmark`, `e2e`, and `conformance` no longer appear in `leani --help`;
+    they still run. `init`, `subscribe`, and `backfill` help shows examples.
+
 - <a id="rc1-http-clients"></a>Breaking for HTTP clients of the native API
   that do not use the SDK:
   - A POST or DELETE needs `content-type: application/json` or the header
@@ -1058,6 +1075,11 @@ Take these steps in order; each links to the entries below that detail it.
   supported distributions.
 
 ### Fixed
+
+- `leani subscribe` stops gracefully on SIGTERM, as sent by `timeout` and
+  agent harnesses, and persists its verified anchor instead of dying.
+  Error chains no longer print a cause twice, as in `…(os error 2): No such
+  file or directory (os error 2)`.
 
 - Xatu LOG0 rows also accept the public dataset's empty hexadecimal topic
   sentinel (`0x`), including NUL-padded strings. A real 32-byte zero topic
