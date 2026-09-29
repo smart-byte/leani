@@ -45,6 +45,11 @@ files.each do |relative|
         errors << "#{relative}:#{line_number}: missing #{target}" unless documentation_route_exists?(root, decoded)
         next
       end
+      # Other site-absolute paths are static files the site serves from site/public.
+      if decoded.start_with?("/")
+        errors << "#{relative}:#{line_number}: missing #{target}" unless root.join("site/public", decoded.delete_prefix("/")).file?
+        next
+      end
       resolved = source.dirname.join(decoded).cleanpath
       errors << "#{relative}:#{line_number}: missing #{target}" unless resolved.exist?
     rescue ArgumentError
