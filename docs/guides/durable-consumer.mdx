@@ -21,7 +21,8 @@ acknowledgement advances retention and delivery state.
    restart.
 2. Poll retained changes under a lease.
 3. Apply one change idempotently and store its cursor in the same destination
-   transaction.
+   transaction. Key both by the consumer's stream as well as the sequence: a
+   node whose store is replaced numbers its changes from the start again.
 4. Commit the destination transaction.
 5. Acknowledge that cursor to Leani. If this request is lost, accept the same
    change again and rely on idempotent application.
@@ -35,3 +36,12 @@ acknowledgement advances retention and delivery state.
   safe: the event may be delivered again, so application writes must be
   idempotent.
 </Aside>
+
+The consumer's credential goes with every call, and Leani accepts an
+acknowledgement only for a change it delivered to that consumer. This loop
+uses the generic consumer routes, which serve processors with `canonical`
+delivery ordering. A processor with a split live stream
+(`block_versioned_idempotent`, such as `blobs-money`) fences renewal and
+acknowledgement by streaming session: read it with the SDK's
+`streamLive()` or `subscribe()` from `@smart-byte/leani-sdk/backfill`, and
+acknowledge each batch's boundary.

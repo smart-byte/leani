@@ -42,7 +42,7 @@ pub(crate) fn processor_contract(
         output: OutputPolicyConfig {
             mode: OutputPolicyMode::Full,
             window: None,
-            finalized_only,
+            finalized_only: None,
         },
         delivery: DeliveryPolicyConfig {
             mode: DeliveryPolicyMode::Window,

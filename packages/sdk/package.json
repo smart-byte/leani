@@ -9,11 +9,13 @@
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
-      "import": "./dist/index.js"
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
     },
     "./backfill": {
       "types": "./dist/backfill.d.ts",
-      "import": "./dist/backfill.js"
+      "import": "./dist/backfill.js",
+      "default": "./dist/backfill.js"
     },
     "./package.json": "./package.json"
   },
@@ -39,7 +41,7 @@
     "sse"
   ],
   "engines": {
-    "node": ">=20",
+    "node": ">=20.3.0",
     "bun": ">=1.2"
   },
   "publishConfig": {

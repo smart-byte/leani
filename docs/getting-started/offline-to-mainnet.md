@@ -49,6 +49,23 @@ docker run --rm leani:local \
   doctor --config /etc/leani/examples/externalized.toml --json
 ```
 
+The image's default command serves `/etc/leani/node.toml`, which protects the
+API with a bearer token from `LEANI_API_TOKEN` and refuses to start without
+one of at least 16 printable ASCII characters without spaces:
+
+```bash
+export LEANI_API_TOKEN="$(openssl rand -hex 32)"
+docker run --rm --env LEANI_API_TOKEN \
+  --publish 127.0.0.1:8080:8080 \
+  --volume leani-data:/var/lib/leani \
+  leani:local
+```
+
+Send it as `Authorization: Bearer $LEANI_API_TOKEN` to every route except the
+operational ones: `/health/*`, `/metrics`, `/v1/network/status`, and
+`/debug/network`. See the [runbook](/docs/operations/runbook/) for the rest
+of the container profile.
+
 ## Bounded public event example
 
 After the offline check passes, follow

@@ -11,6 +11,7 @@ use arrow_array::{
     LargeStringArray, ListArray, RecordBatch, StringArray, TimestampMillisecondArray, UInt8Array,
     UInt16Array, UInt32Array, UInt64Array,
 };
+use arrow_schema::{DataType, Schema, TimeUnit};
 use futures::StreamExt;
 use leani_primitives::{
     Address, BlockFrame, BlockHash, BlockNumber, BlockRange, BlockRef, ChainId, Completeness,
@@ -22,13 +23,16 @@ use leani_source_api::{FilterSet, SourceBudget};
 use object_store::{ObjectStore, ObjectStoreExt, path::Path as ObjectPath};
 use parquet::{
     arrow::{ProjectionMask, async_reader::ParquetRecordBatchStreamBuilder},
+    errors::ParquetError,
     file::metadata::ParquetMetaData,
 };
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    CatalogObject, XatuCatalog, XatuDate, XatuError, XatuTable, reader::ObjectStoreReader,
+    CatalogObject, XatuCatalog, XatuDate, XatuError, XatuTable,
+    catalog::pinning_problem,
+    reader::{InputBudget, ObjectStoreReader},
 };
 
 const EXECUTION_BLOCK_COLUMNS: &[&str] = &[
@@ -91,6 +95,11 @@ const GENERIC_BEACON_BLOCK_COLUMNS: &[&str] = &[
     "execution_payload_block_number",
     "execution_payload_parent_hash",
     "execution_payload_transactions_count",
+    "execution_payload_gas_limit",
+    "execution_payload_gas_used",
+    "execution_payload_base_fee_per_gas",
+    "execution_payload_blob_gas_used",
+    "execution_payload_excess_blob_gas",
 ];
 const GENERIC_TRANSACTION_COLUMNS: &[&str] = &[
     "block_number",
@@ -116,6 +125,178 @@ const GENERIC_LOG_COLUMNS: &[&str] = &[
     "topic3",
     "data",
 ];
+
+/// Most withdrawals one execution payload holds (`MAX_WITHDRAWALS_PER_PAYLOAD`).
+const MAX_WITHDRAWALS_PER_PAYLOAD: usize = 16;
+
+/// How a projected Xatu column is encoded, which fixes the Arrow types it
+/// may arrive as. Decoders follow the declared encoding and a batch's Arrow
+/// type, never the content of a value.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ColumnEncoding {
+    /// A `ClickHouse` unsigned integer of any width.
+    Unsigned,
+    /// A `ClickHouse` `DateTime64(3)`.
+    TimestampMillis,
+    Boolean,
+    /// A `UInt128` or `UInt256` as little-endian fixed-width bytes, which
+    /// older exports narrowed to an unsigned integer.
+    UnsignedOrLittleEndian,
+    /// A `UInt128` or `UInt256` as little-endian fixed-width bytes.
+    LittleEndian,
+    /// Exactly this many bytes, as `0x`-prefixed hexadecimal text such as a
+    /// `FixedString`, or as a raw binary column of exactly that width.
+    FixedHex(i32),
+    /// `0x`-prefixed hexadecimal text of any length.
+    Hex,
+    /// A list of 32-byte [`Self::FixedHex`] values.
+    HashList,
+    /// Plain text, such as a fork name.
+    Text,
+}
+
+impl ColumnEncoding {
+    fn accepts(self, data_type: &DataType) -> bool {
+        let unsigned = matches!(
+            data_type,
+            DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64
+        );
+        let little_endian =
+            matches!(data_type, DataType::FixedSizeBinary(width) if (1..=32).contains(width));
+        let text = matches!(
+            data_type,
+            DataType::Utf8 | DataType::LargeUtf8 | DataType::Binary | DataType::LargeBinary
+        );
+        match self {
+            Self::Unsigned => unsigned,
+            Self::TimestampMillis => {
+                matches!(data_type, DataType::Timestamp(TimeUnit::Millisecond, _))
+            }
+            Self::Boolean => matches!(data_type, DataType::Boolean),
+            Self::UnsignedOrLittleEndian => unsigned || little_endian,
+            Self::LittleEndian => little_endian,
+            Self::FixedHex(bytes) => {
+                text || matches!(
+                    data_type,
+                    DataType::FixedSizeBinary(width)
+                        if *width == bytes || *width == bytes.saturating_mul(2).saturating_add(2)
+                )
+            }
+            Self::Hex | Self::Text => text,
+            Self::HashList => matches!(
+                data_type,
+                DataType::List(field) | DataType::LargeList(field)
+                    if Self::FixedHex(32).accepts(field.data_type())
+            ),
+        }
+    }
+}
+
+/// The declared encoding of every column a projection reads, by name. A
+/// column shared by several tables is encoded alike in each.
+const COLUMN_ENCODINGS: &[(&str, ColumnEncoding)] = &[
+    ("address", ColumnEncoding::FixedHex(20)),
+    ("base_fee_per_gas", ColumnEncoding::Unsigned),
+    ("blob_gas", ColumnEncoding::Unsigned),
+    ("blob_gas_fee_cap", ColumnEncoding::LittleEndian),
+    ("blob_hashes", ColumnEncoding::HashList),
+    ("block_date_time", ColumnEncoding::TimestampMillis),
+    ("block_hash", ColumnEncoding::FixedHex(32)),
+    ("block_number", ColumnEncoding::Unsigned),
+    ("block_total_bytes", ColumnEncoding::Unsigned),
+    ("block_version", ColumnEncoding::Text),
+    ("data", ColumnEncoding::Hex),
+    (
+        "execution_payload_base_fee_per_gas",
+        ColumnEncoding::LittleEndian,
+    ),
+    ("execution_payload_blob_gas_used", ColumnEncoding::Unsigned),
+    ("execution_payload_block_hash", ColumnEncoding::FixedHex(32)),
+    ("execution_payload_block_number", ColumnEncoding::Unsigned),
+    (
+        "execution_payload_excess_blob_gas",
+        ColumnEncoding::Unsigned,
+    ),
+    ("execution_payload_gas_limit", ColumnEncoding::Unsigned),
+    ("execution_payload_gas_used", ColumnEncoding::Unsigned),
+    (
+        "execution_payload_parent_hash",
+        ColumnEncoding::FixedHex(32),
+    ),
+    (
+        "execution_payload_transactions_count",
+        ColumnEncoding::Unsigned,
+    ),
+    (
+        "execution_payload_transactions_total_bytes",
+        ColumnEncoding::Unsigned,
+    ),
+    ("extra_data", ColumnEncoding::Hex),
+    ("from", ColumnEncoding::FixedHex(20)),
+    ("from_address", ColumnEncoding::FixedHex(20)),
+    ("gas", ColumnEncoding::Unsigned),
+    ("gas_limit", ColumnEncoding::Unsigned),
+    ("gas_price", ColumnEncoding::UnsignedOrLittleEndian),
+    ("gas_used", ColumnEncoding::Unsigned),
+    ("hash", ColumnEncoding::FixedHex(32)),
+    ("input", ColumnEncoding::Hex),
+    ("log_index", ColumnEncoding::Unsigned),
+    ("nonce", ColumnEncoding::Unsigned),
+    ("position", ColumnEncoding::Unsigned),
+    ("size", ColumnEncoding::Unsigned),
+    ("slot", ColumnEncoding::Unsigned),
+    ("slot_start_date_time", ColumnEncoding::Unsigned),
+    ("success", ColumnEncoding::Boolean),
+    ("to", ColumnEncoding::FixedHex(20)),
+    ("to_address", ColumnEncoding::FixedHex(20)),
+    ("topic0", ColumnEncoding::FixedHex(32)),
+    ("topic1", ColumnEncoding::FixedHex(32)),
+    ("topic2", ColumnEncoding::FixedHex(32)),
+    ("topic3", ColumnEncoding::FixedHex(32)),
+    ("transaction_hash", ColumnEncoding::FixedHex(32)),
+    ("transaction_index", ColumnEncoding::Unsigned),
+    ("transaction_type", ColumnEncoding::Unsigned),
+    ("type", ColumnEncoding::Unsigned),
+    ("value", ColumnEncoding::UnsignedOrLittleEndian),
+    ("withdrawal_address", ColumnEncoding::FixedHex(20)),
+    ("withdrawal_amount", ColumnEncoding::LittleEndian),
+    ("withdrawal_index", ColumnEncoding::Unsigned),
+    ("withdrawal_validator_index", ColumnEncoding::Unsigned),
+];
+
+fn column_encoding(name: &str) -> Option<ColumnEncoding> {
+    COLUMN_ENCODINGS
+        .iter()
+        .find(|(column, _)| *column == name)
+        .map(|(_, encoding)| *encoding)
+}
+
+/// Refuse an object whose projected columns arrive as Arrow types their
+/// declared encodings do not allow, before any row is decoded.
+fn validate_column_types(
+    table: XatuTable,
+    schema: &Schema,
+    columns: &[&str],
+) -> Result<(), XatuError> {
+    for name in columns {
+        let encoding = column_encoding(name).ok_or_else(|| {
+            XatuError::Data(format!(
+                "projected column {name:?} has no declared encoding"
+            ))
+        })?;
+        let field = schema
+            .field_with_name(name)
+            .map_err(|error| XatuError::Data(error.to_string()))?;
+        if !encoding.accepts(field.data_type()) {
+            return Err(XatuError::ColumnType {
+                table,
+                column: (*name).to_owned(),
+                actual: format!("{:?}", field.data_type()),
+            });
+        }
+    }
+    Ok(())
+}
 
 pub(crate) fn generic_log_columns(
     log_fields: LogFieldSet,
@@ -649,6 +830,10 @@ impl ProjectionObjectMetrics {
     }
 }
 
+/// Stream `columns` of `object` into `consume`. Every byte requested from
+/// the store, footer and merged gaps included, is charged before it is
+/// requested to the open's input budget, of which earlier objects used
+/// `input_bytes_used`.
 #[allow(clippy::too_many_arguments)]
 async fn read_projected(
     store: Arc<dyn ObjectStore>,
@@ -656,7 +841,7 @@ async fn read_projected(
     columns: &[&str],
     budget: SourceBudget,
     batch_rows: usize,
-    projected_bytes_used: &mut u64,
+    input_bytes_used: &mut u64,
     cancellation: &CancellationToken,
     mut consume: impl FnMut(&RecordBatch) -> Result<u64, XatuError>,
 ) -> Result<ProjectionObjectMetrics, XatuError> {
@@ -670,28 +855,62 @@ async fn read_projected(
         .head(&location)
         .await
         .map_err(|error| XatuError::ObjectStore(error.to_string()))?;
-    let (reader, reader_metrics) = ObjectStoreReader::new(Arc::clone(&store), location, head.size);
+    // Every read is conditioned on this version, so an object rewritten
+    // mid-read fails instead of mixing two versions.
+    if let Some(detail) = pinning_problem(head.e_tag.as_deref()) {
+        return Err(XatuError::Unpinned {
+            location: object.location.clone(),
+            detail,
+        });
+    }
+    let input = InputBudget::new(budget.max_input_bytes, *input_bytes_used);
+    let parquet_error = |error: ParquetError| match input.refused() {
+        Some(actual) => XatuError::Budget {
+            resource: "input_bytes",
+            actual,
+            limit: budget.max_input_bytes,
+        },
+        None => XatuError::Parquet(error.to_string()),
+    };
+    let (reader, reader_metrics) = ObjectStoreReader::new(
+        Arc::clone(&store),
+        &head,
+        budget.max_in_flight_requests,
+        Arc::clone(&input),
+    );
     let builder = ParquetRecordBatchStreamBuilder::new(reader)
         .await
-        .map_err(|error| XatuError::Parquet(error.to_string()))?;
+        .map_err(parquet_error)?;
     let schema = builder.metadata().file_metadata().schema_descr();
     let root_indices = selected_root_indices(schema, columns)?;
-    let projected_compressed_bytes = projected_compressed_bytes(builder.metadata(), &root_indices);
-    let next_bytes = projected_bytes_used.saturating_add(projected_compressed_bytes);
-    if next_bytes > budget.max_input_bytes {
+    validate_column_types(object.table, builder.schema(), columns)?;
+    let (projected_compressed_bytes, largest_row_group) =
+        projected_compressed_bytes(builder.metadata(), &root_indices);
+    // Refuse the object before any column is requested when the selected
+    // column chunks alone exceed what the budget has left.
+    let needed = input.used().saturating_add(projected_compressed_bytes);
+    if needed > budget.max_input_bytes {
         return Err(XatuError::Budget {
-            resource: "projected_input_bytes",
-            actual: next_bytes,
+            resource: "input_bytes",
+            actual: needed,
             limit: budget.max_input_bytes,
         });
     }
-    *projected_bytes_used = next_bytes;
+    // The reader fetches, and holds, one row group's selected columns at a
+    // time.
+    if largest_row_group > budget.max_resident_bytes {
+        return Err(XatuError::Budget {
+            resource: "resident_bytes",
+            actual: largest_row_group,
+            limit: budget.max_resident_bytes,
+        });
+    }
     let projection = ProjectionMask::roots(schema, root_indices);
     let mut stream = builder
         .with_batch_size(batch_rows)
         .with_projection(projection)
         .build()
-        .map_err(|error| XatuError::Parquet(error.to_string()))?;
+        .map_err(parquet_error)?;
     let mut rows_scanned = 0_u64;
     let mut rows_selected = 0_u64;
     let mut batches = 0_u64;
@@ -704,7 +923,7 @@ async fn read_projected(
         let Some(batch) = next else {
             break;
         };
-        let batch = batch.map_err(|error| XatuError::Parquet(error.to_string()))?;
+        let batch = batch.map_err(parquet_error)?;
         rows_scanned =
             rows_scanned.saturating_add(u64::try_from(batch.num_rows()).unwrap_or(u64::MAX));
         rows_selected = rows_selected.saturating_add(consume(&batch)?);
@@ -714,6 +933,7 @@ async fn read_projected(
     }
 
     let reader_metrics = reader_metrics.snapshot();
+    *input_bytes_used = input.used();
     Ok(ProjectionObjectMetrics {
         table: object.table,
         partition: object.partition.clone(),
@@ -722,7 +942,7 @@ async fn read_projected(
         object_bytes: head.size,
         projected_compressed_bytes,
         logical_range_requests: reader_metrics.logical_range_requests,
-        fetched_bytes: reader_metrics.returned_bytes,
+        fetched_bytes: reader_metrics.requested_bytes,
         selected_columns: columns.iter().map(|column| (*column).to_owned()).collect(),
         rows_scanned,
         rows_selected,
@@ -748,16 +968,26 @@ fn selected_root_indices(
         .collect()
 }
 
-fn projected_compressed_bytes(metadata: &ParquetMetaData, root_indices: &[usize]) -> u64 {
+/// The selected columns' compressed bytes across all row groups, and in the
+/// largest row group.
+fn projected_compressed_bytes(metadata: &ParquetMetaData, root_indices: &[usize]) -> (u64, u64) {
     let roots = root_indices.iter().copied().collect::<BTreeSet<_>>();
     let schema = metadata.file_metadata().schema_descr();
     metadata
         .row_groups()
         .iter()
-        .flat_map(|group| group.columns().iter().enumerate())
-        .filter(|(leaf, _)| roots.contains(&schema.get_column_root_idx(*leaf)))
-        .map(|(_, column)| u64::try_from(column.compressed_size()).unwrap_or(0))
-        .sum()
+        .map(|group| {
+            group
+                .columns()
+                .iter()
+                .enumerate()
+                .filter(|(leaf, _)| roots.contains(&schema.get_column_root_idx(*leaf)))
+                .map(|(_, column)| u64::try_from(column.compressed_size()).unwrap_or(0))
+                .fold(0_u64, u64::saturating_add)
+        })
+        .fold((0, 0), |(total, largest), group| {
+            (total.saturating_add(group), largest.max(group))
+        })
 }
 
 #[derive(Clone, Debug)]
@@ -844,6 +1074,11 @@ struct GenericBeaconBlockRow {
     parent_hash: BlockHash,
     timestamp: u64,
     transaction_count: u32,
+    gas_limit: u64,
+    gas_used: u64,
+    base_fee_per_gas: Quantity,
+    blob_gas_used: Option<u64>,
+    excess_blob_gas: Option<u64>,
 }
 
 fn parse_generic_execution_blocks(
@@ -900,6 +1135,24 @@ fn parse_generic_beacon_blocks(
                     "execution_payload_transactions_count",
                     row,
                 )?,
+                gas_limit: required_u64(batch, "execution_payload_gas_limit", row)?,
+                gas_used: required_u64(batch, "execution_payload_gas_used", row)?,
+                base_fee_per_gas: required_quantity_le(
+                    batch,
+                    "execution_payload_base_fee_per_gas",
+                    row,
+                )?,
+                // Before Mainnet Dencun these columns use zero defaults,
+                // but the execution header has no blob fields.
+                blob_gas_used: (required_u64(batch, "slot_start_date_time", row)? >= 1_710_338_135)
+                    .then(|| optional_u64(batch, "execution_payload_blob_gas_used", row))
+                    .transpose()?
+                    .flatten(),
+                excess_blob_gas: (required_u64(batch, "slot_start_date_time", row)?
+                    >= 1_710_338_135)
+                    .then(|| optional_u64(batch, "execution_payload_excess_blob_gas", row))
+                    .transpose()?
+                    .flatten(),
             },
             "generic beacon block",
         )?;
@@ -1004,11 +1257,18 @@ fn parse_generic_logs(
         {
             continue;
         }
-        let mut topics = vec![fixed_bytes::<32>(batch, "topic0", row)?];
-        for name in ["topic1", "topic2", "topic3"] {
-            match optional_fixed_bytes::<32>(batch, name, row)? {
-                Some(topic) => topics.push(topic),
-                None => break,
+        // A log carries zero to four topics; `LOG0` has none.
+        let mut topics = Vec::with_capacity(4);
+        let mut absent = None;
+        for name in ["topic0", "topic1", "topic2", "topic3"] {
+            match (optional_topic(batch, name, row)?, absent) {
+                (Some(topic), None) => topics.push(topic),
+                (Some(_), Some(missing)) => {
+                    return Err(XatuError::Data(format!(
+                        "{name} follows the absent {missing} at row {row}"
+                    )));
+                }
+                (None, _) => absent = absent.or(Some(name)),
             }
         }
         if filters.scope.topics.iter().any(|filter| {
@@ -1095,11 +1355,11 @@ fn normalize_generic_frames(
                     transactions_root: None,
                     receipts_root: None,
                     withdrawals_root: None,
-                    gas_limit: None,
-                    gas_used: None,
-                    base_fee_per_gas: None,
-                    blob_gas_used: None,
-                    excess_blob_gas: None,
+                    gas_limit: Some(beacon.gas_limit),
+                    gas_used: Some(beacon.gas_used),
+                    base_fee_per_gas: Some(beacon.base_fee_per_gas),
+                    blob_gas_used: beacon.blob_gas_used,
+                    excess_blob_gas: beacon.excess_blob_gas,
                     size_bytes: None,
                     transaction_count: Some(beacon.transaction_count),
                     consensus_size_bytes: None,
@@ -1126,6 +1386,12 @@ fn normalize_generic_frames(
                         "duplicate transaction index in block {number}"
                     )));
                 }
+                validate_transaction_count(
+                    number,
+                    &values,
+                    beacon.transaction_count,
+                    selects_transactions(inputs.filters),
+                )?;
                 (
                     Material::Filtered {
                         value: values,
@@ -1180,6 +1446,164 @@ fn normalize_generic_frames(
     Ok(frames)
 }
 
+/// Whether `filters` select transactions, so that a block's projected list
+/// may be shorter than its payload.
+fn selects_transactions(filters: &FilterSet) -> bool {
+    !filters.scope.transaction_types.is_empty()
+        || !filters.scope.transaction_hashes.is_empty()
+        || !filters.scope.senders.is_empty()
+        || !filters.scope.recipients.is_empty()
+        || !filters.senders.is_empty()
+        || !filters.recipients.is_empty()
+}
+
+/// Check a block's projected transactions, sorted by index without
+/// duplicates, against the count its beacon payload declares. A list the
+/// filters did not narrow holds every transaction, so its indices are
+/// exactly `0..count`.
+fn validate_transaction_count(
+    number: BlockNumber,
+    transactions: &[TransactionEnvelope],
+    count: u32,
+    filtered: bool,
+) -> Result<(), XatuError> {
+    let expected = usize::try_from(count).unwrap_or(usize::MAX);
+    if transactions.len() > expected
+        || transactions
+            .last()
+            .is_some_and(|transaction| transaction.index >= count)
+    {
+        return Err(XatuError::Data(format!(
+            "block {number} projects transactions beyond its {count} payload transactions"
+        )));
+    }
+    if !filtered && transactions.len() != expected {
+        return Err(XatuError::IncompleteRange {
+            table: XatuTable::CanonicalExecutionTransaction,
+            range: BlockRange::single(number),
+            expected,
+            actual: transactions.len(),
+        });
+    }
+    Ok(())
+}
+
+/// Prove a chunk's withdrawal rows complete. Withdrawal indices are global
+/// and consecutive, and blocks take them in execution order, so between two
+/// slots with withdrawals the indices continue exactly, and a slot between
+/// them without rows had none. The nearest slots with rows outside the chunk,
+/// which `withdrawals` also holds, prove its edges the same way, and a slot
+/// with the most withdrawals a payload holds lacks none. Any other edge, and
+/// any jump in the indices, leaves the rows unproven: they have not all been
+/// exported yet.
+fn validate_withdrawal_coverage(
+    range: BlockRange,
+    beacon_blocks: &BTreeMap<u64, BeaconBlockRow>,
+    withdrawals: &BTreeMap<u64, Vec<WithdrawalRow>>,
+) -> Result<(), XatuError> {
+    fn indices_of(rows: &[WithdrawalRow]) -> impl Iterator<Item = u64> + '_ {
+        rows.iter().map(|row| row.index)
+    }
+    let unproven = |detail: String| XatuError::IncompleteWithdrawals { range, detail };
+    let (Some(first), Some(last)) = (
+        beacon_blocks.values().next(),
+        beacon_blocks.values().next_back(),
+    ) else {
+        return Ok(());
+    };
+    // The last index before the chunk, and the first after it.
+    let mut previous = withdrawals
+        .range(..first.slot)
+        .next_back()
+        .and_then(|(_, rows)| indices_of(rows).max());
+    let next = withdrawals
+        .range(last.slot.saturating_add(1)..)
+        .next()
+        .and_then(|(_, rows)| indices_of(rows).min());
+    let mut unproven_empty = None;
+    let mut last_full = false;
+    for (position, block) in beacon_blocks.values().enumerate() {
+        let mut indices = withdrawals
+            .get(&block.slot)
+            .map_or_else(Vec::new, |rows| indices_of(rows).collect::<Vec<_>>());
+        if indices.len() > MAX_WITHDRAWALS_PER_PAYLOAD {
+            return Err(XatuError::Data(format!(
+                "slot {} has {} withdrawal rows; a payload holds at most {MAX_WITHDRAWALS_PER_PAYLOAD}",
+                block.slot,
+                indices.len()
+            )));
+        }
+        last_full = indices.len() == MAX_WITHDRAWALS_PER_PAYLOAD;
+        indices.sort_unstable();
+        let Some(&lowest) = indices.first() else {
+            unproven_empty.get_or_insert(block.slot);
+            continue;
+        };
+        match previous {
+            Some(before) if lowest <= before => {
+                return Err(XatuError::Data(format!(
+                    "slot {} repeats or reorders withdrawal index {lowest}",
+                    block.slot
+                )));
+            }
+            Some(before) if lowest == before.saturating_add(1) => {}
+            // A full payload at the chunk's first slot lacks no rows.
+            _ if position == 0 && last_full => {}
+            Some(before) => {
+                return Err(unproven(format!(
+                    "withdrawal indices jump from {before} to {lowest} at slot {}",
+                    block.slot
+                )));
+            }
+            None => {
+                return Err(unproven(match unproven_empty {
+                    Some(slot) => format!(
+                        "slot {slot} has no withdrawal rows, and no earlier slot shows it had none"
+                    ),
+                    None => format!(
+                        "no earlier slot shows that slot {} lacks no withdrawal index below {lowest}",
+                        block.slot
+                    ),
+                }));
+            }
+        }
+        for pair in indices.windows(2) {
+            if pair[1] == pair[0] {
+                return Err(XatuError::Data(format!(
+                    "slot {} repeats withdrawal index {}",
+                    block.slot, pair[1]
+                )));
+            }
+            if pair[1] != pair[0].saturating_add(1) {
+                return Err(unproven(format!(
+                    "withdrawal indices jump from {} to {} at slot {}",
+                    pair[0], pair[1], block.slot
+                )));
+            }
+        }
+        previous = indices.last().copied();
+        unproven_empty = None;
+    }
+    match (previous, next) {
+        (Some(before), Some(after)) if after <= before => Err(XatuError::Data(format!(
+            "slot after the chunk repeats or reorders withdrawal index {after}"
+        ))),
+        (Some(before), Some(after)) if after == before.saturating_add(1) => Ok(()),
+        // A full payload at the chunk's last slot lacks no rows.
+        _ if last_full => Ok(()),
+        _ => Err(unproven(match unproven_empty {
+            Some(slot) => {
+                format!("slot {slot} has no withdrawal rows, and no later slot shows it had none")
+            }
+            None => format!(
+                "no later slot shows that slot {} lacks no withdrawal index above {}",
+                last.slot,
+                previous.unwrap_or_default()
+            ),
+        })),
+    }
+}
+
 fn validate_frame_budget(frames: &[BlockFrame], budget: SourceBudget) -> Result<(), XatuError> {
     let frame_count = u64::try_from(frames.len()).unwrap_or(u64::MAX);
     if frame_count > budget.max_frames {
@@ -1223,7 +1647,7 @@ fn parse_execution_blocks(
             timestamp,
             gas_used: required_u64(batch, "gas_used", row)?,
             extra_data: decode_variable_bytes(
-                required_bytes(batch, "extra_data", row)?,
+                binary_at(column(batch, "extra_data")?, row)?,
                 &format!("extra_data at row {row}"),
             )?,
             base_fee_per_gas: required_u64(batch, "base_fee_per_gas", row)?,
@@ -1321,15 +1745,42 @@ fn parse_beacon_transactions(
     Ok(selected)
 }
 
+/// Collect the withdrawal rows of `slots`, and of the nearest slot with rows
+/// on either side of them, whose indices bound theirs.
 fn parse_withdrawals(
     batch: &RecordBatch,
     slots: &BTreeSet<u64>,
     output: &mut BTreeMap<u64, Vec<WithdrawalRow>>,
 ) -> Result<u64, XatuError> {
+    let (Some(&first), Some(&last)) = (slots.first(), slots.last()) else {
+        return Ok(0);
+    };
     let mut selected = 0_u64;
     for row in 0..batch.num_rows() {
         let slot = required_u64(batch, "slot", row)?;
-        if !slots.contains(&slot) {
+        if slot < first {
+            // Keep only the nearest earlier slot.
+            if output.range(slot.saturating_add(1)..first).next().is_some() {
+                continue;
+            }
+            if let Some(farther) = output.range(..slot).next().map(|(slot, _)| *slot) {
+                output.remove(&farther);
+            }
+        } else if slot > last {
+            // Keep only the nearest later slot.
+            if output.range(last.saturating_add(1)..slot).next().is_some() {
+                continue;
+            }
+            if let Some(farther) = output
+                .range(slot.saturating_add(1)..)
+                .next()
+                .map(|(slot, _)| *slot)
+            {
+                output.remove(&farther);
+            }
+        } else if slots.contains(&slot) {
+            selected = selected.saturating_add(1);
+        } else {
             continue;
         }
         output.entry(slot).or_default().push(WithdrawalRow {
@@ -1338,7 +1789,6 @@ fn parse_withdrawals(
             address: required_address(batch, "withdrawal_address", row)?,
             amount_gwei: required_quantity_u64_le(batch, "withdrawal_amount", row)?,
         });
-        selected = selected.saturating_add(1);
     }
     Ok(selected)
 }
@@ -1412,6 +1862,8 @@ fn normalize_frames(inputs: NormalizationInputs<'_>) -> Result<Vec<BlockFrame>, 
             actual: beacon_blocks.len(),
         });
     }
+    // Each block's execution size depends on its withdrawals.
+    validate_withdrawal_coverage(range, beacon_blocks, withdrawals)?;
     beacon_transactions.sort_by_key(|transaction| (transaction.slot, transaction.index));
     let mut transactions_by_slot = BTreeMap::<u64, Vec<BeaconTransactionRow>>::new();
     for transaction in beacon_transactions {
@@ -1511,11 +1963,6 @@ fn normalize_frames(inputs: NormalizationInputs<'_>) -> Result<Vec<BlockFrame>, 
                 logs: Vec::new(),
             });
         }
-        let mut receipt_scope = scope.clone();
-        receipt_scope.transaction_hashes = transactions
-            .iter()
-            .map(|transaction| transaction.hash)
-            .collect();
         frames.push(BlockFrame {
             chain_id: ChainId(1),
             block: BlockRef {
@@ -1551,12 +1998,22 @@ fn normalize_frames(inputs: NormalizationInputs<'_>) -> Result<Vec<BlockFrame>, 
                 scope: scope.clone(),
                 completeness: Completeness::DatasetDeclared,
             },
+            // One receipt per projected transaction, so the receipts are
+            // complete for the same type-3 predicate. Listing their hashes
+            // would narrow the claim below the consumer's filter.
             receipts: Material::Filtered {
                 value: receipts,
-                scope: receipt_scope,
+                scope: scope.clone(),
                 completeness: Completeness::DatasetDeclared,
             },
-            logs: Material::Missing(MissingReason::NotRequested),
+            // Receipts imply logs, but this projection reads no log rows, so
+            // its receipts carry none. Partial logs keep the receipts from
+            // satisfying a log requirement.
+            logs: Material::Filtered {
+                value: Vec::new(),
+                scope: scope.clone(),
+                completeness: Completeness::Partial,
+            },
             withdrawals: Material::Missing(MissingReason::NotRequested),
             blob_sidecars: Material::Missing(MissingReason::NotRequested),
             traces: Material::Missing(MissingReason::Unsupported),
@@ -1828,12 +2285,22 @@ fn optional_address(
     }
 }
 
+/// Decode a `ClickHouse` `UInt128` or `UInt256`, exported as little-endian
+/// fixed-width bytes.
 fn required_quantity_le(
     batch: &RecordBatch,
     name: &str,
     row: usize,
 ) -> Result<Quantity, XatuError> {
-    let value = binary_at(column(batch, name)?, row)?;
+    let array = column(batch, name)?;
+    if array.is_null(row) {
+        return Err(XatuError::Data(format!("{name} is null at row {row}")));
+    }
+    let value = array
+        .as_any()
+        .downcast_ref::<FixedSizeBinaryArray>()
+        .map(|array| array.value(row))
+        .ok_or_else(|| type_error(name, array))?;
     if value.is_empty() || value.len() > 32 {
         return Err(XatuError::Data(format!(
             "{name} has {} raw bytes at row {row}; expected 1-32",
@@ -1902,10 +2369,12 @@ fn required_hash_list(
     };
     (0..values.len())
         .map(|index| {
-            binary_at(values.as_ref(), index).and_then(|value| {
-                decode_fixed_bytes::<32>(value, &format!("{name} element {index} at row {row}"))
-                    .map(BlockHash::new)
-            })
+            fixed_bytes_at::<32>(
+                values.as_ref(),
+                index,
+                &format!("{name} element {index} at row {row}"),
+            )
+            .map(BlockHash::new)
         })
         .collect()
 }
@@ -1915,22 +2384,48 @@ fn fixed_bytes<const N: usize>(
     name: &str,
     row: usize,
 ) -> Result<[u8; N], XatuError> {
-    let value = binary_at(column(batch, name)?, row)?;
-    decode_fixed_bytes(value, &format!("{name} at row {row}"))
+    fixed_bytes_at(column(batch, name)?, row, &format!("{name} at row {row}"))
 }
 
-fn optional_fixed_bytes<const N: usize>(
+/// Decode an `N`-byte value by its Arrow type: a binary column exactly `N`
+/// wide holds raw bytes, and any other holds `0x`-prefixed hexadecimal text.
+fn fixed_bytes_at<const N: usize>(
+    array: &dyn Array,
+    row: usize,
+    context: &str,
+) -> Result<[u8; N], XatuError> {
+    let value = binary_at(array, row)?;
+    if matches!(array.data_type(), DataType::FixedSizeBinary(width) if usize::try_from(*width) == Ok(N))
+    {
+        return value
+            .try_into()
+            .map_err(|_| XatuError::Data(format!("{context} is not {N} raw bytes")));
+    }
+    decode_fixed_bytes(value, context)
+}
+
+/// A topic, or `None` for an absent topic: null, empty text, `0x`, or
+/// either empty representation with `ClickHouse` `FixedString` NUL padding.
+fn optional_topic(
     batch: &RecordBatch,
     name: &str,
     row: usize,
-) -> Result<Option<[u8; N]>, XatuError> {
+) -> Result<Option<[u8; 32]>, XatuError> {
     let array = column(batch, name)?;
     if array.is_null(row) {
         return Ok(None);
     }
-    binary_at(array, row)
-        .and_then(|value| decode_fixed_bytes(value, &format!("{name} at row {row}")))
-        .map(Some)
+    let raw = matches!(array.data_type(), DataType::FixedSizeBinary(32));
+    let value = binary_at(array, row)?;
+    if !raw
+        && (value.iter().all(|byte| *byte == 0)
+            || value
+                .strip_prefix(b"0x")
+                .is_some_and(|rest| rest.iter().all(|byte| *byte == 0)))
+    {
+        return Ok(None);
+    }
+    fixed_bytes_at(array, row, &format!("{name} at row {row}")).map(Some)
 }
 
 fn required_bytes<'a>(
@@ -1953,33 +2448,38 @@ fn optional_variable_bytes(
     decode_variable_bytes(binary_at(array, row)?, &format!("{name} at row {row}")).map(Some)
 }
 
+/// Decode `0x`-prefixed hexadecimal text of exactly `N` bytes.
 fn decode_fixed_bytes<const N: usize>(value: &[u8], context: &str) -> Result<[u8; N], XatuError> {
-    if let Ok(bytes) = value.try_into() {
-        return Ok(bytes);
-    }
-    if value.len() == N * 2 + 2 && value.starts_with(b"0x") {
-        let mut bytes = [0; N];
-        hex::decode_to_slice(&value[2..], &mut bytes)
-            .map_err(|error| XatuError::Data(format!("{context} has invalid hex: {error}")))?;
-        return Ok(bytes);
-    }
-    Err(XatuError::Data(format!(
-        "{context} has {} bytes; expected {N} raw bytes or 0x-prefixed hex",
-        value.len()
-    )))
+    let hexadecimal = value
+        .strip_prefix(b"0x")
+        .filter(|hexadecimal| hexadecimal.len() == N * 2)
+        .ok_or_else(|| {
+            XatuError::Data(format!(
+                "{context} has {} bytes; expected 0x-prefixed hex of {N} bytes",
+                value.len()
+            ))
+        })?;
+    let mut bytes = [0; N];
+    hex::decode_to_slice(hexadecimal, &mut bytes)
+        .map_err(|error| XatuError::Data(format!("{context} has invalid hex: {error}")))?;
+    Ok(bytes)
 }
 
+/// Decode `0x`-prefixed hexadecimal text; an empty value holds no bytes.
 fn decode_variable_bytes(value: &[u8], context: &str) -> Result<Vec<u8>, XatuError> {
-    if let Some(hexadecimal) = value.strip_prefix(b"0x") {
-        if !hexadecimal.len().is_multiple_of(2) {
-            return Err(XatuError::Data(format!(
-                "{context} has an odd hexadecimal length"
-            )));
-        }
-        return hex::decode(hexadecimal)
-            .map_err(|error| XatuError::Data(format!("{context} has invalid hex: {error}")));
+    if value.is_empty() {
+        return Ok(Vec::new());
     }
-    Ok(value.to_vec())
+    let hexadecimal = value
+        .strip_prefix(b"0x")
+        .ok_or_else(|| XatuError::Data(format!("{context} is not 0x-prefixed hexadecimal")))?;
+    if !hexadecimal.len().is_multiple_of(2) {
+        return Err(XatuError::Data(format!(
+            "{context} has an odd hexadecimal length"
+        )));
+    }
+    hex::decode(hexadecimal)
+        .map_err(|error| XatuError::Data(format!("{context} has invalid hex: {error}")))
 }
 
 fn binary_at(array: &dyn Array, row: usize) -> Result<&[u8], XatuError> {
@@ -2053,10 +2553,641 @@ fn now_unix_ms() -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        sync::atomic::{AtomicUsize, Ordering},
+        time::Duration,
+    };
+
     use super::*;
-    use arrow_array::ArrayRef;
+    use arrow_array::{ArrayRef, Int64Array};
     use arrow_schema::{DataType, Field, Schema};
-    use leani_primitives::TopicFilter;
+    use bytes::Bytes;
+    use futures::stream::BoxStream;
+    use leani_primitives::{Capability, CapabilitySet, TopicFilter};
+    use object_store::{
+        CopyOptions, GetOptions, GetRange, GetResult, ListResult, MultipartUpload, ObjectMeta,
+        PutMultipartOptions, PutOptions, PutPayload, PutResult, memory::InMemory,
+    };
+    use parquet::{
+        arrow::ArrowWriter,
+        file::properties::{EnabledStatistics, WriterProperties},
+    };
+
+    /// An in-memory store that records how many ranged reads are in flight
+    /// and can replace an object just before its first read below the footer.
+    #[derive(Debug, Default)]
+    struct RecordingStore {
+        inner: InMemory,
+        in_flight: AtomicUsize,
+        peak_in_flight: AtomicUsize,
+        replacement: std::sync::Mutex<Option<(ObjectPath, Bytes)>>,
+        /// Report every HEAD's `ETag` as weak, as a compressing CDN may.
+        weak_e_tags: bool,
+        /// Bytes of every ranged read requested.
+        requested_bytes: AtomicUsize,
+    }
+
+    impl std::fmt::Display for RecordingStore {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("RecordingStore")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStore for RecordingStore {
+        async fn put_opts(
+            &self,
+            location: &ObjectPath,
+            payload: PutPayload,
+            options: PutOptions,
+        ) -> object_store::Result<PutResult> {
+            self.inner.put_opts(location, payload, options).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &ObjectPath,
+            options: PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn MultipartUpload>> {
+            self.inner.put_multipart_opts(location, options).await
+        }
+
+        async fn get_opts(
+            &self,
+            location: &ObjectPath,
+            options: GetOptions,
+        ) -> object_store::Result<GetResult> {
+            let Some(GetRange::Bounded(range)) = options.range.clone() else {
+                let mut result = self.inner.get_opts(location, options).await?;
+                if self.weak_e_tags {
+                    result.meta.e_tag = result.meta.e_tag.map(|tag| format!("W/\"{tag}\""));
+                }
+                return Ok(result);
+            };
+            self.requested_bytes.fetch_add(
+                usize::try_from(range.end - range.start).expect("range length"),
+                Ordering::SeqCst,
+            );
+            if range.end < self.inner.head(location).await?.size {
+                let replacement = self.replacement.lock().expect("replacement lock").take();
+                if let Some((path, bytes)) = replacement {
+                    self.inner.put(&path, bytes.into()).await?;
+                }
+            }
+            let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            self.peak_in_flight.fetch_max(now, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            let result = self.inner.get_opts(location, options).await;
+            self.in_flight.fetch_sub(1, Ordering::SeqCst);
+            result
+        }
+
+        fn delete_stream(
+            &self,
+            locations: BoxStream<'static, object_store::Result<ObjectPath>>,
+        ) -> BoxStream<'static, object_store::Result<ObjectPath>> {
+            self.inner.delete_stream(locations)
+        }
+
+        fn list(
+            &self,
+            prefix: Option<&ObjectPath>,
+        ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+            self.inner.list(prefix)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&ObjectPath>,
+        ) -> object_store::Result<ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy_opts(
+            &self,
+            from: &ObjectPath,
+            to: &ObjectPath,
+            options: CopyOptions,
+        ) -> object_store::Result<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+    }
+
+    /// One uncompressed Parquet row group without dictionaries or statistics,
+    /// so objects with equally wide values share one byte layout.
+    fn parquet_object(columns: Vec<(&str, ArrayRef)>) -> Bytes {
+        parquet_object_in_row_groups(columns, 1024 * 1024)
+    }
+
+    /// An object whose row groups hold at most `rows` rows each.
+    fn parquet_object_in_row_groups(columns: Vec<(&str, ArrayRef)>, rows: usize) -> Bytes {
+        let batch = RecordBatch::try_from_iter(columns).expect("batch");
+        let properties = WriterProperties::builder()
+            .set_dictionary_enabled(false)
+            .set_statistics_enabled(EnabledStatistics::None)
+            .set_max_row_group_row_count(Some(rows))
+            .build();
+        let mut bytes = Vec::new();
+        let mut writer =
+            ArrowWriter::try_new(&mut bytes, batch.schema(), Some(properties)).expect("writer");
+        writer.write(&batch).expect("write");
+        writer.close().expect("close");
+        Bytes::from(bytes)
+    }
+
+    const EXECUTION_BLOCK_OBJECT: &str = "canonical_execution_block/1000/0.parquet";
+
+    async fn stored_object(store: &RecordingStore, bytes: Bytes) -> CatalogObject {
+        let location = ObjectPath::from(EXECUTION_BLOCK_OBJECT);
+        store.put(&location, bytes.into()).await.expect("put");
+        CatalogObject {
+            table: XatuTable::CanonicalExecutionBlock,
+            partition: "0".to_owned(),
+            location: EXECUTION_BLOCK_OBJECT.to_owned(),
+            url: url::Url::parse("https://xatu.invalid/canonical_execution_block/1000/0.parquet")
+                .expect("URL"),
+        }
+    }
+
+    fn test_budget(max_in_flight_requests: usize) -> SourceBudget {
+        SourceBudget {
+            max_input_bytes: 64 << 20,
+            max_frame_bytes: 1 << 20,
+            max_frames: 1_000,
+            max_buffered_frames: 16,
+            max_in_flight_requests,
+            temporary_disk_bytes: 1,
+            max_resident_bytes: 64 << 20,
+        }
+    }
+
+    #[allow(clippy::unnecessary_wraps)]
+    fn rows(batch: &RecordBatch) -> Result<u64, XatuError> {
+        Ok(u64::try_from(batch.num_rows()).unwrap_or(u64::MAX))
+    }
+
+    #[tokio::test]
+    async fn range_reads_keep_to_the_budgeted_requests_in_flight() {
+        let store = Arc::new(RecordingStore::default());
+        let numbers =
+            |first: u64| Arc::new(UInt64Array::from_iter_values(first..first + 4)) as ArrayRef;
+        // Projected columns more than a coalescing gap apart.
+        let filler = |byte: u8| {
+            Arc::new(BinaryArray::from_iter_values(
+                (0..4).map(|_| vec![byte; 400_000]),
+            )) as ArrayRef
+        };
+        let object = stored_object(
+            &store,
+            parquet_object(vec![
+                ("block_number", numbers(1)),
+                ("filler_a", filler(0xaa)),
+                ("gas_used", numbers(5)),
+                ("filler_b", filler(0xbb)),
+                ("base_fee_per_gas", numbers(9)),
+            ]),
+        )
+        .await;
+        let mut projected = 0;
+        let metrics = read_projected(
+            Arc::clone(&store) as Arc<dyn ObjectStore>,
+            &object,
+            &["block_number", "gas_used", "base_fee_per_gas"],
+            test_budget(1),
+            8_192,
+            &mut projected,
+            &CancellationToken::new(),
+            rows,
+        )
+        .await
+        .expect("projection");
+        assert_eq!(metrics.rows_selected, 4);
+        // Audit History-1: object_store fetched up to ten ranges at once.
+        assert_eq!(
+            store.peak_in_flight.load(Ordering::SeqCst),
+            1,
+            "the source budget allows one request in flight"
+        );
+    }
+
+    #[tokio::test]
+    async fn range_reads_are_pinned_to_the_object_version_seen_at_head() {
+        let store = Arc::new(RecordingStore::default());
+        let version = |first: u64| {
+            parquet_object(vec![(
+                "block_number",
+                Arc::new(UInt64Array::from_iter_values(first..first + 1_000)) as ArrayRef,
+            )])
+        };
+        let object = stored_object(&store, version(0)).await;
+        // The publisher rewrites the object after its footer was read.
+        *store.replacement.lock().expect("replacement lock") =
+            Some((ObjectPath::from(EXECUTION_BLOCK_OBJECT), version(1_000_000)));
+        let mut projected = 0;
+        let mut first_seen = None;
+        let result = read_projected(
+            Arc::clone(&store) as Arc<dyn ObjectStore>,
+            &object,
+            &["block_number"],
+            test_budget(4),
+            8_192,
+            &mut projected,
+            &CancellationToken::new(),
+            |batch| {
+                first_seen = first_seen.or_else(|| {
+                    batch
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<UInt64Array>()
+                        .map(|numbers| numbers.value(0))
+                });
+                rows(batch)
+            },
+        )
+        .await;
+        // Audit History-4: the footer of one version decoded the pages of
+        // another.
+        let Err(error) = result else {
+            panic!(
+                "a read spanning two object versions succeeded, starting at block {first_seen:?}"
+            );
+        };
+        assert!(
+            error.to_string().contains("precondition"),
+            "the ETag condition refuses the rewritten object: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn projected_columns_must_arrive_as_their_declared_arrow_types() {
+        let store = Arc::new(RecordingStore::default());
+        let object = stored_object(
+            &store,
+            parquet_object(vec![
+                (
+                    "block_number",
+                    Arc::new(UInt64Array::from(vec![7])) as ArrayRef,
+                ),
+                // `extra_data` is hexadecimal text, not a signed integer.
+                (
+                    "extra_data",
+                    Arc::new(Int64Array::from(vec![1])) as ArrayRef,
+                ),
+            ]),
+        )
+        .await;
+        let mut projected = 0;
+        let mut blocks = BTreeMap::new();
+        // Block 7 is outside the range, so no row reaches a decoder.
+        let range = BlockRange::single(BlockNumber(42));
+        let error = read_projected(
+            Arc::clone(&store) as Arc<dyn ObjectStore>,
+            &object,
+            &["block_number", "extra_data"],
+            test_budget(4),
+            8_192,
+            &mut projected,
+            &CancellationToken::new(),
+            |batch| parse_execution_blocks(batch, range, &mut blocks),
+        )
+        .await
+        .expect_err("a column of an undeclared Arrow type");
+        assert!(error.to_string().contains("extra_data"), "{error}");
+    }
+
+    #[test]
+    fn every_projected_column_declares_its_arrow_encoding() {
+        for column in EXECUTION_BLOCK_COLUMNS
+            .iter()
+            .chain(EXECUTION_TRANSACTION_COLUMNS)
+            .chain(BEACON_BLOCK_COLUMNS)
+            .chain(BEACON_TRANSACTION_COLUMNS)
+            .chain(WITHDRAWAL_COLUMNS)
+            .chain(GENERIC_EXECUTION_BLOCK_COLUMNS)
+            .chain(GENERIC_BEACON_BLOCK_COLUMNS)
+            .chain(GENERIC_TRANSACTION_COLUMNS)
+            .chain(GENERIC_LOG_COLUMNS)
+        {
+            assert!(
+                column_encoding(column).is_some(),
+                "{column} has no declared Arrow encoding"
+            );
+        }
+        let accepts = |column: &str, data_type: DataType| {
+            column_encoding(column)
+                .expect("declared column")
+                .accepts(&data_type)
+        };
+        assert!(accepts("block_number", DataType::UInt64));
+        assert!(!accepts("block_number", DataType::Int64));
+        assert!(accepts("transaction_hash", DataType::FixedSizeBinary(66)));
+        assert!(accepts("transaction_hash", DataType::FixedSizeBinary(32)));
+        assert!(!accepts("transaction_hash", DataType::FixedSizeBinary(20)));
+        assert!(accepts("to_address", DataType::Utf8));
+        assert!(!accepts("input", DataType::FixedSizeBinary(32)));
+        assert!(accepts("gas_price", DataType::FixedSizeBinary(16)));
+        assert!(!accepts("withdrawal_amount", DataType::Utf8));
+        assert!(!accepts("success", DataType::UInt8));
+    }
+
+    #[test]
+    fn hex_columns_are_decoded_by_their_arrow_type_not_their_content() {
+        let text = |value: &str| {
+            RecordBatch::try_from_iter(vec![(
+                "value",
+                Arc::new(StringArray::from(vec![value])) as ArrayRef,
+            )])
+            .expect("batch")
+        };
+        // Audit History-2: 32 characters of text were taken for a raw hash.
+        assert!(required_hash(&text("0123456789abcdef0123456789abcdef"), "value", 0).is_err());
+        assert_eq!(
+            required_hash(&text(&format!("0x{}", "ab".repeat(32))), "value", 0).expect("hex hash"),
+            BlockHash::new([0xab; 32])
+        );
+        let binary = |value: &[u8]| {
+            RecordBatch::try_from_iter(vec![(
+                "value",
+                Arc::new(BinaryArray::from_vec(vec![value])) as ArrayRef,
+            )])
+            .expect("batch")
+        };
+        // Raw bytes in a hexadecimal-text column are not guessed at.
+        assert!(optional_variable_bytes(&binary(&[0x12, 0x34]), "value", 0).is_err());
+        assert_eq!(
+            optional_variable_bytes(&binary(b"0x1234"), "value", 0).expect("hex bytes"),
+            Some(vec![0x12, 0x34])
+        );
+        // A fixed-width binary column of the value's width holds raw bytes.
+        let raw = FixedSizeBinaryArray::try_from_iter([[0xcd_u8; 32]].into_iter()).expect("array");
+        let batch =
+            RecordBatch::try_from_iter(vec![("value", Arc::new(raw) as ArrayRef)]).expect("batch");
+        assert_eq!(
+            required_hash(&batch, "value", 0).expect("raw hash"),
+            BlockHash::new([0xcd; 32])
+        );
+    }
+
+    fn generic_transaction(index: u32) -> TransactionEnvelope {
+        TransactionEnvelope {
+            hash: TransactionHash::new([u8::try_from(index).unwrap_or(u8::MAX); 32]),
+            transaction_type: 2,
+            index,
+            encoded: None,
+            from: Some(Address::new([0x22; 20])),
+            to: None,
+            nonce: Some(0),
+            gas_limit: Some(21_000),
+            value: Some(quantity_from_u64(0)),
+            input: None,
+            max_fee_per_gas: None,
+            max_priority_fee_per_gas: None,
+            max_fee_per_blob_gas: None,
+            blob_versioned_hashes: Vec::new(),
+            size_bytes: None,
+        }
+    }
+
+    /// Normalize block 42, whose payload holds `transaction_count`
+    /// transactions, from projected rows at `indices`.
+    fn generic_transaction_frames(
+        filters: &FilterSet,
+        transaction_count: u32,
+        indices: &[u32],
+    ) -> Result<Vec<BlockFrame>, XatuError> {
+        let number = 42;
+        let hash = BlockHash::new([0x42; 32]);
+        normalize_generic_frames(GenericNormalizationInputs {
+            range: BlockRange::single(BlockNumber(number)),
+            kind: GenericProjectionKind::Transactions,
+            include_header: true,
+            filters,
+            execution_blocks: &BTreeMap::from([(
+                number,
+                GenericExecutionBlockRow {
+                    hash,
+                    timestamp: 1_700_000_000,
+                },
+            )]),
+            beacon_blocks: &BTreeMap::from([(
+                number,
+                GenericBeaconBlockRow {
+                    hash,
+                    parent_hash: BlockHash::ZERO,
+                    timestamp: 1_700_000_000,
+                    transaction_count,
+                    gas_limit: 30_000_000,
+                    gas_used: 21_000,
+                    base_fee_per_gas: quantity_from_u64(7),
+                    blob_gas_used: None,
+                    excess_blob_gas: None,
+                },
+            )]),
+            transactions: BTreeMap::from([(
+                number,
+                indices.iter().copied().map(generic_transaction).collect(),
+            )]),
+            logs: BTreeMap::new(),
+            provenance: &[],
+        })
+    }
+
+    #[test]
+    fn unfiltered_transactions_account_for_every_payload_transaction() {
+        let unfiltered = FilterSet::default();
+        // Audit M-H8: a block with three transactions was projected as two.
+        assert!(
+            matches!(
+                generic_transaction_frames(&unfiltered, 3, &[0, 2]),
+                Err(XatuError::IncompleteRange {
+                    table: XatuTable::CanonicalExecutionTransaction,
+                    expected: 3,
+                    actual: 2,
+                    ..
+                })
+            ),
+            "an unfiltered list shorter than the payload"
+        );
+        generic_transaction_frames(&unfiltered, 3, &[0, 1, 2]).expect("complete transactions");
+        generic_transaction_frames(&unfiltered, 0, &[]).expect("an empty block");
+        assert!(generic_transaction_frames(&unfiltered, 1, &[1]).is_err());
+
+        // A filtered list may be shorter, but never longer or outside the
+        // payload.
+        let senders = FilterSet {
+            senders: vec![Address::new([0x22; 20])],
+            ..FilterSet::default()
+        };
+        generic_transaction_frames(&senders, 3, &[2]).expect("a filtered subset");
+        assert!(
+            generic_transaction_frames(&senders, 1, &[0, 1]).is_err(),
+            "more transactions than the payload"
+        );
+        assert!(
+            generic_transaction_frames(&senders, 2, &[2]).is_err(),
+            "an index outside the payload"
+        );
+    }
+
+    fn log_batch(topic_columns: [ArrayRef; 4]) -> RecordBatch {
+        let hash = format!("0x{}", "44".repeat(32));
+        let address = format!("0x{}", "55".repeat(20));
+        let [first, second, third, fourth] = topic_columns;
+        RecordBatch::try_from_iter(vec![
+            (
+                "block_number",
+                Arc::new(UInt64Array::from(vec![42])) as ArrayRef,
+            ),
+            (
+                "transaction_index",
+                Arc::new(UInt64Array::from(vec![1])) as ArrayRef,
+            ),
+            (
+                "transaction_hash",
+                Arc::new(StringArray::from(vec![hash.as_str()])) as ArrayRef,
+            ),
+            (
+                "log_index",
+                Arc::new(UInt64Array::from(vec![2])) as ArrayRef,
+            ),
+            (
+                "address",
+                Arc::new(StringArray::from(vec![address.as_str()])) as ArrayRef,
+            ),
+            ("topic0", first),
+            ("topic1", second),
+            ("topic2", third),
+            ("topic3", fourth),
+            (
+                "data",
+                Arc::new(StringArray::from(vec![Some("0x")])) as ArrayRef,
+            ),
+        ])
+        .expect("log batch")
+    }
+
+    fn text_topic(value: Option<&str>) -> ArrayRef {
+        Arc::new(StringArray::from(vec![value]))
+    }
+
+    fn parse_block_42_logs(
+        batch: &RecordBatch,
+        filters: &FilterSet,
+    ) -> Result<BTreeMap<u64, Vec<Log>>, XatuError> {
+        let mut output = BTreeMap::new();
+        parse_generic_logs(
+            batch,
+            BlockRange::single(BlockNumber(42)),
+            filters,
+            LogFieldSet::ALL,
+            &mut output,
+        )?;
+        Ok(output)
+    }
+
+    #[test]
+    fn logs_without_topics_are_projected() {
+        let topic = format!("0x{}", "66".repeat(32));
+        let nul_padded: ArrayRef = Arc::new(
+            FixedSizeBinaryArray::try_from_iter([[0_u8; 66]].into_iter()).expect("NUL topic"),
+        );
+        let mut padded_hex = [0_u8; 66];
+        padded_hex[..2].copy_from_slice(b"0x");
+        let padded_hex: ArrayRef =
+            Arc::new(FixedSizeBinaryArray::try_from_iter([padded_hex].into_iter()).unwrap());
+        for (name, topic0) in [
+            ("null topic0", text_topic(None)),
+            (
+                "empty hexadecimal topic0 from public Xatu",
+                text_topic(Some("0x")),
+            ),
+            ("NUL-padded empty hexadecimal topic0", padded_hex),
+            (
+                "binary empty hexadecimal topic0",
+                Arc::new(BinaryArray::from_vec(vec![b"0x"])) as ArrayRef,
+            ),
+            ("empty topic0", text_topic(Some(""))),
+            ("NUL-padded FixedString topic0", nul_padded),
+        ] {
+            // Audit M-H9: one LOG0 row aborted the whole chunk.
+            let output = parse_block_42_logs(
+                &log_batch([topic0, text_topic(None), text_topic(None), text_topic(None)]),
+                &FilterSet::default(),
+            )
+            .unwrap_or_else(|error| panic!("{name}: {error}"));
+            assert!(output[&42][0].topics.is_empty(), "{name}");
+        }
+        assert!(
+            parse_block_42_logs(
+                &log_batch([
+                    text_topic(Some(&topic)),
+                    text_topic(None),
+                    text_topic(Some(&topic)),
+                    text_topic(None),
+                ]),
+                &FilterSet::default(),
+            )
+            .is_err(),
+            "a topic after an absent topic"
+        );
+        let topic_zero = FilterSet {
+            scope: FilterScope {
+                topics: vec![TopicFilter {
+                    position: 0,
+                    alternatives: vec![[0x66; 32]],
+                }],
+                ..FilterScope::default()
+            },
+            ..FilterSet::default()
+        };
+        let output = parse_block_42_logs(
+            &log_batch([
+                text_topic(None),
+                text_topic(None),
+                text_topic(None),
+                text_topic(None),
+            ]),
+            &topic_zero,
+        )
+        .expect("a topic filter skips LOG0 rows");
+        assert!(output.is_empty());
+    }
+
+    #[test]
+    fn a_zero_topic_is_present_but_malformed_short_hex_is_rejected() {
+        let raw: ArrayRef =
+            Arc::new(FixedSizeBinaryArray::try_from_iter([[0_u8; 32]].into_iter()).unwrap());
+        let output = parse_block_42_logs(
+            &log_batch([raw, text_topic(None), text_topic(None), text_topic(None)]),
+            &FilterSet::default(),
+        )
+        .unwrap();
+        assert_eq!(output[&42][0].topics, vec![[0; 32]]);
+        let zero_text = format!("0x{}", "0".repeat(64));
+        let output = parse_block_42_logs(
+            &log_batch([
+                text_topic(Some(&zero_text)),
+                text_topic(None),
+                text_topic(None),
+                text_topic(None),
+            ]),
+            &FilterSet::default(),
+        )
+        .unwrap();
+        assert_eq!(output[&42][0].topics, vec![[0; 32]]);
+        assert!(
+            parse_block_42_logs(
+                &log_batch([
+                    text_topic(Some("0x00")),
+                    text_topic(None),
+                    text_topic(None),
+                    text_topic(None)
+                ]),
+                &FilterSet::default()
+            )
+            .is_err()
+        );
+    }
 
     #[test]
     fn little_endian_xatu_quantities_become_canonical_big_endian() {
@@ -2360,34 +3491,33 @@ mod tests {
         .collect()
     }
 
-    #[test]
-    fn dencun_execution_block_size_matches_verified_raw_block() {
-        let transaction_sizes = dencun_transaction_sizes();
-        assert_eq!(
-            transaction_sizes
-                .iter()
-                .map(|transaction| u64::from(transaction.size_bytes))
-                .sum::<u64>(),
-            33_644
-        );
-        let withdrawals = (0..16)
+    const DENCUN_BLOCK: u64 = 19_426_589;
+    const DENCUN_SLOT: u64 = 8_626_181;
+
+    /// The withdrawal rows of Dencun block 19,426,589, truncated or extended
+    /// to `count`.
+    fn dencun_withdrawals(count: u64) -> Vec<WithdrawalRow> {
+        (0..count)
             .map(|offset| WithdrawalRow {
                 index: 38_266_054 + offset,
                 validator_index: 1_268_201 + offset,
                 address: Address::new([0; 20]),
                 amount_gwei: if offset == 15 { 60_026_761 } else { 16_025_579 },
             })
-            .collect::<Vec<_>>();
+            .collect()
+    }
+
+    fn dencun_blocks(hash: BlockHash) -> (ExecutionBlockRow, BeaconBlockRow) {
         let execution = ExecutionBlockRow {
-            number: 19_426_589,
-            hash: BlockHash::ZERO,
+            number: DENCUN_BLOCK,
+            hash,
             timestamp: 1_710_338_159,
             gas_used: 7_155_950,
             extra_data: vec![0; 11],
             base_fee_per_gas: 55_745_530_424,
         };
         let beacon = BeaconBlockRow {
-            slot: 8_626_181,
+            slot: DENCUN_SLOT,
             number: execution.number,
             hash: execution.hash,
             parent_hash: BlockHash::ZERO,
@@ -2402,11 +3532,354 @@ mod tests {
             transaction_count: 79,
             transactions_total_bytes: 33_644,
         };
+        (execution, beacon)
+    }
+
+    /// Normalize Dencun block 19,426,589 with one blob transaction and the
+    /// given withdrawal rows.
+    fn dencun_blob_frames(
+        withdrawals: &BTreeMap<u64, Vec<WithdrawalRow>>,
+    ) -> Result<Vec<BlockFrame>, XatuError> {
+        let transaction_hash = TransactionHash::new([0x33; 32]);
+        let (execution, beacon) = dencun_blocks(BlockHash::new([0x11; 32]));
+        normalize_frames(NormalizationInputs {
+            range: BlockRange::single(BlockNumber(DENCUN_BLOCK)),
+            execution_blocks: &BTreeMap::from([(DENCUN_BLOCK, execution)]),
+            beacon_blocks: &BTreeMap::from([(DENCUN_BLOCK, beacon)]),
+            beacon_transactions: vec![BeaconTransactionRow {
+                slot: DENCUN_SLOT,
+                index: 60,
+                hash: transaction_hash,
+                from: Address::new([0x44; 20]),
+                to: Some(Address::new([0x55; 20])),
+                gas_limit: 21_000,
+                size_bytes: 150,
+                blob_gas: 131_072,
+                max_fee_per_blob_gas: quantity_from_u64(1),
+                blob_hashes: vec![BlockHash::new([0x66; 32])],
+            }],
+            transaction_sizes: &BTreeMap::from([(DENCUN_SLOT, dencun_transaction_sizes())]),
+            withdrawals,
+            execution_transactions: &BTreeMap::from([(
+                transaction_hash,
+                ExecutionTransactionRow {
+                    block_number: DENCUN_BLOCK,
+                    index: 60,
+                    hash: transaction_hash,
+                    gas_used: 21_000,
+                    gas_price: quantity_from_u64(1),
+                    success: true,
+                },
+            )]),
+            provenance: &[],
+        })
+    }
+
+    fn dencun_slot_withdrawals(rows: Vec<WithdrawalRow>) -> BTreeMap<u64, Vec<WithdrawalRow>> {
+        BTreeMap::from([(DENCUN_SLOT, rows)])
+    }
+
+    #[test]
+    fn dencun_execution_block_size_matches_verified_raw_block() {
+        let transaction_sizes = dencun_transaction_sizes();
+        assert_eq!(
+            transaction_sizes
+                .iter()
+                .map(|transaction| u64::from(transaction.size_bytes))
+                .sum::<u64>(),
+            33_644
+        );
+        let (execution, beacon) = dencun_blocks(BlockHash::ZERO);
 
         assert_eq!(
-            execution_block_rlp_len(&execution, &beacon, &transaction_sizes, &withdrawals)
-                .expect("exact size"),
+            execution_block_rlp_len(
+                &execution,
+                &beacon,
+                &transaction_sizes,
+                &dencun_withdrawals(16)
+            )
+            .expect("exact size"),
             34_975
+        );
+    }
+
+    #[test]
+    fn blob_block_sizes_need_every_withdrawal_row_and_at_most_sixteen() {
+        dencun_blob_frames(&dencun_slot_withdrawals(dencun_withdrawals(16)))
+            .expect("the verified block");
+        // Audit M-H8: missing rows were read as a block without withdrawals,
+        // which understated its size.
+        assert!(
+            matches!(
+                dencun_blob_frames(&BTreeMap::new()),
+                Err(XatuError::IncompleteWithdrawals { .. })
+            ),
+            "a slot without withdrawal rows"
+        );
+        assert!(
+            matches!(
+                dencun_blob_frames(&dencun_slot_withdrawals(dencun_withdrawals(17))),
+                Err(XatuError::Data(_))
+            ),
+            "more withdrawals than a payload holds"
+        );
+        let mut gap = dencun_withdrawals(16);
+        gap[3].index += 100;
+        assert!(
+            matches!(
+                dencun_blob_frames(&dencun_slot_withdrawals(gap)),
+                Err(XatuError::IncompleteWithdrawals { .. })
+            ),
+            "non-consecutive withdrawal indices"
+        );
+        let mut duplicate = dencun_withdrawals(16);
+        duplicate[3].index = duplicate[2].index;
+        assert!(
+            matches!(
+                dencun_blob_frames(&dencun_slot_withdrawals(duplicate)),
+                Err(XatuError::Data(_))
+            ),
+            "a duplicated withdrawal row"
+        );
+    }
+
+    #[test]
+    fn blob_receipts_declare_the_predicate_of_their_transactions() {
+        let frames = dencun_blob_frames(&dencun_slot_withdrawals(dencun_withdrawals(16)))
+            .expect("normalized blob frame");
+
+        let frame = &frames[0];
+        let Material::Filtered {
+            scope: transaction_scope,
+            ..
+        } = &frame.transactions
+        else {
+            panic!("blob transactions are a filtered projection");
+        };
+        let Material::Filtered {
+            value: receipts,
+            scope: receipt_scope,
+            ..
+        } = &frame.receipts
+        else {
+            panic!("blob receipts are a filtered projection");
+        };
+        assert_eq!(receipts.len(), 1);
+        assert_eq!(receipt_scope, transaction_scope);
+        // The blobs processor's requirement filter.
+        let blob_transactions = FilterScope {
+            transaction_types: vec![3],
+            ..FilterScope::default()
+        };
+        assert!(receipt_scope.covers_at(&blob_transactions, frame.block.number));
+    }
+
+    #[tokio::test]
+    async fn weak_etags_are_refused_before_any_range_read() {
+        let store = Arc::new(RecordingStore {
+            weak_e_tags: true,
+            ..RecordingStore::default()
+        });
+        let object = stored_object(
+            &store,
+            parquet_object(vec![(
+                "block_number",
+                Arc::new(UInt64Array::from(vec![7])) as ArrayRef,
+            )]),
+        )
+        .await;
+        let mut projected = 0;
+        let error = read_projected(
+            Arc::clone(&store) as Arc<dyn ObjectStore>,
+            &object,
+            &["block_number"],
+            test_budget(4),
+            8_192,
+            &mut projected,
+            &CancellationToken::new(),
+            rows,
+        )
+        .await
+        .expect_err("a weak ETag cannot pin a read");
+        // Review M4: If-Match compares strongly, so a weak ETag failed every
+        // read with a precondition error that looked transient.
+        assert!(error.to_string().contains("weak ETag"), "{error}");
+        assert_eq!(store.peak_in_flight.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn probes_flag_objects_whose_reads_cannot_be_pinned() {
+        assert_eq!(crate::catalog::pinning_problem(Some("\"8e7c\"")), None);
+        assert!(
+            crate::catalog::pinning_problem(None)
+                .is_some_and(|problem| problem.contains("no ETag"))
+        );
+        let store = Arc::new(RecordingStore {
+            weak_e_tags: true,
+            ..RecordingStore::default()
+        });
+        let object = stored_object(
+            &store,
+            parquet_object(vec![(
+                "block_number",
+                Arc::new(UInt64Array::from(vec![7])) as ArrayRef,
+            )]),
+        )
+        .await;
+        let catalog = XatuCatalog::with_store(
+            crate::XatuCatalogConfig::default(),
+            Arc::clone(&store) as Arc<dyn ObjectStore>,
+        );
+        let report = catalog.inspect(vec![object], 1).await.expect("inspection");
+        // Review M4: the probe neither required nor judged the ETag.
+        assert_eq!(report.objects[0].e_tag.as_deref(), Some("W/\"0\""));
+        assert!(!report.is_valid());
+        assert!(
+            report
+                .failures
+                .iter()
+                .any(|failure| failure.error.contains("weak ETag")),
+            "{:?}",
+            report.failures
+        );
+    }
+
+    /// Normalize three consecutive blocks without transactions whose slots
+    /// hold withdrawal rows with the given indices.
+    fn withdrawal_frames(slots: [&[u64]; 3]) -> Result<Vec<BlockFrame>, XatuError> {
+        withdrawal_frames_between(None, slots, None)
+    }
+
+    fn withdrawal_row(index: u64) -> WithdrawalRow {
+        WithdrawalRow {
+            index,
+            validator_index: index,
+            address: Address::new([0; 20]),
+            amount_gwei: 1,
+        }
+    }
+
+    /// [`withdrawal_frames`], with the chunk's nearest outside slots holding
+    /// the withdrawal index `before` its first slot and `after` its last.
+    fn withdrawal_frames_between(
+        before: Option<u64>,
+        slots: [&[u64]; 3],
+        after: Option<u64>,
+    ) -> Result<Vec<BlockFrame>, XatuError> {
+        let first_block = 20_000_000;
+        let first_slot = 9_000_000;
+        let mut execution_blocks = BTreeMap::new();
+        let mut beacon_blocks = BTreeMap::new();
+        let mut withdrawals = BTreeMap::new();
+        if let Some(index) = before {
+            withdrawals.insert(first_slot - 2, vec![withdrawal_row(index)]);
+        }
+        if let Some(index) = after {
+            withdrawals.insert(first_slot + 4, vec![withdrawal_row(index)]);
+        }
+        for (offset, indices) in (0_u64..).zip(slots) {
+            let (mut execution, mut beacon) =
+                dencun_blocks(BlockHash::new([u8::try_from(offset).expect("offset"); 32]));
+            execution.number = first_block + offset;
+            beacon.number = execution.number;
+            beacon.slot = first_slot + offset;
+            beacon.transaction_count = 0;
+            beacon.transactions_total_bytes = 0;
+            if !indices.is_empty() {
+                withdrawals.insert(
+                    beacon.slot,
+                    indices.iter().copied().map(withdrawal_row).collect(),
+                );
+            }
+            execution_blocks.insert(execution.number, execution);
+            beacon_blocks.insert(beacon.number, beacon);
+        }
+        normalize_frames(NormalizationInputs {
+            range: BlockRange::new(BlockNumber(first_block), BlockNumber(first_block + 2))
+                .expect("range"),
+            execution_blocks: &execution_blocks,
+            beacon_blocks: &beacon_blocks,
+            beacon_transactions: Vec::new(),
+            transaction_sizes: &BTreeMap::new(),
+            withdrawals: &withdrawals,
+            execution_transactions: &BTreeMap::new(),
+            provenance: &[],
+        })
+    }
+
+    fn indices(range: std::ops::Range<u64>) -> Vec<u64> {
+        range.collect()
+    }
+
+    #[test]
+    fn a_slot_between_consecutive_withdrawal_indices_had_none() {
+        // Review I2: a block without withdrawals failed its chunk forever.
+        let frames = withdrawal_frames([&indices(0..16), &[], &indices(16..32)])
+            .expect("withdrawal indices continue across the empty slot");
+        assert_eq!(frames.len(), 3);
+    }
+
+    #[test]
+    fn a_truncated_withdrawal_slot_leaves_its_chunk_incomplete() {
+        // Review I2: ten of sixteen rows passed, understating the block size.
+        let error = withdrawal_frames([&indices(0..10), &indices(16..32), &indices(32..48)])
+            .expect_err("indices 10 to 15 are missing");
+        assert!(
+            matches!(error, XatuError::IncompleteWithdrawals { .. }),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn withdrawal_rows_that_cannot_be_proven_complete_leave_their_chunk_incomplete() {
+        for (name, slots) in [
+            (
+                "an index gap across an empty slot",
+                [indices(0..16), Vec::new(), indices(20..36)],
+            ),
+            (
+                "an empty first slot",
+                [Vec::new(), indices(0..16), indices(16..32)],
+            ),
+            (
+                "an empty last slot",
+                [indices(0..16), indices(16..32), Vec::new()],
+            ),
+            ("no rows at all", [Vec::new(), Vec::new(), Vec::new()]),
+        ] {
+            let error = withdrawal_frames([&slots[0], &slots[1], &slots[2]]).expect_err(name);
+            assert!(
+                matches!(error, XatuError::IncompleteWithdrawals { .. }),
+                "{name}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn blob_receipts_do_not_stand_in_for_logs() {
+        let frames = dencun_blob_frames(&dencun_slot_withdrawals(dencun_withdrawals(16)))
+            .expect("normalized blob frame");
+        let requirement = |capabilities| leani_processor_api::DataRequirement {
+            capabilities,
+            log_fields: LogFieldSet::NONE,
+            allow_filtered: true,
+            filter: FilterScope {
+                transaction_types: vec![3],
+                ..FilterScope::default()
+            },
+            minimum_finality: Finality::Finalized,
+        };
+        let blobs = CapabilitySet::of(Capability::Header)
+            .with(Capability::Transactions)
+            .with(Capability::Receipts);
+        assert_eq!(requirement(blobs).validate_frame(&frames[0]), Ok(()));
+        // Task 4 carry-forward: receipts derive logs, but Xatu projects no
+        // logs into its blob receipts.
+        assert!(
+            requirement(CapabilitySet::of(Capability::Logs))
+                .validate_frame(&frames[0])
+                .is_err(),
+            "logs of blob transactions derived from receipts without logs"
         );
     }
 
@@ -2421,5 +3894,417 @@ mod tests {
             ExecutionBlockFork::Prague
         );
         assert!(parse_execution_block_fork(b"unknown-future-fork").is_err());
+    }
+
+    #[test]
+    fn truncated_withdrawals_at_the_edges_of_a_one_block_chunk_stay_incomplete() {
+        let size = |frames: Vec<BlockFrame>| {
+            frames[0]
+                .header
+                .as_present()
+                .expect("header")
+                .size_bytes
+                .expect("size")
+        };
+        assert_eq!(
+            size(
+                dencun_blob_frames(&dencun_slot_withdrawals(dencun_withdrawals(16)))
+                    .expect("all sixteen rows")
+            ),
+            34_975
+        );
+        // External review F3: without its last row the block measured 34,939
+        // bytes, and without its first 34,940; both passed.
+        for (name, rows) in [
+            ("the last row missing", dencun_withdrawals(15)),
+            (
+                "the first row missing",
+                dencun_withdrawals(16).into_iter().skip(1).collect(),
+            ),
+        ] {
+            let result = dencun_blob_frames(&dencun_slot_withdrawals(rows));
+            assert!(
+                matches!(result, Err(XatuError::IncompleteWithdrawals { .. })),
+                "{name}: {:?}",
+                result.map(size)
+            );
+        }
+    }
+
+    #[test]
+    fn neighbouring_slots_prove_the_withdrawals_at_the_chunk_edges() {
+        // External review F3: a block without withdrawals at either edge of a
+        // chunk failed it, whatever the slots around the chunk showed.
+        for (name, before, slots, after) in [
+            (
+                "an empty first slot",
+                Some(99),
+                [Vec::new(), indices(100..116), indices(116..132)],
+                None,
+            ),
+            (
+                "an empty last slot",
+                None,
+                [indices(100..116), indices(116..132), Vec::new()],
+                Some(132),
+            ),
+            (
+                "no withdrawals at all",
+                Some(99),
+                [Vec::new(), Vec::new(), Vec::new()],
+                Some(100),
+            ),
+            (
+                "short payloads at both edges",
+                Some(99),
+                [indices(100..110), indices(110..126), indices(126..130)],
+                Some(130),
+            ),
+        ] {
+            let frames =
+                withdrawal_frames_between(before, [&slots[0], &slots[1], &slots[2]], after)
+                    .unwrap_or_else(|error| panic!("{name}: {error}"));
+            assert_eq!(frames.len(), 3, "{name}");
+        }
+    }
+
+    #[test]
+    fn chunk_edges_without_neighbouring_evidence_stay_incomplete() {
+        for (name, before, slots, after) in [
+            (
+                "an empty first slot after an index gap",
+                Some(98),
+                [Vec::new(), indices(100..116), indices(116..132)],
+                None,
+            ),
+            (
+                "an empty last slot before an index gap",
+                None,
+                [indices(100..116), indices(116..132), Vec::new()],
+                Some(133),
+            ),
+            (
+                "a short first slot without an earlier slot",
+                None,
+                [indices(101..116), indices(116..132), indices(132..148)],
+                None,
+            ),
+            (
+                "a short last slot without a later slot",
+                None,
+                [indices(100..116), indices(116..132), indices(132..147)],
+                None,
+            ),
+            (
+                "a short last slot before an index gap",
+                None,
+                [indices(100..116), indices(116..132), indices(132..147)],
+                Some(148),
+            ),
+        ] {
+            let error = withdrawal_frames_between(before, [&slots[0], &slots[1], &slots[2]], after)
+                .expect_err(name);
+            assert!(
+                matches!(error, XatuError::IncompleteWithdrawals { .. }),
+                "{name}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn withdrawal_parsing_keeps_the_nearest_slot_on_each_side_of_the_chunk() {
+        let rows: [(u64, u64); 9] = [
+            (5, 1),
+            (8, 2),
+            (9, 3),
+            (9, 4),
+            (10, 5),
+            (11, 6),
+            (12, 7),
+            (14, 8),
+            (3, 0),
+        ];
+        let numbers = |values: Vec<u64>| Arc::new(UInt64Array::from(values)) as ArrayRef;
+        let fixed = |width: usize| {
+            Arc::new(
+                FixedSizeBinaryArray::try_from_iter(rows.iter().map(|_| {
+                    let mut value = vec![0_u8; width];
+                    value[0] = 1;
+                    value
+                }))
+                .expect("fixed-width column"),
+            ) as ArrayRef
+        };
+        let batch = RecordBatch::try_from_iter([
+            (
+                "slot",
+                numbers(rows.iter().map(|(slot, _)| *slot).collect()),
+            ),
+            (
+                "withdrawal_index",
+                numbers(rows.iter().map(|(_, index)| *index).collect()),
+            ),
+            (
+                "withdrawal_validator_index",
+                numbers(rows.iter().map(|(_, index)| *index).collect()),
+            ),
+            ("withdrawal_address", fixed(20)),
+            ("withdrawal_amount", fixed(8)),
+        ])
+        .expect("batch");
+        let mut output = BTreeMap::new();
+        parse_withdrawals(&batch, &BTreeSet::from([10, 11]), &mut output).expect("rows");
+        let kept = output
+            .iter()
+            .map(|(slot, rows)| (*slot, rows.iter().map(|row| row.index).collect()))
+            .collect::<Vec<(u64, Vec<u64>)>>();
+        // Review 2: rows outside the chunk were dropped, leaving its edges
+        // without evidence.
+        assert_eq!(
+            kept,
+            [(9, vec![3, 4]), (10, vec![5]), (11, vec![6]), (12, vec![7])]
+        );
+    }
+
+    #[tokio::test]
+    async fn range_reads_charge_every_requested_byte_to_the_input_budget() {
+        let store = Arc::new(RecordingStore::default());
+        let padding = vec![0xab; 128 * 1024];
+        let object = stored_object(
+            &store,
+            parquet_object(vec![
+                (
+                    "block_number",
+                    Arc::new(UInt64Array::from(vec![7])) as ArrayRef,
+                ),
+                (
+                    "padding",
+                    Arc::new(BinaryArray::from(vec![padding.as_slice()])) as ArrayRef,
+                ),
+                ("gas_used", Arc::new(UInt64Array::from(vec![8])) as ArrayRef),
+            ]),
+        )
+        .await;
+        let mut budget = test_budget(4);
+        budget.max_input_bytes = 1_024;
+        let mut used = 0;
+        let metrics = read_projected(
+            Arc::clone(&store) as Arc<dyn ObjectStore>,
+            &object,
+            &["block_number", "gas_used"],
+            budget,
+            8_192,
+            &mut used,
+            &CancellationToken::new(),
+            rows,
+        )
+        .await
+        .expect("the footer and the two columns fit the budget");
+        let requested =
+            u64::try_from(store.requested_bytes.load(Ordering::SeqCst)).expect("requested bytes");
+        // External review F4: the 128 KiB between the columns were merged into
+        // one request of 131,808 bytes under a 1,024-byte budget, and 711
+        // bytes were reported fetched.
+        assert!(
+            requested <= 1_024,
+            "{requested} bytes requested under a 1,024-byte budget"
+        );
+        assert_eq!(metrics.fetched_bytes, requested);
+        assert_eq!(used, requested);
+        assert!(metrics.projected_compressed_bytes < requested);
+    }
+
+    #[tokio::test]
+    async fn a_row_group_must_fit_the_resident_budget() {
+        let store = Arc::new(RecordingStore::default());
+        let numbers = (0..2_048_u64).collect::<Vec<_>>();
+        let object = stored_object(
+            &store,
+            parquet_object(vec![
+                (
+                    "block_number",
+                    Arc::new(UInt64Array::from(numbers.clone())) as ArrayRef,
+                ),
+                ("gas_used", Arc::new(UInt64Array::from(numbers)) as ArrayRef),
+            ]),
+        )
+        .await;
+        let mut budget = test_budget(4);
+        budget.max_resident_bytes = 1_024;
+        let error = read_projected(
+            Arc::clone(&store) as Arc<dyn ObjectStore>,
+            &object,
+            &["block_number", "gas_used"],
+            budget,
+            8_192,
+            &mut 0,
+            &CancellationToken::new(),
+            rows,
+        )
+        .await
+        .expect_err("the row group's columns exceed what one read may hold");
+        // Review I1: a row group was bounded only by what the open may
+        // acquire in total.
+        assert!(
+            matches!(
+                error,
+                XatuError::Budget {
+                    resource: "resident_bytes",
+                    limit: 1_024,
+                    ..
+                }
+            ),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn row_groups_are_held_one_at_a_time() {
+        let store = Arc::new(RecordingStore::default());
+        let numbers = (0..2_048_u64).collect::<Vec<_>>();
+        let object = stored_object(
+            &store,
+            parquet_object_in_row_groups(
+                vec![
+                    (
+                        "block_number",
+                        Arc::new(UInt64Array::from(numbers.clone())) as ArrayRef,
+                    ),
+                    ("gas_used", Arc::new(UInt64Array::from(numbers)) as ArrayRef),
+                ],
+                1_024,
+            ),
+        )
+        .await;
+        let read = |budget| {
+            let store = Arc::clone(&store) as Arc<dyn ObjectStore>;
+            let object = object.clone();
+            async move {
+                read_projected(
+                    store,
+                    &object,
+                    &["block_number", "gas_used"],
+                    budget,
+                    8_192,
+                    &mut 0,
+                    &CancellationToken::new(),
+                    rows,
+                )
+                .await
+            }
+        };
+        let whole = read(test_budget(4)).await.expect("read");
+        // A batch never spans row groups.
+        assert_eq!(whole.batches, 2);
+        // Review 2 A: room for the larger row group, less than both.
+        let mut budget = test_budget(4);
+        budget.max_resident_bytes = whole.projected_compressed_bytes - 1;
+        let held = read(budget)
+            .await
+            .expect("each row group fits what one read may hold");
+        assert_eq!(held.rows_scanned, 2_048);
+    }
+
+    #[tokio::test]
+    async fn footer_reads_count_toward_the_input_budget() {
+        let store = Arc::new(RecordingStore::default());
+        let object = stored_object(
+            &store,
+            parquet_object(vec![(
+                "block_number",
+                Arc::new(UInt64Array::from(vec![7])) as ArrayRef,
+            )]),
+        )
+        .await;
+        let mut budget = test_budget(4);
+        budget.max_input_bytes = 64;
+        let mut used = 0;
+        let error = read_projected(
+            Arc::clone(&store) as Arc<dyn ObjectStore>,
+            &object,
+            &["block_number"],
+            budget,
+            8_192,
+            &mut used,
+            &CancellationToken::new(),
+            rows,
+        )
+        .await
+        .expect_err("the footer alone exceeds the budget");
+        // External review F4: footers were read before, and outside, the
+        // budget check.
+        assert!(
+            matches!(
+                error,
+                XatuError::Budget {
+                    resource: "input_bytes",
+                    limit: 64,
+                    ..
+                }
+            ),
+            "{error}"
+        );
+        assert!(store.requested_bytes.load(Ordering::SeqCst) <= 64);
+    }
+
+    /// The source budget's counters, each tripped where the projection
+    /// enforces it: bytes acquired from the object store, bytes of each
+    /// normalized frame, and frames emitted.
+    #[tokio::test]
+    async fn budget_contract_names_each_exceeded_counter() {
+        let store = Arc::new(RecordingStore::default());
+        let object = stored_object(
+            &store,
+            parquet_object(vec![(
+                "block_number",
+                Arc::new(UInt64Array::from(vec![7])) as ArrayRef,
+            )]),
+        )
+        .await;
+        let mut acquisition = test_budget(4);
+        acquisition.max_input_bytes = 64;
+        let acquired = read_projected(
+            Arc::clone(&store) as Arc<dyn ObjectStore>,
+            &object,
+            &["block_number"],
+            acquisition,
+            8_192,
+            &mut 0,
+            &CancellationToken::new(),
+            rows,
+        )
+        .await
+        .map(|_| ());
+        let blob_frames = dencun_blob_frames(&dencun_slot_withdrawals(dencun_withdrawals(16)))
+            .expect("blob frame");
+        let mut frame_limited = test_budget(1);
+        frame_limited.max_frame_bytes = blob_frames[0].estimated_heap_bytes() - 1;
+        let frames = withdrawal_frames([&indices(0..16), &indices(16..32), &indices(32..48)])
+            .expect("frames");
+        let mut emitted = test_budget(1);
+        emitted.max_frames = 2;
+        assert_eq!(validate_frame_budget(&blob_frames, test_budget(1)), Ok(()));
+        assert_eq!(validate_frame_budget(&frames, test_budget(1)), Ok(()));
+        for (counter, outcome, expected) in [
+            ("acquired", acquired, "input_bytes"),
+            (
+                "frame",
+                validate_frame_budget(&blob_frames, frame_limited),
+                "frame_bytes",
+            ),
+            ("emitted", validate_frame_budget(&frames, emitted), "frames"),
+        ] {
+            match outcome {
+                Err(XatuError::Budget {
+                    resource,
+                    actual,
+                    limit,
+                }) => {
+                    assert_eq!(resource, expected, "{counter}");
+                    assert!(actual > limit, "{counter}: {actual} <= {limit}");
+                }
+                other => panic!("{counter}: {other:?}"),
+            }
+        }
     }
 }

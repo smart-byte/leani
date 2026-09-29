@@ -1,0 +1,24 @@
+version: 2
+updates:
+  # Workflow actions stay pinned to full commit SHAs; Dependabot updates the
+  # SHA together with its version comment.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+  - package-ecosystem: bun
+    directories:
+      - /packages/sdk
+      - /site
+    schedule:
+      interval: weekly
+  # Refreshes the Dockerfile's digest-pinned base images. CI rejects a rust
+  # tag update until rust-toolchain.toml moves to the same version with it.
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly

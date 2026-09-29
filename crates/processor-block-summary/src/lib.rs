@@ -1,4 +1,4 @@
-//! Ethereum block summaries from verified headers and bodies.
+//! Ethereum block summaries from verified blocks or predicate-complete trusted datasets.
 
 use alloy_primitives::U256;
 use async_trait::async_trait;
@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 pub const BLOCK_COLLECTION: &str = "ethereum.blocks";
 pub const BLOCK_NUMBER_INDEX_COLLECTION: &str = "ethereum.blocks.by-number";
 pub const BLOCK_SUMMARY_KIND: &str = "ethereum.block.summary";
-pub const BLOCK_SUMMARY_VERSION: &str = "1.1.0";
+pub const BLOCK_SUMMARY_VERSION: &str = "1.2.0";
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct BlockSummaryConfig {
@@ -60,10 +60,11 @@ impl BlockSummaryProcessor {
             .map_err(|error| ProcessorError::Input(error.to_string()))?;
         let id = ProcessorId::new("block-summary")
             .map_err(|error| ProcessorError::Input(error.to_string()))?;
-        let version = Version::new(1, 1, 0);
+        let version = Version::new(1, 2, 0);
         let config_hash = BlockHash::new(*blake3::hash(&encoded).as_bytes());
         let descriptor = ProcessorDescriptor {
-            instance: ProcessorInstanceId::legacy(&id, &version, config_hash),
+            instance: ProcessorInstanceId::legacy(&id, &version, config_hash)
+                .map_err(|error| ProcessorError::Input(error.to_string()))?,
             id,
             version,
             code_hash: BlockHash::new(
@@ -75,7 +76,7 @@ impl BlockSummaryProcessor {
             requirements: vec![DataRequirement {
                 capabilities: CapabilitySet::of(Capability::Header).with(Capability::Body),
                 log_fields: leani_primitives::LogFieldSet::NONE,
-                allow_filtered: false,
+                allow_filtered: true,
                 filter: FilterScope::default(),
                 minimum_finality: Finality::Included,
             }],
@@ -123,28 +124,40 @@ impl Processor for BlockSummaryProcessor {
         self.descriptor.requirements[0]
             .validate_frame(block)
             .map_err(|error| ProcessorError::Input(error.to_owned()))?;
-        let header = match &block.header {
-            Material::Complete(header) => header,
-            Material::Filtered { .. } => {
-                return Err(ProcessorError::Input(
-                    "execution header projection is filtered".to_owned(),
-                ));
-            }
-            Material::Missing(reason) => {
-                return Err(ProcessorError::Input(format!(
-                    "execution header is missing: {reason:?}"
-                )));
-            }
-        };
-        let transaction_count = block
-            .transactions
-            .as_complete()
-            .and_then(|transactions| u32::try_from(transactions.len()).ok())
-            .ok_or_else(|| {
-                ProcessorError::Input(
-                    "complete execution body transaction count is unavailable".to_owned(),
-                )
-            })?;
+        // validate_frame above checks scope coverage and rejects Partial.
+        // Dataset-declared material remains filtered and never claims RLP or
+        // cryptographic verification that the public tables cannot supply.
+        let header = block
+            .header
+            .as_present()
+            .ok_or_else(|| ProcessorError::Input("execution header is unavailable".to_owned()))?;
+        if header.gas_limit.is_none() || header.gas_used.is_none() {
+            return Err(ProcessorError::Input(
+                "summary header omits gas limit or gas used".to_owned(),
+            ));
+        }
+        let transactions = block.transactions.as_present().ok_or_else(|| {
+            ProcessorError::Input("execution body transaction count is unavailable".to_owned())
+        })?;
+        let transaction_count = u32::try_from(transactions.len()).map_err(|_| {
+            ProcessorError::Input("execution transaction count overflows u32".to_owned())
+        })?;
+        if transactions
+            .iter()
+            .enumerate()
+            .any(|(index, transaction)| usize::try_from(transaction.index).ok() != Some(index))
+        {
+            return Err(ProcessorError::Input(
+                "summary transactions do not cover consecutive body indices".to_owned(),
+            ));
+        }
+        if matches!(block.transactions, Material::Filtered { .. })
+            && header.transaction_count.is_none()
+        {
+            return Err(ProcessorError::Input(
+                "dataset summary lacks the payload transaction count".to_owned(),
+            ));
+        }
         if let Some(header_count) = header.transaction_count
             && header_count != transaction_count
         {
@@ -184,15 +197,22 @@ impl Processor for BlockSummaryProcessor {
         delta.validate(&self.descriptor)?;
         let decoded: BlockSummaryEntity = postcard::from_bytes(&delta.payload)
             .map_err(|error| ProcessorError::DeltaPayload(error.to_string()))?;
-        let mut checksums = Vec::with_capacity(2);
-        for finality in [Finality::Included, Finality::Finalized] {
-            let mut entity = decoded.clone();
-            entity.finality = finality;
-            let payload = postcard::to_allocvec(&entity)
-                .map_err(|error| ProcessorError::DeltaPayload(error.to_string()))?;
-            checksums.push(
-                EncodedDelta::new(&self.descriptor, delta.chain_id, delta.block, payload).checksum,
-            );
+        let mut checksums = Vec::with_capacity(4);
+        // Dataset rows carry no execution-block size. A block a dataset
+        // summarized first matches the same block from verified material,
+        // such as the live lane's handoff overlap after a Xatu backfill.
+        for size_bytes in [decoded.size_bytes, None] {
+            for finality in [Finality::Included, Finality::Finalized] {
+                let mut entity = decoded.clone();
+                entity.finality = finality;
+                entity.size_bytes = size_bytes;
+                let payload = postcard::to_allocvec(&entity)
+                    .map_err(|error| ProcessorError::DeltaPayload(error.to_string()))?;
+                checksums.push(
+                    EncodedDelta::new(&self.descriptor, delta.chain_id, delta.block, payload)
+                        .checksum,
+                );
+            }
         }
         checksums.sort_unstable();
         checksums.dedup();
@@ -455,5 +475,52 @@ mod tests {
                 .entity(BLOCK_COLLECTION, &older.block.hash.0)
                 .is_some()
         );
+    }
+    #[tokio::test]
+    async fn trusted_dataset_summary_matches_complete_material_and_refuses_missing_rows() {
+        use leani_primitives::Completeness;
+        let processor = processor();
+        let complete = frame();
+        let expected = processor.map(&complete).await.unwrap();
+        let mut projected = complete.clone();
+        projected.header = Material::Filtered {
+            value: complete.header.as_present().unwrap().clone(),
+            scope: FilterScope::default(),
+            completeness: Completeness::DatasetDeclared,
+        };
+        projected.transactions = Material::Filtered {
+            value: complete.transactions.as_present().unwrap().clone(),
+            scope: FilterScope::default(),
+            completeness: Completeness::DatasetDeclared,
+        };
+        assert_eq!(
+            processor.map(&projected).await.unwrap().payload,
+            expected.payload
+        );
+        // Verified material with an exact size is equivalent to a summary a
+        // dataset applied first without one, never to another block's.
+        let mut sized = complete.clone();
+        if let Material::Complete(header) = &mut sized.header {
+            header.size_bytes = Some(1_234);
+        }
+        let sized = processor.map(&sized).await.unwrap();
+        assert_ne!(sized.checksum, expected.checksum);
+        let variants = processor.finality_variant_checksums(&sized).unwrap();
+        assert!(variants.contains(&expected.checksum));
+        let mut other = complete.clone();
+        if let Material::Complete(header) = &mut other.header {
+            header.gas_used = Some(1);
+        }
+        let other = processor.map(&other).await.unwrap();
+        assert!(!variants.contains(&other.checksum));
+        if let Material::Filtered { value, .. } = &mut projected.transactions {
+            value.pop();
+        }
+        assert!(processor.map(&projected).await.is_err());
+        projected.transactions = complete.transactions;
+        if let Material::Filtered { completeness, .. } = &mut projected.header {
+            *completeness = Completeness::Partial;
+        }
+        assert!(processor.map(&projected).await.is_err());
     }
 }

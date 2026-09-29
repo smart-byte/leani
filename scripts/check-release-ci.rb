@@ -4,6 +4,17 @@
 require "json"
 require "open3"
 
+# Static mode: enforce the protected-publication structure of the workflows.
+if ARGV.first == "--workflows"
+  abort "usage: check-release-ci.rb --workflows [DIRECTORY]" if ARGV.length > 2
+  require_relative "lib/release_workflow_policy"
+  directory = ARGV[1] || File.expand_path("../.github/workflows", __dir__)
+  errors = ReleaseWorkflowPolicy.violations(directory)
+  abort errors.uniq.join("\n") unless errors.empty?
+  puts "release workflow policy passed for #{directory}"
+  exit
+end
+
 repository = ENV.fetch("GITHUB_REPOSITORY")
 commit = ENV.fetch("GITHUB_SHA")
 abort "invalid repository" unless repository.match?(%r{\A[\w.-]+/[\w.-]+\z})
@@ -15,7 +26,7 @@ def api(path)
   JSON.parse(output)
 end
 
-abort "usage: check-release-ci.rb [--container]" unless ARGV.empty? || ARGV == ["--container"]
+abort "usage: check-release-ci.rb [--container | --workflows [DIRECTORY]]" unless ARGV.empty? || ARGV == ["--container"]
 workflows = %w[ci.yml security.yml site.yml]
 # Container publication verifies a separate successful preparation run below;
 # requiring its own in-progress publication run to finish would deadlock.

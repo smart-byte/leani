@@ -76,7 +76,10 @@ pub enum StorageLimitAction {
 #[serde(rename_all = "snake_case")]
 pub enum RawHistoryRetention {
     Full,
-    Window { blocks: u64 },
+    /// No job owns a rolling window yet: creating a job refuses it.
+    Window {
+        blocks: u64,
+    },
 }
 
 /// Optional locator families built in later RPC phases.
@@ -85,6 +88,7 @@ pub enum RawHistoryRetention {
 pub struct RawHistoryIndexPolicy {
     pub block_hash: bool,
     pub transaction_hash: bool,
+    /// No log index exists: creating a job refuses `true`.
     pub logs: bool,
 }
 
@@ -244,7 +248,13 @@ impl RawHistoryJobSpec {
         }
         if self.indexes.logs {
             return Err(HistoryStoreError::InvalidJob(
-                "raw log indexes are not implemented; use receipt scans or disable indexes.logs"
+                "log indexes are not supported; set \"logs\": false in \"indexes\": logs are read from the retained receipts"
+                    .to_owned(),
+            ));
+        }
+        if matches!(self.retention, RawHistoryRetention::Window { .. }) {
+            return Err(HistoryStoreError::InvalidJob(
+                "window retention is not supported: a job keeps the segments it retains until it is deleted; use \"retention\": \"full\""
                     .to_owned(),
             ));
         }
@@ -306,11 +316,6 @@ impl RawHistoryJobSpec {
         {
             return Err(HistoryStoreError::InvalidJob(
                 "segment limits and target block span must be non-zero".to_owned(),
-            ));
-        }
-        if matches!(self.retention, RawHistoryRetention::Window { blocks: 0 }) {
-            return Err(HistoryStoreError::InvalidJob(
-                "window retention must keep at least one block".to_owned(),
             ));
         }
         let required_trust = match self.verification {
@@ -644,6 +649,7 @@ impl HistoryStore {
     }
 
     /// Mark queued or resumable work running and increment its attempt count.
+    /// Its last error stays visible until the run commits a segment.
     ///
     /// # Errors
     ///
@@ -673,6 +679,21 @@ impl HistoryStore {
             Some(error),
         )
         .await?;
+        required_job(self, id).await
+    }
+
+    /// Record why a job is waiting for its sources while it stays running and
+    /// resumable.
+    ///
+    /// # Errors
+    ///
+    /// Terminal and unknown jobs cannot wait.
+    pub async fn wait_raw_history_job(
+        &self,
+        id: &RawHistoryJobId,
+        error: &str,
+    ) -> Result<RawHistoryJob, HistoryStoreError> {
+        transition_nonterminal(self, id, RawHistoryJobState::Running, Some(error)).await?;
         required_job(self, id).await
     }
 
@@ -790,6 +811,28 @@ impl HistoryStore {
         required_job(self, id).await
     }
 
+    /// When `job` last made progress: when it gained its newest segment, or
+    /// else when it was created. Both are persisted, so a restart keeps the
+    /// time.
+    pub(crate) async fn raw_history_job_progressed_at(
+        &self,
+        job: &RawHistoryJob,
+    ) -> Result<u64, HistoryStoreError> {
+        let owned: Option<i64> = sqlx::query_scalar(
+            "SELECT MAX(created_at_unix_ms) FROM raw_segment_owners
+             WHERE owner_kind = 'raw_history_job' AND owner_id = ?",
+        )
+        .bind(job.id.as_str())
+        .fetch_one(&self.inner.pool)
+        .await?;
+        Ok(owned
+            .map(|owned| i64_u64(owned, "owner creation time"))
+            .transpose()?
+            .map_or(job.created_at_unix_ms, |owned| {
+                owned.max(job.created_at_unix_ms)
+            }))
+    }
+
     /// Attach already-retained compatible segments to a non-terminal job.
     ///
     /// This is the durable reuse path: overlapping raw work never copies or
@@ -827,10 +870,21 @@ impl HistoryStore {
                     .ranges
                     .iter()
                     .any(|range| ranges_overlap(*range, descriptor.range))
-                && !self.owners(&record.metadata.id).await?.iter().any(|owner| {
-                    owner.kind == SegmentOwnerKind::RawHistoryJob && owner.owner_id == id.as_str()
-                })
             {
+                let owners = self.owners(&record.metadata.id).await?;
+                if owners.iter().any(|owner| {
+                    owner.kind == SegmentOwnerKind::RawHistoryJob && owner.owner_id == id.as_str()
+                }) {
+                    continue;
+                }
+                // A segment whose file is gone serves nothing. One nothing
+                // owns is forgotten, so this job acquires its blocks again.
+                if self.segment_file_missing(&record).await? {
+                    if owners.is_empty() {
+                        self.drop_missing_segment(&record).await?;
+                    }
+                    continue;
+                }
                 self.add_owner(
                     &record.metadata.id,
                     SegmentOwnerKind::RawHistoryJob,
@@ -971,8 +1025,7 @@ async fn transition_running(
     let now = unix_ms()?;
     let result = sqlx::query(
         "UPDATE raw_history_jobs
-         SET state = 'running', attempts = attempts + 1, last_error = NULL,
-             updated_at_unix_ms = ?
+         SET state = 'running', attempts = attempts + 1, updated_at_unix_ms = ?
          WHERE job_id = ? AND state IN ('queued', 'running', 'storage_backpressured')",
     )
     .bind(u64_i64(now, "job update time")?)
@@ -1370,6 +1423,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn window_retention_and_log_indexes_are_refused_with_their_replacement() {
+        // Audit: window retention passed this validation and the node then
+        // refused every such job, and log indexes were "not implemented".
+        let directory = tempdir().expect("temporary directory");
+        let store = HistoryStore::open(config(directory.path()))
+            .await
+            .expect("store");
+        let range = || vec![BlockRange::new(BlockNumber(1), BlockNumber(3)).expect("range")];
+        let mut window = spec(range());
+        window.retention = RawHistoryRetention::Window { blocks: 64 };
+        let error = store
+            .create_raw_history_job(RawHistoryJobId::new("window").expect("ID"), window)
+            .await
+            .expect_err("window retention is refused");
+        assert!(matches!(error, HistoryStoreError::InvalidJob(_)), "{error}");
+        assert!(
+            error.to_string().contains("\"retention\": \"full\""),
+            "{error}"
+        );
+
+        let mut logs = spec(range());
+        logs.indexes.logs = true;
+        let error = store
+            .create_raw_history_job(RawHistoryJobId::new("logs").expect("ID"), logs)
+            .await
+            .expect_err("log indexes are refused");
+        assert!(matches!(error, HistoryStoreError::InvalidJob(_)), "{error}");
+        assert!(error.to_string().contains("\"logs\": false"), "{error}");
+        assert!(store.raw_history_jobs().await.expect("jobs").is_empty());
+    }
+
+    #[tokio::test]
     async fn post_merge_execution_profile_accepts_exact_minimum_material() {
         let directory = tempdir().expect("temporary directory");
         let store = HistoryStore::open(config(directory.path()))
@@ -1692,6 +1777,71 @@ mod tests {
                 .expect("idempotent cancel")
                 .state,
             RawHistoryJobState::Cancelled
+        );
+    }
+
+    #[tokio::test]
+    async fn a_quarantined_segment_returns_its_range_to_the_job_that_owned_it() {
+        use std::io::{Seek, SeekFrom, Write};
+
+        let directory = tempdir().expect("temporary directory");
+        let store = HistoryStore::open(config(directory.path()))
+            .await
+            .expect("store");
+        let id = RawHistoryJobId::new("quarantine-job").expect("ID");
+        let range = BlockRange::new(BlockNumber(500), BlockNumber(505)).expect("range");
+        store
+            .create_raw_history_job(id.clone(), spec(vec![range]))
+            .await
+            .expect("create");
+        store.start_raw_history_job(&id).await.expect("start");
+        Box::pin(commit_range(
+            &store,
+            &id,
+            "quarantine-coverage",
+            &frames(500, 502),
+        ))
+        .await;
+        let segment = SegmentId::new("quarantine-coverage").expect("segment ID");
+        let record = store
+            .segment(&segment)
+            .await
+            .expect("lookup")
+            .expect("committed segment");
+        store.inner.pool.close().await;
+        drop(store);
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(directory.path().join(&record.relative_path))
+            .expect("open segment");
+        file.seek(SeekFrom::Start(81)).expect("seek payload");
+        file.write_all(&[0xaa]).expect("corrupt segment");
+        file.sync_all().expect("persist corruption");
+
+        // Audit M-H1: the corrupt segment refused the whole store.
+        let reopened = HistoryStore::open(config(directory.path()))
+            .await
+            .expect("a corrupt segment does not refuse the store");
+        assert!(
+            reopened
+                .read_block(&segment, BlockNumber(501))
+                .await
+                .is_err()
+        );
+        let job = reopened
+            .raw_history_job(&id)
+            .await
+            .expect("job")
+            .expect("present");
+        assert_eq!(job.state, RawHistoryJobState::Running);
+        assert_eq!(job.remaining_ranges, vec![range]);
+        assert_eq!(job.committed_segments, 0);
+        assert!(
+            job.last_error
+                .as_deref()
+                .is_some_and(|error| error.contains("quarantined")),
+            "{:?}",
+            job.last_error
         );
     }
 

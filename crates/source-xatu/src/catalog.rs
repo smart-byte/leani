@@ -10,11 +10,14 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use url::Url;
 
-use crate::reader::ObjectStoreReader;
+use crate::reader::{InputBudget, ObjectStoreReader};
 
 pub const DEFAULT_XATU_BASE_URL: &str =
     "https://data.ethpandaops.io/xatu/mainnet/databases/default/";
 pub const XATU_DATA_ORIGIN: &str = "https://data.ethpandaops.io/xatu/";
+/// The only network Xatu history supports: projections stamp every frame as
+/// Ethereum mainnet (chain 1).
+const MAINNET: &str = "mainnet";
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct XatuCatalogConfig {
@@ -36,7 +39,8 @@ impl XatuCatalogConfig {
     ///
     /// # Errors
     ///
-    /// Returns [`XatuError::Network`] for an empty or unsafe network name and
+    /// Returns [`XatuError::Network`] for an empty or unsafe network name,
+    /// [`XatuError::UnsupportedNetwork`] for any network but `mainnet`, and
     /// [`XatuError::Url`] if the resulting URL is invalid.
     pub fn public(network: impl Into<String>) -> Result<Self, XatuError> {
         let network = network.into();
@@ -46,6 +50,9 @@ impl XatuCatalogConfig {
                 .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
         {
             return Err(XatuError::Network(network));
+        }
+        if network != MAINNET {
+            return Err(XatuError::UnsupportedNetwork(network));
         }
         let base_url = Url::parse(&format!("{XATU_DATA_ORIGIN}{network}/databases/default/"))
             .map_err(XatuError::Url)?;
@@ -376,8 +383,13 @@ impl XatuCatalog {
     ///
     /// # Errors
     ///
-    /// Returns [`XatuError`] if the HTTP store cannot be configured.
+    /// Returns [`XatuError::UnsupportedNetwork`] for any network but
+    /// `mainnet`, or another [`XatuError`] if the HTTP store cannot be
+    /// configured.
     pub fn new(config: XatuCatalogConfig) -> Result<Self, XatuError> {
+        if config.network != MAINNET {
+            return Err(XatuError::UnsupportedNetwork(config.network));
+        }
         let store = HttpBuilder::new()
             .with_url(config.base_url.as_str().trim_end_matches('/'))
             .build()
@@ -395,6 +407,11 @@ impl XatuCatalog {
 
     pub(crate) fn store(&self) -> Arc<dyn ObjectStore> {
         Arc::clone(&self.store)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_store(config: XatuCatalogConfig, store: Arc<dyn ObjectStore>) -> Self {
+        Self { config, store }
     }
 
     /// Resolve every 1,000-block execution partition intersecting `range`.
@@ -535,6 +552,17 @@ impl XatuCatalog {
                             .to_string(),
                         });
                     }
+                    // History reads refuse an object they cannot pin.
+                    if let Some(detail) = pinning_problem(inspection.e_tag.as_deref()) {
+                        failures.push(ObjectProbeFailure {
+                            object: inspection.object.clone(),
+                            error: XatuError::Unpinned {
+                                location: inspection.object.location.clone(),
+                                detail,
+                            }
+                            .to_string(),
+                        });
+                    }
                     inspections.push(inspection);
                 }
                 Err(failure) => failures.push(failure),
@@ -573,7 +601,14 @@ async fn inspect_object(
         .head(&location)
         .await
         .map_err(|error| XatuError::ObjectStore(error.to_string()))?;
-    let (mut reader, _) = ObjectStoreReader::new(store, location, head.size);
+    // The probe reads an object it cannot pin unpinned, so the report still
+    // shows its schema, and flags the object.
+    let mut pinned = head.clone();
+    if pinning_problem(head.e_tag.as_deref()).is_some() {
+        pinned.e_tag = None;
+    }
+    // Only the footer is read, and its metadata reads are capped.
+    let (mut reader, _) = ObjectStoreReader::new(store, &pinned, 1, InputBudget::new(u64::MAX, 0));
     let metadata = reader
         .get_metadata(None)
         .await
@@ -635,6 +670,8 @@ pub enum XatuError {
     Date,
     #[error("invalid Xatu network name: {0}")]
     Network(String),
+    #[error("Xatu history supports Ethereum mainnet only; network {0:?} is not supported")]
+    UnsupportedNetwork(String),
     #[error("invalid block range for Xatu partitioning")]
     BlockRange,
     #[error("catalog concurrency must be greater than zero")]
@@ -669,6 +706,30 @@ pub enum XatuError {
         table: XatuTable,
         missing: Vec<String>,
     },
+    #[error(
+        "Xatu table {table} column {column} is Arrow {actual}, which its declared encoding does not allow"
+    )]
+    ColumnType {
+        table: XatuTable,
+        column: String,
+        actual: String,
+    },
+    #[error("Xatu withdrawals of {range:?} are incomplete: {detail}")]
+    IncompleteWithdrawals { range: BlockRange, detail: String },
+    #[error("Xatu object {location} has {detail}, so its reads cannot be pinned to one version")]
+    Unpinned { location: String, detail: String },
+}
+
+/// Why reads of an object with `e_tag` cannot be pinned to one version, if
+/// they cannot: `If-Match` compares strong `ETag`s only.
+pub(crate) fn pinning_problem(e_tag: Option<&str>) -> Option<String> {
+    match e_tag {
+        None => Some("no ETag".to_owned()),
+        Some(tag) if tag.starts_with("W/") => {
+            Some(format!("the weak ETag {tag}, which If-Match never matches"))
+        }
+        Some(_) => None,
+    }
 }
 
 #[cfg(test)]

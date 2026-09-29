@@ -17,8 +17,8 @@ large backfill.
 
 | Source | Role | Strength | Main limitation |
 |---|---|---|---|
-| Xatu public Parquet | Default specialized backfill | Free, canonical, columnar, rich tables, filter/project before retaining | Donated hosting; filtered rows are trusted data |
-| EraE archives | General raw historical source | Sparse native reader; complete block bodies and receipts with locally checked execution commitments | Publisher catalog remains the canonicality trust root |
+| Xatu public Parquet | Default specialized backfill | Free, canonical, columnar, rich tables, filter/project before retaining | Donated hosting; filtered rows are trusted data; Ethereum mainnet only |
+| EraE archives | General raw historical source | Sparse native reader; complete block bodies and receipts with locally checked execution commitments | The mirror and its catalog remain the canonicality trust root; receipts only from Byzantium |
 | Ethereum P2P/Reth | Recent and live | No vendor key, follows head, bodies/receipts | Old history is thinning; consensus finality remains separate |
 | Beacon light client/CL | Canonicality/finality | Anchors post-Merge execution payloads | Adds a consensus component |
 | AWS public blockchain | Secondary Parquet source | Free public S3, daily updates | Validate schema completeness for each fork/use case |
@@ -66,16 +66,38 @@ projections:
 3. logs with address and all four topic positions; and
 4. the existing blob/type-3 projection.
 
+Xatu history is Ethereum mainnet only. Its projections stamp every frame as
+chain 1, so the adapter refuses any Xatu network but `mainnet`, and
+configuration validation refuses a `xatu` history source on another chain.
+
 The current Xatu projections require Beacon execution payloads for parent
 hashes, so Mainnet requests must begin at block **15,537,394** (the Merge) or
 later. Earlier ranges fail during planning. A processor deployment/start block
 before the Merge does not make that range available from this adapter; use a
 source that explicitly advertises the required historical range.
 
-Parquet reads fetch only the requested byte ranges in at most 256 KiB requests,
-with up to four range reads in flight per reader. This avoids large downloads
-of gaps between projected columns. Public hosting can still retry or stall;
-source availability and throughput need dated operational evidence.
+Parquet reads fetch only the byte ranges of the projected columns. Ranges
+at most 1 MiB apart are merged into one request, which also downloads the
+bytes between them, while the input budget covers those bytes; no larger gap
+is downloaded. Every requested byte, footers and merged gaps included, counts
+against the source budget's `max_input_bytes` for the whole chunk, and is
+charged before it is requested. A chunk's `fetched_bytes` reports those
+bytes, and its `projected_compressed_bytes` the selected column chunks alone.
+The reader holds one row group's selected columns at a time, so an object
+whose largest such row group exceeds the budget's `max_resident_bytes` is
+refused before any column is requested.
+At most the source budget's `max_in_flight_requests` requests are in flight
+per object, and the node sets it from `budgets.source_concurrency`.
+
+Every request carries `If-Match` with the ETag the object had at HEAD, so an
+object rewritten during a read fails the chunk, which is retried against the
+new version, instead of mixing two versions. `If-Match` never matches a weak
+ETag, so an object without a strong ETag is refused as a schema drift: a
+backfill tries its next configured source, and fails when none can serve the
+range; `leani source probe xatu` reports each object's ETag and flags such
+objects. A range response of another length, and a footer whose metadata
+range exceeds 64 MiB, are refused too. Public hosting can still retry or
+stall; source availability and throughput need dated operational evidence.
 
 Every immutable chunk encodes its projection kind and exact filters. `open`
 therefore cannot execute a different physical projection from the one that
@@ -88,6 +110,32 @@ receipts. Declarative events select `canonical_execution_logs` without beacon
 transactions, withdrawals, or blob fields. Both read the minimal execution
 and beacon block columns needed for timestamps, canonical hash, and parent
 identity.
+
+Each projected column has a declared encoding that fixes the Arrow types it
+may arrive as, and a column of any other type fails the object before a row
+is decoded, as a schema drift, which a backfill answers with its next
+configured source. Hashes, addresses, and byte strings are `0x`-prefixed
+hexadecimal text, or raw bytes only in a fixed-width binary column of exactly
+their size.
+
+The projections check what the dataset declares:
+
+- a transaction projection that no filter narrows must hold every
+  transaction the beacon payload counts, with indices `0..count`; a filtered
+  one may be shorter, but never longer or outside the payload;
+- the blobs projection proves every block's withdrawals, on which its
+  execution size depends, from the global withdrawal index: between two slots
+  with rows the indices must continue exactly, so a slot between them
+  without rows had none. The nearest slots with rows before and after the
+  chunk, in the daily objects it reads, prove its edges the same way, and a
+  slot with 16 rows, the most a payload holds, lacks none. An edge they do
+  not prove, a jump in the indices, such as a partly exported slot, or more
+  than 16 rows in one payload leaves the chunk incomplete. Xatu exports no
+  withdrawals root or count per block to check against;
+- logs may carry no topics (`LOG0`), whether the export leaves `topic0`
+  null, empty, or NUL-padded;
+- blob receipts carry no logs, so blob frames declare their logs a partial
+  projection, and a log requirement cannot be met through those receipts.
 
 Source-native transfer/trace/state-diff readers remain optional breadth work;
 their stronger derived-table semantics must be explicit before they can
@@ -128,9 +176,38 @@ Implemented usage:
 7. checkpoint and continue.
 
 This gives bounded memory/network use, needs no temporary archive file, and
-avoids relying on old execution P2P peers. The reader supports HTTP(S) mirrors
-and local `file:` catalogs and processes large requests in bounded frame
-batches.
+avoids relying on old execution P2P peers. The reader supports HTTPS mirrors,
+local `file:` catalogs, and plain `http` mirrors on loopback, or elsewhere
+only with `allow_insecure_http = true` on the history source. It never
+follows a redirect. It processes large requests in bounded frame batches,
+reading one byte range at a time within a chunk:
+
+- each batch's byte ranges are checked against the remaining input budget
+  before they are requested;
+- the checksum catalog is read with a 16 MiB cap, and each range response
+  with a cap at its requested length, as the bodies stream in;
+- an e2store record may not declare more bytes than its indexed extent
+  holds;
+- a block's compressed header, body, and receipt list are decompressed
+  through one shared cap, the frame budget, at most 32 MiB;
+- each normalized frame is checked against the frame budget before it is
+  queued, as the other sources check theirs.
+
+Errors, logs, and frame provenance show the mirror as
+`scheme://host[:port]/…/<file>`, so credentials in its userinfo, query, or
+path are not printed.
+
+EraE serves headers and bodies from genesis, but receipts and logs only from
+Byzantium (block 4,370,000). Earlier receipts carry an intermediate state
+root instead of a status, which frames cannot represent, so a plan that needs
+receipts or logs before Byzantium fails with an error that says so.
+
+The checksum catalog is cached for 10 minutes. A plan that asks past it
+fetches it again once the catalog is 30 seconds old; each refetch that still
+lacks the range doubles that interval, up to the 10 minutes, and a refetch
+that brings new eras starts it over. Each refetch sends the `ETag` and
+`Last-Modified` the mirror last sent, so an unchanged catalog costs a 304. A
+chunk already planned opens from the cached catalog whatever its age.
 
 The direct mainnet catalog was populated on 2026-08-01 even though the rendered
 history webpage's generated counter was stale. A live sparse probe decoded and
@@ -145,12 +222,16 @@ JSON was intentionally not retained: it expanded past 2 GB. Operational
 backfills map and commit bounded frames directly; raw JSON is a diagnostic
 format, not a storage format.
 
-The catalog advertises each full object's SHA-256. Sparse mode records that
-identity but cannot honestly claim to have recomputed a full-file checksum
-without downloading the full object. Its local commitment checks establish
-internal Ethereum execution consistency; the execution hash's canonicality
-still follows the publisher catalog until it is anchored through independently
-verified consensus material.
+The mirror and its checksum catalog are the trust root. The catalog
+advertises each full object's SHA-256; sparse mode records it as the
+object's version, not as a checksum, because it never downloads the whole
+object to recompute it. Local commitment checks establish internal Ethereum
+execution consistency: the transaction, receipt, ommer, withdrawal, and
+logs-bloom commitments, and the parent hashes within an object. The block
+hash is computed from the archived header itself, so frames report
+`header_hash` as not checked, and `withdrawals_root` as unavailable before
+Shanghai. Canonicality follows the mirror's catalog until it is anchored
+through independently verified consensus material.
 
 ### EraE versus Xatu
 
@@ -332,6 +413,48 @@ The self-contained profile instead discovers consensus peers directly and
 uses the standard light-client bootstrap/update/finality req/resp protocols.
 Both transports share the same local proof verifier and explicit
 weak-subjectivity checkpoint boundary.
+
+A raw-history job retries a range that only lagging sources lack, those with
+a non-zero expected lag, such as an EraE catalog that has not caught up. It
+keeps their reasons in the job's `last_error` while it waits, until it
+commits a segment, and fails once it has gone without progress for four
+times the longest expected lag, and at least 24 hours. That time counts from
+the newest segment the job retained, or else from its creation, both kept in
+the catalog, so restarting the node does not start it again; a new job under
+the same ID counts from its own creation. A transport failure, such as an
+unreachable mirror, also keeps the job waiting, for at most 72 hours without
+progress, or the lag bound when that is longer; then the job fails with the
+reasons in `last_error`. Those hours include time the node was down or the
+job paused at its storage limit, so either bound fails a job only once the
+running node has itself seen the range fail for an hour without committing
+a segment; after a restart the sources get that hour again, and frames a
+source delivers without a commit do not restart it. A source whose
+advertised range does not cover the
+range, such as a local archive of older blocks, is passed over. A range
+missing inside the advertised range of a source without expected lag, such as
+a gap in a local archive, fails the job at once, and so does a terminal
+error, such as a schema drift, from any source that could serve it, which
+another source's lag no longer hides.
+
+Retained raw history is itself a source. The node verifies a segment's
+whole-file BLAKE3 checksum once per process, when it writes the segment or
+when it first reads it after a restart, and each block read checks its own
+record's checksum against the segment's seek directory; segment reads never
+run on the async runtime's threads. A segment that fails either check leaves
+the catalog, so its blocks read as missing and another source serves them;
+its file moves to `raw-history/quarantine/`. Each raw-history job that owned
+it records why in `last_error`, and acquires the blocks again: a running job
+next, and a completed one once it is back in the queue. A segment whose file
+is missing when the node starts leaves the catalog the same way, unless most
+files are missing, which the node takes as a segment directory not yet
+available and keeps their rows; a file that disappears while the node runs
+fails its reads, which fall back to other sources, until the file returns. A
+job adopting retained segments skips one whose file is gone, and removes its
+row once nothing owns it.
+Jobs whose ranges overlap share segments: before each acquisition a job
+adopts the compatible segments other jobs retained, and a job that publishes
+a segment another job has just published adopts that one, once it verifies,
+instead of failing.
 
 An operator must be able to choose:
 

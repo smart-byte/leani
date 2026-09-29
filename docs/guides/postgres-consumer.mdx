@@ -73,7 +73,7 @@ Using `psql` with your connection string:
 
 ```bash
 psql "$DATABASE_URL" -c 'select count(*), max(sequence) from leani_applied_changes'
-psql "$DATABASE_URL" -c 'select processor, network, sequence from leani_cursors'
+psql "$DATABASE_URL" -c 'select processor, network, stream, sequence from leani_cursors'
 curl -s http://127.0.0.1:8080/v1/processors/usdc-weth-latest/consumers/postgres-example
 ```
 
@@ -92,9 +92,16 @@ The destination implementation is:
 
 <CodeExample example="postgres-destination" />
 
-The `(processor, network, sequence)` key makes replay idempotent. The cursor is
-stored in the same transaction as the event. A failed acknowledgement after
-commit can cause redelivery; a committed event must remain safe to apply again.
+The `(processor, network, stream, sequence)` key makes replay idempotent.
+Sequences are unique only within one node store: a node whose store is
+replaced numbers its changes from the start again, and the consumer is created
+again there. `stream` names the durable consumer by its processor instance, ID,
+and creation time, as the node reports them, so those changes never collide
+with the rows already applied. Re-creating the consumer on the same store also
+changes `stream`, so the retained changes it receives again are applied again
+under the new value. The cursor is stored in the same transaction as
+the event. A failed acknowledgement after commit can cause redelivery; a
+committed event must remain safe to apply again.
 This example stores a change log. When building domain tables, apply both
 forward and inverse mutations to keep those tables correct through reorgs.
 

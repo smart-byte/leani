@@ -6,10 +6,7 @@ mod parity;
 mod processor;
 mod schedule;
 
-pub use math::{
-    BLOB_GAS_PER_BLOB, calculate_eip7918_floor, fake_exponential, get_blob_base_fee,
-    get_blob_base_fee_eip7918,
-};
+pub use math::{BLOB_GAS_PER_BLOB, calculate_eip7918_floor, fake_exponential, get_blob_base_fee};
 pub use model::{BlobTransactionEntity, BlobsBlockEntity, BlobsDelta};
 pub use parity::{
     BlobsCompatibilityExport, BlobsParityReport, CompatibilityBlobTransaction, CompatibilityBlock,

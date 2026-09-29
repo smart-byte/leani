@@ -23,15 +23,29 @@ export class LeaniError extends Error {
       retryable: boolean;
       details?: Record<string, unknown> | null;
       requestId?: string;
+      cause?: unknown;
     },
   ) {
-    super(message);
+    super(message, options.cause === undefined ? undefined : { cause: options.cause });
     this.name = "LeaniError";
     this.status = options.status;
     this.code = options.code;
     this.retryable = options.retryable;
     this.details = options.details;
     this.requestId = options.requestId;
+  }
+}
+
+/**
+ * A request that failed below HTTP: the connection was refused or reset, the
+ * deadline passed, the response body broke off, or a stream went silent. It
+ * has no HTTP status (`status` is 0), is always retryable, and keeps the
+ * underlying failure as `cause`.
+ */
+export class TransportError extends LeaniError {
+  constructor(message: string, cause?: unknown) {
+    super(message, { status: 0, code: "transport", retryable: true, cause });
+    this.name = "TransportError";
   }
 }
 

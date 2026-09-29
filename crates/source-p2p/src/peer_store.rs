@@ -3,7 +3,6 @@
 use std::{
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
-    str::FromStr as _,
     sync::Mutex,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -254,6 +253,14 @@ impl ExecutionPeerStore {
         qualification: PeerQualification,
         detail: Option<&str>,
     ) {
+        // A lagging or timed-out probe is no evidence against the peer: it may
+        // catch up, or answer the next probe. Its stored evidence stays as is.
+        if matches!(
+            qualification,
+            PeerQualification::Lagging | PeerQualification::TimedOut
+        ) {
+            return;
+        }
         let mut quality = self
             .quality
             .lock()
@@ -690,7 +697,10 @@ async fn open_database(path: &Path, create: bool) -> Result<SqlitePool, Executio
             }
         })?;
     }
-    let options = SqliteConnectOptions::from_str(&format!("sqlite://{}", path.to_string_lossy()))?
+    // A plain filename, not a `sqlite://` URL: URL parsing percent-decodes
+    // the path and treats `?` as the start of connection parameters.
+    let options = SqliteConnectOptions::new()
+        .filename(path)
         .create_if_missing(create)
         .foreign_keys(true)
         .journal_mode(SqliteJournalMode::Wal)
@@ -1182,6 +1192,59 @@ mod tests {
 
         store.record_failure(peer_id, "later failure");
         assert!(!store.is_available_body_server(peer_id));
+    }
+
+    #[test]
+    fn lagging_or_timed_out_qualification_is_not_a_service_failure() {
+        let store = ExecutionPeerStore::new(None, 16);
+        let peer_id = node_record(1).id;
+        store.record_success(
+            peer_id,
+            PeerMaterialKind::Body,
+            25_000_000,
+            Duration::from_millis(12),
+        );
+        store.record_qualification(
+            peer_id,
+            PeerQualification::Lagging,
+            Some("verified anchor header was not served"),
+        );
+        store.record_qualification(
+            peer_id,
+            PeerQualification::TimedOut,
+            Some("timed out requesting peer head header"),
+        );
+        assert!(
+            store.is_available_body_server(peer_id),
+            "a lagging or slow probe is no evidence against the peer"
+        );
+
+        store.record_qualification(
+            peer_id,
+            PeerQualification::Rejected,
+            Some("peer returned a mismatched verified anchor header"),
+        );
+        assert!(!store.is_available_body_server(peer_id));
+    }
+
+    #[tokio::test]
+    async fn database_paths_are_opened_literally() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let requested = directory
+            .path()
+            .join("peers%41")
+            .join("execution-network.sqlite");
+        let store = ExecutionPeerStore::new(Some(requested.clone()), 16);
+        store
+            .persist(vec![node_record(1)])
+            .await
+            .expect("persist a percent-named peer store");
+        assert!(requested.exists());
+        assert!(!directory.path().join("peersA").exists());
+
+        let reopened = ExecutionPeerStore::new(Some(requested), 16);
+        reopened.initialize().await.expect("reopen peer store");
+        assert_eq!(reopened.candidate_ids(), HashSet::from([node_record(1).id]));
     }
 
     #[tokio::test]

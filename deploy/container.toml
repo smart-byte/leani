@@ -21,6 +21,12 @@ maximum_history_retained_bytes = "1GiB"
 [budgets.store]
 maximum_physical_bytes = "2GiB"
 
+[budgets.history_pipeline]
+# A Xatu backfill read holds about 450 MiB per active chunk. Two fit the
+# 1 GiB memory budget and leave the rest of compose.yaml's 2 GiB container
+# limit to the node; the default of four would not.
+maximum_active_chunks = 2
+
 [[sources.history]]
 id = "xatu"
 kind = "xatu"
@@ -40,8 +46,15 @@ minimum_agreement = 1
 
 [[processors]]
 id = "blobs-money"
-instance = "blobs-container"
-version = "1.4.0"
+# A new instance for each processor version that changes its identity: the
+# store refuses another version under an instance it holds. 0.1.0-rc.1 kept
+# blobs-money 1.4.0 as `blobs-container`, whose rows stay inert in the volume.
+instance = "blobs-container-1-5"
+version = "1.5.0"
+# Without live following, no automatic job ever indexes history: `leani
+# backfill` materializes explicit ranges. History mode is node policy, not
+# part of the processor's identity.
+history_mode = "on_demand"
 start_block = 19426589
 publish = "included_and_finalized"
 
@@ -69,8 +82,19 @@ verification_segment_blocks = 8192
 http_bind = "0.0.0.0:8545"
 ws_bind = "0.0.0.0:8546"
 historical_mode = "on_demand"
-transaction_locator = false
 minimum_recent_blocks = 128
+# JSON-RPC has no authentication. The container listens on all of its
+# interfaces so published ports work; compose.yaml publishes them on host
+# loopback only. Publish them further only behind an authenticating proxy.
+allow_unauthenticated_remote = true
 
 [api]
 bind = "0.0.0.0:8080"
+# `serve` refuses to start unless LEANI_API_TOKEN holds at least 16
+# printable ASCII characters without spaces, for example from
+# `openssl rand -hex 32`.
+bearer_token_env = "LEANI_API_TOKEN"
+# The compose service name, so other services can call http://leani:8080.
+# Add every other name clients use to reach the API; the API answers other
+# Host names with 421.
+allowed_hosts = ["leani"]

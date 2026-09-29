@@ -17,8 +17,11 @@ increased the runtime's complexity and failure surface. The subscribe CLI audit
 therefore proposed making Reth the sole Discv4 owner if startup and large
 processor-ingestion benchmarks showed no material regression.
 
-Leani separately decodes EIP-1459 DNS trees because the pinned Reth 2.4.1 DNS
-resolver does not correctly join segmented TXT records. That seeder is not a
+Leani separately decodes EIP-1459 DNS trees. It adopted that seeder because
+the DNS resolver of Reth 2.4.1, pinned at the time, did not correctly join
+segmented TXT records. The resolver of the Reth 2.5.2 now pinned joins them
+itself; Leani's resolver joins them too and, like Reth's, appends a trailing
+dot so that each lookup is a fully qualified name. That seeder is not a
 second discovery or dialing service: it verifies and decodes DNS records and
 submits candidates to Reth's peer manager.
 

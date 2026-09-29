@@ -23,6 +23,12 @@ Every checked profile is a complete configuration that `leani doctor` validates.
 | `terminal` | One bounded result and delivery contract for a finite job | Reports and batch outcomes |
 | `full` | Complete configured output collection | Small, intentionally permanent application datasets |
 
+The `windowed` profile keeps one entity per decoded event, without
+`key_fields`. That keeps its `evm-events` processor block-local: on-demand
+backfills and materialization jobs accept its ranges in any order, and its
+finalized coverage compacts. Keyed output makes the processor ordered, which
+refuses materialization jobs and keeps one coverage row per applied block.
+
 Copy the closest file from `config/modes` to `./leani.toml`, change its `data_dir`, processor
 identity, start block, source credentials, and budgets, then run:
 

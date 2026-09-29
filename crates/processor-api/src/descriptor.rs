@@ -3,13 +3,15 @@
 use std::{fmt, str::FromStr};
 
 use leani_primitives::{
-    BlockFrame, BlockHash, BlockNumber, CapabilitySet, FilterScope, Finality, LogField, LogFieldSet,
+    BlockFrame, BlockHash, BlockNumber, Capability, CapabilitySet, Completeness, FilterScope,
+    Finality, LogField, LogFieldSet, Material,
 };
 use semver::Version;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-#[derive(Clone, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+/// Stable processor namespace. Decoding validates it like [`Self::new`].
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(transparent)]
 pub struct ProcessorId(String);
 
@@ -53,6 +55,16 @@ impl FromStr for ProcessorId {
     }
 }
 
+impl<'de> Deserialize<'de> for ProcessorId {
+    fn deserialize<Deserializer>(deserializer: Deserializer) -> Result<Self, Deserializer::Error>
+    where
+        Deserializer: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::new(value).map_err(serde::de::Error::custom)
+    }
+}
+
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 #[error("invalid processor ID `{0}`; use 1-64 ASCII letters, digits, '.', '_' or '-'")]
 pub struct ProcessorIdError(String);
@@ -90,14 +102,18 @@ impl ProcessorInstanceId {
 
     /// Reproduce the processor-instance key used before explicit instance IDs.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// The derived value is always valid for supported processor IDs,
-    /// versions, and hashes.
-    #[must_use]
-    pub fn legacy(id: &ProcessorId, version: &Version, config_hash: BlockHash) -> Self {
+    /// Returns [`ProcessorInstanceIdError`] when the derived key is not a
+    /// valid instance ID: the version carries `+` build metadata, or the ID
+    /// and version together exceed 126 bytes, since the key adds `@`, `:`,
+    /// and the 64-digit configuration hash within the 192-byte limit.
+    pub fn legacy(
+        id: &ProcessorId,
+        version: &Version,
+        config_hash: BlockHash,
+    ) -> Result<Self, ProcessorInstanceIdError> {
         Self::new(format!("{id}@{version}:{}", hex::encode(config_hash.0)))
-            .expect("legacy processor instance is valid")
     }
 
     #[must_use]
@@ -166,12 +182,19 @@ pub enum RetentionPolicy {
     FinalizedHistory,
 }
 
+/// Persistence of processor working state.
+///
+/// The store persists state in every mode; [`CheckpointPolicy`] alone takes
+/// recovery checkpoints. [`LifecyclePolicies::validate`] therefore rejects
+/// `Ephemeral`, and `Checkpointed` without automatic checkpoints.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StatePolicyMode {
+    /// Not implemented: rejected by validation.
     Ephemeral,
     #[default]
     Durable,
+    /// Durable state with automatic recovery checkpoints.
     Checkpointed,
 }
 
@@ -229,6 +252,9 @@ pub struct OutputPolicy {
     pub mode: OutputPolicyMode,
     #[serde(default)]
     pub window: Option<OutputWindow>,
+    /// Ignored; kept for descriptor compatibility. To publish only finalized
+    /// blocks, use [`PublicationPolicy::FinalizedOnly`]
+    /// (`publish = "finalized_only"`).
     #[serde(default)]
     pub finalized_only: bool,
 }
@@ -322,11 +348,18 @@ pub enum DeliveryOrdering {
     BlockVersionedIdempotent,
 }
 
+/// Longest lease TTL a durable consumer may hold: 100 years. Its
+/// milliseconds, and the expiry of a lease taken now, stay far inside an
+/// `i64`.
+pub const MAXIMUM_CONSUMER_LEASE_TTL: std::time::Duration =
+    std::time::Duration::from_hours(100 * 365 * 24);
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct DurableConsumerPolicy {
     pub id: String,
     pub required: bool,
+    /// Between one second and [`MAXIMUM_CONSUMER_LEASE_TTL`].
     pub lease_ttl_seconds: u64,
 }
 
@@ -516,10 +549,15 @@ impl LifecyclePolicies {
                     .id
                     .bytes()
                     .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
-                || consumer.lease_ttl_seconds == 0
                 || !consumer_ids.insert(&consumer.id)
             {
-                return Err("delivery consumers need unique portable IDs and positive lease TTLs");
+                return Err("delivery consumers need unique portable IDs");
+            }
+            if consumer.lease_ttl_seconds == 0
+                || std::time::Duration::from_secs(consumer.lease_ttl_seconds)
+                    > MAXIMUM_CONSUMER_LEASE_TTL
+            {
+                return Err("delivery consumer lease TTLs must be non-zero and at most 100 years");
             }
             if consumer.required
                 && !matches!(self.delivery.mode, DeliveryPolicyMode::UntilAcknowledged)
@@ -546,10 +584,20 @@ impl LifecyclePolicies {
         {
             return Err("automatic checkpoints must retain at least one checkpoint");
         }
-        if matches!(self.state.mode, StatePolicyMode::Ephemeral)
-            && matches!(publication, PublicationPolicy::IncludedAndFinalized)
-        {
-            return Err("included publication requires durable processor state");
+        // The store always persists processor state, and only the checkpoint
+        // policy takes checkpoints. Reject the modes that promise otherwise.
+        match self.state.mode {
+            StatePolicyMode::Ephemeral => {
+                return Err(
+                    "ephemeral processor state is not implemented; use durable or checkpointed state",
+                );
+            }
+            StatePolicyMode::Checkpointed
+                if !matches!(self.checkpoint.mode, CheckpointPolicyMode::Automatic) =>
+            {
+                return Err("checkpointed processor state requires automatic checkpoints");
+            }
+            StatePolicyMode::Durable | StatePolicyMode::Checkpointed => {}
         }
         Ok(())
     }
@@ -567,6 +615,13 @@ pub struct DataRequirement {
 impl DataRequirement {
     /// Check frame-level material and finality requirements.
     ///
+    /// When the requirement accepts filtered material, every filtered
+    /// component that can supply one of its capabilities, directly or by
+    /// derivation, must claim predicate completeness rather than
+    /// [`Completeness::Partial`], and its scope must cover [`Self::filter`] at
+    /// the frame's block ([`FilterScope::covers_at`]). Filtered components for
+    /// other capabilities are not inspected.
+    ///
     /// # Errors
     ///
     /// Returns a static reason when the frame cannot be passed to the mapper.
@@ -579,6 +634,9 @@ impl DataRequirement {
             .satisfies(self.capabilities, self.allow_filtered)
         {
             return Err("frame does not meet capability completeness");
+        }
+        if self.allow_filtered {
+            self.validate_filtered_material(frame)?;
         }
         if frame.verification.has_failures() {
             return Err("frame contains failed verification");
@@ -600,6 +658,47 @@ impl DataRequirement {
             return Err("frame logs omit a required transaction hash");
         }
         Ok(())
+    }
+
+    fn validate_filtered_material(&self, frame: &BlockFrame) -> Result<(), &'static str> {
+        let components = [
+            (Capability::Header, filter_claim(&frame.header)),
+            (Capability::Transactions, filter_claim(&frame.transactions)),
+            (Capability::Receipts, filter_claim(&frame.receipts)),
+            (Capability::Logs, filter_claim(&frame.logs)),
+            (Capability::Withdrawals, filter_claim(&frame.withdrawals)),
+            (Capability::BlobSidecars, filter_claim(&frame.blob_sidecars)),
+            (Capability::Traces, filter_claim(&frame.traces)),
+            (Capability::StateDiffs, filter_claim(&frame.state_diffs)),
+        ];
+        for (capability, claim) in components {
+            let Some((scope, completeness)) = claim else {
+                continue;
+            };
+            let supplies = CapabilitySet::of(capability).with_derivable();
+            if supplies.intersection(self.capabilities) == CapabilitySet::NONE {
+                continue;
+            }
+            if completeness == Completeness::Partial {
+                return Err("filtered frame material is only a partial projection");
+            }
+            if !scope.covers_at(&self.filter, frame.block.number) {
+                return Err("filtered frame material does not cover the requirement filter");
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The predicate and completeness claim of filtered material.
+fn filter_claim<T>(material: &Material<T>) -> Option<(&FilterScope, Completeness)> {
+    match material {
+        Material::Filtered {
+            scope,
+            completeness,
+            ..
+        } => Some((scope, *completeness)),
+        Material::Complete(_) | Material::Missing(_) => None,
     }
 }
 
@@ -687,9 +786,11 @@ impl<'de> Deserialize<'de> for ProcessorDescriptor {
         }
 
         let wire = DescriptorWire::deserialize(deserializer)?;
-        let instance = wire.instance.unwrap_or_else(|| {
-            ProcessorInstanceId::legacy(&wire.id, &wire.version, wire.config_hash)
-        });
+        let instance = match wire.instance {
+            Some(instance) => instance,
+            None => ProcessorInstanceId::legacy(&wire.id, &wire.version, wire.config_hash)
+                .map_err(serde::de::Error::custom)?,
+        };
         let lifecycle = wire.lifecycle.unwrap_or_else(|| {
             LifecyclePolicies::from_legacy(
                 wire.retention.unwrap_or(RetentionPolicy::FullOutputHistory),
@@ -715,8 +816,9 @@ impl<'de> Deserialize<'de> for ProcessorDescriptor {
 #[cfg(test)]
 mod tests {
     use leani_primitives::{
-        Address, BlockHash, BlockRef, Capability, ChainId, Log, Material, MissingReason,
-        ReceiptEnvelope, TransactionHash, VerificationReport,
+        Address, BlockHash, BlockRange, BlockRef, Capability, ChainId, Completeness,
+        HeaderEnvelope, Log, Material, MissingReason, ReceiptEnvelope, TransactionHash,
+        VerificationReport,
     };
 
     use super::*;
@@ -823,6 +925,258 @@ mod tests {
         );
     }
 
+    fn empty_frame() -> BlockFrame {
+        BlockFrame {
+            chain_id: ChainId(1),
+            block: BlockRef {
+                number: BlockNumber(1),
+                hash: BlockHash::new([1; 32]),
+                parent_hash: BlockHash::ZERO,
+                timestamp: 1,
+            },
+            finality: Finality::Finalized,
+            header: Material::Missing(MissingReason::NotRequested),
+            transactions: Material::Missing(MissingReason::NotRequested),
+            receipts: Material::Missing(MissingReason::NotRequested),
+            logs: Material::Missing(MissingReason::NotRequested),
+            withdrawals: Material::Missing(MissingReason::NotRequested),
+            blob_sidecars: Material::Missing(MissingReason::NotRequested),
+            traces: Material::Missing(MissingReason::NotRequested),
+            state_diffs: Material::Missing(MissingReason::NotRequested),
+            provenance: Vec::new(),
+            verification: VerificationReport::default(),
+        }
+    }
+
+    fn address_scope(addresses: &[u8]) -> FilterScope {
+        FilterScope {
+            addresses: addresses
+                .iter()
+                .map(|byte| Address::new([*byte; 20]))
+                .collect(),
+            ..FilterScope::default()
+        }
+    }
+
+    fn filtered<T>(value: T, scope: FilterScope, completeness: Completeness) -> Material<T> {
+        Material::Filtered {
+            value,
+            scope,
+            completeness,
+        }
+    }
+
+    fn filtered_log_requirement(addresses: &[u8]) -> DataRequirement {
+        DataRequirement {
+            capabilities: CapabilitySet::of(Capability::Logs),
+            log_fields: LogFieldSet::NONE,
+            allow_filtered: true,
+            filter: address_scope(addresses),
+            minimum_finality: Finality::Included,
+        }
+    }
+
+    #[test]
+    fn filtered_material_must_be_predicate_complete_and_cover_the_requirement_filter() {
+        let requirement = filtered_log_requirement(&[0xaa]);
+        let mut frame = empty_frame();
+
+        // Audit probe: another consumer's partial projection was accepted.
+        frame.logs = filtered(Vec::new(), address_scope(&[0xbb]), Completeness::Partial);
+        assert!(requirement.validate_frame(&frame).is_err());
+
+        frame.logs = filtered(
+            Vec::new(),
+            address_scope(&[0xbb]),
+            Completeness::VerifiedPredicate,
+        );
+        assert_eq!(
+            requirement.validate_frame(&frame),
+            Err("filtered frame material does not cover the requirement filter")
+        );
+
+        frame.logs = filtered(
+            Vec::new(),
+            address_scope(&[0xaa, 0xbb]),
+            Completeness::Partial,
+        );
+        assert_eq!(
+            requirement.validate_frame(&frame),
+            Err("filtered frame material is only a partial projection")
+        );
+
+        frame.logs = filtered(
+            Vec::new(),
+            address_scope(&[0xbb, 0xaa]),
+            Completeness::DatasetDeclared,
+        );
+        assert_eq!(requirement.validate_frame(&frame), Ok(()));
+
+        frame.logs = filtered(
+            Vec::new(),
+            FilterScope::default(),
+            Completeness::VerifiedPredicate,
+        );
+        assert_eq!(requirement.validate_frame(&frame), Ok(()));
+
+        frame.logs = Material::Complete(Vec::new());
+        assert_eq!(requirement.validate_frame(&frame), Ok(()));
+
+        let wildcard = filtered_log_requirement(&[]);
+        frame.logs = filtered(
+            Vec::new(),
+            address_scope(&[0xaa]),
+            Completeness::VerifiedPredicate,
+        );
+        assert_eq!(
+            wildcard.validate_frame(&frame),
+            Err("filtered frame material does not cover the requirement filter")
+        );
+    }
+
+    #[test]
+    fn filtered_receipts_that_derive_logs_must_cover_the_requirement_filter() {
+        let requirement = filtered_log_requirement(&[0xaa]);
+        let mut frame = empty_frame();
+        frame.receipts = filtered(
+            Vec::new(),
+            address_scope(&[0xbb]),
+            Completeness::VerifiedPredicate,
+        );
+        assert_eq!(
+            requirement.validate_frame(&frame),
+            Err("filtered frame material does not cover the requirement filter")
+        );
+
+        // Covering logs do not excuse other non-covering material a mapper
+        // could read for the same capability.
+        frame.logs = filtered(
+            Vec::new(),
+            address_scope(&[0xaa]),
+            Completeness::VerifiedPredicate,
+        );
+        assert_eq!(
+            requirement.validate_frame(&frame),
+            Err("filtered frame material does not cover the requirement filter")
+        );
+
+        frame.receipts = Material::Missing(MissingReason::NotRequested);
+        assert_eq!(requirement.validate_frame(&frame), Ok(()));
+    }
+
+    #[test]
+    fn filtered_material_the_requirement_does_not_read_is_ignored() {
+        let requirement = filtered_log_requirement(&[0xaa]);
+        let mut frame = empty_frame();
+        frame.logs = Material::Complete(Vec::new());
+        frame.transactions = filtered(Vec::new(), address_scope(&[0xbb]), Completeness::Partial);
+        frame.header = filtered(
+            HeaderEnvelope {
+                rlp: None,
+                transactions_root: None,
+                receipts_root: None,
+                withdrawals_root: None,
+                gas_limit: None,
+                gas_used: None,
+                base_fee_per_gas: None,
+                blob_gas_used: None,
+                excess_blob_gas: None,
+                size_bytes: None,
+                transaction_count: None,
+                consensus_size_bytes: None,
+            },
+            address_scope(&[0xbb]),
+            Completeness::Partial,
+        );
+        assert_eq!(requirement.validate_frame(&frame), Ok(()));
+    }
+
+    #[test]
+    fn filtered_material_is_compared_at_the_frame_block() {
+        let requirement = filtered_log_requirement(&[0xaa]);
+        let mut frame = empty_frame();
+        let mut scope = address_scope(&[0xaa]);
+        scope.block_range = Some(BlockRange::single(frame.block.number));
+        frame.logs = filtered(Vec::new(), scope.clone(), Completeness::DatasetDeclared);
+        assert_eq!(requirement.validate_frame(&frame), Ok(()));
+
+        scope.block_range = Some(BlockRange::single(BlockNumber(2)));
+        frame.logs = filtered(Vec::new(), scope, Completeness::DatasetDeclared);
+        assert_eq!(
+            requirement.validate_frame(&frame),
+            Err("filtered frame material does not cover the requirement filter")
+        );
+    }
+
+    #[test]
+    fn invalid_ranges_ids_and_capability_bits_do_not_deserialize() {
+        // Audit probe: both decoded without validation.
+        assert!(serde_json::from_str::<BlockRange>(r#"{"start":9,"end":1}"#).is_err());
+        assert!(serde_json::from_str::<ProcessorId>(r#""../bad""#).is_err());
+        assert!(serde_json::from_str::<CapabilitySet>("4096").is_err());
+        assert!(serde_json::from_str::<LogFieldSet>("2").is_err());
+
+        assert_eq!(
+            serde_json::from_str::<BlockRange>(r#"{"start":1,"end":9}"#).expect("range"),
+            BlockRange::new(BlockNumber(1), BlockNumber(9)).expect("range")
+        );
+        assert_eq!(
+            serde_json::from_str::<ProcessorId>(r#""fixture""#).expect("ID"),
+            ProcessorId::new("fixture").expect("ID")
+        );
+        assert_eq!(
+            serde_json::from_str::<CapabilitySet>("4095").expect("capabilities"),
+            CapabilitySet::ALL
+        );
+        assert_eq!(
+            serde_json::from_str::<LogFieldSet>("1").expect("log fields"),
+            LogFieldSet::ALL
+        );
+    }
+
+    #[test]
+    fn legacy_instance_derivation_failure_is_a_deserialization_error() {
+        let descriptor = |id: &str, version: &str| {
+            serde_json::json!({
+                "id": id,
+                "version": version,
+                "code_hash": BlockHash::new([1; 32]),
+                "config_hash": BlockHash::new([2; 32]),
+                "start": "Genesis",
+                "requirements": [{
+                    "capabilities": CapabilitySet::of(Capability::Header),
+                    "log_fields": LogFieldSet::NONE,
+                    "allow_filtered": false,
+                    "filter": FilterScope::default(),
+                    "minimum_finality": "Included"
+                }],
+                "mode": "BlockLocal",
+                "delivery_ordering": "block_versioned_idempotent",
+                "publication": "finalized_only",
+                "schemas": {
+                    "delta_version": 1,
+                    "entity_schema": "fixture.entity.v1",
+                    "change_schema": "fixture.change.v1"
+                }
+            })
+        };
+
+        // Audit probe: semver build metadata panicked while deriving the
+        // legacy instance.
+        let error =
+            serde_json::from_value::<ProcessorDescriptor>(descriptor("fixture", "1.0.0+build"))
+                .expect_err("build metadata cannot form a legacy instance ID");
+        assert!(error.to_string().contains("invalid processor instance ID"));
+
+        let long_version = format!("1.0.0-{}", "a".repeat(64));
+        let error = serde_json::from_value::<ProcessorDescriptor>(descriptor(
+            &"p".repeat(64),
+            &long_version,
+        ))
+        .expect_err("an over-long legacy instance ID is invalid");
+        assert!(error.to_string().contains("invalid processor instance ID"));
+    }
+
     #[test]
     fn artifact_policy_is_independent_and_window_is_bounded() {
         let mut lifecycle = LifecyclePolicies::default();
@@ -851,6 +1205,57 @@ mod tests {
             lifecycle.validate(PublicationPolicy::FinalizedOnly),
             Err("artifact window must declare exactly one block, age, or byte limit")
         );
+    }
+
+    #[test]
+    fn consumer_lease_ttls_are_bounded_like_the_store_bounds_them() {
+        // Task 16b: validation refused only a zero TTL, and the store then
+        // refused one over 100 years.
+        assert_eq!(
+            MAXIMUM_CONSUMER_LEASE_TTL.as_secs(),
+            100 * 365 * 24 * 60 * 60
+        );
+        let mut lifecycle = LifecyclePolicies::default();
+        lifecycle.delivery.mode = DeliveryPolicyMode::UntilAcknowledged;
+        lifecycle.delivery.consumers = vec![DurableConsumerPolicy {
+            id: "destination".to_owned(),
+            required: true,
+            lease_ttl_seconds: 100 * 365 * 24 * 60 * 60,
+        }];
+        assert_eq!(lifecycle.validate(PublicationPolicy::FinalizedOnly), Ok(()));
+        for lease_ttl_seconds in [100 * 365 * 24 * 60 * 60 + 1, u64::MAX, 0] {
+            lifecycle.delivery.consumers[0].lease_ttl_seconds = lease_ttl_seconds;
+            assert_eq!(
+                lifecycle.validate(PublicationPolicy::FinalizedOnly),
+                Err("delivery consumer lease TTLs must be non-zero and at most 100 years"),
+                "{lease_ttl_seconds}"
+            );
+        }
+    }
+
+    #[test]
+    fn state_modes_without_distinct_persistence_are_rejected() {
+        // Audit probe (Processor-6): `ephemeral` validated whenever
+        // publication was not included, although the store always persists
+        // processor state, and `checkpointed` state validated without
+        // checkpoints.
+        let mut lifecycle = LifecyclePolicies::default();
+        lifecycle.state.mode = StatePolicyMode::Ephemeral;
+        assert_eq!(
+            lifecycle.validate(PublicationPolicy::FinalizedOnly),
+            Err("ephemeral processor state is not implemented; use durable or checkpointed state")
+        );
+        lifecycle.state.mode = StatePolicyMode::Checkpointed;
+        lifecycle.checkpoint.mode = CheckpointPolicyMode::None;
+        assert_eq!(
+            lifecycle.validate(PublicationPolicy::FinalizedOnly),
+            Err("checkpointed processor state requires automatic checkpoints")
+        );
+        lifecycle.checkpoint.mode = CheckpointPolicyMode::Automatic;
+        assert_eq!(lifecycle.validate(PublicationPolicy::FinalizedOnly), Ok(()));
+        lifecycle.state.mode = StatePolicyMode::Durable;
+        lifecycle.checkpoint.mode = CheckpointPolicyMode::None;
+        assert_eq!(lifecycle.validate(PublicationPolicy::FinalizedOnly), Ok(()));
     }
 
     #[test]
@@ -888,6 +1293,7 @@ mod tests {
                 &descriptor.version,
                 descriptor.config_hash
             )
+            .expect("legacy instance")
         );
     }
 }

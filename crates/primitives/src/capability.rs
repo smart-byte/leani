@@ -27,11 +27,26 @@ impl Capability {
 }
 
 /// Stable bit representation used in descriptors and durable records.
-#[derive(
-    Clone, Copy, Debug, Default, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize,
-)]
+///
+/// Decoding rejects bits that name no [`Capability`].
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(transparent)]
 pub struct CapabilitySet(u16);
+
+impl<'de> Deserialize<'de> for CapabilitySet {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let bits = u16::deserialize(deserializer)?;
+        Self::from_bits(bits).ok_or_else(|| {
+            serde::de::Error::custom(format!(
+                "unknown capability bits 0x{:04x}",
+                bits & !Self::ALL.0
+            ))
+        })
+    }
+}
 
 impl CapabilitySet {
     pub const NONE: Self = Self(0);
@@ -135,6 +150,14 @@ pub struct FrameCapabilityReport {
 }
 
 impl FrameCapabilityReport {
+    /// Whether material for every `required` capability is complete or, with
+    /// `allow_filtered`, merely present.
+    ///
+    /// Presence says nothing about which predicate filtered the material or
+    /// how complete it claims to be. Consumers that accept filtered material
+    /// must also check its [`crate::Completeness`] and that its
+    /// [`crate::FilterScope`] covers their own filter, as
+    /// `DataRequirement::validate_frame` in `leani-processor-api` does.
     #[must_use]
     pub const fn satisfies(self, required: CapabilitySet, allow_filtered: bool) -> bool {
         if allow_filtered {
@@ -164,5 +187,21 @@ mod tests {
         };
         assert!(report.satisfies(CapabilitySet::of(Capability::Logs), true));
         assert!(!report.satisfies(CapabilitySet::of(Capability::Logs), false));
+    }
+
+    #[test]
+    fn decoding_rejects_unknown_capability_bits() {
+        let unknown = CapabilitySet::ALL.bits() + 1;
+        let encoded = postcard::to_allocvec(&unknown).expect("encode");
+        assert!(postcard::from_bytes::<CapabilitySet>(&encoded).is_err());
+        let deserializer: serde::de::value::U16Deserializer<serde::de::value::Error> =
+            serde::de::IntoDeserializer::into_deserializer(unknown);
+        assert!(CapabilitySet::deserialize(deserializer).is_err());
+
+        let encoded = postcard::to_allocvec(&CapabilitySet::ALL).expect("encode");
+        assert_eq!(
+            postcard::from_bytes::<CapabilitySet>(&encoded).expect("decode"),
+            CapabilitySet::ALL
+        );
     }
 }

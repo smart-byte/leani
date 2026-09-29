@@ -6,6 +6,23 @@ info:
     Coverage-aware queries and durable processor changes. All cursors are
     opaque. Ethereum quantities that can exceed JavaScript's safe integer
     range are encoded as unsigned decimal strings.
+
+    Every route answers a `Host` name other than `localhost` and those in
+    `api.allowed_hosts` with 421 `host_not_allowed` (IP addresses pass), and
+    a browser `Origin` other than a loopback one or one in
+    `api.allowed_origins` with 403 `origin_not_allowed`. A GET or HEAD
+    without an `Origin` whose `Sec-Fetch-Site` is `cross-site` or
+    `same-site` and whose `Sec-Fetch-Mode` is not `navigate` gets 403
+    `cross_site_request`; on the two consumer stream routes, so does one in
+    any mode, navigations included. A POST or DELETE needs
+    `content-type: application/json` or `x-leani-request: 1`, and gets 415
+    `unsupported_media_type` otherwise.
+
+    A consumer created with a credential needs it in
+    `x-leani-consumer-credential` on every consumer-scoped delivery route,
+    in addition to any bearer token, and gets 403 `forbidden` without it.
+    Listing, reading, and revoking consumers are administrative: only the
+    bearer token protects them, whether or not a consumer has a credential.
 servers:
   - url: http://127.0.0.1:8080
 security:
@@ -185,11 +202,24 @@ paths:
     get:
       summary: Stream processor changes
       operationId: streamProcessorChanges
+      parameters:
+        - name: Last-Event-ID
+          in: header
+          description: |
+            The id of the last event received, which is its cursor, as an
+            EventSource sends it when it reconnects. The stream resumes after
+            it when `after` is absent.
+          schema:
+            $ref: "#/components/schemas/Cursor"
       responses:
         "200":
           description: |
             Resumable SSE stream. The event id is the opaque resume cursor and
-            each data field contains one ChangeEnvelope.
+            each data field contains one ChangeEnvelope. When the node shuts
+            down, the stream ends after a whole event; reconnect after the
+            last event's id. An `error` event carries an ErrorBody and ends
+            the stream; reconnect only when its `retryable` is true. A stored
+            change the node cannot render is not retryable.
           content:
             text/event-stream:
               schema:
@@ -218,6 +248,11 @@ paths:
     get:
       summary: Query processor entities
       operationId: queryProcessorEntities
+      description: |
+        Without a cursor, reads current retained output in entity-key order
+        without creating a snapshot; its `nextCursor` continues that read,
+        and later pages see later commits. A cursor from a snapshot reads the
+        snapshot's next page. Create a stable snapshot with POST.
       parameters:
         - $ref: "#/components/parameters/FromBlock"
         - $ref: "#/components/parameters/ToBlock"
@@ -228,6 +263,33 @@ paths:
           in: query
           schema:
             $ref: "#/components/schemas/Cursor"
+      responses:
+        "200":
+          description: A page of current output, or of a snapshot for a snapshot cursor.
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: "#/components/schemas/GenericOutputPage"
+                  - $ref: "#/components/schemas/GenericSnapshotPage"
+        default:
+          $ref: "#/components/responses/Error"
+    post:
+      summary: Snapshot processor entities
+      operationId: createProcessorEntitySnapshot
+      description: |
+        Copies the matching retained output into a stable, short-lived
+        snapshot and returns its first page. Read later pages with GET and the
+        page's `nextCursor`, and release the snapshot when done. A
+        `finalized_only` processor's snapshot holds blocks whose changes are
+        not published yet, so it offers no boundary to follow:
+        `boundaryCursor` and `recovery.follow` are null.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/OutputQuery"
       responses:
         "200":
           description: Stable retained-output snapshot page.
@@ -313,6 +375,8 @@ paths:
     delete:
       summary: Release a processor query snapshot
       operationId: releaseProcessorQuerySnapshot
+      parameters:
+        - $ref: "#/components/parameters/LeaniRequest"
       responses:
         "204":
           description: Snapshot released.
@@ -351,6 +415,8 @@ paths:
     post:
       summary: Restore a processor recovery checkpoint
       operationId: restoreProcessorRecoveryCheckpoint
+      parameters:
+        - $ref: "#/components/parameters/LeaniRequest"
       responses:
         "200":
           description: Private state repaired at the exact current cursor.
@@ -405,6 +471,22 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/PortableSavepoint"
+        "409":
+          description: |
+            `savepoint_limit`: the processor instance already keeps 16
+            savepoints; delete one first. `savepoint_exists`: the ID is taken.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorBody"
+        "507":
+          description: |
+            `physical_storage_limit`: the savepoint would exceed the physical
+            store budget. Free space or raise the budget first.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorBody"
         default:
           $ref: "#/components/responses/Error"
   /v1/processors/{processor}/savepoints/{savepoint}:
@@ -433,6 +515,8 @@ paths:
     delete:
       summary: Delete a processor savepoint
       operationId: deleteProcessorSavepoint
+      parameters:
+        - $ref: "#/components/parameters/LeaniRequest"
       responses:
         "204":
           description: Savepoint explicitly deleted.
@@ -485,6 +569,10 @@ paths:
     get:
       summary: Read a durable consumer
       operationId: getDurableConsumer
+      description: |
+        Administrative: only the bearer token protects it, whether or not the
+        consumer has a credential, as for the consumer list. A credential
+        isolates applications on the consumer-scoped delivery routes.
       responses:
         "200":
           description: Durable consumer state and lag.
@@ -497,6 +585,12 @@ paths:
     delete:
       summary: Revoke a durable consumer
       operationId: revokeDurableConsumer
+      description: |
+        Administrative: only the bearer token protects it, whether or not the
+        consumer has a credential, so an operator can revoke a consumer whose
+        credential is lost.
+      parameters:
+        - $ref: "#/components/parameters/LeaniRequest"
       responses:
         "200":
           description: Consumer explicitly revoked.
@@ -514,6 +608,12 @@ paths:
     post:
       summary: Renew a durable consumer lease
       operationId: renewDurableConsumerLease
+      description: |
+        A split live stream fences renewal by session, so its processors get
+        409 `consumer_session_required`; renew through
+        `/streams/live/consumers/{consumer}/lease` instead.
+      parameters:
+        - $ref: "#/components/parameters/LeaniRequest"
       responses:
         "200":
           description: Consumer lease renewed without advancing acknowledgement.
@@ -535,7 +635,10 @@ paths:
         - $ref: "#/components/parameters/Limit"
       responses:
         "200":
-          description: Replay batch; advances only the delivered head.
+          description: |
+            Replay batch after the acknowledgement. Its last change becomes
+            the consumer's delivered sequence, which bounds acknowledgement;
+            the acknowledgement does not move.
           content:
             application/json:
               schema:
@@ -550,6 +653,12 @@ paths:
     post:
       summary: Acknowledge durable consumer changes
       operationId: acknowledgeDurableConsumerChanges
+      description: |
+        A cursor beyond the consumer's delivered sequence gets 409
+        `acknowledgement_beyond_delivered`. A split live stream fences
+        acknowledgement by session, so its processors get 409
+        `consumer_session_required`; acknowledge through
+        `/streams/live/consumers/{consumer}/ack` instead.
       requestBody:
         required: true
         content:
@@ -612,6 +721,13 @@ paths:
     get:
       summary: Stream the dedicated live lane for a durable consumer
       operationId: streamLiveDurableConsumer
+      description: |
+        Each batch holds one whole block's commit, and records the consumer's
+        delivered sequence through it. A request whose `Sec-Fetch-Site` is
+        `cross-site` or `same-site` without an allowed `Origin`, such as a
+        navigation of another site's frame, gets 403 `cross_site_request`.
+        When the node shuts down, the stream ends after a whole record;
+        reconnect to resume after the acknowledged cursor.
       responses:
         "200":
           description: Server-sent live-lane batches.
@@ -625,6 +741,11 @@ paths:
     post:
       summary: Acknowledge a live-lane consumer batch
       operationId: acknowledgeLiveDurableConsumer
+      description: |
+        The cursor must end a block's commit, as a batch's
+        `acknowledgeableCursor` does, and gets 409
+        `acknowledgement_mid_block` otherwise. A cursor beyond the consumer's
+        delivered sequence gets 409 `acknowledgement_beyond_delivered`.
       responses:
         "200":
           description: Updated live-lane acknowledgement state.
@@ -638,6 +759,8 @@ paths:
     post:
       summary: Renew a live-lane consumer lease
       operationId: renewLiveDurableConsumerLease
+      parameters:
+        - $ref: "#/components/parameters/LeaniRequest"
       responses:
         "200":
           description: Renewed live-lane lease.
@@ -646,6 +769,8 @@ paths:
     delete:
       summary: Release a live-lane consumer lease
       operationId: releaseLiveDurableConsumerLease
+      parameters:
+        - $ref: "#/components/parameters/LeaniRequest"
       responses:
         "200":
           description: Released live-lane lease.
@@ -672,6 +797,13 @@ paths:
     get:
       summary: Stream changes from one backfill subscription
       operationId: streamBackfillConsumer
+      description: |
+        Each batch and the completion record the consumer's delivered
+        sequence through their acknowledgement boundary. A request whose
+        `Sec-Fetch-Site` is `cross-site` or `same-site` without an allowed
+        `Origin`, such as a navigation of another site's frame, gets 403
+        `cross_site_request`. When the node shuts down, the stream ends after
+        a whole record; reconnect to resume after the acknowledged cursor.
       responses:
         "200":
           description: Server-sent backfill delivery batches.
@@ -685,6 +817,11 @@ paths:
     post:
       summary: Acknowledge a backfill subscription batch
       operationId: acknowledgeBackfillConsumer
+      description: |
+        The cursor must be a batch's `acknowledgeableCursor` or the
+        completion's `cursor` (409 `acknowledgement_invalid` otherwise), and
+        not beyond the consumer's delivered sequence (409
+        `acknowledgement_beyond_delivered`).
       responses:
         "200":
           description: Updated backfill acknowledgement state.
@@ -698,6 +835,8 @@ paths:
     post:
       summary: Renew a backfill consumer lease
       operationId: renewBackfillConsumerLease
+      parameters:
+        - $ref: "#/components/parameters/LeaniRequest"
       responses:
         "200":
           description: Renewed backfill lease.
@@ -706,6 +845,8 @@ paths:
     delete:
       summary: Release a backfill consumer lease
       operationId: releaseBackfillConsumerLease
+      parameters:
+        - $ref: "#/components/parameters/LeaniRequest"
       responses:
         "200":
           description: Released backfill lease.
@@ -717,9 +858,22 @@ paths:
     post:
       summary: Reset a processor live lane for replay
       operationId: resetProcessorLiveLane
+      parameters:
+        - $ref: "#/components/parameters/LeaniRequest"
       responses:
         "200":
           description: Paused live-lane reset state.
+        "409":
+          description: |
+            The lane cannot be reset. `single_block_exceeds_delivery_limit`:
+            its first unapplied block still exceeds the delivery limit; raise
+            the limit first. `live_lane_requires_rebuild`: the lane failed with
+            `processor_finality_conflict`, so its coverage contradicts the
+            canonical chain; rebuild the processor as a replacement instance.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorBody"
         default:
           $ref: "#/components/responses/Error"
   /admin/v1/processors/{processor}/artifacts:
@@ -728,6 +882,8 @@ paths:
     delete:
       summary: Delete retained processor artifacts
       operationId: deleteProcessorArtifacts
+      parameters:
+        - $ref: "#/components/parameters/LeaniRequest"
       responses:
         "200":
           description: Artifact deletion result.
@@ -756,9 +912,21 @@ paths:
     post:
       summary: Create a backfill subscription
       operationId: createBackfillSubscription
+      description: |
+        A new subscription's consumer `credential` holds 32 to 512 printable
+        ASCII characters without spaces (400 otherwise). Re-submitting an
+        existing subscription's request unchanged returns its status, even
+        with a credential from before that rule. The credential enters the
+        request's idempotency identity, an unkeyed BLAKE3 hash of the whole
+        request that the node keeps, so use a random one.
+
+        A range that starts past the node's finalized head gets 409
+        `range_after_finalized_head`, and one that only ends past it
+        `history_not_finalized`. Their `details.currentFinalizedHead` holds
+        the head's `number` and its `hash` as `0x` hex.
       responses:
-        "201":
-          description: Created backfill subscription.
+        "202":
+          description: Backfill subscription accepted; its current status.
         default:
           $ref: "#/components/responses/Error"
   /admin/v1/backfill-subscriptions/{id}:
@@ -775,6 +943,8 @@ paths:
     delete:
       summary: Delete a terminal backfill subscription
       operationId: deleteBackfillSubscription
+      parameters:
+        - $ref: "#/components/parameters/LeaniRequest"
       responses:
         "200":
           description: Deleted backfill subscription.
@@ -786,6 +956,8 @@ paths:
     post:
       summary: Cancel a backfill subscription
       operationId: cancelBackfillSubscription
+      parameters:
+        - $ref: "#/components/parameters/LeaniRequest"
       responses:
         "200":
           description: Cancelled backfill subscription.
@@ -803,9 +975,14 @@ paths:
     post:
       summary: Create a materialization job
       operationId: createMaterializationJob
+      description: |
+        A range that starts past the node's finalized head gets 409
+        `range_after_finalized_head`, and one that only ends past it
+        `history_not_finalized`. Their `details.currentFinalizedHead` holds
+        the head's `number` and its `hash` as `0x` hex.
       responses:
-        "201":
-          description: Created materialization job.
+        "202":
+          description: Materialization job accepted; its current status.
         default:
           $ref: "#/components/responses/Error"
   /admin/v1/materialization-jobs/{id}:
@@ -822,6 +999,8 @@ paths:
     delete:
       summary: Delete a terminal materialization job
       operationId: deleteMaterializationJob
+      parameters:
+        - $ref: "#/components/parameters/LeaniRequest"
       responses:
         "200":
           description: Deleted materialization job.
@@ -833,6 +1012,8 @@ paths:
     post:
       summary: Cancel a materialization job
       operationId: cancelMaterializationJob
+      parameters:
+        - $ref: "#/components/parameters/LeaniRequest"
       responses:
         "200":
           description: Cancelled materialization job.
@@ -851,8 +1032,8 @@ paths:
       summary: Create a raw-history job
       operationId: createRawHistoryJob
       responses:
-        "201":
-          description: Created raw-history job.
+        "202":
+          description: Raw-history job accepted; its current state.
         default:
           $ref: "#/components/responses/Error"
   /admin/v1/raw-history-jobs/{id}:
@@ -869,6 +1050,8 @@ paths:
     delete:
       summary: Delete a terminal raw-history job
       operationId: deleteRawHistoryJob
+      parameters:
+        - $ref: "#/components/parameters/LeaniRequest"
       responses:
         "200":
           description: Deleted raw-history job.
@@ -880,6 +1063,8 @@ paths:
     post:
       summary: Cancel a raw-history job
       operationId: cancelRawHistoryJob
+      parameters:
+        - $ref: "#/components/parameters/LeaniRequest"
       responses:
         "200":
           description: Cancelled raw-history job.
@@ -1227,12 +1412,27 @@ components:
       in: header
       required: false
       description: |
-        Consumer-scoped credential. An administrator bearer credential can be
-        used instead on the protected listener.
+        The consumer's credential. A consumer created with one needs it, in
+        addition to any bearer token, on its lease, change, acknowledgement,
+        and stream requests, and gets 403 `forbidden` without it or with
+        another; the node compares it in constant time. Listing, inspecting,
+        and revoking consumers need only the bearer token. A consumer without
+        one, such as a configured consumer, takes none. Credentials created
+        before 32 characters were required keep working.
       schema:
         type: string
         minLength: 16
         maxLength: 512
+    LeaniRequest:
+      name: x-leani-request
+      in: header
+      required: false
+      description: |
+        Marks a mutating request without a JSON body as sent by a Leani
+        client. A POST or DELETE needs `content-type: application/json` or
+        this header, and gets HTTP 415 otherwise.
+      schema:
+        const: "1"
     Subscription:
       name: subscription
       in: path
@@ -1296,14 +1496,6 @@ components:
     Hash32:
       type: string
       pattern: "^0x[0-9a-f]{64}$"
-    ByteArray32:
-      type: array
-      minItems: 32
-      maxItems: 32
-      items:
-        type: integer
-        minimum: 0
-        maximum: 255
     Address:
       type: string
       pattern: "^0x[0-9a-f]{40}$"
@@ -1529,8 +1721,11 @@ components:
         complete:
           type: boolean
         state:
+          description: |
+            `paused` and `failed` report the processor's live lane;
+            `/v1/network/status` gives its `pauseReason`.
           type: string
-          enum: [starting, backfilling, catching_up, live, degraded, failed]
+          enum: [starting, backfilling, catching_up, live, degraded, paused, failed]
     ChainFinalizedHead:
       type: object
       additionalProperties: false
@@ -1606,6 +1801,25 @@ components:
           $ref: "#/components/schemas/SafeInteger"
         finality:
           $ref: "#/components/schemas/Finality"
+    GenericOutputPage:
+      type: object
+      additionalProperties: false
+      required: [data, nextCursor, retainedBounds, coverage]
+      properties:
+        data:
+          type: array
+          items:
+            $ref: "#/components/schemas/GenericOutputEntity"
+        nextCursor:
+          oneOf:
+            - $ref: "#/components/schemas/Cursor"
+            - type: "null"
+        retainedBounds:
+          oneOf:
+            - $ref: "#/components/schemas/OutputBounds"
+            - type: "null"
+        coverage:
+          $ref: "#/components/schemas/ProcessorCoverage"
     GenericSnapshotPage:
       type: object
       additionalProperties: false
@@ -1624,7 +1838,9 @@ components:
           type: string
           pattern: "^[0-9a-f]{32}$"
         boundaryCursor:
-          description: Null when the processor has delivery disabled.
+          description: |
+            Null when the processor has delivery disabled or is
+            `finalized_only`, whose retained state holds unpublished blocks.
           oneOf:
             - $ref: "#/components/schemas/Cursor"
             - type: "null"
@@ -1701,20 +1917,36 @@ components:
         leaseTtlSeconds:
           type: integer
           minimum: 1
+          maximum: 3153600000
         credential:
+          description: |
+            A random secret of 32 to 512 printable ASCII characters without
+            spaces, such as `openssl rand -hex 32`. Only a hash keyed with the
+            node's secret is stored. The consumer's lease, change,
+            acknowledgement, and stream requests then need it; listing,
+            inspecting, and revoking consumers need only the bearer token.
+            These bounds apply to a new consumer: the node checks the ID
+            first, so an existing consumer ID gets 409 `consumer_exists`
+            whatever the credential, even one outside them.
           type: string
-          minLength: 16
+          minLength: 32
           maxLength: 512
+          pattern: "^[!-~]+$"
           writeOnly: true
     DurableConsumer:
       type: object
       additionalProperties: false
       required:
-        [id, processorInstance, role, state, acknowledgedSequence, deliveredSequence, acknowledgedCursor, deliveredCursor, leaseTtlMs, leaseExpiresAtUnixMs, leaseActive, lagChanges, lagBlocks, lagBytes, lagAgeMs, createdAtUnixMs, updatedAtUnixMs]
+        [id, processorInstance, streamId, role, state, acknowledgedSequence, deliveredSequence, acknowledgedCursor, deliveredCursor, leaseGeneration, leaseTtlMs, leaseExpiresAtUnixMs, leaseActive, lagChanges, lagBlocks, lagBytes, lagAgeMs, createdAtUnixMs, updatedAtUnixMs]
       properties:
         id:
           type: string
         processorInstance:
+          type: string
+        streamId:
+          description: |
+            The delivery stream this consumer reads: the processor's live or
+            canonical stream, or a backfill subscription's history stream.
           type: string
         role:
           type: string
@@ -1725,11 +1957,19 @@ components:
         acknowledgedSequence:
           $ref: "#/components/schemas/DecimalQuantity"
         deliveredSequence:
+          description: |
+            The last sequence a page read or stream batch handed to this
+            consumer; acknowledgement cannot pass it.
           $ref: "#/components/schemas/DecimalQuantity"
         acknowledgedCursor:
           $ref: "#/components/schemas/Cursor"
         deliveredCursor:
           $ref: "#/components/schemas/Cursor"
+        leaseGeneration:
+          description: |
+            How many stream sessions have taken this consumer's lease; each
+            new session fences the one before it. `0` before the first.
+          $ref: "#/components/schemas/DecimalQuantity"
         leaseTtlMs:
           $ref: "#/components/schemas/DecimalQuantity"
         leaseExpiresAtUnixMs:
@@ -1761,9 +2001,9 @@ components:
         blockNumber:
           $ref: "#/components/schemas/SafeInteger"
         blockHash:
-          $ref: "#/components/schemas/ByteArray32"
+          $ref: "#/components/schemas/Hash32"
         stateChecksum:
-          $ref: "#/components/schemas/ByteArray32"
+          $ref: "#/components/schemas/Hash32"
         stateBytes:
           $ref: "#/components/schemas/SafeInteger"
         createdAtUnixMs:
@@ -1799,9 +2039,9 @@ components:
         blockNumber:
           $ref: "#/components/schemas/SafeInteger"
         blockHash:
-          $ref: "#/components/schemas/ByteArray32"
+          $ref: "#/components/schemas/Hash32"
         stateChecksum:
-          $ref: "#/components/schemas/ByteArray32"
+          $ref: "#/components/schemas/Hash32"
         stateBytes:
           $ref: "#/components/schemas/SafeInteger"
         createdAtUnixMs:
@@ -1851,6 +2091,10 @@ components:
         excessBlobGas:
           $ref: "#/components/schemas/DecimalQuantity"
         blobBaseFee:
+          description: >-
+            Protocol blob base fee in wei per blob gas: the EIP-4844 fee for
+            excessBlobGas under the fork active at the block's timestamp.
+            EIP-7918 does not change it.
           $ref: "#/components/schemas/DecimalQuantity"
         executionBaseFee:
           $ref: "#/components/schemas/DecimalQuantity"
@@ -1861,8 +2105,13 @@ components:
         executionEthBurnedWei:
           $ref: "#/components/schemas/DecimalQuantity"
         blobEthBurnedWei:
+          description: blobBaseFee times blobGasUsed.
           $ref: "#/components/schemas/DecimalQuantity"
         reserveFeeWei:
+          description: >-
+            EIP-7918 reserve price in wei per blob gas from Fusaka on, null
+            before. It only changes how excess blob gas evolves and is not
+            applied to blobBaseFee.
           oneOf:
             - $ref: "#/components/schemas/DecimalQuantity"
             - type: "null"
@@ -1905,6 +2154,7 @@ components:
         executionBurnedWei:
           $ref: "#/components/schemas/DecimalQuantity"
         blobBurnedWei:
+          description: The block's blobBaseFee times this transaction's blob gas.
           $ref: "#/components/schemas/DecimalQuantity"
     BlobSchedule:
       type: object
@@ -1915,8 +2165,12 @@ components:
         name:
           type: string
         activationBlock:
+          description: >-
+            Block-number label for atBlock lookups. For Dencun it is 19426589,
+            the first block the blobs processor covers.
           $ref: "#/components/schemas/SafeInteger"
         activationTimestamp:
+          description: The fork's parameters apply to blocks from this timestamp on.
           $ref: "#/components/schemas/SafeInteger"
         forkId:
           type: string
@@ -1935,7 +2189,7 @@ components:
     Erc20Balance:
       type: object
       additionalProperties: false
-      required: [token, address, balance, asOfBlock, blockHash, finality, coverageFrom, complete, method]
+      required: [token, address, balance, asOfBlock, blockHash, finality, coverageFrom, complete, incompleteFrom, method]
       properties:
         token:
           $ref: "#/components/schemas/Address"
@@ -1953,6 +2207,16 @@ components:
           $ref: "#/components/schemas/SafeInteger"
         complete:
           type: boolean
+        incompleteFrom:
+          description: >-
+            Block whose transfer the ledger could not apply for this token and
+            holder, an outgoing transfer above the derived balance or an
+            incoming one that overflows it. From that block the pair is
+            incomplete and no longer derived, and balance keeps its last
+            derived value. Null while the pair is derived.
+          oneOf:
+            - $ref: "#/components/schemas/SafeInteger"
+            - type: "null"
         method:
           type: string
           const: erc20_transfer_ledger

@@ -7,7 +7,7 @@ use leani_processor_erc20::{
     BALANCE_COLLECTION, TokenBalanceEntity, balance_key as erc20_balance_key,
 };
 
-use crate::{ApiError, Erc20Balance, QueryContext, QueryExtension, parse_address};
+use crate::{ApiError, Erc20Balance, QueryContext, QueryExtension, finality_name, parse_address};
 
 /// Typed ERC-20 balance queries backed by one processor instance.
 #[derive(Clone, Copy, Debug, Default)]
@@ -33,12 +33,16 @@ async fn get_balance(
 ) -> Result<Json<Erc20Balance>, ApiError> {
     let token = parse_address(&token)?;
     let address = parse_address(&address)?;
-    let value = context
-        .entity(BALANCE_COLLECTION, &erc20_balance_key(token, address))
+    let stored = context
+        .output_entity(BALANCE_COLLECTION, &erc20_balance_key(token, address))
         .await?
         .ok_or_else(|| ApiError::not_found("ERC-20 balance is not indexed"))?;
-    let entity: TokenBalanceEntity = postcard::from_bytes(&value).map_err(|error| {
+    let entity: TokenBalanceEntity = postcard::from_bytes(&stored.value).map_err(|error| {
         ApiError::internal(&format!("stored ERC-20 balance is invalid: {error}"))
     })?;
-    Ok(Json(Erc20Balance::from(&entity)))
+    // The entity keeps the finality its block had when reduced.
+    Ok(Json(Erc20Balance {
+        finality: finality_name(stored.finality),
+        ..Erc20Balance::from(&entity)
+    }))
 }

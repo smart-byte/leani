@@ -77,8 +77,10 @@ in the [Uniswap subscription guide](/docs/guides/uniswap-price-subscriptions/).
 The page `limit` only controls transport size. Creating the first page copies
 the entire matching collection under the store writer lock. Defaults cap each
 snapshot at 100,000 rows / 64 MiB and all outstanding snapshots together at 32
-snapshots / 128 MiB (including key and row overhead). Physical store admission
-also applies. Release snapshots promptly; the node expires them after five
-minutes and cleans expired rows every 30 seconds. `query_snapshot_capacity`
-returns retryable HTTP 503 when aggregate admission is full. Very slow readers
-can outlive the retained stream and must rebuild, as the example does.
+snapshots / 128 MiB (including key and row overhead). A request over the
+per-snapshot caps or outside coverage is rejected before it takes the writer
+lock. Physical store admission also applies. Release snapshots promptly; the
+node expires them after five minutes and cleans expired rows every 30 seconds.
+`query_snapshot_capacity` returns retryable HTTP 503 when aggregate admission
+is full. Very slow readers can outlive the retained stream and must rebuild, as
+the example does.

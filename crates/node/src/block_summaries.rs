@@ -4,6 +4,11 @@ use leani_processor_block_summary::BLOCK_SUMMARY_VERSION;
 
 use crate::{builtin_processors::processor_contract, config::ProcessorConfig};
 
+/// The instance a compact `[blocks]` configuration runs. It changes with each
+/// processor version that changes identity; the store refuses a new version
+/// under an instance it holds.
+pub(crate) const COMPACT_INSTANCE: &str = "block-summary-1-2";
+
 pub(crate) fn processor_config(instance: &str, finalized_only: bool) -> ProcessorConfig {
     processor_contract(
         "block-summary",
@@ -24,7 +29,7 @@ mod tests {
         let configured = processor_config("demo-blocks", false);
         assert_eq!(configured.id, "block-summary");
         assert_eq!(configured.instance, "demo-blocks");
-        assert_eq!(configured.version, "1.1.0");
+        assert_eq!(configured.version, "1.2.0");
         assert_eq!(configured.history_mode, ProcessorHistoryMode::OnDemand);
         assert!(configured.settings.is_empty());
     }

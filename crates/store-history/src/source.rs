@@ -22,7 +22,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     HistoryStore, HistoryStoreError, MaterialShapeId, RawHistoryMaterialProfile, RawHistoryProfile,
-    SegmentId, SegmentRead, SegmentRecord, VerificationClass,
+    SegmentError, SegmentId, SegmentRead, SegmentRecord, VerificationClass,
 };
 
 const RETAINED_SCHEMA_VERSION: &str = "retained-raw-segment.v1";
@@ -39,6 +39,7 @@ pub struct RetainedHistorySourceConfig {
     pub trust: TrustModel,
     pub priority: u16,
     pub required_profile: RawHistoryProfile,
+    pub material_profile: Option<RawHistoryMaterialProfile>,
 }
 
 impl RetainedHistorySourceConfig {
@@ -76,7 +77,16 @@ impl RetainedHistorySourceConfig {
             trust,
             priority: 0,
             required_profile: RawHistoryProfile::ProcessorReuse,
+            material_profile: None,
         })
+    }
+
+    /// Describe the shape so a narrower log predicate can reuse its frames.
+    /// Construction verifies that this profile hashes to `material_shape`.
+    #[must_use]
+    pub fn with_material_profile(mut self, profile: RawHistoryMaterialProfile) -> Self {
+        self.material_profile = Some(profile);
+        self
     }
 
     #[must_use]
@@ -147,6 +157,10 @@ impl RetainedHistorySource {
         config: RetainedHistorySourceConfig,
     ) -> Result<Self, SourceError> {
         if config.chain_id.0 == 0
+            || config
+                .material_profile
+                .as_ref()
+                .is_some_and(|profile| profile.shape_id() != config.material_shape)
             || config.capabilities == CapabilitySet::NONE
             || config.capabilities.contains(Capability::Mempool)
             || (config.log_fields != LogFieldSet::NONE
@@ -168,7 +182,15 @@ impl RetainedHistorySource {
             // authoritative exact cover check.
             range: None,
             capabilities: config.capabilities,
-            complete_capabilities: config.capabilities,
+            complete_capabilities: if config
+                .material_profile
+                .as_ref()
+                .is_some_and(|profile| profile.allow_filtered)
+            {
+                CapabilitySet::NONE
+            } else {
+                config.capabilities
+            },
             trust: config.trust,
             finality: FinalityModel::Finalized,
             partitioning: Partitioning::SourceDefined("raw-segment".to_owned()),
@@ -201,7 +223,12 @@ impl RetainedHistorySource {
         if !self.config.log_fields.contains_all(request.log_fields) {
             return Ok((compatible, available));
         }
-        for record in self.store.segments().await.map_err(source_store_error)? {
+        for record in self
+            .store
+            .segments()
+            .await
+            .map_err(|error| source_store_error(&error))?
+        {
             let descriptor = &record.metadata.descriptor;
             if descriptor.chain_id != request.chain_id
                 || descriptor.material_shape != self.config.material_shape
@@ -211,11 +238,15 @@ impl RetainedHistorySource {
             {
                 continue;
             }
-            available = available.union(descriptor.complete_capabilities.with_derivable());
-            if descriptor
-                .complete_capabilities
-                .with_derivable()
-                .contains_all(request.required)
+            let supplied = if request.allow_filtered
+                && request.verification_policy != VerificationPolicy::CompleteCryptographic
+            {
+                descriptor.present_capabilities.with_derivable()
+            } else {
+                descriptor.complete_capabilities.with_derivable()
+            };
+            available = available.union(supplied);
+            if supplied.contains_all(request.required)
                 && descriptor.verification >= required_verification
                 && descriptor.trust >= required_trust
                 && descriptor.trust >= self.config.trust
@@ -231,6 +262,27 @@ impl RetainedHistorySource {
             )
         });
         Ok((compatible, available))
+    }
+
+    fn material_covers(&self, request: &DataRequest) -> bool {
+        if self.config.material_shape == MaterialShapeId::COMPLETE_EXECUTION
+            || RawHistoryMaterialProfile::from_request(request).shape_id()
+                == self.config.material_shape
+        {
+            return true;
+        }
+        // Scope inclusion is sufficient for logs when every requested field
+        // is retained. Other material keeps its exact shape requirement.
+        let Some(profile) = &self.config.material_profile else {
+            return false;
+        };
+        request.required == CapabilitySet::of(Capability::Logs)
+            && request.allow_filtered
+            && profile.log_fields.contains_all(request.log_fields)
+            && profile.projection.log_fields.is_empty()
+            && profile.filters.senders.is_empty()
+            && profile.filters.recipients.is_empty()
+            && profile.filters.scope.covers(&request.filters.scope)
     }
 
     fn compatible_lookup_segment(&self, record: &SegmentRecord, required: CapabilitySet) -> bool {
@@ -256,18 +308,21 @@ impl RetainedHistorySource {
             .store
             .segment(segment_id)
             .await
-            .map_err(source_store_error)?
+            .map_err(|error| source_store_error(&error))?
         else {
             return Ok(None);
         };
         if !self.compatible_lookup_segment(&record, required) {
             return Ok(None);
         }
-        let read = self
-            .store
-            .read_block(segment_id, block_number)
-            .await
-            .map_err(source_store_error)?;
+        let read = match self.store.read_block(segment_id, block_number).await {
+            Ok(read) => read,
+            // A segment that failed validation no longer covers the block,
+            // and one whose file is gone cannot serve it now.
+            Err(HistoryStoreError::Quarantined { .. }) => return Ok(None),
+            Err(HistoryStoreError::Segment(error)) if error.is_missing_file() => return Ok(None),
+            Err(error) => return Err(source_store_error(&error)),
+        };
         self.stats.locator_uses.fetch_add(1, Ordering::Relaxed);
         self.stats.segment_opens.fetch_add(1, Ordering::Relaxed);
         self.stats.record_reads.fetch_add(1, Ordering::Relaxed);
@@ -313,7 +368,7 @@ impl HistorySource for RetainedHistorySource {
             .store
             .block_hash_locators(chain_id, hash)
             .await
-            .map_err(source_store_error)?
+            .map_err(|error| source_store_error(&error))?
         {
             let Some(read) = self
                 .read_lookup(&locator.segment_id, locator.block_number, required)
@@ -344,7 +399,7 @@ impl HistorySource for RetainedHistorySource {
             .store
             .transaction_locators(chain_id, hash)
             .await
-            .map_err(source_store_error)?
+            .map_err(|error| source_store_error(&error))?
         {
             let Some(read) = self
                 .read_lookup(&locator.segment_id, locator.block_number, required)
@@ -403,6 +458,7 @@ impl HistorySource for RetainedHistorySource {
         Ok(sliced)
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn plan(&self, request: &DataRequest) -> Result<SourcePlan, SourceError> {
         if request.chain_id != self.config.chain_id {
             return Err(SourceError::MissingRange(request.range));
@@ -419,10 +475,7 @@ impl HistorySource for RetainedHistorySource {
                 available: self.config.capabilities.with_derivable().bits(),
             });
         }
-        if self.config.material_shape != MaterialShapeId::COMPLETE_EXECUTION
-            && RawHistoryMaterialProfile::from_request(request).shape_id()
-                != self.config.material_shape
-        {
+        if !self.material_covers(request) {
             return Err(SourceError::MissingMaterial {
                 gaps: vec![request.range],
                 required: request.required.bits(),
@@ -447,10 +500,12 @@ impl HistorySource for RetainedHistorySource {
         let mut chunks = Vec::with_capacity(selected.len());
         let mut physical_plan = Vec::with_capacity(selected.len());
         let mut estimated_bytes = Some(0_u64);
+        let mut supplied = CapabilitySet::ALL;
         let mut complete = CapabilitySet::ALL;
         let mut trust = self.config.trust;
         for (record, range) in selected {
             let descriptor = &record.metadata.descriptor;
+            supplied = supplied.intersection(descriptor.present_capabilities.with_derivable());
             complete = complete.intersection(descriptor.complete_capabilities.with_derivable());
             trust = trust.min(descriptor.trust);
             let estimate = record
@@ -472,7 +527,16 @@ impl HistorySource for RetainedHistorySource {
                 )],
                 estimated_bytes: estimate,
                 trust: descriptor.trust,
-                completeness: "complete retained frame".to_owned(),
+                completeness: if descriptor
+                    .complete_capabilities
+                    .with_derivable()
+                    .contains_all(request.required)
+                {
+                    "complete retained frame"
+                } else {
+                    "filtered retained frame; consumer validates predicate completeness"
+                }
+                .to_owned(),
                 derived: false,
             });
             chunks.push(SourceChunk {
@@ -495,7 +559,7 @@ impl HistorySource for RetainedHistorySource {
             chunks,
             estimated_bytes,
             estimated_lag: Duration::ZERO,
-            supplied: complete,
+            supplied,
             complete,
             trust,
             schema_version: RETAINED_SCHEMA_VERSION.to_owned(),
@@ -536,7 +600,7 @@ impl HistorySource for RetainedHistorySource {
             .store
             .reader(&partition.segment_id)
             .await
-            .map_err(source_store_error)?;
+            .map_err(|error| retained_read_error(&error, chunk.range))?;
         let descriptor = &reader.metadata().descriptor;
         if descriptor.chain_id != self.config.chain_id
             || descriptor.material_shape != self.config.material_shape
@@ -549,6 +613,8 @@ impl HistorySource for RetainedHistorySource {
         }
         self.stats.segment_opens.fetch_add(1, Ordering::Relaxed);
         let stats = self.stats.clone();
+        let store = self.store.clone();
+        let runtime = tokio::runtime::Handle::current();
         let range = chunk.range;
         let (sender, receiver) = tokio::sync::mpsc::channel(budget.max_buffered_frames);
         tokio::task::spawn_blocking(move || {
@@ -561,35 +627,16 @@ impl HistorySource for RetainedHistorySource {
                 let read = match reader.read_block(number) {
                     Ok(read) => read,
                     Err(error) => {
-                        let _ =
-                            sender.blocking_send(Err(SourceError::CorruptFrame(error.to_string())));
+                        let metadata = reader.metadata().clone();
+                        let error = runtime.block_on(store.segment_read_failed(&metadata, error));
+                        let _ = sender.blocking_send(Err(retained_read_error(&error, range)));
                         return;
                     }
                 };
-                if read.logical_bytes_read > budget.max_frame_bytes {
-                    let _ = sender.blocking_send(Err(SourceError::BudgetExceeded {
-                        resource: "frame_bytes",
-                        limit: budget.max_frame_bytes,
-                        observed: read.logical_bytes_read,
-                    }));
-                    return;
-                }
-                input_bytes = match input_bytes.checked_add(read.logical_bytes_read) {
-                    Some(bytes) if bytes <= budget.max_input_bytes => bytes,
-                    Some(bytes) => {
-                        let _ = sender.blocking_send(Err(SourceError::BudgetExceeded {
-                            resource: "input_bytes",
-                            limit: budget.max_input_bytes,
-                            observed: bytes,
-                        }));
-                        return;
-                    }
-                    None => {
-                        let _ = sender.blocking_send(Err(SourceError::BudgetExceeded {
-                            resource: "input_bytes",
-                            limit: budget.max_input_bytes,
-                            observed: u64::MAX,
-                        }));
+                input_bytes = match charge_record(&read, budget, input_bytes) {
+                    Ok(bytes) => bytes,
+                    Err(error) => {
+                        let _ = sender.blocking_send(Err(error));
                         return;
                     }
                 };
@@ -609,6 +656,39 @@ impl HistorySource for RetainedHistorySource {
             receiver.recv().await.map(|item| (item, receiver))
         })))
     }
+}
+
+/// Check one record read against `budget`, returning the input the open
+/// has acquired with it.
+fn charge_record(
+    read: &SegmentRead,
+    budget: SourceBudget,
+    input_bytes: u64,
+) -> Result<u64, SourceError> {
+    // One stored record is held at a time.
+    if read.stored_bytes_read > budget.max_resident_bytes {
+        return Err(SourceError::BudgetExceeded {
+            resource: "resident_bytes",
+            limit: budget.max_resident_bytes,
+            observed: read.stored_bytes_read,
+        });
+    }
+    if read.logical_bytes_read > budget.max_frame_bytes {
+        return Err(SourceError::BudgetExceeded {
+            resource: "frame_bytes",
+            limit: budget.max_frame_bytes,
+            observed: read.logical_bytes_read,
+        });
+    }
+    let acquired = input_bytes.saturating_add(read.logical_bytes_read);
+    if acquired > budget.max_input_bytes {
+        return Err(SourceError::BudgetExceeded {
+            resource: "input_bytes",
+            limit: budget.max_input_bytes,
+            observed: acquired,
+        });
+    }
+    Ok(acquired)
 }
 
 fn select_cover(
@@ -675,10 +755,49 @@ const fn minimum_trust_for_policy(policy: VerificationPolicy) -> TrustModel {
     }
 }
 
-fn source_store_error(error: HistoryStoreError) -> SourceError {
+/// A retained segment that failed validation no longer covers `range`, and
+/// one whose file is gone, as when its mount went away, cannot serve it now;
+/// another source may still serve it.
+fn retained_read_error(error: &HistoryStoreError, range: BlockRange) -> SourceError {
     match error {
-        HistoryStoreError::UnknownSegment(_) => SourceError::Unavailable(error.to_string()),
-        other => SourceError::CorruptFrame(other.to_string()),
+        HistoryStoreError::Quarantined { .. } => SourceError::MissingRange(range),
+        HistoryStoreError::Segment(segment) if segment.is_missing_file() => {
+            SourceError::MissingRange(range)
+        }
+        other => source_store_error(other),
+    }
+}
+
+/// A failure that can clear, such as transient I/O or a busy catalog, is
+/// unavailable, so callers retry or fail over; anything else is corrupt.
+fn source_store_error(error: &HistoryStoreError) -> SourceError {
+    let transient = match error {
+        HistoryStoreError::UnknownSegment(_)
+        | HistoryStoreError::Io(_)
+        | HistoryStoreError::Task(_)
+        | HistoryStoreError::Sql(
+            sqlx::Error::Io(_)
+            | sqlx::Error::PoolTimedOut
+            | sqlx::Error::PoolClosed
+            | sqlx::Error::WorkerCrashed,
+        ) => true,
+        // A read that ends early is a truncated file.
+        HistoryStoreError::Segment(SegmentError::Io(io)) => {
+            io.kind() != std::io::ErrorKind::UnexpectedEof
+        }
+        // SQLITE_BUSY, SQLITE_LOCKED, SQLITE_IOERR, and SQLITE_FULL,
+        // including their extended codes: the catalog is contended, or its
+        // disk failed or filled up.
+        HistoryStoreError::Sql(sqlx::Error::Database(database)) => database
+            .code()
+            .and_then(|code| code.parse::<i32>().ok())
+            .is_some_and(|code| matches!(code & 0xff, 5 | 6 | 10 | 13)),
+        _ => false,
+    };
+    if transient {
+        SourceError::Unavailable(error.to_string())
+    } else {
+        SourceError::CorruptFrame(error.to_string())
     }
 }
 
@@ -781,6 +900,7 @@ mod tests {
             max_buffered_frames: 2,
             max_in_flight_requests: 1,
             temporary_disk_bytes: 0,
+            max_resident_bytes: 8 * 1024 * 1024,
         }
     }
 
@@ -1030,6 +1150,231 @@ mod tests {
             Err(SourceError::MissingMaterial { .. })
         ));
         assert_eq!(stronger.stats().segment_opens, 0);
+    }
+
+    #[test]
+    fn transient_store_failures_stay_retryable() {
+        // Audit History-6: every store failure but an unknown segment read as
+        // corrupt material, which no retry or failover recovers.
+        for error in [
+            HistoryStoreError::Io(std::io::Error::other("disk busy")),
+            HistoryStoreError::Sql(sqlx::Error::PoolTimedOut),
+            HistoryStoreError::Segment(crate::SegmentError::Io(std::io::Error::other(
+                "read interrupted",
+            ))),
+        ] {
+            let mapped = source_store_error(&error);
+            assert!(matches!(mapped, SourceError::Unavailable(_)), "{mapped}");
+        }
+        for error in [
+            HistoryStoreError::Segment(crate::SegmentError::ContentChecksum),
+            HistoryStoreError::CatalogIntegrity("malformed row".to_owned()),
+        ] {
+            let mapped = source_store_error(&error);
+            assert!(matches!(mapped, SourceError::CorruptFrame(_)), "{mapped}");
+        }
+    }
+
+    /// A catalog failure the driver reports with `code`.
+    #[derive(Debug)]
+    struct SqliteFailure(i32);
+
+    impl std::fmt::Display for SqliteFailure {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(formatter, "SQLite error {}", self.0)
+        }
+    }
+
+    impl std::error::Error for SqliteFailure {}
+
+    impl sqlx::error::DatabaseError for SqliteFailure {
+        fn message(&self) -> &'static str {
+            "SQLite error"
+        }
+
+        fn code(&self) -> Option<std::borrow::Cow<'_, str>> {
+            Some(self.0.to_string().into())
+        }
+
+        fn as_error(&self) -> &(dyn std::error::Error + Send + Sync + 'static) {
+            self
+        }
+
+        fn as_error_mut(&mut self) -> &mut (dyn std::error::Error + Send + Sync + 'static) {
+            self
+        }
+
+        fn into_error(self: Box<Self>) -> Box<dyn std::error::Error + Send + Sync + 'static> {
+            self
+        }
+
+        fn kind(&self) -> sqlx::error::ErrorKind {
+            sqlx::error::ErrorKind::Other
+        }
+    }
+
+    #[test]
+    fn catalog_failures_that_can_clear_stay_retryable() {
+        let classify = |code| {
+            source_store_error(&HistoryStoreError::Sql(sqlx::Error::Database(Box::new(
+                SqliteFailure(code),
+            ))))
+        };
+        // BUSY, BUSY_SNAPSHOT, LOCKED, IOERR, IOERR_READ, and FULL. Review M7:
+        // a failing or full disk read as corrupt material.
+        for code in [5, 517, 6, 10, 266, 13] {
+            let mapped = classify(code);
+            assert!(
+                matches!(mapped, SourceError::Unavailable(_)),
+                "{code}: {mapped}"
+            );
+        }
+        // CORRUPT and CONSTRAINT.
+        for code in [11, 19] {
+            let mapped = classify(code);
+            assert!(
+                matches!(mapped, SourceError::CorruptFrame(_)),
+                "{code}: {mapped}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn open_holds_one_stored_record_within_the_resident_budget() {
+        let directory = tempdir().expect("temporary directory");
+        let store = HistoryStore::open(config(directory.path()))
+            .await
+            .expect("store");
+        let shape = MaterialShapeId::COMPLETE_EXECUTION;
+        let all = frames(24, 25);
+        Box::pin(publish(
+            &store,
+            "resident",
+            &all,
+            shape,
+            VerificationClass::TrustedDataset,
+            TrustModel::TrustedDataset,
+        ))
+        .await;
+        let source = RetainedHistorySource::new(
+            store,
+            RetainedHistorySourceConfig::local(
+                ChainId(1),
+                shape,
+                all[0].capabilities().complete,
+                VerificationClass::TrustedDataset,
+                TrustModel::TrustedDataset,
+            )
+            .expect("profile"),
+        )
+        .expect("source");
+        let plan = source
+            .plan(&request(
+                BlockRange::new(BlockNumber(24), BlockNumber(25)).expect("range"),
+                CapabilitySet::of(Capability::Transactions),
+            ))
+            .await
+            .expect("plan");
+        let mut constrained = budget();
+        constrained.max_resident_bytes = 1;
+        let mut stream = source
+            .open(&plan.chunks[0], constrained, CancellationToken::new())
+            .await
+            .expect("open");
+        // Review I1: a stored record was bounded only by what the open may
+        // acquire in total.
+        let first = stream.next().await;
+        assert!(
+            matches!(
+                first,
+                Some(Err(SourceError::BudgetExceeded {
+                    resource: "resident_bytes",
+                    ..
+                }))
+            ),
+            "{first:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_segment_file_gone_while_open_reads_as_missing() {
+        let directory = tempdir().expect("temporary directory");
+        let store = HistoryStore::open(config(directory.path()))
+            .await
+            .expect("store");
+        let shape = MaterialShapeId::COMPLETE_EXECUTION;
+        let all = frames(30, 31);
+        let capabilities = all[0].capabilities();
+        let mut pending = store
+            .begin_segment_indexed(
+                SegmentId::new("gone-while-open").expect("segment ID"),
+                SegmentDescriptor {
+                    chain_id: ChainId(1),
+                    range: BlockRange::new(BlockNumber(30), BlockNumber(31)).expect("range"),
+                    material_shape: shape,
+                    present_capabilities: capabilities.present,
+                    complete_capabilities: capabilities.complete,
+                    verification: VerificationClass::TrustedDataset,
+                    trust: TrustModel::TrustedDataset,
+                },
+                Compression::Snappy,
+                SegmentReservation::new(1024 * 1024, 1024 * 1024),
+                RawHistoryIndexPolicy {
+                    block_hash: true,
+                    transaction_hash: false,
+                    logs: false,
+                },
+            )
+            .await
+            .expect("begin");
+        for frame in &all {
+            pending.append(frame).expect("append");
+        }
+        let record = pending.commit(&[]).await.expect("commit");
+        let source = RetainedHistorySource::new(
+            store.clone(),
+            RetainedHistorySourceConfig::local(
+                ChainId(1),
+                shape,
+                capabilities.complete,
+                VerificationClass::TrustedDataset,
+                TrustModel::TrustedDataset,
+            )
+            .expect("profile"),
+        )
+        .expect("source");
+        let required = CapabilitySet::of(Capability::Transactions);
+        let plan = source
+            .plan(&request(
+                BlockRange::new(BlockNumber(30), BlockNumber(31)).expect("range"),
+                required,
+            ))
+            .await
+            .expect("plan");
+        std::fs::remove_file(directory.path().join(&record.relative_path))
+            .expect("take the file away");
+        // Another source may serve the blocks while the file is gone, and the
+        // segment serves them again once it returns.
+        assert!(matches!(
+            source
+                .open(&plan.chunks[0], budget(), CancellationToken::new())
+                .await,
+            Err(SourceError::MissingRange(_))
+        ));
+        assert_eq!(
+            source
+                .block_by_hash(ChainId(1), all[0].block.hash, required)
+                .await
+                .expect("lookup"),
+            None
+        );
+        assert!(
+            store
+                .segment(&record.metadata.id)
+                .await
+                .expect("lookup")
+                .is_some()
+        );
     }
 
     #[tokio::test]

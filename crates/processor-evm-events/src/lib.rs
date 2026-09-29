@@ -40,7 +40,10 @@ pub struct EventOutput {
     pub collection: String,
     pub kind: String,
     /// Field names used to construct a deterministic key. Empty uses
-    /// transaction hash plus log index.
+    /// transaction hash plus log index, which no other event shares. A key
+    /// from these fields can repeat across blocks, so any keyed output makes
+    /// the processor reduce blocks in chain order, and a key holds its
+    /// newest event.
     #[serde(default)]
     pub key_fields: Vec<String>,
     /// Optional canonical-block timestamp bucket.
@@ -48,7 +51,7 @@ pub struct EventOutput {
     pub bucket_seconds: Option<u64>,
 }
 
-/// Stable public entity emitted for every matching log.
+/// Stable public entity for one decoded log.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct DecodedEvent {
     pub schema_version: u16,
@@ -69,6 +72,8 @@ pub struct DecodedEvent {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 struct EventDelta {
     events: Vec<MappedEvent>,
+    /// Logs with a configured signature that do not decode as its event.
+    skipped_logs: u32,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -127,9 +132,9 @@ pub struct EvmEventsProcessor {
 impl EvmEventsProcessor {
     /// Parse and validate static event ABI fragments.
     ///
-    /// Dynamic ABI values, anonymous events, duplicate signatures, invalid
-    /// output names, and impossible key/bucket mappings fail at construction
-    /// before a source range is opened.
+    /// Dynamic ABI values, unnamed parameters, anonymous events, duplicate
+    /// signatures, invalid output names, and impossible key/bucket mappings
+    /// fail at construction before a source range is opened.
     ///
     /// # Errors
     ///
@@ -151,17 +156,37 @@ impl EvmEventsProcessor {
         {
             return Err(input_error("event signatures must be unique"));
         }
+        // Events are hashed in configured order, so reordering them creates a
+        // new instance identity. Sorting them here would change the identity
+        // of every existing instance.
         let normalized = postcard::to_allocvec(&config)
             .map_err(|error| input_error(format!("configuration encoding failed: {error}")))?;
         let id = ProcessorId::new("evm-events").map_err(|error| input_error(error.to_string()))?;
-        let version = Version::new(1, 0, 0);
+        let version = Version::new(1, 1, 0);
         let config_hash = BlockHash::new(*blake3::hash(&normalized).as_bytes());
         let topics = parsed.iter().map(|event| event.topic0).collect();
+        // A configured key can repeat across blocks, so which event it holds
+        // depends on the order its blocks reduce in, and an undo restores the
+        // value from before the block. Keyed output is therefore ordered, and
+        // its live lane waits for its history. The default key is unique to
+        // one event, so keyless output stays block-local.
+        let (mode, delivery_ordering) = if parsed
+            .iter()
+            .any(|event| !event.output.key_fields.is_empty())
+        {
+            (ReductionMode::OrderedState, DeliveryOrdering::Canonical)
+        } else {
+            (
+                ReductionMode::BlockLocal,
+                DeliveryOrdering::BlockVersionedIdempotent,
+            )
+        };
         let descriptor = ProcessorDescriptor {
-            instance: ProcessorInstanceId::legacy(&id, &version, config_hash),
+            instance: ProcessorInstanceId::legacy(&id, &version, config_hash)
+                .map_err(|error| input_error(error.to_string()))?,
             id,
             version,
-            code_hash: BlockHash::new(*blake3::hash(b"leani/evm-events/1.0.0").as_bytes()),
+            code_hash: BlockHash::new(*blake3::hash(b"leani/evm-events/1.1.0").as_bytes()),
             config_hash,
             start: StartPoint::Block(config.start_block),
             requirements: vec![DataRequirement {
@@ -178,12 +203,12 @@ impl EvmEventsProcessor {
                 },
                 minimum_finality: Finality::Included,
             }],
-            mode: ReductionMode::BlockLocal,
-            delivery_ordering: DeliveryOrdering::BlockVersionedIdempotent,
+            mode,
+            delivery_ordering,
             publication: PublicationPolicy::IncludedAndFinalized,
             lifecycle: LifecyclePolicies::from_legacy(RetentionPolicy::FullOutputHistory),
             schemas: ProcessorSchemas {
-                delta_version: 1,
+                delta_version: 2,
                 entity_schema: "evm.event.entity.v1".to_owned(),
                 change_schema: "evm.event.change.v1".to_owned(),
             },
@@ -232,6 +257,7 @@ impl Processor for EvmEventsProcessor {
             .map_err(|error| input_error(error.to_owned()))?;
         let logs = accepted_logs(&block.logs)?;
         let mut events = Vec::new();
+        let mut skipped_logs = 0_u32;
         for log in logs {
             if !self.addresses.is_empty() && !self.addresses.contains(&log.address) {
                 continue;
@@ -248,12 +274,13 @@ impl Processor for EvmEventsProcessor {
                     event.signature, log.log_index
                 ))
             })?;
-            let values = decode_values(event, log).map_err(|detail| {
-                ProcessorError::Input(format!(
-                    "{} log {} in transaction {} is invalid: {detail}",
-                    event.signature, log.log_index, transaction_hash
-                ))
-            })?;
+            // Another contract can emit this signature with another layout,
+            // such as an ERC-721 `Transfer` for the ERC-20 ABI. A log that
+            // does not decode is not this event, so it is counted, not fatal.
+            let Ok(values) = decode_values(event, log) else {
+                skipped_logs = skipped_logs.saturating_add(1);
+                continue;
+            };
             let bucket_start_timestamp = event
                 .output
                 .bucket_seconds
@@ -288,14 +315,41 @@ impl Processor for EvmEventsProcessor {
                 event.kind.clone(),
             )
         });
-        let payload = postcard::to_allocvec(&EventDelta { events })
-            .map_err(|error| ProcessorError::DeltaPayload(error.to_string()))?;
+        let payload = postcard::to_allocvec(&EventDelta {
+            events,
+            skipped_logs,
+        })
+        .map_err(|error| ProcessorError::DeltaPayload(error.to_string()))?;
         Ok(EncodedDelta::new(
             &self.descriptor,
             block.chain_id,
             block.block,
             payload,
         ))
+    }
+
+    fn finality_variant_checksums(
+        &self,
+        delta: &EncodedDelta,
+    ) -> Result<Vec<BlockHash>, ProcessorError> {
+        delta.validate(&self.descriptor)?;
+        let decoded: EventDelta = postcard::from_bytes(&delta.payload)
+            .map_err(|error| ProcessorError::DeltaPayload(error.to_string()))?;
+        let mut checksums = Vec::with_capacity(2);
+        for finality in [Finality::Included, Finality::Finalized] {
+            let mut variant = decoded.clone();
+            for event in &mut variant.events {
+                event.entity.finality = finality;
+            }
+            let payload = postcard::to_allocvec(&variant)
+                .map_err(|error| ProcessorError::DeltaPayload(error.to_string()))?;
+            checksums.push(
+                EncodedDelta::new(&self.descriptor, delta.chain_id, delta.block, payload).checksum,
+            );
+        }
+        checksums.sort_unstable();
+        checksums.dedup();
+        Ok(checksums)
     }
 
     async fn reduce(
@@ -307,16 +361,26 @@ impl Processor for EvmEventsProcessor {
         validate_cursor(&self.descriptor, cursor, delta)?;
         let delta: EventDelta = postcard::from_bytes(&delta.payload)
             .map_err(|error| ProcessorError::DeltaPayload(error.to_string()))?;
-        let mut changes = Vec::with_capacity(delta.events.len());
-        for event in delta.events {
+        // Each emitted change must match its key's net mutation in the block,
+        // so a key keeps only its last event, in log order. Keyed blocks
+        // reduce in chain order, so that event is the key's newest.
+        let mut last_event = BTreeMap::new();
+        for (index, event) in delta.events.iter().enumerate() {
+            last_event.insert((&event.collection, &event.key), index);
+        }
+        let mut changes = Vec::with_capacity(last_event.len());
+        for (index, event) in delta.events.iter().enumerate() {
+            if last_event.get(&(&event.collection, &event.key)) != Some(&index) {
+                continue;
+            }
             let payload = postcard::to_allocvec(&event.entity)
                 .map_err(|error| ProcessorError::State(error.to_string()))?;
             transaction
                 .put(&event.collection, event.key.clone(), payload.clone())
                 .await?;
             let change = DomainChange {
-                kind: event.kind,
-                key: event.key,
+                kind: event.kind.clone(),
+                key: event.key.clone(),
                 operation: ChangeOperation::Upsert,
                 payload,
             };
@@ -352,17 +416,20 @@ fn parse_event(definition: &EventDefinition) -> Result<ParsedEvent, ProcessorErr
         .unwrap_or(definition.abi.trim())
         .trim_end_matches(';')
         .trim();
-    if fragment.contains(" anonymous") {
-        return Err(input_error("anonymous events are not supported"));
-    }
     let open = fragment
         .find('(')
         .ok_or_else(|| input_error("event ABI is missing `(`"))?;
     let close = fragment
         .rfind(')')
         .ok_or_else(|| input_error("event ABI is missing `)`"))?;
-    if close <= open || !fragment[close + 1..].trim().is_empty() {
-        return Err(input_error("event ABI has trailing or unbalanced syntax"));
+    // `anonymous` is an attribute after the parameter list; a parameter
+    // name such as `anonymousVoter` is not.
+    match fragment[close + 1..].trim() {
+        "anonymous" => return Err(input_error("anonymous events are not supported")),
+        trailing if close <= open || !trailing.is_empty() => {
+            return Err(input_error("event ABI has trailing or unbalanced syntax"));
+        }
+        _ => {}
     }
     let name = fragment[..open].trim();
     if !valid_identifier(name) {
@@ -374,7 +441,9 @@ fn parse_event(definition: &EventDefinition) -> Result<ParsedEvent, ProcessorErr
         for parameter in parameters.split(',') {
             let tokens = parameter.split_whitespace().collect::<Vec<_>>();
             let (kind, indexed, field_name) = match tokens.as_slice() {
-                [kind, field] => (parse_kind(kind)?, false, *field),
+                // `type indexed` is an unnamed indexed parameter, not a field
+                // named `indexed`; output values need a name.
+                [kind, field] if *field != "indexed" => (parse_kind(kind)?, false, *field),
                 [kind, "indexed", field] => (parse_kind(kind)?, true, *field),
                 _ => {
                     return Err(input_error(format!(
@@ -680,7 +749,8 @@ fn input_error(detail: impl Into<String>) -> ProcessorError {
 #[cfg(test)]
 mod tests {
     use leani_primitives::{BlockRef, ChainId, Log, Material, TransactionHash, VerificationReport};
-    use leani_testkit::MemoryReducer;
+    use leani_store_sqlite::{ChangeDirection, SqliteStore, StoreConfig, StoreError};
+    use leani_testkit::{MemoryReducer, fixture_frame};
 
     use super::*;
 
@@ -809,13 +879,377 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn malformed_static_abi_data_fails_deterministically() {
+    async fn truncated_abi_data_is_skipped_and_counted() {
         let processor = processor();
-        let error = processor
+        let delta = processor
             .map(&frame(vec![0; 31]))
             .await
-            .expect_err("truncated ABI data");
-        assert!(error.to_string().contains("expected 32 data bytes"));
+            .expect("truncated ABI data is not this event");
+        let decoded: EventDelta = postcard::from_bytes(&delta.payload).expect("delta");
+        assert_eq!(decoded.skipped_logs, 1);
+        assert!(decoded.events.is_empty());
+    }
+
+    fn transfer_topic() -> [u8; 32] {
+        keccak256("Transfer(address,address,uint256)").0
+    }
+
+    fn transfer_log(value: u8, log_index: u32) -> Log {
+        let mut from = [0_u8; 32];
+        from[12..].fill(0x22);
+        let mut to = [0_u8; 32];
+        to[12..].fill(0x33);
+        let mut data = vec![0_u8; 32];
+        data[31] = value;
+        Log {
+            address: Address::new([0x11; 20]),
+            topics: vec![transfer_topic(), from, to],
+            data,
+            transaction_hash: Some(TransactionHash::new([0x44; 32])),
+            transaction_index: 0,
+            log_index,
+        }
+    }
+
+    fn transfer_frame(number: u64, parent: BlockHash, logs: Vec<Log>) -> BlockFrame {
+        let mut frame = fixture_frame(number, parent);
+        frame.finality = Finality::Included;
+        frame.logs = Material::Complete(logs);
+        frame
+    }
+
+    fn transfers(values: &[u8]) -> Vec<Log> {
+        values
+            .iter()
+            .zip(0..)
+            .map(|(value, log_index)| transfer_log(*value, log_index))
+            .collect()
+    }
+
+    fn cursor(processor: &EvmEventsProcessor, frame: &BlockFrame) -> ProcessorCursor {
+        ProcessorCursor {
+            processor_id: processor.descriptor.id.to_string(),
+            processor_version: processor.descriptor.version.to_string(),
+            chain_id: frame.chain_id,
+            block_number: frame.block.number,
+            block_hash: frame.block.hash,
+            finality: frame.finality,
+            sequence: frame.block.number.0,
+        }
+    }
+
+    async fn open_store(directory: &tempfile::TempDir) -> SqliteStore {
+        SqliteStore::open(StoreConfig::new(directory.path().join("events.sqlite")))
+            .await
+            .expect("store")
+    }
+
+    async fn apply(store: &SqliteStore, processor: &EvmEventsProcessor, frame: &BlockFrame) {
+        let delta = processor.map(frame).await.expect("map");
+        store
+            .apply(processor, cursor(processor, frame), &delta, &[])
+            .await
+            .expect("apply");
+    }
+
+    async fn transfer_key(processor: &EvmEventsProcessor) -> Vec<u8> {
+        let delta = processor
+            .map(&transfer_frame(1, BlockHash::ZERO, transfers(&[1])))
+            .await
+            .expect("map");
+        let decoded: EventDelta = postcard::from_bytes(&delta.payload).expect("delta");
+        decoded.events[0].key.clone()
+    }
+
+    async fn stored_transfer(
+        store: &SqliteStore,
+        processor: &EvmEventsProcessor,
+        key: &[u8],
+    ) -> Option<DecodedEvent> {
+        store
+            .entity(processor.descriptor(), "events.transfers", key)
+            .await
+            .expect("read entity")
+            .map(|bytes| postcard::from_bytes(&bytes).expect("decode entity"))
+    }
+
+    async fn applied_changes(
+        store: &SqliteStore,
+        processor: &EvmEventsProcessor,
+        block: u64,
+    ) -> usize {
+        store
+            .changes(processor.descriptor(), ChainId(1), 0, 1_000)
+            .await
+            .expect("changes")
+            .iter()
+            .filter(|record| {
+                record.block.number == BlockNumber(block)
+                    && record.direction == ChangeDirection::Apply
+            })
+            .count()
+    }
+
+    #[tokio::test]
+    async fn an_erc721_transfer_with_the_erc20_signature_is_skipped_and_counted() {
+        // Audit probe (H20): with no address filter, an ERC-721 `Transfer`
+        // (four topics, no data) shares the ERC-20 topic zero and failed the
+        // whole block.
+        let processor = EvmEventsProcessor::new(EvmEventsConfig {
+            start_block: BlockNumber(1),
+            addresses: Vec::new(),
+            events: vec![EventDefinition {
+                abi: "event Transfer(address indexed from, address indexed to, uint256 value)"
+                    .to_owned(),
+                output: EventOutput {
+                    collection: "events.transfers".to_owned(),
+                    kind: "events.transfer".to_owned(),
+                    key_fields: Vec::new(),
+                    bucket_seconds: None,
+                },
+            }],
+        })
+        .expect("processor");
+        let mut erc721 = transfer_log(1, 0);
+        erc721.topics.push([0; 32]);
+        erc721.data.clear();
+        let frame = transfer_frame(1, BlockHash::ZERO, vec![erc721, transfer_log(2, 1)]);
+        let delta = processor
+            .map(&frame)
+            .await
+            .expect("a foreign log shape does not fail the block");
+        let decoded: EventDelta = postcard::from_bytes(&delta.payload).expect("delta");
+        assert_eq!(decoded.skipped_logs, 1);
+        assert_eq!(decoded.events.len(), 1);
+        assert_eq!(decoded.events[0].entity.log_index, 1);
+    }
+
+    #[tokio::test]
+    async fn an_invalid_bool_word_is_skipped_and_counted() {
+        let processor = EvmEventsProcessor::new(EvmEventsConfig {
+            start_block: BlockNumber(1),
+            addresses: Vec::new(),
+            events: vec![EventDefinition {
+                abi: "event Paused(address indexed account, bool paused)".to_owned(),
+                output: EventOutput {
+                    collection: "events.pauses".to_owned(),
+                    kind: "events.pause".to_owned(),
+                    key_fields: Vec::new(),
+                    bucket_seconds: None,
+                },
+            }],
+        })
+        .expect("processor");
+        let topic0 = processor.events.keys().next().copied().expect("topic");
+        let paused = |word: u8, log_index: u32| {
+            let mut data = vec![0_u8; 32];
+            data[31] = word;
+            Log {
+                address: Address::new([0x11; 20]),
+                topics: vec![topic0, [0; 32]],
+                data,
+                transaction_hash: Some(TransactionHash::new([0x44; 32])),
+                transaction_index: 0,
+                log_index,
+            }
+        };
+        let frame = transfer_frame(1, BlockHash::ZERO, vec![paused(2, 0), paused(1, 1)]);
+        let delta = processor
+            .map(&frame)
+            .await
+            .expect("an invalid word does not fail the block");
+        let decoded: EventDelta = postcard::from_bytes(&delta.payload).expect("delta");
+        assert_eq!(decoded.skipped_logs, 1);
+        assert_eq!(decoded.events.len(), 1);
+        assert_eq!(decoded.events[0].entity.values["paused"], "true");
+    }
+
+    #[tokio::test]
+    async fn repeated_keys_in_one_block_apply_and_undo_in_a_real_store() {
+        // Audit probe (H21): two events for a key that already existed failed
+        // the block with "0 matching state mutations"; a new key passed only
+        // through the store's inverse-delete fallback.
+        let processor = processor();
+        let key = transfer_key(&processor).await;
+        let directory = tempfile::tempdir().expect("directory");
+        let store = open_store(&directory).await;
+        let first = transfer_frame(1, BlockHash::ZERO, transfers(&[1, 2]));
+        apply(&store, &processor, &first).await;
+        let second = transfer_frame(2, first.block.hash, transfers(&[3, 4]));
+        apply(&store, &processor, &second).await;
+        let latest = stored_transfer(&store, &processor, &key)
+            .await
+            .expect("latest transfer");
+        assert_eq!(latest.values["value"], "4");
+        // One change per key and block, matching the key's net mutation.
+        assert_eq!(applied_changes(&store, &processor, 1).await, 1);
+        assert_eq!(applied_changes(&store, &processor, 2).await, 1);
+
+        store
+            .undo(
+                processor.descriptor(),
+                second.chain_id,
+                second.block.number,
+                second.block.hash,
+                &[],
+            )
+            .await
+            .expect("undo the second block");
+        let restored = stored_transfer(&store, &processor, &key)
+            .await
+            .expect("restored transfer");
+        assert_eq!(restored.block_number, BlockNumber(1));
+        assert_eq!(restored.values["value"], "2");
+        store
+            .undo(
+                processor.descriptor(),
+                first.chain_id,
+                first.block.number,
+                first.block.hash,
+                &[],
+            )
+            .await
+            .expect("undo the first block");
+        assert_eq!(stored_transfer(&store, &processor, &key).await, None);
+    }
+
+    #[test]
+    fn keyed_outputs_reduce_in_chain_order_and_keyless_ones_stay_block_local() {
+        // Audit finding F1: a `key_fields` key repeats across blocks, but
+        // block-local reduction let the hot and cold lanes apply its blocks
+        // in any order, and an undo then restored a stale preimage.
+        let output = |collection: &str, key_fields: &[&str]| EventOutput {
+            collection: collection.to_owned(),
+            kind: collection.to_owned(),
+            key_fields: key_fields.iter().map(|field| (*field).to_owned()).collect(),
+            bucket_seconds: None,
+        };
+        let ordering = |transfer_keys: &[&str]| {
+            let processor = EvmEventsProcessor::new(EvmEventsConfig {
+                start_block: BlockNumber(1),
+                addresses: Vec::new(),
+                events: vec![
+                    EventDefinition {
+                        abi: "event Transfer(address indexed from, address indexed to, uint256 value)"
+                            .to_owned(),
+                        output: output("events.transfers", transfer_keys),
+                    },
+                    EventDefinition {
+                        abi: "event Approval(address indexed owner, address indexed spender, uint256 value)"
+                            .to_owned(),
+                        output: output("events.approvals", &[]),
+                    },
+                ],
+            })
+            .expect("processor");
+            (
+                processor.descriptor.mode,
+                processor.descriptor.delivery_ordering,
+            )
+        };
+        // One keyed output orders the whole processor.
+        assert_eq!(
+            ordering(&["to"]),
+            (ReductionMode::OrderedState, DeliveryOrdering::Canonical)
+        );
+        assert_eq!(
+            ordering(&[]),
+            (
+                ReductionMode::BlockLocal,
+                DeliveryOrdering::BlockVersionedIdempotent
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn a_keyed_instance_stored_as_block_local_is_refused() {
+        // The ordering is part of the stored descriptor, though not of the
+        // instance ID or its hashes: a keyed instance that an earlier build
+        // registered block-local no longer matches its descriptor.
+        let processor = processor();
+        let mut block_local = processor.descriptor().clone();
+        block_local.mode = ReductionMode::BlockLocal;
+        block_local.delivery_ordering = DeliveryOrdering::BlockVersionedIdempotent;
+        let directory = tempfile::tempdir().expect("directory");
+        let store = open_store(&directory).await;
+        store
+            .register_processor(&block_local)
+            .await
+            .expect("register the block-local descriptor");
+        let error = store
+            .register_processor(processor.descriptor())
+            .await
+            .expect_err("another ordering conflicts with the stored descriptor");
+        assert!(matches!(error, StoreError::ProcessorIdentity(_)), "{error}");
+    }
+
+    #[tokio::test]
+    async fn included_and_finalized_deltas_of_one_block_are_equivalent() {
+        // Audit probe (M-P3): the mapped payload embeds finality, but only the
+        // exact checksum counted as equivalent on replay.
+        let processor = processor();
+        let mut value = vec![0_u8; 32];
+        value[31] = 9;
+        let included = frame(value);
+        let mut finalized = included.clone();
+        finalized.finality = Finality::Finalized;
+        let included_delta = processor.map(&included).await.expect("included");
+        let finalized_delta = processor.map(&finalized).await.expect("finalized");
+        assert_ne!(included_delta.checksum, finalized_delta.checksum);
+        let mut other_value = vec![0_u8; 32];
+        other_value[31] = 8;
+        let other = processor.map(&frame(other_value)).await.expect("other");
+        for delta in [&included_delta, &finalized_delta] {
+            let variants = processor
+                .finality_variant_checksums(delta)
+                .expect("finality variants");
+            assert_eq!(variants.len(), 2);
+            assert!(variants.contains(&included_delta.checksum));
+            assert!(variants.contains(&finalized_delta.checksum));
+            assert!(!variants.contains(&other.checksum));
+        }
+    }
+
+    #[test]
+    fn abi_parameters_need_names_and_names_may_contain_keywords() {
+        let parse = |abi: &str| {
+            EvmEventsProcessor::new(EvmEventsConfig {
+                start_block: BlockNumber(1),
+                addresses: Vec::new(),
+                events: vec![EventDefinition {
+                    abi: abi.to_owned(),
+                    output: EventOutput {
+                        collection: "events.votes".to_owned(),
+                        kind: "events.vote".to_owned(),
+                        key_fields: Vec::new(),
+                        bucket_seconds: None,
+                    },
+                }],
+            })
+        };
+        // Audit probe: an unnamed indexed parameter parsed as a data field
+        // named `indexed`.
+        let error = parse("event Deposit(address indexed, uint256 amount)")
+            .expect_err("an unnamed parameter is rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("must be `type name` or `type indexed name`")
+        );
+        // Audit probe: a parameter name containing `anonymous` was rejected.
+        let processor = parse("event Vote(address indexed anonymousVoter, uint256 weight)")
+            .expect("a parameter may be named anonymousVoter");
+        let event = processor.events.values().next().expect("event");
+        assert_eq!(event.signature, "Vote(address,uint256)");
+        assert_eq!(event.fields[0].name, "anonymousVoter");
+        assert!(event.fields[0].indexed);
+        let error = parse("event Ping(uint256 value) anonymous")
+            .expect_err("anonymous events are rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("anonymous events are not supported")
+        );
     }
 
     #[test]

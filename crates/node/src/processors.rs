@@ -440,7 +440,7 @@ impl ProcessorFactory for BlockSummaryProcessorFactory {
     }
 
     fn description(&self) -> &str {
-        "Verified Ethereum block summaries with transaction counts"
+        "Ethereum block summaries with transaction counts, from verified or dataset-declared blocks"
     }
 
     fn create(
@@ -657,7 +657,7 @@ impl ProcessorFactory for TransactionStatsProcessorFactory {
     }
 
     fn description(&self) -> &str {
-        "Directional transaction counts and value totals for one address pair"
+        "Directional transaction counts and submitted value totals for one address pair"
     }
 
     fn create(

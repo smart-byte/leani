@@ -26,5 +26,8 @@ tokio.workspace = true
 tokio-util.workspace = true
 url.workspace = true
 
+[dev-dependencies]
+leani-processor-api = { path = "../processor-api" }
+
 [lints]
 workspace = true

@@ -27,11 +27,18 @@ pub struct TransactionStatsConfig {
     pub complete_from_start: bool,
 }
 
+/// Aggregate of the transactions sent from `from` to `to`.
+///
+/// The processor requests no receipts, so both totals cover every submitted
+/// transaction, including reverted ones.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct TransactionStatsEntity {
     pub from: Address,
     pub to: Address,
+    /// Submitted transactions, reverted ones included.
     pub count: u64,
+    /// Submitted value in wei: the sum of the transactions' `value` fields,
+    /// including reverted transactions that transferred nothing.
     pub total_value: Quantity,
     pub as_of_block: BlockNumber,
     pub block_hash: BlockHash,
@@ -72,7 +79,8 @@ impl TransactionStatsProcessor {
         let version = Version::new(1, 0, 0);
         let config_hash = BlockHash::new(*blake3::hash(&encoded).as_bytes());
         let descriptor = ProcessorDescriptor {
-            instance: ProcessorInstanceId::legacy(&id, &version, config_hash),
+            instance: ProcessorInstanceId::legacy(&id, &version, config_hash)
+                .map_err(|error| ProcessorError::Input(error.to_string()))?,
             id,
             version,
             code_hash: BlockHash::new(*blake3::hash(b"leani/transaction-stats/1.0.0").as_bytes()),

@@ -5,8 +5,9 @@ use std::{pin::Pin, time::Duration};
 use async_trait::async_trait;
 use futures::Stream;
 use leani_primitives::{
-    Address, BlockFrame, BlockHash, BlockRange, BlockRef, CapabilitySet, ChainId, FilterScope,
-    Finality, LogFieldSet, SourceCursor, SourceId, SourceKind, TransactionHash, TrustModel,
+    Address, BlockFrame, BlockHash, BlockNumber, BlockRange, BlockRef, CapabilitySet, ChainId,
+    FilterScope, Finality, LogFieldSet, SourceCursor, SourceId, SourceKind, TransactionHash,
+    TrustModel,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -234,12 +235,32 @@ impl SourcePlan {
 /// Hard per-open resource limits enforced by source adapters.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct SourceBudget {
+    /// Bytes one open may acquire over its life: object and byte-range reads,
+    /// downloaded responses, decoded records, and the normalized frames it
+    /// builds.
     pub max_input_bytes: u64,
     pub max_frame_bytes: u64,
     pub max_frames: u64,
     pub max_buffered_frames: usize,
     pub max_in_flight_requests: usize,
     pub temporary_disk_bytes: u64,
+    /// Bytes of raw input one open may hold in memory at once before it
+    /// decodes them: the selected columns of a Parquet row group, a batch of
+    /// byte ranges fetched from an era file, one line of a JSON-lines object,
+    /// one stored record, or one window of peer responses.
+    pub max_resident_bytes: u64,
+}
+
+/// Where a Leani node, or its source probes, raise the limit a budget error
+/// names.
+fn budget_hint(resource: &str) -> &'static str {
+    match resource {
+        "resident_bytes" => {
+            "; raise the resident budget: a Leani node sets it from budgets.memory_bytes, \
+             and leani source probe from --max-input-bytes"
+        }
+        _ => "",
+    }
 }
 
 impl SourceBudget {
@@ -254,6 +275,7 @@ impl SourceBudget {
             || self.max_frames == 0
             || self.max_buffered_frames == 0
             || self.max_in_flight_requests == 0
+            || self.max_resident_bytes == 0
         {
             Err(SourceError::InvalidBudget)
         } else {
@@ -321,7 +343,10 @@ pub enum FinalityEvent {
         block_hash: BlockHash,
         beacon_slot: u64,
     },
+    /// A verified finalized execution block. Its number and hash come from
+    /// the execution payload proof of the finalized beacon header.
     Finalized {
+        block_number: BlockNumber,
         block_hash: BlockHash,
         beacon_slot: u64,
         beacon_block_root: [u8; 32],
@@ -332,6 +357,91 @@ pub enum FinalityEvent {
         second: BlockHash,
         beacon_slot: u64,
     },
+}
+
+/// An execution block the Ethereum sync committee attested: the execution
+/// payload of a beacon header that at least two thirds of the committee signed
+/// in a light-client optimistic update, proven by the header's execution
+/// branch.
+///
+/// It is not final. A later attested head may be on another branch.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct AttestedHead {
+    pub beacon_slot: u64,
+    pub beacon_block_root: [u8; 32],
+    pub block_number: BlockNumber,
+    pub block_hash: BlockHash,
+}
+
+/// Publishes the newest verified [`AttestedHead`] to the execution live lane,
+/// which includes no block above it.
+///
+/// Hand it only to a finality source that verifies optimistic updates against
+/// the sync committee; give the live lane an [`AttestedHeadReceiver`], which
+/// cannot publish. The head moves forward by beacon slot only, and the
+/// channel keeps just the newest one, so a slow reader never sees a backlog.
+#[derive(Clone, Debug)]
+pub struct AttestedHeadPublisher(tokio::sync::watch::Sender<Option<AttestedHead>>);
+
+impl Default for AttestedHeadPublisher {
+    fn default() -> Self {
+        Self(tokio::sync::watch::Sender::new(None))
+    }
+}
+
+impl AttestedHeadPublisher {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Publish a verified head if its beacon slot is newer than the latest.
+    /// Returns whether it was published.
+    pub fn publish(&self, head: AttestedHead) -> bool {
+        self.0.send_if_modified(|latest| {
+            if latest.is_some_and(|latest| latest.beacon_slot >= head.beacon_slot) {
+                return false;
+            }
+            *latest = Some(head);
+            true
+        })
+    }
+
+    /// The newest published head, if any.
+    #[must_use]
+    pub fn latest(&self) -> Option<AttestedHead> {
+        *self.0.borrow()
+    }
+
+    /// A receiver that follows the newest published head.
+    #[must_use]
+    pub fn subscribe(&self) -> AttestedHeadReceiver {
+        AttestedHeadReceiver(self.0.subscribe())
+    }
+}
+
+/// Follows the newest verified [`AttestedHead`] an
+/// [`AttestedHeadPublisher`] publishes. It cannot publish one.
+#[derive(Clone, Debug)]
+pub struct AttestedHeadReceiver(tokio::sync::watch::Receiver<Option<AttestedHead>>);
+
+impl AttestedHeadReceiver {
+    /// The newest published head, marked as seen.
+    pub fn latest(&mut self) -> Option<AttestedHead> {
+        *self.0.borrow_and_update()
+    }
+
+    /// The newest published head, without marking it as seen.
+    #[must_use]
+    pub fn peek(&self) -> Option<AttestedHead> {
+        *self.0.borrow()
+    }
+
+    /// Wait until a head newer than the one last seen is published. Returns
+    /// `false` once no publisher is left.
+    pub async fn changed(&mut self) -> bool {
+        self.0.changed().await.is_ok()
+    }
 }
 
 /// Optional non-range lookup families implemented by a historical source.
@@ -501,7 +611,10 @@ pub enum SourceError {
     SchemaDrift { expected: String, actual: String },
     #[error("source frame is corrupt: {0}")]
     CorruptFrame(String),
-    #[error("source resource budget exceeded: {resource}, limit {limit}, observed {observed}")]
+    #[error(
+        "source resource budget exceeded: {resource}, limit {limit}, observed {observed}{}",
+        budget_hint(resource)
+    )]
     BudgetExceeded {
         resource: &'static str,
         limit: u64,
@@ -517,4 +630,56 @@ pub enum SourceError {
     Unavailable(String),
     #[error("source protocol error: {0}")]
     Protocol(String),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resident_budget_errors_say_where_to_raise_the_budget() {
+        let error = SourceError::BudgetExceeded {
+            resource: "resident_bytes",
+            limit: 1,
+            observed: 2,
+        }
+        .to_string();
+        // Review 3 (5): the hint named only the node's setting, which the
+        // source probes do not use.
+        for knob in ["budgets.memory_bytes", "--max-input-bytes"] {
+            assert!(error.contains(knob), "{error}");
+        }
+    }
+
+    fn head(beacon_slot: u64, block: u64, marker: u8) -> AttestedHead {
+        AttestedHead {
+            beacon_slot,
+            beacon_block_root: [marker; 32],
+            block_number: BlockNumber(block),
+            block_hash: BlockHash::new([marker; 32]),
+        }
+    }
+
+    #[tokio::test]
+    async fn attested_heads_only_move_forward_by_beacon_slot() {
+        let heads = AttestedHeadPublisher::new();
+        let mut follower = heads.subscribe();
+        assert_eq!(heads.latest(), None);
+        assert!(heads.publish(head(100, 1_000, 1)));
+        assert!(follower.changed().await);
+        assert_eq!(follower.latest(), Some(head(100, 1_000, 1)));
+        // An older or equal slot, such as a lagging endpoint's, never replaces
+        // the newest head, and wakes no reader.
+        assert!(!heads.publish(head(99, 999, 2)));
+        assert!(!heads.publish(head(100, 1_000, 3)));
+        assert_eq!(heads.latest(), Some(head(100, 1_000, 1)));
+        // A newer slot on another branch, even at a lower block, replaces it.
+        assert!(heads.publish(head(101, 999, 4)));
+        assert_eq!(follower.peek(), Some(head(101, 999, 4)));
+        assert!(follower.changed().await, "the newer head woke no reader");
+        assert_eq!(follower.latest(), Some(head(101, 999, 4)));
+        // A receiver outlives no publisher: the live lane then waits for none.
+        drop(heads);
+        assert!(!follower.changed().await);
+    }
 }

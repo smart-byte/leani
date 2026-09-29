@@ -7,7 +7,14 @@ use crate::BLOB_GAS_PER_BLOB;
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct BlobFork {
     pub name: String,
+    /// First block the schedule attributes to this fork, for block coverage
+    /// and block-number lookups only. For the first fork it is the
+    /// processor's default and earliest start: mainnet Dencun's 19,426,589
+    /// is the first block the processor covers, two slots after the fork
+    /// activated.
     pub activation_block: u64,
+    /// Fork activation time. The fork's parameters apply to every block whose
+    /// header timestamp is at or after it.
     pub activation_timestamp: u64,
     /// Four-byte EIP-2124/EIP-6122 fork hash, encoded as eight lower-case hex digits.
     pub fork_id: String,
@@ -135,19 +142,25 @@ impl BlobSchedule {
         self.forks.first().map_or(0, |fork| fork.activation_block)
     }
 
+    /// Parameters of the fork active at a block's header `timestamp`.
+    /// Post-merge forks activate by timestamp, not block number.
     #[must_use]
-    pub fn parameters(&self, block_number: u64) -> Option<BlobParameters> {
-        self.fork_at_block(block_number).map(|fork| BlobParameters {
-            target_blobs_per_block: fork.target_blobs_per_block,
-            max_blobs_per_block: fork.max_blobs_per_block,
-            target_blob_gas: u64::from(fork.target_blobs_per_block)
-                .saturating_mul(BLOB_GAS_PER_BLOB),
-            max_blob_gas: u64::from(fork.max_blobs_per_block).saturating_mul(BLOB_GAS_PER_BLOB),
-            base_fee_update_fraction: fork.base_fee_update_fraction,
-            eip7918: fork.eip7918,
-        })
+    pub fn parameters_at_timestamp(&self, timestamp: u64) -> Option<BlobParameters> {
+        self.fork_at_timestamp(timestamp)
+            .map(|fork| BlobParameters {
+                target_blobs_per_block: fork.target_blobs_per_block,
+                max_blobs_per_block: fork.max_blobs_per_block,
+                target_blob_gas: u64::from(fork.target_blobs_per_block)
+                    .saturating_mul(BLOB_GAS_PER_BLOB),
+                max_blob_gas: u64::from(fork.max_blobs_per_block).saturating_mul(BLOB_GAS_PER_BLOB),
+                base_fee_update_fraction: fork.base_fee_update_fraction,
+                eip7918: fork.eip7918,
+            })
     }
 
+    /// Fork whose [`BlobFork::activation_block`] is at or before
+    /// `block_number`, for block-number lookups. Block parameters follow
+    /// [`Self::parameters_at_timestamp`].
     #[must_use]
     pub fn fork_at_block(&self, block_number: u64) -> Option<&BlobFork> {
         self.forks
@@ -173,33 +186,37 @@ mod tests {
     fn mainnet_schedule_selects_historical_parameters() {
         let schedule = BlobSchedule::mainnet();
         schedule.validate().expect("valid");
-        assert!(schedule.parameters(schedule.first_block() - 1).is_none());
-        let dencun = schedule.parameters(19_426_589).expect("Dencun");
+        assert!(schedule.parameters_at_timestamp(1_710_338_134).is_none());
+        let dencun = schedule
+            .parameters_at_timestamp(1_710_338_135)
+            .expect("Dencun");
         assert_eq!(dencun.target_blobs_per_block, 3);
         assert_eq!(dencun.max_blobs_per_block, 6);
         assert!(!dencun.eip7918);
         assert_eq!(
             schedule
-                .parameters(23_975_777)
+                .parameters_at_timestamp(1_765_290_070)
                 .expect("pre-BPO1")
                 .target_blobs_per_block,
             6
         );
         assert_eq!(
             schedule
-                .parameters(23_975_778)
+                .parameters_at_timestamp(1_765_290_071)
                 .expect("BPO1")
                 .target_blobs_per_block,
             10
         );
         assert_eq!(
             schedule
-                .parameters(24_179_382)
+                .parameters_at_timestamp(1_767_747_670)
                 .expect("pre-BPO2")
                 .target_blobs_per_block,
             10
         );
-        let bpo2 = schedule.parameters(24_179_383).expect("BPO2");
+        let bpo2 = schedule
+            .parameters_at_timestamp(1_767_747_671)
+            .expect("BPO2");
         assert_eq!(bpo2.target_blobs_per_block, 14);
         assert!(bpo2.eip7918);
         assert_eq!(

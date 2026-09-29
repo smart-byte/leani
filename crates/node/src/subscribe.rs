@@ -3,8 +3,9 @@
 mod sse;
 
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     fs,
+    hash::Hash,
     io::{self, IsTerminal, Write},
     net::{Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
@@ -18,6 +19,7 @@ use futures::{StreamExt as _, future::join_all};
 use leani_primitives::{
     Address, BlockFrame, BlockHash, BlockNumber, BlockRange, BlockRef, ChainId, Finality,
 };
+use leani_processor_api::ChangeOperation;
 use leani_processor_block_summary::{
     BLOCK_SUMMARY_KIND, BLOCK_SUMMARY_VERSION, BlockSummaryEntity,
 };
@@ -26,7 +28,7 @@ use leani_source_api::{
     ChainEvent, ChainEventStream, DataRequest, FieldProjection, FilterSet, LiveSource as _,
     LiveStart, NetworkTelemetrySnapshot, SourceBudget, SourceError, VerificationPolicy,
 };
-use leani_store_sqlite::{ChangeDirection, ChangeRecord, SqliteStore};
+use leani_store_sqlite::{ChangeDirection, ChangeRecord, SqliteStore, StoreError};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use url::Url;
@@ -40,20 +42,29 @@ use crate::{
     },
     config::{Config, FinalitySourceKind},
     local_state,
-    process::{Exit, configured_store_config, spawn_embedded_network_runtime},
+    process::{
+        Exit, configured_store_config, processor_descriptors, spawn_embedded_network_runtime,
+    },
     processors::ProcessorRegistry,
-    uniswap_markets::{MARKET_CATALOG, Market, Token, processor_config, resolve_markets},
+    uniswap_markets::{
+        MARKET_CATALOG, Market, Token, UNISWAP_V3_FACTORY_BLOCK, processor_config, resolve_markets,
+    },
 };
 
 const BLOCK_PROCESSOR_INSTANCE: &str = "cli-ethereum-blocks";
 const UNISWAP_PROCESSOR_INSTANCE: &str = "cli-uniswap-v3-prices";
 const CHECKPOINT_CACHE_MAX_AGE: Duration = Duration::from_hours(12);
+/// Largest checkpoint provider response body read.
+const MAX_CHECKPOINT_RESPONSE_BYTES: usize = 1_024 * 1_024;
 const LOCALLY_VERIFIED_CHECKPOINT_MAX_AGE: Duration = Duration::from_hours(13 * 24);
 const MAINNET_SLOT_SECONDS: u64 = 12;
 const INCLUDED_UPDATE_MAX_AGE: Duration = Duration::from_secs(90);
 const FINALIZED_UPDATE_MAX_AGE: Duration = Duration::from_mins(30);
 const PRICE_PRECISION: usize = 8;
 const STARTUP_UPDATE_SCAN_LIMIT: usize = 10_000;
+/// The only chain built-in subscriptions follow.
+const MAINNET_CHAIN_ID: u64 = 1;
+const UNISWAP_OBSERVATION_KIND: &str = "uniswap.price.observation";
 const ATTACHED_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const ATTACHED_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const ATTACHED_STREAM_STALL_TIMEOUT: Duration = Duration::from_secs(90);
@@ -171,6 +182,8 @@ pub(crate) struct InitializedCheckpoint {
 #[derive(Clone, Debug)]
 struct ProviderCheckpoint {
     provider: Url,
+    /// The provider as the prompt and errors show it, without secrets.
+    label: String,
     root: String,
     slot: u64,
     beacon_api: bool,
@@ -183,6 +196,8 @@ struct CheckpointQuorum {
     agreeing_providers: Vec<Url>,
     beacon_api_endpoints: Vec<Url>,
     attempted: usize,
+    /// Every provider's answer or failure, without URL secrets.
+    observations: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -313,6 +328,8 @@ struct AttachedEnvelope {
     block: Value,
     finality: String,
     kind: String,
+    #[serde(default)]
+    key: Option<String>,
     data: Option<Value>,
     #[serde(flatten)]
     extra: BTreeMap<String, Value>,
@@ -323,11 +340,40 @@ struct AttachedEnvelope {
 #[derive(Debug, Default)]
 struct FinalizedGate {
     pending: BTreeMap<u64, Vec<(AttachedEnvelope, Value)>>,
+    /// The node's finalized block when the subscription first connected.
+    /// The stream replays the retained log, and blocks up to this one were
+    /// already final then, so they are not printed.
+    floor: Option<u64>,
+    /// The block a block summary replay must hold first, the one above the
+    /// floor: every block has a summary, so a later one means the node
+    /// pruned those between before the subscription connected.
+    next_summary: Option<u64>,
+    /// Blocks dropped since the last report. Finalized output has a hole
+    /// there, reported right before the next finalized row.
+    dropped: Option<FinalityGap>,
 }
 
 /// Blocks retained while waiting for finality. Two epochs is roughly 64
 /// blocks; this bound only matters if a node stops emitting markers.
 const FINALIZED_GATE_MAX_BLOCKS: usize = 1_024;
+
+/// Blocks that finalized output never shows.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FinalityGap {
+    from: u64,
+    to: u64,
+    /// The first missing block's timestamp, when known.
+    timestamp: Option<u64>,
+    reason: FinalityGapReason,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FinalityGapReason {
+    /// The gate reached its bound without a finality marker.
+    GateFull,
+    /// The node pruned the blocks' changes before the subscription connected.
+    ChangeLogPruned,
+}
 
 impl FinalizedGate {
     #[cfg(test)]
@@ -335,16 +381,69 @@ impl FinalizedGate {
         self.pending.len()
     }
 
-    fn hold(&mut self, block: u64, envelope: AttachedEnvelope, raw: Value) {
-        self.pending.entry(block).or_default().push((envelope, raw));
-        while self.pending.len() > FINALIZED_GATE_MAX_BLOCKS {
-            let Some((dropped, _)) = self.pending.pop_first() else {
-                break;
-            };
-            eprintln!(
-                "leani: dropping unfinalized block {dropped} from the finality gate; the node stopped reporting finality markers"
-            );
+    /// Start at the node's finalized block when the subscription first
+    /// connects; `summaries` when every block has a change.
+    fn seed(&mut self, floor: Option<u64>, summaries: bool) {
+        self.floor = floor;
+        self.next_summary = floor
+            .filter(|_| summaries)
+            .map(|floor| floor.saturating_add(1));
+    }
+
+    /// Whether `block` was already final when the subscription connected.
+    fn final_at_connect(&self, block: u64) -> bool {
+        self.floor.is_some_and(|floor| block <= floor)
+    }
+
+    /// Check the replay's first applied block above the floor, whatever its
+    /// finality. Returns the blocks the node pruned before it, if any.
+    fn pruned_below(&mut self, block: u64) -> Option<FinalityGap> {
+        if self.final_at_connect(block) {
+            return None;
         }
+        self.next_summary
+            .take()
+            .filter(|&next| block > next)
+            .map(|next| FinalityGap {
+                from: next,
+                to: block.saturating_sub(1),
+                timestamp: None,
+                reason: FinalityGapReason::ChangeLogPruned,
+            })
+    }
+
+    /// Hold an included envelope. Past the bound, the oldest held block is
+    /// dropped into the unreported gap.
+    fn hold(&mut self, block: u64, envelope: AttachedEnvelope, raw: Value) {
+        if self.final_at_connect(block) {
+            return;
+        }
+        self.pending.entry(block).or_default().push((envelope, raw));
+        if self.pending.len() > FINALIZED_GATE_MAX_BLOCKS
+            && let Some((dropped, envelopes)) = self.pending.pop_first()
+        {
+            if let Some(gap) = &mut self.dropped {
+                gap.to = dropped;
+            } else {
+                eprintln!(
+                    "leani: dropping unfinalized blocks from {dropped} from the finality gate; the node stopped reporting finality markers"
+                );
+                self.dropped = Some(FinalityGap {
+                    from: dropped,
+                    to: dropped,
+                    timestamp: envelopes
+                        .first()
+                        .and_then(|(envelope, _)| envelope.block.get("timestamp"))
+                        .and_then(Value::as_u64),
+                    reason: FinalityGapReason::GateFull,
+                });
+            }
+        }
+    }
+
+    /// The blocks dropped since the last report.
+    const fn take_dropped(&mut self) -> Option<FinalityGap> {
+        self.dropped.take()
     }
 
     fn undo(&mut self, block: u64) {
@@ -360,11 +459,13 @@ impl FinalizedGate {
             .flatten()
             .map(|(mut envelope, mut raw)| {
                 "finalized".clone_into(&mut envelope.finality);
-                raw["finality"] = Value::String("finalized".to_owned());
-                if let Some(data) = raw.get_mut("data").and_then(Value::as_object_mut)
-                    && data.contains_key("finality")
-                {
-                    data.insert("finality".to_owned(), Value::String("finalized".to_owned()));
+                if let Some(raw) = raw.as_object_mut() {
+                    raw.insert("finality".to_owned(), Value::String("finalized".to_owned()));
+                    if let Some(data) = raw.get_mut("data").and_then(Value::as_object_mut)
+                        && data.contains_key("finality")
+                    {
+                        data.insert("finality".to_owned(), Value::String("finalized".to_owned()));
+                    }
                 }
                 (envelope, raw)
             })
@@ -376,10 +477,141 @@ fn envelope_block_number(envelope: &AttachedEnvelope) -> Option<u64> {
     envelope.block.get("number").and_then(Value::as_u64)
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Debug, Default)]
 struct SseRenderOutcome {
     stop: bool,
     observed_change: bool,
+    /// The node reported a retryable error and ended the stream; reconnect.
+    retry: Option<String>,
+}
+
+/// Change keys an undo can still be matched to. A reorg reverts a few
+/// blocks, far fewer changes than this. An undo whose change aged out, or
+/// was applied before this run, is printed from its block and change key.
+const RECENT_CHANGE_KEYS: usize = 4_096;
+
+/// Recent changes by key, each with what this subscription did with it. An
+/// undo stores a delete or the previous value, never the value it reverts,
+/// so it is rendered from here.
+#[derive(Debug)]
+struct RecentChanges<K, V> {
+    /// Each key with the generation it was remembered under.
+    items: HashMap<K, (u64, V)>,
+    /// Keys oldest first. An entry whose key was forgotten, or remembered
+    /// again under a newer generation, evicts nothing.
+    order: VecDeque<(K, u64)>,
+    generation: u64,
+}
+
+impl<K, V> Default for RecentChanges<K, V> {
+    fn default() -> Self {
+        Self {
+            items: HashMap::new(),
+            order: VecDeque::new(),
+            generation: 0,
+        }
+    }
+}
+
+impl<K: Clone + Eq + Hash, V> RecentChanges<K, V> {
+    fn remember(&mut self, key: K, value: V) {
+        if let Some(entry) = self.items.get_mut(&key) {
+            entry.1 = value;
+            return;
+        }
+        self.generation += 1;
+        self.items.insert(key.clone(), (self.generation, value));
+        self.order.push_back((key, self.generation));
+        if self.order.len() > RECENT_CHANGE_KEYS
+            && let Some((oldest, generation)) = self.order.pop_front()
+            && self
+                .items
+                .get(&oldest)
+                .is_some_and(|(current, _)| *current == generation)
+        {
+            self.items.remove(&oldest);
+        }
+    }
+
+    fn forget(&mut self, key: &K) {
+        self.items.remove(key);
+    }
+
+    fn get(&self, key: &K) -> Option<&V> {
+        self.items.get(key).map(|(_, value)| value)
+    }
+}
+
+/// Recent attached changes by key: the item printed for each, and apart
+/// from them the keys of changes filtered out, as another pool's are, so a
+/// busy node's other changes never push printed rows out.
+#[derive(Debug, Default)]
+struct AttachedChanges {
+    printed: RecentChanges<String, AttachedItem>,
+    hidden: RecentChanges<String, ()>,
+}
+
+impl AttachedChanges {
+    fn remember_printed(&mut self, key: String, item: AttachedItem) {
+        self.hidden.forget(&key);
+        self.printed.remember(key, item);
+    }
+
+    fn remember_hidden(&mut self, key: String) {
+        self.printed.forget(&key);
+        self.hidden.remember(key, ());
+    }
+}
+
+/// An item an attached subscription prints: a latest row at startup, or a
+/// change, kept to render its undo.
+#[derive(Clone, Debug)]
+enum AttachedItem {
+    Block(AttachedBlockSummary),
+    Price {
+        market: Market,
+        entity: AttachedPoolPrice,
+        timestamp: u64,
+    },
+}
+
+/// Stream position and output of an attached subscription, across
+/// reconnects.
+#[derive(Debug, Default)]
+struct AttachedState {
+    cursor: Option<String>,
+    last_sequence: Option<u64>,
+    gate: FinalizedGate,
+    changes: AttachedChanges,
+    /// Still-fresh latest rows read at startup, printed once the first hello
+    /// shows the node serves this feed.
+    snapshot: Vec<AttachedItem>,
+    /// Whether the current connection sent a valid hello.
+    greeted: bool,
+    /// Whether any connection did. The first hello seeds the finality gate.
+    identified: bool,
+}
+
+/// The connection handshake an attached subscription requires first.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AttachedHello {
+    chain_id: u64,
+    processor: AttachedHelloProcessor,
+    #[serde(default)]
+    coverage: Option<AttachedHelloCoverage>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AttachedHelloProcessor {
+    id: String,
+    instance: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AttachedHelloCoverage {
+    finalized_through: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -407,32 +639,28 @@ pub(crate) async fn subscribe(
         options.requested_config.as_deref(),
         &options.working_directory,
     );
-    let inferred_endpoint = infer_endpoint(configured_path.as_deref())?;
-    let endpoint = options.endpoint.clone().or(inferred_endpoint);
+    // An explicit endpoint needs no local configuration; only a missing one
+    // is inferred from `api.bind`.
+    let endpoint = match (&options.endpoint, options.mode) {
+        (Some(endpoint), _) => Some(endpoint.clone()),
+        (None, SubscribeMode::Embedded) => None,
+        (None, SubscribeMode::Client | SubscribeMode::Auto) => {
+            infer_endpoint(configured_path.as_deref())?
+        }
+    };
 
-    match options.mode {
-        SubscribeMode::Client => {
+    let outcome = match (options.mode, endpoint) {
+        (SubscribeMode::Client, endpoint) => {
             let endpoint = endpoint
                 .context("client mode needs --endpoint or a local leani.toml with api.bind")?;
             subscribe_attached(&options, &markets, endpoint).await
         }
-        SubscribeMode::Auto if options.endpoint.is_some() => {
-            subscribe_attached(
-                &options,
-                &markets,
-                endpoint.expect("explicit endpoint is present"),
-            )
-            .await
+        (SubscribeMode::Auto, Some(endpoint))
+            if options.endpoint.is_some() || endpoint_is_reachable(&options, &endpoint).await =>
+        {
+            subscribe_attached(&options, &markets, endpoint).await
         }
-        SubscribeMode::Auto if endpoint_is_reachable(&options, endpoint.as_ref()).await => {
-            subscribe_attached(
-                &options,
-                &markets,
-                endpoint.expect("reachable endpoint is present"),
-            )
-            .await
-        }
-        SubscribeMode::Auto | SubscribeMode::Embedded => {
+        (SubscribeMode::Auto | SubscribeMode::Embedded, _) => {
             Box::pin(subscribe_embedded(
                 &options,
                 &markets,
@@ -441,7 +669,48 @@ pub(crate) async fn subscribe(
             ))
             .await
         }
+    };
+    finish_subscription(outcome)
+}
+
+/// A reader that closed stdout, as `| head -1` does, ends the subscription
+/// successfully. Embedded mode has already persisted its verified anchor by
+/// then: it does so on every exit from its loop.
+fn finish_subscription(outcome: Result<Exit>) -> Result<Exit> {
+    match outcome {
+        Err(error) if error.downcast_ref::<StdoutClosed>().is_some() => Ok(Exit::Success),
+        outcome => outcome,
     }
+}
+
+/// Stdout was closed by its reader.
+#[derive(Debug, thiserror::Error)]
+#[error("stdout was closed by its reader")]
+struct StdoutClosed;
+
+/// Print one stdout row. `println!` panics once the reader has gone; this
+/// reports [`StdoutClosed`] instead.
+#[cfg(not(test))]
+fn print_row(row: &str) -> Result<()> {
+    write_row(&mut io::stdout().lock(), row)
+}
+
+#[cfg(test)]
+fn print_row(row: &str) -> Result<()> {
+    tests::capture_row(row).unwrap_or_else(|| write_row(&mut io::stdout().lock(), row))
+}
+
+/// Write and flush one whole row to the locked stdout handle.
+fn write_row(output: &mut impl Write, row: &str) -> Result<()> {
+    writeln!(output, "{row}")
+        .and_then(|()| output.flush())
+        .map_err(|error| {
+            if error.kind() == io::ErrorKind::BrokenPipe {
+                anyhow::Error::new(StdoutClosed)
+            } else {
+                anyhow::Error::new(error).context("write subscription output")
+            }
+        })
 }
 
 pub(crate) fn reset_subscription(options: &ResetSubscriptionOptions) -> Result<Exit> {
@@ -545,10 +814,7 @@ fn infer_endpoint(path: Option<&Path>) -> Result<Option<Url>> {
         .context("construct local API endpoint")
 }
 
-async fn endpoint_is_reachable(options: &SubscribeOptions, endpoint: Option<&Url>) -> bool {
-    let Some(endpoint) = endpoint else {
-        return false;
-    };
+async fn endpoint_is_reachable(options: &SubscribeOptions, endpoint: &Url) -> bool {
     let Ok(url) = endpoint.join("health/live") else {
         return false;
     };
@@ -564,6 +830,88 @@ async fn endpoint_is_reachable(options: &SubscribeOptions, endpoint: Option<&Url
         .is_ok_and(|response| response.status().is_success())
 }
 
+/// Name the reset that rebuilds a Uniswap subscription whose stored
+/// processor the store refuses: its identity includes its start block, as
+/// when ETH/USDT or WBTC/ETH moved to the factory block, and its markets, as
+/// when a `--data-dir` is reused for another market set. Other protocols and
+/// errors pass through.
+fn explain_subscription_refusal(
+    error: StoreError,
+    options: &SubscribeOptions,
+    markets: &[Market],
+) -> anyhow::Error {
+    if options.protocol != SubscribeProtocol::UniswapV3
+        || !matches!(error, StoreError::ProcessorIdentity(_))
+    {
+        return error.into();
+    }
+    let cause = format!(
+        "this subscription's state was created with another start block or market set \
+         (ETH/USDT and WBTC/ETH now start at the Uniswap V3 factory block \
+         {UNISWAP_V3_FACTORY_BLOCK})"
+    );
+    // A --data-dir from an earlier release carries no subscription marker,
+    // and `leani reset subscription` refuses it.
+    if let Some(data_dir) = &options.data_dir
+        && !local_state::is_subscription_directory(&options.working_directory.join(data_dir))
+    {
+        let directory = data_dir.to_str().map_or_else(
+            || "--data-dir".to_owned(),
+            |path| format!("--data-dir {path}"),
+        );
+        return anyhow::Error::new(error).context(format!(
+            "{cause}; `leani reset subscription` refuses its {directory}, which carries no \
+             subscription marker: once it holds only this subscription's state, delete it \
+             yourself"
+        ));
+    }
+    let mut command = vec!["leani reset subscription uniswap-v3".to_owned()];
+    command.extend(markets.iter().map(|market| market.symbol.to_owned()));
+    if options.finality == SubscribeFinality::Finalized {
+        command.push("--finality finalized".to_owned());
+    }
+    let paths = [
+        ("--data-dir", options.data_dir.as_deref()),
+        ("--config", options.requested_config.as_deref()),
+    ];
+    for (flag, path) in paths {
+        let Some(path) = path else {
+            continue;
+        };
+        let Some(word) = shell_word(path) else {
+            return anyhow::Error::new(error).context(format!(
+                "{cause}; rebuild it with `leani reset subscription uniswap-v3` for the same \
+                 markets, --finality, --data-dir, and --config (its {flag} path is not valid \
+                 UTF-8, so no exact command is shown)"
+            ));
+        };
+        command.push(format!("{flag} {word}"));
+    }
+    command.push("--yes".to_owned());
+    anyhow::Error::new(error).context(format!("{cause}; rebuild it with `{}`", command.join(" ")))
+}
+
+/// `path` as one POSIX shell word that `leani` reads as that path: prefixed
+/// with `./` when it starts with a dash, which would read as an option, and
+/// single-quoted unless every character is in `[A-Za-z0-9_./-]`. `None` for
+/// a path that is not UTF-8, which no printed command names exactly.
+fn shell_word(path: &Path) -> Option<String> {
+    let path = path.to_str()?;
+    let path = if path.starts_with('-') {
+        format!("./{path}")
+    } else {
+        path.to_owned()
+    };
+    if !path.is_empty()
+        && path
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || "_./-".contains(character))
+    {
+        return Some(path);
+    }
+    Some(format!("'{}'", path.replace('\'', r"'\''")))
+}
+
 #[allow(clippy::too_many_lines)]
 async fn subscribe_embedded(
     options: &SubscribeOptions,
@@ -574,8 +922,12 @@ async fn subscribe_embedded(
     let data_dir = subscription_data_dir(options, markets, config_path)?;
     fs::create_dir_all(&data_dir)
         .with_context(|| format!("create subscription data directory {}", data_dir.display()))?;
-    let data_dir_lock = local_state::lock_runtime_directory(&data_dir)?;
-    let config = embedded_config(options, markets, config_path, &data_dir).await?;
+    // Marked before the store opens, so a refused identity can still be
+    // reset.
+    let data_dir_lock =
+        local_state::lock_subscription_directory(&data_dir, options.data_dir.is_none())?;
+    let (config, checkpoint_origin) =
+        embedded_config(options, markets, config_path, &data_dir).await?;
     if let Some(peer_store) = merge_local_execution_peer_stores(
         config_path,
         &data_dir,
@@ -600,18 +952,27 @@ async fn subscribe_embedded(
         .first()
         .cloned()
         .context("subscription processor was not instantiated")?;
-    let store = SqliteStore::open(configured_store_config(
-        &config,
-        data_dir.join("leani.sqlite"),
-    ))
-    .await?;
-    store.register_processor(processor.descriptor()).await?;
+    let store = SqliteStore::open(
+        configured_store_config(&config, data_dir.join("leani.sqlite"))
+            .with_processors(processor_descriptors(&processors)),
+    )
+    .await
+    .map_err(|error| explain_subscription_refusal(error, options, markets))?;
+    store
+        .register_processor(processor.descriptor())
+        .await
+        .map_err(|error| explain_subscription_refusal(error, options, markets))?;
     let mut after = store
         .change_bounds(processor.descriptor())
         .await?
         .map_or(0, |bounds| bounds.latest);
-    let mut runtime =
-        spawn_embedded_network_runtime(config.clone(), store.clone(), processors, data_dir_lock)?;
+    let mut runtime = spawn_embedded_network_runtime(
+        config.clone(),
+        store.clone(),
+        processors,
+        data_dir_lock,
+        checkpoint_origin,
+    )?;
     let preview_requirement = processor
         .descriptor()
         .requirements
@@ -652,8 +1013,7 @@ async fn subscribe_embedded(
     // A peer preview can outrun the durable runtime's anchored overlap.
     // Retain both its identities and ordered block context through readiness so
     // later overlap commits confirm the preview instead of regressing stdout.
-    let mut previewed = HashSet::<ObservationKey>::new();
-    let mut preview_blocks = BTreeMap::<u64, (BlockRef, Vec<SubscriptionItem>)>::new();
+    let mut output = EmbeddedOutput::default();
     let mut preview_stream = None::<ChainEventStream>;
     let outcome = async {
     loop {
@@ -700,12 +1060,32 @@ async fn subscribe_embedded(
                     STARTUP_UPDATE_SCAN_LIMIT,
                 )
                 .await?;
+            // Startup changes are seen but, except the newest, not printed:
+            // their undos stay hidden like them, unless a preview showed them.
+            let now = unix_seconds();
+            for record in &startup_records {
+                if !update_is_fresh(options.finality, record.block.timestamp, now)
+                    || (options.finality == SubscribeFinality::Finalized
+                        && record.finality != Finality::Finalized)
+                {
+                    continue;
+                }
+                if let Some(item) = local_item(options.protocol, markets, record)? {
+                    output.seen.remember(
+                        record.change.key.clone(),
+                        SeenItem {
+                            item,
+                            printed: false,
+                        },
+                    );
+                }
+            }
             let startup_items = latest_fresh_items(
                 options.protocol,
                 markets,
                 startup_records,
                 options.finality,
-                unix_seconds(),
+                now,
             )?;
             // Readiness means the anchored lane is operational, not that it
             // has already committed a displayable update. Keep racing the
@@ -725,25 +1105,15 @@ async fn subscribe_embedded(
                     eprintln!("leani: live execution and verified finality are ready");
                 }
                 for (item, record) in startup_items {
-                    match reconcile_preview_handoff(
-                        &mut preview_blocks,
-                        &mut previewed,
-                        &item,
-                        record.direction,
-                    ) {
-                        PreviewHandoffAction::Suppress => continue,
-                        PreviewHandoffAction::Render { reverted } => {
-                            render_preview_reverts(options.format, &reverted)?;
-                        }
-                    }
-                    render_local_item(
+                    if render_durable_item(
                         options.format,
-                        &item,
+                        item,
                         &record,
                         processor.as_ref(),
                         store.epoch(),
-                    )?;
-                    if options.once {
+                        &mut output,
+                    )? && options.once
+                    {
                         return Ok(Exit::Success);
                     }
                 }
@@ -776,10 +1146,10 @@ async fn subscribe_embedded(
                                 frame.block,
                                 "apply",
                             )?;
-                            previewed.extend(rendered.iter().copied());
+                            output.previewed.extend(rendered.iter().copied());
                             retain_preview_block(
-                                &mut preview_blocks,
-                                &mut previewed,
+                                &mut output.preview_blocks,
+                                &mut output.previewed,
                                 frame.block,
                                 items,
                             );
@@ -831,10 +1201,10 @@ async fn subscribe_embedded(
                                 "apply",
                             )?;
                             rendered_any = !rendered.is_empty();
-                            previewed.extend(rendered);
+                            output.previewed.extend(rendered);
                             retain_preview_block(
-                                &mut preview_blocks,
-                                &mut previewed,
+                                &mut output.preview_blocks,
+                                &mut output.previewed,
                                 frame.block,
                                 items,
                             );
@@ -842,8 +1212,8 @@ async fn subscribe_embedded(
                         Ok(ChainEvent::Reorg { reverted, applied }) => {
                             for block in reverted {
                                 if let Some(items) = revert_preview_block(
-                                    &mut preview_blocks,
-                                    &mut previewed,
+                                    &mut output.preview_blocks,
+                                    &mut output.previewed,
                                     block,
                                 ) {
                                     let reverted = render_preview_items(
@@ -854,7 +1224,7 @@ async fn subscribe_embedded(
                                     )?;
                                     debug_assert!(reverted
                                         .iter()
-                                        .all(|key| !previewed.contains(key)));
+                                        .all(|key| !output.previewed.contains(key)));
                                 }
                             }
                             for frame in applied {
@@ -871,10 +1241,10 @@ async fn subscribe_embedded(
                                     "apply",
                                 )?;
                                 rendered_any |= !rendered.is_empty();
-                                previewed.extend(rendered);
+                                output.previewed.extend(rendered);
                                 retain_preview_block(
-                                    &mut preview_blocks,
-                                    &mut previewed,
+                                    &mut output.preview_blocks,
+                                    &mut output.previewed,
                                     frame.block,
                                     items,
                                 );
@@ -917,38 +1287,20 @@ async fn subscribe_embedded(
             )
             .await?;
         let full_batch = records.len() == 256;
+        let now = unix_seconds();
         for record in records {
             after = record.cursor.sequence;
-            if !update_is_fresh(options.finality, record.block.timestamp, unix_seconds()) {
-                continue;
-            }
-            if options.finality == SubscribeFinality::Finalized
-                && record.finality != Finality::Finalized
+            if render_durable_change(
+                options,
+                markets,
+                &record,
+                processor.as_ref(),
+                store.epoch(),
+                &mut output,
+                now,
+            )? && options.once
             {
-                continue;
-            }
-            if let Some(item) = local_item(options.protocol, markets, &record)? {
-                match reconcile_preview_handoff(
-                    &mut preview_blocks,
-                    &mut previewed,
-                    &item,
-                    record.direction,
-                ) {
-                    PreviewHandoffAction::Suppress => continue,
-                    PreviewHandoffAction::Render { reverted } => {
-                        render_preview_reverts(options.format, &reverted)?;
-                    }
-                }
-                render_local_item(
-                    options.format,
-                    &item,
-                    &record,
-                    processor.as_ref(),
-                    store.epoch(),
-                )?;
-                if options.once {
-                    return Ok(Exit::Success);
-                }
+                return Ok(Exit::Success);
             }
         }
         if full_batch {
@@ -1015,7 +1367,8 @@ async fn embedded_config(
     markets: &[Market],
     config_path: Option<&Path>,
     data_dir: &Path,
-) -> Result<Config> {
+) -> Result<(Config, leani_finality_beacon_api::CheckpointOrigin)> {
+    let mut origin = leani_finality_beacon_api::CheckpointOrigin::Operator;
     let mut config = if let Some(path) = config_path {
         Config::load(path)?
     } else {
@@ -1058,13 +1411,20 @@ async fn embedded_config(
             true,
         )
         .await?;
+        // A cached anchor this node verified is replaced by a later persisted
+        // one; an accepted provider quorum is an operator trust root.
+        if checkpoint.trust == CheckpointTrust::LocallyVerified {
+            origin = leani_finality_beacon_api::CheckpointOrigin::LocallyVerified;
+        }
         config.finality.checkpoint = checkpoint.root;
         config.finality.checkpoint_slot = checkpoint.slot;
-        config.finality.endpoints = checkpoint
-            .beacon_api_endpoints
-            .iter()
-            .map(|endpoint| Url::parse(endpoint).context("parse cached Beacon API endpoint"))
-            .collect::<Result<Vec<_>>>()?;
+        config.finality.endpoints = crate::init::starter_finality_endpoints(
+            checkpoint
+                .beacon_api_endpoints
+                .iter()
+                .map(|endpoint| Url::parse(endpoint).context("parse cached Beacon API endpoint"))
+                .collect::<Result<Vec<_>>>()?,
+        )?;
     }
     match finality_kind {
         FinalitySourceKind::BeaconApi => {
@@ -1084,7 +1444,7 @@ async fn embedded_config(
         markets,
         options.finality,
     )?];
-    Ok(config.validate()?.into_inner())
+    Ok((config.validate()?.into_inner(), origin))
 }
 
 fn subscription_processor(
@@ -1180,6 +1540,14 @@ fn reset_subscription_directory(
         "subscription state",
         true,
     )?;
+    // Only a directory `leani subscribe` marked is subscription state; a
+    // node's data_dir carries the same lock file and is never reset here.
+    if !local_state::is_subscription_directory(&data_dir) {
+        bail!(
+            "refusing to reset {}: it carries no embedded subscription marker, so it may hold a node's state. `leani subscribe` marks each directory it creates, and marks a subscription's default directory from an earlier release when it next runs; delete any other directory yourself",
+            data_dir.display()
+        );
+    }
 
     eprintln!("leani: embedded subscription cold-start reset");
     eprintln!("  directory: {}", data_dir.display());
@@ -1202,7 +1570,9 @@ fn reset_subscription_directory(
             bail!("subscription reset was not confirmed");
         }
     }
-    let _lock = local_state::lock_runtime_directory(&data_dir)?;
+    // The lock checks the marker again: a node may have taken the directory
+    // over while the prompt waited.
+    let _lock = local_state::lock_subscription_state(&data_dir)?;
     let unknown = local_state::remove_known_runtime_state(&data_dir)?;
     for path in unknown {
         eprintln!("leani: preserved unknown entry {}", path.display());
@@ -1389,38 +1759,82 @@ async fn fetch_checkpoint_quorum(options: &SubscribeOptions) -> Result<Checkpoin
             options.checkpoint_urls.len()
         );
     }
-    let mut unique = HashSet::new();
-    for provider in &options.checkpoint_urls {
-        if !unique.insert(provider.as_str()) {
-            bail!("checkpoint provider {provider} is configured more than once");
-        }
-    }
+    validate_checkpoint_providers(&options.checkpoint_urls)?;
     let attempted = options.checkpoint_urls.len();
+    let client = checkpoint_client_builder()
+        .build()
+        .context("build the checkpoint provider client")?;
+    let labels =
+        leani_finality_beacon_api::endpoint_labels(&options.checkpoint_urls, "--checkpoint-url");
     let responses = futures::future::join_all(
         options
             .checkpoint_urls
             .iter()
             .cloned()
-            .map(fetch_checkpoint),
+            .zip(labels.iter().cloned())
+            .map(|(provider, label)| fetch_checkpoint(&client, provider, label)),
     )
     .await;
     let mut successful = Vec::new();
     let mut failures = Vec::new();
-    for response in responses {
+    for (label, response) in labels.iter().zip(responses) {
         match response {
             Ok(response) => successful.push(response),
-            Err(error) => failures.push(format!("{error:#}")),
+            Err(error) => failures.push(format!("{label}: {error:#}")),
         }
     }
     select_checkpoint_quorum(&successful, failures, attempted, options.checkpoint_quorum)
 }
 
+/// The HTTP client for untrusted checkpoint providers: a bounded timeout,
+/// and no redirect is ever followed to another origin.
+fn checkpoint_client_builder() -> reqwest::ClientBuilder {
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_secs(15))
+}
+
+/// Reject provider sets that cannot form an independent, authenticated
+/// quorum: plain HTTP outside loopback, or one provider listed twice.
+fn validate_checkpoint_providers(providers: &[Url]) -> Result<()> {
+    let mut unique = HashSet::new();
+    for provider in providers {
+        let loopback = match provider.host() {
+            Some(url::Host::Domain(host)) => host.eq_ignore_ascii_case("localhost"),
+            Some(url::Host::Ipv4(address)) => address.is_loopback(),
+            Some(url::Host::Ipv6(address)) => address.is_loopback(),
+            None => false,
+        };
+        if provider.scheme() != "https" && !(provider.scheme() == "http" && loopback) {
+            bail!(
+                "checkpoint provider {} must use https; plain http is accepted only on loopback",
+                leani_finality_beacon_api::redacted_url(provider)
+            );
+        }
+        // Scheme, host, port, and path identify a provider, as they identify
+        // a Beacon endpoint. A credential, query, or trailing slash does not
+        // make it independent.
+        let identity = crate::config::finality_endpoint_identity(provider);
+        if !unique.insert(identity) {
+            bail!(
+                "checkpoint provider {} is configured more than once",
+                leani_finality_beacon_api::redacted_url(provider)
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Select the checkpoint that a strict majority of the attempted providers
+/// report. Competing quorums, or any provider reporting another root at the
+/// selected slot, fail closed.
 fn select_checkpoint_quorum(
     successful: &[ProviderCheckpoint],
     failures: Vec<String>,
     attempted: usize,
     minimum_agreement: usize,
 ) -> Result<CheckpointQuorum> {
+    let required = minimum_agreement.max(attempted / 2 + 1);
     let beacon_api_endpoints = successful
         .iter()
         .filter(|response| response.beacon_api)
@@ -1433,21 +1847,40 @@ fn select_checkpoint_quorum(
             .or_default()
             .push(response.provider.clone());
     }
-    let selected = grouped
+    let observations = successful
         .iter()
-        .filter(|(_, providers)| providers.len() >= minimum_agreement)
-        .max_by_key(|((slot, _), providers)| (*slot, providers.len()));
-    let Some(((slot, root), providers)) = selected else {
-        let observations = grouped
-            .iter()
-            .map(|((slot, root), providers)| {
-                format!("slot {slot} root {root} from {}", providers.len())
-            })
-            .chain(failures)
-            .collect::<Vec<_>>()
-            .join("; ");
-        bail!("checkpoint quorum {minimum_agreement}/{attempted} was not reached: {observations}");
+        .map(|response| {
+            format!(
+                "{}: slot {} root {}",
+                response.label, response.slot, response.root
+            )
+        })
+        .chain(failures)
+        .collect::<Vec<_>>();
+    let mut reached = grouped
+        .iter()
+        .filter(|(_, providers)| providers.len() >= required);
+    let Some(((slot, root), providers)) = reached.next() else {
+        bail!(
+            "checkpoint quorum {required}/{attempted} was not reached: {}",
+            observations.join("; ")
+        );
     };
+    if reached.next().is_some() {
+        bail!(
+            "checkpoint providers reached conflicting quorums: {}",
+            observations.join("; ")
+        );
+    }
+    if successful
+        .iter()
+        .any(|response| response.slot == *slot && response.root != *root)
+    {
+        bail!(
+            "checkpoint providers disagree about the root at slot {slot}: {}",
+            observations.join("; ")
+        );
+    }
     let mut agreeing_providers = providers.clone();
     agreeing_providers.sort_by(|left, right| left.as_str().cmp(right.as_str()));
     Ok(CheckpointQuorum {
@@ -1456,22 +1889,32 @@ fn select_checkpoint_quorum(
         agreeing_providers,
         beacon_api_endpoints,
         attempted,
+        observations,
     })
 }
 
-async fn fetch_checkpoint(provider: Url) -> Result<ProviderCheckpoint> {
-    let client = reqwest::Client::new();
+async fn fetch_checkpoint(
+    client: &reqwest::Client,
+    provider: Url,
+    label: String,
+) -> Result<ProviderCheckpoint> {
     let beacon_endpoint = provider_url(&provider, "eth/v1/beacon/headers/finalized")?;
     let beacon_response = client
-        .get(beacon_endpoint)
-        .timeout(Duration::from_secs(15))
+        .get(beacon_endpoint.clone())
         .send()
-        .await?;
+        .await
+        .map_err(reqwest::Error::without_url)?;
     if beacon_response.status().is_success() {
-        let response = beacon_response.json::<BeaconHeaderResponse>().await?;
+        let response: BeaconHeaderResponse = read_provider_json(
+            beacon_response,
+            &provider,
+            "eth/v1/beacon/headers/finalized",
+        )
+        .await?;
         let root = normalized_checkpoint_root(&response.data.root)?;
         return Ok(ProviderCheckpoint {
             provider,
+            label,
             root,
             slot: response
                 .data
@@ -1486,13 +1929,12 @@ async fn fetch_checkpoint(provider: Url) -> Result<ProviderCheckpoint> {
 
     let checkpointz_endpoint = provider_url(&provider, "checkpointz/v1/beacon/slots")?;
     let response = client
-        .get(checkpointz_endpoint)
-        .timeout(Duration::from_secs(15))
+        .get(checkpointz_endpoint.clone())
         .send()
-        .await?
-        .error_for_status()?
-        .json::<CheckpointzResponse>()
-        .await?;
+        .await
+        .map_err(reqwest::Error::without_url)?;
+    let response: CheckpointzResponse =
+        read_provider_json(response, &provider, "checkpointz/v1/beacon/slots").await?;
     let slot = response
         .data
         .slots
@@ -1503,6 +1945,7 @@ async fn fetch_checkpoint(provider: Url) -> Result<ProviderCheckpoint> {
         normalized_checkpoint_root(&slot.block_root.expect("usable checkpoint has a block root"))?;
     Ok(ProviderCheckpoint {
         provider,
+        label,
         root,
         slot: slot
             .slot
@@ -1512,32 +1955,64 @@ async fn fetch_checkpoint(provider: Url) -> Result<ProviderCheckpoint> {
     })
 }
 
+/// Decode a provider response read with a size cap, refusing redirects. An
+/// error body keeps none of the provider's secrets.
+async fn read_provider_json<T: serde::de::DeserializeOwned>(
+    response: reqwest::Response,
+    provider: &Url,
+    path: &str,
+) -> Result<T> {
+    let label = leani_finality_beacon_api::request_label(
+        &leani_finality_beacon_api::normalized_endpoint(provider),
+        path,
+    );
+    let body =
+        leani_finality_beacon_api::read_response(response, &label, MAX_CHECKPOINT_RESPONSE_BYTES)
+            .await
+            .map_err(|error| error.redacting(provider))?;
+    serde_json::from_slice(&body).context("decode the checkpoint provider response")
+}
+
 fn normalized_checkpoint_root(root: &str) -> Result<String> {
     let root = leani_finality_beacon_api::parse_checkpoint_root(root)
         .context("checkpoint response contains an invalid block root")?;
     Ok(format!("0x{}", hex::encode(root)))
 }
 
+/// The URL of `suffix` below `provider`, keeping its last path segment and
+/// the API key in its query string.
 fn provider_url(provider: &Url, suffix: &str) -> Result<Url> {
-    let mut provider = provider.clone();
-    if !provider.path().ends_with('/') {
-        provider.set_path(&format!("{}/", provider.path()));
-    }
-    provider.join(suffix).context("construct checkpoint URL")
+    leani_finality_beacon_api::request_url(
+        &leani_finality_beacon_api::normalized_endpoint(provider),
+        suffix,
+    )
+    .context("construct checkpoint URL")
+}
+
+/// The checkpoint summary shown before an operator accepts a new trust root:
+/// every provider's answer or failure, not only the agreeing ones.
+fn checkpoint_summary(checkpoint: &CheckpointQuorum) -> Vec<String> {
+    let mut lines = vec![format!(
+        "  quorum:   {}/{} providers",
+        checkpoint.agreeing_providers.len(),
+        checkpoint.attempted
+    )];
+    lines.extend(
+        checkpoint
+            .observations
+            .iter()
+            .map(|observation| format!("  provider: {observation}")),
+    );
+    lines.push(format!("  root:     {}", checkpoint.root));
+    lines.push(format!("  slot:     {}", checkpoint.slot));
+    lines
 }
 
 fn confirm_checkpoint(options: &SubscribeOptions, checkpoint: &CheckpointQuorum) -> Result<()> {
     eprintln!("leani: weak-subjectivity checkpoint bootstrap");
-    eprintln!(
-        "  quorum:   {}/{} providers",
-        checkpoint.agreeing_providers.len(),
-        checkpoint.attempted
-    );
-    for provider in &checkpoint.agreeing_providers {
-        eprintln!("  provider: {provider}");
+    for line in checkpoint_summary(checkpoint) {
+        eprintln!("{line}");
     }
-    eprintln!("  root:     {}", checkpoint.root);
-    eprintln!("  slot:     {}", checkpoint.slot);
     eprintln!("Subsequent light-client updates are verified from this agreed root.");
     if options.accept_checkpoint {
         return Ok(());
@@ -1646,31 +2121,37 @@ fn persist_verified_anchor(
             updated_at_unix_seconds: unix_seconds(),
         },
     )?;
-    eprintln!(
+    // This also runs on the way out after a reader closed stdout, as with
+    // `2>&1 | head`, when stderr may be closed too: `eprintln!` would panic.
+    let _ = writeln!(
+        io::stderr().lock(),
         "leani: persisted locally verified checkpoint at slot {}",
         anchor.beacon_slot
     );
     Ok(())
 }
 
+/// The item an applied change carries. An undo or a delete stores a delete
+/// marker or the previous value, never the value it reverts, so it is never
+/// decoded: an undo is matched to what it reverts by change key.
 fn local_item(
     protocol: SubscribeProtocol,
     markets: &[Market],
     record: &ChangeRecord,
 ) -> Result<Option<SubscriptionItem>> {
+    if record.change.kind != subscription_change_kind(protocol)
+        || record.direction == ChangeDirection::Undo
+        || record.change.operation == ChangeOperation::Delete
+    {
+        return Ok(None);
+    }
     match protocol {
         SubscribeProtocol::Blocks => {
-            if record.change.kind != BLOCK_SUMMARY_KIND {
-                return Ok(None);
-            }
             let entity = postcard::from_bytes(&record.change.payload)
                 .context("decode embedded Ethereum block summary")?;
             Ok(Some(SubscriptionItem::Block(entity)))
         }
         SubscribeProtocol::UniswapV3 => {
-            if record.change.kind != "uniswap.price.observation" {
-                return Ok(None);
-            }
             let entity: PoolPriceEntity = postcard::from_bytes(&record.change.payload)
                 .context("decode embedded Uniswap observation")?;
             let market = markets
@@ -1701,19 +2182,18 @@ fn latest_fresh_items(
         if finality == SubscribeFinality::Finalized && record.finality != Finality::Finalized {
             continue;
         }
+        if record.direction == ChangeDirection::Undo {
+            // Retire the item the undo reverts, found by its change key.
+            latest.retain(|_, (_, applied): &mut (SubscriptionItem, ChangeRecord)| {
+                applied.change.kind != record.change.kind || applied.change.key != record.change.key
+            });
+            continue;
+        }
         if let Some(item) = local_item(protocol, markets, &record)? {
-            let scope = item.scope_key();
-            match record.direction {
-                ChangeDirection::Apply | ChangeDirection::Finalized => {
-                    latest.insert(scope, (item, record));
-                }
-                ChangeDirection::Undo => {
-                    latest.remove(&scope);
-                }
-                ChangeDirection::ResetRequired => {
-                    bail!("embedded subscription history requires a fresh snapshot");
-                }
+            if record.direction == ChangeDirection::ResetRequired {
+                bail!("embedded subscription history requires a fresh snapshot");
             }
+            latest.insert(item.scope_key(), (item, record));
         }
     }
     Ok(latest.into_values().collect())
@@ -1726,14 +2206,7 @@ fn address_matches(address: Address, expected: &str) -> bool {
 }
 
 fn embedded_snapshot_budget(config: &Config) -> SourceBudget {
-    SourceBudget {
-        max_input_bytes: config.budgets.memory_bytes,
-        max_frame_bytes: config.budgets.memory_bytes.min(32 * 1_024 * 1_024),
-        max_frames: 64,
-        max_buffered_frames: 64,
-        max_in_flight_requests: config.budgets.source_concurrency,
-        temporary_disk_bytes: config.budgets.temporary_disk_bytes,
-    }
+    crate::process::live_source_budget(config)
 }
 
 async fn preview_head_snapshot(
@@ -1952,20 +2425,12 @@ fn reconcile_preview_handoff(
     blocks: &mut BTreeMap<u64, (BlockRef, Vec<SubscriptionItem>)>,
     previewed: &mut HashSet<ObservationKey>,
     candidate: &SubscriptionItem,
-    direction: ChangeDirection,
 ) -> PreviewHandoffAction {
-    // An exact durable apply confirms an already-rendered preview. An undo of
-    // that identity must remain visible because the user saw the apply.
+    // An exact durable apply confirms an already-rendered preview.
     let key = observation_key(candidate);
     if previewed.remove(&key) {
         remove_preview_item(blocks, key);
-        return if direction == ChangeDirection::Undo {
-            PreviewHandoffAction::Render {
-                reverted: Vec::new(),
-            }
-        } else {
-            PreviewHandoffAction::Suppress
-        };
+        return PreviewHandoffAction::Suppress;
     }
     if preview_is_at_or_after(blocks, candidate) {
         return PreviewHandoffAction::Suppress;
@@ -2026,6 +2491,144 @@ fn render_preview_reverts(
     Ok(())
 }
 
+/// What an embedded subscription showed: the peer preview rows the durable
+/// lane still confirms or reverts, and the recent durable changes it saw.
+#[derive(Debug, Default)]
+struct EmbeddedOutput {
+    preview_blocks: BTreeMap<u64, (BlockRef, Vec<SubscriptionItem>)>,
+    previewed: HashSet<ObservationKey>,
+    seen: RecentChanges<Vec<u8>, SeenItem>,
+}
+
+/// A durable change's item, and whether this run printed it, as a durable
+/// row or by confirming the preview row that showed it.
+#[derive(Clone, Debug)]
+struct SeenItem {
+    item: SubscriptionItem,
+    printed: bool,
+}
+
+/// Print one durable change after readiness; `now` judges the freshness of
+/// included rows. Returns whether it printed an update that satisfies
+/// `--once`; an undo never does.
+fn render_durable_change(
+    options: &SubscribeOptions,
+    markets: &[Market],
+    record: &ChangeRecord,
+    processor: &dyn leani_processor_api::Processor,
+    store_epoch: [u8; 16],
+    output: &mut EmbeddedOutput,
+    now: u64,
+) -> Result<bool> {
+    if record.direction == ChangeDirection::Undo {
+        if record.change.kind == subscription_change_kind(options.protocol) {
+            render_durable_undo(options, record, processor, store_epoch, output, now)?;
+        }
+        return Ok(false);
+    }
+    let shown = match options.finality {
+        // An included row is a live update; a stale one is catch-up.
+        SubscribeFinality::Included => {
+            update_is_fresh(SubscribeFinality::Included, record.block.timestamp, now)
+        }
+        // A finalized row prints however late finality arrives.
+        SubscribeFinality::Finalized => record.finality == Finality::Finalized,
+    };
+    if !shown {
+        return Ok(false);
+    }
+    let Some(item) = local_item(options.protocol, markets, record)? else {
+        return Ok(false);
+    };
+    // A recompute republishes covered blocks. A finalized block is never
+    // undone, so one this run printed prints once.
+    if options.finality == SubscribeFinality::Finalized
+        && output
+            .seen
+            .get(&record.change.key)
+            .is_some_and(|seen| seen.printed && seen.item.block_hash() == item.block_hash())
+    {
+        return Ok(false);
+    }
+    render_durable_item(options.format, item, record, processor, store_epoch, output)
+}
+
+/// Print a durable apply unless the peer preview already showed it, and
+/// remember it for its undo. Returns whether it printed.
+fn render_durable_item(
+    format: SubscribeFormat,
+    item: SubscriptionItem,
+    record: &ChangeRecord,
+    processor: &dyn leani_processor_api::Processor,
+    store_epoch: [u8; 16],
+    output: &mut EmbeddedOutput,
+) -> Result<bool> {
+    let confirms_preview = output.previewed.contains(&observation_key(&item));
+    let printed =
+        match reconcile_preview_handoff(&mut output.preview_blocks, &mut output.previewed, &item) {
+            PreviewHandoffAction::Suppress => false,
+            PreviewHandoffAction::Render { reverted } => {
+                render_preview_reverts(format, &reverted)?;
+                render_local_item(format, &item, record, processor, store_epoch)?;
+                true
+            }
+        };
+    output.seen.remember(
+        record.change.key.clone(),
+        SeenItem {
+            item,
+            printed: printed || confirms_preview,
+        },
+    );
+    Ok(printed)
+}
+
+/// Print a durable undo from the item its change key carried, however old:
+/// the store keeps a delete or the previous value for it, never the
+/// reverted value.
+fn render_durable_undo(
+    options: &SubscribeOptions,
+    record: &ChangeRecord,
+    processor: &dyn leani_processor_api::Processor,
+    store_epoch: [u8; 16],
+    output: &mut EmbeddedOutput,
+    now: u64,
+) -> Result<()> {
+    let Some(seen) = output.seen.get(&record.change.key).cloned() else {
+        // Applied before this run, or aged out: only a fresh undo is news.
+        if !update_is_fresh(options.finality, record.block.timestamp, now) {
+            return Ok(());
+        }
+        if options.format == SubscribeFormat::Raw {
+            let envelope = leani_api::change_envelope_json(store_epoch, processor, record.clone())?;
+            return print_row(&serde_json::to_string(&envelope)?);
+        }
+        return render_undone_change(
+            options,
+            &UndoneChange {
+                block_number: record.block.number.0,
+                block_hash: record.block.hash.to_string(),
+                timestamp: record.block.timestamp,
+                key: Some(format!("0x{}", hex::encode(&record.change.key))),
+                finality: record.finality.name().to_owned(),
+                sequence: record.cursor.sequence.to_string(),
+            },
+        );
+    };
+    // Shown as a durable row, or as a preview row the durable lane never
+    // confirmed: print the undo, and retire that preview row so no later
+    // replacement reverts it again.
+    let key = observation_key(&seen.item);
+    let previewed = output.previewed.remove(&key);
+    if previewed {
+        remove_preview_item(&mut output.preview_blocks, key);
+    }
+    if seen.printed || previewed {
+        render_local_item(options.format, &seen.item, record, processor, store_epoch)?;
+    }
+    Ok(())
+}
+
 fn render_local_item(
     format: SubscribeFormat,
     item: &SubscriptionItem,
@@ -2035,9 +2638,7 @@ fn render_local_item(
 ) -> Result<()> {
     if format == SubscribeFormat::Raw {
         let envelope = leani_api::change_envelope_json(store_epoch, processor, record.clone())?;
-        println!("{}", serde_json::to_string(&envelope)?);
-        io::stdout().flush()?;
-        return Ok(());
+        return print_row(&serde_json::to_string(&envelope)?);
     }
     render_item(
         format,
@@ -2138,7 +2739,7 @@ fn render_price(format: SubscribeFormat, output: &RenderedPrice<'_>) -> Result<(
                 || "volume=n/a".to_owned(),
                 |volume| format!("volume={} {}", volume, base_token(output.market).symbol),
             );
-            println!(
+            print_row(&format!(
                 "{}  {} {}  {}  block={}  {}{}",
                 timestamp,
                 output.market.symbol,
@@ -2151,11 +2752,9 @@ fn render_price(format: SubscribeFormat, output: &RenderedPrice<'_>) -> Result<(
                 } else {
                     format!("  {}", output.operation)
                 }
-            );
+            ))
         }
-        SubscribeFormat::Json => println!(
-            "{}",
-            serde_json::to_string(&json!({
+        SubscribeFormat::Json => print_row(&serde_json::to_string(&json!({
                 "schema": "leani.market-price.v2",
                 "market": output.market.symbol,
                 "protocol": "uniswap-v3",
@@ -2185,12 +2784,9 @@ fn render_price(format: SubscribeFormat, output: &RenderedPrice<'_>) -> Result<(
                     "amount0": output.amount0,
                     "amount1": output.amount1,
                 },
-            }))?
-        ),
+        }))?),
         SubscribeFormat::Raw => unreachable!("raw records are rendered before price conversion"),
     }
-    io::stdout().flush()?;
-    Ok(())
 }
 
 fn render_block_summary(format: SubscribeFormat, output: &RenderedBlockSummary) -> Result<()> {
@@ -2229,7 +2825,7 @@ fn render_block_summary(format: SubscribeFormat, output: &RenderedBlockSummary) 
             let transactions = output
                 .transaction_count
                 .map_or_else(|| "unknown".to_owned(), |count| count.to_string());
-            println!(
+            print_row(&format!(
                 "{}  block={}  txs={}  gas={}  base_fee={}  blobs={}  {}{}",
                 timestamp,
                 output.block_number,
@@ -2243,11 +2839,9 @@ fn render_block_summary(format: SubscribeFormat, output: &RenderedBlockSummary) 
                 } else {
                     format!("  {}", output.operation)
                 }
-            );
+            ))
         }
-        SubscribeFormat::Json => println!(
-            "{}",
-            serde_json::to_string(&json!({
+        SubscribeFormat::Json => print_row(&serde_json::to_string(&json!({
                 "schema": "leani.block-summary.v1",
                 "chainId": output.chain_id,
                 "blockNumber": output.block_number,
@@ -2264,14 +2858,11 @@ fn render_block_summary(format: SubscribeFormat, output: &RenderedBlockSummary) 
                 "finality": output.finality,
                 "operation": output.operation,
                 "sequence": output.sequence,
-            }))?
-        ),
+        }))?),
         SubscribeFormat::Raw => {
             unreachable!("raw records are rendered before block-summary conversion")
         }
     }
-    io::stdout().flush()?;
-    Ok(())
 }
 
 fn compact_count(value: u64) -> String {
@@ -2476,6 +3067,7 @@ async fn connect_attached_stream(
     Ok(AttachedStreamConnection::Retry)
 }
 
+#[allow(clippy::too_many_lines)]
 async fn subscribe_attached(
     options: &SubscribeOptions,
     markets: &[Market],
@@ -2491,23 +3083,23 @@ async fn subscribe_attached(
         }
         attached_start_cursor(&client, options, markets, &endpoint).await
     };
-    let (mut cursor, rendered_snapshot) = tokio::select! {
+    let (cursor, snapshot) = tokio::select! {
         result = tokio::signal::ctrl_c() => {
             result.context("install Ctrl-C handler")?;
             return Ok(Exit::Success);
         }
         result = startup => result?,
     };
-    if rendered_snapshot && options.once {
-        return Ok(Exit::Success);
-    }
     announce_attached(options.protocol, &endpoint, markets);
     let mut backoff = Duration::from_secs(1);
-    let mut last_sequence = None;
-    let mut gate = FinalizedGate::default();
+    let mut state = AttachedState {
+        cursor,
+        snapshot,
+        ..AttachedState::default()
+    };
     loop {
         let mut stream_url = processor_url(&endpoint, &options.processor, "stream")?;
-        if let Some(cursor) = &cursor {
+        if let Some(cursor) = &state.cursor {
             stream_url.query_pairs_mut().append_pair("after", cursor);
         }
         let response = match connect_attached_stream(&client, options, stream_url, backoff).await? {
@@ -2520,6 +3112,9 @@ async fn subscribe_attached(
         };
         let mut bytes = response.bytes_stream();
         let mut buffer = EventBuffer::default();
+        // Every connection identifies the node again before its changes count.
+        state.greeted = false;
+        let mut retry = None;
         loop {
             let chunk = tokio::select! {
                 result = tokio::signal::ctrl_c() => {
@@ -2551,11 +3146,10 @@ async fn subscribe_attached(
             buffer.push(&chunk);
             let outcome = render_attached_sse_events(
                 &mut buffer,
-                &mut cursor,
-                &mut last_sequence,
+                &mut state,
                 options,
                 markets,
-                &mut gate,
+                unix_seconds(),
             )?;
             if outcome.observed_change {
                 backoff = Duration::from_secs(1);
@@ -2563,11 +3157,22 @@ async fn subscribe_attached(
             if outcome.stop {
                 return Ok(Exit::Success);
             }
+            if outcome.retry.is_some() {
+                retry = outcome.retry;
+                break;
+            }
         }
-        eprintln!(
-            "leani: stream ended; reconnecting in {}s",
-            backoff.as_secs()
-        );
+        if let Some(error) = retry {
+            eprintln!(
+                "leani: node reported a retryable stream error ({error}); reconnecting in {}s",
+                backoff.as_secs()
+            );
+        } else {
+            eprintln!(
+                "leani: stream ended; reconnecting in {}s",
+                backoff.as_secs()
+            );
+        }
         if wait_for_reconnect(backoff).await? {
             return Ok(Exit::Success);
         }
@@ -2575,60 +3180,76 @@ async fn subscribe_attached(
     }
 }
 
+/// Where an attached subscription starts its stream, and the still-fresh
+/// latest rows it prints first. Nothing prints before the stream's hello
+/// shows the node serves this feed.
 async fn attached_start_cursor(
     client: &reqwest::Client,
     options: &SubscribeOptions,
     markets: &[Market],
     endpoint: &Url,
-) -> Result<(Option<String>, bool)> {
-    let use_latest =
-        options.finality == SubscribeFinality::Included && options.format != SubscribeFormat::Raw;
-    if use_latest {
-        match options.protocol {
-            SubscribeProtocol::Blocks => {
-                let (cursor, latest) =
-                    attached_latest_block_snapshot(client, options, endpoint).await?;
-                let mut rendered = false;
-                if let Some(latest) = latest
-                    && update_is_fresh(options.finality, latest.timestamp, unix_seconds())
-                {
-                    render_attached_block_summary(options.format, latest, "apply", None)?;
-                    rendered = true;
-                }
-                Ok((cursor, rendered))
-            }
-            SubscribeProtocol::UniswapV3 => {
-                let (cursor, latest) =
-                    attached_latest_snapshot(client, options, markets, endpoint).await?;
-                let mut rendered = false;
-                for (market, latest) in latest {
-                    if !update_is_fresh(options.finality, latest.timestamp, unix_seconds()) {
-                        continue;
-                    }
-                    render_attached_price(
-                        options.format,
-                        &market,
-                        &latest.data,
-                        latest.timestamp,
-                        "apply",
-                        None,
-                    )?;
-                    rendered = true;
-                    if options.once {
-                        break;
-                    }
-                }
-                Ok((cursor, rendered))
-            }
-        }
-    } else {
-        Ok((
-            attached_change_head(client, options, endpoint)
-                .await?
-                .cursor,
-            false,
-        ))
+) -> Result<(Option<String>, Vec<AttachedItem>)> {
+    if options.finality == SubscribeFinality::Finalized {
+        // A block included before now is finalized later, so replay the
+        // retained log. The hello's finalized block ends what was already
+        // final and is not printed.
+        return Ok((None, Vec::new()));
     }
+    if options.format == SubscribeFormat::Raw {
+        let head = attached_change_head(client, options, endpoint).await?;
+        return Ok((head.cursor, Vec::new()));
+    }
+    match options.protocol {
+        SubscribeProtocol::Blocks => {
+            let (cursor, latest) =
+                attached_latest_block_snapshot(client, options, endpoint).await?;
+            let snapshot = latest
+                .filter(|latest| {
+                    update_is_fresh(options.finality, latest.timestamp, unix_seconds())
+                })
+                .map(AttachedItem::Block)
+                .into_iter()
+                .collect();
+            Ok((cursor, snapshot))
+        }
+        SubscribeProtocol::UniswapV3 => {
+            let (cursor, latest) =
+                attached_latest_snapshot(client, options, markets, endpoint).await?;
+            let snapshot = latest
+                .into_iter()
+                .filter(|(_, latest)| {
+                    update_is_fresh(options.finality, latest.timestamp, unix_seconds())
+                })
+                .map(|(market, latest)| AttachedItem::Price {
+                    market,
+                    entity: latest.data,
+                    timestamp: latest.timestamp,
+                })
+                .collect();
+            Ok((cursor, snapshot))
+        }
+    }
+}
+
+/// Print the startup rows, and remember them for their undos. Returns
+/// whether any printed.
+fn render_attached_snapshot(
+    options: &SubscribeOptions,
+    snapshot: Vec<AttachedItem>,
+    changes: &mut AttachedChanges,
+) -> Result<bool> {
+    let mut rendered = false;
+    for item in snapshot {
+        render_attached_item(options.format, &item, "apply", None)?;
+        rendered = true;
+        if let Some(key) = item.change_key() {
+            changes.remember_printed(key, item);
+        }
+        if options.once {
+            break;
+        }
+    }
+    Ok(rendered)
 }
 
 fn announce_attached(protocol: SubscribeProtocol, endpoint: &Url, markets: &[Market]) {
@@ -2648,27 +3269,59 @@ fn announce_attached(protocol: SubscribeProtocol, endpoint: &Url, markets: &[Mar
     }
 }
 
+/// Print the complete events in `buffer`; `now` judges the freshness of
+/// included rows.
+#[allow(clippy::too_many_lines)]
 fn render_attached_sse_events(
     buffer: &mut EventBuffer,
-    cursor: &mut Option<String>,
-    last_sequence: &mut Option<u64>,
+    state: &mut AttachedState,
     options: &SubscribeOptions,
     markets: &[Market],
-    gate: &mut FinalizedGate,
+    now: u64,
 ) -> Result<SseRenderOutcome> {
     let mut outcome = SseRenderOutcome::default();
-    while let Some(event) = buffer.next_frame()? {
-        let parsed = sse::parse(&event).context("node sent a malformed SSE frame")?;
-        if parsed.name.as_deref() == Some("hello") {
-            continue;
+    while let Some(event) = buffer
+        .next_event()
+        .context("node sent a malformed SSE frame")?
+    {
+        match event.name.as_deref() {
+            Some("error") => {
+                if let Some(error) = retryable_stream_error(&event.data) {
+                    outcome.retry = Some(error);
+                    return Ok(outcome);
+                }
+                bail!("node subscription stream reported an error: {}", event.data);
+            }
+            Some("hello") => {
+                let hello = validate_attached_hello(&event.data, options)?;
+                state.greeted = true;
+                if !state.identified {
+                    state.identified = true;
+                    state.gate.seed(
+                        hello
+                            .coverage
+                            .and_then(|coverage| coverage.finalized_through),
+                        options.protocol == SubscribeProtocol::Blocks,
+                    );
+                    let snapshot = std::mem::take(&mut state.snapshot);
+                    if render_attached_snapshot(options, snapshot, &mut state.changes)?
+                        && options.once
+                    {
+                        outcome.stop = true;
+                        return Ok(outcome);
+                    }
+                }
+                continue;
+            }
+            // Fail closed: a stream that has not identified its node is
+            // never printed.
+            _ if !state.greeted => {
+                bail!("the node's stream sent a change before its hello; refusing to print it")
+            }
+            _ => {}
         }
-        let Some(data) = parsed.data else {
-            continue;
-        };
-        if parsed.name.as_deref() == Some("error") {
-            bail!("node subscription stream reported an error: {data}");
-        }
-        let value: Value = serde_json::from_str(&data).context("node sent malformed SSE JSON")?;
+        let value: Value =
+            serde_json::from_str(&event.data).context("node sent malformed SSE JSON")?;
         let envelope: AttachedEnvelope = serde_json::from_value(value.clone())
             .context("node sent an invalid SSE change envelope")?;
         if envelope.cursor.is_empty()
@@ -2689,23 +3342,38 @@ fn render_attached_sse_events(
             .sequence
             .parse::<u64>()
             .context("node SSE event sequence is not an unsigned integer")?;
-        if last_sequence.is_some_and(|last| sequence <= last) {
+        if state.last_sequence.is_some_and(|last| sequence <= last) {
             continue;
         }
-        *last_sequence = Some(sequence);
-        *cursor = Some(envelope.cursor.clone());
-        if options.finality == SubscribeFinality::Finalized && envelope.finality != "finalized" {
-            match (
-                envelope.operation.as_str(),
-                envelope_block_number(&envelope),
-            ) {
-                ("apply", Some(block)) if !envelope.kind.starts_with("system.") => {
-                    gate.hold(block, envelope, value);
-                }
-                ("undo", Some(block)) => gate.undo(block),
-                _ => {}
+        state.last_sequence = Some(sequence);
+        state.cursor = Some(envelope.cursor.clone());
+        if options.finality == SubscribeFinality::Finalized {
+            let block = envelope_block_number(&envelope);
+            let system = envelope.kind.starts_with("system.");
+            // The first change applied above the floor, included or already
+            // finalized, shows whether the node pruned blocks before it.
+            // Nothing above the floor printed yet: report them at once.
+            if !system
+                && envelope.operation == "apply"
+                && let Some(pruned) = block.and_then(|block| state.gate.pruned_below(block))
+            {
+                render_finality_gap(options, &pruned)?;
             }
-            continue;
+            if envelope.finality != "finalized" {
+                match (envelope.operation.as_str(), block) {
+                    ("apply", Some(block)) if !system => state.gate.hold(block, envelope, value),
+                    ("undo", Some(block)) => state.gate.undo(block),
+                    _ => {}
+                }
+                continue;
+            }
+            if !system && block.is_some_and(|block| state.gate.final_at_connect(block)) {
+                continue;
+            }
+            // Report dropped blocks before the finalized rows after them.
+            if let Some(dropped) = state.gate.take_dropped() {
+                render_finality_gap(options, &dropped)?;
+            }
         }
         let mut to_render = Vec::new();
         if envelope.kind.starts_with("system.finality")
@@ -2715,18 +3383,12 @@ fn render_attached_sse_events(
                 .and_then(|data| data.get("throughBlock"))
                 .and_then(Value::as_u64)
         {
-            to_render = gate.release(through);
+            to_render = state.gate.release(through);
         }
         to_render.push((envelope, value));
         for (envelope, value) in to_render {
-            if render_attached(
-                options.protocol,
-                options.format,
-                options.finality,
-                markets,
-                envelope,
-                &value,
-            )? && options.once
+            if render_attached(options, markets, envelope, &value, &mut state.changes, now)?
+                && options.once
             {
                 outcome.stop = true;
                 return Ok(outcome);
@@ -2734,6 +3396,100 @@ fn render_attached_sse_events(
         }
     }
     Ok(outcome)
+}
+
+/// Parse a stream's hello and require the node to serve this feed:
+/// Ethereum mainnet and the built-in processor this subscription renders.
+fn validate_attached_hello(data: &str, options: &SubscribeOptions) -> Result<AttachedHello> {
+    let hello: AttachedHello =
+        serde_json::from_str(data).context("node sent a malformed stream hello")?;
+    if hello.chain_id != MAINNET_CHAIN_ID {
+        bail!(
+            "the attached node serves chain {}, but built-in subscriptions follow Ethereum mainnet (chain {MAINNET_CHAIN_ID}); use --endpoint to select a mainnet node or --mode embedded",
+            hello.chain_id
+        );
+    }
+    let expected = match options.protocol {
+        SubscribeProtocol::Blocks => "block-summary",
+        SubscribeProtocol::UniswapV3 => "uniswap-observations",
+    };
+    if hello.processor.id != expected {
+        bail!(
+            "the attached processor {} is a {} processor; this feed needs {expected}",
+            hello.processor.instance,
+            hello.processor.id
+        );
+    }
+    if options.processor != hello.processor.instance && options.processor != hello.processor.id {
+        bail!(
+            "the attached node answered for processor {} instead of the requested {}",
+            hello.processor.instance,
+            options.processor
+        );
+    }
+    Ok(hello)
+}
+
+/// The message of an `event: error` the node marks retryable, or `None` for
+/// a permanent or unreadable one, which ends the subscription.
+fn retryable_stream_error(data: &str) -> Option<String> {
+    let body = serde_json::from_str::<Value>(data).ok()?;
+    let error = body.get("error")?;
+    (error.get("retryable") == Some(&Value::Bool(true))).then(|| {
+        error
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown error")
+            .to_owned()
+    })
+}
+
+const fn protocol_name(protocol: SubscribeProtocol) -> &'static str {
+    match protocol {
+        SubscribeProtocol::Blocks => "blocks",
+        SubscribeProtocol::UniswapV3 => "uniswap-v3",
+    }
+}
+
+/// Report blocks that finalized output never shows.
+fn render_finality_gap(options: &SubscribeOptions, gap: &FinalityGap) -> Result<()> {
+    let (reason, explanation) = match gap.reason {
+        FinalityGapReason::GateFull => (
+            "finality_gate_full",
+            format!(
+                "dropped unfinalized: no finality marker arrived while {FINALIZED_GATE_MAX_BLOCKS} blocks were held"
+            ),
+        ),
+        FinalityGapReason::ChangeLogPruned => (
+            "change_log_pruned",
+            "not retained: the node pruned them before this subscription connected".to_owned(),
+        ),
+    };
+    match options.format {
+        SubscribeFormat::Pretty => {
+            let timestamp = gap.timestamp.map(readable_timestamp).transpose()?;
+            let blocks = if gap.from == gap.to {
+                format!("block={}", gap.from)
+            } else {
+                format!("blocks={}-{}", gap.from, gap.to)
+            };
+            print_row(&format!(
+                "{}  gap  {blocks}  {explanation}",
+                timestamp.as_deref().unwrap_or("unknown time"),
+            ))
+        }
+        SubscribeFormat::Json | SubscribeFormat::Raw => {
+            print_row(&serde_json::to_string(&json!({
+                "schema": "leani.subscription-gap.v1",
+                "protocol": protocol_name(options.protocol),
+                "operation": "gap",
+                "fromBlock": gap.from,
+                "toBlock": gap.to,
+                "timestamp": gap.timestamp,
+                "reason": reason,
+            }))?)
+        }
+    }
 }
 
 async fn attached_change_head(
@@ -2917,87 +3673,271 @@ async fn wait_for_reconnect(delay: Duration) -> Result<bool> {
     }
 }
 
+/// Print one attached change. Returns whether it printed an update that
+/// satisfies `--once`; an undo never does.
 fn render_attached(
-    protocol: SubscribeProtocol,
-    format: SubscribeFormat,
-    finality: SubscribeFinality,
+    options: &SubscribeOptions,
     markets: &[Market],
     envelope: AttachedEnvelope,
     raw: &Value,
+    changes: &mut AttachedChanges,
+    now: u64,
 ) -> Result<bool> {
-    if protocol == SubscribeProtocol::Blocks {
-        return render_attached_block(format, finality, envelope, raw);
-    }
-    if !envelope.kind.starts_with("uniswap.price.observation.") {
+    if !envelope
+        .kind
+        .strip_prefix(subscription_change_kind(options.protocol))
+        .is_some_and(|suffix| suffix.starts_with('.'))
+    {
         return Ok(false);
     }
-    let Some(entity) = envelope.data else {
-        return Ok(false);
-    };
-    let mut entity: AttachedPoolPrice =
-        serde_json::from_value(entity).context("decode attached Uniswap price observation")?;
-    entity.finality.clone_from(&envelope.finality);
-    if finality == SubscribeFinality::Finalized && entity.finality != "finalized" {
+    if envelope.operation == "undo" {
+        render_attached_undo(options, &envelope, raw, changes, now)?;
         return Ok(false);
     }
-    let Some(market) = markets
-        .iter()
-        .find(|market| market.pool.eq_ignore_ascii_case(&entity.pool))
-    else {
+    let Some(data) = envelope.data else {
         return Ok(false);
     };
-    let timestamp = envelope
-        .block
-        .get("timestamp")
-        .and_then(Value::as_u64)
-        .context("attached Uniswap event omitted block.timestamp")?;
-    if !update_is_fresh(finality, timestamp, unix_seconds()) {
+    let item = match options.protocol {
+        SubscribeProtocol::Blocks => {
+            let mut entity: AttachedBlockSummary =
+                serde_json::from_value(data).context("decode attached block summary")?;
+            entity.finality.clone_from(&envelope.finality);
+            Some(AttachedItem::Block(entity))
+        }
+        SubscribeProtocol::UniswapV3 => {
+            let mut entity: AttachedPoolPrice = serde_json::from_value(data)
+                .context("decode attached Uniswap price observation")?;
+            entity.finality.clone_from(&envelope.finality);
+            match markets
+                .iter()
+                .find(|market| market.pool.eq_ignore_ascii_case(&entity.pool))
+            {
+                Some(market) => Some(AttachedItem::Price {
+                    market: *market,
+                    entity,
+                    timestamp: envelope
+                        .block
+                        .get("timestamp")
+                        .and_then(Value::as_u64)
+                        .context("attached Uniswap event omitted block.timestamp")?,
+                }),
+                None => None,
+            }
+        }
+    };
+    let item = item.filter(|item| match options.finality {
+        // An included row is a live update; a stale one is the node
+        // catching up.
+        SubscribeFinality::Included => {
+            update_is_fresh(SubscribeFinality::Included, item.timestamp(), now)
+        }
+        // A finalized row prints however late finality arrives. Blocks final
+        // before the subscription connected never reach here.
+        SubscribeFinality::Finalized => envelope.finality == "finalized",
+    });
+    let Some(item) = item else {
+        if let Some(key) = envelope.key {
+            changes.remember_hidden(key);
+        }
+        return Ok(false);
+    };
+    // A node recompute republishes covered blocks. A finalized block is
+    // never undone, so one this run printed prints once.
+    if options.finality == SubscribeFinality::Finalized
+        && let Some(key) = &envelope.key
+        && changes
+            .printed
+            .get(key)
+            .is_some_and(|printed| printed.same_block(&item))
+    {
         return Ok(false);
     }
-    if format == SubscribeFormat::Raw {
-        println!("{}", serde_json::to_string(&raw)?);
-        io::stdout().flush()?;
-        return Ok(true);
+    if options.format == SubscribeFormat::Raw {
+        print_row(&serde_json::to_string(raw)?)?;
+    } else {
+        render_attached_item(
+            options.format,
+            &item,
+            &envelope.operation,
+            Some(envelope.sequence),
+        )?;
     }
-    render_attached_price(
-        format,
-        market,
-        &entity,
-        timestamp,
-        &envelope.operation,
-        Some(envelope.sequence),
-    )?;
+    if let Some(key) = envelope.key {
+        changes.remember_printed(key, item);
+    }
     Ok(true)
 }
 
-fn render_attached_block(
-    format: SubscribeFormat,
-    finality: SubscribeFinality,
-    envelope: AttachedEnvelope,
+/// Print an attached undo from the item its change key printed, however
+/// old. Its data is a delete or the previous value, never the value it
+/// reverts, so it is not read.
+fn render_attached_undo(
+    options: &SubscribeOptions,
+    envelope: &AttachedEnvelope,
     raw: &Value,
-) -> Result<bool> {
-    if !envelope.kind.starts_with(BLOCK_SUMMARY_KIND) {
-        return Ok(false);
+    changes: &AttachedChanges,
+    now: u64,
+) -> Result<()> {
+    let key = envelope.key.as_ref();
+    if let Some(item) = key.and_then(|key| changes.printed.get(key)) {
+        return if options.format == SubscribeFormat::Raw {
+            print_row(&serde_json::to_string(raw)?)
+        } else {
+            render_attached_item(
+                options.format,
+                &item.with_finality(&envelope.finality),
+                "undo",
+                Some(envelope.sequence.clone()),
+            )
+        };
     }
-    let Some(entity) = envelope.data else {
-        return Ok(false);
-    };
-    let mut entity: AttachedBlockSummary =
-        serde_json::from_value(entity).context("decode attached block summary")?;
-    entity.finality.clone_from(&envelope.finality);
-    if finality == SubscribeFinality::Finalized && entity.finality != "finalized" {
-        return Ok(false);
+    // Seen but filtered out, as another pool's change is.
+    if key.is_some_and(|key| changes.hidden.get(key).is_some()) {
+        return Ok(());
     }
-    if !update_is_fresh(finality, entity.timestamp, unix_seconds()) {
-        return Ok(false);
+    // Applied before this run, or aged out: only a fresh undo is news.
+    let block = &envelope.block;
+    let timestamp = block
+        .get("timestamp")
+        .and_then(Value::as_u64)
+        .context("attached undo omitted block.timestamp")?;
+    if !update_is_fresh(options.finality, timestamp, now) {
+        return Ok(());
     }
-    if format == SubscribeFormat::Raw {
-        println!("{}", serde_json::to_string(raw)?);
-        io::stdout().flush()?;
-        return Ok(true);
+    match options.format {
+        SubscribeFormat::Raw => print_row(&serde_json::to_string(raw)?),
+        SubscribeFormat::Pretty | SubscribeFormat::Json => render_undone_change(
+            options,
+            &UndoneChange {
+                block_number: block
+                    .get("number")
+                    .and_then(Value::as_u64)
+                    .context("attached undo omitted block.number")?,
+                block_hash: block
+                    .get("hash")
+                    .and_then(Value::as_str)
+                    .context("attached undo omitted block.hash")?
+                    .to_owned(),
+                timestamp,
+                key: envelope.key.clone(),
+                finality: envelope.finality.clone(),
+                sequence: envelope.sequence.clone(),
+            },
+        ),
     }
-    render_attached_block_summary(format, entity, &envelope.operation, Some(envelope.sequence))?;
-    Ok(true)
+}
+
+impl AttachedItem {
+    const fn timestamp(&self) -> u64 {
+        match self {
+            Self::Block(entity) => entity.timestamp,
+            Self::Price { timestamp, .. } => *timestamp,
+        }
+    }
+
+    fn block_hash(&self) -> &str {
+        match self {
+            Self::Block(entity) => &entity.block_hash,
+            Self::Price { entity, .. } => &entity.block_hash,
+        }
+    }
+
+    /// Whether both items belong to the same block.
+    fn same_block(&self, other: &Self) -> bool {
+        self.block_hash().eq_ignore_ascii_case(other.block_hash())
+    }
+
+    fn with_finality(&self, finality: &str) -> Self {
+        let mut item = self.clone();
+        match &mut item {
+            Self::Block(entity) => finality.clone_into(&mut entity.finality),
+            Self::Price { entity, .. } => finality.clone_into(&mut entity.finality),
+        }
+        item
+    }
+
+    /// The change key the node's stream names this item's change by, as the
+    /// processors build it: a block summary is keyed by block hash, and a
+    /// Uniswap observation by pool, block hash, and big-endian log index.
+    /// `None` when the node sent malformed hex.
+    fn change_key(&self) -> Option<String> {
+        fn digits(value: &str, bytes: usize) -> Option<String> {
+            let digits = value.strip_prefix("0x")?;
+            (digits.len() == bytes * 2 && digits.bytes().all(|byte| byte.is_ascii_hexdigit()))
+                .then(|| digits.to_ascii_lowercase())
+        }
+        match self {
+            Self::Block(entity) => Some(format!("0x{}", digits(&entity.block_hash, 32)?)),
+            Self::Price { entity, .. } => Some(format!(
+                "0x{}{}{:08x}",
+                digits(&entity.pool, 20)?,
+                digits(&entity.block_hash, 32)?,
+                entity.log_index
+            )),
+        }
+    }
+}
+
+fn render_attached_item(
+    format: SubscribeFormat,
+    item: &AttachedItem,
+    operation: &str,
+    sequence: Option<String>,
+) -> Result<()> {
+    match item {
+        AttachedItem::Block(entity) => {
+            render_attached_block_summary(format, entity.clone(), operation, sequence)
+        }
+        AttachedItem::Price {
+            market,
+            entity,
+            timestamp,
+        } => render_attached_price(format, market, entity, *timestamp, operation, sequence),
+    }
+}
+
+/// An undo of a change this run did not print. Its stored payload is a
+/// delete or the previous value, never the value it reverts, so the row
+/// names the reverted block and the change key instead.
+struct UndoneChange {
+    block_number: u64,
+    block_hash: String,
+    timestamp: u64,
+    key: Option<String>,
+    finality: String,
+    sequence: String,
+}
+
+fn render_undone_change(options: &SubscribeOptions, change: &UndoneChange) -> Result<()> {
+    match options.format {
+        SubscribeFormat::Pretty => print_row(&format!(
+            "{}  block={}  key={}  {}  undo",
+            readable_timestamp(change.timestamp)?,
+            change.block_number,
+            change.key.as_deref().unwrap_or("unknown"),
+            change.finality,
+        )),
+        SubscribeFormat::Json => print_row(&serde_json::to_string(&json!({
+            "schema": "leani.subscription-undo.v1",
+            "protocol": protocol_name(options.protocol),
+            "blockNumber": change.block_number,
+            "blockHash": change.block_hash,
+            "timestamp": change.timestamp,
+            "key": change.key,
+            "finality": change.finality,
+            "operation": "undo",
+            "sequence": change.sequence,
+        }))?),
+        SubscribeFormat::Raw => unreachable!("raw undos print the node's change envelope"),
+    }
+}
+
+/// The change kind a built-in subscription renders.
+const fn subscription_change_kind(protocol: SubscribeProtocol) -> &'static str {
+    match protocol {
+        SubscribeProtocol::Blocks => BLOCK_SUMMARY_KIND,
+        SubscribeProtocol::UniswapV3 => UNISWAP_OBSERVATION_KIND,
+    }
 }
 
 fn render_attached_block_summary(
@@ -3128,8 +4068,10 @@ mod tests {
     use leani_store_sqlite::{DeliveryOrigin, DeliveryOriginKind};
 
     fn checkpoint_provider(provider: &str, root_byte: u8, slot: u64) -> ProviderCheckpoint {
+        let url = Url::parse(provider).expect("provider URL");
         ProviderCheckpoint {
-            provider: Url::parse(provider).expect("provider URL"),
+            label: leani_finality_beacon_api::redacted_url(&url),
+            provider: url,
             root: format!("0x{}", hex::encode([root_byte; 32])),
             slot,
             beacon_api: provider.contains("publicnode"),
@@ -3231,66 +4173,1441 @@ mod tests {
     }
 
     fn attached_finalized_options() -> SubscribeOptions {
+        let mut options = attached_included_options();
+        options.finality = SubscribeFinality::Finalized;
+        options
+    }
+
+    fn attached_included_options() -> SubscribeOptions {
         let mut options = subscribe_options(Vec::new());
         options.protocol = SubscribeProtocol::Blocks;
+        options.processor = "block-summary".to_owned();
         options.mode = SubscribeMode::Client;
         options.format = SubscribeFormat::Json;
-        options.finality = SubscribeFinality::Finalized;
         options.once = true;
         options
+    }
+
+    /// The stream handshake of a node serving `processor` on `chain_id`.
+    fn attached_hello(chain_id: u64, processor: &str, finalized_through: Option<u64>) -> Vec<u8> {
+        let hello = json!({
+            "apiVersion": "v1",
+            "chainId": chain_id,
+            "processor": { "id": processor, "instance": processor, "version": "1.0.0" },
+            "coverage": { "chainId": chain_id, "finalizedThrough": finalized_through },
+        });
+        format!("event: hello\ndata: {hello}\n\n").into_bytes()
+    }
+
+    fn stream_error(retryable: bool) -> Vec<u8> {
+        let error = json!({
+            "error": { "code": "internal", "message": "store busy", "retryable": retryable },
+        });
+        format!("event: error\ndata: {error}\n\n").into_bytes()
+    }
+
+    thread_local! {
+        /// Rows `print_row` captures for the current test instead of printing.
+        static CAPTURED_ROWS: std::cell::RefCell<Option<Vec<String>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    pub(super) fn capture_row(row: &str) -> Option<Result<()>> {
+        CAPTURED_ROWS.with_borrow_mut(|rows| {
+            rows.as_mut().map(|rows| {
+                rows.push(row.to_owned());
+                Ok(())
+            })
+        })
+    }
+
+    /// Run `render` with stdout rows captured; returns its result and them.
+    fn captured<T>(render: impl FnOnce() -> T) -> (T, Vec<String>) {
+        CAPTURED_ROWS.set(Some(Vec::new()));
+        let result = render();
+        (result, CAPTURED_ROWS.take().unwrap_or_default())
+    }
+
+    /// A writer whose reader has gone.
+    struct ClosedPipe;
+
+    impl Write for ClosedPipe {
+        fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+            Err(io::ErrorKind::BrokenPipe.into())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_closed_stdout_ends_the_subscription_successfully() {
+        // Audit CLI-1: `println!` panicked on EPIPE.
+        let error = write_row(&mut ClosedPipe, "row").expect_err("the reader has gone");
+        assert!(matches!(
+            finish_subscription(Err(error.context("render a price"))),
+            Ok(Exit::Success)
+        ));
+        assert!(finish_subscription(Err(anyhow::anyhow!("node unreachable"))).is_err());
+    }
+
+    /// The delta of one block the built-in `protocol` processor reduces.
+    fn fixture_delta_payload(
+        protocol: SubscribeProtocol,
+        markets: &[Market],
+        block: BlockRef,
+    ) -> Vec<u8> {
+        match protocol {
+            SubscribeProtocol::Blocks => postcard::to_allocvec(&BlockSummaryEntity {
+                chain_id: ChainId(1),
+                block_number: block.number,
+                block_hash: block.hash,
+                parent_hash: block.parent_hash,
+                timestamp: block.timestamp,
+                gas_limit: Some(60_000_000),
+                gas_used: Some(30_000_000),
+                base_fee_per_gas: None,
+                blob_gas_used: None,
+                excess_blob_gas: None,
+                transaction_count: Some(3),
+                size_bytes: None,
+                finality: Finality::Included,
+            }),
+            SubscribeProtocol::UniswapV3 => {
+                let word =
+                    |value: I256| leani_primitives::Quantity::new(value.into_raw().to_be_bytes());
+                postcard::to_allocvec(&UniswapPriceDelta {
+                    observations: vec![PoolPriceEntity {
+                        pool: Address::from(
+                            markets[0]
+                                .pool
+                                .parse::<AlloyAddress>()
+                                .expect("catalog pool"),
+                        ),
+                        kind: PoolKind::V3,
+                        reserve0: None,
+                        reserve1: None,
+                        amount0: Some(word(I256::unchecked_from(2_500_000_000_i64))),
+                        amount1: Some(word(I256::unchecked_from(-1_250_000_000_000_000_000_i128))),
+                        sqrt_price_x96: Some(leani_primitives::Quantity::new(
+                            U256::from_str("2045662359789070170858018546451766")
+                                .expect("sqrt price")
+                                .to_be_bytes(),
+                        )),
+                        block_number: block.number,
+                        block_hash: block.hash,
+                        log_index: 7,
+                        finality: Finality::Included,
+                    }],
+                })
+            }
+        }
+        .expect("encode delta")
+    }
+
+    /// Commit one block of a real built-in processor to a real store, then
+    /// undo it as a reorg does. The store undoes the entity the block
+    /// created with an empty `Delete`.
+    async fn applied_then_undone(
+        protocol: SubscribeProtocol,
+        markets: &[Market],
+    ) -> (
+        std::sync::Arc<dyn leani_processor_api::Processor>,
+        SqliteStore,
+        tempfile::TempDir,
+        Vec<ChangeRecord>,
+    ) {
+        applied_then_undone_at(protocol, markets, unix_seconds()).await
+    }
+
+    /// [`applied_then_undone`] for a block with `timestamp`.
+    async fn applied_then_undone_at(
+        protocol: SubscribeProtocol,
+        markets: &[Market],
+        timestamp: u64,
+    ) -> (
+        std::sync::Arc<dyn leani_processor_api::Processor>,
+        SqliteStore,
+        tempfile::TempDir,
+        Vec<ChangeRecord>,
+    ) {
+        let processor = ProcessorRegistry::standard()
+            .instantiate(
+                &subscription_processor(protocol, markets, SubscribeFinality::Included)
+                    .expect("processor configuration"),
+                1,
+            )
+            .expect("processor");
+        let block = BlockRef {
+            number: BlockNumber(20_000_000),
+            hash: BlockHash::new([0x42; 32]),
+            parent_hash: BlockHash::new([0x41; 32]),
+            timestamp,
+        };
+        let payload = fixture_delta_payload(protocol, markets, block);
+        let directory = tempfile::tempdir().expect("store directory");
+        let store = SqliteStore::open(leani_store_sqlite::StoreConfig::new(
+            directory.path().join("leani.sqlite"),
+        ))
+        .await
+        .expect("open store");
+        store
+            .register_processor(processor.descriptor())
+            .await
+            .expect("register processor");
+        let delta = leani_processor_api::EncodedDelta::new(
+            processor.descriptor(),
+            ChainId(1),
+            block,
+            payload,
+        );
+        store
+            .apply(
+                processor.as_ref(),
+                leani_primitives::ProcessorCursor {
+                    processor_id: processor.descriptor().id.to_string(),
+                    processor_version: processor.descriptor().version.to_string(),
+                    chain_id: ChainId(1),
+                    block_number: block.number,
+                    block_hash: block.hash,
+                    finality: Finality::Included,
+                    sequence: 1,
+                },
+                &delta,
+                &[],
+            )
+            .await
+            .expect("apply the block");
+        store
+            .undo(
+                processor.descriptor(),
+                ChainId(1),
+                block.number,
+                block.hash,
+                &[],
+            )
+            .await
+            .expect("undo the block");
+        let records = store
+            .changes(processor.descriptor(), ChainId(1), 0, 16)
+            .await
+            .expect("changes");
+        (processor, store, directory, records)
+    }
+
+    /// Fields an undo row repeats from the row of the change it reverts.
+    const REPEATED_FIELDS: [&str; 7] = [
+        "schema",
+        "blockNumber",
+        "blockHash",
+        "transactionCount",
+        "market",
+        "price",
+        "logIndex",
+    ];
+
+    /// Assert that `undone` reverts `applied`: a row repeats the reverted
+    /// item, and a raw envelope names the same change of `protocol`.
+    fn assert_undo_repeats(
+        format: SubscribeFormat,
+        protocol: SubscribeProtocol,
+        applied: &Value,
+        undone: &Value,
+    ) {
+        assert_eq!(applied["operation"], "apply");
+        assert_eq!(undone["operation"], "undo");
+        if format == SubscribeFormat::Raw {
+            let kind = subscription_change_kind(protocol);
+            assert!(undone["key"].is_string(), "{undone}");
+            assert_eq!(undone["key"], applied["key"]);
+            assert!(undone["block"]["hash"].is_string(), "{undone}");
+            assert_eq!(undone["block"]["hash"], applied["block"]["hash"]);
+            assert_eq!(applied["kind"], format!("{kind}.put"));
+            assert_eq!(undone["kind"], format!("{kind}.delete"));
+        } else {
+            assert!(undone["schema"].is_string(), "{undone}");
+            assert!(undone["blockHash"].is_string(), "{undone}");
+            for field in REPEATED_FIELDS {
+                assert_eq!(undone.get(field), applied.get(field), "{field}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn embedded_undo_of_a_created_entity_renders_the_item_it_reverts() {
+        // Audit H18: embedded mode decoded every undo's payload, and the store
+        // undoes a created entity with an empty `Delete`, so any reorg exited.
+        let market = resolve_markets(&["ETH/USDC".to_owned()]).expect("market");
+        for (protocol, markets) in [
+            (SubscribeProtocol::Blocks, &[][..]),
+            (SubscribeProtocol::UniswapV3, &market[..]),
+        ] {
+            let (processor, store, _directory, records) =
+                applied_then_undone(protocol, markets).await;
+            let [_, undo] = records.as_slice() else {
+                panic!("an apply and its undo: {records:?}");
+            };
+            assert_eq!(undo.direction, ChangeDirection::Undo);
+            assert_eq!(undo.change.operation, ChangeOperation::Delete);
+            assert!(undo.change.payload.is_empty());
+            let mut options = subscribe_options(Vec::new());
+            options.protocol = protocol;
+            for format in [SubscribeFormat::Json, SubscribeFormat::Raw] {
+                options.format = format;
+                let mut output = EmbeddedOutput::default();
+                let (printed, rows) = captured(|| {
+                    records
+                        .iter()
+                        .map(|record| {
+                            render_durable_change(
+                                &options,
+                                markets,
+                                record,
+                                processor.as_ref(),
+                                store.epoch(),
+                                &mut output,
+                                unix_seconds(),
+                            )
+                        })
+                        .collect::<Result<Vec<_>>>()
+                });
+                // An undo prints but never satisfies `--once`.
+                assert_eq!(
+                    printed.expect("an undo never ends the subscription"),
+                    [true, false]
+                );
+                assert_eq!(rows.len(), 2, "{format:?}: {rows:?}");
+                let applied: Value = serde_json::from_str(&rows[0]).expect("apply row");
+                let undone: Value = serde_json::from_str(&rows[1]).expect("undo row");
+                assert_undo_repeats(format, protocol, &applied, &undone);
+            }
+            // An undo of a change this run never printed names its block and
+            // change key.
+            options.format = SubscribeFormat::Json;
+            let (printed, rows) = captured(|| {
+                render_durable_change(
+                    &options,
+                    markets,
+                    undo,
+                    processor.as_ref(),
+                    store.epoch(),
+                    &mut EmbeddedOutput::default(),
+                    unix_seconds(),
+                )
+            });
+            assert!(!printed.expect("an unknown undo"));
+            let row: Value = serde_json::from_str(&rows[0]).expect("undo row");
+            assert_eq!(row["schema"], "leani.subscription-undo.v1");
+            assert_eq!(row["operation"], "undo");
+            assert_eq!(row["blockNumber"], 20_000_000);
+            assert_eq!(row["blockHash"], undo.block.hash.to_string());
+            assert_eq!(row["key"], format!("0x{}", hex::encode(&undo.change.key)));
+            assert!(
+                latest_fresh_items(
+                    protocol,
+                    markets,
+                    records.clone(),
+                    SubscribeFinality::Included,
+                    unix_seconds(),
+                )
+                .expect("startup selection survives an undo")
+                .is_empty()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn embedded_undo_of_a_previewed_block_prints_once() {
+        // An undo must print when a peer preview row showed the block that
+        // the durable lane only saw at startup, and must not wait behind a
+        // newer preview row.
+        let (processor, store, _directory, records) =
+            applied_then_undone(SubscribeProtocol::Blocks, &[]).await;
+        let item = local_item(SubscribeProtocol::Blocks, &[], &records[0])
+            .expect("decode")
+            .expect("block item");
+        let mut options = subscribe_options(Vec::new());
+        options.protocol = SubscribeProtocol::Blocks;
+        options.format = SubscribeFormat::Json;
+        let undo = |output: &mut EmbeddedOutput| {
+            captured(|| {
+                render_durable_change(
+                    &options,
+                    &[],
+                    &records[1],
+                    processor.as_ref(),
+                    store.epoch(),
+                    output,
+                    unix_seconds(),
+                )
+            })
+        };
+
+        let mut output = EmbeddedOutput::default();
+        output.previewed.insert(observation_key(&item));
+        retain_preview_block(
+            &mut output.preview_blocks,
+            &mut output.previewed,
+            records[0].block,
+            vec![item.clone()],
+        );
+        output.seen.remember(
+            records[0].change.key.clone(),
+            SeenItem {
+                item: item.clone(),
+                printed: false,
+            },
+        );
+        let (printed, rows) = undo(&mut output);
+        assert!(!printed.expect("undo"));
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert!(output.previewed.is_empty());
+        assert!(output.preview_blocks.is_empty());
+
+        let SubscriptionItem::Block(entity) = &item else {
+            panic!("expected a block item");
+        };
+        let next = BlockRef {
+            number: BlockNumber(entity.block_number.0 + 1),
+            hash: BlockHash::new([0x43; 32]),
+            parent_hash: entity.block_hash,
+            timestamp: entity.timestamp,
+        };
+        let newer = SubscriptionItem::Block(BlockSummaryEntity {
+            block_number: next.number,
+            block_hash: next.hash,
+            parent_hash: next.parent_hash,
+            ..entity.clone()
+        });
+        let mut output = EmbeddedOutput::default();
+        output.previewed.insert(observation_key(&newer));
+        retain_preview_block(
+            &mut output.preview_blocks,
+            &mut output.previewed,
+            next,
+            vec![newer],
+        );
+        output.seen.remember(
+            records[0].change.key.clone(),
+            SeenItem {
+                item,
+                printed: true,
+            },
+        );
+        let (printed, rows) = undo(&mut output);
+        assert!(!printed.expect("undo"));
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(output.preview_blocks.len(), 1, "the newer preview stays");
+    }
+
+    #[tokio::test]
+    async fn attached_undo_of_a_created_entity_renders_the_item_it_reverts() {
+        // Audit H18: attached mode returned early on `data: null`, so the
+        // undo of a created entity vanished.
+        let market = resolve_markets(&["ETH/USDC".to_owned()]).expect("market");
+        let other_market = resolve_markets(&["ETH/USDT".to_owned()]).expect("market");
+        for (protocol, processor_id, markets) in [
+            (SubscribeProtocol::Blocks, "block-summary", &[][..]),
+            (
+                SubscribeProtocol::UniswapV3,
+                "uniswap-observations",
+                &market[..],
+            ),
+        ] {
+            let (processor, store, _directory, records) =
+                applied_then_undone(protocol, markets).await;
+            let frames = records
+                .iter()
+                .map(|record| {
+                    let envelope = leani_api::change_envelope_json(
+                        store.epoch(),
+                        processor.as_ref(),
+                        record.clone(),
+                    )
+                    .expect("envelope");
+                    format!(
+                        "event: {}\ndata: {envelope}\n\n",
+                        envelope["operation"].as_str().expect("operation")
+                    )
+                    .into_bytes()
+                })
+                .collect::<Vec<_>>();
+            let mut options = attached_included_options();
+            options.protocol = protocol;
+            options.processor = processor_id.to_owned();
+            options.once = false;
+            let render = |options: &SubscribeOptions, frames: &[Vec<u8>], markets: &[Market]| {
+                let mut buffer = EventBuffer::default();
+                buffer.push(&attached_hello(1, processor_id, None));
+                for frame in frames {
+                    buffer.push(frame);
+                }
+                captured(|| {
+                    render_attached_sse_events(
+                        &mut buffer,
+                        &mut AttachedState::default(),
+                        options,
+                        markets,
+                        unix_seconds(),
+                    )
+                })
+            };
+            for format in [SubscribeFormat::Json, SubscribeFormat::Raw] {
+                options.format = format;
+                let (outcome, rows) = render(&options, &frames, markets);
+                assert!(!outcome.expect("an undo renders").stop);
+                assert_eq!(rows.len(), 2, "{format:?}: {rows:?}");
+                let applied: Value = serde_json::from_str(&rows[0]).expect("apply row");
+                let undone: Value = serde_json::from_str(&rows[1]).expect("undo row");
+                assert_undo_repeats(format, protocol, &applied, &undone);
+            }
+            // An undo of a change this run never saw names its block and key.
+            options.format = SubscribeFormat::Json;
+            let (outcome, rows) = render(&options, &frames[1..], markets);
+            outcome.expect("an unknown undo renders");
+            let row: Value = serde_json::from_str(&rows[0]).expect("undo row");
+            assert_eq!(row["schema"], "leani.subscription-undo.v1");
+            assert_eq!(row["blockNumber"], 20_000_000);
+            assert_eq!(
+                row["key"],
+                format!("0x{}", hex::encode(&records[1].change.key))
+            );
+            if protocol == SubscribeProtocol::UniswapV3 {
+                // Another pool's change and its undo both stay hidden.
+                let (outcome, rows) = render(&options, &frames, &other_market);
+                outcome.expect("another pool's undo");
+                assert!(rows.is_empty(), "{rows:?}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn attached_finalized_subscriptions_replay_blocks_unfinalized_at_connect() {
+        // Audit M-N5: `--finality finalized` started at the change head, so a
+        // block included before connecting was never printed once finalized.
+        let head = r#"{"cursor":"cursor-9"}"#;
+        let (endpoint, contacted) = loopback_server(
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{head}",
+                head.len()
+            ),
+            1,
+        )
+        .await;
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("client");
+        let (cursor, _) =
+            attached_start_cursor(&client, &attached_finalized_options(), &[], &endpoint)
+                .await
+                .expect("start");
+        assert_eq!(
+            cursor, None,
+            "the stream must start before unfinalized blocks"
+        );
+        assert_eq!(contacted.await.expect("server"), 0);
+    }
+
+    #[test]
+    fn attached_finalized_subscriptions_skip_blocks_final_before_they_connect() {
+        let now = unix_seconds();
+        let options = attached_finalized_options();
+        let mut state = AttachedState::default();
+        let mut buffer = EventBuffer::default();
+        buffer.push(&attached_hello(1, "block-summary", Some(100)));
+        buffer.push(&attached_block_event(1, 100, "included", now));
+        buffer.push(&attached_block_event(2, 101, "included", now));
+        render_blocks(&mut buffer, &mut state, &options).expect("replay the retained log");
+        assert_eq!(
+            state.gate.pending_blocks(),
+            1,
+            "block 100 was finalized before the subscription connected"
+        );
+        // A reconnect's hello does not move what counted as final.
+        state.greeted = false;
+        buffer.push(&attached_hello(1, "block-summary", Some(105)));
+        buffer.push(&attached_block_event(3, 102, "included", now));
+        render_blocks(&mut buffer, &mut state, &options).expect("reconnect");
+        assert_eq!(state.gate.pending_blocks(), 2);
+
+        buffer.push(&attached_marker_event(4, 101, "system.finality.put", 101));
+        let (outcome, rows) = captured(|| render_blocks(&mut buffer, &mut state, &options));
+        assert!(outcome.expect("finality releases block 101").stop);
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        let row: Value = serde_json::from_str(&rows[0]).expect("JSON row");
+        assert_eq!(row["blockNumber"], 101);
+        assert_eq!(row["finality"], "finalized");
+    }
+
+    #[test]
+    fn a_full_finality_gate_reports_the_block_it_drops() {
+        // Audit M-N5: past 1,024 held blocks the gate dropped the oldest with
+        // only a note on stderr, a silent hole in finalized output.
+        let now = unix_seconds();
+        let options = attached_finalized_options();
+        let mut state = AttachedState::default();
+        let mut buffer = EventBuffer::default();
+        buffer.push(&attached_hello(1, "block-summary", None));
+        let held = u64::try_from(FINALIZED_GATE_MAX_BLOCKS).expect("gate bound") + 1;
+        for block in 1..=held {
+            buffer.push(&attached_block_event(block, block, "included", now));
+        }
+        let (outcome, rows) = captured(|| render_blocks(&mut buffer, &mut state, &options));
+        assert!(!outcome.expect("hold unfinalized blocks").stop);
+        // The hole is reported where it is, before the next finalized row.
+        assert!(rows.is_empty(), "{rows:?}");
+        assert_eq!(state.gate.pending_blocks(), FINALIZED_GATE_MAX_BLOCKS);
+        buffer.push(&attached_marker_event(
+            held + 1,
+            held,
+            "system.finality.put",
+            2,
+        ));
+        let (outcome, rows) = captured(|| render_blocks(&mut buffer, &mut state, &options));
+        assert!(outcome.expect("finality releases block 2").stop);
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        let gap: Value = serde_json::from_str(&rows[0]).expect("JSON gap row");
+        assert_eq!(gap["schema"], "leani.subscription-gap.v1");
+        assert_eq!(gap["operation"], "gap");
+        assert_eq!(gap["fromBlock"], 1);
+        assert_eq!(gap["toBlock"], 1);
+        assert_eq!(gap["timestamp"], now);
+        assert_eq!(gap["reason"], "finality_gate_full");
+        let row: Value = serde_json::from_str(&rows[1]).expect("block row");
+        assert_eq!(row["blockNumber"], 2);
+    }
+
+    #[test]
+    fn retryable_stream_errors_reconnect_instead_of_ending_the_subscription() {
+        // Audit SSE-6: every `event: error` ended the subscription, even one
+        // the node marks retryable.
+        let options = attached_included_options();
+        for retryable in [true, false] {
+            let mut buffer = EventBuffer::default();
+            buffer.push(&attached_hello(1, "block-summary", None));
+            buffer.push(&stream_error(retryable));
+            let outcome = render_blocks(&mut buffer, &mut AttachedState::default(), &options);
+            if retryable {
+                let outcome = outcome.expect("a retryable error reconnects");
+                assert_eq!(outcome.retry.as_deref(), Some("store busy"));
+            } else {
+                assert!(outcome.is_err(), "a permanent error ends the subscription");
+            }
+        }
+    }
+
+    #[test]
+    fn attached_streams_fail_closed_without_a_matching_hello() {
+        // Audit CLI-5: the stream's hello was discarded, so a node serving
+        // another chain or processor was printed as this feed.
+        let now = unix_seconds();
+        let options = attached_included_options();
+        for (hello, expected) in [
+            (attached_hello(5, "block-summary", None), "chain 5"),
+            (attached_hello(1, "erc20-balances", None), "erc20-balances"),
+            (Vec::new(), "hello"),
+        ] {
+            let mut buffer = EventBuffer::default();
+            buffer.push(&hello);
+            buffer.push(&attached_block_event(1, 100, "included", now));
+            let (outcome, rows) =
+                captured(|| render_blocks(&mut buffer, &mut AttachedState::default(), &options));
+            let error = outcome.expect_err("an unidentified stream is refused");
+            assert!(format!("{error:#}").contains(expected), "{error:#}");
+            assert!(rows.is_empty(), "{rows:?}");
+        }
+        // A startup snapshot also waits for the hello.
+        let mut state = AttachedState {
+            snapshot: vec![AttachedItem::Block(AttachedBlockSummary {
+                chain_id: 1,
+                block_number: 99,
+                block_hash: format!("0x{}", hex::encode([99; 32])),
+                parent_hash: format!("0x{}", hex::encode([98; 32])),
+                timestamp: now,
+                gas_limit: None,
+                gas_used: None,
+                base_fee_per_gas: None,
+                blob_gas_used: None,
+                excess_blob_gas: None,
+                transaction_count: None,
+                size_bytes: None,
+                finality: "included".to_owned(),
+            })],
+            ..AttachedState::default()
+        };
+        let mut buffer = EventBuffer::default();
+        buffer.push(&attached_hello(5, "block-summary", None));
+        let (outcome, rows) = captured(|| render_blocks(&mut buffer, &mut state, &options));
+        assert!(outcome.is_err());
+        assert!(rows.is_empty(), "{rows:?}");
+
+        let mut buffer = EventBuffer::default();
+        buffer.push(&attached_hello(1, "block-summary", None));
+        let (outcome, rows) = captured(|| render_blocks(&mut buffer, &mut state, &options));
+        assert!(outcome.expect("the matching node renders").stop);
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        // Every connection identifies its node again.
+        state.greeted = false;
+        let mut buffer = EventBuffer::default();
+        buffer.push(&attached_block_event(2, 100, "included", now));
+        assert!(render_blocks(&mut buffer, &mut state, &options).is_err());
+    }
+
+    #[test]
+    fn a_subscription_reset_never_removes_a_node_data_directory() {
+        // Audit CLI-7: `reset subscription --data-dir` accepted any directory
+        // with a Leani lock file, such as an idle node's data_dir.
+        let root = tempfile::tempdir().expect("temporary directory");
+        let node = root.path().join("node-data");
+        fs::create_dir_all(node.join("raw-history")).expect("node raw history");
+        fs::write(node.join("leani.sqlite"), b"node database").expect("node database");
+        drop(local_state::lock_runtime_directory(&node).expect("an idle node's lock file"));
+
+        let error = reset_subscription_directory(&node, None, root.path(), true)
+            .expect_err("a node data directory is never reset");
+        assert!(
+            error.to_string().contains("subscription marker"),
+            "{error:#}"
+        );
+        assert!(node.join("leani.sqlite").is_file());
+        assert!(node.join("raw-history").is_dir());
+    }
+
+    #[test]
+    fn a_refused_subscription_hint_quotes_paths_and_names_both_causes() {
+        // Task 8 review: the stored start block can be the later one, and a
+        // reused --data-dir with other markets is refused the same way.
+        let root = tempfile::tempdir().expect("temporary directory");
+        drop(
+            local_state::lock_subscription_directory(
+                &root.path().join("srv/my leani's state"),
+                false,
+            )
+            .expect("a subscription directory"),
+        );
+        let mut options = subscribe_options(Vec::new());
+        options.working_directory = root.path().to_path_buf();
+        options.data_dir = Some(PathBuf::from("srv/my leani's state"));
+        options.requested_config = Some(PathBuf::from("configs/node 1.toml"));
+        let markets = resolve_markets(&["ETH/USDC".to_owned()]).expect("market");
+        let message = format!(
+            "{:#}",
+            explain_subscription_refusal(
+                StoreError::ProcessorIdentity(UNISWAP_PROCESSOR_INSTANCE.to_owned()),
+                &options,
+                &markets,
+            )
+        );
+        assert!(
+            message.contains("another start block or market set"),
+            "{message}"
+        );
+        assert!(!message.contains("earlier start block"), "{message}");
+        assert!(
+            message.contains(
+                r"`leani reset subscription uniswap-v3 ETH/USDC --data-dir 'srv/my leani'\''s state' --config 'configs/node 1.toml' --yes`"
+            ),
+            "{message}"
+        );
+    }
+
+    /// Render every complete event in `buffer` for a blocks feed.
+    fn render_blocks(
+        buffer: &mut EventBuffer,
+        state: &mut AttachedState,
+        options: &SubscribeOptions,
+    ) -> Result<SseRenderOutcome> {
+        render_attached_sse_events(buffer, state, options, &[], unix_seconds())
+    }
+
+    /// A node's SSE frame for one change, from its envelope.
+    fn sse_frame(envelope: &Value) -> Vec<u8> {
+        format!(
+            "event: {}\ndata: {envelope}\n\n",
+            envelope["operation"].as_str().expect("operation")
+        )
+        .into_bytes()
+    }
+
+    /// An included block summary change at `block`, keyed by its hash like
+    /// the processor's.
+    fn block_change(sequence: u64, block: u64, operation: &str, timestamp: u64) -> Value {
+        block_change_at(sequence, block, operation, "included", timestamp)
+    }
+
+    /// [`block_change`] with `finality`.
+    fn block_change_at(
+        sequence: u64,
+        block: u64,
+        operation: &str,
+        finality: &str,
+        timestamp: u64,
+    ) -> Value {
+        let hash = format!(
+            "0x{}",
+            hex::encode([u8::try_from(block % 250).unwrap_or(0); 32])
+        );
+        let parent = format!("0x{}", hex::encode([0; 32]));
+        let (suffix, data) = if operation == "undo" {
+            ("delete", Value::Null)
+        } else {
+            (
+                "put",
+                json!({
+                    "chainId": 1, "blockNumber": block, "blockHash": hash,
+                    "parentHash": parent, "timestamp": timestamp, "gasLimit": 60_000_000,
+                    "gasUsed": 30_000_000, "baseFeePerGas": null, "blobGasUsed": null,
+                    "excessBlobGas": null, "transactionCount": 3, "sizeBytes": null,
+                    "finality": finality,
+                }),
+            )
+        };
+        json!({
+            "sequence": sequence.to_string(),
+            "cursor": format!("cursor-{sequence}"),
+            "operation": operation,
+            "block": { "number": block, "hash": hash, "parentHash": parent, "timestamp": timestamp },
+            "finality": finality,
+            "kind": format!("{BLOCK_SUMMARY_KIND}.{suffix}"),
+            "key": hash,
+            "data": data,
+        })
+    }
+
+    #[test]
+    fn a_finalized_summary_above_the_floor_is_no_pruned_gap() {
+        // Review 2, N1: only held (included) applies consumed the pruned-block
+        // check, so a summary arriving already finalized, as while the node
+        // catches up in finalized history, left a false gap below the next
+        // included one.
+        let now = unix_seconds();
+        let mut options = attached_finalized_options();
+        options.once = false;
+        let mut state = AttachedState::default();
+        let mut buffer = EventBuffer::default();
+        buffer.push(&attached_hello(1, "block-summary", Some(100)));
+        buffer.push(&sse_frame(&block_change_at(
+            1,
+            101,
+            "apply",
+            "finalized",
+            now,
+        )));
+        buffer.push(&sse_frame(&block_change(2, 102, "apply", now)));
+        buffer.push(&attached_marker_event(3, 102, "system.finality.put", 102));
+        let (outcome, rows) = captured(|| render_blocks(&mut buffer, &mut state, &options));
+        outcome.expect("render");
+        assert!(
+            rows.iter()
+                .all(|row| !row.contains("leani.subscription-gap.v1")),
+            "{rows:?}"
+        );
+        assert_eq!(rows.len(), 2, "{rows:?}");
+    }
+
+    #[test]
+    fn an_attached_finalized_block_republished_by_the_node_prints_once() {
+        // Review 2, N2: a node recompute republishes covered blocks as
+        // finalized changes; without the age filter they printed again.
+        let now = unix_seconds();
+        let mut options = attached_finalized_options();
+        options.once = false;
+        let mut state = AttachedState::default();
+        let mut buffer = EventBuffer::default();
+        buffer.push(&attached_hello(1, "block-summary", Some(99)));
+        buffer.push(&sse_frame(&block_change_at(
+            1,
+            100,
+            "apply",
+            "finalized",
+            now,
+        )));
+        buffer.push(&sse_frame(&block_change_at(
+            2,
+            100,
+            "apply",
+            "finalized",
+            now,
+        )));
+        let (outcome, rows) = captured(|| render_blocks(&mut buffer, &mut state, &options));
+        outcome.expect("render");
+        assert_eq!(rows.len(), 1, "{rows:?}");
+    }
+
+    #[test]
+    fn an_embedded_finalized_record_republished_by_the_node_prints_once() {
+        let processor = ProcessorRegistry::standard()
+            .instantiate(
+                &subscription_processor(
+                    SubscribeProtocol::Blocks,
+                    &[],
+                    SubscribeFinality::Finalized,
+                )
+                .expect("processor configuration"),
+                1,
+            )
+            .expect("processor");
+        let mut record = block_record(100, unix_seconds());
+        record.finality = Finality::Finalized;
+        let mut republished = record.clone();
+        republished.cursor.sequence += 1;
+        let mut options = subscribe_options(Vec::new());
+        options.protocol = SubscribeProtocol::Blocks;
+        options.format = SubscribeFormat::Json;
+        options.finality = SubscribeFinality::Finalized;
+        let mut output = EmbeddedOutput::default();
+        let (printed, rows) = captured(|| {
+            [&record, &republished]
+                .into_iter()
+                .map(|record| {
+                    render_durable_change(
+                        &options,
+                        &[],
+                        record,
+                        processor.as_ref(),
+                        [0; 16],
+                        &mut output,
+                        unix_seconds(),
+                    )
+                })
+                .collect::<Result<Vec<_>>>()
+        });
+        assert_eq!(printed.expect("render"), [true, false]);
+        assert_eq!(rows.len(), 1, "{rows:?}");
+    }
+
+    /// A Uniswap observation change of `market`'s pool.
+    fn price_change(
+        sequence: u64,
+        market: &Market,
+        log_index: u32,
+        operation: &str,
+        timestamp: u64,
+    ) -> Value {
+        let hash = format!("0x{}", hex::encode([0x42; 32]));
+        let key = format!(
+            "0x{}{}{log_index:08x}",
+            market.pool.trim_start_matches("0x").to_ascii_lowercase(),
+            hash.trim_start_matches("0x")
+        );
+        let (suffix, data) = if operation == "undo" {
+            ("delete", Value::Null)
+        } else {
+            (
+                "put",
+                json!({
+                    "pool": market.pool.to_ascii_lowercase(), "kind": "v3",
+                    "reserve0": null, "reserve1": null, "amount0": "2500000000",
+                    "amount1": "-1250000000000000000",
+                    "sqrtPriceX96": "2045662359789070170858018546451766",
+                    "blockNumber": 20_000_000, "blockHash": hash, "logIndex": log_index,
+                    "finality": "included",
+                }),
+            )
+        };
+        json!({
+            "sequence": sequence.to_string(),
+            "cursor": format!("cursor-{sequence}"),
+            "operation": operation,
+            "block": {
+                "number": 20_000_000, "hash": hash, "parentHash": hash, "timestamp": timestamp,
+            },
+            "finality": "included",
+            "kind": format!("{UNISWAP_OBSERVATION_KIND}.{suffix}"),
+            "key": key,
+            "data": data,
+        })
+    }
+
+    /// A block applied ten minutes ago: fresh then, stale for an included
+    /// row now.
+    const LATE: u64 = 600;
+
+    #[tokio::test]
+    async fn an_embedded_undo_of_a_printed_row_prints_however_old() {
+        // Review 1, Important 1: the freshness gate ran before the undo's
+        // change key was looked up, so a late undo of a printed row, as
+        // after a node restart and a reconnect backoff, vanished.
+        let market = resolve_markets(&["ETH/USDC".to_owned()]).expect("market");
+        let applied_at = unix_seconds() - LATE;
+        for (protocol, markets) in [
+            (SubscribeProtocol::Blocks, &[][..]),
+            (SubscribeProtocol::UniswapV3, &market[..]),
+        ] {
+            let (processor, store, _directory, records) =
+                applied_then_undone_at(protocol, markets, applied_at).await;
+            let mut options = subscribe_options(Vec::new());
+            options.protocol = protocol;
+            options.format = SubscribeFormat::Json;
+            let render = |record: &ChangeRecord, output: &mut EmbeddedOutput, now: u64| {
+                captured(|| {
+                    render_durable_change(
+                        &options,
+                        markets,
+                        record,
+                        processor.as_ref(),
+                        store.epoch(),
+                        output,
+                        now,
+                    )
+                })
+            };
+            let mut output = EmbeddedOutput::default();
+            let (printed, rows) = render(&records[0], &mut output, applied_at + 10);
+            assert!(printed.expect("a fresh apply prints"));
+            assert_eq!(rows.len(), 1, "{protocol:?}: {rows:?}");
+            let (_, rows) = render(&records[1], &mut output, applied_at + LATE);
+            assert_eq!(rows.len(), 1, "{protocol:?}: {rows:?}");
+            let undone: Value = serde_json::from_str(&rows[0]).expect("undo row");
+            assert_eq!(undone["operation"], "undo");
+            // An undo of a change this run never saw is news only while
+            // fresh.
+            let (_, rows) = render(
+                &records[1],
+                &mut EmbeddedOutput::default(),
+                applied_at + LATE,
+            );
+            assert!(rows.is_empty(), "{protocol:?}: {rows:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_attached_undo_of_a_printed_row_prints_however_old() {
+        let market = resolve_markets(&["ETH/USDC".to_owned()]).expect("market");
+        let applied_at = unix_seconds() - LATE;
+        for (protocol, processor_id, markets) in [
+            (SubscribeProtocol::Blocks, "block-summary", &[][..]),
+            (
+                SubscribeProtocol::UniswapV3,
+                "uniswap-observations",
+                &market[..],
+            ),
+        ] {
+            let (processor, store, _directory, records) =
+                applied_then_undone_at(protocol, markets, applied_at).await;
+            let mut options = subscribe_options(Vec::new());
+            options.protocol = protocol;
+            options.processor = processor_id.to_owned();
+            options.format = SubscribeFormat::Json;
+            options.once = false;
+            let frames = records
+                .iter()
+                .map(|record| {
+                    sse_frame(
+                        &leani_api::change_envelope_json(
+                            store.epoch(),
+                            processor.as_ref(),
+                            record.clone(),
+                        )
+                        .expect("envelope"),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let mut state = AttachedState::default();
+            let mut buffer = EventBuffer::default();
+            buffer.push(&attached_hello(1, processor_id, None));
+            buffer.push(&frames[0]);
+            let (outcome, rows) = captured(|| {
+                render_attached_sse_events(
+                    &mut buffer,
+                    &mut state,
+                    &options,
+                    markets,
+                    applied_at + 10,
+                )
+            });
+            outcome.expect("a fresh apply prints");
+            assert_eq!(rows.len(), 1, "{protocol:?}: {rows:?}");
+            buffer.push(&frames[1]);
+            let (outcome, rows) = captured(|| {
+                render_attached_sse_events(
+                    &mut buffer,
+                    &mut state,
+                    &options,
+                    markets,
+                    applied_at + LATE,
+                )
+            });
+            outcome.expect("a late undo prints");
+            assert_eq!(rows.len(), 1, "{protocol:?}: {rows:?}");
+            let undone: Value = serde_json::from_str(&rows[0]).expect("undo row");
+            assert_eq!(undone["operation"], "undo");
+            // An undo of a change this run never saw is news only while
+            // fresh.
+            let mut buffer = EventBuffer::default();
+            buffer.push(&attached_hello(1, processor_id, None));
+            buffer.push(&frames[1]);
+            let (outcome, rows) = captured(|| {
+                render_attached_sse_events(
+                    &mut buffer,
+                    &mut AttachedState::default(),
+                    &options,
+                    markets,
+                    applied_at + LATE,
+                )
+            });
+            outcome.expect("a stale unknown undo");
+            assert!(rows.is_empty(), "{protocol:?}: {rows:?}");
+        }
+    }
+
+    #[test]
+    fn a_node_that_adopts_a_subscription_directory_is_never_reset_as_one() {
+        // Review 1, Important 2: a node that took over a directory
+        // `leani subscribe` had marked kept the marker, so `reset
+        // subscription` deleted the node's store.
+        let root = tempfile::tempdir().expect("temporary directory");
+        let shared = root.path().join("srv-leani");
+        drop(
+            local_state::lock_subscription_directory(&shared, false)
+                .expect("a new subscription directory"),
+        );
+        assert!(local_state::is_subscription_directory(&shared));
+        drop(
+            local_state::after_release(|| local_state::lock_runtime_directory(&shared))
+                .expect("a node adopts it"),
+        );
+        fs::write(shared.join("leani.sqlite"), b"node database").expect("node database");
+
+        let error = reset_subscription_directory(&shared, None, root.path(), true)
+            .expect_err("a node's directory is never reset as a subscription");
+        assert!(
+            error.to_string().contains("subscription marker"),
+            "{error:#}"
+        );
+        assert!(shared.join("leani.sqlite").is_file());
+    }
+
+    #[test]
+    fn attached_finalized_blocks_print_however_late_finality_arrives() {
+        // Review 1, Important 3: a released block older than 30 minutes, as
+        // during a long finality delay, was dropped without a trace.
+        let late = unix_seconds() - 45 * 60;
+        let mut options = attached_finalized_options();
+        options.once = false;
+        let mut state = AttachedState::default();
+        let mut buffer = EventBuffer::default();
+        buffer.push(&attached_hello(1, "block-summary", Some(99)));
+        buffer.push(&attached_block_event(1, 100, "included", late));
+        buffer.push(&attached_marker_event(2, 100, "system.finality.put", 100));
+        let (outcome, rows) = captured(|| render_blocks(&mut buffer, &mut state, &options));
+        outcome.expect("finality releases block 100");
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        let row: Value = serde_json::from_str(&rows[0]).expect("JSON row");
+        assert_eq!(row["blockNumber"], 100);
+        assert_eq!(row["finality"], "finalized");
+    }
+
+    #[test]
+    fn embedded_finalized_blocks_print_however_late_finality_arrives() {
+        let processor = ProcessorRegistry::standard()
+            .instantiate(
+                &subscription_processor(
+                    SubscribeProtocol::Blocks,
+                    &[],
+                    SubscribeFinality::Finalized,
+                )
+                .expect("processor configuration"),
+                1,
+            )
+            .expect("processor");
+        let mut record = block_record(100, unix_seconds() - 45 * 60);
+        record.finality = Finality::Finalized;
+        let mut options = subscribe_options(Vec::new());
+        options.protocol = SubscribeProtocol::Blocks;
+        options.format = SubscribeFormat::Json;
+        options.finality = SubscribeFinality::Finalized;
+        let (printed, rows) = captured(|| {
+            render_durable_change(
+                &options,
+                &[],
+                &record,
+                processor.as_ref(),
+                [0; 16],
+                &mut EmbeddedOutput::default(),
+                unix_seconds(),
+            )
+        });
+        assert!(printed.expect("a late finalized block prints"));
+        assert_eq!(rows.len(), 1, "{rows:?}");
+    }
+
+    #[tokio::test]
+    async fn startup_row_keys_match_the_processors_change_keys() {
+        // A startup row is remembered under the key the stream names its
+        // change by; pin that against the built-in processors' own keys.
+        let market = resolve_markets(&["ETH/USDC".to_owned()]).expect("market");
+        for (protocol, markets) in [
+            (SubscribeProtocol::Blocks, &[][..]),
+            (SubscribeProtocol::UniswapV3, &market[..]),
+        ] {
+            let (processor, store, _directory, records) =
+                applied_then_undone(protocol, markets).await;
+            let applied = leani_api::change_envelope_json(
+                store.epoch(),
+                processor.as_ref(),
+                records[0].clone(),
+            )
+            .expect("envelope");
+            let item = match protocol {
+                SubscribeProtocol::Blocks => AttachedItem::Block(
+                    serde_json::from_value(applied["data"].clone()).expect("summary"),
+                ),
+                SubscribeProtocol::UniswapV3 => AttachedItem::Price {
+                    market: markets[0],
+                    entity: serde_json::from_value(applied["data"].clone()).expect("price"),
+                    timestamp: unix_seconds(),
+                },
+            };
+            assert_eq!(
+                item.change_key(),
+                Some(format!("0x{}", hex::encode(&records[0].change.key))),
+                "{protocol:?}"
+            );
+            assert_eq!(item.change_key().as_deref(), applied["key"].as_str());
+        }
+    }
+
+    #[test]
+    fn an_undo_of_a_startup_row_repeats_it() {
+        // Review 1, minor 1: startup rows were not remembered, so their undo
+        // printed the row reserved for changes this run never showed.
+        let now = unix_seconds();
+        let mut options = attached_included_options();
+        options.once = false;
+        let startup = block_change(1, 100, "apply", now);
+        let mut state = AttachedState {
+            snapshot: vec![AttachedItem::Block(
+                serde_json::from_value(startup["data"].clone()).expect("summary"),
+            )],
+            ..AttachedState::default()
+        };
+        let mut buffer = EventBuffer::default();
+        buffer.push(&attached_hello(1, "block-summary", None));
+        buffer.push(&sse_frame(&block_change(2, 100, "undo", now)));
+        let (outcome, rows) = captured(|| render_blocks(&mut buffer, &mut state, &options));
+        outcome.expect("render");
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        let undone: Value = serde_json::from_str(&rows[1]).expect("undo row");
+        assert_eq!(undone["schema"], "leani.block-summary.v1");
+        assert_eq!(undone["operation"], "undo");
+        assert_eq!(undone["blockNumber"], 100);
+    }
+
+    #[test]
+    fn other_pools_changes_do_not_push_printed_rows_out() {
+        // Review 1, minor 2: another pool's filtered changes shared the key
+        // budget, so a busy node pushed printed rows out before their undo.
+        let now = unix_seconds();
+        let market = resolve_markets(&["ETH/USDC".to_owned()]).expect("market");
+        let other = resolve_markets(&["ETH/USDT".to_owned()]).expect("market")[0];
+        let mut options = subscribe_options(Vec::new());
+        options.mode = SubscribeMode::Client;
+        options.format = SubscribeFormat::Json;
+        options.once = false;
+        let mut buffer = EventBuffer::default();
+        buffer.push(&attached_hello(1, "uniswap-observations", None));
+        buffer.push(&sse_frame(&price_change(1, &market[0], 0, "apply", now)));
+        let busy = u64::try_from(RECENT_CHANGE_KEYS).expect("key budget");
+        for (sequence, log_index) in (2..).zip(0..=busy) {
+            let log_index = u32::try_from(log_index).expect("log index");
+            buffer.push(&sse_frame(&price_change(
+                sequence, &other, log_index, "apply", now,
+            )));
+        }
+        buffer.push(&sse_frame(&price_change(
+            busy + 3,
+            &market[0],
+            0,
+            "undo",
+            now,
+        )));
+        let (outcome, rows) = captured(|| {
+            render_attached_sse_events(
+                &mut buffer,
+                &mut AttachedState::default(),
+                &options,
+                &market,
+                now,
+            )
+        });
+        outcome.expect("render");
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        let undone: Value = serde_json::from_str(&rows[1]).expect("undo row");
+        assert_eq!(undone["schema"], "leani.market-price.v2");
+        assert_eq!(undone["operation"], "undo");
+    }
+
+    #[test]
+    fn dropped_blocks_are_reported_as_one_range() {
+        // Review 1, minor 3: every dropped block printed its own gap row,
+        // a burst at connect when the node had finalized nothing yet.
+        let now = unix_seconds();
+        let mut options = attached_finalized_options();
+        options.once = false;
+        let mut state = AttachedState::default();
+        let mut buffer = EventBuffer::default();
+        buffer.push(&attached_hello(1, "block-summary", None));
+        let held = u64::try_from(FINALIZED_GATE_MAX_BLOCKS).expect("gate bound") + 2;
+        for block in 1..=held {
+            buffer.push(&attached_block_event(block, block, "included", now));
+        }
+        buffer.push(&attached_marker_event(
+            held + 1,
+            held,
+            "system.finality.put",
+            held,
+        ));
+        let (outcome, rows) = captured(|| render_blocks(&mut buffer, &mut state, &options));
+        outcome.expect("render");
+        let gaps = rows
+            .iter()
+            .filter(|row| row.contains("leani.subscription-gap.v1"))
+            .collect::<Vec<_>>();
+        assert_eq!(gaps.len(), 1, "{gaps:?}");
+        let gap: Value = serde_json::from_str(gaps[0]).expect("gap row");
+        assert_eq!(gap["fromBlock"], 1);
+        assert_eq!(gap["toBlock"], 2);
+        // The gap row precedes the first finalized row after the hole.
+        assert!(rows[0].contains("leani.subscription-gap.v1"), "{}", rows[0]);
+        assert_eq!(rows.len(), 1 + FINALIZED_GATE_MAX_BLOCKS);
+    }
+
+    #[test]
+    fn a_block_pruned_before_connecting_is_reported() {
+        // Review 1, minor 4: a block the node pruned from its change log
+        // before the subscription connected was missed without a trace.
+        let now = unix_seconds();
+        let mut options = attached_finalized_options();
+        options.once = false;
+        let mut state = AttachedState::default();
+        let mut buffer = EventBuffer::default();
+        buffer.push(&attached_hello(1, "block-summary", Some(100)));
+        buffer.push(&attached_block_event(1, 105, "included", now));
+        buffer.push(&attached_marker_event(2, 105, "system.finality.put", 105));
+        let (outcome, rows) = captured(|| render_blocks(&mut buffer, &mut state, &options));
+        outcome.expect("render");
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        let gap: Value = serde_json::from_str(&rows[0]).expect("gap row");
+        assert_eq!(gap["schema"], "leani.subscription-gap.v1");
+        assert_eq!(gap["fromBlock"], 101);
+        assert_eq!(gap["toBlock"], 104);
+        assert_eq!(gap["reason"], "change_log_pruned");
+        let row: Value = serde_json::from_str(&rows[1]).expect("block row");
+        assert_eq!(row["blockNumber"], 105);
+    }
+
+    #[test]
+    fn a_refused_subscription_hint_sends_an_unmarked_data_dir_to_manual_deletion() {
+        // Review 1, minor 5: for a directory from an earlier release, the
+        // hint printed a reset command that the reset then refuses.
+        let root = tempfile::tempdir().expect("temporary directory");
+        let legacy = root.path().join("legacy-state");
+        fs::create_dir_all(&legacy).expect("legacy directory");
+        fs::write(legacy.join("leani.sqlite"), b"earlier release").expect("legacy state");
+        let mut options = subscribe_options(Vec::new());
+        options.working_directory = root.path().to_path_buf();
+        options.data_dir = Some(legacy.clone());
+        let markets = resolve_markets(&["ETH/USDC".to_owned()]).expect("market");
+        let message = format!(
+            "{:#}",
+            explain_subscription_refusal(
+                StoreError::ProcessorIdentity(UNISWAP_PROCESSOR_INSTANCE.to_owned()),
+                &options,
+                &markets,
+            )
+        );
+        // No reset command, which would be refused.
+        assert!(!message.contains("rebuild it with"), "{message}");
+        assert!(!message.contains("--yes"), "{message}");
+        assert!(message.contains("delete it yourself"), "{message}");
+        assert!(message.contains(&legacy.display().to_string()), "{message}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_refused_subscription_hint_prints_only_commands_that_work() {
+        // Review 1, minor 11: a relative path starting with a dash parses as
+        // an option, and a lossy rendering of a non-UTF-8 path names another
+        // directory.
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let root = tempfile::tempdir().expect("temporary directory");
+        drop(
+            local_state::lock_subscription_directory(&root.path().join("-state"), false)
+                .expect("a subscription directory"),
+        );
+        let markets = resolve_markets(&["ETH/USDC".to_owned()]).expect("market");
+        let hint = |data_dir: Option<PathBuf>, config: Option<PathBuf>| {
+            let mut options = subscribe_options(Vec::new());
+            options.working_directory = root.path().to_path_buf();
+            options.data_dir = data_dir;
+            options.requested_config = config;
+            format!(
+                "{:#}",
+                explain_subscription_refusal(
+                    StoreError::ProcessorIdentity(UNISWAP_PROCESSOR_INSTANCE.to_owned()),
+                    &options,
+                    &markets,
+                )
+            )
+        };
+        let message = hint(Some(PathBuf::from("-state")), None);
+        assert!(message.contains("--data-dir ./-state "), "{message}");
+        let message = hint(
+            None,
+            Some(PathBuf::from(std::ffi::OsStr::from_bytes(
+                b"node-\xff.toml",
+            ))),
+        );
+        assert!(!message.contains('\u{fffd}'), "{message}");
+        assert!(message.contains("not valid UTF-8"), "{message}");
+        // An unmarked --data-dir is named only when it is valid UTF-8.
+        let message = hint(
+            Some(PathBuf::from(std::ffi::OsStr::from_bytes(b"state-\xff"))),
+            None,
+        );
+        assert!(!message.contains('\u{fffd}'), "{message}");
+        assert!(message.contains("delete it yourself"), "{message}");
     }
 
     #[test]
     fn attached_finalized_subscriptions_print_included_blocks_once_finality_covers_them() {
         let now = unix_seconds();
         let options = attached_finalized_options();
-        let mut gate = FinalizedGate::default();
+        let mut state = AttachedState::default();
         let mut buffer = EventBuffer::default();
-        let mut cursor = None;
-        let mut sequence = None;
 
+        buffer.push(&attached_hello(1, "block-summary", None));
         buffer.push(&attached_block_event(1, 100, "included", now));
-        let outcome = render_attached_sse_events(
-            &mut buffer,
-            &mut cursor,
-            &mut sequence,
-            &options,
-            &[],
-            &mut gate,
-        )
-        .expect("included apply is buffered");
+        let (outcome, rows) = captured(|| render_blocks(&mut buffer, &mut state, &options));
         assert!(
-            !outcome.stop,
+            !outcome.expect("included apply is buffered").stop,
             "included block must not print under --finality finalized"
         );
-        assert_eq!(gate.pending_blocks(), 1);
+        assert!(rows.is_empty(), "{rows:?}");
+        assert_eq!(state.gate.pending_blocks(), 1);
 
         buffer.push(&attached_marker_event(2, 100, "system.finality.put", 100));
-        let outcome = render_attached_sse_events(
-            &mut buffer,
-            &mut cursor,
-            &mut sequence,
-            &options,
-            &[],
-            &mut gate,
-        )
-        .expect("finality marker flushes");
+        let (outcome, rows) = captured(|| render_blocks(&mut buffer, &mut state, &options));
         assert!(
-            outcome.stop,
+            outcome.expect("finality marker flushes").stop,
             "the covered block prints once finality reaches it"
         );
-        assert_eq!(gate.pending_blocks(), 0);
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(state.gate.pending_blocks(), 0);
     }
 
     #[test]
     fn attached_finalized_subscriptions_drop_undone_blocks_before_finality() {
         let now = unix_seconds();
         let options = attached_finalized_options();
-        let mut gate = FinalizedGate::default();
+        let mut state = AttachedState::default();
         let mut buffer = EventBuffer::default();
-        let mut cursor = None;
-        let mut sequence = None;
 
+        buffer.push(&attached_hello(1, "block-summary", None));
         buffer.push(&attached_block_event(1, 100, "included", now));
         buffer.push(&attached_marker_event(
             2,
@@ -3299,40 +5616,28 @@ mod tests {
             0,
         ));
         buffer.push(&attached_marker_event(3, 100, "system.finality.put", 100));
-        let outcome = render_attached_sse_events(
-            &mut buffer,
-            &mut cursor,
-            &mut sequence,
-            &options,
-            &[],
-            &mut gate,
-        )
-        .expect("undo then marker");
-        assert!(!outcome.stop, "an undone block must never print");
-        assert_eq!(gate.pending_blocks(), 0);
+        let (outcome, rows) = captured(|| render_blocks(&mut buffer, &mut state, &options));
+        assert!(
+            !outcome.expect("undo then marker").stop,
+            "an undone block must never print"
+        );
+        assert!(rows.is_empty(), "{rows:?}");
+        assert_eq!(state.gate.pending_blocks(), 0);
     }
 
     #[test]
     fn attached_finalized_subscriptions_print_already_finalized_records_directly() {
         let now = unix_seconds();
         let options = attached_finalized_options();
-        let mut gate = FinalizedGate::default();
+        let mut state = AttachedState::default();
         let mut buffer = EventBuffer::default();
-        let mut cursor = None;
-        let mut sequence = None;
 
+        buffer.push(&attached_hello(1, "block-summary", Some(99)));
         buffer.push(&attached_block_event(1, 100, "finalized", now));
-        let outcome = render_attached_sse_events(
-            &mut buffer,
-            &mut cursor,
-            &mut sequence,
-            &options,
-            &[],
-            &mut gate,
-        )
-        .expect("finalized apply prints");
-        assert!(outcome.stop);
-        assert_eq!(gate.pending_blocks(), 0);
+        let (outcome, rows) = captured(|| render_blocks(&mut buffer, &mut state, &options));
+        assert!(outcome.expect("finalized apply prints").stop);
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(state.gate.pending_blocks(), 0);
     }
 
     #[test]
@@ -3344,21 +5649,24 @@ mod tests {
             b"data: {\"sequence\":\"2\",\"cursor\":\"cursor-2\",\"operation\":\"unknown\",\"block\":null,\"finality\":\"finalized\",\"kind\":\"system\"}\n\n".as_slice(),
         ] {
             let mut buffer = EventBuffer::default();
+            buffer.push(&attached_hello(1, "uniswap-observations", None));
             buffer.push(malformed);
             buffer.push(b"data: {\"sequence\":\"3\",\"cursor\":\"cursor-3\",\"operation\":\"finalized\",\"block\":null,\"finality\":\"finalized\",\"kind\":\"system\"}\n\n");
-            let mut cursor = Some("cursor-1".to_owned());
-            let mut sequence = Some(1);
+            let mut state = AttachedState {
+                cursor: Some("cursor-1".to_owned()),
+                last_sequence: Some(1),
+                ..AttachedState::default()
+            };
             let result = render_attached_sse_events(
                 &mut buffer,
-                &mut cursor,
-                &mut sequence,
+                &mut state,
                 &subscribe_options(Vec::new()),
                 &[],
-                &mut FinalizedGate::default(),
+                unix_seconds(),
             );
             assert!(result.is_err(), "malformed event must stop the stream");
-            assert_eq!(cursor.as_deref(), Some("cursor-1"));
-            assert_eq!(sequence, Some(1));
+            assert_eq!(state.cursor.as_deref(), Some("cursor-1"));
+            assert_eq!(state.last_sequence, Some(1));
         }
     }
 
@@ -3614,12 +5922,7 @@ mod tests {
         assert!(preview_is_at_or_after(&preview_blocks, &older));
         assert!(preview_is_at_or_after(&preview_blocks, &preview));
         assert!(matches!(
-            reconcile_preview_handoff(
-                &mut preview_blocks,
-                &mut previewed,
-                &older,
-                ChangeDirection::Apply,
-            ),
+            reconcile_preview_handoff(&mut preview_blocks, &mut previewed, &older,),
             PreviewHandoffAction::Suppress
         ));
 
@@ -3630,12 +5933,7 @@ mod tests {
         assert!(!preview_is_at_or_after(&preview_blocks, &newer));
 
         assert!(matches!(
-            reconcile_preview_handoff(
-                &mut preview_blocks,
-                &mut previewed,
-                &preview,
-                ChangeDirection::Apply,
-            ),
+            reconcile_preview_handoff(&mut preview_blocks, &mut previewed, &preview,),
             PreviewHandoffAction::Suppress
         ));
         assert!(previewed.is_empty());
@@ -3645,7 +5943,6 @@ mod tests {
                 &mut preview_blocks,
                 &mut previewed,
                 &newer,
-                ChangeDirection::Apply,
             ),
             PreviewHandoffAction::Render { reverted } if reverted.is_empty()
         ));
@@ -3669,24 +5966,14 @@ mod tests {
                 .expect("decode delayed block")
                 .expect("delayed block");
             assert!(matches!(
-                reconcile_preview_handoff(
-                    &mut preview_blocks,
-                    &mut previewed,
-                    &delayed,
-                    record.direction,
-                ),
+                reconcile_preview_handoff(&mut preview_blocks, &mut previewed, &delayed,),
                 PreviewHandoffAction::Suppress
             ));
         }
         assert!(previewed.contains(&observation_key(&preview)));
 
         assert!(matches!(
-            reconcile_preview_handoff(
-                &mut preview_blocks,
-                &mut previewed,
-                &preview,
-                preview_record.direction,
-            ),
+            reconcile_preview_handoff(&mut preview_blocks, &mut previewed, &preview,),
             PreviewHandoffAction::Suppress
         ));
         assert!(previewed.is_empty());
@@ -3701,7 +5988,6 @@ mod tests {
                 &mut preview_blocks,
                 &mut previewed,
                 &next,
-                next_record.direction,
             ),
             PreviewHandoffAction::Render { reverted } if reverted.is_empty()
         ));
@@ -3724,12 +6010,7 @@ mod tests {
         )]);
         let mut previewed = HashSet::from([observation_key(&preview)]);
 
-        let action = reconcile_preview_handoff(
-            &mut preview_blocks,
-            &mut previewed,
-            &replacement,
-            ChangeDirection::Apply,
-        );
+        let action = reconcile_preview_handoff(&mut preview_blocks, &mut previewed, &replacement);
         let PreviewHandoffAction::Render { reverted } = action else {
             panic!("replacement must be rendered");
         };
@@ -3771,20 +6052,18 @@ mod tests {
         assert!(previewed.is_empty());
     }
 
-    #[test]
-    fn readiness_does_not_emit_a_lone_undo() {
-        let market = resolve_markets(&["ETH/USDC".to_owned()]).expect("market")[0];
-        let apply = price_record(market, 1, 9_990);
-        let mut undo = apply.clone();
-        undo.cursor.sequence = 2;
-        undo.direction = ChangeDirection::Undo;
-
+    #[tokio::test]
+    async fn readiness_does_not_emit_a_lone_undo() {
+        // The store's own undo of a created observation: an empty `Delete`.
+        let market = resolve_markets(&["ETH/USDC".to_owned()]).expect("market");
+        let (_processor, _store, _directory, records) =
+            applied_then_undone(SubscribeProtocol::UniswapV3, &market).await;
         let items = latest_fresh_items(
             SubscribeProtocol::UniswapV3,
-            &[market],
-            vec![apply, undo],
+            &market,
+            records,
             SubscribeFinality::Included,
-            10_000,
+            unix_seconds(),
         )
         .expect("startup state");
         assert!(items.is_empty());
@@ -3803,6 +6082,7 @@ mod tests {
             }),
             finality: "included".to_owned(),
             kind: "uniswap.price.observation.apply".to_owned(),
+            key: Some("0x01".to_owned()),
             data: Some(
                 serde_json::to_value(AttachedPoolPrice {
                     pool: market.pool.to_owned(),
@@ -3822,17 +6102,24 @@ mod tests {
             extra: BTreeMap::new(),
         };
 
-        assert!(
-            !render_attached(
-                SubscribeProtocol::UniswapV3,
-                SubscribeFormat::Raw,
-                SubscribeFinality::Included,
+        let mut options = subscribe_options(Vec::new());
+        options.format = SubscribeFormat::Raw;
+        let mut changes = AttachedChanges::default();
+        let (rendered, rows) = captured(|| {
+            render_attached(
+                &options,
                 &[market],
                 envelope,
                 &Value::Null,
+                &mut changes,
+                unix_seconds(),
             )
-            .expect("filter catch-up observation")
-        );
+        });
+        assert!(!rendered.expect("filter catch-up observation"));
+        assert!(rows.is_empty(), "{rows:?}");
+        // Its undo is filtered alike, not reported as unknown.
+        assert!(changes.hidden.get(&"0x01".to_owned()).is_some());
+        assert!(changes.printed.get(&"0x01".to_owned()).is_none());
     }
 
     #[test]
@@ -3864,7 +6151,7 @@ mod tests {
             &[
                 checkpoint_provider("https://ethereum-beacon-api.publicnode.com/", 0xaa, 100),
                 checkpoint_provider("https://mainnet.checkpoint.sigp.io/", 0xaa, 100),
-                checkpoint_provider("https://beaconstate-mainnet.chainsafe.io/", 0xbb, 100),
+                checkpoint_provider("https://beaconstate-mainnet.chainsafe.io/", 0xbb, 132),
             ],
             Vec::new(),
             3,
@@ -3887,6 +6174,323 @@ mod tests {
         )
         .expect_err("no quorum");
         assert!(error.to_string().contains("quorum 2/3 was not reached"));
+    }
+
+    #[test]
+    fn checkpoint_quorum_requires_a_strict_majority_of_attempted_providers() {
+        let error = select_checkpoint_quorum(
+            &[
+                checkpoint_provider("https://a.example/", 0xaa, 100),
+                checkpoint_provider("https://b.example/", 0xaa, 100),
+            ],
+            vec![
+                "https://c.example/: unavailable".to_owned(),
+                "https://d.example/: unavailable".to_owned(),
+            ],
+            4,
+            2,
+        )
+        .expect_err("two of four providers are not a majority");
+        assert!(error.to_string().contains("3/4"), "{error:#}");
+
+        let quorum = select_checkpoint_quorum(
+            &[
+                checkpoint_provider("https://a.example/", 0xaa, 100),
+                checkpoint_provider("https://b.example/", 0xaa, 100),
+                checkpoint_provider("https://c.example/", 0xaa, 100),
+            ],
+            vec!["https://d.example/: unavailable".to_owned()],
+            4,
+            2,
+        )
+        .expect("three of four providers are a majority");
+        assert_eq!(quorum.agreeing_providers.len(), 3);
+    }
+
+    #[test]
+    fn checkpoint_quorum_fails_closed_on_dissent_or_competing_quorums() {
+        let error = select_checkpoint_quorum(
+            &[
+                checkpoint_provider("https://a.example/", 0xaa, 100),
+                checkpoint_provider("https://b.example/", 0xaa, 100),
+                checkpoint_provider("https://c.example/", 0xbb, 100),
+            ],
+            Vec::new(),
+            3,
+            2,
+        )
+        .expect_err("a provider reports another root at the agreed slot");
+        assert!(error.to_string().contains("slot 100"), "{error:#}");
+
+        // A provider at a different slot is not dissent.
+        let quorum = select_checkpoint_quorum(
+            &[
+                checkpoint_provider("https://a.example/", 0xaa, 100),
+                checkpoint_provider("https://b.example/", 0xaa, 100),
+                checkpoint_provider("https://c.example/", 0xbb, 132),
+            ],
+            Vec::new(),
+            3,
+            2,
+        )
+        .expect("majority at slot 100");
+        assert_eq!(quorum.slot, 100);
+
+        let error = select_checkpoint_quorum(
+            &[
+                checkpoint_provider("https://a.example/", 0xaa, 100),
+                checkpoint_provider("https://b.example/", 0xaa, 100),
+                checkpoint_provider("https://c.example/", 0xbb, 132),
+                checkpoint_provider("https://d.example/", 0xbb, 132),
+            ],
+            Vec::new(),
+            2,
+            2,
+        )
+        .expect_err("two groups reach the quorum");
+        assert!(error.to_string().contains("conflicting"), "{error:#}");
+    }
+
+    #[test]
+    fn checkpoint_providers_must_be_https_and_unique_after_normalization() {
+        let url = |value: &str| Url::parse(value).expect("provider URL");
+        assert!(validate_checkpoint_providers(&[url("http://checkpoint.example/")]).is_err());
+        validate_checkpoint_providers(&[
+            url("http://127.0.0.1:5052/"),
+            url("http://localhost:5052/"),
+            url("http://[::1]:5052/"),
+            url("https://checkpoint.example/"),
+        ])
+        .expect("plain HTTP is allowed for loopback providers");
+        assert!(
+            validate_checkpoint_providers(&[
+                url("https://a.example/beacon"),
+                url("HTTPS://A.EXAMPLE:443/beacon/?source=alias"),
+            ])
+            .is_err()
+        );
+        // A different port is a different provider, as for Beacon endpoints.
+        validate_checkpoint_providers(&[url("https://a.example:8443/"), url("https://a.example/")])
+            .expect("another port is another provider");
+        assert!(
+            validate_checkpoint_providers(&[
+                url("https://a.example:443/"),
+                url("https://a.example/"),
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn checkpoint_prompt_hides_provider_path_tokens() {
+        let providers = [
+            Url::parse("https://example.quiknode.pro/hunter5/").expect("URL"),
+            Url::parse("https://example.quiknode.pro/hunter6/").expect("URL"),
+            Url::parse("https://c.example/").expect("URL"),
+        ];
+        let labels = leani_finality_beacon_api::endpoint_labels(&providers, "--checkpoint-url");
+        let responses = providers
+            .iter()
+            .zip(&labels)
+            .map(|(provider, label)| ProviderCheckpoint {
+                provider: provider.clone(),
+                label: label.clone(),
+                root: format!("0x{}", hex::encode([0xaa; 32])),
+                slot: 100,
+                beacon_api: true,
+            })
+            .collect::<Vec<_>>();
+        let quorum = select_checkpoint_quorum(&responses, Vec::new(), 3, 2).expect("quorum");
+        let summary = checkpoint_summary(&quorum).join("\n");
+        assert!(!summary.contains("hunter"), "{summary}");
+        assert!(summary.contains("--checkpoint-url[1]"), "{summary}");
+    }
+
+    /// Serve up to `connections` HTTP/1.1 exchanges on 127.0.0.1 with a
+    /// canned `response`. The handle yields how many clients connected.
+    async fn loopback_server(
+        response: String,
+        connections: usize,
+    ) -> (Url, tokio::task::JoinHandle<usize>) {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("loopback listener");
+        let address = listener.local_addr().expect("listener address");
+        let served = tokio::spawn(async move {
+            let mut served = 0;
+            while served < connections {
+                let Ok(Ok((mut stream, _))) =
+                    tokio::time::timeout(Duration::from_secs(1), listener.accept()).await
+                else {
+                    break;
+                };
+                served += 1;
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 1_024];
+                while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    match stream.read(&mut buffer).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(read) => request.extend_from_slice(&buffer[..read]),
+                    }
+                }
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.shutdown().await;
+            }
+            served
+        });
+        (
+            Url::parse(&format!("http://{address}/")).expect("loopback URL"),
+            served,
+        )
+    }
+
+    #[tokio::test]
+    async fn the_checkpoint_client_never_follows_redirects() {
+        let (target, contacted) = loopback_server(
+            "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}".to_owned(),
+            2,
+        )
+        .await;
+        let (origin, _served) = loopback_server(
+            format!(
+                "HTTP/1.1 302 Found\r\nLocation: {target}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            ),
+            2,
+        )
+        .await;
+        let client = checkpoint_client_builder()
+            .no_proxy()
+            .build()
+            .expect("client");
+        let error = fetch_checkpoint(&client, origin, "loopback".to_owned())
+            .await
+            .expect_err("redirected provider");
+        assert!(format!("{error:#}").contains("redirect"), "{error:#}");
+        assert_eq!(
+            contacted.await.expect("redirect target"),
+            0,
+            "the redirect target was contacted"
+        );
+    }
+
+    #[test]
+    fn checkpoint_provider_urls_keep_their_query_key() {
+        // Final review B3: joining the request path dropped a provider's
+        // `?key=` API key.
+        let provider = Url::parse("https://provider.example/base?key=k").expect("provider");
+        assert_eq!(
+            provider_url(&provider, "eth/v1/beacon/headers/finalized")
+                .expect("provider URL")
+                .as_str(),
+            "https://provider.example/base/eth/v1/beacon/headers/finalized?key=k"
+        );
+    }
+
+    #[tokio::test]
+    async fn checkpoint_provider_errors_do_not_echo_its_secrets() {
+        // Final review B2: a provider's error body may echo the request's
+        // path and query, where the API key is.
+        let body = "Cannot GET /hunter5/checkpointz/v1/beacon/slots?apikey=hunter2";
+        let (origin, _served) = loopback_server(
+            format!(
+                "HTTP/1.1 404 Not Found\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            ),
+            2,
+        )
+        .await;
+        let provider = origin.join("hunter5/?apikey=hunter2").expect("provider");
+        let client = checkpoint_client_builder()
+            .no_proxy()
+            .build()
+            .expect("client");
+        let error = fetch_checkpoint(&client, provider, "loopback".to_owned())
+            .await
+            .expect_err("missing checkpoint");
+        let rendered = format!("{error:#}");
+        assert!(rendered.contains("HTTP 404"), "{rendered}");
+        for secret in ["hunter5", "hunter2"] {
+            assert!(!rendered.contains(secret), "{rendered}");
+        }
+    }
+
+    #[tokio::test]
+    async fn embedded_subscriptions_use_the_default_pool_and_responding_providers() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let now = unix_seconds();
+        let slot =
+            (now - leani_finality_beacon_api::MAINNET_GENESIS_TIME) / MAINNET_SLOT_SECONDS - 100;
+        write_checkpoint_cache(
+            &directory.path().join("checkpoint.json"),
+            &CachedCheckpoint {
+                schema: "leani.verified-checkpoint.v1".to_owned(),
+                root: format!("0x{}", hex::encode([0xaa; 32])),
+                slot,
+                execution_block_hash: Some(format!("0x{}", hex::encode([0xbb; 32]))),
+                trust: CheckpointTrust::LocallyVerified,
+                accepted_providers: Vec::new(),
+                beacon_api_endpoints: vec!["https://beacon.example/".to_owned()],
+                updated_at_unix_seconds: now,
+            },
+        )
+        .expect("cached checkpoint");
+        let markets = resolve_markets(&["ETH/USDC".to_owned()]).expect("market");
+        let (config, origin) = embedded_config(
+            &subscribe_options(Vec::new()),
+            &markets,
+            None,
+            directory.path(),
+        )
+        .await
+        .expect("embedded configuration");
+        assert_eq!(
+            config
+                .finality
+                .endpoints
+                .iter()
+                .map(Url::as_str)
+                .collect::<Vec<_>>(),
+            [
+                "https://ethereum-beacon-api.publicnode.com/",
+                "https://lodestar-mainnet.chainsafe.io/",
+                "https://beacon.example/",
+            ]
+        );
+        assert_eq!(
+            origin,
+            leani_finality_beacon_api::CheckpointOrigin::LocallyVerified
+        );
+    }
+
+    #[test]
+    fn checkpoint_prompt_lists_every_provider_answer_and_failure() {
+        let quorum = select_checkpoint_quorum(
+            &[
+                checkpoint_provider("https://a.example/", 0xaa, 100),
+                checkpoint_provider("https://b.example/", 0xaa, 100),
+                checkpoint_provider("https://c.example/", 0xaa, 100),
+                checkpoint_provider("https://d.example/", 0xbb, 132),
+            ],
+            vec!["https://e.example: timed out".to_owned()],
+            5,
+            2,
+        )
+        .expect("quorum");
+        let summary = checkpoint_summary(&quorum).join("\n");
+        for expected in [
+            "a.example",
+            "b.example",
+            "c.example",
+            "https://d.example: slot 132",
+            "https://e.example: timed out",
+        ] {
+            assert!(
+                summary.contains(expected),
+                "{expected} missing from:\n{summary}"
+            );
+        }
     }
 
     #[test]
@@ -4092,6 +6696,71 @@ mod tests {
     }
 
     #[test]
+    fn eth_usdc_starter_keeps_its_identity() {
+        // ETH/USDC starts at its pool's exact creation block, so existing
+        // ETH/USDC subscriptions and compact nodes reopen their state.
+        let markets = resolve_markets(&["ETH/USDC".to_owned()]).expect("market");
+        assert_eq!(markets[0].start_block, 12_376_729);
+        let directory = subscription_data_dir_for(
+            None,
+            SubscribeProtocol::UniswapV3,
+            &markets,
+            None,
+            SubscribeFinality::Included,
+            Path::new("."),
+        )
+        .expect("Uniswap identity");
+        assert_eq!(
+            directory.file_name().and_then(|name| name.to_str()),
+            Some("f7a9f202aa323e4d")
+        );
+    }
+
+    #[test]
+    fn a_refused_subscription_names_its_exact_reset_command() {
+        let root = tempfile::tempdir().expect("temporary directory");
+        drop(
+            local_state::lock_subscription_directory(&root.path().join("srv-leani"), false)
+                .expect("a subscription directory"),
+        );
+        let mut options = subscribe_options(Vec::new());
+        options.finality = SubscribeFinality::Finalized;
+        options.working_directory = root.path().to_path_buf();
+        options.data_dir = Some(PathBuf::from("srv-leani"));
+        let markets =
+            resolve_markets(&["weth/usdt".to_owned(), "WBTC/ETH".to_owned()]).expect("markets");
+        let refusal = leani_store_sqlite::StoreError::ProcessorIdentity(
+            UNISWAP_PROCESSOR_INSTANCE.to_owned(),
+        );
+        let message = format!(
+            "{:#}",
+            explain_subscription_refusal(refusal, &options, &markets)
+        );
+        assert!(
+            message.contains(
+                "`leani reset subscription uniswap-v3 ETH/USDT WBTC/ETH --finality finalized --data-dir srv-leani --yes`"
+            ),
+            "{message}"
+        );
+        assert!(
+            message.ends_with(
+                "processor instance cli-uniswap-v3-prices conflicts with its stored descriptor"
+            ),
+            "{message}"
+        );
+        // Other store failures keep their own message.
+        let other = explain_subscription_refusal(
+            leani_store_sqlite::StoreError::Numeric("fixture"),
+            &options,
+            &markets,
+        );
+        assert_eq!(
+            format!("{other:#}"),
+            leani_store_sqlite::StoreError::Numeric("fixture").to_string()
+        );
+    }
+
+    #[test]
     fn reset_removes_only_the_exact_derived_subscription_directory() {
         let root = tempfile::tempdir().expect("temporary directory");
         let subscriptions = root.path().join("subscriptions");
@@ -4102,17 +6771,18 @@ mod tests {
         fs::write(target.join("checkpoint.json"), b"fixture").expect("target state");
         fs::write(sibling.join("checkpoint.json"), b"sibling").expect("sibling state");
         drop(
-            local_state::lock_runtime_directory(&target)
-                .expect("mark target as Leani runtime state"),
+            local_state::lock_subscription_directory(&target, true)
+                .expect("mark target as subscription state"),
         );
 
         assert!(
             reset_subscription_directory(&target, None, root.path(), true).expect("reset target")
         );
         assert!(local_state::is_runtime_directory(&target));
+        assert!(local_state::is_subscription_directory(&target));
         assert!(!target.join("checkpoint.json").exists());
         assert!(sibling.join("checkpoint.json").is_file());
-        assert!(reset_subscription_directory(&target, None, root.path(), true).is_ok());
+        reset_subscription_directory(&target, None, root.path(), true).expect("reset again");
         assert!(reset_subscription_directory(root.path(), None, root.path(), true).is_err());
     }
 

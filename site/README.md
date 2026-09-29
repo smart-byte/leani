@@ -21,8 +21,13 @@ after changing it to regenerate the SVG favicon, ICO, Apple touch icon, and
 social-media avatar under `public`.
 
 Use `bun run check`, `bun run examples:check`, and `bun run build` before review.
+`bun run docs:watch-check` verifies that the dev server picks up added, edited,
+renamed, and deleted docs. It runs its own foreground dev server on a free
+port, beside any other dev server.
 `LEANI_SITE_MODE` and `LEANI_DOCS_REF` override automatically derived preview or
-release metadata when reproducing CI locally.
+release metadata when reproducing CI locally. Without `LEANI_SITE_MODE`, only
+a `v`-prefixed release tag on the checked-out commit or the `site-production`
+branch selects production; an SDK tag does not.
 
 Cloudflare Pages project `leani` uses `site` as its root,
 `bun install --frozen-lockfile && bun run build` as its command, and `dist` as
@@ -39,9 +44,12 @@ Configure these Pages build variables:
 | `NODE_VERSION` | `24` | `24` |
 | `SKIP_DEPENDENCY_INSTALL` | `1` | `1` |
 | `LEANI_SITE_MODE` | `production` | `preview` |
-| `LEANI_DOCS_REF` | Promoted release tag, initially `v0.1.0-rc.1` | `main` |
+| `LEANI_DOCS_REF` | Promoted release tag, initially `v0.1.0-rc.1` | Unset (branch-derived) |
 
 Set the production `LEANI_DOCS_REF` to the release being promoted before running
-the promotion workflow. The explicit value avoids selecting an SDK tag when
-the SDK and node tags point to the same commit. Git integration manages builds
+the promotion workflow. A production build fails unless its documentation ref,
+`LEANI_DOCS_REF` or else the commit's exact `v*` tag, equals `v` followed by the
+workspace version, so a stale value fails the deployment instead of linking to
+an earlier release. Leave the preview value unset: each preview then links to
+its own branch, `main` for the main preview. Git integration manages builds
 without a Cloudflare token in GitHub Actions.

@@ -28,6 +28,9 @@ trust = "trusted_dataset"
 manifest = "./archives/mainnet/manifest.json"
 ```
 
+A relative `manifest` path is relative to the directory of the configuration
+file, not the working directory the node starts in.
+
 Manifest:
 
 ```json
@@ -57,12 +60,26 @@ Each non-empty object line is one JSON-encoded `BlockFrame`. Objects must:
 - have the exact declared byte length and BLAKE3 digest;
 - contain exactly one frame per block in their declared range;
 - be ordered, contiguous, and parent-linked;
-- match the manifest chain and declared material capabilities.
+- match the manifest chain, finality, and declared material capabilities;
+- be reached without crossing a symbolic link below the manifest's
+  directory.
 
-Reads enforce the normal source byte, frame, and frame-count budgets. The
-adapter verifies the complete object before yielding frames and adds immutable
-object identity to frame provenance. A missing line, checksum mismatch,
-truncated frame, parent mismatch, schema mismatch, or range gap fails closed.
+Reads enforce the normal source byte, frame, and frame-count budgets, and
+hold one line at a time. The adapter verifies the complete object's length
+and BLAKE3 digest before it yields any frame; a length or checksum mismatch
+fails the read then. It then streams the frames from the same open file,
+hashing it again as it goes, and adds immutable object identity to their
+provenance. A structural failure, such as a truncated frame, a block out of
+order, missing, or repeated, a parent mismatch, a schema mismatch, or a
+chain or finality mismatch, fails the read as corrupt where it is found,
+after the frames before it may already have been applied; a later source or
+a rerun resumes after them. An object edited in place between the two passes
+fails with the checksum error only after its frames.
+
+Frames report only the checks the archive made: the object's BLAKE3 digest,
+and the parent link to the previous frame of the same object. A frame's own
+verification claims and consensus anchor are dropped, and the trust of its
+earlier provenance is capped at `trusted_dataset`.
 
 The archive is a trusted-dataset source, not automatically a cryptographic raw
 history source. An EraE adapter must additionally decode raw bodies/receipts,
@@ -80,6 +97,10 @@ leani backfill \
 
 The runtime records coverage and discards input frames after reduction. Only
 processor output, undo/change journals, and job metadata remain in SQLite.
+An ordered processor such as `erc20-balances` applies its history
+contiguously from `start_block` upward, so `--from` must be the block after
+the last one it applied, or its `start_block` when it has applied none; the
+command refuses any other start and names the block to use.
 
 When `rpc.historical_mode = "on_demand"`, the same source can answer bounded
 historical RPC without importing frames into SQLite. Exact block and receipt

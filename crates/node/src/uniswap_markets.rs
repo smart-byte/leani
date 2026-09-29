@@ -4,6 +4,7 @@ use std::collections::HashSet;
 
 use anyhow::{Context as _, Result, bail};
 use leani_processor_uniswap::UNISWAP_OBSERVATIONS_VERSION;
+use leani_store_sqlite::StoreError;
 
 use crate::{builtin_processors::processor_contract, config::ProcessorConfig};
 
@@ -46,6 +47,16 @@ const WBTC: Token = Token {
     decimals: 8,
 };
 
+/// Exact creation block of the USDC/WETH 0.05% pool.
+const USDC_WETH_500_CREATION_BLOCK: u64 = 12_376_729;
+
+/// Uniswap V3 factory deployment block: a lower bound for a pool whose exact
+/// creation block is not pinned here, since no V3 pool predates the factory.
+pub(crate) const UNISWAP_V3_FACTORY_BLOCK: u64 = 12_369_621;
+
+/// Processor instance of a compact `[uniswap]` node configuration.
+pub(crate) const COMPACT_INSTANCE: &str = "uniswap-observations";
+
 pub(crate) const MARKET_CATALOG: &[Market] = &[
     Market {
         symbol: "ETH/USDC",
@@ -54,7 +65,7 @@ pub(crate) const MARKET_CATALOG: &[Market] = &[
         token0: USDC,
         token1: WETH,
         base_is_token0: false,
-        start_block: 12_376_729,
+        start_block: USDC_WETH_500_CREATION_BLOCK,
     },
     Market {
         symbol: "ETH/USDT",
@@ -63,7 +74,7 @@ pub(crate) const MARKET_CATALOG: &[Market] = &[
         token0: WETH,
         token1: USDT,
         base_is_token0: true,
-        start_block: 12_376_729,
+        start_block: UNISWAP_V3_FACTORY_BLOCK,
     },
     Market {
         symbol: "WBTC/ETH",
@@ -72,7 +83,7 @@ pub(crate) const MARKET_CATALOG: &[Market] = &[
         token0: WBTC,
         token1: WETH,
         base_is_token0: true,
-        start_block: 12_376_729,
+        start_block: UNISWAP_V3_FACTORY_BLOCK,
     },
 ];
 
@@ -139,6 +150,25 @@ pub(crate) fn processor_config(
     Ok(processor)
 }
 
+/// Name the operator's routes when the store refuses the compact
+/// `[uniswap]` processor it holds: that processor's identity includes its
+/// market set and start block, as when ETH/USDT or WBTC/ETH moved to the
+/// factory block. The store refuses it before it would upgrade an older
+/// schema, so the refused store is left as it was, and the release that
+/// wrote it still opens it. Other processors and errors pass through.
+pub(crate) fn explain_compact_refusal(error: StoreError) -> anyhow::Error {
+    if !matches!(&error, StoreError::ProcessorIdentity(instance) if instance == COMPACT_INSTANCE) {
+        return error.into();
+    }
+    anyhow::Error::new(error).context(format!(
+        "this store's `{COMPACT_INSTANCE}` processor was created for another market set or start \
+         block (ETH/USDT and WBTC/ETH now start at the Uniswap V3 factory block \
+         {UNISWAP_V3_FACTORY_BLOCK}); the store is left as it was, so keep that data and start \
+         with a new `data_dir`, or move to an advanced configuration whose `[[processors]]` entry \
+         names a new `instance`"
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -170,5 +200,47 @@ mod tests {
                 .map(|value| value.as_str().expect("market symbol"))
                 .collect::<Vec<_>>();
         assert_eq!(schema_symbols, symbols);
+    }
+
+    #[test]
+    fn the_compact_eth_usdc_starter_keeps_its_processor_identity() {
+        // Final review B12: nothing pinned the identity of the default
+        // upgrade path. Changing it is a breaking identity change, as moving
+        // the ETH/USDT and WBTC/ETH start blocks was: the node then refuses
+        // the processor an existing store holds, so the change needs a
+        // CHANGELOG entry and an upgrade route.
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("leani.toml");
+        std::fs::write(
+            &path,
+            r#"config_version = 1
+network = "ethereum-mainnet"
+data_dir = "./data"
+
+[finality]
+checkpoint = "0x1111111111111111111111111111111111111111111111111111111111111111"
+checkpoint_slot = 15000000
+endpoints = ["https://ethereum-beacon-api.publicnode.com/"]
+
+[uniswap]
+markets = ["ETH/USDC"]
+"#,
+        )
+        .expect("compact configuration");
+        let config = crate::Config::load(&path)
+            .expect("compact configuration loads")
+            .validate()
+            .expect("compact configuration validates")
+            .into_inner();
+        let processor = crate::ProcessorRegistry::standard()
+            .instantiate(&config.processors[0], config.chain.chain_id)
+            .expect("starter processor");
+        let descriptor = processor.descriptor();
+        assert_eq!(descriptor.instance.as_str(), COMPACT_INSTANCE);
+        assert_eq!(COMPACT_INSTANCE, "uniswap-observations");
+        assert_eq!(
+            descriptor.config_hash.to_string(),
+            "0x48cb364c22f01973d44b69b977d52aeb4222d6d8f2ae03b956eff7f8c1589cb1"
+        );
     }
 }

@@ -37,8 +37,14 @@ groups:
           summary: Required finality source is unavailable
           description: Finalized cursors and pruning must not advance while this alert is active.
 
+      # Heads and finality keep advancing only where the profile requires the
+      # live source or finality; a historical-only node stops once its
+      # backfill completes. The guards join on the scrape target labels.
       - alert: LeaniProcessorStalled
-        expr: leani_processor_head_block > 0 and changes(leani_processor_head_block[10m]) == 0
+        expr: >-
+          leani_processor_head_block > 0
+          and changes(leani_processor_head_block[10m]) == 0
+          and on(job, instance) leani_live_required == 1
         for: 5m
         labels:
           severity: warning
@@ -47,13 +53,25 @@ groups:
           description: Processor {{ $labels.processor }} has not advanced for at least ten minutes.
 
       - alert: LeaniFinalityStalled
-        expr: leani_processor_finalized_block > 0 and changes(leani_processor_finalized_block[30m]) == 0
+        expr: >-
+          leani_processor_finalized_block > 0
+          and changes(leani_processor_finalized_block[30m]) == 0
+          and on(job, instance) leani_finality_required == 1
         for: 5m
         labels:
           severity: warning
         annotations:
           summary: Processor finality is not advancing
           description: Processor {{ $labels.processor }} has not finalized a block for at least thirty minutes.
+
+      - alert: LeaniFinalityAnchorExpiring
+        expr: leani_finality_anchor_expiry_seconds < 3 * 86400
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: Verified finality anchor is close to its 14-day age limit
+          description: A restart can bootstrap from the newest verified anchor for less than three days. Restore verified finality, or refresh finality.checkpoint before restarting.
 
       - alert: LeaniOutboxBacklog
         expr: leani_processor_outbox_records > 0

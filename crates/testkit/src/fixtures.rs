@@ -8,15 +8,27 @@ use leani_primitives::{
 };
 use leani_source_api::{FinalityModel, Partitioning, SourceBudget, SourceDescriptor};
 
+/// Build a finalized frame for block `number`.
+///
+/// Each block number has its own hash: `[number; 32]` below 255, and
+/// `0xff` bytes followed by the big-endian number from 255 on.
 #[must_use]
 pub fn fixture_frame(number: u64, parent_hash: BlockHash) -> BlockFrame {
+    let hash = match u8::try_from(number) {
+        Ok(byte) if byte < u8::MAX => [byte; 32],
+        _ => {
+            let mut hash = [u8::MAX; 32];
+            hash[24..].copy_from_slice(&number.to_be_bytes());
+            hash
+        }
+    };
     BlockFrame {
         chain_id: ChainId(1),
         block: BlockRef {
             number: BlockNumber(number),
-            hash: BlockHash::new([u8::try_from(number).unwrap_or(u8::MAX); 32]),
+            hash: BlockHash::new(hash),
             parent_hash,
-            timestamp: 1_700_000_000 + number,
+            timestamp: 1_700_000_000_u64.saturating_add(number),
         },
         finality: Finality::Finalized,
         header: Material::Missing(MissingReason::NotRequested),
@@ -72,5 +84,34 @@ pub const fn default_source_budget() -> SourceBudget {
         max_buffered_frames: 2,
         max_in_flight_requests: 1,
         temporary_disk_bytes: 0,
+        max_resident_bytes: 1024 * 1024,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashSet;
+
+    use super::*;
+
+    #[test]
+    fn fixture_frames_have_one_hash_per_block_number() {
+        // Audit probe (Processor-10): every block from 255 on shared the
+        // hash `[0xff; 32]`.
+        assert_ne!(
+            fixture_frame(255, BlockHash::ZERO).block.hash,
+            fixture_frame(256, BlockHash::ZERO).block.hash
+        );
+        let numbers = [0, 1, 254, 255, 256, 1_000, 1 << 32, u64::MAX];
+        let hashes = numbers
+            .iter()
+            .map(|number| fixture_frame(*number, BlockHash::ZERO).block.hash)
+            .collect::<HashSet<_>>();
+        assert_eq!(hashes.len(), numbers.len());
+        // Hashes below 255 keep their established values.
+        assert_eq!(
+            fixture_frame(7, BlockHash::ZERO).block.hash,
+            BlockHash::new([7; 32])
+        );
     }
 }

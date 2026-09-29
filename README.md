@@ -74,7 +74,8 @@ and attaches to it instead of starting its own runtime. Guides:
 ## Index history without an archive node
 
 Backfill a block range from public Xatu datasets, then query the result. The
-`windowed` profile decodes Uniswap V2 `Sync` events into hourly aggregates:
+`windowed` profile decodes each Uniswap V2 `Sync` event, stamped with its
+hour, and keeps a 30-day window of them:
 
 ```bash
 cp config/modes/windowed.toml leani.toml
@@ -83,7 +84,7 @@ leani serve
 ```
 
 ```bash
-curl -s 'http://127.0.0.1:8080/v1/processors/uniswap-v2-sync-30d/collections/uniswap_v2.sync_hourly/entities?limit=3'
+curl -s 'http://127.0.0.1:8080/v1/processors/uniswap-v2-sync-30d/collections/uniswap_v2.sync/entities?limit=3'
 ```
 
 Any contract event can be indexed from its ABI alone. The complete
@@ -102,9 +103,11 @@ collection = "weth.transfers"
 kind = "weth.transfer"
 ```
 
-Backfills resume from committed coverage, and historical Parquet material is
-discarded after each commit. A backfill can run while the live lane already
-follows the head. See the
+The node's backfills resume from committed coverage, and historical Parquet
+material is discarded after each commit. An interrupted `leani backfill` of an
+ordered processor, such as `erc20-balances`, reruns from the block after the
+last one it applied, which the command names when it refuses another start.
+A backfill can run while the live lane already follows the head. See the
 [bounded Mainnet guide](https://leani.dev/docs/getting-started/bounded-mainnet/),
 the [processor catalog](https://leani.dev/docs/reference/processors/), and
 [backfill while following live](https://leani.dev/docs/guides/backfill-while-following-live/).
@@ -135,8 +138,11 @@ answering wrongly. See the [method matrix](docs/reference/ethereum-json-rpc.md).
 
 ## TypeScript SDK
 
+Install the SDK version that matches your node release; npm's `latest` tag
+can lag behind a prerelease node:
+
 ```bash
-bun add @smart-byte/leani-sdk
+bun add @smart-byte/leani-sdk@0.1.0-rc.1
 ```
 
 ```ts

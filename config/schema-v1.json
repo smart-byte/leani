@@ -18,7 +18,12 @@
       "properties": {
         "config_version": { "const": 1 },
         "network": { "const": "ethereum-mainnet" },
-        "data_dir": { "type": "string", "minLength": 1, "default": "./data" },
+        "data_dir": {
+          "type": "string",
+          "minLength": 1,
+          "default": "./data",
+          "description": "Writable node state. A relative path is relative to the directory of this configuration file."
+        },
         "finality": { "$ref": "#/$defs/starterFinality" },
         "blocks": { "$ref": "#/$defs/starterBlocks" },
         "uniswap": { "$ref": "#/$defs/starterUniswap" },
@@ -79,7 +84,11 @@
       ],
       "properties": {
         "config_version": { "const": 1 },
-        "data_dir": { "type": "string", "minLength": 1 },
+        "data_dir": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Writable node state. A relative path is relative to the directory of this configuration file."
+        },
         "chain": { "$ref": "#/$defs/chain" },
         "raw_history": { "$ref": "#/$defs/rawHistory" },
         "artifact_storage": { "$ref": "#/$defs/artifactStorage" },
@@ -256,7 +265,7 @@
       "properties": {
         "id": { "type": "string", "minLength": 1 },
         "kind": {
-          "enum": ["xatu", "era_e", "parquet", "archive"]
+          "enum": ["xatu", "era_e", "archive"]
         },
         "priority": {
           "type": "integer",
@@ -266,8 +275,29 @@
         "trust": {
           "enum": ["trusted_dataset", "verified_material"]
         },
-        "manifest": { "type": "string" },
-        "endpoint": { "type": "string", "format": "uri" }
+        "chunk_blocks": {
+          "$ref": "#/$defs/positiveInteger",
+          "multipleOf": 1000,
+          "default": 1000,
+          "description": "Xatu only: blocks per acquisition chunk for headers, transactions, and logs, a multiple of Xatu's 1,000-block partitions."
+        },
+        "blobs_chunk_blocks": {
+          "$ref": "#/$defs/positiveInteger",
+          "multipleOf": 1000,
+          "default": 8000,
+          "description": "Xatu only: blocks per acquisition chunk for the blobs projection, a multiple of 1,000."
+        },
+        "batch_rows": {
+          "$ref": "#/$defs/positiveInteger",
+          "default": 8192,
+          "description": "Xatu only: Parquet rows decoded per bounded Arrow batch."
+        },
+        "manifest": {
+          "type": "string",
+          "description": "Archive only: the archive manifest. A relative path is relative to the directory of this configuration file."
+        },
+        "endpoint": { "type": "string", "format": "uri" },
+        "allow_insecure_http": { "type": "boolean" }
       }
     },
     "liveSource": {
@@ -380,7 +410,7 @@
       "additionalProperties": false,
       "required": ["mode"],
       "properties": {
-        "mode": { "enum": ["ephemeral", "durable", "checkpointed"] }
+        "mode": { "enum": ["durable", "checkpointed"] }
       }
     },
     "outputWindow": {
@@ -392,7 +422,8 @@
         "max_rows": { "$ref": "#/$defs/positiveInteger" },
         "max_bytes": { "$ref": "#/$defs/humanBytes" }
       },
-      "minProperties": 1
+      "minProperties": 1,
+      "maxProperties": 1
     },
     "outputPolicy": {
       "type": "object",
@@ -400,8 +431,34 @@
       "required": ["mode"],
       "properties": {
         "mode": { "enum": ["none", "latest", "window", "full"] },
-        "window": { "$ref": "#/$defs/outputWindow" },
-        "finalized_only": { "type": "boolean" }
+        "window": { "$ref": "#/$defs/outputWindow" }
+      }
+    },
+    "artifactWindow": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Exactly one limit.",
+      "properties": {
+        "max_blocks": { "$ref": "#/$defs/positiveInteger" },
+        "max_age": { "$ref": "#/$defs/humanDuration" },
+        "max_bytes": { "$ref": "#/$defs/humanBytes" }
+      },
+      "minProperties": 1,
+      "maxProperties": 1
+    },
+    "artifactPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "mode": {
+          "enum": ["none", "window", "full"],
+          "default": "none",
+          "description": "Retention of immutable finalized map results, independent of queryable output and delivery."
+        },
+        "window": {
+          "$ref": "#/$defs/artifactWindow",
+          "description": "Required in window mode, and only valid there."
+        }
       }
     },
     "consumer": {
@@ -411,7 +468,10 @@
       "properties": {
         "id": { "type": "string", "minLength": 1, "maxLength": 128 },
         "required": { "type": "boolean" },
-        "lease_ttl": { "$ref": "#/$defs/humanDuration" }
+        "lease_ttl": {
+          "$ref": "#/$defs/humanDuration",
+          "description": "From one second to 100 years."
+        }
       }
     },
     "deliveryPruning": {
@@ -503,6 +563,7 @@
           ]
         },
         "state": { "$ref": "#/$defs/statePolicy" },
+        "artifacts": { "$ref": "#/$defs/artifactPolicy" },
         "output": { "$ref": "#/$defs/outputPolicy" },
         "delivery": { "$ref": "#/$defs/deliveryPolicy" },
         "checkpoint": { "$ref": "#/$defs/checkpointPolicy" },
@@ -529,15 +590,81 @@
         "http_bind",
         "ws_bind",
         "historical_mode",
-        "transaction_locator",
         "minimum_recent_blocks"
       ],
       "properties": {
         "http_bind": { "$ref": "#/$defs/socketAddress" },
         "ws_bind": { "$ref": "#/$defs/socketAddress" },
         "historical_mode": { "enum": ["on_demand", "disabled"] },
-        "transaction_locator": { "type": "boolean" },
-        "minimum_recent_blocks": { "$ref": "#/$defs/positiveInteger" }
+        "transaction_locator": {
+          "type": "boolean",
+          "deprecated": true,
+          "description": "Deprecated and ignored: nothing reads it. Still accepted so existing configurations load, with a warning; remove it."
+        },
+        "minimum_recent_blocks": { "$ref": "#/$defs/positiveInteger" },
+        "allow_unauthenticated_remote": {
+          "type": "boolean",
+          "default": false,
+          "description": "Serve JSON-RPC, which has no authentication, on a non-loopback http_bind or ws_bind. Only behind a trusted network or authenticating proxy."
+        },
+        "allowed_origins": {
+          "$ref": "#/$defs/allowedOrigins",
+          "description": "Browser origins, besides loopback ones on any port, that may call JSON-RPC over HTTP or WebSocket. Any other Origin gets HTTP 403."
+        },
+        "max_batch_requests": {
+          "$ref": "#/$defs/positiveInteger",
+          "default": 100,
+          "description": "Most calls in one batch; a longer batch is refused whole with -32600."
+        },
+        "max_response_bytes": {
+          "$ref": "#/$defs/humanBytes",
+          "default": "16MiB",
+          "description": "Most encoded bytes of one response or batch response; each call past it is answered with -32005."
+        },
+        "max_log_results": {
+          "$ref": "#/$defs/positiveInteger",
+          "default": 10000,
+          "description": "Most logs one eth_getLogs call returns; more fail with -32005 and a smaller block range to retry."
+        },
+        "max_log_addresses": {
+          "$ref": "#/$defs/positiveInteger",
+          "default": 1000,
+          "description": "Most addresses in one log filter; more fail with -32602."
+        },
+        "max_log_topic_alternatives": {
+          "$ref": "#/$defs/positiveInteger",
+          "default": 1000,
+          "description": "Most alternatives at one topic position of a log filter; more fail with -32602."
+        },
+        "max_subscriptions_per_connection": {
+          "$ref": "#/$defs/positiveInteger",
+          "default": 128,
+          "description": "Most live subscriptions on one WebSocket connection; more fail with -32005."
+        },
+        "max_websocket_connections": {
+          "$ref": "#/$defs/positiveInteger",
+          "default": 256,
+          "description": "Most open WebSocket connections; a further upgrade gets HTTP 503."
+        },
+        "max_outbound_bytes": {
+          "$ref": "#/$defs/humanBytes",
+          "default": "64MiB",
+          "description": "Queued subscription notification bytes shared across WebSocket connections and listeners; at least max_subscription_event_bytes."
+        },
+        "max_subscription_event_bytes": {
+          "$ref": "#/$defs/humanBytes",
+          "default": "16MiB",
+          "description": "Most encoded bytes of subscription notifications one chain event may produce for one WebSocket connection, and that a connection may leave unread. A connection past the first is closed with 1008, past the second with 1013."
+        }
+      }
+    },
+    "allowedOrigins": {
+      "type": "array",
+      "default": [],
+      "items": {
+        "type": "string",
+        "pattern": "^[Hh][Tt][Tt][Pp][Ss]?://[^/?#@]+/?$",
+        "description": "An http or https origin such as https://app.example, without a path; the scheme and host match in any case"
       }
     },
     "api": {
@@ -547,6 +674,25 @@
       "properties": {
         "bind": { "$ref": "#/$defs/socketAddress" },
         "bearer_token_env": { "type": "string", "minLength": 1 },
+        "allow_unauthenticated_remote": {
+          "type": "boolean",
+          "default": false,
+          "description": "Serve the API on a non-loopback bind without bearer_token_env. Only behind an authenticating proxy."
+        },
+        "allowed_hosts": {
+          "type": "array",
+          "default": [],
+          "description": "Host names, besides localhost, that requests may address. Any other Host name gets HTTP 421; IP addresses always pass.",
+          "items": {
+            "type": "string",
+            "pattern": "^[^:/?#@*\\s]+$|^\\[[0-9A-Fa-f:.]+\\]$",
+            "description": "A host name or IP address without a scheme or port; IPv6 in brackets"
+          }
+        },
+        "allowed_origins": {
+          "$ref": "#/$defs/allowedOrigins",
+          "description": "Browser origins, besides loopback ones on any port, that may call the API. Any other Origin gets HTTP 403."
+        },
         "delivery": {
           "type": "object",
           "additionalProperties": false,

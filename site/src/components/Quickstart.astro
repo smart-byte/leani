@@ -13,19 +13,19 @@ const shellLines = (source: string) => source.split('\n').map(hlShell);
   <h2 id="quickstart-h"><span class="mono"># </span>Follow Ethereum blocks</h2>
   <p class="lede">
     <a href="/docs/getting-started/install/">Install the alpha from source</a>,
-    then read block summaries directly from Ethereum's network with one command. On first use,
+    then follow new block summaries directly from Ethereum's network with one command. On first use,
     Leani asks you to approve a checkpoint, a trusted starting point for checking the chain.
     Prepare a reusable node when you want queries and SDK subscriptions.
   </p>
   <div class="pair">
     <div>
-      <p class="mono label">1 · inspect a first block</p>
+      <p class="mono label">1 · follow live blocks</p>
       <TerminalFrame title="shell">
         <div class="command" data-copy-value={boundedMainnetQuickstart}>
           <span data-copy-source>
             {shellLines(boundedMainnetQuickstart).map((line) => <span class="t-line" set:html={line} />)}
           </span>
-          <button type="button" class="copy mono" data-copy-button aria-label="Copy first-run commands">copy</button>
+          <button type="button" class="copy mono" data-copy-button aria-label="Copy follow command">copy</button>
         </div>
       </TerminalFrame>
       <p class="status mono" role="status" aria-live="polite" data-copy-status></p>

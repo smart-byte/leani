@@ -33,8 +33,14 @@ const html = (
   )
 ).join('\n');
 
-for (const term of ['configuration', '@smart-byte/leani-sdk', 'JSON-RPC', 'processor']) {
-  if (!html.toLocaleLowerCase('en-US').includes(term.toLocaleLowerCase('en-US'))) {
+const sdkPackage = (
+  JSON.parse(await readFile(resolve(repositoryRoot, 'packages/sdk/package.json'), 'utf8')) as {
+    name: string;
+  }
+).name;
+const searchableHtml = html.toLocaleLowerCase('en-US');
+for (const term of ['configuration', sdkPackage, 'JSON-RPC', 'processor']) {
+  if (!searchableHtml.includes(term.toLocaleLowerCase('en-US'))) {
     throw new Error(`representative search term is absent from built documentation: ${term}`);
   }
 }

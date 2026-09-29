@@ -104,7 +104,8 @@ impl UniswapLatestProcessor {
         let version = Version::new(2, 0, 0);
         let config_hash = BlockHash::new(*blake3::hash(&encoded).as_bytes());
         let descriptor = ProcessorDescriptor {
-            instance: ProcessorInstanceId::legacy(&id, &version, config_hash),
+            instance: ProcessorInstanceId::legacy(&id, &version, config_hash)
+                .map_err(|error| ProcessorError::Input(error.to_string()))?,
             id,
             version,
             code_hash: BlockHash::new(*blake3::hash(b"leani/uniswap-latest/2.0.0").as_bytes()),
@@ -189,7 +190,8 @@ impl UniswapObservationsProcessor {
         let version = Version::new(2, 1, 0);
         let config_hash = BlockHash::new(*blake3::hash(&encoded).as_bytes());
         let descriptor = ProcessorDescriptor {
-            instance: ProcessorInstanceId::legacy(&id, &version, config_hash),
+            instance: ProcessorInstanceId::legacy(&id, &version, config_hash)
+                .map_err(|error| ProcessorError::Input(error.to_string()))?,
             id,
             version,
             code_hash: BlockHash::new(
@@ -277,6 +279,22 @@ impl Processor for UniswapLatestProcessor {
             current.insert(observation.pool, observation);
         }
         for (pool, observation) in current {
+            // Ordered lanes apply blocks in order; like the observation
+            // reducer, never let an older observation replace a newer one.
+            let stored = transaction
+                .get(CURRENT_COLLECTION, &pool.0)
+                .await?
+                .map(|encoded| {
+                    postcard::from_bytes::<PoolPriceEntity>(&encoded)
+                        .map_err(|error| ProcessorError::State(error.to_string()))
+                })
+                .transpose()?;
+            if stored.is_some_and(|stored| {
+                (stored.block_number, stored.log_index)
+                    > (observation.block_number, observation.log_index)
+            }) {
+                continue;
+            }
             write_entity(
                 transaction,
                 CURRENT_COLLECTION,
@@ -817,5 +835,46 @@ mod tests {
         .expect("decode latest observation after older finality");
         assert_eq!(latest_after_finality.block_number, frame.block.number);
         assert_eq!(latest_after_finality.block_hash, frame.block.hash);
+    }
+
+    #[tokio::test]
+    async fn ordered_latest_keeps_the_newest_observation_when_an_older_block_arrives() {
+        // Audit probe (Processor-8): the ordered latest reducer wrote without
+        // comparing positions, unlike the block-local observation reducer.
+        let pool = Address::new([3; 20]);
+        let processor = UniswapLatestProcessor::new(UniswapConfig {
+            start_block: BlockNumber(1),
+            pools: vec![PoolConfig {
+                address: pool,
+                kind: PoolKind::V3,
+            }],
+        })
+        .expect("processor");
+        let mut older = fixture_frame(1, BlockHash::ZERO);
+        older.logs =
+            Material::Complete(vec![log(pool, v3_initialize_topic(), &[U256::from(11)], 7)]);
+        let mut newer = fixture_frame(2, older.block.hash);
+        newer.logs =
+            Material::Complete(vec![log(pool, v3_initialize_topic(), &[U256::from(22)], 0)]);
+        let mut reducer = MemoryReducer::default();
+        for frame in [&newer, &older] {
+            let delta = processor.map(frame).await.expect("map");
+            processor
+                .reduce(&mut reducer, &cursor(&processor, frame), &delta)
+                .await
+                .expect("reduce");
+        }
+        let latest: PoolPriceEntity = postcard::from_bytes(
+            reducer
+                .entity(CURRENT_COLLECTION, &pool.0)
+                .expect("latest observation"),
+        )
+        .expect("decode");
+        assert_eq!(latest.block_number, newer.block.number);
+        assert_eq!(
+            U256::from_be_bytes(latest.sqrt_price_x96.expect("sqrt").0),
+            U256::from(22)
+        );
+        assert_eq!(reducer.emitted().len(), 1);
     }
 }

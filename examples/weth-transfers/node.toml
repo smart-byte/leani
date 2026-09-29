@@ -43,7 +43,7 @@ checkpoint = ""
 id = "evm-events"
 instance = "weth-transfers"
 history_mode = "on_demand"
-version = "1.0.0"
+version = "1.1.0"
 start_block = 17000000
 publish = "finalized_only"
 
@@ -55,7 +55,6 @@ mode = "none"
 
 [processors.output]
 mode = "window"
-finalized_only = true
 
 [processors.output.window]
 max_blocks = 216000
@@ -86,7 +85,6 @@ key_fields = []
 http_bind = "127.0.0.1:8547"
 ws_bind = "127.0.0.1:8548"
 historical_mode = "on_demand"
-transaction_locator = false
 minimum_recent_blocks = 128
 
 [api]

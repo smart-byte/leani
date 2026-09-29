@@ -52,10 +52,12 @@ Copy the operational template:
 cp config/example.toml config/manual-mainnet.toml
 ```
 
-Edit at least these fields:
+Edit at least these fields. A relative `data_dir` is relative to the
+configuration file, so from `config/` this names the `data/manual-mainnet`
+directory created above:
 
 ```toml
-data_dir = "./data/manual-mainnet"
+data_dir = "../data/manual-mainnet"
 
 [finality]
 kind = "consensus_p2p"
@@ -107,15 +109,16 @@ FROM=$((TO - 9999))
 echo "Testing blocks $FROM through $TO"
 ```
 
-Set the configured processor start to the numeric value printed as `FROM`:
+In the copied `blobs-money` entry, set the processor start to the numeric
+value printed as `FROM`, and keep the entry's other fields and policy tables:
 
 ```toml
 [[processors]]
 id = "blobs-money"
-version = "1.4.0"
+instance = "blobs-production"
+version = "1.5.0"
 start_block = 0 # Replace 0 with the numeric FROM value printed above.
 publish = "included_and_finalized"
-retention = "full_output_history"
 ```
 
 `serve` uses this configured value. The finite `e2e mainnet` command overrides
@@ -364,10 +367,12 @@ than `eth_subscribe`.
 
 This mode isolates free public datasets from P2P and head following. Copy
 `deploy/container.toml` to `config/manual-history.toml`, then configure local
-bind addresses and a fresh data directory:
+bind addresses, a fresh data directory, relative to the configuration file,
+and the processor start; keep the other settings and the processor's policy
+tables as copied:
 
 ```toml
-data_dir = "./data/manual-history-10k"
+data_dir = "../data/manual-history-10k"
 
 [sources.live]
 kind = "disabled"
@@ -382,16 +387,16 @@ minimum_agreement = 1
 
 [[processors]]
 id = "blobs-money"
-version = "1.4.0"
+instance = "blobs-container-1-5"
+version = "1.5.0"
+history_mode = "on_demand"
 start_block = 0 # Replace 0 with the numeric FROM value printed above.
 publish = "included_and_finalized"
-retention = "full_output_history"
 
 [rpc]
 http_bind = "127.0.0.1:8545"
 ws_bind = "127.0.0.1:8546"
 historical_mode = "on_demand"
-transaction_locator = false
 minimum_recent_blocks = 128
 
 [api]
@@ -461,7 +466,9 @@ to the Leani checkout containing the SDK fixture.
 Start the checked local service with:
 
 ```bash
-docker compose --profile benchmark up -d benchmark-postgres
+# Compose resolves the node's LEANI_API_TOKEN for every service; the
+# database ignores it.
+LEANI_API_TOKEN=unused docker compose --profile benchmark up -d benchmark-postgres
 export LEANI_BENCHMARK_POSTGRES_URL=postgres://leani_benchmark:leani_benchmark@127.0.0.1:55432/leani_benchmark
 scripts/run-controlled-benchmarks.sh delivery-faults
 ```
@@ -476,7 +483,9 @@ work, so the result answers “how fast can the node index and deliver this
 processor output to an immediately acknowledging consumer?”
 
 Run benchmarks with the release binary, a fresh data directory, and an
-immutable report path:
+immutable report path. Like a node, the benchmark holds its data directory,
+execution P2P peer store and identity included, so it refuses a directory
+that a running node or another benchmark holds:
 
 ```bash
 ./target/release/leani \

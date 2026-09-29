@@ -66,7 +66,7 @@ checkpoint = ""
 [[processors]]
 id = "blobs-money"
 instance = "benchmark-blobs-externalized"
-version = "1.4.0"
+version = "1.5.0"
 history_control = "node_owned"
 history_mode = "on_demand"
 start_block = 19426589
@@ -80,7 +80,6 @@ mode = "none"
 
 [processors.output]
 mode = "full"
-finalized_only = true
 
 [processors.delivery]
 mode = "none"
@@ -113,7 +112,6 @@ mode = "none"
 
 [processors.output]
 mode = "full"
-finalized_only = true
 
 [processors.delivery]
 mode = "none"
@@ -139,7 +137,6 @@ kind = "v3"
 http_bind = "127.0.0.1:8545"
 ws_bind = "127.0.0.1:8546"
 historical_mode = "on_demand"
-transaction_locator = false
 minimum_recent_blocks = 128
 
 [api]

@@ -1,5 +1,6 @@
 //! Versioned aggregate HTTP query and resumable SSE API.
 
+mod browser_guard;
 mod extension;
 mod extensions;
 
@@ -64,11 +65,17 @@ use leani_store_sqlite::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use thiserror::Error;
+use tokio_util::sync::CancellationToken;
+
+use browser_guard::{RequestPolicy, guard_browser_requests, lowercase_set, normalized_origins};
 
 const API_VERSION: &str = "1";
 const MAX_PAGE_SIZE: usize = 1_000;
 const CONSUMER_CREDENTIAL_HEADER: &str = "x-leani-consumer-credential";
 const CONSUMER_SESSION_HEADER: &str = "x-leani-consumer-session";
+/// First payload byte of a cursor that continues an entity GET without a
+/// snapshot; snapshot page cursors start with 1.
+const OUTPUT_PAGE_CURSOR_VERSION: u8 = 2;
 static REQUEST_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 /// Failure from [`commit_then_ack`].
@@ -126,6 +133,11 @@ struct ReadinessInner {
     finality_required: bool,
     live_ready: AtomicBool,
     finality_ready: AtomicBool,
+    /// Unix seconds of the newest verified finality anchor; zero when none.
+    finality_anchor_unix_seconds: AtomicU64,
+    finality_anchor_expires_unix_seconds: AtomicU64,
+    /// Failed writes of the persisted finality anchor.
+    finality_anchor_write_failures: Arc<AtomicU64>,
 }
 
 impl ReadinessHandle {
@@ -137,6 +149,9 @@ impl ReadinessHandle {
                 finality_required,
                 live_ready: AtomicBool::new(false),
                 finality_ready: AtomicBool::new(false),
+                finality_anchor_unix_seconds: AtomicU64::new(0),
+                finality_anchor_expires_unix_seconds: AtomicU64::new(0),
+                finality_anchor_write_failures: Arc::default(),
             }),
         }
     }
@@ -147,6 +162,40 @@ impl ReadinessHandle {
 
     pub fn set_finality_ready(&self, ready: bool) {
         self.inner.finality_ready.store(ready, Ordering::Release);
+    }
+
+    /// Record a verified finality anchor's slot time and the time a restart
+    /// can no longer bootstrap from it, both in Unix seconds. An older anchor
+    /// than the one already recorded is ignored.
+    pub fn set_finality_anchor(&self, anchor_unix_seconds: u64, expires_unix_seconds: u64) {
+        self.inner
+            .finality_anchor_expires_unix_seconds
+            .fetch_max(expires_unix_seconds, Ordering::AcqRel);
+        self.inner
+            .finality_anchor_unix_seconds
+            .fetch_max(anchor_unix_seconds, Ordering::AcqRel);
+    }
+
+    /// The counter a finality source increments when persisting its anchor
+    /// fails.
+    #[must_use]
+    pub fn finality_anchor_write_failures(&self) -> Arc<AtomicU64> {
+        self.inner.finality_anchor_write_failures.clone()
+    }
+
+    fn finality_anchor(&self) -> Option<(u64, u64)> {
+        let anchor = self
+            .inner
+            .finality_anchor_unix_seconds
+            .load(Ordering::Acquire);
+        (anchor != 0).then(|| {
+            (
+                anchor,
+                self.inner
+                    .finality_anchor_expires_unix_seconds
+                    .load(Ordering::Acquire),
+            )
+        })
     }
 
     /// Whether every required live/finality lane is currently ready.
@@ -205,6 +254,14 @@ pub struct ApiConfig {
     pub query_snapshot_max_total_bytes: u64,
     /// Optional bearer token. Debug output always redacts this value.
     pub bearer_token: Option<Arc<str>>,
+    /// `Host` names, besides `localhost`, that requests may address, without
+    /// a port. Any other name gets HTTP 421; IP addresses always pass, since
+    /// DNS rebinding cannot send one.
+    pub allowed_hosts: BTreeSet<String>,
+    /// Browser origins, besides loopback ones on any port, that may call the
+    /// API, as lowercase ASCII serializations such as `https://app.example`.
+    /// Any other `Origin` gets HTTP 403.
+    pub allowed_origins: BTreeSet<String>,
     pub readiness: ReadinessHandle,
     pub network_telemetry: NetworkTelemetry,
     /// Processor instances whose historical coverage is application-requested
@@ -218,6 +275,10 @@ pub struct ApiConfig {
     pub backfill_control: Option<Arc<dyn BackfillControl>>,
     /// Optional independent raw-history control plane supplied by the node.
     pub raw_history_control: Option<Arc<dyn RawHistoryControl>>,
+    /// Cancelled when the node shuts down: open change and delivery streams
+    /// then end cleanly, so the shutdown need not wait for their clients,
+    /// which reconnect from their last cursor.
+    pub shutdown: CancellationToken,
 }
 
 impl Default for ApiConfig {
@@ -237,12 +298,15 @@ impl Default for ApiConfig {
             query_snapshot_max_total_snapshots: 32,
             query_snapshot_max_total_bytes: 128 * 1024 * 1024,
             bearer_token: None,
+            allowed_hosts: BTreeSet::new(),
+            allowed_origins: BTreeSet::new(),
             readiness: ReadinessHandle::default(),
             network_telemetry: NetworkTelemetry::default(),
             on_demand_processors: BTreeSet::new(),
             application_subscription_processors: BTreeSet::new(),
             backfill_control: None,
             raw_history_control: None,
+            shutdown: CancellationToken::new(),
         }
     }
 }
@@ -274,6 +338,8 @@ impl std::fmt::Debug for ApiConfig {
                 "bearer_token",
                 &self.bearer_token.as_ref().map(|_| "[REDACTED]"),
             )
+            .field("allowed_hosts", &self.allowed_hosts)
+            .field("allowed_origins", &self.allowed_origins)
             .field("readiness", &self.readiness)
             .field("network_telemetry", &self.network_telemetry)
             .field("on_demand_processors", &self.on_demand_processors)
@@ -289,6 +355,7 @@ impl std::fmt::Debug for ApiConfig {
                 "raw_history_control",
                 &self.raw_history_control.as_ref().map(|_| "[AVAILABLE]"),
             )
+            .field("shutdown", &self.shutdown.is_cancelled())
             .finish()
     }
 }
@@ -1031,7 +1098,14 @@ pub fn router_with_processors(
     config: ApiConfig,
 ) -> Result<Router, ApiError> {
     config.validate()?;
-    let bearer_token = config.bearer_token.clone();
+    let bearer_token = config
+        .bearer_token
+        .as_deref()
+        .map(|token| blake3::hash(token.as_bytes()));
+    let request_policy = Arc::new(RequestPolicy {
+        allowed_hosts: lowercase_set(&config.allowed_hosts),
+        allowed_origins: normalized_origins(&config.allowed_origins),
+    });
     let primary = processors
         .first()
         .cloned()
@@ -1093,7 +1167,7 @@ pub fn router_with_processors(
         )
         .route(
             "/v1/processors/{processor}/collections/{collection}/entities",
-            get(query_output_entities),
+            get(query_output_entities).post(create_output_snapshot),
         )
         .route(
             "/v1/processors/{processor}/collections/{collection}/entities/{key}",
@@ -1247,21 +1321,41 @@ pub fn router_with_processors(
         .route("/debug/network", get(network_dashboard))
         .route("/metrics", get(metrics))
         .with_state(state);
-    Ok(operational.merge(protected))
+    Ok(operational
+        .merge(protected)
+        .layer(middleware::from_fn_with_state(
+            request_policy,
+            guard_browser_requests,
+        )))
 }
 
-async fn authenticate(State(expected): State<Arc<str>>, request: Request, next: Next) -> Response {
+/// Accept a request whose `Authorization` carries the configured token.
+/// Both tokens are compared as BLAKE3 digests, whose equality check is
+/// constant-time, so the time taken does not reveal how much of a guess
+/// matched.
+async fn authenticate(
+    State(expected): State<blake3::Hash>,
+    request: Request,
+    next: Next,
+) -> Response {
     let authorized = request
         .headers()
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Bearer "))
-        .is_some_and(|value| value == expected.as_ref());
+        .and_then(bearer_credentials)
+        .is_some_and(|token| blake3::hash(token.as_bytes()) == expected);
     if authorized {
         next.run(request).await
     } else {
         ApiError::unauthorized().into_response()
     }
+}
+
+/// The token of a `Bearer` authorization, whose scheme is case-insensitive.
+fn bearer_credentials(authorization: &str) -> Option<&str> {
+    let (scheme, token) = authorization.split_once(' ')?;
+    let token = token.trim_start_matches(' ');
+    (scheme.eq_ignore_ascii_case("bearer") && !token.is_empty()).then_some(token)
 }
 
 #[derive(Debug, Serialize)]
@@ -1279,7 +1373,8 @@ struct StatusResponse {
 }
 
 async fn status(State(state): State<ApiState>) -> Result<Json<StatusResponse>, ApiError> {
-    let store_stats = state.store.stats().await?;
+    // Page counts give the database size without scanning tables.
+    let store_stats = state.store.storage_stats().await?;
     let processors = processor_summaries(&state);
     Ok(Json(StatusResponse {
         api_version: API_VERSION,
@@ -1402,7 +1497,10 @@ async fn network_status(
     let mut applied_blocks = 0_u64;
     for processor in state.processors.values() {
         let coverage = coverage(&state, processor.as_ref(), None).await?;
-        let store_stats = state.store.processor_stats(processor.descriptor()).await?;
+        let store_stats = state
+            .store
+            .cached_processor_stats(processor.descriptor())
+            .await?;
         applied_blocks = applied_blocks.saturating_add(store_stats.applied_blocks);
         let runtime = state
             .store
@@ -2167,7 +2265,7 @@ fn backfill_error(error: BackfillControlError) -> ApiError {
                 "requestedToBlock": requested,
                 "currentFinalizedHead": {
                     "number": finalized,
-                    "hash": finalized_hash,
+                    "hash": hash_hex(finalized_hash),
                 },
                 "suggestedToBlock": finalized,
                 "action": "clamp_and_retry"
@@ -2189,7 +2287,7 @@ fn backfill_error(error: BackfillControlError) -> ApiError {
                 "requestedFromBlock": requested,
                 "currentFinalizedHead": {
                     "number": finalized,
-                    "hash": finalized_hash,
+                    "hash": hash_hex(finalized_hash),
                 }
             }));
             error
@@ -2420,8 +2518,11 @@ struct HealthResponse {
     reasons: Vec<&'static str>,
 }
 
+// Health probes are unauthenticated and polled every few seconds, often with
+// a short timeout: they read in-memory readiness plus a trivial store ping and
+// never scan tables.
 async fn liveness(State(state): State<ApiState>) -> Response {
-    let database_ok = state.store.stats().await.is_ok();
+    let database_ok = state.store.ping().await.is_ok();
     let body = HealthResponse {
         status: if database_ok { "live" } else { "failed" },
         uptime_seconds: state.started.elapsed().as_secs(),
@@ -2449,7 +2550,7 @@ async fn liveness(State(state): State<ApiState>) -> Response {
 }
 
 async fn readiness(State(state): State<ApiState>) -> Response {
-    let database_ok = state.store.stats().await.is_ok();
+    let database_ok = state.store.ping().await.is_ok();
     let readiness = state.config.readiness.snapshot();
     let mut reasons = Vec::new();
     if !database_ok {
@@ -2487,7 +2588,8 @@ async fn readiness(State(state): State<ApiState>) -> Response {
 async fn metrics(State(state): State<ApiState>) -> Result<Response, ApiError> {
     use std::fmt::Write as _;
 
-    let store_metrics = state.store.stats().await?;
+    // Whole-table counts refresh at most once per store stats TTL.
+    let store_metrics = state.store.cached_stats().await?;
     let store_budgets = state.store.budget_stats().await?;
     let recent_metrics = state.store.recent_stats(state.config.chain_id).await?;
     let readiness = state.config.readiness.snapshot();
@@ -2522,6 +2624,49 @@ async fn metrics(State(state): State<ApiState>) -> Result<Response, ApiError> {
         writeln!(output, "# TYPE leani_{name} gauge")?;
         writeln!(output, "leani_{name} {}", u8::from(value))?;
     }
+    if let Some((anchor, expires)) = state.config.readiness.finality_anchor() {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        writeln!(
+            output,
+            "# HELP leani_finality_anchor_age_seconds Age of the newest verified finality anchor."
+        )?;
+        writeln!(output, "# TYPE leani_finality_anchor_age_seconds gauge")?;
+        writeln!(
+            output,
+            "leani_finality_anchor_age_seconds {}",
+            now.saturating_sub(anchor)
+        )?;
+        writeln!(
+            output,
+            "# HELP leani_finality_anchor_expiry_seconds Seconds until a restart can no longer bootstrap from that anchor; negative once it has expired."
+        )?;
+        writeln!(output, "# TYPE leani_finality_anchor_expiry_seconds gauge")?;
+        writeln!(
+            output,
+            "leani_finality_anchor_expiry_seconds {}",
+            i128::from(expires) - i128::from(now)
+        )?;
+    }
+    writeln!(
+        output,
+        "# HELP leani_finality_anchor_write_failures_total Failed writes of the persisted finality anchor."
+    )?;
+    writeln!(
+        output,
+        "# TYPE leani_finality_anchor_write_failures_total counter"
+    )?;
+    writeln!(
+        output,
+        "leani_finality_anchor_write_failures_total {}",
+        state
+            .config
+            .readiness
+            .finality_anchor_write_failures()
+            .load(Ordering::Relaxed)
+    )?;
     writeln!(output, "# TYPE leani_uptime_seconds counter")?;
     writeln!(
         output,
@@ -2577,6 +2722,8 @@ async fn metrics(State(state): State<ApiState>) -> Result<Response, ApiError> {
             "history_delivery_retained_bytes",
             store_metrics.history_delivery_retained_bytes,
         ),
+        ("deferred_changes", store_metrics.deferred_changes),
+        ("deferred_change_bytes", store_metrics.deferred_change_bytes),
         ("recent_frames", recent_metrics.frames),
         ("recent_frame_bytes", recent_metrics.encoded_bytes),
     ] {
@@ -2876,7 +3023,7 @@ async fn append_processor_metrics(output: &mut String, state: &ApiState) -> Resu
         let descriptor = processor.descriptor();
         let cursor = state.store.processor_cursor(descriptor).await?;
         let finalized = state.store.finalized_through(descriptor).await?;
-        let processor_store = state.store.processor_stats(descriptor).await?;
+        let processor_store = state.store.cached_processor_stats(descriptor).await?;
         let delivery = state.store.delivery_stream_stats(descriptor).await?;
         if let Ok(runtime) = state.store.processor_runtime_state(descriptor).await {
             writeln!(
@@ -3367,6 +3514,7 @@ pub struct Erc20Balance {
     finality: &'static str,
     coverage_from: u64,
     complete: bool,
+    incomplete_from: Option<u64>,
     method: String,
 }
 
@@ -3381,6 +3529,7 @@ impl From<&TokenBalanceEntity> for Erc20Balance {
             finality: finality_name(value.finality),
             coverage_from: value.coverage_from.0,
             complete: value.complete,
+            incomplete_from: value.incomplete_from.map(|block| block.0),
             method: value.method.clone(),
         }
     }
@@ -3432,12 +3581,15 @@ pub struct BlobsBlock {
     blob_count: u32,
     blob_gas_used: String,
     excess_blob_gas: String,
+    /// Protocol blob base fee in wei per blob gas; EIP-7918 does not change it.
     blob_base_fee: String,
     execution_base_fee: String,
     gas_used: String,
     gas_limit: String,
     execution_eth_burned_wei: String,
+    /// `blob_base_fee` times the block's blob gas.
     blob_eth_burned_wei: String,
+    /// EIP-7918 reserve price from Fusaka on, reported but never applied.
     reserve_fee_wei: Option<String>,
     transaction_count: u32,
     target_blobs_per_block: u32,
@@ -3489,6 +3641,7 @@ pub struct BlobTransaction {
     blob_count: u32,
     total_burned_wei: String,
     execution_burned_wei: String,
+    /// The block's protocol blob base fee times this transaction's blob gas.
     blob_burned_wei: String,
 }
 
@@ -3688,6 +3841,7 @@ async fn renew_consumer(
 ) -> Result<Json<ConsumerResponse>, ApiError> {
     let processor = configured_processor(&state, &processor)?;
     authorize_consumer_scope(&state, processor.as_ref(), &consumer, &headers).await?;
+    ensure_unfenced_default_stream(&state, processor.as_ref()).await?;
     let consumer = state
         .store
         .renew_consumer(processor.descriptor(), &consumer)
@@ -3745,6 +3899,13 @@ async fn consumer_changes(
             limit,
         )
         .await?;
+    record_page_delivery(
+        &state,
+        &default_delivery_stream_id(processor.descriptor()),
+        &consumer,
+        &records,
+    )
+    .await?;
     let coverage = coverage(&state, processor.as_ref(), None).await?;
     let data = records
         .into_iter()
@@ -3772,6 +3933,7 @@ async fn acknowledge_consumer(
 ) -> Result<Json<ConsumerResponse>, ApiError> {
     let processor = configured_processor(&state, &processor)?;
     authorize_consumer_scope(&state, processor.as_ref(), &consumer, &headers).await?;
+    ensure_unfenced_default_stream(&state, processor.as_ref()).await?;
     let sequence = decode_change_cursor(&state, processor.as_ref(), &request.cursor)?.sequence;
     let consumer = state
         .store
@@ -3780,6 +3942,44 @@ async fn acknowledge_consumer(
     Ok(Json(
         consumer_response(&state, processor.as_ref(), consumer).await?,
     ))
+}
+
+/// A split live stream fences renewal and acknowledgement by session, which
+/// the generic consumer routes cannot check, so they refuse its processors;
+/// their consumers renew and acknowledge through the live stream routes.
+async fn ensure_unfenced_default_stream(
+    state: &ApiState,
+    processor: &dyn Processor,
+) -> Result<(), ApiError> {
+    let stream = state
+        .store
+        .delivery_stream(&default_delivery_stream_id(processor.descriptor()))
+        .await?;
+    if stream.is_some_and(|stream| stream.kind == DeliveryStreamKind::Live) {
+        return Err(ApiError::conflict(
+            "consumer_session_required",
+            "this processor delivers through a split live stream; renew and acknowledge through /streams/live/consumers/{consumer}/lease and /ack with its x-leani-consumer-session",
+        ));
+    }
+    Ok(())
+}
+
+/// Record that a consumer page was handed out, through its last change, so
+/// the consumer may acknowledge it. A consumer that left the active state
+/// meanwhile records nothing, and its acknowledgement fails on that state.
+async fn record_page_delivery(
+    state: &ApiState,
+    stream_id: &str,
+    consumer: &str,
+    records: &[ChangeRecord],
+) -> Result<(), ApiError> {
+    if let Some(last) = records.last() {
+        state
+            .store
+            .record_consumer_delivery_in_stream(stream_id, consumer, None, last.cursor.sequence)
+            .await?;
+    }
+    Ok(())
 }
 
 async fn backfill_consumer_changes(
@@ -3802,6 +4002,7 @@ async fn backfill_consumer_changes(
             limit,
         )
         .await?;
+    record_page_delivery(&state, &stream_id, &consumer, &records).await?;
     let coverage = coverage(&state, processor.as_ref(), None).await?;
     let data = records
         .into_iter()
@@ -3955,6 +4156,8 @@ struct HistoryProgressUnit {
     raw_payload_bytes: u64,
     encoded_change_bytes: u64,
     acknowledgeable_cursor: String,
+    /// The progress boundary's sequence, the unit's last.
+    acknowledgeable_sequence: u64,
     changes: Vec<ChangeEnvelope>,
 }
 
@@ -3969,6 +4172,7 @@ struct PendingHistoryBatch {
     raw_payload_bytes: u64,
     encoded_change_bytes: u64,
     acknowledgeable_cursor: String,
+    acknowledgeable_sequence: u64,
     changes: Vec<ChangeEnvelope>,
 }
 
@@ -3997,6 +4201,9 @@ struct LiveConsumerStreamState {
     consumer_id: String,
     fetch_after: u64,
     fetched: VecDeque<ChangeRecord>,
+    /// The last page read reached the stream head, so the last block in
+    /// `fetched` is whole: a block's records commit together.
+    fetched_through_head: bool,
     gzip: bool,
     terminal: bool,
     lease: ConsumerSessionGuard,
@@ -4021,6 +4228,14 @@ async fn stream_live_consumer(
         .store
         .acquire_consumer_session_in_stream(processor.descriptor(), &stream_id, &consumer)
         .await?;
+    // Guard at once: an error before the stream starts must release the
+    // exclusive lease instead of holding it until its TTL.
+    let lease_guard = ConsumerSessionGuard {
+        store: state.store.clone(),
+        stream_id: stream_id.clone(),
+        consumer_id: consumer.clone(),
+        generation: lease.generation,
+    };
     let session_token = encode_consumer_session_token(
         &state,
         processor.as_ref(),
@@ -4054,14 +4269,10 @@ async fn stream_live_consumer(
         consumer_id: consumer.clone(),
         fetch_after: durable_consumer.acknowledged_sequence,
         fetched: VecDeque::new(),
+        fetched_through_head: false,
         gzip,
         terminal: false,
-        lease: ConsumerSessionGuard {
-            store: state.store.clone(),
-            stream_id,
-            consumer_id: consumer,
-            generation: lease.generation,
-        },
+        lease: lease_guard,
     };
     let body_stream = stream::once(std::future::ready(Ok::<Bytes, Infallible>(hello)))
         .chain(stream::unfold(stream_state, poll_live_consumer));
@@ -4069,6 +4280,7 @@ async fn stream_live_consumer(
         body_stream,
         gzip,
         state.config.live_batch_limits,
+        &state.config.shutdown,
     ));
     response.headers_mut().insert(
         header::CONTENT_TYPE,
@@ -4203,11 +4415,14 @@ struct LiveLaneResetResponse {
     required_delivery_bytes: String,
 }
 
+/// Reset a failed live lane for replay. A lane of any delivery ordering can
+/// fail, so this needs no split live stream: the reset reads only the lane's
+/// gap marker and the processor's delivery limit.
 async fn reset_live_lane(
     State(state): State<ApiState>,
     Path(processor): Path<String>,
 ) -> Result<Json<LiveLaneResetResponse>, ApiError> {
-    let (processor, _) = live_delivery_scope(&state, &processor).await?;
+    let processor = configured_processor(&state, &processor)?;
     let gap = match state
         .store
         .reset_failed_live_lane(processor.descriptor())
@@ -4252,21 +4467,23 @@ async fn poll_live_consumer(
     if stream_state.terminal {
         return None;
     }
+    // The heartbeat is due one interval after the previous record. Any
+    // processor's commit wakes this stream, so a fresh interval per wake-up
+    // would starve an idle stream of heartbeats on a busy node.
+    let heartbeat_due = tokio::time::Instant::now() + stream_state.state.config.heartbeat_interval;
     loop {
-        if let Some(first) = stream_state.fetched.front().cloned() {
-            let mut records = Vec::new();
-            while stream_state
+        if let Some((first, block_records)) = whole_live_block(
+            &stream_state.fetched,
+            stream_state.fetched_through_head,
+            stream_state.state.config.live_batch_limits.maximum_events,
+        ) {
+            let records = stream_state
                 .fetched
-                .front()
-                .is_some_and(|record| same_live_commit(&first, record))
-            {
-                records.push(
-                    stream_state
-                        .fetched
-                        .pop_front()
-                        .expect("front record exists"),
-                );
-            }
+                .drain(..block_records)
+                .collect::<Vec<_>>();
+            let delivered_through = records
+                .last()
+                .map_or(first.cursor.sequence, |record| record.cursor.sequence);
             let live_limits = stream_state.state.config.live_batch_limits;
             if u64::try_from(records.len()).unwrap_or(u64::MAX) > live_limits.maximum_events {
                 stream_state.terminal = true;
@@ -4392,17 +4609,17 @@ async fn poll_live_consumer(
                 last_cursor: Some(last_cursor),
                 changes,
             };
-            if !live_stream_session_is_current(&stream_state).await {
+            if let Some(failure) = record_session_delivery(
+                &stream_state.state,
+                &stream_state.stream_id,
+                &stream_state.consumer_id,
+                stream_state.lease.generation,
+                delivered_through,
+            )
+            .await
+            {
                 stream_state.terminal = true;
-                return Some((
-                    Ok(ndjson_failure(
-                        "consumer_session_lost",
-                        "consumer streaming lease is no longer current".to_owned(),
-                        None,
-                        None,
-                    )),
-                    stream_state,
-                ));
+                return Some((Ok(failure), stream_state));
             }
             return Some((Ok(ndjson_line_or_error(&batch)), stream_state));
         }
@@ -4431,15 +4648,21 @@ async fn poll_live_consumer(
             .await
         {
             Ok(records) if !records.is_empty() => {
+                stream_state.fetched_through_head = records.len() < fetch_limit;
                 stream_state.fetch_after = records
                     .last()
                     .map_or(stream_state.fetch_after, |record| record.cursor.sequence);
                 stream_state.fetched.extend(records);
             }
+            Ok(_) if !stream_state.fetched.is_empty() => {
+                // The previous full page ended exactly at the head, and so
+                // did its last block.
+                stream_state.fetched_through_head = true;
+            }
             Ok(_) => {
                 tokio::select! {
                     () = stream_state.state.store.wait_for_delivery_changes() => {}
-                    () = tokio::time::sleep(stream_state.state.config.heartbeat_interval) => {
+                    () = tokio::time::sleep_until(heartbeat_due) => {
                         if !live_stream_session_is_current(&stream_state).await {
                             stream_state.terminal = true;
                             return Some((
@@ -4490,6 +4713,59 @@ async fn poll_live_consumer(
                 ));
             }
         }
+    }
+}
+
+/// The first block of `fetched` and its record count, once it can go out as
+/// one batch: a record of another commit follows it, or the page read that
+/// fetched it reached the stream head, since a block's records commit
+/// together. A block already past `maximum_events` is returned to fail the
+/// stream. Otherwise a page read ended inside the block, which waits for the
+/// next read.
+fn whole_live_block(
+    fetched: &VecDeque<ChangeRecord>,
+    fetched_through_head: bool,
+    maximum_events: u64,
+) -> Option<(ChangeRecord, usize)> {
+    let first = fetched.front()?;
+    let records = fetched
+        .iter()
+        .take_while(|record| same_live_commit(first, record))
+        .count();
+    (records < fetched.len()
+        || fetched_through_head
+        || u64::try_from(records).unwrap_or(u64::MAX) > maximum_events)
+        .then(|| (first.clone(), records))
+}
+
+/// Record a batch as delivered through `sequence` for the session sending
+/// it, so the consumer may acknowledge it, and return the failure record to
+/// send instead when that session is no longer current or the store fails.
+async fn record_session_delivery(
+    state: &ApiState,
+    stream_id: &str,
+    consumer_id: &str,
+    generation: u64,
+    sequence: u64,
+) -> Option<Bytes> {
+    match state
+        .store
+        .record_consumer_delivery_in_stream(stream_id, consumer_id, Some(generation), sequence)
+        .await
+    {
+        Ok(true) => None,
+        Ok(false) => Some(ndjson_failure(
+            "consumer_session_lost",
+            "consumer streaming lease is no longer current".to_owned(),
+            None,
+            None,
+        )),
+        Err(error) => Some(ndjson_failure(
+            "delivery_failed",
+            error.to_string(),
+            None,
+            None,
+        )),
     }
 }
 
@@ -4587,6 +4863,14 @@ async fn stream_backfill_consumer(
         .store
         .acquire_consumer_session_in_stream(processor.descriptor(), &stream_id, &consumer)
         .await?;
+    // Guard at once: an error before the stream starts must release the
+    // exclusive lease instead of holding it until its TTL.
+    let lease_guard = ConsumerSessionGuard {
+        store: state.store.clone(),
+        stream_id: stream_id.clone(),
+        consumer_id: consumer.clone(),
+        generation: lease.generation,
+    };
     let session_token = encode_consumer_session_token(
         &state,
         processor.as_ref(),
@@ -4637,17 +4921,17 @@ async fn stream_backfill_consumer(
         pending_completion: None,
         completion_sequence: None,
         terminal: false,
-        lease: ConsumerSessionGuard {
-            store: state.store.clone(),
-            stream_id,
-            consumer_id: consumer,
-            generation: lease.generation,
-        },
+        lease: lease_guard,
     };
     let batch_limits = stream_state.batch_limits;
     let body_stream = stream::once(std::future::ready(Ok::<Bytes, Infallible>(hello)))
         .chain(stream::unfold(stream_state, poll_backfill_consumer));
-    let mut response = Response::new(buffered_delivery_body(body_stream, gzip, batch_limits));
+    let mut response = Response::new(buffered_delivery_body(
+        body_stream,
+        gzip,
+        batch_limits,
+        &state.config.shutdown,
+    ));
     response.headers_mut().insert(
         header::CONTENT_TYPE,
         HeaderValue::from_static("application/x-ndjson"),
@@ -4666,6 +4950,9 @@ async fn poll_backfill_consumer(
     if stream_state.terminal {
         return None;
     }
+    // Due one interval after the previous record, however often other
+    // streams' changes or acknowledgements wake this one.
+    let heartbeat_due = tokio::time::Instant::now() + stream_state.state.config.heartbeat_interval;
     loop {
         if let Some(completion_sequence) = stream_state.completion_sequence {
             let acknowledged = stream_state
@@ -4686,7 +4973,7 @@ async fn poll_backfill_consumer(
             }
             tokio::select! {
                 () = stream_state.state.store.wait_for_delivery_capacity_change() => {}
-                () = tokio::time::sleep(stream_state.state.config.heartbeat_interval) => {
+                () = tokio::time::sleep_until(heartbeat_due) => {
                     if !backfill_stream_session_is_current(&stream_state).await {
                         stream_state.terminal = true;
                         return Some((
@@ -4822,20 +5109,21 @@ async fn poll_backfill_consumer(
                     stream_state.terminal = true;
                     return Some((Ok(ndjson_failure(code, message, None, None)), stream_state));
                 }
-                let batch_pending = stream_state.pending_batch.is_some();
-                let wait = stream_state.pending_batch.as_ref().map_or(
-                    stream_state.state.config.heartbeat_interval,
-                    |batch| {
-                        stream_state
+                let batch_due = stream_state.pending_batch.as_ref().map(|batch| {
+                    tokio::time::Instant::now()
+                        + stream_state
                             .batch_limits
                             .maximum_delay
                             .saturating_sub(batch.started.elapsed())
-                    },
-                );
+                });
+                // A pending batch waits for its delay, which may be longer
+                // than a client's idle limit, so heartbeats keep their
+                // schedule meanwhile. They leave the batch as it is.
+                let wake_at = batch_due.map_or(heartbeat_due, |due| due.min(heartbeat_due));
                 tokio::select! {
                     () = stream_state.state.store.wait_for_delivery_changes() => {}
-                    () = tokio::time::sleep(wait) => {
-                        if batch_pending {
+                    () = tokio::time::sleep_until(wake_at) => {
+                        if batch_due.is_some_and(|due| due <= tokio::time::Instant::now()) {
                             continue;
                         }
                         if !backfill_stream_session_is_current(&stream_state).await {
@@ -4936,6 +5224,7 @@ fn build_history_progress_unit(
     }
     let (from_block, through_block, processed_blocks) =
         decode_progress_boundary(&boundary.change.payload, boundary.block.number.0)?;
+    let acknowledgeable_sequence = boundary.cursor.sequence;
     let acknowledgeable_cursor = change_envelope_in_stream(
         &stream_state.state,
         stream_state.processor.as_ref(),
@@ -4993,6 +5282,7 @@ fn build_history_progress_unit(
         raw_payload_bytes,
         encoded_change_bytes,
         acknowledgeable_cursor,
+        acknowledgeable_sequence,
         changes,
     })
 }
@@ -5051,6 +5341,7 @@ fn append_history_unit(batch: &mut Option<PendingHistoryBatch>, unit: HistoryPro
             .encoded_change_bytes
             .saturating_add(unit.encoded_change_bytes);
         batch.acknowledgeable_cursor = unit.acknowledgeable_cursor;
+        batch.acknowledgeable_sequence = unit.acknowledgeable_sequence;
         batch.changes.extend(unit.changes);
     } else {
         *batch = Some(PendingHistoryBatch {
@@ -5064,6 +5355,7 @@ fn append_history_unit(batch: &mut Option<PendingHistoryBatch>, unit: HistoryPro
             raw_payload_bytes: unit.raw_payload_bytes,
             encoded_change_bytes: unit.encoded_change_bytes,
             acknowledgeable_cursor: unit.acknowledgeable_cursor,
+            acknowledgeable_sequence: unit.acknowledgeable_sequence,
             changes: unit.changes,
         });
     }
@@ -5072,18 +5364,6 @@ fn append_history_unit(batch: &mut Option<PendingHistoryBatch>, unit: HistoryPro
 async fn emit_history_batch(
     mut stream_state: BackfillConsumerStreamState,
 ) -> (Result<Bytes, Infallible>, BackfillConsumerStreamState) {
-    if !backfill_stream_session_is_current(&stream_state).await {
-        stream_state.terminal = true;
-        return (
-            Ok(ndjson_failure(
-                "consumer_session_lost",
-                "consumer streaming lease is no longer current".to_owned(),
-                None,
-                None,
-            )),
-            stream_state,
-        );
-    }
     let Some(pending) = stream_state.pending_batch.take() else {
         stream_state.terminal = true;
         return (
@@ -5096,6 +5376,7 @@ async fn emit_history_batch(
             stream_state,
         );
     };
+    let delivered_through = pending.acknowledgeable_sequence;
     let first_cursor = pending.changes.first().map(|change| change.cursor.clone());
     let last_cursor = pending.changes.last().map(|change| change.cursor.clone());
     let encoded_event_payload = match serde_json::to_vec(&pending.changes) {
@@ -5152,6 +5433,18 @@ async fn emit_history_batch(
         acknowledgeable_cursor: pending.acknowledgeable_cursor,
         changes: pending.changes,
     };
+    if let Some(failure) = record_session_delivery(
+        &stream_state.state,
+        &stream_state.stream_id,
+        &stream_state.consumer_id,
+        stream_state.lease.generation,
+        delivered_through,
+    )
+    .await
+    {
+        stream_state.terminal = true;
+        return (Ok(failure), stream_state);
+    }
     (Ok(ndjson_line_or_error(&batch)), stream_state)
 }
 
@@ -5159,18 +5452,6 @@ async fn emit_backfill_completion(
     mut stream_state: BackfillConsumerStreamState,
     record: ChangeRecord,
 ) -> (Result<Bytes, Infallible>, BackfillConsumerStreamState) {
-    if !backfill_stream_session_is_current(&stream_state).await {
-        stream_state.terminal = true;
-        return (
-            Ok(ndjson_failure(
-                "consumer_session_lost",
-                "consumer streaming lease is no longer current".to_owned(),
-                None,
-                None,
-            )),
-            stream_state,
-        );
-    }
     let metadata =
         match leani_store_sqlite::decode_backfill_completion_metadata(&record.change.payload) {
             Ok(metadata) => metadata,
@@ -5240,6 +5521,18 @@ async fn emit_backfill_completion(
         repair_hint: (metadata.republished_blocks < metadata.requested_blocks)
             .then_some("recompute"),
     };
+    if let Some(failure) = record_session_delivery(
+        &stream_state.state,
+        &stream_state.stream_id,
+        &stream_state.consumer_id,
+        stream_state.lease.generation,
+        record.cursor.sequence,
+    )
+    .await
+    {
+        stream_state.terminal = true;
+        return (Ok(failure), stream_state);
+    }
     stream_state.completion_sequence = Some(record.cursor.sequence);
     (Ok(ndjson_line_or_error(&completion)), stream_state)
 }
@@ -5332,7 +5625,15 @@ struct BufferedDeliveryChunk {
     _byte_permit: tokio::sync::OwnedSemaphorePermit,
 }
 
-fn buffered_delivery_body<S>(source: S, gzip: bool, limits: DeliveryBatchLimits) -> Body
+/// Stream `source`'s NDJSON records as a response body through a bounded
+/// buffer. The node's `shutdown` ends the body after a whole record, with the
+/// gzip trailer, so clients reconnect from their last acknowledged cursor.
+fn buffered_delivery_body<S>(
+    source: S,
+    gzip: bool,
+    limits: DeliveryBatchLimits,
+    shutdown: &CancellationToken,
+) -> Body
 where
     S: Stream<Item = Result<Bytes, Infallible>> + Send + 'static,
 {
@@ -5340,6 +5641,7 @@ where
     let byte_capacity = usize::try_from(limits.maximum_buffered_bytes)
         .expect("validated delivery buffer fits usize");
     let byte_budget = Arc::new(tokio::sync::Semaphore::new(byte_capacity));
+    let source = source.take_until(shutdown.clone().cancelled_owned());
     tokio::spawn(async move {
         futures::pin_mut!(source);
         let mut compressor = DeliveryCompressor::new(gzip);
@@ -5637,28 +5939,21 @@ async fn authorize_consumer_scope(
     consumer: &str,
     headers: &HeaderMap,
 ) -> Result<(), ApiError> {
-    if let Some(credential) = headers
-        .get(CONSUMER_CREDENTIAL_HEADER)
-        .and_then(|value| value.to_str().ok())
-    {
-        if state
-            .store
-            .consumer_credential_matches(processor.descriptor(), consumer, credential)
-            .await?
-        {
-            return Ok(());
-        }
-        return Err(ApiError::forbidden(
-            "consumer credential does not match this durable consumer",
-        ));
-    }
-    // The optional global bearer setting is the API trust boundary. When it is
-    // configured, the router middleware has already authenticated this
-    // request. When it is omitted (for example on a loopback-only local
-    // sidecar), consumer operations are intentionally unauthenticated too.
-    Ok(())
+    authorize_consumer_scope_in_stream(
+        state,
+        processor,
+        &default_delivery_stream_id(processor.descriptor()),
+        consumer,
+        headers,
+    )
+    .await
 }
 
+/// A consumer with a credential needs it in `x-leani-consumer-credential`
+/// on every consumer-scoped request, in addition to any bearer token the
+/// router already checked; the store compares it in constant time. A
+/// consumer without one, such as one the node configuration declares, is
+/// reachable with the bearer alone.
 async fn authorize_consumer_scope_in_stream(
     state: &ApiState,
     processor: &dyn Processor,
@@ -5666,27 +5961,25 @@ async fn authorize_consumer_scope_in_stream(
     consumer: &str,
     headers: &HeaderMap,
 ) -> Result<(), ApiError> {
-    if let Some(credential) = headers
+    let presented = headers
         .get(CONSUMER_CREDENTIAL_HEADER)
-        .and_then(|value| value.to_str().ok())
+        .map(HeaderValue::as_bytes);
+    if state
+        .store
+        .consumer_credential_authorizes_in_stream(
+            processor.descriptor(),
+            stream_id,
+            consumer,
+            presented,
+        )
+        .await?
     {
-        if state
-            .store
-            .consumer_credential_matches_in_stream(
-                processor.descriptor(),
-                stream_id,
-                consumer,
-                credential,
-            )
-            .await?
-        {
-            return Ok(());
-        }
-        return Err(ApiError::forbidden(
-            "consumer credential does not match this durable consumer",
-        ));
+        Ok(())
+    } else {
+        Err(ApiError::forbidden(
+            "x-leani-consumer-credential is missing or does not match this durable consumer",
+        ))
     }
-    Ok(())
 }
 
 async fn consumer_response(
@@ -5820,7 +6113,35 @@ async fn list_output_collections(
 
 #[derive(Clone, Debug, Serialize)]
 struct RecoveryCheckpointList {
-    data: Vec<RecoveryCheckpoint>,
+    data: Vec<RecoveryCheckpointResponse>,
+}
+
+/// A recovery checkpoint on the wire. Its hashes are `0x` hex, like every
+/// other hash the API returns; the store type serializes them as byte arrays.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RecoveryCheckpointResponse {
+    checkpoint_id: u64,
+    processor_instance: String,
+    block_number: u64,
+    block_hash: String,
+    state_checksum: String,
+    state_bytes: u64,
+    created_at_unix_ms: u64,
+}
+
+impl From<RecoveryCheckpoint> for RecoveryCheckpointResponse {
+    fn from(checkpoint: RecoveryCheckpoint) -> Self {
+        Self {
+            checkpoint_id: checkpoint.checkpoint_id,
+            processor_instance: checkpoint.processor_instance,
+            block_number: checkpoint.block_number.0,
+            block_hash: hash_hex(checkpoint.block_hash),
+            state_checksum: hash_hex(checkpoint.state_checksum),
+            state_bytes: checkpoint.state_bytes,
+            created_at_unix_ms: checkpoint.created_at_unix_ms,
+        }
+    }
 }
 
 async fn list_recovery_checkpoints(
@@ -5832,7 +6153,10 @@ async fn list_recovery_checkpoints(
         data: state
             .store
             .recovery_checkpoints(processor.descriptor())
-            .await?,
+            .await?
+            .into_iter()
+            .map(RecoveryCheckpointResponse::from)
+            .collect(),
     }))
 }
 
@@ -5868,7 +6192,35 @@ struct RecoveryRestoreResponse {
 
 #[derive(Clone, Debug, Serialize)]
 struct PortableSavepointList {
-    data: Vec<PortableSavepoint>,
+    data: Vec<PortableSavepointResponse>,
+}
+
+/// A portable savepoint on the wire, with `0x` hex hashes like a recovery
+/// checkpoint's.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PortableSavepointResponse {
+    savepoint_id: String,
+    processor_instance: String,
+    block_number: u64,
+    block_hash: String,
+    state_checksum: String,
+    state_bytes: u64,
+    created_at_unix_ms: u64,
+}
+
+impl From<PortableSavepoint> for PortableSavepointResponse {
+    fn from(savepoint: PortableSavepoint) -> Self {
+        Self {
+            savepoint_id: savepoint.savepoint_id,
+            processor_instance: savepoint.processor_instance,
+            block_number: savepoint.block_number.0,
+            block_hash: hash_hex(savepoint.block_hash),
+            state_checksum: hash_hex(savepoint.state_checksum),
+            state_bytes: savepoint.state_bytes,
+            created_at_unix_ms: savepoint.created_at_unix_ms,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -5886,7 +6238,10 @@ async fn list_portable_savepoints(
         data: state
             .store
             .portable_savepoints(processor.descriptor())
-            .await?,
+            .await?
+            .into_iter()
+            .map(PortableSavepointResponse::from)
+            .collect(),
     }))
 }
 
@@ -5894,13 +6249,13 @@ async fn create_portable_savepoint(
     State(state): State<ApiState>,
     Path(processor): Path<String>,
     Json(request): Json<CreateSavepointRequest>,
-) -> Result<(StatusCode, Json<PortableSavepoint>), ApiError> {
+) -> Result<(StatusCode, Json<PortableSavepointResponse>), ApiError> {
     let processor = configured_processor(&state, &processor)?;
     let savepoint = state
         .store
         .create_portable_savepoint(processor.descriptor(), &request.id)
         .await?;
-    Ok((StatusCode::CREATED, Json(savepoint)))
+    Ok((StatusCode::CREATED, Json(savepoint.into())))
 }
 
 async fn export_portable_savepoint(
@@ -5945,7 +6300,7 @@ struct OutputEntityQuery {
 
 #[derive(Clone, Copy, Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct QueryAndFollowRequest {
+struct OutputQueryRequest {
     from_block: Option<u64>,
     to_block: Option<u64>,
     from_timestamp: Option<u64>,
@@ -5964,8 +6319,8 @@ impl From<&OutputEntityQuery> for OutputQuery {
     }
 }
 
-impl From<QueryAndFollowRequest> for OutputQuery {
-    fn from(value: QueryAndFollowRequest) -> Self {
+impl From<OutputQueryRequest> for OutputQuery {
+    fn from(value: OutputQueryRequest) -> Self {
         Self {
             from_block: value.from_block.map(BlockNumber),
             to_block: value.to_block.map(BlockNumber),
@@ -6022,42 +6377,87 @@ struct GenericSnapshotPage {
     recovery: Value,
 }
 
+/// One page of current retained output, read without a snapshot, so a GET
+/// holds no durable state.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GenericOutputPage {
+    data: Vec<GenericOutputEntity>,
+    next_cursor: Option<String>,
+    retained_bounds: Option<OutputBoundsResponse>,
+    coverage: CoverageResponse,
+}
+
+/// Read current output in entity-key order without a snapshot, or continue
+/// such a read or a snapshot from its cursor. Only POST creates snapshots.
 async fn query_output_entities(
     State(state): State<ApiState>,
     Path((processor, collection)): Path<(String, String)>,
     Query(query): Query<OutputEntityQuery>,
+) -> Result<Response, ApiError> {
+    let processor = configured_processor(&state, &processor)?;
+    ensure_output_retained(processor.as_ref())?;
+    let limit = page_limit(&state, query.limit)?;
+    let Some(cursor) = query.cursor.as_deref() else {
+        let query =
+            resolve_output_query(&state, processor.as_ref(), &collection, (&query).into()).await?;
+        let page =
+            read_output_page(&state, processor, &collection, query, Vec::new(), 0, limit).await?;
+        return Ok(Json(page).into_response());
+    };
+    if page_cursor_version(cursor)? == OUTPUT_PAGE_CURSOR_VERSION {
+        let cursor = decode_output_page_cursor(&state, processor.as_ref(), &collection, cursor)?;
+        let query = OutputQuery {
+            from_block: cursor.from_block.map(BlockNumber),
+            to_block: cursor.to_block.map(BlockNumber),
+            from_timestamp: cursor.from_timestamp,
+            to_timestamp: cursor.to_timestamp,
+        };
+        // Coverage and retention can shrink between pages.
+        let query = resolve_output_query(&state, processor.as_ref(), &collection, query).await?;
+        let page = read_output_page(
+            &state,
+            processor,
+            &collection,
+            query,
+            cursor.start_key,
+            cursor.position,
+            limit,
+        )
+        .await?;
+        return Ok(Json(page).into_response());
+    }
+    let cursor = decode_snapshot_cursor(&state, processor.as_ref(), &collection, cursor)?;
+    let page = read_generic_snapshot_page(
+        &state,
+        processor,
+        &collection,
+        cursor.snapshot_id,
+        Some(cursor.after_ordinal),
+        limit,
+    )
+    .await?;
+    Ok(Json(page).into_response())
+}
+
+/// Create a stable snapshot of the collection and read its first page.
+async fn create_output_snapshot(
+    State(state): State<ApiState>,
+    Path((processor, collection)): Path<(String, String)>,
+    Json(query): Json<OutputQueryRequest>,
 ) -> Result<Json<GenericSnapshotPage>, ApiError> {
     let processor = configured_processor(&state, &processor)?;
     ensure_output_retained(processor.as_ref())?;
     let limit = page_limit(&state, query.limit)?;
-    let page = if let Some(cursor) = query.cursor.as_deref() {
-        let cursor = decode_snapshot_cursor(&state, processor.as_ref(), &collection, cursor)?;
-        read_generic_snapshot_page(
-            &state,
-            processor,
-            &collection,
-            cursor.snapshot_id,
-            Some(cursor.after_ordinal),
-            limit,
-        )
-        .await?
-    } else {
-        create_generic_snapshot_page(
-            &state,
-            processor,
-            &collection,
-            OutputQuery::from(&query),
-            limit,
-        )
-        .await?
-    };
-    Ok(Json(page))
+    Ok(Json(
+        create_generic_snapshot_page(&state, processor, &collection, query.into(), limit).await?,
+    ))
 }
 
 async fn query_and_follow(
     State(state): State<ApiState>,
     Path((processor, collection)): Path<(String, String)>,
-    Json(query): Json<QueryAndFollowRequest>,
+    Json(query): Json<OutputQueryRequest>,
 ) -> Result<Json<GenericSnapshotPage>, ApiError> {
     let processor = configured_processor(&state, &processor)?;
     ensure_output_retained(processor.as_ref())?;
@@ -6109,41 +6509,10 @@ async fn create_generic_snapshot_page(
     state: &ApiState,
     processor: Arc<dyn Processor>,
     collection: &str,
-    mut query: OutputQuery,
+    query: OutputQuery,
     limit: usize,
 ) -> Result<GenericSnapshotPage, ApiError> {
-    let cursor = state.store.processor_cursor(processor.descriptor()).await?;
-    // Resolve open block bounds once. Pagination must continue reporting the
-    // same request even when ingestion advances the processor cursor.
-    if query.from_block.is_some() || query.to_block.is_some() {
-        let from = query.from_block.unwrap_or_else(|| {
-            BlockNumber(processor_start_block(processor.descriptor()))
-                .min(query.to_block.unwrap_or(BlockNumber(u64::MAX)))
-        });
-        let to = query.to_block.unwrap_or_else(|| {
-            cursor
-                .as_ref()
-                .map_or(from, |cursor| cursor.block_number.max(from))
-        });
-        let requested =
-            BlockRange::new(from, to).map_err(|error| ApiError::invalid(&error.to_string()))?;
-        let requested_coverage = coverage(state, processor.as_ref(), Some(requested)).await?;
-        if !requested_coverage.is_complete() {
-            return Err(ApiError::range_incomplete(requested_coverage));
-        }
-        query.from_block = Some(from);
-        query.to_block = Some(to);
-    }
-    let bounds = state
-        .store
-        .output_bounds(processor.descriptor(), collection)
-        .await?;
-    reject_unretained_range(
-        processor.as_ref(),
-        query,
-        bounds,
-        cursor.as_ref().map(|cursor| cursor.block_number),
-    )?;
+    let query = resolve_output_query(state, processor.as_ref(), collection, query).await?;
     let snapshot = state
         .store
         .create_covered_query_snapshot(
@@ -6168,6 +6537,122 @@ async fn create_generic_snapshot_page(
         limit,
     )
     .await
+}
+
+/// Resolve a query's open block bounds against the processor cursor, and
+/// reject a range the processor has not covered or no longer retains.
+async fn resolve_output_query(
+    state: &ApiState,
+    processor: &dyn Processor,
+    collection: &str,
+    mut query: OutputQuery,
+) -> Result<OutputQuery, ApiError> {
+    let cursor = state.store.processor_cursor(processor.descriptor()).await?;
+    // Resolve open block bounds once. Pagination must continue reporting the
+    // same request even when ingestion advances the processor cursor.
+    if query.from_block.is_some() || query.to_block.is_some() {
+        let from = query.from_block.unwrap_or_else(|| {
+            BlockNumber(processor_start_block(processor.descriptor()))
+                .min(query.to_block.unwrap_or(BlockNumber(u64::MAX)))
+        });
+        let to = query.to_block.unwrap_or_else(|| {
+            cursor
+                .as_ref()
+                .map_or(from, |cursor| cursor.block_number.max(from))
+        });
+        let requested =
+            BlockRange::new(from, to).map_err(|error| ApiError::invalid(&error.to_string()))?;
+        let requested_coverage = coverage(state, processor, Some(requested)).await?;
+        if !requested_coverage.is_complete() {
+            return Err(ApiError::range_incomplete(requested_coverage));
+        }
+        query.from_block = Some(from);
+        query.to_block = Some(to);
+    }
+    let bounds = state
+        .store
+        .output_bounds(processor.descriptor(), collection)
+        .await?;
+    reject_unretained_range(
+        processor,
+        query,
+        bounds,
+        cursor.as_ref().map(|cursor| cursor.block_number),
+    )?;
+    Ok(query)
+}
+
+/// Read one page of current output from `start_key` on in entity-key order,
+/// numbering its rows from `position`. Later pages see later commits.
+async fn read_output_page(
+    state: &ApiState,
+    processor: Arc<dyn Processor>,
+    collection: &str,
+    query: OutputQuery,
+    start_key: Vec<u8>,
+    position: u64,
+    limit: usize,
+) -> Result<GenericOutputPage, ApiError> {
+    let (rows, more) = state
+        .store
+        .output_entities_page(processor.descriptor(), collection, query, &start_key, limit)
+        .await?;
+    let next_position = position.saturating_add(u64::try_from(rows.len()).unwrap_or(u64::MAX));
+    let next_cursor = if more {
+        rows.last()
+            .map(|row| {
+                // The next key in byte order: nothing sorts between them.
+                let mut start_key = row.key.clone();
+                start_key.push(0);
+                encode_checksummed(&OutputPageCursor {
+                    version: OUTPUT_PAGE_CURSOR_VERSION,
+                    epoch: state.store.epoch(),
+                    chain_id: state.config.chain_id.0,
+                    processor_instance: processor.descriptor().instance.to_string(),
+                    processor_version: processor.descriptor().version.to_string(),
+                    collection: collection.to_owned(),
+                    from_block: query.from_block.map(|block| block.0),
+                    to_block: query.to_block.map(|block| block.0),
+                    from_timestamp: query.from_timestamp,
+                    to_timestamp: query.to_timestamp,
+                    start_key,
+                    position: next_position,
+                })
+            })
+            .transpose()?
+    } else {
+        None
+    };
+    let data = rows
+        .into_iter()
+        .zip(position..)
+        .map(|(mut row, ordinal)| {
+            row.ordinal = ordinal;
+            render_output_entity(processor.as_ref(), collection, row)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let retained_bounds = state
+        .store
+        .output_bounds(processor.descriptor(), collection)
+        .await?
+        .map(OutputBoundsResponse::from);
+    let requested = query
+        .from_block
+        .zip(query.to_block)
+        .map(|(from, to)| BlockRange::new(from, to))
+        .transpose()
+        .map_err(|error| ApiError::invalid(&error.to_string()))?;
+    let coverage = coverage(state, processor.as_ref(), requested).await?;
+    if requested.is_some() && !coverage.is_complete() {
+        // A reorg may have removed coverage while the page was read.
+        return Err(ApiError::range_incomplete(coverage));
+    }
+    Ok(GenericOutputPage {
+        data,
+        next_cursor,
+        retained_bounds,
+        coverage,
+    })
 }
 
 async fn read_generic_snapshot_page(
@@ -6214,10 +6699,14 @@ async fn read_generic_snapshot_page(
         .output_bounds(processor.descriptor(), collection)
         .await?
         .map(OutputBoundsResponse::from);
+    // A finalized_only processor's snapshot holds blocks whose changes are
+    // still unpublished, so it offers no boundary to follow, as
+    // query-and-follow refuses it.
     let boundary_cursor = (processor.descriptor().lifecycle.delivery.mode
-        != leani_processor_api::DeliveryPolicyMode::None)
-        .then(|| encode_consumer_cursor(state, processor.as_ref(), snapshot.boundary_sequence))
-        .transpose()?;
+        != leani_processor_api::DeliveryPolicyMode::None
+        && ensure_snapshot_follow_supported(processor.as_ref()).is_ok())
+    .then(|| encode_consumer_cursor(state, processor.as_ref(), snapshot.boundary_sequence))
+    .transpose()?;
     let requested = snapshot
         .query
         .from_block
@@ -6438,6 +6927,53 @@ fn decode_snapshot_cursor(
     Ok(cursor)
 }
 
+/// Continues an entity GET that reads current output without a snapshot.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct OutputPageCursor {
+    version: u8,
+    epoch: [u8; 16],
+    chain_id: u64,
+    processor_instance: String,
+    processor_version: String,
+    collection: String,
+    from_block: Option<u64>,
+    to_block: Option<u64>,
+    from_timestamp: Option<u64>,
+    to_timestamp: Option<u64>,
+    start_key: Vec<u8>,
+    position: u64,
+}
+
+fn decode_output_page_cursor(
+    state: &ApiState,
+    processor: &dyn Processor,
+    collection: &str,
+    encoded: &str,
+) -> Result<OutputPageCursor, ApiError> {
+    let cursor: OutputPageCursor = decode_checksummed(encoded)?;
+    if cursor.version != OUTPUT_PAGE_CURSOR_VERSION
+        || cursor.epoch != state.store.epoch()
+        || cursor.chain_id != state.config.chain_id.0
+        || cursor.processor_instance != processor.descriptor().instance.as_str()
+        || cursor.processor_version != processor.descriptor().version.to_string()
+        || cursor.collection != collection
+    {
+        return Err(ApiError::cursor(
+            "query cursor belongs to another store, chain, processor, or collection",
+        ));
+    }
+    Ok(cursor)
+}
+
+/// The version that opens a page cursor's payload; postcard encodes the
+/// leading `u8` as its first byte.
+fn page_cursor_version(encoded: &str) -> Result<u8, ApiError> {
+    checksummed_payload(encoded)?
+        .first()
+        .copied()
+        .ok_or_else(|| ApiError::cursor("cursor payload is invalid"))
+}
+
 fn encode_checksummed<T: Serialize>(value: &T) -> Result<String, ApiError> {
     let payload = postcard::to_allocvec(value)
         .map_err(|error| ApiError::internal(&format!("cursor encoding failed: {error}")))?;
@@ -6448,16 +6984,22 @@ fn encode_checksummed<T: Serialize>(value: &T) -> Result<String, ApiError> {
 }
 
 fn decode_checksummed<T: for<'de> Deserialize<'de>>(encoded: &str) -> Result<T, ApiError> {
-    let bytes = hex::decode(encoded).map_err(|_| ApiError::cursor("cursor is not valid hex"))?;
-    let payload_length = bytes
+    postcard::from_bytes(&checksummed_payload(encoded)?)
+        .map_err(|_| ApiError::cursor("cursor payload is invalid"))
+}
+
+fn checksummed_payload(encoded: &str) -> Result<Vec<u8>, ApiError> {
+    let mut payload =
+        hex::decode(encoded).map_err(|_| ApiError::cursor("cursor is not valid hex"))?;
+    let payload_length = payload
         .len()
         .checked_sub(16)
         .ok_or_else(|| ApiError::cursor("cursor is truncated"))?;
-    let (payload, checksum) = bytes.split_at(payload_length);
-    if blake3::hash(payload).as_bytes()[..16] != *checksum {
+    let checksum = payload.split_off(payload_length);
+    if blake3::hash(&payload).as_bytes()[..16] != *checksum {
         return Err(ApiError::cursor("cursor checksum mismatch"));
     }
-    postcard::from_bytes(payload).map_err(|_| ApiError::cursor("cursor payload is invalid"))
+    Ok(payload)
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -6529,12 +7071,25 @@ async fn change_stream(
     State(state): State<ApiState>,
     Path(processor): Path<String>,
     Query(query): Query<ChangesQuery>,
+    headers: HeaderMap,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, ApiError> {
     let processor = configured_processor(&state, &processor)?;
     ensure_delivery_enabled(processor.as_ref())?;
+    // An EventSource reconnects with the last event's ID, which is its
+    // cursor, in `Last-Event-ID`; an explicit `after` takes precedence.
+    let last_event_id = headers
+        .get("last-event-id")
+        .map(|value| {
+            value
+                .to_str()
+                .map_err(|_| ApiError::cursor("Last-Event-ID is not a valid cursor"))
+        })
+        .transpose()?
+        .filter(|value| !value.is_empty());
     let after = query
         .after
         .as_deref()
+        .or(last_event_id)
         .map(|cursor| decode_change_cursor(&state, processor.as_ref(), cursor))
         .transpose()?
         .map(|cursor| cursor.sequence);
@@ -6567,8 +7122,12 @@ async fn change_stream(
         .event("hello")
         .json_data(&hello)
         .unwrap_or_else(|_| Event::default().event("error").data("{}"));
+    // The node's shutdown ends the stream after a whole event. An error event
+    // would stop the SDK's subscription; an end makes clients reconnect from
+    // the last event's cursor.
     let poll = stream::once(std::future::ready(Ok(hello_event)))
-        .chain(stream::unfold(stream_state, poll_change));
+        .chain(stream::unfold(stream_state, poll_change))
+        .take_until(state.config.shutdown.clone().cancelled_owned());
     Ok(Sse::new(poll).keep_alive(
         KeepAlive::new()
             .interval(state.config.heartbeat_interval)
@@ -6733,11 +7292,14 @@ fn change_envelope_with_stream(
     record: ChangeRecord,
 ) -> Result<ChangeEnvelope, ApiError> {
     let cursor = if let Some(stream_id) = stream_id {
-        encode_stream_cursor(state, processor, stream_id, record.cursor.sequence)?
+        encode_stream_cursor(state, processor, stream_id, record.cursor.sequence)
     } else {
-        encode_change_cursor(state, processor, &record.cursor)?
+        encode_change_cursor(state, processor, &record.cursor)
     };
-    render_change_envelope(processor, cursor, record)
+    // Rendering a stored change fails the same way on every attempt.
+    cursor
+        .and_then(|cursor| render_change_envelope(processor, cursor, record))
+        .map_err(ApiError::not_retryable)
 }
 
 /// Render one stored change with the same stable envelope used by the HTTP
@@ -6760,8 +7322,11 @@ pub fn change_envelope_json(
         processor_id: processor.descriptor().instance.to_string(),
         processor_version: processor.descriptor().version.to_string(),
         sequence: record.cursor.sequence,
-    })?;
-    serde_json::to_value(render_change_envelope(processor, cursor, record)?).map_err(ApiError::from)
+    })
+    .map_err(ApiError::not_retryable)?;
+    let envelope =
+        render_change_envelope(processor, cursor, record).map_err(ApiError::not_retryable)?;
+    serde_json::to_value(envelope).map_err(ApiError::from)
 }
 
 #[allow(clippy::too_many_lines)]
@@ -6974,6 +7539,12 @@ fn decode_stream_change_cursor(
     Ok(cursor)
 }
 
+/// Key-derivation context of consumer session token MACs.
+const SESSION_TOKEN_CONTEXT: &str = "leani 2026-09-24 consumer session token";
+
+/// A session token is its postcard payload and a BLAKE3 MAC of it, keyed
+/// from the store's secret, so no client can make one for a session it does
+/// not hold. Version 1 tokens carried an unkeyed checksum.
 fn encode_consumer_session_token(
     state: &ApiState,
     processor: &dyn Processor,
@@ -6981,8 +7552,8 @@ fn encode_consumer_session_token(
     consumer_id: &str,
     generation: u64,
 ) -> Result<String, ApiError> {
-    encode_cursor(&ConsumerSessionToken {
-        version: 1,
+    let mut token = postcard::to_allocvec(&ConsumerSessionToken {
+        version: 2,
         epoch: state.store.epoch(),
         chain_id: state.config.chain_id.0,
         processor_id: processor.descriptor().instance.to_string(),
@@ -6991,8 +7562,15 @@ fn encode_consumer_session_token(
         consumer_id: consumer_id.to_owned(),
         generation,
     })
+    .map_err(|error| ApiError::internal(&format!("session token encoding failed: {error}")))?;
+    let tag = state.store.node_mac(SESSION_TOKEN_CONTEXT, &token);
+    token.extend_from_slice(tag.as_bytes());
+    Ok(hex::encode(token))
 }
 
+/// Verify a session token's MAC in constant time, then its scope. A token
+/// this node cannot verify, including one issued before an upgrade, is a
+/// lost session: the client opens a new stream.
 fn decode_consumer_session_token(
     state: &ApiState,
     processor: &dyn Processor,
@@ -7000,8 +7578,20 @@ fn decode_consumer_session_token(
     consumer_id: &str,
     encoded: &str,
 ) -> Result<u64, ApiError> {
-    let token: ConsumerSessionToken = decode_cursor_payload(encoded)?;
-    if token.version != 1
+    let lost = || {
+        ApiError::conflict(
+            "consumer_session_lost",
+            "consumer session token is not valid for this store, chain, processor, stream, consumer, or generation",
+        )
+    };
+    let bytes = hex::decode(encoded).map_err(|_| lost())?;
+    let payload_length = bytes.len().checked_sub(blake3::OUT_LEN).ok_or_else(lost)?;
+    let (payload, tag) = bytes.split_at(payload_length);
+    if state.store.node_mac(SESSION_TOKEN_CONTEXT, payload) != *tag {
+        return Err(lost());
+    }
+    let token: ConsumerSessionToken = postcard::from_bytes(payload).map_err(|_| lost())?;
+    if token.version != 2
         || token.epoch != state.store.epoch()
         || token.chain_id != state.config.chain_id.0
         || token.processor_id != processor.descriptor().instance.as_str()
@@ -7009,10 +7599,7 @@ fn decode_consumer_session_token(
         || token.stream_id != stream_id
         || token.consumer_id != consumer_id
     {
-        return Err(ApiError::conflict(
-            "consumer_session_lost",
-            "consumer session token belongs to another store, chain, processor, stream, consumer, or generation",
-        ));
+        return Err(lost());
     }
     Ok(token.generation)
 }
@@ -7074,12 +7661,12 @@ fn validate_api_cursor(
         2 => cursor.processor_id == descriptor.instance.as_str(),
         1 => {
             cursor.processor_id == descriptor.id.as_str()
-                && descriptor.instance
-                    == leani_processor_api::ProcessorInstanceId::legacy(
-                        &descriptor.id,
-                        &descriptor.version,
-                        descriptor.config_hash,
-                    )
+                && leani_processor_api::ProcessorInstanceId::legacy(
+                    &descriptor.id,
+                    &descriptor.version,
+                    descriptor.config_hash,
+                )
+                .is_ok_and(|legacy| descriptor.instance == legacy)
         }
         _ => false,
     };
@@ -7311,6 +7898,13 @@ impl ApiError {
         Self::new(StatusCode::INTERNAL_SERVER_ERROR, "internal", message, true)
     }
 
+    /// The same error, marked as one a retry would repeat, such as stored
+    /// data the node cannot decode or render.
+    fn not_retryable(mut self) -> Self {
+        self.retryable = false;
+        self
+    }
+
     fn new(status: StatusCode, code: &'static str, message: &str, retryable: bool) -> Self {
         Self {
             status,
@@ -7343,6 +7937,7 @@ impl ApiError {
 }
 
 impl From<StoreError> for ApiError {
+    #[allow(clippy::too_many_lines)]
     fn from(error: StoreError) -> Self {
         match error {
             StoreError::OutputRangePruned => Self::output_not_retained(
@@ -7393,10 +7988,46 @@ impl From<StoreError> for ApiError {
                 response
             }
             matched @ (StoreError::AcknowledgementBackwards { .. }
-            | StoreError::AcknowledgementBeyondDelivered { .. }
             | StoreError::AcknowledgementNotBoundary { .. }
             | StoreError::AcknowledgementBeyondHead { .. }) => {
                 Self::conflict("acknowledgement_invalid", &matched.to_string())
+            }
+            matched @ StoreError::AcknowledgementBeyondDelivered {
+                sequence,
+                delivered,
+            } => {
+                let mut response =
+                    Self::conflict("acknowledgement_beyond_delivered", &matched.to_string());
+                response.details = Some(json!({
+                    "sequence": sequence.to_string(),
+                    "deliveredSequence": delivered.to_string()
+                }));
+                response
+            }
+            matched @ StoreError::AcknowledgementMidBlock { sequence, block } => {
+                let mut response =
+                    Self::conflict("acknowledgement_mid_block", &matched.to_string());
+                response.details = Some(json!({
+                    "sequence": sequence.to_string(),
+                    "blockNumber": block.0
+                }));
+                response
+            }
+            matched @ StoreError::PhysicalStorageLimit {
+                limit_bytes,
+                projected_bytes,
+            } => {
+                let mut response = Self::new(
+                    StatusCode::INSUFFICIENT_STORAGE,
+                    "physical_storage_limit",
+                    &matched.to_string(),
+                    false,
+                );
+                response.details = Some(json!({
+                    "limitBytes": limit_bytes.to_string(),
+                    "projectedBytes": projected_bytes.to_string()
+                }));
+                response
             }
             matched @ StoreError::QueryTooExpensive { .. } => {
                 Self::too_expensive(&matched.to_string())
@@ -7417,11 +8048,17 @@ impl From<StoreError> for ApiError {
             matched @ StoreError::SavepointExists { .. } => {
                 Self::conflict("savepoint_exists", &matched.to_string())
             }
+            matched @ StoreError::SavepointLimit { .. } => {
+                Self::conflict("savepoint_limit", &matched.to_string())
+            }
             matched @ (StoreError::SavepointChecksum | StoreError::SavepointContract) => {
                 Self::conflict("savepoint_invalid", &matched.to_string())
             }
             matched @ StoreError::CheckpointRestoreBoundary { .. } => {
                 Self::conflict("checkpoint_restore_boundary", &matched.to_string())
+            }
+            matched @ StoreError::LiveLaneRequiresRebuild { .. } => {
+                Self::conflict("live_lane_requires_rebuild", &matched.to_string())
             }
             matched @ StoreError::ArtifactContract => Self::new(
                 StatusCode::UNPROCESSABLE_ENTITY,
@@ -7434,6 +8071,11 @@ impl From<StoreError> for ApiError {
             | StoreError::ConflictingArtifact(_)) => {
                 Self::conflict("artifact_replay_conflict", &matched.to_string())
             }
+            // Stored data that fails to decode fails the same way on retry.
+            matched @ (StoreError::Invariant(_)
+            | StoreError::Encoding(_)
+            | StoreError::Numeric(_)
+            | StoreError::Json(_)) => Self::internal(&matched.to_string()).not_retryable(),
             other => Self::internal(&other.to_string()),
         }
     }
@@ -7441,13 +8083,13 @@ impl From<StoreError> for ApiError {
 
 impl From<serde_json::Error> for ApiError {
     fn from(error: serde_json::Error) -> Self {
-        Self::internal(&error.to_string())
+        Self::internal(&error.to_string()).not_retryable()
     }
 }
 
 impl From<std::fmt::Error> for ApiError {
     fn from(error: std::fmt::Error) -> Self {
-        Self::internal(&error.to_string())
+        Self::internal(&error.to_string()).not_retryable()
     }
 }
 
@@ -7469,7 +8111,7 @@ impl IntoResponse for ApiError {
 mod tests {
     use axum::{
         body::{Body, to_bytes},
-        http::Request,
+        http::{Method, Request},
     };
     use leani_primitives::{Address, ChainId, ProcessorCursor, TransactionHash};
     use tower::ServiceExt;
@@ -7503,11 +8145,181 @@ mod tests {
         }))
     }
 
+    /// Retain live delivery until the named required consumer acknowledges.
+    fn acknowledged_delivery(
+        mut lifecycle: leani_processor_api::LifecyclePolicies,
+        consumer: &str,
+    ) -> leani_processor_api::LifecyclePolicies {
+        lifecycle.delivery.mode = leani_processor_api::DeliveryPolicyMode::UntilAcknowledged;
+        lifecycle.delivery.consumers = vec![leani_processor_api::DurableConsumerPolicy {
+            id: consumer.to_owned(),
+            required: true,
+            lease_ttl_seconds: 300,
+        }];
+        lifecycle
+    }
+
+    /// A consumer credential of an accepted length.
+    const TEST_CREDENTIAL: &str = "test-consumer-credential-0123456789abcdef";
+    /// Another consumer's credential, equally valid on its own.
+    const OTHER_CREDENTIAL: &str = "other-consumer-credential-0123456789abcdef";
+
+    /// Apply finalized blocks through `processor.map`. The frames carry an
+    /// empty complete header, which an ordered ledger requires.
+    async fn apply_finalized_blocks(
+        store: &SqliteStore,
+        processor: &dyn Processor,
+        blocks: std::ops::RangeInclusive<u64>,
+    ) {
+        for number in blocks {
+            let parent = if number > 1 {
+                leani_testkit::fixture_frame(number - 1, BlockHash::ZERO)
+                    .block
+                    .hash
+            } else {
+                BlockHash::ZERO
+            };
+            let mut frame = leani_testkit::fixture_frame(number, parent);
+            frame.header = leani_primitives::Material::Complete(leani_primitives::HeaderEnvelope {
+                rlp: None,
+                transactions_root: None,
+                receipts_root: None,
+                withdrawals_root: None,
+                gas_limit: None,
+                gas_used: None,
+                base_fee_per_gas: None,
+                blob_gas_used: None,
+                excess_blob_gas: None,
+                size_bytes: None,
+                transaction_count: None,
+                consensus_size_bytes: None,
+            });
+            let delta = processor.map(&frame).await.expect("map");
+            store
+                .apply(
+                    processor,
+                    ProcessorCursor {
+                        chain_id: frame.chain_id,
+                        processor_id: processor.descriptor().id.to_string(),
+                        processor_version: processor.descriptor().version.to_string(),
+                        block_number: frame.block.number,
+                        block_hash: frame.block.hash,
+                        finality: Finality::Finalized,
+                        sequence: number,
+                    },
+                    &delta,
+                    &[],
+                )
+                .await
+                .expect("apply finalized block");
+        }
+    }
+
+    /// A block-local counter whose block `n` publishes `n + 1` changes, so a
+    /// live commit can end past a page read.
+    #[derive(Debug)]
+    struct FanOutCounter(leani_testkit::BlockLocalCounter);
+
+    #[async_trait]
+    impl Processor for FanOutCounter {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
+        fn descriptor(&self) -> &ProcessorDescriptor {
+            self.0.descriptor()
+        }
+
+        async fn map(
+            &self,
+            block: &leani_primitives::BlockFrame,
+        ) -> Result<leani_processor_api::EncodedDelta, leani_processor_api::ProcessorError>
+        {
+            self.0.map(block).await
+        }
+
+        async fn reduce(
+            &self,
+            transaction: &mut dyn leani_processor_api::ReducerTransaction,
+            cursor: &ProcessorCursor,
+            _delta: &leani_processor_api::EncodedDelta,
+        ) -> Result<leani_processor_api::DomainChanges, leani_processor_api::ProcessorError>
+        {
+            let mut changes = Vec::new();
+            for index in 0..=cursor.block_number.0 {
+                let mut key = cursor.block_number.0.to_be_bytes().to_vec();
+                key.extend_from_slice(&index.to_be_bytes());
+                let payload = index.to_be_bytes().to_vec();
+                transaction
+                    .put("counter.fan-out", key.clone(), payload.clone())
+                    .await?;
+                let change = leani_processor_api::DomainChange {
+                    kind: "synthetic.counter".to_owned(),
+                    key,
+                    operation: ChangeOperation::Upsert,
+                    payload,
+                };
+                transaction.emit(change.clone()).await?;
+                changes.push(change);
+            }
+            Ok(leani_processor_api::DomainChanges { changes })
+        }
+    }
+
+    /// Read the next NDJSON record of a delivery stream.
+    async fn next_ndjson_record(
+        body: &mut (impl Stream<Item = Result<Bytes, axum::Error>> + Unpin),
+        buffered: &mut Vec<u8>,
+    ) -> Value {
+        while !buffered.contains(&b'\n') {
+            let chunk = tokio::time::timeout(Duration::from_secs(5), body.next())
+                .await
+                .expect("stream record in time")
+                .expect("stream record")
+                .expect("stream bytes");
+            buffered.extend_from_slice(&chunk);
+        }
+        let newline = buffered
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .expect("record line");
+        let line = buffered.drain(..=newline).collect::<Vec<_>>();
+        serde_json::from_slice(&line[..newline]).expect("NDJSON record")
+    }
+
+    /// Read SSE frames until the first one with an `id:`, and return its
+    /// data.
+    async fn first_sse_change(
+        body: &mut (impl Stream<Item = Result<Bytes, axum::Error>> + Unpin),
+    ) -> Value {
+        let mut text = String::new();
+        loop {
+            if let Some(end) = text.find("\n\n") {
+                let frame = text.drain(..end + 2).collect::<String>();
+                if frame.lines().any(|line| line.starts_with("id:")) {
+                    let data = frame
+                        .lines()
+                        .find_map(|line| line.strip_prefix("data: "))
+                        .expect("data line");
+                    return serde_json::from_str(data).expect("change JSON");
+                }
+                continue;
+            }
+            let chunk = tokio::time::timeout(Duration::from_secs(5), body.next())
+                .await
+                .expect("SSE frame in time")
+                .expect("SSE frame")
+                .expect("SSE bytes");
+            text.push_str(std::str::from_utf8(&chunk).expect("UTF-8 frame"));
+        }
+    }
+
     async fn seed_blob_block(
         store: &SqliteStore,
         processor: &BlobsProcessor,
         number: u64,
         transaction_count: u32,
+        finality: Finality,
     ) {
         let hash_byte = u8::try_from(number % 251).expect("small hash byte");
         let parent_byte = u8::try_from(number.saturating_sub(1) % 251).expect("small parent byte");
@@ -7519,7 +8331,7 @@ mod tests {
             block_hash,
             parent_hash,
             timestamp: number,
-            finality: Finality::Finalized,
+            finality,
             size_bytes: 1,
             blob_count: transaction_count,
             blob_gas_used: u64::from(transaction_count) * 131_072,
@@ -7581,7 +8393,7 @@ mod tests {
                     chain_id: ChainId(1),
                     block_number: BlockNumber(number),
                     block_hash,
-                    finality: Finality::Finalized,
+                    finality,
                     sequence: number,
                 },
                 &delta,
@@ -7591,10 +8403,14 @@ mod tests {
             .expect("apply blob fixture");
     }
 
+    /// Seed one observation at block 42 into either Uniswap processor. Only
+    /// a live block leaves a retained canonical row; a backfilled one has
+    /// none.
     async fn seed_uniswap_observation(
         store: &SqliteStore,
-        processor: &leani_processor_uniswap::UniswapObservationsProcessor,
+        processor: &dyn Processor,
         pool: Address,
+        canonical_row: bool,
     ) -> leani_primitives::BlockRef {
         let block = leani_primitives::BlockRef {
             number: BlockNumber(42),
@@ -7602,10 +8418,12 @@ mod tests {
             parent_hash: BlockHash::new([0x41; 32]),
             timestamp: 1_800_000_000,
         };
-        store
-            .store_canonical_anchor(ChainId(1), block, Finality::Included)
-            .await
-            .expect("canonical observation block");
+        if canonical_row {
+            store
+                .store_canonical_anchor(ChainId(1), block, Finality::Included)
+                .await
+                .expect("canonical observation block");
+        }
         let payload = postcard::to_allocvec(&leani_processor_uniswap::UniswapPriceDelta {
             observations: vec![leani_processor_uniswap::PoolPriceEntity {
                 pool,
@@ -7702,6 +8520,48 @@ mod tests {
             .await
             .expect("apply block summary");
         block
+    }
+
+    /// Mint 100 of token `0x33…33` to `0x11…11` in an included block.
+    async fn seed_erc20_balance(
+        store: &SqliteStore,
+        processor: &leani_processor_erc20::Erc20BalanceProcessor,
+    ) -> leani_primitives::BlockRef {
+        let mut recipient = [0; 32];
+        recipient[12..].copy_from_slice(&[0x11; 20]);
+        let mut frame = leani_testkit::fixture_frame(1, BlockHash::ZERO);
+        frame.finality = Finality::Included;
+        frame.logs = leani_primitives::Material::Complete(vec![leani_primitives::Log {
+            address: Address::new([0x33; 20]),
+            topics: vec![
+                alloy_primitives::keccak256("Transfer(address,address,uint256)").0,
+                [0; 32],
+                recipient,
+            ],
+            data: U256::from(100).to_be_bytes::<32>().to_vec(),
+            transaction_hash: Some(leani_primitives::TransactionHash::new([7; 32])),
+            transaction_index: 0,
+            log_index: 0,
+        }]);
+        let delta = processor.map(&frame).await.expect("map mint");
+        store
+            .apply(
+                processor,
+                ProcessorCursor {
+                    processor_id: processor.descriptor().id.to_string(),
+                    processor_version: processor.descriptor().version.to_string(),
+                    chain_id: ChainId(1),
+                    block_number: frame.block.number,
+                    block_hash: frame.block.hash,
+                    finality: Finality::Included,
+                    sequence: 1,
+                },
+                &delta,
+                &[],
+            )
+            .await
+            .expect("apply mint");
+        frame.block
     }
 
     #[test]
@@ -8259,7 +9119,8 @@ mod tests {
         );
         let instance = processor.descriptor().instance.to_string();
         let block =
-            seed_uniswap_observation(&store, processor.as_ref(), Address::new([0x22; 20])).await;
+            seed_uniswap_observation(&store, processor.as_ref(), Address::new([0x22; 20]), true)
+                .await;
         let processor: Arc<dyn Processor> = processor;
         let registration = QueryExtensionRegistration::new(
             processor.clone(),
@@ -8307,6 +9168,212 @@ mod tests {
         assert_eq!(body["timestamp"], block.timestamp);
         assert_eq!(body["data"]["blockNumber"], block.number.0);
         assert_eq!(body["data"]["logIndex"], 7);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn typed_endpoints_report_finality_from_entity_metadata() {
+        // Audit M-P1: typed endpoints reported the finality a block had when
+        // it was reduced, so finalized data stayed "included".
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = SqliteStore::open(leani_store_sqlite::StoreConfig::new(
+            directory.path().join("node.sqlite"),
+        ))
+        .await
+        .expect("store");
+        let summary = Arc::new(
+            leani_processor_block_summary::BlockSummaryProcessor::new(
+                leani_processor_block_summary::BlockSummaryConfig {
+                    start_block: BlockNumber(0),
+                },
+            )
+            .expect("block-summary processor"),
+        );
+        let summary_block = seed_block_summary(&store, summary.as_ref()).await;
+        let observations = Arc::new(observations_processor());
+        let observed = seed_uniswap_observation(
+            &store,
+            observations.as_ref(),
+            Address::new([0x22; 20]),
+            true,
+        )
+        .await;
+        let latest = Arc::new(
+            leani_processor_uniswap::UniswapLatestProcessor::new(uniswap_config())
+                .expect("latest processor"),
+        );
+        seed_uniswap_observation(&store, latest.as_ref(), Address::new([0x22; 20]), false).await;
+        let blobs = Arc::new(BlobsProcessor::default());
+        let blob_block = blobs.schedule().first_block();
+        seed_blob_block(&store, &blobs, blob_block, 0, Finality::Included).await;
+        let blob_hash =
+            BlockHash::new([u8::try_from(blob_block % 251).expect("small hash byte"); 32]);
+        // Review 1, minor 2: ERC-20 balances too.
+        let erc20 = Arc::new(
+            leani_processor_erc20::Erc20BalanceProcessor::new(
+                leani_processor_erc20::Erc20BalanceConfig {
+                    start_block: BlockNumber(1),
+                    addresses: vec![Address::new([0x11; 20])],
+                    tokens: vec![Address::new([0x33; 20])],
+                    complete_from_start: true,
+                },
+            )
+            .expect("ERC-20 processor"),
+        );
+        let minted = seed_erc20_balance(&store, erc20.as_ref()).await;
+        for (descriptor, number, hash) in [
+            (
+                summary.descriptor(),
+                summary_block.number,
+                summary_block.hash,
+            ),
+            (observations.descriptor(), observed.number, observed.hash),
+            (latest.descriptor(), observed.number, observed.hash),
+            (blobs.descriptor(), BlockNumber(blob_block), blob_hash),
+            (erc20.descriptor(), minted.number, minted.hash),
+        ] {
+            store
+                .mark_finalized(descriptor, number, hash)
+                .await
+                .expect("finalize");
+        }
+        let summary_instance = summary.descriptor().instance.to_string();
+        let observations_instance = observations.descriptor().instance.to_string();
+        let latest_instance = latest.descriptor().instance.to_string();
+        let erc20_instance = erc20.descriptor().instance.to_string();
+        let summary: Arc<dyn Processor> = summary;
+        let observations: Arc<dyn Processor> = observations;
+        let latest: Arc<dyn Processor> = latest;
+        let blobs: Arc<dyn Processor> = blobs;
+        let erc20: Arc<dyn Processor> = erc20;
+        let registrations = vec![
+            QueryExtensionRegistration::new(summary.clone(), Arc::new(BlockSummaryQueryExtension)),
+            QueryExtensionRegistration::new(
+                observations.clone(),
+                Arc::new(UniswapObservationsQueryExtension),
+            ),
+            QueryExtensionRegistration::new(latest.clone(), Arc::new(UniswapQueryExtension)),
+            QueryExtensionRegistration::new(blobs.clone(), Arc::new(BlobsQueryExtension)),
+            QueryExtensionRegistration::new(erc20.clone(), Arc::new(Erc20QueryExtension)),
+        ];
+        let app = router_with_processors(
+            store,
+            vec![summary, observations, latest, blobs, erc20],
+            registrations,
+            ApiConfig::default(),
+        )
+        .expect("router");
+
+        for (path, finality) in [
+            (
+                format!(
+                    "/v1/processors/{latest_instance}/query/pools/0x{}",
+                    "22".repeat(20)
+                ),
+                "/finality",
+            ),
+            (
+                format!("/v1/processors/{summary_instance}/query/latest"),
+                "/data/finality",
+            ),
+            (
+                format!(
+                    "/v1/processors/{summary_instance}/query/blocks/{}",
+                    summary_block.number.0
+                ),
+                "/data/finality",
+            ),
+            (
+                format!(
+                    "/v1/processors/{observations_instance}/query/pools/0x{}/latest",
+                    "22".repeat(20)
+                ),
+                "/data/finality",
+            ),
+            (format!("/v1/q/blobs/blocks/{blob_block}"), "/finality"),
+            (
+                format!("/v1/q/blobs/blocks?fromBlock={blob_block}&toBlock={blob_block}"),
+                "/data/0/finality",
+            ),
+            (
+                format!("/v1/q/blobs/snapshot?fromBlock={blob_block}&toBlock={blob_block}"),
+                "/data/0/block/finality",
+            ),
+            (
+                format!(
+                    "/v1/processors/{erc20_instance}/query/balances/0x{}/0x{}",
+                    "33".repeat(20),
+                    "11".repeat(20)
+                ),
+                "/finality",
+            ),
+        ] {
+            let (status, body) = send(&app, get_request(&path)).await;
+            assert_eq!(status, StatusCode::OK, "{path}: {body}");
+            assert_eq!(
+                body.pointer(finality),
+                Some(&json!("finalized")),
+                "{path}: {body}"
+            );
+        }
+    }
+
+    /// One configured V3 pool, at `0x22…22`.
+    fn uniswap_config() -> leani_processor_uniswap::UniswapConfig {
+        leani_processor_uniswap::UniswapConfig {
+            start_block: BlockNumber(1),
+            pools: vec![leani_processor_uniswap::PoolConfig {
+                address: Address::new([0x22; 20]),
+                kind: leani_processor_uniswap::PoolKind::V3,
+            }],
+        }
+    }
+
+    fn observations_processor() -> leani_processor_uniswap::UniswapObservationsProcessor {
+        leani_processor_uniswap::UniswapObservationsProcessor::new(uniswap_config())
+            .expect("observations processor")
+    }
+
+    #[tokio::test]
+    async fn latest_uniswap_observation_needs_no_retained_canonical_block() {
+        // Audit Processor-9: the latest observation needed a retained
+        // canonical block, which a backfilled block does not leave, so it
+        // answered 404 for an indexed observation.
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = SqliteStore::open(leani_store_sqlite::StoreConfig::new(
+            directory.path().join("node.sqlite"),
+        ))
+        .await
+        .expect("store");
+        let processor = Arc::new(observations_processor());
+        let observed =
+            seed_uniswap_observation(&store, processor.as_ref(), Address::new([0x22; 20]), false)
+                .await;
+        let instance = processor.descriptor().instance.to_string();
+        let processor: Arc<dyn Processor> = processor;
+        let registration = QueryExtensionRegistration::new(
+            processor.clone(),
+            Arc::new(UniswapObservationsQueryExtension),
+        );
+        let app = router_with_processors(
+            store,
+            vec![processor],
+            vec![registration],
+            ApiConfig::default(),
+        )
+        .expect("router");
+        let (status, body) = send(
+            &app,
+            get_request(&format!(
+                "/v1/processors/{instance}/query/pools/0x{}/latest",
+                "22".repeat(20)
+            )),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["timestamp"], observed.timestamp);
+        assert_eq!(body["data"]["blockNumber"], observed.number.0);
+        assert_eq!(body["data"]["finality"], "included");
     }
 
     #[tokio::test]
@@ -8614,6 +9681,9 @@ mod tests {
             },
         )
         .expect("router");
+        // Review 1, Important 2: the control plane judges a short credential
+        // after its idempotency lookup, since a subscription created before
+        // the 32-character rule re-submits it; the API passes it on.
         let response = router
             .oneshot(
                 Request::post("/admin/v1/backfill-subscriptions")
@@ -9010,7 +10080,10 @@ mod tests {
         ))
         .await
         .expect("store");
-        let processor = Arc::new(BlockLocalCounter::default().with_split_delivery());
+        let counter = BlockLocalCounter::default().with_split_delivery();
+        let lifecycle =
+            acknowledged_delivery(counter.descriptor().lifecycle.clone(), "destination");
+        let processor = Arc::new(counter.with_lifecycle(lifecycle));
         store
             .register_processor(processor.descriptor())
             .await
@@ -9159,6 +10232,7 @@ mod tests {
                     CONSUMER_SESSION_HEADER,
                     session_token.expect("consumer session token"),
                 )
+                .header("x-leani-request", "1")
                 .body(Body::empty())
                 .expect("release request"),
             )
@@ -9173,7 +10247,575 @@ mod tests {
         assert_eq!(replacement.status(), StatusCode::OK);
     }
 
+    /// The heartbeat interval of the heartbeat schedule tests.
+    const SHORT_HEARTBEAT: Duration = Duration::from_millis(300);
+
+    /// Wake every waiting delivery stream several times per `SHORT_HEARTBEAT`,
+    /// as other processors' commits and acknowledgements do, until aborted.
+    fn wake_delivery_streams(store: SqliteStore) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            let other = leani_testkit::BlockLocalCounter::named("other-counter");
+            store
+                .register_processor(other.descriptor())
+                .await
+                .expect("register the other processor");
+            let stream_id = default_delivery_stream_id(other.descriptor());
+            for number in 1.. {
+                // A published change wakes the streams waiting for changes,
+                // and a prune those waiting for delivery capacity.
+                apply_finalized_blocks(&store, &other, number..=number).await;
+                store
+                    .prune_changes_before_in_stream(other.descriptor(), &stream_id, 0)
+                    .await
+                    .expect("prune nothing");
+                tokio::time::sleep(SHORT_HEARTBEAT / 6).await;
+            }
+        })
+    }
+
+    /// Read a delivery stream's next record while other streams' wake-ups
+    /// keep arriving, allowing two heartbeat intervals.
+    async fn next_record_while_others_wake(
+        store: &SqliteStore,
+        body: &mut (impl Stream<Item = Result<Bytes, axum::Error>> + Unpin),
+        buffered: &mut Vec<u8>,
+    ) -> Value {
+        let waker = wake_delivery_streams(store.clone());
+        let record =
+            tokio::time::timeout(SHORT_HEARTBEAT * 2, next_ndjson_record(body, buffered)).await;
+        waker.abort();
+        record.expect("a record within two heartbeat intervals")
+    }
+
     #[tokio::test]
+    async fn live_consumer_stream_heartbeats_on_schedule_while_other_processors_publish() {
+        // Every processor's commit woke the idle stream, which then restarted
+        // its full heartbeat interval: on a busy node it never sent one, and
+        // the SDK's idle watchdog would reconnect it.
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = SqliteStore::open(leani_store_sqlite::StoreConfig::new(
+            directory.path().join("node.sqlite"),
+        ))
+        .await
+        .expect("store");
+        let counter = leani_testkit::BlockLocalCounter::default().with_split_delivery();
+        let lifecycle =
+            acknowledged_delivery(counter.descriptor().lifecycle.clone(), "destination");
+        let processor = Arc::new(counter.with_lifecycle(lifecycle));
+        store
+            .register_processor(processor.descriptor())
+            .await
+            .expect("register processor");
+        store
+            .create_consumer_in_stream(
+                processor.descriptor(),
+                &default_delivery_stream_id(processor.descriptor()),
+                "destination",
+                ConsumerRole::Required,
+                ConsumerStartPosition::EarliestRetained,
+                Duration::from_secs(30),
+            )
+            .await
+            .expect("consumer");
+        let app = router_with_processors(
+            store.clone(),
+            vec![processor],
+            Vec::new(),
+            ApiConfig {
+                heartbeat_interval: SHORT_HEARTBEAT,
+                ..ApiConfig::default()
+            },
+        )
+        .expect("router");
+        let response = app
+            .oneshot(
+                Request::get(
+                    "/v1/processors/synthetic-counter/streams/live/consumers/destination/stream",
+                )
+                .body(Body::empty())
+                .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let mut body = response.into_body().into_data_stream();
+        let mut buffered = Vec::new();
+        assert_eq!(
+            next_ndjson_record(&mut body, &mut buffered).await["type"],
+            "hello"
+        );
+        let record = next_record_while_others_wake(&store, &mut body, &mut buffered).await;
+        assert_eq!(record["type"], "heartbeat", "{record}");
+    }
+
+    /// What the history stream of `history_stream_router` has published.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum HistoryFixture {
+        /// Nothing yet; the subscription still runs.
+        Waiting,
+        /// Block 1's progress unit, a batch pending for `PENDING_BATCH_DELAY`.
+        Pending,
+        /// Block 1's progress unit and the completion.
+        Completed,
+    }
+
+    /// Longer than three `SHORT_HEARTBEAT`s, the SDK's idle limit.
+    const PENDING_BATCH_DELAY: Duration = Duration::from_secs(3);
+
+    /// Serve the history stream of a backfill subscription over block 1.
+    #[allow(clippy::too_many_lines)]
+    async fn history_stream_router(store: &SqliteStore, fixture: HistoryFixture) -> Router {
+        use leani_testkit::{BlockLocalCounter, fixture_frame};
+
+        let processor = Arc::new(BlockLocalCounter::default().with_split_delivery());
+        store
+            .register_processor(processor.descriptor())
+            .await
+            .expect("register processor");
+        let subscription_id = "heartbeat-fixture";
+        let stream_id = store
+            .create_backfill_delivery_stream(processor.descriptor(), subscription_id)
+            .await
+            .expect("history stream")
+            .stream_id;
+        store
+            .create_consumer_in_stream(
+                processor.descriptor(),
+                &stream_id,
+                "destination",
+                ConsumerRole::Required,
+                ConsumerStartPosition::EarliestRetained,
+                Duration::from_secs(30),
+            )
+            .await
+            .expect("consumer");
+        let range =
+            leani_primitives::BlockRange::new(BlockNumber(1), BlockNumber(1)).expect("range");
+        let completed = fixture == HistoryFixture::Completed;
+        if fixture != HistoryFixture::Waiting {
+            let job = leani_store_sqlite::JobRecord {
+                id: subscription_id.to_owned(),
+                kind: "backfill_subscription_job".to_owned(),
+                state: leani_store_sqlite::JobState::Queued,
+                payload: b"heartbeat-fixture".to_vec(),
+                checkpoint: None,
+                attempts: 0,
+                updated_at_unix_ms: 1,
+            };
+            store
+                .create_backfill_subscription_job(
+                    &leani_store_sqlite::BackfillSubscriptionRecord {
+                        subscription_id: subscription_id.to_owned(),
+                        job_id: job.id.clone(),
+                        processor_instance: processor.descriptor().instance.to_string(),
+                        history_stream_id: stream_id.clone(),
+                        mode: leani_store_sqlite::BackfillSubscriptionMode::FillMissing,
+                        publication_revision: 0,
+                        state: leani_store_sqlite::BackfillSubscriptionState::Queued,
+                        consumer_id: "destination".to_owned(),
+                        ranges: vec![range],
+                        range,
+                        preexisting_coverage: Vec::new(),
+                        captured_finalized_target: BlockNumber(1),
+                        idempotency_key: "heartbeat-fixture".to_owned(),
+                        effective_block_limit: 1,
+                        effective_byte_limit: 1024 * 1024,
+                        resume_below_ratio_millionths: 750_000,
+                        delivery_batch_limits:
+                            leani_store_sqlite::BackfillDeliveryBatchLimits::default(),
+                        initial_sequence: 0,
+                        completion_sequence: None,
+                        processed_work_blocks: 0,
+                    },
+                    &job,
+                    BlockHash::new([4; 32]),
+                )
+                .await
+                .expect("subscription");
+            let frame = fixture_frame(1, BlockHash::ZERO);
+            let delta = processor.map(&frame).await.expect("map");
+            store
+                .apply_with_change_publication_to_stream(
+                    processor.as_ref(),
+                    ProcessorCursor {
+                        chain_id: frame.chain_id,
+                        processor_id: processor.descriptor().id.to_string(),
+                        processor_version: processor.descriptor().version.to_string(),
+                        block_number: frame.block.number,
+                        block_hash: frame.block.hash,
+                        finality: Finality::Finalized,
+                        sequence: 1,
+                    },
+                    &delta,
+                    &[],
+                    true,
+                    &stream_id,
+                )
+                .await
+                .expect("history apply");
+        }
+        if completed {
+            store
+                .append_backfill_completion(
+                    processor.descriptor(),
+                    &stream_id,
+                    ChainId(1),
+                    BlockNumber(1),
+                )
+                .await
+                .expect("completion");
+        }
+        let control = Arc::new(StaticBackfillControl {
+            status: BackfillStatus {
+                id: subscription_id.to_owned(),
+                owner: HistoricalWorkOwner::Subscription,
+                processor: processor.descriptor().instance.to_string(),
+                delivery_stream_id: Some(stream_id),
+                publication_revision: Some("0".to_owned()),
+                from_block: 1,
+                to_block: 1,
+                ranges: vec![BackfillRange {
+                    from_block: 1,
+                    to_block: 1,
+                }],
+                requested_blocks: 1,
+                processed_blocks: u64::from(completed),
+                remaining_blocks: u64::from(!completed),
+                captured_finalized_target: Some(1),
+                mode: BackfillExecutionMode::FillMissing,
+                batching: None,
+                state: if completed {
+                    BackfillState::Draining
+                } else {
+                    BackfillState::Running
+                },
+                attempts: 1,
+                updated_at_unix_ms: 1,
+                report: None,
+                last_error: None,
+            },
+        });
+        router_with_processors(
+            store.clone(),
+            vec![processor],
+            Vec::new(),
+            ApiConfig {
+                backfill_control: Some(control),
+                heartbeat_interval: SHORT_HEARTBEAT,
+                history_batch_limits: DeliveryBatchLimits {
+                    maximum_delay: PENDING_BATCH_DELAY,
+                    ..DeliveryBatchLimits::history_default()
+                },
+                ..ApiConfig::default()
+            },
+        )
+        .expect("router")
+    }
+
+    const HEARTBEAT_HISTORY_STREAM: &str =
+        "/v1/backfill-subscriptions/heartbeat-fixture/consumers/destination/stream";
+
+    #[tokio::test]
+    async fn waiting_history_stream_heartbeats_on_schedule_while_other_processors_publish() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = SqliteStore::open(leani_store_sqlite::StoreConfig::new(
+            directory.path().join("node.sqlite"),
+        ))
+        .await
+        .expect("store");
+        let response = history_stream_router(&store, HistoryFixture::Waiting)
+            .await
+            .oneshot(
+                Request::get(HEARTBEAT_HISTORY_STREAM)
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let mut body = response.into_body().into_data_stream();
+        let mut buffered = Vec::new();
+        assert_eq!(
+            next_ndjson_record(&mut body, &mut buffered).await["type"],
+            "hello"
+        );
+        let record = next_record_while_others_wake(&store, &mut body, &mut buffered).await;
+        assert_eq!(record["type"], "heartbeat", "{record}");
+    }
+
+    #[tokio::test]
+    async fn completed_history_stream_heartbeats_on_schedule_while_capacity_changes() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = SqliteStore::open(leani_store_sqlite::StoreConfig::new(
+            directory.path().join("node.sqlite"),
+        ))
+        .await
+        .expect("store");
+        let response = history_stream_router(&store, HistoryFixture::Completed)
+            .await
+            .oneshot(
+                Request::get(HEARTBEAT_HISTORY_STREAM)
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let mut body = response.into_body().into_data_stream();
+        let mut buffered = Vec::new();
+        for expected in ["hello", "batch", "backfill_complete"] {
+            let record = next_ndjson_record(&mut body, &mut buffered).await;
+            assert_eq!(record["type"], expected, "{record}");
+        }
+        // The stream now waits for the completion's acknowledgement.
+        let record = next_record_while_others_wake(&store, &mut body, &mut buffered).await;
+        assert_eq!(record["type"], "heartbeat", "{record}");
+    }
+
+    #[tokio::test]
+    async fn pending_history_batch_does_not_hold_back_heartbeats() {
+        // A batch below its target waited for its delay without heartbeats,
+        // so a `maximumDelayMs` over three heartbeat intervals tripped the
+        // SDK's idle limit on every connection.
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = SqliteStore::open(leani_store_sqlite::StoreConfig::new(
+            directory.path().join("node.sqlite"),
+        ))
+        .await
+        .expect("store");
+        let response = history_stream_router(&store, HistoryFixture::Pending)
+            .await
+            .oneshot(
+                Request::get(HEARTBEAT_HISTORY_STREAM)
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let mut body = response.into_body().into_data_stream();
+        let mut buffered = Vec::new();
+        assert_eq!(
+            next_ndjson_record(&mut body, &mut buffered).await["type"],
+            "hello"
+        );
+        let opened = Instant::now();
+        let record = tokio::time::timeout(
+            SHORT_HEARTBEAT * 2,
+            next_ndjson_record(&mut body, &mut buffered),
+        )
+        .await
+        .expect("a heartbeat while the batch is pending");
+        assert_eq!(record["type"], "heartbeat", "{record}");
+        // Heartbeats neither flush nor reorder the batch: it follows at its
+        // own deadline.
+        let batch = loop {
+            let record = next_ndjson_record(&mut body, &mut buffered).await;
+            if record["type"] != "heartbeat" {
+                break record;
+            }
+        };
+        assert_eq!(batch["type"], "batch", "{batch}");
+        assert!(opened.elapsed() >= PENDING_BATCH_DELAY / 2);
+    }
+
+    /// A counter whose stored changes cannot be rendered as JSON.
+    #[derive(Debug)]
+    struct UnrenderableCounter(leani_testkit::BlockLocalCounter);
+
+    #[async_trait]
+    impl Processor for UnrenderableCounter {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
+        fn descriptor(&self) -> &ProcessorDescriptor {
+            self.0.descriptor()
+        }
+
+        async fn map(
+            &self,
+            block: &leani_primitives::BlockFrame,
+        ) -> Result<leani_processor_api::EncodedDelta, leani_processor_api::ProcessorError>
+        {
+            self.0.map(block).await
+        }
+
+        async fn reduce(
+            &self,
+            transaction: &mut dyn leani_processor_api::ReducerTransaction,
+            cursor: &ProcessorCursor,
+            delta: &leani_processor_api::EncodedDelta,
+        ) -> Result<leani_processor_api::DomainChanges, leani_processor_api::ProcessorError>
+        {
+            self.0.reduce(transaction, cursor, delta).await
+        }
+
+        fn change_json(
+            &self,
+            _change: &leani_processor_api::DomainChange,
+        ) -> Result<Option<Value>, leani_processor_api::ProcessorError> {
+            Err(leani_processor_api::ProcessorError::Invariant(
+                "stored change has an unknown layout".to_owned(),
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn changes_that_cannot_be_rendered_are_not_retryable() {
+        // Audit M-D3: rendering a stored change fails the same way on every
+        // attempt. Marked retryable, it would make the SDK reconnect forever.
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = SqliteStore::open(leani_store_sqlite::StoreConfig::new(
+            directory.path().join("node.sqlite"),
+        ))
+        .await
+        .expect("store");
+        let processor = Arc::new(UnrenderableCounter(
+            leani_testkit::BlockLocalCounter::default(),
+        ));
+        store
+            .register_processor(processor.descriptor())
+            .await
+            .expect("register processor");
+        apply_finalized_blocks(&store, processor.as_ref(), 1..=1).await;
+        let app = router_with_processors(store, vec![processor], Vec::new(), ApiConfig::default())
+            .expect("router");
+
+        let page = app
+            .clone()
+            .oneshot(
+                Request::get("/v1/processors/synthetic-counter/changes")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(page.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let page: Value = serde_json::from_slice(
+            &to_bytes(page.into_body(), usize::MAX)
+                .await
+                .expect("error body"),
+        )
+        .expect("error JSON");
+        assert_eq!(page["error"]["retryable"], false, "{page}");
+
+        let stream = app
+            .oneshot(
+                Request::get("/v1/processors/synthetic-counter/stream")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(stream.status(), StatusCode::OK);
+        let mut body = stream.into_body().into_data_stream();
+        let mut text = String::new();
+        let error = loop {
+            if let Some(start) = text.find("event: error\n")
+                && let Some(end) = text[start..].find("\n\n")
+            {
+                let frame = &text[start..start + end];
+                let data = frame
+                    .lines()
+                    .find_map(|line| line.strip_prefix("data: "))
+                    .expect("error data");
+                break serde_json::from_str::<Value>(data).expect("error JSON");
+            }
+            let chunk = tokio::time::timeout(Duration::from_secs(5), body.next())
+                .await
+                .expect("SSE frame in time")
+                .expect("SSE frame")
+                .expect("SSE bytes");
+            text.push_str(std::str::from_utf8(&chunk).expect("UTF-8 frame"));
+        };
+        assert_eq!(error["error"]["retryable"], false, "{error}");
+    }
+
+    #[tokio::test]
+    async fn stored_data_that_cannot_be_decoded_is_not_retryable() {
+        for error in [
+            StoreError::Invariant("stored hash is not 32 bytes".to_owned()),
+            StoreError::Encoding("unknown durable layout".to_owned()),
+            StoreError::Numeric("sequence"),
+            StoreError::Json(serde_json::from_str::<Value>("{").expect_err("truncated JSON")),
+        ] {
+            let error = ApiError::from(error);
+            assert_eq!(error.status, StatusCode::INTERNAL_SERVER_ERROR);
+            assert!(!error.retryable, "{}", error.message);
+        }
+        // A failed read may succeed when retried, SQLite's own failures
+        // included: this one cannot open a directory as a database.
+        assert!(ApiError::from(StoreError::Io(std::io::Error::other("disk busy"))).retryable);
+        let directory = tempfile::tempdir().expect("tempdir");
+        let sqlite = SqliteStore::open(leani_store_sqlite::StoreConfig::new(
+            directory.path().to_path_buf(),
+        ))
+        .await
+        .expect_err("a directory is not a database");
+        assert!(matches!(sqlite, StoreError::Sqlx(_)), "{sqlite}");
+        assert!(ApiError::from(sqlite).retryable);
+    }
+
+    #[tokio::test]
+    async fn recreating_an_existing_required_consumer_still_conflicts() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = SqliteStore::open(leani_store_sqlite::StoreConfig::new(
+            directory.path().join("node.sqlite"),
+        ))
+        .await
+        .expect("store");
+        // Registered while the stream retained until acknowledged, as an
+        // earlier release also allowed on window streams.
+        let blobs = BlobsProcessor::default();
+        let lifecycle = acknowledged_delivery(blobs.descriptor().lifecycle.clone(), "blobs-api");
+        let instance = blobs.descriptor().instance.clone();
+        let publication = blobs.descriptor().publication;
+        let acknowledged = blobs.with_contract(instance, publication, lifecycle);
+        store
+            .create_consumer(
+                acknowledged.descriptor(),
+                "blobs-api",
+                ConsumerRole::Required,
+                ConsumerStartPosition::CurrentHead,
+                Duration::from_mins(5),
+            )
+            .await
+            .expect("required consumer");
+        let router = router(
+            store,
+            Arc::new(BlobsProcessor::default()),
+            ApiConfig::default(),
+        )
+        .expect("router");
+        let create = |id: &str| {
+            Request::post("/v1/processors/blobs-money/consumers")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "id": id,
+                        "role": "required",
+                        "start": { "position": "current_head" },
+                        "leaseTtlSeconds": 300,
+                        "credential": "blobs-api-test-credential"
+                    })
+                    .to_string(),
+                ))
+                .expect("request")
+        };
+        // Review 1, Important 2: an application that re-creates its consumer
+        // at startup still learns that it exists, whatever its credential;
+        // only a new consumer needs 32 characters.
+        let (status, body) = send(&router, create("blobs-api")).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["error"]["code"], "consumer_exists");
+        let (status, body) = send(&router, create("blobs-api-2")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["error"]["code"], "invalid_request");
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn durable_consumer_api_rejects_acknowledgement_beyond_committed_head() {
         let directory = tempfile::tempdir().expect("tempdir");
         let store = SqliteStore::open(leani_store_sqlite::StoreConfig::new(
@@ -9181,7 +10823,9 @@ mod tests {
         ))
         .await
         .expect("store");
-        let processor = Arc::new(BlobsProcessor::default());
+        // A canonical stream: split live streams fence acknowledgement by
+        // session and refuse the generic route.
+        let processor = Arc::new(leani_testkit::OrderedLedgerProcessor::default());
         let future_cursor = encode_cursor(&ApiCursor {
             version: 2,
             epoch: store.epoch(),
@@ -9191,32 +10835,44 @@ mod tests {
             sequence: 1,
         })
         .expect("cursor");
-        let router = router(store, processor, ApiConfig::default()).expect("router");
+        let configured: Arc<dyn Processor> = processor;
+        let router =
+            router_with_processors(store, vec![configured], Vec::new(), ApiConfig::default())
+                .expect("router");
+        let create_consumer = |role: &str| {
+            Request::post("/v1/processors/synthetic-ledger/consumers")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "id": "ledger-api",
+                        "role": role,
+                        "start": { "position": "current_head" },
+                        "leaseTtlSeconds": 300,
+                        "credential": TEST_CREDENTIAL
+                    })
+                    .to_string(),
+                ))
+                .expect("request")
+        };
+        // A required consumer would pin the window-retained stream.
+        let required = router
+            .clone()
+            .oneshot(create_consumer("required"))
+            .await
+            .expect("response");
+        assert_eq!(required.status(), StatusCode::BAD_REQUEST);
         let create = router
             .clone()
-            .oneshot(
-                Request::post("/v1/processors/blobs-money/consumers")
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(
-                        serde_json::json!({
-                            "id": "blobs-api",
-                            "role": "required",
-                            "start": { "position": "current_head" },
-                            "leaseTtlSeconds": 300,
-                            "credential": "blobs-api-test-credential"
-                        })
-                        .to_string(),
-                    ))
-                    .expect("request"),
-            )
+            .oneshot(create_consumer("best_effort"))
             .await
             .expect("response");
         assert_eq!(create.status(), StatusCode::CREATED);
 
+        // Audit H24: the credential is required once the consumer has one.
         let unauthenticated = router
             .clone()
             .oneshot(
-                Request::post("/v1/processors/blobs-money/consumers/blobs-api/ack")
+                Request::post("/v1/processors/synthetic-ledger/consumers/ledger-api/ack")
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from(
                         serde_json::json!({ "cursor": future_cursor.clone() }).to_string(),
@@ -9225,14 +10881,14 @@ mod tests {
             )
             .await
             .expect("response");
-        assert_eq!(unauthenticated.status(), StatusCode::CONFLICT);
+        assert_eq!(unauthenticated.status(), StatusCode::FORBIDDEN);
 
         let forbidden = router
             .clone()
             .oneshot(
-                Request::post("/v1/processors/blobs-money/consumers/blobs-api/ack")
+                Request::post("/v1/processors/synthetic-ledger/consumers/ledger-api/ack")
                     .header(header::CONTENT_TYPE, "application/json")
-                    .header(CONSUMER_CREDENTIAL_HEADER, "another-consumer-secret")
+                    .header(CONSUMER_CREDENTIAL_HEADER, OTHER_CREDENTIAL)
                     .body(Body::from(
                         serde_json::json!({ "cursor": future_cursor.clone() }).to_string(),
                     ))
@@ -9245,9 +10901,9 @@ mod tests {
         let acknowledge = router
             .clone()
             .oneshot(
-                Request::post("/v1/processors/blobs-money/consumers/blobs-api/ack")
+                Request::post("/v1/processors/synthetic-ledger/consumers/ledger-api/ack")
                     .header(header::CONTENT_TYPE, "application/json")
-                    .header(CONSUMER_CREDENTIAL_HEADER, "blobs-api-test-credential")
+                    .header(CONSUMER_CREDENTIAL_HEADER, TEST_CREDENTIAL)
                     .body(Body::from(
                         serde_json::json!({ "cursor": future_cursor }).to_string(),
                     ))
@@ -9264,7 +10920,7 @@ mod tests {
 
         let list = router
             .oneshot(
-                Request::get("/v1/processors/blobs-money/consumers")
+                Request::get("/v1/processors/synthetic-ledger/consumers")
                     .body(Body::empty())
                     .expect("request"),
             )
@@ -9273,9 +10929,816 @@ mod tests {
         assert_eq!(list.status(), StatusCode::OK);
         let body = to_bytes(list.into_body(), usize::MAX).await.expect("body");
         let body: Value = serde_json::from_slice(&body).expect("JSON");
-        assert_eq!(body["data"][0]["id"], "blobs-api");
+        assert_eq!(body["data"][0]["id"], "ledger-api");
         assert_eq!(body["data"][0]["acknowledgedSequence"], "0");
         assert_eq!(body["data"][0]["deliveredSequence"], "0");
+    }
+
+    fn consumer_request(
+        method: &Method,
+        path: &str,
+        credential: Option<&str>,
+        body: Option<&Value>,
+    ) -> Request<Body> {
+        let mut request = Request::builder().method(method.clone()).uri(path);
+        if let Some(credential) = credential {
+            request = request.header(CONSUMER_CREDENTIAL_HEADER, credential);
+        }
+        match body {
+            Some(body) => request
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_string())),
+            None => request.header("x-leani-request", "1").body(Body::empty()),
+        }
+        .expect("consumer request")
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn consumer_credentials_guard_every_consumer_scoped_route() {
+        // Audit H24 and Auth-4: a credential was checked only when a request
+        // sent one, and a client could choose any 16-byte credential.
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = SqliteStore::open(leani_store_sqlite::StoreConfig::new(
+            directory.path().join("node.sqlite"),
+        ))
+        .await
+        .expect("store");
+        let ledger = Arc::new(leani_testkit::OrderedLedgerProcessor::default());
+        let counter = leani_testkit::BlockLocalCounter::default();
+        let lifecycle =
+            acknowledged_delivery(counter.descriptor().lifecycle.clone(), "destination");
+        let split = Arc::new(counter.with_lifecycle(lifecycle));
+        for processor in [ledger.descriptor(), split.descriptor()] {
+            store
+                .register_processor(processor)
+                .await
+                .expect("register processor");
+        }
+        let live_stream = default_delivery_stream_id(split.descriptor());
+        let history_stream = store
+            .create_backfill_delivery_stream(split.descriptor(), "repair-1")
+            .await
+            .expect("history stream")
+            .stream_id;
+        for stream_id in [&live_stream, &history_stream] {
+            store
+                .create_consumer_with_credential_in_stream(
+                    split.descriptor(),
+                    stream_id,
+                    "destination",
+                    ConsumerRole::Required,
+                    ConsumerStartPosition::EarliestRetained,
+                    Duration::from_secs(30),
+                    TEST_CREDENTIAL,
+                )
+                .await
+                .expect("consumer with a credential");
+        }
+        apply_finalized_blocks(&store, ledger.as_ref(), 1..=1).await;
+        let control = Arc::new(StaticBackfillControl {
+            status: BackfillStatus {
+                id: "repair-1".to_owned(),
+                owner: HistoricalWorkOwner::Subscription,
+                processor: split.descriptor().instance.to_string(),
+                delivery_stream_id: Some(history_stream.clone()),
+                publication_revision: Some("0".to_owned()),
+                from_block: 1,
+                to_block: 1,
+                ranges: vec![BackfillRange {
+                    from_block: 1,
+                    to_block: 1,
+                }],
+                requested_blocks: 1,
+                processed_blocks: 0,
+                remaining_blocks: 1,
+                captured_finalized_target: Some(1),
+                mode: BackfillExecutionMode::FillMissing,
+                batching: None,
+                state: BackfillState::Running,
+                attempts: 1,
+                updated_at_unix_ms: 1,
+                report: None,
+                last_error: None,
+            },
+        });
+        let ledger: Arc<dyn Processor> = ledger;
+        let split: Arc<dyn Processor> = split;
+        let app = router_with_processors(
+            store,
+            vec![ledger, split],
+            Vec::new(),
+            ApiConfig {
+                backfill_control: Some(control),
+                ..ApiConfig::default()
+            },
+        )
+        .expect("router");
+
+        let create = |credential: &str| {
+            consumer_request(
+                &Method::POST,
+                "/v1/processors/synthetic-ledger/consumers",
+                None,
+                Some(&json!({
+                    "id": "reader",
+                    "role": "best_effort",
+                    "start": { "position": "earliest_retained" },
+                    "leaseTtlSeconds": 300,
+                    "credential": credential
+                })),
+            )
+        };
+        // 27 characters: enough before, too short now.
+        let (status, body) = send(&app, create("short-credential-0123456789")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(
+            send(&app, create(TEST_CREDENTIAL)).await.0,
+            StatusCode::CREATED
+        );
+
+        let cursor = json!({ "cursor": "00" });
+        let live = "/v1/processors/synthetic-counter/streams/live/consumers/destination";
+        let history = "/v1/backfill-subscriptions/repair-1/consumers/destination";
+        let routes = [
+            (
+                Method::POST,
+                "/v1/processors/synthetic-ledger/consumers/reader/lease".to_owned(),
+                None,
+            ),
+            (
+                Method::GET,
+                "/v1/processors/synthetic-ledger/consumers/reader/changes".to_owned(),
+                None,
+            ),
+            (
+                Method::POST,
+                "/v1/processors/synthetic-ledger/consumers/reader/ack".to_owned(),
+                Some(&cursor),
+            ),
+            (Method::POST, format!("{live}/ack"), Some(&cursor)),
+            (Method::POST, format!("{live}/lease"), None),
+            (Method::DELETE, format!("{live}/lease"), None),
+            (Method::GET, format!("{live}/stream"), None),
+            (Method::GET, format!("{history}/changes"), None),
+            (Method::POST, format!("{history}/ack"), Some(&cursor)),
+            (Method::POST, format!("{history}/lease"), None),
+            (Method::DELETE, format!("{history}/lease"), None),
+            (Method::GET, format!("{history}/stream"), None),
+        ];
+        // Review 1, minor 3: every mismatch is collected, so a regression
+        // names each route it opens.
+        let mut mismatches = Vec::new();
+        for (method, path, body) in routes {
+            for (presented, credential, forbidden) in [
+                ("no credential", None, true),
+                ("another credential", Some(OTHER_CREDENTIAL), true),
+                ("its credential", Some(TEST_CREDENTIAL), false),
+            ] {
+                // Stream bodies never end, so only the status is read.
+                let status = app
+                    .clone()
+                    .oneshot(consumer_request(&method, &path, credential, body))
+                    .await
+                    .expect("response")
+                    .status();
+                if (status == StatusCode::FORBIDDEN) != forbidden {
+                    mismatches.push(format!("{method} {path} with {presented}: {status}"));
+                }
+            }
+        }
+        assert!(mismatches.is_empty(), "{mismatches:#?}");
+    }
+
+    #[tokio::test]
+    async fn session_tokens_are_authenticated_by_the_node() {
+        // Audit H24: a session token carried an unkeyed checksum over values
+        // anyone could read, so a client could forge another's session.
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = SqliteStore::open(leani_store_sqlite::StoreConfig::new(
+            directory.path().join("node.sqlite"),
+        ))
+        .await
+        .expect("store");
+        let counter = leani_testkit::BlockLocalCounter::default();
+        let lifecycle =
+            acknowledged_delivery(counter.descriptor().lifecycle.clone(), "destination");
+        let processor = Arc::new(counter.with_lifecycle(lifecycle));
+        store
+            .register_processor(processor.descriptor())
+            .await
+            .expect("register processor");
+        let stream_id = default_delivery_stream_id(processor.descriptor());
+        store
+            .create_consumer_in_stream(
+                processor.descriptor(),
+                &stream_id,
+                "destination",
+                ConsumerRole::Required,
+                ConsumerStartPosition::EarliestRetained,
+                Duration::from_secs(30),
+            )
+            .await
+            .expect("consumer");
+        let forged = |version: u8| {
+            encode_cursor(&ConsumerSessionToken {
+                version,
+                epoch: store.epoch(),
+                chain_id: 1,
+                processor_id: processor.descriptor().instance.to_string(),
+                processor_version: processor.descriptor().version.to_string(),
+                stream_id: stream_id.clone(),
+                consumer_id: "destination".to_owned(),
+                generation: 1,
+            })
+            .expect("forged token")
+        };
+        let forged = [forged(1), forged(2)];
+        let configured: Arc<dyn Processor> = processor.clone();
+        let app = router_with_processors(store, vec![configured], Vec::new(), ApiConfig::default())
+            .expect("router");
+        let path = "/v1/processors/synthetic-counter/streams/live/consumers/destination";
+        let stream = app
+            .clone()
+            .oneshot(get_request(&format!("{path}/stream")))
+            .await
+            .expect("stream");
+        assert_eq!(stream.status(), StatusCode::OK);
+        let mut body = stream.into_body().into_data_stream();
+        let hello = next_ndjson_record(&mut body, &mut Vec::new()).await;
+        let token = hello["sessionToken"].as_str().expect("session token");
+        let renew = |token: &str| {
+            Request::post(format!("{path}/lease"))
+                .header(CONSUMER_SESSION_HEADER, token)
+                .header("x-leani-request", "1")
+                .body(Body::empty())
+                .expect("renew request")
+        };
+        for forged in &forged {
+            assert_ne!(forged, token);
+            let (status, body) = send(&app, renew(forged)).await;
+            assert_eq!(status, StatusCode::CONFLICT, "{body}");
+            assert_eq!(body["error"]["code"], "consumer_session_lost");
+        }
+        assert_eq!(send(&app, renew(token)).await.0, StatusCode::OK);
+        drop(body);
+    }
+
+    #[tokio::test]
+    async fn generic_consumer_routes_refuse_split_live_processors() {
+        // Audit M-A4: the generic renew and acknowledgement routes skipped
+        // the session fence of a split live stream.
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = SqliteStore::open(leani_store_sqlite::StoreConfig::new(
+            directory.path().join("node.sqlite"),
+        ))
+        .await
+        .expect("store");
+        let counter = leani_testkit::BlockLocalCounter::default();
+        let lifecycle =
+            acknowledged_delivery(counter.descriptor().lifecycle.clone(), "destination");
+        let processor = Arc::new(counter.with_lifecycle(lifecycle));
+        store
+            .register_processor(processor.descriptor())
+            .await
+            .expect("register processor");
+        store
+            .create_consumer_with_credential(
+                processor.descriptor(),
+                "destination",
+                ConsumerRole::Required,
+                ConsumerStartPosition::EarliestRetained,
+                Duration::from_secs(30),
+                TEST_CREDENTIAL,
+            )
+            .await
+            .expect("consumer");
+        apply_finalized_blocks(&store, processor.as_ref(), 1..=1).await;
+        let cursor = encode_stream_cursor_for(&store, processor.descriptor(), 1);
+        let configured: Arc<dyn Processor> = processor;
+        let app = router_with_processors(store, vec![configured], Vec::new(), ApiConfig::default())
+            .expect("router");
+        let path = "/v1/processors/synthetic-counter/consumers/destination";
+        for (method, route, body) in [
+            (Method::POST, "lease", None),
+            (Method::POST, "ack", Some(json!({ "cursor": cursor }))),
+        ] {
+            let (status, response) = send(
+                &app,
+                consumer_request(
+                    &method,
+                    &format!("{path}/{route}"),
+                    Some(TEST_CREDENTIAL),
+                    body.as_ref(),
+                ),
+            )
+            .await;
+            assert_eq!(status, StatusCode::CONFLICT, "{route}: {response}");
+            assert_eq!(
+                response["error"]["code"], "consumer_session_required",
+                "{route}"
+            );
+        }
+        // Reading needs no session.
+        let (status, page) = send(
+            &app,
+            consumer_request(
+                &Method::GET,
+                &format!("{path}/changes"),
+                Some(TEST_CREDENTIAL),
+                None,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{page}");
+        assert_eq!(page["data"].as_array().map(Vec::len), Some(1));
+    }
+
+    /// A generic change cursor for `sequence` of a processor's default stream.
+    fn encode_stream_cursor_for(
+        store: &SqliteStore,
+        descriptor: &ProcessorDescriptor,
+        sequence: u64,
+    ) -> String {
+        encode_cursor(&ApiCursor {
+            version: 2,
+            epoch: store.epoch(),
+            chain_id: 1,
+            processor_id: descriptor.instance.to_string(),
+            processor_version: descriptor.version.to_string(),
+            sequence,
+        })
+        .expect("cursor")
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn acknowledgements_stop_at_what_the_consumer_was_delivered() {
+        // Audit M-A5: acknowledgements were checked against the stream head,
+        // so a client could acknowledge changes it never read.
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = SqliteStore::open(leani_store_sqlite::StoreConfig::new(
+            directory.path().join("node.sqlite"),
+        ))
+        .await
+        .expect("store");
+        let processor = Arc::new(leani_testkit::OrderedLedgerProcessor::default());
+        store
+            .register_processor(processor.descriptor())
+            .await
+            .expect("register processor");
+        store
+            .create_consumer_with_credential(
+                processor.descriptor(),
+                "reader",
+                ConsumerRole::BestEffort,
+                ConsumerStartPosition::EarliestRetained,
+                Duration::from_secs(30),
+                TEST_CREDENTIAL,
+            )
+            .await
+            .expect("consumer");
+        apply_finalized_blocks(&store, processor.as_ref(), 1..=2).await;
+        let cursors = [1, 2]
+            .map(|sequence| encode_stream_cursor_for(&store, processor.descriptor(), sequence));
+        let configured: Arc<dyn Processor> = processor;
+        let app = router_with_processors(store, vec![configured], Vec::new(), ApiConfig::default())
+            .expect("router");
+        let path = "/v1/processors/synthetic-ledger/consumers/reader";
+        let acknowledge = |cursor: &str| {
+            consumer_request(
+                &Method::POST,
+                &format!("{path}/ack"),
+                Some(TEST_CREDENTIAL),
+                Some(&json!({ "cursor": cursor })),
+            )
+        };
+        let read = |limit: usize| {
+            consumer_request(
+                &Method::GET,
+                &format!("{path}/changes?limit={limit}"),
+                Some(TEST_CREDENTIAL),
+                None,
+            )
+        };
+        let (status, body) = send(&app, acknowledge(&cursors[1])).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["error"]["code"], "acknowledgement_beyond_delivered");
+
+        let (status, page) = send(&app, read(1)).await;
+        assert_eq!(status, StatusCode::OK, "{page}");
+        assert_eq!(page["data"][0]["sequence"], "1");
+        let (_, consumer) = send(&app, consumer_request(&Method::GET, path, None, None)).await;
+        assert_eq!(consumer["deliveredSequence"], "1");
+        let (status, body) = send(&app, acknowledge(&cursors[1])).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["error"]["code"], "acknowledgement_beyond_delivered");
+        let (status, body) = send(&app, acknowledge(&cursors[0])).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+
+        let (_, page) = send(&app, read(10)).await;
+        assert_eq!(page["data"][0]["sequence"], "2");
+        let (status, body) = send(&app, acknowledge(&cursors[1])).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["acknowledgedSequence"], "2");
+        assert_eq!(body["deliveredSequence"], "2");
+    }
+
+    #[tokio::test]
+    async fn live_batches_keep_blocks_whole_and_acknowledgements_end_them() {
+        // Audit M-A3: a page read that ended inside a block sent that block
+        // in two batches, and a destination could commit and acknowledge
+        // half of it. A page of 4 ends inside block 2; the next read reaches
+        // the head.
+        stream_two_whole_live_blocks(3).await;
+        // Review 1, minor 2: a page of 5 ends exactly at the head, so only
+        // the empty read after it shows that block 2 is complete.
+        stream_two_whole_live_blocks(4).await;
+    }
+
+    #[tokio::test]
+    async fn a_live_block_past_the_event_limit_fails_without_reading_on() {
+        // Review 1, minor 2: a read that ended inside a block too large for
+        // one batch must not wait for the rest of it, which would buffer
+        // the whole block.
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = SqliteStore::open(leani_store_sqlite::StoreConfig::new(
+            directory.path().join("node.sqlite"),
+        ))
+        .await
+        .expect("store");
+        let processor = FanOutCounter(leani_testkit::BlockLocalCounter::default());
+        apply_finalized_blocks(&store, &processor, 1..=2).await;
+        let second_block = store
+            .changes(processor.descriptor(), ChainId(1), 2, 10)
+            .await
+            .expect("block 2")
+            .into_iter()
+            .collect::<VecDeque<_>>();
+        assert_eq!(second_block.len(), 3);
+        let batch = |maximum_events| {
+            whole_live_block(&second_block, false, maximum_events).map(|(_, records)| records)
+        };
+        assert_eq!(batch(3), None);
+        assert_eq!(batch(2), Some(3));
+    }
+
+    /// Stream two fan-out blocks, of 2 and 3 records, through a live stream
+    /// whose batches hold `maximum_events`, and acknowledge them.
+    #[allow(clippy::too_many_lines)]
+    async fn stream_two_whole_live_blocks(maximum_events: u64) {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = SqliteStore::open(leani_store_sqlite::StoreConfig::new(
+            directory.path().join("node.sqlite"),
+        ))
+        .await
+        .expect("store");
+        let counter = leani_testkit::BlockLocalCounter::default();
+        let lifecycle =
+            acknowledged_delivery(counter.descriptor().lifecycle.clone(), "destination");
+        let processor = Arc::new(FanOutCounter(counter.with_lifecycle(lifecycle)));
+        store
+            .register_processor(processor.descriptor())
+            .await
+            .expect("register processor");
+        let stream_id = default_delivery_stream_id(processor.descriptor());
+        store
+            .create_consumer_in_stream(
+                processor.descriptor(),
+                &stream_id,
+                "destination",
+                ConsumerRole::Required,
+                ConsumerStartPosition::EarliestRetained,
+                Duration::from_secs(30),
+            )
+            .await
+            .expect("consumer");
+        // A page read holds one record more than a batch.
+        apply_finalized_blocks(&store, processor.as_ref(), 1..=2).await;
+        let configured: Arc<dyn Processor> = processor;
+        let app = router_with_processors(
+            store,
+            vec![configured],
+            Vec::new(),
+            ApiConfig {
+                live_batch_limits: DeliveryBatchLimits {
+                    maximum_events,
+                    ..DeliveryBatchLimits::live_default()
+                },
+                ..ApiConfig::default()
+            },
+        )
+        .expect("router");
+        let path = "/v1/processors/synthetic-counter/streams/live/consumers/destination";
+        let stream = app
+            .clone()
+            .oneshot(get_request(&format!("{path}/stream")))
+            .await
+            .expect("stream");
+        assert_eq!(stream.status(), StatusCode::OK);
+        let mut body = stream.into_body().into_data_stream();
+        let mut buffered = Vec::new();
+        let hello = next_ndjson_record(&mut body, &mut buffered).await;
+        let token = hello["sessionToken"]
+            .as_str()
+            .expect("session token")
+            .to_owned();
+        let mut batches = Vec::new();
+        let mut delivered = 0;
+        while delivered < 5 {
+            let batch = next_ndjson_record(&mut body, &mut buffered).await;
+            assert_eq!(batch["type"], "batch", "{batch}");
+            let changes = batch["changes"].as_array().expect("changes").len();
+            delivered += changes;
+            batches.push((
+                batch["throughBlock"].as_u64().expect("block"),
+                changes,
+                batch,
+            ));
+        }
+        assert_eq!(
+            batches
+                .iter()
+                .map(|(block, changes, _)| (*block, *changes))
+                .collect::<Vec<_>>(),
+            [(1, 2), (2, 3)]
+        );
+        let second = &batches[1].2;
+        let acknowledge = |cursor: &Value| {
+            Request::post(format!("{path}/ack"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(CONSUMER_SESSION_HEADER, token.as_str())
+                .body(Body::from(json!({ "cursor": cursor }).to_string()))
+                .expect("acknowledgement request")
+        };
+        let (status, response) = send(&app, acknowledge(&second["changes"][0]["cursor"])).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{response}");
+        assert_eq!(response["error"]["code"], "acknowledgement_mid_block");
+        let (status, response) = send(&app, acknowledge(&second["acknowledgeableCursor"])).await;
+        assert_eq!(status, StatusCode::OK, "{response}");
+        assert_eq!(response["acknowledgedSequence"], "5");
+        drop(body);
+    }
+
+    #[tokio::test]
+    async fn change_streams_resume_from_last_event_id() {
+        // Audit SSE-1: EventSource reconnects with Last-Event-ID, which the
+        // stream ignored, so it restarted from the oldest retained change.
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = SqliteStore::open(leani_store_sqlite::StoreConfig::new(
+            directory.path().join("node.sqlite"),
+        ))
+        .await
+        .expect("store");
+        let processor = Arc::new(leani_testkit::OrderedLedgerProcessor::default());
+        apply_finalized_blocks(&store, processor.as_ref(), 1..=3).await;
+        let cursors = [1, 2]
+            .map(|sequence| encode_stream_cursor_for(&store, processor.descriptor(), sequence));
+        let configured: Arc<dyn Processor> = processor;
+        let app = router_with_processors(store, vec![configured], Vec::new(), ApiConfig::default())
+            .expect("router");
+        for (query, last_event_id, first) in [
+            (String::new(), cursors[0].as_str(), "2"),
+            // An explicit `after` wins.
+            (format!("?after={}", cursors[1]), cursors[0].as_str(), "3"),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::get(format!("/v1/processors/synthetic-ledger/stream{query}"))
+                        .header("last-event-id", last_event_id)
+                        .body(Body::empty())
+                        .expect("request"),
+                )
+                .await
+                .expect("response");
+            assert_eq!(response.status(), StatusCode::OK);
+            let mut body = response.into_body().into_data_stream();
+            assert_eq!(
+                first_sse_change(&mut body).await["sequence"],
+                first,
+                "{query}"
+            );
+        }
+        let (status, body) = send(
+            &app,
+            Request::get("/v1/processors/synthetic-ledger/stream")
+                .header("last-event-id", "not-a-cursor")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["error"]["code"], "cursor_invalid");
+    }
+
+    #[tokio::test]
+    async fn finalized_only_snapshots_carry_no_follow_boundary() {
+        // Audit M-A2: a snapshot of a finalized_only processor still offered
+        // a boundary cursor to follow, which query-and-follow refuses.
+        use leani_processor_api::PublicationPolicy;
+
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = SqliteStore::open(leani_store_sqlite::StoreConfig::new(
+            directory.path().join("node.sqlite"),
+        ))
+        .await
+        .expect("store");
+        let processor = Arc::new(
+            leani_testkit::BlockLocalCounter::default()
+                .with_publication(PublicationPolicy::FinalizedOnly),
+        );
+        apply_finalized_blocks(&store, processor.as_ref(), 1..=2).await;
+        let configured: Arc<dyn Processor> = processor;
+        let app = router_with_processors(store, vec![configured], Vec::new(), ApiConfig::default())
+            .expect("router");
+        let path = "/v1/processors/synthetic-counter/collections/counter.blocks/entities";
+        let (status, first) = send(
+            &app,
+            Request::post(path)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"limit":1}"#))
+                .expect("request"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{first}");
+        let next = first["nextCursor"].as_str().expect("next page").to_owned();
+        let (status, second) = send(&app, get_request(&format!("{path}?cursor={next}"))).await;
+        assert_eq!(status, StatusCode::OK, "{second}");
+        for page in [&first, &second] {
+            assert_eq!(page["data"].as_array().map(Vec::len), Some(1));
+            assert_eq!(page["boundaryCursor"], Value::Null, "{page}");
+            assert_eq!(page["recovery"]["follow"], Value::Null, "{page}");
+        }
+        // Reading current output without a snapshot offers no boundary.
+        let (status, current) = send(&app, get_request(path)).await;
+        assert_eq!(status, StatusCode::OK, "{current}");
+        assert!(current.get("boundaryCursor").is_none(), "{current}");
+    }
+
+    #[tokio::test]
+    async fn portable_savepoint_refusals_have_stable_codes() {
+        // Task 2 review: a full physical store budget answered 500.
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = SqliteStore::open(leani_store_sqlite::StoreConfig::new(
+            directory.path().join("node.sqlite"),
+        ))
+        .await
+        .expect("store");
+        let processor = Arc::new(leani_testkit::BlockLocalCounter::default());
+        apply_finalized_blocks(&store, processor.as_ref(), 1..=1).await;
+        let configured: Arc<dyn Processor> = processor;
+        let app = router_with_processors(store, vec![configured], Vec::new(), ApiConfig::default())
+            .expect("router");
+        let create = |id: &str| {
+            Request::post("/v1/processors/synthetic-counter/savepoints")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(json!({ "id": id }).to_string()))
+                .expect("savepoint request")
+        };
+        for index in 1..=16 {
+            let (status, body) = send(&app, create(&format!("savepoint-{index}"))).await;
+            assert_eq!(status, StatusCode::CREATED, "{body}");
+        }
+        let (status, body) = send(&app, create("savepoint-17")).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["error"]["code"], "savepoint_limit");
+
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = SqliteStore::open(
+            leani_store_sqlite::StoreConfig::new(directory.path().join("node.sqlite"))
+                .with_storage_budget(leani_store_sqlite::StoreStorageBudget {
+                    maximum_physical_bytes: 1,
+                }),
+        )
+        .await
+        .expect("store");
+        // Private state only, so the apply itself needs no physical admission.
+        let processor = Arc::new(
+            leani_testkit::BlockLocalCounter::default()
+                .with_output_none()
+                .with_delivery_none(),
+        );
+        apply_finalized_blocks(&store, processor.as_ref(), 1..=1).await;
+        let configured: Arc<dyn Processor> = processor;
+        let app = router_with_processors(store, vec![configured], Vec::new(), ApiConfig::default())
+            .expect("router");
+        let (status, body) = send(&app, create("over-budget")).await;
+        assert_eq!(status, StatusCode::INSUFFICIENT_STORAGE, "{body}");
+        assert_eq!(body["error"]["code"], "physical_storage_limit");
+        assert_eq!(body["error"]["retryable"], false);
+    }
+
+    #[tokio::test]
+    async fn checkpoint_and_savepoint_hashes_are_hex_strings() {
+        // Task 22: every other API hash is `0x` hex, but recovery checkpoints
+        // and portable savepoints sent `blockHash` and `stateChecksum` as
+        // arrays of 32 integers.
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = SqliteStore::open(leani_store_sqlite::StoreConfig::new(
+            directory.path().join("node.sqlite"),
+        ))
+        .await
+        .expect("store");
+        let processor = Arc::new(leani_testkit::BlockLocalCounter::default());
+        apply_finalized_blocks(&store, processor.as_ref(), 1..=1).await;
+        let descriptor = processor.descriptor().clone();
+        let configured: Arc<dyn Processor> = processor;
+        let app = router_with_processors(
+            store.clone(),
+            vec![configured],
+            Vec::new(),
+            ApiConfig::default(),
+        )
+        .expect("router");
+
+        let checkpoint = store
+            .recovery_checkpoints(&descriptor)
+            .await
+            .expect("checkpoints")
+            .first()
+            .cloned()
+            .expect("the finalized block's automatic checkpoint");
+        let (status, checkpoints) = send(
+            &app,
+            get_request("/v1/processors/synthetic-counter/checkpoints"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{checkpoints}");
+        let listed = &checkpoints["data"][0];
+        assert_eq!(
+            listed["blockHash"],
+            hash_hex(checkpoint.block_hash),
+            "{listed}"
+        );
+        assert_eq!(
+            listed["stateChecksum"],
+            hash_hex(checkpoint.state_checksum),
+            "{listed}"
+        );
+        assert_eq!(listed["blockNumber"], 1, "{listed}");
+        assert_eq!(listed["checkpointId"], checkpoint.checkpoint_id, "{listed}");
+
+        let (status, created) = send(
+            &app,
+            Request::post("/v1/processors/synthetic-counter/savepoints")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(json!({ "id": "hex-hashes" }).to_string()))
+                .expect("savepoint request"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{created}");
+        let savepoint = store
+            .portable_savepoints(&descriptor)
+            .await
+            .expect("savepoints")
+            .first()
+            .cloned()
+            .expect("the created savepoint");
+        let (status, savepoints) = send(
+            &app,
+            get_request("/v1/processors/synthetic-counter/savepoints"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{savepoints}");
+        for body in [&created, &savepoints["data"][0]] {
+            assert_eq!(body["savepointId"], "hex-hashes", "{body}");
+            assert_eq!(body["blockHash"], hash_hex(savepoint.block_hash), "{body}");
+            assert_eq!(
+                body["stateChecksum"],
+                hash_hex(savepoint.state_checksum),
+                "{body}"
+            );
+            assert_eq!(body["blockNumber"], 1, "{body}");
+        }
+    }
+
+    #[test]
+    fn finalized_head_error_details_carry_a_hex_hash() {
+        // Task 22: the finalized head in these refusals' details was an array
+        // of 32 integers, unlike every other API hash.
+        let finalized_hash = BlockHash::new([0xab; 32]);
+        for error in [
+            BackfillControlError::HistoryNotFinalized {
+                requested: 11,
+                finalized: 10,
+                finalized_hash,
+            },
+            BackfillControlError::RangeAfterFinalizedHead {
+                requested: 11,
+                finalized: 10,
+                finalized_hash,
+            },
+        ] {
+            let error = backfill_error(error);
+            let details = error.details.expect("finalized head details");
+            assert_eq!(
+                details["currentFinalizedHead"],
+                json!({ "number": 10, "hash": format!("0x{}", "ab".repeat(32)) }),
+                "{} {details}",
+                error.code
+            );
+        }
     }
 
     #[tokio::test]
@@ -9431,6 +11894,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn resetting_a_contradicted_live_lane_answers_that_it_needs_a_rebuild() {
+        use leani_testkit::BlockLocalCounter;
+
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = SqliteStore::open(leani_store_sqlite::StoreConfig::new(
+            directory.path().join("reset-api.sqlite"),
+        ))
+        .await
+        .expect("store");
+        let processor = Arc::new(BlockLocalCounter::named("contradicted-counter"));
+        // Finality found the lane's coverage contradicting the canonical
+        // chain. It records no gap marker, so the refusal must not depend on
+        // one.
+        store
+            .register_processor(processor.descriptor())
+            .await
+            .expect("register");
+        store
+            .fail_processor_live_lane(processor.descriptor(), "processor_finality_conflict")
+            .await
+            .expect("contradiction");
+        let configured: Arc<dyn Processor> = processor.clone();
+        let response =
+            router_with_processors(store, vec![configured], Vec::new(), ApiConfig::default())
+                .expect("router")
+                .oneshot(
+                    Request::post("/admin/v1/processors/contradicted-counter/lanes/live/reset")
+                        .header("x-leani-request", "1")
+                        .body(Body::empty())
+                        .expect("request"),
+                )
+                .await
+                .expect("response");
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body: Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body"),
+        )
+        .expect("JSON");
+        assert_eq!(body["error"]["code"], "live_lane_requires_rebuild");
+    }
+
+    #[tokio::test]
     #[allow(clippy::too_many_lines)]
     async fn artifact_routes_inspect_export_and_explicitly_delete() {
         use leani_processor_api::{ArtifactPolicyMode, LifecyclePolicies};
@@ -9528,6 +12036,7 @@ mod tests {
                 Request::delete(
                     "/admin/v1/processors/synthetic-counter/artifacts?fromBlock=1&toBlock=1",
                 )
+                .header("x-leani-request", "1")
                 .body(Body::empty())
                 .expect("request"),
             )
@@ -9614,8 +12123,8 @@ mod tests {
         .expect("store");
         let processor = Arc::new(BlobsProcessor::default());
         let first_block = processor.schedule().first_block();
-        seed_blob_block(&store, &processor, first_block, 2).await;
-        seed_blob_block(&store, &processor, first_block + 1, 0).await;
+        seed_blob_block(&store, &processor, first_block, 2, Finality::Finalized).await;
+        seed_blob_block(&store, &processor, first_block + 1, 0, Finality::Finalized).await;
         let router = router(store, processor, ApiConfig::default()).expect("router");
 
         let first_page = router
@@ -9735,6 +12244,261 @@ mod tests {
         );
     }
 
+    /// Read what `body` still sends until it ends, which it must within five
+    /// seconds.
+    async fn rest_of_body(
+        mut body: impl Stream<Item = Result<Bytes, axum::Error>> + Unpin,
+        stream: &str,
+    ) -> Vec<u8> {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let mut rest = Vec::new();
+            while let Some(chunk) = body.next().await {
+                rest.extend_from_slice(&chunk.expect("stream bytes"));
+            }
+            rest
+        })
+        .await
+        .unwrap_or_else(|_| panic!("the {stream} stayed open after the node shut down"))
+    }
+
+    #[tokio::test]
+    async fn open_change_streams_end_when_the_node_shuts_down() {
+        // Audit M-N2: the SSE body ignored the node's shutdown, so a graceful
+        // shutdown waited for its client forever.
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = SqliteStore::open(leani_store_sqlite::StoreConfig::new(
+            directory.path().join("node.sqlite"),
+        ))
+        .await
+        .expect("store");
+        // Registered, so its stream waits for changes.
+        let processor = Arc::new(BlobsProcessor::default());
+        store
+            .register_processor(processor.descriptor())
+            .await
+            .expect("register processor");
+        let shutdown = CancellationToken::new();
+        let router = router(
+            store,
+            processor,
+            ApiConfig {
+                shutdown: shutdown.clone(),
+                ..ApiConfig::default()
+            },
+        )
+        .expect("router");
+        let response = router
+            .oneshot(
+                Request::get("/v1/processors/blobs-money/stream")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let mut body = response.into_body().into_data_stream();
+        let hello = tokio::time::timeout(Duration::from_secs(5), body.next())
+            .await
+            .expect("hello in time")
+            .expect("hello frame")
+            .expect("hello bytes");
+        assert!(String::from_utf8_lossy(&hello).contains("event: hello"));
+
+        shutdown.cancel();
+        // It ends after whole events. An error event would stop the SDK's
+        // subscription instead of letting it reconnect.
+        let rest = rest_of_body(body, "change stream").await;
+        let rest = String::from_utf8(rest).expect("UTF-8 events");
+        assert!(!rest.contains("event: error"), "{rest}");
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn open_delivery_streams_end_when_the_node_shuts_down() {
+        // Audit M-N2: the NDJSON delivery bodies ignored the node's shutdown
+        // too. They end after whole records, gzip included.
+        use std::io::Read as _;
+
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = SqliteStore::open(leani_store_sqlite::StoreConfig::new(
+            directory.path().join("node.sqlite"),
+        ))
+        .await
+        .expect("store");
+        let counter = leani_testkit::BlockLocalCounter::default().with_split_delivery();
+        let lifecycle =
+            acknowledged_delivery(counter.descriptor().lifecycle.clone(), "destination");
+        let processor = Arc::new(counter.with_lifecycle(lifecycle));
+        store
+            .register_processor(processor.descriptor())
+            .await
+            .expect("register processor");
+        store
+            .create_consumer_in_stream(
+                processor.descriptor(),
+                &default_delivery_stream_id(processor.descriptor()),
+                "destination",
+                ConsumerRole::Required,
+                ConsumerStartPosition::EarliestRetained,
+                Duration::from_secs(30),
+            )
+            .await
+            .expect("live consumer");
+        let subscription_id = "shutdown-fixture";
+        let history_stream = store
+            .create_backfill_delivery_stream(processor.descriptor(), subscription_id)
+            .await
+            .expect("history stream")
+            .stream_id;
+        store
+            .create_consumer_in_stream(
+                processor.descriptor(),
+                &history_stream,
+                "destination",
+                ConsumerRole::Required,
+                ConsumerStartPosition::EarliestRetained,
+                Duration::from_secs(30),
+            )
+            .await
+            .expect("history consumer");
+        let range = BlockRange::new(BlockNumber(1), BlockNumber(3)).expect("range");
+        let job = leani_store_sqlite::JobRecord {
+            id: subscription_id.to_owned(),
+            kind: "backfill_subscription_job".to_owned(),
+            state: leani_store_sqlite::JobState::Queued,
+            payload: b"api-stream-fixture".to_vec(),
+            checkpoint: None,
+            attempts: 0,
+            updated_at_unix_ms: 1,
+        };
+        store
+            .create_backfill_subscription_job(
+                &leani_store_sqlite::BackfillSubscriptionRecord {
+                    subscription_id: subscription_id.to_owned(),
+                    job_id: job.id.clone(),
+                    processor_instance: processor.descriptor().instance.to_string(),
+                    history_stream_id: history_stream.clone(),
+                    mode: leani_store_sqlite::BackfillSubscriptionMode::FillMissing,
+                    publication_revision: 0,
+                    state: leani_store_sqlite::BackfillSubscriptionState::Queued,
+                    consumer_id: "destination".to_owned(),
+                    ranges: vec![range],
+                    range,
+                    preexisting_coverage: Vec::new(),
+                    captured_finalized_target: BlockNumber(3),
+                    idempotency_key: "shutdown-fixture".to_owned(),
+                    effective_block_limit: 3,
+                    effective_byte_limit: 1024 * 1024,
+                    resume_below_ratio_millionths: 750_000,
+                    delivery_batch_limits: leani_store_sqlite::BackfillDeliveryBatchLimits::default(
+                    ),
+                    initial_sequence: 0,
+                    completion_sequence: None,
+                    processed_work_blocks: 0,
+                },
+                &job,
+                BlockHash::new([4; 32]),
+            )
+            .await
+            .expect("subscription");
+        let control = Arc::new(StaticBackfillControl {
+            status: BackfillStatus {
+                id: subscription_id.to_owned(),
+                owner: HistoricalWorkOwner::Subscription,
+                processor: processor.descriptor().instance.to_string(),
+                delivery_stream_id: Some(history_stream),
+                publication_revision: Some("0".to_owned()),
+                from_block: 1,
+                to_block: 3,
+                ranges: vec![BackfillRange {
+                    from_block: 1,
+                    to_block: 3,
+                }],
+                requested_blocks: 3,
+                processed_blocks: 0,
+                remaining_blocks: 3,
+                captured_finalized_target: Some(3),
+                mode: BackfillExecutionMode::FillMissing,
+                batching: None,
+                state: BackfillState::Running,
+                attempts: 1,
+                updated_at_unix_ms: 1,
+                report: None,
+                last_error: None,
+            },
+        });
+        let shutdown = CancellationToken::new();
+        let app = router_with_processors(
+            store,
+            vec![processor],
+            Vec::new(),
+            ApiConfig {
+                backfill_control: Some(control),
+                live_batch_limits: DeliveryBatchLimits {
+                    compression: DeliveryCompression::Gzip,
+                    ..DeliveryBatchLimits::live_default()
+                },
+                shutdown: shutdown.clone(),
+                ..ApiConfig::default()
+            },
+        )
+        .expect("router");
+        let open = |path: &'static str, gzip: bool| {
+            let app = app.clone();
+            async move {
+                let mut request = Request::get(path);
+                if gzip {
+                    request = request.header(header::ACCEPT_ENCODING, "gzip");
+                }
+                let response = app
+                    .oneshot(request.body(Body::empty()).expect("request"))
+                    .await
+                    .expect("response");
+                assert_eq!(response.status(), StatusCode::OK, "{path}");
+                response
+            }
+        };
+        let live = open(
+            "/v1/processors/synthetic-counter/streams/live/consumers/destination/stream",
+            true,
+        )
+        .await;
+        assert_eq!(live.headers()[header::CONTENT_ENCODING], "gzip");
+        let mut live = live.into_body().into_data_stream();
+        let history = open(
+            "/v1/backfill-subscriptions/shutdown-fixture/consumers/destination/stream",
+            false,
+        )
+        .await;
+        let mut history = history.into_body().into_data_stream();
+        let mut received = Vec::new();
+        assert_eq!(
+            next_ndjson_record(&mut history, &mut received).await["type"],
+            "hello"
+        );
+        let first_live = tokio::time::timeout(Duration::from_secs(5), live.next())
+            .await
+            .expect("live hello in time")
+            .expect("live hello")
+            .expect("live hello bytes");
+
+        shutdown.cancel();
+        let mut compressed = first_live.to_vec();
+        compressed.extend(rest_of_body(live, "live delivery stream").await);
+        let mut records = String::new();
+        flate2::read::GzDecoder::new(compressed.as_slice())
+            .read_to_string(&mut records)
+            .expect("a whole gzip stream, trailer included");
+        let records = records.lines().collect::<Vec<_>>();
+        assert_eq!(records.len(), 1, "{records:?}");
+        assert!(records[0].contains(r#""type":"hello""#), "{records:?}");
+        received.extend(rest_of_body(history, "backfill delivery stream").await);
+        assert!(
+            received.is_empty() || received.ends_with(b"\n"),
+            "a record was cut off: {received:?}"
+        );
+    }
+
     #[tokio::test]
     async fn change_stream_first_frame_is_hello_without_id() {
         use futures::StreamExt as _;
@@ -9781,6 +12545,33 @@ mod tests {
         assert_eq!(hello["chainId"], 1);
         assert_eq!(hello["processor"]["id"], "blobs-money");
         assert!(hello["coverage"].is_object());
+    }
+
+    #[test]
+    fn erc20_balance_renders_where_the_ledger_became_incomplete() {
+        let mut entity = TokenBalanceEntity {
+            token: Address::new([0x22; 20]),
+            address: Address::new([0x11; 20]),
+            balance: Quantity::new([0; 32]),
+            as_of_block: BlockNumber(7),
+            block_hash: BlockHash::new([7; 32]),
+            finality: Finality::Included,
+            coverage_from: BlockNumber(1),
+            complete: false,
+            incomplete_from: Some(BlockNumber(7)),
+            method: "erc20_transfer_ledger".to_owned(),
+        };
+        let json = serde_json::to_value(Erc20Balance::from(&entity)).expect("render");
+        assert_eq!(json["incompleteFrom"], 7);
+        assert_eq!(json["complete"], false);
+        entity.incomplete_from = None;
+        let json = serde_json::to_value(Erc20Balance::from(&entity)).expect("render");
+        assert!(json["incompleteFrom"].is_null());
+        assert!(
+            json.as_object()
+                .expect("object")
+                .contains_key("incompleteFrom")
+        );
     }
 
     #[test]
@@ -9950,7 +12741,603 @@ mod tests {
         assert_eq!(authorized.status(), StatusCode::OK);
     }
 
+    async fn send(router: &Router, request: Request<Body>) -> (StatusCode, Value) {
+        let response = router.clone().oneshot(request).await.expect("response");
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+        )
+    }
+
+    fn get_request(path: &str) -> Request<Body> {
+        Request::get(path).body(Body::empty()).expect("request")
+    }
+
+    async fn blobs_router(config: ApiConfig) -> (Router, tempfile::TempDir) {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = SqliteStore::open(leani_store_sqlite::StoreConfig::new(
+            directory.path().join("node.sqlite"),
+        ))
+        .await
+        .expect("store");
+        let router = router(store, Arc::new(BlobsProcessor::default()), config).expect("router");
+        (router, directory)
+    }
+
     #[tokio::test]
+    async fn requests_need_an_allowed_host_and_origin() {
+        // Audit H25: with no Host or Origin check, a page that rebinds its own
+        // name to 127.0.0.1, or any cross-site page, could call the API.
+        let (router, _directory) = blobs_router(ApiConfig {
+            allowed_hosts: BTreeSet::from(["leani".to_owned()]),
+            allowed_origins: BTreeSet::from(["https://app.example".to_owned()]),
+            ..ApiConfig::default()
+        })
+        .await;
+        let with_host = |host: &str| {
+            Request::get("/health/live")
+                .header(header::HOST, host)
+                .body(Body::empty())
+                .expect("request")
+        };
+        for host in [
+            "rebound.example:8080",
+            "leani.rebound.example",
+            "localhost.rebound.example:8080",
+            "127.0.0.1.rebound.example",
+            "[::1].rebound.example",
+            // Spellings that name loopback without being a listed name or an
+            // address in canonical form.
+            "localhost.",
+            "127.0.0.1.",
+            "0x7f.0.0.1",
+            "[::1%25lo]",
+        ] {
+            let (status, body) = send(&router, with_host(host)).await;
+            assert_eq!(status, StatusCode::MISDIRECTED_REQUEST, "{host}");
+            assert_eq!(body["error"]["code"], "host_not_allowed", "{host}");
+        }
+        // No rebinding sends an address, so health probes and scrapers may
+        // call the node by any IP.
+        for host in [
+            "localhost:8080",
+            "LOCALHOST",
+            "127.0.0.1:18080",
+            "10.0.0.5:8080",
+            "[::1]:8080",
+            "[::1]",
+            "[2001:db8::1]:8080",
+            "leani:8080",
+            "Leani",
+        ] {
+            assert_eq!(
+                send(&router, with_host(host)).await.0,
+                StatusCode::OK,
+                "{host}"
+            );
+        }
+        // An absolute request target names the host as well.
+        let (status, _) = send(&router, get_request("http://rebound.example/health/live")).await;
+        assert_eq!(status, StatusCode::MISDIRECTED_REQUEST);
+
+        let with_origin = |path: &str, origin: &str| {
+            Request::get(path)
+                .header(header::ORIGIN, origin)
+                .body(Body::empty())
+                .expect("request")
+        };
+        for origin in [
+            "https://evil.example",
+            "null",
+            "http://localhost.evil.example",
+            "http://app.example",
+        ] {
+            for path in ["/v1/status", "/health/live"] {
+                let (status, body) = send(&router, with_origin(path, origin)).await;
+                assert_eq!(status, StatusCode::FORBIDDEN, "{origin} {path}");
+                assert_eq!(
+                    body["error"]["code"], "origin_not_allowed",
+                    "{origin} {path}"
+                );
+            }
+            // An EventSource stream is a GET too; only its Origin guards it.
+            let stream = router
+                .clone()
+                .oneshot(with_origin("/v1/processors/blobs-money/stream", origin))
+                .await
+                .expect("stream response");
+            assert_eq!(stream.status(), StatusCode::FORBIDDEN, "{origin}");
+            // A mutation that passes the content-type rule is still refused.
+            let snapshot =
+                Request::post("/v1/processors/blobs-money/collections/blobs.blocks/entities")
+                    .header(header::ORIGIN, origin)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("x-leani-request", "1")
+                    .body(Body::from("{}"))
+                    .expect("request");
+            let (status, body) = send(&router, snapshot).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{origin} snapshot");
+            assert_eq!(body["error"]["code"], "origin_not_allowed", "{origin}");
+        }
+        for origin in [
+            "http://localhost:5173",
+            "http://127.0.0.1",
+            "https://[::1]:8443",
+            "https://app.example",
+        ] {
+            let (status, _) = send(&router, with_origin("/v1/status", origin)).await;
+            assert_eq!(status, StatusCode::OK, "{origin}");
+        }
+    }
+
+    #[tokio::test]
+    async fn mutations_need_a_json_content_type_or_the_leani_request_header() {
+        // Audit H25: body-less mutations went through as simple cross-site
+        // requests, which carry no preflight.
+        let (router, _directory) = blobs_router(ApiConfig::default()).await;
+        let release = |headers: &[(&str, &str)]| {
+            let mut request = Request::delete(
+                "/v1/processors/blobs-money/query-snapshots/00000000000000000000000000000000",
+            );
+            for (name, value) in headers {
+                request = request.header(*name, *value);
+            }
+            request.body(Body::empty()).expect("request")
+        };
+        let refused: [&[(&str, &str)]; 6] = [
+            &[],
+            &[("content-type", "text/plain")],
+            &[("content-type", "application/x-www-form-urlencoded")],
+            &[("content-type", "multipart/form-data; boundary=x")],
+            &[("x-leani-request", "0")],
+            &[("x-leani-request", "true")],
+        ];
+        for headers in refused {
+            let (status, body) = send(&router, release(headers)).await;
+            assert_eq!(status, StatusCode::UNSUPPORTED_MEDIA_TYPE, "{headers:?}");
+            assert_eq!(
+                body["error"]["code"], "unsupported_media_type",
+                "{headers:?}"
+            );
+        }
+        let accepted: [&[(&str, &str)]; 3] = [
+            &[("x-leani-request", "1")],
+            &[("content-type", "application/json")],
+            &[("content-type", "Application/JSON; charset=utf-8")],
+        ];
+        for headers in accepted {
+            let (status, body) = send(&router, release(headers)).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{headers:?}: {body}");
+        }
+        let reset = Request::post("/admin/v1/processors/blobs-money/lanes/live/reset")
+            .body(Body::empty())
+            .expect("request");
+        assert_eq!(
+            send(&router, reset).await.0,
+            StatusCode::UNSUPPORTED_MEDIA_TYPE
+        );
+        assert_eq!(
+            send(&router, get_request("/v1/status")).await.0,
+            StatusCode::OK
+        );
+    }
+
+    #[tokio::test]
+    async fn only_post_creates_query_snapshots() {
+        // Audit M-A1: every cursorless entity GET created a durable snapshot
+        // against a node-wide cap, so any page could fill it with GETs.
+        use leani_primitives::ProcessorCursor;
+        use leani_testkit::{BlockLocalCounter, fixture_frame};
+
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = SqliteStore::open(leani_store_sqlite::StoreConfig::new(
+            directory.path().join("snapshots.sqlite"),
+        ))
+        .await
+        .expect("store");
+        let processor = Arc::new(BlockLocalCounter::default());
+        let mut parent = BlockHash::ZERO;
+        for number in 1..=3 {
+            let frame = fixture_frame(number, parent);
+            let delta = processor.map(&frame).await.expect("map");
+            let descriptor = processor.descriptor();
+            store
+                .apply(
+                    processor.as_ref(),
+                    ProcessorCursor {
+                        processor_id: descriptor.id.to_string(),
+                        processor_version: descriptor.version.to_string(),
+                        chain_id: frame.chain_id,
+                        block_number: frame.block.number,
+                        block_hash: frame.block.hash,
+                        finality: frame.finality,
+                        sequence: number,
+                    },
+                    &delta,
+                    &[],
+                )
+                .await
+                .expect("apply");
+            parent = frame.block.hash;
+        }
+        let configured: Arc<dyn Processor> = processor;
+        let router = router_with_processors(
+            store,
+            vec![configured],
+            Vec::new(),
+            ApiConfig {
+                query_snapshot_max_total_snapshots: 1,
+                ..ApiConfig::default()
+            },
+        )
+        .expect("router");
+        let path = "/v1/processors/synthetic-counter/collections/counter.blocks/entities";
+
+        // Cursorless GETs page through current output without a snapshot.
+        for _ in 0..2 {
+            let (mut keys, mut ordinals) = (Vec::new(), Vec::new());
+            let mut next = format!("{path}?limit=2");
+            loop {
+                let (status, page) = send(&router, get_request(&next)).await;
+                assert_eq!(status, StatusCode::OK, "{page}");
+                assert!(page.get("snapshotId").is_none(), "{page}");
+                for entity in page["data"].as_array().expect("data") {
+                    keys.push(entity["key"].clone());
+                    ordinals.push(entity["ordinal"].clone());
+                }
+                match page["nextCursor"].as_str() {
+                    Some(cursor) => next = format!("{path}?cursor={cursor}"),
+                    None => break,
+                }
+            }
+            assert_eq!(keys.len(), 3);
+            assert_eq!(ordinals, [json!("0"), json!("1"), json!("2")]);
+        }
+
+        // POST creates the snapshot, against the node-wide cap.
+        let create = || {
+            Request::post(path)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"limit":2}"#))
+                .expect("request")
+        };
+        let (status, first) = send(&router, create()).await;
+        assert_eq!(status, StatusCode::OK, "{first}");
+        assert_eq!(first["rowCount"], "3");
+        let (status, full) = send(&router, create()).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{full}");
+        assert_eq!(full["error"]["code"], "query_snapshot_capacity");
+        // Its later pages are read by GET.
+        let next = first["nextCursor"].as_str().expect("next cursor");
+        let (status, second) = send(&router, get_request(&format!("{path}?cursor={next}"))).await;
+        assert_eq!(status, StatusCode::OK, "{second}");
+        assert_eq!(second["snapshotId"], first["snapshotId"]);
+        assert_eq!(second["data"].as_array().expect("data").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn bearer_scheme_is_case_insensitive_and_the_token_exact() {
+        // Audit Auth-1.
+        let (router, _directory) = blobs_router(ApiConfig {
+            bearer_token: Some(Arc::from("very-secret-token")),
+            ..ApiConfig::default()
+        })
+        .await;
+        let status = |authorization: &'static str| {
+            let router = router.clone();
+            async move {
+                let request = Request::get("/v1/status")
+                    .header(header::AUTHORIZATION, authorization)
+                    .body(Body::empty())
+                    .expect("request");
+                send(&router, request).await.0
+            }
+        };
+        for authorization in [
+            "Bearer very-secret-token",
+            "bearer very-secret-token",
+            "BEARER very-secret-token",
+            "Bearer  very-secret-token",
+        ] {
+            assert_eq!(
+                status(authorization).await,
+                StatusCode::OK,
+                "{authorization}"
+            );
+        }
+        for authorization in [
+            "Bearer very-secret-toke",
+            "Bearer very-secret-token-",
+            "Bearer VERY-SECRET-TOKEN",
+            "Basic very-secret-token",
+            "Bearervery-secret-token",
+            "Bearer",
+            "Bearer ",
+            "very-secret-token",
+        ] {
+            assert_eq!(
+                status(authorization).await,
+                StatusCode::UNAUTHORIZED,
+                "{authorization}"
+            );
+        }
+    }
+
+    fn with_headers(method: &Method, path: &str, headers: &[(&str, &str)]) -> Request<Body> {
+        let mut request = Request::builder().method(method.clone()).uri(path);
+        for (name, value) in headers {
+            request = request.header(*name, *value);
+        }
+        request.body(Body::empty()).expect("request")
+    }
+
+    /// Headers a browser sends when a cross-site page loads an image.
+    const CROSS_SITE_IMAGE: [(&str, &str); 3] = [
+        ("sec-fetch-site", "cross-site"),
+        ("sec-fetch-mode", "no-cors"),
+        ("sec-fetch-dest", "image"),
+    ];
+
+    #[tokio::test]
+    async fn cross_site_subresource_requests_are_refused() {
+        // Audit H25, review 1: a no-cors GET such as an image load carries no
+        // `Origin`; only its Fetch Metadata tells it apart from a navigation.
+        let (router, _directory) = blobs_router(ApiConfig::default()).await;
+        for path in [
+            "/v1/status",
+            "/health/live",
+            // Both routes take a durable consumer's session lease.
+            "/v1/processors/blobs-money/streams/live/consumers/destination/stream",
+            "/v1/backfill-subscriptions/repair-1/consumers/destination/stream",
+        ] {
+            for method in [Method::GET, Method::HEAD] {
+                let (status, body) =
+                    send(&router, with_headers(&method, path, &CROSS_SITE_IMAGE)).await;
+                assert_eq!(status, StatusCode::FORBIDDEN, "{method} {path}");
+                if method == Method::GET {
+                    assert_eq!(body["error"]["code"], "cross_site_request", "{path}");
+                }
+            }
+        }
+        // Another port on localhost is the same site, not the same origin.
+        let same_site_script = [
+            ("sec-fetch-site", "same-site"),
+            ("sec-fetch-mode", "no-cors"),
+            ("sec-fetch-dest", "script"),
+        ];
+        assert_eq!(
+            send(
+                &router,
+                with_headers(&Method::GET, "/v1/status", &same_site_script)
+            )
+            .await
+            .0,
+            StatusCode::FORBIDDEN
+        );
+        let allowed: [&[(&str, &str)]; 6] = [
+            // The SDK, curl, and other clients send no Fetch Metadata.
+            &[],
+            // A link followed from another site, or a typed address.
+            &[
+                ("sec-fetch-site", "cross-site"),
+                ("sec-fetch-mode", "navigate"),
+                ("sec-fetch-dest", "document"),
+            ],
+            &[
+                ("sec-fetch-site", "none"),
+                ("sec-fetch-mode", "navigate"),
+                ("sec-fetch-dest", "document"),
+            ],
+            // The node's own pages, such as the network dashboard.
+            &[
+                ("sec-fetch-site", "same-origin"),
+                ("sec-fetch-mode", "cors"),
+                ("sec-fetch-dest", "empty"),
+            ],
+            &[
+                ("sec-fetch-site", "same-origin"),
+                ("sec-fetch-mode", "no-cors"),
+                ("sec-fetch-dest", "image"),
+            ],
+            // A CORS request carries an `Origin`, which the Origin check
+            // judges.
+            &[
+                ("origin", "http://localhost:5173"),
+                ("sec-fetch-site", "same-site"),
+                ("sec-fetch-mode", "cors"),
+                ("sec-fetch-dest", "empty"),
+            ],
+        ];
+        for headers in allowed {
+            assert_eq!(
+                send(&router, with_headers(&Method::GET, "/v1/status", headers))
+                    .await
+                    .0,
+                StatusCode::OK,
+                "{headers:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_cross_site_image_cannot_take_a_consumer_session() {
+        // Audit H25, review 1: opening a consumer's live stream takes its
+        // session lease, so an image on any page could lock the consumer out.
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = SqliteStore::open(leani_store_sqlite::StoreConfig::new(
+            directory.path().join("node.sqlite"),
+        ))
+        .await
+        .expect("store");
+        let counter = leani_testkit::BlockLocalCounter::default().with_split_delivery();
+        let lifecycle =
+            acknowledged_delivery(counter.descriptor().lifecycle.clone(), "destination");
+        let processor = Arc::new(counter.with_lifecycle(lifecycle));
+        store
+            .register_processor(processor.descriptor())
+            .await
+            .expect("register processor");
+        store
+            .create_consumer_in_stream(
+                processor.descriptor(),
+                &default_delivery_stream_id(processor.descriptor()),
+                "destination",
+                ConsumerRole::Required,
+                ConsumerStartPosition::EarliestRetained,
+                Duration::from_secs(30),
+            )
+            .await
+            .expect("consumer");
+        let configured: Arc<dyn Processor> = processor;
+        let app = router_with_processors(store, vec![configured], Vec::new(), ApiConfig::default())
+            .expect("router");
+        let path = "/v1/processors/synthetic-counter/streams/live/consumers/destination/stream";
+        // The image's response stays open, as a real image load would.
+        let image = app
+            .clone()
+            .oneshot(with_headers(&Method::GET, path, &CROSS_SITE_IMAGE))
+            .await
+            .expect("image response");
+        assert_eq!(image.status(), StatusCode::FORBIDDEN);
+        let consumer = app
+            .oneshot(Request::get(path).body(Body::empty()).expect("request"))
+            .await
+            .expect("consumer response");
+        assert_eq!(consumer.status(), StatusCode::OK);
+        drop(image);
+    }
+
+    /// Headers a browser sends for a navigation of a hidden frame to another
+    /// site's URL.
+    const CROSS_SITE_FRAME: [(&str, &str); 3] = [
+        ("sec-fetch-site", "cross-site"),
+        ("sec-fetch-mode", "navigate"),
+        ("sec-fetch-dest", "iframe"),
+    ];
+
+    #[tokio::test]
+    async fn cross_site_navigations_cannot_open_a_consumer_stream() {
+        // Task 13 review: a hidden frame or a redirect of another site's page
+        // navigates without an `Origin`, so it passed the subresource check
+        // and took a consumer's session lease.
+        let (router, _directory) = blobs_router(ApiConfig::default()).await;
+        let top_level: [(&str, &str); 4] = [
+            ("sec-fetch-site", "cross-site"),
+            ("sec-fetch-mode", "navigate"),
+            ("sec-fetch-dest", "document"),
+            ("sec-fetch-user", "?1"),
+        ];
+        let same_site: [(&str, &str); 3] = [
+            ("sec-fetch-site", "same-site"),
+            ("sec-fetch-mode", "navigate"),
+            ("sec-fetch-dest", "document"),
+        ];
+        let streams = [
+            "/v1/processors/blobs-money/streams/live/consumers/destination/stream",
+            "/v1/backfill-subscriptions/repair-1/consumers/destination/stream",
+        ];
+        for path in streams {
+            for headers in [&CROSS_SITE_FRAME[..], &top_level[..], &same_site[..]] {
+                for method in [Method::GET, Method::HEAD] {
+                    let (status, body) = send(&router, with_headers(&method, path, headers)).await;
+                    assert_eq!(status, StatusCode::FORBIDDEN, "{method} {path} {headers:?}");
+                    if method == Method::GET {
+                        assert_eq!(body["error"]["code"], "cross_site_request", "{path}");
+                    }
+                }
+            }
+            // The SDK and curl, a typed address, the node's own pages, and a
+            // CORS request from an allowed origin still reach the route.
+            let allowed: [&[(&str, &str)]; 4] = [
+                &[],
+                &[("sec-fetch-site", "none"), ("sec-fetch-mode", "navigate")],
+                &[
+                    ("sec-fetch-site", "same-origin"),
+                    ("sec-fetch-mode", "cors"),
+                ],
+                &[
+                    ("origin", "http://localhost:5173"),
+                    ("sec-fetch-site", "same-site"),
+                    ("sec-fetch-mode", "cors"),
+                ],
+            ];
+            for headers in allowed {
+                let (status, body) = send(&router, with_headers(&Method::GET, path, headers)).await;
+                assert_ne!(status, StatusCode::FORBIDDEN, "{path} {headers:?}: {body}");
+            }
+        }
+        // Other routes still let navigations through.
+        let (status, _) = send(
+            &router,
+            with_headers(&Method::GET, "/v1/status", &CROSS_SITE_FRAME),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        // End to end: the frame does not take the lease, the consumer does.
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = SqliteStore::open(leani_store_sqlite::StoreConfig::new(
+            directory.path().join("node.sqlite"),
+        ))
+        .await
+        .expect("store");
+        let counter = leani_testkit::BlockLocalCounter::default();
+        let lifecycle =
+            acknowledged_delivery(counter.descriptor().lifecycle.clone(), "destination");
+        let processor = Arc::new(counter.with_lifecycle(lifecycle));
+        store
+            .register_processor(processor.descriptor())
+            .await
+            .expect("register processor");
+        store
+            .create_consumer_in_stream(
+                processor.descriptor(),
+                &default_delivery_stream_id(processor.descriptor()),
+                "destination",
+                ConsumerRole::Required,
+                ConsumerStartPosition::EarliestRetained,
+                Duration::from_secs(30),
+            )
+            .await
+            .expect("consumer");
+        let configured: Arc<dyn Processor> = processor;
+        let app = router_with_processors(store, vec![configured], Vec::new(), ApiConfig::default())
+            .expect("router");
+        let path = "/v1/processors/synthetic-counter/streams/live/consumers/destination/stream";
+        let frame = app
+            .clone()
+            .oneshot(with_headers(&Method::GET, path, &CROSS_SITE_FRAME))
+            .await
+            .expect("frame response");
+        assert_eq!(frame.status(), StatusCode::FORBIDDEN);
+        let consumer = app
+            .oneshot(get_request(path))
+            .await
+            .expect("consumer response");
+        assert_eq!(consumer.status(), StatusCode::OK);
+        drop(frame);
+    }
+
+    #[tokio::test]
+    async fn configured_origins_match_without_a_trailing_slash() {
+        let (router, _directory) = blobs_router(ApiConfig {
+            allowed_origins: BTreeSet::from(["HTTPS://App.Example/".to_owned()]),
+            ..ApiConfig::default()
+        })
+        .await;
+        let request = Request::get("/v1/status")
+            .header(header::ORIGIN, "https://app.example")
+            .body(Body::empty())
+            .expect("request");
+        assert_eq!(send(&router, request).await.0, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn readiness_is_component_specific_and_metrics_are_exposed() {
         let directory = tempfile::tempdir().expect("tempdir");
         let store = SqliteStore::open(leani_store_sqlite::StoreConfig::new(
@@ -9958,7 +13345,12 @@ mod tests {
         ))
         .await
         .expect("store");
-        let processor = Arc::new(BlobsProcessor::default());
+        let blobs = BlobsProcessor::default();
+        let lifecycle =
+            acknowledged_delivery(blobs.descriptor().lifecycle.clone(), "metrics-required");
+        let instance = blobs.descriptor().instance.clone();
+        let publication = blobs.descriptor().publication;
+        let processor = Arc::new(blobs.with_contract(instance, publication, lifecycle));
         store
             .create_consumer(
                 processor.descriptor(),
@@ -9990,6 +13382,14 @@ mod tests {
         assert!(!readiness.finality_ready());
         readiness.set_live_ready(true);
         readiness.set_finality_ready(true);
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_secs();
+        readiness.set_finality_anchor(now - 3_600, now + 3 * 86_400);
+        readiness
+            .finality_anchor_write_failures()
+            .fetch_add(2, Ordering::Relaxed);
         assert!(readiness.is_ready());
         assert!(readiness.live_ready());
         assert!(readiness.finality_ready());
@@ -10024,11 +13424,72 @@ mod tests {
         assert!(body.contains("leani_live_ready 1"));
         assert!(body.contains("leani_finality_required 1"));
         assert!(body.contains("leani_finality_ready 1"));
+        let gauge = |name: &str| {
+            body.lines()
+                .find_map(|line| line.strip_prefix(&format!("{name} ")))
+                .and_then(|value| value.parse::<i64>().ok())
+                .unwrap_or_else(|| panic!("{name} missing from metrics"))
+        };
+        assert!((3_600..3_700).contains(&gauge("leani_finality_anchor_age_seconds")));
+        assert!(
+            (3 * 86_400 - 100..=3 * 86_400)
+                .contains(&gauge("leani_finality_anchor_expiry_seconds"))
+        );
+        assert_eq!(gauge("leani_finality_anchor_write_failures_total"), 2);
         assert!(body.contains("leani_processor_delivery_live_bytes"));
         assert!(body.contains("leani_processor_delivery_pruned_through_sequence"));
         assert!(body.contains("leani_processor_required_ack_watermark"));
         assert!(body.contains("leani_consumer_acknowledged_sequence"));
         assert!(body.contains("leani_consumer_lease_active"));
+        assert!(body.contains("leani_store_deferred_changes 0"));
+        assert!(body.contains("leani_store_deferred_change_bytes 0"));
+    }
+
+    #[tokio::test]
+    async fn health_probes_skip_store_scans_and_metrics_reuse_cached_counts() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = SqliteStore::open(leani_store_sqlite::StoreConfig::new(
+            directory.path().join("node.sqlite"),
+        ))
+        .await
+        .expect("store");
+        let processor = Arc::new(BlobsProcessor::default());
+        store
+            .register_processor(processor.descriptor())
+            .await
+            .expect("register");
+        let router = router(store.clone(), processor, ApiConfig::default()).expect("router");
+        let get = |path: &'static str| {
+            let router = router.clone();
+            async move {
+                router
+                    .oneshot(Request::get(path).body(Body::empty()).expect("request"))
+                    .await
+                    .expect("response")
+                    .status()
+            }
+        };
+
+        let before = store.statistics_scans();
+        assert_eq!(get("/health/live").await, StatusCode::OK);
+        assert_eq!(get("/health/ready").await, StatusCode::OK);
+        assert_eq!(get("/v1/status").await, StatusCode::OK);
+        assert_eq!(
+            store.statistics_scans(),
+            before,
+            "health and status probes scanned store tables"
+        );
+
+        assert_eq!(get("/metrics").await, StatusCode::OK);
+        let scanned = store.statistics_scans();
+        assert!(scanned > before);
+        assert_eq!(get("/metrics").await, StatusCode::OK);
+        assert_eq!(get("/v1/network/status").await, StatusCode::OK);
+        assert_eq!(
+            store.statistics_scans(),
+            scanned,
+            "metrics and network status rescanned within the cache TTL"
+        );
     }
 
     #[tokio::test]
@@ -10696,6 +14157,7 @@ mod tests {
         .expect("store");
         let processor = Arc::new(BlockLocalCounter::default());
         let mut parent = BlockHash::ZERO;
+        let mut hashes = Vec::new();
         for number in 0..=4 {
             let mut frame = fixture_frame(number, parent);
             frame.finality = Finality::Included;
@@ -10719,9 +14181,10 @@ mod tests {
                 .await
                 .expect("apply");
             parent = frame.block.hash;
+            hashes.push(parent);
         }
         store
-            .mark_finalized(processor.descriptor(), BlockNumber(2))
+            .mark_finalized(processor.descriptor(), BlockNumber(2), hashes[2])
             .await
             .expect("mark finalized");
 

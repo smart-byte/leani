@@ -19,8 +19,8 @@ Every record carries one of three statuses:
 
 | Status | Meaning |
 |---|---|
-| `preview` | A peer supplied the block; its connection to the chain is still being checked. Only the embedded CLI prints this during startup. |
-| `included` | The block is on the currently followed chain. A reorg can still remove it. |
+| `preview` | A peer supplied the block; nothing verified connects it to the chain yet. Only the embedded CLI prints this during startup. |
+| `included` | The block's ancestry is verified to an execution header the Ethereum sync committee attested. A reorg can still remove it. |
 | `finalized` | Ethereum consensus has finalized the block. |
 
 `finalized` reflects the node's configured finality source. Embedded and
@@ -28,6 +28,24 @@ native-P2P runs verify it locally through light-client proofs. Sources that
 serve finalized material under dataset trust (Xatu, EraE) carry the label
 under that source's trust model; subscribing to them does not turn the label
 into an independent proof.
+
+Post-merge execution headers carry no seal, so any peer could serve a
+self-consistent block of its own after the chain tip. The live lane therefore
+includes a block only when its header chain leads to an attested head: an
+execution header that at least two thirds of the sync committee signed in a
+light-client optimistic update. The finality source verifies that update each
+slot, with the header's execution branch. A block above the newest attested
+head waits for the next one, one to two slots. Without verified finality there
+is no attested head, so live following requires a finality source.
+
+If verified finality ever names another block at a height than the chain the
+node followed, neither block is finalized. When the node's blocks there are
+unfinalized, for example because the lane stalled across a reorg, the network
+lanes restart: retained blocks that do not link to the new finalized anchor
+are undone as a reorg and never finalized, as a branch reorged away while the
+node was down is at startup. The lanes halt and report not ready instead when
+the contradicted block is itself finalized, or when restarting twice did not
+resolve the contradiction.
 
 ```text
 requested       100 ─────────────────────────────── 140
@@ -71,7 +89,10 @@ With `publish = "finalized_only"` the change stream carries only finalized
 processor state and journaled for undo, but their changes stay in the store
 until verified finality promotes them. Their bytes count against the delivery
 budget from the moment they are applied, so a slow consumer pauses the
-processor exactly as it would with included publication. A reorg of an
+processor exactly as it would with included publication. For a processor with
+the default canonical delivery ordering, a block that is already finalized
+when it is applied, for example after gap recovery, first publishes the older
+blocks still waiting, so the stream stays in block order. A reorg of an
 unpublished block emits nothing downstream.
 
 Use processor status for exact intervals and `/v1/network/status` for the

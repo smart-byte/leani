@@ -128,6 +128,7 @@ pub struct AcquisitionBudgetShape {
     pub max_buffered_frames: usize,
     pub max_in_flight_requests: usize,
     pub temporary_disk_bytes: u64,
+    pub max_resident_bytes: u64,
 }
 
 impl From<SourceBudget> for AcquisitionBudgetShape {
@@ -139,6 +140,7 @@ impl From<SourceBudget> for AcquisitionBudgetShape {
             max_buffered_frames: budget.max_buffered_frames,
             max_in_flight_requests: budget.max_in_flight_requests,
             temporary_disk_bytes: budget.temporary_disk_bytes,
+            max_resident_bytes: budget.max_resident_bytes,
         }
     }
 }
@@ -785,6 +787,7 @@ impl HistoricalMaterialCoordinator {
                     subscriber_id,
                     cancellation: cancellation.clone(),
                     terminal: false,
+                    reading: false,
                 });
                 starts.push((acquisition, chunk.clone()));
             }
@@ -820,6 +823,7 @@ impl HistoricalMaterialCoordinator {
                         subscriber_id,
                         cancellation: cancellation.clone(),
                         terminal: false,
+                        reading: false,
                     });
                     if end == u64::MAX {
                         break;
@@ -861,6 +865,7 @@ impl HistoricalMaterialCoordinator {
                     subscriber_id,
                     cancellation: cancellation.clone(),
                     terminal: false,
+                    reading: false,
                 });
                 starts.push((acquisition, physical_chunk));
                 if end == u64::MAX {
@@ -870,27 +875,20 @@ impl HistoricalMaterialCoordinator {
             }
         }
         for (acquisition, physical_chunk) in starts {
-            let producer = acquisition.clone();
-            let source = source.clone();
-            let startup_gate = startup_gate.clone();
             // Reserve immediately when capacity is available. Deferring every
             // acquisition to independently race on the semaphore lets a later
             // chunk fill its bounded queue while the next in-order chunk is
             // still waiting for a permit, which can deadlock the reorder
             // window. Open order is the runtime's consumption order.
             let active_permit = self.inner.active_chunks.clone().try_acquire_owned().ok();
-            tokio::spawn(async move {
-                tokio::task::yield_now().await;
-                if let Some(startup_gate) = startup_gate {
-                    tokio::select! {
-                        () = startup_gate.wait() => {}
-                        () = producer.cancellation.cancelled() => return,
-                    }
-                }
-                producer
-                    .produce(source, physical_chunk, budget, active_permit)
-                    .await;
-            });
+            spawn_producer(
+                acquisition,
+                source.clone(),
+                physical_chunk,
+                budget,
+                active_permit,
+                startup_gate.clone(),
+            );
         }
         let streams = subscriptions
             .into_iter()
@@ -949,23 +947,21 @@ impl HistoricalMaterialCoordinator {
                 .fetch_add(1, Ordering::Relaxed);
             acquisition
         };
-        let producer = acquisition.clone();
         let active_permit = self.inner.active_chunks.clone().try_acquire_owned().ok();
-        tokio::spawn(async move {
-            tokio::task::yield_now().await;
-            if let Some(startup_gate) = startup_gate {
-                tokio::select! {
-                    () = startup_gate.wait() => {}
-                    () = producer.cancellation.cancelled() => return,
-                }
-            }
-            producer.produce(source, chunk, budget, active_permit).await;
-        });
+        spawn_producer(
+            acquisition.clone(),
+            source,
+            chunk,
+            budget,
+            active_permit,
+            startup_gate,
+        );
         material_subscription_stream(MaterialSubscription {
             acquisition,
             subscriber_id,
             cancellation,
             terminal: false,
+            reading: false,
         })
     }
 
@@ -1028,6 +1024,72 @@ struct CoordinatorInner {
     active_acquisitions: AtomicU64,
 }
 
+/// Run one acquisition's producer on its own task.
+///
+/// The first read starts after one scheduler yield, and after the startup
+/// gate when there is one.
+fn spawn_producer(
+    acquisition: Arc<Acquisition>,
+    source: Arc<dyn HistorySource>,
+    chunk: SourceChunk,
+    budget: SourceBudget,
+    active_permit: Option<OwnedSemaphorePermit>,
+    startup_gate: Option<HistoricalMaterialStartupGate>,
+) {
+    tokio::spawn(async move {
+        let _exit = ProducerExit {
+            acquisition: acquisition.clone(),
+        };
+        tokio::task::yield_now().await;
+        if let Some(startup_gate) = startup_gate {
+            tokio::select! {
+                () = startup_gate.wait() => {}
+                () = acquisition.cancellation.cancelled() => return,
+            }
+        }
+        acquisition
+            .produce(source, chunk, budget, active_permit)
+            .await;
+    });
+}
+
+/// Ends an acquisition whose producer task stopped without recording an
+/// outcome, because its source panicked or the task was dropped, so its
+/// subscribers fail instead of waiting forever.
+struct ProducerExit {
+    acquisition: Arc<Acquisition>,
+}
+
+impl Drop for ProducerExit {
+    fn drop(&mut self) {
+        let mut state = self
+            .acquisition
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.terminal.is_some() {
+            return;
+        }
+        state.terminal = Some(Err(if self.acquisition.cancellation.is_cancelled() {
+            SourceError::Cancelled
+        } else {
+            SourceError::Unavailable(format!(
+                "historical material acquisition {} for blocks {}..={} stopped without an outcome: its producer {}",
+                self.acquisition.id,
+                self.acquisition.range.start().0,
+                self.acquisition.range.end().0,
+                if std::thread::panicking() {
+                    "panicked"
+                } else {
+                    "was dropped"
+                },
+            ))
+        }));
+        drop(state);
+        self.acquisition.changed.notify_waiters();
+    }
+}
+
 struct ActiveAcquisitionGuard {
     coordinator: Arc<CoordinatorInner>,
     _permit: OwnedSemaphorePermit,
@@ -1054,9 +1116,17 @@ impl Drop for ActiveAcquisitionGuard {
 }
 
 impl CoordinatorInner {
+    /// Reserve retained bytes for one frame of `acquisition`.
+    ///
+    /// A read-ahead acquisition, which some subscriber has not started
+    /// reading yet, may only fill half of `memory_bytes`. Its frames stay
+    /// buffered until the job reaches it, so the other half is kept for
+    /// acquisitions that are being read: the frame a job waits for next
+    /// always finds room once those drain, up to half the budget in size.
     async fn reserve(
         self: &Arc<Self>,
         bytes: u64,
+        acquisition: &Acquisition,
         cancellation: &CancellationToken,
     ) -> Result<Arc<MemoryReservation>, SourceError> {
         if bytes > self.config.memory_bytes {
@@ -1066,24 +1136,49 @@ impl CoordinatorInner {
                 observed: bytes,
             });
         }
-        loop {
-            {
-                let mut retained = self
-                    .memory
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                if retained.saturating_add(bytes) <= self.config.memory_bytes {
-                    *retained = retained.saturating_add(bytes);
-                    return Ok(Arc::new(MemoryReservation {
-                        coordinator: Arc::downgrade(self),
-                        bytes,
-                    }));
-                }
+        wait_until(&self.memory_changed, cancellation, || {
+            let limit = if acquisition.is_read_ahead() {
+                self.config.memory_bytes / 2
+            } else {
+                self.config.memory_bytes
+            };
+            let mut retained = self
+                .memory
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if retained.saturating_add(bytes) > limit {
+                return Ok(None);
             }
-            tokio::select! {
-                () = cancellation.cancelled() => return Err(SourceError::Cancelled),
-                () = self.memory_changed.notified() => {}
-            }
+            *retained = retained.saturating_add(bytes);
+            Ok(Some(Arc::new(MemoryReservation {
+                coordinator: Arc::downgrade(self),
+                bytes,
+            })))
+        })
+        .await
+    }
+}
+
+/// Wait until `ready` yields a value, checking again after each notification.
+///
+/// The notification is registered before every check, so a `notify_waiters`
+/// that races the check wakes this waiter instead of leaving it asleep while
+/// capacity is free.
+async fn wait_until<T>(
+    changed: &Notify,
+    cancellation: &CancellationToken,
+    mut ready: impl FnMut() -> Result<Option<T>, SourceError>,
+) -> Result<T, SourceError> {
+    loop {
+        let notified = changed.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if let Some(value) = ready()? {
+            return Ok(value);
+        }
+        tokio::select! {
+            () = cancellation.cancelled() => return Err(SourceError::Cancelled),
+            () = notified => {}
         }
     }
 }
@@ -1362,7 +1457,7 @@ impl Acquisition {
                                 continue;
                             }
                             let retention = match coordinator
-                                .reserve(estimated_bytes.max(1), &self.cancellation)
+                                .reserve(estimated_bytes.max(1), &self, &self.cancellation)
                                 .await
                             {
                                 Ok(retention) => retention,
@@ -1421,34 +1516,34 @@ impl Acquisition {
         retention: Arc<MemoryReservation>,
         cancellation: &CancellationToken,
     ) -> Result<(), SourceError> {
-        loop {
-            {
-                let mut state = self
-                    .state
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                if state.subscribers.is_empty() {
-                    return Err(SourceError::Cancelled);
-                }
-                if state.frames.len() < self.maximum_buffered_frames {
-                    let sequence = state.produced;
-                    state.produced = state.produced.saturating_add(1);
-                    state.frames.push_back(BufferedFrame {
-                        sequence,
-                        frame,
-                        physical_attributed: false,
-                        retention,
-                    });
-                    drop(state);
-                    self.changed.notify_waiters();
-                    return Ok(());
-                }
+        let mut pending = Some((frame, retention));
+        wait_until(&self.changed, cancellation, || {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if state.subscribers.is_empty() {
+                return Err(SourceError::Cancelled);
             }
-            tokio::select! {
-                () = cancellation.cancelled() => return Err(SourceError::Cancelled),
-                () = self.changed.notified() => {}
+            if state.frames.len() >= self.maximum_buffered_frames {
+                return Ok(None);
             }
-        }
+            let Some((frame, retention)) = pending.take() else {
+                return Ok(Some(()));
+            };
+            let sequence = state.produced;
+            state.produced = state.produced.saturating_add(1);
+            state.frames.push_back(BufferedFrame {
+                sequence,
+                frame,
+                physical_attributed: false,
+                retention,
+            });
+            drop(state);
+            self.changed.notify_waiters();
+            Ok(Some(()))
+        })
+        .await
     }
 
     fn acknowledge(&self, subscriber_id: u64, sequence: u64) {
@@ -1482,6 +1577,40 @@ impl Acquisition {
         }
         drop(state);
         self.changed.notify_waiters();
+        // A subscriber that had not started reading may have been the one
+        // keeping this acquisition in the read-ahead share of memory.
+        self.notify_memory_waiters();
+    }
+
+    /// Record that `subscriber_id` started reading this acquisition.
+    fn start_reading(&self, subscriber_id: u64) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(progress) = state.subscribers.get_mut(&subscriber_id) {
+            progress.reading = true;
+        }
+        drop(state);
+        self.notify_memory_waiters();
+    }
+
+    /// Whether a subscriber has not started reading this acquisition yet, so
+    /// its frames are held ahead of that subscriber's current position.
+    fn is_read_ahead(&self) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .subscribers
+            .values()
+            .any(|progress| !progress.reading)
+    }
+
+    /// Wake producers waiting for material memory, whose share may change.
+    fn notify_memory_waiters(&self) {
+        if let Some(coordinator) = self.coordinator.upgrade() {
+            coordinator.memory_changed.notify_waiters();
+        }
     }
 }
 
@@ -1500,6 +1629,9 @@ struct SubscriberProgress {
     delivered: u64,
     acknowledged: u64,
     end_exclusive: u64,
+    /// Whether the subscriber has started reading; until then the
+    /// acquisition is read ahead of it.
+    reading: bool,
 }
 
 impl SubscriberProgress {
@@ -1508,6 +1640,7 @@ impl SubscriberProgress {
             delivered: start,
             acknowledged: start,
             end_exclusive,
+            reading: false,
         }
     }
 }
@@ -1586,6 +1719,7 @@ struct MaterialSubscription {
     subscriber_id: u64,
     cancellation: CancellationToken,
     terminal: bool,
+    reading: bool,
 }
 
 fn material_subscription_stream(subscription: MaterialSubscription) -> HistoricalMaterialStream {
@@ -1599,6 +1733,10 @@ impl MaterialSubscription {
     async fn next(&mut self) -> Option<Result<HistoricalMaterialFrame, SourceError>> {
         if self.terminal {
             return None;
+        }
+        if !self.reading {
+            self.reading = true;
+            self.acquisition.start_reading(self.subscriber_id);
         }
         loop {
             let notified = self.acquisition.changed.notified();
@@ -1663,5 +1801,35 @@ impl MaterialSubscription {
 impl Drop for MaterialSubscription {
     fn drop(&mut self) {
         self.acquisition.unregister(self.subscriber_id);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn a_release_that_races_the_capacity_check_still_wakes_the_waiter() {
+        let changed = Notify::new();
+        let cancellation = CancellationToken::new();
+        let mut checks = 0_u32;
+        let woke = tokio::time::timeout(
+            Duration::from_secs(1),
+            wait_until(&changed, &cancellation, || {
+                checks += 1;
+                if checks == 1 {
+                    // Capacity is released, and its waiters notified, just
+                    // after this check found none.
+                    changed.notify_waiters();
+                    return Ok(None);
+                }
+                Ok(Some(()))
+            }),
+        )
+        .await;
+        assert!(woke.is_ok(), "the release that raced the check was lost");
+        assert_eq!(checks, 2);
     }
 }

@@ -115,7 +115,7 @@ function schemaKind(root: JsonObject, schema: JsonObject): string {
 
 function schemaConstraints(schema: JsonObject): JsonObject {
   return Object.fromEntries(
-    ['default', 'minimum', 'maximum', 'minLength', 'maxLength', 'minItems', 'maxItems', 'pattern', 'format']
+    ['default', 'minimum', 'maximum', 'multipleOf', 'minLength', 'maxLength', 'minItems', 'maxItems', 'pattern', 'format']
       .filter((key) => key in schema)
       .map((key) => [key, schema[key]]),
   );
@@ -126,6 +126,9 @@ async function configReference(repositoryRoot: string): Promise<JsonObject> {
   const fields: JsonObject[] = [];
   const fieldIndexes = new Map<string, number>();
   const visit = (schema: JsonObject, path: string, required: boolean): void => {
+    // Deprecated fields stay in the schema so existing files validate, but
+    // the reference no longer offers them.
+    if (schema.deprecated === true) return;
     const resolved = resolveSchema(root, schema);
     const field = {
       path,
@@ -174,6 +177,7 @@ async function configReference(repositoryRoot: string): Promise<JsonObject> {
 
 async function sdkReference(repositoryRoot: string): Promise<JsonObject> {
   const ts = siteRequire(repositoryRoot)('typescript') as any;
+  const packageName = (await readJson(resolve(repositoryRoot, 'packages/sdk/package.json'))).name as string;
   const methods: JsonObject[] = [];
   const types: JsonObject[] = [];
   for (const module of ['index', 'backfill', 'errors']) {
@@ -200,10 +204,11 @@ async function sdkReference(repositoryRoot: string): Promise<JsonObject> {
       if (ts.isInterfaceDeclaration(statement) && ['LeaniClient', 'BackfillSubscriptionClient'].includes(name)) {
         visit(statement.members, module === 'backfill' ? 'backfill' : '');
       }
+      const entryPoint = module === 'backfill' ? `${packageName}/backfill` : packageName;
       if (ts.isInterfaceDeclaration(statement) || ts.isTypeAliasDeclaration(statement)) {
-        types.push({ name, module: module === 'backfill' ? '@smart-byte/leani-sdk/backfill' : '@smart-byte/leani-sdk', signature: statement.getText(file) });
+        types.push({ name, module: entryPoint, signature: statement.getText(file) });
       } else if (ts.isFunctionDeclaration(statement) && module !== 'errors') {
-        types.push({ name, module: module === 'backfill' ? '@smart-byte/leani-sdk/backfill' : '@smart-byte/leani-sdk',
+        types.push({ name, module: entryPoint,
           signature: source.slice(statement.getStart(file), statement.body?.pos ?? statement.end).trim() + ';' });
       }
     }

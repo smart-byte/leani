@@ -85,8 +85,8 @@ use crate::{
     processors::ProcessorRegistry,
 };
 
-const REPORT_VERSION: u32 = 19;
-const REPORT_SCHEMA: &str = "leani.benchmark.v19";
+const REPORT_VERSION: u32 = 20;
+const REPORT_SCHEMA: &str = "leani.benchmark.v20";
 const DELIVERY_READ_LIMIT: usize = 1_000;
 const GENERIC_EVENT_LOG_SCHEMA: &str = "leani.benchmark.generic-event-log.v1";
 const ONE_DOMAIN_EVENT_PER_ROW: &str = "one_domain_event_per_row";
@@ -153,8 +153,8 @@ pub(crate) struct RealSourceBenchmarkOptions {
     pub report: PathBuf,
 }
 
-const REAL_SOURCE_REPORT_VERSION: u32 = 7;
-const REAL_SOURCE_REPORT_SCHEMA: &str = "leani.real-source-benchmark.v7";
+const REAL_SOURCE_REPORT_VERSION: u32 = 8;
+const REAL_SOURCE_REPORT_SCHEMA: &str = "leani.real-source-benchmark.v8";
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -195,6 +195,8 @@ struct RealSourceBenchmarkReport {
     consumer_complete_milliseconds: Option<u64>,
     blocks_per_second_milli: Option<u64>,
     peak_rss_bytes: Option<u64>,
+    /// [`PEAK_RSS_VM_HWM`] or [`PEAK_RSS_SAMPLED`].
+    peak_rss_measurement: Option<&'static str>,
     peak_physical_store_bytes: Option<u64>,
     peak_delivery_retained_bytes: Option<u64>,
     peak_material_buffered_bytes: Option<u64>,
@@ -451,6 +453,8 @@ struct BenchmarkRunReport {
     expected_digest: String,
     correctness_passed: bool,
     peak_rss_bytes: Option<u64>,
+    /// [`PEAK_RSS_VM_HWM`] or [`PEAK_RSS_SAMPLED`].
+    peak_rss_measurement: Option<&'static str>,
     peak_physical_store_bytes: Option<u64>,
     peak_delivery_retained_bytes: Option<u64>,
     peak_history_delivery_retained_bytes: Option<u64>,
@@ -525,11 +529,14 @@ struct ArtifactSegmentCandidateMeasurement {
     correctness_passed: bool,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct BenchmarkSample {
     elapsed_milliseconds: u64,
     rss_bytes: Option<u64>,
+    /// Linux: the kernel's resident high-water mark since the run's sampling
+    /// began. `None` where it cannot be reset for each run.
+    peak_rss_bytes: Option<u64>,
     source_frames: u64,
     source_estimated_bytes: u64,
     committed_through: Option<u64>,
@@ -552,6 +559,7 @@ struct BenchmarkSample {
 #[derive(Clone, Copy, Debug, Default)]
 struct BenchmarkSamplePeaks {
     rss_bytes: Option<u64>,
+    rss_measurement: Option<&'static str>,
     physical_store_bytes: Option<u64>,
     delivery_retained_bytes: Option<u64>,
     history_delivery_retained_bytes: Option<u64>,
@@ -825,16 +833,34 @@ struct QueryMeasurement {
     digest: String,
 }
 
+/// Measured runs from which a summary estimates a p95 tail. Fewer runs
+/// support only their minimum, median, and maximum.
+const P95_MINIMUM_RUNS: usize = 10;
+
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct BenchmarkSummary {
     runs: usize,
+    /// `min_median_max` below [`P95_MINIMUM_RUNS`] runs, when the p95 fields
+    /// are null; `min_median_max_p95` otherwise.
+    statistics: &'static str,
+    minimum_elapsed_milliseconds: u64,
     median_elapsed_milliseconds: u64,
-    p95_elapsed_milliseconds: u64,
+    maximum_elapsed_milliseconds: u64,
+    /// The slow tail: the elapsed time 95% of runs stayed within,
+    /// interpolated between runs.
+    p95_elapsed_milliseconds: Option<u64>,
+    minimum_blocks_per_second_milli: u64,
     median_blocks_per_second_milli: u64,
-    p95_blocks_per_second_milli: u64,
+    maximum_blocks_per_second_milli: u64,
+    /// The slow tail too: the rate 95% of runs reached, which is the 5th
+    /// percentile of per-run rates, interpolated between runs.
+    p95_blocks_per_second_milli: Option<u64>,
     coefficient_of_variation: f64,
     peak_rss_bytes: Option<u64>,
+    /// How `peak_rss_bytes` was measured: see [`PEAK_RSS_VM_HWM`] and
+    /// [`PEAK_RSS_SAMPLED`]. With runs measured both ways, the latter.
+    peak_rss_measurement: Option<&'static str>,
     peak_physical_store_bytes: Option<u64>,
     peak_delivery_retained_bytes: Option<u64>,
     peak_history_delivery_retained_bytes: Option<u64>,
@@ -935,6 +961,9 @@ pub(crate) async fn run_real_source(
     registry: &ProcessorRegistry,
 ) -> Result<Exit> {
     validate_real_source_options(&options)?;
+    // Everything the run opens lives in its data directory, the execution P2P
+    // peer store and identity included: hold the directory, as a node does.
+    let _data_dir_lock = crate::local_state::lock_runtime_directory(&options.data_dir)?;
     let mut config = Config::load(config_path)
         .with_context(|| format!("load configuration {}", config_path.display()))?;
     config.data_dir.clone_from(&options.data_dir);
@@ -994,7 +1023,7 @@ pub(crate) async fn run_real_source(
                 );
             }
             let available = BlockRange::new(BlockNumber(available_start), anchor.block.number)?;
-            let persistent = execution_p2p_source(&config, p2p_network_telemetry.clone())?;
+            let persistent = execution_p2p_source(&config, p2p_network_telemetry.clone(), None)?;
             p2p_request_metrics_source = Some(persistent.clone());
             let source = leani_source_p2p::RethP2pHistorySource::from_persistent_source(
                 persistent.as_ref().clone(),
@@ -1267,6 +1296,7 @@ pub(crate) async fn run_real_source(
         blocks_per_second_milli: consumer_complete
             .map(|consumer_ms| throughput_per_second_milli(range.len(), consumer_ms)),
         peak_rss_bytes: peaks.rss_bytes,
+        peak_rss_measurement: peaks.rss_measurement,
         peak_physical_store_bytes: peaks.physical_store_bytes,
         peak_delivery_retained_bytes: peaks.delivery_retained_bytes,
         peak_material_buffered_bytes: peaks.material_buffered_bytes,
@@ -1405,17 +1435,7 @@ const fn build_profile() -> &'static str {
 }
 
 fn configured_real_source_budget(config: &Config, range: BlockRange) -> SourceBudget {
-    SourceBudget {
-        max_input_bytes: config.budgets.temporary_disk_bytes,
-        max_frame_bytes: config.budgets.memory_bytes.min(32 * 1_024 * 1_024),
-        max_frames: range.len(),
-        max_buffered_frames: config
-            .budgets
-            .mapper_concurrency
-            .max(config.budgets.source_concurrency),
-        max_in_flight_requests: config.budgets.source_concurrency,
-        temporary_disk_bytes: config.budgets.temporary_disk_bytes,
-    }
+    crate::process::historical_source_budget(config, range)
 }
 
 fn configured_real_runtime(config: &Config) -> HistoricalRuntimeConfig {
@@ -3934,6 +3954,7 @@ fn finalize_run(
         observed_digest,
         expected_digest,
         peak_rss_bytes: peaks.rss_bytes,
+        peak_rss_measurement: peaks.rss_measurement,
         peak_physical_store_bytes: peaks.physical_store_bytes,
         peak_delivery_retained_bytes: peaks.delivery_retained_bytes,
         peak_history_delivery_retained_bytes: peaks.history_delivery_retained_bytes,
@@ -3949,8 +3970,16 @@ fn finalize_run(
 fn benchmark_sample_peaks(samples: &[BenchmarkSample]) -> BenchmarkSamplePeaks {
     let maximum =
         |value: fn(&BenchmarkSample) -> Option<u64>| samples.iter().filter_map(value).max();
+    let (rss_bytes, rss_measurement) = maximum(|sample| sample.peak_rss_bytes).map_or_else(
+        || {
+            let largest = maximum(|sample| sample.rss_bytes);
+            (largest, largest.map(|_| PEAK_RSS_SAMPLED))
+        },
+        |peak| (Some(peak), Some(PEAK_RSS_VM_HWM)),
+    );
     BenchmarkSamplePeaks {
-        rss_bytes: maximum(|sample| sample.rss_bytes),
+        rss_bytes,
+        rss_measurement,
         physical_store_bytes: maximum(|sample| sample.physical_store_bytes),
         delivery_retained_bytes: maximum(|sample| sample.delivery_retained_bytes),
         history_delivery_retained_bytes: maximum(|sample| sample.history_delivery_retained_bytes),
@@ -4495,6 +4524,10 @@ async fn consume_subscription(
             .saturating_add(batch_sample.transmitted_bytes);
         measurement.batch_samples.push(batch_sample);
         if let Some(sequence) = boundary {
+            // This direct sink received the page it read, through `after`.
+            store
+                .record_consumer_delivery_in_stream(stream_id, consumer_id, None, after)
+                .await?;
             store
                 .acknowledge_consumer_in_stream(descriptor, stream_id, consumer_id, sequence)
                 .await?;
@@ -5607,11 +5640,13 @@ impl Sampler {
         let samples = Arc::new(Mutex::new(Vec::new()));
         let task_samples = samples.clone();
         let started = Instant::now();
+        let peak_rss_reset = reset_peak_rss();
         let task = tokio::spawn(async move {
             loop {
                 sample_once(
                     &task_samples,
                     started,
+                    peak_rss_reset,
                     &source,
                     SampleStores {
                         processor: store.as_ref(),
@@ -5627,6 +5662,7 @@ impl Sampler {
                         sample_once(
                             &task_samples,
                             started,
+                            peak_rss_reset,
                             &source,
                             SampleStores {
                                 processor: store.as_ref(),
@@ -5661,11 +5697,13 @@ impl Sampler {
         let samples = Arc::new(Mutex::new(Vec::new()));
         let task_samples = samples.clone();
         let started = Instant::now();
+        let peak_rss_reset = reset_peak_rss();
         let task = tokio::spawn(async move {
             loop {
                 sample_real_once(
                     &task_samples,
                     started,
+                    peak_rss_reset,
                     &sources,
                     &store,
                     &descriptor,
@@ -5677,6 +5715,7 @@ impl Sampler {
                         sample_real_once(
                             &task_samples,
                             started,
+                            peak_rss_reset,
                             &sources,
                             &store,
                             &descriptor,
@@ -5705,6 +5744,7 @@ impl Sampler {
 async fn sample_real_once(
     samples: &Mutex<Vec<BenchmarkSample>>,
     started: Instant,
+    peak_rss_reset: bool,
     sources: &[Arc<dyn HistorySource>],
     store: &SqliteStore,
     descriptor: &ProcessorDescriptor,
@@ -5729,6 +5769,7 @@ async fn sample_real_once(
     samples.lock().await.push(BenchmarkSample {
         elapsed_milliseconds: elapsed_milliseconds(started),
         rss_bytes: process_rss_bytes(),
+        peak_rss_bytes: peak_rss_reset.then(process_peak_rss_bytes).flatten(),
         source_frames,
         source_estimated_bytes: source_bytes,
         committed_through,
@@ -5757,9 +5798,11 @@ async fn sample_real_once(
     });
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn sample_once(
     samples: &Mutex<Vec<BenchmarkSample>>,
     started: Instant,
+    peak_rss_reset: bool,
     source: &GeneratedHistorySource,
     stores: SampleStores<'_>,
     descriptor: Option<&ProcessorDescriptor>,
@@ -5799,6 +5842,7 @@ async fn sample_once(
     samples.lock().await.push(BenchmarkSample {
         elapsed_milliseconds: elapsed_milliseconds(started),
         rss_bytes: process_rss_bytes(),
+        peak_rss_bytes: peak_rss_reset.then(process_peak_rss_bytes).flatten(),
         source_frames: source.frames,
         source_estimated_bytes: source.estimated_bytes,
         committed_through,
@@ -5866,18 +5910,37 @@ fn summarize(runs: &[BenchmarkRunReport]) -> BenchmarkSummary {
             .sum::<f64>()
             / elapsed.len() as f64
     };
+    let tail = runs.len() >= P95_MINIMUM_RUNS;
+    let measurements = runs
+        .iter()
+        .filter_map(|run| run.peak_rss_measurement)
+        .collect::<Vec<_>>();
     BenchmarkSummary {
         runs: runs.len(),
-        median_elapsed_milliseconds: percentile(&elapsed, 50),
-        p95_elapsed_milliseconds: percentile(&elapsed, 95),
-        median_blocks_per_second_milli: percentile(&throughput, 50),
-        p95_blocks_per_second_milli: percentile(&throughput, 95),
+        statistics: if tail {
+            "min_median_max_p95"
+        } else {
+            "min_median_max"
+        },
+        minimum_elapsed_milliseconds: elapsed.first().copied().unwrap_or_default(),
+        median_elapsed_milliseconds: interpolated_quantile(&elapsed, 0.5),
+        maximum_elapsed_milliseconds: elapsed.last().copied().unwrap_or_default(),
+        p95_elapsed_milliseconds: tail.then(|| interpolated_quantile(&elapsed, 0.95)),
+        minimum_blocks_per_second_milli: throughput.first().copied().unwrap_or_default(),
+        median_blocks_per_second_milli: interpolated_quantile(&throughput, 0.5),
+        maximum_blocks_per_second_milli: throughput.last().copied().unwrap_or_default(),
+        p95_blocks_per_second_milli: tail.then(|| interpolated_quantile(&throughput, 0.05)),
         coefficient_of_variation: if mean == 0.0 {
             0.0
         } else {
             variance.sqrt() / mean
         },
         peak_rss_bytes: runs.iter().filter_map(|run| run.peak_rss_bytes).max(),
+        peak_rss_measurement: measurements
+            .iter()
+            .copied()
+            .find(|measurement| *measurement == PEAK_RSS_SAMPLED)
+            .or_else(|| measurements.first().copied()),
         peak_physical_store_bytes: runs
             .iter()
             .filter_map(|run| run.peak_physical_store_bytes)
@@ -5921,6 +5984,24 @@ fn percentile(sorted: &[u64], percentile: usize) -> u64 {
     sorted[index.saturating_sub(1).min(sorted.len().saturating_sub(1))]
 }
 
+/// The `quantile` (0 to 1) of ascending `sorted` values, interpolated
+/// linearly between the two nearest ranks and rounded. Unlike a nearest
+/// rank, a p95 of ten or more runs is not simply the most extreme run.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss
+)]
+fn interpolated_quantile(sorted: &[u64], quantile: f64) -> u64 {
+    let Some(last) = sorted.len().checked_sub(1) else {
+        return 0;
+    };
+    let rank = quantile.clamp(0.0, 1.0) * last as f64;
+    let below = sorted[(rank.floor() as usize).min(last)] as f64;
+    let above = sorted[(rank.ceil() as usize).min(last)] as f64;
+    (below + (above - below) * rank.fract()).round() as u64
+}
+
 fn source_budget(blocks: u64) -> SourceBudget {
     SourceBudget {
         max_input_bytes: 64 * 1_024 * 1_024 * 1_024,
@@ -5929,6 +6010,7 @@ fn source_budget(blocks: u64) -> SourceBudget {
         max_buffered_frames: 64,
         max_in_flight_requests: 8,
         temporary_disk_bytes: 0,
+        max_resident_bytes: 64 * 1_024 * 1_024 * 1_024,
     }
 }
 
@@ -6621,14 +6703,7 @@ fn process_rss_bytes() -> Option<u64> {
     #[cfg(target_os = "linux")]
     {
         let status = std::fs::read_to_string("/proc/self/status").ok()?;
-        let kib = status
-            .lines()
-            .find_map(|line| line.strip_prefix("VmRSS:"))?
-            .split_whitespace()
-            .next()?
-            .parse::<u64>()
-            .ok()?;
-        return kib.checked_mul(1_024);
+        return proc_status_bytes(&status, "VmRSS:");
     }
     #[cfg(target_os = "macos")]
     {
@@ -6644,6 +6719,50 @@ fn process_rss_bytes() -> Option<u64> {
     }
     #[allow(unreachable_code)]
     None
+}
+
+/// A peak RSS read from Linux's `VmHWM`, the kernel's resident high-water
+/// mark, reset as each run's sampling starts: no spike escapes it.
+const PEAK_RSS_VM_HWM: &str = "linux_vm_hwm";
+/// A peak RSS that is the largest periodic sample of the resident set, on
+/// macOS or where Linux cannot reset `VmHWM`: spikes between samples escape
+/// it.
+const PEAK_RSS_SAMPLED: &str = "sampled_rss";
+
+/// Reset the kernel's resident high-water mark to the current resident set,
+/// so that `VmHWM` covers only what follows. Linux 4.0 and later; false
+/// elsewhere, or when `/proc` refuses the reset.
+fn reset_peak_rss() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        return std::fs::write("/proc/self/clear_refs", "5").is_ok();
+    }
+    #[allow(unreachable_code)]
+    false
+}
+
+/// Linux's `VmHWM`: the most resident memory since the last reset.
+fn process_peak_rss_bytes() -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        let status = std::fs::read_to_string("/proc/self/status").ok()?;
+        return proc_status_bytes(&status, "VmHWM:");
+    }
+    #[allow(unreachable_code)]
+    None
+}
+
+/// A `/proc/<pid>/status` memory figure, such as `VmRSS:`, in bytes.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn proc_status_bytes(status: &str, key: &str) -> Option<u64> {
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix(key))?
+        .split_whitespace()
+        .next()?
+        .parse::<u64>()
+        .ok()?
+        .checked_mul(1_024)
 }
 
 fn write_immutable(path: &Path, encoded: &[u8]) -> Result<()> {
@@ -6705,6 +6824,146 @@ fn write_sample_report(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn measured_run(
+        elapsed_milliseconds: u64,
+        samples: Vec<BenchmarkSample>,
+    ) -> BenchmarkRunReport {
+        finalize_run(
+            1,
+            BenchmarkMode::Acquire,
+            BenchmarkProductProfile::AcquireDiscard,
+            1_000,
+            0,
+            0,
+            0,
+            elapsed_milliseconds,
+            GeneratedSourceStats::default(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            String::new(),
+            String::new(),
+            samples,
+        )
+    }
+
+    #[test]
+    fn fewer_than_ten_runs_report_min_median_and_max_but_no_p95() {
+        // Audit Bench-1: the nearest-rank "p95" of three runs was the slowest
+        // run's time and the fastest run's throughput.
+        let runs = [300, 100, 200].map(|elapsed| measured_run(elapsed, Vec::new()));
+        let summary = serde_json::to_value(summarize(&runs)).expect("summary JSON");
+        assert_eq!(summary["runs"], 3);
+        assert_eq!(summary["statistics"], "min_median_max", "{summary}");
+        assert_eq!(summary["minimumElapsedMilliseconds"], 100);
+        assert_eq!(summary["medianElapsedMilliseconds"], 200);
+        assert_eq!(summary["maximumElapsedMilliseconds"], 300);
+        assert!(summary["p95ElapsedMilliseconds"].is_null(), "{summary}");
+        assert_eq!(summary["minimumBlocksPerSecondMilli"], 3_333_333);
+        assert_eq!(summary["medianBlocksPerSecondMilli"], 5_000_000);
+        assert_eq!(summary["maximumBlocksPerSecondMilli"], 10_000_000);
+        assert!(summary["p95BlocksPerSecondMilli"].is_null(), "{summary}");
+    }
+
+    #[test]
+    fn ten_or_more_runs_interpolate_a_p95_on_the_slow_side() {
+        let runs = (1..=10)
+            .map(|run| measured_run(run * 100, Vec::new()))
+            .collect::<Vec<_>>();
+        let summary = serde_json::to_value(summarize(&runs)).expect("summary JSON");
+        assert_eq!(summary["statistics"], "min_median_max_p95", "{summary}");
+        // Rank 0.95 × 9 = 8.55 lies between the ninth and the slowest run...
+        assert_eq!(summary["p95ElapsedMilliseconds"], 955);
+        assert_eq!(summary["maximumElapsedMilliseconds"], 1_000);
+        assert_eq!(summary["medianElapsedMilliseconds"], 550);
+        // ...and the throughput 95% of runs reach lies above the slowest.
+        assert_eq!(summary["p95BlocksPerSecondMilli"], 1_050_000);
+        assert_eq!(summary["minimumBlocksPerSecondMilli"], 1_000_000);
+    }
+
+    #[test]
+    fn peak_rss_is_the_kernel_high_water_mark_where_one_is_reported() {
+        // Audit Bench-2: the peak was the largest VmRSS sample, which misses
+        // any spike between samples.
+        let status =
+            "Name:\tleani\nVmPeak:\t  900000 kB\nVmHWM:\t     500 kB\nVmRSS:\t     100 kB\n";
+        assert_eq!(proc_status_bytes(status, "VmHWM:"), Some(500 * 1_024));
+        assert_eq!(proc_status_bytes(status, "VmRSS:"), Some(100 * 1_024));
+        let sample = |rss_bytes, peak_rss_bytes| BenchmarkSample {
+            rss_bytes,
+            peak_rss_bytes,
+            ..BenchmarkSample::default()
+        };
+        let peaks =
+            benchmark_sample_peaks(&[sample(Some(100), Some(300)), sample(Some(200), Some(500))]);
+        assert_eq!(
+            (peaks.rss_bytes, peaks.rss_measurement),
+            (Some(500), Some("linux_vm_hwm"))
+        );
+        let sampled = benchmark_sample_peaks(&[sample(Some(100), None), sample(Some(200), None)]);
+        assert_eq!(
+            (sampled.rss_bytes, sampled.rss_measurement),
+            (Some(200), Some("sampled_rss"))
+        );
+        let unknown = benchmark_sample_peaks(&[sample(None, None)]);
+        assert_eq!((unknown.rss_bytes, unknown.rss_measurement), (None, None));
+
+        // Reports say how their peak was measured, and a summary over runs
+        // measured both ways says the weaker.
+        let exact = measured_run(100, vec![sample(Some(100), Some(500))]);
+        let run = serde_json::to_value(&exact).expect("run JSON");
+        assert_eq!(run["peakRssMeasurement"], "linux_vm_hwm", "{run}");
+        let summary = serde_json::to_value(summarize(&[
+            exact,
+            measured_run(100, vec![sample(Some(600), None)]),
+        ]))
+        .expect("summary JSON");
+        assert_eq!(summary["peakRssBytes"], 600);
+        assert_eq!(summary["peakRssMeasurement"], "sampled_rss", "{summary}");
+    }
+
+    #[tokio::test]
+    async fn the_benchmark_refuses_a_held_data_directory_before_opening_anything() {
+        // Carried from audit CLI-8: the benchmark opened the execution P2P
+        // peer store and identity in its data directory without holding the
+        // directory, so it could share them with a running node. It now
+        // refuses before it reads even its configuration, which is absent.
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let _node = crate::local_state::lock_runtime_directory(directory.path())
+            .expect("a node holds the data directory");
+        let error = run_real_source(
+            &directory.path().join("leani.toml"),
+            RealSourceBenchmarkOptions {
+                processor: "blobs-money".to_owned(),
+                source_policy: BenchmarkRealSourcePolicy::P2pOnly,
+                from_block: 19_426_589,
+                to_block: 19_426_590,
+                data_dir: directory.path().to_path_buf(),
+                consumer_delay_ms: 0,
+                timeout_seconds: 1,
+                sample_interval_ms: 250,
+                source_concurrency: None,
+                mapper_concurrency: None,
+                maximum_active_chunks: None,
+                expected_output_digest: None,
+                delivery_compression: BenchmarkCompression::Gzip,
+                report: directory.path().join("report.json"),
+            },
+            &ProcessorRegistry::standard(),
+        )
+        .await
+        .expect_err("the node holds the data directory");
+        assert!(
+            format!("{error:#}").contains("already in use by another Leani process"),
+            "{error:#}"
+        );
+    }
 
     #[test]
     fn real_source_metrics_are_reported_as_per_run_deltas() {

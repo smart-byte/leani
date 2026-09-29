@@ -37,3 +37,4 @@ Accepted records:
 - [0015 — Single-owner execution Discv4 discovery](0015-single-owner-execution-discv4.md)
 - [0016 — Requested coverage in output snapshots](0016-query-snapshot-requested-coverage.md)
 - [0017 — MIT license](0017-mit-license.md)
+- [0018 — Forward-only store migrations to schema 23](0018-forward-only-store-migrations.md)

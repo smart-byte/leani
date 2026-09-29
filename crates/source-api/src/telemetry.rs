@@ -309,10 +309,7 @@ impl NetworkTelemetry {
 
     /// Record a fail-closed network-lane exit and its bounded retry delay.
     pub fn supervisor_backoff(&self, error: impl fmt::Display, retry: Duration) {
-        let mut error = error.to_string();
-        if error.len() > MAX_ERROR_LENGTH {
-            error.truncate(MAX_ERROR_LENGTH);
-        }
+        let error = bounded_error(error);
         let now = Instant::now();
         let mut supervisor = write_lock(&self.inner.supervisor);
         supervisor.state = NetworkSupervisorState::BackingOff;
@@ -326,6 +323,18 @@ impl NetworkTelemetry {
     pub fn supervisor_stopped(&self) {
         let mut supervisor = write_lock(&self.inner.supervisor);
         supervisor.state = NetworkSupervisorState::Stopped;
+        supervisor.retry_at = None;
+        supervisor.updated = Instant::now();
+    }
+
+    /// Record a network-lane failure that no retry resolves: the supervisor
+    /// stops with the error, and does not retry.
+    pub fn supervisor_halted(&self, error: impl fmt::Display) {
+        let error = bounded_error(error);
+        let mut supervisor = write_lock(&self.inner.supervisor);
+        supervisor.state = NetworkSupervisorState::Stopped;
+        supervisor.failures = supervisor.failures.saturating_add(1);
+        supervisor.last_error = Some(error);
         supervisor.retry_at = None;
         supervisor.updated = Instant::now();
     }
@@ -560,7 +569,12 @@ impl NetworkSessionTelemetry {
         self.update(|record| record.range = range);
     }
 
-    /// Advance the highest execution head observed from the connected peer set.
+    /// Advance the highest execution head this session has verified.
+    ///
+    /// Pass only the number of a header that passed validation. A peer's
+    /// claimed head, such as its handshake status, is not a verified head:
+    /// kept as a maximum, one inflated claim would overstate the head for the
+    /// session's lifetime.
     ///
     /// This is intentionally independent from [`Self::set_range`]: a request
     /// may probe the block after the observed head without making that future
@@ -580,10 +594,7 @@ impl NetworkSessionTelemetry {
     }
 
     pub fn record_error(&self, error: impl fmt::Display) {
-        let mut error = error.to_string();
-        if error.len() > MAX_ERROR_LENGTH {
-            error.truncate(MAX_ERROR_LENGTH);
-        }
+        let error = bounded_error(error);
         self.update(|record| record.last_error = Some(error));
     }
 
@@ -790,7 +801,8 @@ pub struct NetworkSessionSnapshot {
     pub connected_peers: usize,
     pub known_peers: usize,
     pub attempts: u64,
-    /// Highest execution block currently advertised or directly served by a peer.
+    /// Highest execution block this session has verified: a header that passed
+    /// validation, never a peer's claimed head.
     pub observed_head_block: Option<u64>,
     /// First block in the current material request, if a request is active.
     pub from_block: Option<u64>,
@@ -799,6 +811,14 @@ pub struct NetworkSessionSnapshot {
     pub last_error: Option<String>,
     pub age_seconds: u64,
     pub update_age_seconds: u64,
+}
+
+/// Render `error` in at most [`MAX_ERROR_LENGTH`] bytes, cut at a character
+/// boundary: the text can come from a remote endpoint and need not be ASCII.
+fn bounded_error(error: impl fmt::Display) -> String {
+    let mut error = error.to_string();
+    error.truncate(error.floor_char_boundary(MAX_ERROR_LENGTH));
+    error
 }
 
 fn read_lock<T>(lock: &RwLock<T>) -> std::sync::RwLockReadGuard<'_, T> {
@@ -943,5 +963,25 @@ mod tests {
         assert_eq!(stopped.state, NetworkSupervisorState::Stopped);
         assert_eq!(stopped.failures, 1);
         assert!(stopped.retry_in_seconds.is_none());
+    }
+
+    #[test]
+    fn long_non_ascii_errors_are_cut_at_a_character_boundary() {
+        // A two-byte character straddles the byte limit, as remote error text can.
+        let message = "a".repeat(MAX_ERROR_LENGTH - 1) + "é";
+        let assert_bounded = |error: Option<String>| {
+            let error = error.expect("error recorded");
+            assert!(error.len() <= MAX_ERROR_LENGTH);
+            assert!(std::str::from_utf8(error.as_bytes()).is_ok());
+            assert_eq!(error, "a".repeat(MAX_ERROR_LENGTH - 1));
+        };
+
+        let telemetry = NetworkTelemetry::default();
+        telemetry.supervisor_backoff(&message, Duration::from_secs(1));
+        assert_bounded(telemetry.snapshot().supervisor.last_error);
+
+        let session = telemetry.register(NetworkLane::Live);
+        session.record_error(&message);
+        assert_bounded(telemetry.snapshot().sessions[0].last_error.clone());
     }
 }

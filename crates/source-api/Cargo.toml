@@ -22,7 +22,11 @@ leani-primitives = { version = "=0.1.0-rc.1", path = "../primitives" }
 postcard.workspace = true
 serde.workspace = true
 thiserror.workspace = true
+tokio = { version = "1.48", default-features = false, features = ["sync"] }
 tokio-util.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
 
 [lints]
 workspace = true

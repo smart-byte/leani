@@ -24,7 +24,7 @@ test("runnable example seeds all 101 rows and applies a forward and inverse muta
     }
   }();
   let released = false;
-  let resumedAt: string | null = null;
+  let resumedAt = null as string | null;
   const client = createLeaniClient({ baseUrl: "http://example.test", fetch: async (input, init) => {
     const url = new URL(String(input));
     if (init?.method === "DELETE") {

@@ -11,6 +11,8 @@ publish = false
 [dependencies]
 async-trait.workspace = true
 blake3.workspace = true
+futures.workspace = true
+getrandom.workspace = true
 hex.workspace = true
 leani-primitives = { path = "../primitives" }
 leani-processor-api = { path = "../processor-api" }
@@ -21,6 +23,7 @@ serde_json.workspace = true
 sqlx.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+tracing.workspace = true
 
 [dev-dependencies]
 blake3.workspace = true

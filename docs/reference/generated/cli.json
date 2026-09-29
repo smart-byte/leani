@@ -235,12 +235,10 @@
             "id": "data_dir",
             "long": "data-dir",
             "short": null,
-            "help": "Data directory written to the generated configuration",
+            "help": "Data directory for the generated configuration [default: `data` beside it]",
             "required": false,
             "action": "Set",
-            "defaultValues": [
-              "./data"
-            ],
+            "defaultValues": [],
             "possibleValues": []
           },
           {
@@ -932,6 +930,26 @@
             "possibleValues": []
           },
           {
+            "id": "endpoint",
+            "long": "endpoint",
+            "short": null,
+            "help": "Submit to an already running node, preserving an optional URL prefix",
+            "required": false,
+            "action": "Set",
+            "defaultValues": [],
+            "possibleValues": []
+          },
+          {
+            "id": "token",
+            "long": "token",
+            "short": null,
+            "help": "Bearer token for a running node",
+            "required": false,
+            "action": "Set",
+            "defaultValues": [],
+            "possibleValues": []
+          },
+          {
             "id": "config",
             "long": "config",
             "short": null,
@@ -1122,7 +1140,7 @@
                     "id": "network",
                     "long": "network",
                     "short": null,
-                    "help": "Xatu network catalog",
+                    "help": "Xatu network catalog; only mainnet is supported",
                     "required": false,
                     "action": "Set",
                     "defaultValues": [
@@ -1198,7 +1216,7 @@
                     "id": "max_input_bytes",
                     "long": "max-input-bytes",
                     "short": null,
-                    "help": "Maximum projected compressed Parquet bytes",
+                    "help": "Maximum bytes the projection fetches in all, Parquet footers and merged gaps included, and the most it holds at once",
                     "required": false,
                     "action": "Set",
                     "defaultValues": [
@@ -1520,7 +1538,7 @@
                     "id": "endpoint",
                     "long": "endpoint",
                     "short": null,
-                    "help": "Override the public mainnet archive base URL",
+                    "help": "Override the public mainnet archive base URL with an https, file, or loopback http URL",
                     "required": false,
                     "action": "Set",
                     "defaultValues": [],

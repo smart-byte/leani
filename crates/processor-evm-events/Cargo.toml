@@ -21,7 +21,9 @@ serde.workspace = true
 serde_json.workspace = true
 
 [dev-dependencies]
+leani-store-sqlite = { path = "../store-sqlite" }
 leani-testkit = { path = "../testkit" }
+tempfile.workspace = true
 tokio.workspace = true
 
 [lints]

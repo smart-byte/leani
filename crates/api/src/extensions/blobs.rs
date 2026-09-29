@@ -3,7 +3,7 @@ use axum::{
     extract::{Path, Query, State},
     routing::get,
 };
-use leani_primitives::{BlockNumber, BlockRange};
+use leani_primitives::{BlockNumber, BlockRange, Finality};
 use leani_processor_blobs::{
     BLOCK_COLLECTION, BlobsBlockEntity, BlobsProcessor, TRANSACTION_BLOCK_INDEX,
     TRANSACTION_COLLECTION,
@@ -13,7 +13,7 @@ use serde::Deserialize;
 use crate::{
     ApiError, BlobScheduleResponse, BlobTransaction, BlobsBlock, BlobsSnapshotEntry,
     CoverageResponse, Page, QueryContext, QueryExtension, decode_block, decode_transaction,
-    parse_hash,
+    finality_name, parse_hash,
 };
 
 const BLOCK_CURSOR_NAMESPACE: &str = "blobs.blocks";
@@ -59,16 +59,35 @@ async fn list_blocks(
 ) -> Result<Json<Page<BlobsBlock>>, ApiError> {
     let (entities, next_cursor, coverage) = scan_blocks(&context, &query).await?;
     Ok(Json(Page::new(
-        entities.iter().map(BlobsBlock::from).collect(),
+        entities
+            .iter()
+            .map(|(entity, finality)| blobs_block(entity, *finality))
+            .collect(),
         next_cursor,
         coverage,
     )))
 }
 
+/// A block with the finality its output metadata records now; the entity
+/// keeps the finality it had when reduced.
+fn blobs_block(entity: &BlobsBlockEntity, finality: Finality) -> BlobsBlock {
+    BlobsBlock {
+        finality: finality_name(finality),
+        ..BlobsBlock::from(entity)
+    }
+}
+
+/// Retained blocks of the requested range, each with its current finality.
+type ScannedBlocks = (
+    Vec<(BlobsBlockEntity, Finality)>,
+    Option<String>,
+    CoverageResponse,
+);
+
 async fn scan_blocks(
     context: &QueryContext,
     query: &ListBlocksQuery,
-) -> Result<(Vec<BlobsBlockEntity>, Option<String>, CoverageResponse), ApiError> {
+) -> Result<ScannedBlocks, ApiError> {
     let requested = BlockRange::new(BlockNumber(query.from_block), BlockNumber(query.to_block))
         .map_err(|error| ApiError::invalid(&error.to_string()))?;
     let coverage = if query.allow_partial {
@@ -86,16 +105,16 @@ async fn scan_blocks(
         query.from_block.saturating_sub(1).to_be_bytes().to_vec()
     };
     let rows = context
-        .scan(BLOCK_COLLECTION, Some(&after), limit.saturating_add(1))
+        .scan_output(BLOCK_COLLECTION, Some(&after), limit.saturating_add(1))
         .await?;
     let mut entities = Vec::with_capacity(rows.len());
-    for (_, value) in rows {
-        let entity = decode_block(&value)?;
+    for row in rows {
+        let entity = decode_block(&row.value)?;
         if entity.block_number > query.to_block {
             break;
         }
         if requested.contains(BlockNumber(entity.block_number)) {
-            entities.push(entity);
+            entities.push((entity, row.finality));
         }
     }
     let has_more = entities.len() > limit;
@@ -103,7 +122,7 @@ async fn scan_blocks(
     let next_cursor = if has_more {
         entities
             .last()
-            .map(|entity| {
+            .map(|(entity, _)| {
                 context.encode_scoped_scan_cursor(
                     BLOCK_CURSOR_NAMESPACE,
                     &scope,
@@ -123,7 +142,7 @@ async fn list_snapshot(
 ) -> Result<Json<Page<BlobsSnapshotEntry>>, ApiError> {
     let (entities, next_cursor, coverage) = scan_blocks(&context, &query).await?;
     let mut data = Vec::with_capacity(entities.len());
-    for entity in entities {
+    for (entity, finality) in entities {
         let keys = context
             .index_keys(
                 TRANSACTION_BLOCK_INDEX,
@@ -146,7 +165,7 @@ async fn list_snapshot(
         }
         transactions.sort_by_key(|transaction| transaction.transaction_index);
         data.push(BlobsSnapshotEntry {
-            block: BlobsBlock::from(&entity),
+            block: blobs_block(&entity, finality),
             transactions,
         });
     }
@@ -157,11 +176,14 @@ async fn get_block(
     State(context): State<QueryContext>,
     Path(number): Path<u64>,
 ) -> Result<Json<BlobsBlock>, ApiError> {
-    let value = context
-        .entity(BLOCK_COLLECTION, &number.to_be_bytes())
+    let stored = context
+        .output_entity(BLOCK_COLLECTION, &number.to_be_bytes())
         .await?
         .ok_or_else(|| ApiError::not_found("blob block is not indexed"))?;
-    Ok(Json(BlobsBlock::from(&decode_block(&value)?)))
+    Ok(Json(blobs_block(
+        &decode_block(&stored.value)?,
+        stored.finality,
+    )))
 }
 
 #[derive(Debug, Deserialize)]

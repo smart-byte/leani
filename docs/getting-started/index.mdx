@@ -13,7 +13,7 @@ import { Aside } from '@astrojs/starlight/components';
 import CodeExample from '@docs/components/docs/CodeExample.astro';
 
 [Install the current alpha](/docs/getting-started/install/) first. This example
-prints a real Ethereum Mainnet block with no API key and no configuration file.
+follows real Ethereum Mainnet blocks with no API key and no configuration file.
 Run it from a fresh directory:
 
 ```bash
@@ -27,21 +27,21 @@ checkpoint. At least two must agree before you can accept it. This is the
 starting trust anchor for subsequent verification.
 
 Peer discovery can take several minutes, even on a later run with cached state.
-Leani prints progress to stderr. Success is a line shaped like:
+Leani prints progress to stderr, then one line per block, shaped like:
 
 ```text
 2026-09-07T12:11:59Z  block=25925396  txs=381  gas=43.17M / 60.00M (72.0%)  base_fee=0.069459109 gwei  blobs=3  included
 ```
 
-Your block number and values will differ. `--once` exits after that first result.
-Remove it to keep following blocks, or add `--format json` for scripts.
+Your block numbers and values will differ. Leani keeps following new blocks
+until you press Ctrl-C. Add `--format json` for scripts.
 
 <Aside type="note" title="Read the finality label">
   The first result may say `preview`: a peer supplied the block and Leani is
   still checking its place in Ethereum's chain. JSON reports
   `finality: "preview"`. Later rows say `included` (on the followed chain, a
   reorg can still remove them) or `finalized`. Use
-  `leani subscribe blocks --finality finalized --once` when you need a result
+  `leani subscribe blocks --finality finalized` when you need only blocks
   Ethereum consensus has finalized.
 </Aside>
 

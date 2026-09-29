@@ -7,7 +7,7 @@
     "lang": "shell",
     "lines": [
       {
-        "text": "$ leani subscribe blocks --once"
+        "text": "$ leani subscribe blocks"
       },
       {
         "text": ""
@@ -16,13 +16,13 @@
         "text": "# On first use, review and accept the checkpoint."
       },
       {
-        "text": "# --once may print an early peer preview."
+        "text": "# The first row may be an early peer preview."
       },
       {
         "text": "# Print only blocks Ethereum has finalized:"
       },
       {
-        "text": "$ leani subscribe blocks --finality finalized --once"
+        "text": "$ leani subscribe blocks --finality finalized"
       }
     ],
     "noteHref": "/docs/getting-started/install/",

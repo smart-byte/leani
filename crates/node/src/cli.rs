@@ -46,9 +46,9 @@ pub enum Command {
         /// Optional protocol targets; Uniswap requires one or more markets such as `ETH/USDC`.
         #[arg(num_args = 0.., value_name = "TARGET")]
         targets: Vec<String>,
-        /// Data directory written to the generated configuration.
-        #[arg(long, default_value = "./data")]
-        data_dir: PathBuf,
+        /// Data directory for the generated configuration [default: `data` beside it].
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
         /// Checkpoint provider used for weak-subjectivity quorum (repeatable or comma-delimited).
         #[arg(
             long,
@@ -58,7 +58,8 @@ pub enum Command {
                 "https://mainnet.checkpoint.sigp.io/",
                 "https://beaconstate-mainnet.chainsafe.io/"
             ],
-            env = "LEANI_CHECKPOINT_URLS"
+            env = "LEANI_CHECKPOINT_URLS",
+            hide_env_values = true
         )]
         checkpoint_url: Vec<url::Url>,
         /// Number of independent checkpoint providers that must agree.
@@ -89,7 +90,7 @@ pub enum Command {
         #[arg(long)]
         processor: Option<String>,
         /// Optional bearer token for a running node.
-        #[arg(long, env = "LEANI_API_TOKEN")]
+        #[arg(long, env = "LEANI_API_TOKEN", hide_env_values = true)]
         token: Option<String>,
         /// Lowest status to print: `included` (default) or `finalized`.
         #[arg(long, value_enum, default_value_t = SubscribeFinality::Included)]
@@ -106,7 +107,8 @@ pub enum Command {
                 "https://mainnet.checkpoint.sigp.io/",
                 "https://beaconstate-mainnet.chainsafe.io/"
             ],
-            env = "LEANI_CHECKPOINT_URLS"
+            env = "LEANI_CHECKPOINT_URLS",
+            hide_env_values = true
         )]
         checkpoint_url: Vec<url::Url>,
         /// Number of independent checkpoint providers that must agree.
@@ -136,6 +138,12 @@ pub enum Command {
         from: u64,
         #[arg(long)]
         to: u64,
+        /// Submit to an already running node, preserving an optional URL prefix.
+        #[arg(long)]
+        endpoint: Option<url::Url>,
+        /// Bearer token for a running node.
+        #[arg(long, env = "LEANI_API_TOKEN", hide_env_values = true)]
+        token: Option<String>,
     },
     /// Inspect or probe configured data sources.
     Source {
@@ -652,7 +660,7 @@ pub enum SourceCommand {
 pub enum ProbeSource {
     /// Inspect the configured Xatu catalog.
     Xatu {
-        /// Xatu network catalog.
+        /// Xatu network catalog; only mainnet is supported.
         #[arg(long, default_value = "mainnet")]
         network: String,
         /// First execution block in the inclusive probe range.
@@ -673,7 +681,8 @@ pub enum ProbeSource {
         /// Maximum simultaneous footer requests.
         #[arg(long, default_value_t = 4)]
         concurrency: usize,
-        /// Maximum projected compressed Parquet bytes.
+        /// Maximum bytes the projection fetches in all, Parquet footers and
+        /// merged gaps included, and the most it holds at once.
         #[arg(long, default_value_t = 268_435_456)]
         max_input_bytes: u64,
         /// Arrow rows decoded in one bounded batch.
@@ -733,7 +742,8 @@ pub enum ProbeSource {
         /// Last execution block in the inclusive probe range.
         #[arg(long)]
         to_block: u64,
-        /// Override the public mainnet archive base URL.
+        /// Override the public mainnet archive base URL with an https, file,
+        /// or loopback http URL.
         #[arg(long)]
         endpoint: Option<url::Url>,
         /// Maximum sparse archive and normalized bytes.

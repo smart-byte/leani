@@ -16,13 +16,14 @@ on:
 
 permissions:
   contents: read
-  actions: read
-  id-token: write
 
 jobs:
   package:
     name: Build and inspect npm package
     runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      actions: read
     defaults:
       run:
         working-directory: packages/sdk
@@ -30,13 +31,20 @@ jobs:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           fetch-depth: 0
+          persist-credentials: false
       - name: Verify publication history
         run: ruby ../../scripts/check-publication.rb HEAD
-      - name: Require passing release CI
+      - name: Require matching SDK tag and passing release CI
         if: ${{ inputs.publish }}
         env:
           GH_TOKEN: ${{ github.token }}
-        run: ruby ../../scripts/check-release-ci.rb
+        run: |
+          version=$(ruby -rjson -e 'puts JSON.parse(File.read("package.json")).fetch("version")')
+          if [ "$GITHUB_REF" != "refs/tags/sdk-v$version" ]; then
+            echo "publishing requires dispatching from refs/tags/sdk-v$version" >&2
+            exit 1
+          fi
+          ruby ../../scripts/check-release-ci.rb
       - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
         with:
           node-version: 24
@@ -59,6 +67,19 @@ jobs:
           npm pack --pack-destination "$RUNNER_TEMP/sdk-package"
           tar -xzf "$RUNNER_TEMP"/sdk-package/*.tgz -C "$RUNNER_TEMP/sdk-unpacked"
           ruby ../../scripts/check-artifact-privacy.rb "$RUNNER_TEMP/sdk-unpacked"
+          # test:package checked its own pack; check the archive to be published.
+          # The ${...} below are JavaScript template literals.
+          # shellcheck disable=SC2016
+          node --input-type=module -e '
+            import { readFileSync } from "node:fs";
+            const root = `${process.env.RUNNER_TEMP}/sdk-unpacked/package`;
+            const { version } = JSON.parse(readFileSync(`${root}/package.json`, "utf8"));
+            const { SDK_VERSION } = await import(`${root}/dist/index.js`);
+            if (SDK_VERSION !== version) {
+              console.error(`archive SDK_VERSION ${SDK_VERSION} is not package version ${version}`);
+              process.exit(1);
+            }
+          '
           cd "$RUNNER_TEMP/sdk-package"
           sha256sum ./*.tgz > SHA256SUMS
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -67,17 +88,42 @@ jobs:
           path: ${{ runner.temp }}/sdk-package/
           if-no-files-found: error
           retention-days: 14
+
+  # The only job with an OIDC token or the npm secret. It runs no project
+  # code and publishes the archive that the package job tested.
+  publish:
+    name: Publish tested npm package
+    needs: package
+    if: ${{ inputs.publish }}
+    runs-on: ubuntu-24.04
+    environment: release-npm
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          name: leani-sdk-candidate
+          path: ${{ runner.temp }}/sdk-package
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+      - name: Pin npm with trusted publishing support
+        run: npm install --global npm@11.19.1
       - name: Publish with npm provenance
-        if: ${{ inputs.publish }}
+        working-directory: ${{ runner.temp }}/sdk-package
         env:
           BOOTSTRAP: ${{ inputs.bootstrap }}
           NODE_AUTH_TOKEN: ${{ inputs.bootstrap && secrets.NPM_TOKEN || '' }}
         run: |
           if [ "$BOOTSTRAP" = true ] && [ -z "$NODE_AUTH_TOKEN" ]; then
-            echo "Configure the bootstrap NPM_TOKEN secret" >&2
+            echo "Configure the bootstrap NPM_TOKEN secret on the release-npm environment" >&2
             exit 1
           fi
-          version=$(node -p 'require("./package.json").version')
+          sha256sum --check SHA256SUMS
+          set -- ./*.tgz
+          test "$#" -eq 1 || { echo "expected exactly one tested npm archive" >&2; exit 1; }
+          version=$(tar -xzOf "$1" package/package.json | node -p 'JSON.parse(require("fs").readFileSync(0, "utf8")).version')
           if [ "$GITHUB_REF" != "refs/tags/sdk-v$version" ]; then
             echo "publishing requires dispatching from refs/tags/sdk-v$version" >&2
             exit 1
@@ -86,6 +132,4 @@ jobs:
             *-*) dist_tag=next ;;
             *) dist_tag=latest ;;
           esac
-          cd "$RUNNER_TEMP/sdk-package"
-          sha256sum --check SHA256SUMS
           npm publish ./*.tgz --access public --provenance --tag "$dist_tag"

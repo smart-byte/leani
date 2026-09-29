@@ -1,7 +1,7 @@
 //! Strict, versioned node configuration.
 
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fmt, fs,
     net::SocketAddr,
     path::{Path, PathBuf},
@@ -161,13 +161,17 @@ impl StarterConfig {
         .map_err(|error| format!("built-in Ethereum Mainnet defaults are invalid: {error}"))?;
         let processor = match (self.blocks, self.uniswap) {
             (Some(_), None) => Ok(crate::block_summaries::processor_config(
-                "block-summary",
+                crate::block_summaries::COMPACT_INSTANCE,
                 false,
             )),
             (None, Some(uniswap)) => {
                 let markets = crate::uniswap_markets::resolve_markets(&uniswap.markets)
                     .map_err(|error| error.to_string())?;
-                crate::uniswap_markets::processor_config(&markets, "uniswap-observations", false)
+                crate::uniswap_markets::processor_config(
+                    &markets,
+                    crate::uniswap_markets::COMPACT_INSTANCE,
+                    false,
+                )
             }
             _ => {
                 return Err(
@@ -186,6 +190,28 @@ impl StarterConfig {
         config.api.bind = self.api.bind;
         Ok(config)
     }
+}
+
+/// The managed Beacon transport pool of the built-in Mainnet defaults.
+pub(crate) fn default_finality_endpoints() -> Result<Vec<Url>, String> {
+    let defaults: Config = toml::from_str(include_str!(
+        "../../../config/defaults/ethereum-mainnet.toml"
+    ))
+    .map_err(|error| format!("built-in Ethereum Mainnet defaults are invalid: {error}"))?;
+    Ok(defaults.finality.endpoints)
+}
+
+/// A Beacon endpoint's identity: scheme, host, port, and path. Credentials,
+/// query strings, and a trailing slash do not make a separate transport.
+pub(crate) fn finality_endpoint_identity(endpoint: &Url) -> String {
+    let endpoint = leani_finality_beacon_api::normalized_endpoint(endpoint);
+    format!(
+        "{}://{}:{}{}",
+        endpoint.scheme(),
+        endpoint.host_str().unwrap_or_default(),
+        endpoint.port_or_known_default().unwrap_or_default(),
+        endpoint.path()
+    )
 }
 
 /// Physical backend for immutable finalized processor artifacts. Lifecycle
@@ -471,10 +497,17 @@ pub struct HistorySourceConfig {
     /// Parquet rows decoded per bounded Arrow batch by Xatu.
     #[serde(default)]
     pub batch_rows: Option<usize>,
+    /// An archive source's manifest. [`Config::load`] resolves a relative
+    /// path against the configuration file's directory.
     #[serde(default)]
     pub manifest: Option<PathBuf>,
     #[serde(default)]
     pub endpoint: Option<Url>,
+    /// Accept a plain `http` eraE endpoint off loopback. Its catalog and
+    /// archive bytes then travel unauthenticated, so anyone on the path can
+    /// replace them.
+    #[serde(default)]
+    pub allow_insecure_http: bool,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
@@ -482,6 +515,8 @@ pub struct HistorySourceConfig {
 pub enum HistorySourceKind {
     Xatu,
     EraE,
+    /// No source reads it. Decoded only so validation can refuse it and
+    /// name `xatu`, which reads public Parquet history.
     Parquet,
     Archive,
 }
@@ -830,8 +865,10 @@ pub struct OutputPolicyConfig {
     pub mode: OutputPolicyMode,
     #[serde(default)]
     pub window: Option<OutputWindowConfig>,
-    #[serde(default)]
-    pub finalized_only: bool,
+    /// Never applied. Decoded only so validation can refuse it and name
+    /// `publish = "finalized_only"`, which publishes only finalized blocks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finalized_only: Option<bool>,
 }
 
 impl From<OutputPolicyConfig> for OutputPolicy {
@@ -844,7 +881,7 @@ impl From<OutputPolicyConfig> for OutputPolicy {
                 max_rows: window.max_rows,
                 max_bytes: window.max_bytes.map(HumanBytes::bytes),
             }),
-            finalized_only: value.finalized_only,
+            finalized_only: false,
         }
     }
 }
@@ -1111,8 +1148,71 @@ pub struct RpcConfig {
     pub http_bind: SocketAddr,
     pub ws_bind: SocketAddr,
     pub historical_mode: HistoricalMode,
-    pub transaction_locator: bool,
+    /// Deprecated and ignored: nothing ever read it. Still accepted so
+    /// existing configurations load, with a warning.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transaction_locator: Option<bool>,
     pub minimum_recent_blocks: u64,
+    /// Serve JSON-RPC, which has no authentication, on a non-loopback bind.
+    #[serde(default)]
+    pub allow_unauthenticated_remote: bool,
+    /// Browser origins, besides loopback ones, that may call JSON-RPC.
+    #[serde(default)]
+    pub allowed_origins: Vec<String>,
+    #[serde(default = "default_rpc_max_batch_requests")]
+    pub max_batch_requests: usize,
+    #[serde(default = "default_rpc_max_response_bytes")]
+    pub max_response_bytes: HumanBytes,
+    #[serde(default = "default_rpc_max_log_results")]
+    pub max_log_results: usize,
+    #[serde(default = "default_rpc_max_log_addresses")]
+    pub max_log_addresses: usize,
+    #[serde(default = "default_rpc_max_log_topic_alternatives")]
+    pub max_log_topic_alternatives: usize,
+    #[serde(default = "default_rpc_max_subscriptions_per_connection")]
+    pub max_subscriptions_per_connection: usize,
+    #[serde(default = "default_rpc_max_websocket_connections")]
+    pub max_websocket_connections: usize,
+    #[serde(default = "default_rpc_max_subscription_event_bytes")]
+    pub max_subscription_event_bytes: HumanBytes,
+    #[serde(default = "default_rpc_max_outbound_bytes")]
+    pub max_outbound_bytes: HumanBytes,
+}
+
+const fn default_rpc_max_batch_requests() -> usize {
+    leani_rpc::DEFAULT_MAX_BATCH_REQUESTS
+}
+
+fn default_rpc_max_response_bytes() -> HumanBytes {
+    HumanBytes(u64::try_from(leani_rpc::DEFAULT_MAX_RESPONSE_BYTES).unwrap_or(u64::MAX))
+}
+
+const fn default_rpc_max_log_results() -> usize {
+    leani_rpc::DEFAULT_MAX_LOG_RESULTS
+}
+
+const fn default_rpc_max_log_addresses() -> usize {
+    leani_rpc::DEFAULT_MAX_LOG_ADDRESSES
+}
+
+const fn default_rpc_max_log_topic_alternatives() -> usize {
+    leani_rpc::DEFAULT_MAX_LOG_TOPIC_ALTERNATIVES
+}
+
+const fn default_rpc_max_subscriptions_per_connection() -> usize {
+    leani_rpc::DEFAULT_MAX_SUBSCRIPTIONS_PER_CONNECTION
+}
+
+const fn default_rpc_max_websocket_connections() -> usize {
+    leani_rpc::DEFAULT_MAX_WEBSOCKET_CONNECTIONS
+}
+
+fn default_rpc_max_outbound_bytes() -> HumanBytes {
+    HumanBytes(u64::try_from(leani_rpc::DEFAULT_MAX_OUTBOUND_BYTES).unwrap_or(u64::MAX))
+}
+
+fn default_rpc_max_subscription_event_bytes() -> HumanBytes {
+    HumanBytes(u64::try_from(leani_rpc::DEFAULT_MAX_SUBSCRIPTION_EVENT_BYTES).unwrap_or(u64::MAX))
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
@@ -1128,6 +1228,16 @@ pub struct ApiConfig {
     pub bind: SocketAddr,
     #[serde(default)]
     pub bearer_token_env: Option<String>,
+    /// Serve the API without a bearer token on a non-loopback bind.
+    #[serde(default)]
+    pub allow_unauthenticated_remote: bool,
+    /// `Host` names, besides `localhost`, that requests may address. IP
+    /// addresses, the bind address included, always pass.
+    #[serde(default)]
+    pub allowed_hosts: Vec<String>,
+    /// Browser origins, besides loopback ones, that may call the API.
+    #[serde(default)]
+    pub allowed_origins: Vec<String>,
     #[serde(default)]
     pub delivery: ApiDeliveryConfig,
 }
@@ -1262,13 +1372,36 @@ impl ValidatedConfig {
 
 impl Config {
     /// Read TOML without opening the configured data directory or any network
-    /// connection.
+    /// connection. Relative paths in the file, its `data_dir` and archive
+    /// `manifest`s, are resolved against the directory of the file at `path`.
     ///
     /// # Errors
     ///
     /// Returns [`ConfigError`] when the file cannot be read or its TOML does
-    /// not match the strict schema.
+    /// not match the strict schema, or a relative data directory would start
+    /// on an empty store while its former working-directory location holds one.
     pub fn load(path: &Path) -> Result<Self, ConfigError> {
+        let working_directory = std::env::current_dir().ok();
+        let (config, warnings) = Self::load_with_warnings(path, working_directory.as_deref())?;
+        if !warnings.is_empty() {
+            // Commands such as `subscribe` read the same file several times.
+            static WARNED: std::sync::Once = std::sync::Once::new();
+            WARNED.call_once(|| {
+                for warning in &warnings {
+                    tracing::warn!(config = %path.display(), "{warning}");
+                }
+            });
+        }
+        Ok(config)
+    }
+
+    /// [`Self::load`], returning its warnings instead of logging them:
+    /// deprecated settings, and state a relative `data_dir` left under
+    /// `working_directory` beside state it uses.
+    pub(crate) fn load_with_warnings(
+        path: &Path,
+        working_directory: Option<&Path>,
+    ) -> Result<(Self, Vec<String>), ConfigError> {
         let input = fs::read_to_string(path).map_err(|source| ConfigError::Read {
             path: path.to_path_buf(),
             source,
@@ -1281,7 +1414,7 @@ impl Config {
         let is_starter = document
             .as_table()
             .is_some_and(|table| table.contains_key("network"));
-        if is_starter {
+        let mut config = if is_starter {
             let starter =
                 toml::from_str::<StarterConfig>(&input).map_err(|source| ConfigError::Parse {
                     path: path.to_path_buf(),
@@ -1290,13 +1423,44 @@ impl Config {
             starter.expand().map_err(|detail| ConfigError::Expand {
                 path: path.to_path_buf(),
                 detail,
-            })
+            })?
         } else {
-            toml::from_str(&input).map_err(|source| ConfigError::Parse {
+            toml::from_str::<Self>(&input).map_err(|source| ConfigError::Parse {
                 path: path.to_path_buf(),
                 source,
-            })
+            })?
+        };
+        // Every relative path in the file is relative to the file.
+        let written = std::mem::take(&mut config.data_dir);
+        config.data_dir = resolve_relative_to_file(path, &written);
+        for source in &mut config.sources.history {
+            if let Some(manifest) = source.manifest.as_mut() {
+                *manifest = resolve_relative_to_file(path, manifest);
+            }
         }
+        let mut warnings = config.deprecation_warnings();
+        if let Some(working_directory) = working_directory
+            && written.is_relative()
+            && !written.as_os_str().is_empty()
+        {
+            warnings.extend(check_data_directory(
+                &beneath(working_directory, &written),
+                &config.data_dir,
+            )?);
+        }
+        Ok((config, warnings))
+    }
+
+    /// Deprecated settings this configuration still carries, which the node
+    /// ignores.
+    #[must_use]
+    pub fn deprecation_warnings(&self) -> Vec<String> {
+        let mut warnings = Vec::new();
+        if self.rpc.transaction_locator.is_some() {
+            warnings
+                .push("rpc.transaction_locator is deprecated and ignored; remove it".to_owned());
+        }
+        warnings
     }
 
     /// Perform validation that requires no I/O.
@@ -1370,7 +1534,7 @@ impl Config {
             "sources.history",
             &mut errors,
         );
-        validate_history_sources(&self.sources.history, &mut errors);
+        validate_history_sources(&self.sources.history, self.chain.chain_id, &mut errors);
         if matches!(self.sources.live.kind, LiveSourceKind::P2p)
             && self.sources.live.minimum_peers == 0
         {
@@ -1571,7 +1735,7 @@ impl Config {
         {
             errors.push(ValidationError::new(
                 "sources.live/finality",
-                "the P2P live source requires verified beacon_api or consensus_p2p finality",
+                "the P2P live source requires verified beacon_api or consensus_p2p finality: a block is included only once its ancestry reaches an execution header the sync committee attested, which the finality source verifies; set finality.kind, or sources.live.kind = \"disabled\" for finalized-dataset backfills",
             ));
         }
         if self.processors.is_empty() {
@@ -1588,6 +1752,12 @@ impl Config {
             &mut errors,
         );
         for (index, processor) in self.processors.iter().enumerate() {
+            if processor.output.finalized_only.is_some() {
+                errors.push(ValidationError::new(
+                    format!("processors[{index}].output.finalized_only"),
+                    "was never applied and is no longer accepted; remove it, and set publish = \"finalized_only\" to publish only finalized blocks",
+                ));
+            }
             if processor.require_retained_input && !self.raw_history.enabled {
                 errors.push(ValidationError::new(
                     format!("processors[{index}].require_retained_input"),
@@ -1679,13 +1849,188 @@ impl Config {
                 "HTTP RPC, WebSocket RPC, and native API addresses must be distinct",
             ));
         }
+        validate_exposure(&self.api, &self.rpc, &mut errors);
 
         errors
     }
 }
 
-fn validate_history_sources(sources: &[HistorySourceConfig], errors: &mut Vec<ValidationError>) {
+/// Where a path written in the configuration file at `file` points. A
+/// relative path is beside the file, not under whatever working directory
+/// the node started in. A file named without a directory is in the working
+/// directory already, and an empty path stays empty for validation to
+/// report.
+fn resolve_relative_to_file(file: &Path, path: &Path) -> PathBuf {
+    match file.parent() {
+        Some(directory) if !directory.as_os_str().is_empty() && !path.as_os_str().is_empty() => {
+            beneath(directory, path)
+        }
+        _ => path.to_path_buf(),
+    }
+}
+
+/// `path` under `directory`, without a leading `./`; an absolute `path`
+/// stays as it is.
+fn beneath(directory: &Path, path: &Path) -> PathBuf {
+    directory.join(path.strip_prefix(".").unwrap_or(path))
+}
+
+/// Guard the upgrade from 0.1.0-rc.1, which resolved a relative `data_dir`
+/// under the working directory rather than beside the configuration. Refuse
+/// when only that former location holds Leani state: the node would start
+/// on an empty store and the old one would look lost. When both hold state,
+/// the operator already runs this layout, so warn and use the documented
+/// location. An absolute `data_dir` never reaches this check.
+// ponytail: an rc.1 upgrade shim; remove it once rc.1 stores are gone.
+fn check_data_directory(previous: &Path, current: &Path) -> Result<Option<String>, ConfigError> {
+    let holds_state = |directory: &Path| {
+        ["leani.sqlite", "subscriptions"]
+            .iter()
+            .any(|entry| directory.join(entry).exists())
+    };
+    // Canonicalization recognizes `.`/`..` and symlink aliases of existing
+    // directories. If the old directory has state it necessarily exists.
+    if previous == current
+        || fs::canonicalize(previous)
+            .ok()
+            .is_some_and(|old| fs::canonicalize(current).is_ok_and(|new| old == new))
+        || !holds_state(previous)
+    {
+        return Ok(None);
+    }
+    if !holds_state(current) {
+        return Err(ConfigError::AmbiguousDataDirectory {
+            previous: previous.to_path_buf(),
+            current: current.to_path_buf(),
+        });
+    }
+    Ok(Some(format!(
+        "relative data_dir resolves to {} beside the configuration; {} under the working directory also holds Leani state and is not used; set an absolute data_dir to choose explicitly",
+        current.display(),
+        previous.display()
+    )))
+}
+
+/// Refuse a listener beyond loopback that nothing authenticates unless the
+/// operator opts in, malformed host and origin allowlists, and zero RPC caps.
+fn validate_exposure(api: &ApiConfig, rpc: &RpcConfig, errors: &mut Vec<ValidationError>) {
+    let remote = |bind: SocketAddr| !bind.ip().to_canonical().is_loopback();
+    if remote(api.bind) && api.bearer_token_env.is_none() && !api.allow_unauthenticated_remote {
+        errors.push(ValidationError::new(
+            "api.bind",
+            "a non-loopback bind needs api.bearer_token_env, or api.allow_unauthenticated_remote = true behind an authenticating proxy",
+        ));
+    }
+    for (field, bind) in [
+        ("rpc.http_bind", rpc.http_bind),
+        ("rpc.ws_bind", rpc.ws_bind),
+    ] {
+        if remote(bind) && !rpc.allow_unauthenticated_remote {
+            errors.push(ValidationError::new(
+                field,
+                "JSON-RPC has no authentication; a non-loopback bind needs rpc.allow_unauthenticated_remote = true behind a trusted network or authenticating proxy",
+            ));
+        }
+    }
+    for (index, host) in api.allowed_hosts.iter().enumerate() {
+        if allowed_host(host).is_none() {
+            errors.push(ValidationError::new(
+                format!("api.allowed_hosts[{index}]"),
+                "must be a host name or IP address, without a scheme or port; IPv6 in brackets",
+            ));
+        }
+    }
+    for (field, origins) in [
+        ("api.allowed_origins", &api.allowed_origins),
+        ("rpc.allowed_origins", &rpc.allowed_origins),
+    ] {
+        for (index, origin) in origins.iter().enumerate() {
+            if allowed_origin(origin).is_none() {
+                errors.push(ValidationError::new(
+                    format!("{field}[{index}]"),
+                    "must be an http or https origin such as https://app.example, without a path",
+                ));
+            }
+        }
+    }
+    // One connection's full notification room must fit the shared budget.
+    if rpc.max_outbound_bytes.bytes() < rpc.max_subscription_event_bytes.bytes()
+        || rpc.max_outbound_bytes.bytes() > u64::from(u32::MAX)
+    {
+        errors.push(ValidationError::new(
+            "rpc.max_outbound_bytes",
+            "must be at least max_subscription_event_bytes and at most 4294967295 bytes",
+        ));
+    }
+    for (field, value) in [
+        ("rpc.max_batch_requests", rpc.max_batch_requests),
+        (
+            "rpc.max_response_bytes",
+            usize::try_from(rpc.max_response_bytes.bytes()).unwrap_or(usize::MAX),
+        ),
+        ("rpc.max_log_results", rpc.max_log_results),
+        ("rpc.max_log_addresses", rpc.max_log_addresses),
+        (
+            "rpc.max_log_topic_alternatives",
+            rpc.max_log_topic_alternatives,
+        ),
+        (
+            "rpc.max_subscriptions_per_connection",
+            rpc.max_subscriptions_per_connection,
+        ),
+        (
+            "rpc.max_websocket_connections",
+            rpc.max_websocket_connections,
+        ),
+        (
+            "rpc.max_subscription_event_bytes",
+            usize::try_from(rpc.max_subscription_event_bytes.bytes()).unwrap_or(usize::MAX),
+        ),
+    ] {
+        if value == 0 {
+            errors.push(ValidationError::new(field, "must be greater than zero"));
+        }
+    }
+}
+
+/// An `api.allowed_hosts` entry as the API compares `Host` names: lowercase,
+/// an IPv6 address in brackets. `None` for anything but a bare host name or
+/// address.
+pub(crate) fn allowed_host(value: &str) -> Option<String> {
+    if value.contains('*') {
+        return None;
+    }
+    url::Host::parse(value).ok().map(|host| host.to_string())
+}
+
+/// An allowed-origin entry in the serialization browsers send, such as
+/// `https://app.example`. `None` for anything but an `http` or `https`
+/// origin without credentials, path, query, or fragment.
+pub(crate) fn allowed_origin(value: &str) -> Option<String> {
+    let url = Url::parse(value).ok()?;
+    (matches!(url.scheme(), "http" | "https")
+        && url.has_host()
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.path() == "/"
+        && url.query().is_none()
+        && url.fragment().is_none())
+    .then(|| url.origin().ascii_serialization())
+}
+
+#[allow(clippy::too_many_lines)]
+fn validate_history_sources(
+    sources: &[HistorySourceConfig],
+    chain_id: u64,
+    errors: &mut Vec<ValidationError>,
+) {
     for (index, source) in sources.iter().enumerate() {
+        if matches!(source.kind, HistorySourceKind::Parquet) {
+            errors.push(ValidationError::new(
+                format!("sources.history[{index}].kind"),
+                "`parquet` sources are not implemented, and the node skipped them; use `xatu` for public Parquet history, `era_e`, or `archive`",
+            ));
+        }
         match source.kind {
             HistorySourceKind::Archive if source.manifest.is_none() => {
                 errors.push(ValidationError::new(
@@ -1711,6 +2056,15 @@ fn validate_history_sources(sources: &[HistorySourceConfig], errors: &mut Vec<Va
                             "eraE endpoints must use http, https, or file",
                         ));
                     }
+                    if endpoint.scheme() == "http"
+                        && !source.allow_insecure_http
+                        && !leani_source_erae::is_loopback(endpoint)
+                    {
+                        errors.push(ValidationError::new(
+                            format!("sources.history[{index}].endpoint"),
+                            "plain http eraE endpoints are accepted only on loopback; use https, or set allow_insecure_http = true to accept an unauthenticated mirror",
+                        ));
+                    }
                     if !endpoint.path().ends_with('/') {
                         errors.push(ValidationError::new(
                             format!("sources.history[{index}].endpoint"),
@@ -1726,6 +2080,18 @@ fn validate_history_sources(sources: &[HistorySourceConfig], errors: &mut Vec<Va
                 ));
             }
             _ => {}
+        }
+        if source.allow_insecure_http && !matches!(source.kind, HistorySourceKind::EraE) {
+            errors.push(ValidationError::new(
+                format!("sources.history[{index}].allow_insecure_http"),
+                "is only valid for an eraE source",
+            ));
+        }
+        if matches!(source.kind, HistorySourceKind::Xatu) && chain_id != 1 {
+            errors.push(ValidationError::new(
+                format!("sources.history[{index}].kind"),
+                "Xatu history supports Ethereum mainnet (chain 1) only",
+            ));
         }
         if matches!(source.kind, HistorySourceKind::Xatu) {
             for (field, blocks) in [
@@ -2020,6 +2386,11 @@ fn validate_finality(finality: &FinalityConfig, errors: &mut Vec<ValidationError
             "finality.checkpoint",
             "must be a 0x-prefixed 32-byte weak-subjectivity checkpoint root",
         ));
+    } else if finality.checkpoint[2..].bytes().all(|digit| digit == b'0') {
+        errors.push(ValidationError::new(
+            "finality.checkpoint",
+            "must not be the all-zero placeholder root",
+        ));
     }
     match finality.kind {
         FinalitySourceKind::BeaconApi => {
@@ -2037,11 +2408,23 @@ fn validate_finality(finality: &FinalityConfig, errors: &mut Vec<ValidationError
                     "must be within 1..=the number of endpoints",
                 ));
             }
+            let mut identities = HashMap::new();
             for (index, endpoint) in finality.endpoints.iter().enumerate() {
                 if !matches!(endpoint.scheme(), "http" | "https") {
                     errors.push(ValidationError::new(
                         format!("finality.endpoints[{index}]"),
                         "only http and https URLs are supported",
+                    ));
+                }
+                let first = *identities
+                    .entry(finality_endpoint_identity(endpoint))
+                    .or_insert(index);
+                if first != index {
+                    errors.push(ValidationError::new(
+                        format!("finality.endpoints[{index}]"),
+                        format!(
+                            "duplicates finality.endpoints[{first}]; each transport counts once toward agreement"
+                        ),
                     ));
                 }
             }
@@ -2059,10 +2442,11 @@ fn validate_finality(finality: &FinalityConfig, errors: &mut Vec<ValidationError
                     "must be empty for consensus_p2p finality",
                 ));
             }
-            if finality.minimum_peers == 0 || finality.minimum_peers > 128 {
+            let maximum = leani_finality_consensus_p2p::DEFAULT_MAXIMUM_PEERS;
+            if finality.minimum_peers == 0 || finality.minimum_peers > maximum {
                 errors.push(ValidationError::new(
                     "finality.minimum_peers",
-                    "must be between 1 and 128",
+                    format!("must be between 1 and {maximum}, the consensus peers dialed at once"),
                 ));
             }
             for (index, bootnode) in finality.bootnodes.iter().enumerate() {
@@ -2325,6 +2709,10 @@ fn unique_non_empty_ids<'a>(
 
 #[derive(Debug, Error)]
 pub enum ConfigError {
+    #[error(
+        "relative data_dir resolves to {current} beside the configuration, which holds no Leani state, but {previous} under the working directory does; move that state beside the configuration, or set data_dir to the intended absolute path"
+    )]
+    AmbiguousDataDirectory { previous: PathBuf, current: PathBuf },
     #[error("failed to read configuration at {path}: {source}")]
     Read {
         path: PathBuf,
@@ -2401,7 +2789,7 @@ minimum_peers = 1
 
 [finality]
 kind = "beacon_api"
-checkpoint = "0x0000000000000000000000000000000000000000000000000000000000000000"
+checkpoint = "0x1111111111111111111111111111111111111111111111111111111111111111"
 checkpoint_slot = 0
 endpoints = ["http://127.0.0.1:5052"]
 
@@ -2436,12 +2824,14 @@ verification_segment_blocks = 8192
 http_bind = "127.0.0.1:8545"
 ws_bind = "127.0.0.1:8546"
 historical_mode = "on_demand"
-transaction_locator = false
 minimum_recent_blocks = 128
 
 [api]
 bind = "127.0.0.1:8080"
 "#;
+
+#[cfg(test)]
+mod schema_parity;
 
 #[cfg(test)]
 mod tests {
@@ -2956,6 +3346,61 @@ verification_segment_blocks = 8192"#,
         }
     }
 
+    fn erae_source(extra: &str) -> HistorySourceConfig {
+        toml::from_str(&format!(
+            "id = \"erae\"\nkind = \"era_e\"\npriority = 20\ntrust = \"trusted_dataset\"\n{extra}"
+        ))
+        .expect("eraE source")
+    }
+
+    #[test]
+    fn erae_mirrors_use_https_unless_on_loopback_or_opted_in() {
+        // Audit M-H3: a plain-http mirror was accepted anywhere.
+        let mut config = config();
+        config
+            .sources
+            .history
+            .push(erae_source("endpoint = \"http://mirror.example/erae/\""));
+        assert_eq!(error_fields(&config), ["sources.history[1].endpoint"]);
+
+        for loopback in ["http://127.0.0.1:8080/erae/", "http://localhost/erae/"] {
+            config.sources.history[1] = erae_source(&format!("endpoint = \"{loopback}\""));
+            assert!(error_fields(&config).is_empty(), "{loopback}");
+        }
+        config.sources.history[1] =
+            erae_source("endpoint = \"http://mirror.example/erae/\"\nallow_insecure_http = true");
+        assert!(error_fields(&config).is_empty(), "an explicit opt-in");
+
+        // The opt-in only means something for an eraE mirror.
+        config.sources.history[0] = toml::from_str(
+            "id = \"xatu\"\nkind = \"xatu\"\npriority = 10\ntrust = \"trusted_dataset\"\nallow_insecure_http = true",
+        )
+        .expect("Xatu source");
+        assert_eq!(
+            error_fields(&config),
+            ["sources.history[0].allow_insecure_http"]
+        );
+
+        // Ruling R6: the new field is in the configuration schema.
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let schema: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(repository.join("config/schema-v1.json")).expect("schema"),
+        )
+        .expect("configuration schema is JSON");
+        assert!(
+            schema["$defs"]["historySource"]["properties"]["allow_insecure_http"].is_object(),
+            "sources.history.allow_insecure_http is missing from the schema"
+        );
+    }
+
+    #[test]
+    fn xatu_history_sources_are_mainnet_only() {
+        // Audit History-3: Xatu stamps every frame as chain 1.
+        let mut config = config();
+        config.chain.chain_id = 11_155_111;
+        assert_eq!(error_fields(&config), ["sources.history[0].kind"]);
+    }
+
     #[test]
     fn retained_only_processors_require_enabled_raw_history_and_on_demand_scheduling() {
         let mut config = config();
@@ -2992,6 +3437,83 @@ verification_segment_blocks = 8192"#,
             errors
                 .iter()
                 .any(|error| error.field == "finality.checkpoint")
+        );
+    }
+
+    fn finality_errors(config: Config) -> Vec<ValidationError> {
+        config
+            .validate()
+            .map_or_else(|errors| errors.0, |_| Vec::new())
+    }
+
+    #[test]
+    fn live_following_without_finality_is_refused() {
+        // Without verified finality nothing verifies the attested heads that
+        // bound what the P2P live lane includes.
+        let mut config = config();
+        config.finality.kind = FinalitySourceKind::Disabled;
+        let errors = finality_errors(config.clone());
+        let refusal = errors
+            .iter()
+            .find(|error| error.field == "sources.live/finality")
+            .unwrap_or_else(|| panic!("live following without finality validated: {errors:?}"));
+        assert!(
+            refusal.message.contains("sync committee attested"),
+            "{refusal:?}"
+        );
+        // Disabling live following as well is a finalized-dataset backfill.
+        config.sources.live.kind = LiveSourceKind::Disabled;
+        assert!(
+            finality_errors(config)
+                .iter()
+                .all(|error| error.field != "sources.live/finality")
+        );
+    }
+
+    #[test]
+    fn finality_validation_rejects_the_all_zero_checkpoint_root() {
+        let mut config = config();
+        config.finality.checkpoint = format!("0x{}", "00".repeat(32));
+        let errors = finality_errors(config);
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.field == "finality.checkpoint"),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn finality_validation_limits_minimum_peers_to_the_consensus_peer_set() {
+        let mut config = config();
+        config.finality.kind = FinalitySourceKind::ConsensusP2p;
+        config.finality.endpoints.clear();
+        config.finality.checkpoint_slot = 12_345;
+        config.finality.minimum_peers = 25;
+        let errors = finality_errors(config.clone());
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.field == "finality.minimum_peers"),
+            "{errors:?}"
+        );
+        config.finality.minimum_peers = 24;
+        config.validate().expect("the P2P maximum is attainable");
+    }
+
+    #[test]
+    fn finality_validation_rejects_endpoint_aliases() {
+        let mut config = config();
+        config.finality.endpoints = vec![
+            Url::parse("https://a.example/beacon").expect("URL"),
+            Url::parse("HTTPS://A.EXAMPLE:443/beacon/?key=alias").expect("URL"),
+        ];
+        let errors = finality_errors(config);
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.field == "finality.endpoints[1]"),
+            "{errors:?}"
         );
     }
 
@@ -3179,7 +3701,11 @@ markets = ["LINK/ETH"]
         let config = starter.expand().expect("expand blocks config");
         assert_eq!(config.processors.len(), 1);
         assert_eq!(config.processors[0].id, "block-summary");
-        assert_eq!(config.processors[0].version, "1.1.0");
+        assert_eq!(
+            config.processors[0].instance,
+            crate::block_summaries::COMPACT_INSTANCE
+        );
+        assert_eq!(config.processors[0].version, "1.2.0");
         assert!(config.processors[0].settings.is_empty());
     }
 
@@ -3194,6 +3720,7 @@ markets = ["LINK/ETH"]
             "config/modes/windowed.toml",
             "config/modes/full.toml",
             "config/benchmarks/real-source.toml",
+            "deploy/container.toml",
         ] {
             let path = repository.join(relative);
             Config::load(&path)
@@ -3216,5 +3743,439 @@ markets = ["LINK/ETH"]
             schema["$defs"]["advancedConfig"]["additionalProperties"],
             serde_json::Value::Bool(false)
         );
+    }
+
+    fn error_fields(config: &Config) -> Vec<String> {
+        config
+            .validation_errors()
+            .into_iter()
+            .map(|error| error.field)
+            .collect()
+    }
+
+    #[test]
+    fn non_loopback_binds_need_authentication_or_an_explicit_opt_in() {
+        // Audit M-D7: the container profile served every interface with no
+        // bearer, so publishing its ports exposed the admin routes.
+        for bind in ["0.0.0.0:8080", "[::]:8080", "192.0.2.10:8080"] {
+            let mut config = config();
+            config.api.bind = bind.parse().expect("bind");
+            assert_eq!(error_fields(&config), ["api.bind"], "{bind}");
+            config.api.bearer_token_env = Some("LEANI_API_TOKEN".to_owned());
+            assert!(error_fields(&config).is_empty(), "{bind} with a bearer");
+            config.api.bearer_token_env = None;
+            config.api.allow_unauthenticated_remote = true;
+            assert!(error_fields(&config).is_empty(), "{bind} opted in");
+        }
+        for bind in [
+            "127.0.0.1:18080",
+            "127.0.0.2:8080",
+            "[::1]:8080",
+            "[::ffff:127.0.0.1]:8080",
+        ] {
+            let mut config = config();
+            config.api.bind = bind.parse().expect("bind");
+            assert!(error_fields(&config).is_empty(), "{bind}");
+        }
+
+        let mut config = config();
+        config.rpc.http_bind = "0.0.0.0:8545".parse().expect("bind");
+        config.rpc.ws_bind = "[::]:8546".parse().expect("bind");
+        // JSON-RPC has no bearer, so only the opt-in serves it remotely.
+        config.api.bearer_token_env = Some("LEANI_API_TOKEN".to_owned());
+        assert_eq!(error_fields(&config), ["rpc.http_bind", "rpc.ws_bind"]);
+        config.rpc.allow_unauthenticated_remote = true;
+        assert!(error_fields(&config).is_empty());
+    }
+
+    #[test]
+    fn host_and_origin_allowlists_are_checked_and_normalized() {
+        let mut config = config();
+        config.api.allowed_hosts = [
+            "Leani",
+            "[::1]",
+            "10.0.0.5",
+            "leani:8080",
+            "http://leani",
+            "*",
+            "",
+        ]
+        .map(ToOwned::to_owned)
+        .to_vec();
+        config.api.allowed_origins = [
+            "https://App.Example",
+            "http://localhost:3000/",
+            "https://app.example/path",
+            "null",
+        ]
+        .map(ToOwned::to_owned)
+        .to_vec();
+        config.rpc.allowed_origins = [
+            "https://dapp.example:8443",
+            "ftp://files.example",
+            "https://user@app.example",
+        ]
+        .map(ToOwned::to_owned)
+        .to_vec();
+        assert_eq!(
+            error_fields(&config),
+            [
+                "api.allowed_hosts[3]",
+                "api.allowed_hosts[4]",
+                "api.allowed_hosts[5]",
+                "api.allowed_hosts[6]",
+                "api.allowed_origins[2]",
+                "api.allowed_origins[3]",
+                "rpc.allowed_origins[1]",
+                "rpc.allowed_origins[2]",
+            ]
+        );
+        assert_eq!(allowed_host("Leani").as_deref(), Some("leani"));
+        assert_eq!(allowed_host("[::1]").as_deref(), Some("[::1]"));
+        assert_eq!(
+            allowed_origin("https://App.Example:443/").as_deref(),
+            Some("https://app.example")
+        );
+        assert_eq!(
+            allowed_origin("http://localhost:3000").as_deref(),
+            Some("http://localhost:3000")
+        );
+        // The schema's pattern accepts the scheme in any case too, and both
+        // refuse a query or fragment.
+        assert_eq!(
+            allowed_origin("HTTPS://App.Example").as_deref(),
+            Some("https://app.example")
+        );
+        assert_eq!(allowed_origin("https://app.example?x=1"), None);
+        assert_eq!(allowed_origin("https://app.example#f"), None);
+    }
+
+    #[test]
+    fn rpc_limits_default_to_the_documented_caps_and_must_be_positive() {
+        let config = config();
+        assert_eq!(config.rpc.max_batch_requests, 100);
+        assert_eq!(config.rpc.max_response_bytes.bytes(), 16 * 1_024 * 1_024);
+        assert_eq!(config.rpc.max_log_results, 10_000);
+        assert_eq!(config.rpc.max_log_addresses, 1_000);
+        assert_eq!(config.rpc.max_log_topic_alternatives, 1_000);
+        assert_eq!(config.rpc.max_subscriptions_per_connection, 128);
+        assert_eq!(config.rpc.max_websocket_connections, 256);
+        assert_eq!(
+            config.rpc.max_subscription_event_bytes.bytes(),
+            16 * 1_024 * 1_024
+        );
+        assert_eq!(config.rpc.max_outbound_bytes.bytes(), 64 * 1_024 * 1_024);
+        // The shared budget holds one connection's whole notification room
+        // and fits tokio's permits.
+        let mut bounded = config.clone();
+        bounded.rpc.max_outbound_bytes =
+            HumanBytes::from_bytes(bounded.rpc.max_subscription_event_bytes.bytes() - 1);
+        assert_eq!(error_fields(&bounded), ["rpc.max_outbound_bytes"]);
+        bounded.rpc.max_outbound_bytes = HumanBytes::from_bytes(u64::from(u32::MAX) + 1);
+        assert_eq!(error_fields(&bounded), ["rpc.max_outbound_bytes"]);
+        let mut config = config;
+        config.rpc.max_batch_requests = 0;
+        config.rpc.max_response_bytes = HumanBytes::from_bytes(0);
+        config.rpc.max_log_results = 0;
+        config.rpc.max_log_addresses = 0;
+        config.rpc.max_log_topic_alternatives = 0;
+        config.rpc.max_subscriptions_per_connection = 0;
+        config.rpc.max_websocket_connections = 0;
+        config.rpc.max_subscription_event_bytes = HumanBytes::from_bytes(0);
+        assert_eq!(
+            error_fields(&config),
+            [
+                "rpc.max_batch_requests",
+                "rpc.max_response_bytes",
+                "rpc.max_log_results",
+                "rpc.max_log_addresses",
+                "rpc.max_log_topic_alternatives",
+                "rpc.max_subscriptions_per_connection",
+                "rpc.max_websocket_connections",
+                "rpc.max_subscription_event_bytes",
+            ]
+        );
+
+        // Ruling R6: every field is in the configuration schema.
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let schema: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(repository.join("config/schema-v1.json")).expect("schema"),
+        )
+        .expect("configuration schema is JSON");
+        for (section, fields) in [
+            (
+                "api",
+                &[
+                    "allow_unauthenticated_remote",
+                    "allowed_hosts",
+                    "allowed_origins",
+                ][..],
+            ),
+            (
+                "rpc",
+                &[
+                    "allow_unauthenticated_remote",
+                    "allowed_origins",
+                    "max_batch_requests",
+                    "max_response_bytes",
+                    "max_log_results",
+                    "max_log_addresses",
+                    "max_log_topic_alternatives",
+                    "max_subscriptions_per_connection",
+                    "max_websocket_connections",
+                    "max_subscription_event_bytes",
+                ][..],
+            ),
+        ] {
+            for field in fields {
+                assert!(
+                    schema["$defs"][section]["properties"][field].is_object(),
+                    "{section}.{field} is missing from the schema"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn transaction_locator_is_optional_and_ignored_with_a_warning() {
+        // Audit Config-6: `rpc.transaction_locator` was required, yet nothing
+        // read it.
+        let without = VALID_CONFIG_TOML;
+        assert!(!without.contains("transaction_locator"));
+        let config: Config = toml::from_str(without).expect("the locator is optional");
+        assert!(error_fields(&config).is_empty());
+        assert!(config.deprecation_warnings().is_empty());
+        for value in [true, false] {
+            let with = without.replace(
+                "minimum_recent_blocks = 128",
+                &format!("minimum_recent_blocks = 128\ntransaction_locator = {value}"),
+            );
+            let config: Config = toml::from_str(&with).expect("an existing configuration loads");
+            assert!(error_fields(&config).is_empty(), "{value}");
+            assert_eq!(
+                config.deprecation_warnings(),
+                ["rpc.transaction_locator is deprecated and ignored; remove it"],
+                "{value}"
+            );
+        }
+    }
+
+    fn toml_string(path: &Path) -> String {
+        toml::Value::String(path.display().to_string()).to_string()
+    }
+
+    #[test]
+    fn a_relative_data_dir_is_beside_its_configuration_file() {
+        // Audit Config-8: a relative `data_dir` named a directory under
+        // whatever working directory the node started in.
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let directory = temp.path().join("node");
+        fs::create_dir_all(&directory).expect("configuration directory");
+        let advanced = directory.join("advanced.toml");
+        fs::write(&advanced, VALID_CONFIG_TOML).expect("advanced configuration");
+        assert_eq!(
+            Config::load(&advanced).expect("advanced").data_dir,
+            directory.join("data")
+        );
+
+        // The compact form's default `data_dir` is `./data` too.
+        let compact = directory.join("compact.toml");
+        fs::write(
+            &compact,
+            format!(
+                "config_version = 1\nnetwork = \"ethereum-mainnet\"\n\n[finality]\ncheckpoint = \"0x{}\"\ncheckpoint_slot = 1\nendpoints = [\"https://beacon.example/\"]\n\n[blocks]\n",
+                "11".repeat(32)
+            ),
+        )
+        .expect("compact configuration");
+        assert_eq!(
+            Config::load(&compact).expect("compact").data_dir,
+            directory.join("data")
+        );
+
+        fs::write(
+            &advanced,
+            VALID_CONFIG_TOML.replace("data_dir = \"./data\"", "data_dir = \"../state\""),
+        )
+        .expect("parent-relative configuration");
+        assert_eq!(
+            Config::load(&advanced).expect("parent-relative").data_dir,
+            directory.join("../state")
+        );
+
+        let absolute = temp.path().join("elsewhere");
+        fs::write(
+            &advanced,
+            VALID_CONFIG_TOML.replace(
+                "data_dir = \"./data\"",
+                &format!("data_dir = {}", toml_string(&absolute)),
+            ),
+        )
+        .expect("absolute configuration");
+        assert_eq!(
+            Config::load(&advanced).expect("absolute").data_dir,
+            absolute
+        );
+    }
+
+    #[test]
+    fn data_dir_resolution_keeps_what_needs_no_directory() {
+        // A configuration named without a directory is in the working
+        // directory already.
+        assert_eq!(
+            resolve_relative_to_file(Path::new("leani.toml"), Path::new("./data")),
+            Path::new("./data")
+        );
+        assert_eq!(
+            resolve_relative_to_file(Path::new("/etc/leani/node.toml"), Path::new("./data")),
+            Path::new("/etc/leani/data")
+        );
+        assert_eq!(
+            resolve_relative_to_file(Path::new("/etc/leani/node.toml"), Path::new("state")),
+            Path::new("/etc/leani/state")
+        );
+        assert_eq!(
+            resolve_relative_to_file(
+                Path::new("/etc/leani/node.toml"),
+                Path::new("/var/lib/leani")
+            ),
+            Path::new("/var/lib/leani")
+        );
+        // Validation still reports an empty `data_dir`.
+        assert_eq!(
+            resolve_relative_to_file(Path::new("/etc/leani/node.toml"), Path::new("")),
+            Path::new("")
+        );
+    }
+
+    #[test]
+    fn output_finalized_only_is_refused_in_favour_of_publish() {
+        // Audit: nothing read `[processors.output] finalized_only`.
+        for value in [true, false] {
+            let stale = VALID_CONFIG_TOML.replace(
+                "[processors.output]\nmode = \"full\"",
+                &format!("[processors.output]\nmode = \"full\"\nfinalized_only = {value}"),
+            );
+            let config: Config = toml::from_str(&stale).expect("the key still decodes");
+            let errors = config.validation_errors();
+            assert!(
+                errors.iter().any(|error| {
+                    error.field == "processors[0].output.finalized_only"
+                        && error.message.contains("publish = \"finalized_only\"")
+                }),
+                "{value}: {errors:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn parquet_history_sources_are_refused() {
+        // Audit: a `parquet` source validated, and the node then skipped it.
+        let mut config = config();
+        config.sources.history.push(
+            toml::from_str(
+                "id = \"parquet\"\nkind = \"parquet\"\npriority = 20\ntrust = \"trusted_dataset\"",
+            )
+            .expect("parquet source"),
+        );
+        let errors = config.validation_errors();
+        assert!(
+            errors.iter().any(|error| {
+                error.field == "sources.history[1].kind" && error.message.contains("`xatu`")
+            }),
+            "{errors:?}"
+        );
+    }
+
+    fn acknowledged_consumer(lease_ttl: &str) -> Config {
+        toml::from_str(&VALID_CONFIG_TOML.replace(
+            "[processors.delivery]\nmode = \"window\"",
+            &format!(
+                "[processors.delivery]\nmode = \"until_acknowledged\"\n\n[[processors.delivery.consumers]]\nid = \"destination\"\nrequired = true\nlease_ttl = \"{lease_ttl}\""
+            ),
+        ))
+        .expect("consumer configuration")
+    }
+
+    #[test]
+    fn consumer_lease_ttls_over_100_years_fail_validation() {
+        // Task 16b: `doctor` accepted a lease TTL the store refuses at
+        // `serve`.
+        assert!(error_fields(&acknowledged_consumer("36500d")).is_empty());
+        let errors = acknowledged_consumer("36501d").validation_errors();
+        assert!(
+            errors.iter().any(|error| {
+                error.field == "processors[0]" && error.message.contains("at most 100 years")
+            }),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn relative_data_dir_refuses_only_to_leave_state_behind() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let working = temp.path().join("working");
+        let node = temp.path().join("node");
+        fs::create_dir_all(working.join("data")).unwrap();
+        fs::create_dir_all(&node).unwrap();
+        let path = node.join("leani.toml");
+        fs::write(&path, VALID_CONFIG_TOML).unwrap();
+        fs::write(working.join("data/leani.sqlite"), b"old store").unwrap();
+        let load = || Config::load_with_warnings(&path, Some(&working));
+        assert!(matches!(
+            load(),
+            Err(ConfigError::AmbiguousDataDirectory { .. })
+        ));
+        assert!(!node.join("data").exists(), "refusal creates no state");
+        // Both hold state: this layout is already in use, so load and warn.
+        fs::create_dir_all(node.join("data")).unwrap();
+        fs::write(node.join("data/leani.sqlite"), b"other store").unwrap();
+        let (_, warnings) = load().expect("both locations hold state");
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("also holds Leani state")),
+            "{warnings:?}"
+        );
+        assert_eq!(
+            fs::read(working.join("data/leani.sqlite")).unwrap(),
+            b"old store"
+        );
+        assert_eq!(
+            fs::read(node.join("data/leani.sqlite")).unwrap(),
+            b"other store"
+        );
+        fs::remove_file(working.join("data/leani.sqlite")).unwrap();
+        fs::remove_file(node.join("data/leani.sqlite")).unwrap();
+        fs::create_dir_all(working.join("data/subscriptions")).unwrap();
+        assert!(load().is_err(), "embedded subscription state also counts");
+        fs::write(
+            &path,
+            VALID_CONFIG_TOML.replace(
+                "data_dir = \"./data\"",
+                &format!("data_dir = {}", toml_string(&node.join("data"))),
+            ),
+        )
+        .unwrap();
+        assert!(
+            load().is_ok(),
+            "absolute path explicitly selects a location"
+        );
+    }
+
+    #[test]
+    fn data_directory_aliases_are_not_ambiguous() {
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("data");
+        fs::create_dir_all(&data).unwrap();
+        fs::write(data.join("leani.sqlite"), b"state").unwrap();
+        assert!(check_data_directory(&data, &data.join(".")).is_ok());
+        assert!(check_data_directory(&data, &data.join("../data")).is_ok());
+        #[cfg(unix)]
+        {
+            let alias = temp.path().join("alias");
+            std::os::unix::fs::symlink(&data, &alias).unwrap();
+            assert!(check_data_directory(&data, &alias).is_ok());
+        }
     }
 }

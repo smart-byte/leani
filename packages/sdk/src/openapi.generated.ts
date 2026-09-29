@@ -237,10 +237,25 @@ export interface paths {
             };
             cookie?: never;
         };
-        /** Query processor entities */
+        /**
+         * Query processor entities
+         * @description Without a cursor, reads current retained output in entity-key order
+         *     without creating a snapshot; its `nextCursor` continues that read,
+         *     and later pages see later commits. A cursor from a snapshot reads the
+         *     snapshot's next page. Create a stable snapshot with POST.
+         */
         get: operations["queryProcessorEntities"];
         put?: never;
-        post?: never;
+        /**
+         * Snapshot processor entities
+         * @description Copies the matching retained output into a stable, short-lived
+         *     snapshot and returns its first page. Read later pages with GET and the
+         *     page's `nextCursor`, and release the snapshot when done. A
+         *     `finalized_only` processor's snapshot holds blocks whose changes are
+         *     not published yet, so it offers no boundary to follow:
+         *     `boundaryCursor` and `recovery.follow` are null.
+         */
+        post: operations["createProcessorEntitySnapshot"];
         delete?: never;
         options?: never;
         head?: never;
@@ -418,11 +433,21 @@ export interface paths {
             };
             cookie?: never;
         };
-        /** Read a durable consumer */
+        /**
+         * Read a durable consumer
+         * @description Administrative: only the bearer token protects it, whether or not the
+         *     consumer has a credential, as for the consumer list. A credential
+         *     isolates applications on the consumer-scoped delivery routes.
+         */
         get: operations["getDurableConsumer"];
         put?: never;
         post?: never;
-        /** Revoke a durable consumer */
+        /**
+         * Revoke a durable consumer
+         * @description Administrative: only the bearer token protects it, whether or not the
+         *     consumer has a credential, so an operator can revoke a consumer whose
+         *     credential is lost.
+         */
         delete: operations["revokeDurableConsumer"];
         options?: never;
         head?: never;
@@ -434,8 +459,13 @@ export interface paths {
             query?: never;
             header?: {
                 /**
-                 * @description Consumer-scoped credential. An administrator bearer credential can be
-                 *     used instead on the protected listener.
+                 * @description The consumer's credential. A consumer created with one needs it, in
+                 *     addition to any bearer token, on its lease, change, acknowledgement,
+                 *     and stream requests, and gets 403 `forbidden` without it or with
+                 *     another; the node compares it in constant time. Listing, inspecting,
+                 *     and revoking consumers need only the bearer token. A consumer without
+                 *     one, such as a configured consumer, takes none. Credentials created
+                 *     before 32 characters were required keep working.
                  */
                 "x-leani-consumer-credential"?: components["parameters"]["ConsumerCredential"];
             };
@@ -447,7 +477,12 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** Renew a durable consumer lease */
+        /**
+         * Renew a durable consumer lease
+         * @description A split live stream fences renewal by session, so its processors get
+         *     409 `consumer_session_required`; renew through
+         *     `/streams/live/consumers/{consumer}/lease` instead.
+         */
         post: operations["renewDurableConsumerLease"];
         delete?: never;
         options?: never;
@@ -460,8 +495,13 @@ export interface paths {
             query?: never;
             header?: {
                 /**
-                 * @description Consumer-scoped credential. An administrator bearer credential can be
-                 *     used instead on the protected listener.
+                 * @description The consumer's credential. A consumer created with one needs it, in
+                 *     addition to any bearer token, on its lease, change, acknowledgement,
+                 *     and stream requests, and gets 403 `forbidden` without it or with
+                 *     another; the node compares it in constant time. Listing, inspecting,
+                 *     and revoking consumers need only the bearer token. A consumer without
+                 *     one, such as a configured consumer, takes none. Credentials created
+                 *     before 32 characters were required keep working.
                  */
                 "x-leani-consumer-credential"?: components["parameters"]["ConsumerCredential"];
             };
@@ -486,8 +526,13 @@ export interface paths {
             query?: never;
             header?: {
                 /**
-                 * @description Consumer-scoped credential. An administrator bearer credential can be
-                 *     used instead on the protected listener.
+                 * @description The consumer's credential. A consumer created with one needs it, in
+                 *     addition to any bearer token, on its lease, change, acknowledgement,
+                 *     and stream requests, and gets 403 `forbidden` without it or with
+                 *     another; the node compares it in constant time. Listing, inspecting,
+                 *     and revoking consumers need only the bearer token. A consumer without
+                 *     one, such as a configured consumer, takes none. Credentials created
+                 *     before 32 characters were required keep working.
                  */
                 "x-leani-consumer-credential"?: components["parameters"]["ConsumerCredential"];
             };
@@ -499,7 +544,14 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** Acknowledge durable consumer changes */
+        /**
+         * Acknowledge durable consumer changes
+         * @description A cursor beyond the consumer's delivered sequence gets 409
+         *     `acknowledgement_beyond_delivered`. A split live stream fences
+         *     acknowledgement by session, so its processors get 409
+         *     `consumer_session_required`; acknowledge through
+         *     `/streams/live/consumers/{consumer}/ack` instead.
+         */
         post: operations["acknowledgeDurableConsumerChanges"];
         delete?: never;
         options?: never;
@@ -570,8 +622,13 @@ export interface paths {
             query?: never;
             header?: {
                 /**
-                 * @description Consumer-scoped credential. An administrator bearer credential can be
-                 *     used instead on the protected listener.
+                 * @description The consumer's credential. A consumer created with one needs it, in
+                 *     addition to any bearer token, on its lease, change, acknowledgement,
+                 *     and stream requests, and gets 403 `forbidden` without it or with
+                 *     another; the node compares it in constant time. Listing, inspecting,
+                 *     and revoking consumers need only the bearer token. A consumer without
+                 *     one, such as a configured consumer, takes none. Credentials created
+                 *     before 32 characters were required keep working.
                  */
                 "x-leani-consumer-credential"?: components["parameters"]["ConsumerCredential"];
             };
@@ -581,7 +638,15 @@ export interface paths {
             };
             cookie?: never;
         };
-        /** Stream the dedicated live lane for a durable consumer */
+        /**
+         * Stream the dedicated live lane for a durable consumer
+         * @description Each batch holds one whole block's commit, and records the consumer's
+         *     delivered sequence through it. A request whose `Sec-Fetch-Site` is
+         *     `cross-site` or `same-site` without an allowed `Origin`, such as a
+         *     navigation of another site's frame, gets 403 `cross_site_request`.
+         *     When the node shuts down, the stream ends after a whole record;
+         *     reconnect to resume after the acknowledged cursor.
+         */
         get: operations["streamLiveDurableConsumer"];
         put?: never;
         post?: never;
@@ -596,8 +661,13 @@ export interface paths {
             query?: never;
             header?: {
                 /**
-                 * @description Consumer-scoped credential. An administrator bearer credential can be
-                 *     used instead on the protected listener.
+                 * @description The consumer's credential. A consumer created with one needs it, in
+                 *     addition to any bearer token, on its lease, change, acknowledgement,
+                 *     and stream requests, and gets 403 `forbidden` without it or with
+                 *     another; the node compares it in constant time. Listing, inspecting,
+                 *     and revoking consumers need only the bearer token. A consumer without
+                 *     one, such as a configured consumer, takes none. Credentials created
+                 *     before 32 characters were required keep working.
                  */
                 "x-leani-consumer-credential"?: components["parameters"]["ConsumerCredential"];
             };
@@ -609,7 +679,13 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** Acknowledge a live-lane consumer batch */
+        /**
+         * Acknowledge a live-lane consumer batch
+         * @description The cursor must end a block's commit, as a batch's
+         *     `acknowledgeableCursor` does, and gets 409
+         *     `acknowledgement_mid_block` otherwise. A cursor beyond the consumer's
+         *     delivered sequence gets 409 `acknowledgement_beyond_delivered`.
+         */
         post: operations["acknowledgeLiveDurableConsumer"];
         delete?: never;
         options?: never;
@@ -622,8 +698,13 @@ export interface paths {
             query?: never;
             header?: {
                 /**
-                 * @description Consumer-scoped credential. An administrator bearer credential can be
-                 *     used instead on the protected listener.
+                 * @description The consumer's credential. A consumer created with one needs it, in
+                 *     addition to any bearer token, on its lease, change, acknowledgement,
+                 *     and stream requests, and gets 403 `forbidden` without it or with
+                 *     another; the node compares it in constant time. Listing, inspecting,
+                 *     and revoking consumers need only the bearer token. A consumer without
+                 *     one, such as a configured consumer, takes none. Credentials created
+                 *     before 32 characters were required keep working.
                  */
                 "x-leani-consumer-credential"?: components["parameters"]["ConsumerCredential"];
             };
@@ -649,8 +730,13 @@ export interface paths {
             query?: never;
             header?: {
                 /**
-                 * @description Consumer-scoped credential. An administrator bearer credential can be
-                 *     used instead on the protected listener.
+                 * @description The consumer's credential. A consumer created with one needs it, in
+                 *     addition to any bearer token, on its lease, change, acknowledgement,
+                 *     and stream requests, and gets 403 `forbidden` without it or with
+                 *     another; the node compares it in constant time. Listing, inspecting,
+                 *     and revoking consumers need only the bearer token. A consumer without
+                 *     one, such as a configured consumer, takes none. Credentials created
+                 *     before 32 characters were required keep working.
                  */
                 "x-leani-consumer-credential"?: components["parameters"]["ConsumerCredential"];
             };
@@ -675,8 +761,13 @@ export interface paths {
             query?: never;
             header?: {
                 /**
-                 * @description Consumer-scoped credential. An administrator bearer credential can be
-                 *     used instead on the protected listener.
+                 * @description The consumer's credential. A consumer created with one needs it, in
+                 *     addition to any bearer token, on its lease, change, acknowledgement,
+                 *     and stream requests, and gets 403 `forbidden` without it or with
+                 *     another; the node compares it in constant time. Listing, inspecting,
+                 *     and revoking consumers need only the bearer token. A consumer without
+                 *     one, such as a configured consumer, takes none. Credentials created
+                 *     before 32 characters were required keep working.
                  */
                 "x-leani-consumer-credential"?: components["parameters"]["ConsumerCredential"];
             };
@@ -686,7 +777,15 @@ export interface paths {
             };
             cookie?: never;
         };
-        /** Stream changes from one backfill subscription */
+        /**
+         * Stream changes from one backfill subscription
+         * @description Each batch and the completion record the consumer's delivered
+         *     sequence through their acknowledgement boundary. A request whose
+         *     `Sec-Fetch-Site` is `cross-site` or `same-site` without an allowed
+         *     `Origin`, such as a navigation of another site's frame, gets 403
+         *     `cross_site_request`. When the node shuts down, the stream ends after
+         *     a whole record; reconnect to resume after the acknowledged cursor.
+         */
         get: operations["streamBackfillConsumer"];
         put?: never;
         post?: never;
@@ -701,8 +800,13 @@ export interface paths {
             query?: never;
             header?: {
                 /**
-                 * @description Consumer-scoped credential. An administrator bearer credential can be
-                 *     used instead on the protected listener.
+                 * @description The consumer's credential. A consumer created with one needs it, in
+                 *     addition to any bearer token, on its lease, change, acknowledgement,
+                 *     and stream requests, and gets 403 `forbidden` without it or with
+                 *     another; the node compares it in constant time. Listing, inspecting,
+                 *     and revoking consumers need only the bearer token. A consumer without
+                 *     one, such as a configured consumer, takes none. Credentials created
+                 *     before 32 characters were required keep working.
                  */
                 "x-leani-consumer-credential"?: components["parameters"]["ConsumerCredential"];
             };
@@ -714,7 +818,13 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** Acknowledge a backfill subscription batch */
+        /**
+         * Acknowledge a backfill subscription batch
+         * @description The cursor must be a batch's `acknowledgeableCursor` or the
+         *     completion's `cursor` (409 `acknowledgement_invalid` otherwise), and
+         *     not beyond the consumer's delivered sequence (409
+         *     `acknowledgement_beyond_delivered`).
+         */
         post: operations["acknowledgeBackfillConsumer"];
         delete?: never;
         options?: never;
@@ -727,8 +837,13 @@ export interface paths {
             query?: never;
             header?: {
                 /**
-                 * @description Consumer-scoped credential. An administrator bearer credential can be
-                 *     used instead on the protected listener.
+                 * @description The consumer's credential. A consumer created with one needs it, in
+                 *     addition to any bearer token, on its lease, change, acknowledgement,
+                 *     and stream requests, and gets 403 `forbidden` without it or with
+                 *     another; the node compares it in constant time. Listing, inspecting,
+                 *     and revoking consumers need only the bearer token. A consumer without
+                 *     one, such as a configured consumer, takes none. Credentials created
+                 *     before 32 characters were required keep working.
                  */
                 "x-leani-consumer-credential"?: components["parameters"]["ConsumerCredential"];
             };
@@ -816,7 +931,20 @@ export interface paths {
         /** List backfill subscriptions */
         get: operations["listBackfillSubscriptions"];
         put?: never;
-        /** Create a backfill subscription */
+        /**
+         * Create a backfill subscription
+         * @description A new subscription's consumer `credential` holds 32 to 512 printable
+         *     ASCII characters without spaces (400 otherwise). Re-submitting an
+         *     existing subscription's request unchanged returns its status, even
+         *     with a credential from before that rule. The credential enters the
+         *     request's idempotency identity, an unkeyed BLAKE3 hash of the whole
+         *     request that the node keeps, so use a random one.
+         *
+         *     A range that starts past the node's finalized head gets 409
+         *     `range_after_finalized_head`, and one that only ends past it
+         *     `history_not_finalized`. Their `details.currentFinalizedHead` holds
+         *     the head's `number` and its `hash` as `0x` hex.
+         */
         post: operations["createBackfillSubscription"];
         delete?: never;
         options?: never;
@@ -873,7 +1001,13 @@ export interface paths {
         /** List materialization jobs */
         get: operations["listMaterializationJobs"];
         put?: never;
-        /** Create a materialization job */
+        /**
+         * Create a materialization job
+         * @description A range that starts past the node's finalized head gets 409
+         *     `range_after_finalized_head`, and one that only ends past it
+         *     `history_not_finalized`. Their `details.currentFinalizedHead` holds
+         *     the head's `number` and its `hash` as `0x` hex.
+         */
         post: operations["createMaterializationJob"];
         delete?: never;
         options?: never;
@@ -1244,7 +1378,6 @@ export interface components {
         /** @example -1000000000000000000 */
         SignedDecimalQuantity: string;
         Hash32: string;
-        ByteArray32: number[];
         Address: string;
         /** @description Store-, chain-, and processor-bound opaque value. */
         Cursor: string;
@@ -1350,8 +1483,12 @@ export interface components {
             /** @description Highest covered block recorded as finalized. This is not a contiguous-coverage guarantee; lower gaps or non-finalized blocks can exist. Inspect available intervals for exact finalized coverage. */
             finalizedThrough: components["schemas"]["SafeInteger"] | null;
             complete: boolean;
-            /** @enum {string} */
-            state: "starting" | "backfilling" | "catching_up" | "live" | "degraded" | "failed";
+            /**
+             * @description `paused` and `failed` report the processor's live lane;
+             *     `/v1/network/status` gives its `pauseReason`.
+             * @enum {string}
+             */
+            state: "starting" | "backfilling" | "catching_up" | "live" | "degraded" | "paused" | "failed";
         };
         ChainFinalizedHead: {
             number: components["schemas"]["SafeInteger"];
@@ -1386,11 +1523,20 @@ export interface components {
             blockTimestamp: components["schemas"]["SafeInteger"];
             finality: components["schemas"]["Finality"];
         };
+        GenericOutputPage: {
+            data: components["schemas"]["GenericOutputEntity"][];
+            nextCursor: components["schemas"]["Cursor"] | null;
+            retainedBounds: components["schemas"]["OutputBounds"] | null;
+            coverage: components["schemas"]["ProcessorCoverage"];
+        };
         GenericSnapshotPage: {
             data: components["schemas"]["GenericOutputEntity"][];
             nextCursor: components["schemas"]["Cursor"] | null;
             snapshotId: string;
-            /** @description Null when the processor has delivery disabled. */
+            /**
+             * @description Null when the processor has delivery disabled or is
+             *     `finalized_only`, whose retained state holds unpublished blocks.
+             */
             boundaryCursor: components["schemas"]["Cursor"] | null;
             rowCount: components["schemas"]["DecimalQuantity"];
             /** @description Snapshot accounting bytes, including entity keys and row overhead. */
@@ -1426,19 +1572,43 @@ export interface components {
                 cursor: components["schemas"]["Cursor"];
             };
             leaseTtlSeconds: number;
+            /**
+             * @description A random secret of 32 to 512 printable ASCII characters without
+             *     spaces, such as `openssl rand -hex 32`. Only a hash keyed with the
+             *     node's secret is stored. The consumer's lease, change,
+             *     acknowledgement, and stream requests then need it; listing,
+             *     inspecting, and revoking consumers need only the bearer token.
+             *     These bounds apply to a new consumer: the node checks the ID
+             *     first, so an existing consumer ID gets 409 `consumer_exists`
+             *     whatever the credential, even one outside them.
+             */
             credential: string;
         };
         DurableConsumer: {
             id: string;
             processorInstance: string;
+            /**
+             * @description The delivery stream this consumer reads: the processor's live or
+             *     canonical stream, or a backfill subscription's history stream.
+             */
+            streamId: string;
             /** @enum {string} */
             role: "required" | "best_effort";
             /** @enum {string} */
             state: "active" | "reset_required" | "revoked";
             acknowledgedSequence: components["schemas"]["DecimalQuantity"];
+            /**
+             * @description The last sequence a page read or stream batch handed to this
+             *     consumer; acknowledgement cannot pass it.
+             */
             deliveredSequence: components["schemas"]["DecimalQuantity"];
             acknowledgedCursor: components["schemas"]["Cursor"];
             deliveredCursor: components["schemas"]["Cursor"];
+            /**
+             * @description How many stream sessions have taken this consumer's lease; each
+             *     new session fences the one before it. `0` before the first.
+             */
+            leaseGeneration: components["schemas"]["DecimalQuantity"];
             leaseTtlMs: components["schemas"]["DecimalQuantity"];
             leaseExpiresAtUnixMs: components["schemas"]["DecimalQuantity"];
             leaseActive: boolean;
@@ -1453,8 +1623,8 @@ export interface components {
             checkpointId: components["schemas"]["SafeInteger"];
             processorInstance: string;
             blockNumber: components["schemas"]["SafeInteger"];
-            blockHash: components["schemas"]["ByteArray32"];
-            stateChecksum: components["schemas"]["ByteArray32"];
+            blockHash: components["schemas"]["Hash32"];
+            stateChecksum: components["schemas"]["Hash32"];
             stateBytes: components["schemas"]["SafeInteger"];
             createdAtUnixMs: components["schemas"]["SafeInteger"];
         };
@@ -1470,8 +1640,8 @@ export interface components {
             savepointId: string;
             processorInstance: string;
             blockNumber: components["schemas"]["SafeInteger"];
-            blockHash: components["schemas"]["ByteArray32"];
-            stateChecksum: components["schemas"]["ByteArray32"];
+            blockHash: components["schemas"]["Hash32"];
+            stateChecksum: components["schemas"]["Hash32"];
             stateBytes: components["schemas"]["SafeInteger"];
             createdAtUnixMs: components["schemas"]["SafeInteger"];
         };
@@ -1485,12 +1655,15 @@ export interface components {
             blobCount: components["schemas"]["SafeInteger"];
             blobGasUsed: components["schemas"]["DecimalQuantity"];
             excessBlobGas: components["schemas"]["DecimalQuantity"];
+            /** @description Protocol blob base fee in wei per blob gas: the EIP-4844 fee for excessBlobGas under the fork active at the block's timestamp. EIP-7918 does not change it. */
             blobBaseFee: components["schemas"]["DecimalQuantity"];
             executionBaseFee: components["schemas"]["DecimalQuantity"];
             gasUsed: components["schemas"]["DecimalQuantity"];
             gasLimit: components["schemas"]["DecimalQuantity"];
             executionEthBurnedWei: components["schemas"]["DecimalQuantity"];
+            /** @description blobBaseFee times blobGasUsed. */
             blobEthBurnedWei: components["schemas"]["DecimalQuantity"];
+            /** @description EIP-7918 reserve price in wei per blob gas from Fusaka on, null before. It only changes how excess blob gas evolves and is not applied to blobBaseFee. */
             reserveFeeWei: components["schemas"]["DecimalQuantity"] | null;
             transactionCount: components["schemas"]["SafeInteger"];
             targetBlobsPerBlock: components["schemas"]["SafeInteger"];
@@ -1509,11 +1682,14 @@ export interface components {
             blobCount: components["schemas"]["SafeInteger"];
             totalBurnedWei: components["schemas"]["DecimalQuantity"];
             executionBurnedWei: components["schemas"]["DecimalQuantity"];
+            /** @description The block's blobBaseFee times this transaction's blob gas. */
             blobBurnedWei: components["schemas"]["DecimalQuantity"];
         };
         BlobSchedule: {
             name: string;
+            /** @description Block-number label for atBlock lookups. For Dencun it is 19426589, the first block the blobs processor covers. */
             activationBlock: components["schemas"]["SafeInteger"];
+            /** @description The fork's parameters apply to blocks from this timestamp on. */
             activationTimestamp: components["schemas"]["SafeInteger"];
             forkId: string;
             targetBlobsPerBlock: components["schemas"]["SafeInteger"];
@@ -1532,6 +1708,8 @@ export interface components {
             finality: components["schemas"]["Finality"];
             coverageFrom: components["schemas"]["SafeInteger"];
             complete: boolean;
+            /** @description Block whose transfer the ledger could not apply for this token and holder, an outgoing transfer above the derived balance or an incoming one that overflows it. From that block the pair is incomplete and no longer derived, and balance keeps its last derived value. Null while the pair is derived. */
+            incompleteFrom: components["schemas"]["SafeInteger"] | null;
             /** @constant */
             method: "erc20_transfer_ledger";
         };
@@ -1673,10 +1851,21 @@ export interface components {
         Collection: string;
         Consumer: string;
         /**
-         * @description Consumer-scoped credential. An administrator bearer credential can be
-         *     used instead on the protected listener.
+         * @description The consumer's credential. A consumer created with one needs it, in
+         *     addition to any bearer token, on its lease, change, acknowledgement,
+         *     and stream requests, and gets 403 `forbidden` without it or with
+         *     another; the node compares it in constant time. Listing, inspecting,
+         *     and revoking consumers need only the bearer token. A consumer without
+         *     one, such as a configured consumer, takes none. Credentials created
+         *     before 32 characters were required keep working.
          */
         ConsumerCredential: string;
+        /**
+         * @description Marks a mutating request without a JSON body as sent by a Leani
+         *     client. A POST or DELETE needs `content-type: application/json` or
+         *     this header, and gets HTTP 415 otherwise.
+         */
+        LeaniRequest: "1";
         Subscription: string;
         Identifier: string;
         Block: components["schemas"]["SafeInteger"];
@@ -1944,7 +2133,14 @@ export interface operations {
                 /** @description Opaque cursor of the last fully committed event. */
                 after?: components["parameters"]["After"];
             };
-            header?: never;
+            header?: {
+                /**
+                 * @description The id of the last event received, which is its cursor, as an
+                 *     EventSource sends it when it reconnects. The stream resumes after
+                 *     it when `after` is absent.
+                 */
+                "Last-Event-ID"?: components["schemas"]["Cursor"];
+            };
             path: {
                 processor: components["parameters"]["Processor"];
             };
@@ -1954,7 +2150,11 @@ export interface operations {
         responses: {
             /**
              * @description Resumable SSE stream. The event id is the opaque resume cursor and
-             *     each data field contains one ChangeEnvelope.
+             *     each data field contains one ChangeEnvelope. When the node shuts
+             *     down, the stream ends after a whole event; reconnect after the
+             *     last event's id. An `error` event carries an ErrorBody and ends
+             *     the stream; reconnect only when its `retryable` is true. A stored
+             *     change the node cannot render is not retryable.
              */
             200: {
                 headers: {
@@ -2008,6 +2208,34 @@ export interface operations {
             cookie?: never;
         };
         requestBody?: never;
+        responses: {
+            /** @description A page of current output, or of a snapshot for a snapshot cursor. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["GenericOutputPage"] | components["schemas"]["GenericSnapshotPage"];
+                };
+            };
+            default: components["responses"]["Error"];
+        };
+    };
+    createProcessorEntitySnapshot: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                processor: components["parameters"]["Processor"];
+                collection: components["parameters"]["Collection"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["OutputQuery"];
+            };
+        };
         responses: {
             /** @description Stable retained-output snapshot page. */
             200: {
@@ -2107,7 +2335,14 @@ export interface operations {
     releaseProcessorQuerySnapshot: {
         parameters: {
             query?: never;
-            header?: never;
+            header?: {
+                /**
+                 * @description Marks a mutating request without a JSON body as sent by a Leani
+                 *     client. A POST or DELETE needs `content-type: application/json` or
+                 *     this header, and gets HTTP 415 otherwise.
+                 */
+                "x-leani-request"?: components["parameters"]["LeaniRequest"];
+            };
             path: {
                 processor: components["parameters"]["Processor"];
                 snapshot: string;
@@ -2154,7 +2389,14 @@ export interface operations {
     restoreProcessorRecoveryCheckpoint: {
         parameters: {
             query?: never;
-            header?: never;
+            header?: {
+                /**
+                 * @description Marks a mutating request without a JSON body as sent by a Leani
+                 *     client. A POST or DELETE needs `content-type: application/json` or
+                 *     this header, and gets HTTP 415 otherwise.
+                 */
+                "x-leani-request"?: components["parameters"]["LeaniRequest"];
+            };
             path: {
                 processor: components["parameters"]["Processor"];
                 checkpoint: components["schemas"]["SafeInteger"];
@@ -2226,6 +2468,30 @@ export interface operations {
                     "application/json": components["schemas"]["PortableSavepoint"];
                 };
             };
+            /**
+             * @description `savepoint_limit`: the processor instance already keeps 16
+             *     savepoints; delete one first. `savepoint_exists`: the ID is taken.
+             */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /**
+             * @description `physical_storage_limit`: the savepoint would exceed the physical
+             *     store budget. Free space or raise the budget first.
+             */
+            507: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
             default: components["responses"]["Error"];
         };
     };
@@ -2256,7 +2522,14 @@ export interface operations {
     deleteProcessorSavepoint: {
         parameters: {
             query?: never;
-            header?: never;
+            header?: {
+                /**
+                 * @description Marks a mutating request without a JSON body as sent by a Leani
+                 *     client. A POST or DELETE needs `content-type: application/json` or
+                 *     this header, and gets HTTP 415 otherwise.
+                 */
+                "x-leani-request"?: components["parameters"]["LeaniRequest"];
+            };
             path: {
                 processor: components["parameters"]["Processor"];
                 savepoint: string;
@@ -2354,7 +2627,14 @@ export interface operations {
     revokeDurableConsumer: {
         parameters: {
             query?: never;
-            header?: never;
+            header?: {
+                /**
+                 * @description Marks a mutating request without a JSON body as sent by a Leani
+                 *     client. A POST or DELETE needs `content-type: application/json` or
+                 *     this header, and gets HTTP 415 otherwise.
+                 */
+                "x-leani-request"?: components["parameters"]["LeaniRequest"];
+            };
             path: {
                 processor: components["parameters"]["Processor"];
                 consumer: components["parameters"]["Consumer"];
@@ -2380,10 +2660,21 @@ export interface operations {
             query?: never;
             header?: {
                 /**
-                 * @description Consumer-scoped credential. An administrator bearer credential can be
-                 *     used instead on the protected listener.
+                 * @description The consumer's credential. A consumer created with one needs it, in
+                 *     addition to any bearer token, on its lease, change, acknowledgement,
+                 *     and stream requests, and gets 403 `forbidden` without it or with
+                 *     another; the node compares it in constant time. Listing, inspecting,
+                 *     and revoking consumers need only the bearer token. A consumer without
+                 *     one, such as a configured consumer, takes none. Credentials created
+                 *     before 32 characters were required keep working.
                  */
                 "x-leani-consumer-credential"?: components["parameters"]["ConsumerCredential"];
+                /**
+                 * @description Marks a mutating request without a JSON body as sent by a Leani
+                 *     client. A POST or DELETE needs `content-type: application/json` or
+                 *     this header, and gets HTTP 415 otherwise.
+                 */
+                "x-leani-request"?: components["parameters"]["LeaniRequest"];
             };
             path: {
                 processor: components["parameters"]["Processor"];
@@ -2412,8 +2703,13 @@ export interface operations {
             };
             header?: {
                 /**
-                 * @description Consumer-scoped credential. An administrator bearer credential can be
-                 *     used instead on the protected listener.
+                 * @description The consumer's credential. A consumer created with one needs it, in
+                 *     addition to any bearer token, on its lease, change, acknowledgement,
+                 *     and stream requests, and gets 403 `forbidden` without it or with
+                 *     another; the node compares it in constant time. Listing, inspecting,
+                 *     and revoking consumers need only the bearer token. A consumer without
+                 *     one, such as a configured consumer, takes none. Credentials created
+                 *     before 32 characters were required keep working.
                  */
                 "x-leani-consumer-credential"?: components["parameters"]["ConsumerCredential"];
             };
@@ -2425,7 +2721,11 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description Replay batch; advances only the delivered head. */
+            /**
+             * @description Replay batch after the acknowledgement. Its last change becomes
+             *     the consumer's delivered sequence, which bounds acknowledgement;
+             *     the acknowledgement does not move.
+             */
             200: {
                 headers: {
                     [name: string]: unknown;
@@ -2442,8 +2742,13 @@ export interface operations {
             query?: never;
             header?: {
                 /**
-                 * @description Consumer-scoped credential. An administrator bearer credential can be
-                 *     used instead on the protected listener.
+                 * @description The consumer's credential. A consumer created with one needs it, in
+                 *     addition to any bearer token, on its lease, change, acknowledgement,
+                 *     and stream requests, and gets 403 `forbidden` without it or with
+                 *     another; the node compares it in constant time. Listing, inspecting,
+                 *     and revoking consumers need only the bearer token. A consumer without
+                 *     one, such as a configured consumer, takes none. Credentials created
+                 *     before 32 characters were required keep working.
                  */
                 "x-leani-consumer-credential"?: components["parameters"]["ConsumerCredential"];
             };
@@ -2542,8 +2847,13 @@ export interface operations {
             query?: never;
             header?: {
                 /**
-                 * @description Consumer-scoped credential. An administrator bearer credential can be
-                 *     used instead on the protected listener.
+                 * @description The consumer's credential. A consumer created with one needs it, in
+                 *     addition to any bearer token, on its lease, change, acknowledgement,
+                 *     and stream requests, and gets 403 `forbidden` without it or with
+                 *     another; the node compares it in constant time. Listing, inspecting,
+                 *     and revoking consumers need only the bearer token. A consumer without
+                 *     one, such as a configured consumer, takes none. Credentials created
+                 *     before 32 characters were required keep working.
                  */
                 "x-leani-consumer-credential"?: components["parameters"]["ConsumerCredential"];
             };
@@ -2570,8 +2880,13 @@ export interface operations {
             query?: never;
             header?: {
                 /**
-                 * @description Consumer-scoped credential. An administrator bearer credential can be
-                 *     used instead on the protected listener.
+                 * @description The consumer's credential. A consumer created with one needs it, in
+                 *     addition to any bearer token, on its lease, change, acknowledgement,
+                 *     and stream requests, and gets 403 `forbidden` without it or with
+                 *     another; the node compares it in constant time. Listing, inspecting,
+                 *     and revoking consumers need only the bearer token. A consumer without
+                 *     one, such as a configured consumer, takes none. Credentials created
+                 *     before 32 characters were required keep working.
                  */
                 "x-leani-consumer-credential"?: components["parameters"]["ConsumerCredential"];
             };
@@ -2598,10 +2913,21 @@ export interface operations {
             query?: never;
             header?: {
                 /**
-                 * @description Consumer-scoped credential. An administrator bearer credential can be
-                 *     used instead on the protected listener.
+                 * @description The consumer's credential. A consumer created with one needs it, in
+                 *     addition to any bearer token, on its lease, change, acknowledgement,
+                 *     and stream requests, and gets 403 `forbidden` without it or with
+                 *     another; the node compares it in constant time. Listing, inspecting,
+                 *     and revoking consumers need only the bearer token. A consumer without
+                 *     one, such as a configured consumer, takes none. Credentials created
+                 *     before 32 characters were required keep working.
                  */
                 "x-leani-consumer-credential"?: components["parameters"]["ConsumerCredential"];
+                /**
+                 * @description Marks a mutating request without a JSON body as sent by a Leani
+                 *     client. A POST or DELETE needs `content-type: application/json` or
+                 *     this header, and gets HTTP 415 otherwise.
+                 */
+                "x-leani-request"?: components["parameters"]["LeaniRequest"];
             };
             path: {
                 processor: components["parameters"]["Processor"];
@@ -2626,10 +2952,21 @@ export interface operations {
             query?: never;
             header?: {
                 /**
-                 * @description Consumer-scoped credential. An administrator bearer credential can be
-                 *     used instead on the protected listener.
+                 * @description The consumer's credential. A consumer created with one needs it, in
+                 *     addition to any bearer token, on its lease, change, acknowledgement,
+                 *     and stream requests, and gets 403 `forbidden` without it or with
+                 *     another; the node compares it in constant time. Listing, inspecting,
+                 *     and revoking consumers need only the bearer token. A consumer without
+                 *     one, such as a configured consumer, takes none. Credentials created
+                 *     before 32 characters were required keep working.
                  */
                 "x-leani-consumer-credential"?: components["parameters"]["ConsumerCredential"];
+                /**
+                 * @description Marks a mutating request without a JSON body as sent by a Leani
+                 *     client. A POST or DELETE needs `content-type: application/json` or
+                 *     this header, and gets HTTP 415 otherwise.
+                 */
+                "x-leani-request"?: components["parameters"]["LeaniRequest"];
             };
             path: {
                 processor: components["parameters"]["Processor"];
@@ -2654,8 +2991,13 @@ export interface operations {
             query?: never;
             header?: {
                 /**
-                 * @description Consumer-scoped credential. An administrator bearer credential can be
-                 *     used instead on the protected listener.
+                 * @description The consumer's credential. A consumer created with one needs it, in
+                 *     addition to any bearer token, on its lease, change, acknowledgement,
+                 *     and stream requests, and gets 403 `forbidden` without it or with
+                 *     another; the node compares it in constant time. Listing, inspecting,
+                 *     and revoking consumers need only the bearer token. A consumer without
+                 *     one, such as a configured consumer, takes none. Credentials created
+                 *     before 32 characters were required keep working.
                  */
                 "x-leani-consumer-credential"?: components["parameters"]["ConsumerCredential"];
             };
@@ -2682,8 +3024,13 @@ export interface operations {
             query?: never;
             header?: {
                 /**
-                 * @description Consumer-scoped credential. An administrator bearer credential can be
-                 *     used instead on the protected listener.
+                 * @description The consumer's credential. A consumer created with one needs it, in
+                 *     addition to any bearer token, on its lease, change, acknowledgement,
+                 *     and stream requests, and gets 403 `forbidden` without it or with
+                 *     another; the node compares it in constant time. Listing, inspecting,
+                 *     and revoking consumers need only the bearer token. A consumer without
+                 *     one, such as a configured consumer, takes none. Credentials created
+                 *     before 32 characters were required keep working.
                  */
                 "x-leani-consumer-credential"?: components["parameters"]["ConsumerCredential"];
             };
@@ -2710,8 +3057,13 @@ export interface operations {
             query?: never;
             header?: {
                 /**
-                 * @description Consumer-scoped credential. An administrator bearer credential can be
-                 *     used instead on the protected listener.
+                 * @description The consumer's credential. A consumer created with one needs it, in
+                 *     addition to any bearer token, on its lease, change, acknowledgement,
+                 *     and stream requests, and gets 403 `forbidden` without it or with
+                 *     another; the node compares it in constant time. Listing, inspecting,
+                 *     and revoking consumers need only the bearer token. A consumer without
+                 *     one, such as a configured consumer, takes none. Credentials created
+                 *     before 32 characters were required keep working.
                  */
                 "x-leani-consumer-credential"?: components["parameters"]["ConsumerCredential"];
             };
@@ -2738,10 +3090,21 @@ export interface operations {
             query?: never;
             header?: {
                 /**
-                 * @description Consumer-scoped credential. An administrator bearer credential can be
-                 *     used instead on the protected listener.
+                 * @description The consumer's credential. A consumer created with one needs it, in
+                 *     addition to any bearer token, on its lease, change, acknowledgement,
+                 *     and stream requests, and gets 403 `forbidden` without it or with
+                 *     another; the node compares it in constant time. Listing, inspecting,
+                 *     and revoking consumers need only the bearer token. A consumer without
+                 *     one, such as a configured consumer, takes none. Credentials created
+                 *     before 32 characters were required keep working.
                  */
                 "x-leani-consumer-credential"?: components["parameters"]["ConsumerCredential"];
+                /**
+                 * @description Marks a mutating request without a JSON body as sent by a Leani
+                 *     client. A POST or DELETE needs `content-type: application/json` or
+                 *     this header, and gets HTTP 415 otherwise.
+                 */
+                "x-leani-request"?: components["parameters"]["LeaniRequest"];
             };
             path: {
                 subscription: components["parameters"]["Subscription"];
@@ -2766,10 +3129,21 @@ export interface operations {
             query?: never;
             header?: {
                 /**
-                 * @description Consumer-scoped credential. An administrator bearer credential can be
-                 *     used instead on the protected listener.
+                 * @description The consumer's credential. A consumer created with one needs it, in
+                 *     addition to any bearer token, on its lease, change, acknowledgement,
+                 *     and stream requests, and gets 403 `forbidden` without it or with
+                 *     another; the node compares it in constant time. Listing, inspecting,
+                 *     and revoking consumers need only the bearer token. A consumer without
+                 *     one, such as a configured consumer, takes none. Credentials created
+                 *     before 32 characters were required keep working.
                  */
                 "x-leani-consumer-credential"?: components["parameters"]["ConsumerCredential"];
+                /**
+                 * @description Marks a mutating request without a JSON body as sent by a Leani
+                 *     client. A POST or DELETE needs `content-type: application/json` or
+                 *     this header, and gets HTTP 415 otherwise.
+                 */
+                "x-leani-request"?: components["parameters"]["LeaniRequest"];
             };
             path: {
                 subscription: components["parameters"]["Subscription"];
@@ -2792,7 +3166,14 @@ export interface operations {
     resetProcessorLiveLane: {
         parameters: {
             query?: never;
-            header?: never;
+            header?: {
+                /**
+                 * @description Marks a mutating request without a JSON body as sent by a Leani
+                 *     client. A POST or DELETE needs `content-type: application/json` or
+                 *     this header, and gets HTTP 415 otherwise.
+                 */
+                "x-leani-request"?: components["parameters"]["LeaniRequest"];
+            };
             path: {
                 processor: components["parameters"]["Processor"];
             };
@@ -2807,13 +3188,35 @@ export interface operations {
                 };
                 content?: never;
             };
+            /**
+             * @description The lane cannot be reset. `single_block_exceeds_delivery_limit`:
+             *     its first unapplied block still exceeds the delivery limit; raise
+             *     the limit first. `live_lane_requires_rebuild`: the lane failed with
+             *     `processor_finality_conflict`, so its coverage contradicts the
+             *     canonical chain; rebuild the processor as a replacement instance.
+             */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
             default: components["responses"]["Error"];
         };
     };
     deleteProcessorArtifacts: {
         parameters: {
             query?: never;
-            header?: never;
+            header?: {
+                /**
+                 * @description Marks a mutating request without a JSON body as sent by a Leani
+                 *     client. A POST or DELETE needs `content-type: application/json` or
+                 *     this header, and gets HTTP 415 otherwise.
+                 */
+                "x-leani-request"?: components["parameters"]["LeaniRequest"];
+            };
             path: {
                 processor: components["parameters"]["Processor"];
             };
@@ -2880,8 +3283,8 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description Created backfill subscription. */
-            201: {
+            /** @description Backfill subscription accepted; its current status. */
+            202: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -2914,7 +3317,14 @@ export interface operations {
     deleteBackfillSubscription: {
         parameters: {
             query?: never;
-            header?: never;
+            header?: {
+                /**
+                 * @description Marks a mutating request without a JSON body as sent by a Leani
+                 *     client. A POST or DELETE needs `content-type: application/json` or
+                 *     this header, and gets HTTP 415 otherwise.
+                 */
+                "x-leani-request"?: components["parameters"]["LeaniRequest"];
+            };
             path: {
                 id: components["parameters"]["Identifier"];
             };
@@ -2935,7 +3345,14 @@ export interface operations {
     cancelBackfillSubscription: {
         parameters: {
             query?: never;
-            header?: never;
+            header?: {
+                /**
+                 * @description Marks a mutating request without a JSON body as sent by a Leani
+                 *     client. A POST or DELETE needs `content-type: application/json` or
+                 *     this header, and gets HTTP 415 otherwise.
+                 */
+                "x-leani-request"?: components["parameters"]["LeaniRequest"];
+            };
             path: {
                 id: components["parameters"]["Identifier"];
             };
@@ -2981,8 +3398,8 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description Created materialization job. */
-            201: {
+            /** @description Materialization job accepted; its current status. */
+            202: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -3015,7 +3432,14 @@ export interface operations {
     deleteMaterializationJob: {
         parameters: {
             query?: never;
-            header?: never;
+            header?: {
+                /**
+                 * @description Marks a mutating request without a JSON body as sent by a Leani
+                 *     client. A POST or DELETE needs `content-type: application/json` or
+                 *     this header, and gets HTTP 415 otherwise.
+                 */
+                "x-leani-request"?: components["parameters"]["LeaniRequest"];
+            };
             path: {
                 id: components["parameters"]["Identifier"];
             };
@@ -3036,7 +3460,14 @@ export interface operations {
     cancelMaterializationJob: {
         parameters: {
             query?: never;
-            header?: never;
+            header?: {
+                /**
+                 * @description Marks a mutating request without a JSON body as sent by a Leani
+                 *     client. A POST or DELETE needs `content-type: application/json` or
+                 *     this header, and gets HTTP 415 otherwise.
+                 */
+                "x-leani-request"?: components["parameters"]["LeaniRequest"];
+            };
             path: {
                 id: components["parameters"]["Identifier"];
             };
@@ -3082,8 +3513,8 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description Created raw-history job. */
-            201: {
+            /** @description Raw-history job accepted; its current state. */
+            202: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -3116,7 +3547,14 @@ export interface operations {
     deleteRawHistoryJob: {
         parameters: {
             query?: never;
-            header?: never;
+            header?: {
+                /**
+                 * @description Marks a mutating request without a JSON body as sent by a Leani
+                 *     client. A POST or DELETE needs `content-type: application/json` or
+                 *     this header, and gets HTTP 415 otherwise.
+                 */
+                "x-leani-request"?: components["parameters"]["LeaniRequest"];
+            };
             path: {
                 id: components["parameters"]["Identifier"];
             };
@@ -3137,7 +3575,14 @@ export interface operations {
     cancelRawHistoryJob: {
         parameters: {
             query?: never;
-            header?: never;
+            header?: {
+                /**
+                 * @description Marks a mutating request without a JSON body as sent by a Leani
+                 *     client. A POST or DELETE needs `content-type: application/json` or
+                 *     this header, and gets HTTP 415 otherwise.
+                 */
+                "x-leani-request"?: components["parameters"]["LeaniRequest"];
+            };
             path: {
                 id: components["parameters"]["Identifier"];
             };

@@ -609,8 +609,9 @@ impl SegmentWriter {
     }
 }
 
-/// Validated seekable reader. Opening verifies the complete file checksum and
-/// every directory/anchor invariant without decoding frame payloads.
+/// Validated seekable reader. [`Self::open`] verifies the complete file
+/// checksum and every directory/anchor invariant without decoding frame
+/// payloads; each read checks its record's own checksum and seek entry.
 #[derive(Debug)]
 pub struct SegmentReader {
     file: File,
@@ -794,6 +795,33 @@ impl SegmentReader {
         })
     }
 
+    /// Open a segment whose whole-file checksum was already verified against
+    /// `metadata`, checking only that the file still has its closed length.
+    /// Each read still checks its record's checksum against the seek
+    /// directory.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the file is missing, unreadable, or not its closed length.
+    pub(crate) fn open_verified(
+        path: impl AsRef<Path>,
+        metadata: SegmentMetadata,
+    ) -> Result<Self, SegmentError> {
+        let file = OpenOptions::new().read(true).open(path.as_ref())?;
+        if file.metadata()?.len() != metadata.physical_bytes {
+            return Err(SegmentError::DirectoryBounds);
+        }
+        let directory_offset = closed_file_len(metadata.descriptor.range.len(), 0)?
+            .checked_sub(HEADER_BYTES)
+            .and_then(|trailing| metadata.physical_bytes.checked_sub(trailing))
+            .ok_or(SegmentError::DirectoryBounds)?;
+        Ok(Self {
+            file,
+            metadata,
+            directory_offset,
+        })
+    }
+
     #[must_use]
     pub const fn metadata(&self) -> &SegmentMetadata {
         &self.metadata
@@ -813,6 +841,19 @@ impl SegmentReader {
         }
         let index = block.0 - self.metadata.descriptor.range.start().0;
         let entry = read_entry_at(&mut self.file, self.directory_offset, index)?;
+        // The file may have changed since its checksum was verified, so the
+        // entry must still name this block inside the payload area before
+        // its lengths size any buffer.
+        if entry.block_number != block
+            || entry.payload_offset < HEADER_BYTES
+            || entry
+                .payload_offset
+                .checked_add(u64::from(entry.stored_len))
+                .is_none_or(|end| end > self.directory_offset)
+            || u64::from(entry.logical_len) > self.metadata.logical_bytes
+        {
+            return Err(SegmentError::RecordBounds(block));
+        }
         self.file.seek(SeekFrom::Start(entry.payload_offset))?;
         let mut stored = vec![0; entry.stored_len as usize];
         self.file.read_exact(&mut stored)?;
@@ -1132,6 +1173,8 @@ pub enum SegmentError {
     DecodedLength { expected: usize, actual: usize },
     #[error("decoded record identity mismatch for block {0}")]
     DecodedIdentity(BlockNumber),
+    #[error("closed segment differs from its catalog record")]
+    CatalogMismatch,
     #[error("block {block} is outside segment range {range:?}")]
     BlockOutOfRange {
         block: BlockNumber,
@@ -1145,6 +1188,24 @@ pub enum SegmentError {
     Durable(#[from] leani_primitives::DurableError),
     #[error("snappy codec failed: {0}")]
     Snappy(snap::Error),
+}
+
+impl SegmentError {
+    /// Whether a closed segment's file is gone.
+    pub(crate) fn is_missing_file(&self) -> bool {
+        matches!(self, Self::Io(error) if error.kind() == io::ErrorKind::NotFound)
+    }
+
+    /// Whether reading a closed segment failed because its bytes are wrong,
+    /// rather than on a transient I/O failure or a caller's out-of-range
+    /// block. A read that ends early is a truncated file.
+    pub(crate) fn is_corruption(&self) -> bool {
+        match self {
+            Self::Io(error) => error.kind() == io::ErrorKind::UnexpectedEof,
+            Self::BlockOutOfRange { .. } => false,
+            _ => true,
+        }
+    }
 }
 
 #[cfg(test)]

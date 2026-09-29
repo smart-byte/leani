@@ -123,11 +123,29 @@ describe("backfill subscriptions", () => {
     expect(request?.url).toBe(
       "http://node.test/admin/v1/backfill-subscriptions/repair-1",
     );
+    expect(request?.headers.get("x-leani-request")).toBe("1");
     expect(result).toMatchObject({
       removedDeliveryRecords: 100,
       retainedProcessorOutput: true,
       retainedLiveStream: true,
     });
+  });
+
+  test("body-less cancellation is marked as a Leani request", async () => {
+    let request: Request | undefined;
+    const client = createBackfillSubscriptionClient({
+      baseUrl: "http://node.test",
+      fetch: async (input, init) => {
+        request = new Request(input, init);
+        return Response.json({ id: "repair-1" });
+      },
+    });
+    await client.cancel("repair-1");
+    expect(request?.method).toBe("POST");
+    expect(request?.url).toBe(
+      "http://node.test/admin/v1/backfill-subscriptions/repair-1/cancel",
+    );
+    expect(request?.headers.get("x-leani-request")).toBe("1");
   });
 
   test("creation accepts an atomic finalized upper bound", async () => {
@@ -181,6 +199,53 @@ describe("backfill subscriptions", () => {
         emittedAt: "2026-08-07T00:00:00.000Z",
       },
     ]);
+  });
+
+  test("NDJSON parser reads a large record split into small chunks in linear time", async () => {
+    // Review: every chunk rescanned the whole buffered record.
+    const payload = "x".repeat(8 * 1024 * 1024);
+    const encoded = new TextEncoder().encode(
+      `${JSON.stringify({ type: "batch", payload })}\n`,
+    );
+    let offset = 0;
+    const body = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        if (offset >= encoded.length) {
+          controller.close();
+          return;
+        }
+        controller.enqueue(encoded.slice(offset, offset + 1024));
+        offset += 1024;
+      },
+    });
+    const started = performance.now();
+    const records: unknown[] = [];
+    for await (const record of parseNdjson(body)) {
+      records.push(record);
+    }
+    expect(performance.now() - started).toBeLessThan(1_000);
+    expect(records).toHaveLength(1);
+    expect((records[0] as { payload: string }).payload.length).toBe(payload.length);
+  });
+
+  test("NDJSON parser refuses a record over 65 MiB", async () => {
+    // Review: a record without its newline grew the buffer without bound.
+    const chunk = new Uint8Array(1024 * 1024).fill(0x78);
+    let sent = 0;
+    const body = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        if (sent++ < 70) {
+          controller.enqueue(chunk);
+        } else {
+          controller.close();
+        }
+      },
+    });
+    await expect(parseNdjson(body).next()).rejects.toMatchObject({
+      name: "LeaniError",
+      code: "invalid_response",
+      retryable: false,
+    });
   });
 
   test("client opens a fenced session without exposing its token", async () => {
@@ -245,6 +310,7 @@ describe("backfill subscriptions", () => {
     expect(requests[1]?.headers.get("x-leani-consumer-session")).toBe(
       "history-session",
     );
+    expect(requests[1]?.headers.get("x-leani-request")).toBe("1");
   });
 
   test("events convenience flattens history batches intentionally", async () => {
@@ -266,6 +332,91 @@ describe("backfill subscriptions", () => {
       kinds.push(event.kind);
     }
     expect(kinds).toEqual(["pool.price.put"]);
+  });
+
+  test("delivery batches carry every acknowledgement boundary with their changes", async () => {
+    // Audit SDK-3: events() drops the batch acknowledgement cursor, and a
+    // batch without changes or the completion yields nothing at all.
+    const acknowledged: string[] = [];
+    const client = createBackfillSubscriptionClient({
+      baseUrl: "http://node.test",
+      fetch: async (input, init) => {
+        const request = new Request(input, init);
+        if (request.method === "DELETE") {
+          return new Response(null, { status: 204 });
+        }
+        if (request.url.endsWith("/ack")) {
+          acknowledged.push(((await request.json()) as { cursor: string }).cursor);
+          return Response.json({ acknowledgedSequence: "1" });
+        }
+        return new Response(
+          chunkedBody([
+            '{"type":"hello","apiVersion":"1","chainId":1,"processor":{"id":"blobs-money","instance":"blobs-production","version":"1.0.0","codeHash":"0x01","configHash":"0x02","genericApi":"processor-v1","changeSchema":"blobs-money.change.v1","queryExtensions":[],"subscriptions":true,"artifactRetention":"none","deliveryOrdering":"block_versioned_idempotent"},"subscriptionId":"repair-1","streamId":"history-1","streamKind":"backfill","publicationRevision":"0","ranges":[{"fromBlock":1,"toBlock":3}],"acknowledgedCursor":"cursor-0","storeEpoch":"00","heartbeatIntervalMs":"15000","sessionToken":"history-session","sessionExpiresAtUnixMs":"1000","leaseTtlMs":"300000"}\n',
+            '{"type":"batch","streamId":"history-1","originKind":"historical_backfill","originId":"repair-1","publicationRevision":"0","fromBlock":1,"throughBlock":1,"processedBlockCount":"1","domainChangeCount":"1","progressUnitCount":"1","rawPayloadBytes":"8","uncompressedEncodedBytes":"32","transmittedBytes":"32","buildDelayMs":"0","firstCursor":"event-1","lastCursor":"event-1","acknowledgeableCursor":"boundary-1","changes":[{"kind":"pool.price.put","cursor":"event-1"}]}\n',
+            '{"type":"batch","streamId":"history-1","originKind":"historical_backfill","originId":"repair-1","publicationRevision":"0","fromBlock":2,"throughBlock":3,"processedBlockCount":"2","domainChangeCount":"0","progressUnitCount":"1","rawPayloadBytes":"0","uncompressedEncodedBytes":"2","transmittedBytes":"2","buildDelayMs":"0","firstCursor":null,"lastCursor":null,"acknowledgeableCursor":"boundary-3","changes":[]}\n',
+            '{"type":"backfill_complete","subscriptionId":"repair-1","streamId":"history-1","ranges":[{"fromBlock":1,"toBlock":3}],"throughBlock":3,"cursor":"complete-4","mode":"fill_missing","disposition":"published_all","requestedBlockCount":"3","coveredBeforeRequestBlockCount":"0","coveredBeforeRequestRanges":[],"newlyProcessedBlockCount":"3","republishedBlockCount":"3","domainChangeCount":"1","preexistingCoverageSkipped":false}\n',
+          ]),
+          { headers: { "content-type": "application/x-ndjson" } },
+        );
+      },
+    });
+    const session = await client.stream<{ kind: string }>("repair-1", "destination");
+    const observed: Array<[string, string[], boolean]> = [];
+    for await (const batch of session.deliveryBatches()) {
+      observed.push([
+        batch.ackCursor,
+        batch.events.map((event) => event.kind),
+        batch.completion !== undefined,
+      ]);
+      await session.acknowledge(batch.ackCursor);
+    }
+    await session.close();
+    expect(observed).toEqual([
+      ["boundary-1", ["pool.price.put"], false],
+      ["boundary-3", [], false],
+      ["complete-4", [], true],
+    ]);
+    expect(acknowledged).toEqual(["boundary-1", "boundary-3", "complete-4"]);
+  });
+
+  test("unified live acknowledgements use the batch boundary, not its last change", async () => {
+    // Audit M-A3: the node refuses a live acknowledgement inside a block.
+    const acknowledged: string[] = [];
+    const client = createBackfillSubscriptionClient({
+      baseUrl: "http://node.test",
+      fetch: async (input, init) => {
+        const request = new Request(input, init);
+        if (request.method === "DELETE") {
+          return new Response(null, { status: 204 });
+        }
+        if (request.url.endsWith("/ack")) {
+          acknowledged.push(((await request.json()) as { cursor: string }).cursor);
+          return Response.json({ acknowledgedSequence: "2" });
+        }
+        return new Response(
+          chunkedBody([
+            '{"type":"hello","apiVersion":"1","chainId":1,"processor":{"id":"prices","instance":"prices","version":"1.0.0","codeHash":"0x01","configHash":"0x02","genericApi":"processor-v1","changeSchema":"prices.change.v1","queryExtensions":[],"subscriptions":true,"artifactRetention":"none","deliveryOrdering":"block_versioned_idempotent"},"streamId":"prices:live","streamKind":"live","acknowledgedCursor":"live-0","storeEpoch":"00","heartbeatIntervalMs":"15000","sessionToken":"live-session","sessionExpiresAtUnixMs":"1000","leaseTtlMs":"300000"}\n',
+            '{"type":"batch","streamId":"prices:live","originKind":"live","originId":"prices","publicationRevision":"0","fromBlock":20,"throughBlock":20,"processedBlockCount":"1","domainChangeCount":"2","progressUnitCount":"1","rawPayloadBytes":"16","uncompressedEncodedBytes":"64","transmittedBytes":"64","buildDelayMs":"0","firstCursor":"live-event-1","lastCursor":"live-event-2","acknowledgeableCursor":"live-block-20","changes":[{"kind":"price.live","cursor":"live-event-1"},{"kind":"price.live","cursor":"live-event-2"}]}\n',
+          ]),
+          { headers: { "content-type": "application/x-ndjson" } },
+        );
+      },
+    });
+    const delivery = await client.subscribe<{ kind: string }>({
+      processor: "prices",
+      consumer: "destination",
+      lanes: { live: true },
+    });
+    for await (const batch of delivery.batches()) {
+      expect(batch.events.map((event) => event.cursor)).toEqual([
+        "live-event-1",
+        "live-event-2",
+      ]);
+      await delivery.acknowledge(batch);
+      break;
+    }
+    await delivery.close();
+    expect(acknowledged).toEqual(["live-block-20"]);
   });
 
   test("one subscription merges ready live before history and routes lane acknowledgements", async () => {
@@ -619,7 +770,7 @@ describe("backfill subscriptions", () => {
             start(controller) {
               controller.enqueue(
                 encoder.encode(
-                  '{"type":"hello","sessionToken":"live-session","leaseTtlMs":"180"}\n',
+                  '{"type":"hello","sessionToken":"live-session","leaseTtlMs":"180","heartbeatIntervalMs":"15000"}\n',
                 ),
               );
               setTimeout(() => {
@@ -651,6 +802,7 @@ describe("backfill subscriptions", () => {
     expect(renewals[0]?.headers.get("x-leani-consumer-credential")).toBe(
       "consumer-secret",
     );
+    expect(renewals[0]?.headers.get("x-leani-request")).toBe("1");
   });
 
   test("reset_required terminates the stream with retained bounds", async () => {

@@ -352,14 +352,38 @@ impl LiveSource for ScriptedLiveSource {
         &self.descriptor
     }
 
+    /// Replay the script once the request passes the checks the execution
+    /// P2P live source makes: the chain, the capabilities the descriptor
+    /// supplies completely, whether or not the request accepts filtered
+    /// material, and the finality it reaches.
     async fn subscribe(
         &self,
-        _request: DataRequest,
+        request: DataRequest,
         _start: LiveStart,
         budget: SourceBudget,
         cancellation: CancellationToken,
     ) -> Result<ChainEventStream, SourceError> {
         budget.validate()?;
+        if request.chain_id != self.descriptor.chain_id {
+            return Err(SourceError::InvalidPlan(
+                "live request belongs to another chain".to_owned(),
+            ));
+        }
+        if !self
+            .descriptor
+            .complete_capabilities
+            .with_derivable()
+            .contains_all(request.required)
+        {
+            return Err(SourceError::InvalidPlan(
+                "scripted live source lacks requested capabilities".to_owned(),
+            ));
+        }
+        if !self.descriptor.finality.supports(request.minimum_finality) {
+            return Err(SourceError::InvalidPlan(
+                "scripted live source lacks requested finality".to_owned(),
+            ));
+        }
         let state = EventState {
             steps: self.steps.as_ref().clone().into(),
             cancellation,
@@ -498,7 +522,7 @@ mod tests {
         Material,
     };
     use leani_source_api::{
-        FieldProjection, FilterSet, FinalityEvent, HistorySource, VerificationPolicy,
+        FieldProjection, FilterSet, FinalityEvent, FinalityModel, HistorySource, VerificationPolicy,
     };
 
     use crate::{default_source_budget, fixture_frame, fixture_source_descriptor};
@@ -640,6 +664,57 @@ mod tests {
                 ..
             }))
         ));
+    }
+
+    #[tokio::test]
+    async fn live_script_rejects_requests_it_cannot_serve() {
+        // Audit probe (Processor-10): the scripted live source ignored the
+        // request, so a test could subscribe for material no real source
+        // would supply.
+        let range = BlockRange::single(BlockNumber(1));
+        let mut descriptor = fixture_source_descriptor("live", range);
+        descriptor.finality = FinalityModel::Included;
+        // Headers are supplied only filtered, which a live request, like one
+        // to the P2P source, cannot use.
+        descriptor.capabilities = descriptor.capabilities.with(Capability::Header);
+        let live = ScriptedLiveSource::new(descriptor, Vec::new());
+        let subscribe = |request: DataRequest| {
+            live.subscribe(
+                request,
+                LiveStart::Head,
+                default_source_budget(),
+                CancellationToken::new(),
+            )
+        };
+        let supported = DataRequest {
+            minimum_finality: Finality::Included,
+            ..request(range)
+        };
+        assert!(subscribe(supported.clone()).await.is_ok());
+        for unsupported in [
+            DataRequest {
+                required: CapabilitySet::of(Capability::Header),
+                ..supported.clone()
+            },
+            DataRequest {
+                required: CapabilitySet::of(Capability::Header),
+                allow_filtered: true,
+                ..supported.clone()
+            },
+            DataRequest {
+                chain_id: ChainId(5),
+                ..supported.clone()
+            },
+            DataRequest {
+                minimum_finality: Finality::Finalized,
+                ..supported.clone()
+            },
+        ] {
+            assert!(matches!(
+                subscribe(unsupported).await,
+                Err(SourceError::InvalidPlan(_))
+            ));
+        }
     }
 
     #[tokio::test]
