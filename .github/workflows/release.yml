@@ -117,7 +117,7 @@ jobs:
           unpacked/leani e2e fixture \
             --blocks 128 --data-dir "$RUNNER_TEMP/leani-archive-fixture" \
             --report "$RUNNER_TEMP/leani-archive-fixture.json"
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: leani-${{ matrix.target }}
           path: |
@@ -150,7 +150,7 @@ jobs:
             --cargo-about "$RUNNER_TEMP/license-tools/cargo-about"
           cp THIRD_PARTY_LICENSES.txt sbom-assets/
           ruby scripts/check-artifact-privacy.rb sbom-assets
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: leani-sbom
           path: sbom-assets/
@@ -187,7 +187,7 @@ jobs:
           ruby scripts/check-artifact-privacy.rb \
             release-assets/*.cdx.json release-assets/THIRD_PARTY_LICENSES.txt \
             release-assets/leani.rb release-assets/SHA256SUMS
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: leani-release-candidate-${{ inputs.version }}
           path: release-assets/
