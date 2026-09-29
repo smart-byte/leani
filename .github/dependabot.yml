@@ -23,6 +23,16 @@ updates:
       - /site
     schedule:
       interval: weekly
+    # Starlight releases require compatible Astro and markdown integrations.
+    groups:
+      astro-starlight:
+        patterns:
+          - "astro"
+          - "@astrojs/starlight"
+          - "@astrojs/mdx"
+          - "@astrojs/markdown-*"
+          - "astro-expressive-code"
+          - "starlight-llms-txt"
     # TypeScript 5 provides the JavaScript compiler API required by
     # openapi-typescript and Astro; the native CLI is tracked separately
     # through @typescript/native. Review compiler API migrations explicitly.
