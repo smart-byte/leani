@@ -7,11 +7,6 @@ ignore = [
   # unmaintained notices, not known vulnerabilities; revisit on every Reth bump.
   { id = "RUSTSEC-2023-0089", reason = "atomic-polyfill is inherited through Reth-era dependencies" },
   { id = "RUSTSEC-2024-0436", reason = "paste is inherited through the pinned Reth networking graph" },
-  # object_store 0.13 is the newest version compatible with Parquet 59. Leani's
-  # read-only Xatu adapter invokes only HEAD/range GET; it never invokes the
-  # WebDAV/cloud XML list and credential parsers that reach these code paths.
-  { id = "RUSTSEC-2026-0194", reason = "quick-xml parser is compiled by object_store but unreachable from Leani's HEAD/range-GET-only adapter" },
-  { id = "RUSTSEC-2026-0195", reason = "quick-xml NsReader is compiled by object_store but unreachable from Leani's HEAD/range-GET-only adapter" },
 ]
 
 [licenses]
