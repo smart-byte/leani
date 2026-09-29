@@ -227,7 +227,7 @@ jobs:
       # Attach each image's CycloneDX inventory to its digest; the candidate
       # run's copy expires with its artifacts.
       - name: Attest the amd64 image SBOM
-        uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v4.2.1
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
           subject-name: ${{ steps.push.outputs.image }}
           subject-digest: ${{ steps.push.outputs.amd64-digest }}
@@ -235,7 +235,7 @@ jobs:
           push-to-registry: true
           create-storage-record: false
       - name: Attest the arm64 image SBOM
-        uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v4.2.1
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
           subject-name: ${{ steps.push.outputs.image }}
           subject-digest: ${{ steps.push.outputs.arm64-digest }}
