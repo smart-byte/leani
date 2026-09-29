@@ -10260,7 +10260,7 @@ mod tests {
                 .await
                 .expect("register the other processor");
             let stream_id = default_delivery_stream_id(other.descriptor());
-            for number in 1.. {
+            for number in 1..=u64::MAX {
                 // A published change wakes the streams waiting for changes,
                 // and a prune those waiting for delivery capacity.
                 apply_finalized_blocks(&store, &other, number..=number).await;

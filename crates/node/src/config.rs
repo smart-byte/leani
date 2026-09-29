@@ -1892,8 +1892,7 @@ fn check_data_directory(previous: &Path, current: &Path) -> Result<Option<String
     // directories. If the old directory has state it necessarily exists.
     if previous == current
         || fs::canonicalize(previous)
-            .ok()
-            .is_some_and(|old| fs::canonicalize(current).is_ok_and(|new| old == new))
+            .is_ok_and(|old| fs::canonicalize(current).is_ok_and(|new| old == new))
         || !holds_state(previous)
     {
         return Ok(None);
