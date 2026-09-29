@@ -72,7 +72,6 @@ use reth_network_p2p::{
     error::RequestError,
     headers::client::{HeadersClient, HeadersRequest},
     priority::Priority,
-    receipts::client::ReceiptsClient,
 };
 use reth_network_peers::{NodeRecord, TrustedPeer};
 use reth_tasks::Runtime;
@@ -4834,7 +4833,7 @@ impl RethP2pSource {
             .map(|(peer, block_receipts)| (peer.into_iter().collect(), vec![block_receipts]))?
         } else {
             self.fetch_receipts_batched(
-                &session.fetch,
+                session,
                 headers,
                 &bodies,
                 &hashes,
@@ -5822,7 +5821,7 @@ impl RethP2pSource {
             telemetry.set_phase(NetworkPhase::FetchingReceipts);
             let (receipt_peers, receipts) = self
                 .fetch_receipts_batched(
-                    &session.fetch,
+                    &session,
                     &headers,
                     &bodies,
                     &hashes,
@@ -7004,26 +7003,51 @@ impl RethP2pSource {
         Ok((peers, bodies))
     }
 
-    async fn fetch_receipts<C>(
+    // Reth's generic fetcher chooses receipt encoding from advertised
+    // capabilities, which can exceed the negotiated ETH version. All receipt
+    // acquisition uses our direct dispatcher and the session's actual version.
+    #[allow(clippy::too_many_lines)]
+    async fn fetch_receipts(
         &self,
-        fetch: &C,
+        session: &P2pSession,
         headers: &[Header],
-        bodies: &[BlockBody],
+        bodies: Option<&[BlockBody]>,
         hashes: &[B256],
         policy: MaterialRequestPolicy,
         cancellation: &CancellationToken,
-    ) -> Result<(B512, Vec<Vec<Receipt>>), P2pError>
-    where
-        C: ReceiptsClient<Receipt = Receipt> + DownloadClient,
-    {
-        let mut last_error = None;
+    ) -> Result<(B512, Vec<Vec<Receipt>>), P2pError> {
         let attempts = if headers.len() > 1 {
             1
         } else {
             self.config.retries
         };
+        let mut last_error = None;
         for attempt in 0..attempts {
             let queued_at = Instant::now();
+            let connected_peers = session.fetch.num_connected_peers();
+            let request_limit = effective_material_concurrency(
+                connected_peers,
+                self.config.material_request_concurrency,
+                policy.concurrency,
+            );
+            let per_peer_limit = direct_peer_request_limit(request_limit, connected_peers);
+            // Capacity wait is scheduler queueing, not an on-wire request.
+            // A busy healthy peer can legitimately take longer than the ETH
+            // response timeout to expose another multiplexing slot.
+            let mut lease = self
+                .network
+                .direct_peers
+                .acquire(
+                    PeerMaterialKind::Receipts,
+                    per_peer_limit,
+                    self.config
+                        .request_timeout
+                        .saturating_mul(4)
+                        .min(self.config.peer_wait_timeout),
+                    cancellation,
+                )
+                .await?;
+            let peer_id = lease.peer.peer_id;
             let permit = self
                 .network
                 .request_gate
@@ -7033,54 +7057,79 @@ impl RethP2pSource {
                 .network_telemetry
                 .request_started(queued_at.elapsed());
             let request_started_at = Instant::now();
-            let response = cancellable_peer_request(
-                fetch.get_receipts_with_priority(hashes.to_vec(), policy.priority),
+            let response = request_direct_receipts(
+                &lease.peer,
+                headers,
+                hashes,
+                bodies,
                 self.config.request_timeout,
                 cancellation,
-                "receipts",
             )
             .await;
             drop(permit);
             match response {
                 Ok(response) => {
-                    let (peer, response) = response.split();
                     self.request_metrics.add_response_payload_bytes(
                         P2pRequestKind::Receipts,
-                        response.receipts.length(),
+                        response.response_payload_bytes,
                     );
-                    match validate_receipts(headers, bodies, &response.receipts) {
+                    let validation = match bodies {
+                        Some(bodies) => validate_receipts(headers, bodies, &response.receipts),
+                        None => validate_receipts_against_headers(headers, &response.receipts),
+                    };
+                    match validation {
                         Ok(()) => {
+                            lease.succeeded();
+                            self.network.peer_store.record_success(
+                                peer_id,
+                                PeerMaterialKind::Receipts,
+                                headers.last().map_or(0, |header| header.number),
+                                request_started_at.elapsed(),
+                            );
+                            reward_verified_material_peer(&session.handle, peer_id).await;
                             self.config.network_telemetry.request_succeeded();
-                            self.request_metrics.record(
+                            self.request_metrics.record_batch(
                                 P2pRequestKind::Receipts,
-                                hashes.len(),
+                                response.physical_requests,
+                                response.requested_block_hashes,
                                 response.receipts.len(),
                                 request_started_at.elapsed(),
                                 P2pRequestOutcome::Succeeded,
                             );
-                            return Ok((peer, response.receipts));
+                            return Ok((peer_id, response.receipts));
                         }
                         Err(error) => {
                             self.config.network_telemetry.request_failed();
-                            self.request_metrics.record(
+                            self.request_metrics.record_batch(
                                 P2pRequestKind::Receipts,
-                                hashes.len(),
+                                response.physical_requests.max(1),
+                                response.requested_block_hashes,
                                 response.receipts.len(),
                                 request_started_at.elapsed(),
                                 P2pRequestOutcome::Failed,
                             );
-                            // Material requested by hash answers to its
+                            // Receipts requested by hash answer to their
                             // header's commitments, a verified expectation.
-                            if classify_response_failure(&error, ExpectationTrust::Verified)
-                                == ResponseFault::Invalid
-                            {
-                                fetch.report_bad_message(peer);
-                            }
+                            self.network.penalize_response(
+                                &mut lease,
+                                &error,
+                                ExpectationTrust::Verified,
+                                |peer_id| session.handle.ban_peer(peer_id),
+                            );
                             last_error = Some(error);
                         }
                     }
                 }
+                Err(P2pError::Cancelled) => return Err(P2pError::Cancelled),
                 Err(error) => {
+                    // An eth/70 reply is checked against its headers while it is
+                    // assembled, so its invalid receipts fail the request itself.
+                    self.network.penalize_response(
+                        &mut lease,
+                        &error,
+                        ExpectationTrust::Verified,
+                        |peer_id| session.handle.ban_peer(peer_id),
+                    );
                     record_request_error(&self.config.network_telemetry, &error);
                     self.request_metrics.record(
                         P2pRequestKind::Receipts,
@@ -7103,18 +7152,15 @@ impl RethP2pSource {
     }
 
     #[allow(clippy::too_many_lines)]
-    async fn fetch_receipts_batched<C>(
+    async fn fetch_receipts_batched(
         &self,
-        fetch: &C,
+        session: &P2pSession,
         headers: &[Header],
         bodies: &[BlockBody],
         hashes: &[B256],
         policy: MaterialRequestPolicy,
         cancellation: &CancellationToken,
-    ) -> Result<(HashSet<B512>, Vec<Vec<Receipt>>), P2pError>
-    where
-        C: ReceiptsClient<Receipt = Receipt> + DownloadClient,
-    {
+    ) -> Result<(HashSet<B512>, Vec<Vec<Receipt>>), P2pError> {
         if headers.len() != bodies.len() || headers.len() != hashes.len() {
             return Err(P2pError::InvalidResponse(
                 "receipt batch material length mismatch".to_owned(),
@@ -7134,7 +7180,7 @@ impl RethP2pSource {
             })
             .collect::<Vec<_>>();
         let concurrency = effective_material_concurrency(
-            fetch.num_connected_peers(),
+            session.fetch.num_connected_peers(),
             self.config.material_request_concurrency,
             policy.concurrency,
         );
@@ -7142,9 +7188,9 @@ impl RethP2pSource {
             .map(|(header_chunk, body_chunk, hash_chunk)| async move {
                 let result = self
                     .fetch_receipts(
-                        fetch,
+                        session,
                         &header_chunk,
-                        &body_chunk,
+                        Some(&body_chunk),
                         &hash_chunk,
                         policy,
                         cancellation,
@@ -7185,9 +7231,9 @@ impl RethP2pSource {
             .map(|(header, body, hash)| async move {
                 let result = self
                     .fetch_receipts(
-                        fetch,
+                        session,
                         std::slice::from_ref(&header),
-                        std::slice::from_ref(&body),
+                        Some(std::slice::from_ref(&body)),
                         std::slice::from_ref(&hash),
                         policy,
                         cancellation,
@@ -7824,149 +7870,6 @@ impl RethP2pHistorySource {
     }
 
     #[allow(clippy::too_many_lines)]
-    async fn fetch_direct_receipts(
-        &self,
-        session: &P2pSession,
-        headers: &[Header],
-        hashes: &[B256],
-        policy: MaterialRequestPolicy,
-        cancellation: &CancellationToken,
-    ) -> Result<(B512, Vec<Vec<Receipt>>), P2pError> {
-        let attempts = if headers.len() > 1 {
-            1
-        } else {
-            self.source.config.retries
-        };
-        let mut last_error = None;
-        for attempt in 0..attempts {
-            let queued_at = Instant::now();
-            let connected_peers = session.fetch.num_connected_peers();
-            let request_limit = effective_material_concurrency(
-                connected_peers,
-                self.source.config.material_request_concurrency,
-                policy.concurrency,
-            );
-            let per_peer_limit = direct_peer_request_limit(request_limit, connected_peers);
-            // Capacity wait is scheduler queueing, not an on-wire request.
-            // A busy healthy peer can legitimately take longer than the ETH
-            // response timeout to expose another multiplexing slot.
-            let mut lease = self
-                .source
-                .network
-                .direct_peers
-                .acquire(
-                    PeerMaterialKind::Receipts,
-                    per_peer_limit,
-                    self.source
-                        .config
-                        .request_timeout
-                        .saturating_mul(4)
-                        .min(self.source.config.peer_wait_timeout),
-                    cancellation,
-                )
-                .await?;
-            let peer_id = lease.peer.peer_id;
-            let permit = self
-                .source
-                .network
-                .request_gate
-                .acquire(policy.priority, cancellation)
-                .await?;
-            self.source
-                .config
-                .network_telemetry
-                .request_started(queued_at.elapsed());
-            let request_started_at = Instant::now();
-            let response = request_direct_receipts(
-                &lease.peer,
-                headers,
-                hashes,
-                None,
-                self.source.config.request_timeout,
-                cancellation,
-            )
-            .await;
-            drop(permit);
-            match response {
-                Ok(response) => {
-                    self.source.request_metrics.add_response_payload_bytes(
-                        P2pRequestKind::Receipts,
-                        response.response_payload_bytes,
-                    );
-                    match validate_receipts_against_headers(headers, &response.receipts) {
-                        Ok(()) => {
-                            lease.succeeded();
-                            self.source.network.peer_store.record_success(
-                                peer_id,
-                                PeerMaterialKind::Receipts,
-                                headers.last().map_or(0, |header| header.number),
-                                request_started_at.elapsed(),
-                            );
-                            reward_verified_material_peer(&session.handle, peer_id).await;
-                            self.source.config.network_telemetry.request_succeeded();
-                            self.source.request_metrics.record_batch(
-                                P2pRequestKind::Receipts,
-                                response.physical_requests,
-                                response.requested_block_hashes,
-                                response.receipts.len(),
-                                request_started_at.elapsed(),
-                                P2pRequestOutcome::Succeeded,
-                            );
-                            return Ok((peer_id, response.receipts));
-                        }
-                        Err(error) => {
-                            self.source.config.network_telemetry.request_failed();
-                            self.source.request_metrics.record_batch(
-                                P2pRequestKind::Receipts,
-                                response.physical_requests.max(1),
-                                response.requested_block_hashes,
-                                response.receipts.len(),
-                                request_started_at.elapsed(),
-                                P2pRequestOutcome::Failed,
-                            );
-                            // Receipts requested by hash answer to their
-                            // header's commitments, a verified expectation.
-                            self.source.network.penalize_response(
-                                &mut lease,
-                                &error,
-                                ExpectationTrust::Verified,
-                                |peer_id| session.handle.ban_peer(peer_id),
-                            );
-                            last_error = Some(error);
-                        }
-                    }
-                }
-                Err(P2pError::Cancelled) => return Err(P2pError::Cancelled),
-                Err(error) => {
-                    // An eth/70 reply is checked against its headers while it is
-                    // assembled, so its invalid receipts fail the request itself.
-                    self.source.network.penalize_response(
-                        &mut lease,
-                        &error,
-                        ExpectationTrust::Verified,
-                        |peer_id| session.handle.ban_peer(peer_id),
-                    );
-                    record_request_error(&self.source.config.network_telemetry, &error);
-                    self.source.request_metrics.record(
-                        P2pRequestKind::Receipts,
-                        hashes.len(),
-                        0,
-                        request_started_at.elapsed(),
-                        request_outcome(&error),
-                    );
-                    last_error = Some(error);
-                }
-            }
-            if attempt.saturating_add(1) < attempts {
-                retry_pause(self.source.config.retry_backoff, cancellation).await?;
-            }
-        }
-        Err(last_error.unwrap_or_else(|| P2pError::Request {
-            component: "receipts",
-            detail: "retry budget exhausted".to_owned(),
-        }))
-    }
-
     async fn fetch_direct_receipts_batched(
         &self,
         session: &P2pSession,
@@ -8002,9 +7905,11 @@ impl RethP2pHistorySource {
         let outcomes = stream::iter(requests)
             .map(|(header_chunk, hash_chunk)| async move {
                 let result = self
-                    .fetch_direct_receipts(
+                    .source
+                    .fetch_receipts(
                         session,
                         &header_chunk,
+                        None,
                         &hash_chunk,
                         policy,
                         cancellation,
@@ -8038,9 +7943,11 @@ impl RethP2pHistorySource {
         let recovered = stream::iter(fallback)
             .map(|(header, hash)| async move {
                 let result = self
-                    .fetch_direct_receipts(
+                    .source
+                    .fetch_receipts(
                         session,
                         std::slice::from_ref(&header),
+                        None,
                         std::slice::from_ref(&hash),
                         policy,
                         cancellation,
