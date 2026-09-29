@@ -11,8 +11,8 @@ import { BLOBS_MONEY_URL } from '../config';
         transaction, and receipts. Nothing else.
       </p>
       <p>
-        Getting that meant paying for metered RPC: millions of
-        <code>eth_getBlockByNumber</code> and <code>eth_getBlockReceipts</code>
+        Getting that meant paying for metered RPC: millions of{' '}
+        <code>eth_getBlockByNumber</code> and <code>eth_getBlockReceipts</code>{' '}
         calls to backfill history that public datasets already serve, then a
         WebSocket to follow the head. The alternative — running our own full
         node — meant terabyte-class NVMe and days of sync, keeping the whole

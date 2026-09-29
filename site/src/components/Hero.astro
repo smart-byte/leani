@@ -79,7 +79,7 @@ const examples = heroExamples.map((example) => {
             </div>
           </TerminalFrame>
           <p class="mono note">
-            {example.note}
+            {example.note}{' '}
             {'noteHref' in example && (
               <a href={(example as { noteHref: string }).noteHref}>
                 {(example as { noteLabel: string }).noteLabel}
