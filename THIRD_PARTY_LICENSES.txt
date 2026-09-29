@@ -3561,6 +3561,7 @@ jobserver 0.1.35 — https://github.com/rust-lang/jobserver-rs
 js-sys 0.3.103 — https://github.com/wasm-bindgen/wasm-bindgen/tree/master/crates/js-sys
 openssl-probe 0.2.1 — https://github.com/rustls/openssl-probe
 pkg-config 0.3.33 — https://github.com/rust-lang/pkg-config-rs
+socket2 0.5.10 — https://github.com/rust-lang/socket2
 socket2 0.6.5 — https://github.com/rust-lang/socket2
 wasm-bindgen-futures 0.4.76 — https://github.com/wasm-bindgen/wasm-bindgen/tree/master/crates/futures
 wasm-bindgen-macro-support 0.2.126 — https://github.com/wasm-bindgen/wasm-bindgen/tree/master/crates/macro-support
@@ -3949,9 +3950,9 @@ DEALINGS IN THE SOFTWARE.
 ==============================================================================
 MIT License (MIT)
 ==============================================================================
-hickory-net 0.26.1 — https://github.com/hickory-dns/hickory-dns
-hickory-proto 0.26.1 — https://github.com/hickory-dns/hickory-dns
-hickory-resolver 0.26.1 — https://github.com/hickory-dns/hickory-dns
+hickory-net 0.26.3 — https://github.com/hickory-dns/hickory-dns
+hickory-proto 0.26.3 — https://github.com/hickory-dns/hickory-dns
+hickory-resolver 0.26.3 — https://github.com/hickory-dns/hickory-dns
 
 Copyright (c) 2015 The Hickory DNS Developers
 Copyright (c) 2017 Google LLC.
