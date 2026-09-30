@@ -28,9 +28,6 @@ end
 
 abort "usage: check-release-ci.rb [--container | --workflows [DIRECTORY]]" unless ARGV.empty? || ARGV == ["--container"]
 workflows = %w[ci.yml security.yml site.yml]
-# Container publication verifies a separate successful preparation run below;
-# requiring its own in-progress publication run to finish would deadlock.
-workflows << "container.yml" unless ARGV == ["--container"]
 workflows.each do |workflow|
   response = api("repos/#{repository}/actions/workflows/#{workflow}/runs?head_sha=#{commit}&per_page=100")
   runs = response.fetch("workflow_runs").select do |run|
@@ -43,17 +40,37 @@ workflows.each do |workflow|
   puts "#{workflow}: passed on #{commit}"
 end
 
-candidate_id = ENV.fetch("CANDIDATE_RUN_ID", "")
-unless candidate_id.empty?
-  abort "invalid candidate run ID" unless candidate_id.match?(/\A[1-9][0-9]*\z/)
+verify_candidate = lambda do |candidate_id, workflow, artifacts|
+  abort "a verified #{workflow} candidate run ID is required" unless candidate_id.match?(/\A[1-9][0-9]*\z/)
   run = api("repos/#{repository}/actions/runs/#{candidate_id}")
-  container = ARGV == ["--container"]
-  workflow = container ? "container.yml" : "release.yml"
-  events = container ? %w[push workflow_dispatch] : %w[workflow_dispatch]
+  events = workflow == "container.yml" ? %w[push workflow_dispatch] : %w[workflow_dispatch]
   unless run["head_sha"] == commit && events.include?(run["event"]) &&
          run["status"] == "completed" && run["conclusion"] == "success" &&
          run["path"] == ".github/workflows/#{workflow}"
     abort "candidate must be a successful #{workflow} run from the exact release commit"
   end
+  inventory = api("repos/#{repository}/actions/runs/#{candidate_id}/artifacts?per_page=100")
+  names = inventory.fetch("artifacts").reject { |item| item.fetch("expired") }.map { |item| item.fetch("name") }
+  abort "candidate #{candidate_id} lacks its unexpired preparation artifacts" unless
+    inventory.fetch("total_count") <= 100 && artifacts.all? { |wanted| names.any? { |name| File.fnmatch(wanted, name) } }
   puts "candidate #{candidate_id}: passed on #{commit}"
+end
+
+# A publication run waiting for approval must not invalidate a successful
+# container preparation. Its explicit ID binds every publisher to the same
+# tested images, and the artifact inventory rejects a publication-only run.
+container = ARGV == ["--container"]
+container_id = ENV.fetch(container ? "CANDIDATE_RUN_ID" : "CONTAINER_CANDIDATE_RUN_ID", "")
+verify_candidate.call(container_id, "container.yml", %w[leani-container-amd64 leani-container-arm64])
+
+candidate_id = ENV.fetch("CANDIDATE_RUN_ID", "")
+unless container || candidate_id.empty?
+  workflow = ENV.fetch("CANDIDATE_WORKFLOW", "release.yml")
+  artifacts = {
+    "release.yml" => ["leani-release-candidate-#{ENV.fetch('RELEASE_VERSION', 'v*')}"],
+    "sdk-release.yml" => ["leani-sdk-candidate"],
+    "crates-release.yml" => ["leani-rust-library-candidate"],
+  }
+  abort "invalid candidate workflow" unless artifacts.key?(workflow)
+  verify_candidate.call(candidate_id, workflow, artifacts.fetch(workflow))
 end

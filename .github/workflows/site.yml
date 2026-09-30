@@ -1,4 +1,5 @@
 name: Site and documentation
+run-name: Site and documentation${{ inputs.release_request && format(' [{0}]', inputs.release_request) || '' }}
 
 on:
   push:
@@ -35,6 +36,11 @@ on:
       - ".github/workflows/site.yml"
       - ".github/workflows/site-promote.yml"
   workflow_dispatch:
+    inputs:
+      release_request:
+        description: Correlation ID used by the release coordinator
+        required: false
+        type: string
 
 permissions:
   contents: read

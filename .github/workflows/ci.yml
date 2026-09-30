@@ -1,10 +1,16 @@
 name: CI
+run-name: CI${{ inputs.release_request && format(' [{0}]', inputs.release_request) || '' }}
 
 on:
   push:
     branches: [main]
   pull_request:
   workflow_dispatch:
+    inputs:
+      release_request:
+        description: Correlation ID used by the release coordinator
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -85,6 +91,8 @@ jobs:
         run: ruby scripts/check-sdk-pins.rb
       - name: Validate release CI requirements
         run: ruby scripts/test-release-ci.rb
+      - name: Validate coordinated release preparation and recovery
+        run: python3 scripts/test-coordinated-release.py
       - name: Validate artifact privacy checks
         run: ruby scripts/test-artifact-privacy.rb
       - name: Validate Rust package inspection

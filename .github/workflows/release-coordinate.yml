@@ -1,0 +1,174 @@
+name: Coordinate release
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: Prepare a version PR, build candidates, or publish verified candidates
+        required: true
+        default: prepare
+        type: choice
+        options: [prepare, candidate, publish]
+      version:
+        description: Coordinated version without v (for example 0.1.0-rc.2)
+        required: true
+        type: string
+      candidate_run_id:
+        description: Successful Coordinate release candidate run ID (publish only)
+        required: false
+        type: string
+      release_commit:
+        description: Exact commit on main to rebuild older candidates (candidate only; defaults to this main revision)
+        required: false
+        type: string
+      promote_site:
+        description: Promote the release site after all artifacts are published
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: coordinated-release
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    name: Validate release and prepare inputs
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify publication history
+        run: ruby scripts/check-publication.rb HEAD
+      - name: Validate requested version
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+          RELEASE_ACTION: ${{ inputs.action }}
+          RELEASE_COMMIT: ${{ inputs.release_commit }}
+        run: |
+          python3 - <<'PY'
+          import os, re, sys
+          sys.path.insert(0, 'scripts')
+          from lib.release_common import metadata, version
+          requested = os.environ['RELEASE_VERSION']
+          if version(requested) != requested:
+              sys.exit('version must not include the v prefix')
+          commit = os.environ['RELEASE_COMMIT'] or 'HEAD'
+          if commit != 'HEAD' and not re.fullmatch(r'[a-f0-9]{40}', commit):
+              sys.exit('release_commit must be an exact commit SHA')
+          if os.environ['RELEASE_ACTION'] == 'candidate' and metadata(commit) != requested:
+              sys.exit('merge the release preparation PR before building candidates')
+          PY
+      - name: Prepare version changes
+        if: inputs.action == 'prepare'
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/release-preparation"
+          python3 scripts/prepare-release.py "$RELEASE_VERSION" --output "$RUNNER_TEMP/release-preparation/prepared.json"
+          ruby scripts/check-sdk-pins.rb
+          git diff --check
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: inputs.action == 'prepare'
+        with:
+          name: leani-release-preparation
+          path: ${{ runner.temp }}/release-preparation/prepared.json
+          if-no-files-found: error
+          retention-days: 14
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        if: inputs.action == 'publish'
+        with:
+          name: leani-release-plan-${{ inputs.version }}
+          path: ${{ runner.temp }}/release-plan
+          run-id: ${{ inputs.candidate_run_id }}
+          github-token: ${{ github.token }}
+      - name: Verify candidate plan before requesting approval
+        if: inputs.action == 'publish'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CANDIDATE_RUN_ID: ${{ inputs.candidate_run_id }}
+          RELEASE_VERSION: ${{ inputs.version }}
+        run: >-
+          python3 scripts/coordinate-release.py verify-plan
+          --plan "$RUNNER_TEMP/release-plan/release-plan.json"
+          --candidate-run-id "$CANDIDATE_RUN_ID" --version "$RELEASE_VERSION"
+
+  prepare:
+    name: Open release preparation PR
+    needs: validate
+    if: github.ref == 'refs/heads/main' && inputs.action == 'prepare'
+    runs-on: ubuntu-24.04
+    environment: release-control
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: leani-release-preparation
+          path: ${{ runner.temp }}/release-preparation
+      - name: Open the reviewed version update
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_CONTROL_TOKEN || github.token }}
+        run: python3 scripts/coordinate-release.py open-pr --prepared "$RUNNER_TEMP/release-preparation/prepared.json"
+
+  coordinate:
+    name: Coordinate candidates and publication
+    needs: validate
+    if: github.ref == 'refs/heads/main' && inputs.action != 'prepare'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    environment: release-control
+    permissions:
+      contents: write
+      actions: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        if: inputs.action == 'publish'
+        with:
+          name: leani-release-plan-${{ inputs.version }}
+          path: ${{ runner.temp }}/release-plan
+          run-id: ${{ inputs.candidate_run_id }}
+          github-token: ${{ github.token }}
+      - name: Coordinate release workflows
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_CONTROL_TOKEN || github.token }}
+          RELEASE_ACTION: ${{ inputs.action }}
+          RELEASE_VERSION: ${{ inputs.version }}
+          CANDIDATE_RUN_ID: ${{ inputs.candidate_run_id }}
+          PROMOTE_SITE: ${{ inputs.promote_site }}
+          RELEASE_COMMIT: ${{ inputs.release_commit }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/release-plan"
+          if [ "$RELEASE_ACTION" = candidate ]; then
+            set -- candidate "$RELEASE_VERSION" --output "$RUNNER_TEMP/release-plan/release-plan.json"
+            if [ -n "$RELEASE_COMMIT" ]; then set -- "$@" --commit "$RELEASE_COMMIT"; fi
+            python3 scripts/coordinate-release.py "$@"
+          else
+            set -- publish --plan "$RUNNER_TEMP/release-plan/release-plan.json" --candidate-run-id "$CANDIDATE_RUN_ID" --version "$RELEASE_VERSION"
+            if [ "$PROMOTE_SITE" = true ]; then set -- "$@" --promote-site; fi
+            python3 scripts/coordinate-release.py "$@"
+          fi
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always() && inputs.action == 'candidate'
+        with:
+          name: leani-release-plan-${{ inputs.version }}
+          path: ${{ runner.temp }}/release-plan/release-plan.json
+          if-no-files-found: warn
+          retention-days: 14

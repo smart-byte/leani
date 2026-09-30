@@ -49,7 +49,7 @@ Configure these Pages build variables:
 | `NODE_VERSION` | `24` | `24` |
 | `SKIP_DEPENDENCY_INSTALL` | `1` | `1` |
 | `LEANI_SITE_MODE` | `production` | `preview` |
-| `LEANI_DOCS_REF` | Promoted release tag, initially `v0.1.0-rc.1` | Unset (branch-derived) |
+| `LEANI_DOCS_REF` | Unset (derived from the promoted workspace version), or the matching release tag | Unset (branch-derived) |
 
 Set the production `LEANI_DOCS_REF` to the release being promoted before running
 the promotion workflow. A production build fails unless its documentation ref,
