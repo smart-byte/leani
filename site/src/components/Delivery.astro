@@ -1,3 +1,27 @@
+---
+import session from '../data/handoff-session.json';
+
+// A recorded handoff drives the seam: the history lane's last block, the live
+// lane's first block (whose parentHash names it), then the live head. The
+// coverage gap, its intervals, and the timing around them are illustrative.
+const rows = session.rows;
+const live = rows.slice(-3);
+const first = rows.at(-4)!;
+const last = rows.at(-5)!;
+const head = live.at(-1)!.blockNumber;
+const TILES = 75;
+const GAP_AT = 40;
+const GAP_LENGTH = 8;
+const start = last.blockNumber - TILES;
+const gapStart = start + GAP_AT;
+const gapEnd = gapStart + GAP_LENGTH - 1;
+// Drawn about two epochs behind the head, where finality usually trails.
+const finalizedThrough = head - 64;
+const fmt = (n: number) => n.toLocaleString('en-US');
+const tail = (n: number) => String(n).slice(-3);
+const short = (hash: string) => `${hash.slice(0, 6)}…${hash.slice(-6)}`;
+const summary = `Historical coverage fills its gap from block ${fmt(gapStart)} to ${fmt(gapEnd)}. The last history block, ${fmt(last.blockNumber)}, has hash ${short(last.blockHash)}, and the first live block, ${fmt(first.blockNumber)}, names that hash as its parent, so the lanes join without overlap or omission. The live lane follows the attested head at block ${fmt(head)}. A consumer's durable cursor trails at sequence ${first.sequence}, and delivery history behind it can be pruned.`;
+---
 <section id="delivery" class="wrap section" aria-labelledby="delivery-h">
   <p class="eyebrow mono">The durable boundary</p>
   <h2 id="delivery-h"><span class="mono"># </span>Backfill meets live without a gap</h2>
@@ -6,6 +30,83 @@
     parent-hash boundary. Downstream delivery uses the same committed change
     protocol for both.
   </p>
+
+  <figure class="seam">
+    <div
+      class="chart"
+      role="img"
+      aria-label={summary}
+      data-seam
+      data-start={start}
+      data-gap={gapStart}
+      data-last={last.blockNumber}
+      data-head={head}
+      data-seq={last.sequence}
+      style={`--tiles: ${TILES}; --gap-at: ${GAP_AT}; --gap-n: ${GAP_LENGTH}; --fin-at: ${finalizedThrough - start + 1}`}
+    >
+      <div class="zone z1 is-complete">
+        <div class="lab"><span class="stage">historical coverage</span><i class="rail arrow"></i></div>
+        <div class="band">
+          <i class="line"></i><span class="fin-label">finalized</span><span class="inc-label">included</span>
+          <span class="gap-chip"><span class="miss">first missing · {fmt(gapStart)}</span><span class="done">backfilled {tail(gapStart)}–{tail(gapEnd)}</span></span>
+        </div>
+        <div class="hist">
+          <span class="gap">{Array.from({ length: GAP_LENGTH }, () => <i class="is-bf"></i>)}</span><span class="gap-box"></span>
+          <span class="ivl ivl-a"><span>committed …{tail(start)}–{tail(gapStart - 1)}</span></span>
+          <span class="ivl ivl-b"><span>committed …{tail(gapEnd + 1)}–{tail(last.blockNumber - 1)}</span></span>
+          <span class="ivl ivl-all"><span>committed …{tail(start)}–{tail(last.blockNumber - 1)} · contiguous</span></span>
+        </div>
+        <div class="track"><i class="ack"></i><i class="pend"></i></div>
+        <div class="foot"><span class="first">#{fmt(start)}</span></div>
+        <i class="fin"></i>
+      </div>
+      <div class="zone z2 is-zipped">
+        <div class="lab"><i class="rail"></i><span class="stage">exact hash handoff</span><i class="rail arrow"></i></div>
+        <div class="band">
+          <i class="line"></i>
+          <span class="checks"><span class="chk is-ok"><i></i>parent hash</span><span class="chk is-ok"><i></i>canonical ancestry</span><span class="chk is-ok"><i></i>coverage</span></span>
+        </div>
+        <div class="pair">
+          <div class="big hb"><span class="kind">history · last block</span><b>#{fmt(last.blockNumber)}</b><span class="kv"><i>hash</i><em class="h">{short(last.blockHash)}</em></span><span class="kv sub"><i>seq</i><em>{last.sequence}</em></span></div>
+          <div class="zip"><b class="ok"></b></div>
+          <div class="big lb"><span class="kind">live · first block</span><b>#{fmt(first.blockNumber)}</b><span class="kv"><i>parent</i><em class="h">{short(first.parentHash)}</em></span><span class="kv sub"><i>hash</i><em>{short(first.blockHash)}</em></span></div>
+        </div>
+        <div class="track">
+          <i class="ack"></i><i class="pend"></i><i class="tick is-on is-acked" data-b={last.blockNumber}></i><i class="tick is-on is-acked" data-b={first.blockNumber}></i>
+          <span class="cur is-on"><i class="fence"></i><i class="caret"></i><span class="pill"><b>durable cursor</b><span class="dot">·</span><span class="seq">seq {first.sequence}</span><span class="ackmsg">commit → ACK</span></span></span>
+        </div>
+        <div class="foot"></div>
+      </div>
+      <div class="zone z3">
+        <div class="lab"><i class="rail"></i><span class="stage">live canonical head</span></div>
+        <div class="band"><i class="line"></i></div>
+        <div class="live">
+          {live.map((row) => (
+            <div class:list={['lt', 'is-in', { 'is-head': row.blockNumber === head }]}>
+              <span>{fmt(row.blockNumber).slice(0, -3)}</span><b>{tail(row.blockNumber)}</b><em>{row.blockHash.slice(0, 6)}…</em>
+              {row.blockNumber === head && <span class="headmark">attested head</span>}
+            </div>
+          ))}
+        </div>
+        <div class="track"><i class="ack"></i><i class="pend"></i>{live.map((row) => <i class="tick is-on" data-b={row.blockNumber}></i>)}</div>
+        <div class="foot"></div>
+      </div>
+      <div class="gut" aria-hidden="true"><svg viewBox="0 0 34 220"><path d="M0 17H13Q21 17 21 25V169Q21 177 13 177H4"/><path d="M9 173L4 177L9 181"/></svg></div>
+      <div class="legend" aria-hidden="true">
+        <span><i class="sw sw-gap"></i>coverage gap</span>
+        <span><i class="sw sw-bf"></i>backfilled</span>
+        <span><i class="sw sw-ack"></i>ACKed · prunable behind the fence</span>
+        <span><i class="sw sw-fence"></i>prune fence</span>
+        <span><i class="sw sw-pend"></i>published · awaiting ACK</span>
+      </div>
+    </div>
+    <figcaption class="cap">
+      Real Mainnet blocks, hashes, and sequences ({rows[0]!.sequence}–{rows.at(-1)!.sequence}) from a recorded{' '}
+      <code>{session.command}</code> session, leani {session.leaniVersion}. Finality is drawn 64 blocks (about two
+      epochs) behind the head and earlier sequences are counted back from the recording; coverage intervals and
+      timing are illustrative.
+    </figcaption>
+  </figure>
 
   <ol class="flow">
     <li>
@@ -30,12 +131,6 @@
     </li>
   </ol>
 
-  <div class="contract mono" aria-label="Delivery sequence">
-    <span>historical coverage</span><span aria-hidden="true">→</span>
-    <span>exact hash handoff</span><span aria-hidden="true">→</span>
-    <span>live canonical head</span><span aria-hidden="true">→</span>
-    <span class="accent">durable cursor</span>
-  </div>
   <p class="note">
     Transport is at-least-once. Exactly-once application behavior comes from
     committing the destination mutation and cursor in one transaction, then acknowledging.
@@ -53,7 +148,7 @@
   .flow {
     list-style: none;
     padding: 0;
-    margin-top: 2.5rem;
+    margin-top: 1.875rem;
     display: grid;
     grid-template-columns: repeat(4, minmax(0, 1fr));
     gap: 1rem;
@@ -62,20 +157,200 @@
   .num { color: var(--accent); font-size: 0.75rem; }
   h3 { font-size: 1rem; margin-top: 0.55rem; }
   .flow p { color: var(--ink-dim); font-size: 0.88rem; margin-top: 0.55rem; }
-  .contract {
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    flex-wrap: wrap;
-    gap: 0.8rem;
-    margin-top: 2.5rem;
-    padding: 1.1rem;
-    background: var(--panel);
-    border: 1px solid var(--panel-edge);
-    border-radius: 10px;
-    font-size: 0.82rem;
-  }
   .note { color: var(--ink-dim); font-size: 0.82rem; max-width: 72ch; margin-top: 0.8rem; }
   @media (max-width: 800px) { .flow { grid-template-columns: 1fr 1fr; } }
   @media (max-width: 500px) { .flow { grid-template-columns: 1fr; } }
+
+  /* One chain read left to right: coverage, the hash seam, the live head, and
+     a cursor lane under all three. Zone widths are fixed so the seam's tile
+     centers (50% ± 87px) and the live tile centers (36/100/164px) are known
+     without script; the lazy timeline measures them again when it runs. */
+  .seam { margin: 2.25rem 0 0; }
+  .chart { position: relative; display: grid; grid-template-columns: minmax(0, 1fr) 364px 200px 34px; padding: 20px 26px 16px; border: 1px solid #1d2b24; border-radius: 12px; background: radial-gradient(ellipse 22% 58% at 57% 56%, rgb(62 224 127 / 0.07), transparent 72%), linear-gradient(180deg, #0e1612, #0b110e); font-family: var(--font-mono); }
+  .zone { position: relative; display: grid; grid-template-rows: 34px 24px 108px 28px 26px; min-width: 0; }
+  .zone > :not(.lab) { transition: opacity 400ms; }
+  .lab { display: flex; align-items: center; gap: 10px; min-width: 0; }
+  .stage { font-size: 10.5px; line-height: 1; letter-spacing: 0.1em; text-transform: uppercase; color: #cfe3d6; white-space: nowrap; }
+  .rail { position: relative; flex: 1 1 auto; min-width: 12px; height: 1px; background: #2a4a38; }
+  .arrow::after { content: ''; position: absolute; right: 0; top: -3px; border-left: 5px solid #3b6a51; border-top: 3.5px solid transparent; border-bottom: 3.5px solid transparent; }
+  .band { position: relative; }
+  .line { position: absolute; top: 50%; height: 1px; background: rgb(62 224 127 / 0.28); }
+  .z1 .line { left: calc(var(--fin-at) * 100% / var(--tiles)); right: 0; }
+  .z2 .line { left: 0; right: 0; }
+  .z3 .line { left: 0; width: var(--hx, 164px); transition: width 420ms cubic-bezier(0.2, 0.8, 0.2, 1); }
+  .fin-label, .inc-label { position: absolute; top: 50%; transform: translateY(-50%); font-size: 9.5px; line-height: 1; letter-spacing: 0.08em; text-transform: uppercase; white-space: nowrap; }
+  .fin-label { right: calc(100% - var(--fin-at) * 100% / var(--tiles) + 7px); color: #8fa89a; }
+  .inc-label { left: calc(var(--fin-at) * 100% / var(--tiles) + 7px); padding-right: 6px; color: rgb(62 224 127 / 0.8); background: #0d1511; }
+  .gap-chip { position: absolute; top: 50%; left: calc((var(--gap-at) + var(--gap-n) / 2) * 100% / var(--tiles)); transform: translate(-50%, -50%); padding: 3px 8px; border: 1px solid rgb(237 203 137 / 0.5); border-radius: 999px; background: #0d1511; font-size: 10px; line-height: 1; white-space: nowrap; transition: border-color 300ms; }
+  .miss { color: #edcb89; }
+  .done { display: none; color: #9ff0c4; }
+  .z1.is-complete .gap-chip { border-color: rgb(62 224 127 / 0.45); }
+  .z1.is-complete .miss { display: none; }
+  .z1.is-complete .done { display: inline; }
+  .fin { position: absolute; left: calc(var(--fin-at) * 100% / var(--tiles)); top: 46px; width: 1px; height: 120px; background: linear-gradient(rgb(159 240 196 / 0.55), rgb(159 240 196 / 0.12)); }
+
+  /* Committed tiles are one masked gradient on each side of the gap; only
+     the gap's own tiles are elements, so the backfill can drop them in. */
+  .hist { position: relative; }
+  .hist::before, .hist::after { content: ''; position: absolute; bottom: 0; height: 34px; background: linear-gradient(180deg, #2f6246, #1d412e); mask: repeating-linear-gradient(90deg, transparent 0 0.75px, #000 0 calc(100% / var(--n) - 0.75px), transparent 0 calc(100% / var(--n))); }
+  .hist::before { --n: var(--gap-at); left: 0; width: calc(var(--n) * 100% / var(--tiles)); }
+  .hist::after { --n: calc(var(--tiles) - var(--gap-at) - var(--gap-n)); right: 0; width: calc(var(--n) * 100% / var(--tiles)); }
+  .gap { position: absolute; bottom: 0; left: calc(var(--gap-at) * 100% / var(--tiles)); width: calc(var(--gap-n) * 100% / var(--tiles)); height: 34px; display: flex; }
+  .gap i { position: relative; flex: 1 1 0; }
+  .gap i::before { content: ''; position: absolute; inset: 0; background: repeating-linear-gradient(135deg, rgb(237 203 137 / 0.38) 0 1.5px, transparent 1.5px 4px); }
+  .gap .is-bf::before { inset: 0 0.75px; border-radius: 1.5px; background: linear-gradient(180deg, #5ccb8c, #2c7a4f); animation: drop 460ms cubic-bezier(0.2, 0.8, 0.2, 1) both; }
+  .gap-box { position: absolute; left: calc(var(--gap-at) * 100% / var(--tiles)); width: calc(var(--gap-n) * 100% / var(--tiles)); bottom: -4px; height: 42px; border: 1px dashed rgb(237 203 137 / 0.65); border-radius: 3px; pointer-events: none; transition: opacity 400ms; }
+  .z1.is-complete .gap-box { opacity: 0; }
+  .ivl { position: absolute; bottom: 44px; height: 5px; border: 1px solid #35533f; border-bottom: 0; transition: opacity 400ms; }
+  .ivl span { position: absolute; left: 50%; bottom: 7px; padding: 0 5px; transform: translateX(-50%); background: #0d1511; font-size: 9.5px; line-height: 1; color: #6f877a; white-space: nowrap; }
+  .ivl-a { left: calc(0.5 * 100% / var(--tiles)); width: calc((var(--gap-at) - 1) * 100% / var(--tiles)); }
+  .ivl-b { left: calc((var(--gap-at) + var(--gap-n) + 0.5) * 100% / var(--tiles)); width: calc((var(--tiles) - var(--gap-at) - var(--gap-n) - 1) * 100% / var(--tiles)); }
+  .ivl-all { left: calc(0.5 * 100% / var(--tiles)); width: calc((var(--tiles) - 1) * 100% / var(--tiles)); opacity: 0; }
+  .ivl-all span { color: #9ff0c4; }
+  .z1.is-complete .ivl-a, .z1.is-complete .ivl-b { opacity: 0; }
+  .z1.is-complete .ivl-all { opacity: 1; }
+
+  .pair { display: flex; justify-content: center; align-self: end; height: 104px; }
+  .big { position: relative; width: 150px; flex: 0 0 150px; padding: 11px; border: 1px solid #355a45; border-radius: 8px; background: linear-gradient(160deg, #15251c, #0e1813); display: flex; flex-direction: column; gap: 7px; }
+  .lb { border-color: rgb(62 224 127 / 0.55); background: linear-gradient(160deg, #173826, #0f1f16); box-shadow: 0 0 28px rgb(62 224 127 / 0.08); }
+  .kind { font-size: 8.5px; line-height: 1; letter-spacing: 0.12em; text-transform: uppercase; color: #8fa89a; white-space: nowrap; }
+  .lb .kind { color: var(--accent); }
+  .big b { font-size: 14.5px; line-height: 1; color: var(--ink); }
+  .kv { display: flex; align-items: baseline; gap: 5px; font-size: 10.5px; line-height: 1; white-space: nowrap; }
+  .kv i { min-width: 34px; flex: 0 0 auto; font-style: normal; color: #6f877a; }
+  .lb .kv i { min-width: 40px; }
+  .kv em { font-style: normal; color: #b9cfc2; }
+  .sub { opacity: 0.72; }
+  .h { transition: color 400ms, text-shadow 400ms; }
+  .z2.is-zipped .h { color: #9ff0c4; text-shadow: 0 0 12px rgb(62 224 127 / 0.45); }
+  /* Teeth are two gradient columns: the open set sits pushed apart, the
+     closed set interlocks, and zipping reveals one over the other top-down. */
+  .zip { position: relative; flex: 0 0 24px; }
+  .zip::before, .zip::after {
+    content: ''; position: absolute; inset: 0;
+    background:
+      repeating-linear-gradient(180deg, var(--tooth) 0 5px, transparent 5px 12px) left var(--edge) top 8px / 10px 89px no-repeat,
+      repeating-linear-gradient(180deg, var(--tooth) 0 5px, transparent 5px 12px) right var(--edge) top 14px / 10px 77px no-repeat;
+    transition: clip-path 900ms cubic-bezier(0.3, 0.7, 0.2, 1);
+  }
+  .zip::before { --tooth: #2b4436; --edge: -3px; clip-path: inset(0 0 0 0); }
+  .zip::after { --tooth: var(--accent); --edge: 2px; clip-path: inset(0 0 100% 0); filter: drop-shadow(0 0 3px rgb(62 224 127 / 0.5)); }
+  .z2.is-zipped .zip::before { clip-path: inset(100% 0 0 0); }
+  .z2.is-zipped .zip::after { clip-path: inset(0 0 0 0); }
+  .ok { position: absolute; z-index: 1; left: 50%; top: 50%; width: 22px; height: 22px; margin: -11px 0 0 -11px; border-radius: 50%; background: var(--accent); box-shadow: 0 0 0 4px #0d1511, 0 0 18px rgb(62 224 127 / 0.6); transform: scale(0); transition: transform 320ms cubic-bezier(0.3, 1.6, 0.5, 1); }
+  .ok::before { content: ''; position: absolute; left: 7.5px; top: 4.5px; width: 5px; height: 9px; border: solid #06130c; border-width: 0 2px 2px 0; transform: rotate(40deg); }
+  .z2.is-zipped .ok { transform: scale(1); transition-delay: 620ms; }
+  .checks { position: absolute; left: 50%; top: 50%; display: flex; gap: 6px; transform: translate(-50%, -50%); white-space: nowrap; }
+  .chk { display: inline-flex; align-items: center; gap: 5px; padding: 3px 8px 3px 5px; border: 1px solid #22352b; border-radius: 999px; background: #0d1511; font-size: 9.5px; line-height: 1; color: #6f877a; transition: color 300ms, border-color 300ms; }
+  .chk i { position: relative; width: 10px; height: 10px; border: 1px solid #3a5446; border-radius: 50%; transition: background 300ms, border-color 300ms; }
+  .chk.is-ok { color: #cfe3d6; border-color: rgb(62 224 127 / 0.35); }
+  .chk.is-ok i { background: var(--accent); border-color: var(--accent); }
+  .chk.is-ok i::after { content: ''; position: absolute; left: 2.6px; top: 0.6px; width: 2.5px; height: 5px; border: solid #06130c; border-width: 0 1.5px 1.5px 0; transform: rotate(40deg); }
+
+  .live { display: flex; align-items: flex-end; gap: 8px; padding-left: 8px; }
+  .lt { position: relative; display: flex; flex-direction: column; width: 56px; height: 64px; flex: 0 0 56px; padding: 8px 7px 7px; border: 1px solid rgb(62 224 127 / 0.45); border-radius: 7px; background: linear-gradient(160deg, #173a27, #0f2116); opacity: 0; transform: translateY(-14px); transition: opacity 420ms, transform 420ms cubic-bezier(0.2, 0.8, 0.2, 1), border-color 300ms, box-shadow 300ms; }
+  .lt.is-in { opacity: 1; transform: none; }
+  .lt.is-head { border-color: var(--accent); box-shadow: 0 0 22px rgb(62 224 127 / 0.2); }
+  .lt span { font-size: 8.5px; line-height: 1; color: #6f877a; }
+  .lt b { margin-top: 3px; font-size: 15px; line-height: 1.05; color: var(--ink); }
+  .lt em { margin-top: auto; font-style: normal; font-size: 8.5px; line-height: 1; color: rgb(159 240 196 / 0.75); }
+  .lt .headmark { position: absolute; left: 50%; bottom: calc(100% + 44px); padding: 3px 8px; border: 1px solid var(--accent); border-radius: 999px; background: #0f2418; box-shadow: 0 0 14px rgb(62 224 127 / 0.25); font-size: 9px; letter-spacing: 0.1em; text-transform: uppercase; white-space: nowrap; color: var(--accent); transform: translateX(-50%); animation: ping 1.6s ease-out 1; }
+  .headmark::after { content: ''; position: absolute; left: 50%; top: 100%; width: 1px; height: 44px; background: linear-gradient(var(--accent), rgb(62 224 127 / 0.1)); }
+
+  .track { position: relative; }
+  .track::before { content: ''; position: absolute; left: 0; right: 0; top: 11px; height: 1px; background: #243a2e; }
+  .ack { position: absolute; left: 0; top: 8px; height: 7px; width: var(--cut, 100%); border-block: 1px solid rgb(62 224 127 / 0.22); background: repeating-linear-gradient(-45deg, rgb(62 224 127 / 0.34) 0 1.5px, transparent 1.5px 4.5px); transition: width 480ms cubic-bezier(0.3, 0.7, 0.2, 1); }
+  .pend { position: absolute; top: 10px; height: 3px; left: var(--cut, 0px); width: max(0px, calc(var(--pub, 0px) - var(--cut, 0px))); background: repeating-linear-gradient(90deg, rgb(62 224 127 / 0.75) 0 3px, transparent 3px 7px); transition: left 480ms cubic-bezier(0.3, 0.7, 0.2, 1), width 480ms cubic-bezier(0.3, 0.7, 0.2, 1); }
+  .z1 .track { --cut: 100%; --pub: 100%; }
+  .z2 .track { --cut: calc(50% + 87px); --pub: 100%; }
+  .z3 .track { --cut: 0px; --pub: 164px; }
+  .tick { position: absolute; top: 7px; width: 9px; height: 9px; margin-left: -4.5px; border: 1.5px solid var(--accent); border-radius: 50%; background: #0d1511; opacity: 0; transform: scale(0.4); transition: opacity 260ms, transform 260ms, background 260ms; }
+  .tick.is-on { opacity: 1; transform: none; }
+  .tick.is-acked { background: var(--accent); }
+  .z2 .tick { left: calc(50% - 87px); }
+  .z2 .tick + .tick { left: calc(50% + 87px); }
+  .z3 .tick { left: 36px; }
+  .z3 .tick + .tick { left: 100px; }
+  .z3 .tick + .tick + .tick { left: 164px; }
+  .cur { position: absolute; z-index: 2; left: var(--x, 0px); top: 0; width: 0; height: 54px; opacity: 0; transition: left 480ms cubic-bezier(0.3, 0.7, 0.2, 1), opacity 240ms; }
+  .cur.is-on { opacity: 1; }
+  .z2 .cur { --x: calc(50% + 87px); --px: -143px; }
+  .fence { position: absolute; left: -1px; top: 2px; width: 2px; height: 19px; border-radius: 1px; background: #edcb89; box-shadow: 0 0 8px rgb(237 203 137 / 0.55); }
+  .caret { position: absolute; left: -5px; top: -6px; border-left: 5px solid transparent; border-right: 5px solid transparent; border-bottom: 7px solid var(--accent); filter: drop-shadow(0 0 4px rgb(62 224 127 / 0.6)); }
+  .pill { position: absolute; top: 28px; left: var(--px, -84px); display: inline-flex; align-items: center; gap: 6px; padding: 4px 9px; border: 1px solid rgb(62 224 127 / 0.5); border-radius: 999px; background: #0f2418; font-size: 10.5px; line-height: 1; color: #cfe3d6; white-space: nowrap; transition: left 480ms cubic-bezier(0.3, 0.7, 0.2, 1), background 250ms, border-color 250ms; }
+  .pill b { font-weight: 400; color: var(--accent); }
+  .dot { color: #4f6a5b; }
+  .ackmsg { display: none; font-weight: 700; color: #06130c; }
+  .cur.is-ack .pill { background: var(--accent); border-color: var(--accent); }
+  .cur.is-ack .pill > :not(.ackmsg) { display: none; }
+  .cur.is-ack .ackmsg { display: inline; }
+  .cur.is-ack .fence { animation: fence 700ms ease-out; }
+  .chart.is-sweep .ack, .chart.is-sweep .pend, .chart.is-sweep .cur, .chart.is-sweep .pill { transition: none; }
+  .foot { position: relative; }
+  .first { position: absolute; left: 0; top: 7px; font-size: 9.5px; line-height: 1; color: #4f6a5b; }
+  .gut { position: relative; }
+  .gut svg { position: absolute; left: 0; top: 0; width: 34px; height: 220px; overflow: visible; fill: none; stroke: #2f5a42; stroke-width: 1; }
+  .legend { grid-column: 1 / -1; display: flex; flex-wrap: wrap; gap: 8px 22px; margin-top: 10px; padding-top: 12px; border-top: 1px solid #16221c; font-size: 10px; line-height: 1.2; color: var(--ink-dim); }
+  .legend span { display: inline-flex; align-items: center; gap: 7px; }
+  .sw { display: inline-block; flex: 0 0 auto; }
+  .sw-gap { width: 14px; height: 10px; border: 1px dashed rgb(237 203 137 / 0.7); background: repeating-linear-gradient(135deg, rgb(237 203 137 / 0.38) 0 1.5px, transparent 1.5px 4px); }
+  .sw-bf { width: 5px; height: 12px; border-radius: 1px; background: linear-gradient(#5ccb8c, #2c7a4f); }
+  .sw-ack { width: 18px; height: 7px; border-block: 1px solid rgb(62 224 127 / 0.22); background: repeating-linear-gradient(-45deg, rgb(62 224 127 / 0.4) 0 1.5px, transparent 1.5px 4.5px); }
+  .sw-fence { width: 2px; height: 12px; background: #edcb89; }
+  .sw-pend { width: 18px; height: 3px; background: repeating-linear-gradient(90deg, rgb(62 224 127 / 0.75) 0 3px, transparent 3px 7px); }
+  .cap { margin-top: 10px; font: 10.5px/1.55 var(--font-mono); color: #5f786a; }
+  .cap code { font: inherit; color: var(--ink-dim); }
+  .chart.is-fading .zone > :not(.lab) { opacity: 0.1; }
+  .chart.is-reset *, .chart.is-reset *::before, .chart.is-reset *::after { transition: none !important; animation: none !important; }
+  @keyframes drop { from { transform: translateY(-14px); opacity: 0; filter: brightness(1.8); } to { transform: none; opacity: 1; filter: none; } }
+  @keyframes ping { 0% { box-shadow: 0 0 0 0 rgb(62 224 127 / 0.6), 0 0 14px rgb(62 224 127 / 0.25); } 100% { box-shadow: 0 0 0 10px rgb(62 224 127 / 0), 0 0 14px rgb(62 224 127 / 0.25); } }
+  @keyframes fence { 0% { box-shadow: 0 0 18px 3px rgb(237 203 137 / 0.9); } 100% { box-shadow: 0 0 8px rgb(237 203 137 / 0.55); } }
+
+  /* Narrow screens stack the three zones; the cursor lane runs under each. */
+  @media (max-width: 999px) {
+    .chart { grid-template-columns: minmax(0, 1fr); row-gap: 14px; padding: 16px 14px 14px; background: linear-gradient(180deg, #0e1612, #0b110e); }
+    .gut { display: none; }
+    .z1 { grid-template-rows: 30px 26px 66px 28px 24px; }
+    .z2 { grid-template-rows: 30px 26px 108px 28px 26px; }
+    .z3 { grid-template-rows: 30px 26px 72px 28px 26px; }
+    .z2 .lab > .rail:first-child, .z3 .lab > .rail:first-child { display: none; }
+    .z3 .lab::after { content: ''; flex: 1 1 auto; height: 1px; background: #2a4a38; }
+    .fin { top: 43px; height: 79px; }
+    .inc-label { display: none; }
+    .lt .headmark { bottom: calc(100% + 10px); }
+    .headmark::after { height: 10px; }
+    .legend { gap: 8px 14px; margin-top: 0; }
+  }
+  @media (max-width: 600px) {
+    .seam { margin-top: 1.75rem; }
+    .kv { font-size: 10px; }
+    .kv i { min-width: 30px; }
+    .lb .kv i { min-width: 37px; }
+    .big { width: 146px; flex-basis: 146px; padding: 10px; }
+    .kind { letter-spacing: 0.08em; }
+    .zip { flex-basis: 22px; }
+    .checks { gap: 4px; }
+    .chk { padding: 3px 6px 3px 4px; font-size: 8.8px; }
+    .z2 .track { --cut: calc(50% + 84px); }
+    .z2 .tick { left: calc(50% - 84px); }
+    .z2 .tick + .tick { left: calc(50% + 84px); }
+    .z2 .cur { --x: calc(50% + 84px); --px: -141px; }
+    .cap { font-size: 10px; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .chart *, .chart *::before, .chart *::after { transition: none !important; animation: none !important; }
+  }
 </style>
+
+<script>
+  // The seam's timeline loads only once the section nears the viewport.
+  const chart = document.querySelector<HTMLElement>('#delivery [data-seam]');
+  if (chart && !matchMedia('(prefers-reduced-motion: reduce)').matches) {
+    const io = new IntersectionObserver((entries) => {
+      if (!entries.some((entry) => entry.isIntersecting)) return;
+      io.disconnect();
+      void import('../lib/seam').then(({ startSeam }) => startSeam(chart));
+    }, { rootMargin: '300px 0px' });
+    io.observe(chart);
+  }
+</script>
