@@ -1,64 +1,152 @@
 ---
 import TerminalFrame from './TerminalFrame.astro';
 import { QUICKSTART_URL } from '../config';
-import { hlShell } from '../lib/highlight';
+import { hlShell, hlTs } from '../lib/highlight';
 import { exampleSource } from '../lib/examples';
+import { blockRowHtml } from '../lib/block-row';
+import followExamples from '../data/follow-examples.json';
+import session from '../data/follow-session.json';
 
-const boundedMainnetQuickstart = exampleSource('live-block-first-run').code;
-const boundedMainnetQuery = exampleSource('live-block-node').code;
-const shellLines = (source: string) => source.split('\n').map(hlShell);
+interface Example {
+  id: string;
+  label: string;
+  title: string;
+  lang: string;
+  code: string;
+  note?: string;
+  noteHref?: string;
+  noteLabel?: string;
+}
+
+// Tabs 1–2 are the checked CLI examples; 3–4 show the same node from viem and the SDK.
+const examples = ([
+  { id: 'follow', label: 'follow live blocks', title: 'shell', lang: 'shell', code: exampleSource('live-block-first-run').code },
+  { id: 'node', label: 'prepare a reusable node', title: 'shell', lang: 'shell', code: exampleSource('live-block-node').code },
+  ...followExamples.map(({ id, label, title, lang, lines, note, noteHref, noteLabel }) => ({
+    id, label, title, lang, code: lines.map((line) => line.text).join('\n'), note, noteHref, noteLabel,
+  })),
+] satisfies Example[]).map((example: Example) => ({
+  ...example,
+  html: example.code.split('\n').map(example.lang === 'ts' ? hlTs : hlShell),
+}));
+
+// The server renders the first recorded rows; the lazy replay continues from there.
+const recorded = session.recordedAt.slice(0, 10);
+const firstRows = session.rows.slice(0, 6);
 ---
-<section id="quickstart" class="wrap section" aria-labelledby="quickstart-h">
-  <p class="eyebrow mono">Ethereum Mainnet · no API key</p>
-  <h2 id="quickstart-h"><span class="mono"># </span>Follow Ethereum blocks</h2>
-  <p class="lede">
-    <a href="/docs/getting-started/install/">Install the alpha from source</a>,
-    then follow new block summaries directly from Ethereum's network with one command. On first use,
-    Leani asks you to approve a checkpoint, a trusted starting point for checking the chain.
-    Prepare a reusable node when you want queries and SDK subscriptions.
-  </p>
-  <div class="pair">
-    <div>
-      <p class="mono label">1 · follow live blocks</p>
-      <TerminalFrame title="shell">
-        <div class="command" data-copy-value={boundedMainnetQuickstart}>
-          <span data-copy-source>
-            {shellLines(boundedMainnetQuickstart).map((line) => <span class="t-line" set:html={line} />)}
-          </span>
-          <button type="button" class="copy mono" data-copy-button aria-label="Copy follow command">copy</button>
-        </div>
-      </TerminalFrame>
-      <p class="status mono" role="status" aria-live="polite" data-copy-status></p>
-    </div>
-    <div>
-      <p class="mono label">2 · prepare a reusable node</p>
-      <TerminalFrame title="shell">
-        <div class="command" data-copy-value={boundedMainnetQuery}>
-          <span data-copy-source>
-            {shellLines(boundedMainnetQuery).map((line) => <span class="t-line" set:html={line} />)}
-          </span>
-          <button type="button" class="copy mono" data-copy-button aria-label="Copy reusable node commands">copy</button>
-        </div>
-      </TerminalFrame>
-      <p class="status mono" role="status" aria-live="polite" data-copy-status></p>
+<section id="quickstart" class="section" aria-labelledby="quickstart-h">
+  <div class="wrap">
+    <p class="eyebrow mono">Ethereum Mainnet · no API key</p>
+    <h2 id="quickstart-h"><span class="mono"># </span>Follow Ethereum blocks</h2>
+    <p class="lede">
+      <a href="/docs/getting-started/install/">Install the alpha from source</a>,
+      then follow new block summaries directly from Ethereum's network with one command. On first use,
+      Leani asks you to approve a checkpoint, a trusted starting point for checking the chain.
+      Prepare a reusable node when you want queries and SDK subscriptions.
+    </p>
+  </div>
+
+  <div class="live" data-follow-live>
+    <canvas aria-hidden="true"></canvas>
+    <div class="wrap column">
+      <div class="frame" data-live-term>
+        <i class="intake" aria-hidden="true"></i>
+        <TerminalFrame title="leani — follow Ethereum blocks">
+          <div class="view">
+            <div class="lines" data-lines>
+              <span class="ln" set:html={hlShell(`$ ${session.command}`)} />
+              {firstRows.map((row) => <span class="ln" set:html={blockRowHtml(row)} />)}
+            </div>
+          </div>
+        </TerminalFrame>
+      </div>
+      <p class="caption mono">
+        Recorded on Ethereum Mainnet · {recorded} · leani {session.leaniVersion}<span data-replay hidden> · replayed 4× faster</span>
+      </p>
     </div>
   </div>
-  <p class="after">
-    Your first result may be a <span class="mono">preview</span> while Leani checks the block's place in Ethereum's chain.
-    Rows marked <span class="mono">included</span> are on the followed chain and can still be reorged.
-    Add <span class="mono">--finality finalized</span> to print only blocks Ethereum consensus has finalized.
-    See the <a href={QUICKSTART_URL}>full quickstart</a>, then{' '}
-    <a href="/docs/getting-started/bounded-mainnet/">index a bounded historical range</a>.
-  </p>
+
+  <div class="wrap column">
+    <div class="tabs mono" role="tablist" aria-label="Examples">
+      {examples.map((example, i) => (
+        <button
+          type="button"
+          role="tab"
+          id={`follow-tab-${example.id}`}
+          aria-controls={`follow-panel-${example.id}`}
+          aria-selected={i === 0 ? 'true' : 'false'}
+          tabindex={i === 0 ? 0 : -1}
+        >{i + 1} · {example.label}</button>
+      ))}
+    </div>
+    {examples.map((example) => (
+      <div class="panel" role="tabpanel" id={`follow-panel-${example.id}`} aria-labelledby={`follow-tab-${example.id}`}>
+        <TerminalFrame title={example.title}>
+          <div class="command" data-copy-value={example.code}>
+            <span data-copy-source>
+              {example.html.map((line) => <span class="t-line" set:html={line} />)}
+            </span>
+            <button type="button" class="copy mono" data-copy-button aria-label={`Copy the ${example.label} example`}>copy</button>
+          </div>
+        </TerminalFrame>
+        <p class="status mono" role="status" aria-live="polite" data-copy-status></p>
+        {example.note && (
+          <p class="note mono">{example.note} {example.noteHref && <a href={example.noteHref}>{example.noteLabel}</a>}</p>
+        )}
+      </div>
+    ))}
+    <p class="after">
+      Your first row may be a <span class="mono">preview</span> while Leani checks the block's place in Ethereum's chain.
+      Rows marked <span class="mono">included</span> are on the followed chain and can still be reorged.
+      Add <span class="mono">--finality finalized</span> to print only blocks Ethereum consensus has finalized.
+      See the <a href={QUICKSTART_URL}>full quickstart</a>, then{' '}
+      <a href="/docs/getting-started/bounded-mainnet/">index a bounded historical range</a>.
+    </p>
+  </div>
 </section>
 
 <style>
   h2 { margin-top: 1rem; }
   .lede { color: var(--ink-dim); max-width: 66ch; margin-top: 1rem; }
-  .pair { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 1.25rem; margin-top: 2.5rem; }
-  .pair > div { min-width: 0; }
-  @media (max-width: 900px) { .pair { grid-template-columns: 1fr; } }
-  .label { color: var(--ink-dim); font-size: 0.8rem; margin-bottom: 0.5rem; }
+  .column > * { margin-left: auto; width: min(100%, 58.5rem); }
+
+  .live { position: relative; margin-top: 2.5rem; padding-block: 2.75rem; }
+  .live canvas { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
+  .column { position: relative; }
+  .frame { position: relative; }
+  .frame :global(.term-body) { font-size: 0.75rem; padding-block: 0.6rem; overflow: hidden; }
+  .view { height: calc(7 * 1.7em); overflow: hidden; display: flex; flex-direction: column; margin-inline: -1.1rem; }
+  .live:global(.is-live) .view { justify-content: flex-end; }
+  .lines { transition: transform 320ms cubic-bezier(0.2, 0.7, 0.2, 1); }
+  .lines :global(.ln) { display: block; min-height: 1.7em; padding-inline: 1.1rem; white-space: pre-wrap; }
+  .lines :global(.br-f) { white-space: nowrap; }
+  .lines :global(.br-ts), .lines :global(.br-key), .lines :global(.br-unit) { color: var(--ink-dim); }
+  .lines :global(.br-preview) { color: #edcb89; }
+  .lines :global(.br-included) { color: var(--accent); }
+  .lines :global(.br-finalized) { color: var(--syntax-string); }
+  .lines :global(.br-undo) { color: #e58f7a; }
+  .lines :global(.is-new) { animation: row-in 1100ms ease-out; }
+  @keyframes row-in {
+    from { background-color: rgb(62 224 127 / 0.14); box-shadow: inset 2px 0 0 var(--accent); }
+    to { background-color: rgb(62 224 127 / 0); box-shadow: inset 2px 0 0 rgb(62 224 127 / 0); }
+  }
+  .intake {
+    position: absolute; z-index: 1; left: 0; top: 2.3rem; bottom: 0; width: 2px; pointer-events: none;
+    background: linear-gradient(180deg, transparent, var(--accent) 24%, var(--accent) 76%, transparent);
+    box-shadow: 0 0 14px rgb(62 224 127 / 0.6);
+    opacity: calc(0.16 + var(--glow, 0) * 0.84);
+  }
+  .caption { color: var(--ink-dim); font-size: 0.7rem; margin-top: 0.6rem; }
+
+  .tabs { display: flex; gap: 0.4rem; flex-wrap: wrap; margin-top: 2.25rem; margin-bottom: 0.75rem; }
+  .tabs [role='tab'] {
+    background: none; border: 1px solid var(--panel-edge); border-radius: 6px;
+    color: var(--ink-dim); font: inherit; font-size: 0.8rem;
+    padding: 0.35rem 0.8rem; cursor: pointer;
+  }
+  .tabs [role='tab']:hover { color: var(--ink); border-color: var(--accent-dim); }
+  .tabs [role='tab'][aria-selected='true'] { color: var(--accent); border-color: var(--accent-dim); }
+  .panel + .panel { margin-top: 1rem; }
   .command { position: relative; min-width: 0; padding-right: 3.25rem; }
   .copy {
     position: absolute; top: 0; right: 0;
@@ -68,13 +156,38 @@ const shellLines = (source: string) => source.split('\n').map(hlShell);
   }
   .copy:hover { color: var(--accent); border-color: var(--accent-dim); }
   .status { min-height: 1.4em; color: var(--accent); font-size: 0.72rem; margin-top: 0.35rem; }
+  .note { color: var(--ink-dim); font-size: 0.72rem; }
   .after { color: var(--ink-dim); margin-top: 1.5rem; overflow-wrap: anywhere; }
+
+  /* Below this width the terminal takes the full column, so bytes run across a
+     strip above it and drop in through its top edge. */
+  @media (max-width: 1199px) {
+    .column > * { width: 100%; }
+    .live { padding-top: 6.5rem; }
+    .intake {
+      top: 0; bottom: auto; left: 16%; right: 16%; width: auto; height: 2px;
+      background: linear-gradient(90deg, transparent, var(--accent) 24%, var(--accent) 76%, transparent);
+    }
+  }
+  @media (max-width: 600px) {
+    .live { margin-top: 2rem; padding-block: 6rem 2rem; }
+    .frame :global(.term-body) { font-size: 0.68rem; }
+    .view { height: calc(11 * 1.7em); }
+    /* Rows wrap here; indent continuation lines so each row reads as one. */
+    .lines :global(.ln) { padding-left: calc(1.1rem + 2ch); text-indent: -2ch; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .lines { transition: none; }
+    .lines :global(.is-new) { animation: none; }
+  }
 </style>
 
 <script>
-  document.querySelectorAll<HTMLElement>('#quickstart .command').forEach((command) => {
+  const section = document.getElementById('quickstart');
+
+  section?.querySelectorAll<HTMLElement>('.command').forEach((command) => {
     const button = command.querySelector<HTMLButtonElement>('[data-copy-button]');
-    const status = command.closest<HTMLElement>('.pair > div')?.querySelector<HTMLElement>('[data-copy-status]');
+    const status = command.closest<HTMLElement>('[role="tabpanel"]')?.querySelector<HTMLElement>('[data-copy-status]');
     button?.addEventListener('click', async () => {
       try {
         await navigator.clipboard.writeText(command.dataset.copyValue ?? '');
@@ -84,4 +197,43 @@ const shellLines = (source: string) => source.split('\n').map(hlShell);
       }
     });
   });
+
+  const tablist = section?.querySelector<HTMLElement>('[role="tablist"]');
+  const tabs = [...(section?.querySelectorAll<HTMLButtonElement>('[role="tab"]') ?? [])];
+  const panels = [...(section?.querySelectorAll<HTMLElement>('[role="tabpanel"]') ?? [])];
+  function select(index: number, focus = true) {
+    tabs.forEach((tab, i) => {
+      tab.setAttribute('aria-selected', String(i === index));
+      tab.tabIndex = i === index ? 0 : -1;
+      panels[i]!.hidden = i !== index;
+    });
+    if (focus) tabs[index]!.focus();
+  }
+
+  // Panels render visible for JS-off readers; JS collapses them to tabs.
+  if (tabs.length) select(0, false);
+  tabs.forEach((tab, i) => tab.addEventListener('click', () => select(i)));
+  tablist?.addEventListener('keydown', (e) => {
+    const current = tabs.findIndex((t) => t.getAttribute('aria-selected') === 'true');
+    let next = current;
+    if (e.key === 'ArrowRight') next = (current + 1) % tabs.length;
+    if (e.key === 'ArrowLeft') next = (current - 1 + tabs.length) % tabs.length;
+    if (e.key === 'Home') next = 0;
+    if (e.key === 'End') next = tabs.length - 1;
+    if (next !== current) {
+      e.preventDefault();
+      select(next);
+    }
+  });
+
+  // The replay and its recorded session load only once the section nears the viewport.
+  const live = section?.querySelector<HTMLElement>('[data-follow-live]');
+  if (live && !matchMedia('(prefers-reduced-motion: reduce)').matches) {
+    const io = new IntersectionObserver((entries) => {
+      if (!entries.some((entry) => entry.isIntersecting)) return;
+      io.disconnect();
+      void import('../lib/firehose').then(({ startFirehose }) => startFirehose(live));
+    }, { rootMargin: '300px 0px' });
+    io.observe(live);
+  }
 </script>
