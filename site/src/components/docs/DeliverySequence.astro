@@ -1,0 +1,192 @@
+---
+import session from '../../data/handoff-session.json';
+
+// One delivery through the durable boundary, drawn from the recorded handoff
+// session: the first half of the rows is history, the second half arrives
+// live, and each live block names the previous block's hash as its parent.
+const format = new Intl.NumberFormat('en-US');
+const short = (hash: string) => `${hash.slice(0, 6)}…${hash.slice(-6)}`;
+const clock = (seconds: number) => `${new Date(seconds * 1000).toISOString().slice(11, 19)}Z`;
+const split = Math.floor(session.rows.length / 2);
+const lastHistory = session.rows[split - 1]!;
+const passes = session.rows.slice(split).map((row, index) => ({
+  num: `#${format.format(row.blockNumber)}`,
+  time: clock(row.timestamp),
+  parent: short(row.parentHash),
+  prev: `hash(#${format.format(row.blockNumber - 1)})`,
+  seq: `seq ${row.sequence}`,
+  kicker: index === 0 ? 'hash handoff' : 'canonical ancestry',
+}));
+const first = passes[0]!;
+const coveredThrough = format.format(lastHistory.blockNumber);
+// Illustrative: the recording starts at the handoff, not at a backfill.
+const historyStart = format.format(26_080_000);
+---
+<figure class="delivery not-content" data-passes={JSON.stringify(passes)}>
+  <p class="summary">
+    Delivery sequence. History commits coverage through block {coveredThrough}.
+    Live block {first.num} arrives, and its parent hash {first.parent} equals the
+    hash of block {coveredThrough}, so the handoff is exact. Its header chain
+    leads to an attested head and the core commits the branch. Leani publishes
+    change {first.seq} to your database, which applies it idempotently, persists
+    the cursor and sequence, and commits in one transaction before acknowledging.
+    The acknowledgement allows pruning up to {first.seq}.
+  </p>
+  <div class="seq" aria-hidden="true" data-llms-skip>
+    <div class="stage" data-stage="0">
+      <p class="head"><b>01</b>historical coverage</p>
+      <div class="ev hist" data-at="0.2"><span class="tag">history</span><span class="interval"><i></i><b>{historyStart} – {coveredThrough}</b></span></div>
+      <div class="ev hist" data-at="1.5"><span class="tag">history → core</span><span class="msg">commit interval</span></div>
+      <div class="ev hist" data-at="2"><span class="tag">core</span><span class="pill">coverage ≤ {coveredThrough} <em>✓</em></span></div>
+    </div>
+    <div class="stage" data-stage="1">
+      <p class="head"><b>02</b>exact hash handoff</p>
+      <div class="ev" data-at="2.6"><span class="tag">live</span><span class="block"><i class="cube"></i><b data-slot="num">{first.num}</b><small data-slot="time">{first.time}</small></span></div>
+      <div class="ev" data-at="3.4"><span class="tag">live → core</span><span class="msg">header + body</span></div>
+      <div class="ev" data-at="3.8">
+        <span class="tag">core</span>
+        <span class="hash">
+          <span class="kicker" data-slot="kicker">{first.kicker}</span>
+          <span class="row"><em>parent</em><code data-slot="parent">{first.parent}</code></span>
+          <span class="row"><em>=</em><code data-slot="prev">{first.prev}</code><i class="ok" data-at="4.3">✓</i></span>
+        </span>
+      </div>
+    </div>
+    <div class="stage" data-stage="2">
+      <p class="head"><b>03</b>live canonical head</p>
+      <div class="ev" data-at="4.9"><span class="tag">live</span><span class="badge">attested head <em>✓</em><small>sync committee ≥ 2/3</small></span></div>
+      <div class="ev" data-at="5.3"><span class="tag">core</span><span class="pill">branch committed <em>✓</em></span></div>
+      <div class="ev" data-at="5.7"><span class="tag">core → database</span><span class="msg"><b data-slot="seq">{first.seq}</b> apply <span data-slot="num">{first.num}</span></span></div>
+    </div>
+    <div class="stage" data-stage="3">
+      <p class="head"><b>04</b>durable cursor</p>
+      <div class="ev" data-at="6.2">
+        <span class="tag">database</span>
+        <span class="tx">
+          <span class="kicker">one transaction</span>
+          <ol>
+            <li data-at="6.4">begin</li>
+            <li data-at="6.8">apply idempotently</li>
+            <li data-at="7.2">persist cursor + <span data-slot="seq">{first.seq}</span></li>
+            <li data-at="7.6">commit</li>
+          </ol>
+        </span>
+      </div>
+      <div class="ev" data-at="8"><span class="tag">database → core</span><span class="msg ack">ACK <span data-slot="seq">{first.seq}</span></span></div>
+      <div class="ev" data-at="8.5"><span class="tag">core</span><span class="fence">prune ≤ <span data-slot="seq">{first.seq}</span> allowed</span></div>
+    </div>
+  </div>
+  <figcaption>
+    <span>Real blocks, hashes, and sequences from a recorded leani {session.leaniVersion} Mainnet session · interval and timing illustrative</span>
+    <span class="status" data-slot="status" data-llms-skip>{first.num} · {first.seq}</span>
+  </figcaption>
+</figure>
+
+<style>
+  .delivery {
+    --d-ink: var(--sl-color-white);
+    --d-dim: var(--sl-color-gray-3);
+    --d-faint: var(--sl-color-gray-4);
+    --d-edge: var(--sl-color-gray-5);
+    --d-panel: var(--sl-color-bg-sidebar);
+    --d-accent: var(--sl-color-accent);
+    --d-accent-low: var(--sl-color-accent-low);
+    --d-amber: #edcb89;
+    --d-amber-ink: #efe2c4;
+    --d-amber-edge: #5c4a2a;
+    --d-amber-bg: #16140e;
+    --d-mono: var(--__sl-font-mono);
+    margin: var(--sl-content-gap-y, 1rem) 0 0;
+    padding: 1.1rem 1.25rem 0.9rem;
+    border: 1px solid var(--d-edge);
+    border-radius: 0.75rem;
+    background: var(--d-panel);
+    font: 0.8rem/1.5 var(--d-mono);
+    color: var(--d-ink);
+  }
+  /* Starlight's light palette has no amber; darken it for contrast on paper. */
+  :global(html[data-theme='light']) .delivery {
+    --d-amber: #8a5a00;
+    --d-amber-ink: #4f3500;
+    --d-amber-edge: #dcbd7a;
+    --d-amber-bg: #fcf5e5;
+  }
+  .summary { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+  .seq { position: relative; display: grid; gap: 0.2rem; padding-left: 1.6rem; }
+  .seq::before { content: ''; position: absolute; left: 0.34rem; top: 0.7rem; bottom: 0.9rem; width: 1px; background: linear-gradient(var(--d-accent), var(--d-amber)); opacity: 0.45; }
+  .stage { display: grid; gap: 0.45rem; }
+  .stage + .stage { margin-top: 0.65rem; }
+  .head { position: relative; display: flex; align-items: center; gap: 0.6rem; color: var(--d-dim); transition: color 0.3s; }
+  .head::before { content: ''; position: absolute; left: -1.56rem; top: 50%; width: 0.6rem; height: 0.6rem; margin-top: -0.3rem; border: 1px solid var(--d-accent); border-radius: 50%; background: var(--d-panel); transition: background 0.3s, box-shadow 0.3s; }
+  .head b { font-weight: 400; font-size: 0.7rem; color: var(--d-accent); border: 1px solid color-mix(in srgb, var(--d-accent) 40%, transparent); border-radius: 4px; padding: 0 0.3rem; }
+  .is-now .head { color: var(--d-ink); }
+  .is-now .head::before { background: var(--d-accent); box-shadow: 0 0 10px color-mix(in srgb, var(--d-accent) 60%, transparent); }
+  .ev { display: grid; grid-template-columns: 8.5rem minmax(0, 1fr); align-items: center; gap: 0.75rem; transition: opacity 0.35s ease, transform 0.35s ease; }
+  .tag { justify-self: end; font-size: 0.66rem; letter-spacing: 0.08em; text-transform: uppercase; color: var(--d-faint); white-space: nowrap; }
+  .msg, .pill, .fence, .block, .badge, .hash, .tx { justify-self: start; }
+  .msg { color: var(--d-dim); }
+  .msg b { font-weight: 400; color: var(--d-ink); margin-right: 0.35rem; }
+  .ack { color: var(--d-amber); }
+  .interval { position: relative; display: block; height: 1.6rem; border: 1px solid color-mix(in srgb, var(--d-accent) 35%, var(--d-edge)); border-radius: 5px; overflow: hidden; background: repeating-linear-gradient(135deg, color-mix(in srgb, var(--d-accent) 6%, transparent) 0 6px, transparent 6px 12px); }
+  .interval i { position: absolute; inset: 0; background: linear-gradient(90deg, color-mix(in srgb, var(--d-accent) 14%, transparent), color-mix(in srgb, var(--d-accent) 30%, transparent)); transform-origin: left; transition: transform 1.2s cubic-bezier(0.3, 0.6, 0.3, 1); }
+  .interval b { position: relative; display: flex; align-items: center; justify-content: center; height: 100%; font-weight: 400; font-size: 0.72rem; }
+  .pill, .fence { display: inline-flex; align-items: center; gap: 0.45rem; padding: 0.15rem 0.65rem; border-radius: 999px; white-space: nowrap; }
+  .pill { border: 1px solid color-mix(in srgb, var(--d-accent) 45%, transparent); background: var(--d-accent-low); }
+  .pill em, .badge em, .ok { font-style: normal; color: var(--d-accent); }
+  .fence { border: 1px solid var(--d-amber-edge); background: var(--d-amber-bg); color: var(--d-amber-ink); }
+  .fence::before { content: ''; width: 0.5rem; height: 0.5rem; border: 1px solid var(--d-amber); border-radius: 2px; background: repeating-linear-gradient(135deg, var(--d-amber) 0 1px, transparent 1px 3px); }
+  .block { display: inline-flex; align-items: center; gap: 0.5rem; padding: 0.2rem 0.65rem 0.2rem 0.4rem; border: 1px solid color-mix(in srgb, var(--d-accent) 50%, transparent); border-radius: 6px; background: var(--d-accent-low); white-space: nowrap; box-shadow: 0 0 18px color-mix(in srgb, var(--d-accent) 14%, transparent); transition: transform 0.8s cubic-bezier(0.2, 0.7, 0.2, 1); }
+  .block b { font-weight: 400; }
+  .block small, .badge small { font-size: 0.68rem; color: var(--d-dim); }
+  .cube { width: 0.85rem; height: 0.85rem; border-radius: 2px; background: linear-gradient(135deg, #91ffb9, #37b86b); box-shadow: inset -3px -3px 0 rgb(0 0 0 / 0.2); }
+  .hash, .tx { position: relative; display: grid; gap: 0.25rem; margin-top: 0.4rem; padding: 0.6rem 0.75rem 0.5rem; border-radius: 7px; }
+  .hash { border: 1px solid color-mix(in srgb, var(--d-accent) 45%, transparent); }
+  .kicker { position: absolute; top: -0.55rem; left: 0.5rem; padding: 0 0.35rem; background: var(--d-panel); font-size: 0.62rem; letter-spacing: 0.08em; text-transform: uppercase; color: var(--d-accent); }
+  .row { display: flex; align-items: center; gap: 0.45rem; }
+  .row em { width: 3rem; font-style: normal; color: var(--d-faint); }
+  .hash code { padding: 0 0.35rem; border: 1px solid color-mix(in srgb, var(--d-accent) 55%, transparent); border-radius: 4px; background: transparent; font: inherit; color: var(--d-ink); box-shadow: 0 0 12px color-mix(in srgb, var(--d-accent) 16%, transparent); }
+  .ok { transition: opacity 0.3s, transform 0.3s; }
+  .badge { display: inline-flex; flex-wrap: wrap; align-items: baseline; gap: 0.1rem 0.5rem; padding: 0.2rem 0.65rem; border: 1px solid color-mix(in srgb, var(--d-accent) 50%, transparent); border-radius: 6px; background: var(--d-accent-low); }
+  .tx { border: 1px solid var(--d-amber-edge); background: var(--d-amber-bg); }
+  .tx .kicker { color: var(--d-amber); background: var(--d-panel); }
+  .tx ol { list-style: none; margin: 0; padding: 0; display: grid; gap: 0.1rem; }
+  .tx li { display: flex; align-items: center; gap: 0.45rem; color: var(--d-amber-ink); transition: opacity 0.3s; }
+  .tx li::before { content: ''; width: 0.4rem; height: 0.4rem; flex: none; border-radius: 50%; background: var(--d-amber); box-shadow: 0 0 8px color-mix(in srgb, var(--d-amber) 60%, transparent); transition: background 0.3s, box-shadow 0.3s; }
+  figcaption { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: 0.35rem 1rem; margin-top: 0.9rem; padding-top: 0.7rem; border-top: 1px solid var(--d-edge); font-size: 0.68rem; line-height: 1.5; color: var(--d-faint); }
+  .status { display: inline-flex; align-items: center; gap: 0.45rem; color: var(--d-dim); white-space: nowrap; }
+  .status::before { content: ''; width: 0.4rem; height: 0.4rem; border-radius: 50%; background: var(--d-edge); }
+
+  /* The replay hides what hasn't happened yet; the static frame shows everything. */
+  .is-anim .ev:not(.is-on) { opacity: 0; transform: translateY(4px); }
+  .is-anim .ev:not(.is-on) .interval i { transform: scaleX(0); }
+  .is-anim .ev:not(.is-on) .block { transform: translateX(-2.5rem); }
+  .is-anim .ok:not(.is-on) { opacity: 0; transform: scale(0.4); }
+  .is-anim .tx li:not(.is-on) { opacity: 0.35; }
+  .is-anim .tx li:not(.is-on)::before { background: var(--d-edge); box-shadow: none; }
+  .is-later .hist { opacity: 0.5; }
+  .is-anim .status::before { background: var(--d-accent); box-shadow: 0 0 8px var(--d-accent); }
+
+  @media (max-width: 32rem) {
+    .ev { grid-template-columns: minmax(0, 1fr); gap: 0.2rem; }
+    .tag { justify-self: start; }
+    .hash, .tx { margin-top: 0.55rem; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .ev, .head, .head::before, .interval i, .block, .ok, .tx li { transition: none; }
+  }
+</style>
+
+<script>
+  // The replay only loads once the figure nears the viewport, and never under
+  // reduced motion, where the static frame already tells the whole sequence.
+  const figures = document.querySelectorAll<HTMLElement>('figure.delivery');
+  if (figures.length && !matchMedia('(prefers-reduced-motion: reduce)').matches) {
+    const observer = new IntersectionObserver((entries) => {
+      const near = entries.filter((entry) => entry.isIntersecting).map((entry) => entry.target as HTMLElement);
+      if (!near.length) return;
+      near.forEach((figure) => observer.unobserve(figure));
+      void import('../../lib/delivery-sequence').then(({ replayDelivery }) => near.forEach(replayDelivery));
+    }, { rootMargin: '200px 0px' });
+    figures.forEach((figure) => observer.observe(figure));
+  }
+</script>
