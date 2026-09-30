@@ -16,6 +16,7 @@
     "examples:check": "bun ../scripts/docs/verify-examples.ts --shell --typescript",
     "size:check": "bun ../scripts/docs/asset-budget.ts",
     "search:check": "bun ../scripts/docs/search-check.ts",
+    "legal:check": "bun ../scripts/docs/legal-check.ts",
     "test": "bun test"
   },
   "dependencies": {

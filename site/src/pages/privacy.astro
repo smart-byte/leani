@@ -1,0 +1,176 @@
+---
+import Legal from '../layouts/Legal.astro';
+import { COMPANY, LEGAL_NOTICE_URL } from '../config';
+import { UMAMI_ORIGIN } from '../lib/analytics';
+
+const analyticsHost = new URL(UMAMI_ORIGIN).host;
+---
+<Legal title="Privacy policy" description="What personal data leani.dev processes, why, and your rights.">
+  <h1>Privacy policy</h1>
+  <p>
+    This policy explains what personal data is processed when you visit leani.dev, why, and what
+    rights you have. The leani software runs on your own infrastructure; this policy covers only
+    the website.
+  </p>
+  <ul>
+    <li>No cookies, accounts, forms, or advertising.</li>
+    <li>Cloudflare delivers the site and processes connection data to do so.</li>
+    <li>Our own Umami server counts page views without cookies or stored IP addresses, and you can opt out.</li>
+  </ul>
+
+  <h2>Controller</h2>
+  <address>
+    <strong>{COMPANY.name}</strong><br />
+    {COMPANY.street}, {COMPANY.city}, Germany<br />
+    Managing director: {COMPANY.managingDirector}<br />
+    Email: <a href={`mailto:${COMPANY.email}`}>{COMPANY.email}</a> · Phone: {COMPANY.phone}
+  </address>
+  <p>Full provider details are in the <a href={LEGAL_NOTICE_URL}>legal notice</a>.</p>
+
+  <h2>Hosting and delivery</h2>
+  <p>
+    leani.dev is a static website served by Cloudflare Pages, a service of Cloudflare, Inc.,
+    101 Townsend St., San Francisco, CA 94107, USA. To deliver pages and protect the site against
+    attacks, Cloudflare processes what your browser sends with every request: your IP address, the
+    requested address, date and time, the referring page, your browser and operating system, and
+    technical connection data.
+  </p>
+  <ul>
+    <li><strong>Legal basis:</strong> our legitimate interest in delivering the site securely and reliably (Art. 6(1)(f) GDPR).</li>
+    <li><strong>Processor:</strong> Cloudflare processes this data on our behalf under a data processing agreement (Art. 28 GDPR).</li>
+    <li><strong>Transfer to the USA:</strong> Cloudflare, Inc. is certified under the EU-U.S. Data Privacy Framework, which the European Commission has found to provide adequate protection (Art. 45 GDPR).</li>
+    <li><strong>Retention:</strong> we don't keep these request logs ourselves; Cloudflare keeps them only as long as delivery and security require.</li>
+  </ul>
+
+  <h2>Analytics with Umami</h2>
+  <p>
+    We count page views with Umami, open-source analytics that we run ourselves at {analyticsHost} on a
+    server of Hetzner Online GmbH, Industriestr. 25, 91710 Gunzenhausen, Germany, located in
+    Finland. Hetzner processes this data on our behalf under a data processing agreement (Art. 28
+    GDPR); nobody else receives it. When a page loads, a small script sends:
+  </p>
+  <ul>
+    <li>the page's address, without query string or fragment, and its title;</li>
+    <li>the website you came from, which browsers usually share only as a domain;</li>
+    <li>your browser, operating system, device type, screen size, and language;</li>
+    <li>your country, derived from your IP address.</li>
+  </ul>
+  <p>
+    Umami sets no cookies and stores nothing on your device. It does not store your IP address: to
+    tell visits apart, it derives a pseudonymous identifier from your IP address, your browser's
+    user agent, and a salt that changes every day, so visits cannot be linked across days. We look
+    at the results only in aggregate, to see which pages help and what to improve. We don't build
+    profiles or combine this data with anything else.
+  </p>
+  <ul>
+    <li><strong>Legal basis:</strong> our legitimate interest in understanding how the site and its documentation are used (Art. 6(1)(f) GDPR).</li>
+    <li><strong>Retention:</strong> analytics records are deleted after 13 months.</li>
+    <li><strong>Your choice:</strong> Umami doesn't count browsers that send Do Not Track, and you can turn it off for this browser below.</li>
+  </ul>
+  <div class="notice optout" data-optout hidden>
+    <p data-optout-state></p>
+    <button type="button" class="btn btn-ghost" data-optout-toggle></button>
+  </div>
+  <noscript><p>With JavaScript turned off, the analytics script doesn't run, so there's nothing to opt out of.</p></noscript>
+
+  <h2>Data stored in your browser</h2>
+  <p>
+    The documentation remembers your color theme in your browser's local storage under <code>starlight-theme</code>.
+    If you opt out of analytics, <code>umami.disabled</code> is stored there too. Both stay on your
+    device and are never sent to us. They are strictly necessary for functions you use
+    (§&nbsp;25(2) No.&nbsp;2 TDDDG), so no consent is needed; you can delete them anytime in your
+    browser settings.
+  </p>
+
+  <h2>Email</h2>
+  <p>
+    When you email us, we process your email address, your message, and anything you include, to
+    answer you. The legal basis is Art. 6(1)(b) GDPR if your message concerns a contract or its
+    preparation, and otherwise our legitimate interest in answering inquiries (Art. 6(1)(f) GDPR).
+    Our email runs on Google Workspace (Google Ireland Limited, Gordon House, Barrow Street,
+    Dublin 4, Ireland), which processes it on our behalf under a data processing agreement. Google
+    may process data in the USA; Google LLC is certified under the EU-U.S. Data Privacy Framework.
+    We delete correspondence once it is resolved, unless commercial or tax law requires us to keep
+    it (up to six or ten years under §&nbsp;257 HGB and §&nbsp;147 AO).
+  </p>
+
+  <h2>Links to other websites</h2>
+  <p>
+    The site links to GitHub, npm, Homebrew, ethPandaOps, blobs.money, and smart-byte.com. Your
+    browser contacts those sites only when you follow a link, and their privacy policies apply there.
+  </p>
+
+  <h2>Your rights</h2>
+  <p>
+    You have the right to access your personal data (Art. 15 GDPR), to have it rectified (Art. 16)
+    or erased (Art. 17), to restrict its processing (Art. 18), and to data portability (Art. 20).
+    Write to <a href={`mailto:${COMPANY.email}`}>{COMPANY.email}</a>. Because we store no IP
+    addresses and no identifiers tied to a person, we usually cannot link analytics records to you.
+  </p>
+  <div class="notice">
+    <p>
+      <strong>Right to object (Art. 21 GDPR).</strong> Where we process data on the basis of
+      legitimate interests (Art. 6(1)(f) GDPR), you can object at any time on grounds relating to
+      your particular situation. For analytics, the switch above takes effect immediately in this
+      browser.
+    </p>
+  </div>
+  <p>
+    You can also lodge a complaint with a data protection supervisory authority (Art. 77 GDPR), in
+    particular in the EU member state where you live or work. The authority responsible for us is
+    the Bayerisches Landesamt für Datenschutzaufsicht (BayLDA), Promenade 18, 91522 Ansbach,
+    Germany, <a href="https://www.lda.bayern.de">www.lda.bayern.de</a>.
+  </p>
+
+  <h2>Other information</h2>
+  <p>
+    You don't have to provide personal data. Without the connection data your browser sends, the
+    site cannot be delivered; analytics is optional. We don't use automated decision-making or
+    profiling (Art. 22 GDPR). We update this policy when the site or the law changes.
+  </p>
+  <p>Last updated: 30 September 2026</p>
+</Legal>
+
+<style>
+  .optout { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 0.75rem 1.5rem; }
+  .optout p { margin: 0; }
+  .optout .btn { font-size: 0.85rem; background: none; cursor: pointer; }
+</style>
+
+<script>
+  // Umami skips tracking while localStorage['umami.disabled'] is set.
+  const box = document.querySelector<HTMLElement>('[data-optout]');
+  const state = box?.querySelector<HTMLElement>('[data-optout-state]');
+  const toggle = box?.querySelector<HTMLButtonElement>('[data-optout-toggle]');
+  const KEY = 'umami.disabled';
+  const doNotTrack = [navigator.doNotTrack, (window as { doNotTrack?: string }).doNotTrack].some((value) => value === '1' || value === 'yes');
+
+  function render(): void {
+    if (!state || !toggle) return;
+    let disabled: boolean;
+    try {
+      disabled = localStorage.getItem(KEY) !== null;
+    } catch {
+      state.textContent = 'This browser blocks local storage. Turn on Do Not Track to stop analytics.';
+      toggle.hidden = true;
+      return;
+    }
+    state.textContent = doNotTrack
+      ? 'Your browser sends Do Not Track, so your visits are not counted.'
+      : disabled
+        ? 'Your visits are not counted in this browser.'
+        : 'Your visits are counted, without cookies.';
+    toggle.hidden = doNotTrack;
+    toggle.textContent = disabled ? 'Count my visits again' : "Don't count my visits";
+  }
+
+  toggle?.addEventListener('click', () => {
+    if (localStorage.getItem(KEY) !== null) localStorage.removeItem(KEY);
+    else localStorage.setItem(KEY, '1');
+    render();
+  });
+  if (box) {
+    box.hidden = false;
+    render();
+  }
+</script>

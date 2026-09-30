@@ -39,9 +39,10 @@ const assets = allAssets.filter((asset) => !isLlmsText(asset));
 const llmsText = allAssets.filter(isLlmsText);
 const html = assets.filter((asset) => extname(asset.path) === '.html');
 const landing = await readFile(resolve(dist, 'index.html'), 'utf8');
-const entryScripts = Array.from(landing.matchAll(/<script[^>]+src="([^"]+)"/g), (match) =>
-  match[1]!.replace(/^\//, ''),
-);
+// The analytics tag loads deferred from its own origin; this budget covers the site's own bundles.
+const entryScripts = Array.from(landing.matchAll(/<script[^>]+src="([^"]+)"/g), (match) => match[1]!)
+  .filter((src) => !/^https?:\/\//.test(src))
+  .map((src) => src.replace(/^\//, ''));
 const landingScriptBytes = entryScripts.reduce((sum, path) => {
   const asset = assets.find((candidate) => candidate.path === path);
   if (!asset) throw new Error(`landing entry script is missing from dist: ${path}`);

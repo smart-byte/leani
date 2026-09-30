@@ -1,0 +1,42 @@
+---
+import Legal from '../layouts/Legal.astro';
+import { COMPANY, PRIVACY_URL } from '../config';
+
+const phoneHref = `tel:${COMPANY.phone.replace(/[^+\d]/g, '')}`;
+---
+<Legal title="Legal notice (Impressum)" description="Provider information for leani.dev under § 5 DDG.">
+  <h1>Legal notice</h1>
+  <p>leani and leani.dev are provided by:</p>
+  <address>
+    <strong>{COMPANY.name}</strong><br />
+    {COMPANY.street}<br />
+    {COMPANY.city}<br />
+    Germany
+  </address>
+  <p>Represented by its managing director, {COMPANY.managingDirector}.</p>
+  <p>
+    Phone: <a href={phoneHref}>{COMPANY.phone}</a><br />
+    Email: <a href={`mailto:${COMPANY.email}`}>{COMPANY.email}</a>
+  </p>
+  <p>Commercial register: Munich Local Court (Amtsgericht München), {COMPANY.register}</p>
+  <p>VAT ID under §&nbsp;27a UStG: {COMPANY.vatId}</p>
+  <p>How this site handles personal data is described in the <a href={PRIVACY_URL}>privacy policy</a>.</p>
+
+  <div lang="de">
+    <h2 id="impressum">Impressum</h2>
+    <p>Anbieter von leani und leani.dev gemäß §&nbsp;5 DDG:</p>
+    <address>
+      <strong>{COMPANY.name}</strong><br />
+      {COMPANY.street}<br />
+      {COMPANY.city}<br />
+      Deutschland
+    </address>
+    <p>Vertreten durch den Geschäftsführer {COMPANY.managingDirector}.</p>
+    <p>
+      Telefon: <a href={phoneHref}>{COMPANY.phone}</a><br />
+      E-Mail: <a href={`mailto:${COMPANY.email}`}>{COMPANY.email}</a>
+    </p>
+    <p>Handelsregister: Amtsgericht München, {COMPANY.register}</p>
+    <p>Umsatzsteuer-Identifikationsnummer gemäß §&nbsp;27a UStG: {COMPANY.vatId}</p>
+  </div>
+</Legal>
