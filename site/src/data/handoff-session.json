@@ -1,0 +1,79 @@
+{
+  "recordedAt": "2026-09-30T07:53:22Z",
+  "leaniVersion": "0.1.0-rc.1",
+  "command": "leani subscribe blocks --format json",
+  "rows": [
+    {
+      "blockNumber": 26088920,
+      "blockHash": "0x3b704df798d658dc31a62c054209f78afa1b593597881abade3a32e8d9317ea5",
+      "parentHash": "0xff9707e951f5ba0202e58ef091f666bc5351e0de9f6131bfc45c789c5b48bec8",
+      "timestamp": 1790754731,
+      "sequence": "279",
+      "finality": "included",
+      "operation": "apply"
+    },
+    {
+      "blockNumber": 26088921,
+      "blockHash": "0xf69370db8ca405deb920861698849ce9c43fa972e7d4760ebd834c039b38a51f",
+      "parentHash": "0x3b704df798d658dc31a62c054209f78afa1b593597881abade3a32e8d9317ea5",
+      "timestamp": 1790754743,
+      "sequence": "280",
+      "finality": "included",
+      "operation": "apply"
+    },
+    {
+      "blockNumber": 26088922,
+      "blockHash": "0x605090c4d9169d06c21a2c736825797f993af08e77afab5ce38683a1aff8e500",
+      "parentHash": "0xf69370db8ca405deb920861698849ce9c43fa972e7d4760ebd834c039b38a51f",
+      "timestamp": 1790754755,
+      "sequence": "281",
+      "finality": "included",
+      "operation": "apply"
+    },
+    {
+      "blockNumber": 26088923,
+      "blockHash": "0xee28ad9dc514e397358881b3da0ca62e164e47fa28b98bcb4cab36a4ab2bfb30",
+      "parentHash": "0x605090c4d9169d06c21a2c736825797f993af08e77afab5ce38683a1aff8e500",
+      "timestamp": 1790754767,
+      "sequence": "282",
+      "finality": "included",
+      "operation": "apply"
+    },
+    {
+      "blockNumber": 26088924,
+      "blockHash": "0x386040c6103bb7286106c10e2d9814f3bcb9a52b186eb0e70a4f077fa294e05c",
+      "parentHash": "0xee28ad9dc514e397358881b3da0ca62e164e47fa28b98bcb4cab36a4ab2bfb30",
+      "timestamp": 1790754779,
+      "sequence": "283",
+      "finality": "included",
+      "operation": "apply"
+    },
+    {
+      "blockNumber": 26088925,
+      "blockHash": "0x67bb27f13dc27e97351ea897cd94cbd06d746e91a379ad07b898fb33fe71d3d9",
+      "parentHash": "0x386040c6103bb7286106c10e2d9814f3bcb9a52b186eb0e70a4f077fa294e05c",
+      "timestamp": 1790754791,
+      "sequence": "284",
+      "finality": "included",
+      "operation": "apply"
+    },
+    {
+      "blockNumber": 26088926,
+      "blockHash": "0xecc5e07931e35392ae4ba896a2f3b4c060858e457d62b39495e140224235aad0",
+      "parentHash": "0x67bb27f13dc27e97351ea897cd94cbd06d746e91a379ad07b898fb33fe71d3d9",
+      "timestamp": 1790754803,
+      "sequence": "285",
+      "finality": "included",
+      "operation": "apply"
+    },
+    {
+      "blockNumber": 26088927,
+      "blockHash": "0x2019ca3d9a5a17afe2c904ad6b3f89af6c1ec1a98fd8e8736199c95d4005bbdd",
+      "parentHash": "0xecc5e07931e35392ae4ba896a2f3b4c060858e457d62b39495e140224235aad0",
+      "timestamp": 1790754815,
+      "sequence": "286",
+      "finality": "included",
+      "operation": "apply"
+    }
+  ]
+}

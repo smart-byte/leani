@@ -2,6 +2,7 @@ import { describe, expect, test } from 'bun:test';
 import { readdirSync } from 'node:fs';
 import followExamples from '../src/data/follow-examples.json';
 import followSession from '../src/data/follow-session.json';
+import handoffSession from '../src/data/handoff-session.json';
 import costs from '../src/data/costs.json';
 import processorCatalog from '../../docs/reference/generated/processor-catalog.json';
 import { blockRowHtml } from '../src/lib/block-row';
@@ -40,6 +41,21 @@ describe('canned data', () => {
       expect(block).toBeGreaterThan(previous);
       previous = block;
     }
+  });
+
+  test('the handoff session is one real parent-hash chain', () => {
+    // The landing seam and the docs sequence draw their hash match from these
+    // rows, so each block must name the previous block as its parent.
+    expect(handoffSession.recordedAt).toMatch(/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$/);
+    expect(handoffSession.rows.length).toBeGreaterThanOrEqual(2);
+    handoffSession.rows.forEach((row, i) => {
+      expect(row.blockHash).toMatch(/^0x[0-9a-f]{64}$/);
+      if (i === 0) return;
+      const previous = handoffSession.rows[i - 1]!;
+      expect(row.blockNumber).toBe(previous.blockNumber + 1);
+      expect(row.parentHash).toBe(previous.blockHash);
+      expect(Number(row.sequence)).toBe(Number(previous.sequence) + 1);
+    });
   });
 
   test('block rows keep their exact text when highlighted', () => {
