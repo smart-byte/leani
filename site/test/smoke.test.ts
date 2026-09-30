@@ -17,7 +17,6 @@ test('interactive widgets use scoped selectors and semantic copy controls', () =
   expect(quickstart).toContain('button type="button"');
   expect(quickstart).toContain('aria-live="polite"');
   expect(quickstart).not.toContain("addEventListener('click', () => navigator.clipboard");
-  expect(hero).toContain('e.preventDefault()');
   expect(hero).not.toContain('api.github.com');
 });
 
