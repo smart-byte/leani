@@ -1,6 +1,6 @@
 ---
 import TerminalFrame from './TerminalFrame.astro';
-import { QUICKSTART_URL } from '../config';
+import { HOMEBREW_INSTALL, INSTALL_URL, QUICKSTART_URL } from '../config';
 import { hlShell, hlTs } from '../lib/highlight';
 import { exampleSource } from '../lib/examples';
 import { blockRowHtml } from '../lib/block-row';
@@ -39,7 +39,7 @@ const firstRows = session.rows.slice(0, 6);
     <p class="eyebrow mono">Ethereum Mainnet · no API key</p>
     <h2 id="quickstart-h"><span class="mono"># </span>Follow Ethereum blocks</h2>
     <p class="lede">
-      <a href="/docs/getting-started/install/">Install the alpha from source</a>,
+      Install the preview with Homebrew or <a href={INSTALL_URL}>from source</a>,
       then follow new block summaries directly from Ethereum's network with one command. On first use,
       Leani asks you to approve a checkpoint, a trusted starting point for checking the chain.
       Prepare a reusable node when you want queries and SDK subscriptions.
@@ -67,6 +67,17 @@ const firstRows = session.rows.slice(0, 6);
   </div>
 
   <div class="wrap column">
+    <div data-copy-scope>
+      <div class="install mono">
+        <span class="install-label">install</span>
+        <div class="command" data-copy-value={HOMEBREW_INSTALL}>
+          <span data-copy-source set:html={hlShell(HOMEBREW_INSTALL)} />
+          <button type="button" class="copy mono" data-copy-button aria-label="Copy install command">copy</button>
+        </div>
+        <a class="install-more" href={`${INSTALL_URL}#published-releases`}>Other platforms →</a>
+      </div>
+      <p class="status mono" role="status" aria-live="polite" data-copy-status></p>
+    </div>
     <div class="tabs mono" role="tablist" aria-label="Examples">
       {examples.map((example, i) => (
         <button
@@ -138,7 +149,12 @@ const firstRows = session.rows.slice(0, 6);
   }
   .caption { color: var(--ink-dim); font-size: 0.7rem; margin-top: 0.6rem; }
 
-  .tabs { display: flex; gap: 0.4rem; flex-wrap: wrap; margin-top: 2.25rem; margin-bottom: 0.75rem; }
+  .install { display: flex; align-items: center; flex-wrap: wrap; gap: 0.4rem 1rem; margin-top: 0.5rem; padding: 0.6rem 0.6rem 0.6rem 1.1rem; background: var(--panel); border: 1px solid var(--panel-edge); border-radius: 10px; font-size: 0.85rem; }
+  .install-label { color: var(--ink-dim); font-size: 0.7rem; letter-spacing: 0.08em; text-transform: uppercase; }
+  /* Grow but never shrink, so a narrow strip wraps instead of overlapping the copy button. */
+  .install .command { flex: 1 0 auto; white-space: pre; }
+  .install-more { font-size: 0.75rem; white-space: nowrap; }
+  .tabs { display: flex; gap: 0.4rem; flex-wrap: wrap; margin-top: 0.6rem; margin-bottom: 0.75rem; }
   .tabs [role='tab'] {
     background: none; border: 1px solid var(--panel-edge); border-radius: 6px;
     color: var(--ink-dim); font: inherit; font-size: 0.8rem;
@@ -173,6 +189,7 @@ const firstRows = session.rows.slice(0, 6);
     .live { margin-top: 2rem; padding-block: 6rem 2rem; }
     .frame :global(.term-body) { font-size: 0.68rem; }
     .view { height: calc(11 * 1.7em); }
+    .install { font-size: 0.78rem; }
     /* Rows wrap here; indent continuation lines so each row reads as one. */
     .lines :global(.ln) { padding-left: calc(1.1rem + 2ch); text-indent: -2ch; }
   }
@@ -187,7 +204,7 @@ const firstRows = session.rows.slice(0, 6);
 
   section?.querySelectorAll<HTMLElement>('.command').forEach((command) => {
     const button = command.querySelector<HTMLButtonElement>('[data-copy-button]');
-    const status = command.closest<HTMLElement>('[role="tabpanel"]')?.querySelector<HTMLElement>('[data-copy-status]');
+    const status = command.closest<HTMLElement>('[role="tabpanel"], [data-copy-scope]')?.querySelector<HTMLElement>('[data-copy-status]');
     button?.addEventListener('click', async () => {
       try {
         await navigator.clipboard.writeText(command.dataset.copyValue ?? '');
