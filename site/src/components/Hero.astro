@@ -1,6 +1,6 @@
 ---
 import EngineWorld from './EngineWorld.astro';
-import { GITHUB_URL, LIMITATIONS_URL } from '../config';
+import { GITHUB_URL, HOMEBREW_INSTALL, INSTALL_URL, LIMITATIONS_URL } from '../config';
 import processorReference from '../generated/processors-reference.json';
 
 // Measured or catalog-backed facts; the storage figure is the externalized
@@ -11,7 +11,8 @@ const stats = [
   [`${processorReference.processors.length} processors`, 'built in, or your own native Rust'],
   ['MIT-licensed', 'Rust library + standalone node'],
 ];
-const command = 'leani subscribe blocks';
+// Install, then run: one copy pastes both lines, which a shell runs in order.
+const commands = [HOMEBREW_INSTALL, 'leani subscribe blocks'];
 ---
 <section class="hero">
   <div class="wrap body">
@@ -39,12 +40,12 @@ const command = 'leani subscribe blocks';
 
     <div class="run">
       <div class="command mono">
-        <code><span class="prompt">$</span>{command}</code>
-        <button type="button" class="copy-button" data-copy-value={command} aria-label="Copy command">
+        <code>{commands.map((line) => <span class="line"><span class="prompt">$</span>{line}</span>)}</code>
+        <button type="button" class="copy-button" data-copy-value={commands.join('\n')} aria-label="Copy install and run commands">
           <svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.5" y="5.5" width="8" height="8" rx="1.6"/><path d="M10.5 3.2V3A1.5 1.5 0 0 0 9 1.5H3.5A1.5 1.5 0 0 0 2 3v5.5A1.5 1.5 0 0 0 3.5 10h.3"/></svg>
         </button>
       </div>
-      <p class="note mono">No API key. No config file. <span class="copied" role="status" aria-live="polite"></span></p>
+      <p class="note mono">No API key. No config file. <a href={`${INSTALL_URL}#published-releases`}>Other platforms →</a> <span class="copied" role="status" aria-live="polite"></span></p>
     </div>
 
     <ul class="stats mono" aria-label="Measured facts">
@@ -86,7 +87,8 @@ const command = 'leani subscribe blocks';
 
   .run { display: flex; flex-direction: column; align-items: flex-start; gap: 0.55rem; margin-top: 0.5rem; }
   .command { display: inline-flex; align-items: stretch; border: 1px solid var(--panel-edge); border-radius: 8px; background: color-mix(in srgb, var(--panel) 88%, transparent); box-shadow: 0 10px 30px rgb(0 0 0 / 0.35); font-size: 0.82rem; line-height: 1; }
-  .command code { display: inline-flex; align-items: center; gap: 0.6rem; padding: 0.75rem 1rem 0.75rem 0.9rem; font-family: var(--font-mono); color: var(--ink); }
+  .command code { display: grid; align-content: center; row-gap: 0.55rem; padding: 0.75rem 1rem 0.75rem 0.9rem; font-family: var(--font-mono); color: var(--ink); }
+  .line { display: flex; gap: 0.6rem; white-space: nowrap; }
   .prompt { color: var(--accent); user-select: none; }
   .copy-button { display: grid; place-items: center; width: 2.6rem; border: 0; border-left: 1px solid var(--panel-edge); background: none; color: var(--ink-dim); cursor: pointer; }
   .copy-button:hover { color: var(--accent); }
@@ -110,6 +112,7 @@ const command = 'leani subscribe blocks';
   @media (max-width: 600px) {
     .stage { height: 18.5rem; margin-top: 0.5rem; }
     .camera { --stage-scale: 0.45; }
+    .command { font-size: 0.76rem; }
   }
   @media (max-width: 460px) { .stats { grid-template-columns: 1fr; } }
 
