@@ -12,6 +12,7 @@ checker = File.expand_path("check-release-ci.rb", __dir__)
 sha = "a" * 40
 passed = { "id" => 1, "head_sha" => sha, "event" => "push", "status" => "completed", "conclusion" => "success" }
 candidate = passed.merge("event" => "workflow_dispatch", "path" => ".github/workflows/release.yml")
+artifacts = { "total_count" => 5, "artifacts" => %w[leani-container-amd64 leani-container-arm64 leani-release-candidate-v0.1.0-rc.2 leani-sdk-candidate leani-rust-library-candidate].map { |name| { "name" => name, "expired" => false } } }
 cases = [
   ["all exact-commit checks pass", { "workflow_runs" => [passed] }, candidate, true],
   ["older commit cannot satisfy checks", { "workflow_runs" => [passed.merge("head_sha" => "b" * 40)] }, candidate, false],
@@ -26,6 +27,16 @@ cases = [
   ["container preparation from a pull request is rejected", { "workflow_runs" => [passed] }, passed.merge("path" => ".github/workflows/container.yml", "event" => "pull_request"), false, ["--container"]],
   ["binary candidate cannot authorize a container", { "workflow_runs" => [passed] }, candidate, false, ["--container"]],
   ["older container candidate is rejected", { "workflow_runs" => [passed] }, passed.merge("path" => ".github/workflows/container.yml", "head_sha" => "b" * 40), false, ["--container"]],
+  ["container publication waiting for approval does not invalidate its prepared candidate", { "workflow_runs" => [passed] }, candidate, true, [],
+   { "container_checks" => { "workflow_runs" => [passed, passed.merge("id" => 2, "status" => "waiting", "conclusion" => nil)] } }],
+  ["expired candidates cannot authorize publication", { "workflow_runs" => [passed] }, candidate, false, [],
+   { "artifacts" => { "total_count" => 0, "artifacts" => [] }, "expected_error" => "lacks its unexpired preparation artifacts" }],
+  ["publication-only container run cannot authorize other publishers", { "workflow_runs" => [passed] }, candidate, false, [],
+   { "artifacts" => { "total_count" => 1, "artifacts" => [{ "name" => "leani-release-candidate-v0.1.0-rc.2", "expired" => false }] }, "expected_error" => "lacks its unexpired preparation artifacts" }],
+  ["verified SDK candidate is accepted", { "workflow_runs" => [passed] }, candidate.merge("path" => ".github/workflows/sdk-release.yml"), true, [],
+   { "candidate_workflow" => "sdk-release.yml" }],
+  ["binary candidate cannot authorize SDK publication", { "workflow_runs" => [passed] }, candidate, false, [],
+   { "candidate_workflow" => "sdk-release.yml", "expected_error" => "candidate must be a successful sdk-release.yml run" }],
 ]
 
 Dir.mktmpdir("leani-release-ci-test-") do |directory|
@@ -34,7 +45,18 @@ Dir.mktmpdir("leani-release-ci-test-") do |directory|
     #!#{RbConfig.ruby}
     require "json"
     data = JSON.parse(File.read(ENV.fetch("RELEASE_TEST_FIXTURE")))
-    key = ARGV.last.include?("/actions/runs/") ? "candidate" : "checks"
+    path = ARGV.last
+    key = if path.include?("/artifacts?")
+            "artifacts"
+          elsif path.include?("/actions/runs/456")
+            "container"
+          elsif path.include?("/actions/runs/")
+            "candidate"
+          elsif path.include?("/workflows/container.yml/")
+            "container_checks"
+          else
+            "checks"
+          end
     puts JSON.generate(data.fetch(key))
   RUBY
   File.chmod(0o755, shim)
@@ -44,12 +66,19 @@ Dir.mktmpdir("leani-release-ci-test-") do |directory|
     "GITHUB_REPOSITORY" => "example/leani",
     "GITHUB_SHA" => sha,
     "CANDIDATE_RUN_ID" => "123",
+    "CONTAINER_CANDIDATE_RUN_ID" => "456",
     "RELEASE_TEST_FIXTURE" => fixture,
   }
-  cases.each do |name, checks, candidate_run, success, arguments|
-    File.write(fixture, JSON.generate("checks" => checks, "candidate" => candidate_run))
-    output, status = Open3.capture2e(environment, RbConfig.ruby, checker, *Array(arguments))
+  cases.each do |name, checks, candidate_run, success, arguments, overrides|
+    data = { "checks" => checks, "container_checks" => checks, "candidate" => candidate_run,
+             "container" => passed.merge("path" => ".github/workflows/container.yml"), "artifacts" => artifacts }.merge(overrides || {})
+    File.write(fixture, JSON.generate(data))
+    configured = environment.merge("CANDIDATE_WORKFLOW" => data["candidate_workflow"])
+    output, status = Open3.capture2e(configured, RbConfig.ruby, checker, *Array(arguments))
     raise "#{name}: unexpected result: #{output}" unless status.success? == success
+    if data["expected_error"] && !output.include?(data["expected_error"])
+      raise "#{name}: rejected for another reason: #{output}"
+    end
     puts "PASS #{name}"
   end
 end
@@ -103,7 +132,7 @@ policy_cases = [
    "site.yml: workflow permissions must be declared and read-only"],
   ["extra publish permission is rejected", "sdk-release.yml",
    ->(document) { job.call(document, "publish").fetch("permissions")["contents"] = "write" },
-   "sdk-release.yml publish: permissions must be exactly id-token: write"],
+   "sdk-release.yml publish: permissions must be exactly id-token: write, actions: read"],
   ["persisted checkout credentials are rejected", "ci.yml",
    ->(document) { step.call(document, "rust", "actions/checkout@").fetch("with").delete("persist-credentials") },
    "ci.yml rust: checkout must set persist-credentials: false"],
@@ -171,6 +200,15 @@ policy_cases = [
   ["workflow_run trigger is rejected", "site.yml",
    ->(document) { (document["on"] || document[true])["workflow_run"] = { "workflows" => ["CI"], "types" => ["completed"] } },
    "site.yml: workflows must not trigger on workflow_run"],
+  ["release controller cannot run from unreviewed branches", "release-coordinate.yml",
+   ->(document) { job.call(document, "coordinate")["if"] = "inputs.action != 'prepare'" },
+   "release-coordinate.yml coordinate: release control must dispatch from main"],
+  ["release controller cannot grant registry OIDC", "release-coordinate.yml",
+   ->(document) { job.call(document, "coordinate").fetch("permissions")["id-token"] = "write" },
+   "release-coordinate.yml coordinate: permissions must be exactly contents: write, actions: write"],
+  ["release controller main restriction cannot be bypassed by another condition", "release-coordinate.yml",
+   ->(document) { job.call(document, "coordinate")["if"] += " || true" },
+   "release-coordinate.yml coordinate: release control must dispatch from main"],
 ]
 
 Dir.mktmpdir("leani-release-workflows-test-") do |directory|

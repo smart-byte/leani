@@ -8,6 +8,81 @@ audience:
 status: preview
 ---
 
+## Coordinated releases
+
+Use **Actions → Coordinate release** (`release-coordinate.yml`), dispatched
+from `main`. Enter an unprefixed version such as `0.1.0-rc.2`. It has three actions:
+
+1. **prepare** generates a release PR with workspace and SDK versions, exact
+   internal crate requirements, lockfile versions, current install pins, and the
+   changelog release heading. Historical migration notes, processor versions,
+   schema numbers, and the OpenAPI contract version stay intact. Review the
+   upgrade instructions and merge the PR after CI passes.
+2. **candidate** creates annotated `v<version>` and `sdk-v<version>` tags on the
+   dispatch's reviewed `main` commit. Existing tags must already name that commit;
+   tags are never moved. It starts or reuses exact-commit CI, security, site,
+   container, binary, Rust-library, and SDK preparation runs. After all pass, it
+   verifies their artifacts and uploads `leani-release-plan-<version>` with run
+   IDs and file checksums. Keep this successful **Coordinate release run ID**.
+3. **publish** takes that coordinator run ID as `candidate_run_id`. It checks
+   plan provenance, tags, checksums, and current CI, then dispatches the binary,
+   Rust-library, SDK, and container publishers in order. Each retains its own
+   protected environment and registry identity. Approve deployments as they
+   appear. Select `promote_site` to promote the site after every artifact is
+   published and verified.
+
+The prepare and candidate actions do not publish release artifacts; candidate
+reserves both release tags. Plans and artifacts expire after 14 days. To
+regenerate older candidates, run candidate from `main` with `release_commit`
+set to the original release's exact SHA. That commit must be on `main`, its
+package versions must match, and its existing tags must still point to it.
+Publishing an existing plan also remains possible after `main` advances. The
+plan binds both the released source and the reviewed coordinator revision.
+
+If publication fails, rerun **publish** with the same candidate run ID. It checks
+GitHub asset hashes, crates.io checksums, npm archive integrity, and GHCR image
+identities before writing. Matching publications are reused; different bytes
+stop the release. A partial Rust-library publication uploads only missing crates,
+and a partial GitHub draft can finish uploading missing assets. Registries are
+not a transaction: completed publications remain available if a later step fails.
+The run summary links each workflow and records publication progress.
+If the coordinator times out while a publisher awaits approval, a retry rejoins
+that same publisher for the recorded candidate instead of starting another one.
+
+The Ubuntu coordinator uses Python 3.11+, GitHub CLI, and Docker Buildx. It does
+not compile packages or receive registry OIDC permissions. Homebrew tap updates
+remain a separate reviewed PR, following the prerelease policy below.
+
+### Coordinator setup
+
+Create `release-control` with the same required reviewers, self-review protection,
+and administrator bypass restriction as the publishing environments below. Allow
+only the `main` **branch**. Its write jobs are also restricted to `main` by YAML
+and the release workflow policy checker.
+
+For automatic tags, add `RELEASE_CONTROL_TOKEN` as an environment secret on
+`release-control`. Use a repository-scoped fine-grained token owned by a release
+maintainer already allowed by the tag ruleset, with Contents, Pull requests,
+Actions, and Workflows read/write permissions. Do not add GitHub Actions to the
+tag ruleset's bypass list. An appropriately authorized GitHub App installation
+credential can serve the same purpose. The coordinator otherwise falls back to
+`GITHUB_TOKEN`: it can dispatch workflows and open PRs when repository settings
+permit, but cannot bypass protected release tags.
+
+A preparation PR created with `GITHUB_TOKEN` may require approval of its CI runs;
+a maintainer or App credential avoids that requirement. Registries still trust
+`crates-release.yml` and `sdk-release.yml`; no registry token belongs in
+`release-control`. Its approval authorizes coordination and does not replace
+the publishers' environment approvals.
+
+For site promotion, leave Cloudflare's production `LEANI_DOCS_REF` unset. The
+production builder derives the release tag from the promoted workspace version.
+If an explicit value is configured instead, update it before promotion; a stale
+value fails production. Keep the `SITE_PROMOTION_TOKEN` setup described below
+when GitHub requires it.
+
+## Release verification
+
 1. Keep release verification results in ignored local storage.
 2. Run the Rust, SDK, dependency-policy, and publication checks from a clean
    checkout. Test restart, replay, and backup/restore with the packaged binary.
@@ -58,14 +133,17 @@ without building or installing project code:
 | --- | --- | --- | --- |
 | `release.yml` | `release-github` | `contents: write`, `actions: read`, `id-token: write`, `attestations: write` | `v*` tag |
 | `container.yml` | `release-ghcr` | `packages: write`, `actions: read`, `id-token: write`, `attestations: write` | `v*` tag |
-| `crates-release.yml` | `release-crates` | `contents: read`, `id-token: write` | `v*` tag |
-| `sdk-release.yml` | `release-npm` | `id-token: write` | `sdk-v*` tag |
+| `crates-release.yml` | `release-crates` | `contents: read`, `actions: read`, `id-token: write` | `v*` tag |
+| `sdk-release.yml` | `release-npm` | `actions: read`, `id-token: write` | `sdk-v*` tag |
 | `site-promote.yml` | `site-production` | `contents: write` | `v*` tag |
+| `release-coordinate.yml` preparation PR | `release-control` | `contents: write`, `pull-requests: write` | `main` |
+| `release-coordinate.yml` coordination | `release-control` | `contents: write`, `actions: write` | `main` |
 
 No other job may request a write permission, `id-token: write` included, read
-a secret, or keep its checkout credentials. Only the crates.io publish job
-checks out the repository, because Cargo cannot upload a prepared archive, and
-npm publishes a local archive file named right after `publish`. No workflow
+a secret, or keep its checkout credentials. The crates.io publish job checks out
+the repository because Cargo cannot upload a prepared archive. The coordinator
+checks out reviewed control scripts, without building or installing project
+dependencies. npm publishes a local archive file named right after `publish`. No workflow
 may run on `pull_request_target` or `workflow_run`: both run with the base
 repository's token, secrets, and cache on behalf of events a pull request
 controls.
@@ -80,7 +158,8 @@ the next publication; each publish job waits for its environment's approval.
 
 Environments (Settings → Environments): create `release-github`,
 `release-ghcr`, `release-crates`, and `release-npm`, and edit the existing
-`site-production`. For each of the five:
+`site-production`. Configure `release-control` separately as above. For each of
+the five publishing environments:
 
 - Required reviewers: at least one release maintainer. Enable
   "Prevent self-review" once two or more maintainers can approve.
@@ -139,10 +218,12 @@ Rulesets (Settings → Rules → Rulesets):
 
 ### Publication order
 
-The release, crates.io, and npm workflows start with `check-release-ci.rb`,
-which requires the newest `container.yml` run for the release commit to have
-succeeded. A container publication is such a run. While it waits for approval,
-and after it is rejected or fails, those gates fail. Publish in this order:
+The release, crates.io, and npm workflows start with `check-release-ci.rb`, which
+verifies the explicit `container_candidate_run_id` for the release commit. It
+must be successful and carry both unexpired container artifacts. A later
+container publication waiting for approval or failing does not invalidate that
+preparation. CI, security, and site still require their newest exact-commit
+validation runs to succeed. The coordinator publishes in this order:
 
 1. `release.yml` from the `v*` tag, approved in `release-github`;
 2. `crates-release.yml` from the `v*` tag and `sdk-release.yml` from the
@@ -151,13 +232,10 @@ and after it is rejected or fails, those gates fail. Publish in this order:
 4. `site-promote.yml` from the `v*` tag once the GitHub release is published,
    approved in `site-production`.
 
-A workflow checks its gate when it starts, so a run that has passed its gate
-can wait for approval while the next one starts. To recover when a container
-publication is rejected or fails, or when a gate must run while one waits,
-cancel or finish that run. Then dispatch `container.yml` from the `v*` tag with
-`publish=false`. Its successful run rebuilds and scans both images, satisfies
-the gates again, and can serve as the `candidate_run_id` of a new container
-publication.
+A standalone publisher must also supply `container_candidate_run_id`; container
+publication uses its own `candidate_run_id`. To regenerate expired images,
+dispatch `container.yml` from the `v*` tag with `publish=false` and use the new
+preparation run ID for subsequent publications.
 
 ### Provenance and dependency updates
 
@@ -215,6 +293,8 @@ from the tag with `publish=true` and the successful preparation run's numeric
 same commit and downloads its existing assets; it does not rebuild them. Its
 publish job then waits for approval in the `release-github` environment.
 Candidates expire after 14 days, so prepare a new candidate if necessary.
+When dispatching this publisher directly, also supply the successful
+`container_candidate_run_id`; the coordinator supplies both IDs automatically.
 
 If a required workflow has no run for the release commit because of path
 filters, dispatch it explicitly on the release ref. A successful run for an
@@ -240,6 +320,9 @@ The package job tests and scans a local npm archive, checks that the archive's
 `publish=true`, the `release-npm` job downloads that archive, checks that its
 version matches the tag, and publishes it with provenance; a dry run stops
 after the upload for manual inspection.
+The coordinator supplies the SDK preparation `candidate_run_id` and
+`container_candidate_run_id`. With a candidate ID, the publisher verifies and
+downloads that existing archive instead of building it again.
 
 For the first publication, a maintainer with access to the `@smart-byte` scope
 must configure a short-lived granular `NPM_TOKEN` environment secret on
@@ -271,8 +354,9 @@ switch the formula to stable releases by default; publishing a later prerelease
 through it requires an explicit decision. Rendering the formula fails if
 `SHA256SUMS` lacks an archive or holds a malformed checksum.
 
-Before promoting the site, set the Cloudflare Pages project's production
-`LEANI_DOCS_REF` build variable to the node release tag being promoted. A
+For automatic promotion, leave Cloudflare Pages' production `LEANI_DOCS_REF`
+unset; the builder derives the tag from the promoted workspace version. If an
+explicit value is configured, set it to the release tag being promoted. A
 production build fails unless its documentation ref equals `v` followed by the
 workspace version of the commit it builds, so a stale value fails the
 deployment instead of linking to an earlier release. SDK tags never select a
@@ -326,6 +410,10 @@ archive paths, and contents before uploading the dry-run packages. With
 compiling and stops unless it produced exactly the tested archives: the same
 names, as many, byte for byte. It then publishes with
 `cargo publish --no-verify`, because Cargo cannot upload a prepared archive.
+With `candidate_run_id`, the publisher reuses successful preparation archives
+instead of rerunning tests. It still requires byte-identical repackaging and
+`container_candidate_run_id`. Retries verify registry checksums and upload only
+missing crates.
 
 The first publication requires a crates.io account with a verified email and
 an API token with permission to create the four crates. Store it as the

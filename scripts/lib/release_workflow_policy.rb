@@ -9,8 +9,8 @@ require "yaml"
 # jobs built and tested. Changing a permission set here is a release-policy
 # change: document it in docs/contributing/releasing.md.
 module ReleaseWorkflowPolicy
-  # Only crates.io publication checks out the repository: Cargo repackages
-  # the tested commit because it cannot upload a prepared archive.
+# Crates.io repackages the tested commit. The coordinator checks out reviewed
+# release control scripts, but never builds packages with its write token.
   PUBLISH_JOBS = {
     "release.yml" => {
       "publish" => {
@@ -27,18 +27,30 @@ module ReleaseWorkflowPolicy
       },
     },
     "sdk-release.yml" => {
-      "publish" => { environment: "release-npm", artifact: true, permissions: { "id-token" => "write" } },
+      "publish" => { environment: "release-npm", artifact: true, permissions: { "id-token" => "write", "actions" => "read" } },
     },
     "crates-release.yml" => {
       "publish" => {
         environment: "release-crates",
         artifact: true,
         checkout: true,
-        permissions: { "contents" => "read", "id-token" => "write" },
+        permissions: { "contents" => "read", "id-token" => "write", "actions" => "read" },
       },
     },
     "site-promote.yml" => {
       "promote" => { environment: "site-production", artifact: false, permissions: { "contents" => "write" } },
+    },
+    "release-coordinate.yml" => {
+      "prepare" => {
+        environment: "release-control", artifact: true, checkout: true, controller: true,
+        condition: "github.ref == 'refs/heads/main' && inputs.action == 'prepare'",
+        permissions: { "contents" => "write", "pull-requests" => "write" },
+      },
+      "coordinate" => {
+        environment: "release-control", artifact: false, checkout: true, controller: true,
+        condition: "github.ref == 'refs/heads/main' && inputs.action != 'prepare'",
+        permissions: { "contents" => "write", "actions" => "write" },
+      },
     },
   }.freeze
 
@@ -157,6 +169,9 @@ module ReleaseWorkflowPolicy
   # A publish job must download what another job of the same workflow
   # uploaded: in this run, or in the preparation run it names by run-id.
   def self.check_publisher(file, name, job, publisher, uploads, errors)
+    if publisher[:controller] && job["if"] != publisher[:condition]
+      errors << "#{file} #{name}: release control must dispatch from main"
+    end
     unless environment_name(job) == publisher[:environment]
       errors << "#{file} #{name}: must run in the #{publisher[:environment]} environment"
     end

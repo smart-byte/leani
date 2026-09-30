@@ -1,8 +1,13 @@
 name: Promote release site
+run-name: Promote release site${{ inputs.release_request && format(' [{0}]', inputs.release_request) || '' }}
 
 on:
   workflow_dispatch:
     inputs:
+      release_request:
+        description: Correlation ID used by the release coordinator
+        required: false
+        type: string
       release_tag:
         description: Published Leani release tag to promote (for example v0.1.0-rc.1)
         required: true

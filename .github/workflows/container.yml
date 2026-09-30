@@ -1,4 +1,5 @@
 name: Container candidate
+run-name: Container candidate${{ inputs.release_request && format(' [{0}]', inputs.release_request) || '' }}
 
 on:
   push:
@@ -6,6 +7,10 @@ on:
   pull_request:
   workflow_dispatch:
     inputs:
+      release_request:
+        description: Correlation ID used by the release coordinator
+        required: false
+        type: string
       image_tag:
         description: Immutable image tag (normally the matching v-prefixed release tag)
         required: true

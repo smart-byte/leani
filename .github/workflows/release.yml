@@ -1,8 +1,17 @@
 name: Prepare release
+run-name: Prepare release${{ inputs.release_request && format(' [{0}]', inputs.release_request) || '' }}
 
 on:
   workflow_dispatch:
     inputs:
+      container_candidate_run_id:
+        description: Successful container preparation run ID (required when publishing)
+        required: false
+        type: string
+      release_request:
+        description: Correlation ID used by the release coordinator
+        required: false
+        type: string
       version:
         description: SemVer tag to package (for example v0.1.0-rc.1)
         required: true
@@ -64,6 +73,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           CANDIDATE_RUN_ID: ${{ inputs.candidate_run_id }}
+          CONTAINER_CANDIDATE_RUN_ID: ${{ inputs.container_candidate_run_id }}
         run: ruby scripts/check-release-ci.rb
 
   archive:
@@ -233,12 +243,30 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "$RELEASE_VERSION" release-assets/* \
-            --repo "$GITHUB_REPOSITORY" \
-            --verify-tag \
-            --draft \
-            --generate-notes \
-            --title "Leani $RELEASE_VERSION"
+          # A retry can finish a partially uploaded draft, but must never
+          # replace an existing asset or publish a different candidate.
+          if gh api "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_VERSION" > existing-release.json 2> release-error.txt; then
+            jq -r '.assets[].name' existing-release.json > existing-assets.txt
+            while IFS= read -r name; do
+              case "$name" in */*|.*) echo "unexpected release asset" >&2; exit 1 ;; esac
+              test -f "release-assets/$name" || { echo "unexpected release asset $name" >&2; exit 1; }
+              mkdir -p existing-assets
+              gh release download "$RELEASE_VERSION" --repo "$GITHUB_REPOSITORY" --pattern "$name" --dir existing-assets
+              cmp "existing-assets/$name" "release-assets/$name" || { echo "existing release asset differs: $name" >&2; exit 1; }
+            done < existing-assets.txt
+            for asset in release-assets/*; do
+              name=${asset##*/}
+              if ! grep -Fxq "$name" existing-assets.txt; then
+                test "$(jq -r .draft existing-release.json)" = true || { echo "published release is incomplete" >&2; exit 1; }
+                gh release upload "$RELEASE_VERSION" "$asset" --repo "$GITHUB_REPOSITORY"
+              fi
+            done
+          else
+            grep -q 'HTTP 404' release-error.txt || { cat release-error.txt >&2; exit 1; }
+            gh release create "$RELEASE_VERSION" release-assets/* \
+              --repo "$GITHUB_REPOSITORY" --verify-tag --draft --generate-notes \
+              --title "Leani $RELEASE_VERSION"
+          fi
           case "${RELEASE_VERSION%%+*}" in
             *-*) prerelease=true; latest=false ;;
             *) prerelease=false; latest=true ;;

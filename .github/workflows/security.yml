@@ -1,4 +1,5 @@
 name: Secret history scan
+run-name: Secret history scan${{ inputs.release_request && format(' [{0}]', inputs.release_request) || '' }}
 
 on:
   push:
@@ -6,6 +7,11 @@ on:
     tags: ['**']
   pull_request:
   workflow_dispatch:
+    inputs:
+      release_request:
+        description: Correlation ID used by the release coordinator
+        required: false
+        type: string
 
 permissions:
   contents: read
