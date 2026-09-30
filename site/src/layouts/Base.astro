@@ -4,6 +4,7 @@ import '@fontsource/jetbrains-mono/700.css';
 import '@fontsource-variable/inter';
 import '../styles/global.css';
 import { SOCIAL_IMAGE } from '../lib/social';
+import { umamiScript } from '../lib/analytics';
 
 interface Props { title: string; description: string }
 const { title, description } = Astro.props;
@@ -31,6 +32,7 @@ const socialImage = new URL(SOCIAL_IMAGE.path, Astro.site);
     <meta property="og:image:height" content={String(SOCIAL_IMAGE.height)} />
     <meta property="og:image:alt" content={SOCIAL_IMAGE.alt} />
     <meta name="twitter:card" content="summary_large_image" />
+    {umamiScript && <script is:inline defer {...umamiScript}></script>}
   </head>
   <body>
     <a class="skip-link" href="#main">Skip to content</a>

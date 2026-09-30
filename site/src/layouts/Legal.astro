@@ -1,0 +1,32 @@
+---
+import Base from './Base.astro';
+import Header from '../components/Header.astro';
+import Footer from '../components/Footer.astro';
+
+interface Props { title: string; description: string }
+const { title, description } = Astro.props;
+---
+<Base title={`${title} · leani`} description={description}>
+  <Header slot="before-main" />
+  <article class="wrap legal">
+    <slot />
+  </article>
+  <Footer slot="after-main" />
+</Base>
+
+<style>
+  .legal { max-width: 46rem; padding-block: 3.5rem 4.5rem; }
+  .legal :global(h1) { font-size: clamp(1.9rem, 4vw, 2.5rem); }
+  .legal :global(h2) { font-size: 1.3rem; margin-top: 2.75rem; }
+  .legal :global(h3) { font-size: 1.02rem; margin-top: 1.75rem; }
+  .legal :global(:is(p, address, ul)) { color: var(--ink-dim); line-height: 1.65; margin-top: 0.8rem; }
+  .legal :global(ul) { padding-left: 1.2rem; }
+  .legal :global(li + li) { margin-top: 0.35rem; }
+  .legal :global(address) { font-style: normal; }
+  .legal :global(strong) { color: var(--ink); font-weight: 600; }
+  .legal :global(.notice) {
+    margin-top: 1.25rem; padding: 1rem 1.2rem;
+    background: var(--panel); border: 1px solid var(--panel-edge); border-radius: 10px;
+  }
+  .legal :global(.notice > :first-child) { margin-top: 0; }
+</style>

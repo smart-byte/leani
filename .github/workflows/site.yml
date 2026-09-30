@@ -79,3 +79,6 @@ jobs:
       - name: Verify static search
         working-directory: site
         run: bun run search:check
+      - name: Verify legal links and first-party loading
+        working-directory: site
+        run: bun run legal:check

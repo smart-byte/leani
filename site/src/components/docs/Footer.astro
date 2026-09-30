@@ -1,0 +1,16 @@
+---
+import Default from '@astrojs/starlight/components/Footer.astro';
+import { COMPANY, LEGAL_NOTICE_URL, PRIVACY_URL } from '../../config';
+---
+<Default><slot /></Default>
+<p class="legal">
+  Built by <a href={COMPANY.url}>Smart-Byte</a> ·{' '}
+  <a href={LEGAL_NOTICE_URL}>Legal notice (Impressum)</a> ·{' '}
+  <a href={PRIVACY_URL}>Privacy</a>
+</p>
+
+<style>
+  .legal { margin-top: 2.5rem; font-size: var(--sl-text-xs); color: var(--sl-color-gray-3); }
+  .legal a { color: inherit; }
+  .legal a:hover { color: var(--sl-color-white); }
+</style>

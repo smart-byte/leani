@@ -4,6 +4,7 @@ import starlightLlmsTxt from 'starlight-llms-txt';
 import { fileURLToPath } from 'node:url';
 import { DOC_SECTIONS, DOC_SECTION_LABELS, DOC_STARTER_PAGES } from './src/lib/docs';
 import { SOCIAL_IMAGE } from './src/lib/social';
+import { umamiScript } from './src/lib/analytics';
 
 const site = 'https://leani.dev';
 
@@ -48,11 +49,14 @@ export default defineConfig({
       pagefind: true,
       // Starlight already declares a large Twitter card; give it the image.
       head: [
-        ['og:image', new URL(SOCIAL_IMAGE.path, site).href],
-        ['og:image:width', String(SOCIAL_IMAGE.width)],
-        ['og:image:height', String(SOCIAL_IMAGE.height)],
-        ['og:image:alt', SOCIAL_IMAGE.alt],
-      ].map(([property, content]) => ({ tag: 'meta', attrs: { property, content } })),
+        ...[
+          ['og:image', new URL(SOCIAL_IMAGE.path, site).href],
+          ['og:image:width', String(SOCIAL_IMAGE.width)],
+          ['og:image:height', String(SOCIAL_IMAGE.height)],
+          ['og:image:alt', SOCIAL_IMAGE.alt],
+        ].map(([property, content]) => ({ tag: 'meta', attrs: { property, content } })),
+        ...(umamiScript ? [{ tag: 'script', attrs: { defer: true, ...umamiScript } }] : []),
+      ],
       plugins: [
         // Serves /llms.txt, /llms-full.txt, and /llms-small.txt for AI agents.
         starlightLlmsTxt({
@@ -91,6 +95,7 @@ export default defineConfig({
       components: {
         Banner: './src/components/docs/PreviewBanner.astro',
         EditLink: './src/components/docs/EditLink.astro',
+        Footer: './src/components/docs/Footer.astro',
         Pagination: './src/components/docs/Pagination.astro',
         Sidebar: './src/components/docs/Sidebar.astro',
       },
