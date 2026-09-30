@@ -1,37 +1,8 @@
 [
   {
-    "id": "quickstart",
-    "label": "quickstart",
-    "title": "leani \u2014 follow Ethereum blocks",
-    "note": "Build the current alpha from source, then follow checkpoint setup on first use.",
-    "lang": "shell",
-    "lines": [
-      {
-        "text": "$ leani subscribe blocks"
-      },
-      {
-        "text": ""
-      },
-      {
-        "text": "# On first use, review and accept the checkpoint."
-      },
-      {
-        "text": "# The first row may be an early peer preview."
-      },
-      {
-        "text": "# Print only blocks Ethereum has finalized:"
-      },
-      {
-        "text": "$ leani subscribe blocks --finality finalized"
-      }
-    ],
-    "noteHref": "/docs/getting-started/install/",
-    "noteLabel": "Install Leani \u2192"
-  },
-  {
     "id": "rpc",
-    "label": "rpc subset",
-    "title": "watch.ts \u2014 query your prepared node",
+    "label": "query with viem",
+    "title": "watch.ts — query your prepared node",
     "note": "Use the RPC port of the node created by leani init blocks.",
     "lang": "ts",
     "lines": [
@@ -57,16 +28,16 @@
         "text": "const chainId = await eth.getChainId();"
       },
       {
-        "text": "console.log(chainId); // 1 \u2014 Ethereum Mainnet"
+        "text": "console.log(chainId); // 1 — Ethereum Mainnet"
       }
     ],
     "noteHref": "/docs/guides/json-rpc/",
-    "noteLabel": "Run the RPC example \u2192"
+    "noteLabel": "Run the RPC example →"
   },
   {
     "id": "sdk",
-    "label": "typescript sdk",
-    "title": "watch.ts \u2014 follow block summaries",
+    "label": "stream with the SDK",
+    "title": "watch.ts — follow block summaries",
     "note": "Start a block-summary node with leani init blocks and leani serve.",
     "lang": "ts",
     "lines": [
@@ -105,6 +76,6 @@
       }
     ],
     "noteHref": "/docs/guides/query-then-follow/",
-    "noteLabel": "Seed state and handle reorgs \u2192"
+    "noteLabel": "Seed state and handle reorgs →"
   }
 ]

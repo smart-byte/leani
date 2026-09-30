@@ -1,23 +1,51 @@
 import { describe, expect, test } from 'bun:test';
 import { readdirSync } from 'node:fs';
-import heroExamples from '../src/data/hero-examples.json';
+import followExamples from '../src/data/follow-examples.json';
+import followSession from '../src/data/follow-session.json';
 import costs from '../src/data/costs.json';
 import processorCatalog from '../../docs/reference/generated/processor-catalog.json';
+import { blockRowHtml } from '../src/lib/block-row';
 
 const demoDir = new URL('../src/data/processors/', import.meta.url);
 
+// One `leani subscribe blocks` pretty row, as printed by the CLI.
+const BLOCK_ROW =
+  /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ {2}block=(\d+) {2}txs=\d+ {2}gas=[\d.]+[kKMG]? \/ [\d.]+[kKMG]? \([\d.]+%\) {2}base_fee=[\d.]+ gwei {2}blobs=\d+ {2}(?:preview|included|finalized)$/;
+
 describe('canned data', () => {
-  test('hero examples each carry id, label, title, note, and lines', () => {
-    expect(heroExamples.length).toBeGreaterThanOrEqual(3);
-    for (const example of heroExamples) {
-      for (const key of ['id', 'label', 'title', 'note'] as const) {
+  test('follow examples each carry id, label, title, note, and lines', () => {
+    expect(followExamples.length).toBeGreaterThanOrEqual(2);
+    for (const example of followExamples) {
+      for (const key of ['id', 'label', 'title', 'note', 'noteHref', 'noteLabel'] as const) {
         expect(typeof example[key]).toBe('string');
         expect(example[key].length).toBeGreaterThan(0);
       }
-      if (example.lines) {
-        expect(example.lines.length).toBeGreaterThan(3);
-        for (const line of example.lines) expect(typeof line.text).toBe('string');
-      }
+      expect(['ts', 'shell']).toContain(example.lang);
+      expect(example.lines.length).toBeGreaterThan(3);
+      for (const line of example.lines) expect(typeof line.text).toBe('string');
+    }
+  });
+
+  test('the follow replay is a recorded session of real CLI rows', () => {
+    expect(followSession.recordedAt).toMatch(/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$/);
+    expect(followSession.leaniVersion).toMatch(/^\d+\.\d+\.\d+/);
+    expect(followSession.command).toBe('leani subscribe blocks');
+    // The page renders six rows up front and replays the rest.
+    expect(followSession.rows.length).toBeGreaterThan(6);
+    let previous = 0;
+    for (const row of followSession.rows) {
+      const match = row.match(BLOCK_ROW);
+      expect(match).not.toBeNull();
+      const block = Number(match![1]);
+      expect(block).toBeGreaterThan(previous);
+      previous = block;
+    }
+  });
+
+  test('block rows keep their exact text when highlighted', () => {
+    for (const row of followSession.rows) {
+      const text = blockRowHtml(row).replace(/<[^>]+>/g, '').replace(/&amp;/g, '&');
+      expect(text).toBe(row);
     }
   });
 
