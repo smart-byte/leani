@@ -98,6 +98,9 @@ function renderTypeCard(source: string): string {
         aria-selected={i === 0 ? 'true' : 'false'}
         tabindex={i === 0 ? 0 : -1}
         data-demo-id={demo.id}
+        data-umami-event="tab"
+        data-umami-event-group="processors"
+        data-umami-event-tab={demo.id}
       >{demo.label}</button>
     ))}
   </div>
