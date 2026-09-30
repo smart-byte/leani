@@ -17,7 +17,7 @@ const command = 'leani subscribe blocks';
   <div class="wrap body">
     <div class="intro">
       <a class="eyebrow mono" href={LIMITATIONS_URL}>Public preview</a>
-      <h1>Ethereum data, shaped for your application.</h1>
+      <h1>Ethereum data, <span class="shaped">shaped</span> for your application.</h1>
       <p class="sub">
         An Ethereum indexing node you run inside your own infra. Backfill from
         public datasets, follow the head over Ethereum P2P, and deterministically
@@ -68,6 +68,11 @@ const command = 'leani subscribe blocks';
   .body { display: flex; flex-direction: column; align-items: flex-start; padding-top: 3.5rem; padding-bottom: 3rem; }
   .intro, .run, .stats { position: relative; z-index: 2; min-width: 0; }
   h1 { font-size: clamp(2.4rem, 6vw, 4.2rem); max-width: 18ch; margin-top: 0.9rem; }
+  .shaped { color: var(--accent); }
+  /* Decode state; the script builds these nodes and removes them when done. */
+  .shaped :global(.glyph) { display: inline-block; text-align: center; }
+  .shaped :global(.raw) { color: #6f8d7c; font-family: var(--font-mono); font-size: 0.78em; font-weight: 400; }
+  .shaped :global(.sr-only) { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
   .sub { color: var(--ink-dim); font-size: 1.15rem; max-width: 52ch; margin-top: 1.1rem; }
   .cta { display: flex; gap: 0.9rem; margin-top: 1.7rem; flex-wrap: wrap; }
 
@@ -252,6 +257,36 @@ const command = 'leani subscribe blocks';
       window.clearTimeout(copiedTimer);
       copiedTimer = window.setTimeout(() => { copied.textContent = ''; }, 2400);
     });
+
+    // "shaped" resolves from raw hex once, the way leani reduces chain bytes.
+    // Letters are split only while decoding, so the settled heading is plain,
+    // kerned text; a hidden copy keeps the accessible name whole meanwhile.
+    const shaped = hero.querySelector<HTMLElement>('.shaped');
+    if (shaped && !reducedMotion.matches) {
+      void document.fonts.ready.then(() => {
+        const word = shaped.textContent ?? '';
+        const letters = [...word].map((char) => Object.assign(document.createElement('span'), { textContent: char }));
+        const glyphs = document.createElement('span');
+        glyphs.setAttribute('aria-hidden', 'true');
+        glyphs.append(...letters);
+        shaped.replaceChildren(Object.assign(document.createElement('span'), { className: 'sr-only', textContent: word }), glyphs);
+        const widths = letters.map((letter) => letter.getBoundingClientRect().width);
+        letters.forEach((letter, i) => { letter.className = 'glyph'; letter.style.width = `${widths[i]}px`; });
+        const start = performance.now();
+        const decode = window.setInterval(() => {
+          const elapsed = performance.now() - start;
+          letters.forEach((letter, i) => {
+            const raw = elapsed < 260 + i * 110;
+            letter.textContent = raw ? '0123456789abcdef'[Math.floor(Math.random() * 16)]! : word[i]!;
+            letter.classList.toggle('raw', raw);
+          });
+          if (elapsed >= 260 + letters.length * 110) {
+            window.clearInterval(decode);
+            shaped.textContent = word;
+          }
+        }, 55);
+      });
+    }
 
     clock.hidden = false;
     update();
