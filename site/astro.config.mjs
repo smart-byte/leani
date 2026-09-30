@@ -67,6 +67,8 @@ export default defineConfig({
           promote: DOC_STARTER_PAGES.map((page) => page.id),
           demote: ['docs/contributing/**'],
           exclude: ['docs/contributing/**'],
+          // Animated diagrams mark their labels; exports keep the text versions next to them.
+          customSelectors: { all: ['[data-llms-skip]'] },
           customSets: DOC_SECTIONS.filter((section) => section !== 'contributing').map((section) => ({
             label: DOC_SECTION_LABELS[section],
             paths: [`docs/${section}`, `docs/${section}/**`],

@@ -9,9 +9,13 @@ audience:
 status: preview
 ---
 
+import DeliverySequence from '@docs/components/docs/DeliverySequence.astro';
+
 Leani delivery is deliberately at-least-once. Exactly-once application effects
 come from an application transaction, not from pretending an HTTP response and
 a database commit are atomic.
+
+<DeliverySequence />
 
 ```text
 Leani change ─> begin destination transaction
