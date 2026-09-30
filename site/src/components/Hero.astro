@@ -1,10 +1,7 @@
 ---
-import TerminalFrame from './TerminalFrame.astro';
+import EngineWorld from './EngineWorld.astro';
 import { GITHUB_URL, LIMITATIONS_URL, QUICKSTART_URL } from '../config';
-import heroExamples from '../data/hero-examples.json';
 import processorReference from '../generated/processors-reference.json';
-
-import { esc, hlShell, hlTs } from '../lib/highlight';
 
 // Measured or catalog-backed facts; the storage figure is the externalized
 // profile's evidence row in data/costs.json, footnoted there as workload-specific.
@@ -14,29 +11,11 @@ const stats = [
   [`${processorReference.processors.length} processors`, 'built in, or your own native Rust'],
   ['MIT-licensed', 'Rust library + standalone node'],
 ];
-
-// Lines with a className keep their whole-line styling (dim context, accent
-// payoffs); everything else gets language tokens.
-const examples = heroExamples.map((example) => {
-  const lines = example.lines;
-  return {
-  ...example,
-  lines: lines.map((line) => ({
-    ...line,
-    className: 'className' in line ? line.className : undefined,
-    html:
-      line.text && !('className' in line && line.className)
-        ? example.lang === 'ts'
-          ? hlTs(line.text)
-          : hlShell(line.text)
-        : undefined,
-  })),
-  };
-});
+const command = 'leani subscribe blocks';
 ---
-<section class="hero wrap section">
-  <div class="hero-grid">
-    <div class="hero-copy">
+<section class="hero">
+  <div class="wrap body">
+    <div class="intro">
       <a class="eyebrow mono" href={LIMITATIONS_URL}>Public preview</a>
       <h1>Ethereum data, shaped for your application.</h1>
       <p class="sub">
@@ -52,120 +31,229 @@ const examples = heroExamples.map((example) => {
       </div>
     </div>
 
-    <div class="hero-term">
-      <div class="hero-tabs mono" role="tablist" aria-label="Hero examples">
-        {examples.map((example, i) => (
-          <button
-            role="tab"
-            id={`hero-tab-${example.id}`}
-            aria-controls={`hero-panel-${example.id}`}
-            aria-selected={i === 0 ? 'true' : 'false'}
-            tabindex={i === 0 ? 0 : -1}
-          >{example.label}</button>
-        ))}
-      </div>
-      {examples.map((example) => (
-        <div
-          class="hero-panel"
-          role="tabpanel"
-          id={`hero-panel-${example.id}`}
-          aria-labelledby={`hero-tab-${example.id}`}
-        >
-          <TerminalFrame title={example.title}>
-            <div class="hero-transcript">
-              {example.lines.map((l) => (
-                <span class={`t-line ${l.className ?? ''}`} set:html={l.html ?? esc(l.text)} />
-              ))}
-            </div>
-          </TerminalFrame>
-          <p class="mono note">
-            {example.note}{' '}
-            {'noteHref' in example && (
-              <a href={(example as { noteHref: string }).noteHref}>
-                {(example as { noteLabel: string }).noteLabel}
-              </a>
-            )}
-          </p>
-        </div>
-      ))}
+    <div class="stage" aria-hidden="true">
+      <div class="camera"><div class="tilt"><div class="pitch"><div class="yaw">
+        <EngineWorld idPrefix="hero" active="map" />
+      </div></div></div></div>
     </div>
-  </div>
 
-  <ul class="stats mono" aria-label="Measured facts">
-    {stats.map(([value, label]) => (
-      <li><b>{value}</b><span>{label}</span></li>
-    ))}
-  </ul>
+    <div class="run">
+      <div class="command mono">
+        <code><span class="prompt">$</span>{command}</code>
+        <button type="button" class="copy-button" data-copy-value={command} aria-label="Copy command">
+          <svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.5" y="5.5" width="8" height="8" rx="1.6"/><path d="M10.5 3.2V3A1.5 1.5 0 0 0 9 1.5H3.5A1.5 1.5 0 0 0 2 3v5.5A1.5 1.5 0 0 0 3.5 10h.3"/></svg>
+        </button>
+      </div>
+      <p class="note mono">No API key. No config file. <span class="copied" role="status" aria-live="polite"></span></p>
+      <div class="clock mono" role="group" aria-label="Ethereum Mainnet slot clock, computed in your browser from the beacon chain genesis time" hidden>
+        <p class="clock-line">
+          <span class="net"><i></i>Mainnet</span>
+          <span>slot <b data-slot></b><em>·</em>epoch <b data-epoch></b></span>
+          <span class="next">next in <b data-next></b>s</span>
+        </p>
+        <div class="epoch" aria-hidden="true"></div>
+      </div>
+    </div>
+
+    <ul class="stats mono" aria-label="Measured facts">
+      {stats.map(([value, label]) => (
+        <li><b>{value}</b><span>{label}</span></li>
+      ))}
+    </ul>
+  </div>
 </section>
 
 <style>
-  .hero { padding-top: 3.5rem; }
-  .hero-grid { display: grid; gap: 2.5rem; align-items: center; }
-  .hero-copy, .hero-term, .hero-panel { min-width: 0; }
+  .hero { position: relative; isolation: isolate; overflow: hidden; }
+  .body { display: flex; flex-direction: column; align-items: flex-start; padding-top: 3.5rem; padding-bottom: 3rem; }
+  .intro, .run, .stats { position: relative; z-index: 2; min-width: 0; }
   h1 { font-size: clamp(2.4rem, 6vw, 4.2rem); max-width: 18ch; margin-top: 0.9rem; }
   .sub { color: var(--ink-dim); font-size: 1.15rem; max-width: 52ch; margin-top: 1.1rem; }
   .cta { display: flex; gap: 0.9rem; margin-top: 1.7rem; flex-wrap: wrap; }
-  .hero-term { max-width: 54rem; }
-  /* Wide screens: copy left, terminal right, so the product runs above the fold. */
-  @media (min-width: 1000px) {
-    .hero-grid { grid-template-columns: minmax(0, 11fr) minmax(0, 12fr); gap: 3rem; }
-    h1 { font-size: clamp(2.3rem, 3.1vw, 2.9rem); max-width: 14ch; }
-    .sub { font-size: 1.02rem; max-width: 42ch; }
-    .hero-term { max-width: none; }
-    .hero-term :global(.term-body) { font-size: 0.78rem; }
+
+  .stage {
+    position: relative; z-index: 0; align-self: stretch; height: 30rem; margin: 1.5rem -1.25rem 0;
+    pointer-events: none;
+    background: radial-gradient(ellipse 62% 56% at 52% 52%, #17402a80, transparent 74%);
+    mask-image: linear-gradient(transparent, #000 14%, #000 86%, transparent);
   }
+  .camera { --stage-scale: 0.8; position: absolute; width: 860px; height: 480px; left: 52.5%; top: 45%; margin: -240px 0 0 -430px; transform: scale(var(--stage-scale)); perspective: 1800px; }
+  .tilt, .pitch, .yaw { width: 100%; height: 100%; transform-style: preserve-3d; }
+  .tilt { transform: rotateX(var(--ty, 0deg)) rotateY(var(--tx, 0deg)); transition: transform 900ms cubic-bezier(0.2, 0.65, 0.3, 1); }
+  /* Two slow, out-of-phase drifts, so the camera never visibly loops. */
+  .pitch { transform: rotateX(55deg); animation: hero-pitch 13s ease-in-out -6.5s infinite alternate; }
+  .yaw { transform: rotateZ(-30deg); animation: hero-yaw 20s ease-in-out -10s infinite alternate; }
+  .stage[data-running='false'] .pitch, .stage[data-running='false'] .yaw { animation-play-state: paused; }
+  @keyframes hero-pitch { from { transform: rotateX(53.5deg); } to { transform: rotateX(56.5deg); } }
+  @keyframes hero-yaw { from { transform: rotateZ(-34deg); } to { transform: rotateZ(-26deg); } }
+
+  .run { display: flex; flex-direction: column; align-items: flex-start; gap: 0.55rem; margin-top: 0.5rem; }
+  .command { display: inline-flex; align-items: stretch; border: 1px solid var(--panel-edge); border-radius: 8px; background: color-mix(in srgb, var(--panel) 88%, transparent); box-shadow: 0 10px 30px rgb(0 0 0 / 0.35); font-size: 0.82rem; line-height: 1; }
+  .command code { display: inline-flex; align-items: center; gap: 0.6rem; padding: 0.75rem 1rem 0.75rem 0.9rem; font-family: var(--font-mono); color: var(--ink); }
+  .prompt { color: var(--accent); user-select: none; }
+  .copy-button { display: grid; place-items: center; width: 2.6rem; border: 0; border-left: 1px solid var(--panel-edge); background: none; color: var(--ink-dim); cursor: pointer; }
+  .copy-button:hover { color: var(--accent); }
+  .copy-button svg { width: 14px; height: 14px; fill: none; stroke: currentColor; stroke-width: 1.3; }
+  .note { font-size: 0.72rem; color: var(--ink-dim); }
+  .copied { color: var(--accent); }
+
+  .clock { width: min(25rem, 100%); margin-top: 0.35rem; }
+  .clock[hidden] { display: none; }
+  .clock-line { display: flex; align-items: center; gap: 0.9rem; font-size: 0.72rem; letter-spacing: 0.02em; color: var(--ink-dim); white-space: nowrap; }
+  .net { display: inline-flex; align-items: center; gap: 0.5rem; color: var(--accent); font-size: 0.69rem; letter-spacing: 0.14em; text-transform: uppercase; }
+  .net i { width: 6px; height: 6px; border-radius: 50%; background: var(--accent); box-shadow: 0 0 10px rgb(62 224 127 / 0.6); }
+  .clock b { color: var(--ink); font-weight: 400; font-variant-numeric: tabular-nums; }
+  .clock em { font-style: normal; color: #3f574a; margin: 0 0.5rem; }
+  .next { margin-left: auto; }
+  /* Cells are generated by the script, so they need unscoped selectors. */
+  .epoch { display: grid; grid-template-columns: repeat(32, minmax(0, 1fr)); gap: 3px; height: 6px; margin-top: 0.55rem; }
+  .epoch :global(i) { position: relative; overflow: hidden; border-radius: 1.5px; box-shadow: inset 0 0 0 1px #1b2a22; }
+  .epoch :global(.is-past) { background: #1d3829; box-shadow: none; }
+  .epoch :global(.is-now) { background: #173524; box-shadow: 0 0 10px rgb(62 224 127 / 0.45); }
+  .epoch :global(.is-now)::after { content: ''; position: absolute; inset: 0; background: var(--accent); transform-origin: 0 50%; transform: scaleX(var(--fill, 0)); transition: transform 260ms linear; }
+
   .stats {
-    list-style: none; padding: 1.25rem 0 0; margin-top: 3rem;
+    align-self: stretch; list-style: none; padding: 1.25rem 0 0; margin-top: 2.5rem;
     border-top: 1px solid var(--panel-edge);
     display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 1.25rem;
   }
-  @media (max-width: 760px) { .stats { grid-template-columns: 1fr 1fr; } }
-  @media (max-width: 460px) { .stats { grid-template-columns: 1fr; } }
   .stats b { display: block; color: var(--accent); font-size: 0.95rem; }
   .stats span { display: block; color: var(--ink-dim); font-size: 0.76rem; margin-top: 0.15rem; }
-  .hero-tabs { display: flex; gap: 0.4rem; flex-wrap: wrap; margin-bottom: 0.75rem; }
-  .hero-tabs [role='tab'] {
-    background: none; border: 1px solid var(--panel-edge); border-radius: 6px;
-    color: var(--ink-dim); font: inherit; font-size: 0.8rem;
-    padding: 0.35rem 0.8rem; cursor: pointer;
+
+  @media (max-width: 760px) {
+    .stage { height: 24rem; }
+    .camera { --stage-scale: 0.6; }
+    .stats { grid-template-columns: 1fr 1fr; }
   }
-  .hero-tabs [role='tab']:hover { color: var(--ink); border-color: var(--accent-dim); }
-  .hero-tabs [role='tab'][aria-selected='true'] {
-    color: var(--accent); border-color: var(--accent-dim);
+  @media (max-width: 600px) {
+    .stage { height: 18.5rem; margin-top: 0.5rem; }
+    .camera { --stage-scale: 0.45; }
+    .clock-line { display: grid; grid-template-columns: 1fr auto; row-gap: 0.45rem; }
+    .clock-line > span:nth-child(2) { grid-row: 2; grid-column: 1 / -1; }
+    .next { margin-left: 0; }
   }
-  .hero-panel { margin-top: 0; }
-  .hero-panel + .hero-panel { margin-top: 1rem; }
-  .note { color: var(--ink-dim); font-size: 0.7rem; margin-top: 0.5rem; }
+  @media (max-width: 460px) { .stats { grid-template-columns: 1fr; } }
+
+  /* Wide screens: the engine fills the right of the first screen behind the
+     copy, a scrim keeps the copy readable, and the stats sit on the fold. */
+  @media (min-width: 1180px) {
+    .hero::before {
+      --wrap-left: max(1.25rem, calc((100% - var(--max-width)) / 2 + 1.25rem));
+      content: ''; position: absolute; inset: 0; z-index: 1; pointer-events: none;
+      background:
+        linear-gradient(90deg, var(--bg) calc(var(--wrap-left) + 38px), rgb(11 15 13 / 0.88) calc(var(--wrap-left) + 268px), rgb(11 15 13 / 0.45) calc(var(--wrap-left) + 426px), rgb(11 15 13 / 0) calc(var(--wrap-left) + 585px)),
+        linear-gradient(0deg, var(--bg), rgb(11 15 13 / 0.9) 11%, rgb(11 15 13 / 0) 30%),
+        linear-gradient(180deg, rgb(11 15 13 / 0.6), rgb(11 15 13 / 0) 14%);
+    }
+    .body { min-height: clamp(44rem, calc(100svh - 3.5rem), 60rem); padding-bottom: 2.25rem; }
+    .intro { max-width: 30rem; }
+    h1 { font-size: 3.5rem; line-height: 1.07; letter-spacing: -0.02em; max-width: 13ch; margin-top: 1.1rem; }
+    .sub { font-size: 1.02rem; max-width: 36ch; }
+    .stage {
+      --stage-x: 255px;
+      position: absolute; inset: 0; height: auto; margin: 0; mask-image: none;
+      background:
+        radial-gradient(ellipse 38% 46% at calc(50% + var(--stage-x)) 47%, #17402a70, transparent 72%),
+        radial-gradient(ellipse 70% 62% at calc(50% + var(--stage-x) + 30px) 54%, #0f2419, transparent 75%);
+    }
+    .camera { --stage-scale: 0.9; left: calc(50% + var(--stage-x)); top: 47%; }
+    .run { margin-top: 1.5rem; margin-bottom: 1.75rem; }
+    .stats { margin-top: auto; }
+  }
+  @media (min-width: 1360px) {
+    .stage { --stage-x: 300px; }
+    .camera { --stage-scale: 1.06; }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .tilt, .epoch :global(.is-now)::after { transition: none; }
+    .pitch, .yaw { animation: none; }
+  }
 </style>
 
 <script>
+  import { SLOT_SECONDS, SLOTS_PER_EPOCH, slotClock } from '../lib/beacon';
 
-  const tablist = document.querySelector<HTMLElement>('.hero-tabs');
-  const tabs = [...document.querySelectorAll<HTMLButtonElement>('.hero-tabs [role="tab"]')];
-  const panels = [...document.querySelectorAll<HTMLElement>('.hero-panel')];
-  function select(index: number, opts: { focus?: boolean } = {}) {
-    tabs.forEach((tab, i) => {
-      tab.setAttribute('aria-selected', String(i === index));
-      tab.tabIndex = i === index ? 0 : -1;
-      panels[i]!.hidden = i !== index;
+  const hero = document.querySelector<HTMLElement>('.hero');
+  if (hero) {
+    const stage = hero.querySelector<HTMLElement>('.stage')!;
+    const tilt = hero.querySelector<HTMLElement>('.tilt')!;
+    const liveSource = hero.querySelector<HTMLElement>('.live-source');
+    const clock = hero.querySelector<HTMLElement>('.clock')!;
+    const slotOut = clock.querySelector<HTMLElement>('[data-slot]')!;
+    const epochOut = clock.querySelector<HTMLElement>('[data-epoch]')!;
+    const nextOut = clock.querySelector<HTMLElement>('[data-next]')!;
+    const bar = clock.querySelector<HTMLElement>('.epoch')!;
+    const cells = Array.from({ length: SLOTS_PER_EPOCH }, () => bar.appendChild(document.createElement('i')));
+    const format = new Intl.NumberFormat('en-US');
+    const reducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)');
+    const finePointer = window.matchMedia('(hover: hover) and (pointer: fine)');
+    let visible = true;
+    let shownSlot = -1;
+    let timer = 0;
+    let pointerFrame = 0;
+
+    // Each real slot boundary also flashes the engine's live emitter.
+    const tick = () => {
+      const { slot, epoch, slotInEpoch, secondsIntoSlot } = slotClock(Date.now());
+      if (slot !== shownSlot) {
+        if (shownSlot !== -1 && stage.dataset.running === 'true' && liveSource) {
+          liveSource.classList.remove('is-slot');
+          void liveSource.offsetWidth;
+          liveSource.classList.add('is-slot');
+        }
+        shownSlot = slot;
+        slotOut.textContent = format.format(slot);
+        epochOut.textContent = format.format(epoch);
+        cells.forEach((cell, i) => { cell.className = i < slotInEpoch ? 'is-past' : i === slotInEpoch ? 'is-now' : ''; });
+      }
+      nextOut.textContent = String(Math.max(1, Math.ceil(SLOT_SECONDS - secondsIntoSlot))).padStart(2, '0');
+      cells[slotInEpoch]!.style.setProperty('--fill', (secondsIntoSlot / SLOT_SECONDS).toFixed(3));
+    };
+    const resetTilt = () => {
+      cancelAnimationFrame(pointerFrame);
+      pointerFrame = 0;
+      tilt.style.removeProperty('--tx');
+      tilt.style.removeProperty('--ty');
+    };
+    const update = () => {
+      const running = visible && !document.hidden && !reducedMotion.matches;
+      stage.dataset.running = String(running);
+      if (!running) resetTilt();
+      const ticking = visible && !document.hidden;
+      if (ticking && !timer) { tick(); timer = window.setInterval(tick, 250); }
+      if (!ticking && timer) { window.clearInterval(timer); timer = 0; }
+    };
+
+    new IntersectionObserver(([entry]) => { visible = entry!.isIntersecting; update(); }).observe(hero);
+    document.addEventListener('visibilitychange', update);
+    reducedMotion.addEventListener('change', update);
+    hero.addEventListener('pointermove', (event) => {
+      if (stage.dataset.running !== 'true' || !finePointer.matches || pointerFrame) return;
+      pointerFrame = requestAnimationFrame(() => {
+        pointerFrame = 0;
+        const bounds = hero.getBoundingClientRect();
+        tilt.style.setProperty('--tx', `${((event.clientX - bounds.left) / bounds.width - 0.5) * 6}deg`);
+        tilt.style.setProperty('--ty', `${((event.clientY - bounds.top) / bounds.height - 0.5) * -4}deg`);
+      });
     });
-    if (opts.focus !== false) tabs[index]!.focus();
+    hero.addEventListener('pointerleave', resetTilt);
+
+    const copyButton = hero.querySelector<HTMLButtonElement>('[data-copy-value]')!;
+    const copied = hero.querySelector<HTMLElement>('.copied')!;
+    let copiedTimer = 0;
+    copyButton.addEventListener('click', async () => {
+      try {
+        await navigator.clipboard.writeText(copyButton.dataset.copyValue ?? '');
+        copied.textContent = 'Copied.';
+      } catch {
+        copied.textContent = 'Copy failed. Select the command manually.';
+      }
+      window.clearTimeout(copiedTimer);
+      copiedTimer = window.setTimeout(() => { copied.textContent = ''; }, 2400);
+    });
+
+    clock.hidden = false;
+    update();
   }
-
-  // Panels render visible for JS-off readers; JS collapses to tab view.
-  select(0, { focus: false });
-
-  tabs.forEach((tab, i) => tab.addEventListener('click', () => select(i)));
-  tablist?.addEventListener('keydown', (e) => {
-    const current = tabs.findIndex((t) => t.getAttribute('aria-selected') === 'true');
-    let next = current;
-    if (e.key === 'ArrowRight') next = (current + 1) % tabs.length;
-    if (e.key === 'ArrowLeft') next = (current - 1 + tabs.length) % tabs.length;
-    if (e.key === 'Home') next = 0;
-    if (e.key === 'End') next = tabs.length - 1;
-    if (next !== current) {
-      e.preventDefault();
-      select(next);
-    }
-  });
 </script>

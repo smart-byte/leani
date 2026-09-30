@@ -14,7 +14,7 @@ const defaultItems: [string, string][] = [
 
 const { items = defaultItems, label = 'Sections' } = Astro.props;
 ---
-<nav class="sidenav mono" aria-label={label}>
+<nav class="sidenav mono over-hero" aria-label={label}>
   <ul>
     {items.map(([href, label]) => (
       <li><a href={href} data-target={href.slice(1)}>{label}</a></li>
@@ -55,6 +55,11 @@ const { items = defaultItems, label = 'Sections' } = Astro.props;
   }
   .sidenav a:hover { color: var(--ink); }
   .sidenav a.active { color: var(--accent); border-left-color: var(--accent); }
+  /* The hero's engine owns the right edge of the first screen, so the rail
+     starts hidden and returns once the hero scrolls away, or on hover and
+     keyboard focus. Rendering it hidden avoids a flash before the script runs. */
+  .sidenav { transition: opacity 250ms; }
+  .sidenav.over-hero:not(:hover, :focus-within) { opacity: 0; }
 
   /* Narrow screens: collapsible menu, top right. */
   .mobilenav {
@@ -125,6 +130,17 @@ const { items = defaultItems, label = 'Sections' } = Astro.props;
   for (const id of byId.keys()) {
     const section = document.getElementById(id);
     if (section) observer.observe(section);
+  }
+
+  const rail = document.querySelector<HTMLElement>('.sidenav');
+  const hero = document.querySelector<HTMLElement>('.hero');
+  if (rail && hero) {
+    new IntersectionObserver(
+      ([entry]) => rail.classList.toggle('over-hero', entry!.intersectionRatio >= 0.35),
+      { threshold: [0, 0.35, 1] },
+    ).observe(hero);
+  } else {
+    rail?.classList.remove('over-hero');
   }
 
   // Collapse the mobile menu after a jump.
