@@ -129,9 +129,6 @@ const processorLayers = [
   .live-gem { position: absolute; width: 28px; height: 40px; left: 42px; top: 36px; transform: translateZ(42px) rotateZ(30deg) rotateX(-55deg); }
   .gem-top { width: 28px; height: 27px; background: linear-gradient(90deg, #91ffb9 50%, #3d9c63 50%); clip-path: polygon(50% 0, 100% 76%, 50% 100%, 0 76%); }
   .gem-bottom { width: 28px; height: 14px; margin-top: -2px; background: linear-gradient(90deg, #59c883 50%, #246b40 50%); clip-path: polygon(0 0, 50% 35%, 100% 0, 50% 100%); }
-  /* A parent marks a real slot boundary with .is-slot; the emitter flashes once. */
-  .live-source.is-slot .emitter-base { animation: slot-flash 1.4s ease-out; }
-  .live-source.is-slot .live-gem { animation: slot-lift 1.4s ease-out; }
   /* Opacity animation on a 3D parent flattens its faces, even at opacity: 1.
      Keep packets solid; their paths start and end inside the source/core/state.
      Packets float just above the source pads (z 8) and stay below the lowest
@@ -213,8 +210,6 @@ const processorLayers = [
   @keyframes arrive { 0% { opacity: 0.85; } 55%, 100% { opacity: 0; } }
   @keyframes handoff { 0% { opacity: 1; box-shadow: 0 0 12px #3ee07f; } 60%, 100% { opacity: 0.25; box-shadow: none; } }
   @keyframes discard { 0% { transform: translate3d(0, 0, 28px); opacity: 0; } 15% { opacity: 0.65; } 100% { transform: translate3d(45px, 65px, 1px) scale(0.2); opacity: 0; } }
-  @keyframes slot-flash { 0% { border-color: #b4ffd0; box-shadow: 0 6px 0 #112519, 0 7px 0 #315e41, 0 0 36px #3ee07faa; } 100% { border-color: #409761; box-shadow: 0 6px 0 #112519, 0 7px 0 #315e41, 0 0 0 #3ee07f00; } }
-  @keyframes slot-lift { 0%, 100% { translate: 0 0 0; } 18% { translate: 0 0 12px; } }
   @media (prefers-reduced-motion: reduce) {
     .plate-surface, .module-surface { transition: none; }
     .world *, .world *::before, .world *::after { animation: none !important; }
