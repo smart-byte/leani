@@ -15,7 +15,7 @@ const analyticsHost = new URL(UMAMI_ORIGIN).host;
   <ul>
     <li>No cookies, accounts, forms, or advertising.</li>
     <li>Cloudflare delivers the site and processes connection data to do so.</li>
-    <li>Our own Umami server counts page views without cookies or stored IP addresses, and you can opt out.</li>
+    <li>Our own Umami server counts page views and a few clicks without cookies or stored IP addresses, and you can opt out.</li>
   </ul>
 
   <h2>Controller</h2>
@@ -47,11 +47,13 @@ const analyticsHost = new URL(UMAMI_ORIGIN).host;
     We count page views with Umami, open-source analytics that we run ourselves at {analyticsHost} on a
     server of Hetzner Online GmbH, Industriestr. 25, 91710 Gunzenhausen, Germany, located in
     Finland. Hetzner processes this data on our behalf under a data processing agreement (Art. 28
-    GDPR); nobody else receives it. When a page loads, a small script sends:
+    GDPR); nobody else receives it. When a page loads, and when you use one of a few controls, a
+    small script sends:
   </p>
   <ul>
     <li>the page's address, without query string or fragment, and its title;</li>
     <li>the website you came from, which browsers usually share only as a domain;</li>
+    <li>which control you used, such as copying a command, switching an example tab, or following a link to GitHub;</li>
     <li>your browser, operating system, device type, screen size, and language;</li>
     <li>your country, derived from your IP address.</li>
   </ul>

@@ -29,7 +29,7 @@ const commands = [HOMEBREW_INSTALL, 'leani subscribe blocks'];
       </p>
       <div class="cta">
         <a class="btn btn-primary" href="#quickstart">Quickstart →</a>
-        <a class="btn btn-ghost" href={GITHUB_URL}>GitHub ↗</a>
+        <a class="btn btn-ghost" href={GITHUB_URL} data-umami-event="outbound" data-umami-event-place="hero" data-umami-event-to="github">GitHub ↗</a>
       </div>
     </div>
 
@@ -42,13 +42,13 @@ const commands = [HOMEBREW_INSTALL, 'leani subscribe blocks'];
     <div class="run">
       <div class="command mono">
         <code>{commands.map((line) => (
-          <button type="button" class="line" data-copy-value={line} aria-label={`Copy ${line}`}><span class="prompt">$</span>{line}</button>
+          <button type="button" class="line" data-copy-value={line} aria-label={`Copy ${line}`} data-umami-event="copy" data-umami-event-place="hero" data-umami-event-item={line}><span class="prompt">$</span>{line}</button>
         ))}</code>
-        <button type="button" class="copy-button" data-copy-value={commands.join('\n')} aria-label="Copy install and run commands">
+        <button type="button" class="copy-button" data-copy-value={commands.join('\n')} aria-label="Copy install and run commands" data-umami-event="copy" data-umami-event-place="hero" data-umami-event-item="install and run">
           <svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.5" y="5.5" width="8" height="8" rx="1.6"/><path d="M10.5 3.2V3A1.5 1.5 0 0 0 9 1.5H3.5A1.5 1.5 0 0 0 2 3v5.5A1.5 1.5 0 0 0 3.5 10h.3"/></svg>
         </button>
       </div>
-      <p class="note mono">No API key. No config file. <a href={`${INSTALL_URL}#published-releases`}>Other platforms →</a> <span class="copied" role="status" aria-live="polite"></span></p>
+      <p class="note mono">No API key. No config file. <a href={`${INSTALL_URL}#published-releases`} data-umami-event="outbound" data-umami-event-place="hero" data-umami-event-to="install docs">Other platforms →</a> <span class="copied" role="status" aria-live="polite"></span></p>
     </div>
 
     <ul class="stats mono" aria-label="Measured facts">

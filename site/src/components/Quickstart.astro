@@ -72,9 +72,9 @@ const firstRows = session.rows.slice(0, 6);
         <span class="install-label">install</span>
         <div class="command" data-copy-value={HOMEBREW_INSTALL}>
           <span data-copy-source set:html={hlShell(HOMEBREW_INSTALL)} />
-          <button type="button" class="copy mono" data-copy-button aria-label="Copy install command">copy</button>
+          <button type="button" class="copy mono" data-copy-button aria-label="Copy install command" data-umami-event="copy" data-umami-event-place="follow" data-umami-event-item={HOMEBREW_INSTALL}>copy</button>
         </div>
-        <a class="install-more" href={`${INSTALL_URL}#published-releases`}>Other platforms →</a>
+        <a class="install-more" href={`${INSTALL_URL}#published-releases`} data-umami-event="outbound" data-umami-event-place="follow" data-umami-event-to="install docs">Other platforms →</a>
       </div>
       <p class="status mono" role="status" aria-live="polite" data-copy-status></p>
     </div>
@@ -87,6 +87,9 @@ const firstRows = session.rows.slice(0, 6);
           aria-controls={`follow-panel-${example.id}`}
           aria-selected={i === 0 ? 'true' : 'false'}
           tabindex={i === 0 ? 0 : -1}
+          data-umami-event="tab"
+          data-umami-event-group="follow"
+          data-umami-event-tab={example.id}
         >{i + 1} · {example.label}</button>
       ))}
     </div>
@@ -97,7 +100,7 @@ const firstRows = session.rows.slice(0, 6);
             <span data-copy-source>
               {example.html.map((line) => <span class="t-line" set:html={line} />)}
             </span>
-            <button type="button" class="copy mono" data-copy-button aria-label={`Copy the ${example.label} example`}>copy</button>
+            <button type="button" class="copy mono" data-copy-button aria-label={`Copy the ${example.label} example`} data-umami-event="copy" data-umami-event-place="follow" data-umami-event-item={`example: ${example.id}`}>copy</button>
           </div>
         </TerminalFrame>
         <p class="status mono" role="status" aria-live="polite" data-copy-status></p>
