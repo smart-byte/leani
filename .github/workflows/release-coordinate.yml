@@ -124,7 +124,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.RELEASE_CONTROL_TOKEN }}
         run: |
-          test -n "$GH_TOKEN" || { echo "configure the RELEASE_CONTROL_TOKEN secret on release-control (docs/contributing/releasing.md)" >&2; exit 1; }
+          test -n "$GH_TOKEN" || { echo "configure the RELEASE_CONTROL_TOKEN secret on release-control (docs/maintainers/releasing.md)" >&2; exit 1; }
           python3 scripts/coordinate-release.py open-pr --prepared "$RUNNER_TEMP/release-preparation/prepared.json"
 
   coordinate:
@@ -158,7 +158,7 @@ jobs:
           PROMOTE_SITE: ${{ inputs.promote_site }}
           RELEASE_COMMIT: ${{ inputs.release_commit }}
         run: |
-          test -n "$GH_TOKEN" || { echo "configure the RELEASE_CONTROL_TOKEN secret on release-control (docs/contributing/releasing.md)" >&2; exit 1; }
+          test -n "$GH_TOKEN" || { echo "configure the RELEASE_CONTROL_TOKEN secret on release-control (docs/maintainers/releasing.md)" >&2; exit 1; }
           mkdir -p "$RUNNER_TEMP/release-plan"
           if [ "$RELEASE_ACTION" = candidate ]; then
             set -- candidate "$RELEASE_VERSION" --output "$RUNNER_TEMP/release-plan/release-plan.json"
