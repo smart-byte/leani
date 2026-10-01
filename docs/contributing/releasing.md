@@ -20,10 +20,14 @@ from `main`. Enter an unprefixed version such as `0.1.0-rc.2`. It has three acti
    upgrade instructions and merge the PR after CI passes.
 2. **candidate** creates annotated `v<version>` and `sdk-v<version>` tags on the
    dispatch's reviewed `main` commit. Existing tags must already name that commit;
-   tags are never moved. It starts or reuses exact-commit CI, security, site,
-   container, binary, Rust-library, and SDK preparation runs. After all pass, it
-   verifies their artifacts and uploads `leani-release-plan-<version>` with run
-   IDs and file checksums. Keep this successful **Coordinate release run ID**.
+   tags are never moved. Before creating them, it waits for the CI, security,
+   site, and container runs that `main` already started for that commit and
+   stops if the latest one failed, so a known failure never reserves a version.
+   It then starts or reuses exact-commit CI, security, site, container, binary,
+   Rust-library, and SDK preparation runs. After all pass, it verifies their
+   artifacts and uploads `leani-release-plan-<version>` with run IDs and file
+   checksums. Keep this successful **Coordinate release run ID**; its summary
+   ends with the publication deadline.
 3. **publish** takes that coordinator run ID as `candidate_run_id`. It checks
    plan provenance, tags, checksums, and current CI, then dispatches the binary,
    Rust-library, SDK, and container publishers in order. Each retains its own
@@ -32,12 +36,16 @@ from `main`. Enter an unprefixed version such as `0.1.0-rc.2`. It has three acti
    published and verified.
 
 The prepare and candidate actions do not publish release artifacts; candidate
-reserves both release tags. Plans and artifacts expire after 14 days. To
-regenerate older candidates, run candidate from `main` with `release_commit`
-set to the original release's exact SHA. That commit must be on `main`, its
-package versions must match, and its existing tags must still point to it.
-Publishing an existing plan also remains possible after `main` advances. The
-plan binds both the released source and the reviewed coordinator revision.
+reserves both release tags. Plans expire after 14 days. A reused preparation
+run's artifacts can expire sooner, so publish before the deadline in the
+candidate summary. To regenerate older candidates, run candidate from `main`
+with `release_commit` set to the original release's exact SHA. That commit must
+be on `main`, its package versions must match, and its existing tags must still
+point to it. Publishing an existing plan also remains possible after `main`
+advances. The plan binds both the released source and the reviewed coordinator
+revision. Publishers run the workflow files of the release tag, so the
+coordinator can only publish releases whose commit already contains it
+(`0.1.0-rc.2` onward).
 
 If publication fails, rerun **publish** with the same candidate run ID. It checks
 GitHub asset hashes, crates.io checksums, npm archive integrity, and GHCR image
@@ -60,20 +68,22 @@ and administrator bypass restriction as the publishing environments below. Allow
 only the `main` **branch**. Its write jobs are also restricted to `main` by YAML
 and the release workflow policy checker.
 
-For automatic tags, add `RELEASE_CONTROL_TOKEN` as an environment secret on
+Add the required `RELEASE_CONTROL_TOKEN` as an environment secret on
 `release-control`. Use a repository-scoped fine-grained token owned by a release
 maintainer already allowed by the tag ruleset, with Contents, Pull requests,
 Actions, and Workflows read/write permissions. Do not add GitHub Actions to the
-tag ruleset's bypass list. An appropriately authorized GitHub App installation
-credential can serve the same purpose. The coordinator otherwise falls back to
-`GITHUB_TOKEN`: it can dispatch workflows and open PRs when repository settings
-permit, but cannot bypass protected release tags.
+tag ruleset's bypass list. The coordinator never falls back to
+`GITHUB_TOKEN`, which stays read-only: a pull request or tag it creates starts
+no workflow runs, so the preparation PR would never receive CI, and the tag
+ruleset refuses its tags.
 
-A preparation PR created with `GITHUB_TOKEN` may require approval of its CI runs;
-a maintainer or App credential avoids that requirement. Registries still trust
-`crates-release.yml` and `sdk-release.yml`; no registry token belongs in
-`release-control`. Its approval authorizes coordination and does not replace
-the publishers' environment approvals.
+Registries still trust `crates-release.yml` and `sdk-release.yml`; no registry
+token belongs in `release-control`. Its approval authorizes coordination and
+does not replace the publishers' environment approvals.
+
+Make the `leani` GHCR package public before the first coordinated publication
+(step 7 of release verification below). The coordinator checks published images
+anonymously and stops when GHCR refuses access.
 
 For site promotion, leave Cloudflare's production `LEANI_DOCS_REF` unset. The
 production builder derives the release tag from the promoted workspace version.
@@ -136,14 +146,15 @@ without building or installing project code:
 | `crates-release.yml` | `release-crates` | `contents: read`, `actions: read`, `id-token: write` | `v*` tag |
 | `sdk-release.yml` | `release-npm` | `actions: read`, `id-token: write` | `sdk-v*` tag |
 | `site-promote.yml` | `site-production` | `contents: write` | `v*` tag |
-| `release-coordinate.yml` preparation PR | `release-control` | `contents: write`, `pull-requests: write` | `main` |
-| `release-coordinate.yml` coordination | `release-control` | `contents: write`, `actions: write` | `main` |
+| `release-coordinate.yml` preparation PR | `release-control` | `contents: read` | `main` |
+| `release-coordinate.yml` coordination | `release-control` | `contents: read`, `actions: read` | `main` |
 
 No other job may request a write permission, `id-token: write` included, read
 a secret, or keep its checkout credentials. The crates.io publish job checks out
 the repository because Cargo cannot upload a prepared archive. The coordinator
 checks out reviewed control scripts, without building or installing project
-dependencies. npm publishes a local archive file named right after `publish`. No workflow
+dependencies, and writes only with its `RELEASE_CONTROL_TOKEN` secret. npm
+publishes a local archive file named right after `publish`. No workflow
 may run on `pull_request_target` or `workflow_run`: both run with the base
 repository's token, secrets, and cache on behalf of events a pull request
 controls.
@@ -235,7 +246,9 @@ validation runs to succeed. The coordinator publishes in this order:
 A standalone publisher must also supply `container_candidate_run_id`; container
 publication uses its own `candidate_run_id`. To regenerate expired images,
 dispatch `container.yml` from the `v*` tag with `publish=false` and use the new
-preparation run ID for subsequent publications.
+preparation run ID for subsequent publications. Builds and publications of a
+ref use separate concurrency groups, so such a build never cancels a
+publication awaiting approval.
 
 ### Provenance and dependency updates
 

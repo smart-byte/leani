@@ -1,5 +1,5 @@
 name: Container candidate
-run-name: Container candidate${{ inputs.release_request && format(' [{0}]', inputs.release_request) || '' }}
+run-name: ${{ inputs.release_request && format('Container candidate [{0}]', inputs.release_request) || '' }}
 
 on:
   push:
@@ -29,9 +29,10 @@ on:
 permissions:
   contents: read
 
+# A later build of the same ref must never cancel a publication awaiting approval.
 concurrency:
-  group: container-${{ github.ref }}
-  cancel-in-progress: true
+  group: container-${{ github.ref }}-${{ inputs.publish && 'publish' || 'build' }}
+  cancel-in-progress: ${{ !inputs.publish }}
 
 jobs:
   build-and-scan:

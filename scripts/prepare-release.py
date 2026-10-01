@@ -23,9 +23,9 @@ def prepare(requested, output):
     files = {}
 
     def update(path, transform):
-        original = Path(path).read_text()
-        changed = transform(original)
-        if changed != original:
+        current = files.get(path, Path(path).read_text())
+        changed = transform(current)
+        if changed != current:
             files[path] = changed
 
     def replace_once(text, before, after):
@@ -70,15 +70,14 @@ def prepare(requested, output):
     update("packages/sdk/src/index.ts", lambda text: replace_once(text, f'SDK_VERSION = "{old}"', f'SDK_VERSION = "{requested}"'))
     # Only current install instructions change. Historical migration notes,
     # processor versions, schema numbers, and the API contract remain intact.
-    for path in ("README.md", "docs/getting-started/install.mdx"):
-        update(path, lambda text: text.replace(old, requested))
+    # A whole version token only: 0.1.0 must not rewrite 10.1.0 or 0.1.0-rc.1.
+    current_version = r"(?<![\d.])" + re.escape(old) + r"(?!\w|\.\d|-rc\.)"
+    for path in ("README.md", "docs/getting-started/install.mdx", "skills/leani/references/processors.md"):
+        update(path, lambda text: re.sub(current_version, requested, text))
     documents = ["packages/sdk/README.md", *git("ls-files", "docs/*.md", "docs/*.mdx", "docs/**/*.md", "docs/**/*.mdx").splitlines()]
+    install = r"(\b(?:bun\s+add|npm\s+(?:install|i)|pnpm\s+add|yarn\s+add)\b[^\n`]*?@smart-byte/leani-sdk@)" + re.escape(old) + r"(?=[\s`'\"]|$)"
     for path in documents:
-        text = files.get(path, Path(path).read_text())
-        install = r"(\b(?:bun\s+add|npm\s+(?:install|i)|pnpm\s+add|yarn\s+add)\b[^\n`]*?@smart-byte/leani-sdk@)" + re.escape(old) + r"(?=[\s`'\"]|$)"
-        changed = re.sub(install, lambda match: match[1] + requested, text)
-        if changed != Path(path).read_text():
-            files[path] = changed
+        update(path, lambda text: re.sub(install, lambda match: match[1] + requested, text))
     date = datetime.now(timezone.utc).date().isoformat()
     def changelog(text):
         if text.count("## [Unreleased]") != 1:
@@ -90,7 +89,7 @@ def prepare(requested, output):
         return before + f"## [Unreleased]\n\n## [{requested}] - {date}" + current + entries[boundary:]
     update("CHANGELOG.md", changelog)
     if "-rc." not in requested:
-        files["README.md"] = files["README.md"].replace("Status: pre-release preview", "Status: stable release", 1)
+        update("README.md", lambda text: text.replace("Status: pre-release preview", "Status: stable release", 1))
     # Compute everything before writing, so a malformed manifest cannot leave
     # a half-prepared checkout.
     for path, contents in files.items():
@@ -107,6 +106,6 @@ if __name__ == "__main__":
     args = parser.parse_args()
     try:
         prepare(args.version, args.output)
-    except (ReleaseError, KeyError, ValueError) as error:
+    except (ReleaseError, KeyError, ValueError, OSError) as error:
         print(f"release preparation: {error}", file=sys.stderr)
         sys.exit(1)

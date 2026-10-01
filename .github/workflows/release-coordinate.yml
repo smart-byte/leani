@@ -108,9 +108,10 @@ jobs:
     if: github.ref == 'refs/heads/main' && inputs.action == 'prepare'
     runs-on: ubuntu-24.04
     environment: release-control
+    # Writes use RELEASE_CONTROL_TOKEN: a PR or tag created by GITHUB_TOKEN
+    # starts no CI, and the tag ruleset refuses it.
     permissions:
-      contents: write
-      pull-requests: write
+      contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -121,8 +122,10 @@ jobs:
           path: ${{ runner.temp }}/release-preparation
       - name: Open the reviewed version update
         env:
-          GH_TOKEN: ${{ secrets.RELEASE_CONTROL_TOKEN || github.token }}
-        run: python3 scripts/coordinate-release.py open-pr --prepared "$RUNNER_TEMP/release-preparation/prepared.json"
+          GH_TOKEN: ${{ secrets.RELEASE_CONTROL_TOKEN }}
+        run: |
+          test -n "$GH_TOKEN" || { echo "configure the RELEASE_CONTROL_TOKEN secret on release-control (docs/contributing/releasing.md)" >&2; exit 1; }
+          python3 scripts/coordinate-release.py open-pr --prepared "$RUNNER_TEMP/release-preparation/prepared.json"
 
   coordinate:
     name: Coordinate candidates and publication
@@ -132,8 +135,8 @@ jobs:
     timeout-minutes: 300
     environment: release-control
     permissions:
-      contents: write
-      actions: write
+      contents: read
+      actions: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -148,13 +151,14 @@ jobs:
           github-token: ${{ github.token }}
       - name: Coordinate release workflows
         env:
-          GH_TOKEN: ${{ secrets.RELEASE_CONTROL_TOKEN || github.token }}
+          GH_TOKEN: ${{ secrets.RELEASE_CONTROL_TOKEN }}
           RELEASE_ACTION: ${{ inputs.action }}
           RELEASE_VERSION: ${{ inputs.version }}
           CANDIDATE_RUN_ID: ${{ inputs.candidate_run_id }}
           PROMOTE_SITE: ${{ inputs.promote_site }}
           RELEASE_COMMIT: ${{ inputs.release_commit }}
         run: |
+          test -n "$GH_TOKEN" || { echo "configure the RELEASE_CONTROL_TOKEN secret on release-control (docs/contributing/releasing.md)" >&2; exit 1; }
           mkdir -p "$RUNNER_TEMP/release-plan"
           if [ "$RELEASE_ACTION" = candidate ]; then
             set -- candidate "$RELEASE_VERSION" --output "$RUNNER_TEMP/release-plan/release-plan.json"
