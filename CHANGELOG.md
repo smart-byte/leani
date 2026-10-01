@@ -6,6 +6,8 @@ record, and documented RPC contracts.
 
 ## [Unreleased]
 
+## [0.1.0-rc.2] - 2026-10-01
+
 ### Upgrading from 0.1.0-rc.1
 
 Take these steps in order; each links to the entries below that detail it.
@@ -45,7 +47,7 @@ Take these steps in order; each links to the entries below that detail it.
    output ([windowed](#rc1-windowed)). A refused start leaves the store
    unchanged.
 4. Upgrade the SDK with the node, by exact version:
-   `bun add @smart-byte/leani-sdk@<version>` ([SDK](#rc1-sdk)).
+   `bun add @smart-byte/leani-sdk@0.1.0-rc.2` ([SDK](#rc1-sdk)).
 5. Update HTTP and JSON-RPC clients that do not use the SDK: a JSON body or
    `x-leani-request: 1` on mutations, POST to create query snapshots
    ([HTTP](#rc1-http-clients)), consumer credentials and acknowledgements

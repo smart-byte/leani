@@ -20,9 +20,9 @@ async-trait.workspace = true
 blake3.workspace = true
 futures.workspace = true
 hex.workspace = true
-leani-primitives = { version = "=0.1.0-rc.1", path = "../primitives" }
-leani-processor-api = { version = "=0.1.0-rc.1", path = "../processor-api" }
-leani-source-api = { version = "=0.1.0-rc.1", path = "../source-api" }
+leani-primitives = { version = "=0.1.0-rc.2", path = "../primitives" }
+leani-processor-api = { version = "=0.1.0-rc.2", path = "../processor-api" }
+leani-source-api = { version = "=0.1.0-rc.2", path = "../source-api" }
 semver.workspace = true
 serde.workspace = true
 sha2.workspace = true
