@@ -1,5 +1,5 @@
 name: Prepare SDK release
-run-name: Prepare SDK release${{ inputs.release_request && format(' [{0}]', inputs.release_request) || '' }}
+run-name: ${{ inputs.release_request && format('Prepare SDK release [{0}]', inputs.release_request) || '' }}
 
 on:
   workflow_dispatch:

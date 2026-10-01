@@ -40,6 +40,7 @@ class Preparation(unittest.TestCase):
             "docs/getting-started/install.mdx": 'Expect `leani 0.1.0-rc.1`.\nbun add @smart-byte/leani-sdk@0.1.0-rc.1\n',
             "docs/operations/upgrade.md": 'The rc.1 store has schema 21.\nbun add @smart-byte/leani-sdk@0.1.0-rc.1\n',
             "docs/adr/history.md": 'Version 0.1.0-rc.1 used schema 21; the migration goes to schema 23.\n',
+            "skills/leani/references/processors.md": '(`https://raw.githubusercontent.com/smart-byte/leani/v0.1.0-rc.1/examples/node.toml`\nfor 0.1.0-rc.1).\n',
             "CHANGELOG.md": '# Changelog\n\n## [Unreleased]\n\n### Upgrading from 0.1.0-rc.1\n\nBack up schema 21 before upgrading to 23.\nbun add @smart-byte/leani-sdk@<version>\n\n## [0.1.0-rc.1]\n\nOriginal release.\n',
         }
         members = {"node": "leani", "primitives": "leani-primitives", "processor-api": "leani-processor-api", "source-api": "leani-source-api", "testkit": "leani-testkit"}
@@ -77,10 +78,25 @@ class Preparation(unittest.TestCase):
                                  str(self.root / "README.md"), str(self.root / "docs/operations/upgrade.md")], text=True, capture_output=True)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual((self.root / "docs/adr/history.md").read_text(), 'Version 0.1.0-rc.1 used schema 21; the migration goes to schema 23.\n')
+        self.assertEqual((self.root / "skills/leani/references/processors.md").read_text(),
+                         '(`https://raw.githubusercontent.com/smart-byte/leani/v0.1.0-rc.2/examples/node.toml`\nfor 0.1.0-rc.2).\n')
         changelog = (self.root / "CHANGELOG.md").read_text()
         self.assertIn("### Upgrading from 0.1.0-rc.1", changelog)
         self.assertIn("Back up schema 21 before upgrading to 23.", changelog)
         self.assertIn("## [0.1.0-rc.2]", changelog)
+
+    def test_stable_releases_update_status_and_only_whole_version_tokens(self):
+        result = self.prepare("0.1.0")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Status: stable release (`v0.1.0`).", (self.root / "README.md").read_text())
+        with (self.root / "README.md").open("a") as stream:
+            stream.write("Previously previewed as `v0.1.0-rc.1`.\n")
+        self.run_git("-c", "user.name=Release fixture", "-c", "user.email=fixture@example.invalid", "commit", "-qam", "stable")
+        result = self.prepare("0.1.1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        readme = (self.root / "README.md").read_text()
+        self.assertIn("Status: stable release (`v0.1.1`).", readme)
+        self.assertIn("Previously previewed as `v0.1.0-rc.1`.", readme)
 
     def test_preparation_error_leaves_every_tracked_file_unchanged(self):
         (self.root / "CHANGELOG.md").write_text("Missing unreleased heading\n")
@@ -116,6 +132,12 @@ class Publication(unittest.TestCase):
         self.unreviewed_source = False
         self.pending_crates = False
         self.bad_asset = False
+        self.draft_assets = None
+        self.missing_tags = False
+        self.created = []
+        self.failed_gate = None
+        self.compare_status = "identical"
+        self.sdk_lag = 0
         self.files = {}
         self.run_ids = {stage: index + 10 for index, stage in enumerate(release.WORKFLOWS)}
 
@@ -158,30 +180,47 @@ class Publication(unittest.TestCase):
                 "head_branch": "feature" if run_id == 99 and self.unreviewed_source else "main",
                 "status": "completed", "conclusion": "success", "name": workflow, "html_url": f"https://github.com/example/leani/actions/runs/{run_id}"}
 
+    def github_release(self):
+        assets = [{"name": path.name, "id": index, "digest": "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()}
+                  for index, path in enumerate(sorted(self.binary.iterdir()))]
+        if self.bad_asset:
+            assets[0]["digest"] = "sha256:" + "0" * 64
+        record = {"tag_name": f"v{self.version}", "prerelease": "-rc." in self.version}
+        if self.draft_assets is not None:
+            return {**record, "draft": True, "assets": assets[:self.draft_assets]}
+        return {**record, "draft": False, "assets": assets} if "binaries" in self.published else None
+
     def api(self, path, data=None, missing=False):
         if path.startswith("compare/"):
-            return {"status": "identical"}
+            return {"status": self.compare_status}
         if path.startswith("git/ref/tags/"):
-            return {"object": {"type": "tag", "sha": "b" * 40}}
+            return None if self.missing_tags else {"object": {"type": "tag", "sha": "b" * 40}}
+        if path in ("git/tags", "git/refs"):
+            self.created.append(path)
+            return {"sha": "d" * 40}
         if path.startswith("git/tags/"):
             return {"object": {"type": "commit", "sha": "c" * 40 if self.moved_tag else self.sha}}
+        if path == "releases?per_page=100":
+            record = self.github_release()
+            return [record] if record else []
         if path.startswith("releases/tags/"):
-            if "binaries" not in self.published:
-                return None
-            assets = [{"name": path.name, "digest": "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()} for path in self.binary.iterdir()]
-            if self.bad_asset:
-                assets[0]["digest"] = "sha256:" + "0" * 64
-            return {"draft": False, "prerelease": "-rc." in self.version, "assets": assets}
+            # Like GitHub, the tag lookup only returns a published release.
+            record = self.github_release()
+            return record if record and not record["draft"] else None
         if path.endswith("/dispatches"):
             self.dispatches.append((path, data))
             self.last_dispatch = path.split('/')[2]
             if self.last_dispatch != self.failed_workflow:
                 self.published.add(next(stage for stage, workflow in release.WORKFLOWS.items() if workflow == self.last_dispatch))
+                if self.last_dispatch == "release.yml":
+                    self.draft_assets = None
             return {"workflow_run_id": 900}
         if path.startswith("actions/workflows/"):
             workflow = path.split('/')[2]
             stage = next(stage for stage, value in release.WORKFLOWS.items() if value == workflow)
             runs = [self.run_record(self.run_ids[stage], workflow)]
+            if stage == self.failed_gate:
+                runs.insert(0, {**self.run_record(500, workflow), "event": "push", "conclusion": "failure"})
             if stage == "crates" and self.pending_crates:
                 waiting = self.run_record(900, workflow)
                 waiting.update(status="waiting", conclusion=None,
@@ -192,7 +231,8 @@ class Publication(unittest.TestCase):
             run_id = int(path.split('/')[2])
             stage = next(stage for stage, value in self.run_ids.items() if value == run_id)
             names = release.Coordinator(self.gh).artifact_names(stage, self.version)
-            return {"total_count": len(names), "artifacts": [{"name": name, "expired": False} for name in names]}
+            return {"total_count": len(names), "artifacts": [{"name": name, "expired": False, "expires_at": f"2026-10-{run_id}T00:00:00Z"}
+                                                            for name in names]}
         if path.startswith("actions/runs/"):
             run_id = int(path.split('/')[2])
             if run_id == 900 and self.pending_crates:
@@ -220,6 +260,9 @@ class Publication(unittest.TestCase):
             return {"version": {"checksum": hashlib.sha256((self.crates / f"{name}-{self.version}.crate").read_bytes()).hexdigest()}}
         if "sdk" not in self.published:
             return None
+        if self.sdk_lag:
+            self.sdk_lag -= 1
+            return None
         return {"version": self.version, "dist": {"integrity": "sha512-" + release.base64.b64encode(
             hashlib.sha512((self.sdk / f"smart-byte-leani-sdk-{self.version}.tgz").read_bytes()).digest()).decode()}}
 
@@ -234,7 +277,8 @@ class Publication(unittest.TestCase):
     @contextmanager
     def services(self):
         with patch.object(self.gh, "api", side_effect=self.api), patch.object(release, "command", side_effect=self.download), \
-                patch.object(release, "registry_json", side_effect=self.registry), patch.object(release, "image_manifest", side_effect=self.image):
+                patch.object(release, "registry_json", side_effect=self.registry), patch.object(release, "image_manifest", side_effect=self.image), \
+                patch.object(release.time, "sleep"):
             yield release.Coordinator(self.gh)
 
     def test_partial_release_only_dispatches_the_unfinished_publisher(self):
@@ -244,9 +288,10 @@ class Publication(unittest.TestCase):
         path, request = self.dispatches[0]
         self.assertEqual(path, "actions/workflows/crates-release.yml/dispatches")
         self.assertEqual(request["ref"], f"v{self.version}")
+        self.assertTrue(request["return_run_details"])
         self.assertEqual(request["inputs"]["candidate_run_id"], str(self.run_ids["crates"]))
         self.assertEqual(request["inputs"]["container_candidate_run_id"], str(self.run_ids["container"]))
-        self.assertFalse(request["inputs"]["bootstrap"])
+        self.assertEqual(request["inputs"]["bootstrap"], "false")
 
     def test_candidate_records_the_verified_runs_and_artifact_hashes(self):
         output = self.root / "candidate-plan.json"
@@ -259,10 +304,54 @@ class Publication(unittest.TestCase):
         self.assertEqual(plan["runs"], self.run_ids)
         self.assertEqual(plan["artifacts"], self.plan["artifacts"])
         self.assertEqual(self.dispatches, [])
+        # The container preparation run's artifacts expire first.
+        self.assertTrue(coordinator.messages[-1].endswith(f"before 2026-10-{self.run_ids['container']}T00:00:00Z"))
+
+    def test_known_failure_on_main_stops_before_release_tags_exist(self):
+        self.missing_tags = True
+        self.failed_gate = "ci"
+        with self.services() as coordinator, self.assertRaisesRegex(ReleaseError, "before reserving release tags"):
+            coordinator.candidate(self.version, self.root / "candidate-plan.json")
+        self.assertEqual(self.created, [])
 
     def test_different_published_bytes_stop_before_any_publisher_is_dispatched(self):
         self.bad_asset = True
         with self.services() as coordinator, self.assertRaisesRegex(ReleaseError, "asset differs"):
+            coordinator.publish(self.plan, 99)
+        self.assertEqual(self.dispatches, [])
+
+    def test_partial_draft_with_different_bytes_stops_before_any_publisher_is_dispatched(self):
+        self.published.clear()
+        self.draft_assets = 2
+        self.bad_asset = True
+        with self.services() as coordinator, self.assertRaisesRegex(ReleaseError, "asset differs"):
+            coordinator.publish(self.plan, 99)
+        self.assertEqual(self.dispatches, [])
+
+    def test_matching_partial_draft_is_finished_by_the_binary_publisher(self):
+        self.published.discard("binaries")
+        self.draft_assets = 2
+        with self.services() as coordinator:
+            coordinator.publish(self.plan, 99)
+        self.assertEqual([path.split('/')[2] for path, _ in self.dispatches], ["release.yml", "crates-release.yml"])
+
+    def test_registry_lag_after_publication_is_awaited(self):
+        self.published.discard("sdk")
+        self.partial_crates = set(CRATES)
+        self.sdk_lag = 2
+        with self.services() as coordinator:
+            coordinator.publish(self.plan, 99)
+        self.assertEqual([path.split('/')[2] for path, _ in self.dispatches], ["sdk-release.yml"])
+
+    def test_newer_failed_validation_blocks_publication(self):
+        self.failed_gate = "security"
+        with self.services() as coordinator, self.assertRaisesRegex(ReleaseError, "latest security validation must pass"):
+            coordinator.publish(self.plan, 99)
+        self.assertEqual(self.dispatches, [])
+
+    def test_release_commit_outside_main_is_rejected(self):
+        self.compare_status = "diverged"
+        with self.services() as coordinator, self.assertRaisesRegex(ReleaseError, "must be on main"):
             coordinator.publish(self.plan, 99)
         self.assertEqual(self.dispatches, [])
 
@@ -323,6 +412,55 @@ class Publication(unittest.TestCase):
         with self.services() as coordinator, self.assertRaisesRegex(ReleaseError, "checksum mismatch"):
             coordinator.publish(self.plan, 99)
         self.assertEqual(self.dispatches, [])
+
+
+class PreparationPullRequest(unittest.TestCase):
+    def setUp(self):
+        self.requests = []
+        self.changed_on_main = []
+        self.payload = {"schema": 1, "version": "0.1.0-rc.2", "base_sha": "a" * 40,
+                        "files": {"Cargo.toml": "version\n", "Cargo.lock": "lock\n", "CHANGELOG.md": "changes\n"}}
+
+    def api(self, path, data=None, missing=False):
+        self.requests.append((path, data))
+        responses = {"commits/main": {"sha": "b" * 40, "commit": {"tree": {"sha": "c" * 40}}},
+                     "git/trees": {"sha": "d" * 40}, "git/commits": {"sha": "e" * 40}, "git/refs": {},
+                     "pulls": {"html_url": "https://github.com/example/leani/pull/1"}}
+        if path in responses:
+            return responses[path]
+        if path.startswith("compare/"):
+            return {"status": "ahead", "files": [{"filename": name} for name in self.changed_on_main]}
+        if path.startswith("git/ref/heads/"):
+            return None
+        if path.startswith("pulls?"):
+            return []
+        raise AssertionError(f"unexpected GitHub API request: {path}")
+
+    def open_pr(self):
+        gh = GitHub("example/leani")
+        with patch.object(gh, "api", side_effect=self.api):
+            release.Coordinator(gh).open_pr(self.payload)
+
+    def writes(self):
+        return [path for path, data in self.requests if data is not None]
+
+    def test_main_advancing_elsewhere_bases_the_release_on_current_main(self):
+        self.changed_on_main = ["crates/node/src/main.rs"]
+        self.open_pr()
+        commit = next(data for path, data in self.requests if path == "git/commits")
+        self.assertEqual(commit["parents"], ["b" * 40])
+
+    def test_main_changing_a_prepared_file_stops_before_any_write(self):
+        self.changed_on_main = ["Cargo.lock"]
+        with self.assertRaisesRegex(ReleaseError, "rerun prepare"):
+            self.open_pr()
+        self.assertEqual(self.writes(), [])
+
+    def test_files_outside_the_release_allowlist_are_refused_before_any_write(self):
+        self.payload["files"][".github/workflows/ci.yml"] = "on: push\n"
+        with self.assertRaisesRegex(ReleaseError, "unexpected file"):
+            self.open_pr()
+        self.assertEqual(self.writes(), [])
 
 
 if __name__ == "__main__":

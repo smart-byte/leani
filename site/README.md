@@ -51,10 +51,11 @@ Configure these Pages build variables:
 | `LEANI_SITE_MODE` | `production` | `preview` |
 | `LEANI_DOCS_REF` | Unset (derived from the promoted workspace version), or the matching release tag | Unset (branch-derived) |
 
-Set the production `LEANI_DOCS_REF` to the release being promoted before running
-the promotion workflow. A production build fails unless its documentation ref,
-`LEANI_DOCS_REF` or else the commit's exact `v*` tag, equals `v` followed by the
-workspace version, so a stale value fails the deployment instead of linking to
-an earlier release. Leave the preview value unset: each preview then links to
+Leave the production `LEANI_DOCS_REF` unset so each promotion derives its ref
+from the workspace version; an explicit value must be updated to the release
+being promoted before running the promotion workflow. A production build fails
+unless its documentation ref, `LEANI_DOCS_REF` or else the commit's exact `v*`
+tag, equals `v` followed by the workspace version, so a stale value fails the
+deployment instead of linking to an earlier release. Leave the preview value unset: each preview then links to
 its own branch, `main` for the main preview. Git integration manages builds
 without a Cloudflare token in GitHub Actions.

@@ -9,8 +9,9 @@ require "yaml"
 # jobs built and tested. Changing a permission set here is a release-policy
 # change: document it in docs/contributing/releasing.md.
 module ReleaseWorkflowPolicy
-# Crates.io repackages the tested commit. The coordinator checks out reviewed
-# release control scripts, but never builds packages with its write token.
+  # Crates.io repackages the tested commit. The coordinator checks out reviewed
+  # release control scripts and writes only with its release-control credential;
+  # its workflow token stays read-only.
   PUBLISH_JOBS = {
     "release.yml" => {
       "publish" => {
@@ -44,12 +45,12 @@ module ReleaseWorkflowPolicy
       "prepare" => {
         environment: "release-control", artifact: true, checkout: true, controller: true,
         condition: "github.ref == 'refs/heads/main' && inputs.action == 'prepare'",
-        permissions: { "contents" => "write", "pull-requests" => "write" },
+        permissions: { "contents" => "read" },
       },
       "coordinate" => {
         environment: "release-control", artifact: false, checkout: true, controller: true,
         condition: "github.ref == 'refs/heads/main' && inputs.action != 'prepare'",
-        permissions: { "contents" => "write", "actions" => "write" },
+        permissions: { "contents" => "read", "actions" => "read" },
       },
     },
   }.freeze

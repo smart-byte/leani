@@ -1,6 +1,6 @@
 # ADR 0019: Coordinated release preparation and publication
 
-Status: proposed
+Status: accepted
 
 Date: 2026-09-30
 
@@ -23,12 +23,15 @@ that verified plan and dispatches the existing publishers in order.
 
 Keep publisher workflow filenames, environments, and registry OIDC identities.
 Use separate `workflow_dispatch` runs rather than moving registry publication
-into a reusable workflow with a different caller identity. The controller gets
-Contents/Actions write access only in `release-control`, with required reviewers,
-self-review and administrator bypass disabled, and deployment limited to `main`.
-It has no registry OIDC access and does not build packages with its write token.
-Automatic tags use a maintainer credential allowed by the existing tag ruleset;
-GitHub Actions is not added to that bypass list.
+into a reusable workflow with a different caller identity. The controller writes
+only with a maintainer credential held in `release-control`, with required
+reviewers, self-review and administrator bypass disabled, and deployment limited
+to `main`; its `GITHUB_TOKEN` stays read-only. A pull request or tag created by
+`GITHUB_TOKEN` would start no workflow runs, and the existing tag ruleset admits
+the maintainer credential; GitHub Actions is not added to that bypass list. The
+controller has no registry OIDC access and does not build packages with its
+credential. Because tags are never moved, candidate generation first requires
+the commit's existing CI, security, site, and container runs to have passed.
 
 Every publisher verifies an explicit successful container preparation ID and its
 unexpired artifacts. Actual CI, security, and site gates still require their

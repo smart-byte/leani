@@ -72,24 +72,20 @@ def image_manifest(ref):
     result = subprocess.run(["docker", "buildx", "imagetools", "inspect", ref, "--raw"],
                             text=True, capture_output=True, timeout=180)
     if result.returncode:
-        if "not found" in result.stderr.lower() or "manifest unknown" in result.stderr.lower():
+        error = result.stderr.lower()
+        if "not found" in error or "manifest unknown" in error:
             return None
-        raise ReleaseError("unable to verify GHCR image; check package visibility and registry access")
+        if "unauthorized" in error or "denied" in error:
+            raise ReleaseError("GHCR refused anonymous access; make the leani package public (docs/contributing/releasing.md)")
+        raise ReleaseError("unable to verify GHCR image; check registry access")
     return json.loads(result.stdout)
 
 
-def container_published(directory, repository, release):
+def container_published(expected, repository, release):
     image = f"ghcr.io/{repository.lower()}"
-    expected = {}
-    for arch in ("amd64", "arm64"):
-        root = Path(directory) / f"leani-container-{arch}"
-        expected[arch] = (root / "image.id").read_text().strip()
-        if not re.fullmatch(r"sha256:[a-f0-9]{64}", expected[arch]):
-            raise ReleaseError("invalid candidate image identity")
-        if verify_sums(root) != {f"leani-container-{arch}.tar.gz", f"leani-container-{arch}.cdx.json", "image.id"}:
-            raise ReleaseError("container candidate inventory is incomplete")
+    for arch, identity in expected.items():
         existing = image_manifest(f"{image}:v{release}-{arch}")
-        if existing is not None and existing.get("config", {}).get("digest") != expected[arch]:
+        if existing is not None and existing.get("config", {}).get("digest") != identity:
             raise ReleaseError(f"GHCR already has a different {arch} image for v{release}")
     index = image_manifest(f"{image}:v{release}")
     if index is None:
@@ -111,25 +107,35 @@ def container_published(directory, repository, release):
     return found == set(expected)
 
 
-def release_published(gh, directory, release):
-    existing = gh.api(f"releases/tags/v{release}", missing=True)
+def github_release(gh, tag):
+    # releases/tags/{tag} hides drafts, and a retry must find a partial draft.
+    # ponytail: newest 100 releases; a retry follows its draft closely.
+    matches = [item for item in gh.api("releases?per_page=100") if item["tag_name"] == tag]
+    if len(matches) > 1:
+        raise ReleaseError(f"several GitHub releases use {tag}; delete the extra drafts")
+    return matches[0] if matches else None
+
+
+def asset_digest(gh, asset):
+    if asset.get("digest"):
+        return asset["digest"]
+    result = subprocess.run(["gh", "api", "-H", "Accept: application/octet-stream", f"{gh.prefix}/releases/assets/{asset['id']}"],
+                            capture_output=True, timeout=600)
+    if result.returncode:
+        raise ReleaseError(f"unable to download GitHub release asset {asset['name']}")
+    return "sha256:" + hashlib.sha256(result.stdout).hexdigest()
+
+
+def release_published(gh, expected, release):
+    existing = github_release(gh, f"v{release}")
     if existing is None:
         return False
-    expected = file_hashes(directory)
     assets = {item["name"]: item for item in existing["assets"]}
     if any(name not in expected for name in assets):
         raise ReleaseError("GitHub release contains unexpected assets")
-    with tempfile.TemporaryDirectory(prefix="leani-published-assets-") as temporary:
-        for name, asset in assets.items():
-            digest = asset.get("digest")
-            if digest:
-                actual = digest
-            else:
-                command("gh", "release", "download", f"v{release}", "--repo", gh.repository,
-                        "--pattern", name, "--dir", temporary)
-                actual = "sha256:" + sha256(Path(temporary) / name)
-            if actual != "sha256:" + expected[name]:
-                raise ReleaseError(f"GitHub release asset differs from the candidate: {name}")
+    for name, asset in assets.items():
+        if asset_digest(gh, asset) != "sha256:" + expected[name]:
+            raise ReleaseError(f"GitHub release asset differs from the candidate: {name}")
     if existing["draft"]:
         return False
     if set(assets) != set(expected) or bool(existing["prerelease"]) != ("-rc." in release):
@@ -161,19 +167,17 @@ class Coordinator:
         return sorted((run for run in result["workflow_runs"] if run["head_sha"] == commit
                        and run["event"] in ("push", "workflow_dispatch")), key=lambda run: run["id"], reverse=True)
 
-    def dispatch(self, workflow, ref, commit, inputs=None, request_prefix="leani"):
-        request_id = f"{request_prefix}-{uuid.uuid4().hex}"
-        inputs = {**(inputs or {}), "release_request": request_id}
-        result = self.gh.api(f"actions/workflows/{workflow}/dispatches", {"ref": ref, "inputs": inputs})
-        if result and result.get("workflow_run_id"):
-            return result["workflow_run_id"]
-        # Older GitHub API versions return 204 instead of the run ID. The
-        # unique run name prevents another maintainer's dispatch being selected.
-        while True:
-            for run in self.runs(workflow, commit):
-                if f"[{request_id}]" in run.get("display_title", ""):
-                    return run["id"]
-            self.pause()
+    def dispatch(self, workflow, ref, inputs, request_prefix=None):
+        # String values are valid for every workflow_dispatch input type.
+        inputs = {key: str(value).lower() if isinstance(value, bool) else str(value) for key, value in inputs.items()}
+        if request_prefix:
+            # The unique run name lets a retry rejoin this publication run.
+            inputs["release_request"] = f"{request_prefix}-{uuid.uuid4().hex}"
+        result = self.gh.api(f"actions/workflows/{workflow}/dispatches",
+                             {"ref": ref, "inputs": inputs, "return_run_details": True})
+        if not result or not result.get("workflow_run_id"):
+            raise ReleaseError(f"GitHub did not return the {workflow} run it started")
+        return result["workflow_run_id"]
 
     def resume_publication(self, stage, candidate_run_id, commit):
         prefix = f"leani-publish-{candidate_run_id}-{stage}"
@@ -247,17 +251,20 @@ class Coordinator:
                 if not hashes or any("/" in filename for filename in hashes):
                     raise ReleaseError(f"{name} must contain flat release files")
                 inventory[stage][name] = hashes
-                verify_sums(destination)
+                listed = verify_sums(destination)
                 if stage == "binaries":
                     archives = {f"leani-v{plan['version']}-{target}.tar.gz" for target in TARGETS}
                     if not archives <= hashes.keys() or not {"leani.cdx.json", "THIRD_PARTY_LICENSES.txt", "leani.rb"} <= hashes.keys():
                         raise ReleaseError("binary candidate is missing archives, notices, formula, or node SBOM")
+                elif stage == "container":
+                    if listed != {f"{name}.tar.gz", f"{name}.cdx.json", "image.id"}:
+                        raise ReleaseError("container candidate inventory is incomplete")
                 elif stage == "crates":
-                    if verify_sums(destination) != {f"{name}-{plan['version']}.crate" for name in CRATES}:
+                    if listed != {f"{crate}-{plan['version']}.crate" for crate in CRATES}:
                         raise ReleaseError("unexpected Rust candidate packages")
                 elif stage == "sdk":
                     filename = f"smart-byte-leani-sdk-{plan['version']}.tgz"
-                    if verify_sums(destination) != {filename}:
+                    if listed != {filename}:
                         raise ReleaseError("unexpected SDK candidate archive")
                     with tarfile.open(destination / filename) as archive:
                         stream = archive.extractfile("package/package.json")
@@ -268,12 +275,26 @@ class Coordinator:
             raise ReleaseError("release candidate files differ from the recorded plan")
         return inventory
 
+    def require_passing_main_checks(self, commit):
+        # Release tags are never moved, so a failure already known on this
+        # commit must stop the release before its tags exist.
+        for stage in (*GATES, "container"):
+            runs = self.runs(WORKFLOWS[stage], commit)
+            while runs and runs[0]["status"] != "completed":
+                self.pause()
+                runs = self.runs(WORKFLOWS[stage], commit)
+            if runs and runs[0]["conclusion"] != "success":
+                raise ReleaseError(f"the latest {stage} run failed on {commit}; rerun or fix it before reserving release tags")
+
     def candidate(self, release, output, commit=None):
         release = version(release)
         coordinator_commit = git("rev-parse", "HEAD")
         commit = commit or coordinator_commit
         self.release_commit(release, commit)
-        for name in (f"v{release}", f"sdk-v{release}"):
+        tags = (f"v{release}", f"sdk-v{release}")
+        if any(self.gh.api(f"git/ref/tags/{name}", missing=True) is None for name in tags):
+            self.require_passing_main_checks(commit)
+        for name in tags:
             self.verify_tag(name, commit, create=True)
         plan = {"schema": 1, "repository": self.gh.repository, "version": release, "commit": commit,
                 "coordinator_commit": coordinator_commit, "state": "preparing", "runs": {}, "artifacts": {}}
@@ -294,7 +315,7 @@ class Coordinator:
                     if run["status"] == "completed" and run["conclusion"] == "success" and set(self.artifact_names(stage, release)) <= self.gh.artifacts(run["id"]).keys():
                         selected = run["id"]
                         break
-            plan["runs"][stage] = selected or self.dispatch(workflow, ref, commit, inputs)
+            plan["runs"][stage] = selected or self.dispatch(workflow, ref, inputs)
             Path(output).write_text(json.dumps(plan, indent=2) + "\n")
         for stage, run_id in plan["runs"].items():
             self.wait(run_id)
@@ -303,7 +324,10 @@ class Coordinator:
             plan["artifacts"] = self.collect(plan, directory)
         plan["state"] = "verified"
         Path(output).write_text(json.dumps(plan, indent=2) + "\n")
-        self.report(f"Verified all candidates for v{release} at {commit}; publish using this coordinator run ID")
+        # Reused preparation runs can expire well before the plan's own 14 days.
+        deadline = min(self.gh.artifacts(run_id)[name]["expires_at"] for stage, run_id in plan["runs"].items()
+                       for name in self.artifact_names(stage, release))
+        self.report(f"Verified all candidates for v{release} at {commit}; publish using this coordinator run ID before {deadline}")
 
     def validate_plan(self, plan, candidate_run_id):
         if (plan.get("schema") != 1 or plan.get("state") != "verified" or plan.get("repository") != self.gh.repository
@@ -335,15 +359,20 @@ class Coordinator:
         with tempfile.TemporaryDirectory(prefix="leani-publish-") as directory:
             self.collect(plan, directory, compare=True)
             root = Path(directory)
-            binary = root / "binaries" / f"leani-release-candidate-v{release}"
+            binaries = plan["artifacts"]["binaries"][f"leani-release-candidate-v{release}"]
             crates = root / "crates" / "leani-rust-library-candidate"
             sdk = root / "sdk" / "leani-sdk-candidate"
+            images = {arch: (root / "container" / f"leani-container-{arch}" / "image.id").read_text().strip()
+                      for arch in ("amd64", "arm64")}
+            if not all(re.fullmatch(r"sha256:[a-f0-9]{64}", identity) for identity in images.values()):
+                raise ReleaseError("invalid candidate image identity")
+            checks = {"binaries": lambda: release_published(self.gh, binaries, release),
+                      "crates": lambda: not missing_crates(crates, release),
+                      "sdk": lambda: sdk_published(sdk, release),
+                      "container": lambda: container_published(images, self.gh.repository, release)}
             # Check every destination before the first write. Existing versions
             # with different bytes are an error, never a reason to overwrite.
-            done = {"binaries": release_published(self.gh, binary, release),
-                    "crates": not missing_crates(crates, release),
-                    "sdk": sdk_published(sdk, release),
-                    "container": container_published(root / "container", self.gh.repository, release)}
+            done = {stage: check() for stage, check in checks.items()}
             for stage in ("binaries", "crates", "sdk", "container"):
                 if done[stage]:
                     self.report(f"{stage}: already published; verified candidate bytes")
@@ -357,12 +386,14 @@ class Coordinator:
                 else:
                     inputs = {"publish": True, "image_tag": f"v{release}", "candidate_run_id": str(plan["runs"][stage])}
                 pending, prefix = self.resume_publication(stage, candidate_run_id, commit)
-                self.wait(pending or self.dispatch(WORKFLOWS[stage], ref, commit, inputs, prefix))
-                verified = {"binaries": lambda: release_published(self.gh, binary, release),
-                            "crates": lambda: not missing_crates(crates, release),
-                            "sdk": lambda: sdk_published(sdk, release),
-                            "container": lambda: container_published(root / "container", self.gh.repository, release)}[stage]()
-                if not verified:
+                self.wait(pending or self.dispatch(WORKFLOWS[stage], ref, inputs, prefix))
+                # Registries and their CDNs can briefly lag a finished publisher.
+                # ponytail: 20 checks 15 s apart; raise the count if npm needs longer.
+                for _ in range(20):
+                    if checks[stage]():
+                        break
+                    self.pause()
+                else:
                     raise ReleaseError(f"{stage} publication finished but the verified artifacts are not available")
                 self.report(f"{stage}: published and verified")
             if promote_site:
@@ -370,7 +401,7 @@ class Coordinator:
                 if branch and branch["object"]["sha"] == commit:
                     self.report("site: already promoted to the release commit")
                 else:
-                    self.wait(self.dispatch("site-promote.yml", f"v{release}", commit, {"release_tag": f"v{release}"}))
+                    self.wait(self.dispatch("site-promote.yml", f"v{release}", {"release_tag": f"v{release}"}))
                     branch = self.gh.api("git/ref/heads/site-production")
                     if branch["object"]["sha"] != commit:
                         raise ReleaseError("site-production did not reach the release commit")
@@ -382,18 +413,25 @@ class Coordinator:
         if payload.get("schema") != 1 or not re.fullmatch(r"[a-f0-9]{40}", payload["base_sha"]):
             raise ReleaseError("invalid release preparation")
         base = payload["base_sha"]
-        current = self.gh.api("commits/main")
-        if current["sha"] != base:
-            raise ReleaseError("main changed during preparation; rerun to generate a current release PR")
         files = payload["files"]
         for name, contents in files.items():
             if (not isinstance(contents, str) or name.startswith("/") or ".." in Path(name).parts
-                    or not (name in ("Cargo.toml", "Cargo.lock", "CHANGELOG.md", "README.md", "packages/sdk/package.json", "packages/sdk/src/index.ts", "packages/sdk/README.md")
+                    or not (name in ("Cargo.toml", "Cargo.lock", "CHANGELOG.md", "README.md", "packages/sdk/package.json", "packages/sdk/src/index.ts",
+                                     "packages/sdk/README.md", "skills/leani/references/processors.md")
                             or re.fullmatch(r"crates/[^/]+/Cargo.toml", name) or re.fullmatch(r"examples/[^/]+/Cargo.toml", name)
                             or re.fullmatch(r"docs/[\w./-]+\.mdx?", name))):
                 raise ReleaseError("unexpected file in the release preparation")
         if not files:
             raise ReleaseError("empty release preparation")
+        current = self.gh.api("commits/main")
+        if current["sha"] != base:
+            # The prepare job waits for approval while main moves on. Its files
+            # still apply when main left every one of them untouched.
+            comparison = self.gh.api(f"compare/{base}...{current['sha']}")
+            changed = {item["filename"] for item in comparison.get("files", [])}
+            # The compare API lists at most 300 files, so a list that long may be truncated.
+            if comparison["status"] != "ahead" or len(changed) >= 300 or changed & files.keys():
+                raise ReleaseError("main changed the prepared files during preparation; rerun prepare")
         tree = self.gh.api("git/trees", {"base_tree": current["commit"]["tree"]["sha"],
                                        "tree": [{"path": name, "mode": "100644", "type": "blob", "content": contents}
                                                 for name, contents in sorted(files.items())]})
@@ -401,10 +439,10 @@ class Coordinator:
         existing = self.gh.api(f"git/ref/heads/{branch}", missing=True)
         if existing:
             previous = self.gh.api(f"git/commits/{existing['object']['sha']}")
-            if previous["tree"]["sha"] != tree["sha"] or [item["sha"] for item in previous["parents"]] != [base]:
+            if previous["tree"]["sha"] != tree["sha"] or [item["sha"] for item in previous["parents"]] != [current["sha"]]:
                 raise ReleaseError(f"{branch} already contains different work; it will not be overwritten")
         else:
-            commit = self.gh.api("git/commits", {"message": f"chore(release): prepare {release}", "tree": tree["sha"], "parents": [base]})
+            commit = self.gh.api("git/commits", {"message": f"chore(release): prepare {release}", "tree": tree["sha"], "parents": [current["sha"]]})
             self.gh.api("git/refs", {"ref": f"refs/heads/{branch}", "sha": commit["sha"]})
         pulls = self.gh.api(f"pulls?state=open&head={self.gh.repository.split('/')[0]}:{branch}&base=main")
         if pulls:

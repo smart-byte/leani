@@ -1,5 +1,5 @@
 name: Prepare release
-run-name: Prepare release${{ inputs.release_request && format(' [{0}]', inputs.release_request) || '' }}
+run-name: ${{ inputs.release_request && format('Prepare release [{0}]', inputs.release_request) || '' }}
 
 on:
   workflow_dispatch:
@@ -245,28 +245,39 @@ jobs:
         run: |
           # A retry can finish a partially uploaded draft, but must never
           # replace an existing asset or publish a different candidate.
-          if gh api "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_VERSION" > existing-release.json 2> release-error.txt; then
-            jq -r '.assets[].name' existing-release.json > existing-assets.txt
-            while IFS= read -r name; do
-              case "$name" in */*|.*) echo "unexpected release asset" >&2; exit 1 ;; esac
-              test -f "release-assets/$name" || { echo "unexpected release asset $name" >&2; exit 1; }
-              mkdir -p existing-assets
-              gh release download "$RELEASE_VERSION" --repo "$GITHUB_REPOSITORY" --pattern "$name" --dir existing-assets
-              cmp "existing-assets/$name" "release-assets/$name" || { echo "existing release asset differs: $name" >&2; exit 1; }
-            done < existing-assets.txt
-            for asset in release-assets/*; do
-              name=${asset##*/}
-              if ! grep -Fxq "$name" existing-assets.txt; then
-                test "$(jq -r .draft existing-release.json)" = true || { echo "published release is incomplete" >&2; exit 1; }
-                gh release upload "$RELEASE_VERSION" "$asset" --repo "$GITHUB_REPOSITORY"
-              fi
-            done
-          else
-            grep -q 'HTTP 404' release-error.txt || { cat release-error.txt >&2; exit 1; }
-            gh release create "$RELEASE_VERSION" release-assets/* \
-              --repo "$GITHUB_REPOSITORY" --verify-tag --draft --generate-notes \
-              --title "Leani $RELEASE_VERSION"
-          fi
+          # releases/tags/{tag} hides drafts, so list releases instead.
+          # ponytail: newest 100 releases; a retry follows its draft closely.
+          # shellcheck disable=SC2016 # jq reads $ENV itself
+          gh api "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+            --jq '[.[] | select(.tag_name == $ENV.RELEASE_VERSION)]' > matching-releases.json
+          case "$(jq length matching-releases.json)" in
+            0)
+              gh release create "$RELEASE_VERSION" release-assets/* \
+                --repo "$GITHUB_REPOSITORY" --verify-tag --draft --generate-notes \
+                --title "Leani $RELEASE_VERSION"
+              ;;
+            1)
+              jq '.[0]' matching-releases.json > existing-release.json
+              jq -r '.assets[] | [.name, .id, .digest // ""] | @tsv' existing-release.json > existing-assets.tsv
+              while IFS=$'\t' read -r name id digest; do
+                case "$name" in */*|.*) echo "unexpected release asset" >&2; exit 1 ;; esac
+                test -f "release-assets/$name" || { echo "unexpected release asset $name" >&2; exit 1; }
+                if [ -z "$digest" ]; then
+                  gh api -H 'Accept: application/octet-stream' "repos/$GITHUB_REPOSITORY/releases/assets/$id" > existing-asset
+                  digest="sha256:$(sha256sum existing-asset | cut -d' ' -f1)"
+                fi
+                test "$digest" = "sha256:$(sha256sum "release-assets/$name" | cut -d' ' -f1)" || { echo "existing release asset differs: $name" >&2; exit 1; }
+              done < existing-assets.tsv
+              for asset in release-assets/*; do
+                name=${asset##*/}
+                if ! cut -f1 existing-assets.tsv | grep -Fxq "$name"; then
+                  test "$(jq -r .draft existing-release.json)" = true || { echo "published release is incomplete" >&2; exit 1; }
+                  gh release upload "$RELEASE_VERSION" "$asset" --repo "$GITHUB_REPOSITORY"
+                fi
+              done
+              ;;
+            *) echo "several releases use $RELEASE_VERSION; delete the extra drafts" >&2; exit 1 ;;
+          esac
           case "${RELEASE_VERSION%%+*}" in
             *-*) prerelease=true; latest=false ;;
             *) prerelease=false; latest=true ;;
