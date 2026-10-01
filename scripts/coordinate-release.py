@@ -76,7 +76,7 @@ def image_manifest(ref):
         if "not found" in error or "manifest unknown" in error:
             return None
         if "unauthorized" in error or "denied" in error:
-            raise ReleaseError("GHCR refused anonymous access; make the leani package public (docs/contributing/releasing.md)")
+            raise ReleaseError("GHCR refused anonymous access; make the leani package public (docs/maintainers/releasing.md)")
         raise ReleaseError("unable to verify GHCR image; check registry access")
     return json.loads(result.stdout)
 
