@@ -41,6 +41,8 @@ class Preparation(unittest.TestCase):
             "docs/operations/upgrade.md": 'The rc.1 store has schema 21.\nbun add @smart-byte/leani-sdk@0.1.0-rc.1\n',
             "docs/adr/history.md": 'Version 0.1.0-rc.1 used schema 21; the migration goes to schema 23.\n',
             "skills/leani/references/processors.md": '(`https://raw.githubusercontent.com/smart-byte/leani/v0.1.0-rc.1/examples/node.toml`\nfor 0.1.0-rc.1).\n',
+            "THIRD_PARTY_LICENSES.txt": 'leani 0.1.0-rc.1 — https://github.com/smart-byte/leani\nleani-primitives 0.1.0-rc.1 — https://github.com/smart-byte/leani\n'
+                                        'external 0.1.0-rc.1 — https://example.invalid/external\n',
             "CHANGELOG.md": '# Changelog\n\n## [Unreleased]\n\n### Upgrading from 0.1.0-rc.1\n\nBack up schema 21 before upgrading to 23.\nbun add @smart-byte/leani-sdk@<version>\n\n## [0.1.0-rc.1]\n\nOriginal release.\n',
         }
         members = {"node": "leani", "primitives": "leani-primitives", "processor-api": "leani-processor-api", "source-api": "leani-source-api", "testkit": "leani-testkit"}
@@ -80,6 +82,10 @@ class Preparation(unittest.TestCase):
         self.assertEqual((self.root / "docs/adr/history.md").read_text(), 'Version 0.1.0-rc.1 used schema 21; the migration goes to schema 23.\n')
         self.assertEqual((self.root / "skills/leani/references/processors.md").read_text(),
                          '(`https://raw.githubusercontent.com/smart-byte/leani/v0.1.0-rc.2/examples/node.toml`\nfor 0.1.0-rc.2).\n')
+        # The license notices name every workspace crate with its version; CI regenerates them from Cargo.lock.
+        self.assertEqual((self.root / "THIRD_PARTY_LICENSES.txt").read_text(),
+                         'leani 0.1.0-rc.2 — https://github.com/smart-byte/leani\nleani-primitives 0.1.0-rc.2 — https://github.com/smart-byte/leani\n'
+                         'external 0.1.0-rc.1 — https://example.invalid/external\n')
         changelog = (self.root / "CHANGELOG.md").read_text()
         self.assertIn("### Upgrading from 0.1.0-rc.1", changelog)
         self.assertIn("Back up schema 21 before upgrading to 23.", changelog)

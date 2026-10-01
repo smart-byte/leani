@@ -66,6 +66,10 @@ def prepare(requested, output):
         return "[[package]]".join(blocks)
 
     update("Cargo.lock", lockfile)
+    # The license notices list each workspace crate as "name version — repository",
+    # and CI regenerates them from Cargo.lock to check the committed copy.
+    workspace_entry = r"(?m)^(" + "|".join(re.escape(name) for name in sorted(names)) + r") " + re.escape(old) + " — "
+    update("THIRD_PARTY_LICENSES.txt", lambda text: re.sub(workspace_entry, lambda match: f"{match[1]} {requested} — ", text))
     update("packages/sdk/package.json", lambda text: replace_once(text, f'"version": "{old}"', f'"version": "{requested}"'))
     update("packages/sdk/src/index.ts", lambda text: replace_once(text, f'SDK_VERSION = "{old}"', f'SDK_VERSION = "{requested}"'))
     # Only current install instructions change. Historical migration notes,

@@ -417,7 +417,7 @@ class Coordinator:
         for name, contents in files.items():
             if (not isinstance(contents, str) or name.startswith("/") or ".." in Path(name).parts
                     or not (name in ("Cargo.toml", "Cargo.lock", "CHANGELOG.md", "README.md", "packages/sdk/package.json", "packages/sdk/src/index.ts",
-                                     "packages/sdk/README.md", "skills/leani/references/processors.md")
+                                     "packages/sdk/README.md", "skills/leani/references/processors.md", "THIRD_PARTY_LICENSES.txt")
                             or re.fullmatch(r"crates/[^/]+/Cargo.toml", name) or re.fullmatch(r"examples/[^/]+/Cargo.toml", name)
                             or re.fullmatch(r"docs/[\w./-]+\.mdx?", name))):
                 raise ReleaseError("unexpected file in the release preparation")

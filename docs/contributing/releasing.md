@@ -22,8 +22,9 @@ The manually dispatched **Coordinate release** workflow
 (`release-coordinate.yml`) runs from `main` in three steps:
 
 1. **prepare** opens a pull request that updates workspace and SDK versions,
-   exact internal crate requirements, lockfile versions, current install pins,
-   and the changelog heading. It is reviewed and merged like any other change.
+   exact internal crate requirements, lockfile versions, license notices,
+   current install pins, and the changelog heading. It is reviewed and merged
+   like any other change.
 2. **candidate** reserves annotated `v<version>` and `sdk-v<version>` tags on the
    merged commit. Tags are never moved. It then builds and tests every artifact
    once and records the runs and checksums in a release plan.
