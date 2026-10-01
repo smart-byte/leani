@@ -16,7 +16,7 @@ import {
 export { LeaniError, TransportError, type LeaniErrorBody } from "./errors.ts";
 
 // Kept literal for toolchain compatibility; tests pin it to package.json.
-export const SDK_VERSION = "0.1.0-rc.1" as const;
+export const SDK_VERSION = "0.1.0-rc.2" as const;
 
 /** Sent on mutations without a JSON body, which the node otherwise refuses. */
 const LEANI_REQUEST_HEADER: Readonly<Record<string, string>> = Object.freeze({
