@@ -12,8 +12,8 @@ Use **Actions → Coordinate release** (`release-coordinate.yml`), dispatched
 from `main`. Enter an unprefixed version such as `0.1.0-rc.2`. It has three actions:
 
 1. **prepare** generates a release PR with workspace and SDK versions, exact
-   internal crate requirements, lockfile versions, current install pins, and the
-   changelog release heading. Historical migration notes, processor versions,
+   internal crate requirements, lockfile versions, license notices, current
+   install pins, and the changelog release heading. Historical migration notes, processor versions,
    schema numbers, and the OpenAPI contract version stay intact. Review the
    upgrade instructions and merge the PR after CI passes.
 2. **candidate** creates annotated `v<version>` and `sdk-v<version>` tags on the
