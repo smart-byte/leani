@@ -19,18 +19,20 @@ for repository settings and publication steps.
 ## Release flow
 
 The manually dispatched **Coordinate release** workflow
-(`release-coordinate.yml`) runs from `main` in three steps:
+(`release-coordinate.yml`) runs from `main` in two steps:
 
 1. **prepare** opens a pull request that updates workspace and SDK versions,
    exact internal crate requirements, lockfile versions, license notices,
    current install pins, and the changelog heading. It is reviewed and merged
    like any other change.
-2. **candidate** reserves annotated `v<version>` and `sdk-v<version>` tags on the
-   merged commit. Tags are never moved. It then builds and tests every artifact
-   once and records the runs and checksums in a release plan.
-3. **publish** verifies that plan and dispatches the publishers, each approved
-   in its own protected environment. Publication is resumable rather than
-   atomic: a retry reuses matching publications, and different bytes stop it.
+2. **release** runs after one maintainer approval. It reserves annotated
+   `v<version>` and `sdk-v<version>` tags on the merged commit, which are never
+   moved, builds and tests every artifact once, and records the runs and
+   checksums in a release plan. It then dispatches the publishers in their
+   protected environments, checks each publication against the plan, promotes
+   the documentation site, and waits until leani.dev serves the release.
+   Publication is resumable rather than atomic: a retry reuses matching
+   publications, and different bytes stop it.
 
 ## Release-facing changes
 
