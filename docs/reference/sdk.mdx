@@ -101,7 +101,10 @@ live block or a history progress unit. A backfill session's `deliveryBatches()`
 yields every boundary as `ackCursor` with the `events` it covers, including
 batches without changes and the completion; `events()` flattens the changes
 without boundaries. A consumer with a credential passes it as `credential`
-on every call and stream. See
+on every call and stream. `retry(subscription)` re-queues a failed subscription
+to resume from its committed progress, and `delete(subscription, {
+discardUnacknowledged: true })` deletes a failed or cancelled one whose
+consumer has not acknowledged every record. See
 [durable delivery](/docs/concepts/durable-delivery/) for lease and reset semantics.
 
 The inventory below is generated from both public entry points and shared error

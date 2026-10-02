@@ -943,11 +943,45 @@ paths:
     delete:
       summary: Delete a terminal backfill subscription
       operationId: deleteBackfillSubscription
+      description: |
+        A completed subscription can be deleted once its consumer acknowledged
+        the completion. A failed or cancelled one can be deleted once its
+        required consumer acknowledged every delivered record, and gets 409
+        `backfill_conflict` while one is unacknowledged: read its stream to
+        the end and acknowledge, or pass `discardUnacknowledged=true`.
+      parameters:
+        - $ref: "#/components/parameters/LeaniRequest"
+        - name: discardUnacknowledged
+          in: query
+          description: |
+            Delete a failed or cancelled subscription although its required
+            consumer has not acknowledged every record. Has no effect on a
+            subscription that is still running.
+          schema:
+            type: boolean
+            default: false
+      responses:
+        "200":
+          description: Deleted backfill subscription.
+        default:
+          $ref: "#/components/responses/Error"
+  /admin/v1/backfill-subscriptions/{id}/retry:
+    parameters:
+      - $ref: "#/components/parameters/Identifier"
+    post:
+      summary: Retry a failed backfill subscription
+      operationId: retryBackfillSubscription
+      description: |
+        Re-queues a failed subscription. It resumes from its committed
+        progress with the same history stream, consumer, and acknowledgement,
+        and its error is cleared. A subscription that is still active returns
+        its status unchanged; a completed or cancelled one gets 409
+        `backfill_conflict`.
       parameters:
         - $ref: "#/components/parameters/LeaniRequest"
       responses:
         "200":
-          description: Deleted backfill subscription.
+          description: Retried backfill subscription.
         default:
           $ref: "#/components/responses/Error"
   /admin/v1/backfill-subscriptions/{id}/cancel:

@@ -131,6 +131,41 @@ describe("backfill subscriptions", () => {
     });
   });
 
+  test("deletion can discard unacknowledged records", async () => {
+    let request: Request | undefined;
+    const client = createBackfillSubscriptionClient({
+      baseUrl: "http://node.test",
+      fetch: async (input, init) => {
+        request = new Request(input, init);
+        return Response.json({ id: "repair-1", owner: "subscription" });
+      },
+    });
+    await client.delete("repair-1", { discardUnacknowledged: true });
+    expect(request?.method).toBe("DELETE");
+    expect(request?.url).toBe(
+      "http://node.test/admin/v1/backfill-subscriptions/repair-1?discardUnacknowledged=true",
+    );
+    expect(request?.headers.get("x-leani-request")).toBe("1");
+  });
+
+  test("retry re-queues a failed subscription", async () => {
+    let request: Request | undefined;
+    const client = createBackfillSubscriptionClient({
+      baseUrl: "http://node.test",
+      fetch: async (input, init) => {
+        request = new Request(input, init);
+        return Response.json({ id: "repair-1", state: "queued" });
+      },
+    });
+    const status = await client.retry("repair-1");
+    expect(request?.method).toBe("POST");
+    expect(request?.url).toBe(
+      "http://node.test/admin/v1/backfill-subscriptions/repair-1/retry",
+    );
+    expect(request?.headers.get("x-leani-request")).toBe("1");
+    expect(status.state).toBe("queued");
+  });
+
   test("body-less cancellation is marked as a Leani request", async () => {
     let request: Request | undefined;
     const client = createBackfillSubscriptionClient({
