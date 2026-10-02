@@ -1,8 +1,9 @@
 ---
+import Wordmark from './Wordmark.astro';
 import { COMPANY, GITHUB_URL, LEGAL_NOTICE_URL, PRIVACY_URL, sourceUrl } from '../config';
 ---
 <footer class="wrap">
-  <p class="mono"><span class="accent">leani</span>_ — the lean Ethereum indexing node</p>
+  <p class="tag mono"><Wordmark height={18} /><span>— the lean Ethereum indexing node</span></p>
   <nav aria-label="Footer">
     <a href="/docs">Docs</a>
     <a href="/docs/getting-started/">Getting started</a>
@@ -23,6 +24,7 @@ import { COMPANY, GITHUB_URL, LEGAL_NOTICE_URL, PRIVACY_URL, sourceUrl } from '.
 
 <style>
   footer { padding-block: 3.5rem; border-top: 1px solid var(--panel-edge); display: grid; gap: 0.9rem; }
+  .tag { display: flex; flex-wrap: wrap; align-items: baseline; gap: 0.6rem; }
   nav { display: flex; gap: 1.5rem; flex-wrap: wrap; }
   .fine { color: var(--ink-dim); font-size: 0.8rem; }
 </style>

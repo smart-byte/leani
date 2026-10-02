@@ -1,4 +1,9 @@
-# Leani
+<h1>
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="site/public/leani-wordmark-on-dark.svg">
+    <img src="site/public/leani-wordmark-on-light.svg" alt="Leani" height="48">
+  </picture>
+</h1>
 
 Lean, state-minimized Ethereum indexing node. Leani backfills application
 data from public datasets, follows the chain head over native Ethereum P2P,

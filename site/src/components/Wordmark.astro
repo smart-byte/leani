@@ -1,0 +1,21 @@
+---
+// The leani wordmark, inline so it takes the page's colours: "lean" and the i's
+// stem in currentColor, the kept block in the accent. The paths match
+// src/assets/brand/leani-wordmark-on-dark.svg; test/smoke.test.ts checks that.
+interface Props { height: number; class?: string }
+const { height, class: className } = Astro.props;
+const VIEW_W = 220.37;
+const VIEW_H = 75.2;
+---
+<svg
+  class:list={['wordmark', className]}
+  viewBox={`0 0 ${VIEW_W} ${VIEW_H}`}
+  width={Math.round((height * VIEW_W) / VIEW_H)}
+  height={height}
+  role="img"
+  aria-label="Leani"
+>
+  <path d="M5 0V74M24 50H64.4A20.2 20.2 0 1 0 59.67 62.98M120.8 50A20.2 20.2 0 1 0 80.4 50A20.2 20.2 0 1 0 120.8 50M120.8 26V74M141.8 74V26M141.8 74V48.8A19 19 0 0 1 179.8 48.8V74" fill="none" stroke="currentColor" stroke-width="10" />
+  <path d="M195.8 74L205.8 74L216 26L206 26Z" fill="currentColor" />
+  <rect x="207.37" y="6" width="13" height="13" rx="1.2" fill="var(--accent)" />
+</svg>

@@ -43,8 +43,10 @@ export default defineConfig({
       description: 'Run the Ethereum data processors your application needs, and keep only their durable results.',
       favicon: '/favicon.svg',
       logo: {
-        src: './src/assets/leani-mark.svg',
+        light: './src/assets/brand/leani-wordmark-on-light.svg',
+        dark: './src/assets/brand/leani-wordmark-on-dark.svg',
         alt: 'Leani',
+        replacesTitle: true,
       },
       pagefind: true,
       // Starlight already declares a large Twitter card; give it the image.

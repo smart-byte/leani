@@ -21,6 +21,19 @@ test('interactive widgets use scoped selectors and semantic copy controls', () =
   expect(hero).not.toContain('api.github.com');
 });
 
+test('every copy of the wordmark draws the published shapes', () => {
+  const read = (path: string) => readFileSync(new URL(path, import.meta.url), 'utf8');
+  // Path data and block position: the parts that would drift if one copy were edited alone.
+  const shapes = (svg: string) =>
+    [...svg.matchAll(/ d="([^"]+)"|<rect x="([\d.]+)" y="([\d.]+)"/g)].map((m) => m.slice(1).filter(Boolean).join(' '));
+  const published = shapes(read('../src/assets/brand/leani-wordmark-on-dark.svg'));
+
+  expect(published).toHaveLength(3);
+  expect(shapes(read('../src/assets/brand/leani-wordmark-on-light.svg'))).toEqual(published);
+  expect(shapes(read('../src/components/Wordmark.astro'))).toEqual(published);
+  expect(shapes(read('../scripts/og-card.html')).slice(0, 3)).toEqual(published);
+});
+
 test('the share card image matches its declared size', async () => {
   const { SOCIAL_IMAGE } = await import('../src/lib/social');
   const png = readFileSync(new URL(`../public${SOCIAL_IMAGE.path}`, import.meta.url));
