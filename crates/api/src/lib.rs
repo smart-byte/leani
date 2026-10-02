@@ -60,7 +60,8 @@ use leani_store_sqlite::{
     ArtifactOwnerKind, ArtifactPruneOutcome, ArtifactReplayOutcome, ChangeBounds, ChangeDirection,
     ChangeRecord, ConsumerRole, ConsumerStartPosition, DeliveryStreamKind, DurableConsumer,
     OutputBounds, OutputQuery, PortableSavepoint, ProcessorArtifactStats, ProcessorRunState,
-    QuerySnapshotEntity, RecoveryCheckpoint, SqliteStore, StoreError, default_delivery_stream_id,
+    QuerySnapshotEntity, RecoveryCheckpoint, SqliteStore, StoreError, UnacknowledgedDelivery,
+    default_delivery_stream_id,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -813,7 +814,20 @@ pub trait BackfillControl: std::fmt::Debug + Send + Sync {
 
     async fn cancel(&self, id: &str) -> Result<BackfillStatus, BackfillControlError>;
 
-    async fn delete(&self, id: &str) -> Result<HistoricalWorkDeletion, BackfillControlError>;
+    /// Re-queue a failed subscription to resume from its committed progress,
+    /// keeping its stream, consumer, and acknowledgement. Retrying a
+    /// subscription that is still active returns its status unchanged.
+    async fn retry(&self, id: &str) -> Result<BackfillStatus, BackfillControlError> {
+        Err(BackfillControlError::Conflict(format!(
+            "historical work {id} cannot be retried by this control plane"
+        )))
+    }
+
+    async fn delete(
+        &self,
+        id: &str,
+        unacknowledged: UnacknowledgedDelivery,
+    ) -> Result<HistoricalWorkDeletion, BackfillControlError>;
 }
 
 /// Transport request for an independently retained raw-history job. Chain and
@@ -1268,6 +1282,10 @@ pub fn router_with_processors(
         .route(
             "/admin/v1/backfill-subscriptions/{id}/cancel",
             axum::routing::post(cancel_backfill_subscription),
+        )
+        .route(
+            "/admin/v1/backfill-subscriptions/{id}/retry",
+            axum::routing::post(retry_backfill_subscription),
         )
         .route(
             "/admin/v1/materialization-jobs",
@@ -2209,10 +2227,30 @@ async fn cancel_materialization_job(
     cancel_owned_historical_work(&state, &id, HistoricalWorkOwner::Materialization).await
 }
 
+async fn retry_backfill_subscription(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+) -> Result<Json<BackfillStatus>, ApiError> {
+    let current = backfill_control(&state)?
+        .inspect(&id)
+        .await
+        .map_err(backfill_error)?;
+    if current.owner != HistoricalWorkOwner::Subscription {
+        return Err(ApiError::not_found(&id));
+    }
+    Ok(Json(
+        backfill_control(&state)?
+            .retry(&id)
+            .await
+            .map_err(backfill_error)?,
+    ))
+}
+
 async fn delete_owned_historical_work(
     state: &ApiState,
     id: &str,
     owner: HistoricalWorkOwner,
+    unacknowledged: UnacknowledgedDelivery,
 ) -> Result<Json<HistoricalWorkDeletion>, ApiError> {
     let current = backfill_control(state)?
         .inspect(id)
@@ -2223,24 +2261,51 @@ async fn delete_owned_historical_work(
     }
     Ok(Json(
         backfill_control(state)?
-            .delete(id)
+            .delete(id, unacknowledged)
             .await
             .map_err(backfill_error)?,
     ))
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct DeleteBackfillSubscriptionQuery {
+    /// Delete a failed or cancelled subscription although its required
+    /// consumer has not acknowledged every delivered record.
+    #[serde(default)]
+    discard_unacknowledged: bool,
+}
+
 async fn delete_backfill_subscription(
     State(state): State<ApiState>,
     Path(id): Path<String>,
+    Query(query): Query<DeleteBackfillSubscriptionQuery>,
 ) -> Result<Json<HistoricalWorkDeletion>, ApiError> {
-    delete_owned_historical_work(&state, &id, HistoricalWorkOwner::Subscription).await
+    let unacknowledged = if query.discard_unacknowledged {
+        UnacknowledgedDelivery::Discard
+    } else {
+        UnacknowledgedDelivery::Protect
+    };
+    delete_owned_historical_work(
+        &state,
+        &id,
+        HistoricalWorkOwner::Subscription,
+        unacknowledged,
+    )
+    .await
 }
 
 async fn delete_materialization_job(
     State(state): State<ApiState>,
     Path(id): Path<String>,
 ) -> Result<Json<HistoricalWorkDeletion>, ApiError> {
-    delete_owned_historical_work(&state, &id, HistoricalWorkOwner::Materialization).await
+    delete_owned_historical_work(
+        &state,
+        &id,
+        HistoricalWorkOwner::Materialization,
+        UnacknowledgedDelivery::Protect,
+    )
+    .await
 }
 
 fn backfill_error(error: BackfillControlError) -> ApiError {
@@ -5112,8 +5177,9 @@ async fn poll_backfill_consumer(
             Ok(_) => {
                 if let Some((code, message)) = backfill_terminal_stream_failure(&stream_state).await
                 {
-                    stream_state.terminal = true;
-                    return Some((Ok(ndjson_failure(code, message, None, None)), stream_state));
+                    return Some(
+                        end_backfill_stream(stream_state, heartbeat_due, code, message).await,
+                    );
                 }
                 let batch_due = stream_state.pending_batch.as_ref().map(|batch| {
                     tokio::time::Instant::now()
@@ -5147,11 +5213,10 @@ async fn poll_backfill_consumer(
                         if let Some((code, message)) =
                             backfill_terminal_stream_failure(&stream_state).await
                         {
-                            stream_state.terminal = true;
-                            return Some((
-                                Ok(ndjson_failure(code, message, None, None)),
-                                stream_state,
-                            ));
+                            return Some(
+                                end_backfill_stream(stream_state, heartbeat_due, code, message)
+                                    .await,
+                            );
                         }
                         let heartbeat = ConsumerStreamHeartbeat {
                             record_type: "heartbeat",
@@ -5190,6 +5255,67 @@ async fn poll_backfill_consumer(
             }
         }
     }
+}
+
+/// Ends a failed or cancelled subscription's stream with its failure record,
+/// after the batch the stream holds and once the consumer acknowledged what it
+/// was delivered. The job committed those records, a consumer acknowledges
+/// only what it was delivered, and its streaming session ends with the stream:
+/// ending earlier leaves records it can never acknowledge, which keeps the
+/// subscription from being deleted. Like a completion, the stream sends
+/// heartbeats while it waits.
+async fn end_backfill_stream(
+    mut stream_state: BackfillConsumerStreamState,
+    heartbeat_due: tokio::time::Instant,
+    code: &'static str,
+    message: String,
+) -> (Result<Bytes, Infallible>, BackfillConsumerStreamState) {
+    if stream_state.pending_batch.is_some() {
+        return emit_history_batch(stream_state).await;
+    }
+    loop {
+        let acknowledged = stream_state
+            .state
+            .store
+            .consumer_in_stream(
+                stream_state.processor.descriptor(),
+                &stream_state.stream_id,
+                &stream_state.consumer_id,
+            )
+            .await
+            .ok()
+            .flatten()
+            .is_none_or(|consumer| consumer.acknowledged_sequence >= consumer.delivered_sequence);
+        if acknowledged {
+            break;
+        }
+        tokio::select! {
+            () = stream_state.state.store.wait_for_delivery_capacity_change() => {}
+            () = tokio::time::sleep_until(heartbeat_due) => {
+                if !backfill_stream_session_is_current(&stream_state).await {
+                    stream_state.terminal = true;
+                    return (
+                        Ok(ndjson_failure(
+                            "consumer_session_lost",
+                            "consumer streaming lease is no longer current".to_owned(),
+                            None,
+                            None,
+                        )),
+                        stream_state,
+                    );
+                }
+                return (
+                    Ok(ndjson_line_or_error(&ConsumerStreamHeartbeat {
+                        record_type: "heartbeat",
+                        emitted_at: unix_ms_rfc3339(current_unix_ms()),
+                    })),
+                    stream_state,
+                );
+            }
+        }
+    }
+    stream_state.terminal = true;
+    (Ok(ndjson_failure(code, message, None, None)), stream_state)
 }
 
 async fn backfill_terminal_stream_failure(
@@ -8683,7 +8809,11 @@ mod tests {
             Err(BackfillControlError::NotFound(id.to_owned()))
         }
 
-        async fn delete(&self, id: &str) -> Result<HistoricalWorkDeletion, BackfillControlError> {
+        async fn delete(
+            &self,
+            id: &str,
+            _unacknowledged: UnacknowledgedDelivery,
+        ) -> Result<HistoricalWorkDeletion, BackfillControlError> {
             Err(BackfillControlError::NotFound(id.to_owned()))
         }
     }
@@ -8758,7 +8888,11 @@ mod tests {
             self.inspect(id).await
         }
 
-        async fn delete(&self, id: &str) -> Result<HistoricalWorkDeletion, BackfillControlError> {
+        async fn delete(
+            &self,
+            id: &str,
+            _unacknowledged: UnacknowledgedDelivery,
+        ) -> Result<HistoricalWorkDeletion, BackfillControlError> {
             let status = self.inspect(id).await?;
             Ok(HistoricalWorkDeletion {
                 id: id.to_owned(),
@@ -8777,6 +8911,184 @@ mod tests {
                 retained_live_stream: status.owner == HistoricalWorkOwner::Subscription,
             })
         }
+    }
+
+    /// Records the retry and delete requests the admin routes forward.
+    #[derive(Debug)]
+    struct RecordingBackfillControl {
+        status: BackfillStatus,
+        requests: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait]
+    impl BackfillControl for RecordingBackfillControl {
+        async fn create_historical_work(
+            &self,
+            _request: CreateBackfillRequest,
+            _owner: HistoricalWorkOwner,
+        ) -> Result<BackfillStatus, BackfillControlError> {
+            Err(BackfillControlError::Invalid(
+                "recording fixture".to_owned(),
+            ))
+        }
+
+        async fn list(
+            &self,
+            _owner: Option<HistoricalWorkOwner>,
+        ) -> Result<Vec<BackfillStatus>, BackfillControlError> {
+            Ok(vec![self.status.clone()])
+        }
+
+        async fn inspect(&self, id: &str) -> Result<BackfillStatus, BackfillControlError> {
+            if id == self.status.id {
+                Ok(self.status.clone())
+            } else {
+                Err(BackfillControlError::NotFound(id.to_owned()))
+            }
+        }
+
+        async fn cancel(&self, id: &str) -> Result<BackfillStatus, BackfillControlError> {
+            self.inspect(id).await
+        }
+
+        async fn retry(&self, id: &str) -> Result<BackfillStatus, BackfillControlError> {
+            self.requests
+                .lock()
+                .expect("requests")
+                .push(format!("retry {id}"));
+            let mut status = self.inspect(id).await?;
+            status.state = BackfillState::Queued;
+            status.last_error = None;
+            Ok(status)
+        }
+
+        async fn delete(
+            &self,
+            id: &str,
+            unacknowledged: UnacknowledgedDelivery,
+        ) -> Result<HistoricalWorkDeletion, BackfillControlError> {
+            self.requests
+                .lock()
+                .expect("requests")
+                .push(format!("delete {id} {unacknowledged:?}"));
+            let status = self.inspect(id).await?;
+            Ok(HistoricalWorkDeletion {
+                id: id.to_owned(),
+                owner: status.owner,
+                removed_jobs: 1,
+                removed_subscription_ranges: 1,
+                removed_consumers: 1,
+                removed_delivery_records: 3,
+                removed_delivery_streams: 1,
+                removed_coverage_intervals: 0,
+                removed_coverage_segments: 0,
+                removed_exact_coverage: 0,
+                removed_applied_blocks: 0,
+                removed_finalized_undo: 0,
+                retained_processor_output: true,
+                retained_live_stream: true,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn admin_routes_retry_and_delete_backfill_subscriptions() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = SqliteStore::open(leani_store_sqlite::StoreConfig::new(
+            directory.path().join("node.sqlite"),
+        ))
+        .await
+        .expect("store");
+        let control = Arc::new(RecordingBackfillControl {
+            status: BackfillStatus {
+                id: "failed-subscription".to_owned(),
+                owner: HistoricalWorkOwner::Subscription,
+                processor: "blobs-production".to_owned(),
+                delivery_stream_id: Some("stream".to_owned()),
+                publication_revision: Some("0".to_owned()),
+                from_block: 1,
+                to_block: 3,
+                ranges: vec![BackfillRange {
+                    from_block: 1,
+                    to_block: 3,
+                }],
+                requested_blocks: 3,
+                processed_blocks: 1,
+                remaining_blocks: 2,
+                captured_finalized_target: Some(3),
+                mode: BackfillExecutionMode::FillMissing,
+                batching: None,
+                state: BackfillState::Failed,
+                attempts: 1,
+                updated_at_unix_ms: 1,
+                report: None,
+                last_error: Some("source unavailable at block 2".to_owned()),
+            },
+            requests: std::sync::Mutex::new(Vec::new()),
+        });
+        let app = router_with_processors(
+            store,
+            vec![Arc::new(leani_testkit::BlockLocalCounter::default())],
+            Vec::new(),
+            ApiConfig {
+                backfill_control: Some(control.clone()),
+                ..ApiConfig::default()
+            },
+        )
+        .expect("router");
+        let send = |request: axum::http::request::Builder| {
+            app.clone().oneshot(
+                request
+                    .header("x-leani-request", "1")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+        };
+        let base = "/admin/v1/backfill-subscriptions/failed-subscription";
+
+        let retried = send(Request::post(format!("{base}/retry")))
+            .await
+            .expect("retry response");
+        assert_eq!(retried.status(), StatusCode::OK);
+        let retried: Value = serde_json::from_slice(
+            &to_bytes(retried.into_body(), usize::MAX)
+                .await
+                .expect("retry body"),
+        )
+        .expect("retry JSON");
+        assert_eq!(retried["state"], "queued");
+        assert!(retried["lastError"].is_null(), "{retried}");
+
+        for path in [
+            base.to_owned(),
+            format!("{base}?discardUnacknowledged=false"),
+            format!("{base}?discardUnacknowledged=true"),
+        ] {
+            let deleted = send(Request::delete(path.as_str()))
+                .await
+                .expect("delete response");
+            assert_eq!(deleted.status(), StatusCode::OK, "{path}");
+        }
+        let unknown = send(Request::delete(format!("{base}?discard=true")))
+            .await
+            .expect("unknown parameter response");
+        assert_eq!(unknown.status(), StatusCode::BAD_REQUEST);
+        let missing = send(Request::post(
+            "/admin/v1/backfill-subscriptions/missing/retry",
+        ))
+        .await
+        .expect("missing response");
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+
+        assert_eq!(
+            *control.requests.lock().expect("requests"),
+            [
+                "retry failed-subscription",
+                "delete failed-subscription Protect",
+                "delete failed-subscription Protect",
+                "delete failed-subscription Discard",
+            ]
+        );
     }
 
     fn block() -> BlobsBlockEntity {
@@ -10072,6 +10384,219 @@ mod tests {
         decoder.try_finish().expect("complete gzip stream");
         plain_bytes.extend_from_slice(decoder.get_ref());
         assert!(plain_bytes.iter().all(u8::is_ascii_whitespace));
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn failed_backfill_stream_delivers_its_committed_batch_before_the_failure() {
+        use leani_primitives::ProcessorCursor;
+        use leani_testkit::{BlockLocalCounter, fixture_frame};
+
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = SqliteStore::open(leani_store_sqlite::StoreConfig::new(
+            directory.path().join("node.sqlite"),
+        ))
+        .await
+        .expect("store");
+        let processor = Arc::new(BlockLocalCounter::default().with_split_delivery());
+        store
+            .register_processor(processor.descriptor())
+            .await
+            .expect("register processor");
+        let subscription_id = "failed-fixture";
+        let stream_id = store
+            .create_backfill_delivery_stream(processor.descriptor(), subscription_id)
+            .await
+            .expect("history stream")
+            .stream_id;
+        store
+            .create_consumer_in_stream(
+                processor.descriptor(),
+                &stream_id,
+                "destination",
+                ConsumerRole::Required,
+                ConsumerStartPosition::EarliestRetained,
+                Duration::from_secs(30),
+            )
+            .await
+            .expect("consumer");
+        let range =
+            leani_primitives::BlockRange::new(BlockNumber(1), BlockNumber(3)).expect("range");
+        let job = leani_store_sqlite::JobRecord {
+            id: subscription_id.to_owned(),
+            kind: "backfill_subscription_job".to_owned(),
+            state: leani_store_sqlite::JobState::Queued,
+            payload: b"failed-stream-fixture".to_vec(),
+            checkpoint: None,
+            attempts: 0,
+            updated_at_unix_ms: 1,
+        };
+        store
+            .create_backfill_subscription_job(
+                &leani_store_sqlite::BackfillSubscriptionRecord {
+                    subscription_id: subscription_id.to_owned(),
+                    job_id: job.id.clone(),
+                    processor_instance: processor.descriptor().instance.to_string(),
+                    history_stream_id: stream_id.clone(),
+                    mode: leani_store_sqlite::BackfillSubscriptionMode::FillMissing,
+                    publication_revision: 0,
+                    state: leani_store_sqlite::BackfillSubscriptionState::Queued,
+                    consumer_id: "destination".to_owned(),
+                    ranges: vec![range],
+                    range,
+                    preexisting_coverage: Vec::new(),
+                    captured_finalized_target: BlockNumber(3),
+                    idempotency_key: "failed-stream-fixture".to_owned(),
+                    effective_block_limit: 3,
+                    effective_byte_limit: 1024 * 1024,
+                    resume_below_ratio_millionths: 750_000,
+                    delivery_batch_limits: leani_store_sqlite::BackfillDeliveryBatchLimits::default(
+                    ),
+                    initial_sequence: 0,
+                    completion_sequence: None,
+                    processed_work_blocks: 0,
+                },
+                &job,
+                BlockHash::new([4; 32]),
+            )
+            .await
+            .expect("subscription");
+        // The job committed block 1, then failed before block 2.
+        let frame = fixture_frame(1, BlockHash::ZERO);
+        let delta = processor.map(&frame).await.expect("map");
+        store
+            .apply_with_change_publication_to_stream(
+                processor.as_ref(),
+                ProcessorCursor {
+                    chain_id: frame.chain_id,
+                    processor_id: processor.descriptor().id.to_string(),
+                    processor_version: processor.descriptor().version.to_string(),
+                    block_number: frame.block.number,
+                    block_hash: frame.block.hash,
+                    finality: Finality::Finalized,
+                    sequence: 1,
+                },
+                &delta,
+                &[],
+                true,
+                &stream_id,
+            )
+            .await
+            .expect("history apply");
+        let control = Arc::new(StaticBackfillControl {
+            status: BackfillStatus {
+                id: subscription_id.to_owned(),
+                owner: HistoricalWorkOwner::Subscription,
+                processor: processor.descriptor().instance.to_string(),
+                delivery_stream_id: Some(stream_id.clone()),
+                publication_revision: Some("0".to_owned()),
+                from_block: 1,
+                to_block: 3,
+                ranges: vec![BackfillRange {
+                    from_block: 1,
+                    to_block: 3,
+                }],
+                requested_blocks: 3,
+                processed_blocks: 1,
+                remaining_blocks: 2,
+                captured_finalized_target: Some(3),
+                mode: BackfillExecutionMode::FillMissing,
+                batching: None,
+                state: BackfillState::Failed,
+                attempts: 1,
+                updated_at_unix_ms: 1,
+                report: None,
+                last_error: Some("source unavailable at block 2".to_owned()),
+            },
+        });
+        let app = router_with_processors(
+            store.clone(),
+            vec![processor.clone()],
+            Vec::new(),
+            ApiConfig {
+                backfill_control: Some(control),
+                // The one committed block never fills a batch, and its delay
+                // outlasts the test: only the failure can release it.
+                history_batch_limits: DeliveryBatchLimits {
+                    maximum_processed_blocks: 100,
+                    maximum_delay: Duration::from_secs(600),
+                    ..ApiConfig::default().history_batch_limits
+                },
+                heartbeat_interval: Duration::from_millis(50),
+                ..ApiConfig::default()
+            },
+        )
+        .expect("router");
+        let consumer_path = "/v1/backfill-subscriptions/failed-fixture/consumers/destination";
+        let response = app
+            .clone()
+            .oneshot(
+                Request::get(format!("{consumer_path}/stream"))
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let mut body = response.into_body().into_data_stream();
+        let mut buffered = Vec::new();
+
+        let hello = next_ndjson_record(&mut body, &mut buffered).await;
+        assert_eq!(hello["type"], "hello");
+        let batch = next_ndjson_record(&mut body, &mut buffered).await;
+        assert_eq!(batch["type"], "batch", "unexpected record: {batch}");
+        assert_eq!(batch["processedBlockCount"], "1");
+        // Unacknowledged, the stream keeps its session open with heartbeats
+        // instead of ending, so the acknowledgement below can still land.
+        let held = next_ndjson_record(&mut body, &mut buffered).await;
+        assert_eq!(held["type"], "heartbeat", "unexpected record: {held}");
+        let acknowledged = app
+            .oneshot(
+                Request::post(format!("{consumer_path}/ack"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(
+                        CONSUMER_SESSION_HEADER,
+                        hello["sessionToken"].as_str().expect("session token"),
+                    )
+                    .body(Body::from(
+                        json!({ "cursor": batch["acknowledgeableCursor"] }).to_string(),
+                    ))
+                    .expect("ack request"),
+            )
+            .await
+            .expect("ack response");
+        assert_eq!(acknowledged.status(), StatusCode::OK);
+        // The stream holds its session, with heartbeats, until that
+        // acknowledgement; only then does it end with the failure.
+        let failure = loop {
+            let record = next_ndjson_record(&mut body, &mut buffered).await;
+            if record["type"] != "heartbeat" {
+                break record;
+            }
+        };
+        assert_eq!(failure["type"], "error", "unexpected record: {failure}");
+        assert_eq!(failure["code"], "backfill_failed");
+        assert_eq!(failure["message"], "source unavailable at block 2");
+        let consumer = store
+            .consumer_in_stream(processor.descriptor(), &stream_id, "destination")
+            .await
+            .expect("consumer lookup")
+            .expect("consumer");
+        let records = store
+            .changes_in_stream(
+                processor.descriptor(),
+                &stream_id,
+                leani_primitives::ChainId(1),
+                0,
+                100,
+            )
+            .await
+            .expect("records");
+        assert_eq!(
+            Some(consumer.acknowledged_sequence),
+            records.last().map(|record| record.cursor.sequence),
+            "every committed record is acknowledged"
+        );
     }
 
     #[tokio::test]

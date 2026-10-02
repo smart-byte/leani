@@ -945,6 +945,7 @@ impl BackfillControl for BenchmarkBackfillControl {
     async fn delete(
         &self,
         id: &str,
+        _unacknowledged: leani_store_sqlite::UnacknowledgedDelivery,
     ) -> Result<leani_api::HistoricalWorkDeletion, BackfillControlError> {
         Err(BackfillControlError::Conflict(format!(
             "benchmark subscription {id} cannot be deleted"

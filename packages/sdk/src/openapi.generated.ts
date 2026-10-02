@@ -965,8 +965,41 @@ export interface paths {
         get: operations["getBackfillSubscription"];
         put?: never;
         post?: never;
-        /** Delete a terminal backfill subscription */
+        /**
+         * Delete a terminal backfill subscription
+         * @description A completed subscription can be deleted once its consumer acknowledged
+         *     the completion. A failed or cancelled one can be deleted once its
+         *     required consumer acknowledged every delivered record, and gets 409
+         *     `backfill_conflict` while one is unacknowledged: read its stream to
+         *     the end and acknowledge, or pass `discardUnacknowledged=true`.
+         */
         delete: operations["deleteBackfillSubscription"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/admin/v1/backfill-subscriptions/{id}/retry": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["Identifier"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Retry a failed backfill subscription
+         * @description Re-queues a failed subscription. It resumes from its committed
+         *     progress with the same history stream, consumer, and acknowledgement,
+         *     and its error is cleared. A subscription that is still active returns
+         *     its status unchanged; a completed or cancelled one gets 409
+         *     `backfill_conflict`.
+         */
+        post: operations["retryBackfillSubscription"];
+        delete?: never;
         options?: never;
         head?: never;
         patch?: never;
@@ -3319,7 +3352,14 @@ export interface operations {
     };
     deleteBackfillSubscription: {
         parameters: {
-            query?: never;
+            query?: {
+                /**
+                 * @description Delete a failed or cancelled subscription although its required
+                 *     consumer has not acknowledged every record. Has no effect on a
+                 *     subscription that is still running.
+                 */
+                discardUnacknowledged?: boolean;
+            };
             header?: {
                 /**
                  * @description Marks a mutating request without a JSON body as sent by a Leani
@@ -3336,6 +3376,34 @@ export interface operations {
         requestBody?: never;
         responses: {
             /** @description Deleted backfill subscription. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            default: components["responses"]["Error"];
+        };
+    };
+    retryBackfillSubscription: {
+        parameters: {
+            query?: never;
+            header?: {
+                /**
+                 * @description Marks a mutating request without a JSON body as sent by a Leani
+                 *     client. A POST or DELETE needs `content-type: application/json` or
+                 *     this header, and gets HTTP 415 otherwise.
+                 */
+                "x-leani-request"?: components["parameters"]["LeaniRequest"];
+            };
+            path: {
+                id: components["parameters"]["Identifier"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Retried backfill subscription. */
             200: {
                 headers: {
                     [name: string]: unknown;

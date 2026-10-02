@@ -19,6 +19,22 @@ record, and documented RPC contracts.
 - `leani backfill` logs its progress every 30 seconds: committed blocks,
   blocks per minute and, over P2P, connected peers. A run waiting on peers, or
   on a network that cannot start, no longer looks the same as a working one.
+- `POST /admin/v1/backfill-subscriptions/{id}/retry` re-queues a failed
+  backfill subscription. It resumes from its committed progress with the same
+  history stream, consumer, credential, and acknowledgement, and its error is
+  cleared. Retrying an active subscription returns its status; a completed or
+  cancelled one gets `409 backfill_conflict`. The SDK's backfill client adds
+  `retry(subscription)`.
+- `DELETE /admin/v1/backfill-subscriptions/{id}?discardUnacknowledged=true`
+  deletes a failed or cancelled subscription although its required consumer
+  has not acknowledged every record; without it, the deletion still refuses.
+  The SDK's `delete` takes `{ discardUnacknowledged: true }`.
+
+### Changed
+
+- Breaking for `leani-api` embedders: `BackfillControl::delete` takes an
+  `UnacknowledgedDelivery`, and the trait gains `retry`, whose default refuses.
+  The subscription `DELETE` route refuses unknown query parameters with 400.
 
 ### Fixed
 
@@ -68,6 +84,14 @@ record, and documented RPC contracts.
   running for the same processor instance. They were listed as running
   forever, one more after every restart. The runbook says when a restart
   resumes an ordered lane paused with `hot_cold_handoff_failed`.
+- A failed or cancelled backfill subscription's stream delivers the batch it
+  holds before its `backfill_failed` or `backfill_cancelled` record, and keeps
+  its consumer session, with heartbeats, until the consumer has acknowledged
+  what it was delivered. It used to drop a batch that had not reached its size
+  target and end the session at once, so the job's last committed records
+  could never be acknowledged, and a required consumer's unacknowledged
+  records kept `DELETE /admin/v1/backfill-subscriptions/{id}` refusing the
+  subscription as not safe to delete.
 - A history job no longer fails with "block … was already applied with a
   different delta" when the live lane applies one of its blocks while it runs.
   A processor that records finality in its output, such as `blobs-money`, maps

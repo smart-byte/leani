@@ -413,9 +413,19 @@ export interface BackfillSubscriptionClient {
     subscription: string,
     options?: { signal?: AbortSignal },
   ): Promise<BackfillStatus>;
-  delete(
+  /** Re-queue a failed subscription to resume from its committed progress. */
+  retry(
     subscription: string,
     options?: { signal?: AbortSignal },
+  ): Promise<BackfillStatus>;
+  /**
+   * Delete a terminal subscription. A failed or cancelled one is refused
+   * while its required consumer has unacknowledged records, unless
+   * `discardUnacknowledged` is set.
+   */
+  delete(
+    subscription: string,
+    options?: { signal?: AbortSignal; discardUnacknowledged?: boolean },
   ): Promise<HistoricalWorkDeletion>;
   changes<T = unknown>(
     subscription: string,
@@ -627,13 +637,23 @@ export function createBackfillSubscriptionClient(
         undefined,
         cancelOptions?.signal,
       ),
+    retry: (
+      subscription: string,
+      retryOptions?: { signal?: AbortSignal },
+    ) =>
+      requestJson<BackfillStatus>(
+        "POST",
+        `admin/v1/backfill-subscriptions/${encodeURIComponent(assertIdentity(subscription, "subscription"))}/retry`,
+        undefined,
+        retryOptions?.signal,
+      ),
     delete: (
       subscription: string,
-      deleteOptions?: { signal?: AbortSignal },
+      deleteOptions?: { signal?: AbortSignal; discardUnacknowledged?: boolean },
     ) =>
       requestJson<HistoricalWorkDeletion>(
         "DELETE",
-        `admin/v1/backfill-subscriptions/${encodeURIComponent(assertIdentity(subscription, "subscription"))}`,
+        `admin/v1/backfill-subscriptions/${encodeURIComponent(assertIdentity(subscription, "subscription"))}${deleteOptions?.discardUnacknowledged ? "?discardUnacknowledged=true" : ""}`,
         undefined,
         deleteOptions?.signal,
       ),
