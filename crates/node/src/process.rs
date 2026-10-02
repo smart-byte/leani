@@ -2244,9 +2244,72 @@ impl leani_api::BackfillControl for NativeBackfillControl {
         self.status(&record, outcome.as_ref()).await
     }
 
+    async fn retry(
+        &self,
+        id: &str,
+    ) -> Result<leani_api::BackfillStatus, leani_api::BackfillControlError> {
+        let record = self
+            .store
+            .job(id)
+            .await
+            .map_err(|error| leani_api::BackfillControlError::Internal(error.to_string()))?
+            .ok_or_else(|| leani_api::BackfillControlError::NotFound(id.to_owned()))?;
+        Self::validate_historical_job_kind(&record)?;
+        let outcome = self.outcome(id).await?;
+        let status = self.status(&record, outcome.as_ref()).await?;
+        match status.state {
+            leani_api::BackfillState::Failed => {}
+            leani_api::BackfillState::CompleteReclaimable
+            | leani_api::BackfillState::Completed
+            | leani_api::BackfillState::Cancelled => {
+                return Err(leani_api::BackfillControlError::Conflict(format!(
+                    "historical job {id} in state {:?} can be retried only after it failed",
+                    status.state
+                )));
+            }
+            // Still active, for example after an earlier retry.
+            _ => return Ok(status),
+        }
+        if status.owner != leani_api::HistoricalWorkOwner::Subscription {
+            return Err(leani_api::BackfillControlError::Conflict(format!(
+                "historical job {id} is not a backfill subscription; delete it and create it again"
+            )));
+        }
+        // The failed run's task may still be recording its failure, and a
+        // late write would fail the retried job again. It is not cancelled:
+        // that could record the failed job as cancelled.
+        let running = self.tasks.lock().await.get(id).cloned();
+        if let Some(running) = running
+            && tokio::time::timeout(HISTORICAL_JOB_STOP_WAIT, running.ended.cancelled())
+                .await
+                .is_err()
+        {
+            return Err(leani_api::BackfillControlError::Unavailable(format!(
+                "historical job {id} is still stopping; retry again"
+            )));
+        }
+        self.store
+            .retry_failed_backfill_subscription(id, &Self::outcome_id(id))
+            .await
+            .map_err(|error| leani_api::BackfillControlError::Internal(error.to_string()))?;
+        let record = self
+            .store
+            .job(id)
+            .await
+            .map_err(|error| leani_api::BackfillControlError::Internal(error.to_string()))?
+            .ok_or_else(|| leani_api::BackfillControlError::NotFound(id.to_owned()))?;
+        // Start it now when a slot is free, as creation does; the scheduler
+        // takes it up once one frees or storage allows.
+        self.resume_durable_job(&record).await?;
+        self.jobs_changed.notify_one();
+        let outcome = self.outcome(id).await?;
+        self.status(&record, outcome.as_ref()).await
+    }
+
     async fn delete(
         &self,
         id: &str,
+        unacknowledged: leani_store_sqlite::UnacknowledgedDelivery,
     ) -> Result<leani_api::HistoricalWorkDeletion, leani_api::BackfillControlError> {
         let record = self
             .store
@@ -2286,7 +2349,12 @@ impl leani_api::BackfillControl for NativeBackfillControl {
         let subscription = status.owner == leani_api::HistoricalWorkOwner::Subscription;
         let deleted = self
             .store
-            .delete_terminal_historical_work(id, &Self::outcome_id(id), subscription)
+            .delete_terminal_historical_work(
+                id,
+                &Self::outcome_id(id),
+                subscription,
+                unacknowledged,
+            )
             .await
             .map_err(|error| match error {
                 leani_store_sqlite::StoreError::HistoricalWorkNotDeletable { .. } => {
@@ -10128,6 +10196,22 @@ markets = ["ETH/USDT"]
         processor: Arc<dyn Processor>,
         through: u64,
     ) -> (leani_store_sqlite::SqliteStore, Arc<NativeBackfillControl>) {
+        on_demand_control_with(
+            directory,
+            processor,
+            through,
+            crate::config::ProcessorHistoryControl::NodeOwned,
+        )
+        .await
+    }
+
+    /// [`on_demand_control`] whose processor history is owned as given.
+    async fn on_demand_control_with(
+        directory: &Path,
+        processor: Arc<dyn Processor>,
+        through: u64,
+        history_control: crate::config::ProcessorHistoryControl,
+    ) -> (leani_store_sqlite::SqliteStore, Arc<NativeBackfillControl>) {
         let chain = fixture_chain(through);
         let manifest = write_frame_archive(directory, &chain[1..]);
         let instance = processor.descriptor().instance.to_string();
@@ -10137,6 +10221,7 @@ markets = ["ETH/USDT"]
             &[("synthetic-counter", instance.as_str())],
         );
         config.processors[0].history_mode = crate::config::ProcessorHistoryMode::OnDemand;
+        config.processors[0].history_control = history_control;
         let store = leani_store_sqlite::SqliteStore::open(leani_store_sqlite::StoreConfig::new(
             directory.join("node.sqlite"),
         ))
@@ -10188,7 +10273,13 @@ markets = ["ETH/USDT"]
             .expect("materialization");
         tokio::time::sleep(Duration::from_millis(50)).await;
         control.cancel(&created.id).await.expect("cancel");
-        control.delete(&created.id).await.expect("delete");
+        control
+            .delete(
+                &created.id,
+                leani_store_sqlite::UnacknowledgedDelivery::Protect,
+            )
+            .await
+            .expect("delete");
         // The task's mapping takes 300 ms a block; by now it has ended.
         tokio::time::sleep(Duration::from_secs(2)).await;
         assert!(
@@ -10229,6 +10320,116 @@ markets = ["ETH/USDT"]
         })
         .await
         .expect("the panicked job kept its slot");
+    }
+
+    /// Fails every mapping while `failing` is set.
+    #[derive(Debug)]
+    struct FailingCounter {
+        inner: BlockLocalCounter,
+        failing: std::sync::atomic::AtomicBool,
+    }
+
+    #[async_trait::async_trait]
+    impl Processor for FailingCounter {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
+        fn descriptor(&self) -> &leani_processor_api::ProcessorDescriptor {
+            self.inner.descriptor()
+        }
+
+        async fn map(
+            &self,
+            block: &leani_primitives::BlockFrame,
+        ) -> Result<leani_processor_api::EncodedDelta, leani_processor_api::ProcessorError>
+        {
+            if self.failing.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(leani_processor_api::ProcessorError::Invariant(
+                    "the processor's mapping failed".to_owned(),
+                ));
+            }
+            self.inner.map(block).await
+        }
+
+        async fn reduce(
+            &self,
+            transaction: &mut dyn leani_processor_api::ReducerTransaction,
+            cursor: &leani_primitives::ProcessorCursor,
+            delta: &leani_processor_api::EncodedDelta,
+        ) -> Result<leani_processor_api::DomainChanges, leani_processor_api::ProcessorError>
+        {
+            self.inner.reduce(transaction, cursor, delta).await
+        }
+    }
+
+    #[tokio::test]
+    async fn a_retried_subscription_runs_again_and_completes() {
+        use leani_api::BackfillControl as _;
+
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let processor = Arc::new(FailingCounter {
+            // Subscription IDs name the instance, so it must be portable.
+            inner: BlockLocalCounter::default().with_instance(
+                leani_processor_api::ProcessorInstanceId::new("retried-counter").expect("instance"),
+                leani_primitives::BlockHash::new([0x0c; 32]),
+            ),
+            failing: std::sync::atomic::AtomicBool::new(true),
+        });
+        let instance = processor.descriptor().instance.to_string();
+        let (store, control) = on_demand_control_with(
+            directory.path(),
+            processor.clone(),
+            4,
+            crate::config::ProcessorHistoryControl::ApplicationSubscriptions,
+        )
+        .await;
+        let created = control
+            .create_subscription(leani_api::CreateBackfillRequest {
+                processor: instance,
+                from_block: Some(1),
+                to_block: Some(4.into()),
+                ranges: Vec::new(),
+                mode: leani_api::BackfillExecutionMode::FillMissing,
+                consumer: Some(leani_api::CreateBackfillConsumerRequest {
+                    id: "destination".to_owned(),
+                    role: leani_store_sqlite::ConsumerRole::Required,
+                    lease_ttl_seconds: 60,
+                    credential: None,
+                }),
+                limits: None,
+                batching: None,
+                idempotency_key: "retried".to_owned(),
+            })
+            .await
+            .expect("subscription");
+        wait_for_job_state(&store, &created.id, leani_store_sqlite::JobState::Failed).await;
+        let failed = control.inspect(&created.id).await.expect("failed status");
+        assert_eq!(failed.state, leani_api::BackfillState::Failed);
+        assert!(failed.last_error.is_some());
+
+        processor
+            .failing
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        let retried = control.retry(&created.id).await.expect("retry");
+        assert_ne!(retried.state, leani_api::BackfillState::Failed);
+        assert_eq!(retried.last_error, None);
+        wait_for_job_state(&store, &created.id, leani_store_sqlite::JobState::Completed).await;
+        let completed = control
+            .inspect(&created.id)
+            .await
+            .expect("completed status");
+        assert_eq!(completed.state, leani_api::BackfillState::Draining);
+        assert_eq!(completed.last_error, None);
+        // Retrying a subscription that is no longer failed changes nothing.
+        assert_eq!(
+            control
+                .retry(&created.id)
+                .await
+                .expect("retry an active subscription")
+                .state,
+            leani_api::BackfillState::Draining
+        );
     }
 
     fn durable_job(

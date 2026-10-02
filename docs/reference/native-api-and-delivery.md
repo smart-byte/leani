@@ -142,6 +142,7 @@ POST /admin/v1/backfill-subscriptions
 GET  /admin/v1/backfill-subscriptions
 GET  /admin/v1/backfill-subscriptions/{id}
 POST /admin/v1/backfill-subscriptions/{id}/cancel
+POST /admin/v1/backfill-subscriptions/{id}/retry
 DELETE /admin/v1/backfill-subscriptions/{id}
 POST /admin/v1/raw-history-jobs
 GET  /admin/v1/raw-history-jobs
@@ -203,11 +204,30 @@ ranges. If another overlapping job covers one of those blocks first, the
 subscription still republishes that verified block into its independent stream;
 shared processor coverage cannot silently satisfy another subscription's
 delivery obligation. Completed, failed, and cancelled jobs are terminal and are
-never retried implicitly. After correcting a permanent failure, explicitly
-delete the terminal job before recreating the request; deletion is the retry
-boundary. Deleting a job right after cancelling it waits up to 10 seconds for
-its task to stop, and answers `503 backfill_unavailable`, which is retryable,
-if it has not.
+never retried implicitly; re-submitting a request with the same idempotency key
+returns the terminal job's status.
+
+A failed subscription is retried explicitly with `POST
+/admin/v1/backfill-subscriptions/{id}/retry`, for example after a transient
+outage or after upgrading past the fault that failed it. It resumes from its
+committed progress with the same history stream, consumer, credential, and
+acknowledgement, and its error is cleared. Retrying a subscription that is still
+active returns its status unchanged; a completed or cancelled subscription gets
+`409 backfill_conflict`. A failed materialization job is not retried: delete it
+and create it again, which is what `leani backfill` does with a fresh
+idempotency key.
+
+A failed or cancelled subscription's stream still delivers every record its job
+committed, then holds its session, with heartbeats, until the consumer has
+acknowledged what it was delivered, and only then ends with `backfill_failed`
+or `backfill_cancelled`. Deleting such a subscription is refused with `409
+backfill_conflict` while its required consumer has unacknowledged records: read
+the stream to that end and acknowledge, or delete with
+`?discardUnacknowledged=true` when the application does not need them. The
+parameter never applies to a subscription that is still running. Deleting a job
+right after cancelling it waits up to 10 seconds for its task to stop, and
+answers `503 backfill_unavailable`, which is retryable, if it has not; a retry
+waits the same way for a failed job's task.
 
 ## 3. Common response model
 

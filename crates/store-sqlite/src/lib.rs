@@ -1626,6 +1626,17 @@ pub struct JobRecord {
     pub updated_at_unix_ms: u64,
 }
 
+/// What deleting a failed or cancelled subscription does with delivery records
+/// its active required consumer has not acknowledged.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum UnacknowledgedDelivery {
+    /// Refuse the deletion while such records remain.
+    #[default]
+    Protect,
+    /// Delete them with the subscription, at the caller's explicit request.
+    Discard,
+}
+
 /// Rows removed by an explicit terminal historical-work deletion.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
 pub struct HistoricalWorkDeletion {
@@ -9510,6 +9521,56 @@ impl SqliteStore {
         Ok(result.rows_affected() != 0)
     }
 
+    /// Re-queue a failed backfill subscription and its job for another run.
+    ///
+    /// The terminal-state guards of [`Self::save_job`] and
+    /// [`Self::set_backfill_subscription_state`] keep runtime updates from
+    /// reviving a failed subscription; this is the one explicit way back. The
+    /// job keeps its checkpoint and the subscription its committed range
+    /// progress, history stream, consumer, and acknowledgement, so the next
+    /// run resumes where the failed one stopped. The failure's outcome record
+    /// (`outcome_id`) and the subscription's error are removed. Returns `false`
+    /// and changes nothing unless both the subscription and its job failed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the transaction fails.
+    pub async fn retry_failed_backfill_subscription(
+        &self,
+        job_id: &str,
+        outcome_id: &str,
+    ) -> Result<bool, StoreError> {
+        let _guard = self.inner.writer.lock().await;
+        let mut transaction = self.inner.pool.begin().await?;
+        let now = now_i64()?;
+        let subscription = sqlx::query(
+            "UPDATE backfill_subscriptions
+             SET state = 'queued', last_error = NULL, updated_at_unix_ms = ?
+             WHERE job_id = ? AND state = 'failed'",
+        )
+        .bind(now)
+        .bind(job_id)
+        .execute(&mut *transaction)
+        .await?;
+        let job = sqlx::query(
+            "UPDATE jobs SET state = 'queued', updated_at_unix_ms = ?
+             WHERE job_id = ? AND kind = 'backfill_subscription_job' AND state = 'failed'",
+        )
+        .bind(now)
+        .bind(job_id)
+        .execute(&mut *transaction)
+        .await?;
+        if subscription.rows_affected() == 0 || job.rows_affected() == 0 {
+            return Ok(false);
+        }
+        sqlx::query("DELETE FROM jobs WHERE job_id = ?")
+            .bind(outcome_id)
+            .execute(&mut *transaction)
+            .await?;
+        transaction.commit().await?;
+        Ok(true)
+    }
+
     /// Mark a draining subscription reclaimable after its completion cursor is
     /// durably acknowledged by the required consumer.
     ///
@@ -9617,9 +9678,11 @@ impl SqliteStore {
     ///
     /// A subscription can be deleted after its completion cursor is acknowledged,
     /// or after cancellation/failure when no active required consumer protects an
-    /// unacknowledged delivery record. Its isolated history stream is reclaimed in
-    /// the same transaction. A materialization deletes only its job and outcome
-    /// records; processor entities, state, and coverage remain queryable.
+    /// unacknowledged delivery record. [`UnacknowledgedDelivery::Discard`] lifts
+    /// that protection for a cancelled or failed subscription only. Its isolated
+    /// history stream is reclaimed in the same transaction. A materialization
+    /// deletes only its job and outcome records; processor entities, state, and
+    /// coverage remain queryable.
     ///
     /// # Errors
     ///
@@ -9631,6 +9694,7 @@ impl SqliteStore {
         job_id: &str,
         outcome_id: &str,
         subscription: bool,
+        unacknowledged: UnacknowledgedDelivery,
     ) -> Result<HistoricalWorkDeletion, StoreError> {
         let _guard = self.inner.writer.lock().await;
         let mut transaction = self.inner.pool.begin().await?;
@@ -9663,8 +9727,11 @@ impl SqliteStore {
             let deletable = if state == "complete_reclaimable" {
                 true
             } else if matches!(state.as_str(), "cancelled" | "failed") {
-                let protected: i64 = sqlx::query_scalar(
-                    "SELECT COUNT(*)
+                if unacknowledged == UnacknowledgedDelivery::Discard {
+                    true
+                } else {
+                    let protected: i64 = sqlx::query_scalar(
+                        "SELECT COUNT(*)
                      FROM durable_consumers AS consumer
                      JOIN delivery_streams AS stream
                        ON stream.stream_id = consumer.stream_id
@@ -9672,11 +9739,12 @@ impl SqliteStore {
                        AND consumer.role = 'required'
                        AND consumer.state = 'active'
                        AND consumer.acknowledged_sequence < stream.next_sequence - 1",
-                )
-                .bind(&stream_id)
-                .fetch_one(&mut *transaction)
-                .await?;
-                protected == 0
+                    )
+                    .bind(&stream_id)
+                    .fetch_one(&mut *transaction)
+                    .await?;
+                    protected == 0
+                }
             } else {
                 false
             };
@@ -21589,7 +21657,12 @@ mod tests {
             .await
             .expect("compact owned coverage");
         let deleted = store
-            .delete_terminal_historical_work(id, "owned-coverage-job:outcome", true)
+            .delete_terminal_historical_work(
+                id,
+                "owned-coverage-job:outcome",
+                true,
+                UnacknowledgedDelivery::Protect,
+            )
             .await
             .expect("delete owned coverage");
         assert_eq!(deleted.subscription_ranges, 1);
@@ -23480,7 +23553,12 @@ mod tests {
         );
         assert!(matches!(
             store
-                .delete_terminal_historical_work(&job.id, &format!("{}:outcome", job.id), true,)
+                .delete_terminal_historical_work(
+                    &job.id,
+                    &format!("{}:outcome", job.id),
+                    true,
+                    UnacknowledgedDelivery::Protect
+                )
                 .await,
             Err(StoreError::HistoricalWorkNotDeletable { .. })
         ));
@@ -23512,7 +23590,12 @@ mod tests {
         .expect("subscription state");
         assert_eq!(state, "complete_reclaimable");
         let deleted = store
-            .delete_terminal_historical_work(&job.id, &format!("{}:outcome", job.id), true)
+            .delete_terminal_historical_work(
+                &job.id,
+                &format!("{}:outcome", job.id),
+                true,
+                UnacknowledgedDelivery::Protect,
+            )
             .await
             .expect("delete reclaimable subscription");
         assert_eq!(
@@ -23708,7 +23791,12 @@ mod tests {
             .expect("save outcome");
 
         let deleted = store
-            .delete_terminal_historical_work(&job.id, &format!("{}:outcome", job.id), false)
+            .delete_terminal_historical_work(
+                &job.id,
+                &format!("{}:outcome", job.id),
+                false,
+                UnacknowledgedDelivery::Protect,
+            )
             .await
             .expect("delete materialization metadata");
         assert_eq!(deleted.jobs, 2);
@@ -26026,6 +26114,220 @@ mod tests {
                 .expect("durable subscription")
                 .state,
             BackfillSubscriptionState::Cancelled
+        );
+    }
+
+    /// A fill-missing subscription over blocks 1 to 4 of an output-less
+    /// processor, queued with a required consumer that acknowledges nothing.
+    async fn queued_subscription(
+        store: &SqliteStore,
+        name: &str,
+    ) -> (FixtureProcessor, JobRecord, String) {
+        let mut processor = with_id(FixtureProcessor::block_output(), name);
+        processor.descriptor.lifecycle.output.mode = OutputPolicyMode::None;
+        let subscription_id = format!("{name}-subscription");
+        let stream = store
+            .create_backfill_delivery_stream(&processor.descriptor, &subscription_id)
+            .await
+            .expect("stream")
+            .stream_id;
+        store
+            .create_consumer_in_stream(
+                &processor.descriptor,
+                &stream,
+                "destination",
+                ConsumerRole::Required,
+                ConsumerStartPosition::EarliestRetained,
+                Duration::from_mins(1),
+            )
+            .await
+            .expect("consumer");
+        let range = BlockRange::new(BlockNumber(1), BlockNumber(4)).expect("range");
+        let job = queued_job(&format!("{name}-job"), "backfill_subscription_job");
+        store
+            .create_backfill_subscription_job(
+                &BackfillSubscriptionRecord {
+                    subscription_id,
+                    job_id: job.id.clone(),
+                    processor_instance: processor.descriptor.instance.to_string(),
+                    history_stream_id: stream.clone(),
+                    mode: BackfillSubscriptionMode::FillMissing,
+                    publication_revision: 0,
+                    state: BackfillSubscriptionState::Queued,
+                    consumer_id: "destination".to_owned(),
+                    ranges: vec![range],
+                    range,
+                    preexisting_coverage: Vec::new(),
+                    captured_finalized_target: range.end(),
+                    idempotency_key: format!("{name}-key"),
+                    effective_block_limit: 16,
+                    effective_byte_limit: 1024 * 1024,
+                    resume_below_ratio_millionths: 750_000,
+                    delivery_batch_limits: BackfillDeliveryBatchLimits::default(),
+                    initial_sequence: 0,
+                    completion_sequence: None,
+                    processed_work_blocks: 0,
+                },
+                &job,
+                BlockHash::new([6; 32]),
+            )
+            .await
+            .expect("subscription");
+        (processor, job, stream)
+    }
+
+    /// Commit blocks 1 and 2 of the subscription's range, then fail it.
+    async fn fail_after_two_blocks(
+        store: &SqliteStore,
+        processor: &FixtureProcessor,
+        job: &JobRecord,
+        stream: &str,
+    ) {
+        store
+            .commit_historical_microbatch(
+                processor,
+                HistoricalBatchMode::Apply,
+                &finalized_items(processor, 2).await,
+                &[],
+                stream,
+                &job.id,
+                b"partial",
+                1,
+                false,
+                TEST_COMMIT_LIMITS,
+            )
+            .await
+            .expect("partial microbatch");
+        // As the node records a failure: the job keeps its checkpoint.
+        let committed = store.job(&job.id).await.expect("job").expect("durable job");
+        store
+            .save_job(&JobRecord {
+                state: JobState::Failed,
+                ..committed
+            })
+            .await
+            .expect("fail job");
+        store
+            .set_backfill_subscription_state(
+                &job.id,
+                BackfillSubscriptionState::Failed,
+                Some("source unavailable"),
+            )
+            .await
+            .expect("fail subscription");
+    }
+
+    #[tokio::test]
+    async fn failed_subscription_discards_unacknowledged_delivery_only_when_asked() {
+        let (_directory, store) = store().await;
+        let (processor, job, stream) = queued_subscription(&store, "discarded").await;
+        let outcome = format!("{}:outcome", job.id);
+        // Discarding never applies to a subscription that has not ended.
+        assert!(matches!(
+            store
+                .delete_terminal_historical_work(
+                    &job.id,
+                    &outcome,
+                    true,
+                    UnacknowledgedDelivery::Discard,
+                )
+                .await,
+            Err(StoreError::HistoricalWorkNotDeletable { .. })
+        ));
+        fail_after_two_blocks(&store, &processor, &job, &stream).await;
+        assert!(matches!(
+            store
+                .delete_terminal_historical_work(
+                    &job.id,
+                    &outcome,
+                    true,
+                    UnacknowledgedDelivery::Protect,
+                )
+                .await,
+            Err(StoreError::HistoricalWorkNotDeletable { .. })
+        ));
+        let deleted = store
+            .delete_terminal_historical_work(
+                &job.id,
+                &outcome,
+                true,
+                UnacknowledgedDelivery::Discard,
+            )
+            .await
+            .expect("discarding delete");
+        assert_eq!(deleted.jobs, 1);
+        assert_eq!(deleted.consumers, 1);
+        assert_eq!(deleted.delivery_streams, 1);
+        assert!(deleted.delivery_records > 0, "{deleted:?}");
+        assert!(store.job(&job.id).await.expect("job lookup").is_none());
+    }
+
+    #[tokio::test]
+    async fn failed_subscription_retries_from_its_progress() {
+        let (_directory, store) = store().await;
+        let (processor, job, stream) = queued_subscription(&store, "retried").await;
+        let outcome = format!("{}:outcome", job.id);
+        assert!(
+            !store
+                .retry_failed_backfill_subscription(&job.id, &outcome)
+                .await
+                .expect("retry queued subscription"),
+            "only a failed subscription is retried"
+        );
+        fail_after_two_blocks(&store, &processor, &job, &stream).await;
+        store
+            .save_job(&JobRecord {
+                id: outcome.clone(),
+                kind: "historical_backfill_outcome".to_owned(),
+                state: JobState::Failed,
+                payload: b"{}".to_vec(),
+                checkpoint: None,
+                attempts: 0,
+                updated_at_unix_ms: 1,
+            })
+            .await
+            .expect("failure outcome");
+
+        assert!(
+            store
+                .retry_failed_backfill_subscription(&job.id, &outcome)
+                .await
+                .expect("retry failed subscription")
+        );
+        let retried = store.job(&job.id).await.expect("job").expect("durable job");
+        assert_eq!(retried.state, JobState::Queued);
+        assert_eq!(retried.checkpoint.as_deref(), Some(b"partial".as_slice()));
+        assert!(store.job(&outcome).await.expect("outcome lookup").is_none());
+        assert_eq!(
+            store
+                .backfill_subscription_for_job(&job.id)
+                .await
+                .expect("subscription")
+                .expect("durable subscription")
+                .state,
+            BackfillSubscriptionState::Queued
+        );
+        let last_error: Option<String> =
+            sqlx::query_scalar("SELECT last_error FROM backfill_subscriptions WHERE job_id = ?")
+                .bind(&job.id)
+                .fetch_one(&store.inner.pool)
+                .await
+                .expect("last error");
+        assert_eq!(last_error, None);
+        // The stream keeps what the failed run committed.
+        assert!(
+            !store
+                .changes_in_stream(&processor.descriptor, &stream, ChainId(1), 0, 100)
+                .await
+                .expect("stream records")
+                .is_empty()
+        );
+        assert!(
+            !store
+                .retry_failed_backfill_subscription(&job.id, &outcome)
+                .await
+                .expect("retry again"),
+            "a retried subscription is no longer failed"
         );
     }
 
