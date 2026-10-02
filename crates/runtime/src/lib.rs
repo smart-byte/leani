@@ -3246,6 +3246,26 @@ impl HistoricalRuntime {
                 }
                 .into());
             }
+            // A fill-missing microbatch falls back here for any applied block,
+            // including one applied live with the other finality. Replay it
+            // only when the applied delta is one of this frame's finality
+            // variants; other content is a real conflict.
+            if mode == BackfillMode::FillMissing
+                && let Some(applied) = self
+                    .store
+                    .applied_delta_checksum(
+                        self.processor.descriptor(),
+                        mapped.delta.block.number,
+                        mapped.delta.block.hash,
+                    )
+                    .await?
+                && !mapped.equivalent_checksums.contains(&applied)
+            {
+                return Err(StoreError::ConflictingApply {
+                    block: mapped.delta.block.number,
+                }
+                .into());
+            }
             let sequence = self
                 .store
                 .processor_cursor(self.processor.descriptor())
@@ -18188,6 +18208,228 @@ mod tests {
                 .applied_blocks,
             1
         );
+    }
+
+    /// Applies one delta as the live lane does when the job first opens the
+    /// source: after the job planned its range, before it commits the block.
+    #[derive(Debug)]
+    struct LiveApplyOnOpenSource {
+        inner: ScriptedHistorySource,
+        store: SqliteStore,
+        processor: Arc<FinalitySensitiveCounter>,
+        live: StdMutex<Option<EncodedDelta>>,
+    }
+
+    #[async_trait]
+    impl HistorySource for LiveApplyOnOpenSource {
+        fn descriptor(&self) -> &SourceDescriptor {
+            self.inner.descriptor()
+        }
+
+        async fn plan(
+            &self,
+            request: &DataRequest,
+        ) -> Result<leani_source_api::SourcePlan, SourceError> {
+            self.inner.plan(request).await
+        }
+
+        async fn open(
+            &self,
+            chunk: &SourceChunk,
+            budget: SourceBudget,
+            cancellation: CancellationToken,
+        ) -> Result<leani_source_api::BlockFrameStream, SourceError> {
+            let live = self
+                .live
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+            if let Some(delta) = live {
+                let descriptor = self.processor.descriptor();
+                self.store
+                    .apply(
+                        self.processor.as_ref(),
+                        ProcessorCursor {
+                            processor_id: descriptor.id.to_string(),
+                            processor_version: descriptor.version.to_string(),
+                            chain_id: delta.chain_id,
+                            block_number: delta.block.number,
+                            block_hash: delta.block.hash,
+                            finality: Finality::Included,
+                            sequence: 1,
+                        },
+                        &delta,
+                        &[],
+                    )
+                    .await
+                    .expect("live apply");
+            }
+            self.inner.open(chunk, budget, cancellation).await
+        }
+    }
+
+    struct LiveOverlapRun {
+        _directory: tempfile::TempDir,
+        store: SqliteStore,
+        processor: Arc<FinalitySensitiveCounter>,
+        stream_id: Option<String>,
+        result: Result<BackfillReport, RuntimeError>,
+    }
+
+    /// Runs a fill-missing job over blocks 0 to 3 of a processor that records
+    /// finality in its delta, while the live lane applies block 2 as included
+    /// after the job planned its range. Both shapes commit in microbatches: a
+    /// subscription of a processor without output, or a materialization job
+    /// of one without delivery. `live_payload` replaces the live delta's
+    /// content; by default it is the block mapped as included.
+    async fn history_over_live_block(
+        subscription: bool,
+        live_payload: Option<Vec<u8>>,
+    ) -> LiveOverlapRun {
+        let range = BlockRange::new(BlockNumber(0), BlockNumber(3)).expect("range");
+        let history = frames(range);
+        let processor = Arc::new(FinalitySensitiveCounter {
+            inner: if subscription {
+                BlockLocalCounter::default()
+                    .with_split_delivery()
+                    .with_output_none()
+            } else {
+                BlockLocalCounter::default().with_delivery_none()
+            },
+        });
+        let (directory, store) = store().await;
+        let job = if subscription {
+            externalized_subscription_job(
+                &store,
+                processor.as_ref(),
+                "live-overlap-subscription",
+                range,
+                BackfillMode::FillMissing,
+                0,
+            )
+            .await
+        } else {
+            BackfillJob::for_processor(
+                "live-overlap-materialization",
+                processor.as_ref(),
+                ChainId(1),
+                range,
+                VerificationPolicy::CompleteCryptographic,
+            )
+            .expect("job")
+        };
+        let stream_id = job.delivery_stream_id.clone();
+        let mut included = history[2].clone();
+        included.finality = Finality::Included;
+        let mut live = processor.map(&included).await.expect("map included");
+        if let Some(payload) = live_payload {
+            live = EncodedDelta::new(processor.descriptor(), live.chain_id, live.block, payload);
+        }
+        let runtime = HistoricalRuntime::new(
+            store.clone(),
+            Arc::new(LiveApplyOnOpenSource {
+                inner: ScriptedHistorySource::from_frames(
+                    fixture_source_descriptor("live-overlap-history", range),
+                    history,
+                ),
+                store: store.clone(),
+                processor: processor.clone(),
+                live: StdMutex::new(Some(live)),
+            }),
+            processor.clone(),
+            HistoricalRuntimeConfig {
+                mapper_concurrency: 2,
+                ..HistoricalRuntimeConfig::default()
+            },
+        )
+        .expect("historical runtime");
+        let result = runtime
+            .run(job, default_source_budget(), CancellationToken::new())
+            .await;
+        LiveOverlapRun {
+            _directory: directory,
+            store,
+            processor,
+            stream_id,
+            result,
+        }
+    }
+
+    #[tokio::test]
+    async fn subscription_microbatch_accepts_a_block_applied_live_with_the_other_finality() {
+        // Mapped as finalized, the job's delta for block 2 differs from the
+        // live one only by finality; the job must deliver the block and
+        // complete instead of failing its microbatch with a conflicting apply.
+        let run = history_over_live_block(true, None).await;
+        let report = run.result.expect("history over the included block");
+
+        // Block 2 is republished into the subscription's stream rather than
+        // applied again, so every block counts as committed.
+        assert_eq!(report.frames_committed, 4);
+        assert_eq!(
+            report.final_coverage,
+            vec![BlockRange::new(BlockNumber(0), BlockNumber(3)).expect("range")]
+        );
+        let records = run
+            .store
+            .changes_in_stream(
+                run.processor.descriptor(),
+                run.stream_id.as_deref().expect("subscription stream"),
+                ChainId(1),
+                0,
+                100,
+            )
+            .await
+            .expect("subscription records");
+        let progress_through = records
+            .iter()
+            .filter(|record| record.change.kind == "system.backfill_progress")
+            .map(|record| record.block.number)
+            .collect::<Vec<_>>();
+        assert!(
+            progress_through.contains(&BlockNumber(2)),
+            "block 2 delivered: {progress_through:?}"
+        );
+        assert_eq!(
+            records.last().map(|record| record.change.kind.as_str()),
+            Some("system.backfill_complete")
+        );
+    }
+
+    #[tokio::test]
+    async fn materialization_microbatch_accepts_a_block_applied_live_with_the_other_finality() {
+        let run = history_over_live_block(false, None).await;
+        let report = run.result.expect("history over the included block");
+
+        // Block 2 keeps its live apply, now promoted to finalized.
+        assert_eq!(report.frames_committed, 3);
+        assert_eq!(report.duplicate_frames, 1);
+        assert_eq!(
+            run.store
+                .finalized_through(run.processor.descriptor())
+                .await
+                .expect("finalized coverage"),
+            Some(BlockNumber(3))
+        );
+    }
+
+    #[tokio::test]
+    async fn history_microbatches_still_reject_other_content_applied_live() {
+        // Seven transactions where history has none: not a finality variant.
+        let other = [7_u64.to_be_bytes().as_slice(), &[Finality::Included as u8]].concat();
+        for subscription in [true, false] {
+            let run = history_over_live_block(subscription, Some(other.clone())).await;
+            let error = run.result.expect_err("other content conflicts");
+            assert!(
+                matches!(
+                    error,
+                    RuntimeError::Store(StoreError::ConflictingApply {
+                        block: BlockNumber(2)
+                    })
+                ),
+                "subscription {subscription}: {error}"
+            );
+        }
     }
 
     #[tokio::test]

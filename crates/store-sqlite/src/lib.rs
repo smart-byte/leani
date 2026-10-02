@@ -3631,19 +3631,20 @@ impl SqliteStore {
         let writer_started = Instant::now();
         if mode == HistoricalBatchMode::Apply {
             for item in items {
-                if let Some(checksum) = applied_checksum(
+                // A different checksum need not be a conflict: a processor can
+                // record finality in its delta, so a block applied live as
+                // included differs from its finalized history. Only the
+                // per-block path, which has the processor's finality variants,
+                // can tell, so any applied block falls back to it.
+                if applied_checksum(
                     &self.inner.pool,
                     &instance,
                     item.delta.block.number,
                     item.delta.block.hash,
                 )
                 .await?
+                .is_some()
                 {
-                    if checksum != item.delta.checksum {
-                        return Err(StoreError::ConflictingApply {
-                            block: item.delta.block.number,
-                        });
-                    }
                     return Err(StoreError::HistoricalBatchRequiresFallback);
                 }
                 let covered_hash: Option<Vec<u8>> = sqlx::query_scalar(
@@ -4141,19 +4142,17 @@ impl SqliteStore {
         let _guard = self.inner.writer.lock_history().await;
         let writer_started = Instant::now();
         for item in items {
-            if let Some(checksum) = applied_checksum(
+            // As in `commit_historical_microbatch`: the per-block path decides
+            // whether a different checksum is a finality variant or a conflict.
+            if applied_checksum(
                 &self.inner.pool,
                 &instance,
                 item.delta.block.number,
                 item.delta.block.hash,
             )
             .await?
+            .is_some()
             {
-                if checksum != item.delta.checksum {
-                    return Err(StoreError::ConflictingApply {
-                        block: item.delta.block.number,
-                    });
-                }
                 return Err(StoreError::HistoricalBatchRequiresFallback);
             }
             let covered_hash: Option<Vec<u8>> = sqlx::query_scalar(

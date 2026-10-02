@@ -6,6 +6,18 @@ record, and documented RPC contracts.
 
 ## [Unreleased]
 
+### Fixed
+
+- A history job no longer fails with "block … was already applied with a
+  different delta" when the live lane applies one of its blocks while it runs.
+  A processor that records finality in its output, such as `blobs-money`, maps
+  that block as `included` live and as `finalized` from history. Subscription
+  and materialization microbatches compared the two checksums exactly and
+  failed the job, where single-block commits already accepted a finality
+  variant. Microbatches now hand every already-applied block to the
+  single-block path, which accepts a finality variant and still rejects other
+  content, also for a fill-missing subscription that replays the block.
+
 ## [0.1.0-rc.2] - 2026-10-01
 
 ### Upgrading from 0.1.0-rc.1
