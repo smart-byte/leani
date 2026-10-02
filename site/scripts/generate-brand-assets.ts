@@ -3,13 +3,21 @@ import { dirname, resolve } from 'node:path';
 import sharp from 'sharp';
 
 const siteRoot = resolve(import.meta.dir, '..');
-const source = resolve(siteRoot, 'src/assets/leani-mark.svg');
+const brandDir = resolve(siteRoot, 'src/assets/brand');
 const publicDir = resolve(siteRoot, 'public');
-const svg = await readFile(source);
+// The tile icon is the raster source, and it keeps the old /leani-mark.svg URL working.
+const svg = await readFile(resolve(brandDir, 'leani-icon.svg'));
+const published: Array<[source: string, target: string]> = [
+  ['leani-icon.svg', 'leani-mark.svg'],
+  ['leani-mark-on-dark.svg', 'leani-mark-on-dark.svg'],
+  ['leani-mark-on-light.svg', 'leani-mark-on-light.svg'],
+  ['leani-wordmark-on-dark.svg', 'leani-wordmark-on-dark.svg'],
+  ['leani-wordmark-on-light.svg', 'leani-wordmark-on-light.svg'],
+  ['favicon.svg', 'favicon.svg'],
+];
 
 await mkdir(publicDir, { recursive: true });
-await copyFile(source, resolve(publicDir, 'leani-mark.svg'));
-await copyFile(source, resolve(publicDir, 'favicon.svg'));
+await Promise.all(published.map(([from, to]) => copyFile(resolve(brandDir, from), resolve(publicDir, to))));
 
 async function renderPng(size: number): Promise<Buffer> {
   return sharp(svg, { density: 384 })

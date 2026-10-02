@@ -16,9 +16,12 @@ manifest into ignored render inputs under `src/generated`. Run
 changes; that command requires the repository Rust toolchain. Normal site builds
 require Bun only and make no network requests.
 
-Brand exports come from `src/assets/leani-mark.svg`. Run `bun run brand:update`
-after changing it to regenerate the SVG favicon, ICO, Apple touch icon, and
-social-media avatar under `public`.
+Brand exports come from `src/assets/brand`: the mark and wordmark for dark and
+light backgrounds, the tile icon, and the favicon. Run `bun run brand:update`
+after changing any of them to publish the SVGs and regenerate the ICO, Apple
+touch icon, and social-media avatar under `public`. `src/components/Wordmark.astro`
+and `scripts/og-card.html` inline the wordmark; `bun test` checks that every
+copy matches.
 
 The pinned `typescript` 5.9 package provides the JavaScript compiler API used
 by Astro and the executable documentation generator. TypeScript examples use

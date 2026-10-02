@@ -1,11 +1,11 @@
 ---
+import Wordmark from './Wordmark.astro';
 import { DOCS_URL, GITHUB_URL, QUICKSTART_URL } from '../config';
 ---
 <header class="site-head mono">
   <div class="wrap row">
     <a class="brand" href="/">
-      <img src="/leani-mark.svg" width="22" height="22" alt="" />
-      <span><span class="accent">leani</span>_</span>
+      <Wordmark height={20} />
       <span class="say">(LEE-nee)</span>
     </a>
     <nav aria-label="Site">
@@ -26,7 +26,8 @@ import { DOCS_URL, GITHUB_URL, QUICKSTART_URL } from '../config';
     font-size: 0.82rem;
   }
   .row { display: flex; align-items: center; justify-content: space-between; gap: 1rem; min-height: 3.5rem; }
-  .brand { display: flex; align-items: center; gap: 0.55rem; color: var(--ink); text-decoration: none; font-size: 0.95rem; }
+  /* Baseline alignment: the wordmark's bottom edge is its baseline, so the pronunciation sits on it. */
+  .brand { display: flex; align-items: baseline; gap: 0.6rem; color: var(--ink); text-decoration: none; font-size: 0.95rem; }
   .say { color: var(--ink-dim); font-size: 0.75rem; }
   @media (max-width: 720px) { .say { display: none; } }
   nav { display: flex; gap: 1.5rem; }

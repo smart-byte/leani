@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 220.37 75.2" role="img" aria-labelledby="title description">
+  <title id="title">Leani</title>
+  <desc id="description">The word leani in a geometric lowercase. Its last letter is the Leani mark: an i that leans 12 degrees with a square block for its dot.</desc>
+  <path d="M5 0V74M24 50H64.4A20.2 20.2 0 1 0 59.67 62.98M120.8 50A20.2 20.2 0 1 0 80.4 50A20.2 20.2 0 1 0 120.8 50M120.8 26V74M141.8 74V26M141.8 74V48.8A19 19 0 0 1 179.8 48.8V74" fill="none" stroke="#e6f0ea" stroke-width="10"/>
+  <path d="M195.8 74L205.8 74L216 26L206 26Z" fill="#e6f0ea"/>
+  <rect x="207.37" y="6" width="13" height="13" rx="1.2" fill="#3ee07f"/>
+</svg>

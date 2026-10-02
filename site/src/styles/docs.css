@@ -46,6 +46,11 @@ pre,
   letter-spacing: -0.02em;
 }
 
+/* The wordmark logo, at the same height as on the landing page header. */
+.site-title img {
+  height: 1.375rem;
+}
+
 .sl-markdown-content :is(h2, h3, h4) {
   text-wrap: balance;
 }

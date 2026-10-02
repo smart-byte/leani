@@ -6,6 +6,8 @@
       --virtual-time-budget=3000 --screenshot=public/og-image.png \
       "file://$PWD/scripts/og-card.html"
   Fonts load from node_modules, so run `bun install` first.
+  The wordmark paths match src/assets/brand/leani-wordmark-on-dark.svg. The flow
+  starts at one epoch's 32 slots and thins out to the one block an app keeps.
 -->
 <html lang="en">
 <head>
@@ -17,15 +19,14 @@
   * { box-sizing: border-box; }
   body { margin: 0; }
   .card { width: 1200px; height: 630px; position: relative; overflow: hidden; padding: 64px; background: #0b0f0d; color: #e6f0ea; font-family: 'Inter', sans-serif; }
-  .grid { position: absolute; inset: 0; opacity: .55; background-size: 48px 48px; background-image: linear-gradient(#16201b 1px, transparent 1px), linear-gradient(90deg, #16201b 1px, transparent 1px); }
+  .field { position: absolute; inset: 0; background-image: radial-gradient(circle, #18231e 2.2px, transparent 2.6px); background-size: 48px 48px; background-position: 24px 24px; }
   .top { position: relative; display: flex; justify-content: space-between; align-items: center; }
-  .brand { display: flex; align-items: center; gap: 14px; font: 700 30px 'JetBrains Mono', monospace; }
-  .brand svg { width: 48px; height: 48px; display: block; }
-  .accent { color: #3ee07f; }
+  .brand { display: block; height: 46px; width: auto; }
   .url { font: 400 22px 'JetBrains Mono', monospace; color: #8fa89a; }
   h1 { position: relative; max-width: 860px; margin: 52px 0 0; font-size: 58px; font-weight: 800; line-height: 1.06; letter-spacing: -0.03em; }
   .flow { position: absolute; left: 64px; right: 64px; bottom: 56px; height: 200px; }
   .flow svg { width: 100%; height: 100%; overflow: visible; }
+  .slots { fill: #3c5247; }
   .num { font: 400 16px 'JetBrains Mono', monospace; fill: #3ee07f; }
   .step { font: 700 24px 'JetBrains Mono', monospace; fill: #e6f0ea; }
   .caption { font: 400 17px 'Inter', sans-serif; fill: #8fa89a; }
@@ -33,23 +34,21 @@
 </head>
 <body>
 <div class="card">
-  <div class="grid"></div>
+  <div class="field"></div>
   <div class="top">
-    <div class="brand">
-      <svg viewBox="0 0 256 256" aria-hidden="true"><rect width="256" height="256" rx="48" fill="#242625"/><g transform="translate(-38 -10.5)" fill="#3ee07f"><rect x="84" y="56" width="18" height="18" rx="4"/><rect x="106" y="56" width="18" height="18" rx="4"/><rect x="84" y="78" width="18" height="18" rx="4"/><rect x="106" y="78" width="18" height="18" rx="4"/><path d="M104 104v56c0 23 18 41 41 41h35" fill="none" stroke="#3ee07f" stroke-width="40" stroke-linejoin="round"/><circle cx="180" cy="201" r="20"/><circle cx="228" cy="201" r="20"/></g></svg>
-      <span><span class="accent">leani</span>_</span>
-    </div>
+    <svg class="brand" viewBox="0 0 220.37 75.2" aria-label="Leani">
+      <path d="M5 0V74M24 50H64.4A20.2 20.2 0 1 0 59.67 62.98M120.8 50A20.2 20.2 0 1 0 80.4 50A20.2 20.2 0 1 0 120.8 50M120.8 26V74M141.8 74V26M141.8 74V48.8A19 19 0 0 1 179.8 48.8V74" fill="none" stroke="#e6f0ea" stroke-width="10"/>
+      <path d="M195.8 74L205.8 74L216 26L206 26Z" fill="#e6f0ea"/>
+      <rect x="207.37" y="6" width="13" height="13" rx="1.2" fill="#3ee07f"/>
+    </svg>
     <div class="url">leani.dev</div>
   </div>
   <h1>Keep only the Ethereum data your app needs.</h1>
   <div class="flow">
     <svg viewBox="0 0 1072 200" aria-hidden="true">
-      <g fill="#3ee07f">
-        <rect x="0" y="0" width="26" height="26" rx="6"/><rect x="32" y="0" width="26" height="26" rx="6"/>
-        <rect x="0" y="32" width="26" height="26" rx="6"/><rect x="32" y="32" width="26" height="26" rx="6"/>
-      </g>
-      <path d="M29 76 V112 C29 132 45 146 65 146 H1010" fill="none" stroke="#3ee07f" stroke-width="18" stroke-linecap="round"/>
-      <circle cx="1046" cy="146" r="20" fill="#3ee07f"/>
+      <g class="slots"><circle cx="12" cy="116" r="2.6"/><circle cx="24" cy="116" r="2.6"/><circle cx="36" cy="116" r="2.6"/><circle cx="48" cy="116" r="2.6"/><circle cx="0" cy="128" r="2.6"/><circle cx="12" cy="128" r="2.6"/><circle cx="24" cy="128" r="2.6"/><circle cx="36" cy="128" r="2.6"/><circle cx="48" cy="128" r="2.6"/><circle cx="60" cy="128" r="2.6"/><circle cx="0" cy="140" r="2.6"/><circle cx="12" cy="140" r="2.6"/><circle cx="24" cy="140" r="2.6"/><circle cx="36" cy="140" r="2.6"/><circle cx="48" cy="140" r="2.6"/><circle cx="60" cy="140" r="2.6"/><circle cx="0" cy="152" r="2.6"/><circle cx="12" cy="152" r="2.6"/><circle cx="24" cy="152" r="2.6"/><circle cx="36" cy="152" r="2.6"/><circle cx="48" cy="152" r="2.6"/><circle cx="60" cy="152" r="2.6"/><circle cx="0" cy="164" r="2.6"/><circle cx="12" cy="164" r="2.6"/><circle cx="24" cy="164" r="2.6"/><circle cx="36" cy="164" r="2.6"/><circle cx="48" cy="164" r="2.6"/><circle cx="60" cy="164" r="2.6"/><circle cx="12" cy="176" r="2.6"/><circle cx="24" cy="176" r="2.6"/><circle cx="36" cy="176" r="2.6"/><circle cx="48" cy="176" r="2.6"/></g>
+      <g class="slots"><circle cx="84" cy="146" r="3"/><circle cx="98" cy="146" r="3"/><circle cx="113.7" cy="146" r="3"/><circle cx="131.2" cy="146" r="3"/><circle cx="150.9" cy="146" r="3"/><circle cx="172.9" cy="146" r="3"/><circle cx="197.6" cy="146" r="3"/><circle cx="225.2" cy="146" r="3"/><circle cx="256.2" cy="146" r="3"/><circle cx="290.9" cy="146" r="3"/><circle cx="329.7" cy="146" r="3"/><circle cx="373.2" cy="146" r="3"/><circle cx="421.9" cy="146" r="3"/><circle cx="476.4" cy="146" r="3"/><circle cx="537.5" cy="146" r="3"/><circle cx="605.9" cy="146" r="3"/><circle cx="682.5" cy="146" r="3"/><circle cx="768.4" cy="146" r="3"/><circle cx="864.5" cy="146" r="3"/><circle cx="972.2" cy="146" r="3"/></g>
+      <rect x="1029" y="129" width="34" height="34" rx="2" fill="#3ee07f"/>
       <text class="num" x="150" y="92">01</text><text class="step" x="150" y="122">acquire</text>
       <text class="num" x="380" y="92">02</text><text class="step" x="380" y="122">validate</text>
       <text class="num" x="610" y="92">03</text><text class="step" x="610" y="122">reduce</text>
