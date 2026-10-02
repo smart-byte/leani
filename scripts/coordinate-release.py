@@ -24,6 +24,7 @@ WORKFLOWS = {"ci": "ci.yml", "security": "security.yml", "site": "site.yml", "co
              "binaries": "release.yml", "crates": "crates-release.yml", "sdk": "sdk-release.yml"}
 TARGETS = ("x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu", "x86_64-apple-darwin", "aarch64-apple-darwin")
 GATES = ("ci", "security", "site")
+SITE_URL = "https://leani.dev"
 
 
 def registry_json(url):
@@ -36,6 +37,16 @@ def registry_json(url):
         raise ReleaseError(f"registry returned HTTP {error.code}") from error
     except (URLError, ValueError) as error:
         raise ReleaseError("unable to verify registry publication") from error
+
+
+def site_serves(repository, release):
+    # Production builds pin every documentation edit link to the release tag.
+    try:
+        with urlopen(Request(f"{SITE_URL}/docs/", headers={"User-Agent": "leani-release-coordinator"}), timeout=60) as response:
+            page = response.read(4 * 1024 * 1024).decode("utf-8", "replace")
+    except (HTTPError, URLError):
+        return False
+    return f"github.com/{repository}/edit/v{release}/" in page
 
 
 def missing_crates(directory, release):
@@ -328,20 +339,24 @@ class Coordinator:
         deadline = min(self.gh.artifacts(run_id)[name]["expires_at"] for stage, run_id in plan["runs"].items()
                        for name in self.artifact_names(stage, release))
         self.report(f"Verified all candidates for v{release} at {commit}; publish using this coordinator run ID before {deadline}")
+        return plan
 
     def validate_plan(self, plan, candidate_run_id):
         if (plan.get("schema") != 1 or plan.get("state") != "verified" or plan.get("repository") != self.gh.repository
                 or set(plan.get("runs", {})) != set(WORKFLOWS)):
             raise ReleaseError("invalid or incomplete release plan")
-        release = version(plan["version"])
-        commit = plan["commit"]
-        self.release_commit(release, commit)
+        self.release_commit(version(plan["version"]), plan["commit"])
         source = plan.get("coordinator_commit", "")
         if not re.fullmatch(r"[a-f0-9]{40}", source):
             raise ReleaseError("invalid coordinator source commit")
         run = self.gh.successful_run(candidate_run_id, "release-coordinate.yml", source)
         if run.get("head_branch") != "main" or self.gh.api(f"compare/{source}...main")["status"] not in ("ahead", "identical"):
             raise ReleaseError("candidate plan must come from reviewed release control on main")
+        return self.verify_release(plan)
+
+    def verify_release(self, plan):
+        release = version(plan["version"])
+        commit = plan["commit"]
         for name in (f"v{release}", f"sdk-v{release}"):
             self.verify_tag(name, commit)
         for stage, run_id in plan["runs"].items():
@@ -354,8 +369,19 @@ class Coordinator:
                 raise ReleaseError(f"latest {stage} validation must pass on the release commit")
         return release, commit
 
+    def release(self, release, output, commit=None):
+        # One trigger: build and verify every candidate, publish it, and promote the site.
+        # A failed run is resumed by dispatching release again: candidate reuses the
+        # tags and successful preparation runs, and publication skips verified artifacts.
+        plan = self.candidate(release, output, commit)
+        release, commit = self.verify_release(plan)
+        self.publish_verified(plan, release, commit, os.environ.get("GITHUB_RUN_ID", "local"), promote_site=True)
+
     def publish(self, plan, candidate_run_id, promote_site=False):
         release, commit = self.validate_plan(plan, candidate_run_id)
+        self.publish_verified(plan, release, commit, candidate_run_id, promote_site)
+
+    def publish_verified(self, plan, release, commit, candidate_run_id, promote_site):
         with tempfile.TemporaryDirectory(prefix="leani-publish-") as directory:
             self.collect(plan, directory, compare=True)
             root = Path(directory)
@@ -405,7 +431,18 @@ class Coordinator:
                     branch = self.gh.api("git/ref/heads/site-production")
                     if branch["object"]["sha"] != commit:
                         raise ReleaseError("site-production did not reach the release commit")
-                    self.report("site: promoted; Cloudflare deployment follows through its Git integration")
+                    self.report("site: promoted; waiting for the Cloudflare production build")
+                # Cloudflare builds site-production through its Git integration, which can
+                # stop silently. Only the live site proves the release reached it.
+                # ponytail: 80 checks 15 s apart; raise the count if builds take longer.
+                for _ in range(80):
+                    if site_serves(self.gh.repository, release):
+                        break
+                    self.pause()
+                else:
+                    raise ReleaseError(f"site-production is at the release commit, but {SITE_URL} does not serve v{release}; "
+                                       "check the Cloudflare Pages deployment and its Git connection")
+                self.report(f"site: {SITE_URL} serves v{release}")
         self.report(f"Release v{release} is fully published")
 
     def open_pr(self, payload):
@@ -462,10 +499,11 @@ def main():
     sub = parser.add_subparsers(dest="action", required=True)
     prepare = sub.add_parser("open-pr")
     prepare.add_argument("--prepared", required=True)
-    candidate = sub.add_parser("candidate")
-    candidate.add_argument("version")
-    candidate.add_argument("--output", required=True)
-    candidate.add_argument("--commit")
+    for action in ("candidate", "release"):
+        command_parser = sub.add_parser(action)
+        command_parser.add_argument("version")
+        command_parser.add_argument("--output", required=True)
+        command_parser.add_argument("--commit")
     for action in ("verify-plan", "publish"):
         command_parser = sub.add_parser(action)
         command_parser.add_argument("--plan", required=True)
@@ -483,6 +521,8 @@ def main():
             coordinator.open_pr(json.loads(Path(args.prepared).read_text()))
         elif args.action == "candidate":
             coordinator.candidate(args.version, args.output, args.commit)
+        elif args.action == "release":
+            coordinator.release(args.version, args.output, args.commit)
         elif args.action == "verify-plan":
             plan = json.loads(Path(args.plan).read_text())
             if plan.get("version") != version(args.version):

@@ -144,6 +144,8 @@ class Publication(unittest.TestCase):
         self.failed_gate = None
         self.compare_status = "identical"
         self.sdk_lag = 0
+        self.site_commit = None
+        self.cloudflare_builds = True
         self.files = {}
         self.run_ids = {stage: index + 10 for index, stage in enumerate(release.WORKFLOWS)}
 
@@ -206,6 +208,8 @@ class Publication(unittest.TestCase):
             return {"sha": "d" * 40}
         if path.startswith("git/tags/"):
             return {"object": {"type": "commit", "sha": "c" * 40 if self.moved_tag else self.sha}}
+        if path == "git/ref/heads/site-production":
+            return {"object": {"sha": self.site_commit}} if self.site_commit else None
         if path == "releases?per_page=100":
             record = self.github_release()
             return [record] if record else []
@@ -216,7 +220,9 @@ class Publication(unittest.TestCase):
         if path.endswith("/dispatches"):
             self.dispatches.append((path, data))
             self.last_dispatch = path.split('/')[2]
-            if self.last_dispatch != self.failed_workflow:
+            if self.last_dispatch == "site-promote.yml":
+                self.site_commit = self.sha
+            elif self.last_dispatch != self.failed_workflow:
                 self.published.add(next(stage for stage, workflow in release.WORKFLOWS.items() if workflow == self.last_dispatch))
                 if self.last_dispatch == "release.yml":
                     self.draft_assets = None
@@ -284,8 +290,25 @@ class Publication(unittest.TestCase):
     def services(self):
         with patch.object(self.gh, "api", side_effect=self.api), patch.object(release, "command", side_effect=self.download), \
                 patch.object(release, "registry_json", side_effect=self.registry), patch.object(release, "image_manifest", side_effect=self.image), \
-                patch.object(release.time, "sleep"):
+                patch.object(release.time, "sleep"), \
+                patch.object(release, "site_serves", side_effect=lambda repository, version: self.cloudflare_builds and self.site_commit == self.sha):
             yield release.Coordinator(self.gh)
+
+    def test_release_publishes_everything_and_promotes_the_site(self):
+        self.published.clear()
+        self.partial_crates.clear()
+        with self.services() as coordinator:
+            coordinator.release(self.version, self.root / "release-plan.json")
+        self.assertEqual([path.split('/')[2] for path, _ in self.dispatches],
+                         ["release.yml", "crates-release.yml", "sdk-release.yml", "container.yml", "site-promote.yml"])
+        self.assertEqual(json.loads((self.root / "release-plan.json").read_text())["state"], "verified")
+        self.assertEqual(coordinator.messages[-1], f"Release v{self.version} is fully published")
+
+    def test_promotion_without_a_live_production_build_fails(self):
+        self.cloudflare_builds = False
+        with self.services() as coordinator, self.assertRaisesRegex(ReleaseError, "does not serve"):
+            coordinator.release(self.version, self.root / "release-plan.json")
+        self.assertEqual(self.site_commit, self.sha)
 
     def test_partial_release_only_dispatches_the_unfinished_publisher(self):
         with self.services() as coordinator:

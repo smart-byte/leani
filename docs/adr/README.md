@@ -39,3 +39,4 @@ Accepted records:
 - [0017 — MIT license](0017-mit-license.md)
 - [0018 — Forward-only store migrations to schema 23](0018-forward-only-store-migrations.md)
 - [0019 — Coordinated release preparation and publication](0019-coordinated-release-publication.md)
+- [0020 — Single-approval release](0020-single-approval-release.md)

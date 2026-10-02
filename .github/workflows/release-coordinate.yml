@@ -4,11 +4,11 @@ on:
   workflow_dispatch:
     inputs:
       action:
-        description: Prepare a version PR, build candidates, or publish verified candidates
+        description: Prepare a version PR, release everything (build, publish, promote site), or run the candidate or publish half alone
         required: true
         default: prepare
         type: choice
-        options: [prepare, candidate, publish]
+        options: [prepare, release, candidate, publish]
       version:
         description: Coordinated version without v (for example 0.1.0-rc.2)
         required: true
@@ -18,11 +18,11 @@ on:
         required: false
         type: string
       release_commit:
-        description: Exact commit on main to rebuild older candidates (candidate only; defaults to this main revision)
+        description: Exact commit on main to rebuild older candidates (release or candidate; defaults to this main revision)
         required: false
         type: string
       promote_site:
-        description: Promote the release site after all artifacts are published
+        description: Promote the release site after all artifacts are published (publish only; release always promotes)
         required: true
         default: false
         type: boolean
@@ -65,7 +65,7 @@ jobs:
           commit = os.environ['RELEASE_COMMIT'] or 'HEAD'
           if commit != 'HEAD' and not re.fullmatch(r'[a-f0-9]{40}', commit):
               sys.exit('release_commit must be an exact commit SHA')
-          if os.environ['RELEASE_ACTION'] == 'candidate' and metadata(commit) != requested:
+          if os.environ['RELEASE_ACTION'] in ('release', 'candidate') and metadata(commit) != requested:
               sys.exit('merge the release preparation PR before building candidates')
           PY
       - name: Prepare version changes
@@ -160,8 +160,8 @@ jobs:
         run: |
           test -n "$GH_TOKEN" || { echo "configure the RELEASE_CONTROL_TOKEN secret on release-control (docs/maintainers/releasing.md)" >&2; exit 1; }
           mkdir -p "$RUNNER_TEMP/release-plan"
-          if [ "$RELEASE_ACTION" = candidate ]; then
-            set -- candidate "$RELEASE_VERSION" --output "$RUNNER_TEMP/release-plan/release-plan.json"
+          if [ "$RELEASE_ACTION" = candidate ] || [ "$RELEASE_ACTION" = release ]; then
+            set -- "$RELEASE_ACTION" "$RELEASE_VERSION" --output "$RUNNER_TEMP/release-plan/release-plan.json"
             if [ -n "$RELEASE_COMMIT" ]; then set -- "$@" --commit "$RELEASE_COMMIT"; fi
             python3 scripts/coordinate-release.py "$@"
           else
@@ -170,7 +170,7 @@ jobs:
             python3 scripts/coordinate-release.py "$@"
           fi
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        if: always() && inputs.action == 'candidate'
+        if: always() && (inputs.action == 'candidate' || inputs.action == 'release')
         with:
           name: leani-release-plan-${{ inputs.version }}
           path: ${{ runner.temp }}/release-plan/release-plan.json
