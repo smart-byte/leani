@@ -1,0 +1,169 @@
+---
+// The brand signature: one epoch's 32 slots (a 6×6 grid without its corners)
+// with one kept block. On first view the other slots dim and a stem rises
+// under the block and leans 12°, so the kept block becomes the dot of the
+// Leani i. Without JavaScript it rests as the field; with reduced motion it
+// shows the finished mark.
+//
+// Hovering scans the epoch: a wave lights the slots outward from the block,
+// and the slots near the pointer swell and part around it. The i itself never
+// moves; only the field plays.
+//
+// The block, stem and 12° lean match src/assets/brand/leani-mark-on-dark.svg;
+// the grid is laid out so the kept slot sits exactly where the mark's dot is.
+const BLOCK = { x: 47.04, y: 15, size: 17, cx: 55.54, cy: 23.5 };
+const STEM = { left: 35.96, right: 48.96, top: 39, bottom: 85, originX: 42.46 };
+const STEP = 18.5;
+const KEPT = [3, 2];
+const slots: Array<{ x: number; y: number; delay: number }> = [];
+for (let row = 0; row < 6; row++) {
+  for (let col = 0; col < 6; col++) {
+    const corner = (col === 0 || col === 5) && (row === 0 || row === 5);
+    if (corner || (col === KEPT[0] && row === KEPT[1])) continue;
+    const x = BLOCK.cx + (col - KEPT[0]) * STEP;
+    const y = BLOCK.cy + (row - KEPT[1]) * STEP;
+    // Slots farther from the kept block react later, so changes ripple outward.
+    const delay = Math.hypot(col - KEPT[0], row - KEPT[1]) * 0.07;
+    slots.push({ x: +x.toFixed(2), y: +y.toFixed(2), delay: +delay.toFixed(2) });
+  }
+}
+---
+<div class="kept" data-kept-block aria-hidden="true">
+  <svg viewBox="-4 -18 101 105">
+    <g class="slots">
+      {slots.map((s) => <circle cx={s.x} cy={s.y} r="2.4" style={`--d: ${s.delay}s`} />)}
+    </g>
+    <path
+      class="stem"
+      style={`transform-origin: ${STEM.originX}px ${STEM.bottom}px`}
+      d={`M${STEM.left} ${STEM.bottom}H${STEM.right}V${STEM.top}H${STEM.left}Z`}
+    />
+    <rect class="block" x={BLOCK.x} y={BLOCK.y} width={BLOCK.size} height={BLOCK.size} rx="1.5" />
+  </svg>
+</div>
+
+<script>
+  const reduced = matchMedia('(prefers-reduced-motion: reduce)');
+  // The lens: slots within RADIUS (viewBox units) of the pointer light up and
+  // swell, and are pushed up to PUSH units away from it.
+  const RADIUS = 34;
+  const PUSH = 8;
+  const REST_OPACITY = 0.22;
+  // Lens colours are mixed here as plain rgb(): animating fill between a
+  // color-mix() and var(--accent) flashes red in Chromium.
+  const SLOT_RGB = [0x3c, 0x52, 0x47];
+  const hex = getComputedStyle(document.documentElement).getPropertyValue('--accent').trim();
+  const ACCENT_RGB = /^#[0-9a-f]{6}$/i.test(hex)
+    ? [1, 3, 5].map((i) => parseInt(hex.slice(i, i + 2), 16))
+    : [0x3e, 0xe0, 0x7f];
+  const lensFill = (k: number) => `rgb(${SLOT_RGB.map((c, i) => Math.round(c + (ACCENT_RGB[i] - c) * k)).join(' ')})`;
+
+  for (const el of document.querySelectorAll<HTMLElement>('[data-kept-block]')) {
+    const io = new IntersectionObserver((entries) => {
+      if (!entries.some((e) => e.isIntersecting)) return;
+      el.classList.add('is-on');
+      io.disconnect();
+    }, { threshold: 0.6 });
+    io.observe(el);
+
+    const svg = el.querySelector('svg')!;
+    const slots = [...el.querySelectorAll<SVGCircleElement>('.slots circle')].map((c) => ({
+      c,
+      x: Number(c.getAttribute('cx')),
+      y: Number(c.getAttribute('cy')),
+    }));
+    let pointer: { x: number; y: number } | null = null;
+    let frame = 0;
+    let waveTimer = 0;
+
+    const wave = () => {
+      if (reduced.matches) return;
+      el.classList.remove('is-wave');
+      void el.offsetWidth; // restart the animation
+      el.classList.add('is-wave');
+      clearTimeout(waveTimer);
+      waveTimer = window.setTimeout(() => el.classList.remove('is-wave'), 1400);
+    };
+
+    const render = () => {
+      frame = 0;
+      const still = reduced.matches;
+      const rest = el.classList.contains('is-on') ? REST_OPACITY : 1;
+      for (const s of slots) {
+        const dx = s.x - (pointer?.x ?? Infinity);
+        const dy = s.y - (pointer?.y ?? Infinity);
+        const dist = Math.hypot(dx, dy) || 1;
+        const k = pointer ? Math.max(0, 1 - dist / RADIUS) : 0;
+        if (k === 0) {
+          s.c.style.removeProperty('transform');
+          s.c.style.removeProperty('opacity');
+          s.c.style.removeProperty('fill');
+          continue;
+        }
+        const push = still ? 0 : PUSH * k * k;
+        const scale = still ? 1 : 1 + 1.4 * k * k;
+        s.c.style.transform = `translate(${(dx / dist) * push}px, ${(dy / dist) * push}px) scale(${scale})`;
+        s.c.style.opacity = String(rest + (1 - rest) * k);
+        s.c.style.fill = lensFill(k);
+      }
+    };
+    const schedule = () => { frame ||= requestAnimationFrame(render); };
+    const toViewBox = (e: PointerEvent) => {
+      const box = svg.getBoundingClientRect();
+      const vb = svg.viewBox.baseVal;
+      return {
+        x: vb.x + ((e.clientX - box.left) * vb.width) / box.width,
+        y: vb.y + ((e.clientY - box.top) * vb.height) / box.height,
+      };
+    };
+
+    el.addEventListener('pointerenter', (e) => {
+      if (e.pointerType === 'touch') return;
+      el.classList.add('is-hover');
+      wave();
+    });
+    el.addEventListener('pointermove', (e) => {
+      if (e.pointerType === 'touch') return;
+      pointer = toViewBox(e);
+      schedule();
+    });
+    el.addEventListener('pointerleave', () => {
+      pointer = null;
+      el.classList.remove('is-hover');
+      schedule();
+    });
+    // Touch has no hover: a tap sends the wave instead.
+    el.addEventListener('pointerdown', (e) => {
+      if (e.pointerType === 'touch') wave();
+    });
+  }
+</script>
+
+<style>
+  .kept { width: 100%; max-width: 11rem; }
+  svg { display: block; width: 100%; height: auto; overflow: visible; }
+  .slots { fill: #3c5247; }
+  .slots circle {
+    transform-box: fill-box; transform-origin: center;
+    transition: opacity 0.7s ease var(--d), fill 0.5s ease var(--d), transform 0.5s ease var(--d);
+  }
+  .stem { fill: var(--ink); transform: scaleY(0); }
+  .block { fill: var(--accent); }
+  .is-on .slots circle { opacity: 0.22; }
+  .is-on .stem { animation: kept-rise-and-lean 1.5s cubic-bezier(0.55, 0, 0.25, 1) 0.45s both; }
+  /* While the pointer is over the field, the lens follows it without the reveal's ripple delay. */
+  .is-hover .slots circle { transition: opacity 0.2s ease, fill 0.2s ease, transform 0.3s cubic-bezier(0.2, 0.8, 0.2, 1); }
+  .is-wave .slots circle { animation: kept-wave 0.7s ease-out calc(var(--d) * 2.2) both; }
+  @keyframes kept-rise-and-lean {
+    0% { transform: skewX(0deg) scaleY(0); }
+    48% { transform: skewX(0deg) scaleY(1); }
+    100% { transform: skewX(-12deg) scaleY(1); }
+  }
+  @keyframes kept-wave {
+    30% { fill: var(--accent); opacity: 1; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .slots circle, .is-hover .slots circle { opacity: 0.22; transition: fill 0.2s ease, opacity 0.2s ease; }
+    .stem, .is-on .stem { animation: none; transform: skewX(-12deg); }
+  }
+</style>
