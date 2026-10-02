@@ -1,4 +1,5 @@
 ---
+import KeptBlock from './KeptBlock.astro';
 import { BLOBS_MONEY_URL } from '../config';
 ---
 <section id="why" class="wrap section story" aria-labelledby="story-h">
@@ -31,9 +32,12 @@ import { BLOBS_MONEY_URL } from '../config';
         processor contract applies whichever capable source supplies the block.
       </p>
     </div>
-    <blockquote class="pull mono">
-      Your app doesn't need the whole&nbsp;chain. It needs its own&nbsp;data.
-    </blockquote>
+    <div class="pull">
+      <KeptBlock />
+      <blockquote class="mono">
+        Your app doesn't need the whole&nbsp;chain. It needs its own&nbsp;data<span class="stop">.</span>
+      </blockquote>
+    </div>
   </div>
 </section>
 
@@ -42,11 +46,16 @@ import { BLOBS_MONEY_URL } from '../config';
   @media (max-width: 760px) { .cols { grid-template-columns: 1fr; } }
   .prose { display: grid; gap: 1.1rem; max-width: 58ch; }
   .prose code { font-family: var(--font-mono); font-size: 0.85em; color: var(--accent); }
-  .pull {
-    border-left: 3px solid var(--accent);
-    padding-left: 1.5rem;
+  /* Top-aligned with the prose: centred, the heading above made the column read low. */
+  .pull { display: grid; gap: 1.75rem; justify-items: start; align-self: start; }
+  blockquote {
     font-size: clamp(1.3rem, 2.6vw, 1.8rem);
     line-height: 1.4;
     color: var(--ink);
+  }
+  /* The full stop is the kept block; the period stays in the text for copy and screen readers. */
+  .stop {
+    display: inline-block; width: 0.42em; height: 0.42em; margin-left: 0.06em; overflow: hidden;
+    border-radius: 1px; background: var(--accent); color: transparent; vertical-align: baseline;
   }
 </style>
