@@ -4104,7 +4104,7 @@ pub(crate) fn configured_history_sources(
     Vec<Arc<dyn leani_source_api::HistorySource>>,
     leani_source_api::VerificationPolicy,
 )> {
-    let (sources, policy) = configured_history_candidates(config, processor, raw_history_store)?;
+    let (sources, policy, _) = configured_history_candidates(config, processor, raw_history_store)?;
     require_history_sources(&sources, processor)?;
     Ok((sources, policy))
 }
@@ -4134,8 +4134,21 @@ fn history_sources_with_bridge(
     Vec<Arc<dyn leani_source_api::HistorySource>>,
     leani_source_api::VerificationPolicy,
 )> {
-    let (mut sources, policy) =
+    // Once per process: live-gap recovery assembles sources for every chunk.
+    static REPORTED: std::sync::Mutex<std::collections::BTreeSet<String>> =
+        std::sync::Mutex::new(std::collections::BTreeSet::new());
+    let (mut sources, policy, excluded) =
         configured_history_candidates(config, processor, raw_history_store)?;
+    for reason in excluded {
+        let reason = format!("{}: {reason}", processor.descriptor().instance);
+        if REPORTED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(reason.clone())
+        {
+            info!(%reason, "a configured history source cannot serve this processor");
+        }
+    }
     let configured = config_for_processor_descriptor(config, processor.descriptor())?;
     if !configured.require_retained_input
         && let Some(bridge) = bridge
@@ -4163,14 +4176,19 @@ fn history_sources_with_bridge(
     Ok((sources, policy))
 }
 
+type HistorySources = Vec<Arc<dyn leani_source_api::HistorySource>>;
+
+/// Also returns why each configured source it left out cannot serve the
+/// processor.
 #[allow(clippy::too_many_lines)]
 fn configured_history_candidates(
     config: &Config,
     processor: &dyn leani_processor_api::Processor,
     raw_history_store: Option<&leani_store_history::HistoryStore>,
 ) -> Result<(
-    Vec<std::sync::Arc<dyn leani_source_api::HistorySource>>,
+    HistorySources,
     leani_source_api::VerificationPolicy,
+    Vec<String>,
 )> {
     use leani_source_api::{HistorySource, VerificationPolicy};
     use leani_source_archive::LocalArchiveSource;
@@ -4213,6 +4231,7 @@ fn configured_history_candidates(
         .collect::<Vec<_>>();
     candidates.sort_by_key(|source| source.priority);
     let mut selected = Vec::new();
+    let mut excluded = Vec::new();
     let mut policy = VerificationPolicy::CompleteCryptographic;
     for configured in candidates {
         let source: std::sync::Arc<dyn HistorySource> = match configured.kind {
@@ -4255,9 +4274,17 @@ fn configured_history_candidates(
             crate::config::HistorySourceKind::Parquet => continue,
         };
         let descriptor = source.descriptor();
-        let supplies = descriptor.capabilities.contains_all(required)
-            && (allow_filtered || descriptor.complete_capabilities.contains_all(required));
-        if supplies {
+        if !descriptor.capabilities.contains_all(required) {
+            excluded.push(format!(
+                "{}: it does not serve every material kind the processor requires",
+                descriptor.id
+            ));
+        } else if !allow_filtered && !descriptor.complete_capabilities.contains_all(required) {
+            excluded.push(format!(
+                "{}: it serves the required material only filtered, and the processor reads whole blocks",
+                descriptor.id
+            ));
+        } else {
             if matches!(
                 configured.trust,
                 crate::config::HistoryTrust::TrustedDataset
@@ -4315,7 +4342,7 @@ fn configured_history_candidates(
         }
         policy = VerificationPolicy::TrustedDataset;
     }
-    Ok((selected, policy))
+    Ok((selected, policy, excluded))
 }
 
 fn retained_rpc_log_sources(
