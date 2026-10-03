@@ -245,7 +245,11 @@ export interface ProcessorCoverage {
 ```
 
 `paused` and `failed` report the processor's live lane; `/v1/network/status`
-gives its `pauseReason` and first unapplied block (`liveGap`).
+gives its `pauseReason` and first unapplied block (`liveGap`). Otherwise
+`starting` means nothing is applied yet and `backfilling` that the processor's
+range has gaps. `catching_up` means it has none but the processor has not
+reached the chain's finalized head (`chainFinalizedHead`), or the node is not
+ready yet. Only then is it `live`.
 
 Every `available` interval is inclusive and has one exact finality for every
 block it contains. Intervals split at both coverage gaps and finality

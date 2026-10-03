@@ -59,6 +59,9 @@ record, and documented RPC contracts.
   `peer_recovery_timeout_seconds`, again at that interval while it does.
   Requests spread across connected peers, so such a pool also caps backfill
   throughput.
+- Coverage reports `catching_up`, not `live`, while a processor is still
+  behind the chain's finalized head, even when its range has no gaps and the
+  node is ready.
 - A history job no longer fails with "block … was already applied with a
   different delta" when the live lane applies one of its blocks while it runs.
   A processor that records finality in its output, such as `blobs-money`, maps
