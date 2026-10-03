@@ -12,9 +12,11 @@ license and attribution notices.
 
 ## Before changing a contract
 
-Public source, processor, store, API, SDK, cursor, or durable encoding changes
-need an ADR in `docs/adr/`. Compatibility changes must include migration,
-golden-fixture, and downgrade behavior. Do not broaden RPC compatibility
+Public source, processor, store, API, SDK, cursor, and durable encoding
+contracts are versioned explicitly; explain a change to one in its pull
+request. Compatibility changes must include migration, golden-fixture, and
+downgrade behavior; before v1 they may break only with a documented migration
+or rebuild path. Do not broaden RPC compatibility
 without updating `docs/reference/ethereum-json-rpc.md` and adding differential tests.
 
 ## Local checks

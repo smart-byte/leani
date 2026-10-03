@@ -4674,7 +4674,7 @@ impl RethP2pSource {
                 .disable_tx_gossip(true)
                 .mainnet_boot_nodes()
                 // Leani's own EIP-1459 seeder below decodes the DNS tree and
-                // admits its records through the peer manager (ADR 0015). It
+                // admits its records through the peer manager. It
                 // joins multi-segment TXT records, which Reth 2.4.1 read only
                 // in part; the pinned Reth resolver joins them too.
                 .disable_dns_discovery()
