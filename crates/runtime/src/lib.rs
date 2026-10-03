@@ -1623,8 +1623,10 @@ impl HistoricalRuntime {
         // since the current gap last committed a block.
         let mut gap_failures = 0_u32;
         // Sources are in priority order. A gap starts on the first and moves
-        // to the next only after a source error.
+        // to the next only after a source error. A source that refused to
+        // plan the job is skipped for the rest of it.
         let mut source_index = 0_usize;
+        let mut refused = BTreeSet::new();
         let mut source_bytes = 0_u64;
         let mut physical_source_bytes = 0_u64;
         let mut reused_source_bytes = 0_u64;
@@ -1807,6 +1809,9 @@ impl HistoricalRuntime {
                 continue;
             }
 
+            while refused.contains(&source_index) {
+                source_index = source_index.saturating_add(1) % source_count;
+            }
             let source = self.sources.get(source_index).cloned().ok_or_else(|| {
                 RuntimeError::InvalidConfig("historical source index is invalid".to_owned())
             })?;
@@ -1965,6 +1970,18 @@ impl HistoricalRuntime {
                     )
                     .await?;
                     return Err(error);
+                }
+                Err(RuntimeError::SourceCannotServe { source_id, detail })
+                    if refused.len().saturating_add(1) < source_count =>
+                {
+                    warn!(
+                        job_id = %job.id,
+                        %source_id,
+                        %detail,
+                        "historical source cannot serve this job; the next source serves it"
+                    );
+                    refused.insert(source_index);
+                    source_index = source_index.saturating_add(1) % source_count;
                 }
                 Err(error) => {
                     self.save_checkpoint(
@@ -2396,7 +2413,16 @@ impl HistoricalRuntime {
             }
             (None, _) => request.clone(),
         };
-        let plan = source.plan(&physical_request).await?;
+        let plan = source
+            .plan(&physical_request)
+            .await
+            .map_err(|error| match error {
+                SourceError::InvalidPlan(detail) => RuntimeError::SourceCannotServe {
+                    source_id: source.descriptor().id.to_string(),
+                    detail,
+                },
+                error => error.into(),
+            })?;
         plan.validate()?;
         let startup_gate = startup_permit.map(HistoricalMaterialStartupPermit::gate);
         let mut prior_chunk_last = expected_parent;
@@ -7240,6 +7266,10 @@ pub enum RuntimeError {
     Cancelled,
     #[error("source failed: {0}")]
     Source(#[from] SourceError),
+    /// A history source refused to plan a job's request, as one does for a
+    /// capability it serves only for some request shapes.
+    #[error("historical source {source_id} cannot serve this job: {detail}")]
+    SourceCannotServe { source_id: String, detail: String },
     #[error("processor failed: {0}")]
     Processor(#[from] ProcessorError),
     #[error("store failed: {0}")]
@@ -13846,6 +13876,83 @@ mod tests {
             } else {
                 let error = result.expect_err("no source can serve the range");
                 assert!(error.to_string().contains("schema changed"), "{error}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_source_that_cannot_plan_the_job_falls_over_for_the_rest_of_it() {
+        // A source can advertise a capability it serves only for some
+        // requests, as Xatu does receipts, and refuse the plan. That refusal
+        // failed the job although another configured source served it.
+        let ranges = vec![
+            BlockRange::new(BlockNumber(1), BlockNumber(2)).expect("range"),
+            BlockRange::new(BlockNumber(4), BlockNumber(5)).expect("range"),
+        ];
+        let bounding = BlockRange::new(BlockNumber(1), BlockNumber(5)).expect("range");
+        let refusing = || {
+            let mut descriptor = fixture_source_descriptor("refusing-history", bounding);
+            descriptor.capabilities = leani_primitives::CapabilitySet::of(Capability::Logs);
+            descriptor.complete_capabilities = descriptor.capabilities;
+            Arc::new(ScriptedHistorySource::from_frames(
+                descriptor,
+                frames(bounding),
+            ))
+        };
+        let mut fallback_descriptor = fixture_source_descriptor("fallback-history", bounding);
+        fallback_descriptor.priority = 1;
+        let fallback: Arc<dyn HistorySource> = Arc::new(ScriptedHistorySource::from_frames(
+            fallback_descriptor,
+            frames(bounding),
+        ));
+        for (name, with_fallback) in [("refused-with-fallback", true), ("refused-alone", false)] {
+            let refusing = refusing();
+            let mut sources = vec![refusing.clone() as Arc<dyn HistorySource>];
+            if with_fallback {
+                sources.push(fallback.clone());
+            }
+            let processor = Arc::new(BlockLocalCounter::default());
+            let (_directory, store) = store().await;
+            let result = HistoricalRuntime::new_with_sources(
+                store,
+                sources,
+                processor.clone(),
+                HistoricalRuntimeConfig {
+                    mapper_concurrency: 1,
+                    max_attempts: 3,
+                    retry_base: Duration::from_millis(1),
+                    retry_max: Duration::from_millis(1),
+                    ..HistoricalRuntimeConfig::default()
+                },
+            )
+            .expect("runtime")
+            .run(
+                BackfillJob::for_processor_ranges(
+                    name,
+                    processor.as_ref(),
+                    ChainId(1),
+                    ranges.clone(),
+                    VerificationPolicy::CompleteCryptographic,
+                )
+                .expect("job"),
+                default_source_budget(),
+                CancellationToken::new(),
+            )
+            .await;
+            if with_fallback {
+                let report = result.expect("the fallback source serves the job");
+                assert_eq!(report.final_coverage, ranges);
+                assert_eq!(
+                    (refusing.plan_calls(), refusing.open_calls()),
+                    (1, 0),
+                    "a source that refused the job is not asked again"
+                );
+            } else {
+                let error = result.expect_err("no source can serve the job");
+                assert!(
+                    error.to_string().contains("refusing-history cannot serve"),
+                    "{error}"
+                );
             }
         }
     }
