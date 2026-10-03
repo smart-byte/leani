@@ -6,6 +6,12 @@ record, and documented RPC contracts.
 
 ## [Unreleased]
 
+### Added
+
+- `leani backfill` logs its progress every 30 seconds: committed blocks,
+  blocks per minute and, over P2P, connected peers. A run waiting on peers, or
+  on a network that cannot start, no longer looks the same as a working one.
+
 ### Fixed
 
 - A restart during an automatic backfill could silently erase part of an
@@ -27,6 +33,9 @@ record, and documented RPC contracts.
   once and moves to the next configured source for the rest of its range. The
   node also logs why it leaves a configured history source out of a
   processor's jobs.
+- History P2P connection retries log at `warn` with their error instead of
+  `debug`, so a backfill whose Reth networking cannot start, such as in a
+  sandbox that forbids sockets, no longer waits silently.
 - A history job no longer fails with "block … was already applied with a
   different delta" when the live lane applies one of its blocks while it runs.
   A processor that records finality in its output, such as `blobs-money`, maps
