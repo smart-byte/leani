@@ -1485,7 +1485,10 @@ export interface components {
             complete: boolean;
             /**
              * @description `paused` and `failed` report the processor's live lane;
-             *     `/v1/network/status` gives its `pauseReason`.
+             *     `/v1/network/status` gives its `pauseReason`. `catching_up`
+             *     means the range has no gaps but the processor has not reached
+             *     `chainFinalizedHead` or the node is not ready; only then is it
+             *     `live`.
              * @enum {string}
              */
             state: "starting" | "backfilling" | "catching_up" | "live" | "degraded" | "paused" | "failed";

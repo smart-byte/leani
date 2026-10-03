@@ -2464,6 +2464,12 @@ async fn coverage(
         .ok()
         .map(|runtime| runtime.state);
     let complete = query_range.is_some_and(|range| coverage_gaps(range, &ranges).is_empty());
+    // Contiguous coverage is complete only up to the cursor, so a processor
+    // whose history is still far behind the chain is not live yet.
+    let reached_finalized_head = match (&cursor, &chain_finalized_head) {
+        (Some(cursor), Some(head)) => cursor.block_number.0 >= head.number,
+        _ => true,
+    };
     let processed_through = ranges.last().map(|range| range.end().0);
     Ok(CoverageResponse {
         chain_id: state.config.chain_id.0,
@@ -2483,7 +2489,7 @@ async fn coverage(
             "failed"
         } else if cursor.is_none() {
             "starting"
-        } else if complete && state.config.readiness.snapshot().ready {
+        } else if complete && reached_finalized_head && state.config.readiness.snapshot().ready {
             "live"
         } else if complete {
             "catching_up"
@@ -14067,15 +14073,15 @@ mod tests {
         assert_eq!(live_sync_target(&snapshot), Some(100));
     }
 
-    #[tokio::test]
-    async fn contiguous_coverage_does_not_imply_caught_up_or_live_ready() {
+    /// A store whose block counter has applied fixture blocks 0 and 1.
+    async fn counter_store_through_block_one(
+        directory: &tempfile::TempDir,
+    ) -> (SqliteStore, Arc<leani_testkit::BlockLocalCounter>) {
         use leani_primitives::ProcessorCursor;
-        use leani_source_api::{NetworkLane, NetworkPhase};
         use leani_testkit::{BlockLocalCounter, fixture_frame};
 
-        let directory = tempfile::tempdir().expect("tempdir");
         let store = SqliteStore::open(leani_store_sqlite::StoreConfig::new(
-            directory.path().join("contiguous-but-behind.sqlite"),
+            directory.path().join("counter.sqlite"),
         ))
         .await
         .expect("store");
@@ -14104,6 +14110,15 @@ mod tests {
                 .expect("apply");
             parent = frame.block.hash;
         }
+        (store, processor)
+    }
+
+    #[tokio::test]
+    async fn contiguous_coverage_does_not_imply_caught_up_or_live_ready() {
+        use leani_source_api::{NetworkLane, NetworkPhase};
+
+        let directory = tempfile::tempdir().expect("tempdir");
+        let (store, processor) = counter_store_through_block_one(&directory).await;
 
         let telemetry = NetworkTelemetry::default();
         let session = telemetry.register(NetworkLane::Live);
@@ -14143,6 +14158,53 @@ mod tests {
         assert_eq!(body["processors"][0]["storedRangeContiguous"], true);
         assert_eq!(body["processors"][0]["syncTargetBlock"], 3);
         assert_eq!(body["processors"][0]["blocksRemaining"], 2);
+    }
+
+    #[tokio::test]
+    async fn a_ready_node_reports_a_processor_below_the_finalized_head_as_catching_up() {
+        // A processor ninety thousand blocks behind read as live 30 seconds
+        // after start: its coverage was contiguous and the lanes were ready.
+        for (finalized, expected) in [(5, "catching_up"), (1, "live")] {
+            let directory = tempfile::tempdir().expect("tempdir");
+            let (store, processor) = counter_store_through_block_one(&directory).await;
+            let anchor = leani_testkit::fixture_frame(finalized, BlockHash::ZERO).block;
+            store
+                .store_canonical_anchor(ChainId(1), anchor, Finality::Finalized)
+                .await
+                .expect("finalized anchor");
+            let readiness = ReadinessHandle::new(true, true);
+            readiness.set_live_ready(true);
+            readiness.set_finality_ready(true);
+            let configured: Arc<dyn Processor> = processor;
+            let router = router_with_processors(
+                store,
+                vec![configured],
+                Vec::new(),
+                ApiConfig {
+                    readiness,
+                    ..ApiConfig::default()
+                },
+            )
+            .expect("router");
+
+            let response = router
+                .oneshot(
+                    Request::get("/v1/network/status")
+                        .body(Body::empty())
+                        .expect("request"),
+                )
+                .await
+                .expect("response");
+            let body = to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body");
+            let body: Value = serde_json::from_slice(&body).expect("JSON");
+            assert_eq!(body["processors"][0]["coverage"]["complete"], true);
+            assert_eq!(
+                body["processors"][0]["coverage"]["state"], expected,
+                "finalized head at block {finalized}, cursor at block 1"
+            );
+        }
     }
 
     #[tokio::test]
