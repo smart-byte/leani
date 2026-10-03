@@ -1,6 +1,6 @@
 // docs:start query-then-follow
 import {
-  applyEntityChange, createLeaniClient, LeaniError,
+  applyEntityChange, createLeaniClient, isLiveGapChange, LeaniError,
   type GenericSnapshotPage, type LeaniClient, type UniswapPoolPrice,
 } from "@smart-byte/leani-sdk";
 
@@ -46,7 +46,7 @@ export async function followPrices(
       )) {
         // Both apply and undo carry the entity mutation to perform.
         await applyEntityChange(target, change);
-        if (change.operation === "finalized") {
+        if (change.operation === "finalized" && !isLiveGapChange(change)) {
           console.log("finalized through", change.data.throughBlock);
         }
       }

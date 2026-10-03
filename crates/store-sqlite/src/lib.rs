@@ -1430,6 +1430,28 @@ pub struct BackfillCompletionMetadata {
     pub domain_changes: u64,
 }
 
+/// Kind of the system change that announces blocks a live lane skipped.
+pub const LIVE_GAP_CHANGE_KIND: &str = "system.live_gap";
+
+/// Decode the first and last skipped block of a [`LIVE_GAP_CHANGE_KIND`]
+/// change payload. Bytes after them are reserved for later fields.
+///
+/// # Errors
+///
+/// Returns an error when the payload does not start with two big-endian
+/// block numbers in order.
+pub fn decode_live_gap_notice(payload: &[u8]) -> Result<(BlockNumber, BlockNumber), StoreError> {
+    let invalid = || StoreError::Invariant("invalid live gap notice payload".to_owned());
+    let from = payload.get(..8).ok_or_else(invalid)?;
+    let to = payload.get(8..16).ok_or_else(invalid)?;
+    let from = u64::from_be_bytes(from.try_into().map_err(|_| invalid())?);
+    let to = u64::from_be_bytes(to.try_into().map_err(|_| invalid())?);
+    if from > to {
+        return Err(invalid());
+    }
+    Ok((BlockNumber(from), BlockNumber(to)))
+}
+
 /// Decode versioned terminal metadata carried by a backfill completion
 /// delivery record.
 ///
@@ -4868,6 +4890,80 @@ impl SqliteStore {
                 ))
             })
             .collect()
+    }
+
+    /// Announce on the processor's live delivery stream, before its live lane
+    /// applies `block`, that the lane skipped `skipped`, blocks it never
+    /// processed. The notice is a finalized system change: delivered like any
+    /// other record, and no entity change. Returns whether the processor
+    /// delivers changes at all, and so got the notice.
+    ///
+    /// A lane that delivery backpressure holds before `block` announces again
+    /// on every retry. When the stream already ends with a notice for `block`
+    /// that covers `skipped`, nothing is appended: a repeat would add bytes to
+    /// a full stream and extend that notice's commit, so a consumer that was
+    /// delivered it could no longer acknowledge it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a height exceeds `SQLite`'s numeric range or the
+    /// write fails.
+    pub async fn append_live_gap_notice(
+        &self,
+        descriptor: &ProcessorDescriptor,
+        chain_id: ChainId,
+        block: BlockRef,
+        skipped: BlockRange,
+    ) -> Result<bool, StoreError> {
+        if descriptor.lifecycle.delivery.mode == DeliveryPolicyMode::None {
+            return Ok(false);
+        }
+        let instance = processor_instance(descriptor);
+        let stream_id = default_delivery_stream_id(descriptor);
+        let range = [
+            skipped.start().0.to_be_bytes(),
+            skipped.end().0.to_be_bytes(),
+        ]
+        .concat();
+        let _guard = self.inner.writer.lock().await;
+        let mut transaction = self.inner.pool.begin().await?;
+        let head: Option<(String, i64, Vec<u8>, Vec<u8>)> = sqlx::query_as(
+            "SELECT kind, block_number, block_hash, payload FROM change_log
+             WHERE stream_id = ? ORDER BY stream_sequence DESC LIMIT 1",
+        )
+        .bind(&stream_id)
+        .fetch_optional(&mut *transaction)
+        .await?;
+        if let Some((kind, number, hash, payload)) = head
+            && kind == LIVE_GAP_CHANGE_KIND
+            && number == u64_i64(block.number.0, "block_number")?
+            && hash == block.hash.0.as_slice()
+            && decode_live_gap_notice(&payload)
+                .is_ok_and(|(from, to)| from <= skipped.start() && skipped.end() <= to)
+        {
+            return Ok(true);
+        }
+        append_changes(
+            &mut transaction,
+            &instance,
+            &stream_id,
+            &DeliveryOrigin::live(&instance),
+            chain_id,
+            block,
+            Finality::Finalized,
+            ChangeDirection::Finalized,
+            &[DomainChange {
+                kind: LIVE_GAP_CHANGE_KIND.to_owned(),
+                key: range.clone(),
+                operation: ChangeOperation::Upsert,
+                payload: range,
+            }],
+            &[],
+        )
+        .await?;
+        transaction.commit().await?;
+        self.inner.delivery_changes_available.notify_waiters();
+        Ok(true)
     }
 
     /// Mark all undo records through a height final. They can no longer be
@@ -18982,6 +19078,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_live_gap_notice_decodes_its_range_and_ignores_later_fields() {
+        let mut payload = [3_u64.to_be_bytes(), 5_u64.to_be_bytes()].concat();
+        assert_eq!(
+            decode_live_gap_notice(&payload).expect("notice"),
+            (BlockNumber(3), BlockNumber(5))
+        );
+        // A later release may append fields after the range; a node rolled
+        // back to this one still reads its notices.
+        payload.push(1);
+        assert_eq!(
+            decode_live_gap_notice(&payload).expect("extended notice"),
+            (BlockNumber(3), BlockNumber(5))
+        );
+        let reversed = [5_u64.to_be_bytes(), 3_u64.to_be_bytes()].concat();
+        for invalid in [&payload[..15], &reversed[..]] {
+            assert!(decode_live_gap_notice(invalid).is_err(), "{invalid:?}");
+        }
+    }
+
+    #[test]
     fn delivery_only_created_entity_can_emit_a_richer_payload() {
         let key = 42_u64.to_be_bytes().to_vec();
         let batch = MutationBatch {
@@ -23157,6 +23273,46 @@ mod tests {
                 .expect("an acknowledgement at the end of a block");
             assert_eq!(acknowledged.acknowledged_sequence, sequence);
         }
+    }
+
+    #[tokio::test]
+    async fn a_repeated_live_gap_notice_leaves_the_delivered_one_acknowledgeable() {
+        // A lane that delivery backpressure holds before the block after a
+        // gap announces the gap again on every retry. Each repeat extended
+        // the delivered notice's commit, so its consumer could no longer
+        // acknowledge it, and the stream outgrew its byte limit.
+        let (_directory, store, processor, stream_id) = two_block_live_consumer().await;
+        let following = frame(9, BlockHash::new([8; 32])).block;
+        let skipped = BlockRange::new(BlockNumber(3), BlockNumber(8)).expect("range");
+        let announce = |skipped| {
+            store.append_live_gap_notice(&processor.descriptor, ChainId(1), following, skipped)
+        };
+        announce(skipped).await.expect("announce");
+        assert!(
+            store
+                .record_consumer_delivery_in_stream(&stream_id, "destination", None, 5)
+                .await
+                .expect("record delivery")
+        );
+        announce(skipped).await.expect("announce again");
+        // Fewer skipped blocks, as after a backfill filled the first ones.
+        announce(BlockRange::new(BlockNumber(5), BlockNumber(8)).expect("range"))
+            .await
+            .expect("announce what remains");
+
+        let acknowledged = store
+            .acknowledge_consumer_in_stream(&processor.descriptor, &stream_id, "destination", 5)
+            .await
+            .expect("the delivered notice ends its commit");
+        assert_eq!(acknowledged.acknowledged_sequence, 5);
+        let notices = store
+            .resumable_changes(&processor.descriptor, ChainId(1), None, 100)
+            .await
+            .expect("live stream")
+            .into_iter()
+            .filter(|record| record.change.kind == LIVE_GAP_CHANGE_KIND)
+            .count();
+        assert_eq!(notices, 1);
     }
 
     #[tokio::test]

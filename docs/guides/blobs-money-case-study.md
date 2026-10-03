@@ -139,6 +139,8 @@ t2:
 Leani is tested independently through its API, SDK, RPC, and exported parity
 reports. The blobs.money repository owns the separate PostgreSQL transaction,
 range-reconciliation, deployment, and rollback concerns.
+[Keep your application in sync](/docs/guides/keep-your-application-in-sync/)
+walks through that reconciliation loop.
 
 There are two integration paths:
 

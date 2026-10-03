@@ -101,6 +101,15 @@ export const examples = [
     verifier: { kind: 'typescript', project: 'examples/sdk-subscription/tsconfig.json' },
   },
   {
+    id: 'keep-in-sync',
+    title: 'Keep an application in sync',
+    description: 'Follow the live lane and request every block the processor lacks as history.',
+    language: 'typescript',
+    source: { file: 'examples/sdk-subscription/live-sync.ts', region: 'keep-in-sync' },
+    surfaces: ['docs'],
+    verifier: { kind: 'typescript', project: 'examples/sdk-subscription/tsconfig.json' },
+  },
+  {
     id: 'query-then-follow',
     title: 'Query once, then follow without a race',
     description: 'Seed local state at an exact boundary, resume SSE there, and handle apply, undo, and finalized events.',

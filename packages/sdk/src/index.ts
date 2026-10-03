@@ -451,16 +451,37 @@ export interface ChangeMetadata {
   emittedAt: string;
 }
 
+/** Blocks the live lane skipped, as a `system.live_gap.put` change announces them. */
+export interface LiveGapChangeData {
+  fromBlock: number;
+  toBlock: number;
+  /** Leani does not fill the range: the processor's history is on demand. */
+  reason: "not_filled";
+}
+
 /** System transitions never pretend to contain a processor entity payload. */
 export type ChangeEnvelope<T = unknown> = ChangeMetadata & (
   | { operation: "apply" | "undo"; data: T | null }
   | { operation: "finalized"; data: { throughBlock: number } }
+  | { operation: "finalized"; data: LiveGapChangeData }
   | { operation: "reset_required"; data: {
       earliestAvailableSequence: string;
       latestAvailableSequence: string;
       action: "query_snapshot_then_resume";
     } }
 );
+
+/**
+ * Whether `change` announces blocks the live lane skipped, as after a
+ * restart at a later finalized anchor. Nothing else delivers them: request
+ * them as history, for example with `liveGapBackfill` from
+ * `@smart-byte/leani-sdk/backfill`.
+ */
+export function isLiveGapChange<T>(
+  change: ChangeEnvelope<T>,
+): change is Extract<ChangeEnvelope<T>, { data: LiveGapChangeData }> {
+  return change.operation === "finalized" && change.kind === "system.live_gap.put";
+}
 
 export interface LiveLaneReset {
   processor: string;

@@ -20,6 +20,7 @@
   },
   "include": [
     "index.ts",
+    "live-sync.ts",
     "../custom-node/client.ts",
     "../sdk-postgres/index.ts",
     "../sdk-stream/index.ts"
