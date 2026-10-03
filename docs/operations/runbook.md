@@ -864,5 +864,5 @@ A store upgrades to the binary's schema on the first start that opens it, and
 the upgrade cannot be undone. A start that the store refuses for a processor
 under an existing instance ID (`processor instance … conflicts with its stored
 descriptor`) refuses before that upgrade, so the store stays usable by the
-binary that wrote it. ADR 0018, `docs/adr/0018-forward-only-store-migrations.md`
-in the repository, records this policy.
+binary that wrote it. Store migrations are forward only: rolling an upgraded
+store back means restoring the backup taken before its upgrade.

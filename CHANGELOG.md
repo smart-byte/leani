@@ -581,7 +581,7 @@ Take these steps in order; each links to the entries below that detail it.
   before it opens the store. `leani db backup` copies the store at its
   schema and never upgrades it, refuses a schema newer than the binary
   supports, and refuses a data directory without a store instead of
-  creating one. See ADR 0018.
+  creating one.
 - Breaking for processor authors (`leani-processor-api`):
   `DataRequirement::validate_frame` is stricter for requirements with
   `allow_filtered`. Each filtered component that can supply a required

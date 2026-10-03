@@ -470,5 +470,4 @@ verified header blooms to avoid negative-block receipts and can omit bodies
 when transaction hash is not part of their declared output identity; generic
 RPC and broad processors retain the full-material path. Durable processor
 coverage and retained parent-linked canonical material remain the restart
-authorities. The decisions behind this design are recorded in ADRs 0011
-through 0015; see [decisions](/docs/contributing/decisions/).
+authorities.

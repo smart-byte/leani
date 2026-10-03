@@ -144,7 +144,6 @@ dynamic processor loading; custom native processors are compiled into a node.
 
 Rollback means deploying the previous binary with a store format it supports
 or restoring the pre-migration backup. Every irreversible migration must be
-preceded by a tested export/rebuild path and an ADR. Store migrations are
-forward only, and a start the store refuses for a processor identity leaves
-an older store at its schema; ADR 0018 records the schema 22 and 23
-migrations and this policy.
+preceded by a tested export/rebuild path. Store migrations are forward only,
+and a start the store refuses for a processor identity leaves an older store
+at its schema.
