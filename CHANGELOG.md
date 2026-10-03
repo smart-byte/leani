@@ -36,6 +36,11 @@ record, and documented RPC contracts.
 - History P2P connection retries log at `warn` with their error instead of
   `debug`, so a backfill whose Reth networking cannot start, such as in a
   sandbox that forbids sockets, no longer waits silently.
+- The execution P2P pool warns when it stays below
+  `sources.live.body_serving_peer_target` connected peers for
+  `peer_recovery_timeout_seconds`, again at that interval while it does.
+  Requests spread across connected peers, so such a pool also caps backfill
+  throughput.
 - A history job no longer fails with "block … was already applied with a
   different delta" when the live lane applies one of its blocks while it runs.
   A processor that records finality in its output, such as `blobs-money`, maps

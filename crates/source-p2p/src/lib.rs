@@ -3316,6 +3316,7 @@ where
         );
         let mut network_events_open = true;
         let mut zero_peers_since = Some(tokio::time::Instant::now());
+        let mut few_peers_since = None;
         let mut peer_store_flush = tokio::time::interval_at(
             tokio::time::Instant::now() + peer_store_flush_interval,
             peer_store_flush_interval,
@@ -3350,6 +3351,24 @@ where
                             "recycling stalled execution P2P manager to restart discovery"
                         );
                         break;
+                    }
+                    // Requests spread across connected peers, so a pool this
+                    // small also caps backfill throughput, which otherwise
+                    // just looks slow.
+                    if few_peers_warning_due(
+                        connected_peers,
+                        body_serving_peer_target,
+                        &mut few_peers_since,
+                        now,
+                        peer_recovery_timeout,
+                    ) {
+                        warn!(
+                            connected_peers,
+                            known_peers,
+                            body_serving_peer_target,
+                            "execution P2P stays below its peer target; reachable fixed ports \
+                             (listener_port, discovery_port, discv5_port) and nat admit inbound peers"
+                        );
                     }
                 }
                 event = network_events.next(), if network_events_open => {
@@ -3616,6 +3635,27 @@ fn peer_recovery_due(
     }
     let stalled_since = zero_peers_since.get_or_insert(now);
     now.duration_since(*stalled_since) >= timeout
+}
+
+/// Whether a pool below `target` connected peers has stayed there for
+/// `after`; while it stays, again every `after`.
+fn few_peers_warning_due(
+    connected_peers: usize,
+    target: usize,
+    few_peers_since: &mut Option<tokio::time::Instant>,
+    now: tokio::time::Instant,
+    after: Duration,
+) -> bool {
+    if connected_peers >= target {
+        *few_peers_since = None;
+        return false;
+    }
+    let since = few_peers_since.get_or_insert(now);
+    if now.duration_since(*since) < after {
+        return false;
+    }
+    *since = now;
+    true
 }
 
 #[derive(Debug)]
@@ -12397,6 +12437,33 @@ mod tests {
             started + timeout + Duration::from_secs(1),
             timeout
         ));
+    }
+
+    #[test]
+    fn a_pool_below_its_peer_target_warns_once_per_interval() {
+        let started = tokio::time::Instant::now();
+        let after = Duration::from_mins(5);
+        let mut since = None;
+        let mut due = |connected, elapsed| {
+            few_peers_warning_due(connected, 4, &mut since, started + elapsed, after)
+        };
+
+        assert!(!due(1, Duration::ZERO));
+        assert!(!due(1, Duration::from_secs(299)));
+        assert!(due(1, after), "a pool on one peer for five minutes warns");
+        assert!(
+            !due(3, after + Duration::from_secs(1)),
+            "then not every tick"
+        );
+        assert!(
+            due(3, after * 2),
+            "and again while it stays below the target"
+        );
+        assert!(!due(4, after * 2 + Duration::from_secs(1)));
+        assert!(
+            !due(1, after * 3),
+            "reaching the target restarts the interval"
+        );
     }
 
     #[test]
