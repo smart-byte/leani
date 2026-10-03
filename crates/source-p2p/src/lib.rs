@@ -79,7 +79,7 @@ use secp256k1::SecretKey;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, trace, warn};
+use tracing::{debug, info, trace, warn};
 
 use peer_store::ExecutionPeerStore;
 pub use peer_store::{
@@ -883,13 +883,47 @@ impl AnchoredHeaderProofBuilder {
     }
 }
 
+/// The network handle of one manager generation, which its sessions share
+/// and its task releases as the manager ends. A Reth handle keeps the
+/// manager's Discv5 service, and its UDP port, alive: a session a lane still
+/// holds must not keep a fixed port from the next manager.
+#[derive(Clone, Debug)]
+struct ManagerHandle(Arc<Mutex<Option<NetworkHandle<EthNetworkPrimitives>>>>);
+
+impl ManagerHandle {
+    fn new(handle: NetworkHandle<EthNetworkPrimitives>) -> Self {
+        Self(Arc::new(Mutex::new(Some(handle))))
+    }
+
+    /// The handle, while the manager of this generation runs.
+    fn get(&self) -> Option<NetworkHandle<EthNetworkPrimitives>> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    fn release(&self) {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+    }
+
+    fn ban_peer(&self, peer_id: B512) {
+        if let Some(handle) = self.get() {
+            handle.ban_peer(peer_id);
+        }
+    }
+}
+
 /// Logical lane over the process-wide network manager. Dropping or retrying a
 /// lane must not disconnect healthy peers shared by other lanes.
 #[derive(Debug)]
 struct P2pSession {
     network: Arc<PersistentNetwork>,
     generation: u64,
-    handle: NetworkHandle<EthNetworkPrimitives>,
+    handle: ManagerHandle,
     fetch: FetchClient<EthNetworkPrimitives>,
     telemetry: NetworkSessionTelemetry,
 }
@@ -1179,7 +1213,7 @@ impl PersistentNetwork {
 #[derive(Debug)]
 struct PersistentNetworkState {
     generation: u64,
-    handle: NetworkHandle<EthNetworkPrimitives>,
+    handle: ManagerHandle,
     fetch: FetchClient<EthNetworkPrimitives>,
     peer_store_flush: tokio::sync::mpsc::Sender<tokio::sync::oneshot::Sender<Result<(), String>>>,
     network_task: tokio::task::JoinHandle<()>,
@@ -2520,9 +2554,13 @@ impl PersistentNetwork {
                 }
             }
         }
-        let graceful = tokio::time::timeout(NETWORK_SHUTDOWN_TIMEOUT, running.handle.shutdown())
-            .await
-            .is_ok();
+        // A manager that already ended has released its handle.
+        let graceful = match running.handle.get() {
+            Some(handle) => tokio::time::timeout(NETWORK_SHUTDOWN_TIMEOUT, handle.shutdown())
+                .await
+                .is_ok(),
+            None => true,
+        };
         stop_network_task(graceful, &running.shutdown, &mut running.network_task).await;
     }
 }
@@ -3147,10 +3185,10 @@ fn connect_node_record(handle: &NetworkHandle<EthNetworkPrimitives>, record: Nod
     handle.connect_peer_kind(record.id, PeerKind::Basic, tcp_addr, Some(udp_addr));
 }
 
-async fn reward_verified_material_peer(
-    handle: &NetworkHandle<EthNetworkPrimitives>,
-    peer_id: B512,
-) {
+async fn reward_verified_material_peer(handle: &ManagerHandle, peer_id: B512) {
+    let Some(handle) = handle.get() else {
+        return;
+    };
     handle.reputation_change(
         peer_id,
         ReputationChangeKind::Other(VERIFIED_MATERIAL_RESPONSE_REPUTATION_REWARD),
@@ -3252,6 +3290,7 @@ where
             body_serving_peer_target,
             mut peer_store_flush_requests,
             shutdown,
+            handle,
         } = runtime;
         let mut manager = Box::pin(manager);
         let peer_candidates = Arc::new(PeerCandidateRegistry::new(peer_store_max_entries));
@@ -3436,6 +3475,7 @@ where
         drop(persistence_requests);
         let _ = persistence_worker.await;
         direct_peers.clear();
+        handle.release();
     })
 }
 
@@ -3641,6 +3681,8 @@ struct NetworkManagerRuntime {
     peer_store_flush_requests:
         tokio::sync::mpsc::Receiver<tokio::sync::oneshot::Sender<Result<(), String>>>,
     shutdown: CancellationToken,
+    /// Released once the manager has been torn down.
+    handle: ManagerHandle,
 }
 
 fn classify_disconnect_reason(reason: Option<DisconnectReason>) -> NetworkDisconnectReason {
@@ -4045,7 +4087,9 @@ impl RethP2pSource {
     pub async fn update_advertised_head(&self, head: BlockRef) {
         let state = self.network.state.lock().await;
         if let Some(running) = state.as_ref() {
-            running.handle.update_status(block_status_head(head));
+            if let Some(handle) = running.handle.get() {
+                handle.update_status(block_status_head(head));
+            }
             running.qualification_target.send_if_modified(|current| {
                 if same_qualification_target(*current, head) {
                     false
@@ -4624,7 +4668,9 @@ impl RethP2pSource {
             state.take();
         }
         if let Some(running) = state.as_ref() {
-            running.handle.update_status(block_status_head(advertised));
+            if let Some(handle) = running.handle.get() {
+                handle.update_status(block_status_head(advertised));
+            }
             running.qualification_target.send_if_modified(|current| {
                 if same_qualification_target(*current, advertised) {
                     false
@@ -4694,20 +4740,49 @@ impl RethP2pSource {
             Some(nat) => builder.external_ip_resolver(nat),
             None => builder.disable_nat(),
         };
-        let manager = Box::pin(builder.build_with_noop_provider(MAINNET.clone()).manager())
-            .await
-            .map_err(|error| {
-                let error = P2pError::Network(error.to_string());
-                telemetry.record_error(&error);
-                error
-            })?;
-        let handle = manager.handle().clone();
+        let started = Instant::now();
+        info!(?lane, "building the execution P2P network manager");
+        let built = if self.config.enable_discv5
+            && self.config.discv5_port != 0
+            && let Err(error) =
+                std::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, self.config.discv5_port))
+        {
+            // Reth binds Discv4 before Discv5 and keeps Discv4 running when
+            // Discv5 then fails to bind, so its port would stay taken for
+            // every later build. Fail before Reth binds anything instead.
+            Err(format!(
+                "Discv5 UDP port {} is in use: {error}",
+                self.config.discv5_port
+            ))
+        } else {
+            // A build dropped halfway leaves Reth's Discv4 running, so it
+            // runs to completion in its own task. Nobody receives a build
+            // whose caller was dropped: its manager drops, and discovery
+            // with it.
+            let config = builder.build_with_noop_provider(MAINNET.clone());
+            match tokio::spawn(async move { Box::pin(config.manager()).await }).await {
+                Ok(built) => built.map_err(|error| error.to_string()),
+                Err(error) => Err(format!("the network manager build stopped: {error}")),
+            }
+        };
+        let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let manager = built.map_err(|error| {
+            let error = P2pError::Network(error);
+            warn!(%error, elapsed_ms, "failed to build the execution P2P network manager");
+            telemetry.record_error(&error);
+            error
+        })?;
+        let handle = ManagerHandle::new(manager.handle().clone());
         let fetch = manager.fetch_client();
-        let network_events = handle.event_listener();
+        let network_events = manager.handle().event_listener();
         // A recycled manager can leave request senders behind when its task was
         // aborted before it emitted every SessionClosed event.
         self.network.direct_peers.clear();
         let generation = self.network.next_generation.fetch_add(1, Ordering::Relaxed);
+        info!(
+            generation,
+            elapsed_ms, "built the execution P2P network manager"
+        );
         let shutdown = CancellationToken::new();
         self.network.qualifications.reset(advertised);
         let (qualification_target, qualification_updates) = tokio::sync::watch::channel(advertised);
@@ -4747,6 +4822,7 @@ impl RethP2pSource {
                 body_serving_peer_target: self.config.body_serving_peer_target,
                 peer_store_flush_requests,
                 shutdown: shutdown.clone(),
+                handle: handle.clone(),
             },
         );
         let running = PersistentNetworkState {
@@ -5353,8 +5429,12 @@ impl RethP2pSource {
     ) -> Result<(BlockNumber, BlockHash), P2pError> {
         session.set_range(None);
         session.set_phase(NetworkPhase::FollowingHead);
+        let handle = session
+            .handle
+            .get()
+            .ok_or_else(|| P2pError::Network("the execution network manager ended".to_owned()))?;
         let peers = cancellable_timeout(
-            session.handle.get_all_peers(),
+            handle.get_all_peers(),
             self.config.request_timeout,
             cancellation,
             "peer status",
@@ -9392,6 +9472,10 @@ async fn reconnect_live_session(
             .await
         {
             Ok((session, _)) => {
+                info!(
+                    attempts,
+                    "the live lane reconnected to the execution network"
+                );
                 state.session = session;
                 state.session.set_range(None);
                 state.session.set_phase(NetworkPhase::FollowingHead);
@@ -9404,11 +9488,14 @@ async fn reconnect_live_session(
             Err(P2pError::Cancelled) => return Err(P2pError::Cancelled),
             Err(error) => {
                 if should_retry_session_error(&state.source.config, attempts, &error) {
-                    retry_pause(
-                        session_retry_delay(&state.source.config, attempts),
-                        &state.cancellation,
-                    )
-                    .await?;
+                    let delay = session_retry_delay(&state.source.config, attempts);
+                    warn!(
+                        attempts,
+                        %error,
+                        ?delay,
+                        "the live lane could not reconnect to the execution network; retrying"
+                    );
+                    retry_pause(delay, &state.cancellation).await?;
                 } else {
                     return Err(P2pError::Network(format!(
                         "{request_error}; persistent peer-pool recovery failed: {error}"
@@ -14767,6 +14854,136 @@ mod tests {
             torn_down.load(Ordering::Acquire),
             "shutdown waited out its timeout and aborted the manager's teardown"
         );
+    }
+
+    /// Two distinct UDP ports that nothing holds once this returns.
+    fn free_udp_ports() -> (u16, u16) {
+        let first = std::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).expect("first port");
+        let second = std::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).expect("second port");
+        (
+            first.local_addr().expect("first address").port(),
+            second.local_addr().expect("second address").port(),
+        )
+    }
+
+    #[tokio::test]
+    async fn a_busy_discv5_port_does_not_leave_discv4_bound() {
+        let (discovery_port, discv5_port) = free_udp_ports();
+        let busy = std::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, discv5_port))
+            .expect("hold the Discv5 port");
+        let source = RethP2pSource::mainnet(RethP2pConfig {
+            discovery_port,
+            discv5_port,
+            ..RethP2pConfig::default()
+        })
+        .expect("source");
+        let head = RethP2pSource::mainnet_genesis_block();
+        let failed = source.network_session(head, NetworkLane::Live).await;
+        assert!(failed.is_err(), "Discv5 bound a port another socket holds");
+        drop(busy);
+        // Reth binds Discv4 before Discv5: the failed build must not keep
+        // the fixed Discv4 port, or every later build fails on it.
+        let rebuilt = source.network_session(head, NetworkLane::Live).await;
+        source.shutdown().await;
+        assert!(
+            rebuilt.is_ok(),
+            "a failed build kept a discovery port: {:?}",
+            rebuilt.err()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_retained_session_does_not_block_rebuilding_an_ended_manager() {
+        let (discovery_port, discv5_port) = free_udp_ports();
+        let source = RethP2pSource::mainnet(RethP2pConfig {
+            discovery_port,
+            discv5_port,
+            ..RethP2pConfig::default()
+        })
+        .expect("source");
+        let head = RethP2pSource::mainnet_genesis_block();
+        // The live lane keeps its session while it reconnects.
+        let (retained, _) = source
+            .network_session(head, NetworkLane::Live)
+            .await
+            .expect("first manager");
+        // End the manager the way the zero-peer watchdog does: its loop
+        // breaks and the task tears the manager down.
+        source
+            .network
+            .state
+            .lock()
+            .await
+            .as_ref()
+            .expect("running manager")
+            .shutdown
+            .cancel();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while retained.manager_is_current().await {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the manager task ended");
+        // Reth's Discv5 lookup task holds the service while a lookup runs,
+        // at most the one-minute Discv5 query timeout; the live lane retries
+        // its reconnect meanwhile.
+        tokio::time::timeout(Duration::from_secs(90), async {
+            while std::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, discv5_port)).is_err() {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .expect("the retained session kept the ended manager's Discv5 port");
+        let rebuilt = source.network_session(head, NetworkLane::Live).await;
+        let current = match &rebuilt {
+            Ok((session, _)) => session.manager_is_current().await,
+            Err(_) => false,
+        };
+        source.shutdown().await;
+        let (session, newly_started) =
+            rebuilt.expect("the ended manager's ports block the rebuild");
+        assert!(newly_started);
+        assert!(session.generation > retained.generation);
+        assert!(current, "the rebuilt manager is not current");
+    }
+
+    #[tokio::test]
+    async fn a_dropped_rebuild_finishes_detached_and_frees_the_discv4_port() {
+        let (discovery_port, discv5_port) = free_udp_ports();
+        let source = RethP2pSource::mainnet(RethP2pConfig {
+            discovery_port,
+            discv5_port,
+            ..RethP2pConfig::default()
+        })
+        .expect("source");
+        let head = RethP2pSource::mainnet_genesis_block();
+        let discovery_bound =
+            || std::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, discovery_port)).is_err();
+        // Drop the build once Reth has bound Discv4, while Discv5 starts: a
+        // lane reconnecting through it is cancelled, as when the network
+        // lanes restart.
+        let mut build = Box::pin(source.network_session(head, NetworkLane::Live));
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !discovery_bound() {
+                tokio::select! {
+                    biased;
+                    session = &mut build => panic!("the build finished first: {:?}", session.err()),
+                    () = tokio::time::sleep(Duration::from_millis(5)) => {}
+                }
+            }
+        })
+        .await
+        .expect("Reth bound the Discv4 port");
+        drop(build);
+        let freed = tokio::time::timeout(Duration::from_secs(30), async {
+            while discovery_bound() {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await;
+        source.shutdown().await;
+        freed.expect("a dropped build kept the Discv4 port");
     }
 
     #[test]

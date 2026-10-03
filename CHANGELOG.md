@@ -6,7 +6,29 @@ record, and documented RPC contracts.
 
 ## [Unreleased]
 
+### Added
+
+- `sources.live.stall_timeout_seconds`, ten minutes by default and six
+  minutes to 30 days. When the live lane stays not ready this long while
+  verified finality is ready, within one run of the network lanes, the node
+  exits with status 1 so that systemd or Docker restarts it: a lane restart
+  cannot heal the process-wide execution P2P network the lane stalled in. A
+  wait at the recent-frame hard limit does not count, and the log says why at
+  error level. The exit waits for the stalled lanes no longer than a shutdown
+  does, even when the live lane is stuck on a network build.
+
 ### Fixed
+
+- The live lane follows the head again after the zero-peer watchdog rebuilds
+  the execution P2P network manager with fixed discovery ports, such as the
+  recommended Discv4 30303 and Discv5 30304. The session the lane kept while
+  it reconnected held the ended manager's Discv5 on its port, so the rebuild
+  failed, and the failed rebuild left a new Discv4 bound to 30303. Every later
+  rebuild then failed, without a log line, and the lane stayed not ready until
+  the node was restarted by hand. The ended manager now releases its handle
+  from every session, a busy Discv5 port fails the attempt before anything is
+  bound, and a build runs to completion even when its caller is cancelled.
+  Each build and each failed reconnection attempt is logged.
 
 - A history job no longer fails with "block … was already applied with a
   different delta" when the live lane applies one of its blocks while it runs.

@@ -260,7 +260,11 @@ It requires verified `beacon_api` or `consensus_p2p` finality. Stable
 production ports normally use `listener_port = 30303`,
 `discovery_port = 30303`, and `discv5_port = 30304`. Discv4 and Discv5
 require distinct fixed UDP ports; zero selects an isolated ephemeral port for
-that protocol.
+that protocol. `stall_timeout_seconds`, ten minutes by default and six minutes
+to 30 days, bounds how long the live lane may stay not ready while verified
+finality is ready, within one run of the network lanes: after it, the node
+exits with status 1 so that its process supervisor restarts it. A wait at the
+recent-frame hard limit does not count.
 
 Reth owns the bounded dial queue and receives TCP/RLPx failures directly. A
 terminal failure immediately releases its slot to another eligible peer, while

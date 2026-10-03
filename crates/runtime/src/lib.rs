@@ -3490,6 +3490,9 @@ pub struct SharedLiveRuntime {
     /// drain, or parking a lane. A reconcile on one clone therefore never
     /// races another clone's live loop over the same gap marker.
     lane_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Whether live ingestion waits for finality to prune a full recent-frame
+    /// store.
+    recent_storage_full: Arc<tokio::sync::watch::Sender<bool>>,
 }
 
 impl std::fmt::Debug for SharedLiveRuntime {
@@ -3519,6 +3522,7 @@ impl std::fmt::Debug for SharedLiveRuntime {
                     .unwrap_or_else(std::sync::PoisonError::into_inner),
             )
             .field("lane_busy", &self.lane_lock.try_lock().is_err())
+            .field("recent_storage_full", &*self.recent_storage_full.borrow())
             .finish()
     }
 }
@@ -3588,7 +3592,16 @@ impl SharedLiveRuntime {
             finalized_gap_recovery: None,
             unavailable_processors: Arc::new(StdMutex::new(HashSet::new())),
             lane_lock: Arc::new(tokio::sync::Mutex::new(())),
+            recent_storage_full: Arc::new(tokio::sync::watch::channel(false).0),
         })
+    }
+
+    /// Whether live ingestion waits, not ready, for finality to prune a full
+    /// recent-frame store: a wait its own `recent_storage_stall_limit`
+    /// bounds, not a stalled source.
+    #[must_use]
+    pub fn recent_storage_full(&self) -> tokio::sync::watch::Receiver<bool> {
+        self.recent_storage_full.subscribe()
     }
 
     /// Supply bounded archive/P2P recovery for finalized live gaps that have
@@ -4199,6 +4212,7 @@ impl SharedLiveRuntime {
             {
                 Ok(()) => {
                     if full_since.is_some() {
+                        self.recent_storage_full.send_replace(false);
                         signal_readiness(readiness, true);
                         info!(
                             block = frame.block.number.0,
@@ -4212,6 +4226,7 @@ impl SharedLiveRuntime {
                     projected_bytes,
                 }) => {
                     let since = *full_since.get_or_insert_with(|| {
+                        self.recent_storage_full.send_replace(true);
                         signal_readiness(readiness, false);
                         warn!(
                             reason = "recent_storage_full",
@@ -4223,13 +4238,17 @@ impl SharedLiveRuntime {
                         Instant::now()
                     });
                     if since.elapsed() >= self.config.recent_storage_stall_limit {
+                        self.recent_storage_full.send_replace(false);
                         return Err(RuntimeError::RecentStorageBudget {
                             limit: limit_bytes,
                             observed: projected_bytes,
                         });
                     }
                     tokio::select! {
-                        () = cancellation.cancelled() => return Ok(false),
+                        () = cancellation.cancelled() => {
+                            self.recent_storage_full.send_replace(false);
+                            return Ok(false);
+                        }
                         () = tokio::time::sleep(RECENT_STORAGE_RETRY_INTERVAL) => {}
                     }
                 }
@@ -17575,6 +17594,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_transient_disconnect_drops_live_readiness_until_the_same_stream_delivers() {
+        let range = BlockRange::new(BlockNumber(0), BlockNumber(1)).expect("range");
+        let chain = live_blocks(1);
+        let pause = LiveStep::Delay(Duration::from_millis(50));
+        let processor = Arc::new(BlockLocalCounter::named("disconnect-counter"));
+        let (_directory, store) = store().await;
+        let runtime = SharedLiveRuntime::new(
+            store,
+            Arc::new(ScriptedLiveSource::new(
+                fixture_source_descriptor("disconnect-live", range),
+                vec![
+                    LiveStep::Event(ChainEvent::Block(Box::new(chain[0].clone()))),
+                    pause.clone(),
+                    LiveStep::Event(ChainEvent::Disconnected {
+                        reason: "no attested head".to_owned(),
+                    }),
+                    pause.clone(),
+                    LiveStep::Event(ChainEvent::Block(Box::new(chain[1].clone()))),
+                    pause,
+                ],
+            )),
+            vec![processor],
+            SharedLiveRuntimeConfig::default(),
+        )
+        .expect("runtime");
+        let (ready, mut readiness) = tokio::sync::watch::channel(false);
+        let live = tokio::spawn(async move {
+            runtime
+                .run_with_readiness(
+                    LiveStart::Head,
+                    default_source_budget(),
+                    CancellationToken::new(),
+                    ready,
+                )
+                .await
+        });
+        let mut transitions = Vec::new();
+        while readiness.changed().await.is_ok() {
+            let ready = *readiness.borrow_and_update();
+            if transitions.last() != Some(&ready) {
+                transitions.push(ready);
+            }
+        }
+        let report = tokio::time::timeout(Duration::from_secs(10), live)
+            .await
+            .expect("the live run ended with its stream")
+            .expect("live task")
+            .expect("live run");
+        // The stream owns its resumption: the runtime keeps reading it, and
+        // its next block restores readiness without a new subscription,
+        // which would replay the script from block zero.
+        assert_eq!(transitions, [true, false, true, false]);
+        assert_eq!(report.disconnects, 1);
+        assert_eq!(report.chain_blocks, 2);
+        assert_eq!(report.processors["disconnect-counter"].applied, 2);
+    }
+
+    #[tokio::test]
     async fn live_ingestion_waits_at_the_recent_hard_limit_until_finality_prunes() {
         let range = BlockRange::new(BlockNumber(0), BlockNumber(2)).expect("range");
         let chain = live_blocks(2);
@@ -17594,6 +17671,7 @@ mod tests {
             },
         )
         .expect("runtime");
+        let storage_full = runtime.recent_storage_full();
         let (ready, readiness) = tokio::sync::watch::channel(false);
         let live = tokio::spawn(async move {
             runtime
@@ -17607,7 +17685,8 @@ mod tests {
         });
 
         // Two frames fill the limit. With no finality to prune them, the third
-        // block waits and the live lane reports itself not ready.
+        // block waits and the live lane reports itself not ready, for a full
+        // store rather than its source.
         let recent_tip = || async {
             store
                 .recent_stats(ChainId(1))
@@ -17625,6 +17704,10 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(400)).await;
         assert_eq!(recent_tip().await, Some(BlockNumber(1)));
         assert!(!*readiness.borrow());
+        assert!(
+            *storage_full.borrow(),
+            "the wait is not published as a storage wait"
+        );
         assert_eq!(
             store
                 .processor_cursor(processor.descriptor())
@@ -17652,6 +17735,10 @@ mod tests {
         assert_eq!(report.chain_blocks, 3);
         assert_eq!(report.processors["recent-limit-counter"].applied, 3);
         assert_eq!(recent_tip().await, Some(BlockNumber(2)));
+        assert!(
+            !*storage_full.borrow(),
+            "the storage wait outlived the wait"
+        );
     }
 
     #[tokio::test]
