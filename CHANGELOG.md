@@ -62,6 +62,10 @@ record, and documented RPC contracts.
 - Coverage reports `catching_up`, not `live`, while a processor is still
   behind the chain's finalized head, even when its range has no gaps and the
   node is ready.
+- Each start cancels the automatic backfill jobs earlier starts left queued or
+  running for the same processor instance. They were listed as running
+  forever, one more after every restart. The runbook says when a restart
+  resumes an ordered lane paused with `hot_cold_handoff_failed`.
 - A history job no longer fails with "block … was already applied with a
   different delta" when the live lane applies one of its blocks while it runs.
   A processor that records finality in its output, such as `blobs-money`, maps
