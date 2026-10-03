@@ -830,7 +830,12 @@ replays from there as usual, and a lane failed for another reason, such as
 `processor_finality_conflict`, is left alone. Reconciliation replays nothing
 below the retained frames. A processor's automatic cold backfill fills those
 blocks up to the finalized anchor; an on-demand processor waits for a backfill
-request.
+request. Before its live lane applies a block past those blocks, an on-demand
+block-local processor logs "the live lane skips blocks this processor never
+processed" at warn level, with `from_block`, `to_block`, and `announced`, and
+its live stream announces the range in a `system.live_gap.put` change for the
+application to request. A startup replay from the first retained frame above
+a hole announces it the same way.
 
 Each processor that needed a repair logs one warning, "startup reconciliation
 repaired processor state against the canonical chain", with the fields

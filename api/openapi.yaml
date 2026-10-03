@@ -730,7 +730,17 @@ paths:
         reconnect to resume after the acknowledged cursor.
       responses:
         "200":
-          description: Server-sent live-lane batches.
+          description: |
+            Newline-delimited JSON records: first a `hello` with the
+            processor's coverage as the session starts, then whole-block
+            `batch` records and, while idle, `heartbeat` records. An `error`
+            or `reset_required` record ends the stream. A batch of a
+            `system.live_gap.put` change announces blocks the live lane
+            skipped, which no batch delivers.
+          content:
+            application/x-ndjson:
+              schema:
+                $ref: "#/components/schemas/LiveStreamRecord"
         default:
           $ref: "#/components/responses/Error"
   /v1/processors/{processor}/streams/live/consumers/{consumer}/ack:
@@ -2393,13 +2403,135 @@ components:
             - type: string
               pattern: "^0x[0-9a-f]*$"
             - type: "null"
-        data: {}
+        data:
+          description: |
+            The processor's entity for `apply` and `undo`. For `finalized`,
+            the `system.finality.put` kind carries `{ throughBlock }`, and the
+            `system.live_gap.put` kind carries
+            `{ fromBlock, toBlock, reason: "not_filled" }`: blocks the live
+            lane skipped, such as after a restart at a later finalized anchor.
+            Leani does not fill them; request them as history.
         coverage:
           $ref: "#/components/schemas/ProcessorCoverage"
           description: Present only on reset_required events.
         emittedAt:
           type: string
           description: Stable emission timestamp.
+    LiveStreamRecord:
+      oneOf:
+        - $ref: "#/components/schemas/LiveStreamHello"
+        - $ref: "#/components/schemas/LiveStreamBatch"
+        - $ref: "#/components/schemas/StreamHeartbeat"
+        - $ref: "#/components/schemas/StreamFailure"
+    LiveStreamHello:
+      type: object
+      additionalProperties: false
+      required:
+        [type, apiVersion, chainId, processor, streamId, streamKind, acknowledgedCursor, storeEpoch, heartbeatIntervalMs, sessionToken, sessionExpiresAtUnixMs, leaseTtlMs, coverage]
+      properties:
+        type:
+          const: hello
+        apiVersion:
+          const: "1"
+        chainId:
+          $ref: "#/components/schemas/SafeInteger"
+        processor:
+          $ref: "#/components/schemas/ProcessorSummary"
+        streamId:
+          type: string
+        streamKind:
+          const: live
+        acknowledgedCursor:
+          $ref: "#/components/schemas/Cursor"
+        storeEpoch:
+          type: string
+        heartbeatIntervalMs:
+          $ref: "#/components/schemas/DecimalQuantity"
+        sessionToken:
+          type: string
+          description: Send as `x-leani-consumer-session` to acknowledge, renew, or release.
+        sessionExpiresAtUnixMs:
+          $ref: "#/components/schemas/DecimalQuantity"
+        leaseTtlMs:
+          $ref: "#/components/schemas/DecimalQuantity"
+        coverage:
+          $ref: "#/components/schemas/ProcessorCoverage"
+          description: What the processor covers as the session starts, to diff against the destination.
+    LiveStreamBatch:
+      type: object
+      additionalProperties: false
+      required:
+        [type, streamId, originKind, originId, publicationRevision, fromBlock, throughBlock, processedBlockCount, domainChangeCount, progressUnitCount, rawPayloadBytes, uncompressedEncodedBytes, transmittedBytes, buildDelayMs, firstCursor, lastCursor, acknowledgeableCursor, changes]
+      properties:
+        type:
+          const: batch
+        streamId:
+          type: string
+        originKind:
+          type: string
+          enum: [live, live_recovery]
+        originId:
+          type: string
+        publicationRevision:
+          $ref: "#/components/schemas/DecimalQuantity"
+        fromBlock:
+          $ref: "#/components/schemas/SafeInteger"
+        throughBlock:
+          $ref: "#/components/schemas/SafeInteger"
+        processedBlockCount:
+          $ref: "#/components/schemas/DecimalQuantity"
+        domainChangeCount:
+          $ref: "#/components/schemas/DecimalQuantity"
+          description: Changes other than `system.*` kinds.
+        progressUnitCount:
+          $ref: "#/components/schemas/DecimalQuantity"
+        rawPayloadBytes:
+          $ref: "#/components/schemas/DecimalQuantity"
+        uncompressedEncodedBytes:
+          $ref: "#/components/schemas/DecimalQuantity"
+        transmittedBytes:
+          $ref: "#/components/schemas/DecimalQuantity"
+        buildDelayMs:
+          $ref: "#/components/schemas/DecimalQuantity"
+        firstCursor:
+          $ref: "#/components/schemas/Cursor"
+        lastCursor:
+          $ref: "#/components/schemas/Cursor"
+        acknowledgeableCursor:
+          $ref: "#/components/schemas/Cursor"
+        changes:
+          type: array
+          items:
+            $ref: "#/components/schemas/ChangeEnvelope"
+    StreamHeartbeat:
+      type: object
+      additionalProperties: false
+      required: [type, emittedAt]
+      properties:
+        type:
+          const: heartbeat
+        emittedAt:
+          type: string
+    StreamFailure:
+      type: object
+      additionalProperties: false
+      required: [type, code, message, earliestAvailableSequence, latestAvailableSequence]
+      properties:
+        type:
+          type: string
+          enum: [error, reset_required]
+        code:
+          type: string
+        message:
+          type: string
+        earliestAvailableSequence:
+          oneOf:
+            - $ref: "#/components/schemas/DecimalQuantity"
+            - type: "null"
+        latestAvailableSequence:
+          oneOf:
+            - $ref: "#/components/schemas/DecimalQuantity"
+            - type: "null"
     ChangeHead:
       type: object
       additionalProperties: false

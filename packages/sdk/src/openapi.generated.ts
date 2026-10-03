@@ -1785,11 +1785,76 @@ export interface components {
             /** @description Versioned processor change schema identifier. */
             schema: string;
             key: string | null;
+            /**
+             * @description The processor's entity for `apply` and `undo`. For `finalized`,
+             *     the `system.finality.put` kind carries `{ throughBlock }`, and the
+             *     `system.live_gap.put` kind carries
+             *     `{ fromBlock, toBlock, reason: "not_filled" }`: blocks the live
+             *     lane skipped, such as after a restart at a later finalized anchor.
+             *     Leani does not fill them; request them as history.
+             */
             data: unknown;
             /** @description Present only on reset_required events. */
             coverage?: components["schemas"]["ProcessorCoverage"];
             /** @description Stable emission timestamp. */
             emittedAt: string;
+        };
+        LiveStreamRecord: components["schemas"]["LiveStreamHello"] | components["schemas"]["LiveStreamBatch"] | components["schemas"]["StreamHeartbeat"] | components["schemas"]["StreamFailure"];
+        LiveStreamHello: {
+            /** @constant */
+            type: "hello";
+            /** @constant */
+            apiVersion: "1";
+            chainId: components["schemas"]["SafeInteger"];
+            processor: components["schemas"]["ProcessorSummary"];
+            streamId: string;
+            /** @constant */
+            streamKind: "live";
+            acknowledgedCursor: components["schemas"]["Cursor"];
+            storeEpoch: string;
+            heartbeatIntervalMs: components["schemas"]["DecimalQuantity"];
+            /** @description Send as `x-leani-consumer-session` to acknowledge, renew, or release. */
+            sessionToken: string;
+            sessionExpiresAtUnixMs: components["schemas"]["DecimalQuantity"];
+            leaseTtlMs: components["schemas"]["DecimalQuantity"];
+            /** @description What the processor covers as the session starts, to diff against the destination. */
+            coverage: components["schemas"]["ProcessorCoverage"];
+        };
+        LiveStreamBatch: {
+            /** @constant */
+            type: "batch";
+            streamId: string;
+            /** @enum {string} */
+            originKind: "live" | "live_recovery";
+            originId: string;
+            publicationRevision: components["schemas"]["DecimalQuantity"];
+            fromBlock: components["schemas"]["SafeInteger"];
+            throughBlock: components["schemas"]["SafeInteger"];
+            processedBlockCount: components["schemas"]["DecimalQuantity"];
+            /** @description Changes other than `system.*` kinds. */
+            domainChangeCount: components["schemas"]["DecimalQuantity"];
+            progressUnitCount: components["schemas"]["DecimalQuantity"];
+            rawPayloadBytes: components["schemas"]["DecimalQuantity"];
+            uncompressedEncodedBytes: components["schemas"]["DecimalQuantity"];
+            transmittedBytes: components["schemas"]["DecimalQuantity"];
+            buildDelayMs: components["schemas"]["DecimalQuantity"];
+            firstCursor: components["schemas"]["Cursor"];
+            lastCursor: components["schemas"]["Cursor"];
+            acknowledgeableCursor: components["schemas"]["Cursor"];
+            changes: components["schemas"]["ChangeEnvelope"][];
+        };
+        StreamHeartbeat: {
+            /** @constant */
+            type: "heartbeat";
+            emittedAt: string;
+        };
+        StreamFailure: {
+            /** @enum {string} */
+            type: "error" | "reset_required";
+            code: string;
+            message: string;
+            earliestAvailableSequence: components["schemas"]["DecimalQuantity"] | null;
+            latestAvailableSequence: components["schemas"]["DecimalQuantity"] | null;
         };
         ChangeHead: {
             earliestSequence: components["schemas"]["DecimalQuantity"] | null;
@@ -2865,12 +2930,21 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description Server-sent live-lane batches. */
+            /**
+             * @description Newline-delimited JSON records: first a `hello` with the
+             *     processor's coverage as the session starts, then whole-block
+             *     `batch` records and, while idle, `heartbeat` records. An `error`
+             *     or `reset_required` record ends the stream. A batch of a
+             *     `system.live_gap.put` change announces blocks the live lane
+             *     skipped, which no batch delivers.
+             */
             200: {
                 headers: {
                     [name: string]: unknown;
                 };
-                content?: never;
+                content: {
+                    "application/x-ndjson": components["schemas"]["LiveStreamRecord"];
+                };
             };
             default: components["responses"]["Error"];
         };

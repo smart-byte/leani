@@ -7062,6 +7062,17 @@ async fn run_network_lanes(
             sink_ids: Vec::new(),
             committed_events: Some(committed_events),
             recent_hard_bytes: config.budgets.recent_raw_hard_bytes,
+            // Automatic history refills what the live lane skips; on-demand
+            // history leaves it to whoever requests history, so tell them.
+            live_gap_notices: config
+                .processors
+                .iter()
+                .zip(&processors)
+                .filter(|(configured, _)| {
+                    configured.history_mode == crate::config::ProcessorHistoryMode::OnDemand
+                })
+                .map(|(_, processor)| processor.descriptor().instance.to_string())
+                .collect(),
             ..SharedLiveRuntimeConfig::default()
         },
     )?;
