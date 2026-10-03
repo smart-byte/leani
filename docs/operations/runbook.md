@@ -266,7 +266,14 @@ outbound dialing continue throughout that window, allowing Reth's per-peer
 backoff and candidate rotation to work before the underlying sockets are
 recycled. The mainnet DNS root is also resubmitted every 15 seconds so a
 transient resolver failure during the first lookup does not wait for the
-whole-manager watchdog.
+whole-manager watchdog. Each rebuild logs `building the execution P2P network
+manager` and then `built the execution P2P network manager` or, at warn
+level, `failed to build the execution P2P network manager` with its error.
+While the live lane reconnects, it logs each failed attempt at warn level in
+`the live lane could not reconnect to the execution network; retrying`. A
+fixed Discv5 port can stay busy for up to a minute after a rebuild, while the
+ended manager's last discovery lookup finishes; the lane keeps retrying
+meanwhile.
 
 Processor `coverage.complete` means only that the stored range from the
 configured start through `processedThrough` has no internal gaps. It does not
@@ -397,6 +404,22 @@ names the ones still running in
 the lanes halt (see
 [Finality contradicts the followed chain](#finality-contradicts-the-followed-chain)),
 they stay stopped and not ready while the node keeps serving what it stored.
+
+A live lane that stays not ready while verified finality is ready for
+`sources.live.stall_timeout_seconds`, ten minutes by default, within one run
+of the lanes is treated as stalled. Usually its execution P2P network is
+wedged, which a lane restart cannot heal; it can also be a finality endpoint
+that stops sending attested heads, which a restart may not fix. The lanes
+then stop, the log says `the live lane stalled while verified finality stayed
+ready; the node exits so that it restarts` at error level, and the node exits
+with status 1 for systemd or Docker to start it again. While finality is not
+ready either, the network itself is likely down and the node keeps waiting,
+and a wait at the recent-frame hard limit does not count (see
+[Storage pressure](#storage-pressure)). A run that fails quickly, as when
+another process holds the P2P ports or `persistent_retries = false` gives up,
+never reaches the timeout: the supervisor restarts it with backoff and logs
+each failure. Run the node under a supervisor that restarts it, or raise the
+timeout, up to 30 days.
 
 ## Checkpoint lifecycle
 
@@ -650,7 +673,8 @@ an unfinalized one to make room. When they reach
 live readiness drops, and the log reports `recent_storage_full`. Ingestion
 resumes once a finality advance prunes older frames. After 15 minutes at the
 limit the live lane fails, and the supervisor restarts the network lanes from
-a fresh finalized anchor, which lets finality prune again. A node that keeps
+a fresh finalized anchor, which lets finality prune again; the live stall
+timeout does not count this wait. A node that keeps
 reaching the limit needs working finality, or a hard limit above the
 `rpc.minimum_recent_blocks` window plus the unfinalized tail.
 

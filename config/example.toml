@@ -119,6 +119,11 @@ peer_refill_interval_ms = 1000
 # Rebuild discovery after a sustained zero-peer state (including host sleep or
 # an initially failed DNS/Discv bootstrap).
 peer_recovery_timeout_seconds = 300
+# Exit non-zero, so that the process supervisor restarts the node, after the
+# live lane stays not ready this long (360..=2592000) while verified finality
+# is ready: only a new process recovers a live lane stalled in the
+# process-wide P2P network. A wait at the recent-frame hard limit does not count.
+stall_timeout_seconds = 600
 material_request_concurrency = 32
 # Adaptive request-width ceiling. Eight nearly doubled throughput in the
 # pinned Mainnet receipt-complete benchmark; partial/failed responses shrink

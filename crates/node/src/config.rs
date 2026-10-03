@@ -580,6 +580,10 @@ pub struct LiveSourceConfig {
     /// failures.
     #[serde(default = "default_execution_peer_recovery_timeout_seconds")]
     pub peer_recovery_timeout_seconds: u64,
+    /// Exit the node, so that its process supervisor restarts it, after the
+    /// live lane stays not ready this long while verified finality is ready.
+    #[serde(default = "default_live_stall_timeout_seconds")]
+    pub stall_timeout_seconds: u64,
     /// Concurrent adaptive body/receipt requests. The runtime further bounds
     /// this by connected peers and source budgets.
     #[serde(default = "default_execution_material_request_concurrency")]
@@ -1596,6 +1600,16 @@ impl Config {
             errors.push(ValidationError::new(
                 "sources.live peer refill/recovery intervals",
                 "must be greater than zero for p2p",
+            ));
+        }
+        // Longer than the five-minute startup peer wait, which fails a run
+        // that finds no peers, and short enough to add to the clock.
+        if matches!(self.sources.live.kind, LiveSourceKind::P2p)
+            && !(360..=2_592_000).contains(&self.sources.live.stall_timeout_seconds)
+        {
+            errors.push(ValidationError::new(
+                "sources.live.stall_timeout_seconds",
+                "must be in 360..=2592000 (six minutes to 30 days) for p2p",
             ));
         }
         if matches!(self.sources.live.kind, LiveSourceKind::P2p)
@@ -2629,6 +2643,10 @@ const fn default_execution_peer_recovery_timeout_seconds() -> u64 {
     300
 }
 
+const fn default_live_stall_timeout_seconds() -> u64 {
+    600
+}
+
 const fn default_execution_material_request_concurrency() -> usize {
     32
 }
@@ -3320,6 +3338,31 @@ verification_segment_blocks = 8192"#,
                 .iter()
                 .any(|error| error.message.contains("duplicate ID"))
         );
+    }
+
+    #[test]
+    fn the_live_stall_timeout_outlasts_the_peer_wait_and_stays_representable() {
+        let mut config = config();
+        for valid in [360, 600, 2_592_000] {
+            config.sources.live.stall_timeout_seconds = valid;
+            config.clone().validate().expect("stall timeout in range");
+        }
+        // Below the five-minute startup peer wait, a cold start exits before
+        // its run fails over; a huge "never" overflows the deadline.
+        for invalid in [0, 300, 2_592_001, u64::MAX] {
+            config.sources.live.stall_timeout_seconds = invalid;
+            let errors = config
+                .clone()
+                .validate()
+                .expect_err("stall timeout out of range")
+                .0;
+            assert!(
+                errors
+                    .iter()
+                    .any(|error| error.field == "sources.live.stall_timeout_seconds"),
+                "{invalid} was accepted"
+            );
+        }
     }
 
     #[test]
