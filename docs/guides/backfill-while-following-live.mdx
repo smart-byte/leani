@@ -45,9 +45,11 @@ you intentionally want to restrict P2P recovery to a finalized suffix.
 
 <Aside type="caution" title="A failed job is terminal until acted upon">
   Terminal failed backfill jobs are not retried forever. Inspect the recorded
-  error and either retry, cancel, or replace the job after correcting its cause.
-  Completion is published only after all overlapping ownership and coverage
-  invariants are satisfied.
+  error and correct its cause. Then retry a failed subscription with
+  `POST /admin/v1/backfill-subscriptions/{id}/retry`, which resumes from its
+  committed progress, or delete the job and create it again. Completion is
+  published only after all overlapping ownership and coverage invariants are
+  satisfied.
 </Aside>
 
 For application-owned work, each history lane has its own lease and
