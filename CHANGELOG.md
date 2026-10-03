@@ -30,7 +30,9 @@ record, and documented RPC contracts.
   for example, advertises receipts but serves them only for blob
   transactions, so a recipient-filtered processor that reads receipts failed
   its automatic backfill on a node with Xatu configured. The job now warns
-  once and moves to the next configured source for the rest of its range. The
+  once and moves to the next configured source for the rest of its range.
+  Archive reconciliation, which revisits the range after the handoff, moves
+  past such a source the same way instead of stopping every network lane. The
   node also logs why it leaves a configured history source out of a
   processor's jobs.
 - History P2P connection retries log at `warn` with their error instead of
