@@ -6517,6 +6517,37 @@ impl SqliteStore {
         Ok(())
     }
 
+    /// Check a mapped delta against the one pending for its block, as
+    /// [`Self::persist_delta`] does, without persisting it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::ConflictingPendingDelta`] when another delta is
+    /// pending for the block, and an error for an invalid delta, an encoding
+    /// failure, or a database failure.
+    pub async fn check_pending_delta(
+        &self,
+        descriptor: &ProcessorDescriptor,
+        delta: &EncodedDelta,
+    ) -> Result<(), StoreError> {
+        delta.validate(descriptor)?;
+        let stored: Option<Vec<u8>> = sqlx::query_scalar(
+            "SELECT encoded_delta FROM pending_deltas
+             WHERE instance = ? AND block_number = ? AND block_hash = ?",
+        )
+        .bind(processor_instance(descriptor))
+        .bind(u64_i64(delta.block.number.0, "block_number")?)
+        .bind(delta.block.hash.0.as_slice())
+        .fetch_optional(&self.inner.pool)
+        .await?;
+        if let Some(stored) = stored
+            && stored != delta.encode_durable()?
+        {
+            return Err(StoreError::ConflictingPendingDelta(delta.block.number));
+        }
+        Ok(())
+    }
+
     /// Read durable mapped deltas in block/hash order.
     ///
     /// # Errors

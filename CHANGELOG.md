@@ -8,6 +8,17 @@ record, and documented RPC contracts.
 
 ### Fixed
 
+- A restart during an automatic backfill could silently erase part of an
+  ordered-state processor's history. A live drain that ran while the backfill
+  committed a block applied that block as `included`, because the backfill
+  kept its delta pending before the apply. Its unfinalized undo record, below
+  the retained canonical blocks, then read as a reverted block at the next
+  start, and startup reconciliation undid it under thousands of later blocks:
+  their contributions to the keys the block wrote were gone, while coverage
+  still reported the range complete. History now applies without keeping a
+  pending delta, and reconciliation undoes an ordered lane only from its tip.
+  A store that already holds such a block keeps it, with a warning, until
+  finality promotes it.
 - A history job no longer fails with "block … was already applied with a
   different delta" when the live lane applies one of its blocks while it runs.
   A processor that records finality in its output, such as `blobs-money`, maps
