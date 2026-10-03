@@ -19,6 +19,14 @@ record, and documented RPC contracts.
   pending delta, and reconciliation undoes an ordered lane only from its tip.
   A store that already holds such a block keeps it, with a warning, until
   finality promotes it.
+- A history source that cannot plan a job's request no longer fails the job
+  and parks the processor's live lane with `hot_cold_handoff_failed`. Xatu,
+  for example, advertises receipts but serves them only for blob
+  transactions, so a recipient-filtered processor that reads receipts failed
+  its automatic backfill on a node with Xatu configured. The job now warns
+  once and moves to the next configured source for the rest of its range. The
+  node also logs why it leaves a configured history source out of a
+  processor's jobs.
 - A history job no longer fails with "block … was already applied with a
   different delta" when the live lane applies one of its blocks while it runs.
   A processor that records finality in its output, such as `blobs-money`, maps
