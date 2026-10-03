@@ -7690,6 +7690,15 @@ async fn run_archive_reconciliations(
                         break;
                     }
                     Err(RuntimeError::Cancelled) if cancellation.is_cancelled() => return Ok(()),
+                    // Another source may serve it; passes repeat, so debug only.
+                    Err(RuntimeError::SourceCannotServe { source_id, detail }) => {
+                        debug!(
+                            processor = %processor.descriptor().id,
+                            %source_id,
+                            %detail,
+                            "archive reconciliation source cannot serve this processor"
+                        );
+                    }
                     // Another source, or a larger budget, may serve the range.
                     Err(RuntimeError::Source(error @ SourceError::BudgetExceeded { .. })) => {
                         warn!(
@@ -10088,12 +10097,9 @@ markets = ["ETH/USDT"]
         // kind, so a second instance of a kind collided with the first and
         // the network lanes failed at every start.
         use leani_primitives::{BlockNumber, BlockRange, ChainId};
-        use leani_runtime::{SharedLiveRuntime, SharedLiveRuntimeConfig};
-        use leani_source_api::{ChainEvent, LiveStart};
+        use leani_source_api::LiveStart;
         use leani_store_sqlite::{HotColdHandoffState, SqliteStore, StoreConfig};
-        use leani_testkit::{
-            LiveStep, ScriptedLiveSource, default_source_budget, fixture_source_descriptor,
-        };
+        use leani_testkit::default_source_budget;
 
         let directory = tempfile::tempdir().expect("tempdir");
         let chain = fixture_chain(5);
@@ -10118,76 +10124,18 @@ markets = ["ETH/USDT"]
                 )) as Arc<dyn Processor>
             })
             .collect::<Vec<_>>();
-        // The live lanes retain the overlap up to the finalized anchor.
-        for frame in &chain[3..=4] {
-            store.store_recent_frame(frame).await.expect("recent frame");
-        }
-        let anchor = chain[4].block;
-        let overlap = BlockRange::new(BlockNumber(3), BlockNumber(4)).expect("overlap");
         // An earlier release named counter-a's unverified handoff by its kind.
         store
             .begin_hot_cold_handoff(
                 "handoff-1-synthetic-counter-3-4",
                 processors[0].descriptor(),
                 ChainId(1),
-                overlap,
-                anchor.hash,
+                BlockRange::new(BlockNumber(3), BlockNumber(4)).expect("overlap"),
+                chain[4].block.hash,
             )
             .await
             .expect("earlier handoff");
-        let history_anchor = leani_source_p2p::P2pHistoryAnchor {
-            block: anchor,
-            consensus: leani_primitives::ConsensusAnchor {
-                finality: leani_primitives::Finality::Finalized,
-                execution_block_hash: anchor.hash,
-                beacon_slot: 1,
-                beacon_block_root: [1; 32],
-            },
-        };
-        // The P2P bridge is the last resort; the archive covers the range.
-        let p2p =
-            leani_source_p2p::RethP2pSource::mainnet(leani_source_p2p::RethP2pConfig::default())
-                .expect("execution source");
-        let cancellation = CancellationToken::new();
-        let mut backfills = ColdBackfills::default();
-        spawn_cold_backfills(
-            &config,
-            &store,
-            &processors,
-            4,
-            3,
-            anchor.hash,
-            p2p,
-            history_anchor,
-            None,
-            pipeline_budget(&config),
-            &cancellation,
-            &mut backfills,
-        )
-        .await
-        .expect("each instance starts its own cold backfill");
-        let live = SharedLiveRuntime::new(
-            store.clone(),
-            Arc::new(ScriptedLiveSource::new(
-                fixture_source_descriptor(
-                    "two-instances-live",
-                    BlockRange::new(BlockNumber(0), BlockNumber(5)).expect("range"),
-                ),
-                vec![LiveStep::Event(ChainEvent::Block(Box::new(
-                    chain[5].clone(),
-                )))],
-            )),
-            processors.clone(),
-            SharedLiveRuntimeConfig::default(),
-        )
-        .expect("live runtime");
-        let summary = tokio::time::timeout(
-            Duration::from_secs(30),
-            finish_cold_handoffs(&store, &live, &processors, &mut backfills),
-        )
-        .await
-        .expect("the handoffs finish")
-        .expect("both handoffs verify");
+        let (summary, live) = hand_over_to_live(&config, &store, &processors, &chain).await;
         assert_eq!(summary.verified.len(), 2);
         assert!(summary.failed.is_empty(), "{:?}", summary.failed);
         for processor in &processors {
@@ -10238,46 +10186,7 @@ markets = ["ETH/USDT"]
             .expect("a budget failure leaves the lane waiting");
 
         // The archive audit reconciles both instances.
-        let audit = CancellationToken::new();
-        let mut reconciliations = tokio::spawn({
-            let config = config.clone();
-            let store = store.clone();
-            let processors = processors.clone();
-            let audit = audit.clone();
-            async move { run_archive_reconciliations(&config, &store, &processors, audit).await }
-        });
-        let reconciled = async {
-            loop {
-                let mut verified = 0;
-                for processor in &processors {
-                    if store
-                        .latest_verified_archive_reconciliation(processor.descriptor())
-                        .await
-                        .expect("archive reconciliation")
-                        .is_some()
-                    {
-                        verified += 1;
-                    }
-                }
-                if verified == processors.len() {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-        };
-        tokio::select! {
-            result = &mut reconciliations => {
-                panic!("the archive reconciliation lane stopped: {result:?}");
-            }
-            reconciled = tokio::time::timeout(Duration::from_secs(30), reconciled) => {
-                reconciled.expect("both instances reconcile");
-            }
-        }
-        audit.cancel();
-        reconciliations
-            .await
-            .expect("archive reconciliation task")
-            .expect("archive reconciliation lane");
+        reconcile_until_verified(&config, &store, &processors).await;
 
         // Both follow the live chain.
         live.run(
@@ -10300,6 +10209,177 @@ markets = ["ETH/USDT"]
                 processor.descriptor().instance
             );
         }
+    }
+
+    /// Backfill `processors` from `config`'s history over blocks 1 to 4 of
+    /// `chain`, as a network-lane start does, and verify their hot/cold
+    /// handoffs against a live lane that follows with block 5.
+    async fn hand_over_to_live(
+        config: &Config,
+        store: &leani_store_sqlite::SqliteStore,
+        processors: &[Arc<dyn Processor>],
+        chain: &[leani_primitives::BlockFrame],
+    ) -> (ColdHandoffSummary, leani_runtime::SharedLiveRuntime) {
+        use leani_primitives::{BlockNumber, BlockRange};
+        use leani_source_api::ChainEvent;
+        use leani_testkit::{LiveStep, ScriptedLiveSource, fixture_source_descriptor};
+
+        // The live lanes retain the overlap up to the finalized anchor.
+        for frame in &chain[3..=4] {
+            store.store_recent_frame(frame).await.expect("recent frame");
+        }
+        let anchor = chain[4].block;
+        let history_anchor = leani_source_p2p::P2pHistoryAnchor {
+            block: anchor,
+            consensus: leani_primitives::ConsensusAnchor {
+                finality: leani_primitives::Finality::Finalized,
+                execution_block_hash: anchor.hash,
+                beacon_slot: 1,
+                beacon_block_root: [1; 32],
+            },
+        };
+        // The P2P bridge is the last resort; the archive covers the range.
+        let p2p =
+            leani_source_p2p::RethP2pSource::mainnet(leani_source_p2p::RethP2pConfig::default())
+                .expect("execution source");
+        let cancellation = CancellationToken::new();
+        let mut backfills = ColdBackfills::default();
+        spawn_cold_backfills(
+            config,
+            store,
+            processors,
+            4,
+            3,
+            anchor.hash,
+            p2p,
+            history_anchor,
+            None,
+            pipeline_budget(config),
+            &cancellation,
+            &mut backfills,
+        )
+        .await
+        .expect("each instance starts its own cold backfill");
+        let live = leani_runtime::SharedLiveRuntime::new(
+            store.clone(),
+            Arc::new(ScriptedLiveSource::new(
+                fixture_source_descriptor(
+                    "two-instances-live",
+                    BlockRange::new(BlockNumber(0), BlockNumber(5)).expect("range"),
+                ),
+                vec![LiveStep::Event(ChainEvent::Block(Box::new(
+                    chain[5].clone(),
+                )))],
+            )),
+            processors.to_vec(),
+            leani_runtime::SharedLiveRuntimeConfig::default(),
+        )
+        .expect("live runtime");
+        let summary = tokio::time::timeout(
+            Duration::from_secs(30),
+            finish_cold_handoffs(store, &live, processors, &mut backfills),
+        )
+        .await
+        .expect("the handoffs finish")
+        .expect("the handoffs verify");
+        (summary, live)
+    }
+
+    /// Run the archive reconciliation lane until every processor has a
+    /// verified reconciliation, failing if the lane stops first.
+    async fn reconcile_until_verified(
+        config: &Config,
+        store: &leani_store_sqlite::SqliteStore,
+        processors: &[Arc<dyn Processor>],
+    ) {
+        let audit = CancellationToken::new();
+        let mut reconciliations = tokio::spawn({
+            let config = config.clone();
+            let store = store.clone();
+            let processors = processors.to_vec();
+            let audit = audit.clone();
+            async move { run_archive_reconciliations(&config, &store, &processors, audit).await }
+        });
+        let reconciled = async {
+            loop {
+                let mut verified = 0;
+                for processor in processors {
+                    if store
+                        .latest_verified_archive_reconciliation(processor.descriptor())
+                        .await
+                        .expect("archive reconciliation")
+                        .is_some()
+                    {
+                        verified += 1;
+                    }
+                }
+                if verified == processors.len() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        };
+        tokio::select! {
+            result = &mut reconciliations => {
+                panic!("the archive reconciliation lane stopped: {result:?}");
+            }
+            reconciled = tokio::time::timeout(Duration::from_secs(30), reconciled) => {
+                reconciled.expect("every processor reconciles");
+            }
+        }
+        audit.cancel();
+        reconciliations
+            .await
+            .expect("archive reconciliation task")
+            .expect("archive reconciliation lane");
+    }
+
+    #[tokio::test]
+    async fn archive_reconciliation_moves_past_a_source_that_refuses_the_request() {
+        // Xatu refuses requests its descriptor admits, such as pre-Merge
+        // blocks or receipts beyond blob transactions. The backfill moved on
+        // to the archive, but reconciliation treated the refusal as fatal and
+        // stopped every network lane.
+        let directory = tempfile::tempdir().expect("tempdir");
+        let chain = fixture_chain(5);
+        let manifest = write_frame_archive(directory.path(), &chain[1..=4]);
+        let mut config = archive_config(
+            directory.path(),
+            &manifest,
+            &[("synthetic-counter", "counter-a")],
+        );
+        config.sources.history.insert(
+            0,
+            crate::config::HistorySourceConfig {
+                id: "xatu".to_owned(),
+                kind: crate::config::HistorySourceKind::Xatu,
+                priority: 0,
+                trust: crate::config::HistoryTrust::TrustedDataset,
+                chunk_blocks: None,
+                blobs_chunk_blocks: None,
+                batch_rows: None,
+                manifest: None,
+                endpoint: None,
+                allow_insecure_http: false,
+            },
+        );
+        let store = leani_store_sqlite::SqliteStore::open(leani_store_sqlite::StoreConfig::new(
+            directory.path().join("node.sqlite"),
+        ))
+        .await
+        .expect("store");
+        let processors = vec![Arc::new(
+            BlockLocalCounter::default()
+                .with_instance(
+                    leani_processor_api::ProcessorInstanceId::new("counter-a").expect("instance"),
+                    leani_primitives::BlockHash::new([0xa0; 32]),
+                )
+                .with_filtered_material(),
+        ) as Arc<dyn Processor>];
+
+        let (summary, _live) = hand_over_to_live(&config, &store, &processors, &chain).await;
+        assert!(summary.failed.is_empty(), "{:?}", summary.failed);
+        reconcile_until_verified(&config, &store, &processors).await;
     }
 
     #[tokio::test]
