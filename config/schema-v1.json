@@ -339,6 +339,13 @@
         },
         "peer_refill_interval_ms": { "$ref": "#/$defs/positiveInteger" },
         "peer_recovery_timeout_seconds": { "$ref": "#/$defs/positiveInteger" },
+        "stall_timeout_seconds": {
+          "type": "integer",
+          "minimum": 360,
+          "maximum": 2592000,
+          "default": 600,
+          "description": "Exit the node, so that its process supervisor restarts it, after the live lane stays not ready this long while verified finality is ready."
+        },
         "material_request_concurrency": { "$ref": "#/$defs/positiveInteger" },
         "material_request_blocks": {
           "type": "integer",

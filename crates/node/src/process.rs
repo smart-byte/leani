@@ -5841,10 +5841,14 @@ async fn serve(path: &Path, registry: &ProcessorRegistry) -> Result<Exit> {
                 None,
             ))
             .await?;
-            // Halted lanes stay stopped and not ready until the node
-            // restarts, while the node keeps serving what it stored.
-            if end == NetworkLanesEnd::Halted {
-                supervisor_cancellation.cancelled().await;
+            match end {
+                // Halted lanes stay stopped and not ready until the node
+                // restarts, while the node keeps serving what it stored.
+                NetworkLanesEnd::Halted => supervisor_cancellation.cancelled().await,
+                // Only a new process recovers a wedged live lane: exit
+                // non-zero so that the process supervisor restarts the node.
+                NetworkLanesEnd::Wedged => bail!("the live network lane stalled"),
+                NetworkLanesEnd::Cancelled => {}
             }
             Ok(())
         });
@@ -6571,7 +6575,14 @@ async fn supervise_network_lanes(
     })
     .await;
     handles.network_telemetry.supervisor_stopped();
-    live_source.shutdown().await;
+    // The shutdown waits for the network state, which a hung manager build
+    // can hold.
+    if tokio::time::timeout(Duration::from_secs(10), live_source.shutdown())
+        .await
+        .is_err()
+    {
+        warn!("the execution P2P network did not shut down within 10 seconds");
+    }
     Ok(end)
 }
 
@@ -6596,6 +6607,50 @@ enum NetworkLanesEnd {
     /// The lanes halted: they stay stopped and not ready until the node
     /// restarts.
     Halted,
+    /// The live lane stalled; only a new process recovers it.
+    Wedged,
+}
+
+/// The live lane stayed not ready while verified finality was ready.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "the live lane stayed not ready for {}s while verified finality was ready",
+    timeout.as_secs()
+)]
+struct LiveStalled {
+    timeout: Duration,
+}
+
+/// Resolve once the live lane has been not ready, while verified finality
+/// was ready, for `timeout` without a break. Without finality, the network
+/// itself is likely down, and a restart would not help. A full recent-frame
+/// store also keeps the lane not ready, but the runtime's own limit restarts
+/// the lanes for it, so that wait does not count.
+async fn live_stall(
+    mut live: tokio::sync::watch::Receiver<bool>,
+    mut finality: tokio::sync::watch::Receiver<bool>,
+    mut storage_full: tokio::sync::watch::Receiver<bool>,
+    timeout: Duration,
+) -> LiveStalled {
+    let mut deadline = None;
+    loop {
+        let stalled = *finality.borrow_and_update()
+            && !*live.borrow_and_update()
+            && !*storage_full.borrow_and_update();
+        deadline = match (stalled, deadline) {
+            (false, _) => None,
+            (true, None) => Some(tokio::time::Instant::now() + timeout),
+            (true, deadline) => deadline,
+        };
+        tokio::select! {
+            () = tokio::time::sleep_until(deadline.unwrap_or_else(tokio::time::Instant::now)),
+                if deadline.is_some() => return LiveStalled { timeout },
+            Ok(()) = live.changed() => {}
+            Ok(()) = finality.changed() => {}
+            Ok(()) = storage_full.changed() => {}
+            else => std::future::pending().await,
+        }
+    }
 }
 
 /// Drops the network lanes' readiness when dropped.
@@ -6610,9 +6665,9 @@ impl Drop for LaneReadinessGuard<'_> {
 }
 
 /// Run the network lanes with `run_once` until cancelled. A failed run
-/// restarts after a bounded exponential backoff, unless it halts (see
-/// [`network_lane_failure`]): the lanes then stay stopped and not ready,
-/// with the error, until the node restarts.
+/// restarts after a bounded exponential backoff, unless it halts or wedges
+/// (see [`network_lane_failure`]): the lanes then stay stopped and not
+/// ready, with the error, until the node restarts.
 ///
 /// However the supervisor stops, even by a panic unwinding out of a run or
 /// with its task aborted, readiness drops.
@@ -6638,6 +6693,14 @@ where
             break;
         }
         let failure = match network_lane_failure(&result, &mut reorgs) {
+            LaneFailure::Wedge(failure) => {
+                tracing::error!(
+                    error = %failure,
+                    "the live lane stalled while verified finality stayed ready; the node exits so that it restarts"
+                );
+                handles.network_telemetry.supervisor_halted(&failure);
+                return NetworkLanesEnd::Wedged;
+            }
             LaneFailure::Halt(failure) => {
                 tracing::error!(
                     error = %failure,
@@ -6689,6 +6752,8 @@ enum LaneFailure {
     Heal(String),
     /// Stop, not ready, until the node restarts.
     Halt(String),
+    /// Stop, and exit the node so that its process supervisor restarts it.
+    Wedge(String),
 }
 
 /// The finalized block whose contradiction with retained unfinalized blocks
@@ -6705,7 +6770,9 @@ struct FinalityReorgRestarts {
 /// retained unfinalized blocks heals: the restart reverts them. The same one
 /// again, before finality moves to another block, heals again, until its
 /// `FINALITY_REORG_HALT_OCCURRENCE`th occurrence halts, so a persistent fault
-/// cannot restart the lanes forever. Anything else restarts.
+/// cannot restart the lanes forever. A stalled live lane wedges: a lane
+/// restart cannot heal the process-wide execution network it stalled in.
+/// Anything else restarts.
 fn network_lane_failure(result: &Result<()>, reorgs: &mut FinalityReorgRestarts) -> LaneFailure {
     let error = match result {
         Ok(()) => {
@@ -6714,6 +6781,12 @@ fn network_lane_failure(result: &Result<()>, reorgs: &mut FinalityReorgRestarts)
         Err(error) => error,
     };
     let failure = format!("{error:#}");
+    if error
+        .chain()
+        .any(<dyn std::error::Error>::is::<LiveStalled>)
+    {
+        return LaneFailure::Wedge(failure);
+    }
     if network_lane_halts(error) {
         return LaneFailure::Halt(failure);
     }
@@ -7215,11 +7288,18 @@ async fn run_network_lanes(
     let archive_reconciliations =
         run_archive_reconciliations(config, &store, &processors, lane_cancellation.clone());
     let handoffs = finish_cold_handoffs(&store, &handoff_runtime, &processors, backfills);
+    let stall = live_stall(
+        live_ready_updates.clone(),
+        finality_ready_updates.clone(),
+        handoff_runtime.recent_storage_full(),
+        Duration::from_secs(config.sources.live.stall_timeout_seconds),
+    );
     tokio::pin!(live);
     tokio::pin!(finality);
     tokio::pin!(p2p_bridge_updates);
     tokio::pin!(archive_reconciliations);
     tokio::pin!(handoffs);
+    tokio::pin!(stall);
     let mut handoffs_verified = false;
     let mut handoffs_finished = false;
     let mut live_finished = false;
@@ -7282,6 +7362,7 @@ async fn run_network_lanes(
             result = &mut archive_reconciliations => {
                 break result.context("archive/live reconciliation lane ended");
             }
+            stalled = &mut stall => break Err(stalled.into()),
             result = &mut handoffs, if !handoffs_verified => {
                 handoffs_finished = true;
                 match result {
@@ -7310,9 +7391,8 @@ async fn run_network_lanes(
         }
     };
     lane_cancellation.cancel();
-    // A suspended live commit holds the lane lock that handoff reconciliation
-    // and parking take, so drive both to completion rather than handoffs alone.
-    tokio::join!(
+    stop_lanes(
+        &result,
         async {
             if !live_finished {
                 let _ = live.as_mut().await;
@@ -7323,11 +7403,43 @@ async fn run_network_lanes(
                 let _ = handoffs.as_mut().await;
             }
         },
-    );
+    )
+    .await;
     readiness.set_live_ready(false);
     rpc_readiness.set_live_ready(false);
     readiness.set_finality_ready(false);
     result
+}
+
+/// Wait for the live lane and the handoffs of a run that `result` ended. A
+/// suspended live commit holds the lane lock that handoff reconciliation and
+/// parking take, so drive both to completion rather than handoffs alone.
+/// After a stall, wait only as long as a shutdown: the stalled lane can wait
+/// on a network build that ignores cancellation.
+async fn stop_lanes(
+    result: &Result<()>,
+    live: impl Future<Output = ()>,
+    handoffs: impl Future<Output = ()>,
+) {
+    let stop = async {
+        tokio::join!(live, handoffs);
+    };
+    if !result.as_ref().is_err_and(|error| {
+        error
+            .chain()
+            .any(<dyn std::error::Error>::is::<LiveStalled>)
+    }) {
+        return stop.await;
+    }
+    if tokio::time::timeout(shutdown::SHUTDOWN_DEADLINE, stop)
+        .await
+        .is_err()
+    {
+        warn!(
+            deadline = ?shutdown::SHUTDOWN_DEADLINE,
+            "the stalled live lane did not stop; the node exits without it"
+        );
+    }
 }
 
 /// Publish the newest verified finality anchor's slot time and the time a
@@ -8298,6 +8410,114 @@ mod tests {
             .expect("the supervisor stops once cancelled");
         assert_eq!(end, NetworkLanesEnd::Cancelled);
         assert_eq!(runs.load(std::sync::atomic::Ordering::SeqCst), 5);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_live_lane_wedges_the_supervisor() {
+        // A lane restart cannot heal the process-wide execution P2P state
+        // that stalled the live lane: the supervisor stops at once.
+        let handles = lane_handles();
+        let runs = std::sync::atomic::AtomicUsize::new(0);
+        let end = tokio::time::timeout(
+            Duration::from_mins(10),
+            supervise_lane_runs(&handles, || {
+                runs.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                async {
+                    Err(anyhow::Error::new(LiveStalled {
+                        timeout: Duration::from_mins(10),
+                    }))
+                }
+            }),
+        )
+        .await
+        .expect("the supervisor restarted a stalled live lane");
+        assert_eq!(end, NetworkLanesEnd::Wedged);
+        assert_eq!(runs.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(!handles.readiness.is_ready());
+        assert_eq!(
+            handles.network_telemetry.snapshot().supervisor.state,
+            leani_source_api::NetworkSupervisorState::Stopped
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_run_stops_without_waiting_for_a_live_lane_that_ignores_cancellation() {
+        // A live lane waiting on a hung network build ignores cancellation.
+        // Waiting for it kept a stall from ever exiting the node.
+        let stalled = Err(anyhow::Error::new(LiveStalled {
+            timeout: Duration::from_mins(10),
+        }));
+        tokio::time::timeout(
+            shutdown::SHUTDOWN_DEADLINE + Duration::from_secs(1),
+            stop_lanes(&stalled, std::future::pending(), async {}),
+        )
+        .await
+        .expect("a stalled run stops by the shutdown deadline");
+
+        // Any other end drives a suspended live commit to completion.
+        let live_finished = std::sync::atomic::AtomicBool::new(false);
+        stop_lanes(
+            &Err(anyhow::anyhow!("another failure")),
+            async {
+                tokio::time::sleep(Duration::from_mins(1)).await;
+                live_finished.store(true, std::sync::atomic::Ordering::SeqCst);
+            },
+            async {},
+        )
+        .await;
+        assert!(live_finished.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_live_lane_stalls_while_finality_is_ready_and_storage_has_room() {
+        let (live, live_updates) = tokio::sync::watch::channel(false);
+        let (finality, finality_updates) = tokio::sync::watch::channel(false);
+        let (storage_full, storage_full_updates) = tokio::sync::watch::channel(false);
+        let timeout = Duration::from_mins(10);
+        let almost = Duration::from_secs(599);
+        let stall = tokio::spawn(live_stall(
+            live_updates,
+            finality_updates,
+            storage_full_updates,
+            timeout,
+        ));
+        let settle = || tokio::time::sleep(Duration::from_millis(1));
+        // Nothing ready, as while the network is down: no stall.
+        tokio::time::sleep(Duration::from_hours(1)).await;
+        assert!(!stall.is_finished(), "a node without finality stalled");
+        // Finality ready, live not: the stall starts...
+        finality.send(true).expect("finality watch");
+        settle().await;
+        tokio::time::sleep(almost).await;
+        // ...and a live lane that recovers in time ends it.
+        live.send(true).expect("live watch");
+        settle().await;
+        tokio::time::sleep(Duration::from_hours(1)).await;
+        assert!(!stall.is_finished(), "a recovered live lane stalled");
+        // Losing finality as well also ends it.
+        live.send(false).expect("live watch");
+        settle().await;
+        tokio::time::sleep(almost).await;
+        finality.send(false).expect("finality watch");
+        settle().await;
+        tokio::time::sleep(Duration::from_hours(1)).await;
+        assert!(!stall.is_finished(), "a stall outlived verified finality");
+        // A full recent-frame store holds the live lane back too, and the
+        // runtime's own limit restarts the lanes for it.
+        storage_full.send(true).expect("storage watch");
+        finality.send(true).expect("finality watch");
+        settle().await;
+        tokio::time::sleep(Duration::from_hours(1)).await;
+        assert!(!stall.is_finished(), "a storage wait counted as a stall");
+        // A stall that lasts the timeout resolves.
+        storage_full.send(false).expect("storage watch");
+        let started = tokio::time::Instant::now();
+        let stalled = tokio::time::timeout(timeout + Duration::from_secs(1), stall)
+            .await
+            .expect("the live lane stalled for the whole timeout")
+            .expect("the stall watch");
+        assert_eq!(started.elapsed(), timeout);
+        assert_eq!(stalled.timeout, timeout);
     }
 
     #[test]
