@@ -779,6 +779,22 @@ pub struct BackfillReport {
     pub sources: Vec<BackfillSourceReport>,
 }
 
+/// Plan `request` on `source`. A source can advertise a capability it serves
+/// only for some request shapes, and its plan refuses the rest; another
+/// source may serve them.
+async fn plan_or_refuse(
+    source: &dyn HistorySource,
+    request: &DataRequest,
+) -> Result<leani_source_api::SourcePlan, RuntimeError> {
+    source.plan(request).await.map_err(|error| match error {
+        SourceError::InvalidPlan(detail) => RuntimeError::SourceCannotServe {
+            source_id: source.descriptor().id.to_string(),
+            detail,
+        },
+        error => error.into(),
+    })
+}
+
 /// Re-map a finalized archive range and compare its compact processor deltas
 /// with the checksums originally committed from live execution P2P.
 ///
@@ -790,7 +806,8 @@ pub struct BackfillReport {
 /// # Errors
 ///
 /// Returns an error for source unavailability, cancellation, processor/store
-/// failures, incomplete streams, or any deterministic disagreement.
+/// failures, incomplete streams, or any deterministic disagreement, and
+/// [`RuntimeError::SourceCannotServe`] when `source` refuses the request.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub async fn reconcile_archive_deltas(
     store: &SqliteStore,
@@ -818,7 +835,7 @@ pub async fn reconcile_archive_deltas(
         range,
         verification_policy,
     )?;
-    let plan = source.plan(&job.request).await?;
+    let plan = plan_or_refuse(source, &job.request).await?;
     plan.validate()?;
     let anchor_hash = store
         .coverage_hash(processor.descriptor(), range.end())
@@ -1163,7 +1180,7 @@ mod failpoints {
 
     /// After the canonical recent write, before one processor's apply.
     pub(crate) const BEFORE_LIVE_APPLY: &str = "before_live_apply";
-    /// After a delta's `persist_delta`, before its apply.
+    /// After a delta's `persist_delta` or pending check, before its apply.
     pub(crate) const AFTER_PERSIST_DELTA: &str = "after_persist_delta";
     /// After a reorg's canonical switch, before one processor's undo.
     pub(crate) const BEFORE_REORG_UNDO: &str = "before_reorg_undo";
@@ -1202,6 +1219,9 @@ mod failpoints {
     }
 }
 
+/// Apply one mapped delta. The live lane persists it first; history only
+/// checks the pending one, since a live drain applies any pending delta that
+/// continues an ordered cursor, as an included block.
 async fn commit_mapped_delta(
     store: &SqliteStore,
     processor: &dyn Processor,
@@ -1209,14 +1229,21 @@ async fn commit_mapped_delta(
     sink_ids: &[String],
     publish_changes: bool,
     delivery_stream_id: Option<&str>,
+    persist: bool,
 ) -> Result<ApplyOutcome, RuntimeError> {
     if accept_existing_delta_variant(store, processor, mapped).await? {
         return Ok(ApplyOutcome::AlreadyApplied);
     }
-    if let Err(error) = store
-        .persist_delta(processor.descriptor(), &mapped.delta)
-        .await
-    {
+    let pending = if persist {
+        store
+            .persist_delta(processor.descriptor(), &mapped.delta)
+            .await
+    } else {
+        store
+            .check_pending_delta(processor.descriptor(), &mapped.delta)
+            .await
+    };
+    if let Err(error) = pending {
         if !matches!(error, StoreError::ConflictingPendingDelta(_)) {
             return Err(error.into());
         }
@@ -1613,8 +1640,10 @@ impl HistoricalRuntime {
         // since the current gap last committed a block.
         let mut gap_failures = 0_u32;
         // Sources are in priority order. A gap starts on the first and moves
-        // to the next only after a source error.
+        // to the next only after a source error. A source that refused to
+        // plan the job is skipped for the rest of it.
         let mut source_index = 0_usize;
+        let mut refused = BTreeSet::new();
         let mut source_bytes = 0_u64;
         let mut physical_source_bytes = 0_u64;
         let mut reused_source_bytes = 0_u64;
@@ -1797,6 +1826,9 @@ impl HistoricalRuntime {
                 continue;
             }
 
+            while refused.contains(&source_index) {
+                source_index = source_index.saturating_add(1) % source_count;
+            }
             let source = self.sources.get(source_index).cloned().ok_or_else(|| {
                 RuntimeError::InvalidConfig("historical source index is invalid".to_owned())
             })?;
@@ -1955,6 +1987,18 @@ impl HistoricalRuntime {
                     )
                     .await?;
                     return Err(error);
+                }
+                Err(RuntimeError::SourceCannotServe { source_id, detail })
+                    if refused.len().saturating_add(1) < source_count =>
+                {
+                    warn!(
+                        job_id = %job.id,
+                        %source_id,
+                        %detail,
+                        "historical source cannot serve this job; the next source serves it"
+                    );
+                    refused.insert(source_index);
+                    source_index = source_index.saturating_add(1) % source_count;
                 }
                 Err(error) => {
                     self.save_checkpoint(
@@ -2386,7 +2430,7 @@ impl HistoricalRuntime {
             }
             (None, _) => request.clone(),
         };
-        let plan = source.plan(&physical_request).await?;
+        let plan = plan_or_refuse(source.as_ref(), &physical_request).await?;
         plan.validate()?;
         let startup_gate = startup_permit.map(HistoricalMaterialStartupPermit::gate);
         let mut prior_chunk_last = expected_parent;
@@ -3317,6 +3361,7 @@ impl HistoricalRuntime {
             sink_ids,
             publish_changes,
             delivery_stream_id,
+            false,
         )
         .await
     }
@@ -3791,20 +3836,45 @@ impl SharedLiveRuntime {
     ) -> Result<u64, RuntimeError> {
         let descriptor = processor.descriptor();
         let chain_id = self.source.descriptor().chain_id;
-        let reverted = self
+        let mut reverted = self
             .store
             .noncanonical_unfinalized_blocks(descriptor, chain_id)
             .await?;
+        let mut repaired = 0;
         for (number, hash) in &reverted {
+            // An ordered undo restores the block's preimages and the cursor
+            // before it, so it repairs only the tip. A block below the tip
+            // has later blocks applied on top, and no canonical row vouches
+            // for a history block: it is one applied as included mid-backfill,
+            // which finality promotes, not a reverted one.
+            if descriptor.mode == ReductionMode::OrderedState
+                && !self
+                    .store
+                    .processor_cursor(descriptor)
+                    .await?
+                    .is_some_and(|cursor| {
+                        cursor.block_number == *number && cursor.block_hash == *hash
+                    })
+            {
+                warn!(
+                    processor_instance = %descriptor.instance,
+                    block = number.0,
+                    "startup reconciliation kept an unfinalized block below an ordered lane's tip"
+                );
+                break;
+            }
             self.store
                 .undo(descriptor, chain_id, *number, *hash, &self.config.sink_ids)
                 .await?;
+            repaired += 1;
         }
+        reverted.truncate(repaired);
         let start = processor_start(processor)?;
         let replay_from = self.park_lane_behind_retained_tip(processor, start).await?;
         // A block-local lane applies a pending delta only at its gap, so one
         // below its first unapplied block, such as an interrupted backfill
-        // commit left, never applies; that backfill maps the block again.
+        // commit of an earlier release left, never applies; that backfill
+        // maps the block again.
         let keep_from = if descriptor.mode == ReductionMode::BlockLocal {
             match self.store.live_lane_gap(descriptor).await? {
                 Some(gap) => gap.first_unapplied.number,
@@ -4417,6 +4487,7 @@ impl SharedLiveRuntime {
                     &self.config.sink_ids,
                     true,
                     None,
+                    true,
                 )
                 .await
                 .map(Some)
@@ -7184,6 +7255,10 @@ pub enum RuntimeError {
     Cancelled,
     #[error("source failed: {0}")]
     Source(#[from] SourceError),
+    /// A history source refused to plan a job's request, as one does for a
+    /// capability it serves only for some request shapes.
+    #[error("historical source {source_id} cannot serve this job: {detail}")]
+    SourceCannotServe { source_id: String, detail: String },
     #[error("processor failed: {0}")]
     Processor(#[from] ProcessorError),
     #[error("store failed: {0}")]
@@ -13795,6 +13870,83 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_source_that_cannot_plan_the_job_falls_over_for_the_rest_of_it() {
+        // A source can advertise a capability it serves only for some
+        // requests, as Xatu does receipts, and refuse the plan. That refusal
+        // failed the job although another configured source served it.
+        let ranges = vec![
+            BlockRange::new(BlockNumber(1), BlockNumber(2)).expect("range"),
+            BlockRange::new(BlockNumber(4), BlockNumber(5)).expect("range"),
+        ];
+        let bounding = BlockRange::new(BlockNumber(1), BlockNumber(5)).expect("range");
+        let refusing = || {
+            let mut descriptor = fixture_source_descriptor("refusing-history", bounding);
+            descriptor.capabilities = leani_primitives::CapabilitySet::of(Capability::Logs);
+            descriptor.complete_capabilities = descriptor.capabilities;
+            Arc::new(ScriptedHistorySource::from_frames(
+                descriptor,
+                frames(bounding),
+            ))
+        };
+        let mut fallback_descriptor = fixture_source_descriptor("fallback-history", bounding);
+        fallback_descriptor.priority = 1;
+        let fallback: Arc<dyn HistorySource> = Arc::new(ScriptedHistorySource::from_frames(
+            fallback_descriptor,
+            frames(bounding),
+        ));
+        for (name, with_fallback) in [("refused-with-fallback", true), ("refused-alone", false)] {
+            let refusing = refusing();
+            let mut sources = vec![refusing.clone() as Arc<dyn HistorySource>];
+            if with_fallback {
+                sources.push(fallback.clone());
+            }
+            let processor = Arc::new(BlockLocalCounter::default());
+            let (_directory, store) = store().await;
+            let result = HistoricalRuntime::new_with_sources(
+                store,
+                sources,
+                processor.clone(),
+                HistoricalRuntimeConfig {
+                    mapper_concurrency: 1,
+                    max_attempts: 3,
+                    retry_base: Duration::from_millis(1),
+                    retry_max: Duration::from_millis(1),
+                    ..HistoricalRuntimeConfig::default()
+                },
+            )
+            .expect("runtime")
+            .run(
+                BackfillJob::for_processor_ranges(
+                    name,
+                    processor.as_ref(),
+                    ChainId(1),
+                    ranges.clone(),
+                    VerificationPolicy::CompleteCryptographic,
+                )
+                .expect("job"),
+                default_source_budget(),
+                CancellationToken::new(),
+            )
+            .await;
+            if with_fallback {
+                let report = result.expect("the fallback source serves the job");
+                assert_eq!(report.final_coverage, ranges);
+                assert_eq!(
+                    (refusing.plan_calls(), refusing.open_calls()),
+                    (1, 0),
+                    "a source that refused the job is not asked again"
+                );
+            } else {
+                let error = result.expect_err("no source can serve the job");
+                assert!(
+                    error.to_string().contains("refusing-history cannot serve"),
+                    "{error}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn budget_failures_fail_over_to_the_next_source() {
         let range = BlockRange::new(BlockNumber(1), BlockNumber(2)).expect("range");
         let starved = || {
@@ -16827,7 +16979,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn startup_reconciliation_deletes_a_delta_a_crashed_backfill_left_pending() {
+    async fn a_crashed_backfill_leaves_no_pending_delta_and_restarts_like_a_clean_run() {
         let range = BlockRange::new(BlockNumber(0), BlockNumber(4)).expect("range");
         let counter = Arc::new(BlockLocalCounter::named("crash-backfill-counter"));
         let lanes: Vec<Arc<dyn Processor>> = vec![counter.clone()];
@@ -16837,8 +16989,7 @@ mod tests {
             .await
             .expect("clean backfill");
 
-        // The backfill persists block 1's delta; the process dies before that
-        // delta applies.
+        // The process dies right before the backfill applies block 1.
         let directory = tempfile::tempdir().expect("tempdir");
         let path = directory.path().join("node.sqlite");
         let store = SqliteStore::open(leani_store_sqlite::StoreConfig::new(&path))
@@ -16855,26 +17006,166 @@ mod tests {
             matches!(&crashed, Err(RuntimeError::InvalidConfig(message)) if message.starts_with("injected crash")),
             "the backfill ends at the injected crash: {crashed:?}"
         );
+        // A pending delta would be a live drain's to apply, as included, and
+        // would hold back the hot/cold handoff.
+        assert!(
+            store
+                .pending_deltas(counter.descriptor(), BlockNumber(0), 16)
+                .await
+                .expect("pending deltas")
+                .is_empty(),
+            "history keeps no delta pending"
+        );
         drop(store);
 
         // The restart reconciles before its cold backfill runs again.
         let store = SqliteStore::open(leani_store_sqlite::StoreConfig::new(&path))
             .await
             .expect("reopen store");
-        let report = reduce_failure_runtime(&store, &lanes, &[])
+        reduce_failure_runtime(&store, &lanes, &[])
             .reconcile_startup()
             .await
             .expect("startup reconciliation");
-        assert_eq!(
-            report.processors["crash-backfill-counter"].pending, 0,
-            "no orphan pending delta is left to hold back the hot/cold handoff"
-        );
         run_counter_backfill(&store, &counter, range)
             .await
             .expect("backfill after the restart");
         assert_eq!(
             lane_state(&store, counter.as_ref()).await,
             lane_state(&clean, counter.as_ref()).await
+        );
+    }
+
+    /// The automatic cold backfill's job for an ordered `ledger` over
+    /// `range`, served from finalized history.
+    async fn run_ledger_backfill(
+        store: &SqliteStore,
+        ledger: &Arc<OrderedLedgerProcessor>,
+        range: BlockRange,
+    ) -> Result<BackfillReport, RuntimeError> {
+        let mut descriptor = fixture_source_descriptor("ledger-backfill-history", range);
+        descriptor.capabilities = descriptor.capabilities.with(Capability::Header);
+        descriptor.complete_capabilities =
+            descriptor.complete_capabilities.with(Capability::Header);
+        let history = live_blocks(range.end().0)
+            .into_iter()
+            .filter(|frame| range.contains(frame.block.number))
+            .map(|mut frame| {
+                frame.finality = Finality::Finalized;
+                frame
+            })
+            .collect();
+        HistoricalRuntime::new(
+            store.clone(),
+            Arc::new(ScriptedHistorySource::from_frames(descriptor, history)),
+            ledger.clone(),
+            HistoricalRuntimeConfig {
+                mapper_concurrency: 2,
+                ..HistoricalRuntimeConfig::default()
+            },
+        )
+        .expect("runtime")
+        .run(
+            BackfillJob::for_processor(
+                "ledger-backfill",
+                ledger.as_ref(),
+                ChainId(1),
+                range,
+                VerificationPolicy::CompleteCryptographic,
+            )
+            .expect("job"),
+            default_source_budget(),
+            CancellationToken::new(),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn a_live_drain_leaves_the_block_a_backfill_is_committing_to_it() {
+        // A backfill that kept its block's delta pending before the apply let
+        // a live drain in between apply that block as included. Its
+        // unfinalized undo record, below the retained canonical rows, then
+        // read as a reverted block at the next start.
+        let range = BlockRange::new(BlockNumber(0), BlockNumber(4)).expect("range");
+        let ledger = Arc::new(OrderedLedgerProcessor::named("drain-race-ledger"));
+        let (_directory, store) = store().await;
+        failpoints::arm(
+            failpoints::AFTER_PERSIST_DELTA,
+            ledger.descriptor(),
+            BlockNumber(2),
+        );
+        let stopped = run_ledger_backfill(&store, &ledger, range).await;
+        assert!(
+            matches!(&stopped, Err(RuntimeError::InvalidConfig(message)) if message.starts_with("injected crash")),
+            "the backfill stops right before block 2's apply: {stopped:?}"
+        );
+
+        reduce_failure_runtime(&store, &[ledger.clone() as Arc<dyn Processor>], &[])
+            .reconcile_pending()
+            .await
+            .expect("live drain");
+        assert_eq!(
+            store
+                .processor_cursor(ledger.descriptor())
+                .await
+                .expect("cursor")
+                .map(|cursor| cursor.block_number),
+            Some(BlockNumber(1)),
+            "the drain leaves block 2 to the backfill"
+        );
+
+        run_ledger_backfill(&store, &ledger, range)
+            .await
+            .expect("backfill resumes");
+        let cursor = store
+            .processor_cursor(ledger.descriptor())
+            .await
+            .expect("cursor")
+            .expect("applied");
+        assert_eq!(
+            (cursor.block_number, cursor.finality),
+            (BlockNumber(4), Finality::Finalized)
+        );
+        assert!(
+            store
+                .noncanonical_unfinalized_blocks(ledger.descriptor(), ChainId(1))
+                .await
+                .expect("undo records")
+                .is_empty(),
+            "every block the backfill applied is final"
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_reconciliation_keeps_an_included_block_below_an_ordered_tip() {
+        // No canonical row vouches for a history block, so an unfinalized
+        // undo record there reads as reverted. An ordered undo restores the
+        // block's preimages and the cursor before it, which below the tip
+        // discards every block applied on top.
+        let ledger = Arc::new(OrderedLedgerProcessor::named("included-below-tip-ledger"));
+        let (_clean_directory, clean) = store().await;
+        let (_directory, store) = store().await;
+        for (sequence, mut frame) in (1..).zip(live_blocks(4)) {
+            frame.finality = Finality::Finalized;
+            apply_live_frame(&clean, ledger.as_ref(), &frame, sequence).await;
+            if frame.block.number == BlockNumber(2) {
+                frame.finality = Finality::Included;
+            }
+            apply_live_frame(&store, ledger.as_ref(), &frame, sequence).await;
+        }
+
+        let report = reduce_failure_runtime(&store, &[ledger.clone() as Arc<dyn Processor>], &[])
+            .reconcile_startup()
+            .await
+            .expect("startup reconciliation");
+
+        assert_eq!(report.processors["included-below-tip-ledger"].reverted, 0);
+        let (kept, clean) = (
+            lane_state(&store, ledger.as_ref()).await,
+            lane_state(&clean, ledger.as_ref()).await,
+        );
+        assert_eq!(
+            (kept.cursor, kept.coverage, kept.entities),
+            (clean.cursor, clean.coverage, clean.entities)
         );
     }
 

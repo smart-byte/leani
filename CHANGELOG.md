@@ -6,8 +6,50 @@ record, and documented RPC contracts.
 
 ## [Unreleased]
 
+### Added
+
+- `leani backfill` logs its progress every 30 seconds: committed blocks,
+  blocks per minute and, over P2P, connected peers. A run waiting on peers, or
+  on a network that cannot start, no longer looks the same as a working one.
+
 ### Fixed
 
+- A restart during an automatic backfill could silently erase part of an
+  ordered-state processor's history. A live drain that ran while the backfill
+  committed a block applied that block as `included`, because the backfill
+  kept its delta pending before the apply. Its unfinalized undo record, below
+  the retained canonical blocks, then read as a reverted block at the next
+  start, and startup reconciliation undid it under thousands of later blocks:
+  their contributions to the keys the block wrote were gone, while coverage
+  still reported the range complete. History now applies without keeping a
+  pending delta, and reconciliation undoes an ordered lane only from its tip.
+  A store that already holds such a block keeps it, with a warning, until
+  finality promotes it.
+- A history source that cannot plan a job's request no longer fails the job
+  and parks the processor's live lane with `hot_cold_handoff_failed`. Xatu,
+  for example, advertises receipts but serves them only for blob
+  transactions, so a recipient-filtered processor that reads receipts failed
+  its automatic backfill on a node with Xatu configured. The job now warns
+  once and moves to the next configured source for the rest of its range.
+  Archive reconciliation, which revisits the range after the handoff, moves
+  past such a source the same way instead of stopping every network lane. The
+  node also logs why it leaves a configured history source out of a
+  processor's jobs.
+- History P2P connection retries log at `warn` with their error instead of
+  `debug`, so a backfill whose Reth networking cannot start, such as in a
+  sandbox that forbids sockets, no longer waits silently.
+- The execution P2P pool warns when it stays below
+  `sources.live.body_serving_peer_target` connected peers for
+  `peer_recovery_timeout_seconds`, again at that interval while it does.
+  Requests spread across connected peers, so such a pool also caps backfill
+  throughput.
+- Coverage reports `catching_up`, not `live`, while a processor is still
+  behind the chain's finalized head, even when its range has no gaps and the
+  node is ready.
+- Each start cancels the automatic backfill jobs earlier starts left queued or
+  running for the same processor instance. They were listed as running
+  forever, one more after every restart. The runbook says when a restart
+  resumes an ordered lane paused with `hot_cold_handoff_failed`.
 - A history job no longer fails with "block … was already applied with a
   different delta" when the live lane applies one of its blocks while it runs.
   A processor that records finality in its output, such as `blobs-money`, maps

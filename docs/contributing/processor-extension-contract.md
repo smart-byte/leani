@@ -105,6 +105,16 @@ The processor hashes the canonical meaning of its immutable settings into its
 descriptor `config_hash`. Changing output-affecting settings therefore creates
 a distinct durable processor instance.
 
+Code works the same way: `version` and `code_hash` name what `map` and
+`reduce` compute. Bump both whenever a change alters a delta, a reduced value,
+or an emitted change, and run the result as a new instance, as in a
+[processor rebuild](/docs/operations/runbook/#processor-rebuild-or-rollback).
+The store cannot see code. A binary that maps blocks differently under an
+unchanged identity fails only when it maps a block again that the old binary
+already holds, such as a pending live delta at the next start's hot/cold
+overlap, possibly hours later: the backfill then fails with `already has a
+different pending delta`.
+
 ## Map, reduce, and changes
 
 Every processor implements:
