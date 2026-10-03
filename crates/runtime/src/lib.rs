@@ -779,6 +779,22 @@ pub struct BackfillReport {
     pub sources: Vec<BackfillSourceReport>,
 }
 
+/// Plan `request` on `source`. A source can advertise a capability it serves
+/// only for some request shapes, and its plan refuses the rest; another
+/// source may serve them.
+async fn plan_or_refuse(
+    source: &dyn HistorySource,
+    request: &DataRequest,
+) -> Result<leani_source_api::SourcePlan, RuntimeError> {
+    source.plan(request).await.map_err(|error| match error {
+        SourceError::InvalidPlan(detail) => RuntimeError::SourceCannotServe {
+            source_id: source.descriptor().id.to_string(),
+            detail,
+        },
+        error => error.into(),
+    })
+}
+
 /// Re-map a finalized archive range and compare its compact processor deltas
 /// with the checksums originally committed from live execution P2P.
 ///
@@ -790,7 +806,8 @@ pub struct BackfillReport {
 /// # Errors
 ///
 /// Returns an error for source unavailability, cancellation, processor/store
-/// failures, incomplete streams, or any deterministic disagreement.
+/// failures, incomplete streams, or any deterministic disagreement, and
+/// [`RuntimeError::SourceCannotServe`] when `source` refuses the request.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub async fn reconcile_archive_deltas(
     store: &SqliteStore,
@@ -818,7 +835,7 @@ pub async fn reconcile_archive_deltas(
         range,
         verification_policy,
     )?;
-    let plan = source.plan(&job.request).await?;
+    let plan = plan_or_refuse(source, &job.request).await?;
     plan.validate()?;
     let anchor_hash = store
         .coverage_hash(processor.descriptor(), range.end())
@@ -2413,16 +2430,7 @@ impl HistoricalRuntime {
             }
             (None, _) => request.clone(),
         };
-        let plan = source
-            .plan(&physical_request)
-            .await
-            .map_err(|error| match error {
-                SourceError::InvalidPlan(detail) => RuntimeError::SourceCannotServe {
-                    source_id: source.descriptor().id.to_string(),
-                    detail,
-                },
-                error => error.into(),
-            })?;
+        let plan = plan_or_refuse(source.as_ref(), &physical_request).await?;
         plan.validate()?;
         let startup_gate = startup_permit.map(HistoricalMaterialStartupPermit::gate);
         let mut prior_chunk_last = expected_parent;

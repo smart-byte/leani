@@ -243,6 +243,16 @@ impl BlockLocalCounter {
         self
     }
 
+    /// Accept filtered material, as a processor with a filter scope does, so
+    /// a source that serves only projections becomes a candidate.
+    #[must_use]
+    pub fn with_filtered_material(mut self) -> Self {
+        for requirement in &mut self.descriptor.requirements {
+            requirement.allow_filtered = true;
+        }
+        self
+    }
+
     /// Override the live delivery hard limit for resource-boundary tests.
     #[must_use]
     pub const fn with_delivery_max_bytes(mut self, maximum_bytes: u64) -> Self {
