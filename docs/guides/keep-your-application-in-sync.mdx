@@ -1,0 +1,74 @@
+---
+title: Keep your application in sync
+description: Reconcile your own copy of a processor's output by diffing coverage on every connection, filling announced live gaps, and writing idempotently.
+section: guides
+order: 6
+audience:
+  - app-developer
+status: preview
+---
+
+import CodeExample from '@docs/components/docs/CodeExample.astro';
+
+An application that keeps a processor's output in its own database owns that
+copy, and reconciling it is application logic. Leani makes the loop short: it
+tells the application what it covers and which blocks the live lane skipped.
+This guide applies to processors with
+`history_control = "application_subscriptions"` and
+`history_mode = "on_demand"`, whose history only the application requests.
+A node-owned on-demand processor announces skipped blocks the same way, but
+its operator requests them as `POST /admin/v1/materialization-jobs`.
+
+## Where blocks go missing
+
+- After downtime or a long outage, the live lane resumes at the newest
+  verified finalized anchor. It skips the blocks between the processor's
+  cursor and that anchor. Automatic history refills them; on-demand history
+  leaves them to the application.
+- At startup, retained unfinalized blocks that do not link to the finalized
+  anchor are reverted as a reorg. The application receives their `undo`
+  changes, and the blocks become part of the skipped range.
+- On the application's side, a crash between its commit and its
+  acknowledgement redelivers a batch, and a failed backfill subscription
+  stops until acted upon.
+
+## The loop
+
+1. **Diff coverage on every live session.** The live stream's `hello` carries
+   the processor's `coverage` as the session starts. Holes in
+   `coverage.available`, from the first block the application keeps through
+   `processedThrough`, are blocks the processor never processed. Before its
+   first block, everything from the processor's start up to the finalized
+   head is history to request. `streamLive()` exposes each session's `hello`
+   but does not reconnect: after a failure the SDK marks retryable, open a
+   new session with backoff, which checks coverage again. `subscribe()`
+   reconnects on its own and does not expose the `hello`.
+2. **Keep announced gaps with the batch.** Before the live lane applies a
+   block past its cursor's successor, the live stream delivers a `finalized`
+   change of kind `system.live_gap.put` with `data: { fromBlock, toBlock,
+   reason: "not_filled" }`, in a batch of its own. On a stream that keeps
+   records until they are acknowledged, it survives reconnects. Store the
+   range together with the batch's rows, then acknowledge the batch. In the
+   SDK, `isLiveGapChange` narrows the change, and `applyEntityChange` ignores
+   it.
+3. **Request the kept ranges.** `liveGapBackfill(range, request)` from
+   `@smart-byte/leani-sdk/backfill` builds the `fill_missing` subscription
+   with the idempotency key `live-gap:{consumer}:{fromBlock}-{toBlock}`.
+   Creating it again for the same range returns the same subscription; a hole
+   that history has partly filled meanwhile is a new range, so remember what
+   you already requested. Drop a range once its subscription exists. When a
+   request fails, keep the range and try again later: a failing request must
+   never hold the live lane back.
+4. **Consume the history lanes** beside the live lane, as
+   [Backfill while following live](/docs/guides/backfill-while-following-live/)
+   describes; each has its own lease and acknowledgement.
+5. **Act on failed subscriptions.** A failed subscription stays failed:
+   inspect its `lastError`, correct the cause, then delete it and create it
+   again. Deletion is the retry boundary.
+6. **Write idempotently.** Live, history, and redelivered batches can overlap
+   and arrive out of block order. Write each block's rows as an upsert keyed
+   by block, so that a block arriving twice, or from history after live,
+   changes nothing. Deduplicate batches by cursor, not by block: block `n`
+   can come as a notice batch and then as its own batch.
+
+<CodeExample example="keep-in-sync" />

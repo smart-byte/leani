@@ -3468,6 +3468,11 @@ pub struct SharedLiveRuntimeConfig {
     /// supervisor restarts it from a fresh finalized anchor that finality can
     /// prune through.
     pub recent_storage_stall_limit: Duration,
+    /// Instances of block-local processors whose history nobody fills
+    /// automatically. Before their live lane applies a block past its
+    /// cursor's successor, it announces the skipped blocks on their live
+    /// stream.
+    pub live_gap_notices: BTreeSet<String>,
 }
 
 impl Default for SharedLiveRuntimeConfig {
@@ -3479,6 +3484,7 @@ impl Default for SharedLiveRuntimeConfig {
             committed_events: None,
             recent_hard_bytes: 2 * 1024 * 1024 * 1024,
             recent_storage_stall_limit: Duration::from_mins(15),
+            live_gap_notices: BTreeSet::new(),
         }
     }
 }
@@ -4498,6 +4504,12 @@ impl SharedLiveRuntime {
                     .await?;
                 continue;
             }
+            self.announce_skipped_blocks(
+                processor.as_ref(),
+                prepared.frame.chain_id,
+                prepared.frame.block,
+            )
+            .await?;
             let committed = if processor.descriptor().mode == ReductionMode::BlockLocal {
                 commit_mapped_delta(
                     &self.store,
@@ -4535,6 +4547,54 @@ impl SharedLiveRuntime {
         report.last_block = Some(prepared.frame.block.number);
         report.last_hash = Some(prepared.frame.block.hash);
         Box::pin(self.drain_pending(report)).await
+    }
+
+    /// Announce on a configured block-local lane's live stream the blocks
+    /// between its cursor and `block`, which the lane is about to skip, as
+    /// after a restart at a later finalized anchor, whether it applies `block`
+    /// live or replays it from a gap. A block-local cursor moves to any later
+    /// block, so nothing else records the skipped ones. The notice precedes
+    /// the apply, so a crash between the two announces the range again before
+    /// the block is replayed.
+    async fn announce_skipped_blocks(
+        &self,
+        processor: &dyn Processor,
+        chain_id: leani_primitives::ChainId,
+        block: BlockRef,
+    ) -> Result<(), RuntimeError> {
+        let descriptor = processor.descriptor();
+        if descriptor.mode != ReductionMode::BlockLocal
+            || !self
+                .config
+                .live_gap_notices
+                .contains(descriptor.instance.as_str())
+        {
+            return Ok(());
+        }
+        let Some(cursor) = self.store.processor_cursor(descriptor).await? else {
+            return Ok(());
+        };
+        let Some(last) = block.number.0.checked_sub(1) else {
+            return Ok(());
+        };
+        let Ok(skipped) = BlockRange::new(
+            BlockNumber(cursor.block_number.0.saturating_add(1)),
+            BlockNumber(last),
+        ) else {
+            return Ok(());
+        };
+        let announced = self
+            .store
+            .append_live_gap_notice(descriptor, chain_id, block, skipped)
+            .await?;
+        warn!(
+            processor_instance = %descriptor.instance,
+            from_block = skipped.start().0,
+            to_block = skipped.end().0,
+            announced,
+            "the live lane skips blocks this processor never processed"
+        );
+        Ok(())
     }
 
     /// Record `block` as the first unapplied block of a lane the store failed
@@ -4849,6 +4909,10 @@ impl SharedLiveRuntime {
         finality: Finality,
         report: &mut SharedLiveReport,
     ) -> Result<bool, RuntimeError> {
+        // Startup replays a block-local lane from the first retained frame
+        // above its cursor, past any hole.
+        self.announce_skipped_blocks(processor, delta.chain_id, delta.block)
+            .await?;
         let applied = if finality == Finality::Finalized {
             self.apply_recovered_delta(processor, delta).await
         } else {
@@ -20806,6 +20870,181 @@ mod tests {
                 .await
                 .expect("finalized coverage"),
             None
+        );
+    }
+
+    #[tokio::test]
+    async fn an_on_demand_block_local_lane_announces_the_blocks_it_skips_before_applying() {
+        let chain = live_blocks(6);
+        let counter = Arc::new(BlockLocalCounter::named("gap-counter").with_split_delivery());
+        // History fills this one automatically, and ordered lanes hold a
+        // block past their cursor's successor instead of applying it.
+        let automatic = Arc::new(BlockLocalCounter::named("automatic-counter"));
+        let ledger = Arc::new(OrderedLedgerProcessor::named("gap-ledger"));
+        let lanes: Vec<Arc<dyn Processor>> =
+            vec![counter.clone(), automatic.clone(), ledger.clone()];
+        let (_directory, store) = store().await;
+        let runtime = |steps| {
+            SharedLiveRuntime::new(
+                store.clone(),
+                Arc::new(ScriptedLiveSource::new(
+                    e2e_descriptor(
+                        "gap-live",
+                        BlockRange::new(BlockNumber(0), BlockNumber(9)).expect("range"),
+                    ),
+                    steps,
+                )),
+                lanes.clone(),
+                SharedLiveRuntimeConfig {
+                    live_gap_notices: [
+                        &counter.descriptor().instance,
+                        &ledger.descriptor().instance,
+                    ]
+                    .map(ToString::to_string)
+                    .into(),
+                    ..SharedLiveRuntimeConfig::default()
+                },
+            )
+            .expect("runtime")
+        };
+        // The lane follows blocks 0 and 1, then the node stops. It restarts
+        // at the finalized anchor, block 4, and follows on from block 5.
+        run_live(&runtime(block_events(&chain[..=1])))
+            .await
+            .expect("run before the downtime");
+        store
+            .store_canonical_anchor(ChainId(1), chain[4].block, Finality::Finalized)
+            .await
+            .expect("seed the anchor");
+        run_live(&runtime(block_events(&chain[5..])))
+            .await
+            .expect("run after the downtime");
+
+        let records = store
+            .resumable_changes(counter.descriptor(), ChainId(1), None, 100)
+            .await
+            .expect("live stream");
+        let published = records
+            .iter()
+            .map(|record| {
+                (
+                    record.change.kind.as_str(),
+                    record.block.number.0,
+                    record.direction,
+                )
+            })
+            .collect::<Vec<_>>();
+        let applied = |block| ("synthetic.counter", block, ChangeDirection::Apply);
+        assert_eq!(
+            published,
+            [
+                applied(0),
+                applied(1),
+                // Announced with the block that follows the skipped ones,
+                // before it.
+                ("system.live_gap", 5, ChangeDirection::Finalized),
+                applied(5),
+                applied(6),
+            ]
+        );
+        let notice = &records[2];
+        assert_eq!(notice.finality, Finality::Finalized);
+        assert_eq!(
+            leani_store_sqlite::decode_live_gap_notice(&notice.change.payload)
+                .expect("notice payload"),
+            (BlockNumber(2), BlockNumber(4))
+        );
+        for lane in [automatic.descriptor(), ledger.descriptor()] {
+            let records = store
+                .resumable_changes(lane, ChainId(1), None, 100)
+                .await
+                .expect("stream");
+            assert!(
+                records
+                    .iter()
+                    .all(|record| record.change.kind != "system.live_gap"),
+                "{} announced a gap",
+                lane.id
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_lane_that_replays_past_skipped_blocks_at_startup_announces_them() {
+        let chain = live_blocks(6);
+        let counter =
+            Arc::new(BlockLocalCounter::named("replay-gap-counter").with_split_delivery());
+        let lanes: Vec<Arc<dyn Processor>> = vec![counter.clone()];
+        let (_directory, store) = store().await;
+        let runtime = |steps| {
+            SharedLiveRuntime::new(
+                store.clone(),
+                Arc::new(ScriptedLiveSource::new(
+                    e2e_descriptor(
+                        "replay-gap-live",
+                        BlockRange::new(BlockNumber(0), BlockNumber(9)).expect("range"),
+                    ),
+                    steps,
+                )),
+                lanes.clone(),
+                SharedLiveRuntimeConfig {
+                    live_gap_notices: [counter.descriptor().instance.to_string()].into(),
+                    ..SharedLiveRuntimeConfig::default()
+                },
+            )
+            .expect("runtime")
+        };
+        run_live(&runtime(block_events(&chain[..=1])))
+            .await
+            .expect("run before the downtime");
+        store
+            .store_canonical_anchor(ChainId(1), chain[4].block, Finality::Finalized)
+            .await
+            .expect("seed the anchor");
+        // The node resumes past the skipped blocks and retains block 5, then
+        // dies before the lane applies it or announces them.
+        failpoints::arm(
+            failpoints::BEFORE_LIVE_APPLY,
+            counter.descriptor(),
+            BlockNumber(5),
+        );
+        let crashed = run_live(&runtime(block_events(&chain[5..=5]))).await;
+        assert!(
+            matches!(&crashed, Err(RuntimeError::InvalidConfig(message)) if message.starts_with("injected crash")),
+            "{crashed:?}"
+        );
+        // Startup reconciliation replays the retained block 5 instead.
+        let restarted = runtime(block_events(&chain[6..]));
+        restarted
+            .reconcile_startup()
+            .await
+            .expect("startup reconciliation");
+        run_live(&restarted).await.expect("run after the restart");
+
+        let records = store
+            .resumable_changes(counter.descriptor(), ChainId(1), None, 100)
+            .await
+            .expect("live stream");
+        let notices = records
+            .iter()
+            .filter(|record| record.change.kind == "system.live_gap")
+            .map(|record| {
+                leani_store_sqlite::decode_live_gap_notice(&record.change.payload)
+                    .expect("notice payload")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(notices, [(BlockNumber(2), BlockNumber(4))]);
+        let position = |kind: &str| {
+            records
+                .iter()
+                .position(|record| record.change.kind == kind && record.block.number.0 == 5)
+        };
+        assert!(
+            matches!(
+                (position("system.live_gap"), position("synthetic.counter")),
+                (Some(notice), Some(block)) if notice < block
+            ),
+            "the notice does not precede block 5"
         );
     }
 

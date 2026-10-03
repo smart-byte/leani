@@ -4,6 +4,7 @@ import type {
   ChangeEnvelope,
   DurableConsumer,
   FetchLike,
+  ProcessorCoverage,
   ProcessorSummary,
 } from "./index.ts";
 import {
@@ -168,6 +169,28 @@ export type CreateBackfillSubscription = CreateBackfillSubscriptionBase &
       }
   );
 
+/**
+ * The `fill_missing` subscription for the blocks a live gap notice
+ * announces, its `LiveGapChangeData`, or any other range the destination
+ * lacks. Its idempotency key derives from the consumer and the range, so
+ * creating it again, as after the notice is delivered again, returns the
+ * same subscription.
+ */
+export function liveGapBackfill(
+  range: BackfillRange,
+  request: Omit<CreateBackfillSubscriptionBase, "mode" | "idempotencyKey"> & {
+    consumer: NonNullable<CreateBackfillSubscriptionBase["consumer"]>;
+  },
+): CreateBackfillSubscription {
+  return {
+    ...request,
+    mode: "fill_missing",
+    fromBlock: range.fromBlock,
+    toBlock: range.toBlock,
+    idempotencyKey: `live-gap:${request.consumer.id}:${range.fromBlock}-${range.toBlock}`,
+  };
+}
+
 export interface BackfillStreamHello {
   type: "hello";
   apiVersion: "1";
@@ -266,6 +289,9 @@ export interface LiveStreamHello {
   heartbeatIntervalMs: string;
   sessionExpiresAtUnixMs: string;
   leaseTtlMs: string;
+  /** What the processor covers as the session starts: diff it against the
+   * destination to find blocks to request as history. */
+  coverage: ProcessorCoverage;
 }
 
 export interface LiveStreamBatch<T = unknown> {

@@ -410,7 +410,10 @@ streaming session. Its consumers renew and acknowledge through
 lease and acknowledgement routes answer `409 consumer_session_required`. A
 session token carries a MAC keyed with the per-store secret; one the node
 cannot verify, such as a token from before an upgrade, gets `409
-consumer_session_lost`, and the client opens a new stream.
+consumer_session_lost`, and the client opens a new stream. The live stream's
+`hello` also carries the processor's `coverage` as the session starts, so an
+application can diff its own copy on every connection without polling the
+status route.
 
 `commit_then_ack` in the Rust API helper does not
 construct or execute the acknowledgement future until the destination commit
@@ -645,9 +648,24 @@ from another store, chain, processor version, or expired epoch is rejected.
 
 `finalized`
 
-- advances finality for a processor/chain;
+- advances finality for a processor/chain, as kind `system.finality.put`
+  with `data: { throughBlock }`;
 - need not repeat every entity;
 - permits a consumer to mark earlier changes durable.
+
+A `finalized` change of kind `system.live_gap.put` instead announces blocks
+the live lane skipped, which the processor never processed, as after a
+restart at a later finalized anchor: `data: { fromBlock, toBlock, reason:
+"not_filled" }`. Only block-local processors with `history_mode =
+"on_demand"` announce them, before the block that follows the range, live or
+replayed, and in a batch of their own. After a crash between the two, the
+next block past the cursor announces again, the same range or a longer one;
+a retry the stream's last notice already covers adds none.
+Deduplicate batches by cursor: the notice and the following block share a
+block number.
+Leani does not fill the range: request it as history, such as with a
+`fill_missing` backfill subscription (see
+[Keep your application in sync](/docs/guides/keep-your-application-in-sync/)).
 
 `reset_required`
 
