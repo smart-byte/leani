@@ -7869,6 +7869,36 @@ async fn finish_cold_handoffs(
     })
 }
 
+/// Cancel the automatic jobs under `prefix` that earlier starts left
+/// unfinished. Each start plans its own job through its finalized anchor,
+/// whose range contains theirs; no task of an earlier start still runs them.
+/// Only a range may follow the prefix: instance IDs can hold `:`, so a longer
+/// ID belongs to another instance.
+async fn supersede_automatic_jobs(
+    store: &leani_store_sqlite::SqliteStore,
+    prefix: &str,
+    current: &str,
+) -> Result<()> {
+    use leani_store_sqlite::JobState;
+
+    for mut job in store.jobs(None).await? {
+        if job
+            .id
+            .strip_prefix(prefix)
+            .is_some_and(|range| !range.contains(':'))
+            && job.id != current
+            && matches!(
+                job.state,
+                JobState::Queued | JobState::Running | JobState::StorageBackpressured
+            )
+        {
+            job.state = JobState::Cancelled;
+            store.save_job(&job).await?;
+        }
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn spawn_cold_backfills(
     config: &Config,
@@ -7964,11 +7994,12 @@ async fn spawn_cold_backfills(
         } else {
             runtime
         };
+        let job_prefix = format!(
+            "automatic:{}:{}:",
+            config.chain.chain_id, configured.instance
+        );
         let job = match BackfillJob::for_processor(
-            format!(
-                "automatic:{}:{}:{}-{through}",
-                config.chain.chain_id, configured.instance, configured.start_block
-            ),
+            format!("{job_prefix}{}-{through}", configured.start_block),
             processor.as_ref(),
             ChainId(config.chain.chain_id),
             range,
@@ -7981,6 +8012,7 @@ async fn spawn_cold_backfills(
                 });
             }
         };
+        supersede_automatic_jobs(store, &job_prefix, &job.id).await?;
         let budget = historical_source_budget(config, range);
         let processor_id = configured.instance.clone();
         let processor_descriptor = processor.descriptor().clone();
@@ -8692,6 +8724,63 @@ mod tests {
             assert_eq!(*receiver.borrow(), Some(next));
             assert!(!receiver.has_changed().expect("conflict not published"));
         }
+    }
+
+    #[tokio::test]
+    async fn a_start_supersedes_the_automatic_jobs_earlier_starts_left_unfinished() {
+        use leani_store_sqlite::JobState;
+
+        // Three restarts listed three running automatic jobs for one
+        // processor, although only the newest could be executing.
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let store = leani_store_sqlite::SqliteStore::open(leani_store_sqlite::StoreConfig::new(
+            directory.path().join("node.sqlite"),
+        ))
+        .await
+        .expect("store");
+        let jobs = [
+            ("automatic:1:ledger:5-100", JobState::Running),
+            ("automatic:1:ledger:5-120", JobState::Queued),
+            ("automatic:1:ledger:5-90", JobState::Completed),
+            ("automatic:1:ledger-two:5-120", JobState::Running),
+            // Instance IDs may hold `:`, so `ledger:two` is another instance.
+            ("automatic:1:ledger:two:5-120", JobState::Running),
+            ("automatic:1:ledger:5-140", JobState::Running),
+        ];
+        for (id, state) in jobs {
+            store
+                .save_job(&leani_store_sqlite::JobRecord {
+                    id: id.to_owned(),
+                    kind: leani_runtime::HistoricalJobOwner::Materialization
+                        .job_kind()
+                        .to_owned(),
+                    state,
+                    payload: b"fixture".to_vec(),
+                    checkpoint: None,
+                    attempts: 1,
+                    updated_at_unix_ms: 1,
+                })
+                .await
+                .expect("save job");
+        }
+
+        supersede_automatic_jobs(&store, "automatic:1:ledger:", "automatic:1:ledger:5-140")
+            .await
+            .expect("supersede");
+
+        let states = store
+            .jobs(None)
+            .await
+            .expect("jobs")
+            .into_iter()
+            .map(|job| (job.id, job.state))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        assert_eq!(states["automatic:1:ledger:5-100"], JobState::Cancelled);
+        assert_eq!(states["automatic:1:ledger:5-120"], JobState::Cancelled);
+        assert_eq!(states["automatic:1:ledger:5-90"], JobState::Completed);
+        assert_eq!(states["automatic:1:ledger-two:5-120"], JobState::Running);
+        assert_eq!(states["automatic:1:ledger:two:5-120"], JobState::Running);
+        assert_eq!(states["automatic:1:ledger:5-140"], JobState::Running);
     }
 
     #[tokio::test]
