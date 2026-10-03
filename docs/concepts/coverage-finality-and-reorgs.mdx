@@ -70,6 +70,14 @@ or after the processor start block eligible. Setting it creates an explicit
 suffix boundary. It is a policy limit, not a protocol limitation or a new
 default.
 
+A block-local live lane can open a gap of its own: after downtime it resumes
+at the newest finalized anchor, past blocks it never processed. Automatic
+history refills them. With `history_mode = "on_demand"`, the processor's live
+stream announces them in a `system.live_gap.put` change instead, and the
+application requests them, as
+[Keep your application in sync](/docs/guides/keep-your-application-in-sync/)
+shows.
+
 <Aside type="caution" title="Availability still matters">
   Eligibility does not guarantee that peers retain very old bodies and
   receipts. Full-gap recovery is attempted; an incapable or unavailable source

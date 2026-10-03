@@ -4,10 +4,12 @@ import {
   BackfillStreamError,
   backfillBatchingProfile,
   createBackfillSubscriptionClient,
+  liveGapBackfill,
   parseNdjson,
   type BackfillStreamRecord,
   type LiveStreamRecord,
 } from "../src/backfill.ts";
+import { isLiveGapChange } from "../src/index.ts";
 
 function chunkedBody(chunks: string[]): ReadableStream<Uint8Array> {
   const encoder = new TextEncoder();
@@ -679,6 +681,61 @@ describe("backfill subscriptions", () => {
     expect(streamConnections).toBe(2);
     expect(acknowledgementAttempts).toBe(3);
     await delivery.close();
+  });
+
+  test("a live gap notice becomes an idempotent fill_missing subscription", async () => {
+    const created: unknown[] = [];
+    const client = createBackfillSubscriptionClient({
+      baseUrl: "http://node.test",
+      fetch: async (input, init) => {
+        const request = new Request(input, init);
+        if (request.method === "DELETE") {
+          return new Response(null, { status: 204 });
+        }
+        if (request.url.endsWith("/admin/v1/backfill-subscriptions")) {
+          created.push(await request.json());
+          return Response.json({ id: "subscription-1" });
+        }
+        return new Response(
+          chunkedBody([
+            '{"type":"hello","apiVersion":"1","chainId":1,"processor":{"id":"blobs-money","instance":"blobs-production","version":"1.0.0","codeHash":"0x01","configHash":"0x02","genericApi":"processor-v1","changeSchema":"blobs-money.change.v1","queryExtensions":[],"subscriptions":true,"artifactRetention":"none","deliveryOrdering":"block_versioned_idempotent"},"streamId":"blobs-production:live","streamKind":"live","acknowledgedCursor":"cursor-0","storeEpoch":"00","heartbeatIntervalMs":"15000","sessionToken":"live-session","sessionExpiresAtUnixMs":"1000","leaseTtlMs":"300000","coverage":{"chainId":1,"chainFinalizedHead":null,"available":[{"fromBlock":26107000,"toBlock":26107398,"finality":"finalized"}],"configuredStartBlock":26107000,"processedThrough":26107398,"finalizedThrough":26107398,"complete":true,"state":"live"}}\n',
+            '{"type":"batch","streamId":"blobs-production:live","originKind":"live","originId":"blobs-production","publicationRevision":"0","fromBlock":26109950,"throughBlock":26109950,"processedBlockCount":"1","domainChangeCount":"0","progressUnitCount":"1","rawPayloadBytes":"32","uncompressedEncodedBytes":"300","transmittedBytes":"300","buildDelayMs":"0","firstCursor":"cursor-1","lastCursor":"cursor-2","acknowledgeableCursor":"cursor-2","changes":[{"operation":"finalized","kind":"system.finality.put","cursor":"cursor-1","data":{"throughBlock":26109949}},{"operation":"finalized","kind":"system.live_gap.put","cursor":"cursor-2","data":{"fromBlock":26107399,"toBlock":26109949,"reason":"not_filled"}}]}\n',
+          ]),
+          { headers: { "content-type": "application/x-ndjson" } },
+        );
+      },
+    });
+    const delivery = await client.subscribe({
+      processor: "blobs-production",
+      consumer: "blobs-api",
+      lanes: { live: true },
+    });
+    for await (const batch of delivery.batches()) {
+      for (const change of batch.events) {
+        if (isLiveGapChange(change)) {
+          // A notice delivered again requests the same subscription.
+          for (let attempt = 0; attempt < 2; attempt += 1) {
+            await client.create(
+              liveGapBackfill(change.data, {
+                processor: "blobs-production",
+                consumer: { id: "blobs-api", role: "required", leaseTtlSeconds: 300 },
+              }),
+            );
+          }
+        }
+      }
+      break;
+    }
+    await delivery.close();
+    const request = {
+      processor: "blobs-production",
+      fromBlock: 26107399,
+      toBlock: 26109949,
+      mode: "fill_missing",
+      consumer: { id: "blobs-api", role: "required", leaseTtlSeconds: 300 },
+      idempotencyKey: "live-gap:blobs-api:26107399-26109949",
+    };
+    expect(created).toEqual([request, request]);
   });
 
   test("client consumes the processor live lane independently", async () => {

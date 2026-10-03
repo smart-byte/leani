@@ -61,9 +61,13 @@ path parameter whose value can hold `/` or `%` must move to the query string,
 Typed subscriptions accept `processor` to select a configured instance, for
 example `leani.blobs.subscribe({ processor: "blobs-production" })`. The blobs
 apply payload is `{ block, transactions }`. Narrow `operation` before reading
-processor data: `finalized` carries `{ throughBlock }` instead. Discover canonical
-query paths with `capabilities()` and pass `queryBasePaths` when aliases are
-ambiguous.
+processor data: `finalized` carries `{ throughBlock }` instead, or, when
+`isLiveGapChange()` holds, the `{ fromBlock, toBlock }` the live lane skipped.
+`liveGapBackfill()` in `@smart-byte/leani-sdk/backfill` turns that range into an
+idempotent `fill_missing` subscription request; see
+[Keep your application in sync](/docs/guides/keep-your-application-in-sync/).
+Discover canonical query paths with `capabilities()` and pass `queryBasePaths`
+when aliases are ambiguous.
 
 `queryAndFollow()` returns the **first page** of an immutable snapshot and its
 stream boundary. Follow every `nextCursor` with `queryEntities()`, release the

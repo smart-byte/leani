@@ -49,10 +49,11 @@ if (process.argv.includes('--typescript')) {
 }
 
 if (process.argv.includes('--typescript')) {
-  const verification = Bun.spawn(['bun', 'test', 'examples/sdk-stream/index.test.ts'], {
-    cwd: repositoryRoot, stdout: 'inherit', stderr: 'inherit',
-  });
-  if ((await verification.exited) !== 0) throw new Error('query/follow runtime verification failed');
+  const verification = Bun.spawn(
+    ['bun', 'test', 'examples/sdk-stream/index.test.ts', 'examples/sdk-subscription/live-sync.test.ts'],
+    { cwd: repositoryRoot, stdout: 'inherit', stderr: 'inherit' },
+  );
+  if ((await verification.exited) !== 0) throw new Error('example runtime verification failed');
 }
 
 if (process.argv.includes('--cargo')) {

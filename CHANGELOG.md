@@ -6,6 +6,28 @@ record, and documented RPC contracts.
 
 ## [Unreleased]
 
+### Added
+
+- A block-local processor with `history_mode = "on_demand"` announces blocks
+  its live lane skips, such as after a restart at a later finalized anchor,
+  instead of moving past them silently. Before the lane applies or replays a
+  block past its cursor's successor, the processor's live stream delivers a
+  `finalized` change of kind `system.live_gap.put` with `data: { fromBlock,
+  toBlock, reason: "not_filled" }`, in a batch of its own. Leani does not fill
+  the range; the application requests it.
+- The live stream's `hello` carries the processor's `coverage`, as the SSE
+  stream's does, so an application can diff its copy on every connection.
+- SDK: `isLiveGapChange()` narrows a live gap notice, and `liveGapBackfill()`
+  in `@smart-byte/leani-sdk/backfill` builds the `fill_missing` subscription
+  for a range with a deterministic idempotency key. The guide "Keep your
+  application in sync" walks through the reconciliation loop.
+
+### Changed
+
+- SDK: a `finalized` `ChangeEnvelope` carries either `{ throughBlock }` or
+  `LiveGapChangeData`. TypeScript code that reads `data.throughBlock` after
+  checking only `operation` must exclude `isLiveGapChange(change)` first.
+
 ### Fixed
 
 - A history job no longer fails with "block … was already applied with a

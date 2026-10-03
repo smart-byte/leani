@@ -59,8 +59,9 @@ use leani_store_history::{
 use leani_store_sqlite::{
     ArtifactOwnerKind, ArtifactPruneOutcome, ArtifactReplayOutcome, ChangeBounds, ChangeDirection,
     ChangeRecord, ConsumerRole, ConsumerStartPosition, DeliveryStreamKind, DurableConsumer,
-    OutputBounds, OutputQuery, PortableSavepoint, ProcessorArtifactStats, ProcessorRunState,
-    QuerySnapshotEntity, RecoveryCheckpoint, SqliteStore, StoreError, default_delivery_stream_id,
+    LIVE_GAP_CHANGE_KIND, OutputBounds, OutputQuery, PortableSavepoint, ProcessorArtifactStats,
+    ProcessorRunState, QuerySnapshotEntity, RecoveryCheckpoint, SqliteStore, StoreError,
+    decode_live_gap_notice, default_delivery_stream_id,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -4192,6 +4193,9 @@ struct LiveConsumerStreamHello {
     session_token: String,
     session_expires_at_unix_ms: String,
     lease_ttl_ms: String,
+    /// What the processor covers as the session starts, so a consumer can
+    /// find blocks it lacks without polling the status route.
+    coverage: CoverageResponse,
 }
 
 struct LiveConsumerStreamState {
@@ -4261,6 +4265,7 @@ async fn stream_live_consumer(
         session_token,
         session_expires_at_unix_ms: lease.expires_at_unix_ms.to_string(),
         lease_ttl_ms: durable_consumer.lease_ttl_ms.to_string(),
+        coverage: coverage(&state, processor.as_ref(), None).await?,
     })?;
     let stream_state = LiveConsumerStreamState {
         state: state.clone(),
@@ -7348,6 +7353,15 @@ fn render_change_envelope(
                 "throughBlock": u64::from_be_bytes(encoded)
             }))
         }
+        ChangeOperation::Upsert if record.change.kind == LIVE_GAP_CHANGE_KIND => {
+            let (from, to) = decode_live_gap_notice(&record.change.payload)?;
+            // Leani does not fill the range itself: history is on demand.
+            Some(json!({
+                "fromBlock": from.0,
+                "toBlock": to.0,
+                "reason": "not_filled"
+            }))
+        }
         ChangeOperation::Upsert if record.change.kind == "system.backfill_progress" => {
             let encoded: [u8; 8] = record
                 .change
@@ -10066,6 +10080,135 @@ mod tests {
         decoder.try_finish().expect("complete gzip stream");
         plain_bytes.extend_from_slice(decoder.get_ref());
         assert!(plain_bytes.iter().all(u8::is_ascii_whitespace));
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn a_live_consumer_sees_blocks_the_live_lane_skipped() {
+        use leani_primitives::{BlockRange, ProcessorCursor};
+        use leani_testkit::{BlockLocalCounter, fixture_frame};
+
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = SqliteStore::open(leani_store_sqlite::StoreConfig::new(
+            directory.path().join("node.sqlite"),
+        ))
+        .await
+        .expect("store");
+        let counter = BlockLocalCounter::default().with_split_delivery();
+        let lifecycle =
+            acknowledged_delivery(counter.descriptor().lifecycle.clone(), "destination");
+        let processor = Arc::new(counter.with_lifecycle(lifecycle));
+        store
+            .register_processor(processor.descriptor())
+            .await
+            .expect("register processor");
+        store
+            .create_consumer_in_stream(
+                processor.descriptor(),
+                &default_delivery_stream_id(processor.descriptor()),
+                "destination",
+                ConsumerRole::Required,
+                ConsumerStartPosition::EarliestRetained,
+                Duration::from_secs(30),
+            )
+            .await
+            .expect("consumer");
+        // The live lane follows blocks 1 and 2, skips 3 to 5, and resumes at
+        // block 6, announcing the skipped blocks first.
+        let mut parent = BlockHash::ZERO;
+        for number in [1, 2, 6] {
+            let frame = fixture_frame(number, parent);
+            if number == 6 {
+                store
+                    .append_live_gap_notice(
+                        processor.descriptor(),
+                        frame.chain_id,
+                        frame.block,
+                        BlockRange::new(BlockNumber(3), BlockNumber(5)).expect("skipped"),
+                    )
+                    .await
+                    .expect("gap notice");
+            }
+            let delta = processor.map(&frame).await.expect("map");
+            store
+                .apply(
+                    processor.as_ref(),
+                    ProcessorCursor {
+                        chain_id: frame.chain_id,
+                        processor_id: processor.descriptor().id.to_string(),
+                        processor_version: processor.descriptor().version.to_string(),
+                        block_number: frame.block.number,
+                        block_hash: frame.block.hash,
+                        finality: Finality::Finalized,
+                        sequence: number,
+                    },
+                    &delta,
+                    &[],
+                )
+                .await
+                .expect("live apply");
+            parent = frame.block.hash;
+        }
+        let configured: Arc<dyn Processor> = processor;
+        let app = router_with_processors(store, vec![configured], Vec::new(), ApiConfig::default())
+            .expect("router");
+        let response = app
+            .oneshot(
+                Request::get(
+                    "/v1/processors/synthetic-counter/streams/live/consumers/destination/stream",
+                )
+                .body(Body::empty())
+                .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let mut chunks = response.into_body().into_data_stream();
+        let mut records = Vec::new();
+        for _ in 0..5 {
+            let chunk = tokio::time::timeout(Duration::from_secs(5), chunks.next())
+                .await
+                .expect("stream record in time")
+                .expect("stream record")
+                .expect("stream bytes");
+            records.push(serde_json::from_slice::<Value>(&chunk).expect("NDJSON record"));
+        }
+        // Each session starts with the coverage to reconcile against...
+        let hello = &records[0];
+        assert_eq!(hello["type"], "hello");
+        let available = hello["coverage"]["available"]
+            .as_array()
+            .expect("hello coverage")
+            .iter()
+            .map(|interval| (interval["fromBlock"].clone(), interval["toBlock"].clone()))
+            .collect::<Vec<_>>();
+        assert_eq!(available, [(json!(1), json!(2)), (json!(6), json!(6))]);
+        // ...and the notice is a batch of its own before block 6.
+        let blocks = records[1..]
+            .iter()
+            .map(|batch| {
+                (
+                    batch["fromBlock"].clone(),
+                    batch["domainChangeCount"].clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            blocks,
+            [
+                (json!(1), json!("1")),
+                (json!(2), json!("1")),
+                (json!(6), json!("0")),
+                (json!(6), json!("1")),
+            ]
+        );
+        let notice = &records[3]["changes"][0];
+        assert_eq!(notice["kind"], "system.live_gap.put");
+        assert_eq!(notice["operation"], "finalized");
+        assert_eq!(
+            notice["data"],
+            json!({ "fromBlock": 3, "toBlock": 5, "reason": "not_filled" })
+        );
     }
 
     #[tokio::test]
