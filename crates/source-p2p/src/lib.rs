@@ -8199,7 +8199,9 @@ impl RethP2pHistorySource {
                 Err(error) => {
                     if should_retry_session_error(&self.source.config, attempts, &error) {
                         let delay = session_retry_delay(&self.source.config, attempts);
-                        debug!(
+                        // History waits on this without another sign of life,
+                        // such as for a network that cannot start at all.
+                        warn!(
                             attempt = attempts,
                             ?delay,
                             %error,
@@ -8259,7 +8261,7 @@ impl RethP2pHistorySource {
                 Err(P2pError::Cancelled) => return Err(P2pError::Cancelled),
                 Err(error) if should_retry_session_error(&self.source.config, attempts, &error) => {
                     let delay = session_retry_delay(&self.source.config, attempts);
-                    debug!(
+                    warn!(
                         attempt = attempts,
                         ?delay,
                         %error,

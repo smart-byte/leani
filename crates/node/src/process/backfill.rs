@@ -96,6 +96,23 @@ const API_ATTEMPTS: u32 = 5;
 /// Pause between status polls of a submitted job.
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
 
+/// Pause between progress lines of a standalone backfill.
+const PROGRESS_INTERVAL: Duration = Duration::from_secs(30);
+
+/// The blocks a standalone job has committed, across its runs. Best effort:
+/// a failed read must not end the backfill.
+async fn committed_blocks(store: &leani_store_sqlite::SqliteStore, job_id: &str) -> Option<u64> {
+    store
+        .job(job_id)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|record| record.checkpoint)
+        .and_then(|checkpoint| {
+            leani_runtime::historical_checkpoint_committed_blocks(&checkpoint).ok()
+        })
+}
+
 /// Why one request/response exchange failed.
 enum Failure {
     /// The connection failed, before or after the response headers: a retry
@@ -325,6 +342,7 @@ async fn standalone(
     require_ordered_backfill_start(&store, processor.as_ref(), configured, from).await?;
     let cancellation = CancellationToken::new();
     let mut signals = ShutdownSignals::new()?;
+    let telemetry = leani_source_api::NetworkTelemetry::default();
     let bridge = if matches!(config.sources.live.kind, crate::config::LiveSourceKind::P2p)
         && !configured.require_retained_input
     {
@@ -347,8 +365,7 @@ async fn standalone(
                 anchor.block.number
             );
         }
-        let source =
-            execution_p2p_source(&config, leani_source_api::NetworkTelemetry::default(), None)?;
+        let source = execution_p2p_source(&config, telemetry.clone(), None)?;
         Some(OnDemandP2pBridge {
             source: source.as_ref().clone(),
             anchor,
@@ -436,21 +453,45 @@ async fn standalone(
     );
     tokio::pin!(operation);
     let mut interrupted = false;
-    let result = tokio::select! {
-        result = &mut operation => result,
-        signal = signals.recv() => match signal {
-            Ok(()) => {
-                interrupted = true;
-                cancellation.cancel();
-                tokio::select! {
-                    result = &mut operation => result,
-                    _ = signals.recv() => std::process::exit(130),
+    let mut progress = tokio::time::interval_at(
+        tokio::time::Instant::now() + PROGRESS_INTERVAL,
+        PROGRESS_INTERVAL,
+    );
+    // A rerun of the same range resumes its job, and its count.
+    let mut committed_before = committed_blocks(&store, &job_id).await.unwrap_or(0);
+    let result = loop {
+        tokio::select! {
+            result = &mut operation => break result,
+            _ = progress.tick() => {
+                let committed = committed_blocks(&store, &job_id)
+                    .await
+                    .unwrap_or(committed_before);
+                info!(
+                    committed_blocks = committed,
+                    requested_blocks = range.len(),
+                    blocks_per_minute = committed.saturating_sub(committed_before) * 60
+                        / PROGRESS_INTERVAL.as_secs(),
+                    connected_peers = ?bridge
+                        .as_ref()
+                        .map(|_| telemetry.snapshot().connected_peer_slots),
+                    "processor historical backfill progress"
+                );
+                committed_before = committed;
+            }
+            signal = signals.recv() => break match signal {
+                Ok(()) => {
+                    interrupted = true;
+                    cancellation.cancel();
+                    tokio::select! {
+                        result = &mut operation => result,
+                        _ = signals.recv() => std::process::exit(130),
+                    }
                 }
-            }
-            Err(error) => {
-                warn!(%error, "the shutdown signal handler stopped; the backfill continues");
-                operation.await
-            }
+                Err(error) => {
+                    warn!(%error, "the shutdown signal handler stopped; the backfill continues");
+                    operation.await
+                }
+            },
         }
     };
     cancellation.cancel();
