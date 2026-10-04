@@ -14,13 +14,14 @@ ENV CFLAGS="-ffile-prefix-map=/usr/local/cargo=/cargo"
 ENV CXXFLAGS="-ffile-prefix-map=/usr/local/cargo=/cargo"
 RUN cargo build --locked --release -p leani
 
-FROM debian:bookworm-slim@sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251
+FROM debian:bookworm-slim@sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251 AS runtime
 
 LABEL org.opencontainers.image.title="leani" \
       org.opencontainers.image.source="https://github.com/smart-byte/leani" \
       org.opencontainers.image.licenses="MIT"
 
 RUN apt-get update \
+    && apt-get upgrade --yes \
     && apt-get install --yes --no-install-recommends ca-certificates curl \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --gid 10001 leani \

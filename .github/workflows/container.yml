@@ -61,6 +61,8 @@ jobs:
           load: true
           platforms: linux/${{ matrix.arch }}
           tags: leani:scan
+          # Refresh Debian security packages while retaining the Rust build cache.
+          no-cache-filters: runtime
           build-args: |
             LEANI_GIT_COMMIT=${{ github.sha }}
           cache-from: type=gha,scope=container-${{ matrix.arch }}
