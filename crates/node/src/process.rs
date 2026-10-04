@@ -10158,6 +10158,28 @@ markets = ["ETH/USDT"]
         .unwrap_or_else(|_| panic!("job {id} never reached {state:?}"));
     }
 
+    /// The subscription's state is written after its job's, so a test that
+    /// asserts it waits for it rather than for the job.
+    async fn wait_for_subscription_state(
+        control: &NativeBackfillControl,
+        id: &str,
+        state: leani_api::BackfillState,
+    ) -> leani_api::BackfillStatus {
+        use leani_api::BackfillControl as _;
+
+        tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                let status = control.inspect(id).await.expect("subscription status");
+                if status.state == state {
+                    return status;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("subscription {id} never reached {state:?}"))
+    }
+
     #[tokio::test]
     #[allow(clippy::too_many_lines)]
     async fn two_automatic_instances_of_one_kind_reach_live() {
@@ -10819,9 +10841,9 @@ markets = ["ETH/USDT"]
             })
             .await
             .expect("subscription");
-        wait_for_job_state(&store, &created.id, leani_store_sqlite::JobState::Failed).await;
-        let failed = control.inspect(&created.id).await.expect("failed status");
-        assert_eq!(failed.state, leani_api::BackfillState::Failed);
+        let failed =
+            wait_for_subscription_state(&control, &created.id, leani_api::BackfillState::Failed)
+                .await;
         assert!(failed.last_error.is_some());
 
         processor
@@ -10831,11 +10853,9 @@ markets = ["ETH/USDT"]
         assert_ne!(retried.state, leani_api::BackfillState::Failed);
         assert_eq!(retried.last_error, None);
         wait_for_job_state(&store, &created.id, leani_store_sqlite::JobState::Completed).await;
-        let completed = control
-            .inspect(&created.id)
-            .await
-            .expect("completed status");
-        assert_eq!(completed.state, leani_api::BackfillState::Draining);
+        let completed =
+            wait_for_subscription_state(&control, &created.id, leani_api::BackfillState::Draining)
+                .await;
         assert_eq!(completed.last_error, None);
         // Retrying a subscription that is no longer failed changes nothing.
         assert_eq!(
