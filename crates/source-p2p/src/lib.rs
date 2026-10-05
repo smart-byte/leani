@@ -8217,6 +8217,42 @@ impl RethP2pHistorySource {
         }
     }
 
+    /// Prove the canonical chain from `from` up to this bridge's
+    /// consensus-verified anchor and return its block hashes, lowest first;
+    /// the last is the anchor's.
+    ///
+    /// As for history material, headers come from the persistent peer pool,
+    /// and each segment must end at the hash its proven successor names as
+    /// parent, so every hash is the anchor's ancestor at its height. A peer
+    /// that serves another chain is reported and its range fetched again.
+    /// Retries until `cancellation`; callers bound the wait.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`P2pError::InvalidConfig`] for `from` above the anchor,
+    /// [`P2pError::Cancelled`] when cancelled, and the session errors of a
+    /// history proof without persistent retries.
+    pub async fn anchored_hashes(
+        &self,
+        from: BlockNumber,
+        cancellation: &CancellationToken,
+    ) -> Result<Vec<BlockHash>, P2pError> {
+        let proof = BlockRange::new(from, self.anchor.block.number)
+            .map_err(|error| P2pError::InvalidConfig(error.to_string()))?;
+        let (session, proven) = self
+            .connect_and_fetch_anchored_headers(
+                proof,
+                proof,
+                self.source.config.history_header_request_concurrency,
+                cancellation,
+            )
+            .await?;
+        // As `run_bridge` does after its material: the proof set them.
+        session.set_range(None);
+        session.set_phase(NetworkPhase::Ready);
+        Ok(proven.hashes)
+    }
+
     async fn connect_and_fetch_anchored_headers(
         &self,
         proof: BlockRange,
@@ -14669,6 +14705,44 @@ mod tests {
             .finish()
             .expect("the proof recovers from a wrong tip");
         assert_eq!(assembled.expected_hash(BlockNumber(2_199)), Some(anchor));
+    }
+
+    #[tokio::test]
+    async fn anchored_hashes_rejects_a_start_above_the_anchor() {
+        let anchor_hash = BlockHash::new([0x22; 32]);
+        let available =
+            BlockRange::new(BlockNumber(100), BlockNumber(1_200)).expect("available range");
+        let source = RethP2pHistorySource::from_live_source(
+            RethP2pSource::mainnet(RethP2pConfig::default()).expect("live source"),
+            available,
+            P2pHistoryAnchor {
+                block: BlockRef {
+                    number: available.end(),
+                    hash: anchor_hash,
+                    parent_hash: BlockHash::ZERO,
+                    timestamp: 1,
+                },
+                consensus: ConsensusAnchor {
+                    finality: Finality::Finalized,
+                    execution_block_hash: anchor_hash,
+                    beacon_slot: 1,
+                    beacon_block_root: [0x33; 32],
+                },
+            },
+        )
+        .expect("history source");
+        // One block above the anchor: refused before any peer is needed, so
+        // no network starts.
+        let refused = tokio::time::timeout(
+            Duration::from_secs(1),
+            source.anchored_hashes(BlockNumber(1_201), &CancellationToken::new()),
+        )
+        .await
+        .expect("refused without waiting for peers");
+        assert!(
+            matches!(refused, Err(P2pError::InvalidConfig(_))),
+            "{refused:?}"
+        );
     }
 
     /// The lane's retained window, blocks 1,036..=1,100, and a branch that
