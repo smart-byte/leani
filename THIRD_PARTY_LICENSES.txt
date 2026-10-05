@@ -8838,6 +8838,7 @@ leani-processor-blobs 0.1.0-rc.3 — https://github.com/smart-byte/leani
 leani-processor-block-summary 0.1.0-rc.3 — https://github.com/smart-byte/leani
 leani-processor-erc20 0.1.0-rc.3 — https://github.com/smart-byte/leani
 leani-processor-evm-events 0.1.0-rc.3 — https://github.com/smart-byte/leani
+leani-processor-rollup-txs 0.1.0-rc.3 — https://github.com/smart-byte/leani
 leani-processor-transaction-stats 0.1.0-rc.3 — https://github.com/smart-byte/leani
 leani-processor-uniswap 0.1.0-rc.3 — https://github.com/smart-byte/leani
 leani-rpc 0.1.0-rc.3 — https://github.com/smart-byte/leani
