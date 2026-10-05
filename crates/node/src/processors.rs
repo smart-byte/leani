@@ -172,6 +172,7 @@ impl ProcessorRegistry {
             Arc::new(BlobsProcessorFactory) as Arc<dyn ProcessorFactory>,
             Arc::new(Erc20ProcessorFactory),
             Arc::new(EvmEventsProcessorFactory),
+            Arc::new(RollupTxsProcessorFactory),
             Arc::new(TransactionStatsProcessorFactory),
             Arc::new(UniswapObservationsProcessorFactory),
             Arc::new(UniswapLatestProcessorFactory),
@@ -685,6 +686,110 @@ impl ProcessorFactory for TransactionStatsProcessorFactory {
     }
 }
 
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RollupTxsSettings {
+    rules: Vec<ConfiguredRollupRule>,
+}
+
+/// One `[[processors.settings.rules]]` table: see `leani_processor_rollup_txs::Rule`.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConfiguredRollupRule {
+    rollup: String,
+    purpose: String,
+    to: String,
+    #[serde(default)]
+    from: Option<String>,
+    #[serde(default)]
+    selector: Option<String>,
+    #[serde(default)]
+    chain_id_arg: Option<u64>,
+    #[serde(default)]
+    since: Option<u64>,
+    #[serde(default)]
+    until: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct RollupTxsProcessorFactory;
+
+impl ProcessorFactory for RollupTxsProcessorFactory {
+    fn id(&self) -> &str {
+        leani_processor_rollup_txs::PROCESSOR_ID
+    }
+
+    fn description(&self) -> &str {
+        "Rollups' non-blob L1 transactions (calldata batches, state updates, proofs) matched by configured rules, with execution burn and tips"
+    }
+
+    fn create(
+        &self,
+        configured: &ProcessorConfig,
+        context: ProcessorFactoryContext,
+    ) -> Result<ProcessorComponents, ProcessorFactoryError> {
+        use leani_processor_rollup_txs::{Purpose, RollupTxsConfig, RollupTxsProcessor, Rule};
+
+        let network = match context.chain_id {
+            1 => "mainnet",
+            11_155_111 => "sepolia",
+            17_000 => "holesky",
+            other => {
+                return Err(ProcessorFactoryError::configuration(format!(
+                    "rollup-txs has no network name for chain {other}"
+                )));
+            }
+        };
+        let settings: RollupTxsSettings = decode_settings(configured)?;
+        let rules = settings
+            .rules
+            .iter()
+            .map(|rule| {
+                Ok(Rule {
+                    rollup: rule.rollup.clone(),
+                    purpose: Purpose::parse(&rule.purpose).ok_or_else(|| {
+                        ProcessorFactoryError::configuration(format!(
+                            "rule purpose must be data, state or proof, got `{}`",
+                            rule.purpose
+                        ))
+                    })?,
+                    to: parse_address(&rule.to)?,
+                    from: rule.from.as_deref().map(parse_address).transpose()?,
+                    selector: rule.selector.as_deref().map(parse_selector).transpose()?,
+                    chain_id_arg: rule.chain_id_arg,
+                    since: rule.since,
+                    until: rule.until,
+                })
+            })
+            .collect::<Result<Vec<_>, ProcessorFactoryError>>()?;
+        let processor = RollupTxsProcessor::new(RollupTxsConfig {
+            network: network.to_owned(),
+            start_block: BlockNumber(configured.start_block),
+            rules,
+        })
+        .map_err(|error| ProcessorFactoryError::configuration(error.to_string()))?;
+        let (instance, publication, lifecycle) = configured_contract(configured)?;
+        Ok(ProcessorComponents::new(Arc::new(processor.with_contract(
+            instance,
+            publication,
+            lifecycle,
+        ))))
+    }
+}
+
+fn parse_selector(value: &str) -> Result<[u8; 4], ProcessorFactoryError> {
+    let encoded = value
+        .strip_prefix("0x")
+        .ok_or_else(|| ProcessorFactoryError::configuration("selector must start with 0x"))?;
+    let mut selector = [0_u8; 4];
+    hex::decode_to_slice(encoded, &mut selector).map_err(|_| {
+        ProcessorFactoryError::configuration(format!(
+            "invalid 0x-prefixed 4-byte selector `{value}`"
+        ))
+    })?;
+    Ok(selector)
+}
+
 #[derive(Clone, Copy, Debug, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum ConfiguredPoolKind {
@@ -860,6 +965,50 @@ mod tests {
                 .map(|extension| extension.id()),
             Some("block-summary-v1")
         );
+    }
+
+    #[test]
+    fn rollup_txs_settings_become_matching_rules() {
+        let configured = |purpose: &str| {
+            let mut processor = crate::builtin_processors::processor_contract(
+                "rollup-txs",
+                "rollup-txs-test",
+                "1.0.0",
+                22_000_000,
+                false,
+            );
+            let rule = toml::Table::from_iter([
+                ("rollup".to_owned(), toml::Value::String("base".to_owned())),
+                (
+                    "purpose".to_owned(),
+                    toml::Value::String(purpose.to_owned()),
+                ),
+                (
+                    "to".to_owned(),
+                    toml::Value::String("0x43edb88c4b80fdd2adff2412a7bebf9df42cb40e".to_owned()),
+                ),
+                (
+                    "selector".to_owned(),
+                    toml::Value::String("0x82ecf2f6".to_owned()),
+                ),
+            ]);
+            processor.settings.insert(
+                "rules".to_owned(),
+                toml::Value::Array(vec![toml::Value::Table(rule)]),
+            );
+            processor
+        };
+        let registry = ProcessorRegistry::standard();
+        let components = registry
+            .instantiate_components(&configured("state"), 1)
+            .expect("rollup-txs");
+        let descriptor = components.processor.descriptor();
+        assert_eq!(descriptor.id.as_str(), "rollup-txs");
+        assert_eq!(descriptor.requirements[0].filter.recipients.len(), 1);
+        assert!(matches!(
+            registry.instantiate_components(&configured("settlement"), 1),
+            Err(ProcessorRegistryError::Factory { .. })
+        ));
     }
 
     #[test]

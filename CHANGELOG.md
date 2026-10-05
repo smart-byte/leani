@@ -19,6 +19,13 @@ record, and documented RPC contracts.
   with `consumer` `null` for a materialization job. The OpenAPI document
   describes these responses as `BackfillStatus`, and the SDK's
   `BackfillStatus` adds both fields.
+- A `rollup-txs` 1.0.0 processor: rollups' non-blob L1 transactions (batches
+  posted as calldata, state root and output proposals, proof submissions)
+  matched per block against `[[processors.settings.rules]]`, with each match's
+  gas, execution burn, and priority fee. It emits one `rollups.block` change for
+  every block, also when nothing matched, so a consumer can tell an empty block
+  from an uncovered one. Blob transactions are left to `blobs-money`. See
+  [processor contracts](docs/reference/processor-contracts.md#rollup-txs-100).
 
 ### Changed
 

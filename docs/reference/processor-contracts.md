@@ -185,6 +185,63 @@ and coverage for every block but spool only the final aggregate; after
 acknowledgement the job is complete/reclaimable and deletion remains an
 explicit operator action.
 
+## rollup-txs 1.0.0
+
+A block-local processor for rollups' L1 transactions other than blobs:
+calldata batches, state root and output proposals, and proof submissions. It
+requests header, transaction, calldata, and receipt material filtered to the
+rules' recipients. A transaction matches a rule when it is sent to `to`, from
+`from` when set, calls `selector` when set, carries `chain_id_arg` as its first
+ABI word when set (shared settlement contracts serving several chains), in a
+block whose timestamp lies in `[since, until)`. The first matching rule per
+recipient wins, so list the more specific rules first. Type-3 transactions
+never match: `blobs-money` reports them. Only top-level calls match; a call
+made through a multisig or another contract is not seen.
+
+Every block emits one `rollups.block` change (`rollups.block-bundle.v1`), also
+when nothing matched, so a consumer can tell a block without rollup activity
+from one it never received. The bundle is camelCase JSON: `block`
+(`network`, `blockNumber`, `blockHash`, `parentHash`, `timestamp`) and
+`transactions` (`txHash`, `transactionIndex`, `rollupId`, `purpose` =
+`data`/`state`/`proof`, `fromAddress`, `toAddress`, `selector`, `gasUsed`,
+`executionBurnedWei` = base fee × gas used, `tipWei` = (effective price − base
+fee) × gas used). The network and rules are the processor's configuration
+identity: a rule change needs a new `instance`.
+
+```toml
+[[processors]]
+id = "rollup-txs"
+instance = "rollup-txs-1"
+version = "1.0.0"
+history_control = "application_subscriptions"
+history_mode = "on_demand"
+start_block = 26000000
+publish = "included_and_finalized"
+
+[processors.state]
+mode = "durable"
+
+[processors.output]
+mode = "none"
+
+[processors.delivery]
+mode = "until_acknowledged"
+
+[[processors.delivery.consumers]]
+id = "app"
+required = true
+
+[[processors.settings.rules]]
+rollup = "base"
+purpose = "state"
+to = "0x43edb88c4b80fdd2adff2412a7bebf9df42cb40e"
+selector = "0x82ecf2f6"
+```
+
+Xatu serves receipt material only for type-3 transactions, so it cannot plan
+this processor's history: a job moves past it to the next configured source
+(eraE, then execution-P2P fallback).
+
 ## erc20-balances 1.1.0
 
 An ordered watchlist ledger derived from canonical ERC-20 `Transfer` logs.

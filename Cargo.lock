@@ -4402,6 +4402,7 @@ dependencies = [
  "leani-processor-block-summary",
  "leani-processor-erc20",
  "leani-processor-evm-events",
+ "leani-processor-rollup-txs",
  "leani-processor-transaction-stats",
  "leani-processor-uniswap",
  "leani-rpc",
@@ -4634,6 +4635,24 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "tokio",
+]
+
+[[package]]
+name = "leani-processor-rollup-txs"
+version = "0.1.0-rc.3"
+dependencies = [
+ "alloy-primitives",
+ "async-trait",
+ "blake3",
+ "hex",
+ "leani-primitives",
+ "leani-processor-api",
+ "leani-testkit",
+ "postcard",
+ "semver 1.0.28",
+ "serde",
+ "serde_json",
  "tokio",
 ]
 
