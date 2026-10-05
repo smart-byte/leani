@@ -235,9 +235,10 @@ consumer acknowledges the `backfill_complete` record, which makes it
 `complete_reclaimable`; its stream ends once that acknowledgement lands. A
 stream opened after that sends the same `backfill_complete` record again, with
 the same `cursor`, and ends at once instead of sending heartbeats
-indefinitely. Acknowledging that cursor again succeeds, even after the stream
-has ended and released its session. Should the record no longer be readable,
-the stream ends with `backfill_completed` instead.
+indefinitely. Acknowledging that cursor again with the stream's session token
+succeeds even after the stream has ended, until another stream replaces that
+session. Should the record no longer be readable, the stream ends with
+`backfill_completed` instead.
 
 A draining subscription can be cancelled as well, for example when its
 application will never read it to the end. It becomes `cancelled` and keeps
@@ -414,8 +415,9 @@ content-type: application/json
 ```
 
 Acknowledgement is monotonic and idempotent: repeating the acknowledged
-cursor changes nothing and succeeds, even with the session token of a stream
-that has since ended. A page read or a stream batch records the last
+cursor succeeds and moves no progress. The session token of a stream that has
+ended may still repeat it, without renewing the lease, until another stream
+replaces that session. A page read or a stream batch records the last
 sequence it hands out as the consumer's delivered sequence
 (`deliveredSequence`), and a cursor beyond it gets `409
 acknowledgement_beyond_delivered`, so a buggy client cannot let retention
@@ -430,7 +432,9 @@ ordering, such as `blobs-money`) fences renewal and acknowledgement by
 streaming session. Its consumers renew and acknowledge through
 `/streams/live/consumers/{consumer}/lease` and `/ack` with the
 `x-leani-consumer-session` token from the stream's `hello`, and the generic
-lease and acknowledgement routes answer `409 consumer_session_required`. A
+lease and acknowledgement routes answer `409 consumer_session_required`. Once
+another stream replaces a session, its token gets `409 consumer_session_lost`;
+a session that has only ended may still repeat its acknowledged cursor. A
 session token carries a MAC keyed with the per-store secret; one the node
 cannot verify, such as a token from before an upgrade, gets `409
 consumer_session_lost`, and the client opens a new stream. The live stream's

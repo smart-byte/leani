@@ -12108,13 +12108,14 @@ impl SqliteStore {
     /// Advance one stream-scoped acknowledgement while fencing stale delivery
     /// sessions. Session validation, lease renewal, and acknowledgement commit
     /// atomically so a replaced session can never advance durable progress.
-    /// Repeating the acknowledged sequence changes nothing and succeeds, also
-    /// once the session has ended.
+    /// A session that has ended, but that no other stream has replaced, may
+    /// still repeat the acknowledged sequence: that moves no progress and
+    /// writes nothing, not even a lease renewal.
     ///
     /// # Errors
     ///
-    /// Returns an error for a stale session that does not repeat the
-    /// acknowledged sequence, or any error described by
+    /// Returns an error for a replaced session, for an ended one that does not
+    /// repeat the acknowledged sequence, or any error described by
     /// [`Self::acknowledge_consumer_in_stream`].
     pub async fn acknowledge_consumer_session_in_stream(
         &self,
@@ -12180,10 +12181,12 @@ impl SqliteStore {
             )?;
             let expires_at: i64 = row.try_get("lease_expires_at_unix_ms")?;
             if stored_generation != generation || expires_at <= now {
-                // Repeating the acknowledged sequence changes nothing, so it
-                // succeeds after the session ended too, as for a completion
-                // that a reopened stream sent again and then ended with.
-                if sequence == acknowledged {
+                // A session that ended, and that no other stream has replaced,
+                // may repeat its acknowledged sequence, as for a completion a
+                // reopened stream sent again and then ended with. That moves
+                // no progress, so nothing is written, not even a renewal. A
+                // replaced session keeps failing: another stream took over.
+                if stored_generation == generation && sequence == acknowledged {
                     drop(transaction);
                     drop(writer_guard);
                     return self
@@ -23045,6 +23048,127 @@ mod tests {
             .expect("replacement session acknowledgement");
         assert_eq!(acknowledged.acknowledged_sequence, 1);
         assert!(acknowledged.lease_active);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn an_ended_session_may_repeat_its_acknowledgement_until_it_is_replaced() {
+        // A history stream that sends an acknowledged completion again ends,
+        // releasing its session, before its client can acknowledge it again,
+        // and that repeat must succeed. Review: a session that another stream
+        // replaced could repeat its acknowledgement too, so its client never
+        // learned that it had lost the consumer.
+        let (_directory, store) = store().await;
+        let processor = until_acknowledged(FixtureProcessor::new());
+        let mut parent = BlockHash::ZERO;
+        for number in 1..=2 {
+            let block = frame(number, parent);
+            let delta = processor.map(&block).await.expect("map");
+            store
+                .apply(&processor, cursor(&processor, &block, number), &delta, &[])
+                .await
+                .expect("apply");
+            parent = block.block.hash;
+        }
+        store
+            .create_consumer(
+                &processor.descriptor,
+                "session-owner",
+                ConsumerRole::Required,
+                ConsumerStartPosition::EarliestRetained,
+                Duration::from_secs(30),
+            )
+            .await
+            .expect("consumer");
+        let stream_id = default_delivery_stream_id(&processor.descriptor);
+        let read = async || {
+            store
+                .consumer_in_stream(&processor.descriptor, &stream_id, "session-owner")
+                .await
+                .expect("consumer read")
+                .expect("consumer")
+        };
+        let ended = store
+            .acquire_consumer_session_in_stream(&processor.descriptor, &stream_id, "session-owner")
+            .await
+            .expect("session");
+        assert!(
+            store
+                .record_consumer_delivery_in_stream(
+                    &stream_id,
+                    "session-owner",
+                    Some(ended.generation),
+                    2,
+                )
+                .await
+                .expect("delivery")
+        );
+        store
+            .acknowledge_consumer_session_in_stream(
+                &processor.descriptor,
+                &stream_id,
+                "session-owner",
+                ended.generation,
+                1,
+            )
+            .await
+            .expect("acknowledgement");
+        assert!(
+            store
+                .release_consumer_session_in_stream(&stream_id, "session-owner", ended.generation)
+                .await
+                .expect("release")
+        );
+        let released = read().await;
+        assert!(!released.lease_active);
+
+        // The ended session repeats its acknowledgement, which writes nothing.
+        let repeated = store
+            .acknowledge_consumer_session_in_stream(
+                &processor.descriptor,
+                &stream_id,
+                "session-owner",
+                ended.generation,
+                1,
+            )
+            .await
+            .expect("repeated acknowledgement");
+        assert_eq!(repeated, released);
+        assert_eq!(read().await, released);
+        // Advancing it still takes a live session.
+        assert!(matches!(
+            store
+                .acknowledge_consumer_session_in_stream(
+                    &processor.descriptor,
+                    &stream_id,
+                    "session-owner",
+                    ended.generation,
+                    2,
+                )
+                .await,
+            Err(StoreError::ConsumerSessionLost { .. })
+        ));
+        assert_eq!(read().await, released);
+
+        // Once another stream has replaced the session, even the repeat fails.
+        store
+            .acquire_consumer_session_in_stream(&processor.descriptor, &stream_id, "session-owner")
+            .await
+            .expect("replacement session");
+        let replaced = read().await;
+        assert!(matches!(
+            store
+                .acknowledge_consumer_session_in_stream(
+                    &processor.descriptor,
+                    &stream_id,
+                    "session-owner",
+                    ended.generation,
+                    1,
+                )
+                .await,
+            Err(StoreError::ConsumerSessionLost { .. })
+        ));
+        assert_eq!(read().await, replaced);
     }
 
     #[tokio::test]
