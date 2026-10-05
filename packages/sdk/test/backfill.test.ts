@@ -2,11 +2,16 @@ import { describe, expect, test } from "bun:test";
 
 import {
   BackfillStreamError,
+  TransportError,
   backfillBatchingProfile,
   createBackfillSubscriptionClient,
   liveGapBackfill,
   parseNdjson,
+  runBackfill,
+  type BackfillState,
   type BackfillStreamRecord,
+  type CreateBackfillSubscription,
+  type HistoryDeliveryBatch,
   type LiveStreamRecord,
 } from "../src/backfill.ts";
 import { isLiveGapChange } from "../src/index.ts";
@@ -949,4 +954,583 @@ test("backfill HTTP errors share the main client's error contract", async () => 
       expect((error as InstanceType<typeof LeaniError>).retryable).toBe(true);
     }
   }
+});
+
+type HistoryStep =
+  | "batch"
+  | "complete"
+  | "hang"
+  | "session_active"
+  | "backfill_failed"
+  | "backfill_cancelled"
+  | "consumer_session_lost"
+  | "reset_required";
+
+/**
+ * A node with one application-owned subscription, `sub-1`, whose history is
+ * two one-block batches and a completion. Each stream connection sends its
+ * hello and then its steps: "batch" is the next batch after the last one
+ * acknowledged, as the node redelivers what was not acknowledged; a code is
+ * that stream record; "hang" keeps the connection open; and "session_active"
+ * refuses the connection while another session holds the lease. Like the
+ * node, it refuses a consumer request without the consumer's credential.
+ * `log` records each request the node handles.
+ */
+function fakeHistoryNode(
+  connections: HistoryStep[][],
+  initialState: BackfillState = "queued",
+) {
+  const log: string[] = [];
+  const encoder = new TextEncoder();
+  let state = initialState;
+  let lastError = state === "failed" ? "source unavailable" : null;
+  let acknowledged = 0;
+  let opened = 0;
+  const admin = "/admin/v1/backfill-subscriptions";
+  const consumer = "/v1/backfill-subscriptions/sub-1/consumers/blobs-api";
+  const failure = (status: number, code: string, message: string) =>
+    Response.json(
+      { error: { code, message, retryable: false, requestId: "request-1" } },
+      { status },
+    );
+  const status = () => ({
+    id: "sub-1",
+    owner: "subscription",
+    processor: "blobs-production",
+    deliveryStreamId: "history-1",
+    fromBlock: 1,
+    toBlock: 2,
+    ranges: [{ fromBlock: 1, toBlock: 2 }],
+    requestedBlocks: 2,
+    processedBlocks: acknowledged,
+    remainingBlocks: 2 - acknowledged,
+    mode: "fill_missing",
+    state,
+    attempts: opened,
+    updatedAtUnixMs: 1,
+    report: null,
+    lastError,
+  });
+  const hello = () => ({
+    type: "hello",
+    apiVersion: "1",
+    chainId: 1,
+    processor: { id: "blobs-money", instance: "blobs-production", version: "1.0.0", codeHash: "0x01", configHash: "0x02", genericApi: "processor-v1", changeSchema: "blobs-money.change.v1", queryExtensions: [], subscriptions: true, artifactRetention: "none", deliveryOrdering: "block_versioned_idempotent" },
+    subscriptionId: "sub-1",
+    streamId: "history-1",
+    streamKind: "backfill",
+    publicationRevision: "0",
+    ranges: [{ fromBlock: 1, toBlock: 2 }],
+    acknowledgedCursor: `boundary-${acknowledged}`,
+    storeEpoch: "00",
+    heartbeatIntervalMs: "15000",
+    sessionToken: `session-${opened}`,
+    sessionExpiresAtUnixMs: "1000",
+    leaseTtlMs: "300000",
+  });
+  const batch = (block: number) => ({
+    type: "batch",
+    streamId: "history-1",
+    originKind: "historical_backfill",
+    originId: "sub-1",
+    publicationRevision: "0",
+    fromBlock: block,
+    throughBlock: block,
+    processedBlockCount: "1",
+    domainChangeCount: "1",
+    progressUnitCount: "1",
+    rawPayloadBytes: "8",
+    uncompressedEncodedBytes: "64",
+    transmittedBytes: "64",
+    buildDelayMs: "0",
+    firstCursor: `event-${block}`,
+    lastCursor: `event-${block}`,
+    acknowledgeableCursor: `boundary-${block}`,
+    changes: [
+      {
+        apiVersion: "1",
+        sequence: String(block),
+        cursor: `event-${block}`,
+        originKind: "historical_backfill",
+        originId: "sub-1",
+        publicationRevision: "0",
+        chainId: 1,
+        block: { number: block, hash: `0x0${block}`, parentHash: `0x0${block - 1}`, timestamp: 1_700_000_000 + block * 12 },
+        finality: "finalized",
+        kind: "price.put",
+        schema: "blobs-money.change.v1",
+        key: `0x0${block}`,
+        operation: "apply",
+        data: { block },
+        emittedAt: "2026-10-05T00:00:00.000Z",
+      },
+    ],
+  });
+  const completion = {
+    type: "backfill_complete",
+    subscriptionId: "sub-1",
+    streamId: "history-1",
+    ranges: [{ fromBlock: 1, toBlock: 2 }],
+    throughBlock: 2,
+    cursor: "complete",
+    mode: "fill_missing",
+    disposition: "published_all",
+    requestedBlockCount: "2",
+    coveredBeforeRequestBlockCount: "0",
+    coveredBeforeRequestRanges: [],
+    newlyProcessedBlockCount: "2",
+    republishedBlockCount: "2",
+    domainChangeCount: "2",
+    preexistingCoverageSkipped: false,
+  };
+  const streamFailure = (code: string, message: string) => ({
+    type: code === "reset_required" ? "reset_required" : "error",
+    code,
+    message,
+    earliestAvailableSequence: null,
+    latestAvailableSequence: null,
+  });
+  const stream = (): Response => {
+    const steps = connections[opened];
+    opened += 1;
+    if (steps === undefined) {
+      log.push("unexpected stream");
+      return failure(404, "not_found", "no further stream connection");
+    }
+    if (steps[0] === "session_active") {
+      return failure(409, "consumer_session_active", "another session holds the lease");
+    }
+    const records: unknown[] = [hello()];
+    let next = acknowledged + 1;
+    for (const step of steps) {
+      if (step === "batch") {
+        records.push(batch(next++));
+      } else if (step === "complete") {
+        records.push(completion);
+      } else if (step === "backfill_failed") {
+        state = "failed";
+        lastError = `connection ${opened} failed`;
+        records.push(streamFailure(step, lastError));
+      } else if (step === "backfill_cancelled") {
+        state = "cancelled";
+        records.push(streamFailure(step, "the historical subscription was cancelled"));
+      } else if (step !== "hang") {
+        records.push(streamFailure(step, `${step} on connection ${opened}`));
+      }
+    }
+    return new Response(
+      new ReadableStream<Uint8Array>({
+        start(controller) {
+          for (const record of records) {
+            controller.enqueue(encoder.encode(`${JSON.stringify(record)}\n`));
+          }
+          if (!steps.includes("hang")) {
+            controller.close();
+          }
+        },
+      }),
+      { headers: { "content-type": "application/x-ndjson" } },
+    );
+  };
+  const fetch = async (
+    input: RequestInfo | URL,
+    init?: RequestInit,
+  ): Promise<Response> => {
+    // Like fetch, an aborted request never reaches the node.
+    init?.signal?.throwIfAborted();
+    const request = new Request(input, init);
+    const { pathname, search } = new URL(request.url);
+    if (
+      pathname.startsWith(consumer) &&
+      request.headers.get("x-leani-consumer-credential") !== "consumer-secret"
+    ) {
+      log.push(`unauthorized ${pathname}`);
+      return failure(401, "consumer_unauthorized", "consumer credential required");
+    }
+    switch (`${request.method} ${pathname}`) {
+      case `POST ${admin}`: {
+        const body = (await request.json()) as { idempotencyKey: string };
+        log.push(`create ${body.idempotencyKey}`);
+        return Response.json(status());
+      }
+      case `GET ${admin}/sub-1`:
+        log.push("inspect");
+        return Response.json(status());
+      case `POST ${admin}/sub-1/retry`:
+        log.push("retry");
+        state = "queued";
+        return Response.json(status());
+      case `DELETE ${admin}/sub-1`:
+        log.push(
+          search === "?discardUnacknowledged=true"
+            ? "delete discarding unacknowledged"
+            : "delete",
+        );
+        return Response.json({
+          id: "sub-1",
+          owner: "subscription",
+          removedJobs: 1,
+          removedSubscriptionRanges: 1,
+          removedConsumers: 1,
+          removedDeliveryRecords: 3,
+          removedDeliveryStreams: 1,
+          removedCoverageIntervals: 0,
+          removedCoverageSegments: 0,
+          removedExactCoverage: 0,
+          removedAppliedBlocks: 0,
+          removedFinalizedUndo: 0,
+          retainedProcessorOutput: true,
+          retainedLiveStream: true,
+        });
+      case `GET ${consumer}/stream`:
+        log.push(`stream${search}`);
+        return stream();
+      case `POST ${consumer}/ack`: {
+        const { cursor } = (await request.json()) as { cursor: string };
+        log.push(`ack ${cursor}`);
+        if (cursor === "complete") {
+          state = "complete_reclaimable";
+        } else {
+          acknowledged = Number(cursor.replace("boundary-", ""));
+        }
+        return Response.json({
+          id: "blobs-api",
+          processorInstance: "blobs-production",
+          streamId: "history-1",
+          role: "required",
+          state: "active",
+          acknowledgedSequence: String(acknowledged),
+          deliveredSequence: String(acknowledged),
+          acknowledgedCursor: cursor,
+          deliveredCursor: cursor,
+          leaseGeneration: String(opened),
+          leaseTtlMs: "300000",
+          leaseExpiresAtUnixMs: "1000",
+          leaseActive: true,
+          lagChanges: "0",
+          lagBlocks: "0",
+          lagBytes: "0",
+          lagAgeMs: "0",
+          createdAtUnixMs: "1",
+          updatedAtUnixMs: "1",
+        });
+      }
+      case `DELETE ${consumer}/lease`:
+        log.push("release");
+        return new Response(null, { status: 204 });
+    }
+    log.push(`unexpected ${request.method} ${pathname}`);
+    return failure(404, "not_found", "no such route");
+  };
+  return { fetch, log };
+}
+
+function nodeClient(node: ReturnType<typeof fakeHistoryNode>) {
+  return createBackfillSubscriptionClient({
+    baseUrl: "http://node.test",
+    fetch: node.fetch,
+  });
+}
+
+/** Commit a batch after a moment, as a destination does, then log it. */
+function applyTo(log: string[]) {
+  return async (batch: HistoryDeliveryBatch): Promise<void> => {
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    log.push(`apply ${batch.ackCursor}`);
+  };
+}
+
+const historyRequest: CreateBackfillSubscription = {
+  processor: "blobs-production",
+  fromBlock: 1,
+  toBlock: 2,
+  idempotencyKey: "repair-1",
+  consumer: {
+    id: "blobs-api",
+    role: "required",
+    leaseTtlSeconds: 300,
+    credential: "consumer-secret",
+  },
+};
+
+describe("runBackfill", () => {
+  test.each([
+    ["no consumer", { ...historyRequest, consumer: undefined }, {}, "request.consumer"],
+    ["negative maxRetries", historyRequest, { maxRetries: -1 }, "maxRetries"],
+    ["NaN maxRetries", historyRequest, { maxRetries: Number.NaN }, "maxRetries"],
+  ] as const)(
+    "a run with %s is refused before any request",
+    async (_case, request, options, field) => {
+      const node = fakeHistoryNode([]);
+      const refusal = await runBackfill(nodeClient(node), request, {
+        onBatch: applyTo(node.log),
+        ...options,
+      }).catch((error: unknown) => error);
+      expect(refusal).toBeInstanceOf(TypeError);
+      expect((refusal as TypeError).message).toContain(field);
+      expect(node.log).toEqual([]);
+    },
+  );
+
+  test("applies each batch before acknowledging it and deletes the completed subscription", async () => {
+    const node = fakeHistoryNode([["batch", "batch", "complete"]]);
+    const result = await runBackfill(nodeClient(node), historyRequest, {
+      onBatch: applyTo(node.log),
+      batching: { maximumEvents: 100 },
+    });
+    expect(node.log).toEqual([
+      "create repair-1",
+      "stream?maximumEvents=100",
+      "apply boundary-1",
+      "ack boundary-1",
+      "apply boundary-2",
+      "ack boundary-2",
+      "ack complete",
+      "release",
+      "inspect",
+      "delete",
+    ]);
+    expect(result).toMatchObject({
+      outcome: "completed",
+      subscription: { id: "sub-1", state: "complete_reclaimable" },
+      completion: { type: "backfill_complete", cursor: "complete", throughBlock: 2 },
+      deletion: { id: "sub-1", removedJobs: 1 },
+    });
+  });
+
+  test.each([
+    ["complete_reclaimable", "throw", "completed", "delete"],
+    ["completed", "throw", "completed", "delete"],
+    ["cancelled", "throw", "cancelled", "delete discarding unacknowledged"],
+    ["failed", "discard", "failed", "delete discarding unacknowledged"],
+  ] as const)(
+    "a subscription %s at creation is deleted without opening its stream",
+    async (state, onFailure, outcome, deletion) => {
+      const node = fakeHistoryNode([], state);
+      const result = await runBackfill(nodeClient(node), historyRequest, {
+        onBatch: applyTo(node.log),
+        onFailure,
+      });
+      expect(result).toMatchObject({ outcome, subscription: { id: "sub-1", state } });
+      expect(result.completion).toBeUndefined();
+      expect(node.log).toEqual(["create repair-1", deletion]);
+    },
+  );
+
+  test.each([
+    ["backfill_cancelled", "retry", { outcome: "cancelled", subscription: { state: "cancelled" } }],
+    ["backfill_failed", "discard", { outcome: "failed", subscription: { state: "failed", lastError: "connection 1 failed" } }],
+  ] as const)(
+    "a stream ending with %s under onFailure %s deletes the subscription and its unacknowledged records",
+    async (code, onFailure, expected) => {
+      const node = fakeHistoryNode([["batch", code]]);
+      const result = await runBackfill(nodeClient(node), historyRequest, {
+        onBatch: applyTo(node.log),
+        onFailure,
+      });
+      expect(result).toMatchObject(expected);
+      expect(node.log).toEqual([
+        "create repair-1",
+        "stream",
+        "apply boundary-1",
+        "ack boundary-1",
+        "release",
+        "inspect",
+        "delete discarding unacknowledged",
+      ]);
+    },
+  );
+
+  test("a failed subscription is retried and resumes after its last acknowledgement", async () => {
+    const node = fakeHistoryNode([["batch", "backfill_failed"], ["batch", "complete"]]);
+    const result = await runBackfill(nodeClient(node), historyRequest, {
+      onBatch: applyTo(node.log),
+    });
+    expect(result.outcome).toBe("completed");
+    expect(node.log).toEqual([
+      "create repair-1",
+      "stream",
+      "apply boundary-1",
+      "ack boundary-1",
+      "release",
+      "inspect",
+      "retry",
+      "stream",
+      "apply boundary-2",
+      "ack boundary-2",
+      "ack complete",
+      "release",
+      "inspect",
+      "delete",
+    ]);
+  });
+
+  test("a subscription that keeps failing is left failed once its retries run out", async () => {
+    const node = fakeHistoryNode([["backfill_failed"], ["backfill_failed"]], "failed");
+    const run = runBackfill(nodeClient(node), historyRequest, {
+      onBatch: applyTo(node.log),
+      maxRetries: 2,
+    });
+    await expect(run).rejects.toMatchObject({
+      name: "BackfillStreamError",
+      code: "backfill_failed",
+      message: "connection 2 failed",
+    });
+    expect(node.log).toEqual([
+      "create repair-1",
+      "retry",
+      "stream",
+      "release",
+      "inspect",
+      "retry",
+      "stream",
+      "release",
+      "inspect",
+    ]);
+  });
+
+  test("with onFailure throw, a failed subscription's error is thrown and the subscription kept", async () => {
+    const node = fakeHistoryNode([], "failed");
+    const run = runBackfill(nodeClient(node), historyRequest, {
+      onBatch: applyTo(node.log),
+      onFailure: "throw",
+    });
+    await expect(run).rejects.toMatchObject({
+      name: "BackfillStreamError",
+      code: "backfill_failed",
+      message: "source unavailable",
+    });
+    expect(node.log).toEqual(["create repair-1"]);
+  });
+
+  const resumed = [
+    "create repair-1",
+    "stream",
+    "apply boundary-1",
+    "ack boundary-1",
+    "release",
+    "stream",
+    "apply boundary-2",
+    "ack boundary-2",
+    "ack complete",
+    "release",
+    "inspect",
+    "delete",
+  ];
+  test.each([
+    ["a lost session", [["batch", "consumer_session_lost"], ["batch", "complete"]], resumed],
+    ["a stream that ends early", [["batch"], ["batch", "complete"]], resumed],
+    [
+      "a session another connection still holds",
+      [["session_active"], ["batch", "batch", "complete"]],
+      ["create repair-1", "stream", "stream", "apply boundary-1", "ack boundary-1", "apply boundary-2", "ack boundary-2", "ack complete", "release", "inspect", "delete"],
+    ],
+  ] as Array<[string, HistoryStep[][], string[]]>)(
+    "%s is opened again after a backoff, without applying a batch twice",
+    async (_case, connections, transcript) => {
+      const node = fakeHistoryNode(connections);
+      const started = performance.now();
+      const result = await runBackfill(nodeClient(node), historyRequest, {
+        onBatch: applyTo(node.log),
+      });
+      expect(performance.now() - started).toBeGreaterThanOrEqual(900);
+      expect(result.outcome).toBe("completed");
+      expect(node.log).toEqual(transcript);
+    },
+  );
+
+  test("a reset_required stream is thrown and the subscription kept", async () => {
+    const node = fakeHistoryNode([["reset_required"]]);
+    const run = runBackfill(nodeClient(node), historyRequest, {
+      onBatch: applyTo(node.log),
+    });
+    await expect(run).rejects.toMatchObject({
+      name: "BackfillStreamResetError",
+      code: "reset_required",
+    });
+    expect(node.log).toEqual(["create repair-1", "stream", "release"]);
+  });
+
+  test("an onBatch failure closes the session unacknowledged and is rethrown, even a retryable one", async () => {
+    const node = fakeHistoryNode([["batch", "batch", "complete"]]);
+    const failure = new TransportError("destination unreachable");
+    const run = runBackfill(nodeClient(node), historyRequest, {
+      onBatch: async () => {
+        throw failure;
+      },
+    });
+    await expect(run).rejects.toBe(failure);
+    expect(node.log).toEqual(["create repair-1", "stream", "release"]);
+  });
+
+  test("an abort while streaming closes the session and keeps the subscription", async () => {
+    const node = fakeHistoryNode([["batch", "hang"]]);
+    const stop = new AbortController();
+    const reason = new Error("shutting down");
+    const leani = createBackfillSubscriptionClient({
+      baseUrl: "http://node.test",
+      fetch: async (input, init) => {
+        const response = await node.fetch(input, init);
+        // Stop once the batch is acknowledged, while the run waits for more.
+        if (String(input).endsWith("/ack")) stop.abort(reason);
+        return response;
+      },
+    });
+    const run = runBackfill(leani, historyRequest, {
+      onBatch: applyTo(node.log),
+      signal: stop.signal,
+    });
+    await expect(run).rejects.toBe(reason);
+    expect(node.log).toEqual([
+      "create repair-1",
+      "stream",
+      "apply boundary-1",
+      "ack boundary-1",
+      "release",
+    ]);
+  });
+
+  test("an aborted run creates nothing", async () => {
+    const node = fakeHistoryNode([]);
+    const reason = new Error("shutting down");
+    const run = runBackfill(nodeClient(node), historyRequest, {
+      onBatch: applyTo(node.log),
+      signal: AbortSignal.abort(reason),
+    });
+    await expect(run).rejects.toBe(reason);
+    expect(node.log).toEqual([]);
+  });
+
+  test("a rerun after an interruption resumes the same subscription and deletes it once", async () => {
+    const node = fakeHistoryNode([["batch", "batch", "complete"], ["batch", "complete"]]);
+    const crash = new Error("process killed");
+    let crashed = false;
+    const onBatch = async (batch: HistoryDeliveryBatch): Promise<void> => {
+      if (batch.ackCursor === "boundary-2" && !crashed) {
+        crashed = true;
+        throw crash;
+      }
+      await applyTo(node.log)(batch);
+    };
+    await expect(
+      runBackfill(nodeClient(node), historyRequest, { onBatch }),
+    ).rejects.toBe(crash);
+    const result = await runBackfill(nodeClient(node), historyRequest, { onBatch });
+    expect(result).toMatchObject({ outcome: "completed", subscription: { id: "sub-1" } });
+    expect(node.log).toEqual([
+      "create repair-1",
+      "stream",
+      "apply boundary-1",
+      "ack boundary-1",
+      "release",
+      "create repair-1",
+      "stream",
+      "apply boundary-2",
+      "ack boundary-2",
+      "ack complete",
+      "release",
+      "inspect",
+      "delete",
+    ]);
+  });
 });

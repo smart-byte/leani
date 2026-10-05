@@ -57,3 +57,44 @@ you intentionally want to restrict P2P recovery to a finalized suffix.
 For application-owned work, each history lane has its own lease and
 acknowledgement. A live acknowledgement never advances a history lane, and one
 history lane reconnects without resetting its siblings.
+
+## Run a history subscription in one call
+
+`runBackfill()` from `@smart-byte/leani-sdk/backfill` takes one
+application-owned subscription through its lifecycle: it creates the
+subscription, applies and acknowledges each history batch, acknowledges the
+completion, and deletes the subscription. It resolves once the history is
+applied, so run it beside the live lane rather than before it.
+
+```ts
+import {
+  createBackfillSubscriptionClient,
+  runBackfill,
+} from "@smart-byte/leani-sdk/backfill";
+
+const leani = createBackfillSubscriptionClient({ baseUrl: "http://127.0.0.1:18080" });
+const result = await runBackfill(
+  leani,
+  {
+    processor: "blobs-production",
+    fromBlock: 19_426_589,
+    toBlock: 19_436_588,
+    idempotencyKey: "blobs-api:19426589-19436588",
+    consumer: { id: "blobs-api", role: "required", leaseTtlSeconds: 300 },
+  },
+  {
+    // Your destination's write. It must be idempotent: a batch applied but
+    // not acknowledged is delivered again.
+    onBatch: (batch) => saveChanges(batch.events),
+  },
+);
+console.log(`history ${result.outcome}`);
+```
+
+The idempotency key makes a rerun after a crash resume the same subscription
+after its last acknowledged batch. After a lost connection, the stream is
+opened again with backoff. A failed subscription is retried from its committed
+progress up to `maxRetries` times, then thrown; pass `onFailure: "discard"` to
+delete it instead, or `"throw"` to keep it failed and handle the error
+yourself. An `onBatch` error or an abort keeps the subscription for the next
+run.

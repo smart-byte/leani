@@ -51,6 +51,19 @@ record, and documented RPC contracts.
     `until` would never close its window. It also refuses a rule with
     `chain_id_arg` but no `selector`, whose rows would render `selector: null`
     so that calls to different functions could not be told apart.
+- SDK: `runBackfill(client, request, options)` in
+  `@smart-byte/leani-sdk/backfill` runs an application-owned history
+  subscription to its end in one call. It creates the subscription, applies
+  each batch with `onBatch` and acknowledges it once that resolves, then
+  acknowledges the completion and deletes the subscription. Creation is
+  idempotent, so running the same request again after a crash resumes the
+  same subscription. After a lost connection or consumer session, the stream
+  is opened again with backoff. A failed subscription is retried up to
+  `maxRetries` times, 3 by default, then thrown; `onFailure: "discard"`
+  deletes it instead, and `"throw"` throws at once. A cancelled subscription
+  is deleted with its unacknowledged records. An `onBatch` error or an abort
+  closes the session and keeps the subscription for a rerun. New types:
+  `RunBackfillOptions`, `RunBackfillResult`, and `BackfillFailurePolicy`.
 
 ### Changed
 
