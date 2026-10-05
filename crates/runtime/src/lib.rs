@@ -3473,6 +3473,12 @@ pub struct SharedLiveRuntimeConfig {
     /// cursor's successor, it announces the skipped blocks on their live
     /// stream.
     pub live_gap_notices: BTreeSet<String>,
+    /// Block-local instances whose live lane fills a skipped range of at most
+    /// this many blocks from finalized history before it applies the block
+    /// that follows; it announces what it does not fill.
+    pub live_gap_fill: BTreeMap<String, u64>,
+    /// Longest one fill runs before it announces the rest. Every lane waits.
+    pub live_gap_fill_time_limit: Duration,
 }
 
 impl Default for SharedLiveRuntimeConfig {
@@ -3485,6 +3491,8 @@ impl Default for SharedLiveRuntimeConfig {
             recent_hard_bytes: 2 * 1024 * 1024 * 1024,
             recent_storage_stall_limit: Duration::from_mins(15),
             live_gap_notices: BTreeSet::new(),
+            live_gap_fill: BTreeMap::new(),
+            live_gap_fill_time_limit: Duration::from_mins(5),
         }
     }
 }
@@ -3521,10 +3529,36 @@ pub trait FinalizedLiveGapRecovery: std::fmt::Debug + Send + Sync {
     ) -> Result<Vec<leani_primitives::BlockFrame>, RuntimeError>;
 }
 
+/// Blocks one finalized live-gap history request covers, whether a paused
+/// lane recovers its gap or a lane fills the blocks it skipped.
+const LIVE_GAP_RECOVERY_CHUNK_BLOCKS: u64 = 128;
+
 #[derive(Debug)]
 struct PreparedFrame {
     frame: leani_primitives::BlockFrame,
     deltas: Vec<Option<MappedFrame>>,
+}
+
+/// What the lane does with the block that follows a range it skipped.
+enum GapClosure {
+    /// Apply it: nothing below it is missing, or the rest is announced.
+    Apply,
+    /// Do not apply it now. `Some(error)`: a filled block was refused for
+    /// the lane's capacity or state, so handle `error` as the block's own
+    /// commit failure. `None`: the lane is paused at a capacity limit;
+    /// nothing was fetched.
+    Hold(Option<RuntimeError>),
+}
+
+/// How far filling a skipped range got.
+enum GapFill {
+    /// Every block of the range is applied.
+    Complete,
+    /// The blocks from this one to the end of the range are not filled: the
+    /// lane announces them. From the range's start when no fill started.
+    From(BlockNumber),
+    /// The block that follows the range waits, as [`GapClosure::Hold`] says.
+    Hold(Option<RuntimeError>),
 }
 
 /// One persistent source subscription fanned out to every configured
@@ -4519,12 +4553,27 @@ impl SharedLiveRuntime {
                     .await?;
                 continue;
             }
-            self.announce_skipped_blocks(
-                processor.as_ref(),
-                prepared.frame.chain_id,
-                prepared.frame.block,
-            )
-            .await?;
+            match self
+                .close_skipped_blocks(
+                    processor.as_ref(),
+                    prepared.frame.chain_id,
+                    prepared.frame.block,
+                    report,
+                )
+                .await?
+            {
+                GapClosure::Apply => {}
+                GapClosure::Hold(Some(error)) => {
+                    self.park_live_lane(processor.as_ref(), mapped, &error)
+                        .await?;
+                    continue;
+                }
+                GapClosure::Hold(None) => {
+                    self.park_at_capacity_limit(processor.as_ref(), prepared.frame.block)
+                        .await?;
+                    continue;
+                }
+            }
             let committed = if processor.descriptor().mode == ReductionMode::BlockLocal {
                 commit_mapped_delta(
                     &self.store,
@@ -4564,40 +4613,352 @@ impl SharedLiveRuntime {
         Box::pin(self.drain_pending(report)).await
     }
 
-    /// Announce on a configured block-local lane's live stream the blocks
-    /// between its cursor and `block`, which the lane is about to skip, as
-    /// after a restart at a later finalized anchor, whether it applies `block`
-    /// live or replays it from a gap. A block-local cursor moves to any later
-    /// block, so nothing else records the skipped ones. The notice precedes
-    /// the apply, so a crash between the two announces the range again before
-    /// the block is replayed.
-    async fn announce_skipped_blocks(
+    /// Close the range a configured block-local lane skipped between its
+    /// cursor and `block`, as after a restart at a later finalized anchor,
+    /// before the lane applies `block` live or replays it from a gap. A
+    /// block-local cursor moves to any later block, so nothing else records
+    /// the skipped ones.
+    ///
+    /// A lane in `live_gap_fill` first fills a range of at most its limit
+    /// from finalized history. A lane in `live_gap_notices` or
+    /// `live_gap_fill` announces on its live stream whatever is not filled.
+    async fn close_skipped_blocks(
         &self,
         processor: &dyn Processor,
         chain_id: leani_primitives::ChainId,
         block: BlockRef,
-    ) -> Result<(), RuntimeError> {
+        report: &mut SharedLiveReport,
+    ) -> Result<GapClosure, RuntimeError> {
         let descriptor = processor.descriptor();
+        let instance = descriptor.instance.as_str();
+        let max_blocks = self.config.live_gap_fill.get(instance).copied();
         if descriptor.mode != ReductionMode::BlockLocal
-            || !self
-                .config
-                .live_gap_notices
-                .contains(descriptor.instance.as_str())
+            || (max_blocks.is_none() && !self.config.live_gap_notices.contains(instance))
         {
-            return Ok(());
+            return Ok(GapClosure::Apply);
         }
         let Some(cursor) = self.store.processor_cursor(descriptor).await? else {
-            return Ok(());
+            return Ok(GapClosure::Apply);
         };
         let Some(last) = block.number.0.checked_sub(1) else {
-            return Ok(());
+            return Ok(GapClosure::Apply);
         };
         let Ok(skipped) = BlockRange::new(
             BlockNumber(cursor.block_number.0.saturating_add(1)),
             BlockNumber(last),
         ) else {
-            return Ok(());
+            return Ok(GapClosure::Apply);
         };
+        let unfilled = match max_blocks {
+            None => skipped.start(),
+            // All or nothing: blocks filled at the top of the range would not
+            // link to the cursor.
+            Some(max_blocks) if skipped.len() > max_blocks => {
+                info!(
+                    processor_instance = %descriptor.instance,
+                    from_block = skipped.start().0,
+                    to_block = skipped.end().0,
+                    blocks = skipped.len(),
+                    max_blocks,
+                    "the live lane skips more blocks than live_gap_fill.max_blocks; announcing them"
+                );
+                skipped.start()
+            }
+            Some(_) => match self
+                .fill_skipped_blocks(processor, cursor.block_hash, block, skipped, report)
+                .await?
+            {
+                GapFill::Complete => return Ok(GapClosure::Apply),
+                GapFill::From(next) => next,
+                GapFill::Hold(error) => return Ok(GapClosure::Hold(error)),
+            },
+        };
+        if let Ok(rest) = BlockRange::new(unfilled, skipped.end()) {
+            self.announce_skipped_blocks(processor, chain_id, block, rest)
+                .await?;
+        }
+        Ok(GapClosure::Apply)
+    }
+
+    /// Fill `skipped`, the blocks a lane skipped between its cursor's block,
+    /// `parent`, and `block`, from finalized history before the lane applies
+    /// `block`, in ascending order.
+    ///
+    /// It starts only when it can succeed: a history source is configured,
+    /// the range is finalized, and `block` names a parent that pins the
+    /// range's top. While the store would refuse the lane's first apply for
+    /// its capacity anyway, it holds `block` without fetching. It fetches
+    /// [`LIVE_GAP_RECOVERY_CHUNK_BLOCKS`] blocks at a time and applies each
+    /// one only after checking it, so the applied blocks link from the
+    /// cursor towards `block`. It stops at the first block it cannot fill, or
+    /// before a fetch once `live_gap_fill_time_limit` has passed since it
+    /// started, and returns where the unfilled rest begins.
+    #[allow(clippy::too_many_lines)]
+    async fn fill_skipped_blocks(
+        &self,
+        processor: &dyn Processor,
+        mut parent: BlockHash,
+        block: BlockRef,
+        skipped: BlockRange,
+        report: &mut SharedLiveReport,
+    ) -> Result<GapFill, RuntimeError> {
+        let descriptor = processor.descriptor();
+        let give_up = |next: BlockNumber, reason: &str| -> Result<GapFill, RuntimeError> {
+            warn!(
+                processor_instance = %descriptor.instance,
+                from_block = skipped.start().0,
+                to_block = skipped.end().0,
+                filled_blocks = next.0.saturating_sub(skipped.start().0),
+                reason,
+                "could not fill the blocks the live lane skips; announcing the rest"
+            );
+            Ok(GapFill::From(next))
+        };
+        let Some(recovery) = &self.finalized_gap_recovery else {
+            return give_up(skipped.start(), "no history source serves finalized blocks");
+        };
+        // History serves only finalized blocks.
+        if self
+            .store
+            .finalized_canonical_head(self.source.descriptor().chain_id)
+            .await?
+            .is_none_or(|head| head.number < skipped.end())
+        {
+            return give_up(skipped.start(), "the skipped blocks are not finalized yet");
+        }
+        if block.parent_hash == BlockHash::ZERO {
+            return give_up(
+                skipped.start(),
+                "the block after the skipped ones names no parent",
+            );
+        }
+        if self.store_refuses_lane(descriptor).await? {
+            return Ok(GapFill::Hold(None));
+        }
+        info!(
+            processor_instance = %descriptor.instance,
+            from_block = skipped.start().0,
+            to_block = skipped.end().0,
+            blocks = skipped.len(),
+            "filling the blocks the live lane skips from history"
+        );
+        let started = tokio::time::Instant::now();
+        let (mut applied, mut duplicates) = (0_u64, 0_u64);
+        let mut next = skipped.start();
+        while next <= skipped.end() {
+            if started.elapsed() >= self.config.live_gap_fill_time_limit {
+                return give_up(next, "the fill ran out of time");
+            }
+            let range = BlockRange::new(
+                next,
+                BlockNumber(
+                    next.0
+                        .saturating_add(LIVE_GAP_RECOVERY_CHUNK_BLOCKS - 1)
+                        .min(skipped.end().0),
+                ),
+            )
+            .map_err(|error| RuntimeError::InvalidConfig(error.to_string()))?;
+            let frames = match recovery.recover_chunk(descriptor, range).await {
+                Ok(frames) => frames,
+                Err(RuntimeError::Cancelled | RuntimeError::Source(SourceError::Cancelled)) => {
+                    return Err(RuntimeError::Cancelled);
+                }
+                Err(error) => return give_up(next, &error.to_string()),
+            };
+            if u64::try_from(frames.len()).unwrap_or(u64::MAX) != range.len() {
+                return give_up(
+                    next,
+                    &format!(
+                        "history returned {} of {} blocks",
+                        frames.len(),
+                        range.len()
+                    ),
+                );
+            }
+            for frame in frames {
+                if let Some(reason) = self
+                    .unfillable_frame(processor, &frame, next, parent, block)
+                    .await?
+                {
+                    return give_up(next, &reason);
+                }
+                let delta = match map_with_finality_variants(processor, &frame).await {
+                    Ok((delta, _)) => delta,
+                    Err(error) => return give_up(next, &error.to_string()),
+                };
+                let outcome = match self.apply_recovered_delta(processor, &delta).await {
+                    Ok(outcome) => outcome,
+                    Err(error) if fill_holds_the_lane(&error) => {
+                        return Ok(GapFill::Hold(Some(error)));
+                    }
+                    Err(error) if fill_gives_up(&error) => {
+                        return give_up(next, &error.to_string());
+                    }
+                    Err(error) => return Err(error),
+                };
+                // A block history applied meanwhile, as an application's
+                // subscription can, is not published again.
+                match outcome {
+                    ApplyOutcome::Applied { .. } => applied = applied.saturating_add(1),
+                    ApplyOutcome::AlreadyApplied => duplicates = duplicates.saturating_add(1),
+                }
+                record_apply(
+                    report
+                        .processors
+                        .entry(descriptor.id.to_string())
+                        .or_default(),
+                    &outcome,
+                );
+                parent = frame.block.hash;
+                next = BlockNumber(next.0.saturating_add(1));
+            }
+        }
+        info!(
+            processor_instance = %descriptor.instance,
+            from_block = skipped.start().0,
+            to_block = skipped.end().0,
+            applied,
+            duplicates,
+            elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            "filled the blocks the live lane skipped"
+        );
+        Ok(GapFill::Complete)
+    }
+
+    /// Why `frame`, which history returned for the skipped block `next`,
+    /// cannot be filled, cheapest check first; `None` when it can. It must be
+    /// a well-formed, finalized block of this chain at `next` that descends
+    /// from `parent`. It must match the canonical block the store holds at
+    /// its height, if any, such as a seeded anchor. The last skipped block
+    /// must be `block`'s parent. It must carry the material the processor
+    /// requires.
+    async fn unfillable_frame(
+        &self,
+        processor: &dyn Processor,
+        frame: &leani_primitives::BlockFrame,
+        next: BlockNumber,
+        parent: BlockHash,
+        block: BlockRef,
+    ) -> Result<Option<String>, RuntimeError> {
+        let chain_id = self.source.descriptor().chain_id;
+        if let Err(error) = frame.validate_shape() {
+            return Ok(Some(format!(
+                "history returned a malformed block {}: {error}",
+                next.0
+            )));
+        }
+        if frame.chain_id != chain_id {
+            return Ok(Some("history returned a block of another chain".to_owned()));
+        }
+        if frame.finality != Finality::Finalized {
+            return Ok(Some(format!(
+                "history returned block {} unfinalized",
+                next.0
+            )));
+        }
+        if frame.block.number != next {
+            return Ok(Some(format!(
+                "history returned block {} for block {}",
+                frame.block.number.0, next.0
+            )));
+        }
+        if frame.block.parent_hash != parent {
+            return Ok(Some(format!(
+                "block {} does not descend from the block before it",
+                next.0
+            )));
+        }
+        if let Some((canonical, _)) = self.store.canonical_block(chain_id, next).await?
+            && !same_block(canonical, frame.block)
+        {
+            return Ok(Some(format!(
+                "block {} is not the canonical block at its height",
+                next.0
+            )));
+        }
+        if next.0.saturating_add(1) == block.number.0 && frame.block.hash != block.parent_hash {
+            return Ok(Some(format!(
+                "block {} is not the parent of block {}",
+                next.0, block.number.0
+            )));
+        }
+        for requirement in &processor.descriptor().requirements {
+            if let Err(error) = requirement.validate_frame(frame) {
+                return Ok(Some(format!(
+                    "block {} lacks material the processor requires: {error}",
+                    next.0
+                )));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Whether the store would refuse a filled block for the lane's capacity,
+    /// so a fill would fetch history for nothing: the lane is paused at its
+    /// delivery limit, which delivery pruning lifts, or at a storage limit
+    /// while storage is above its low-water mark. A lane paused for another
+    /// reason is filled: its first apply resumes it, as the replay of the
+    /// block that follows would. Only an apply resumes a lane paused at a
+    /// storage limit, so it is filled again once storage has room.
+    async fn store_refuses_lane(
+        &self,
+        descriptor: &ProcessorDescriptor,
+    ) -> Result<bool, RuntimeError> {
+        let state = self.store.processor_runtime_state(descriptor).await?;
+        if state.state != ProcessorRunState::Paused {
+            return Ok(false);
+        }
+        Ok(match state.reason.as_deref() {
+            Some("delivery_spool_hard_limit") => true,
+            Some("physical_store_hard_limit" | "artifact_store_hard_limit") => {
+                !self.store.storage_below_low_water().await?
+            }
+            _ => false,
+        })
+    }
+
+    /// Park a lane that is paused at a capacity limit at `block`, which
+    /// follows blocks it skipped and has not filled. Once the limit lifts,
+    /// its gap fills those blocks, then replays `block`. A lane that pruning
+    /// resumed since the limit was checked keeps no reason, and waits for
+    /// the next pruning.
+    async fn park_at_capacity_limit(
+        &self,
+        processor: &dyn Processor,
+        block: BlockRef,
+    ) -> Result<(), RuntimeError> {
+        let descriptor = processor.descriptor();
+        let state = self.store.processor_runtime_state(descriptor).await?;
+        self.store
+            .park_processor_live_lane_at(
+                descriptor,
+                block,
+                state
+                    .reason
+                    .as_deref()
+                    .unwrap_or("delivery_spool_hard_limit"),
+                false,
+            )
+            .await?;
+        self.unavailable_processors
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(descriptor.instance.to_string());
+        Ok(())
+    }
+
+    /// Announce on a block-local lane's live stream that it skips `skipped`,
+    /// blocks below `block` it never processed. The notice precedes the
+    /// apply of `block`, so a crash between the two announces the range again
+    /// before the block is replayed.
+    async fn announce_skipped_blocks(
+        &self,
+        processor: &dyn Processor,
+        chain_id: leani_primitives::ChainId,
+        block: BlockRef,
+        skipped: BlockRange,
+    ) -> Result<(), RuntimeError> {
+        let descriptor = processor.descriptor();
         let announced = self
             .store
             .append_live_gap_notice(descriptor, chain_id, block, skipped)
@@ -4926,8 +5287,26 @@ impl SharedLiveRuntime {
     ) -> Result<bool, RuntimeError> {
         // Startup replays a block-local lane from the first retained frame
         // above its cursor, past any hole.
-        self.announce_skipped_blocks(processor, delta.chain_id, delta.block)
-            .await?;
+        match self
+            .close_skipped_blocks(processor, delta.chain_id, delta.block, report)
+            .await?
+        {
+            GapClosure::Apply => {}
+            GapClosure::Hold(Some(error)) => {
+                self.isolate_replay_failure(processor, delta.block, &error)
+                    .await?;
+                // A lane the store refused for capacity without pausing it
+                // there, as one paused above its resume mark for another
+                // reason, pauses at the limit, so later drains wait for it to
+                // lift instead of fetching the same history again.
+                let (reason, _, failed) = live_lane_park_reason(&error)?;
+                if !failed {
+                    self.pause_live_gap(processor, delta.block, reason).await?;
+                }
+                return Ok(false);
+            }
+            GapClosure::Hold(None) => return Ok(false),
+        }
         let applied = if finality == Finality::Finalized {
             self.apply_recovered_delta(processor, delta).await
         } else {
@@ -5249,7 +5628,7 @@ impl SharedLiveRuntime {
             first
                 .number
                 .0
-                .saturating_add(127)
+                .saturating_add(LIVE_GAP_RECOVERY_CHUNK_BLOCKS - 1)
                 .min(finalized_head.number.0),
         );
         let range = BlockRange::new(first.number, through)
@@ -6014,6 +6393,39 @@ fn live_lane_isolatable_error(error: &RuntimeError) -> bool {
                     | StoreError::DeliveryItemTooLarge { .. }
                     | StoreError::PhysicalStorageLimit { .. }
                     | StoreError::ArtifactStorageLimit { .. }
+            )
+    )
+}
+
+/// Whether a fill's apply error is about the lane rather than the filled
+/// block: the lane cannot take blocks now, so the block that follows the
+/// skipped range waits and the error stands for its own commit failure.
+fn fill_holds_the_lane(error: &RuntimeError) -> bool {
+    matches!(
+        error,
+        RuntimeError::Store(
+            StoreError::DeliveryLimit { .. }
+                | StoreError::ProcessorPaused { .. }
+                | StoreError::ProcessorFailed(_)
+                | StoreError::DeliveryItemTooLarge { .. }
+                | StoreError::PhysicalStorageLimit { .. }
+                | StoreError::ArtifactStorageLimit { .. }
+        )
+    )
+}
+
+/// Whether a fill's apply error is about the filled block, which the
+/// processor or the store rejects, so the fill gives up and the lane
+/// announces the rest.
+fn fill_gives_up(error: &RuntimeError) -> bool {
+    matches!(
+        error,
+        RuntimeError::Processor(_)
+            | RuntimeError::Store(
+                StoreError::Processor(_)
+                    | StoreError::Invariant(_)
+                    | StoreError::ConflictingApply { .. }
+                    | StoreError::CanonicalConflict { .. }
             )
     )
 }
@@ -7522,6 +7934,60 @@ mod tests {
             }
             Ok(self
                 .frames
+                .iter()
+                .filter(|frame| {
+                    frame.block.number >= range.start() && frame.block.number <= range.end()
+                })
+                .cloned()
+                .collect())
+        }
+    }
+
+    /// History that counts its requests: it serves `frames` after `delay`,
+    /// or, without frames, is unavailable.
+    #[derive(Debug, Default)]
+    struct CountingLiveGapRecovery {
+        frames: Option<Vec<leani_primitives::BlockFrame>>,
+        delay: Duration,
+        calls: AtomicUsize,
+    }
+
+    impl CountingLiveGapRecovery {
+        fn serving(frames: Vec<leani_primitives::BlockFrame>) -> Self {
+            Self {
+                frames: Some(frames),
+                ..Self::default()
+            }
+        }
+
+        fn failing() -> Self {
+            Self::default()
+        }
+
+        fn after(self, delay: Duration) -> Self {
+            Self { delay, ..self }
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl FinalizedLiveGapRecovery for CountingLiveGapRecovery {
+        async fn recover_chunk(
+            &self,
+            _processor: &ProcessorDescriptor,
+            range: BlockRange,
+        ) -> Result<Vec<leani_primitives::BlockFrame>, RuntimeError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if !self.delay.is_zero() {
+                tokio::time::sleep(self.delay).await;
+            }
+            let frames = self.frames.as_ref().ok_or_else(|| {
+                SourceError::Unavailable("injected live-gap history outage".to_owned())
+            })?;
+            Ok(frames
                 .iter()
                 .filter(|frame| {
                     frame.block.number >= range.start() && frame.block.number <= range.end()
@@ -21066,6 +21532,898 @@ mod tests {
                 (Some(notice), Some(block)) if notice < block
             ),
             "the notice does not precede block 5"
+        );
+    }
+
+    /// One record of a lane's live stream: its kind, block, origin, and
+    /// finality.
+    type Published = (
+        String,
+        u64,
+        leani_store_sqlite::DeliveryOriginKind,
+        Finality,
+    );
+
+    async fn published(store: &SqliteStore, lane: &dyn Processor) -> Vec<Published> {
+        store
+            .resumable_changes(lane.descriptor(), ChainId(1), None, 1_000)
+            .await
+            .expect("live stream")
+            .into_iter()
+            .map(|record| {
+                (
+                    record.change.kind,
+                    record.block.number.0,
+                    record.origin.kind,
+                    record.finality,
+                )
+            })
+            .collect()
+    }
+
+    /// A counter block the live lane applied.
+    fn live_apply(block: u64) -> Published {
+        (
+            "synthetic.counter".to_owned(),
+            block,
+            leani_store_sqlite::DeliveryOriginKind::Live,
+            Finality::Included,
+        )
+    }
+
+    /// A counter block a fill applied from finalized history.
+    fn recovered_apply(block: u64) -> Published {
+        (
+            "synthetic.counter".to_owned(),
+            block,
+            leani_store_sqlite::DeliveryOriginKind::LiveRecovery,
+            Finality::Finalized,
+        )
+    }
+
+    /// A notice of skipped blocks, published with the block that follows
+    /// them.
+    fn notice_at(block: u64) -> Published {
+        (
+            "system.live_gap".to_owned(),
+            block,
+            leani_store_sqlite::DeliveryOriginKind::Live,
+            Finality::Finalized,
+        )
+    }
+
+    /// The ranges a lane's live stream announces as skipped.
+    async fn announced(
+        store: &SqliteStore,
+        lane: &dyn Processor,
+    ) -> Vec<(BlockNumber, BlockNumber)> {
+        store
+            .resumable_changes(lane.descriptor(), ChainId(1), None, 1_000)
+            .await
+            .expect("live stream")
+            .iter()
+            .filter(|record| record.change.kind == "system.live_gap")
+            .map(|record| {
+                leani_store_sqlite::decode_live_gap_notice(&record.change.payload)
+                    .expect("notice payload")
+            })
+            .collect()
+    }
+
+    /// `frames` as finalized history serves them.
+    fn finalized_copies(
+        frames: &[leani_primitives::BlockFrame],
+    ) -> Vec<leani_primitives::BlockFrame> {
+        frames
+            .iter()
+            .cloned()
+            .map(|mut frame| {
+                frame.finality = Finality::Finalized;
+                frame
+            })
+            .collect()
+    }
+
+    /// Fill the ranges `lane` skips, up to `max_blocks` long.
+    fn fill_config(lane: &dyn Processor, max_blocks: u64) -> SharedLiveRuntimeConfig {
+        SharedLiveRuntimeConfig {
+            live_gap_fill: [(lane.descriptor().instance.to_string(), max_blocks)].into(),
+            ..SharedLiveRuntimeConfig::default()
+        }
+    }
+
+    /// A shared live runtime over `store` that follows `steps` and recovers
+    /// skipped blocks from `history`.
+    fn filling_live(
+        store: &SqliteStore,
+        lanes: &[Arc<dyn Processor>],
+        config: SharedLiveRuntimeConfig,
+        history: &Arc<CountingLiveGapRecovery>,
+        steps: Vec<LiveStep>,
+    ) -> SharedLiveRuntime {
+        SharedLiveRuntime::new(
+            store.clone(),
+            Arc::new(ScriptedLiveSource::new(
+                e2e_descriptor(
+                    "fill-live",
+                    BlockRange::new(BlockNumber(0), BlockNumber(135)).expect("range"),
+                ),
+                steps,
+            )),
+            lanes.to_vec(),
+            config,
+        )
+        .expect("runtime")
+        .with_finalized_gap_recovery(history.clone())
+    }
+
+    /// The lanes follow blocks 0 and 1, then the node stops. It restarts at
+    /// the anchor `chain[anchor]`, seeded as `finality`, and follows on from
+    /// block 5.
+    async fn follow_across_downtime(
+        store: &SqliteStore,
+        chain: &[leani_primitives::BlockFrame],
+        anchor: usize,
+        finality: Finality,
+        runtime: impl Fn(Vec<LiveStep>) -> SharedLiveRuntime,
+    ) -> SharedLiveReport {
+        run_live(&runtime(block_events(&chain[..=1])))
+            .await
+            .expect("run before the downtime");
+        store
+            .store_canonical_anchor(ChainId(1), chain[anchor].block, finality)
+            .await
+            .expect("seed the anchor");
+        run_live(&runtime(block_events(&chain[5..])))
+            .await
+            .expect("run after the downtime")
+    }
+
+    #[tokio::test]
+    async fn an_on_demand_lane_that_fills_live_gaps_delivers_the_skipped_blocks_before_the_next_one()
+     {
+        let chain = live_blocks(6);
+        let counter = Arc::new(BlockLocalCounter::named("fill-counter").with_split_delivery());
+        // History fills this one automatically: its live lane neither fills
+        // nor announces what it skips.
+        let automatic = Arc::new(BlockLocalCounter::named("fill-automatic-counter"));
+        let lanes: Vec<Arc<dyn Processor>> = vec![counter.clone(), automatic.clone()];
+        let history = Arc::new(CountingLiveGapRecovery::serving(finalized_copies(
+            &chain[2..=4],
+        )));
+        let (_directory, store) = store().await;
+        let report = follow_across_downtime(&store, &chain, 4, Finality::Finalized, |steps| {
+            filling_live(
+                &store,
+                &lanes,
+                fill_config(counter.as_ref(), 8),
+                &history,
+                steps,
+            )
+        })
+        .await;
+
+        // The skipped blocks arrive in order, finalized and marked recovered,
+        // before the block that follows them, and nothing is announced.
+        assert_eq!(
+            published(&store, counter.as_ref()).await,
+            [
+                live_apply(0),
+                live_apply(1),
+                recovered_apply(2),
+                recovered_apply(3),
+                recovered_apply(4),
+                live_apply(5),
+                live_apply(6),
+            ]
+        );
+        assert_eq!(history.calls(), 1);
+        assert_eq!(report.processors["fill-counter"].applied, 5);
+        let range =
+            |start, end| BlockRange::new(BlockNumber(start), BlockNumber(end)).expect("range");
+        assert_eq!(
+            store
+                .coverage(counter.descriptor(), range(0, 6))
+                .await
+                .expect("coverage"),
+            [range(0, 6)]
+        );
+        assert_eq!(
+            store
+                .finalized_coverage(counter.descriptor(), range(0, 6))
+                .await
+                .expect("finalized coverage"),
+            [range(2, 4)]
+        );
+        assert_eq!(
+            store
+                .coverage(automatic.descriptor(), range(0, 6))
+                .await
+                .expect("coverage"),
+            [range(0, 1), range(5, 6)]
+        );
+        assert_eq!(
+            published(&store, automatic.as_ref()).await,
+            [0, 1, 5, 6].map(live_apply)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_live_gap_larger_than_the_fill_limit_is_announced_without_fetching_history() {
+        let chain = live_blocks(6);
+        let counter = Arc::new(BlockLocalCounter::named("long-gap-counter").with_split_delivery());
+        let lanes: Vec<Arc<dyn Processor>> = vec![counter.clone()];
+        let history = Arc::new(CountingLiveGapRecovery::serving(finalized_copies(
+            &chain[2..=4],
+        )));
+        let (_directory, store) = store().await;
+        // The lane is not in the notice set: one that fills announces what it
+        // does not fill all the same.
+        follow_across_downtime(&store, &chain, 4, Finality::Finalized, |steps| {
+            filling_live(
+                &store,
+                &lanes,
+                fill_config(counter.as_ref(), 2),
+                &history,
+                steps,
+            )
+        })
+        .await;
+
+        assert_eq!(
+            published(&store, counter.as_ref()).await,
+            [
+                live_apply(0),
+                live_apply(1),
+                notice_at(5),
+                live_apply(5),
+                live_apply(6),
+            ]
+        );
+        assert_eq!(
+            announced(&store, counter.as_ref()).await,
+            [(BlockNumber(2), BlockNumber(4))]
+        );
+        assert_eq!(history.calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_live_gap_fill_whose_history_fails_announces_the_whole_range() {
+        let chain = live_blocks(6);
+        let counter =
+            Arc::new(BlockLocalCounter::named("failed-fill-counter").with_split_delivery());
+        let healthy = Arc::new(BlockLocalCounter::named("failed-fill-healthy"));
+        let lanes: Vec<Arc<dyn Processor>> = vec![counter.clone(), healthy.clone()];
+        let history = Arc::new(CountingLiveGapRecovery::failing());
+        let (_directory, store) = store().await;
+        follow_across_downtime(&store, &chain, 4, Finality::Finalized, |steps| {
+            filling_live(
+                &store,
+                &lanes,
+                fill_config(counter.as_ref(), 8),
+                &history,
+                steps,
+            )
+        })
+        .await;
+
+        assert_eq!(
+            published(&store, counter.as_ref()).await,
+            [
+                live_apply(0),
+                live_apply(1),
+                notice_at(5),
+                live_apply(5),
+                live_apply(6),
+            ]
+        );
+        assert_eq!(
+            announced(&store, counter.as_ref()).await,
+            [(BlockNumber(2), BlockNumber(4))]
+        );
+        assert_eq!(history.calls(), 1);
+        assert_eq!(
+            published(&store, healthy.as_ref()).await,
+            [0, 1, 5, 6].map(live_apply)
+        );
+        for lane in &lanes {
+            assert_eq!(
+                store
+                    .processor_runtime_state(lane.descriptor())
+                    .await
+                    .expect("state")
+                    .state,
+                ProcessorRunState::Running,
+                "{}",
+                lane.descriptor().id
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_live_gap_fill_announces_the_rest_at_a_frame_that_does_not_descend_from_the_last_one()
+    {
+        let chain = live_blocks(6);
+        let counter =
+            Arc::new(BlockLocalCounter::named("broken-fill-counter").with_split_delivery());
+        let lanes: Vec<Arc<dyn Processor>> = vec![counter.clone()];
+        // History serves block 2, then a block 3 whose parent is not block 2.
+        let foreign = live_fixture(3, BlockHash::new([0xab; 32]));
+        let history = Arc::new(CountingLiveGapRecovery::serving(finalized_copies(&[
+            chain[2].clone(),
+            foreign,
+            chain[4].clone(),
+        ])));
+        let (_directory, store) = store().await;
+        follow_across_downtime(&store, &chain, 4, Finality::Finalized, |steps| {
+            filling_live(
+                &store,
+                &lanes,
+                fill_config(counter.as_ref(), 8),
+                &history,
+                steps,
+            )
+        })
+        .await;
+
+        assert_eq!(
+            published(&store, counter.as_ref()).await,
+            [
+                live_apply(0),
+                live_apply(1),
+                recovered_apply(2),
+                notice_at(5),
+                live_apply(5),
+                live_apply(6),
+            ]
+        );
+        assert_eq!(
+            announced(&store, counter.as_ref()).await,
+            [(BlockNumber(3), BlockNumber(4))]
+        );
+        assert_eq!(
+            store
+                .processor_runtime_state(counter.descriptor())
+                .await
+                .expect("state")
+                .state,
+            ProcessorRunState::Running
+        );
+    }
+
+    #[tokio::test]
+    async fn a_live_gap_fill_never_applies_a_last_block_the_following_block_does_not_name() {
+        let chain = live_blocks(6);
+        let counter =
+            Arc::new(BlockLocalCounter::named("forged-fill-counter").with_split_delivery());
+        let lanes: Vec<Arc<dyn Processor>> = vec![counter.clone()];
+        // History serves blocks 2 and 3, then a block 4 that descends from
+        // block 3 but is not the parent of block 5.
+        let mut forged = chain[4].clone();
+        forged.block.hash = BlockHash::new([0x44; 32]);
+        let history = Arc::new(CountingLiveGapRecovery::serving(finalized_copies(&[
+            chain[2].clone(),
+            chain[3].clone(),
+            forged.clone(),
+        ])));
+        let (_directory, store) = store().await;
+        // The anchor is block 5 itself, so no canonical row holds block 4:
+        // only block 5's parent tells the forged block apart.
+        follow_across_downtime(&store, &chain, 5, Finality::Finalized, |steps| {
+            filling_live(
+                &store,
+                &lanes,
+                fill_config(counter.as_ref(), 8),
+                &history,
+                steps,
+            )
+        })
+        .await;
+
+        assert_eq!(
+            published(&store, counter.as_ref()).await,
+            [
+                live_apply(0),
+                live_apply(1),
+                recovered_apply(2),
+                recovered_apply(3),
+                notice_at(5),
+                live_apply(5),
+                live_apply(6),
+            ]
+        );
+        assert_eq!(
+            announced(&store, counter.as_ref()).await,
+            [(BlockNumber(4), BlockNumber(4))]
+        );
+        assert_eq!(
+            store
+                .coverage_block_by_hash(counter.descriptor(), forged.block.hash)
+                .await
+                .expect("coverage lookup"),
+            None
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn a_live_gap_fill_waits_for_delivery_capacity_without_announcing_or_refetching() {
+        let chain = live_blocks(8);
+        // Its live delivery holds five blocks' changes, 56 bytes each: the
+        // three it follows before the downtime and two of the three it skips.
+        let counter = {
+            let counter = BlockLocalCounter::named("held-fill-counter").with_split_delivery();
+            let mut lifecycle = counter.descriptor().lifecycle.clone();
+            lifecycle.delivery.max_bytes = 300;
+            lifecycle.delivery.on_limit = DeliveryLimitAction::Pause;
+            Arc::new(counter.with_lifecycle(lifecycle))
+        };
+        let lanes: Vec<Arc<dyn Processor>> = vec![counter.clone()];
+        let history = Arc::new(CountingLiveGapRecovery::serving(finalized_copies(
+            &chain[3..=5],
+        )));
+        let (_directory, store) = store().await;
+        let runtime = |steps| {
+            filling_live(
+                &store,
+                &lanes,
+                fill_config(counter.as_ref(), 8),
+                &history,
+                steps,
+            )
+        };
+        // The lane follows blocks 0..=2, then the node stops. It restarts at
+        // the finalized anchor, block 5, and follows on from block 6.
+        run_live(&runtime(block_events(&chain[..=2])))
+            .await
+            .expect("run before the downtime");
+        store
+            .store_canonical_anchor(ChainId(1), chain[5].block, Finality::Finalized)
+            .await
+            .expect("seed the anchor");
+        run_live(&runtime(block_events(&chain[6..])))
+            .await
+            .expect("run after the downtime");
+
+        // Block 5 does not fit, so the lane holds block 6 and announces
+        // nothing...
+        assert_parked_at(
+            &store,
+            counter.as_ref(),
+            chain[6].block,
+            ProcessorRunState::Paused,
+            "delivery_spool_hard_limit",
+        )
+        .await;
+        assert_eq!(
+            published(&store, counter.as_ref()).await,
+            [
+                live_apply(0),
+                live_apply(1),
+                live_apply(2),
+                recovered_apply(3),
+                recovered_apply(4),
+            ]
+        );
+        // ...and no drain while it waits fetches history again: not those
+        // after blocks 7 and 8, nor one more.
+        runtime(Vec::new())
+            .reconcile_pending()
+            .await
+            .expect("drain while the lane waits");
+        assert_eq!(history.calls(), 1);
+
+        // The consumer acknowledges, so pruning frees the stream and resumes
+        // the lane. The next drain fills the rest from the lane's cursor,
+        // then replays blocks 6..=8.
+        store
+            .prune_changes_before(counter.descriptor(), u64::MAX)
+            .await
+            .expect("free delivery capacity");
+        runtime(Vec::new())
+            .reconcile_pending()
+            .await
+            .expect("drain");
+        assert_eq!(history.calls(), 2);
+        assert_eq!(
+            published(&store, counter.as_ref()).await,
+            [
+                recovered_apply(4),
+                recovered_apply(5),
+                live_apply(6),
+                live_apply(7),
+                live_apply(8),
+            ]
+        );
+        assert_eq!(
+            store
+                .processor_runtime_state(counter.descriptor())
+                .await
+                .expect("state")
+                .state,
+            ProcessorRunState::Running
+        );
+        assert!(
+            store
+                .live_lane_gap(counter.descriptor())
+                .await
+                .expect("gap")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn a_replayed_live_gap_fill_refused_above_the_resume_mark_waits_without_refetching() {
+        let chain = live_blocks(10);
+        // Its live delivery holds six blocks' changes, 56 bytes each, and a
+        // paused lane resumes at or below 324 bytes.
+        let counter = {
+            let counter = BlockLocalCounter::named("resume-mark-counter").with_split_delivery();
+            let mut lifecycle = counter.descriptor().lifecycle.clone();
+            lifecycle.delivery.max_bytes = 360;
+            lifecycle.delivery.on_limit = DeliveryLimitAction::Pause;
+            Arc::new(counter.with_lifecycle(lifecycle))
+        };
+        let lanes: Vec<Arc<dyn Processor>> = vec![counter.clone()];
+        let history = Arc::new(CountingLiveGapRecovery::serving(finalized_copies(
+            &chain[6..=8],
+        )));
+        let (_directory, store) = store().await;
+        let runtime = |steps| {
+            filling_live(
+                &store,
+                &lanes,
+                fill_config(counter.as_ref(), 8),
+                &history,
+                steps,
+            )
+        };
+        // The lane follows blocks 0..=5, 336 bytes, then the node stops. It
+        // resumes at the finalized anchor, block 8, retains block 9, and dies
+        // before the lane applies it.
+        run_live(&runtime(block_events(&chain[..=5])))
+            .await
+            .expect("run before the downtime");
+        store
+            .store_canonical_anchor(ChainId(1), chain[8].block, Finality::Finalized)
+            .await
+            .expect("seed the anchor");
+        failpoints::arm(
+            failpoints::BEFORE_LIVE_APPLY,
+            counter.descriptor(),
+            BlockNumber(9),
+        );
+        let crashed = run_live(&runtime(block_events(&chain[9..=9]))).await;
+        assert!(
+            matches!(&crashed, Err(RuntimeError::InvalidConfig(message)) if message.starts_with("injected crash")),
+            "{crashed:?}"
+        );
+
+        // Startup reconciliation pauses the lane to replay block 9. Paused
+        // above its resume mark, the store refuses the first filled block, so
+        // the lane waits for delivery capacity...
+        let restarted = runtime(block_events(&chain[10..]));
+        restarted
+            .reconcile_startup()
+            .await
+            .expect("startup reconciliation");
+        assert_eq!(history.calls(), 1);
+        // ...and the drains that follow fetch no history again.
+        run_live(&restarted).await.expect("run after the restart");
+        assert_eq!(history.calls(), 1);
+        assert_parked_at(
+            &store,
+            counter.as_ref(),
+            chain[9].block,
+            ProcessorRunState::Paused,
+            "delivery_spool_hard_limit",
+        )
+        .await;
+
+        // Once the consumer acknowledges, the next drain fills the skipped
+        // blocks, then replays blocks 9 and 10.
+        store
+            .prune_changes_before(counter.descriptor(), u64::MAX)
+            .await
+            .expect("free delivery capacity");
+        runtime(Vec::new())
+            .reconcile_pending()
+            .await
+            .expect("drain");
+        assert_eq!(history.calls(), 2);
+        assert_eq!(
+            published(&store, counter.as_ref()).await,
+            [
+                live_apply(5),
+                recovered_apply(6),
+                recovered_apply(7),
+                recovered_apply(8),
+                live_apply(9),
+                live_apply(10),
+            ]
+        );
+        assert!(
+            store
+                .live_lane_gap(counter.descriptor())
+                .await
+                .expect("gap")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_live_gap_fill_that_runs_out_of_time_announces_the_rest() {
+        // Real time: paused time jumps ahead while a SQLite worker thread
+        // answers, so the store's pool times out acquiring a connection.
+        let chain = live_blocks(135);
+        let counter = Arc::new(BlockLocalCounter::named("slow-fill-counter").with_split_delivery());
+        let lanes: Vec<Arc<dyn Processor>> = vec![counter.clone()];
+        // Each request takes longer than the whole fill may.
+        let history = Arc::new(
+            CountingLiveGapRecovery::serving(finalized_copies(&chain[2..=133]))
+                .after(Duration::from_millis(100)),
+        );
+        let (_directory, store) = store().await;
+        let config = SharedLiveRuntimeConfig {
+            live_gap_fill_time_limit: Duration::from_millis(50),
+            ..fill_config(counter.as_ref(), 200)
+        };
+        let runtime = |steps| filling_live(&store, &lanes, config.clone(), &history, steps);
+        run_live(&runtime(block_events(&chain[..=1])))
+            .await
+            .expect("run before the downtime");
+        store
+            .store_canonical_anchor(ChainId(1), chain[133].block, Finality::Finalized)
+            .await
+            .expect("seed the anchor");
+        run_live(&runtime(block_events(&chain[134..])))
+            .await
+            .expect("run after the downtime");
+
+        // The first request, blocks 2..=129, is filled; the time is up before
+        // the next one.
+        assert_eq!(history.calls(), 1);
+        assert_eq!(
+            announced(&store, counter.as_ref()).await,
+            [(BlockNumber(130), BlockNumber(133))]
+        );
+        assert_eq!(
+            published(&store, counter.as_ref()).await,
+            [live_apply(0), live_apply(1)]
+                .into_iter()
+                .chain((2..=129).map(recovered_apply))
+                .chain([notice_at(134), live_apply(134), live_apply(135)])
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_startup_replay_past_a_hole_fills_it_when_configured() {
+        let chain = live_blocks(6);
+        let counter =
+            Arc::new(BlockLocalCounter::named("replay-fill-counter").with_split_delivery());
+        let lanes: Vec<Arc<dyn Processor>> = vec![counter.clone()];
+        let history = Arc::new(CountingLiveGapRecovery::serving(finalized_copies(
+            &chain[2..=4],
+        )));
+        let (_directory, store) = store().await;
+        let runtime = |steps| {
+            filling_live(
+                &store,
+                &lanes,
+                fill_config(counter.as_ref(), 8),
+                &history,
+                steps,
+            )
+        };
+        run_live(&runtime(block_events(&chain[..=1])))
+            .await
+            .expect("run before the downtime");
+        store
+            .store_canonical_anchor(ChainId(1), chain[4].block, Finality::Finalized)
+            .await
+            .expect("seed the anchor");
+        // The node resumes past the skipped blocks and retains block 5, then
+        // dies before the lane fills them or applies it.
+        failpoints::arm(
+            failpoints::BEFORE_LIVE_APPLY,
+            counter.descriptor(),
+            BlockNumber(5),
+        );
+        let crashed = run_live(&runtime(block_events(&chain[5..=5]))).await;
+        assert!(
+            matches!(&crashed, Err(RuntimeError::InvalidConfig(message)) if message.starts_with("injected crash")),
+            "{crashed:?}"
+        );
+        assert_eq!(history.calls(), 0);
+
+        // Startup reconciliation replays the retained block 5, and fills the
+        // blocks below it first.
+        let restarted = runtime(block_events(&chain[6..]));
+        restarted
+            .reconcile_startup()
+            .await
+            .expect("startup reconciliation");
+        assert_eq!(
+            published(&store, counter.as_ref()).await,
+            [
+                live_apply(0),
+                live_apply(1),
+                recovered_apply(2),
+                recovered_apply(3),
+                recovered_apply(4),
+                live_apply(5),
+            ]
+        );
+        run_live(&restarted).await.expect("run after the restart");
+        assert_eq!(
+            published(&store, counter.as_ref()).await.last().cloned(),
+            Some(live_apply(6))
+        );
+        assert_eq!(history.calls(), 1);
+        assert!(
+            store
+                .live_lane_gap(counter.descriptor())
+                .await
+                .expect("gap")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_live_gap_above_the_finalized_head_is_announced_not_filled() {
+        let chain = live_blocks(6);
+        let counter =
+            Arc::new(BlockLocalCounter::named("unfinalized-fill-counter").with_split_delivery());
+        let lanes: Vec<Arc<dyn Processor>> = vec![counter.clone()];
+        let history = Arc::new(CountingLiveGapRecovery::serving(finalized_copies(
+            &chain[2..=4],
+        )));
+        let (_directory, store) = store().await;
+        // History serves only finalized blocks, and nothing up to block 4 is.
+        follow_across_downtime(&store, &chain, 4, Finality::Included, |steps| {
+            filling_live(
+                &store,
+                &lanes,
+                fill_config(counter.as_ref(), 8),
+                &history,
+                steps,
+            )
+        })
+        .await;
+
+        assert_eq!(
+            published(&store, counter.as_ref()).await,
+            [
+                live_apply(0),
+                live_apply(1),
+                notice_at(5),
+                live_apply(5),
+                live_apply(6),
+            ]
+        );
+        assert_eq!(
+            announced(&store, counter.as_ref()).await,
+            [(BlockNumber(2), BlockNumber(4))]
+        );
+        assert_eq!(history.calls(), 0);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn a_storage_paused_fill_resumes_once_the_store_has_room() {
+        let chain = live_blocks(6);
+        // It retains its output, so the physical store limit applies to it,
+        // and delivers nothing, so no delivery limit stops it first.
+        let counter =
+            Arc::new(BlockLocalCounter::named("storage-fill-counter").with_delivery_none());
+        let lanes: Vec<Arc<dyn Processor>> = vec![counter.clone()];
+        let history = Arc::new(CountingLiveGapRecovery::serving(finalized_copies(
+            &chain[2..=4],
+        )));
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("node.sqlite");
+        let runtime = |store: &SqliteStore, steps| {
+            filling_live(
+                store,
+                &lanes,
+                fill_config(counter.as_ref(), 8),
+                &history,
+                steps,
+            )
+        };
+        let store = SqliteStore::open(leani_store_sqlite::StoreConfig::new(&path))
+            .await
+            .expect("store");
+        run_live(&runtime(&store, block_events(&chain[..=1])))
+            .await
+            .expect("run before the downtime");
+        drop(store);
+
+        // The node restarts on a store at its physical limit.
+        let full = SqliteStore::open(
+            leani_store_sqlite::StoreConfig::new(&path).with_storage_budget(
+                leani_store_sqlite::StoreStorageBudget {
+                    maximum_physical_bytes: 1,
+                },
+            ),
+        )
+        .await
+        .expect("full store");
+        full.store_canonical_anchor(ChainId(1), chain[4].block, Finality::Finalized)
+            .await
+            .expect("seed the anchor");
+        run_live(&runtime(&full, block_events(&chain[5..])))
+            .await
+            .expect("run after the downtime");
+        assert_parked_at(
+            &full,
+            counter.as_ref(),
+            chain[5].block,
+            ProcessorRunState::Paused,
+            "physical_store_hard_limit",
+        )
+        .await;
+        assert_eq!(history.calls(), 1);
+        // While the store stays above its low-water mark, no drain fetches
+        // history again.
+        assert!(!full.storage_below_low_water().await.expect("storage"));
+        runtime(&full, Vec::new())
+            .reconcile_pending()
+            .await
+            .expect("drain while the store is full");
+        assert_eq!(history.calls(), 1);
+        assert_parked_at(
+            &full,
+            counter.as_ref(),
+            chain[5].block,
+            ProcessorRunState::Paused,
+            "physical_store_hard_limit",
+        )
+        .await;
+        drop(full);
+
+        // Once the store has room, the next drain fills the skipped blocks,
+        // then replays blocks 5 and 6.
+        let reopened = SqliteStore::open(leani_store_sqlite::StoreConfig::new(&path))
+            .await
+            .expect("reopen with room");
+        runtime(&reopened, Vec::new())
+            .reconcile_pending()
+            .await
+            .expect("drain");
+        assert_eq!(history.calls(), 2);
+        let range =
+            |start, end| BlockRange::new(BlockNumber(start), BlockNumber(end)).expect("range");
+        assert_eq!(
+            reopened
+                .coverage(counter.descriptor(), range(0, 6))
+                .await
+                .expect("coverage"),
+            [range(0, 6)]
+        );
+        assert_eq!(
+            reopened
+                .finalized_coverage(counter.descriptor(), range(0, 6))
+                .await
+                .expect("finalized coverage"),
+            [range(2, 4)]
+        );
+        assert_eq!(
+            reopened
+                .processor_runtime_state(counter.descriptor())
+                .await
+                .expect("state")
+                .state,
+            ProcessorRunState::Running
+        );
+        assert!(
+            reopened
+                .live_lane_gap(counter.descriptor())
+                .await
+                .expect("gap")
+                .is_none()
         );
     }
 
