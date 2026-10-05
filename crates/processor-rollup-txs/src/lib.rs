@@ -8,6 +8,9 @@
 //! processor emits one change per block, also when nothing matched, so a
 //! consumer can tell a block without rollup activity from one that was never
 //! covered.
+//!
+//! The processor is for Ethereum mainnet, from London on: its execution burn
+//! and tip need the base fee that every block has carried since then.
 
 use std::collections::BTreeMap;
 
@@ -29,6 +32,16 @@ use serde::{Deserialize, Serialize};
 pub const PROCESSOR_ID: &str = "rollup-txs";
 pub const BLOCK_COLLECTION: &str = "rollups.blocks";
 pub const CHANGE_KIND: &str = "rollups.block";
+
+/// Ethereum mainnet, the only chain the processor supports.
+const MAINNET_CHAIN_ID: u64 = 1;
+/// Mainnet's London block: the first with a base fee, which every later block
+/// has too.
+const LONDON_BLOCK: u64 = 12_965_000;
+/// Mainnet's genesis timestamp. A `since` or `until` below it predates every
+/// block, so it is most likely a block number written where UNIX seconds
+/// belong.
+const MAINNET_GENESIS_TIMESTAMP: u64 = 1_438_269_973;
 
 /// What a rollup's L1 transaction pays for.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
@@ -68,6 +81,11 @@ impl Purpose {
 /// `selector` when set, carries `chain_id_arg` as its first ABI word when set
 /// (shared settlement contracts serving many chains), in a block whose
 /// timestamp lies in `[since, until)`.
+///
+/// `since` and `until` are UNIX timestamps in seconds, not block numbers.
+/// `chain_id_arg` needs a `selector`: the chain id is the argument after it,
+/// and a row without one renders `selector: null`, so calls to different
+/// functions could not be told apart.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct Rule {
     pub rollup: String,
@@ -81,6 +99,42 @@ pub struct Rule {
 }
 
 impl Rule {
+    /// Reject a rule that cannot work as written; `index` is its position in
+    /// the configuration.
+    fn validate(&self, index: usize) -> Result<(), ProcessorError> {
+        if self.rollup.is_empty() {
+            return Err(ProcessorError::Input(format!(
+                "rule {index} has no rollup id"
+            )));
+        }
+        if self.chain_id_arg.is_some() && self.selector.is_none() {
+            return Err(ProcessorError::Input(format!(
+                "rule {index} for {}: chain_id_arg needs a selector",
+                self.rollup
+            )));
+        }
+        for (field, timestamp) in [("since", self.since), ("until", self.until)] {
+            if let Some(timestamp) = timestamp
+                && timestamp < MAINNET_GENESIS_TIMESTAMP
+            {
+                return Err(ProcessorError::Input(format!(
+                    "rule {index} for {}: since and until are UNIX timestamps in seconds; \
+                     {field} {timestamp} is before mainnet genesis ({MAINNET_GENESIS_TIMESTAMP})",
+                    self.rollup
+                )));
+            }
+        }
+        if let (Some(since), Some(until)) = (self.since, self.until)
+            && since >= until
+        {
+            return Err(ProcessorError::Input(format!(
+                "rule {index} for {} has an empty time window",
+                self.rollup
+            )));
+        }
+        Ok(())
+    }
+
     fn matches(&self, from: Address, input: &[u8], timestamp: u64) -> bool {
         if self.from.is_some_and(|expected| expected != from) {
             return false;
@@ -111,6 +165,8 @@ impl Rule {
 pub struct RollupTxsConfig {
     /// Network name reported with every row, e.g. `mainnet`.
     pub network: String,
+    /// The first block to cover: London or later, since every block needs a
+    /// base fee.
     pub start_block: BlockNumber,
     /// Most specific first per recipient: the first matching rule wins.
     pub rules: Vec<Rule>,
@@ -136,8 +192,8 @@ pub struct TrackedTransaction {
     pub success: bool,
     pub sender: Address,
     pub to: Address,
-    /// The matched rule's selector; `None` when that rule matches any input,
-    /// as for calldata batches, whose first bytes are batch data.
+    /// The matched rule's selector; `None` when the matched rule has no
+    /// selector, as for calldata batches, whose first bytes are batch data.
     pub selector: Option<[u8; 4]>,
     pub gas_used: u64,
     /// Base fee × gas used.
@@ -165,33 +221,32 @@ impl RollupTxsProcessor {
     ///
     /// # Errors
     ///
-    /// Rejects an empty rule set, a rule without a rollup id, an empty time
-    /// window, or a configuration that cannot be encoded.
+    /// Rejects an empty rule set, a start before London, a rule without a
+    /// rollup id, a `chain_id_arg` without a `selector`, a `since` or `until`
+    /// that is not a UNIX timestamp in seconds (below mainnet's genesis, as a
+    /// block number is), an empty time window, or a configuration that cannot
+    /// be encoded.
     pub fn new(config: RollupTxsConfig) -> Result<Self, ProcessorError> {
         if config.rules.is_empty() {
             return Err(ProcessorError::Input(
                 "rollup-txs needs at least one rule".to_owned(),
             ));
         }
+        if config.start_block.0 < LONDON_BLOCK {
+            return Err(ProcessorError::Input(format!(
+                "start_block {} is before London (block {LONDON_BLOCK}), the first block with \
+                 a base fee: the execution burn and tip need one on every block",
+                config.start_block.0
+            )));
+        }
         let mut by_recipient = BTreeMap::<Address, Vec<usize>>::new();
         for (index, rule) in config.rules.iter().enumerate() {
-            if rule.rollup.is_empty() {
-                return Err(ProcessorError::Input(format!(
-                    "rule {index} has no rollup id"
-                )));
-            }
-            if let (Some(since), Some(until)) = (rule.since, rule.until)
-                && since >= until
-            {
-                return Err(ProcessorError::Input(format!(
-                    "rule {index} for {} has an empty time window",
-                    rule.rollup
-                )));
-            }
+            rule.validate(index)?;
             by_recipient.entry(rule.to).or_default().push(index);
         }
-        // The network and rules decide the output; like the blobs processor,
-        // a later coverage start only changes scheduling, not the identity.
+        // The config hash identifies the rules and the network, which is why
+        // it excludes the start block. The start is part of the stored
+        // descriptor, so a changed start under the same instance is rejected.
         let identity = postcard::to_allocvec(&(&config.network, &config.rules))
             .map_err(|error| ProcessorError::Input(error.to_string()))?;
         let config_hash = BlockHash::new(*blake3::hash(&identity).as_bytes());
@@ -256,11 +311,18 @@ impl RollupTxsProcessor {
     ///
     /// # Errors
     ///
-    /// Rejects incomplete or partial material and inconsistent receipts.
+    /// Rejects incomplete or partial material, a frame of another chain, and
+    /// inconsistent receipts.
     pub fn derive(&self, frame: &BlockFrame) -> Result<RollupTxsDelta, ProcessorError> {
         self.descriptor.requirements[0]
             .validate_frame(frame)
             .map_err(|error| ProcessorError::Input(error.to_owned()))?;
+        if frame.chain_id.0 != MAINNET_CHAIN_ID {
+            return Err(ProcessorError::Input(format!(
+                "rollup-txs is for chain {MAINNET_CHAIN_ID}, received {}",
+                frame.chain_id.0
+            )));
+        }
         let header = accepted_material(&frame.header, "header")?;
         let transactions = accepted_material(&frame.transactions, "transactions")?;
         let receipts = receipt_map(accepted_material(&frame.receipts, "receipts")?)?;
@@ -294,7 +356,9 @@ impl RollupTxsProcessor {
             let receipt = receipts.get(&transaction.hash).ok_or_else(|| {
                 ProcessorError::Input(format!("missing receipt for {}", transaction.hash))
             })?;
-            if receipt.transaction_index != transaction.index {
+            if receipt.transaction_index != transaction.index
+                || receipt.transaction_type != transaction.transaction_type
+            {
                 return Err(ProcessorError::Invariant(
                     "transaction/receipt identity mismatch".to_owned(),
                 ));
@@ -310,7 +374,10 @@ impl RollupTxsProcessor {
                 .checked_mul(gas)
                 .ok_or_else(|| ProcessorError::Invariant("execution burn overflow".to_owned()))?;
             let tip = effective_price
-                .saturating_sub(base_fee)
+                .checked_sub(base_fee)
+                .ok_or_else(|| {
+                    ProcessorError::Invariant("effective gas price below base fee".to_owned())
+                })?
                 .checked_mul(gas)
                 .ok_or_else(|| ProcessorError::Invariant("tip overflow".to_owned()))?;
             matched.push(TrackedTransaction {
@@ -564,6 +631,10 @@ mod tests {
     const GAME_FACTORY: Address = Address::new([0xcc; 20]);
     const SHARED_VALIDATOR: Address = Address::new([0xdd; 20]);
     const BASE_FEE: u64 = 7;
+    /// Mainnet's London block, the first with a base fee.
+    const LONDON: u64 = 12_965_000;
+    /// Mainnet's genesis timestamp, the earliest a rule's `since` can be.
+    const MAINNET_GENESIS: u64 = 1_438_269_973;
 
     fn rule(rollup: &str, purpose: Purpose, to: Address) -> Rule {
         Rule {
@@ -578,31 +649,45 @@ mod tests {
         }
     }
 
-    fn processor() -> RollupTxsProcessor {
-        RollupTxsProcessor::new(RollupTxsConfig {
+    fn config(rules: Vec<Rule>) -> RollupTxsConfig {
+        RollupTxsConfig {
             network: "mainnet".to_owned(),
-            start_block: BlockNumber(1),
-            rules: vec![
-                // calldata batches: a transfer from the batcher to the inbox
-                Rule {
-                    from: Some(BATCHER),
-                    ..rule("base", Purpose::Data, INBOX)
-                },
-                // output proposals through the dispute game factory
-                Rule {
-                    selector: Some([0x82, 0xec, 0xf2, 0xf6]),
-                    until: Some(1_000),
-                    ..rule("base", Purpose::State, GAME_FACTORY)
-                },
-                // one shared settlement contract, told apart by the chain id argument
-                Rule {
-                    selector: Some([0x11, 0x22, 0x33, 0x44]),
-                    chain_id_arg: Some(324),
-                    ..rule("zksync", Purpose::Proof, SHARED_VALIDATOR)
-                },
-            ],
-        })
-        .expect("processor")
+            start_block: BlockNumber(LONDON),
+            rules,
+        }
+    }
+
+    fn processor_with(rules: Vec<Rule>) -> RollupTxsProcessor {
+        RollupTxsProcessor::new(config(rules)).expect("processor")
+    }
+
+    /// Why `new` refuses `config`.
+    fn rejection(config: RollupTxsConfig) -> String {
+        match RollupTxsProcessor::new(config).expect_err("a rejected configuration") {
+            ProcessorError::Input(message) => message,
+            other => panic!("expected an input error, got {other:?}"),
+        }
+    }
+
+    fn processor() -> RollupTxsProcessor {
+        processor_with(vec![
+            // calldata batches: a transfer from the batcher to the inbox
+            Rule {
+                from: Some(BATCHER),
+                ..rule("base", Purpose::Data, INBOX)
+            },
+            // output proposals through the dispute game factory
+            Rule {
+                selector: Some([0x82, 0xec, 0xf2, 0xf6]),
+                ..rule("base", Purpose::State, GAME_FACTORY)
+            },
+            // one shared settlement contract, told apart by the chain id argument
+            Rule {
+                selector: Some([0x11, 0x22, 0x33, 0x44]),
+                chain_id_arg: Some(324),
+                ..rule("zksync", Purpose::Proof, SHARED_VALIDATOR)
+            },
+        ])
     }
 
     fn chain_word(chain_id: u64) -> Vec<u8> {
@@ -695,6 +780,19 @@ mod tests {
         }
     }
 
+    /// A calldata batch from the batcher to the inbox, which the fixture's
+    /// first rule matches, paying `price` per gas.
+    fn batch(price: u64) -> Tx {
+        Tx {
+            kind: 2,
+            from: BATCHER,
+            to: INBOX,
+            input: vec![0x00],
+            gas: 100,
+            price,
+        }
+    }
+
     /// `frame` with the receipt of transaction `index` reporting `success`.
     fn with_receipt_success(
         mut frame: BlockFrame,
@@ -705,6 +803,37 @@ mod tests {
             unreachable!("frame() builds complete receipts");
         };
         receipts[index].success = success;
+        frame
+    }
+
+    /// `frame` with the receipt of transaction `index` reporting `kind` as its type.
+    fn with_receipt_type(mut frame: BlockFrame, index: usize, kind: u8) -> BlockFrame {
+        let Material::Complete(receipts) = &mut frame.receipts else {
+            unreachable!("frame() builds complete receipts");
+        };
+        receipts[index].transaction_type = kind;
+        frame
+    }
+
+    /// `frame` with its transactions and receipts projected to `scope`, as the
+    /// live lane delivers them for a recipient filter.
+    fn filtered(mut frame: BlockFrame, scope: &FilterScope) -> BlockFrame {
+        let Material::Complete(transactions) = frame.transactions else {
+            unreachable!("frame() builds complete transactions");
+        };
+        let Material::Complete(receipts) = frame.receipts else {
+            unreachable!("frame() builds complete receipts");
+        };
+        frame.transactions = Material::Filtered {
+            value: transactions,
+            scope: scope.clone(),
+            completeness: Completeness::VerifiedPredicate,
+        };
+        frame.receipts = Material::Filtered {
+            value: receipts,
+            scope: scope.clone(),
+            completeness: Completeness::VerifiedPredicate,
+        };
         frame
     }
 
@@ -817,30 +946,60 @@ mod tests {
     }
 
     #[test]
-    fn a_rule_stops_matching_at_its_until_timestamp() {
-        let call = Tx {
-            kind: 2,
-            from: BATCHER,
-            to: GAME_FACTORY,
-            input: vec![0x82, 0xec, 0xf2, 0xf6],
-            gas: 1,
-            price: 7,
+    fn rules_for_one_recipient_are_tried_in_order() {
+        const PROPOSE: [u8; 4] = [0x82, 0xec, 0xf2, 0xf6];
+        let specific = Rule {
+            selector: Some(PROPOSE),
+            ..rule("base", Purpose::State, GAME_FACTORY)
         };
-        let processor = processor();
+        let catch_all = rule("shared", Purpose::Data, GAME_FACTORY);
+        let call = |input: &[u8]| Tx {
+            to: GAME_FACTORY,
+            input: input.to_vec(),
+            ..batch(BASE_FEE)
+        };
+        let rollups = |rules: Vec<Rule>| {
+            processor_with(rules)
+                .derive(&frame(
+                    500,
+                    &[call(&PROPOSE), call(&[0xde, 0xad, 0xbe, 0xef])],
+                ))
+                .expect("derive")
+                .transactions
+                .into_iter()
+                .map(|transaction| transaction.rollup)
+                .collect::<Vec<_>>()
+        };
+        // the specific rule wins its call, and a miss falls through to the next
+        // rule for the same recipient
         assert_eq!(
-            processor
-                .derive(&frame(999, std::slice::from_ref(&call)))
-                .expect("derive")
-                .transactions
-                .len(),
-            1
+            rollups(vec![specific.clone(), catch_all.clone()]),
+            ["base", "shared"]
         );
-        assert!(
+        // listed after the catch-all, the specific rule never sees a call
+        assert_eq!(rollups(vec![catch_all, specific]), ["shared", "shared"]);
+    }
+
+    #[test]
+    fn since_is_inclusive_and_until_exclusive() {
+        const SINCE: u64 = 1_700_000_000;
+        const UNTIL: u64 = 1_700_086_400;
+        let processor = processor_with(vec![Rule {
+            since: Some(SINCE),
+            until: Some(UNTIL),
+            ..rule("base", Purpose::Data, INBOX)
+        }]);
+        let call = batch(BASE_FEE);
+        let matched = |timestamp| {
             processor
-                .derive(&frame(1_000, &[call]))
+                .derive(&frame(timestamp, std::slice::from_ref(&call)))
                 .expect("derive")
                 .transactions
-                .is_empty()
+                .len()
+        };
+        assert_eq!(
+            [SINCE - 1, SINCE, UNTIL - 1, UNTIL].map(matched),
+            [0, 1, 1, 0]
         );
     }
 
@@ -933,6 +1092,276 @@ mod tests {
             .map(|tx| tx["selector"].clone())
             .collect::<Vec<_>>();
         assert_eq!(selectors, [Value::Null, json!("0x82ecf2f6")]);
+    }
+
+    #[test]
+    fn filtered_material_with_a_matching_scope_is_accepted() {
+        let processor = processor();
+        // what the live lane delivers for this processor's own requirement,
+        // and for its union with other processors' requirements on the lane
+        let required = processor.descriptor.requirements[0].filter.clone();
+        let mut wider = required.clone();
+        wider.recipients.push(Address::new([0x99; 20]));
+        let block = || {
+            frame(
+                500,
+                &[
+                    batch(9),
+                    // sent to a rule's recipient, but not from its sender
+                    Tx {
+                        from: Address::new([0xee; 20]),
+                        ..batch(9)
+                    },
+                ],
+            )
+        };
+        let complete = processor.derive(&block()).expect("derive complete");
+        assert_eq!(complete.transactions.len(), 1);
+        for scope in [required, wider] {
+            assert_eq!(
+                processor
+                    .derive(&filtered(block(), &scope))
+                    .expect("derive filtered"),
+                complete
+            );
+        }
+    }
+
+    #[test]
+    fn filtered_material_that_does_not_cover_the_rules_is_rejected() {
+        let processor = processor();
+        let required = processor.descriptor.requirements[0].filter.clone();
+        let projections = [
+            // kept the recipients of one rule only
+            FilterScope {
+                recipients: required.recipients[..1].to_vec(),
+                ..required.clone()
+            },
+            // blob transactions only, the one kind Xatu serves receipts for
+            FilterScope {
+                transaction_types: vec![3],
+                ..required
+            },
+        ];
+        for scope in projections {
+            let error = processor
+                .derive(&filtered(frame(500, &[batch(9)]), &scope))
+                .expect_err("a projection that can miss matches");
+            assert!(
+                matches!(&error, ProcessorError::Input(reason) if reason.contains("does not cover")),
+                "{error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_effective_price_below_base_fee_is_an_invariant_error() {
+        let processor = processor();
+        assert_eq!(
+            processor
+                .derive(&frame(500, &[batch(BASE_FEE - 1)]))
+                .expect_err("a price below the base fee"),
+            ProcessorError::Invariant("effective gas price below base fee".to_owned())
+        );
+        // a price at the base fee pays no tip
+        let delta = processor
+            .derive(&frame(500, &[batch(BASE_FEE)]))
+            .expect("derive");
+        assert_eq!(wei(delta.transactions[0].tip), U256::ZERO);
+    }
+
+    #[test]
+    fn a_receipt_of_another_transaction_type_is_an_invariant_error() {
+        let frame = with_receipt_type(frame(500, &[batch(9)]), 0, 1);
+        assert_eq!(
+            processor()
+                .derive(&frame)
+                .expect_err("a receipt of another type"),
+            ProcessorError::Invariant("transaction/receipt identity mismatch".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_frame_from_another_chain_is_rejected() {
+        let mut sepolia = frame(500, &[batch(9)]);
+        sepolia.chain_id = ChainId(11_155_111);
+        assert_eq!(
+            processor()
+                .derive(&sepolia)
+                .expect_err("another chain's block"),
+            ProcessorError::Input("rollup-txs is for chain 1, received 11155111".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_start_before_london_is_rejected() {
+        let message = rejection(RollupTxsConfig {
+            start_block: BlockNumber(LONDON - 1),
+            ..config(vec![rule("base", Purpose::Data, INBOX)])
+        });
+        assert!(message.contains("London"), "{message}");
+    }
+
+    #[test]
+    fn a_block_number_in_until_is_rejected() {
+        let message = rejection(config(vec![Rule {
+            until: Some(26_000_000),
+            ..rule("base", Purpose::Data, INBOX)
+        }]));
+        assert!(
+            message.contains("since and until are UNIX timestamps in seconds"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn a_block_number_in_since_is_rejected() {
+        let since = |since| {
+            config(vec![Rule {
+                since: Some(since),
+                ..rule("base", Purpose::Data, INBOX)
+            }])
+        };
+        for before_genesis in [26_000_000, MAINNET_GENESIS - 1] {
+            let message = rejection(since(before_genesis));
+            assert!(
+                message.contains("since and until are UNIX timestamps in seconds"),
+                "{message}"
+            );
+        }
+        // genesis itself is the earliest timestamp
+        RollupTxsProcessor::new(since(MAINNET_GENESIS)).expect("a since at genesis");
+    }
+
+    #[test]
+    fn an_empty_time_window_is_rejected() {
+        const AT: u64 = 1_700_000_000;
+        for (since, until) in [(AT, AT), (AT + 1, AT)] {
+            let message = rejection(config(vec![Rule {
+                since: Some(since),
+                until: Some(until),
+                ..rule("base", Purpose::Data, INBOX)
+            }]));
+            assert!(message.contains("empty time window"), "{message}");
+        }
+    }
+
+    #[test]
+    fn a_chain_id_argument_without_a_selector_is_rejected() {
+        let message = rejection(config(vec![Rule {
+            chain_id_arg: Some(324),
+            ..rule("zksync", Purpose::Proof, SHARED_VALIDATOR)
+        }]));
+        assert!(
+            message.contains("chain_id_arg needs a selector"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn config_hash_changes_with_rule_order_and_content_but_not_start_block() {
+        let first = Rule {
+            selector: Some([0x11, 0x22, 0x33, 0x44]),
+            ..rule("base", Purpose::State, GAME_FACTORY)
+        };
+        let second = rule("base", Purpose::Data, GAME_FACTORY);
+        let hash = |config: RollupTxsConfig| {
+            RollupTxsProcessor::new(config)
+                .expect("processor")
+                .descriptor
+                .config_hash
+        };
+        let identity = hash(config(vec![first.clone(), second.clone()]));
+
+        // the first matching rule wins, so the order is part of the identity
+        assert_ne!(identity, hash(config(vec![second.clone(), first.clone()])));
+        // as are the network and every field of a rule
+        assert_ne!(
+            identity,
+            hash(RollupTxsConfig {
+                network: "sepolia".to_owned(),
+                ..config(vec![first.clone(), second.clone()])
+            })
+        );
+        let changed = [
+            Rule {
+                rollup: "optimism".to_owned(),
+                ..first.clone()
+            },
+            Rule {
+                purpose: Purpose::Proof,
+                ..first.clone()
+            },
+            Rule {
+                to: INBOX,
+                ..first.clone()
+            },
+            Rule {
+                from: Some(BATCHER),
+                ..first.clone()
+            },
+            Rule {
+                selector: Some([0x55, 0x66, 0x77, 0x88]),
+                ..first.clone()
+            },
+            Rule {
+                chain_id_arg: Some(324),
+                ..first.clone()
+            },
+            Rule {
+                since: Some(MAINNET_GENESIS),
+                ..first.clone()
+            },
+            Rule {
+                until: Some(1_800_000_000),
+                ..first.clone()
+            },
+        ];
+        for changed_rule in changed {
+            let described = format!("{changed_rule:?}");
+            assert_ne!(
+                identity,
+                hash(config(vec![changed_rule, second.clone()])),
+                "{described}"
+            );
+        }
+
+        // a later start only changes where coverage begins
+        let later = RollupTxsConfig {
+            start_block: BlockNumber(LONDON + 1),
+            ..config(vec![first, second])
+        };
+        assert_eq!(identity, hash(later));
+    }
+
+    #[tokio::test]
+    async fn an_included_block_redelivered_as_finalized_is_a_finality_variant() {
+        let processor = processor();
+        let included = processor
+            .map(&frame(500, &[batch(9)]))
+            .await
+            .expect("map included");
+        let finalized = processor
+            .map(&BlockFrame {
+                finality: Finality::Finalized,
+                ..frame(500, &[batch(9)])
+            })
+            .await
+            .expect("map finalized");
+        // the mapped bytes keep the finality the block was mapped at
+        assert_ne!(included.checksum, finalized.checksum);
+        let variants = processor
+            .finality_variant_checksums(&included)
+            .expect("finality variants");
+        assert_eq!(variants.len(), 2);
+        assert!(variants.contains(&included.checksum));
+        assert!(variants.contains(&finalized.checksum));
+        assert_eq!(
+            processor
+                .finality_variant_checksums(&finalized)
+                .expect("finality variants"),
+            variants
+        );
     }
 
     #[tokio::test]
