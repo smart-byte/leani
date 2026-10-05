@@ -257,8 +257,12 @@ application finds its own subscriptions in `GET
 `id`; a materialization job's `consumer` is `null`. `processorConfigured` says
 whether the node configures the processor instance named in `processor` now:
 exactly that instance, not another instance of the same kind. While it is
-`false`, the stream and acknowledgement routes refuse the subscription; cancel
-it and delete it with `?discardUnacknowledged=true`.
+`false`, the stream and acknowledgement routes refuse the subscription. That
+can be temporary, as when a restart's configuration leaves the instance out by
+mistake. If the instance will not return, cancel the subscription and delete
+it with `?discardUnacknowledged=true`, which discards its unacknowledged
+records; [Processor rebuild or rollback](/docs/operations/runbook/#processor-rebuild-or-rollback)
+gives the steps around replacing an instance.
 
 ## 3. Common response model
 
@@ -1006,7 +1010,11 @@ export interface BlobsBlockChange {
 
 On a reorg, `undo` contains the previous block plus transactions so a consumer
 can delete or restore them by canonical keys. The replacement branch then
-arrives as ordinary `apply` changes.
+arrives as ordinary `apply` changes. A reorg of several blocks, like the revert
+at a restart after a long outage, undoes them newest first, and the live
+stream delivers each reverted block's `undo` as a batch of its own.
+[Undo runs](/docs/concepts/coverage-finality-and-reorgs/#undo-runs) shows how
+to rebuild derived aggregates once per such run instead of once per block.
 
 ## 8. TypeScript SDK
 
@@ -1274,7 +1282,7 @@ blobs.money continues to own:
 ### Cutover sequence
 
 1. Replace the application-local client with the published
-   `@smart-byte/leani-sdk` package once their contracts match.
+   `@smart-byte/leani-sdk` package.
 2. Start Leani from application-requested ranges derived from PostgreSQL state.
 3. Compare Leani output with existing `blocks` and `blob_transactions`.
 4. Run the native consumer into shadow PostgreSQL tables.

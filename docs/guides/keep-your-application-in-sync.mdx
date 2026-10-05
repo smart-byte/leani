@@ -27,7 +27,12 @@ its operator requests them as `POST /admin/v1/materialization-jobs`.
   leaves them to the application.
 - At startup, retained unfinalized blocks that do not link to the finalized
   anchor are reverted as a reorg. The application receives their `undo`
-  changes, and the blocks become part of the skipped range.
+  changes, and the blocks become part of the skipped range. After a restart
+  that follows a long outage, and on reorgs, several blocks can be reverted in
+  a row: one `undo` batch per block, newest first. Rebuild derived data once
+  per such run, as
+  [Undo runs](/docs/concepts/coverage-finality-and-reorgs/#undo-runs)
+  describes.
 - On the application's side, a crash between its commit and its
   acknowledgement redelivers a batch, and a failed backfill subscription
   stops until acted upon.
@@ -63,8 +68,12 @@ its operator requests them as `POST /admin/v1/materialization-jobs`.
    [Backfill while following live](/docs/guides/backfill-while-following-live/)
    describes; each has its own lease and acknowledgement.
 5. **Act on failed subscriptions.** A failed subscription stays failed:
-   inspect its `lastError`, correct the cause, then delete it and create it
-   again. Deletion is the retry boundary.
+   inspect its `lastError` and correct the cause. Then retry it with
+   `POST /admin/v1/backfill-subscriptions/{id}/retry` (SDK `retry(id)`),
+   which resumes from its committed progress. To abandon it instead, delete
+   it, adding `?discardUnacknowledged=true`
+   (SDK `delete(id, { discardUnacknowledged: true })`) when the consumer will
+   not read the rest.
 6. **Write idempotently.** Live, history, and redelivered batches can overlap
    and arrive out of block order. Write each block's rows as an upsert keyed
    by block, so that a block arriving twice, or from history after live,

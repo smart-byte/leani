@@ -110,6 +110,15 @@ backfills, coverage checks, and when a custom Rust processor is needed.
   `createLeaniClient({ baseUrl }).blocks.subscribe()` from
   `@smart-byte/leani-sdk`. Install the SDK version that matches the node exactly;
   prereleases are not `latest` on npm.
+- A reorg, or the revert at a restart after a long outage, undoes several
+  blocks in a row: one `undo` batch per block, newest first. Rebuild derived
+  aggregates once per run, as "Undo runs" in
+  `$LEANI_SOURCE/docs/concepts/coverage-finality-and-reorgs.mdx` (or
+  https://leani.dev/_llms-txt/concepts.txt) describes.
+- When a changed processor gets a new `instance`, settle the old instance's
+  backfill subscriptions before and after the switch, as "Processor rebuild
+  or rollback" in `$LEANI_SOURCE/docs/operations/runbook.md` (or
+  https://leani.dev/_llms-txt/operations.txt) describes.
 
 ## Documentation
 

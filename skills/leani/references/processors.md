@@ -13,8 +13,13 @@ settings (including the order of configured events), `start_block`, and
 source form an instance's immutable identity: once the store holds an
 instance, the node refuses a changed one (`processor instance … conflicts with
 its stored descriptor`). Give a changed processor a new `instance` name; it
-indexes from its `start_block` beside the old one. Retention and delivery
-limits can change in place. `leani doctor --json` validates the whole file
+indexes from its `start_block` beside the old one. The old instance's backfill
+subscriptions stay behind and count against the history delivery budget until
+deleted: settle them before and after the switch as "Processor rebuild or
+rollback" in the operations runbook describes
+(`$LEANI_SOURCE/docs/operations/runbook.md`, or its section in
+https://leani.dev/_llms-txt/operations.txt). Retention and delivery limits can
+change in place. `leani doctor --json` validates the whole file
 without touching state; fix every entry in `errors` before running anything
 else.
 

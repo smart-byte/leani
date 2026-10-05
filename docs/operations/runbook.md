@@ -68,7 +68,10 @@ volume from rc.1 the new image starts beside that instance and leaves it
 inert: nothing indexes or serves it, but its rows stay in the volume and
 count toward `[budgets.store] maximum_physical_bytes`. For a clean slate,
 remove the volume with `docker compose down -v` before
-`docker compose up --build`, or restore a snapshot of the volume.
+`docker compose up --build`, or restore a snapshot of the volume. When you
+replace an instance yourself, follow
+[Processor rebuild or rollback](#processor-rebuild-or-rollback), which also
+settles the old instance's backfill subscriptions.
 
 The profile runs at most two history chunks at once
 (`[budgets.history_pipeline] maximum_active_chunks = 2`): a Xatu backfill
@@ -888,6 +891,30 @@ Processor code/config identities create separate immutable instances. Backfill
 the replacement instance in parallel, compare coverage and outputs, then move
 consumers. Rollback selects the prior binary/store pair or restores its backup;
 it never mutates a newer instance in place.
+
+The old instance's backfill subscriptions do not move. Their retained records
+count against `[budgets.delivery] maximum_history_retained_bytes` until they
+are deleted, and once the node no longer configures the old instance, their
+stream and acknowledgement routes answer `404 not_found`, so their consumers
+can neither read nor acknowledge them. Settle them around the switch:
+
+1. Before the configuration drops the old instance, let each of its history
+   subscriptions finish, with its consumer acknowledging the
+   `backfill_complete` record, or cancel it. Delete each once its consumer has
+   acknowledged what it was delivered.
+2. After the node restarts without the old instance, list the subscriptions
+   with `GET /admin/v1/backfill-subscriptions`: `processorConfigured: false`
+   marks those of an instance the node does not configure. That can be
+   temporary, as when a restart's configuration leaves an instance out by
+   mistake: configure it again instead. If the old instance will not return,
+   cancel each of its subscriptions with
+   `POST /admin/v1/backfill-subscriptions/{id}/cancel` and delete it with
+   `DELETE /admin/v1/backfill-subscriptions/{id}?discardUnacknowledged=true`,
+   which discards its unacknowledged records. Both requests need the header
+   `x-leani-request: 1`.
+
+The SDK's backfill client makes the same calls with `list()`, `cancel(id)`,
+and `delete(id, { discardUnacknowledged: true })`.
 
 A store upgrades to the binary's schema on the first start that opens it, and
 the upgrade cannot be undone. A start that the store refuses for a processor
