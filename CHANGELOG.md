@@ -34,6 +34,9 @@ record, and documented RPC contracts.
     store that ran the first implementation therefore refuses this one under
     the same `instance` (`processor instance … conflicts with its stored
     descriptor`); configure a new `instance`.
+  - Its delta schema is now 2, where the first implementation's was 1: the
+    deltas and retained artifacts that implementation wrote are refused, not
+    decoded in the new layout.
   - A transaction's `fromAddress` is now `senderAddress`.
   - A transaction gains `success`, `false` for a reverted transaction.
   - `selector` is the matched rule's selector, `null` when that rule has none,
