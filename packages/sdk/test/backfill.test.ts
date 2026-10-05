@@ -1403,12 +1403,15 @@ describe("runBackfill", () => {
     expect(node.log).toEqual(["create repair-1"]);
   });
 
+  // Before opening the stream again, the run reads whether the subscription
+  // ended meanwhile.
   const resumed = [
     "create repair-1",
     "stream",
     "apply boundary-1",
     "ack boundary-1",
     "release",
+    "inspect",
     "stream",
     "apply boundary-2",
     "ack boundary-2",
@@ -1423,7 +1426,7 @@ describe("runBackfill", () => {
     [
       "a session another connection still holds",
       [["session_active"], ["batch", "batch", "complete"]],
-      ["create repair-1", "stream", "stream", "apply boundary-1", "ack boundary-1", "apply boundary-2", "ack boundary-2", "ack complete", "release", "inspect", "delete"],
+      ["create repair-1", "stream", "inspect", "stream", "apply boundary-1", "ack boundary-1", "apply boundary-2", "ack boundary-2", "ack complete", "release", "inspect", "delete"],
     ],
   ] as Array<[string, HistoryStep[][], string[]]>)(
     "%s is opened again after a backoff, without applying a batch twice",
@@ -1463,30 +1466,75 @@ describe("runBackfill", () => {
     expect(node.log).toEqual(["create repair-1", "stream", "release"]);
   });
 
-  test("an abort while streaming closes the session and keeps the subscription", async () => {
-    const node = fakeHistoryNode([["batch", "hang"]]);
-    const stop = new AbortController();
-    const reason = new Error("shutting down");
+  test.each([
+    ["the run's signal", undefined, "stop"],
+    ["the request's signal", "stop", undefined],
+    ["the request's signal beside the run's", "stop", "idle"],
+  ] as const)(
+    "an abort through %s while streaming closes the session and keeps the subscription",
+    async (_case, requestSignal, runSignal) => {
+      const node = fakeHistoryNode([["batch", "hang"]]);
+      const stop = new AbortController();
+      const signals = { stop: stop.signal, idle: new AbortController().signal };
+      const reason = new Error("shutting down");
+      const leani = createBackfillSubscriptionClient({
+        baseUrl: "http://node.test",
+        fetch: async (input, init) => {
+          const response = await node.fetch(input, init);
+          // Stop once the batch is acknowledged, while the run waits for more.
+          if (String(input).endsWith("/ack")) stop.abort(reason);
+          return response;
+        },
+      });
+      const run = runBackfill(
+        leani,
+        { ...historyRequest, signal: requestSignal && signals[requestSignal] },
+        {
+          onBatch: applyTo(node.log),
+          signal: runSignal && signals[runSignal],
+        },
+      );
+      await expect(run).rejects.toBe(reason);
+      expect(node.log).toEqual([
+        "create repair-1",
+        "stream",
+        "apply boundary-1",
+        "ack boundary-1",
+        "release",
+      ]);
+    },
+  );
+
+  test("a completion whose acknowledgement answer is lost ends completed without reopening", async () => {
+    const node = fakeHistoryNode([["batch", "batch", "complete"]]);
     const leani = createBackfillSubscriptionClient({
       baseUrl: "http://node.test",
       fetch: async (input, init) => {
         const response = await node.fetch(input, init);
-        // Stop once the batch is acknowledged, while the run waits for more.
-        if (String(input).endsWith("/ack")) stop.abort(reason);
+        // The node applies the acknowledgement, but its answer never arrives.
+        if (node.log.at(-1) === "ack complete") throw new TypeError("fetch failed");
         return response;
       },
     });
-    const run = runBackfill(leani, historyRequest, {
+    const result = await runBackfill(leani, historyRequest, {
       onBatch: applyTo(node.log),
-      signal: stop.signal,
     });
-    await expect(run).rejects.toBe(reason);
+    expect(result).toMatchObject({
+      outcome: "completed",
+      subscription: { state: "complete_reclaimable" },
+      completion: { type: "backfill_complete", cursor: "complete" },
+    });
     expect(node.log).toEqual([
       "create repair-1",
       "stream",
       "apply boundary-1",
       "ack boundary-1",
+      "apply boundary-2",
+      "ack boundary-2",
+      "ack complete",
       "release",
+      "inspect",
+      "delete",
     ]);
   });
 

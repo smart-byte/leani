@@ -777,7 +777,10 @@ export interface RunBackfillOptions<T = unknown> {
   /** The consumer's credential; `request.consumer.credential` by default. */
   credential?: string;
   batching?: BackfillBatchingRequest;
-  /** Stops the run, which rejects with its reason and keeps the subscription. */
+  /**
+   * Stops the run, as `request.signal` does too. The run rejects with the
+   * abort reason and keeps the subscription.
+   */
   signal?: AbortSignal;
 }
 
@@ -785,7 +788,7 @@ export interface RunBackfillResult {
   outcome: "completed" | "cancelled" | "failed";
   /** The subscription as it ended, before its deletion. */
   subscription: BackfillStatus;
-  /** The completion this run acknowledged, if it streamed one. */
+  /** The completion record this run received, if it streamed one. */
   completion?: BackfillStreamCompletion;
   deletion: HistoricalWorkDeletion;
 }
@@ -793,11 +796,12 @@ export interface RunBackfillResult {
 /**
  * Run an application-owned history subscription to its end: create it,
  * apply and acknowledge each history batch, and delete it once complete.
- * Creation is idempotent by `idempotencyKey`, so running the same request
- * again, as after a crash, resumes the same subscription after its last
- * acknowledged batch; a batch applied but not acknowledged is delivered
+ * Creation is idempotent by `idempotencyKey`, so running the identical
+ * request again, as after a crash, resumes the same subscription after its
+ * last acknowledged batch; a batch applied but not acknowledged is delivered
  * again, so `onBatch` must be idempotent. After a lost connection or
- * consumer session, the stream is opened again with backoff. A failed
+ * consumer session, it backs off, reads the subscription's state, and opens
+ * the stream again unless the subscription ended meanwhile. A failed
  * subscription follows `onFailure`; a cancelled one is deleted with its
  * unacknowledged records. An `onBatch` error, an abort, or any other failure
  * closes the session and is thrown, leaving the subscription for a rerun.
@@ -817,15 +821,16 @@ export async function runBackfill<T = unknown>(
   if (!Number.isSafeInteger(maxRetries) || maxRetries < 0) {
     throw new TypeError("maxRetries must be a non-negative safe integer");
   }
-  const { signal } = options;
-  let subscription = await client.create({
-    ...request,
-    signal: request.signal ?? signal,
-  });
+  // Either signal stops every request of the run.
+  const signal =
+    request.signal && options.signal
+      ? AbortSignal.any([request.signal, options.signal])
+      : (options.signal ?? request.signal);
+  let subscription = await client.create({ ...request, signal });
+  let completion: BackfillStreamCompletion | undefined;
   const finish = async (
     outcome: RunBackfillResult["outcome"],
     discardUnacknowledged: boolean,
-    completion?: BackfillStreamCompletion,
   ): Promise<RunBackfillResult> => ({
     outcome,
     subscription,
@@ -837,6 +842,8 @@ export async function runBackfill<T = unknown>(
   });
   let retries = 0;
   let delayMs = 1_000;
+  // Whether the subscription may have changed since its status was read.
+  let stale = false;
   while (true) {
     const { state } = subscription;
     if (state === "complete_reclaimable" || state === "completed") {
@@ -862,37 +869,44 @@ export async function runBackfill<T = unknown>(
       subscription = await client.retry(subscription.id, { signal });
       continue;
     }
-    let completion: BackfillStreamCompletion;
     try {
+      if (stale) {
+        subscription = await client.inspect(subscription.id, { signal });
+        stale = false;
+        continue;
+      }
       const session = await client.stream<T>(subscription.id, consumer.id, {
         credential: options.credential ?? consumer.credential,
         batching: options.batching,
         signal,
       });
       delayMs = 1_000;
-      completion = await applyHistory(session, options);
+      await applyHistory(session, options, signal, (received) => {
+        completion = received;
+      });
     } catch (error) {
       if (error instanceof ApplicationFailure) {
         throw error.cause;
       }
-      if (
+      const ended =
         error instanceof BackfillStreamError &&
-        (error.code === "backfill_failed" || error.code === "backfill_cancelled")
-      ) {
-        // The subscription's state, and the error it failed with, decide
-        // what follows.
-        subscription = await client.inspect(subscription.id, { signal });
-        continue;
+        (error.code === "backfill_failed" || error.code === "backfill_cancelled");
+      if (!ended) {
+        if (!isTransientStreamFailure(error)) {
+          throw error;
+        }
+        await waitForReconnectDelay(delayMs, signal);
+        delayMs = Math.min(delayMs * 2, 30_000);
       }
-      if (!isTransientStreamFailure(error)) {
-        throw error;
-      }
-      await waitForReconnectDelay(delayMs, signal);
-      delayMs = Math.min(delayMs * 2, 30_000);
+      // The subscription's state decides what follows: it failed or was
+      // cancelled, or it may have ended while the stream was down, as when
+      // the node applied the completion's acknowledgement but its answer was
+      // lost. A stream opened again then would only send heartbeats.
+      stale = true;
       continue;
     }
     subscription = await client.inspect(subscription.id, { signal });
-    return finish("completed", false, completion);
+    return finish("completed", false);
   }
 }
 
@@ -903,12 +917,15 @@ class ApplicationFailure {
 
 /**
  * Apply and acknowledge each batch of a history session, then acknowledge
- * and return its completion. The session is closed however this ends.
+ * its completion, which `received` gets first. The session is closed however
+ * this ends.
  */
 async function applyHistory<T>(
   session: BackfillDeliverySession<T>,
   options: RunBackfillOptions<T>,
-): Promise<BackfillStreamCompletion> {
+  signal: AbortSignal | undefined,
+  received: (completion: BackfillStreamCompletion) => void,
+): Promise<void> {
   try {
     for await (const batch of session.deliveryBatches()) {
       if (batch.completion === undefined) {
@@ -917,17 +934,19 @@ async function applyHistory<T>(
         } catch (error) {
           throw new ApplicationFailure(error);
         }
+      } else {
+        received(batch.completion);
       }
-      await session.acknowledge(batch.ackCursor, { signal: options.signal });
+      await session.acknowledge(batch.ackCursor, { signal });
       if (batch.completion !== undefined) {
-        return batch.completion;
+        return;
       }
     }
   } finally {
     await session.close();
   }
   // The caller's abort ends a session quietly.
-  options.signal?.throwIfAborted();
+  signal?.throwIfAborted();
   throw new TransportError("history stream ended before its completion");
 }
 
