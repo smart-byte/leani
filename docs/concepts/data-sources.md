@@ -318,6 +318,12 @@ durable processor coverage.
 Live requests share the manager but have dispatch priority over queued history
 requests.
 
+An on-demand job keeps the sources it starts with. A job whose range ends in
+the eligible blocks therefore stays `queued` until the node's finalized P2P
+anchor covers its last block, typically seconds after the node starts; without
+`history_fallback_blocks`, that is every job. A job that ends before the
+eligible suffix starts at once.
+
 This is a resilient fallback, not a cheaper archive transport. A recent
 receipt-complete block can carry hundreds of kilobytes before devp2p Snappy,
 and public peers may be full, slow, or missing old history. Keep the persistent
