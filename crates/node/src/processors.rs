@@ -17,7 +17,7 @@ use leani_api::{
 };
 use leani_primitives::{Address, BlockNumber};
 use leani_processor_api::{
-    LifecyclePolicies, Processor, ProcessorInstanceId, PublicationPolicy, StartPoint,
+    LifecyclePolicies, Processor, ProcessorInstanceId, PublicationPolicy, ReductionMode, StartPoint,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -405,6 +405,12 @@ fn validate_instance(
         return Err(descriptor_error(
             configured,
             "configured lifecycle policies differ from implementation",
+        ));
+    }
+    if configured.live_gap_fill.is_some() && descriptor.mode != ReductionMode::BlockLocal {
+        return Err(descriptor_error(
+            configured,
+            "live_gap_fill requires a block-local processor; an ordered lane holds later blocks instead of skipping them",
         ));
     }
     Ok(())
@@ -1122,5 +1128,33 @@ mod tests {
             let errors = registry.validation_errors(&config);
             assert!(errors.is_empty(), "{}: {errors:?}", path.display());
         }
+    }
+
+    #[test]
+    fn live_gap_fill_requires_a_block_local_processor() {
+        let modes = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config/modes");
+        let registry = ProcessorRegistry::standard();
+        let fill = Some(crate::config::LiveGapFillConfig { max_blocks: 64 });
+
+        // transaction-stats is ordered.
+        let mut ordered = Config::load(&modes.join("aggregate-only.toml")).expect("profile");
+        ordered.processors[0].history_mode = crate::config::ProcessorHistoryMode::OnDemand;
+        ordered.processors[0].live_gap_fill = fill;
+        let errors = registry.validation_errors(&ordered);
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert_eq!(errors[0].field, "processors[0]");
+        assert!(
+            errors[0].message.ends_with(
+                "live_gap_fill requires a block-local processor; an ordered lane holds later blocks instead of skipping them"
+            ),
+            "{}",
+            errors[0].message
+        );
+
+        // blobs-money is block-local.
+        let mut block_local = Config::load(&modes.join("externalized.toml")).expect("profile");
+        block_local.processors[0].live_gap_fill = fill;
+        let errors = registry.validation_errors(&block_local);
+        assert!(errors.is_empty(), "{errors:?}");
     }
 }

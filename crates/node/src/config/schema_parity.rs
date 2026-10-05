@@ -801,6 +801,20 @@ fn schema_validation_checks_scalar_constraints_and_exactly_one_branch() {
     .unwrap();
     let validator = jsonschema::validator_for(&schema.0).unwrap();
     assert!(validator.is_valid(&source));
+    for (fill, valid) in [
+        (json!({ "max_blocks": 1 }), true),
+        (json!({ "max_blocks": 7_200 }), true),
+        (json!({ "max_blocks": 0 }), false),
+        (json!({ "max_blocks": 7_201 }), false),
+        (json!({}), false),
+    ] {
+        source["processors"][0]["live_gap_fill"] = fill.clone();
+        assert_eq!(validator.is_valid(&source), valid, "{fill}");
+    }
+    source["processors"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("live_gap_fill");
     for invalid in [json!("many"), json!(0), json!(-1)] {
         source["rpc"]["max_websocket_connections"] = invalid;
         assert!(!validator.is_valid(&source));

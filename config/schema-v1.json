@@ -576,6 +576,7 @@
         "checkpoint": { "$ref": "#/$defs/checkpointPolicy" },
         "undo": { "$ref": "#/$defs/undoPolicy" },
         "coverage": { "$ref": "#/$defs/processorCoverage" },
+        "live_gap_fill": { "$ref": "#/$defs/processorLiveGapFill" },
         "settings": {
           "type": "object",
           "description": "Strictly decoded by the selected processor factory",
@@ -588,6 +589,20 @@
       "additionalProperties": false,
       "properties": {
         "verification_segment_blocks": { "$ref": "#/$defs/positiveInteger" }
+      }
+    },
+    "processorLiveGapFill": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["max_blocks"],
+      "description": "Fill the blocks a block-local live lane skips, such as after a restart at a later finalized anchor, from history before it applies the next block, instead of only announcing them. Requires history_mode = \"on_demand\" and delivery.on_limit = \"pause\". Every live lane waits while a fill runs.",
+      "properties": {
+        "max_blocks": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 7200,
+          "description": "Largest skipped range the lane fills; it announces a longer one, and the rest of a fill that fails or runs longer than five minutes."
+        }
       }
     },
     "rpc": {

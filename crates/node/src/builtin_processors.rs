@@ -65,6 +65,7 @@ pub(crate) fn processor_contract(
             safety_blocks: if finalized_only { 0 } else { 256 },
         },
         coverage: ProcessorCoverageConfig::default(),
+        live_gap_fill: None,
         settings: toml::Table::new(),
     }
 }
