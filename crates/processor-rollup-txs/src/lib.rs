@@ -3,9 +3,11 @@
 //!
 //! Each block is matched against operator-configured rules (the rollups'
 //! contracts, senders and function selectors). Blob (type-3) transactions are
-//! skipped: the blobs processor already reports them. The processor emits one
-//! change per block, also when nothing matched, so a consumer can tell a block
-//! without rollup activity from one that was never covered.
+//! skipped: the blobs processor already reports them. A reverted transaction
+//! is reported like the others, flagged unsuccessful: its gas was paid. The
+//! processor emits one change per block, also when nothing matched, so a
+//! consumer can tell a block without rollup activity from one that was never
+//! covered.
 
 use std::collections::BTreeMap;
 
@@ -25,7 +27,7 @@ use semver::Version;
 use serde::{Deserialize, Serialize};
 
 pub const PROCESSOR_ID: &str = "rollup-txs";
-pub const BLOCK_COLLECTION: &str = "rollup_txs.blocks";
+pub const BLOCK_COLLECTION: &str = "rollups.blocks";
 pub const CHANGE_KIND: &str = "rollups.block";
 
 /// What a rollup's L1 transaction pays for.
@@ -130,8 +132,12 @@ pub struct TrackedTransaction {
     pub transaction_index: u32,
     pub rollup: String,
     pub purpose: Purpose,
-    pub from: Address,
+    /// `false` for a reverted transaction, which is still reported: its gas was paid.
+    pub success: bool,
+    pub sender: Address,
     pub to: Address,
+    /// The matched rule's selector; `None` when that rule matches any input,
+    /// as for calldata batches, whose first bytes are batch data.
     pub selector: Option<[u8; 4]>,
     pub gas_used: u64,
     /// Base fee × gas used.
@@ -221,7 +227,7 @@ impl RollupTxsProcessor {
             lifecycle: LifecyclePolicies::from_legacy(RetentionPolicy::FullOutputHistory),
             schemas: ProcessorSchemas {
                 delta_version: 1,
-                entity_schema: "rollup-txs.entity.v1".to_owned(),
+                entity_schema: "rollups.entity.v1".to_owned(),
                 change_schema: "rollups.block-bundle.v1".to_owned(),
             },
         };
@@ -293,6 +299,7 @@ impl RollupTxsProcessor {
                     "transaction/receipt identity mismatch".to_owned(),
                 ));
             }
+            let success = required(receipt.success, "receipt.success")?;
             let gas_used = required(receipt.gas_used, "receipt.gas_used")?;
             let effective_price = wei(required(
                 receipt.effective_gas_price,
@@ -311,9 +318,10 @@ impl RollupTxsProcessor {
                 transaction_index: transaction.index,
                 rollup: rule.rollup.clone(),
                 purpose: rule.purpose,
-                from,
+                success,
+                sender: from,
                 to,
-                selector: input.get(..4).and_then(|bytes| bytes.try_into().ok()),
+                selector: rule.selector,
                 gas_used,
                 execution_burn: execution_burn.into(),
                 tip: tip.into(),
@@ -435,7 +443,8 @@ impl Processor for RollupTxsProcessor {
     }
 }
 
-/// The public block bundle: camelCase, hex hashes and addresses, wei as decimal strings.
+/// The public block bundle: camelCase, hex hashes and addresses, gas and wei
+/// as decimal strings, and the block's `finality` as blobs-money renders it.
 fn bundle_json(bytes: &[u8]) -> Result<serde_json::Value, ProcessorError> {
     let delta: RollupTxsDelta =
         postcard::from_bytes(bytes).map_err(|error| ProcessorError::State(error.to_string()))?;
@@ -452,7 +461,8 @@ fn bundle_json(bytes: &[u8]) -> Result<serde_json::Value, ProcessorError> {
                 "transactionIndex": transaction.transaction_index,
                 "rollupId": transaction.rollup,
                 "purpose": transaction.purpose.name(),
-                "fromAddress": transaction.from.to_string(),
+                "success": transaction.success,
+                "senderAddress": transaction.sender.to_string(),
                 "toAddress": transaction.to.to_string(),
                 "selector": transaction.selector.map(|selector| format!("0x{}", hex::encode(selector))),
                 "gasUsed": transaction.gas_used.to_string(),
@@ -468,6 +478,7 @@ fn bundle_json(bytes: &[u8]) -> Result<serde_json::Value, ProcessorError> {
             "blockHash": block.block_hash.to_string(),
             "parentHash": block.parent_hash.to_string(),
             "timestamp": block.timestamp,
+            "finality": block.finality.name(),
         },
         "transactions": transactions,
     }))
@@ -541,6 +552,7 @@ mod tests {
         BlockRef, ChainId, HeaderEnvelope, MissingReason, TransactionEnvelope, VerificationReport,
     };
     use leani_testkit::MemoryReducer;
+    use serde_json::{Value, json};
 
     use super::*;
 
@@ -680,6 +692,28 @@ mod tests {
         }
     }
 
+    /// `frame` with the receipt of transaction `index` reporting `success`.
+    fn with_receipt_success(
+        mut frame: BlockFrame,
+        index: usize,
+        success: Option<bool>,
+    ) -> BlockFrame {
+        let Material::Complete(receipts) = &mut frame.receipts else {
+            unreachable!("frame() builds complete receipts");
+        };
+        receipts[index].success = success;
+        frame
+    }
+
+    /// The block's public JSON bundle.
+    fn rendered(processor: &RollupTxsProcessor, delta: &RollupTxsDelta) -> Value {
+        let payload = postcard::to_allocvec(delta).expect("encode");
+        processor
+            .entity_json(BLOCK_COLLECTION, &[], &payload)
+            .expect("render")
+            .expect("a block bundle")
+    }
+
     #[test]
     fn matches_transfers_calls_and_chain_arguments_and_skips_the_rest() {
         let stranger = Address::new([0xee; 20]);
@@ -807,6 +841,97 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_reverted_transaction_is_reported_with_success_false() {
+        let batch = || Tx {
+            kind: 2,
+            from: BATCHER,
+            to: INBOX,
+            input: vec![0x00, 0x01],
+            gas: 100,
+            price: 9,
+        };
+        let processor = processor();
+        let frame = with_receipt_success(frame(500, &[batch(), batch()]), 1, Some(false));
+        let json = rendered(&processor, &processor.derive(&frame).expect("derive"));
+        let reported = json["transactions"]
+            .as_array()
+            .expect("transactions")
+            .iter()
+            .map(|tx| {
+                (
+                    tx["transactionIndex"].clone(),
+                    tx["success"].clone(),
+                    tx["executionBurnedWei"].clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        // the reverted transaction's gas was still paid for
+        assert_eq!(
+            reported,
+            [
+                (json!(0), json!(true), json!("700")),
+                (json!(1), json!(false), json!("700")),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_matched_receipt_without_success_is_rejected() {
+        let batch = Tx {
+            kind: 2,
+            from: BATCHER,
+            to: INBOX,
+            input: vec![0x00],
+            gas: 100,
+            price: 9,
+        };
+        let frame = with_receipt_success(frame(500, &[batch]), 0, None);
+        assert_eq!(
+            processor()
+                .derive(&frame)
+                .expect_err("a receipt without its outcome"),
+            ProcessorError::Input("receipt.success is required".to_owned())
+        );
+    }
+
+    #[test]
+    fn selector_is_the_matched_rules_selector() {
+        let processor = processor();
+        let delta = processor
+            .derive(&frame(
+                500,
+                &[
+                    // a calldata batch: its rule has no selector, its first bytes are batch data
+                    Tx {
+                        kind: 2,
+                        from: BATCHER,
+                        to: INBOX,
+                        input: vec![0x00, 0xde, 0xad, 0xbe, 0xef],
+                        gas: 100,
+                        price: 9,
+                    },
+                    // an output proposal, matched by its rule's selector
+                    Tx {
+                        kind: 2,
+                        from: BATCHER,
+                        to: GAME_FACTORY,
+                        input: vec![0x82, 0xec, 0xf2, 0xf6, 0x01],
+                        gas: 300,
+                        price: 7,
+                    },
+                ],
+            ))
+            .expect("derive");
+        let selectors = rendered(&processor, &delta)["transactions"]
+            .as_array()
+            .expect("transactions")
+            .iter()
+            .map(|tx| tx["selector"].clone())
+            .collect::<Vec<_>>();
+        assert_eq!(selectors, [Value::Null, json!("0x82ecf2f6")]);
+    }
+
     #[tokio::test]
     async fn every_block_emits_one_bundle_change_rendered_as_public_json() {
         let processor = processor();
@@ -837,19 +962,58 @@ mod tests {
             .await
             .expect("reduce");
         assert_eq!(changes.changes.len(), 1);
-        let json = processor
-            .change_json(&changes.changes[0])
-            .expect("render")
-            .expect("bundle");
-        assert_eq!(json["block"]["blockNumber"], 42);
-        assert_eq!(json["block"]["network"], "mainnet");
-        let tx = &json["transactions"][0];
-        assert_eq!(tx["rollupId"], "base");
-        assert_eq!(tx["purpose"], "data");
-        assert_eq!(tx["fromAddress"], format!("0x{}", "bb".repeat(20)));
-        assert_eq!(tx["gasUsed"], "21000");
-        assert_eq!(tx["executionBurnedWei"], (21_000 * BASE_FEE).to_string());
-        assert_eq!(tx["tipWei"], (21_000 * (9 - BASE_FEE)).to_string());
+        let change = &changes.changes[0];
+        assert_eq!(change.kind, "rollups.block");
+        let block_hash = format!("0x{}", "42".repeat(32));
+        let bundle = json!({
+            "block": {
+                "network": "mainnet",
+                "blockNumber": 42,
+                "blockHash": block_hash,
+                "parentHash": format!("0x{}", "41".repeat(32)),
+                "timestamp": 500,
+                "finality": "included",
+            },
+            "transactions": [{
+                "network": "mainnet",
+                "blockNumber": 42,
+                "blockHash": block_hash,
+                "txHash": format!("0x{}", "01".repeat(32)),
+                "transactionIndex": 0,
+                "rollupId": "base",
+                "purpose": "data",
+                "success": true,
+                "senderAddress": format!("0x{}", "bb".repeat(20)),
+                "toAddress": format!("0x{}", "aa".repeat(20)),
+                "selector": null,
+                "gasUsed": "21000",
+                "executionBurnedWei": "147000",
+                "tipWei": "42000",
+            }],
+        });
+        assert_eq!(
+            processor.change_json(change).expect("render"),
+            Some(bundle.clone())
+        );
+        // the bundle is retained by block number in `rollups.blocks`
+        let key = 42_u64.to_be_bytes();
+        let stored = reducer
+            .entity("rollups.blocks", &key)
+            .expect("a retained bundle");
+        assert_eq!(
+            processor
+                .entity_json("rollups.blocks", &key, stored)
+                .expect("render"),
+            Some(bundle)
+        );
+        assert_eq!(
+            processor.descriptor.schemas.entity_schema,
+            "rollups.entity.v1"
+        );
+        assert_eq!(
+            processor.descriptor.schemas.change_schema,
+            "rollups.block-bundle.v1"
+        );
 
         // a block without rollup activity still emits its (empty) bundle
         let empty = processor.derive(&self::frame(501, &[])).expect("derive");

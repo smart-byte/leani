@@ -200,13 +200,27 @@ made through a multisig or another contract is not seen.
 
 Every block emits one `rollups.block` change (`rollups.block-bundle.v1`), also
 when nothing matched, so a consumer can tell a block without rollup activity
-from one it never received. The bundle is camelCase JSON: `block`
-(`network`, `blockNumber`, `blockHash`, `parentHash`, `timestamp`) and
-`transactions` (`txHash`, `transactionIndex`, `rollupId`, `purpose` =
-`data`/`state`/`proof`, `fromAddress`, `toAddress`, `selector`, `gasUsed`,
-`executionBurnedWei` = base fee × gas used, `tipWei` = (effective price − base
-fee) × gas used). The network and rules are the processor's configuration
-identity: a rule change needs a new `instance`.
+from one it never received. Materialized output stores each block's bundle by
+block number in the `rollups.blocks` collection (`rollups.entity.v1`) and
+renders it as the same JSON. The bundle is camelCase JSON:
+
+- `block`: `network`, `blockNumber`, `blockHash`, `parentHash`, `timestamp`,
+  and `finality` (`included` or `finalized`, as on `blobs-money`'s block).
+- `transactions`, in block order: `network`, `blockNumber`, and `blockHash`,
+  repeated from the block so that each transaction stands alone as a row;
+  then `txHash`, `transactionIndex`, `rollupId`, `purpose` (`data`, `state`,
+  or `proof`), `success`, `senderAddress`, `toAddress`, `selector`,
+  `gasUsed`, `executionBurnedWei` = base fee × gas used, and
+  `tipWei` = (effective price − base fee) × gas used.
+
+A reverted transaction is reported like the others, with `success: false`,
+because its gas was paid. `selector` is the matched rule's selector, or `null`
+when that rule has none: the first bytes of a calldata batch are batch data,
+not a function selector. Hashes, addresses, and selectors are lowercase
+`0x`-hex. `gasUsed`, `executionBurnedWei`, and `tipWei` are decimal strings;
+`blockNumber`, `timestamp`, and `transactionIndex` are JSON numbers. The
+network and rules are the processor's configuration identity: a rule change
+needs a new `instance`.
 
 ```toml
 [[processors]]

@@ -22,10 +22,24 @@ record, and documented RPC contracts.
 - A `rollup-txs` 1.0.0 processor: rollups' non-blob L1 transactions (batches
   posted as calldata, state root and output proposals, proof submissions)
   matched per block against `[[processors.settings.rules]]`, with each match's
-  gas, execution burn, and priority fee. It emits one `rollups.block` change for
-  every block, also when nothing matched, so a consumer can tell an empty block
-  from an uncovered one. Blob transactions are left to `blobs-money`. See
+  gas, execution burn, and priority fee. A reverted transaction is reported
+  too, with `success: false`, because its gas was paid. It emits one
+  `rollups.block` change for every block, also when nothing matched, so a
+  consumer can tell an empty block from an uncovered one. Blob transactions
+  are left to `blobs-money`. See
   [processor contracts](docs/reference/processor-contracts.md#rollup-txs-100).
+  Integrations built against its unreleased first implementation must adapt:
+  - The entity collection `rollup_txs.blocks` is now `rollups.blocks`, and
+    the entity schema `rollup-txs.entity.v1` is now `rollups.entity.v1`. A
+    store that ran the first implementation therefore refuses this one under
+    the same `instance` (`processor instance … conflicts with its stored
+    descriptor`); configure a new `instance`.
+  - A transaction's `fromAddress` is now `senderAddress`.
+  - A transaction gains `success`, `false` for a reverted transaction.
+  - `selector` is the matched rule's selector, `null` when that rule has none,
+    instead of the transaction's first four input bytes.
+  - `block` gains `finality`, `included` or `finalized`, as on `blobs-money`'s
+    block.
 
 ### Changed
 
