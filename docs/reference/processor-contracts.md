@@ -194,9 +194,11 @@ rules' recipients. A transaction matches a rule when it is sent to `to`, from
 `from` when set, calls `selector` when set, carries `chain_id_arg` as its first
 ABI word when set (shared settlement contracts serving several chains), in a
 block whose timestamp lies in `[since, until)`. The first matching rule per
-recipient wins, so list the more specific rules first. Type-3 transactions
-never match: `blobs-money` reports them. Only top-level calls match; a call
-made through a multisig or another contract is not seen.
+recipient wins, so list the more specific rules first. A rule also names the
+`rollup` its transactions belong to and their `purpose` (`data`, `state`, or
+`proof`), which the reported rows carry. Type-3 transactions never match:
+`blobs-money` reports them. Only top-level calls match; a call made through a
+multisig or another contract is not seen.
 
 The processor supports Ethereum mainnet only, and only from London (block
 12,965,000) on, because `executionBurnedWei` and `tipWei` need the base fee
@@ -224,16 +226,18 @@ renders it as the same JSON. The bundle is camelCase JSON:
   entity, that carries the bundle.
 - `transactions`, in block order: `network`, `blockNumber`, and `blockHash`,
   repeated from the block so that each transaction stands alone as a row;
-  then `txHash`, `transactionIndex`, `rollupId`, `purpose` (`data`, `state`,
-  or `proof`), `success`, `senderAddress`, `toAddress`, `selector`,
-  `gasUsed`, `executionBurnedWei` = base fee × gas used, and
+  then `txHash`, `transactionIndex`, `rollupId` and `purpose` (`data`,
+  `state`, or `proof`), which are the matched rule's `rollup` and `purpose`,
+  `success`, `senderAddress`, `toAddress`, `selector`, `gasUsed`,
+  `executionBurnedWei` = base fee × gas used, and
   `tipWei` = (effective price − base fee) × gas used.
 
 A reverted transaction is reported like the others, with `success: false`,
 because its gas was paid. `selector` is the matched rule's selector, or `null`
 when that rule has none: the first bytes of a calldata batch are batch data,
-not a function selector. Hashes, addresses, and selectors are lowercase
-`0x`-hex. `gasUsed`, `executionBurnedWei`, and `tipWei` are decimal strings;
+not a function selector. Hashes, addresses, and selectors are `0x` followed by
+lowercase hex digits: 64 for a hash, 40 for an address, and 8 for a selector.
+`gasUsed`, `executionBurnedWei`, and `tipWei` are decimal strings;
 `blockNumber`, `timestamp`, and `transactionIndex` are JSON numbers. The
 rules and the `start_block` are the processor's identity: changing either
 needs a new `instance`.

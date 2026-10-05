@@ -175,7 +175,8 @@ impl Rule {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct RollupTxsConfig {
-    /// Network name reported with every row, e.g. `mainnet`.
+    /// Network name reported with every row: always `"mainnet"`, because the
+    /// processor refuses any other chain.
     pub network: String,
     /// The first block to cover: London or later, since every block needs a
     /// base fee.
@@ -830,8 +831,8 @@ mod tests {
         frame
     }
 
-    /// `frame` with its transactions and receipts projected to `scope`, as the
-    /// live lane delivers them for a recipient filter.
+    /// `frame` with its transactions and receipts labelled as filtered to
+    /// `scope`, as the live lane delivers them for a recipient filter.
     fn filtered(mut frame: BlockFrame, scope: &FilterScope) -> BlockFrame {
         let Material::Complete(transactions) = frame.transactions else {
             unreachable!("frame() builds complete transactions");
