@@ -41,11 +41,16 @@ is no attested head, so live following requires a finality source.
 If verified finality ever names another block at a height than the chain the
 node followed, neither block is finalized. When the node's blocks there are
 unfinalized, for example because the lane stalled across a reorg, the network
-lanes restart: retained blocks that do not link to the new finalized anchor
-are undone as a reorg and never finalized, as a branch reorged away while the
-node was down is at startup. The lanes halt and report not ready instead when
-the contradicted block is itself finalized, or when restarting twice did not
-resolve the contradiction.
+lanes restart: retained unfinalized blocks that neither link to the new
+finalized anchor nor are proven to be its ancestors are undone as a reorg and
+never finalized, as a branch reorged away while the node was down is at
+startup. Where parent links do not reach the anchor, execution headers from
+peers that link by parent hash down from it prove which retained blocks are
+its ancestors, and those are kept and finalized; the runbook's
+[finality contradiction](/docs/operations/runbook/#finality-contradicts-the-followed-chain)
+section explains the proof and its fallback. The lanes halt and report not
+ready instead when the contradicted block is itself finalized, or when
+restarting twice did not resolve the contradiction.
 
 ```text
 requested       100 ─────────────────────────────── 140
