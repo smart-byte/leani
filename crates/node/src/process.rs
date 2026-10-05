@@ -5808,8 +5808,10 @@ async fn serve(path: &Path, registry: &ProcessorRegistry) -> Result<Exit> {
         None
     };
     let (pipeline_budget, material_coordinator) = historical_services(config.get())?;
-    // Only the network lanes publish the P2P history bridge's anchors.
     let network_lanes = live_required && finality_required;
+    // Only the network lanes publish the P2P history bridge's anchors, and
+    // `run_network_lanes` gives up before the first one off Ethereum mainnet.
+    let p2p_bridge_expected = network_lanes && config.get().chain.chain_id == 1;
     let backfill_control = Arc::new(
         NativeBackfillControl::new(
             config.get().clone(),
@@ -5820,7 +5822,7 @@ async fn serve(path: &Path, registry: &ProcessorRegistry) -> Result<Exit> {
             material_coordinator,
             pipeline_budget,
         )
-        .with_p2p_bridge_expected(network_lanes),
+        .with_p2p_bridge_expected(p2p_bridge_expected),
     );
     let mut background = BackgroundTasks::default();
     background.spawn("durable backfill scheduler", {
