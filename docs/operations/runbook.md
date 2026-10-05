@@ -66,12 +66,13 @@ ID, because the store refuses another version under an instance it holds.
 Version 0.1.0-rc.1 ran `blobs-money` 1.4.0 as `blobs-container`, so on a
 volume from rc.1 the new image starts beside that instance and leaves it
 inert: nothing indexes or serves it, but its rows stay in the volume and
-count toward `[budgets.store] maximum_physical_bytes`. For a clean slate,
-remove the volume with `docker compose down -v` before
-`docker compose up --build`, or restore a snapshot of the volume. When you
-replace an instance yourself, follow
-[Processor rebuild or rollback](#processor-rebuild-or-rollback), which also
-settles the old instance's backfill subscriptions.
+count toward `[budgets.store] maximum_physical_bytes`. This upgrade is itself
+an instance replacement: backfill subscriptions on `blobs-container` show
+`processorConfigured: false` and keep counting against
+`[budgets.delivery] maximum_history_retained_bytes` until you settle them as
+step 2 of [Processor rebuild or rollback](#processor-rebuild-or-rollback)
+describes. For a clean slate, remove the volume with `docker compose down -v`
+before `docker compose up --build`, or restore a snapshot of the volume.
 
 The profile runs at most two history chunks at once
 (`[budgets.history_pipeline] maximum_active_chunks = 2`): a Xatu backfill
