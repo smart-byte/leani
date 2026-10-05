@@ -6,6 +6,8 @@ record, and documented RPC contracts.
 
 ## [Unreleased]
 
+## [0.1.0-rc.3] - 2026-10-05
+
 ### Added
 
 - `sources.live.stall_timeout_seconds`, ten minutes by default and six
