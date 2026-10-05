@@ -1056,6 +1056,25 @@ mod tests {
     }
 
     #[test]
+    fn rollup_txs_rejects_a_window_that_is_not_in_unix_seconds() {
+        let registry = ProcessorRegistry::standard();
+        // a block number, and a timestamp in milliseconds: either window would
+        // silently match the wrong blocks
+        for field in ["since", "until"] {
+            for value in [26_000_000_i64, 1_790_000_000_000] {
+                let configured = rollup_txs_with_rule([(field, value.into())]);
+                let Err(error) = registry.instantiate_components(&configured, 1) else {
+                    panic!("{field} {value} was accepted");
+                };
+                assert!(
+                    error.to_string().contains("UNIX timestamps in seconds"),
+                    "{field} {value}: {error}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn rollup_txs_contract_example_loads() {
         #[derive(Deserialize)]
         struct ContractExample {

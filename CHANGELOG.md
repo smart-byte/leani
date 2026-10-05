@@ -41,11 +41,13 @@ record, and documented RPC contracts.
   - It supports Ethereum mainnet only, from London (block 12,965,000) on,
     because its execution burn and tip need the base fee. The node now refuses
     it on another chain, such as Sepolia, and with an earlier `start_block`.
-  - A rule's `since` and `until` are UNIX timestamps in seconds. The node now
-    refuses one below mainnet's genesis timestamp (1438269973), such as a block
-    number, and a rule with `chain_id_arg` but no `selector`, whose rows would
-    render `selector: null` so that calls to different functions could not be
-    told apart.
+  - A rule's `since` and `until` are UNIX timestamps in seconds, below 10^10.
+    The node now refuses one below mainnet's genesis timestamp (1438269973),
+    such as a block number, and one of 10000000000 or more, such as a
+    timestamp in milliseconds, whose `since` would never match and whose
+    `until` would never close its window. It also refuses a rule with
+    `chain_id_arg` but no `selector`, whose rows would render `selector: null`
+    so that calls to different functions could not be told apart.
 
 ### Changed
 

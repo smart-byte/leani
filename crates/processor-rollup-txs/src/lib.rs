@@ -42,6 +42,11 @@ const LONDON_BLOCK: u64 = 12_965_000;
 /// block, so it is most likely a block number written where UNIX seconds
 /// belong.
 const MAINNET_GENESIS_TIMESTAMP: u64 = 1_438_269_973;
+/// The first value that is not a timestamp in seconds: 10^10 seconds is the
+/// year 2286, while any moment since mainnet's genesis, in milliseconds, is
+/// above 1.4 × 10^12. A `since` that large would never match, and an `until`
+/// that large would never end its window.
+const UNIX_SECONDS_LIMIT: u64 = 10_000_000_000;
 
 /// What a rollup's L1 transaction pays for.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
@@ -82,10 +87,10 @@ impl Purpose {
 /// (shared settlement contracts serving many chains), in a block whose
 /// timestamp lies in `[since, until)`.
 ///
-/// `since` and `until` are UNIX timestamps in seconds, not block numbers.
-/// `chain_id_arg` needs a `selector`: the chain id is the argument after it,
-/// and a row without one renders `selector: null`, so calls to different
-/// functions could not be told apart.
+/// `since` and `until` are UNIX timestamps in seconds, not block numbers or
+/// milliseconds. `chain_id_arg` needs a `selector`: the chain id is the
+/// argument after it, and a row without one renders `selector: null`, so calls
+/// to different functions could not be told apart.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct Rule {
     pub rollup: String,
@@ -114,15 +119,22 @@ impl Rule {
             )));
         }
         for (field, timestamp) in [("since", self.since), ("until", self.until)] {
-            if let Some(timestamp) = timestamp
-                && timestamp < MAINNET_GENESIS_TIMESTAMP
-            {
-                return Err(ProcessorError::Input(format!(
-                    "rule {index} for {}: since and until are UNIX timestamps in seconds; \
-                     {field} {timestamp} is before mainnet genesis ({MAINNET_GENESIS_TIMESTAMP})",
-                    self.rollup
-                )));
-            }
+            let Some(timestamp) = timestamp else { continue };
+            let problem = if timestamp < MAINNET_GENESIS_TIMESTAMP {
+                format!("is before mainnet genesis ({MAINNET_GENESIS_TIMESTAMP})")
+            } else if timestamp >= UNIX_SECONDS_LIMIT {
+                format!(
+                    "is not below {UNIX_SECONDS_LIMIT} (the year 2286), so it is most likely in \
+                     milliseconds"
+                )
+            } else {
+                continue;
+            };
+            return Err(ProcessorError::Input(format!(
+                "rule {index} for {}: since and until are UNIX timestamps in seconds; \
+                 {field} {timestamp} {problem}",
+                self.rollup
+            )));
         }
         if let (Some(since), Some(until)) = (self.since, self.until)
             && since >= until
@@ -224,8 +236,8 @@ impl RollupTxsProcessor {
     /// Rejects an empty rule set, a start before London, a rule without a
     /// rollup id, a `chain_id_arg` without a `selector`, a `since` or `until`
     /// that is not a UNIX timestamp in seconds (below mainnet's genesis, as a
-    /// block number is), an empty time window, or a configuration that cannot
-    /// be encoded.
+    /// block number is, or 10^10 and above, as milliseconds are), an empty time
+    /// window, or a configuration that cannot be encoded.
     pub fn new(config: RollupTxsConfig) -> Result<Self, ProcessorError> {
         if config.rules.is_empty() {
             return Err(ProcessorError::Input(
@@ -1231,6 +1243,42 @@ mod tests {
         }
         // genesis itself is the earliest timestamp
         RollupTxsProcessor::new(since(MAINNET_GENESIS)).expect("a since at genesis");
+    }
+
+    #[test]
+    fn a_millisecond_timestamp_is_rejected() {
+        // a timestamp in milliseconds, and the first value that is too large to be
+        // one in seconds
+        const MILLISECONDS: u64 = 1_790_000_000_000;
+        const FIRST_BEYOND_SECONDS: u64 = 10_000_000_000;
+        // the last second that is still a timestamp in seconds (the year 2286)
+        const LAST_SECOND: u64 = FIRST_BEYOND_SECONDS - 1;
+        let window = |since, until| {
+            config(vec![Rule {
+                since,
+                until,
+                ..rule("base", Purpose::Data, INBOX)
+            }])
+        };
+        for value in [MILLISECONDS, FIRST_BEYOND_SECONDS] {
+            for (field, config) in [
+                ("since", window(Some(value), None)),
+                ("until", window(None, Some(value))),
+            ] {
+                let message = rejection(config);
+                assert!(
+                    message.contains("since and until are UNIX timestamps in seconds"),
+                    "{message}"
+                );
+                assert!(message.contains(&format!("{field} {value}")), "{message}");
+            }
+        }
+        for config in [
+            window(Some(LAST_SECOND), None),
+            window(None, Some(LAST_SECOND)),
+        ] {
+            RollupTxsProcessor::new(config).expect("a timestamp in seconds");
+        }
     }
 
     #[test]
