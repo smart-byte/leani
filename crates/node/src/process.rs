@@ -11084,6 +11084,157 @@ markets = ["ETH/USDT"]
         assert_eq!(unchanged.last_error, failed.last_error);
     }
 
+    /// One connection to a backfill subscription's history stream over HTTP.
+    struct HistoryStream {
+        client: reqwest::Client,
+        /// The URL of the consumer's routes.
+        consumer: String,
+        session: String,
+        body: std::pin::Pin<Box<dyn futures::Stream<Item = reqwest::Result<bytes::Bytes>> + Send>>,
+        buffered: Vec<u8>,
+    }
+
+    impl HistoryStream {
+        /// Open the stream of the consumer at `consumer` and read its hello.
+        async fn open(consumer: &str) -> Self {
+            let client = reqwest::Client::builder()
+                .no_proxy()
+                .build()
+                .expect("HTTP client");
+            let response = client
+                .get(format!("{consumer}/stream"))
+                .send()
+                .await
+                .expect("stream response");
+            assert_eq!(response.status(), reqwest::StatusCode::OK);
+            let mut stream = Self {
+                client,
+                consumer: consumer.to_owned(),
+                session: String::new(),
+                body: Box::pin(response.bytes_stream()),
+                buffered: Vec::new(),
+            };
+            let hello = stream.next().await.expect("hello");
+            assert_eq!(hello["type"], "hello", "{hello}");
+            hello["sessionToken"]
+                .as_str()
+                .expect("session token")
+                .clone_into(&mut stream.session);
+            stream
+        }
+
+        /// The next record, or `None` once the stream has ended.
+        async fn next(&mut self) -> Option<serde_json::Value> {
+            use futures::StreamExt as _;
+
+            loop {
+                if let Some(newline) = self.buffered.iter().position(|byte| *byte == b'\n') {
+                    let line = self.buffered.drain(..=newline).collect::<Vec<_>>();
+                    return Some(serde_json::from_slice(&line[..newline]).expect("NDJSON record"));
+                }
+                let chunk = tokio::time::timeout(Duration::from_secs(5), self.body.next())
+                    .await
+                    .expect("a record or the end of the stream in time")?;
+                self.buffered
+                    .extend_from_slice(&chunk.expect("stream bytes"));
+            }
+        }
+
+        /// Acknowledge `cursor` with this stream's session token.
+        async fn acknowledge(&self, cursor: &serde_json::Value) -> (reqwest::StatusCode, String) {
+            let response = self
+                .client
+                .post(format!("{}/ack", self.consumer))
+                .header("x-leani-consumer-session", &self.session)
+                .json(&serde_json::json!({ "cursor": cursor }))
+                .send()
+                .await
+                .expect("acknowledgement response");
+            let status = response.status();
+            (status, response.text().await.expect("acknowledgement body"))
+        }
+    }
+
+    #[tokio::test]
+    async fn reopening_a_completed_history_stream_resends_completion_and_ends() {
+        // Integration feedback: opened again after its consumer acknowledged
+        // the completion, a subscription's stream had nothing to deliver and
+        // sent heartbeats for good, so the application inspected the
+        // subscription on every heartbeat to learn that it was done.
+        use leani_api::BackfillControl as _;
+
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let (store, control, processor, id) = draining_subscription(directory.path()).await;
+        let descriptor = processor.descriptor().clone();
+        let api = leani_api::router_with_processors(
+            store.clone(),
+            vec![processor],
+            Vec::new(),
+            leani_api::ApiConfig {
+                backfill_control: Some(control.clone()),
+                // A stream that sends heartbeats instead of ending shows
+                // within the bounded reads.
+                heartbeat_interval: Duration::from_millis(50),
+                ..leani_api::ApiConfig::default()
+            },
+        )
+        .expect("router");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener");
+        let consumer = format!(
+            "http://{}/v1/backfill-subscriptions/{id}/consumers/destination",
+            listener.local_addr().expect("listener address")
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, api).await.expect("serve");
+        });
+
+        let mut first = HistoryStream::open(&consumer).await;
+        let completion = loop {
+            let record = first.next().await.expect("the completion");
+            if record["type"] == "backfill_complete" {
+                break record;
+            }
+            assert_eq!(record["type"], "batch", "{record}");
+        };
+        let (status, body) = first.acknowledge(&completion["cursor"]).await;
+        assert_eq!(status, reqwest::StatusCode::OK, "{body}");
+        // It ends once the acknowledgement lands, with heartbeats until then.
+        while let Some(record) = first.next().await {
+            assert_eq!(record["type"], "heartbeat", "{record}");
+        }
+        let completed = control.inspect(&id).await.expect("status");
+        assert_eq!(
+            completed.state,
+            leani_api::BackfillState::CompleteReclaimable
+        );
+
+        // Opened again, it sends the same completion and ends the same way.
+        let mut reopened = HistoryStream::open(&consumer).await;
+        assert_eq!(reopened.next().await, Some(completion.clone()));
+        assert_eq!(reopened.next().await, None);
+        // Its session ended with it, and acknowledging the completion again
+        // still succeeds.
+        let stream_id = completed.delivery_stream_id.expect("history stream");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while store
+                .consumer_in_stream(&descriptor, &stream_id, "destination")
+                .await
+                .expect("consumer")
+                .expect("registered consumer")
+                .lease_active
+            {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the ended stream releases its session");
+        let (status, body) = reopened.acknowledge(&completion["cursor"]).await;
+        assert_eq!(status, reqwest::StatusCode::OK, "{body}");
+        server.abort();
+    }
+
     fn durable_job(
         processor: &dyn Processor,
         id: &str,

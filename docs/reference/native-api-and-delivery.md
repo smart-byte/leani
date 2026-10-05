@@ -232,16 +232,23 @@ waits the same way for a failed job's task.
 
 A subscription whose job has finished is `draining` until its required
 consumer acknowledges the `backfill_complete` record, which makes it
-`complete_reclaimable`. A draining subscription can be cancelled as well, for
-example when its application will never read it to the end. It becomes
-`cancelled` and keeps its job's report. Its stream still serves the records
-committed before the cancellation, `backfill_complete` among them, but
-acknowledging them leaves the subscription `cancelled`, and a stream opened
-after that ends with `backfill_cancelled`. Delete it once they are
-acknowledged, or with `?discardUnacknowledged=true` to abandon them. Cancelling
-it and deleting it with `?discardUnacknowledged=true` work even after its
-processor instance was removed from the configuration, when its stream and
-acknowledgement routes answer `404 not_found`.
+`complete_reclaimable`; its stream ends once that acknowledgement lands. A
+stream opened after that sends the same `backfill_complete` record again, with
+the same `cursor`, and ends at once instead of sending heartbeats
+indefinitely. Acknowledging that cursor again succeeds, even after the stream
+has ended and released its session. Should the record no longer be readable,
+the stream ends with `backfill_completed` instead.
+
+A draining subscription can be cancelled as well, for example when its
+application will never read it to the end. It becomes `cancelled` and keeps
+its job's report. Its stream still serves the records committed before the
+cancellation, `backfill_complete` among them, but acknowledging them leaves the
+subscription `cancelled`, and a stream opened after that ends with
+`backfill_cancelled`. Delete it once they are acknowledged, or with
+`?discardUnacknowledged=true` to abandon them. Cancelling it and deleting it
+with `?discardUnacknowledged=true` work even after its processor instance was
+removed from the configuration, when its stream and acknowledgement routes
+answer `404 not_found`.
 
 ## 3. Common response model
 
@@ -406,8 +413,10 @@ content-type: application/json
 { "cursor": "<highest durably committed cursor>" }
 ```
 
-Acknowledgement is monotonic and idempotent. A page read or a stream batch
-records the last sequence it hands out as the consumer's delivered sequence
+Acknowledgement is monotonic and idempotent: repeating the acknowledged
+cursor changes nothing and succeeds, even with the session token of a stream
+that has since ended. A page read or a stream batch records the last
+sequence it hands out as the consumer's delivered sequence
 (`deliveredSequence`), and a cursor beyond it gets `409
 acknowledgement_beyond_delivered`, so a buggy client cannot let retention
 prune changes it never received. A live stream batch holds one block's whole

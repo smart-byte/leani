@@ -9729,6 +9729,29 @@ impl SqliteStore {
         Ok(result.rows_affected() != 0)
     }
 
+    /// Read the history-stream sequence of a backfill subscription's
+    /// completion record, which its job publishes when it finishes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the stored sequence is invalid or the query
+    /// fails.
+    pub async fn backfill_completion_sequence(
+        &self,
+        subscription_id: &str,
+    ) -> Result<Option<u64>, StoreError> {
+        let sequence: Option<Option<i64>> = sqlx::query_scalar(
+            "SELECT completion_sequence FROM backfill_subscriptions WHERE subscription_id = ?",
+        )
+        .bind(subscription_id)
+        .fetch_optional(&self.inner.pool)
+        .await?;
+        sequence
+            .flatten()
+            .map(|sequence| i64_u64(sequence, "backfill completion sequence"))
+            .transpose()
+    }
+
     /// Read a scheduler job.
     ///
     /// # Errors
@@ -12085,10 +12108,13 @@ impl SqliteStore {
     /// Advance one stream-scoped acknowledgement while fencing stale delivery
     /// sessions. Session validation, lease renewal, and acknowledgement commit
     /// atomically so a replaced session can never advance durable progress.
+    /// Repeating the acknowledged sequence changes nothing and succeeds, also
+    /// once the session has ended.
     ///
     /// # Errors
     ///
-    /// Returns an error for a stale session or any error described by
+    /// Returns an error for a stale session that does not repeat the
+    /// acknowledged sequence, or any error described by
     /// [`Self::acknowledge_consumer_in_stream`].
     pub async fn acknowledge_consumer_session_in_stream(
         &self,
@@ -12143,6 +12169,10 @@ impl SqliteStore {
                 state,
             });
         }
+        let acknowledged = i64_u64(
+            row.try_get("acknowledged_sequence")?,
+            "consumer acknowledged sequence",
+        )?;
         if let Some(generation) = session_generation {
             let stored_generation = i64_u64(
                 row.try_get("lease_generation")?,
@@ -12150,16 +12180,25 @@ impl SqliteStore {
             )?;
             let expires_at: i64 = row.try_get("lease_expires_at_unix_ms")?;
             if stored_generation != generation || expires_at <= now {
+                // Repeating the acknowledged sequence changes nothing, so it
+                // succeeds after the session ended too, as for a completion
+                // that a reopened stream sent again and then ended with.
+                if sequence == acknowledged {
+                    drop(transaction);
+                    drop(writer_guard);
+                    return self
+                        .consumer_in_stream(descriptor, stream_id, consumer_id)
+                        .await?
+                        .ok_or_else(|| {
+                            StoreError::Invariant("acknowledged consumer disappeared".to_owned())
+                        });
+                }
                 return Err(StoreError::ConsumerSessionLost {
                     consumer_id: consumer_id.to_owned(),
                     generation,
                 });
             }
         }
-        let acknowledged = i64_u64(
-            row.try_get("acknowledged_sequence")?,
-            "consumer acknowledged sequence",
-        )?;
         let acknowledged_work_blocks = i64_u64(
             row.try_get("acknowledged_work_blocks")?,
             "consumer acknowledged work blocks",
