@@ -6995,6 +6995,12 @@ impl SqliteStore {
     /// old tip and the anchor that the store never retained. An empty ancestry
     /// proves and finalizes nothing.
     ///
+    /// The store checks only that `ancestry` ends at the anchor's hash and
+    /// fits below it; it cannot check the links between the hashes, so
+    /// callers pass only hashes proven down from the anchor, such as an
+    /// anchored header proof's: every retained block that holds one is kept
+    /// and finalized.
+    ///
     /// # Errors
     ///
     /// Returns [`StoreError::Invariant`], before any write, for an ancestry
@@ -28521,6 +28527,78 @@ mod tests {
         );
         for number in 1..=5 {
             assert_eq!(canonical_finality(&store, number).await, Finality::Included);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_seeded_anchor_whose_ancestry_reaches_no_retained_block_proves_nothing() {
+        // An ancestry of blocks 6..=9 only, above the retained tip 5: no
+        // retained block holds one of its hashes, and nothing tells the store
+        // which block its lowest hash names as parent. It proves nothing, so
+        // the store reverts exactly what it reverts without one.
+        let anchor = BlockRef {
+            number: BlockNumber(9),
+            hash: BlockHash::new([0x99; 32]),
+            parent_hash: BlockHash::ZERO,
+            timestamp: 9,
+        };
+        let ancestry = [0x96, 0x97, 0x98]
+            .map(|byte| BlockHash::new([byte; 32]))
+            .into_iter()
+            .chain([anchor.hash])
+            .collect::<Vec<_>>();
+        let (_directory, store, _) = retained_chain().await;
+        let (_empty_directory, without, _) = retained_chain().await;
+        let reverted = store
+            .revert_unproven_recent_blocks(ChainId(1), anchor, &ancestry)
+            .await
+            .expect("revert");
+        assert_eq!(
+            reverted,
+            without
+                .revert_unproven_recent_blocks(ChainId(1), anchor, &[])
+                .await
+                .expect("revert")
+        );
+        assert_eq!(
+            reverted
+                .iter()
+                .map(|block| block.number.0)
+                .collect::<Vec<_>>(),
+            [5, 4, 3, 2, 1]
+        );
+        assert_eq!(
+            store
+                .finalized_canonical_head(ChainId(1))
+                .await
+                .expect("finalized head"),
+            None
+        );
+
+        // Nor does it finalize anything: blocks 1..=3, kept because they link
+        // to the finalized block 4, stay unfinalized, as without one.
+        let (_finalized_directory, finalized, chain) = retained_chain().await;
+        finalized
+            .store_canonical_anchor(ChainId(1), chain[3].block, Finality::Finalized)
+            .await
+            .expect("finalize block 4");
+        let reverted = finalized
+            .revert_unproven_recent_blocks(ChainId(1), anchor, &ancestry)
+            .await
+            .expect("revert");
+        assert_eq!(
+            reverted
+                .iter()
+                .map(|block| block.number.0)
+                .collect::<Vec<_>>(),
+            [5]
+        );
+        for number in 1..=3 {
+            assert_eq!(
+                canonical_finality(&finalized, number).await,
+                Finality::Included,
+                "block {number}"
+            );
         }
     }
 }
