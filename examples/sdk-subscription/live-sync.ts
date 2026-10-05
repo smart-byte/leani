@@ -54,6 +54,9 @@ export interface SyncOptions {
    * not await it, which would hold the live lane back. Given
    * `liveGapBackfill(subscription, …)` again, it resumes this subscription,
    * applies and acknowledges its batches, and deletes it once complete.
+   * Catch its rejection: an abort or a failure keeps the subscription, and
+   * running it again resumes it. `keepInSync` forgets the range once this
+   * returns, so a rejected run is the application's to run again.
    */
   onBackfill(subscription: BackfillStatus): void | Promise<void>;
   signal?: AbortSignal;
