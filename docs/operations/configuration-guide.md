@@ -443,8 +443,11 @@ subscription lands above the cursor meanwhile can shorten what the lane fills
 or announces. That is rare, and idempotent writes and the application's
 coverage diff cover it. A single filled block larger than the stream's
 `max_bytes` fails the lane, as an equally large live block would: raise
-`max_bytes` or remove the table. A fill can also make a hold at the shared
-`[budgets] pending_delta_bytes` more likely. The
+`max_bytes` or remove the table. A fill also makes a hold more likely, and a
+held block's delta counts against the shared `[budgets] pending_delta_bytes`;
+when it does not fit, the lane fails
+(`live_gap_marker_exceeds_pending_delta_budget`) until the budget is raised and
+the lane reset. The
 [runbook](/docs/operations/runbook/#crash-or-interrupted-commit) lists the log
 lines and the recovery.
 
