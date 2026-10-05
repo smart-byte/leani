@@ -36,11 +36,12 @@ record, and documented RPC contracts.
   `backfill_complete` record, with the same `cursor`, and ends. The
   stream found nothing after the acknowledged cursor and sent heartbeats
   indefinitely, so an application inspected the subscription on every
-  heartbeat to learn that it was done. Acknowledging the cursor again
-  succeeds, also after the stream has ended and released its session: a
-  repeated acknowledgement from an ended session used to get `409
-  consumer_session_lost`. Should the record no longer be readable, the stream
-  ends with an `error` record of the new code `backfill_completed`.
+  heartbeat to learn that it was done. Acknowledging the cursor again with
+  the stream's session token succeeds, also after the stream has ended and
+  released its session, without renewing it. Such a repeat used to get `409
+  consumer_session_lost`, which a session that another stream has replaced
+  still gets. Should the record no longer be readable, the stream ends with
+  an `error` record of the new code `backfill_completed`.
 
 ## [0.1.0-rc.3] - 2026-10-05
 
