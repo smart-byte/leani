@@ -99,6 +99,15 @@ objects. A range response of another length, and a footer whose metadata
 range exceeds 64 MiB, are refused too. Public hosting can still retry or
 stall; source availability and throughput need dated operational evidence.
 
+Xatu publishes each partition some time after it closes, so the object for
+the newest blocks may not exist yet, and its reads get 404 Not Found. The
+source reports such a chunk as a range it does not cover, as eraE reports a
+range its catalog does not list yet, not as an unavailable source: a job
+moves on to its next configured source, and the node logs
+`xatu has not published this object yet` with the object's location at
+debug level. Other store failures, such as a 5xx response or a timeout,
+still report the source unavailable.
+
 Every immutable chunk encodes its projection kind and exact filters. `open`
 therefore cannot execute a different physical projection from the one that
 was planned. The source plan reports logical reader, table, selected columns,

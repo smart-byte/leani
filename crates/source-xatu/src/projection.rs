@@ -834,7 +834,7 @@ impl ProjectionObjectMetrics {
 /// the store, footer and merged gaps included, is charged before it is
 /// requested to the open's input budget, of which earlier objects used
 /// `input_bytes_used`.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn read_projected(
     store: Arc<dyn ObjectStore>,
     object: &CatalogObject,
@@ -851,10 +851,14 @@ async fn read_projected(
     let started = Instant::now();
     let location = ObjectPath::parse(&object.location)
         .map_err(|error| XatuError::ObjectStore(error.to_string()))?;
-    let head = store
-        .head(&location)
-        .await
-        .map_err(|error| XatuError::ObjectStore(error.to_string()))?;
+    // Xatu answers 404 Not Found for an object it has not published yet.
+    let not_published = || XatuError::NotPublished {
+        location: object.location.clone(),
+    };
+    let head = store.head(&location).await.map_err(|error| match error {
+        object_store::Error::NotFound { .. } => not_published(),
+        error => XatuError::ObjectStore(error.to_string()),
+    })?;
     // Every read is conditioned on this version, so an object rewritten
     // mid-read fails instead of mixing two versions.
     if let Some(detail) = pinning_problem(head.e_tag.as_deref()) {
@@ -870,6 +874,8 @@ async fn read_projected(
             actual,
             limit: budget.max_input_bytes,
         },
+        // The object was removed after its HEAD.
+        None if is_not_found(&error) => not_published(),
         None => XatuError::Parquet(error.to_string()),
     };
     let (reader, reader_metrics) = ObjectStoreReader::new(
@@ -950,6 +956,18 @@ async fn read_projected(
         peak_batch_memory_bytes,
         elapsed_ms: elapsed_ms(started),
     })
+}
+
+/// Whether a Parquet read failed on the object store's 404 Not Found.
+fn is_not_found(error: &ParquetError) -> bool {
+    matches!(
+        error,
+        ParquetError::External(source)
+            if matches!(
+                source.downcast_ref::<object_store::Error>(),
+                Some(object_store::Error::NotFound { .. })
+            )
+    )
 }
 
 fn selected_root_indices(
@@ -2574,13 +2592,15 @@ mod tests {
     };
 
     /// An in-memory store that records how many ranged reads are in flight
-    /// and can replace an object just before its first read below the footer.
+    /// and can replace or remove an object just before its first read below
+    /// the footer.
     #[derive(Debug, Default)]
     struct RecordingStore {
         inner: InMemory,
         in_flight: AtomicUsize,
         peak_in_flight: AtomicUsize,
         replacement: std::sync::Mutex<Option<(ObjectPath, Bytes)>>,
+        removal: std::sync::Mutex<Option<ObjectPath>>,
         /// Report every HEAD's `ETag` as weak, as a compressing CDN may.
         weak_e_tags: bool,
         /// Bytes of every ranged read requested.
@@ -2632,6 +2652,10 @@ mod tests {
                 let replacement = self.replacement.lock().expect("replacement lock").take();
                 if let Some((path, bytes)) = replacement {
                     self.inner.put(&path, bytes.into()).await?;
+                }
+                let removal = self.removal.lock().expect("removal lock").take();
+                if let Some(path) = removal {
+                    self.inner.delete(&path).await?;
                 }
             }
             let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
@@ -2697,9 +2721,7 @@ mod tests {
 
     const EXECUTION_BLOCK_OBJECT: &str = "canonical_execution_block/1000/0.parquet";
 
-    async fn stored_object(store: &RecordingStore, bytes: Bytes) -> CatalogObject {
-        let location = ObjectPath::from(EXECUTION_BLOCK_OBJECT);
-        store.put(&location, bytes.into()).await.expect("put");
+    fn execution_block_object() -> CatalogObject {
         CatalogObject {
             table: XatuTable::CanonicalExecutionBlock,
             partition: "0".to_owned(),
@@ -2707,6 +2729,12 @@ mod tests {
             url: url::Url::parse("https://xatu.invalid/canonical_execution_block/1000/0.parquet")
                 .expect("URL"),
         }
+    }
+
+    async fn stored_object(store: &RecordingStore, bytes: Bytes) -> CatalogObject {
+        let location = ObjectPath::from(EXECUTION_BLOCK_OBJECT);
+        store.put(&location, bytes.into()).await.expect("put");
+        execution_block_object()
     }
 
     fn test_budget(max_in_flight_requests: usize) -> SourceBudget {
@@ -3705,6 +3733,67 @@ mod tests {
         // read with a precondition error that looked transient.
         assert!(error.to_string().contains("weak ETag"), "{error}");
         assert_eq!(store.peak_in_flight.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn an_unpublished_object_is_reported_as_not_published() {
+        let store = Arc::new(RecordingStore::default());
+        let mut projected = 0;
+        let error = read_projected(
+            Arc::clone(&store) as Arc<dyn ObjectStore>,
+            &execution_block_object(),
+            &["block_number"],
+            test_budget(4),
+            8_192,
+            &mut projected,
+            &CancellationToken::new(),
+            rows,
+        )
+        .await
+        .expect_err("an object the store does not hold");
+        // Xatu answers 404 for an object it has not published yet, which
+        // read as an unavailable source.
+        assert_eq!(
+            error,
+            XatuError::NotPublished {
+                location: EXECUTION_BLOCK_OBJECT.to_owned(),
+            }
+        );
+        assert_eq!(store.requested_bytes.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn an_object_removed_mid_read_is_reported_as_not_published() {
+        let store = Arc::new(RecordingStore::default());
+        let object = stored_object(
+            &store,
+            parquet_object(vec![(
+                "block_number",
+                Arc::new(UInt64Array::from_iter_values(0..1_000)) as ArrayRef,
+            )]),
+        )
+        .await;
+        *store.removal.lock().expect("removal lock") =
+            Some(ObjectPath::from(EXECUTION_BLOCK_OBJECT));
+        let mut projected = 0;
+        let error = read_projected(
+            Arc::clone(&store) as Arc<dyn ObjectStore>,
+            &object,
+            &["block_number"],
+            test_budget(4),
+            8_192,
+            &mut projected,
+            &CancellationToken::new(),
+            rows,
+        )
+        .await
+        .expect_err("a range read of a removed object");
+        assert_eq!(
+            error,
+            XatuError::NotPublished {
+                location: EXECUTION_BLOCK_OBJECT.to_owned(),
+            }
+        );
     }
 
     #[tokio::test]
