@@ -55,8 +55,9 @@ record, and documented RPC contracts.
   the stream's session token succeeds, also after the stream has ended and
   released its session, without renewing it. Such a repeat used to get `409
   consumer_session_lost`, which a session that another stream has replaced
-  still gets. Should the record no longer be readable, the stream ends with
-  an `error` record of the new code `backfill_completed`.
+  still gets. This holds on every session-fenced acknowledgement route, the
+  split live stream's included. Should the record no longer be readable, the
+  stream ends with an `error` record of the new code `backfill_completed`.
 
 ## [0.1.0-rc.3] - 2026-10-05
 
