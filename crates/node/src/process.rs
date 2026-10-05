@@ -7438,7 +7438,7 @@ async fn run_network_lanes(
     // anchor, such as a branch reorged away during downtime, are reverted
     // before it is seeded; reconciliation below undoes their coverage.
     live_runtime
-        .seed_finalized_anchor(live_anchor)
+        .seed_finalized_anchor(live_anchor, &[])
         .await
         .context("seed the verified finalized anchor")?;
     // A crash, abort, or lane restart can interrupt a live commit or reorg

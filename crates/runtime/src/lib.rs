@@ -3740,12 +3740,22 @@ impl SharedLiveRuntime {
 
     /// Seed a verified finalized execution anchor before the live lanes open,
     /// first reverting every retained unfinalized canonical block that is not
-    /// proven to be on its chain.
+    /// proven to be on its chain, and finalizing those `ancestry` proves.
+    ///
+    /// `ancestry` is the canonical hashes ending at the anchor, lowest first,
+    /// proven by hash linkage down from it, or empty. The retained blocks it
+    /// proves, and the blocks below them that parent links prove, are the
+    /// anchor's ancestors: they are kept and finalized. The store checks only
+    /// that `ancestry` ends at the anchor's hash and fits below it; it cannot
+    /// check the links between the hashes, so callers pass only hashes proven
+    /// down from the anchor, such as an anchored header proof's: every
+    /// retained block that holds one is kept and finalized.
     ///
     /// After downtime, the retained tip may be on a branch the network
     /// reorged away, below an anchor it does not link to. Promotion goes by
     /// height, so finality would otherwise finalize that branch's coverage.
-    /// Such blocks are handled as a reorg: the store reverts their canonical
+    /// Only blocks that neither parent links nor `ancestry` prove are
+    /// reverted, as a reorg reverts them: the store reverts their canonical
     /// rows, and [`Self::reconcile_startup`], which must run next, undoes
     /// every processor's coverage of them. Returns the reverted blocks,
     /// highest first.
@@ -3754,16 +3764,20 @@ impl SharedLiveRuntime {
     ///
     /// Returns [`RuntimeError::FinalityContradiction`] when a finalized
     /// canonical block holds another hash at the anchor's height, which no
-    /// revert repairs, and store failures.
+    /// revert repairs, and store failures: among them
+    /// [`StoreError::Invariant`], before any write, for an `ancestry` that
+    /// does not end at the anchor's hash or is longer than the chain up to
+    /// it.
     pub async fn seed_finalized_anchor(
         &self,
         anchor: BlockRef,
+        ancestry: &[BlockHash],
     ) -> Result<Vec<BlockRef>, RuntimeError> {
         let chain_id = self.source.descriptor().chain_id;
         let _lane = self.lane_lock.lock().await;
         let reverted = self
             .store
-            .revert_unproven_recent_blocks(chain_id, anchor, &[])
+            .revert_unproven_recent_blocks(chain_id, anchor, ancestry)
             .await?;
         if let (Some(highest), Some(lowest)) = (reverted.first(), reverted.last()) {
             warn!(
@@ -3771,6 +3785,7 @@ impl SharedLiveRuntime {
                 reverted_blocks = reverted.len(),
                 highest_reverted = highest.number.0,
                 lowest_reverted = lowest.number.0,
+                proven_ancestry_blocks = ancestry.len(),
                 "retained unfinalized blocks do not link to the verified finalized anchor; reverting them as a reorg"
             );
         }
@@ -20704,7 +20719,7 @@ mod tests {
         let restarted = scripted_live(&store, &lanes, Vec::new());
         assert_eq!(
             restarted
-                .seed_finalized_anchor(anchor)
+                .seed_finalized_anchor(anchor, &[])
                 .await
                 .expect("seed the anchor")
                 .len(),
@@ -20764,12 +20779,15 @@ mod tests {
         );
         // Seeding such an anchor over it at startup halts too.
         let seeded = scripted_live(&store, &lanes, Vec::new())
-            .seed_finalized_anchor(BlockRef {
-                number: BlockNumber(2),
-                hash: BlockHash::new([0xf2; 32]),
-                parent_hash: BlockHash::ZERO,
-                timestamp: 1,
-            })
+            .seed_finalized_anchor(
+                BlockRef {
+                    number: BlockNumber(2),
+                    hash: BlockHash::new([0xf2; 32]),
+                    parent_hash: BlockHash::ZERO,
+                    timestamp: 1,
+                },
+                &[],
+            )
             .await;
         assert!(
             matches!(seeded, Err(RuntimeError::FinalityContradiction { .. })),
@@ -21072,7 +21090,7 @@ mod tests {
         };
         let restarted = scripted_live(&store, &lanes, Vec::new());
         let reverted = restarted
-            .seed_finalized_anchor(anchor)
+            .seed_finalized_anchor(anchor, &[])
             .await
             .expect("seed the verified finalized anchor");
         assert_eq!(
@@ -21134,6 +21152,340 @@ mod tests {
                     .is_none(),
                 "branch A block {} stayed canonical",
                 frame.block.number.0
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn a_retained_tip_the_finalized_anchor_proves_is_kept_not_undone() {
+        let chain = live_blocks(10);
+        let counter = Arc::new(BlockLocalCounter::named("proven-counter").with_split_delivery());
+        let ledger = Arc::new(OrderedLedgerProcessor::named("proven-ledger"));
+        let lanes: Vec<Arc<dyn Processor>> = vec![counter.clone(), ledger.clone()];
+        let (_directory, store) = store().await;
+        let runtime = |steps| {
+            SharedLiveRuntime::new(
+                store.clone(),
+                Arc::new(ScriptedLiveSource::new(
+                    e2e_descriptor(
+                        "proven-live",
+                        BlockRange::new(BlockNumber(0), BlockNumber(10)).expect("range"),
+                    ),
+                    steps,
+                )),
+                lanes.clone(),
+                SharedLiveRuntimeConfig {
+                    live_gap_notices: [counter.descriptor().instance.to_string()].into(),
+                    ..SharedLiveRuntimeConfig::default()
+                },
+            )
+            .expect("runtime")
+        };
+        // The lanes follow blocks 0..=5, then the node stops for longer than
+        // the finality lag. It restarts at the finalized anchor, block 8, above
+        // the retained tip, with the hashes proven down from it.
+        run_live(&runtime(block_events(&chain[..=5])))
+            .await
+            .expect("run before the downtime");
+        let anchor = BlockRef {
+            parent_hash: BlockHash::ZERO,
+            ..chain[8].block
+        };
+        let ancestry = chain[..=8]
+            .iter()
+            .map(|frame| frame.block.hash)
+            .collect::<Vec<_>>();
+        let restarted = runtime(block_events(&chain[9..]));
+        assert_eq!(
+            restarted
+                .seed_finalized_anchor(anchor, &ancestry)
+                .await
+                .expect("seed the verified finalized anchor"),
+            Vec::new()
+        );
+        let report = restarted
+            .reconcile_startup()
+            .await
+            .expect("startup reconciliation");
+        // The anchor's ancestors stay applied. They are finalized now: no
+        // finality event links them to the anchor across the blocks the store
+        // never retained.
+        for lane in &lanes {
+            let id = lane.descriptor().id.as_str();
+            assert_eq!(report.processors[id].reverted, 0, "{id}");
+            for frame in &chain[..=5] {
+                assert_eq!(
+                    store
+                        .coverage_block_by_hash(lane.descriptor(), frame.block.hash)
+                        .await
+                        .expect("coverage lookup"),
+                    Some(frame.block.number),
+                    "{id}"
+                );
+            }
+        }
+        for frame in &chain[..=5] {
+            assert_eq!(
+                store
+                    .canonical_block(ChainId(1), frame.block.number)
+                    .await
+                    .expect("canonical lookup")
+                    .map(|(_, finality)| finality),
+                Some(Finality::Finalized),
+                "block {}",
+                frame.block.number.0
+            );
+        }
+
+        // The live lane follows on from the anchor. The on-demand lane
+        // announces only the blocks the store never retained, and neither
+        // lane undoes a block.
+        run_live(&restarted).await.expect("run after the downtime");
+        let records = store
+            .resumable_changes(counter.descriptor(), ChainId(1), None, 100)
+            .await
+            .expect("live stream");
+        let applied = |block| ("synthetic.counter", block, ChangeDirection::Apply);
+        assert_eq!(
+            records
+                .iter()
+                .map(|record| (
+                    record.change.kind.as_str(),
+                    record.block.number.0,
+                    record.direction
+                ))
+                .collect::<Vec<_>>(),
+            (0..=5)
+                .map(applied)
+                .chain([("system.live_gap", 9, ChangeDirection::Finalized)])
+                .chain([9, 10].map(applied))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            leani_store_sqlite::decode_live_gap_notice(&records[6].change.payload)
+                .expect("notice payload"),
+            (BlockNumber(6), BlockNumber(8))
+        );
+        assert!(
+            store
+                .resumable_changes(ledger.descriptor(), ChainId(1), None, 100)
+                .await
+                .expect("ledger stream")
+                .iter()
+                .all(|record| record.direction != ChangeDirection::Undo),
+            "the ledger undid a proven block"
+        );
+
+        // Finality through block 10 finalizes the proven coverage by height,
+        // across the hole. The ledger waits at the hole for history.
+        let finality =
+            verified_finality(&store, &lanes, vec![finalized_at(10, chain[10].block.hash)])
+                .run(verified_finality_checkpoint(), CancellationToken::new())
+                .await
+                .expect("finality run");
+        assert_eq!(finality.finalized_through, Some(BlockNumber(10)));
+        let range =
+            |start, end| BlockRange::new(BlockNumber(start), BlockNumber(end)).expect("range");
+        assert_eq!(
+            store
+                .finalized_coverage(counter.descriptor(), range(0, 10))
+                .await
+                .expect("finalized coverage"),
+            [range(0, 5), range(9, 10)]
+        );
+        assert!(
+            finality
+                .deferred_processors
+                .contains_key(ledger.descriptor().id.as_str()),
+            "{finality:?}"
+        );
+        assert!(finality.failed_processors.is_empty(), "{finality:?}");
+    }
+
+    #[tokio::test]
+    async fn a_branch_reorged_away_during_downtime_is_undone_only_above_the_fork() {
+        // The lanes followed branch A to block 5 before the node stopped.
+        let branch_a = live_blocks(5);
+        let counter = Arc::new(BlockLocalCounter::named("fork-counter").with_split_delivery());
+        let ledger = Arc::new(OrderedLedgerProcessor::named("fork-ledger"));
+        let lanes: Vec<Arc<dyn Processor>> = vec![counter.clone(), ledger.clone()];
+        let (_directory, store) = store().await;
+        run_live(&scripted_live(&store, &lanes, block_events(&branch_a)))
+            .await
+            .expect("live run before the downtime");
+        // Meanwhile the network reorged above block 2 and finalized block 8
+        // on branch B. The hashes proven down from it hold branch A's only
+        // through block 2.
+        let anchor = BlockRef {
+            number: BlockNumber(8),
+            hash: BlockHash::new([0xb8; 32]),
+            parent_hash: BlockHash::ZERO,
+            timestamp: 1,
+        };
+        let ancestry = branch_a[..=2]
+            .iter()
+            .map(|frame| frame.block.hash)
+            .chain([0xb3, 0xb4, 0xb5, 0xb6, 0xb7].map(|byte| BlockHash::new([byte; 32])))
+            .chain([anchor.hash])
+            .collect::<Vec<_>>();
+        let restarted = scripted_live(&store, &lanes, Vec::new());
+        let reverted = restarted
+            .seed_finalized_anchor(anchor, &ancestry)
+            .await
+            .expect("seed the verified finalized anchor");
+        assert_eq!(
+            reverted
+                .iter()
+                .map(|block| block.number.0)
+                .collect::<Vec<_>>(),
+            [5, 4, 3]
+        );
+        let report = restarted
+            .reconcile_startup()
+            .await
+            .expect("startup reconciliation");
+        // Every lane undoes branch A above the fork, as a reorg does, and
+        // keeps the common prefix, which is finalized.
+        for lane in &lanes {
+            let id = lane.descriptor().id.as_str();
+            assert_eq!(report.processors[id].reverted, 3, "{id}");
+            for frame in &branch_a {
+                let number = frame.block.number;
+                assert_eq!(
+                    store
+                        .coverage_block_by_hash(lane.descriptor(), frame.block.hash)
+                        .await
+                        .expect("coverage lookup"),
+                    (number.0 <= 2).then_some(number),
+                    "{id} block {}",
+                    number.0
+                );
+            }
+        }
+        for frame in &branch_a {
+            let number = frame.block.number;
+            assert_eq!(
+                store
+                    .canonical_block(ChainId(1), number)
+                    .await
+                    .expect("canonical lookup")
+                    .map(|(block, finality)| (block.hash, finality)),
+                (number.0 <= 2).then_some((frame.block.hash, Finality::Finalized)),
+                "block {}",
+                number.0
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_anchored_overlap_redelivers_proven_blocks_without_applying_them_twice() {
+        // Lanes with automatic history announce no skipped blocks, and they
+        // resume from an overlap below the finalized anchor.
+        let chain = live_blocks(10);
+        let counter = Arc::new(BlockLocalCounter::named("overlap-counter"));
+        let ledger = Arc::new(OrderedLedgerProcessor::named("overlap-ledger"));
+        let lanes: Vec<Arc<dyn Processor>> = vec![counter.clone(), ledger.clone()];
+        let (_directory, store) = store().await;
+        run_live(&scripted_live(&store, &lanes, block_events(&chain[..=5])))
+            .await
+            .expect("run before the downtime");
+        let anchor = BlockRef {
+            parent_hash: BlockHash::ZERO,
+            ..chain[8].block
+        };
+        let ancestry = chain[..=8]
+            .iter()
+            .map(|frame| frame.block.hash)
+            .collect::<Vec<_>>();
+        // What an overlap of 6 blocks ending at the anchor delivers: the
+        // proven blocks 3..=5 again, then the blocks never retained. The
+        // scripted source ignores the start.
+        let restarted = scripted_live(&store, &lanes, block_events(&chain[3..]));
+        assert_eq!(
+            restarted
+                .seed_finalized_anchor(anchor, &ancestry)
+                .await
+                .expect("seed the verified finalized anchor"),
+            Vec::new()
+        );
+        restarted
+            .reconcile_startup()
+            .await
+            .expect("startup reconciliation");
+        let report = run_live(&restarted).await.expect("run after the downtime");
+        let range =
+            |start, end| BlockRange::new(BlockNumber(start), BlockNumber(end)).expect("range");
+        for lane in &lanes {
+            let id = lane.descriptor().id.as_str();
+            assert_eq!(report.processors[id].duplicates, 3, "{id}");
+            assert_eq!(report.processors[id].applied, 5, "{id}");
+            assert_eq!(
+                store
+                    .coverage(lane.descriptor(), range(0, 10))
+                    .await
+                    .expect("coverage"),
+                [range(0, 10)],
+                "{id}"
+            );
+        }
+        assert_eq!(
+            store
+                .processor_cursor(ledger.descriptor())
+                .await
+                .expect("cursor")
+                .map(|cursor| cursor.block_number),
+            Some(BlockNumber(10))
+        );
+        assert_eq!(
+            store
+                .resumable_changes(counter.descriptor(), ChainId(1), None, 100)
+                .await
+                .expect("live stream")
+                .iter()
+                .map(|record| (record.block.number.0, record.direction))
+                .collect::<Vec<_>>(),
+            (0..=10)
+                .map(|block| (block, ChangeDirection::Apply))
+                .collect::<Vec<_>>()
+        );
+        // Block 8's frame gave the seeded anchor row its parent.
+        assert_eq!(
+            store
+                .canonical_block(ChainId(1), BlockNumber(8))
+                .await
+                .expect("canonical lookup")
+                .map(|(block, _)| block.parent_hash),
+            Some(chain[7].block.hash)
+        );
+
+        // Finality through block 10 walks down across the filled anchor row.
+        let finality =
+            verified_finality(&store, &lanes, vec![finalized_at(10, chain[10].block.hash)])
+                .run(verified_finality_checkpoint(), CancellationToken::new())
+                .await
+                .expect("finality run");
+        assert_eq!(finality.finalized_through, Some(BlockNumber(10)));
+        for lane in &lanes {
+            assert_eq!(
+                store
+                    .finalized_through(lane.descriptor())
+                    .await
+                    .expect("finalized coverage"),
+                Some(BlockNumber(10)),
+                "{}",
+                lane.descriptor().id
+            );
+        }
+        for number in 6..=10 {
+            assert_eq!(
+                store
+                    .canonical_block(ChainId(1), BlockNumber(number))
+                    .await
+                    .expect("canonical lookup")
+                    .map(|(_, finality)| finality),
+                Some(Finality::Finalized),
+                "block {number}"
             );
         }
     }
