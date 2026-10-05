@@ -28,6 +28,9 @@ record, and documented RPC contracts.
   `cancelled`, also without its processor instance configured, and `DELETE
   /admin/v1/backfill-subscriptions/{id}?discardUnacknowledged=true` removes it
   with its records.
+- Retrying a failed backfill subscription whose processor instance is no
+  longer configured answers `400 invalid_request` and changes nothing. The
+  refused retry had already re-queued the subscription and cleared its error.
 
 ## [0.1.0-rc.3] - 2026-10-05
 

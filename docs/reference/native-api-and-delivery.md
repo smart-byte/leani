@@ -213,9 +213,10 @@ outage or after upgrading past the fault that failed it. It resumes from its
 committed progress with the same history stream, consumer, credential, and
 acknowledgement, and its error is cleared. Retrying a subscription that is still
 active returns its status unchanged; a completed or cancelled subscription gets
-`409 backfill_conflict`. A failed materialization job is not retried: delete it
-and create it again, which is what `leani backfill` does with a fresh
-idempotency key.
+`409 backfill_conflict`. A failed subscription whose processor instance is no
+longer configured gets `400 invalid_request` and stays as it was. A failed
+materialization job is not retried: delete it and create it again, which is
+what `leani backfill` does with a fresh idempotency key.
 
 A failed or cancelled subscription's stream still delivers every record its job
 committed, then holds its session, with heartbeats, until the consumer has
