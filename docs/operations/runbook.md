@@ -635,12 +635,27 @@ A contradiction with retained *unfinalized* blocks, for example after the lane
 stalled across a reorg of an attested head, heals itself. The node logs
 `verified finality contradicts retained unfinalized blocks; restarting the
 network lanes to revert them` as a warning and restarts the network lanes
-after the supervisor's backoff. The restart reverts every retained unfinalized
-block that does not link to the newly verified finalized anchor and undoes
-processor coverage of it as a reorg, logging `retained unfinalized blocks do
-not link to the verified finalized anchor; reverting them as a reorg`. Those
-blocks are never finalized; the cold backfill and the live lane fetch the
-finalized chain again.
+after the supervisor's backoff. The restart reverts only the retained
+unfinalized blocks that are not on the newly verified finalized chain, and
+undoes processor coverage of them as a reorg, logging `retained unfinalized
+blocks do not link to the verified finalized anchor; reverting them as a
+reorg`. Those blocks are never finalized; the cold backfill and the live lane
+fetch the finalized chain again.
+
+Every start, and every restart of the network lanes, decides which retained
+blocks are on that chain the same way. Where parent links from them do not
+reach the anchor, as after a contradiction or an outage longer than the
+finality lag, the node proves the blocks on the anchor's chain with
+execution headers from its peers that link by parent hash down from the
+anchor, keeps and finalizes them, and logs `proved retained unfinalized
+blocks against the verified finalized anchor` with the blocks kept and
+reverted. When it cannot prove them within 60 seconds, for example without
+execution peers, it logs `could not prove retained unfinalized blocks against
+the verified finalized anchor; reverting them` as a warning; when the anchor
+is more than 8,192 blocks above the first unfinalized block, `retained
+unfinalized blocks are too far below the verified finalized anchor to prove;
+reverting them`. It then reverts every retained unfinalized block that does
+not link to the anchor.
 
 The network lanes halt instead when the contradiction is with *finalized*
 history, which no revert repairs, or when the same unfinalized contradiction

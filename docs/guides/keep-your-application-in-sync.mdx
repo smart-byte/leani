@@ -25,13 +25,14 @@ its operator requests them as `POST /admin/v1/materialization-jobs`.
   verified finalized anchor. It skips the blocks between the processor's
   cursor and that anchor. Automatic history refills them; on-demand history
   leaves them to the application.
-- At startup, retained unfinalized blocks that do not link to the finalized
-  anchor are reverted as a reorg. The application receives their `undo`
-  changes, and the blocks become part of the skipped range. After a restart
-  that follows a long outage, and on reorgs, several blocks can be reverted in
-  a row: one `undo` batch per block, newest first. Rebuild derived data once
-  per such run, as
-  [Undo runs](/docs/concepts/coverage-finality-and-reorgs/#undo-runs)
+- At startup, retained unfinalized blocks are reverted as a reorg only when
+  they are off the finalized chain, or when the node cannot prove that they
+  are on it: without execution peers within a minute, or after an outage
+  longer than about a day. The application receives their `undo` changes, and
+  the blocks become part of the skipped range. After a restart that follows
+  a long outage, and on reorgs, several blocks can be reverted in a row: one
+  `undo` batch per block, newest first. Rebuild derived data once per such
+  run, as [Undo runs](/docs/concepts/coverage-finality-and-reorgs/#undo-runs)
   describes.
 - On the application's side, a crash between its commit and its
   acknowledgement redelivers a batch, and a failed backfill subscription
