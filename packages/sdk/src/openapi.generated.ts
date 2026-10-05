@@ -1894,8 +1894,10 @@ export interface components {
              *     the `system.finality.put` kind carries `{ throughBlock }`, and the
              *     `system.live_gap.put` kind carries
              *     `{ fromBlock, toBlock, reason: "not_filled" }`: blocks the live
-             *     lane skipped, such as after a restart at a later finalized anchor.
-             *     Leani does not fill them; request them as history.
+             *     lane skipped and did not fill, such as after a restart at a later
+             *     finalized anchor. A processor with `live_gap_fill` delivers a
+             *     short range itself as `live_recovery` batches; request what is
+             *     announced as history.
              */
             data: unknown;
             /** @description Present only on reset_required events. */
@@ -3040,7 +3042,7 @@ export interface operations {
              *     `batch` records and, while idle, `heartbeat` records. An `error`
              *     or `reset_required` record ends the stream. A batch of a
              *     `system.live_gap.put` change announces blocks the live lane
-             *     skipped, which no batch delivers.
+             *     skipped and did not fill.
              */
             200: {
                 headers: {

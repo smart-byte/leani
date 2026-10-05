@@ -24,7 +24,12 @@ its operator requests them as `POST /admin/v1/materialization-jobs`.
 - After downtime or a long outage, the live lane resumes at the newest
   verified finalized anchor. It skips the blocks between the processor's
   cursor and that anchor. Automatic history refills them; on-demand history
-  leaves them to the application.
+  leaves them to the application. With `[processors.live_gap_fill]` (see
+  [Live gap fill](/docs/operations/configuration-guide/#live-gap-fill)) the
+  lane fills a short range itself before it applies the next block, and the
+  live stream delivers those blocks as `live_recovery` batches. It announces
+  only what it did not fill: a longer range, a range history cannot serve yet,
+  and the rest of a fill that failed or ran out of time.
 - At startup, retained unfinalized blocks are reverted as a reorg only when
   they are off the finalized chain, or when the node cannot prove that they
   are on it: without execution peers within a minute, or after an outage
@@ -48,7 +53,10 @@ its operator requests them as `POST /admin/v1/materialization-jobs`.
    head is history to request. `streamLive()` exposes each session's `hello`
    but does not reconnect: after a failure the SDK marks retryable, open a
    new session with backoff, which checks coverage again. `subscribe()`
-   reconnects on its own and does not expose the `hello`.
+   reconnects on its own and does not expose the `hello`. Keep this diff when
+   the processor fills live gaps: it still finds the holes below the
+   processor's cursor, which no fill reaches, and the range of a fill that
+   failed.
 2. **Keep announced gaps with the batch.** Before the live lane applies a
    block past its cursor's successor, the live stream delivers a `finalized`
    change of kind `system.live_gap.put` with `data: { fromBlock, toBlock,
@@ -56,7 +64,8 @@ its operator requests them as `POST /admin/v1/materialization-jobs`.
    records until they are acknowledged, it survives reconnects. Store the
    range together with the batch's rows, then acknowledge the batch. In the
    SDK, `isLiveGapChange` narrows the change, and `applyEntityChange` ignores
-   it.
+   it. A processor that fills live gaps announces only what it did not fill,
+   so keep handling notices.
 3. **Request the kept ranges.** `liveGapBackfill(range, request)` from
    `@smart-byte/leani-sdk/backfill` builds the `fill_missing` subscription
    with the idempotency key `live-gap:{consumer}:{fromBlock}-{toBlock}`.
@@ -79,6 +88,11 @@ its operator requests them as `POST /admin/v1/materialization-jobs`.
    and arrive out of block order. Write each block's rows as an upsert keyed
    by block, so that a block arriving twice, or from history after live,
    changes nothing. Deduplicate batches by cursor, not by block: block `n`
-   can come as a notice batch and then as its own batch.
+   can come as a notice batch and then as its own batch. A `live_recovery`
+   batch can repeat a block that a history subscription delivers, such as one
+   the application requested from its coverage diff while the lane filled the
+   same range. A notice can also be followed by `live_recovery` batches for
+   the blocks it announced, when the lane retries a fill after it held the
+   block that follows.
 
 <CodeExample example="keep-in-sync" />

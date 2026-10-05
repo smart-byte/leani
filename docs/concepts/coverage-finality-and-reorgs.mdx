@@ -81,7 +81,10 @@ history refills them. With `history_mode = "on_demand"`, the processor's live
 stream announces them in a `system.live_gap.put` change instead, and the
 application requests them, as
 [Keep your application in sync](/docs/guides/keep-your-application-in-sync/)
-shows.
+shows. A processor with `[processors.live_gap_fill]` fills a short range
+itself, from finalized history before it applies the next block, and announces
+only what it did not fill; see
+[Live gap fill](/docs/operations/configuration-guide/#live-gap-fill).
 
 <Aside type="caution" title="Availability still matters">
   Eligibility does not guarantee that peers retain very old bodies and

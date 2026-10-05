@@ -22,7 +22,9 @@ All wei quantities are lossless integers.
 
 `history_mode = "on_demand"` disables only automatic historical processor
 coverage. It does not disable canonical live processing, normal JSON-RPC, or
-WebSocket head subscriptions.
+WebSocket head subscriptions, and it still allows `[processors.live_gap_fill]`,
+which fills short ranges the live lane skips (see
+[Live gap fill](/docs/operations/configuration-guide/#live-gap-fill)).
 
 The processor emits one atomic block change containing the block and all of
 its blob transactions. Materialized output stores only the block entity,

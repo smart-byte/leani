@@ -66,6 +66,26 @@ record, and documented RPC contracts.
   through `options.signal` or `request.signal`, closes the session and keeps
   the subscription for a rerun. New types: `RunBackfillOptions`,
   `RunBackfillResult`, and `BackfillFailurePolicy`.
+- `[processors.live_gap_fill] max_blocks = N` (1 to 7,200) lets a block-local
+  processor with `history_mode = "on_demand"` fill blocks its live lane skips,
+  such as after a restart at a later finalized anchor, instead of only
+  announcing them. Before the lane applies the block that follows a range of
+  at most N blocks, it recovers the range from the processor's history
+  sources and delivers it on the live stream, in block order, as finalized
+  `apply` changes with `originKind: "live_recovery"`. A longer range, and the
+  rest of a fill that fails or runs longer than five minutes, is announced in
+  a `system.live_gap.put` change as before, whose `reason: "not_filled"` now
+  means that Leani did not fill the range. Every live lane waits while a fill
+  runs. The table requires `[processors.delivery] on_limit = "pause"`, the
+  default: validation refuses `fail` and `expire_and_reset`, because a fill's
+  burst of blocks could fail the lane or reset its consumers where a notice
+  would not. A single filled block larger than the stream's `max_bytes` fails
+  the lane, as an equally large live block would: raise `max_bytes` or remove
+  the table. The table is not part of an instance's identity, and a release
+  without it refuses a configuration that has it, so remove it before rolling
+  back. The node now registers its execution P2P history bridge after it seeds
+  the finalized anchor and before startup reconciliation, so a fill during the
+  startup replay can use it.
 
 ### Changed
 
@@ -78,6 +98,8 @@ record, and documented RPC contracts.
   are public, under the same stable-first rule.
 - Breaking for `leani-api` embedders: `BackfillStatus` has the fields
   `consumer` and `processor_configured`, which a `BackfillControl` sets.
+- Breaking for `leani` embedders: `config::ProcessorConfig` gains
+  `live_gap_fill`; construct it with `live_gap_fill: None`.
 
 ### Fixed
 

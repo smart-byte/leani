@@ -455,7 +455,10 @@ export interface ChangeMetadata {
 export interface LiveGapChangeData {
   fromBlock: number;
   toBlock: number;
-  /** Leani does not fill the range: the processor's history is on demand. */
+  /**
+   * Leani did not fill the range: the processor's history is on demand, and a
+   * `live_gap_fill` limit, if it has one, did not cover or complete it.
+   */
   reason: "not_filled";
 }
 
@@ -472,9 +475,9 @@ export type ChangeEnvelope<T = unknown> = ChangeMetadata & (
 );
 
 /**
- * Whether `change` announces blocks the live lane skipped, as after a
- * restart at a later finalized anchor. Nothing else delivers them: request
- * them as history, for example with `liveGapBackfill` from
+ * Whether `change` announces blocks the live lane skipped and did not fill,
+ * as after a restart at a later finalized anchor. Nothing else delivers them:
+ * request them as history, for example with `liveGapBackfill` from
  * `@smart-byte/leani-sdk/backfill`.
  */
 export function isLiveGapChange<T>(

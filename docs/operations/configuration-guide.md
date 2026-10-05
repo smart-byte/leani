@@ -346,6 +346,112 @@ Publication values are:
 strictly. `doctor` constructs every configured processor, so malformed ABI,
 address, pool, or custom settings fail before source or store I/O.
 
+### Live gap fill
+
+After downtime the live lane resumes at the newest verified finalized anchor,
+so a block-local processor skips the blocks between its cursor and that
+anchor. Automatic history refills them. With `history_mode = "on_demand"` the
+lane only announces them, in a `system.live_gap.put` change, and whoever
+requests history fills them. `[processors.live_gap_fill]` lets the lane fill a
+short range itself:
+
+```toml
+[[processors]]
+id = "blobs-money"
+instance = "blobs-production"
+history_control = "application_subscriptions"
+history_mode = "on_demand"
+# ...
+
+[processors.delivery]
+mode = "until_acknowledged"
+on_limit = "pause"   # the default, and the only value a fill accepts
+# ...
+
+[processors.live_gap_fill]
+max_blocks = 7200    # fill a skipped range of up to about a day; announce longer ones
+```
+
+Before the lane applies the block that follows a skipped range, live or
+replayed at startup, it recovers the range from the processor's history
+sources, 128 blocks at a time, and applies each block, oldest first, as a
+finalized `apply` with `originKind: "live_recovery"`. Then it applies the
+block itself. The live stream stays contiguous and in block order, announces
+nothing for the range, and the processor's coverage holds the filled blocks as
+finalized. The
+[change protocol](/docs/reference/native-api-and-delivery/#42-operations)
+describes what a consumer sees, and
+[Keep your application in sync](/docs/guides/keep-your-application-in-sync/)
+what an application still does.
+
+`max_blocks` is required and takes 1 to 7,200, about a day of slots. The table
+has no other setting. Validation refuses it for a processor that is not
+`history_mode = "on_demand"`, because automatic history refills skipped
+blocks, and for an ordered processor, such as `transaction-stats` or
+`uniswap-latest`, which holds later blocks instead of skipping them. It also
+requires `[processors.delivery] on_limit = "pause"`, which is the default:
+validation refuses `fail` and `expire_and_reset`, because a fill's burst of
+blocks could fail the lane, or reset its consumers, where announcing the
+blocks would not. It is allowed under both `history_control` values.
+
+The lane announces a range as it does without the table, and fetches nothing,
+when the range is longer than `max_blocks`, when no history source serves
+finalized blocks, or when the range is not finalized yet. The limit is all or
+nothing, because blocks filled at the top of a range could not link to the
+cursor. A fill that starts stops at the first block it cannot fill, and the
+lane announces from there. That happens when history fails or serves too few
+blocks; when a block is not finalized, does not link by parent hash to the one
+before it, is not the canonical block at its height, or lacks material the
+processor requires; and when the time limit passes. The limit is five
+minutes, is fixed, and is checked before each request, so a fill can run for
+five minutes plus one request. A filled block is as trusted as the same block
+delivered by a `fill_missing` subscription, which uses the same sources and
+verification policy, and the filled blocks link by parent hash from the
+cursor's block, through the range, to the block that follows.
+
+The sources are the processor's history sources, in the order a history
+request tries them: retained raw history (`[raw_history]`, when enabled), the
+configured `[[sources.history]]` by `priority`, and last the execution P2P
+bridge, within `sources.live.history_fallback_blocks`. The bridge is available
+to a fill during the replay that follows a restart, too. Bandwidth depends on
+the source. A dataset source such as Xatu serves only the material the processor
+needs, about a kilobyte per block for `blobs-money`. Execution P2P transfers
+whole bodies and receipts, on the order of a megabyte per block on Mainnet
+today, so a few thousand blocks are gigabytes. Configure a dataset source for
+a processor that sets the table. Requests run one after another and do not
+coalesce, so a fill is slower than a pipelined backfill subscription over the
+same range. `sources.live.kind = "disabled"` leaves no live lane, so the table
+does nothing, and `require_retained_input = true` limits a fill to retained
+raw history, which usually does not hold the range: the lane announces it.
+
+The live lane is shared. While a fill runs, it takes no other block: every
+processor's live lane waits, the head that JSON-RPC reports stops advancing,
+and WebSocket subscriptions publish nothing new. That happens after the live
+lane was not running for a while, and `max_blocks` and the time limit bound
+it. Several processors with the table fill one after another, and each
+fetches the blocks again.
+
+Filled blocks are ordinary delivery records under the processor's delivery
+policy, and count against `delivery.max_bytes`. A lane paused at its delivery
+limit, or at a storage limit while storage stays above its low-water mark,
+does not fetch history again on every live block, and a lane that reaches one
+of those limits mid-fill stops there. It holds the block after the range and
+announces nothing. Once consumers acknowledge and pruning resumes it, or
+storage has room, it continues the fill. The unfilled rest is recomputed from
+the processor's cursor on resume, so a history commit that an application's
+subscription lands above the cursor meanwhile can shorten what the lane fills
+or announces. That is rare, and idempotent writes and the application's
+coverage diff cover it. A single filled block larger than the stream's
+`max_bytes` fails the lane, as an equally large live block would: raise
+`max_bytes` or remove the table. A fill can also make a hold at the shared
+`[budgets] pending_delta_bytes` more likely. The
+[runbook](/docs/operations/runbook/#crash-or-interrupted-commit) lists the log
+lines and the recovery.
+
+The table is not part of the instance's identity, so add, change, or remove it
+in place, as with the lifecycle policies below. A release that predates the
+table refuses a configuration that has it, so remove it before rolling back.
+
 ## Orthogonal lifecycle policies
 
 Every processor has six independent lifecycle policies. The pre-launch
