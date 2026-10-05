@@ -21304,6 +21304,153 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn a_proof_from_above_a_finalized_head_keeps_and_finalizes_the_retained_tail() {
+        // The shape a node leaves: its first start seeds the finalized anchor,
+        // block 2, without a parent, and its on-demand lane follows on from it
+        // to block 5. After an outage longer than the finality lag it restarts
+        // at the finalized anchor, block 8, with the hashes peers prove from
+        // the first unfinalized block, 3, up to it.
+        let chain = live_blocks(10);
+        let counter = Arc::new(BlockLocalCounter::named("tail-counter").with_split_delivery());
+        let lanes: Vec<Arc<dyn Processor>> = vec![counter.clone()];
+        let (_directory, store) = store().await;
+        let runtime = |steps| {
+            SharedLiveRuntime::new(
+                store.clone(),
+                Arc::new(ScriptedLiveSource::new(
+                    e2e_descriptor(
+                        "tail-live",
+                        BlockRange::new(BlockNumber(0), BlockNumber(10)).expect("range"),
+                    ),
+                    steps,
+                )),
+                lanes.clone(),
+                SharedLiveRuntimeConfig {
+                    live_gap_notices: [counter.descriptor().instance.to_string()].into(),
+                    ..SharedLiveRuntimeConfig::default()
+                },
+            )
+            .expect("runtime")
+        };
+        let finalized = BlockRef {
+            parent_hash: BlockHash::ZERO,
+            ..chain[2].block
+        };
+        let first = runtime(block_events(&chain[3..=5]));
+        assert_eq!(
+            first
+                .seed_finalized_anchor(finalized, &[])
+                .await
+                .expect("seed the first finalized anchor"),
+            Vec::new()
+        );
+        run_live(&first).await.expect("run before the downtime");
+        let anchor = BlockRef {
+            parent_hash: BlockHash::ZERO,
+            ..chain[8].block
+        };
+        let ancestry = chain[3..=8]
+            .iter()
+            .map(|frame| frame.block.hash)
+            .collect::<Vec<_>>();
+        let restarted = runtime(block_events(&chain[9..]));
+        assert_eq!(
+            restarted
+                .seed_finalized_anchor(anchor, &ancestry)
+                .await
+                .expect("seed the verified finalized anchor"),
+            Vec::new()
+        );
+        // The old finalized anchor stays as seeded. The tail above it is kept
+        // and finalized, and only the blocks the store never retained lie
+        // between it and the new anchor.
+        let mut canonical = Vec::new();
+        for number in 2..=8 {
+            canonical.push(
+                store
+                    .canonical_block(ChainId(1), BlockNumber(number))
+                    .await
+                    .expect("canonical lookup"),
+            );
+        }
+        assert_eq!(
+            canonical,
+            [
+                Some((finalized, Finality::Finalized)),
+                Some((chain[3].block, Finality::Finalized)),
+                Some((chain[4].block, Finality::Finalized)),
+                Some((chain[5].block, Finality::Finalized)),
+                None,
+                None,
+                Some((anchor, Finality::Finalized)),
+            ]
+        );
+        let report = restarted
+            .reconcile_startup()
+            .await
+            .expect("startup reconciliation");
+        assert_eq!(
+            report.processors[counter.descriptor().id.as_str()].reverted,
+            0
+        );
+        let range =
+            |start, end| BlockRange::new(BlockNumber(start), BlockNumber(end)).expect("range");
+        assert_eq!(
+            store
+                .coverage(counter.descriptor(), range(0, 10))
+                .await
+                .expect("coverage"),
+            [range(3, 5)]
+        );
+
+        // The lane announces only the blocks between the old tip and the new
+        // anchor, and undoes nothing.
+        run_live(&restarted).await.expect("run after the downtime");
+        let records = store
+            .resumable_changes(counter.descriptor(), ChainId(1), None, 100)
+            .await
+            .expect("live stream");
+        let applied = |block| ("synthetic.counter", block, ChangeDirection::Apply);
+        assert_eq!(
+            records
+                .iter()
+                .map(|record| (
+                    record.change.kind.as_str(),
+                    record.block.number.0,
+                    record.direction
+                ))
+                .collect::<Vec<_>>(),
+            (3..=5)
+                .map(applied)
+                .chain([("system.live_gap", 9, ChangeDirection::Finalized)])
+                .chain([9, 10].map(applied))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            leani_store_sqlite::decode_live_gap_notice(&records[3].change.payload)
+                .expect("notice payload"),
+            (BlockNumber(6), BlockNumber(8))
+        );
+
+        // Finality through block 10 finalizes the kept coverage by height,
+        // across the hole.
+        let finality =
+            verified_finality(&store, &lanes, vec![finalized_at(10, chain[10].block.hash)])
+                .run(verified_finality_checkpoint(), CancellationToken::new())
+                .await
+                .expect("finality run");
+        assert_eq!(finality.finalized_through, Some(BlockNumber(10)));
+        assert_eq!(
+            store
+                .finalized_coverage(counter.descriptor(), range(0, 10))
+                .await
+                .expect("finalized coverage"),
+            [range(3, 5), range(9, 10)]
+        );
+    }
+
+    #[tokio::test]
     async fn a_branch_reorged_away_during_downtime_is_undone_only_above_the_fork() {
         // The lanes followed branch A to block 5 before the node stopped.
         let branch_a = live_blocks(5);
