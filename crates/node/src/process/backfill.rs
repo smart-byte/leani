@@ -414,7 +414,7 @@ async fn standalone(
         // any processor coverage of them.
         let chain_id = ChainId(config.chain.chain_id);
         store
-            .revert_unproven_recent_blocks(chain_id, bridge.anchor.block)
+            .revert_unproven_recent_blocks(chain_id, bridge.anchor.block, &[])
             .await?;
         store
             .store_canonical_anchor(
