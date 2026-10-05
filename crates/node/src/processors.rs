@@ -1012,6 +1012,36 @@ mod tests {
     }
 
     #[test]
+    fn rollup_txs_contract_example_loads() {
+        #[derive(Deserialize)]
+        struct ContractExample {
+            processors: Vec<ProcessorConfig>,
+        }
+
+        let repository = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let path = repository.join("docs/reference/processor-contracts.md");
+        let contracts = std::fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+        let section = contracts
+            .split("\n## ")
+            .find(|section| section.split_whitespace().next() == Some("rollup-txs"))
+            .expect("a `## rollup-txs` section");
+        let example = section
+            .split_once("```toml\n")
+            .and_then(|(_, rest)| rest.split_once("\n```"))
+            .map(|(example, _)| example)
+            .expect("a TOML example in the rollup-txs section");
+        let example: ContractExample =
+            toml::from_str(example).unwrap_or_else(|error| panic!("rollup-txs example: {error}"));
+        let [configured] = example.processors.as_slice() else {
+            panic!("the rollup-txs example configures one processor");
+        };
+        ProcessorRegistry::standard()
+            .instantiate(configured, 1)
+            .unwrap_or_else(|error| panic!("rollup-txs example: {error}"));
+    }
+
+    #[test]
     fn standard_registry_instantiates_every_operating_mode_profile() {
         let repository = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let registry = ProcessorRegistry::standard();

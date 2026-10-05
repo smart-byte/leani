@@ -230,6 +230,15 @@ mode = "until_acknowledged"
 [[processors.delivery.consumers]]
 id = "app"
 required = true
+lease_ttl = "5m"
+
+[processors.checkpoint]
+mode = "automatic"
+keep = 3
+
+[processors.undo]
+mode = "unfinalized"
+safety_blocks = 256
 
 [[processors.settings.rules]]
 rollup = "base"
@@ -240,7 +249,7 @@ selector = "0x82ecf2f6"
 
 Xatu serves receipt material only for type-3 transactions, so it cannot plan
 this processor's history: a job moves past it to the next configured source
-(eraE, then execution-P2P fallback).
+(for example eraE, then the execution-P2P fallback).
 
 ## erc20-balances 1.1.0
 

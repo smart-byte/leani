@@ -34,6 +34,7 @@ else.
 | `uniswap-observations` | Append-only Uniswap V2/V3 pool observations. `leani init uniswap-v3 ETH/USDC` configures it. |
 | `uniswap-latest` | Latest state per Uniswap pool, with typed query routes. |
 | `blobs-money` | Blob blocks and type-3 transactions: fees, burn, capacity. |
+| `rollup-txs` | Rollups' non-blob L1 transactions (calldata batches, state and output proposals, proofs) matched by configured rules, with gas, execution burn, and tips. Blob transactions stay with `blobs-money`. |
 
 Each processor's settings, output collections, and ordering rules are in the
 "Processor contracts" reference: `$LEANI_SOURCE/docs/reference/processor-contracts.md`,
