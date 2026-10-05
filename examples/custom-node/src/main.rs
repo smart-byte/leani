@@ -461,6 +461,7 @@ mod tests {
                 safety_blocks: 256,
             },
             coverage: leani::config::ProcessorCoverageConfig::default(),
+            live_gap_fill: None,
             settings: [(
                 "change_kind".to_owned(),
                 toml::Value::String("example.block_summary".to_owned()),

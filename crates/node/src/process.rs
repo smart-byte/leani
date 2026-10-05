@@ -7230,6 +7230,29 @@ async fn with_cold_backfills(
 /// wait for.
 const COLD_BACKFILL_STOP_WARNING: Duration = Duration::from_secs(10);
 
+/// What the live lane does with the blocks each processor skips, by
+/// instance: the instances it announces them for, and the most blocks it
+/// first fills from history for those with `live_gap_fill`. Automatic
+/// history refills what the live lane skips; on-demand history leaves it to
+/// whoever requests history, so tell them.
+fn live_gap_policies(
+    config: &Config,
+    processors: &[Arc<dyn leani_processor_api::Processor>],
+) -> (std::collections::BTreeSet<String>, BTreeMap<String, u64>) {
+    let mut notices = std::collections::BTreeSet::new();
+    let mut fills = BTreeMap::new();
+    for (configured, processor) in config.processors.iter().zip(processors) {
+        let instance = processor.descriptor().instance.to_string();
+        if let Some(fill) = configured.live_gap_fill {
+            fills.insert(instance.clone(), fill.max_blocks);
+        }
+        if configured.history_mode == crate::config::ProcessorHistoryMode::OnDemand {
+            notices.insert(instance);
+        }
+    }
+    (notices, fills)
+}
+
 #[allow(clippy::too_many_lines)]
 async fn run_network_lanes(
     config: &Config,
@@ -7407,6 +7430,7 @@ async fn run_network_lanes(
         .to_owned(),
     };
 
+    let (live_gap_notices, live_gap_fill) = live_gap_policies(config, &processors);
     let mut live_runtime = SharedLiveRuntime::new(
         store.clone(),
         live_source.clone(),
@@ -7417,17 +7441,8 @@ async fn run_network_lanes(
             sink_ids: Vec::new(),
             committed_events: Some(committed_events),
             recent_hard_bytes: config.budgets.recent_raw_hard_bytes,
-            // Automatic history refills what the live lane skips; on-demand
-            // history leaves it to whoever requests history, so tell them.
-            live_gap_notices: config
-                .processors
-                .iter()
-                .zip(&processors)
-                .filter(|(configured, _)| {
-                    configured.history_mode == crate::config::ProcessorHistoryMode::OnDemand
-                })
-                .map(|(_, processor)| processor.descriptor().instance.to_string())
-                .collect(),
+            live_gap_notices,
+            live_gap_fill,
             ..SharedLiveRuntimeConfig::default()
         },
     )?;
@@ -7502,6 +7517,14 @@ async fn run_network_lanes(
             "proved retained unfinalized blocks against the verified finalized anchor"
         );
     }
+    // History may fetch over P2P from here on, also to fill what a lane
+    // skipped during the replay below: the proof no longer needs the peers,
+    // and the store accepted the anchor the bridge proves blocks against.
+    if let Some(control) = &backfill_control {
+        control
+            .update_p2p_bridge(live_source.as_ref().clone(), history_anchor.clone())
+            .await;
+    }
     // A crash, abort, or lane restart can interrupt a live commit or reorg
     // between its separately committed steps; repair every processor against
     // the canonical chain before any lane or handoff check runs.
@@ -7525,11 +7548,6 @@ async fn run_network_lanes(
     let overlap_from = selected
         .execution_block_number
         .saturating_sub(overlap_blocks.saturating_sub(1));
-    if let Some(control) = &backfill_control {
-        control
-            .update_p2p_bridge(live_source.as_ref().clone(), history_anchor.clone())
-            .await;
-    }
     let p2p_bridge_updates = {
         let control = backfill_control.clone();
         let source = live_source.as_ref().clone();
@@ -10009,6 +10027,50 @@ mod tests {
         })
         .await;
         assert_eq!(stopped, None);
+    }
+
+    #[test]
+    fn live_gap_policies_announce_on_demand_lanes_and_fill_only_configured_ones() {
+        use crate::config::{LiveGapFillConfig, ProcessorHistoryMode};
+
+        let mut config: Config =
+            toml::from_str(crate::config::VALID_CONFIG_TOML).expect("configuration fixture");
+        let template = config.processors[0].clone();
+        config.processors = [
+            ("automatic", ProcessorHistoryMode::Automatic, None),
+            ("announced", ProcessorHistoryMode::OnDemand, None),
+            ("filled", ProcessorHistoryMode::OnDemand, Some(64)),
+        ]
+        .into_iter()
+        .map(|(instance, history_mode, max_blocks)| ProcessorConfig {
+            instance: instance.to_owned(),
+            history_mode,
+            live_gap_fill: max_blocks.map(|max_blocks| LiveGapFillConfig { max_blocks }),
+            ..template.clone()
+        })
+        .collect();
+        let processors = config
+            .processors
+            .iter()
+            .zip(1_u8..)
+            .map(|(configured, settings)| {
+                Arc::new(
+                    BlockLocalCounter::default().with_instance(
+                        leani_processor_api::ProcessorInstanceId::new(&configured.instance)
+                            .expect("instance"),
+                        leani_primitives::BlockHash::new([settings; 32]),
+                    ),
+                ) as Arc<dyn Processor>
+            })
+            .collect::<Vec<_>>();
+
+        let (notices, fills) = live_gap_policies(&config, &processors);
+
+        assert_eq!(
+            notices,
+            std::collections::BTreeSet::from(["announced", "filled"].map(str::to_owned))
+        );
+        assert_eq!(fills, BTreeMap::from([("filled".to_owned(), 64)]));
     }
 
     #[tokio::test]

@@ -718,6 +718,10 @@ pub struct ProcessorConfig {
     pub undo: UndoPolicyConfig,
     #[serde(default)]
     pub coverage: ProcessorCoverageConfig,
+    /// Absent, the live lane of on-demand history only announces the blocks
+    /// it skips.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub live_gap_fill: Option<LiveGapFillConfig>,
     #[serde(default)]
     pub settings: toml::Table,
 }
@@ -736,6 +740,19 @@ impl Default for ProcessorCoverageConfig {
         }
     }
 }
+
+/// Fill the blocks a block-local live lane skips, such as after a restart at
+/// a later finalized anchor, from history before it applies the next block.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct LiveGapFillConfig {
+    /// Largest skipped range the lane fills; it announces a longer one.
+    pub max_blocks: u64,
+}
+
+/// Largest `live_gap_fill.max_blocks`, about a day of slots: a longer outage
+/// is application history.
+pub const MAX_LIVE_GAP_FILL_BLOCKS: u64 = 7_200;
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -1785,6 +1802,26 @@ impl Config {
                     format!("processors[{index}].history_mode"),
                     "require_retained_input requires on_demand history",
                 ));
+            }
+            if let Some(fill) = processor.live_gap_fill {
+                if !(1..=MAX_LIVE_GAP_FILL_BLOCKS).contains(&fill.max_blocks) {
+                    errors.push(ValidationError::new(
+                        format!("processors[{index}].live_gap_fill.max_blocks"),
+                        format!("must be in 1..={MAX_LIVE_GAP_FILL_BLOCKS}"),
+                    ));
+                }
+                if processor.history_mode != ProcessorHistoryMode::OnDemand {
+                    errors.push(ValidationError::new(
+                        format!("processors[{index}].live_gap_fill"),
+                        "requires on_demand history; automatic history refills skipped blocks",
+                    ));
+                }
+                if processor.delivery.on_limit != DeliveryLimitAction::Pause {
+                    errors.push(ValidationError::new(
+                        format!("processors[{index}].live_gap_fill"),
+                        "requires delivery.on_limit = \"pause\"; a fill's burst of blocks can reach the delivery limit, which would fail the lane under \"fail\" and reset its consumers under \"expire_and_reset\", where announcing the blocks would not",
+                    ));
+                }
             }
             if processor.coverage.verification_segment_blocks == 0 {
                 errors.push(ValidationError::new(
@@ -3467,6 +3504,136 @@ verification_segment_blocks = 8192"#,
         config
             .validate()
             .expect("retained-only on-demand processor configuration");
+    }
+
+    #[test]
+    fn live_gap_fill_requires_on_demand_history() {
+        let mut automatic = config();
+        automatic.processors[0].live_gap_fill = Some(LiveGapFillConfig { max_blocks: 64 });
+        assert_eq!(error_fields(&automatic), ["processors[0].live_gap_fill"]);
+        assert_eq!(
+            automatic.validation_errors()[0].message,
+            "requires on_demand history; automatic history refills skipped blocks"
+        );
+
+        // Wherever the live lane announces the blocks it skips: node-owned
+        // on-demand history, and application subscriptions.
+        let mut node_owned = automatic;
+        node_owned.processors[0].history_mode = ProcessorHistoryMode::OnDemand;
+        assert!(error_fields(&node_owned).is_empty());
+        let subscriptions = VALID_CONFIG_TOML.replace(
+            BASE_PROCESSOR_CONTRACT,
+            r#"instance = "fixture-externalized"
+version = "0.1.0"
+history_control = "application_subscriptions"
+history_mode = "on_demand"
+start_block = 1
+publish = "finalized_only"
+
+[processors.state]
+mode = "durable"
+
+[processors.output]
+mode = "none"
+
+[processors.delivery]
+mode = "until_acknowledged"
+
+[[processors.delivery.consumers]]
+id = "fixture-api"
+required = true
+lease_ttl = "5m"
+
+[processors.checkpoint]
+mode = "automatic"
+keep = 3
+
+[processors.undo]
+mode = "none"
+safety_blocks = 0
+
+[processors.coverage]
+verification_segment_blocks = 8192
+
+[processors.live_gap_fill]
+max_blocks = 64"#,
+        );
+        let subscriptions: Config =
+            toml::from_str(&subscriptions).expect("subscription config parses");
+        assert_eq!(
+            subscriptions.processors[0]
+                .live_gap_fill
+                .map(|fill| fill.max_blocks),
+            Some(64)
+        );
+        assert!(error_fields(&subscriptions).is_empty());
+    }
+
+    #[test]
+    fn live_gap_fill_limits_its_block_count() {
+        let mut config = config();
+        assert!(config.processors[0].live_gap_fill.is_none());
+        config.processors[0].history_mode = ProcessorHistoryMode::OnDemand;
+        for max_blocks in [1, 7_200] {
+            config.processors[0].live_gap_fill = Some(LiveGapFillConfig { max_blocks });
+            assert!(error_fields(&config).is_empty(), "{max_blocks} was refused");
+        }
+        for max_blocks in [0, 7_201] {
+            config.processors[0].live_gap_fill = Some(LiveGapFillConfig { max_blocks });
+            let errors = config.validation_errors();
+            assert_eq!(
+                error_fields(&config),
+                ["processors[0].live_gap_fill.max_blocks"],
+                "{max_blocks} was accepted"
+            );
+            assert_eq!(errors[0].message, "must be in 1..=7200");
+        }
+
+        // No silent default cost, and the time limit is not a setting.
+        for (table, refusal) in [
+            ("", "missing field `max_blocks`"),
+            (
+                "max_blocks = 64\ntime_limit = \"5m\"",
+                "unknown field `time_limit`",
+            ),
+        ] {
+            let configured = VALID_CONFIG_TOML.replace(
+                "\n[rpc]",
+                &format!("\n[processors.live_gap_fill]\n{table}\n\n[rpc]"),
+            );
+            let error = toml::from_str::<Config>(&configured).expect_err("table refused");
+            assert!(error.to_string().contains(refusal), "{error}");
+        }
+    }
+
+    #[test]
+    fn live_gap_fill_requires_delivery_to_pause_at_its_limit() {
+        // A fill delivers a burst of blocks, so it can reach the delivery
+        // limit where announcing them would not.
+        let mut config = config();
+        config.processors[0].history_mode = ProcessorHistoryMode::OnDemand;
+        config.processors[0].live_gap_fill = Some(LiveGapFillConfig { max_blocks: 64 });
+        for on_limit in [
+            DeliveryLimitAction::Fail,
+            DeliveryLimitAction::ExpireAndReset,
+        ] {
+            config.processors[0].delivery.on_limit = on_limit;
+            assert_eq!(
+                error_fields(&config),
+                ["processors[0].live_gap_fill"],
+                "{on_limit:?}"
+            );
+            let message = &config.validation_errors()[0].message;
+            for named in [
+                "delivery.on_limit = \"pause\"",
+                "fail the lane",
+                "reset its consumers",
+            ] {
+                assert!(message.contains(named), "{message}");
+            }
+        }
+        config.processors[0].delivery.on_limit = DeliveryLimitAction::Pause;
+        assert!(error_fields(&config).is_empty());
     }
 
     #[test]
