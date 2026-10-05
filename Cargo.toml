@@ -11,6 +11,7 @@ members = [
   "crates/processor-blobs",
   "crates/processor-erc20",
   "crates/processor-evm-events",
+  "crates/processor-rollup-txs",
   "crates/processor-transaction-stats",
   "crates/processor-uniswap",
   "crates/rpc",

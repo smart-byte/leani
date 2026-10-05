@@ -31,6 +31,7 @@ leani-processor-block-summary = { path = "../processor-block-summary" }
 leani-processor-blobs = { path = "../processor-blobs" }
 leani-processor-erc20 = { path = "../processor-erc20" }
 leani-processor-evm-events = { path = "../processor-evm-events" }
+leani-processor-rollup-txs = { path = "../processor-rollup-txs" }
 leani-processor-transaction-stats = { path = "../processor-transaction-stats" }
 leani-processor-uniswap = { path = "../processor-uniswap" }
 leani-rpc = { path = "../rpc" }
