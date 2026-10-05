@@ -231,7 +231,10 @@ across live and history streams. `maximum_history_retained_bytes` is a lower,
 non-borrowable history ceiling so stalled backfills cannot consume live-lane
 headroom. The two values must satisfy `history <= retained`. Reaching a shared
 bound backpressures only the committing lane; ACK, pruning, queries,
-networking, and unrelated processors remain available.
+networking, and unrelated processors remain available. The backfill
+subscriptions of a replaced processor instance keep counting against the
+history ceiling until they are deleted (see the runbook's
+[Processor rebuild or rollback](/docs/operations/runbook/#processor-rebuild-or-rollback)).
 
 ## Sources and finality
 
@@ -323,8 +326,11 @@ of them under an `instance` its store holds (`processor instance … conflicts
 with its stored descriptor`), before it upgrades an older store, so it never
 mutates an existing cursor namespace. Give the changed processor a new
 `instance` ID: it indexes from its `start_block` beside the old instance,
-whose rows stay in the store. Lifecycle policies, such as retention and delivery
-limits, are not part of the identity and can change in place.
+whose rows stay in the store. Settle the old instance's backfill subscriptions
+before and after the switch, as the runbook's
+[Processor rebuild or rollback](/docs/operations/runbook/#processor-rebuild-or-rollback)
+describes. Lifecycle policies, such as retention and delivery limits, are not
+part of the identity and can change in place.
 
 Publication values are:
 

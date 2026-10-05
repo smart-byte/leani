@@ -106,3 +106,24 @@ unpublished block emits nothing downstream.
 Use processor status for exact intervals and `/v1/network/status` for the
 independent live/finality lane state. Readiness can be healthy while an older
 backfill gap is still being filled.
+
+### Undo runs
+
+A reorg undoes its reverted blocks newest first, and so does the revert at a
+restart after a long outage. A consumer's live stream delivers each reverted
+block's `undo` changes as a batch of its own, so several reverted blocks
+arrive as a run of `undo` batches, newest first, before any replacement
+block's `apply` batch. An application that keeps derived aggregates, such as
+leaderboards or rolling totals, beside its per-block state can rebuild them
+once per run instead of once per batch:
+
+1. Apply each `undo` to the per-block state immediately, record in the same
+   transaction that the aggregates need a rebuild, and acknowledge the batch
+   as usual.
+2. Rebuild the aggregates, and clear that record, when the run ends: before
+   the first batch that is not an undo, at a heartbeat, or when the session
+   closes.
+
+A run of N reverted blocks then costs one rebuild, not N. Because the record
+commits with the per-block state, an application that restarts in the middle
+of a run still finds the rebuild due.

@@ -1670,8 +1670,11 @@ export interface components {
              * @description Whether the node configures the processor instance `processor`
              *     now: exactly that instance, not another instance of its kind.
              *     Without it, the subscription's stream and acknowledgement routes
-             *     refuse the subscription; cancel it and delete it with
-             *     `discardUnacknowledged=true`.
+             *     refuse the subscription. That can be temporary, as when a
+             *     restart's configuration leaves the instance out by mistake. If
+             *     the instance will not return, cancel the subscription and delete
+             *     it with `discardUnacknowledged=true`, which discards its
+             *     unacknowledged records.
              */
             processorConfigured: boolean;
             /**
