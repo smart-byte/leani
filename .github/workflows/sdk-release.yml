@@ -164,4 +164,14 @@ jobs:
             *-*) dist_tag=next ;;
             *) dist_tag=latest ;;
           esac
+          # Until the first stable release, prereleases take `latest`, so an
+          # unversioned install gets the newest one. A stable `latest` never
+          # returns to a prerelease. Choosing the tag here needs no dist-tag
+          # permission on the trusted publisher.
+          if [ "$dist_tag" = next ]; then
+            latest=$(npm view @smart-byte/leani-sdk dist-tags.latest)
+            case "$latest" in
+              *-*) dist_tag=latest ;;
+            esac
+          fi
           npm publish ./*.tgz --access public --provenance --tag "$dist_tag"
