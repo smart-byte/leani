@@ -239,6 +239,12 @@ struct OnDemandP2pBridge {
 /// reason that may pass.
 const DURABLE_JOB_RECHECK: Duration = Duration::from_secs(5);
 
+/// How long a job waits for the P2P history bridge at most. Its first anchor
+/// normally arrives seconds after a start. Past this, the job starts as it
+/// did before the wait existed, so a recent one fails visibly instead of
+/// waiting silently for an anchor that may never come.
+const P2P_BRIDGE_WAIT_LIMIT: Duration = Duration::from_secs(120);
+
 /// How long deleting a historical job waits for its task to end.
 const HISTORICAL_JOB_STOP_WAIT: Duration = Duration::from_secs(10);
 
@@ -262,11 +268,13 @@ struct NativeBackfillControl {
     jobs_changed: Arc<tokio::sync::Notify>,
     p2p_bridge: Arc<tokio::sync::RwLock<Option<OnDemandP2pBridge>>>,
     /// Whether the node's network lanes publish finalized anchors to
-    /// `p2p_bridge`. A job the bridge would serve then waits for it.
+    /// `p2p_bridge`. A job the bridge would serve then waits for it, up to
+    /// [`P2P_BRIDGE_WAIT_LIMIT`].
     p2p_bridge_expected: bool,
-    /// The jobs logged as waiting for the P2P history bridge, so that each
-    /// is logged once.
-    bridge_waits_logged: Arc<std::sync::Mutex<std::collections::BTreeSet<String>>>,
+    /// When each waiting job's wait for the P2P history bridge began, or
+    /// `None` once it ran out and the job may start without the bridge. Each
+    /// wait, and each that runs out, is logged once.
+    bridge_waits: Arc<std::sync::Mutex<BTreeMap<String, Option<tokio::time::Instant>>>>,
     raw_history_store: Option<leani_store_history::HistoryStore>,
     material_coordinator: Option<leani_runtime::HistoricalMaterialCoordinator>,
     pipeline_budget: leani_runtime::HistoricalPipelineBudget,
@@ -278,8 +286,9 @@ enum JobResume {
     Done,
     /// It waits for storage headroom, which no job change signals.
     WaitingForStorage,
-    /// It waits for the P2P history bridge's finalized anchor to cover it,
-    /// which no job change signals either.
+    /// It waits, up to [`P2P_BRIDGE_WAIT_LIMIT`], for the P2P history
+    /// bridge's finalized anchor to cover it, which no job change signals
+    /// either.
     WaitingForBridge,
     /// Every backfill slot is taken; a task that ends wakes the scheduler.
     AtCapacity,
@@ -340,7 +349,7 @@ impl NativeBackfillControl {
             jobs_changed: Arc::new(tokio::sync::Notify::new()),
             p2p_bridge: Arc::new(tokio::sync::RwLock::new(None)),
             p2p_bridge_expected: false,
-            bridge_waits_logged: Arc::default(),
+            bridge_waits: Arc::default(),
             raw_history_store,
             material_coordinator,
             pipeline_budget,
@@ -348,8 +357,9 @@ impl NativeBackfillControl {
     }
 
     /// Hold the jobs the on-demand P2P history bridge would serve until its
-    /// finalized anchor covers them, for a node whose network lanes publish
-    /// that anchor. Set before the durable job scheduler's first pass.
+    /// finalized anchor covers them, up to [`P2P_BRIDGE_WAIT_LIMIT`], for a
+    /// node whose network lanes publish that anchor. Set before the durable
+    /// job scheduler's first pass.
     fn with_p2p_bridge_expected(mut self, expected: bool) -> Self {
         self.p2p_bridge_expected = expected;
         self
@@ -407,7 +417,8 @@ impl NativeBackfillControl {
     }
 
     /// Whether `job` must wait before its sources are fixed, as
-    /// [`bridge_wait`] decides. Its first wait is logged.
+    /// [`bridge_wait`] decides, up to [`P2P_BRIDGE_WAIT_LIMIT`] after its
+    /// first wait. That wait is logged, and so is its running out.
     async fn waits_for_p2p_bridge(
         &self,
         job: &leani_runtime::BackfillJob,
@@ -444,22 +455,47 @@ impl NativeBackfillControl {
                 .history_fallback_start(reference, configured.start_block),
             job.request.range.end().0,
         ) else {
+            // The bridge covers the job, or would not serve it.
+            self.bridge_waits
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&job.id);
             return Ok(false);
         };
-        if self
-            .bridge_waits_logged
+        let now = tokio::time::Instant::now();
+        let mut waits = self
+            .bridge_waits
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(job.id.clone())
-        {
-            info!(
-                job_id = %job.id,
-                through_block,
-                bridge_anchor,
-                "historical job waits for the P2P history bridge"
-            );
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let waited = match waits.get(&job.id).copied() {
+            None => {
+                waits.insert(job.id.clone(), Some(now));
+                drop(waits);
+                info!(
+                    job_id = %job.id,
+                    through_block,
+                    bridge_anchor,
+                    "historical job waits for the P2P history bridge"
+                );
+                return Ok(true);
+            }
+            // Its wait ran out: it starts without the bridge.
+            Some(None) => return Ok(false),
+            Some(Some(since)) => now.duration_since(since),
+        };
+        if waited < P2P_BRIDGE_WAIT_LIMIT {
+            return Ok(true);
         }
-        Ok(true)
+        waits.insert(job.id.clone(), None);
+        drop(waits);
+        warn!(
+            job_id = %job.id,
+            through_block,
+            bridge_anchor,
+            ?waited,
+            "historical job starts without the P2P history bridge"
+        );
+        Ok(false)
     }
 
     fn processor(
@@ -2473,6 +2509,10 @@ impl leani_api::BackfillControl for NativeBackfillControl {
                 }
                 _ => leani_api::BackfillControlError::Internal(error.to_string()),
             })?;
+        self.bridge_waits
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(id);
         Ok(leani_api::HistoricalWorkDeletion {
             id: id.to_owned(),
             owner: status.owner,
@@ -11830,6 +11870,72 @@ markets = ["ETH/USDT"]
             "a job in the window did not wait"
         );
         wait_for_subscription_state(&control, &old.id, leani_api::BackfillState::Draining).await;
+    }
+
+    /// Move tokio's clock ahead by `duration` at once, and let it run on in
+    /// real time. The store's SQLite connections answer on threads of their
+    /// own, so a clock left paused runs ahead into their pool timeouts.
+    async fn skip_ahead(duration: Duration) {
+        tokio::time::pause();
+        tokio::time::advance(duration).await;
+        tokio::time::resume();
+    }
+
+    #[tokio::test]
+    async fn a_job_held_for_the_p2p_bridge_starts_without_it_after_the_bound() {
+        // Review of task 5: a node whose network lanes never publish an
+        // anchor, such as one without verified finality, held every job in
+        // the window for good, while its status said nothing.
+        use leani_api::BackfillControl as _;
+
+        let logs = CapturedLogs::default();
+        let _logs = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_ansi(false)
+                .with_writer({
+                    let logs = logs.clone();
+                    move || logs.clone()
+                })
+                .finish(),
+        );
+        let directory = tempfile::tempdir().expect("temporary directory");
+        // Its mapping takes a while, so the job still runs at the next pass.
+        let processor: Arc<dyn Processor> =
+            Arc::new(SlowCounter(BlockLocalCounter::default().with_instance(
+                leani_processor_api::ProcessorInstanceId::new("bounded-counter").expect("instance"),
+                leani_primitives::BlockHash::new([0x0f; 32]),
+            )));
+        let instance = processor.descriptor().instance.to_string();
+        let control = bridge_expecting_control(directory.path(), processor, 4, None).await;
+        let created = control
+            .create_subscription(subscription(&instance, "bounded", 1, 4))
+            .await
+            .expect("subscription");
+
+        // No anchor comes. Short of the bound, the job still waits.
+        let margin = Duration::from_secs(5);
+        skip_ahead(P2P_BRIDGE_WAIT_LIMIT.saturating_sub(margin)).await;
+        assert!(
+            control.resume_durable_jobs().await.expect("scheduler pass"),
+            "the job stopped waiting before the bound"
+        );
+        // At the bound, it starts without the bridge, as before the wait.
+        skip_ahead(margin).await;
+        assert!(
+            !control.resume_durable_jobs().await.expect("scheduler pass"),
+            "the job still waits past the bound"
+        );
+        // While it runs, a pass neither holds it again nor warns again.
+        assert!(!control.resume_durable_jobs().await.expect("scheduler pass"));
+        wait_for_subscription_state(&control, &created.id, leani_api::BackfillState::Draining)
+            .await;
+        let logged = logs.text();
+        for message in [
+            "historical job waits for the P2P history bridge",
+            "historical job starts without the P2P history bridge",
+        ] {
+            assert_eq!(logged.matches(message).count(), 1, "{message}:\n{logged}");
+        }
     }
 
     #[tokio::test]

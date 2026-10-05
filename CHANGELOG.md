@@ -65,12 +65,16 @@ record, and documented RPC contracts.
   it starts with, so such a job ran without the P2P fallback, used up its
   attempts on Xatu and eraE, which cannot serve recent blocks yet, and failed,
   while a retry moments later completed. A job whose range ends in the P2P
-  fallback window now stays `queued` until the bridge's finalized anchor
+  fallback window now does not start until the bridge's finalized anchor
   reaches its last block, typically seconds after the start, and the node
-  logs `historical job waits for the P2P history bridge` once for it. Without
-  `sources.live.history_fallback_blocks`, the window starts at the processor's
-  start block, so every job waits for the first anchor; a job that ends below
-  a configured window starts at once, as before.
+  logs `historical job waits for the P2P history bridge` once for it. The
+  wait lasts two minutes at most: without an anchor by then, for example
+  while verified finality is unavailable, the node warns
+  `historical job starts without the P2P history bridge` and starts the job
+  as before, so a recent range fails visibly instead of waiting for good.
+  Without `sources.live.history_fallback_blocks`, the window starts at the
+  processor's start block, so every job waits for the first anchor; a job
+  that ends below a configured window starts at once, as before.
 
 ## [0.1.0-rc.3] - 2026-10-05
 
