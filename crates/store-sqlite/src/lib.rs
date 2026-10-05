@@ -12880,7 +12880,7 @@ impl SqliteStore {
             .bind(stream_id)
             .execute(&mut *transaction)
             .await?;
-        let low_water = descriptor.lifecycle.delivery.max_bytes.saturating_mul(9) / 10;
+        let low_water = delivery_resume_mark(descriptor.lifecycle.delivery.max_bytes);
         let resumed = i64_u64(live_bytes, "delivery live bytes")? <= low_water
             && sqlx::query(
                 "UPDATE processor_runtime_state
@@ -14162,6 +14162,53 @@ impl SqliteStore {
                     .maximum_pending_bytes
                     .saturating_mul(9)
                     / 10)
+    }
+
+    /// Whether delivery admission would refuse an apply that adds
+    /// `incoming_bytes` of records to this processor's live stream now.
+    ///
+    /// It decides as an apply does, on the same bytes: a failed lane, an
+    /// item larger than the stream's limit, a paused lane above its resume
+    /// mark, the stream's limit, and the node-wide delivery and physical
+    /// budgets. It writes nothing, so a paused lane that an apply would
+    /// resume stays paused. A processor without delivery is never refused.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the processor is not registered, a stored value
+    /// is invalid, or a read or file inspection fails.
+    pub async fn refuses_live_delivery(
+        &self,
+        descriptor: &ProcessorDescriptor,
+        incoming_bytes: u64,
+    ) -> Result<bool, StoreError> {
+        let limit = descriptor.lifecycle.delivery.max_bytes;
+        if descriptor.lifecycle.delivery.mode == DeliveryPolicyMode::None {
+            return Ok(false);
+        }
+        let state: String =
+            sqlx::query_scalar("SELECT state FROM processor_runtime_state WHERE instance = ?")
+                .bind(processor_instance(descriptor))
+                .fetch_one(&self.inner.pool)
+                .await?;
+        let state = ProcessorRunState::parse(&state)?;
+        if state == ProcessorRunState::Failed || incoming_bytes > limit {
+            return Ok(true);
+        }
+        let current =
+            stream_delivery_bytes(&self.inner.pool, &default_delivery_stream_id(descriptor))
+                .await?;
+        if state == ProcessorRunState::Paused && current > delivery_resume_mark(limit) {
+            return Ok(true);
+        }
+        let projected = current
+            .checked_add(incoming_bytes)
+            .ok_or(StoreError::Numeric("projected delivery bytes"))?;
+        if projected > limit {
+            return Ok(true);
+        }
+        let retained = node_delivery_bytes(&self.inner).await?;
+        Ok(node_delivery_budget_failure(&self.inner, &retained, incoming_bytes, 0)?.is_some())
     }
 }
 
@@ -17552,21 +17599,7 @@ async fn enforce_delivery_capacity(
     if state == ProcessorRunState::Failed {
         return Err(StoreError::ProcessorFailed(instance.to_owned()));
     }
-    let current: i64 =
-        sqlx::query_scalar("SELECT live_bytes FROM delivery_streams WHERE stream_id = ?")
-            .bind(stream_id)
-            .fetch_one(pool)
-            .await?;
-    let current = i64_u64(current, "delivery stream bytes")?;
-    let deferred_stream: i64 = sqlx::query_scalar(
-        "SELECT COALESCE(SUM(bytes), 0) FROM deferred_changes WHERE stream_id = ?",
-    )
-    .bind(stream_id)
-    .fetch_one(pool)
-    .await?;
-    let current = current
-        .checked_add(i64_u64(deferred_stream, "deferred delivery bytes")?)
-        .ok_or(StoreError::Numeric("retained delivery bytes"))?;
+    let current = stream_delivery_bytes(pool, stream_id).await?;
     let limit = backfill_limits
         .as_ref()
         .map_or(descriptor.lifecycle.delivery.max_bytes, |limits| {
@@ -17593,7 +17626,7 @@ async fn enforce_delivery_capacity(
             maximum_work_blocks: indivisible_block_limit,
         });
     }
-    let low_water = limit.saturating_mul(9) / 10;
+    let low_water = delivery_resume_mark(limit);
     if state == ProcessorRunState::Paused {
         if current > low_water {
             return Err(StoreError::ProcessorPaused {
@@ -17607,42 +17640,7 @@ async fn enforce_delivery_capacity(
     let projected = current
         .checked_add(incoming_bytes)
         .ok_or(StoreError::Numeric("projected delivery bytes"))?;
-    let (total_retained, history_retained): (i64, i64) = sqlx::query_as(
-        "SELECT COALESCE(SUM(live_bytes), 0),
-                COALESCE(SUM(CASE WHEN stream_kind = 'backfill' THEN live_bytes ELSE 0 END), 0)
-         FROM delivery_streams",
-    )
-    .fetch_one(pool)
-    .await?;
-    let total_retained = i64_u64(total_retained, "total retained delivery bytes")?;
-    let deferred_total: i64 =
-        sqlx::query_scalar("SELECT COALESCE(SUM(bytes), 0) FROM deferred_changes")
-            .fetch_one(pool)
-            .await?;
-    let total_retained = total_retained
-        .checked_add(i64_u64(deferred_total, "deferred delivery bytes")?)
-        .ok_or(StoreError::Numeric("total retained delivery bytes"))?;
-    let history_retained = i64_u64(history_retained, "history retained delivery bytes")?;
-    let projected_total_retained =
-        total_retained
-            .checked_add(incoming_bytes)
-            .ok_or(StoreError::Numeric(
-                "projected total retained delivery bytes",
-            ))?;
-    let projected_history_retained = history_retained
-        .checked_add(if stream_kind == DeliveryStreamKind::Backfill {
-            incoming_bytes
-        } else {
-            0
-        })
-        .ok_or(StoreError::Numeric(
-            "projected history retained delivery bytes",
-        ))?;
-    let wal_path = PathBuf::from(format!("{}-wal", inner.path.to_string_lossy()));
-    let physical_bytes = file_bytes(&inner.path)?.saturating_add(file_bytes(&wal_path)?);
-    let projected_physical_bytes = physical_bytes
-        .checked_add(incoming_bytes)
-        .ok_or(StoreError::Numeric("projected physical store bytes"))?;
+    let retained = node_delivery_bytes(inner).await?;
     let blocks_within_limit =
         backfill_limits
             .as_ref()
@@ -17662,28 +17660,16 @@ async fn enforce_delivery_capacity(
             current <= byte_low_water && processed.saturating_sub(*acknowledged) <= block_low_water
         },
     );
-    let budget_failure =
-        if projected_history_retained > inner.delivery_budget.maximum_history_retained_bytes {
-            Some((
-                "node_history_retained",
-                inner.delivery_budget.maximum_history_retained_bytes,
-                projected_history_retained,
-            ))
-        } else if projected_total_retained > inner.delivery_budget.maximum_retained_bytes {
-            Some((
-                "node_total_retained",
-                inner.delivery_budget.maximum_retained_bytes,
-                projected_total_retained,
-            ))
-        } else if projected_physical_bytes > inner.storage_budget.maximum_physical_bytes {
-            Some((
-                "node_physical",
-                inner.storage_budget.maximum_physical_bytes,
-                projected_physical_bytes,
-            ))
+    let budget_failure = node_delivery_budget_failure(
+        inner,
+        &retained,
+        incoming_bytes,
+        if stream_kind == DeliveryStreamKind::Backfill {
+            incoming_bytes
         } else {
-            None
-        };
+            0
+        },
+    )?;
     if projected <= limit && blocks_within_limit && below_resume_water && budget_failure.is_none() {
         return Ok(());
     }
@@ -17715,7 +17701,122 @@ async fn enforce_delivery_capacity(
         scope,
         limit_bytes: effective_limit,
         projected_bytes: effective_projected,
+        incoming_bytes,
     })
+}
+
+/// The bytes a delivery stream holds against its limit: its records and the
+/// changes it defers until finality.
+async fn stream_delivery_bytes(pool: &SqlitePool, stream_id: &str) -> Result<u64, StoreError> {
+    let current: i64 =
+        sqlx::query_scalar("SELECT live_bytes FROM delivery_streams WHERE stream_id = ?")
+            .bind(stream_id)
+            .fetch_one(pool)
+            .await?;
+    let current = i64_u64(current, "delivery stream bytes")?;
+    let deferred_stream: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(SUM(bytes), 0) FROM deferred_changes WHERE stream_id = ?",
+    )
+    .bind(stream_id)
+    .fetch_one(pool)
+    .await?;
+    current
+        .checked_add(i64_u64(deferred_stream, "deferred delivery bytes")?)
+        .ok_or(StoreError::Numeric("retained delivery bytes"))
+}
+
+/// The stream bytes at or below which an apply resumes a lane paused at its
+/// delivery limit: 90 % of the limit.
+const fn delivery_resume_mark(limit_bytes: u64) -> u64 {
+    limit_bytes.saturating_mul(9) / 10
+}
+
+/// The bytes the node-wide delivery admission budgets weigh before an apply.
+struct NodeDeliveryBytes {
+    /// Every stream's records and deferred changes.
+    total_retained: u64,
+    /// Every history stream's records.
+    history_retained: u64,
+    /// The database file and its WAL.
+    physical: u64,
+}
+
+async fn node_delivery_bytes(inner: &StoreInner) -> Result<NodeDeliveryBytes, StoreError> {
+    let pool = &inner.pool;
+    let (total_retained, history_retained): (i64, i64) = sqlx::query_as(
+        "SELECT COALESCE(SUM(live_bytes), 0),
+                COALESCE(SUM(CASE WHEN stream_kind = 'backfill' THEN live_bytes ELSE 0 END), 0)
+         FROM delivery_streams",
+    )
+    .fetch_one(pool)
+    .await?;
+    let total_retained = i64_u64(total_retained, "total retained delivery bytes")?;
+    let deferred_total: i64 =
+        sqlx::query_scalar("SELECT COALESCE(SUM(bytes), 0) FROM deferred_changes")
+            .fetch_one(pool)
+            .await?;
+    let total_retained = total_retained
+        .checked_add(i64_u64(deferred_total, "deferred delivery bytes")?)
+        .ok_or(StoreError::Numeric("total retained delivery bytes"))?;
+    let history_retained = i64_u64(history_retained, "history retained delivery bytes")?;
+    let wal_path = PathBuf::from(format!("{}-wal", inner.path.to_string_lossy()));
+    Ok(NodeDeliveryBytes {
+        total_retained,
+        history_retained,
+        physical: file_bytes(&inner.path)?.saturating_add(file_bytes(&wal_path)?),
+    })
+}
+
+/// The node-wide budget an apply would exceed that adds `incoming_bytes` to
+/// delivery, `history_bytes` of them on a history stream, to `retained`: the
+/// budget's scope, its limit, and the bytes the apply would project.
+fn node_delivery_budget_failure(
+    inner: &StoreInner,
+    retained: &NodeDeliveryBytes,
+    incoming_bytes: u64,
+    history_bytes: u64,
+) -> Result<Option<(&'static str, u64, u64)>, StoreError> {
+    let projected_total_retained =
+        retained
+            .total_retained
+            .checked_add(incoming_bytes)
+            .ok_or(StoreError::Numeric(
+                "projected total retained delivery bytes",
+            ))?;
+    let projected_history_retained =
+        retained
+            .history_retained
+            .checked_add(history_bytes)
+            .ok_or(StoreError::Numeric(
+                "projected history retained delivery bytes",
+            ))?;
+    let projected_physical_bytes = retained
+        .physical
+        .checked_add(incoming_bytes)
+        .ok_or(StoreError::Numeric("projected physical store bytes"))?;
+    Ok(
+        if projected_history_retained > inner.delivery_budget.maximum_history_retained_bytes {
+            Some((
+                "node_history_retained",
+                inner.delivery_budget.maximum_history_retained_bytes,
+                projected_history_retained,
+            ))
+        } else if projected_total_retained > inner.delivery_budget.maximum_retained_bytes {
+            Some((
+                "node_total_retained",
+                inner.delivery_budget.maximum_retained_bytes,
+                projected_total_retained,
+            ))
+        } else if projected_physical_bytes > inner.storage_budget.maximum_physical_bytes {
+            Some((
+                "node_physical",
+                inner.storage_budget.maximum_physical_bytes,
+                projected_physical_bytes,
+            ))
+        } else {
+            None
+        },
+    )
 }
 
 fn valid_consumer_id(value: &str) -> bool {
@@ -18998,6 +19099,8 @@ pub enum StoreError {
         scope: &'static str,
         limit_bytes: u64,
         projected_bytes: u64,
+        /// The delivery bytes the refused apply would have added.
+        incoming_bytes: u64,
     },
     #[error(
         "physical store limit: projected SQLite, WAL, and artifact-segment footprint {projected_bytes} bytes exceeds {limit_bytes}"
@@ -24604,6 +24707,68 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[tokio::test]
+    async fn live_delivery_refusal_decides_as_an_apply_without_writing() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = SqliteStore::open(
+            StoreConfig::new(directory.path().join("node.sqlite")).with_delivery_budget(
+                DeliveryStorageBudget {
+                    maximum_retained_bytes: 20,
+                    maximum_history_retained_bytes: 20,
+                },
+            ),
+        )
+        .await
+        .expect("open bounded store");
+        let first = FixtureProcessor::new();
+        let mut second = FixtureProcessor::new();
+        second.descriptor.instance =
+            ProcessorInstanceId::new("fixture-second").expect("second instance");
+        let block = frame(1, BlockHash::ZERO);
+        let first_delta = first.map(&block).await.expect("map first");
+        store
+            .apply(&first, cursor(&first, &block, 1), &first_delta, &[])
+            .await
+            .expect("first stream fits the node budget");
+        let second_delta = second.map(&block).await.expect("map second");
+        let Err(StoreError::DeliveryLimit {
+            scope: "node_total_retained",
+            incoming_bytes,
+            ..
+        }) = store
+            .apply(&second, cursor(&second, &block, 1), &second_delta, &[])
+            .await
+        else {
+            panic!("the node budget admitted the second stream");
+        };
+
+        // The refused block still does not fit the node budget, though the
+        // lane's own stream is empty and an apply that adds nothing would
+        // pass.
+        assert!(
+            store
+                .refuses_live_delivery(&second.descriptor, incoming_bytes)
+                .await
+                .expect("admission")
+        );
+        assert!(
+            !store
+                .refuses_live_delivery(&second.descriptor, 0)
+                .await
+                .expect("admission")
+        );
+        // Asking writes nothing: the lane the refusal paused stays paused,
+        // where an apply that adds nothing would resume it.
+        assert_eq!(
+            store
+                .processor_runtime_state(&second.descriptor)
+                .await
+                .expect("state")
+                .state,
+            ProcessorRunState::Paused
+        );
     }
 
     #[tokio::test]
