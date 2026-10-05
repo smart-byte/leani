@@ -657,6 +657,14 @@ pub struct BackfillStatus {
     pub id: String,
     pub owner: HistoricalWorkOwner,
     pub processor: String,
+    /// Whether this node configures the processor instance `processor` now:
+    /// exactly that instance, not another instance of its kind. Without it,
+    /// the subscription's stream and acknowledgement routes refuse the
+    /// subscription.
+    pub processor_configured: bool,
+    /// The subscription's required consumer; `None` for a materialization
+    /// job.
+    pub consumer: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub delivery_stream_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -8869,6 +8877,8 @@ mod tests {
                 id: format!("api:{}", request.idempotency_key),
                 owner,
                 processor: request.processor,
+                processor_configured: true,
+                consumer: request.consumer.map(|consumer| consumer.id),
                 delivery_stream_id: None,
                 publication_revision: None,
                 from_block,
@@ -9098,6 +9108,8 @@ mod tests {
                 id: "failed-subscription".to_owned(),
                 owner: HistoricalWorkOwner::Subscription,
                 processor: "blobs-production".to_owned(),
+                processor_configured: true,
+                consumer: Some("blobs-api".to_owned()),
                 delivery_stream_id: Some("stream".to_owned()),
                 publication_revision: Some("0".to_owned()),
                 from_block: 1,
@@ -10144,6 +10156,7 @@ mod tests {
         assert_eq!(body["requestedBlocks"], 101);
         assert_eq!(body["mode"], "recompute");
         assert_eq!(body["state"], "queued");
+        assert_eq!(body["processorConfigured"], true);
     }
 
     #[tokio::test]
@@ -10189,6 +10202,8 @@ mod tests {
         .expect("JSON");
         assert_eq!(body["owner"], "materialization");
         assert!(body.get("deliveryStreamId").is_none());
+        // Unlike the stream, the consumer is never left out: it is null.
+        assert_eq!(body.get("consumer"), Some(&Value::Null));
     }
 
     #[tokio::test]
@@ -10307,6 +10322,8 @@ mod tests {
                 id: subscription_id.to_owned(),
                 owner: HistoricalWorkOwner::Subscription,
                 processor: processor.descriptor().instance.to_string(),
+                processor_configured: true,
+                consumer: Some("destination".to_owned()),
                 delivery_stream_id: Some(stream_id.clone()),
                 publication_revision: Some("7".to_owned()),
                 from_block: 1,
@@ -10582,6 +10599,8 @@ mod tests {
                 id: subscription_id.to_owned(),
                 owner: HistoricalWorkOwner::Subscription,
                 processor: processor.descriptor().instance.to_string(),
+                processor_configured: true,
+                consumer: Some("destination".to_owned()),
                 delivery_stream_id: Some(stream_id.clone()),
                 publication_revision: Some("0".to_owned()),
                 from_block: 1,
@@ -11224,6 +11243,8 @@ mod tests {
                 id: subscription_id.to_owned(),
                 owner: HistoricalWorkOwner::Subscription,
                 processor: processor.descriptor().instance.to_string(),
+                processor_configured: true,
+                consumer: Some("destination".to_owned()),
                 delivery_stream_id: Some(stream_id),
                 publication_revision: Some("0".to_owned()),
                 from_block: 1,
@@ -11755,6 +11776,8 @@ mod tests {
                 id: "repair-1".to_owned(),
                 owner: HistoricalWorkOwner::Subscription,
                 processor: split.descriptor().instance.to_string(),
+                processor_configured: true,
+                consumer: Some("destination".to_owned()),
                 delivery_stream_id: Some(history_stream.clone()),
                 publication_revision: Some("0".to_owned()),
                 from_block: 1,
@@ -13160,6 +13183,8 @@ mod tests {
                 id: subscription_id.to_owned(),
                 owner: HistoricalWorkOwner::Subscription,
                 processor: processor.descriptor().instance.to_string(),
+                processor_configured: true,
+                consumer: Some("destination".to_owned()),
                 delivery_stream_id: Some(history_stream),
                 publication_revision: Some("0".to_owned()),
                 from_block: 1,
@@ -14480,6 +14505,8 @@ mod tests {
             id: "history-1".to_owned(),
             owner: HistoricalWorkOwner::Materialization,
             processor: "blobs-production".to_owned(),
+            processor_configured: true,
+            consumer: None,
             delivery_stream_id: None,
             publication_revision: None,
             from_block: 100,
@@ -14730,6 +14757,8 @@ mod tests {
                 id: "first".to_owned(),
                 owner: HistoricalWorkOwner::Subscription,
                 processor: "blobs-production".to_owned(),
+                processor_configured: true,
+                consumer: Some("blobs-api".to_owned()),
                 delivery_stream_id: None,
                 publication_revision: None,
                 from_block: 15,
@@ -14754,6 +14783,8 @@ mod tests {
                 id: "second".to_owned(),
                 owner: HistoricalWorkOwner::Subscription,
                 processor: "blobs-production".to_owned(),
+                processor_configured: true,
+                consumer: Some("blobs-api".to_owned()),
                 delivery_stream_id: None,
                 publication_revision: None,
                 from_block: 26,

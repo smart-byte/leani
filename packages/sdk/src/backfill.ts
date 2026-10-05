@@ -45,6 +45,14 @@ export interface BackfillStatus {
   id: string;
   owner: "subscription";
   processor: string;
+  /**
+   * Whether the node configures the processor instance `processor` now.
+   * Without it, the stream and acknowledgement routes refuse the
+   * subscription: cancel it and delete it with `discardUnacknowledged: true`.
+   */
+  processorConfigured: boolean;
+  /** The required consumer; tell your subscriptions apart by it, not by `id`. */
+  consumer: string | null;
   deliveryStreamId?: string;
   publicationRevision?: string;
   fromBlock: number;

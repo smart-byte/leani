@@ -1655,6 +1655,64 @@ export interface components {
             createdAtUnixMs: components["schemas"]["DecimalQuantity"];
             updatedAtUnixMs: components["schemas"]["DecimalQuantity"];
         };
+        /** @description A backfill subscription or materialization job. */
+        BackfillStatus: {
+            /**
+             * @description Opaque; do not parse it. An application finds its own
+             *     subscriptions by `consumer`.
+             */
+            id: string;
+            /** @enum {string} */
+            owner: "subscription" | "materialization";
+            /** @description The processor instance that runs the job. */
+            processor: string;
+            /**
+             * @description Whether the node configures the processor instance `processor`
+             *     now: exactly that instance, not another instance of its kind.
+             *     Without it, the subscription's stream and acknowledgement routes
+             *     refuse the subscription; cancel it and delete it with
+             *     `discardUnacknowledged=true`.
+             */
+            processorConfigured: boolean;
+            /**
+             * @description The subscription's required consumer, which reads and
+             *     acknowledges its history stream; null for a materialization job.
+             */
+            consumer: string | null;
+            /** @description The subscription's history stream. */
+            deliveryStreamId?: string;
+            publicationRevision?: components["schemas"]["DecimalQuantity"];
+            fromBlock: components["schemas"]["SafeInteger"];
+            toBlock: components["schemas"]["SafeInteger"];
+            ranges: components["schemas"]["RequestedRange"][];
+            requestedBlocks: components["schemas"]["SafeInteger"];
+            processedBlocks: components["schemas"]["SafeInteger"];
+            remainingBlocks: components["schemas"]["SafeInteger"];
+            capturedFinalizedTarget?: components["schemas"]["SafeInteger"];
+            /** @enum {string} */
+            mode: "fill_missing" | "recompute";
+            /** @description The subscription's effective history batch limits. */
+            batching?: {
+                targetEncodedBytes: components["schemas"]["SafeInteger"];
+                maximumEncodedBytes: components["schemas"]["SafeInteger"];
+                maximumEvents: components["schemas"]["SafeInteger"];
+                maximumProcessedBlocks: components["schemas"]["SafeInteger"];
+                maximumDelayMs: components["schemas"]["SafeInteger"];
+                maximumBufferedBatches: components["schemas"]["SafeInteger"];
+                maximumBufferedBytes: components["schemas"]["SafeInteger"];
+                /** @enum {string} */
+                compression: "none" | "gzip";
+            };
+            /** @enum {string} */
+            state: "waiting_for_consumer" | "queued" | "running" | "backpressured" | "storage_backpressured" | "draining" | "complete_reclaimable" | "completed" | "failed" | "cancelled";
+            attempts: components["schemas"]["SafeInteger"];
+            updatedAtUnixMs: components["schemas"]["SafeInteger"];
+            /** @description The completed job's source report; null until it completes. */
+            report: {
+                [key: string]: unknown;
+            } | null;
+            lastError: string | null;
+        };
         RecoveryCheckpoint: {
             checkpointId: components["schemas"]["SafeInteger"];
             processorInstance: string;
@@ -3379,7 +3437,11 @@ export interface operations {
                 headers: {
                     [name: string]: unknown;
                 };
-                content?: never;
+                content: {
+                    "application/json": {
+                        data: components["schemas"]["BackfillStatus"][];
+                    };
+                };
             };
             default: components["responses"]["Error"];
         };
@@ -3398,7 +3460,9 @@ export interface operations {
                 headers: {
                     [name: string]: unknown;
                 };
-                content?: never;
+                content: {
+                    "application/json": components["schemas"]["BackfillStatus"];
+                };
             };
             default: components["responses"]["Error"];
         };
@@ -3419,7 +3483,9 @@ export interface operations {
                 headers: {
                     [name: string]: unknown;
                 };
-                content?: never;
+                content: {
+                    "application/json": components["schemas"]["BackfillStatus"];
+                };
             };
             default: components["responses"]["Error"];
         };
@@ -3482,7 +3548,9 @@ export interface operations {
                 headers: {
                     [name: string]: unknown;
                 };
-                content?: never;
+                content: {
+                    "application/json": components["schemas"]["BackfillStatus"];
+                };
             };
             default: components["responses"]["Error"];
         };
@@ -3510,7 +3578,9 @@ export interface operations {
                 headers: {
                     [name: string]: unknown;
                 };
-                content?: never;
+                content: {
+                    "application/json": components["schemas"]["BackfillStatus"];
+                };
             };
             default: components["responses"]["Error"];
         };
@@ -3529,7 +3599,11 @@ export interface operations {
                 headers: {
                     [name: string]: unknown;
                 };
-                content?: never;
+                content: {
+                    "application/json": {
+                        data: components["schemas"]["BackfillStatus"][];
+                    };
+                };
             };
             default: components["responses"]["Error"];
         };
@@ -3548,7 +3622,9 @@ export interface operations {
                 headers: {
                     [name: string]: unknown;
                 };
-                content?: never;
+                content: {
+                    "application/json": components["schemas"]["BackfillStatus"];
+                };
             };
             default: components["responses"]["Error"];
         };
@@ -3569,7 +3645,9 @@ export interface operations {
                 headers: {
                     [name: string]: unknown;
                 };
-                content?: never;
+                content: {
+                    "application/json": components["schemas"]["BackfillStatus"];
+                };
             };
             default: components["responses"]["Error"];
         };
@@ -3625,7 +3703,9 @@ export interface operations {
                 headers: {
                     [name: string]: unknown;
                 };
-                content?: never;
+                content: {
+                    "application/json": components["schemas"]["BackfillStatus"];
+                };
             };
             default: components["responses"]["Error"];
         };

@@ -1074,7 +1074,13 @@ pub(crate) async fn run_real_source(
         runtime = runtime.with_material_coordinator(coordinator.clone());
     }
     let control = BenchmarkBackfillControl {
-        status: real_source_backfill_status(&job, processor.descriptor(), range, &limits),
+        status: real_source_backfill_status(
+            &job,
+            processor.descriptor(),
+            consumer_id,
+            range,
+            &limits,
+        ),
     };
     let server =
         BenchmarkApiServer::start_with(store.clone(), processor.clone(), control, limits.api)
@@ -1602,6 +1608,7 @@ async fn create_real_source_subscription(
 fn real_source_backfill_status(
     job: &BackfillJob,
     descriptor: &ProcessorDescriptor,
+    consumer_id: &str,
     range: BlockRange,
     limits: &RealDeliveryLimits,
 ) -> ApiBackfillStatus {
@@ -1609,6 +1616,8 @@ fn real_source_backfill_status(
         id: job.id.clone(),
         owner: HistoricalWorkOwner::Subscription,
         processor: descriptor.instance.to_string(),
+        processor_configured: true,
+        consumer: Some(consumer_id.to_owned()),
         delivery_stream_id: job.delivery_stream_id.clone(),
         publication_revision: Some("0".to_owned()),
         from_block: range.start().0,
@@ -4348,6 +4357,8 @@ impl BenchmarkApiServer {
                 id: fixture.job.id.clone(),
                 owner: HistoricalWorkOwner::Subscription,
                 processor: fixture.processor.descriptor().instance.to_string(),
+                processor_configured: true,
+                consumer: Some(fixture.consumer_id.to_owned()),
                 delivery_stream_id: Some(fixture.stream_id.clone()),
                 publication_revision: Some("0".to_owned()),
                 from_block: 1,
