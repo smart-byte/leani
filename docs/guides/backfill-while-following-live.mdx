@@ -64,7 +64,9 @@ history lane reconnects without resetting its siblings.
 application-owned subscription through its lifecycle: it creates the
 subscription, applies and acknowledges each history batch, acknowledges the
 completion, and deletes the subscription. It resolves once the history is
-applied, so run it beside the live lane rather than before it.
+applied, so run it beside the live lane rather than before it, and catch its
+rejection: an abort or a failure keeps the subscription, and running the same
+request again resumes it.
 
 ```ts
 import {
@@ -96,5 +98,4 @@ after its last acknowledged batch. After a lost connection, the stream is
 opened again with backoff. A failed subscription is retried from its committed
 progress up to `maxRetries` times, then thrown; pass `onFailure: "discard"` to
 delete it instead, or `"throw"` to keep it failed and handle the error
-yourself. An `onBatch` error or an abort keeps the subscription for the next
-run.
+yourself.
