@@ -201,13 +201,16 @@ made through a multisig or another contract is not seen.
 The processor supports Ethereum mainnet only, and only from London (block
 12,965,000) on, because `executionBurnedWei` and `tipWei` need the base fee
 that earlier blocks lack. Startup refuses another chain and a pre-London
-`start_block`. `since` and `until` are UNIX timestamps in seconds, not block
-numbers: a block matches from `since` (inclusive) up to `until` (exclusive).
-Startup refuses a `since` or `until` below mainnet's genesis timestamp
-(1438269973), as any block number is, and a window whose `since` is not below
-its `until`. A rule with `chain_id_arg` also needs a `selector`: the chain id
-is the argument after it, and without one the rows would render
-`selector: null`, so calls to different functions could not be told apart.
+`start_block`. `since` and `until` are UNIX timestamps in seconds, below 10^10
+(the year 2286), not block numbers or milliseconds: a block matches from
+`since` (inclusive) up to `until` (exclusive). Startup refuses a `since` or
+`until` below mainnet's genesis timestamp (1438269973), as any block number
+is, and one of 10000000000 or more, as any timestamp in milliseconds is: a
+millisecond `until` would never close its window, and a millisecond `since`
+would never match. It also refuses a window whose `since` is not below its
+`until`. A rule with `chain_id_arg` also needs a `selector`: the chain id is
+the argument after it, and without one the rows would render `selector: null`,
+so calls to different functions could not be told apart.
 
 Every block emits one `rollups.block` change (`rollups.block-bundle.v1`), also
 when nothing matched, so a consumer can tell a block without rollup activity
