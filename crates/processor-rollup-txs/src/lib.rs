@@ -444,7 +444,11 @@ impl Processor for RollupTxsProcessor {
 }
 
 /// The public block bundle: camelCase, hex hashes and addresses, gas and wei
-/// as decimal strings, and the block's `finality` as blobs-money renders it.
+/// as decimal strings.
+///
+/// It leaves out the block's finality. The stored bytes keep the finality the
+/// block was mapped at, while a deferred flush or an entity read reports a
+/// later one; the envelope's or entity's `finality` is the block's.
 fn bundle_json(bytes: &[u8]) -> Result<serde_json::Value, ProcessorError> {
     let delta: RollupTxsDelta =
         postcard::from_bytes(bytes).map_err(|error| ProcessorError::State(error.to_string()))?;
@@ -478,7 +482,6 @@ fn bundle_json(bytes: &[u8]) -> Result<serde_json::Value, ProcessorError> {
             "blockHash": block.block_hash.to_string(),
             "parentHash": block.parent_hash.to_string(),
             "timestamp": block.timestamp,
-            "finality": block.finality.name(),
         },
         "transactions": transactions,
     }))
@@ -972,7 +975,6 @@ mod tests {
                 "blockHash": block_hash,
                 "parentHash": format!("0x{}", "41".repeat(32)),
                 "timestamp": 500,
-                "finality": "included",
             },
             "transactions": [{
                 "network": "mainnet",
@@ -991,10 +993,14 @@ mod tests {
                 "tipWei": "42000",
             }],
         });
-        assert_eq!(
-            processor.change_json(change).expect("render"),
-            Some(bundle.clone())
-        );
+        let rendered_change = processor
+            .change_json(change)
+            .expect("render")
+            .expect("a block bundle");
+        // The envelope's or entity's `finality` is the block's: stored bytes keep
+        // the finality they were mapped at, so the bundle carries none of its own.
+        assert_eq!(rendered_change["block"].get("finality"), None);
+        assert_eq!(rendered_change, bundle);
         // the bundle is retained by block number in `rollups.blocks`
         let key = 42_u64.to_be_bytes();
         let stored = reducer
