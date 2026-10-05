@@ -651,11 +651,10 @@ anchor, keeps and finalizes them, and logs `proved retained unfinalized
 blocks against the verified finalized anchor` with the blocks kept and
 reverted. When it cannot prove them within 60 seconds, for example without
 execution peers, it logs `could not prove retained unfinalized blocks against
-the verified finalized anchor; reverting them` as a warning; when the anchor
-is more than 8,192 blocks above the first unfinalized block, `retained
-unfinalized blocks are too far below the verified finalized anchor to prove;
-reverting them`. It then reverts every retained unfinalized block that does
-not link to the anchor.
+the verified finalized anchor; reverting them` as a warning; when the proof
+would span more than 8,192 blocks, `retained unfinalized blocks are too far
+below the verified finalized anchor to prove; reverting them`. It then reverts
+every retained unfinalized block that does not link to the anchor.
 
 The network lanes halt instead when the contradiction is with *finalized*
 history, which no revert repairs, or when the same unfinalized contradiction
