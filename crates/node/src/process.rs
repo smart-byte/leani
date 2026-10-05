@@ -2288,8 +2288,16 @@ impl leani_api::BackfillControl for NativeBackfillControl {
             )));
         }
         // Refused before it is re-queued: a processor instance that is not
-        // configured cannot run it, and the refusal must leave it failed.
-        self.processor(&status.processor)?;
+        // configured cannot run it, and the refusal must leave it failed. The
+        // status counts only the job's own instance. `Self::processor` also
+        // selects by kind, so it would run the job under another instance of
+        // its kind.
+        if !status.processor_configured {
+            return Err(leani_api::BackfillControlError::Invalid(format!(
+                "processor instance {:?} is not configured",
+                status.processor
+            )));
+        }
         // The failed run's task may still be recording its failure, and a
         // late write would fail the retried job again. It is not cancelled:
         // that could record the failed job as cancelled.
@@ -11088,18 +11096,24 @@ markets = ["ETH/USDT"]
     async fn retrying_a_failed_subscription_of_a_removed_instance_changes_nothing() {
         // Integration feedback: retry re-queued the subscription and cleared
         // its error before it found the processor instance missing, so the
-        // refused retry still changed it.
+        // refused retry still changed it. Review: this instance is named
+        // after its kind, so its name still selected, as a kind, the instance
+        // of that kind that replaced it, and the retried job ran under that.
         use leani_api::BackfillControl as _;
 
         let directory = tempfile::tempdir().expect("temporary directory");
         let processor = Arc::new(FailingCounter {
-            // Subscription IDs name the instance, so it must be portable.
             inner: BlockLocalCounter::default().with_instance(
-                leani_processor_api::ProcessorInstanceId::new("failed-counter").expect("instance"),
+                leani_processor_api::ProcessorInstanceId::new("synthetic-counter")
+                    .expect("instance"),
                 leani_primitives::BlockHash::new([0x0f; 32]),
             ),
             failing: std::sync::atomic::AtomicBool::new(true),
         });
+        assert_eq!(
+            processor.descriptor().instance.as_str(),
+            processor.descriptor().id.as_str()
+        );
         let instance = processor.descriptor().instance.to_string();
         let (_store, control) = on_demand_control_with(
             directory.path(),
@@ -11117,15 +11131,23 @@ markets = ["ETH/USDT"]
                 .await;
         assert!(failed.last_error.is_some());
 
-        let removed = without_processors(&control);
-        let refused = removed.retry(&created.id).await;
-        assert!(
-            matches!(refused, Err(leani_api::BackfillControlError::Invalid(_))),
-            "{refused:?}"
-        );
-        let unchanged = removed.inspect(&created.id).await.expect("status");
-        assert_eq!(unchanged.state, leani_api::BackfillState::Failed);
-        assert_eq!(unchanged.last_error, failed.last_error);
+        let replacement: Arc<dyn Processor> = Arc::new(BlockLocalCounter::default().with_instance(
+            leani_processor_api::ProcessorInstanceId::new("replacement-counter").expect("instance"),
+            leani_primitives::BlockHash::new([0x10; 32]),
+        ));
+        for removed in [
+            replaced_by(&control, replacement),
+            without_processors(&control),
+        ] {
+            let refused = removed.retry(&created.id).await;
+            assert!(
+                matches!(refused, Err(leani_api::BackfillControlError::Invalid(_))),
+                "{refused:?}"
+            );
+            let unchanged = removed.inspect(&created.id).await.expect("status");
+            assert_eq!(unchanged.state, leani_api::BackfillState::Failed);
+            assert_eq!(unchanged.last_error, failed.last_error);
+        }
     }
 
     #[tokio::test]
