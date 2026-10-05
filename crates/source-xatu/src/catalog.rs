@@ -680,6 +680,10 @@ pub enum XatuError {
     Url(url::ParseError),
     #[error("Xatu object store error: {0}")]
     ObjectStore(String),
+    /// The store answered 404 Not Found: Xatu publishes a partition some time
+    /// after it closes.
+    #[error("Xatu has not published object {location} yet")]
+    NotPublished { location: String },
     #[error("Xatu Parquet error: {0}")]
     Parquet(String),
     #[error("Xatu projected data is invalid: {0}")]

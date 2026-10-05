@@ -17,6 +17,7 @@ use leani_source_api::{
 };
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
+use tracing::debug;
 
 use crate::{
     XatuBlobsProjector, XatuCatalog, XatuCatalogConfig, XatuError,
@@ -309,7 +310,7 @@ impl HistorySource for XatuHistorySource {
                     .await
             }
         }
-        .map_err(source_error)?;
+        .map_err(|error| source_error(error, chunk.range))?;
         let normalized_bytes = projection.frames.iter().fold(0_u64, |total, frame| {
             total.saturating_add(frame.estimated_heap_bytes())
         });
@@ -662,7 +663,7 @@ fn log_predicates(request: &DataRequest, range: String) -> Vec<String> {
     predicates
 }
 
-fn source_error(error: XatuError) -> SourceError {
+fn source_error(error: XatuError, chunk_range: BlockRange) -> SourceError {
     match error {
         XatuError::Cancelled => SourceError::Cancelled,
         XatuError::Budget {
@@ -675,6 +676,11 @@ fn source_error(error: XatuError) -> SourceError {
             observed: actual,
         },
         XatuError::ObjectStore(detail) => SourceError::Unavailable(detail),
+        // Another source may already hold what Xatu has not published.
+        XatuError::NotPublished { location } => {
+            debug!(location, "xatu has not published this object yet");
+            SourceError::MissingRange(chunk_range)
+        }
         error @ (XatuError::IncompleteRange { range, .. }
         | XatuError::IncompleteWithdrawals { range, .. }) => SourceError::IncompleteRange {
             range,
@@ -715,16 +721,36 @@ mod tests {
     fn incomplete_table_coverage_is_a_failover_eligible_missing_range() {
         let range = BlockRange::new(BlockNumber(10), BlockNumber(20)).expect("range");
         assert_eq!(
-            source_error(XatuError::IncompleteRange {
-                table: XatuTable::CanonicalBeaconBlock,
+            source_error(
+                XatuError::IncompleteRange {
+                    table: XatuTable::CanonicalBeaconBlock,
+                    range,
+                    expected: 11,
+                    actual: 9,
+                },
                 range,
-                expected: 11,
-                actual: 9,
-            }),
+            ),
             SourceError::IncompleteRange {
                 range,
                 detail: "Xatu table canonical_beacon_block does not completely cover BlockRange { start: BlockNumber(10), end: BlockNumber(20) }: expected 11 rows, received 9".to_owned(),
             },
+        );
+    }
+
+    #[test]
+    fn not_published_maps_to_missing_range() {
+        let range =
+            BlockRange::new(BlockNumber(23_000_000), BlockNumber(23_000_999)).expect("range");
+        // An object Xatu had not published yet read as an unavailable source,
+        // which looked like a transient failure using up the job's attempts.
+        assert_eq!(
+            source_error(
+                XatuError::NotPublished {
+                    location: "canonical_execution_block/1000/23000000.parquet".to_owned(),
+                },
+                range,
+            ),
+            SourceError::MissingRange(range),
         );
     }
 
@@ -948,7 +974,7 @@ mod tests {
             },
         ];
         for drift in drifts {
-            let error = source_error(drift);
+            let error = source_error(drift, BlockRange::single(BlockNumber(20_000_000)));
             assert!(
                 matches!(error, SourceError::SchemaDrift { .. }),
                 "{error:?}"

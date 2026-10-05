@@ -75,6 +75,18 @@ record, and documented RPC contracts.
   Without `sources.live.history_fallback_blocks`, the window starts at the
   processor's start block, so every job waits for the first anchor; a job
   that ends below a configured window starts at once, as before.
+- A Xatu object that is not published yet, which Xatu answers with 404 Not
+  Found, no longer fails its chunk as `source is unavailable`, which looked
+  like a transient failure using up the job's attempts. Xatu now reports the
+  range as one it does not cover, as eraE does for a range its catalog does
+  not list yet: a job still moves on to its next configured source, but its
+  error reads `source does not cover requested range`; a raw-history job
+  waits for the range as for any lagging source; and the node logs
+  `xatu has not published this object yet` with the object's location at
+  debug level. Over JSON-RPC, such a range now fails a historical read with
+  `no_viable_historical_source`, as for eraE, instead of the retryable
+  `historical_source_failed`, when Xatu is the last source the read tries.
+  Other store failures, such as a 5xx response or a timeout, are unchanged.
 
 ## [0.1.0-rc.3] - 2026-10-05
 
