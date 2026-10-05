@@ -7434,13 +7434,74 @@ async fn run_network_lanes(
     if let Some(control) = &backfill_control {
         live_runtime = live_runtime.with_finalized_gap_recovery(control.clone());
     }
-    // Retained unfinalized blocks that do not link to the verified finalized
-    // anchor, such as a branch reorged away during downtime, are reverted
-    // before it is seeded; reconciliation below undoes their coverage.
-    live_runtime
-        .seed_finalized_anchor(live_anchor, &[])
+    let history_anchor = P2pHistoryAnchor {
+        block: live_anchor,
+        consensus: ConsensusAnchor {
+            finality: Finality::Finalized,
+            execution_block_hash: selected.execution_block_hash,
+            beacon_slot: selected.beacon_slot,
+            beacon_block_root: selected.beacon_block_root,
+        },
+    };
+    // Where no parent link reaches the anchor from the retained unfinalized
+    // blocks, as after an outage longer than the finality lag, peer headers
+    // that link by parent hash down from it prove the ones on its chain,
+    // which are kept and finalized. The others, such as a branch reorged
+    // away during downtime, or all of them when no proof is possible, are
+    // reverted before it is seeded; reconciliation below undoes their
+    // coverage.
+    let mut ancestry = Vec::new();
+    let mut summary = None;
+    if let Some(range) = retained_proof_range(&store, chain_id, live_anchor).await? {
+        // The cap bounds its range, which is exactly the proof's:
+        // `anchored_hashes` checks no bound of its own.
+        let bridge = leani_source_p2p::RethP2pHistorySource::from_live_source(
+            live_source.as_ref().clone(),
+            range,
+            history_anchor.clone(),
+        )?;
+        let proving = Instant::now();
+        let Some(proven) = prove_retained_ancestry(range, lane_cancellation, |range| async move {
+            bridge
+                .anchored_hashes(range.start(), lane_cancellation)
+                .await
+        })
+        .await
+        else {
+            // The node stops: a revert now would undo blocks the next start
+            // can prove.
+            return Ok(());
+        };
+        if !proven.is_empty() {
+            // Above the finalized head, every retained block is unfinalized.
+            let retained = store
+                .canonical_coverage(chain_id, range)
+                .await?
+                .into_iter()
+                .map(leani_primitives::BlockRange::len)
+                .sum::<u64>();
+            summary = Some((range, retained, proving.elapsed()));
+        }
+        ancestry = proven;
+    }
+    let reverted = live_runtime
+        .seed_finalized_anchor(live_anchor, &ancestry)
         .await
         .context("seed the verified finalized anchor")?;
+    if let Some((range, retained, elapsed)) = summary {
+        let reverted_in_range = reverted
+            .iter()
+            .filter(|block| range.contains(block.number))
+            .count();
+        info!(
+            from = range.start().0,
+            anchor = range.end().0,
+            kept = retained.saturating_sub(u64::try_from(reverted_in_range).unwrap_or(u64::MAX)),
+            reverted = reverted.len(),
+            elapsed_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
+            "proved retained unfinalized blocks against the verified finalized anchor"
+        );
+    }
     // A crash, abort, or lane restart can interrupt a live commit or reorg
     // between its separately committed steps; repair every processor against
     // the canonical chain before any lane or handoff check runs.
@@ -7464,15 +7525,6 @@ async fn run_network_lanes(
     let overlap_from = selected
         .execution_block_number
         .saturating_sub(overlap_blocks.saturating_sub(1));
-    let history_anchor = P2pHistoryAnchor {
-        block: live_anchor,
-        consensus: ConsensusAnchor {
-            finality: Finality::Finalized,
-            execution_block_hash: selected.execution_block_hash,
-            beacon_slot: selected.beacon_slot,
-            beacon_block_root: selected.beacon_block_root,
-        },
-    };
     if let Some(control) = &backfill_control {
         control
             .update_p2p_bridge(live_source.as_ref().clone(), history_anchor.clone())
@@ -7773,6 +7825,118 @@ fn spawn_execution_peer_warmup(
         }
     });
     std::mem::drop(warmup);
+}
+
+/// Most blocks, from the first retained unfinalized block through the
+/// verified finalized anchor, whose headers startup fetches to prove them.
+// ponytail: a constant, not a knob. A proof saves at most the unfinalized
+// tail (~65-95 blocks of undo and refetch) whatever the outage, while its
+// cost grows with the outage. 8,192 headers (~27 h of slots, ~5 MB, eight
+// requests of `history_header_request_blocks`) cover both field outages
+// (96 and 2,583 headers); a longer one reverts as before.
+const RETAINED_PROOF_MAX_BLOCKS: u64 = 8_192;
+
+/// Longest startup waits for that proof before reverting as before.
+// ponytail: fixed, not a knob. The live lane needs the same execution peers
+// right after, so waiting longer rarely helps; with peers connected the
+// proof is one to eight header requests.
+const RETAINED_PROOF_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// The blocks whose execution headers prove the retained unfinalized blocks
+/// against the verified finalized `anchor` about to be seeded: from the first
+/// unfinalized block through the anchor, so that the blocks below a fork are
+/// kept too.
+///
+/// `None` when parent links decide without a proof: the retained block at the
+/// anchor's height is the anchor, or nothing unfinalized is retained above
+/// the finalized head, or the anchor is not above it. Also `None`, with a
+/// warning, when the range exceeds [`RETAINED_PROOF_MAX_BLOCKS`]. Startup then
+/// reverts the retained unfinalized blocks that do not link to the anchor.
+async fn retained_proof_range(
+    store: &leani_store_sqlite::SqliteStore,
+    chain_id: leani_primitives::ChainId,
+    anchor: leani_primitives::BlockRef,
+) -> Result<Option<leani_primitives::BlockRange>> {
+    use leani_primitives::{BlockNumber, BlockRange};
+
+    if store
+        .canonical_block(chain_id, anchor.number)
+        .await?
+        .is_some_and(|(retained, _)| retained.hash == anchor.hash)
+    {
+        return Ok(None);
+    }
+    let (Some(finalized), Some(tip)) = (
+        store.finalized_canonical_head(chain_id).await?,
+        store.canonical_tip(chain_id).await?,
+    ) else {
+        return Ok(None);
+    };
+    if tip.number <= finalized.number || anchor.number <= finalized.number {
+        return Ok(None);
+    }
+    let first_unfinalized = finalized.number.0 + 1;
+    let blocks = anchor.number.0 - finalized.number.0;
+    if blocks > RETAINED_PROOF_MAX_BLOCKS {
+        warn!(
+            first_unfinalized,
+            anchor = anchor.number.0,
+            blocks,
+            "retained unfinalized blocks are too far below the verified finalized anchor to prove; reverting them"
+        );
+        return Ok(None);
+    }
+    Ok(Some(BlockRange::new(
+        BlockNumber(first_unfinalized),
+        anchor.number,
+    )?))
+}
+
+/// Prove the retained unfinalized blocks in `range` with `fetch`, which
+/// returns the hashes of `range`, proven by hash linkage down from the
+/// verified finalized anchor at its end.
+///
+/// Returns them, or, when `fetch` fails or takes longer than
+/// [`RETAINED_PROOF_TIMEOUT`], an empty ancestry, with which startup reverts
+/// every retained unfinalized block that does not link to the anchor. Returns
+/// `None` once `cancellation` fires, however `fetch` ended: the caller then
+/// seeds and reverts nothing, since a revert during shutdown would undo
+/// blocks the next start can prove.
+async fn prove_retained_ancestry<F, Fut>(
+    range: leani_primitives::BlockRange,
+    cancellation: &CancellationToken,
+    fetch: F,
+) -> Option<Vec<leani_primitives::BlockHash>>
+where
+    F: FnOnce(leani_primitives::BlockRange) -> Fut,
+    Fut: Future<Output = Result<Vec<leani_primitives::BlockHash>, leani_source_p2p::P2pError>>,
+{
+    let proven = tokio::select! {
+        biased;
+        () = cancellation.cancelled() => return None,
+        proven = tokio::time::timeout(RETAINED_PROOF_TIMEOUT, fetch(range)) => proven,
+    };
+    // The fetch may have ended because of it, as `P2pError::Cancelled`.
+    if cancellation.is_cancelled() {
+        return None;
+    }
+    match proven {
+        Ok(Ok(hashes)) => Some(hashes),
+        Ok(Err(error)) => {
+            warn!(
+                %error,
+                "could not prove retained unfinalized blocks against the verified finalized anchor; reverting them"
+            );
+            Some(Vec::new())
+        }
+        Err(_) => {
+            warn!(
+                timeout = ?RETAINED_PROOF_TIMEOUT,
+                "could not prove retained unfinalized blocks against the verified finalized anchor; reverting them"
+            );
+            Some(Vec::new())
+        }
+    }
 }
 
 async fn retained_live_start(
@@ -9620,6 +9784,231 @@ mod tests {
             .await
             .expect("on-demand start");
         assert_eq!(on_demand, LiveStart::Block(anchor));
+    }
+
+    /// A store as a stopped node leaves it: the seeded finalized anchor 9 and
+    /// the retained blocks 10..=13 above it, with `finality`.
+    async fn retained_proof_store(
+        finality: leani_primitives::Finality,
+    ) -> (
+        tempfile::TempDir,
+        leani_store_sqlite::SqliteStore,
+        Vec<leani_primitives::BlockRef>,
+    ) {
+        use leani_primitives::{BlockHash, ChainId, Finality};
+        use leani_store_sqlite::{SqliteStore, StoreConfig};
+
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = SqliteStore::open(StoreConfig::new(directory.path().join("proof.sqlite")))
+            .await
+            .expect("store");
+        let finalized = fixture_frame(9, BlockHash::ZERO).block;
+        store
+            .store_canonical_anchor(ChainId(1), finalized, Finality::Finalized)
+            .await
+            .expect("finalized anchor");
+        let mut parent = finalized.hash;
+        let mut retained = Vec::new();
+        for number in 10..=13 {
+            let mut frame = fixture_frame(number, parent);
+            frame.finality = finality;
+            parent = frame.block.hash;
+            store
+                .store_recent_frame(&frame)
+                .await
+                .expect("recent frame");
+            retained.push(frame.block);
+        }
+        (directory, store, retained)
+    }
+
+    fn proof_range(start: u64, end: u64) -> leani_primitives::BlockRange {
+        leani_primitives::BlockRange::new(
+            leani_primitives::BlockNumber(start),
+            leani_primitives::BlockNumber(end),
+        )
+        .expect("proof range")
+    }
+
+    #[tokio::test]
+    async fn retained_proof_range_spans_the_unfinalized_blocks_below_a_higher_anchor() {
+        use leani_primitives::{BlockHash, ChainId, Finality};
+
+        let (_directory, store, _) = retained_proof_store(Finality::Included).await;
+        // After an outage longer than the finality lag, the verified anchor
+        // is above the retained tip, and no parent link reaches it.
+        let anchor = fixture_frame(20, BlockHash::ZERO).block;
+        assert_eq!(
+            retained_proof_range(&store, ChainId(1), anchor)
+                .await
+                .expect("proof range"),
+            Some(proof_range(10, 20))
+        );
+    }
+
+    #[tokio::test]
+    async fn retained_proof_range_spans_up_to_an_anchor_that_contradicts_a_retained_block() {
+        use leani_primitives::{BlockHash, BlockRef, ChainId, Finality};
+
+        let (_directory, store, retained) = retained_proof_store(Finality::Included).await;
+        // Finality names another block at 12 than the retained one; the
+        // retained blocks below the fork may still be its ancestors.
+        let anchor = BlockRef {
+            hash: BlockHash::new([0xc2; 32]),
+            parent_hash: BlockHash::ZERO,
+            ..retained[2]
+        };
+        assert_eq!(
+            retained_proof_range(&store, ChainId(1), anchor)
+                .await
+                .expect("proof range"),
+            Some(proof_range(10, 12))
+        );
+    }
+
+    #[tokio::test]
+    async fn retained_proof_range_is_none_when_links_decide() {
+        use leani_primitives::{BlockHash, BlockRef, ChainId, Finality};
+        use leani_store_sqlite::{SqliteStore, StoreConfig};
+
+        let above_the_tip = fixture_frame(20, BlockHash::ZERO).block;
+        let (_directory, store, retained) = retained_proof_store(Finality::Included).await;
+        // The retained block at the anchor's height is the anchor: parent
+        // links prove the blocks below it.
+        let retained_anchor = BlockRef {
+            parent_hash: BlockHash::ZERO,
+            ..retained[2]
+        };
+        assert_eq!(
+            retained_proof_range(&store, ChainId(1), retained_anchor)
+                .await
+                .expect("proof range"),
+            None
+        );
+        // An anchor at the finalized head with another hash: no proof keeps
+        // a block above a contradicted finalized one.
+        let contradicting = BlockRef {
+            hash: BlockHash::new([0xc9; 32]),
+            ..fixture_frame(9, BlockHash::ZERO).block
+        };
+        assert_eq!(
+            retained_proof_range(&store, ChainId(1), contradicting)
+                .await
+                .expect("proof range"),
+            None
+        );
+
+        let (_finalized_directory, finalized, _) = retained_proof_store(Finality::Finalized).await;
+        assert_eq!(
+            retained_proof_range(&finalized, ChainId(1), above_the_tip)
+                .await
+                .expect("proof range"),
+            None,
+            "nothing is unfinalized"
+        );
+
+        let empty_directory = tempfile::tempdir().expect("tempdir");
+        let empty = SqliteStore::open(StoreConfig::new(
+            empty_directory.path().join("empty.sqlite"),
+        ))
+        .await
+        .expect("store");
+        assert_eq!(
+            retained_proof_range(&empty, ChainId(1), above_the_tip)
+                .await
+                .expect("proof range"),
+            None,
+            "nothing is retained"
+        );
+    }
+
+    #[tokio::test]
+    async fn retained_proof_range_is_none_beyond_the_cap() {
+        use leani_primitives::{BlockHash, ChainId, Finality};
+
+        let (_directory, store, _) = retained_proof_store(Finality::Included).await;
+        // The finalized head is 9, so 8,192 headers prove 10..=8,201.
+        let at_the_cap = fixture_frame(9 + 8_192, BlockHash::ZERO).block;
+        assert_eq!(
+            retained_proof_range(&store, ChainId(1), at_the_cap)
+                .await
+                .expect("proof range"),
+            Some(proof_range(10, 8_201))
+        );
+        let beyond_the_cap = fixture_frame(9 + 8_193, BlockHash::ZERO).block;
+        assert_eq!(
+            retained_proof_range(&store, ChainId(1), beyond_the_cap)
+                .await
+                .expect("proof range"),
+            None
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_or_stalled_retained_proof_falls_back_to_an_empty_ancestry() {
+        use leani_primitives::BlockHash;
+        use leani_source_p2p::P2pError;
+
+        let range = proof_range(10, 12);
+        let cancellation = CancellationToken::new();
+        let failed = prove_retained_ancestry(range, &cancellation, |_| async {
+            Err(P2pError::Request {
+                component: "block headers",
+                detail: "the peer disconnected".to_owned(),
+            })
+        })
+        .await;
+        assert_eq!(failed, Some(Vec::new()));
+
+        // Without peers, startup waits a minute, not for ever.
+        let started = tokio::time::Instant::now();
+        let stalled = tokio::time::timeout(
+            Duration::from_secs(120),
+            prove_retained_ancestry(range, &cancellation, |_| std::future::pending()),
+        )
+        .await
+        .expect("the proof gives up on its own");
+        assert_eq!(stalled, Some(Vec::new()));
+        assert_eq!(started.elapsed().as_secs(), 60);
+
+        let hashes = vec![
+            BlockHash::new([10; 32]),
+            BlockHash::new([11; 32]),
+            BlockHash::new([12; 32]),
+        ];
+        let proven = prove_retained_ancestry(range, &cancellation, |requested| {
+            assert_eq!(requested, range);
+            let hashes = hashes.clone();
+            async move { Ok(hashes) }
+        })
+        .await;
+        assert_eq!(proven, Some(hashes));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_cancelled_retained_proof_seeds_nothing() {
+        use leani_source_p2p::P2pError;
+
+        let range = proof_range(10, 12);
+        let cancelled = CancellationToken::new();
+        cancelled.cancel();
+        assert_eq!(
+            prove_retained_ancestry(range, &cancelled, |_| std::future::pending()).await,
+            None
+        );
+
+        // A fetch that ends because the node stops did not fail: reverting
+        // after it would undo blocks the next start can prove.
+        let stopping = CancellationToken::new();
+        let stopped = prove_retained_ancestry(range, &stopping, |_| {
+            let stopping = stopping.clone();
+            async move {
+                stopping.cancel();
+                Err(P2pError::Cancelled)
+            }
+        })
+        .await;
+        assert_eq!(stopped, None);
     }
 
     #[tokio::test]

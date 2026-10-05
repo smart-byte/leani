@@ -12,7 +12,7 @@ use super::{
     Exit, NativeBackfillControl, OnDemandP2pBridge, ShutdownSignals, backfill_processor_config,
     configured_store_config, execution_p2p_source, historical_runtime_config, historical_services,
     historical_source_budget, history_sources_with_bridge, p2p_history_anchor,
-    require_ordered_backfill_start,
+    prove_retained_ancestry, require_ordered_backfill_start, retained_proof_range,
 };
 use crate::{
     config::{ArtifactStorageBackend, Config},
@@ -409,12 +409,33 @@ async fn standalone(
         "starting processor historical backfill"
     );
     if let Some(bridge) = &bridge {
-        // As the node seeds it: retained blocks the anchor does not prove are
+        // As the node seeds it: peer headers prove the retained blocks on the
+        // anchor's chain, which are kept and finalized; the others are
         // reverted first, and the next serve's startup reconciliation undoes
         // any processor coverage of them.
         let chain_id = ChainId(config.chain.chain_id);
+        let ancestry = match retained_proof_range(&store, chain_id, bridge.anchor.block).await? {
+            Some(proof) => {
+                let history = leani_source_p2p::RethP2pHistorySource::from_live_source(
+                    bridge.source.clone(),
+                    proof,
+                    bridge.anchor.clone(),
+                )?;
+                let cancellation = &cancellation;
+                let proving = prove_retained_ancestry(proof, cancellation, |proof| async move {
+                    history.anchored_hashes(proof.start(), cancellation).await
+                });
+                // Nothing is reverted on an interrupt: the next run proves
+                // the blocks again.
+                tokio::select! {
+                    ancestry = proving => ancestry.context("backfill cancelled while proving retained blocks")?,
+                    signal = signals.recv() => { signal?; bail!("backfill cancelled while proving retained blocks"); }
+                }
+            }
+            None => Vec::new(),
+        };
         store
-            .revert_unproven_recent_blocks(chain_id, bridge.anchor.block, &[])
+            .revert_unproven_recent_blocks(chain_id, bridge.anchor.block, &ancestry)
             .await?;
         store
             .store_canonical_anchor(
