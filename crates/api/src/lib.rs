@@ -5179,11 +5179,17 @@ async fn poll_backfill_consumer(
                 stream_state.fetched.extend(records);
             }
             Ok(_) => {
-                if let Some((code, message)) = backfill_terminal_stream_failure(&stream_state).await
-                {
-                    return Some(
-                        end_backfill_stream(stream_state, heartbeat_due, code, message).await,
-                    );
+                match backfill_stream_end(&stream_state).await {
+                    Some(BackfillStreamEnd::Failure(code, message)) => {
+                        return Some(
+                            end_backfill_stream(stream_state, heartbeat_due, code, message).await,
+                        );
+                    }
+                    Some(BackfillStreamEnd::Completion(record)) => {
+                        stream_state.fetched.push_back(*record);
+                        continue;
+                    }
+                    None => {}
                 }
                 let batch_due = stream_state.pending_batch.as_ref().map(|batch| {
                     tokio::time::Instant::now()
@@ -5214,13 +5220,18 @@ async fn poll_backfill_consumer(
                                 stream_state,
                             ));
                         }
-                        if let Some((code, message)) =
-                            backfill_terminal_stream_failure(&stream_state).await
-                        {
-                            return Some(
-                                end_backfill_stream(stream_state, heartbeat_due, code, message)
-                                    .await,
-                            );
+                        match backfill_stream_end(&stream_state).await {
+                            Some(BackfillStreamEnd::Failure(code, message)) => {
+                                return Some(
+                                    end_backfill_stream(stream_state, heartbeat_due, code, message)
+                                        .await,
+                                );
+                            }
+                            Some(BackfillStreamEnd::Completion(record)) => {
+                                stream_state.fetched.push_back(*record);
+                                continue;
+                            }
+                            None => {}
                         }
                         let heartbeat = ConsumerStreamHeartbeat {
                             record_type: "heartbeat",
@@ -5261,13 +5272,13 @@ async fn poll_backfill_consumer(
     }
 }
 
-/// Ends a failed or cancelled subscription's stream with its failure record,
-/// after the batch the stream holds and once the consumer acknowledged what it
-/// was delivered. The job committed those records, a consumer acknowledges
-/// only what it was delivered, and its streaming session ends with the stream:
-/// ending earlier leaves records it can never acknowledge, which keeps the
-/// subscription from being deleted. Like a completion, the stream sends
-/// heartbeats while it waits.
+/// Ends a history stream with a failure record, such as a failed or cancelled
+/// subscription's, after the batch the stream holds and once the consumer
+/// acknowledged what it was delivered. The job committed those records, a
+/// consumer acknowledges only what it was delivered, and its streaming session
+/// ends with the stream: ending earlier leaves records it can never
+/// acknowledge, which keeps the subscription from being deleted. Like a
+/// completion, the stream sends heartbeats while it waits.
 async fn end_backfill_stream(
     mut stream_state: BackfillConsumerStreamState,
     heartbeat_due: tokio::time::Instant,
@@ -5322,26 +5333,96 @@ async fn end_backfill_stream(
     (Ok(ndjson_failure(code, message, None, None)), stream_state)
 }
 
-async fn backfill_terminal_stream_failure(
+/// How a history stream that has nothing left to deliver ends.
+enum BackfillStreamEnd {
+    /// With this failure record.
+    Failure(&'static str, String),
+    /// With the subscription's completion, which the consumer acknowledged
+    /// before the stream opened. Delivered again as a fetched completion is,
+    /// it ends the stream the way its first delivery did.
+    Completion(Box<ChangeRecord>),
+}
+
+async fn backfill_stream_end(
     stream_state: &BackfillConsumerStreamState,
-) -> Option<(&'static str, String)> {
+) -> Option<BackfillStreamEnd> {
     let control = stream_state.state.config.backfill_control.as_ref()?;
     match control.inspect(&stream_state.subscription_id).await {
-        Ok(status) if status.state == BackfillState::Failed => Some((
+        Ok(status) if status.state == BackfillState::Failed => Some(BackfillStreamEnd::Failure(
             "backfill_failed",
             status
                 .last_error
                 .unwrap_or_else(|| "the historical subscription failed".to_owned()),
         )),
-        Ok(status) if status.state == BackfillState::Cancelled => Some((
+        Ok(status) if status.state == BackfillState::Cancelled => Some(BackfillStreamEnd::Failure(
             "backfill_cancelled",
             status
                 .last_error
                 .unwrap_or_else(|| "the historical subscription was cancelled".to_owned()),
         )),
-        Ok(_) => None,
-        Err(error) => Some(("backfill_status_failed", error.to_string())),
+        Ok(_) => acknowledged_backfill_completion(stream_state)
+            .await
+            .unwrap_or_else(|error| {
+                Some(BackfillStreamEnd::Failure(
+                    "delivery_failed",
+                    error.to_string(),
+                ))
+            }),
+        Err(error) => Some(BackfillStreamEnd::Failure(
+            "backfill_status_failed",
+            error.to_string(),
+        )),
     }
+}
+
+/// The end of a stream whose consumer has acknowledged the subscription's
+/// completion, as when it opens the stream again: nothing follows the
+/// completion, so the stream would otherwise send heartbeats for good.
+async fn acknowledged_backfill_completion(
+    stream_state: &BackfillConsumerStreamState,
+) -> Result<Option<BackfillStreamEnd>, StoreError> {
+    let store = &stream_state.state.store;
+    let descriptor = stream_state.processor.descriptor();
+    let Some(completion) = store
+        .backfill_completion_sequence(&stream_state.subscription_id)
+        .await?
+    else {
+        return Ok(None);
+    };
+    let acknowledged = store
+        .consumer_in_stream(
+            descriptor,
+            &stream_state.stream_id,
+            &stream_state.consumer_id,
+        )
+        .await?
+        .is_some_and(|consumer| consumer.acknowledged_sequence >= completion);
+    if !acknowledged {
+        return Ok(None);
+    }
+    let record = store
+        .changes_in_stream(
+            descriptor,
+            &stream_state.stream_id,
+            stream_state.state.config.chain_id,
+            completion.saturating_sub(1),
+            1,
+        )
+        .await?
+        .into_iter()
+        .find(|record| {
+            record.cursor.sequence == completion && record.change.kind == "system.backfill_complete"
+        });
+    Ok(Some(record.map_or_else(
+        || {
+            BackfillStreamEnd::Failure(
+                "backfill_completed",
+                "the historical subscription completed and its completion was acknowledged"
+                    .to_owned(),
+            )
+        },
+        |record| BackfillStreamEnd::Completion(Box::new(record)),
+    )))
 }
 
 fn build_history_progress_unit(

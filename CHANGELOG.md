@@ -31,6 +31,16 @@ record, and documented RPC contracts.
 - Retrying a failed backfill subscription whose processor instance is no
   longer configured answers `400 invalid_request` and changes nothing. The
   refused retry had already re-queued the subscription and cleared its error.
+- Reopening the stream of a `complete_reclaimable` backfill subscription,
+  whose consumer has acknowledged its completion, re-sends that
+  `backfill_complete` record, with the same `cursor`, and ends. The
+  stream found nothing after the acknowledged cursor and sent heartbeats
+  indefinitely, so an application inspected the subscription on every
+  heartbeat to learn that it was done. Acknowledging the cursor again
+  succeeds, also after the stream has ended and released its session: a
+  repeated acknowledgement from an ended session used to get `409
+  consumer_session_lost`. Should the record no longer be readable, the stream
+  ends with an `error` record of the new code `backfill_completed`.
 
 ## [0.1.0-rc.3] - 2026-10-05
 
