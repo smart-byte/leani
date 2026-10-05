@@ -204,8 +204,10 @@ from one it never received. Materialized output stores each block's bundle by
 block number in the `rollups.blocks` collection (`rollups.entity.v1`) and
 renders it as the same JSON. The bundle is camelCase JSON:
 
-- `block`: `network`, `blockNumber`, `blockHash`, `parentHash`, `timestamp`,
-  and `finality` (`included` or `finalized`, as on `blobs-money`'s block).
+- `block`: `network`, `blockNumber`, `blockHash`, `parentHash`, and
+  `timestamp`. The bundle carries no finality of its own: the block's
+  finality is the `finality` of the change envelope, or of the retained
+  entity, that carries the bundle.
 - `transactions`, in block order: `network`, `blockNumber`, and `blockHash`,
   repeated from the block so that each transaction stands alone as a row;
   then `txHash`, `transactionIndex`, `rollupId`, `purpose` (`data`, `state`,

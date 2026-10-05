@@ -38,8 +38,6 @@ record, and documented RPC contracts.
   - A transaction gains `success`, `false` for a reverted transaction.
   - `selector` is the matched rule's selector, `null` when that rule has none,
     instead of the transaction's first four input bytes.
-  - `block` gains `finality`, `included` or `finalized`, as on `blobs-money`'s
-    block.
 
 ### Changed
 
