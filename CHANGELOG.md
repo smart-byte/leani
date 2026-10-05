@@ -139,6 +139,16 @@ record, and documented RPC contracts.
   The warning a job logs for each failed attempt on a source no longer calls
   the failure transient: it now reads
   `historical source attempt failed; trying the next source`.
+- A restart after an outage longer than the finality lag no longer reverts
+  every retained unfinalized block. Startup fetches the execution headers
+  from the first unfinalized block up to the newly verified finalized anchor
+  from its peers, checks that they link by parent hash down from the anchor,
+  and keeps and finalizes the retained blocks they prove; only blocks off
+  the finalized chain are reverted. Consumers no longer receive one `undo`
+  batch per retained block, and a skipped-blocks notice starts after the old
+  tip. When the proof is not possible within 60 seconds, or the anchor is
+  more than 8,192 blocks above the first unfinalized block, startup reverts
+  them as before. `leani backfill` over P2P proves them the same way.
 
 ## [0.1.0-rc.3] - 2026-10-05
 
