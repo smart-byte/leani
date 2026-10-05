@@ -53,11 +53,9 @@ crates.io through trusted publishing from `crates-release.yml`.
 ## Release channels
 
 Prerelease versions are marked as GitHub prereleases and do not replace the
-latest stable release. Prerelease SDK versions use npm's `next` tag; stable
-versions use `latest`. Until the first stable release, `latest` stays on the
-last prerelease that received it: npm gave `latest` to the package's first
-version, `0.1.0-rc.1`, and later prereleases move only `next`. An unversioned
-install therefore resolves to that prerelease; install a newer prerelease by
-exact version or with `@next`. The first stable release moves `latest` to
-itself. The Homebrew formula is updated in a separate reviewed step after each
-release's archives are public.
+latest stable release. Until the first stable release, each SDK prerelease
+takes npm's `latest` tag, so an unversioned install resolves to the newest
+prerelease. From the first stable release on, stable versions take `latest`
+and prereleases take `next`. The Homebrew formula follows the same rule: the
+release coordinator opens a reviewed tap PR once a release's archives are
+public.

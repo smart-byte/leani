@@ -27,7 +27,9 @@ two dispatches:
    container, binary, Rust-library, and SDK preparation runs and verifies their
    artifacts. Finally it dispatches the binary, Rust-library, SDK, and container
    publishers in order, checks each publication against the verified
-   candidate, promotes the site, and waits until leani.dev serves the release.
+   candidate, promotes the site, waits until leani.dev serves the release, and
+   opens the [Homebrew](#homebrew) tap PR. Merge the tap PR after its tests
+   pass; the run summary links it.
 
 The **candidate** and **publish** actions run the two halves of **release**
 separately, for example to inspect the candidates before publishing them.
@@ -59,7 +61,7 @@ summary links each workflow and records publication progress.
 
 The Ubuntu coordinator uses Python 3.11+, GitHub CLI, and Docker Buildx. It does
 not compile packages or receive registry OIDC permissions. Homebrew tap updates
-remain a separate reviewed PR, following the [Homebrew](#homebrew) policy below.
+remain a reviewed PR, following the [Homebrew](#homebrew) policy below.
 
 ### Coordinator setup
 
@@ -72,9 +74,11 @@ Allow only the `main` **branch**. Its write jobs are also restricted to `main`
 by YAML and the release workflow policy checker.
 
 Add the required `RELEASE_CONTROL_TOKEN` as an environment secret on
-`release-control`. Use a repository-scoped fine-grained token owned by a release
-maintainer already allowed by the tag ruleset, with Contents, Pull requests,
-Actions, and Workflows read/write permissions. Do not add GitHub Actions to the
+`release-control`. Use a fine-grained token owned by a release maintainer
+already allowed by the tag ruleset, scoped to `smart-byte/leani` and
+`smart-byte/homebrew-tap`, with Contents, Pull requests, Actions, and Workflows
+read/write permissions. The tap needs only Contents and Pull requests; a PR
+the token opens there runs the tap's tests. Do not add GitHub Actions to the
 tag ruleset's bypass list. The coordinator never falls back to
 `GITHUB_TOKEN`, which stays read-only: a pull request or tag it creates starts
 no workflow runs, so the preparation PR would never receive CI, and the tag
@@ -253,8 +257,9 @@ access alone does not grant package publication rights. Dispatch
 The GitHub repository must be public for npm provenance. Once the package
 exists, configure its npm trusted publisher: GitHub owner `smart-byte`,
 repository `leani`, workflow `sdk-release.yml`, environment `release-npm`, and
-permission to publish directly with `npm publish`. Subsequent publications use
-`bootstrap=false` and need no npm secret. Revoke the bootstrap token and delete
+permission to publish directly with `npm publish`. Leave **Allow npm dist-tag**
+unchecked: the publish job chooses the dist-tag when it publishes. Subsequent
+publications use `bootstrap=false` and need no npm secret. Revoke the bootstrap token and delete
 the GitHub secret after switching. See [npm trusted publishing](https://docs.npmjs.com/trusted-publishers/).
 
 ## Container
@@ -271,13 +276,18 @@ anonymous pulls for both architectures before announcing the release.
 
 ## Homebrew
 
-Copy the candidate's `leani.rb` to `Formula/leani.rb` in the shared
-`smart-byte/homebrew-tap` repository only after its public archive URLs exist.
-Run the tap's installation and formula tests. Until the first stable release,
-the formula follows the newest prerelease. When the first stable release ships,
-switch the formula to stable releases by default; publishing a later prerelease
-through it requires an explicit decision. Rendering the formula fails if
-`SHA256SUMS` lacks an archive or holds a malformed checksum.
+After the binary release is public, the coordinator opens a PR on the shared
+`smart-byte/homebrew-tap` repository that copies the verified candidate's
+`leani.rb` to `Formula/leani.rb` on branch `leani-v<version>`. The tap's tests
+install and test the formula on Linux and macOS; merge the PR once they pass.
+A rerun reuses the branch and its open PR.
+
+Until the first stable release, the formula follows the newest prerelease. Once
+the tap serves a stable release, the coordinator opens no PR for a later
+prerelease: shipping one through the tap requires an explicit decision and a
+hand-made PR with the same file. It never moves the formula to an older
+version. Rendering the formula fails if `SHA256SUMS` lacks an archive or holds a
+malformed checksum.
 
 ## Site promotion
 

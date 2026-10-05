@@ -146,6 +146,9 @@ class Publication(unittest.TestCase):
         self.sdk_lag = 0
         self.site_commit = None
         self.cloudflare_builds = True
+        self.tap_version = "0.0.1-rc.1"
+        self.tap_writes = []
+        self.tap_denied = False
         self.files = {}
         self.run_ids = {stage: index + 10 for index, stage in enumerate(release.WORKFLOWS)}
 
@@ -258,6 +261,23 @@ class Publication(unittest.TestCase):
             return record
         raise AssertionError(f"unexpected GitHub API request: {path}")
 
+    def tap_api(self, path, data=None, missing=False):
+        if path == "contents/Formula/leani.rb":
+            formula = f'url "https://github.com/example/leani/releases/download/v{self.tap_version}/leani.tar.gz"'
+            return {"content": release.base64.b64encode(formula.encode()).decode()}
+        if path.startswith("git/ref/heads/"):
+            return None
+        if path == "commits/main":
+            return {"sha": "e" * 40, "commit": {"tree": {"sha": "f" * 40}}}
+        if path.startswith("pulls?"):
+            return []
+        if path in ("git/trees", "git/commits", "git/refs", "pulls"):
+            if self.tap_denied:
+                raise ReleaseError(f"GitHub {path}: HTTP 403")
+            self.tap_writes.append((path, data))
+            return {"sha": "d" * 40, "html_url": "https://github.com/example/homebrew-tap/pull/1"}
+        raise AssertionError(f"unexpected tap API request: {path}")
+
     def download(self, *args):
         self.assertEqual(args[:3], ("gh", "run", "download"))
         name = args[args.index("--name") + 1]
@@ -288,11 +308,13 @@ class Publication(unittest.TestCase):
 
     @contextmanager
     def services(self):
-        with patch.object(self.gh, "api", side_effect=self.api), patch.object(release, "command", side_effect=self.download), \
+        tap = GitHub("example/homebrew-tap")
+        with patch.object(self.gh, "api", side_effect=self.api), patch.object(tap, "api", side_effect=self.tap_api), \
+                patch.object(release, "command", side_effect=self.download), \
                 patch.object(release, "registry_json", side_effect=self.registry), patch.object(release, "image_manifest", side_effect=self.image), \
                 patch.object(release.time, "sleep"), \
                 patch.object(release, "site_serves", side_effect=lambda repository, version: self.cloudflare_builds and self.site_commit == self.sha):
-            yield release.Coordinator(self.gh)
+            yield release.Coordinator(self.gh, tap=tap)
 
     def test_release_publishes_everything_and_promotes_the_site(self):
         self.published.clear()
@@ -303,6 +325,26 @@ class Publication(unittest.TestCase):
                          ["release.yml", "crates-release.yml", "sdk-release.yml", "container.yml", "site-promote.yml"])
         self.assertEqual(json.loads((self.root / "release-plan.json").read_text())["state"], "verified")
         self.assertEqual(coordinator.messages[-1], f"Release v{self.version} is fully published")
+        # The tap PR carries the verified candidate formula.
+        self.assertEqual([path for path, _ in self.tap_writes], ["git/trees", "git/commits", "git/refs", "pulls"])
+        self.assertEqual(self.tap_writes[0][1]["tree"][0]["content"], "formula")
+        self.assertEqual(self.tap_writes[3][1]["head"], f"leani-v{self.version}")
+
+    def test_tap_keeps_a_stable_formula_and_never_downgrades(self):
+        with self.services() as coordinator:
+            self.tap_version = "0.1.0"
+            coordinator.homebrew_pr("0.2.0-rc.1", "formula")
+            self.tap_version = "0.2.0-rc.2"
+            coordinator.homebrew_pr("0.2.0-rc.1", "formula")
+        self.assertEqual(self.tap_writes, [])
+        self.assertIn("open a tap PR by hand", coordinator.messages[0])
+        self.assertEqual(coordinator.messages[1], "homebrew: tap already serves v0.2.0-rc.2")
+
+    def test_tap_without_write_access_names_the_token_after_the_site_is_live(self):
+        self.tap_denied = True
+        with self.services() as coordinator, self.assertRaisesRegex(ReleaseError, "RELEASE_CONTROL_TOKEN needs Contents"):
+            coordinator.release(self.version, self.root / "release-plan.json")
+        self.assertEqual(coordinator.messages[-1], f"site: https://leani.dev serves v{self.version}")
 
     def test_promotion_without_a_live_production_build_fails(self):
         self.cloudflare_builds = False

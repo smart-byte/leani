@@ -982,7 +982,8 @@ Package:
 
 The SDK release workflow builds the JavaScript and type declarations and runs
 packed-package smoke tests in Node and Bun before publication. Prerelease
-versions use npm's `next` tag.
+versions use npm's `latest` tag until the first stable release, and `next`
+after it.
 
 Runtime support:
 

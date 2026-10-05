@@ -6,6 +6,16 @@ record, and documented RPC contracts.
 
 ## [Unreleased]
 
+### Changed
+
+- SDK: until the first stable release, each prerelease is published under
+  npm's `latest` tag, so an unversioned `@smart-byte/leani-sdk` install
+  resolves to the newest prerelease instead of `0.1.0-rc.1`, which does not
+  work with current nodes. The first stable release takes `latest`; later
+  prereleases use `next`. Pinning the exact version stays the documented install.
+- The release coordinator opens the Homebrew tap PR once a release's archives
+  are public, under the same stable-first rule.
+
 ## [0.1.0-rc.3] - 2026-10-05
 
 ### Added
