@@ -58,6 +58,10 @@ Destination writes must be idempotent because a crash between those steps can
 replay a change. Acknowledge a batch's `ackCursor` (or `acknowledgeableCursor`),
 never a change's own cursor; a backfill session's `deliveryBatches()` yields
 every such boundary with its changes, while `events()` yields changes only.
+`runBackfill(client, request, { onBatch })` runs one application-owned
+subscription to its end: it creates it, applies and acknowledges each batch,
+and deletes it once complete. After a crash or an abort, the identical request
+resumes it.
 
 The browser build assumes a same-origin deployment or a reverse proxy that
 adds the application's CORS policy. Leani does not enable cross-origin access

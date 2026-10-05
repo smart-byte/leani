@@ -50,13 +50,14 @@ export interface SyncOptions {
   fromBlock: number;
   /**
    * Consume each new subscription's history lane, beside the live lane:
-   * start `runBackfill()` from `@smart-byte/leani-sdk/backfill` here, but do
-   * not await it, which would hold the live lane back. Given
-   * `liveGapBackfill(subscription, …)` again, it resumes this subscription,
-   * applies and acknowledges its batches, and deletes it once complete.
-   * Catch its rejection: an abort or a failure keeps the subscription, and
-   * running it again resumes it. `keepInSync` forgets the range once this
-   * returns, so a rejected run is the application's to run again.
+   * start `runBackfill()` from `@smart-byte/leani-sdk/backfill` here with
+   * `liveGapBackfill(subscription, …)` and the same processor and consumer,
+   * lease TTL and credential included. Do not await it, which would hold the
+   * live lane back, but catch its rejection. `keepInSync` forgets the range
+   * once this returns, so until a run resolves `completed` the range is the
+   * application's: keep its request and run it again after a rejection or a
+   * restart, once the cause is fixed. An abort or a failure keeps the
+   * subscription.
    */
   onBackfill(subscription: BackfillStatus): void | Promise<void>;
   signal?: AbortSignal;
