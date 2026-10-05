@@ -142,6 +142,7 @@ describe('canned data', () => {
       'block-summary',
       'erc20-balances',
       'evm-events',
+      'rollup-txs',
       'transaction-stats',
       'uniswap-latest',
       'uniswap-observations',
