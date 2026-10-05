@@ -293,7 +293,10 @@ impl RollupTxsProcessor {
             publication: PublicationPolicy::IncludedAndFinalized,
             lifecycle: LifecyclePolicies::from_legacy(RetentionPolicy::FullOutputHistory),
             schemas: ProcessorSchemas {
-                delta_version: 1,
+                // The unreleased first implementation's deltas, version 1, have
+                // another layout: decoding refuses them instead of reading them as
+                // this one's.
+                delta_version: 2,
                 entity_schema: "rollups.entity.v1".to_owned(),
                 change_schema: "rollups.block-bundle.v1".to_owned(),
             },
