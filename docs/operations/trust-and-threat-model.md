@@ -57,13 +57,13 @@ runtime exists.
   coverage there fails the processor's lane. Neither chain is finalized on a
   contradiction. One with retained unfinalized blocks restarts the network
   lanes; one with finalized history, or the same one recurring a third time
-  before finality moves on, halts them. Every start undoes retained
-  unfinalized blocks it cannot prove to be ancestors of the verified finalized
-  anchor as a reorg. Where parent links do not reach the anchor, execution
-  headers from peers, hash-linked down from it, decide which retained
-  unfinalized blocks are its ancestors, and those are kept and finalized.
-  Peers can delay that proof, and a start that does not complete it within a
-  minute undoes the blocks, but they cannot forge it;
+  before finality moves on, halts them. Every start undoes, as a reorg,
+  retained unfinalized blocks that neither link to the verified finalized
+  anchor nor are proven to be its ancestors. Where parent links do not reach
+  the anchor, execution headers from peers, hash-linked down from it, decide
+  which retained unfinalized blocks are its ancestors, and those are kept and
+  finalized. Peers can delay that proof, and a start that does not complete it
+  within a minute undoes the blocks, but they cannot forge it;
 - atomic processor state, undo, coverage, change-log, and outbox commits;
 - opaque checksummed cursors bound to store, chain, processor, and version;
 - bounded API pages, request bodies, SSE batches, and source queues;

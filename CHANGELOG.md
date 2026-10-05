@@ -146,9 +146,9 @@ record, and documented RPC contracts.
   and keeps and finalizes the retained blocks they prove; only blocks off
   the finalized chain are reverted. Consumers no longer receive one `undo`
   batch per retained block, and a skipped-blocks notice starts after the old
-  tip. When the proof is not possible within 60 seconds, or the anchor is
-  more than 8,192 blocks above the first unfinalized block, startup reverts
-  them as before. `leani backfill` over P2P proves them the same way.
+  tip. When the proof is not possible within 60 seconds, or would span more
+  than 8,192 blocks, startup reverts them as before. `leani backfill` over P2P
+  proves them the same way.
 
 ## [0.1.0-rc.3] - 2026-10-05
 
