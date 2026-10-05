@@ -48,7 +48,13 @@ export interface SyncOptions {
   credential: string;
   /** The first block the destination keeps. */
   fromBlock: number;
-  /** Consume each new subscription's history lane, beside the live lane. */
+  /**
+   * Consume each new subscription's history lane, beside the live lane:
+   * start `runBackfill()` from `@smart-byte/leani-sdk/backfill` here, but do
+   * not await it, which would hold the live lane back. Given
+   * `liveGapBackfill(subscription, …)` again, it resumes this subscription,
+   * applies and acknowledges its batches, and deletes it once complete.
+   */
   onBackfill(subscription: BackfillStatus): void | Promise<void>;
   signal?: AbortSignal;
 }

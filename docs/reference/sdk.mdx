@@ -111,6 +111,37 @@ discardUnacknowledged: true })` deletes a failed or cancelled one whose
 consumer has not acknowledged every record. See
 [durable delivery](/docs/concepts/durable-delivery/) for lease and reset semantics.
 
+## Run a history subscription in one call
+
+`runBackfill(client, request, options)` in `@smart-byte/leani-sdk/backfill`
+runs an application-owned subscription to its end; `request` must name its
+`consumer`. It creates the subscription, applies each history batch with
+`options.onBatch` and acknowledges it once that resolves, acknowledges the
+completion, closes the session, and deletes the subscription. It resolves with
+the `outcome` (`completed`, `cancelled`, or `failed`), the `subscription` as it
+ended, the `completion` it acknowledged, if it streamed one, and the
+`deletion`. Creation is idempotent by `idempotencyKey`: running the same
+request again, as after a crash, resumes the same subscription after its last
+acknowledged batch. A batch applied but not acknowledged is delivered again,
+so `onBatch` must be idempotent. A subscription already complete when created
+is deleted without opening its stream.
+
+After a lost connection or consumer session, or while another connection
+still holds the consumer's session, it opens the stream again after a backoff
+of 1 second, doubling up to 30 seconds. A failed subscription follows
+`options.onFailure`. `"retry"`, the
+default, re-queues it with `retry()`, up to `maxRetries` times (3 by default),
+then throws a `BackfillStreamError` with `code: "backfill_failed"` and leaves it
+failed. `"discard"` deletes it with `discardUnacknowledged: true` and resolves
+with the outcome `failed`, and `"throw"` throws at once. A cancelled
+subscription is deleted with `discardUnacknowledged: true`. An error from
+`onBatch`, a `reset_required` stream, any other failure, and an abort of
+`options.signal` close the session and reject without deleting the
+subscription, so the same request can run again. The stream presents
+`options.credential`, by default the request's `consumer.credential`.
+
+## Inventory
+
 The inventory below is generated from both public entry points and shared error
 types. The `backfill.*` members belong to the backfill client.
 
