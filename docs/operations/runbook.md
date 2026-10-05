@@ -896,8 +896,8 @@ it never mutates a newer instance in place.
 The old instance's backfill subscriptions do not move. Their retained records
 count against `[budgets.delivery] maximum_history_retained_bytes` until they
 are deleted, and once the node no longer configures the old instance, their
-stream and acknowledgement routes answer `404 not_found`, so their consumers
-can neither read nor acknowledge them. Settle them around the switch:
+stream and acknowledgement routes refuse (normally `404 not_found`), so their
+consumers can neither read nor acknowledge them. Settle them around the switch:
 
 1. Before the configuration drops the old instance, let each of its history
    subscriptions finish, with its consumer acknowledging the
