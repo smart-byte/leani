@@ -86,6 +86,9 @@ record, and documented RPC contracts.
   `no_viable_historical_source`, as for eraE, instead of the retryable
   `historical_source_failed`, when Xatu is the last source the read tries.
   Other store failures, such as a 5xx response or a timeout, are unchanged.
+  The warning a job logs for each failed attempt on a source no longer calls
+  the failure transient: it now reads
+  `historical source attempt failed; trying the next source`.
 
 ## [0.1.0-rc.3] - 2026-10-05
 

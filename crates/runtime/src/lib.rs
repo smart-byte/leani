@@ -1943,7 +1943,7 @@ impl HistoricalRuntime {
                         source_id = %source.descriptor().id,
                         ?delay,
                         error = %error,
-                        "transient historical source failure"
+                        "historical source attempt failed; trying the next source"
                     );
                     tokio::select! {
                         () = cancellation.cancelled() => {
