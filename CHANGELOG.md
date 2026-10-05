@@ -38,6 +38,14 @@ record, and documented RPC contracts.
   - A transaction gains `success`, `false` for a reverted transaction.
   - `selector` is the matched rule's selector, `null` when that rule has none,
     instead of the transaction's first four input bytes.
+  - It supports Ethereum mainnet only, from London (block 12,965,000) on,
+    because its execution burn and tip need the base fee. The node now refuses
+    it on another chain, such as Sepolia, and with an earlier `start_block`.
+  - A rule's `since` and `until` are UNIX timestamps in seconds. The node now
+    refuses one below mainnet's genesis timestamp (1438269973), such as a block
+    number, and a rule with `chain_id_arg` but no `selector`, whose rows would
+    render `selector: null` so that calls to different functions could not be
+    told apart.
 
 ### Changed
 

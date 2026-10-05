@@ -198,6 +198,17 @@ recipient wins, so list the more specific rules first. Type-3 transactions
 never match: `blobs-money` reports them. Only top-level calls match; a call
 made through a multisig or another contract is not seen.
 
+The processor supports Ethereum mainnet only, and only from London (block
+12,965,000) on, because `executionBurnedWei` and `tipWei` need the base fee
+that earlier blocks lack. Startup refuses another chain and a pre-London
+`start_block`. `since` and `until` are UNIX timestamps in seconds, not block
+numbers: a block matches from `since` (inclusive) up to `until` (exclusive).
+Startup refuses a `since` or `until` below mainnet's genesis timestamp
+(1438269973), as any block number is, and a window whose `since` is not below
+its `until`. A rule with `chain_id_arg` also needs a `selector`: the chain id
+is the argument after it, and without one the rows would render
+`selector: null`, so calls to different functions could not be told apart.
+
 Every block emits one `rollups.block` change (`rollups.block-bundle.v1`), also
 when nothing matched, so a consumer can tell a block without rollup activity
 from one it never received. Materialized output stores each block's bundle by
@@ -221,7 +232,7 @@ when that rule has none: the first bytes of a calldata batch are batch data,
 not a function selector. Hashes, addresses, and selectors are lowercase
 `0x`-hex. `gasUsed`, `executionBurnedWei`, and `tipWei` are decimal strings;
 `blockNumber`, `timestamp`, and `transactionIndex` are JSON numbers. The
-network and rules are the processor's configuration identity: a rule change
+rules and the `start_block` are the processor's identity: changing either
 needs a new `instance`.
 
 ```toml

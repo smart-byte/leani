@@ -730,16 +730,11 @@ impl ProcessorFactory for RollupTxsProcessorFactory {
     ) -> Result<ProcessorComponents, ProcessorFactoryError> {
         use leani_processor_rollup_txs::{Purpose, RollupTxsConfig, RollupTxsProcessor, Rule};
 
-        let network = match context.chain_id {
-            1 => "mainnet",
-            11_155_111 => "sepolia",
-            17_000 => "holesky",
-            other => {
-                return Err(ProcessorFactoryError::configuration(format!(
-                    "rollup-txs has no network name for chain {other}"
-                )));
-            }
-        };
+        if context.chain_id != 1 {
+            return Err(ProcessorFactoryError::configuration(
+                "rollup-txs supports Ethereum mainnet only",
+            ));
+        }
         let settings: RollupTxsSettings = decode_settings(configured)?;
         let rules = settings
             .rules
@@ -763,7 +758,7 @@ impl ProcessorFactory for RollupTxsProcessorFactory {
             })
             .collect::<Result<Vec<_>, ProcessorFactoryError>>()?;
         let processor = RollupTxsProcessor::new(RollupTxsConfig {
-            network: network.to_owned(),
+            network: "mainnet".to_owned(),
             start_block: BlockNumber(configured.start_block),
             rules,
         })
@@ -967,37 +962,36 @@ mod tests {
         );
     }
 
+    /// A `rollup-txs` instance, started after London, with one valid rule
+    /// whose fields `fields` add to or override.
+    fn rollup_txs_with_rule<const N: usize>(fields: [(&str, toml::Value); N]) -> ProcessorConfig {
+        let mut processor = crate::builtin_processors::processor_contract(
+            "rollup-txs",
+            "rollup-txs-test",
+            "1.0.0",
+            22_000_000,
+            false,
+        );
+        let mut rule = toml::Table::from_iter([
+            ("rollup".to_owned(), "base".into()),
+            ("purpose".to_owned(), "state".into()),
+            (
+                "to".to_owned(),
+                "0x43edb88c4b80fdd2adff2412a7bebf9df42cb40e".into(),
+            ),
+            ("selector".to_owned(), "0x82ecf2f6".into()),
+        ]);
+        rule.extend(fields.map(|(key, value)| (key.to_owned(), value)));
+        processor.settings.insert(
+            "rules".to_owned(),
+            toml::Value::Array(vec![toml::Value::Table(rule)]),
+        );
+        processor
+    }
+
     #[test]
     fn rollup_txs_settings_become_matching_rules() {
-        let configured = |purpose: &str| {
-            let mut processor = crate::builtin_processors::processor_contract(
-                "rollup-txs",
-                "rollup-txs-test",
-                "1.0.0",
-                22_000_000,
-                false,
-            );
-            let rule = toml::Table::from_iter([
-                ("rollup".to_owned(), toml::Value::String("base".to_owned())),
-                (
-                    "purpose".to_owned(),
-                    toml::Value::String(purpose.to_owned()),
-                ),
-                (
-                    "to".to_owned(),
-                    toml::Value::String("0x43edb88c4b80fdd2adff2412a7bebf9df42cb40e".to_owned()),
-                ),
-                (
-                    "selector".to_owned(),
-                    toml::Value::String("0x82ecf2f6".to_owned()),
-                ),
-            ]);
-            processor.settings.insert(
-                "rules".to_owned(),
-                toml::Value::Array(vec![toml::Value::Table(rule)]),
-            );
-            processor
-        };
+        let configured = |purpose: &str| rollup_txs_with_rule([("purpose", purpose.into())]);
         let registry = ProcessorRegistry::standard();
         let components = registry
             .instantiate_components(&configured("state"), 1)
@@ -1009,6 +1003,56 @@ mod tests {
             registry.instantiate_components(&configured("settlement"), 1),
             Err(ProcessorRegistryError::Factory { .. })
         ));
+    }
+
+    #[test]
+    fn rollup_txs_rejects_a_selector_that_is_not_four_bytes() {
+        let registry = ProcessorRegistry::standard();
+        for selector in ["0x82ecf2", "0x82ecf2f6aa"] {
+            let error = registry
+                .instantiate_components(&rollup_txs_with_rule([("selector", selector.into())]), 1)
+                .expect_err("a selector of the wrong length");
+            assert!(error.to_string().contains("4-byte selector"), "{error}");
+        }
+    }
+
+    #[test]
+    fn rollup_txs_rejects_an_unknown_settings_key() {
+        let registry = ProcessorRegistry::standard();
+        // a misspelt rule key must not silently drop the constraint it meant
+        let misspelt = rollup_txs_with_rule([("selecter", "0x82ecf2f6".into())]);
+        let mut stray = rollup_txs_with_rule([]);
+        stray
+            .settings
+            .insert("network".to_owned(), "sepolia".into());
+        for (configured, key) in [(misspelt, "selecter"), (stray, "network")] {
+            let error = registry
+                .instantiate_components(&configured, 1)
+                .expect_err("an unknown key");
+            assert!(
+                error
+                    .to_string()
+                    .contains(&format!("unknown field `{key}`")),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn rollup_txs_rejects_a_chain_other_than_mainnet() {
+        let registry = ProcessorRegistry::standard();
+        // Sepolia and Holesky, which the first implementation named
+        for chain_id in [11_155_111, 17_000] {
+            let error = registry
+                .instantiate_components(&rollup_txs_with_rule([]), chain_id)
+                .expect_err("a test network");
+            assert!(
+                error
+                    .to_string()
+                    .contains("rollup-txs supports Ethereum mainnet only"),
+                "{error}"
+            );
+        }
     }
 
     #[test]
