@@ -1,6 +1,6 @@
 {
   "name": "@smart-byte/leani-sdk",
-  "version": "0.1.0-rc.2",
+  "version": "0.1.0-rc.3",
   "description": "Typed Leani queries and resumable live/history delivery",
   "license": "MIT",
   "type": "module",
