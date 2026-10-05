@@ -105,8 +105,8 @@ source reports such a chunk as a range it does not cover, as eraE reports a
 range its catalog does not list yet, not as an unavailable source: a job
 moves on to its next configured source, and the node logs
 `xatu has not published this object yet` with the object's location at
-debug level. Other store failures, such as a 5xx response or a timeout, are
-reported as before.
+debug level. Only a 404 is reported this way; other store failures, such as
+a 5xx response or a timeout, are not.
 
 Every immutable chunk encodes its projection kind and exact filters. `open`
 therefore cannot execute a different physical projection from the one that
