@@ -119,26 +119,30 @@ runs an application-owned subscription to its end; `request` must name its
 `options.onBatch` and acknowledges it once that resolves, acknowledges the
 completion, closes the session, and deletes the subscription. It resolves with
 the `outcome` (`completed`, `cancelled`, or `failed`), the `subscription` as it
-ended, the `completion` it acknowledged, if it streamed one, and the
-`deletion`. Creation is idempotent by `idempotencyKey`: running the same
+ended, the `completion` record it received, if it streamed one, and the
+`deletion`. Creation is idempotent by `idempotencyKey`: running the identical
 request again, as after a crash, resumes the same subscription after its last
-acknowledged batch. A batch applied but not acknowledged is delivered again,
-so `onBatch` must be idempotent. A subscription already complete when created
-is deleted without opening its stream.
+acknowledged batch, and the node refuses a different request under the same
+key. A batch applied but not acknowledged is delivered again, so `onBatch`
+must be idempotent. A subscription already complete when created is deleted
+without opening its stream.
 
 After a lost connection or consumer session, or while another connection
-still holds the consumer's session, it opens the stream again after a backoff
-of 1 second, doubling up to 30 seconds. A failed subscription follows
-`options.onFailure`. `"retry"`, the
+still holds the consumer's session, it waits a backoff of 1 second, doubling
+up to 30 seconds, and reads the subscription's state before it opens the
+stream again: a subscription that ended meanwhile, as when the node applied
+the completion's acknowledgement but its answer was lost, ends the run
+instead. A failed subscription follows `options.onFailure`. `"retry"`, the
 default, re-queues it with `retry()`, up to `maxRetries` times (3 by default),
 then throws a `BackfillStreamError` with `code: "backfill_failed"` and leaves it
 failed. `"discard"` deletes it with `discardUnacknowledged: true` and resolves
 with the outcome `failed`, and `"throw"` throws at once. A cancelled
 subscription is deleted with `discardUnacknowledged: true`. An error from
 `onBatch`, a `reset_required` stream, any other failure, and an abort of
-`options.signal` close the session and reject without deleting the
-subscription, so the same request can run again. The stream presents
-`options.credential`, by default the request's `consumer.credential`.
+`options.signal` or `request.signal` close the session and reject without
+deleting the subscription, so the identical request can run again once the
+cause is fixed. The stream presents `options.credential`, by default the
+request's `consumer.credential`.
 
 ## Inventory
 

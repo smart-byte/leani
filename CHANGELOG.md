@@ -56,14 +56,16 @@ record, and documented RPC contracts.
   subscription to its end in one call. It creates the subscription, applies
   each batch with `onBatch` and acknowledges it once that resolves, then
   acknowledges the completion and deletes the subscription. Creation is
-  idempotent, so running the same request again after a crash resumes the
-  same subscription. After a lost connection or consumer session, the stream
-  is opened again with backoff. A failed subscription is retried up to
-  `maxRetries` times, 3 by default, then thrown; `onFailure: "discard"`
+  idempotent, so running the identical request again after a crash resumes
+  the same subscription. After a lost connection or consumer session, the
+  stream is opened again with backoff, unless the subscription ended
+  meanwhile. A failed subscription is retried up to `maxRetries` times, 3 by
+  default, then its error is thrown, leaving it failed; `onFailure: "discard"`
   deletes it instead, and `"throw"` throws at once. A cancelled subscription
-  is deleted with its unacknowledged records. An `onBatch` error or an abort
-  closes the session and keeps the subscription for a rerun. New types:
-  `RunBackfillOptions`, `RunBackfillResult`, and `BackfillFailurePolicy`.
+  is deleted with its unacknowledged records. An `onBatch` error, or an abort
+  through `options.signal` or `request.signal`, closes the session and keeps
+  the subscription for a rerun. New types: `RunBackfillOptions`,
+  `RunBackfillResult`, and `BackfillFailurePolicy`.
 
 ### Changed
 
