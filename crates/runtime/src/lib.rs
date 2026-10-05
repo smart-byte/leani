@@ -4709,9 +4709,10 @@ impl SharedLiveRuntime {
     /// its capacity anyway, it holds `block` without fetching. It fetches
     /// [`LIVE_GAP_RECOVERY_CHUNK_BLOCKS`] blocks at a time and applies each
     /// one only after checking it, so the applied blocks link from the
-    /// cursor towards `block`. It stops at the first block it cannot fill, or
-    /// before a fetch once `live_gap_fill_time_limit` has passed since it
-    /// started, and returns where the unfilled rest begins.
+    /// cursor towards `block`. It stops at the first block it cannot fill,
+    /// or once `live_gap_fill_time_limit` has passed since it started: it
+    /// starts no fetch after that and gives up a fetch still running then.
+    /// It returns where the unfilled rest begins.
     #[allow(clippy::too_many_lines)]
     async fn fill_skipped_blocks(
         &self,
@@ -4762,6 +4763,7 @@ impl SharedLiveRuntime {
             "filling the blocks the live lane skips from history"
         );
         let started = tokio::time::Instant::now();
+        let deadline = started.checked_add(self.config.live_gap_fill_time_limit);
         let (mut applied, mut duplicates) = (0_u64, 0_u64);
         let mut next = skipped.start();
         while next <= skipped.end() {
@@ -4777,12 +4779,20 @@ impl SharedLiveRuntime {
                 ),
             )
             .map_err(|error| RuntimeError::InvalidConfig(error.to_string()))?;
-            let frames = match recovery.recover_chunk(descriptor, range).await {
-                Ok(frames) => frames,
-                Err(RuntimeError::Cancelled | RuntimeError::Source(SourceError::Cancelled)) => {
+            // Every lane waits for this request, so the time limit bounds it
+            // too: one that a slow peer keeps open past it is given up.
+            let request = recovery.recover_chunk(descriptor, range);
+            let fetched = match deadline {
+                Some(deadline) => tokio::time::timeout_at(deadline, request).await,
+                None => Ok(request.await),
+            };
+            let frames = match fetched {
+                Err(_elapsed) => return give_up(next, "the fill ran out of time"),
+                Ok(Ok(frames)) => frames,
+                Ok(Err(RuntimeError::Cancelled | RuntimeError::Source(SourceError::Cancelled))) => {
                     return Err(RuntimeError::Cancelled);
                 }
-                Err(error) => return give_up(next, &error.to_string()),
+                Ok(Err(error)) => return give_up(next, &error.to_string()),
             };
             if u64::try_from(frames.len()).unwrap_or(u64::MAX) != range.len() {
                 return give_up(
@@ -7993,11 +8003,13 @@ mod tests {
         }
     }
 
-    /// History that counts its requests: it serves `frames` after `delay`,
-    /// or, without frames, is unavailable.
+    /// History that counts its requests: it serves `frames`, or, without
+    /// frames, is unavailable. It answers the first `prompt` requests at
+    /// once and every later one after `delay`.
     #[derive(Debug, Default)]
     struct CountingLiveGapRecovery {
         frames: Option<Vec<leani_primitives::BlockFrame>>,
+        prompt: usize,
         delay: Duration,
         calls: AtomicUsize,
     }
@@ -8014,8 +8026,14 @@ mod tests {
             Self::default()
         }
 
-        fn after(self, delay: Duration) -> Self {
-            Self { delay, ..self }
+        /// Answer the first `prompt` requests at once, and every later one
+        /// after `delay`.
+        fn stalling_after(self, prompt: usize, delay: Duration) -> Self {
+            Self {
+                prompt,
+                delay,
+                ..self
+            }
         }
 
         fn calls(&self) -> usize {
@@ -8030,8 +8048,8 @@ mod tests {
             _processor: &ProcessorDescriptor,
             range: BlockRange,
         ) -> Result<Vec<leani_primitives::BlockFrame>, RuntimeError> {
-            self.calls.fetch_add(1, Ordering::SeqCst);
-            if !self.delay.is_zero() {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            if call >= self.prompt && !self.delay.is_zero() {
                 tokio::time::sleep(self.delay).await;
             }
             let frames = self.frames.as_ref().ok_or_else(|| {
@@ -22209,14 +22227,15 @@ mod tests {
         let chain = live_blocks(135);
         let counter = Arc::new(BlockLocalCounter::named("slow-fill-counter").with_split_delivery());
         let lanes: Vec<Arc<dyn Processor>> = vec![counter.clone()];
-        // Each request takes longer than the whole fill may.
+        // The first request answers at once; a later one would answer long
+        // after the fill's time is up.
         let history = Arc::new(
             CountingLiveGapRecovery::serving(finalized_copies(&chain[2..=133]))
-                .after(Duration::from_millis(100)),
+                .stalling_after(1, Duration::from_secs(30)),
         );
         let (_directory, store) = store().await;
         let config = SharedLiveRuntimeConfig {
-            live_gap_fill_time_limit: Duration::from_millis(50),
+            live_gap_fill_time_limit: Duration::from_secs(1),
             ..fill_config(counter.as_ref(), 200)
         };
         let runtime = |steps| filling_live(&store, &lanes, config.clone(), &history, steps);
@@ -22227,13 +22246,18 @@ mod tests {
             .store_canonical_anchor(ChainId(1), chain[133].block, Finality::Finalized)
             .await
             .expect("seed the anchor");
+        let started = std::time::Instant::now();
         run_live(&runtime(block_events(&chain[134..])))
             .await
             .expect("run after the downtime");
 
-        // The first request, blocks 2..=129, is filled; the time is up before
-        // the next one.
-        assert_eq!(history.calls(), 1);
+        // The first request, blocks 2..=129, is filled. The time is up before
+        // the next request answers, or before it starts, and the lane does not
+        // wait for it.
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "the fill waited for a request past its time limit"
+        );
         assert_eq!(
             announced(&store, counter.as_ref()).await,
             [(BlockNumber(130), BlockNumber(133))]
@@ -22245,6 +22269,52 @@ mod tests {
                 .chain((2..=129).map(recovered_apply))
                 .chain([notice_at(134), live_apply(134), live_apply(135)])
                 .collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_live_gap_fill_abandons_a_history_request_that_outlasts_its_time_limit() {
+        // Real time, as above.
+        let chain = live_blocks(6);
+        let counter =
+            Arc::new(BlockLocalCounter::named("stalled-fill-counter").with_split_delivery());
+        let lanes: Vec<Arc<dyn Processor>> = vec![counter.clone()];
+        // Its one request would answer long after the fill's time is up.
+        let history = Arc::new(
+            CountingLiveGapRecovery::serving(finalized_copies(&chain[2..=4]))
+                .stalling_after(0, Duration::from_secs(30)),
+        );
+        let (_directory, store) = store().await;
+        let config = SharedLiveRuntimeConfig {
+            live_gap_fill_time_limit: Duration::from_millis(200),
+            ..fill_config(counter.as_ref(), 8)
+        };
+        let started = std::time::Instant::now();
+        follow_across_downtime(&store, &chain, 4, Finality::Finalized, |steps| {
+            filling_live(&store, &lanes, config.clone(), &history, steps)
+        })
+        .await;
+
+        // The lane gives the request up when the time is up, announces the
+        // whole range, and follows on: every lane waited no longer than that.
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "the fill waited for a request past its time limit"
+        );
+        assert_eq!(history.calls(), 1);
+        assert_eq!(
+            published(&store, counter.as_ref()).await,
+            [
+                live_apply(0),
+                live_apply(1),
+                notice_at(5),
+                live_apply(5),
+                live_apply(6),
+            ]
+        );
+        assert_eq!(
+            announced(&store, counter.as_ref()).await,
+            [(BlockNumber(2), BlockNumber(4))]
         );
     }
 
