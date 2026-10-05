@@ -649,9 +649,12 @@ export interface ChangeEnvelope<T = unknown> {
 ```
 
 Envelopes carry change-scoped facts, including the processing lane's origin and
-publication revision. Connection-scoped processor identity and node coverage
-are served by the stream's `hello` frame (section 4.3) and by `/v1/status`;
-poll responses continue to carry one top-level `coverage` per page.
+publication revision. `originKind: "live_recovery"` marks a finalized block
+that a live lane applied late, from retained frames or finalized history, as in
+a gap replay or a live gap fill (section 4.2). Connection-scoped processor
+identity and node coverage are served by the stream's `hello` frame (section
+4.3) and by `/v1/status`; poll responses continue to carry one top-level
+`coverage` per page.
 
 `sequence` is a decimal string because a long-running stream can exceed
 JavaScript's safe integer range. It is monotonically increasing in one store
@@ -694,16 +697,24 @@ from another store, chain, processor version, or expired epoch is rejected.
 - permits a consumer to mark earlier changes durable.
 
 A `finalized` change of kind `system.live_gap.put` instead announces blocks
-the live lane skipped, which the processor never processed, as after a
-restart at a later finalized anchor: `data: { fromBlock, toBlock, reason:
-"not_filled" }`. Only block-local processors with `history_mode =
+the live lane skipped and did not fill, which the processor never processed,
+as after a restart at a later finalized anchor: `data: { fromBlock, toBlock,
+reason: "not_filled" }`. Only block-local processors with `history_mode =
 "on_demand"` announce them, before the block that follows the range, live or
 replayed, and in a batch of their own. After a crash between the two, the
 next block past the cursor announces again, the same range or a longer one;
 a retry the stream's last notice already covers adds none.
 Deduplicate batches by cursor: the notice and the following block share a
 block number.
-Leani does not fill the range: request it as history, such as with a
+A processor with
+[`[processors.live_gap_fill]`](/docs/operations/configuration-guide/#live-gap-fill)
+first fills a range of at most `max_blocks` blocks from history. The live
+stream delivers those blocks before the following block, one batch each, in
+block order, as `apply` changes with `originKind: "live_recovery"` and
+`finality: "finalized"`, and announces nothing for them. It announces a longer
+range, a range history cannot serve yet, and whatever a fill leaves when it
+fails or runs out of time, from the first block it did not fill.
+Otherwise Leani does not fill the range: request it as history, such as with a
 `fill_missing` backfill subscription (see
 [Keep your application in sync](/docs/guides/keep-your-application-in-sync/)).
 

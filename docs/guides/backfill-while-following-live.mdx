@@ -31,7 +31,8 @@ processor start                                             observed head
 3. For `history_control = "node_owned"`, let the node schedule missing ranges.
    For `application_subscriptions`, create bounded backfill subscriptions from
    the application and consume their independent history lanes. Request the
-   ranges the live stream announces in `system.live_gap.put` changes too; see
+   ranges the live stream announces in `system.live_gap.put` changes too,
+   those the live lane does not fill itself; see
    [Keep your application in sync](/docs/guides/keep-your-application-in-sync/).
 4. Observe exact coverage intervals, not only `processedThrough`.
 5. Accept the handoff only when parent hash, canonical ancestry, and processor
