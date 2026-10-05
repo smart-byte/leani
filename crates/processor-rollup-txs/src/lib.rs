@@ -861,6 +861,19 @@ mod tests {
             .expect("a block bundle")
     }
 
+    /// The cursor a reducer receives for `frame`'s block.
+    fn cursor_at(processor: &RollupTxsProcessor, frame: &BlockFrame) -> ProcessorCursor {
+        ProcessorCursor {
+            processor_id: processor.descriptor.id.to_string(),
+            processor_version: processor.descriptor.version.to_string(),
+            chain_id: frame.chain_id,
+            block_number: frame.block.number,
+            block_hash: frame.block.hash,
+            finality: frame.finality,
+            sequence: 1,
+        }
+    }
+
     #[test]
     fn matches_transfers_calls_and_chain_arguments_and_skips_the_rest() {
         let stranger = Address::new([0xee; 20]);
@@ -1430,15 +1443,7 @@ mod tests {
             }],
         );
         let delta = processor.map(&frame).await.expect("map");
-        let cursor = ProcessorCursor {
-            processor_id: processor.descriptor.id.to_string(),
-            processor_version: processor.descriptor.version.to_string(),
-            chain_id: frame.chain_id,
-            block_number: frame.block.number,
-            block_hash: frame.block.hash,
-            finality: frame.finality,
-            sequence: 1,
-        };
+        let cursor = cursor_at(&processor, &frame);
         let mut reducer = MemoryReducer::default();
         let changes = processor
             .reduce(&mut reducer, &cursor, &delta)
@@ -1500,9 +1505,57 @@ mod tests {
             processor.descriptor.schemas.change_schema,
             "rollups.block-bundle.v1"
         );
+    }
 
-        // a block without rollup activity still emits its (empty) bundle
-        let empty = processor.derive(&self::frame(501, &[])).expect("derive");
-        assert!(empty.transactions.is_empty());
+    #[tokio::test]
+    async fn a_block_without_rollup_activity_still_emits_an_empty_bundle() {
+        let processor = processor();
+        let quiet_blocks = [
+            (
+                "a transaction sent to a rule's recipient but not from its sender",
+                vec![Tx {
+                    from: Address::new([0xee; 20]),
+                    ..batch(9)
+                }],
+            ),
+            ("no transactions", Vec::new()),
+        ];
+        for (description, transactions) in quiet_blocks {
+            let frame = frame(500, &transactions);
+            let delta = processor.map(&frame).await.expect("map");
+            let mut reducer = MemoryReducer::default();
+            let changes = processor
+                .reduce(&mut reducer, &cursor_at(&processor, &frame), &delta)
+                .await
+                .expect("reduce");
+            let [change] = changes.changes.as_slice() else {
+                panic!("{description}: one change, got {:?}", changes.changes);
+            };
+            assert_eq!(change.kind, "rollups.block", "{description}");
+            assert_eq!(
+                reducer.emitted(),
+                std::slice::from_ref(change),
+                "{description}"
+            );
+            let bundle = processor
+                .change_json(change)
+                .expect("render")
+                .expect("a block bundle");
+            assert_eq!(bundle["block"]["blockNumber"], json!(42), "{description}");
+            assert_eq!(bundle["transactions"], json!([]), "{description}");
+            // the empty bundle is retained too, so a read of the entity tells a
+            // block without rollup activity from one that was never covered
+            let key = 42_u64.to_be_bytes();
+            let stored = reducer
+                .entity("rollups.blocks", &key)
+                .expect("a retained bundle");
+            assert_eq!(
+                processor
+                    .entity_json("rollups.blocks", &key, stored)
+                    .expect("render"),
+                Some(bundle),
+                "{description}"
+            );
+        }
     }
 }
