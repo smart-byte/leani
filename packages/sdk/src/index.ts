@@ -476,9 +476,11 @@ export type ChangeEnvelope<T = unknown> = ChangeMetadata & (
 
 /**
  * Whether `change` announces blocks the live lane skipped and did not fill,
- * as after a restart at a later finalized anchor. Nothing else delivers them:
- * request them as history, for example with `liveGapBackfill` from
- * `@smart-byte/leani-sdk/backfill`.
+ * as after a restart at a later finalized anchor. Request them as history,
+ * for example with `liveGapBackfill` from `@smart-byte/leani-sdk/backfill`.
+ * A processor with `live_gap_fill` can still deliver some of them later as
+ * `live_recovery` batches, when it retries a fill after a hold, a crash, or a
+ * restart of its live lane, so write them idempotently.
  */
 export function isLiveGapChange<T>(
   change: ChangeEnvelope<T>,

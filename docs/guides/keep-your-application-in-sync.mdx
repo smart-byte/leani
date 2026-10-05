@@ -93,6 +93,7 @@ its operator requests them as `POST /admin/v1/materialization-jobs`.
    the application requested from its coverage diff while the lane filled the
    same range. A notice can also be followed by `live_recovery` batches for
    the blocks it announced, when the lane retries a fill after it held the
-   block that follows.
+   block that follows, or after a crash or a restart of its live lane
+   between the notice and that block.
 
 <CodeExample example="keep-in-sync" />

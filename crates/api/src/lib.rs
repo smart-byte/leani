@@ -7575,7 +7575,9 @@ fn render_change_envelope(
         }
         ChangeOperation::Upsert if record.change.kind == LIVE_GAP_CHANGE_KIND => {
             let (from, to) = decode_live_gap_notice(&record.change.payload)?;
-            // Leani does not fill the range itself: history is on demand.
+            // Leani did not fill the range: history is on demand, and the
+            // processor's `live_gap_fill` limit, if any, did not cover it or
+            // the fill stopped before it.
             Some(json!({
                 "fromBlock": from.0,
                 "toBlock": to.0,

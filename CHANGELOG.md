@@ -81,12 +81,15 @@ record, and documented RPC contracts.
   burst of blocks could fail the lane or reset its consumers where a notice
   would not. A single filled block larger than the stream's `max_bytes` fails
   the lane, as an equally large live block would: raise `max_bytes` or remove
-  the table. A fill also makes a hold more likely, and a held block's delta
-  counts against the shared `[budgets] pending_delta_bytes`; when it does not
-  fit, the lane fails (`live_gap_marker_exceeds_pending_delta_budget`) until
-  the budget is raised and the lane reset. The table is not part of an
-  instance's identity, and a release without it refuses a configuration that
-  has it, so remove it before rolling back. The node now registers its
+  the table. A fill also makes a pause at a delivery or storage limit more
+  likely. The lane then holds the block that follows the range, and fetches
+  and announces nothing until the limit has room for its next block. The
+  held block's delta counts against the shared
+  `[budgets] pending_delta_bytes`; when it does not fit, the lane fails
+  (`live_gap_marker_exceeds_pending_delta_budget`) until the budget is raised
+  and the lane reset. The table is not part of an instance's identity, and a
+  release without it refuses a configuration that has it, so remove it before
+  rolling back. The node now registers its
   execution P2P history bridge after it seeds the finalized anchor and before
   startup reconciliation, so a fill during the startup replay can use it.
 

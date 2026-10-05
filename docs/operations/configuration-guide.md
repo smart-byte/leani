@@ -403,11 +403,13 @@ lane announces from there. That happens when history fails or serves too few
 blocks; when a block is not finalized, does not link by parent hash to the one
 before it, is not the canonical block at its height, or lacks material the
 processor requires; and when the time limit passes. The limit is five
-minutes, is fixed, and is checked before each request, so a fill can run for
-five minutes plus one request. A filled block is as trusted as the same block
-delivered by a `fill_missing` subscription, which uses the same sources and
-verification policy, and the filled blocks link by parent hash from the
-cursor's block, through the range, to the block that follows.
+minutes and is fixed. The fill starts no request after it and gives up a
+request still running at it, so a fill runs for at most five minutes plus
+applying the blocks of its last request. A filled block is as trusted as the
+same block delivered by a `fill_missing` subscription, which uses the same
+sources and verification policy. The filled blocks link by parent hash from
+the cursor's block through the range and, when the fill completes, to the
+block that follows.
 
 The sources are the processor's history sources, in the order a history
 request tries them: retained raw history (`[raw_history]`, when enabled), the
@@ -432,20 +434,29 @@ it. Several processors with the table fill one after another, and each
 fetches the blocks again.
 
 Filled blocks are ordinary delivery records under the processor's delivery
-policy, and count against `delivery.max_bytes`. A lane paused at its delivery
-limit, or at a storage limit while storage stays above its low-water mark,
-does not fetch history again on every live block, and a lane that reaches one
-of those limits mid-fill stops there. It holds the block after the range and
-announces nothing. Once consumers acknowledge and pruning resumes it, or
-storage has room, it continues the fill. The unfilled rest is recomputed from
+policy, and count against `delivery.max_bytes` and the node-wide
+`[budgets.delivery]` and `[budgets.store]` limits. A lane that reaches one of
+those limits mid-fill stops there. It holds the block after the range and
+announces nothing. While the store would refuse that block, because the lane
+is paused above its stream's resume mark (90 % of `max_bytes`), a node-wide
+budget has no room for it, or the lane is paused at a storage limit while
+storage stays above its low-water mark, the lane fetches no history for the
+fill, as long as the block after the range is among the retained frames.
+Once finality prunes that frame during a long hold, the lane recovers it from
+history on every live block, as any paused lane recovers its first unapplied
+block. After a restart of the live lanes, a lane held at a node-wide budget
+can fetch once more before it waits again. The lane continues the fill once
+the store would take the block: once consumers acknowledge and pruning brings
+its stream down to the resume mark, once pruning any stream gives a node-wide
+budget room, or once storage has room. The unfilled rest is recomputed from
 the processor's cursor on resume, so a history commit that an application's
 subscription lands above the cursor meanwhile can shorten what the lane fills
 or announces. That is rare, and idempotent writes and the application's
 coverage diff cover it. A single filled block larger than the stream's
 `max_bytes` fails the lane, as an equally large live block would: raise
-`max_bytes` or remove the table. A fill also makes a hold more likely, and a
-held block's delta counts against the shared `[budgets] pending_delta_bytes`;
-when it does not fit, the lane fails
+`max_bytes` or remove the table. A fill also makes a pause at a delivery or
+storage limit more likely, and a held block's delta counts against the shared
+`[budgets] pending_delta_bytes`; when it does not fit, the lane fails
 (`live_gap_marker_exceeds_pending_delta_budget`) until the budget is raised and
 the lane reset. The
 [runbook](/docs/operations/runbook/#crash-or-interrupted-commit) lists the log
