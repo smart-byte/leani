@@ -251,6 +251,15 @@ with `?discardUnacknowledged=true` work even after its processor instance was
 removed from the configuration, when its stream and acknowledgement routes
 answer `404 not_found`.
 
+A subscription's status names its required consumer in `consumer`, so an
+application finds its own subscriptions in `GET
+/admin/v1/backfill-subscriptions` by that field instead of parsing the opaque
+`id`; a materialization job's `consumer` is `null`. `processorConfigured` says
+whether the node configures the processor instance named in `processor` now:
+exactly that instance, not another instance of the same kind. While it is
+`false`, the stream and acknowledgement routes refuse the subscription; cancel
+it and delete it with `?discardUnacknowledged=true`.
+
 ## 3. Common response model
 
 Every processor query includes coverage:

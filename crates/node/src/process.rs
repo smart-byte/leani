@@ -941,6 +941,12 @@ impl NativeBackfillControl {
             })
             .unwrap_or(0)
             .min(requested_blocks);
+        // Only the job's own instance counts. `Self::processor` also selects
+        // by kind, which would count another instance of the job's kind.
+        let processor_configured = self
+            .processors
+            .iter()
+            .any(|processor| processor.descriptor().instance.as_str() == job.processor_instance);
         Ok(leani_api::BackfillStatus {
             id: record.id.clone(),
             owner: match job.owner {
@@ -952,6 +958,10 @@ impl NativeBackfillControl {
                 }
             },
             processor: job.processor_instance,
+            processor_configured,
+            consumer: subscription
+                .as_ref()
+                .map(|subscription| subscription.consumer_id.clone()),
             delivery_stream_id: job.delivery_stream_id,
             from_block: job.request.range.start().0,
             to_block: job.request.range.end().0,
@@ -10915,13 +10925,27 @@ markets = ["ETH/USDT"]
         Arc<dyn Processor>,
         String,
     ) {
-        use leani_api::BackfillControl as _;
-
         // Subscription IDs name the instance, so it must be portable.
         let processor: Arc<dyn Processor> = Arc::new(BlockLocalCounter::default().with_instance(
             leani_processor_api::ProcessorInstanceId::new("drained-counter").expect("instance"),
             leani_primitives::BlockHash::new([0x0d; 32]),
         ));
+        draining_subscription_of(directory, processor).await
+    }
+
+    /// A [`draining_subscription`] of `processor`, whose instance name must be
+    /// portable.
+    async fn draining_subscription_of(
+        directory: &Path,
+        processor: Arc<dyn Processor>,
+    ) -> (
+        leani_store_sqlite::SqliteStore,
+        Arc<NativeBackfillControl>,
+        Arc<dyn Processor>,
+        String,
+    ) {
+        use leani_api::BackfillControl as _;
+
         let instance = processor.descriptor().instance.to_string();
         let (store, control) = on_demand_control_with(
             directory,
@@ -10956,6 +10980,26 @@ markets = ["ETH/USDT"]
             config,
             control.store.clone(),
             Vec::new(),
+            CancellationToken::new(),
+            None,
+            None,
+            control.pipeline_budget.clone(),
+        )
+    }
+
+    /// A control over `control`'s store on a node that configures only
+    /// `processor`, as after its operator replaced the instances before it.
+    fn replaced_by(
+        control: &NativeBackfillControl,
+        processor: Arc<dyn Processor>,
+    ) -> NativeBackfillControl {
+        let mut config = (*control.config).clone();
+        config.processors.truncate(1);
+        config.processors[0].instance = processor.descriptor().instance.to_string();
+        NativeBackfillControl::new(
+            config,
+            control.store.clone(),
+            vec![processor],
             CancellationToken::new(),
             None,
             None,
@@ -11082,6 +11126,77 @@ markets = ["ETH/USDT"]
         let unchanged = removed.inspect(&created.id).await.expect("status");
         assert_eq!(unchanged.state, leani_api::BackfillState::Failed);
         assert_eq!(unchanged.last_error, failed.last_error);
+    }
+
+    #[tokio::test]
+    async fn subscription_status_names_its_consumer_and_configured_processor() {
+        // Integration feedback: an application told its own subscriptions
+        // apart by parsing the consumer out of their job IDs.
+        use leani_api::BackfillControl as _;
+
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let (_store, control, _processor, id) = draining_subscription(directory.path()).await;
+        let listed = control
+            .list(Some(leani_api::HistoricalWorkOwner::Subscription))
+            .await
+            .expect("subscriptions");
+        let [status] = listed.as_slice() else {
+            panic!("one subscription: {listed:?}");
+        };
+        assert_eq!(status.id, id);
+        assert_eq!(status.consumer.as_deref(), Some("destination"));
+        assert!(status.processor_configured);
+    }
+
+    #[tokio::test]
+    async fn status_of_a_removed_instance_reports_it_unconfigured() {
+        // Integration feedback: only its stream's 404 told an application
+        // that a subscription's processor instance was gone. This instance
+        // is named after its kind: its name still selects, as a kind, the
+        // instance of that kind that replaced it.
+        use leani_api::BackfillControl as _;
+
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let processor: Arc<dyn Processor> = Arc::new(BlockLocalCounter::default().with_instance(
+            leani_processor_api::ProcessorInstanceId::new("synthetic-counter").expect("instance"),
+            leani_primitives::BlockHash::new([0x0e; 32]),
+        ));
+        assert_eq!(
+            processor.descriptor().instance.as_str(),
+            processor.descriptor().id.as_str()
+        );
+        let (_store, control, _processor, id) =
+            draining_subscription_of(directory.path(), processor).await;
+        let replacement: Arc<dyn Processor> = Arc::new(BlockLocalCounter::default().with_instance(
+            leani_processor_api::ProcessorInstanceId::new("replacement-counter").expect("instance"),
+            leani_primitives::BlockHash::new([0x0f; 32]),
+        ));
+        for removed in [
+            replaced_by(&control, replacement),
+            without_processors(&control),
+        ] {
+            let status = removed.inspect(&id).await.expect("status");
+            assert!(!status.processor_configured, "{status:?}");
+            assert_eq!(status.consumer.as_deref(), Some("destination"));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_materialization_job_status_names_no_consumer() {
+        use leani_api::BackfillControl as _;
+
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let processor: Arc<dyn Processor> = Arc::new(BlockLocalCounter::default());
+        let instance = processor.descriptor().instance.to_string();
+        let (store, control) = on_demand_control(directory.path(), processor, 4).await;
+        let created = control
+            .create_materialization(materialization(&instance, "no-consumer"))
+            .await
+            .expect("materialization");
+        wait_for_job_state(&store, &created.id, leani_store_sqlite::JobState::Completed).await;
+        let status = control.inspect(&created.id).await.expect("status");
+        assert_eq!(status.consumer, None);
+        assert!(status.processor_configured);
     }
 
     /// One connection to a backfill subscription's history stream over HTTP.

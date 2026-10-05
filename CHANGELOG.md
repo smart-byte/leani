@@ -6,6 +6,19 @@ record, and documented RPC contracts.
 
 ## [Unreleased]
 
+### Added
+
+- A backfill subscription's status reports its required `consumer` and
+  `processorConfigured`: whether the node configures exactly the
+  subscription's processor instance now, another instance of the same kind
+  not counting. An application finds its own subscriptions by `consumer`
+  instead of parsing job IDs, and sees in the status, not only in its
+  stream's `404`, that the instance is gone. The response shape changes:
+  every subscription and materialization job status carries both fields,
+  also in `/v1/network/status`'s `history.jobs`, with `consumer` `null` for a
+  materialization job. The OpenAPI document describes these responses as
+  `BackfillStatus`, and the SDK's `BackfillStatus` adds both fields.
+
 ### Changed
 
 - SDK: until the first stable release, each prerelease is published under
@@ -15,6 +28,8 @@ record, and documented RPC contracts.
   prereleases use `next`. Pinning the exact version stays the documented install.
 - The release coordinator opens the Homebrew tap PR once a release's archives
   are public, under the same stable-first rule.
+- Breaking for `leani-api` embedders: `BackfillStatus` has the fields
+  `consumer` and `processor_configured`, which a `BackfillControl` sets.
 
 ### Fixed
 

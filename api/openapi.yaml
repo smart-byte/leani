@@ -917,6 +917,17 @@ paths:
       responses:
         "200":
           description: Backfill subscriptions.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [data]
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/BackfillStatus"
         default:
           $ref: "#/components/responses/Error"
     post:
@@ -937,6 +948,10 @@ paths:
       responses:
         "202":
           description: Backfill subscription accepted; its current status.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BackfillStatus"
         default:
           $ref: "#/components/responses/Error"
   /admin/v1/backfill-subscriptions/{id}:
@@ -948,6 +963,10 @@ paths:
       responses:
         "200":
           description: Backfill subscription state.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BackfillStatus"
         default:
           $ref: "#/components/responses/Error"
     delete:
@@ -992,6 +1011,10 @@ paths:
       responses:
         "200":
           description: Retried backfill subscription.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BackfillStatus"
         default:
           $ref: "#/components/responses/Error"
   /admin/v1/backfill-subscriptions/{id}/cancel:
@@ -1005,6 +1028,10 @@ paths:
       responses:
         "200":
           description: Cancelled backfill subscription.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BackfillStatus"
         default:
           $ref: "#/components/responses/Error"
   /admin/v1/materialization-jobs:
@@ -1014,6 +1041,17 @@ paths:
       responses:
         "200":
           description: Materialization jobs.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [data]
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/BackfillStatus"
         default:
           $ref: "#/components/responses/Error"
     post:
@@ -1027,6 +1065,10 @@ paths:
       responses:
         "202":
           description: Materialization job accepted; its current status.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BackfillStatus"
         default:
           $ref: "#/components/responses/Error"
   /admin/v1/materialization-jobs/{id}:
@@ -1038,6 +1080,10 @@ paths:
       responses:
         "200":
           description: Materialization job state.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BackfillStatus"
         default:
           $ref: "#/components/responses/Error"
     delete:
@@ -1061,6 +1107,10 @@ paths:
       responses:
         "200":
           description: Cancelled materialization job.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BackfillStatus"
         default:
           $ref: "#/components/responses/Error"
   /admin/v1/raw-history-jobs:
@@ -2035,6 +2085,100 @@ components:
           $ref: "#/components/schemas/DecimalQuantity"
         updatedAtUnixMs:
           $ref: "#/components/schemas/DecimalQuantity"
+    BackfillStatus:
+      type: object
+      description: A backfill subscription or materialization job.
+      additionalProperties: false
+      required:
+        [id, owner, processor, processorConfigured, consumer, fromBlock, toBlock, ranges, requestedBlocks, processedBlocks, remainingBlocks, mode, state, attempts, updatedAtUnixMs, report, lastError]
+      properties:
+        id:
+          type: string
+          description: |
+            Opaque; do not parse it. An application finds its own
+            subscriptions by `consumer`.
+        owner:
+          type: string
+          enum: [subscription, materialization]
+        processor:
+          type: string
+          description: The processor instance that runs the job.
+        processorConfigured:
+          type: boolean
+          description: |
+            Whether the node configures the processor instance `processor`
+            now: exactly that instance, not another instance of its kind.
+            Without it, the subscription's stream and acknowledgement routes
+            refuse the subscription; cancel it and delete it with
+            `discardUnacknowledged=true`.
+        consumer:
+          type: [string, "null"]
+          description: |
+            The subscription's required consumer, which reads and
+            acknowledges its history stream; null for a materialization job.
+        deliveryStreamId:
+          type: string
+          description: The subscription's history stream.
+        publicationRevision:
+          $ref: "#/components/schemas/DecimalQuantity"
+        fromBlock:
+          $ref: "#/components/schemas/SafeInteger"
+        toBlock:
+          $ref: "#/components/schemas/SafeInteger"
+        ranges:
+          type: array
+          items:
+            $ref: "#/components/schemas/RequestedRange"
+        requestedBlocks:
+          $ref: "#/components/schemas/SafeInteger"
+        processedBlocks:
+          $ref: "#/components/schemas/SafeInteger"
+        remainingBlocks:
+          $ref: "#/components/schemas/SafeInteger"
+        capturedFinalizedTarget:
+          $ref: "#/components/schemas/SafeInteger"
+        mode:
+          type: string
+          enum: [fill_missing, recompute]
+        batching:
+          type: object
+          description: The subscription's effective history batch limits.
+          additionalProperties: false
+          required:
+            [targetEncodedBytes, maximumEncodedBytes, maximumEvents, maximumProcessedBlocks, maximumDelayMs, maximumBufferedBatches, maximumBufferedBytes, compression]
+          properties:
+            targetEncodedBytes:
+              $ref: "#/components/schemas/SafeInteger"
+            maximumEncodedBytes:
+              $ref: "#/components/schemas/SafeInteger"
+            maximumEvents:
+              $ref: "#/components/schemas/SafeInteger"
+            maximumProcessedBlocks:
+              $ref: "#/components/schemas/SafeInteger"
+            maximumDelayMs:
+              $ref: "#/components/schemas/SafeInteger"
+            maximumBufferedBatches:
+              $ref: "#/components/schemas/SafeInteger"
+            maximumBufferedBytes:
+              $ref: "#/components/schemas/SafeInteger"
+            compression:
+              type: string
+              enum: [none, gzip]
+        state:
+          type: string
+          enum: [waiting_for_consumer, queued, running, backpressured, storage_backpressured, draining, complete_reclaimable, completed, failed, cancelled]
+        attempts:
+          $ref: "#/components/schemas/SafeInteger"
+        updatedAtUnixMs:
+          $ref: "#/components/schemas/SafeInteger"
+        report:
+          description: The completed job's source report; null until it completes.
+          oneOf:
+            - type: object
+              additionalProperties: true
+            - type: "null"
+        lastError:
+          type: [string, "null"]
     RecoveryCheckpoint:
       type: object
       additionalProperties: false

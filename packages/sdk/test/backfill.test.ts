@@ -33,6 +33,8 @@ describe("backfill subscriptions", () => {
         return Response.json({
           id: "repair-1",
           processor: "blobs-production",
+          processorConfigured: true,
+          consumer: "blobs-api",
           deliveryStreamId: "history-1",
           fromBlock: 1,
           toBlock: 6,
@@ -195,6 +197,8 @@ describe("backfill subscriptions", () => {
           id: "through-finalized",
           owner: "subscription",
           processor: "blobs-production",
+          processorConfigured: true,
+          consumer: "blobs-api",
           fromBlock: 1,
           toBlock: 10,
           ranges: [{ fromBlock: 1, toBlock: 10 }],
