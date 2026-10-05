@@ -3543,11 +3543,18 @@ struct PreparedFrame {
 enum GapClosure {
     /// Apply it: nothing below it is missing, or the rest is announced.
     Apply,
-    /// Do not apply it now. `Some(error)`: a filled block was refused for
-    /// the lane's capacity or state, so handle `error` as the block's own
-    /// commit failure. `None`: the lane is paused at a capacity limit;
-    /// nothing was fetched.
-    Hold(Option<RuntimeError>),
+    /// Do not apply it now.
+    Hold(GapHold),
+}
+
+/// Why the block that follows a skipped range waits.
+enum GapHold {
+    /// A filled block was refused for the lane's capacity or state, so
+    /// handle the error as the block's own commit failure.
+    Refused(RuntimeError),
+    /// The store would refuse the lane's next block at the capacity limit
+    /// this reason names, so nothing was fetched.
+    AtLimit(&'static str),
 }
 
 /// How far filling a skipped range got.
@@ -3557,8 +3564,8 @@ enum GapFill {
     /// The blocks from this one to the end of the range are not filled: the
     /// lane announces them. From the range's start when no fill started.
     From(BlockNumber),
-    /// The block that follows the range waits, as [`GapClosure::Hold`] says.
-    Hold(Option<RuntimeError>),
+    /// The block that follows the range waits.
+    Hold(GapHold),
 }
 
 /// One persistent source subscription fanned out to every configured
@@ -3571,6 +3578,10 @@ pub struct SharedLiveRuntime {
     config: SharedLiveRuntimeConfig,
     finalized_gap_recovery: Option<Arc<dyn FinalizedLiveGapRecovery>>,
     unavailable_processors: Arc<StdMutex<HashSet<String>>>,
+    /// By instance, the first block a lane's fill could not apply because the
+    /// store refused it at a delivery limit, and the delivery bytes it needs.
+    /// The fill fetches that block again only once the store would take them.
+    refused_fills: Arc<StdMutex<HashMap<String, (BlockNumber, u64)>>>,
     /// Serializes processor-lane work across clones: a live commit, a gap
     /// drain, or parking a lane. A reconcile on one clone therefore never
     /// races another clone's live loop over the same gap marker.
@@ -3603,6 +3614,13 @@ impl std::fmt::Debug for SharedLiveRuntime {
                 "unavailable_processors",
                 &self
                     .unavailable_processors
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+            )
+            .field(
+                "refused_fills",
+                &self
+                    .refused_fills
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner),
             )
@@ -3676,6 +3694,7 @@ impl SharedLiveRuntime {
             config,
             finalized_gap_recovery: None,
             unavailable_processors: Arc::new(StdMutex::new(HashSet::new())),
+            refused_fills: Arc::new(StdMutex::new(HashMap::new())),
             lane_lock: Arc::new(tokio::sync::Mutex::new(())),
             recent_storage_full: Arc::new(tokio::sync::watch::channel(false).0),
         })
@@ -4563,13 +4582,13 @@ impl SharedLiveRuntime {
                 .await?
             {
                 GapClosure::Apply => {}
-                GapClosure::Hold(Some(error)) => {
+                GapClosure::Hold(GapHold::Refused(error)) => {
                     self.park_live_lane(processor.as_ref(), mapped, &error)
                         .await?;
                     continue;
                 }
-                GapClosure::Hold(None) => {
-                    self.park_at_capacity_limit(processor.as_ref(), prepared.frame.block)
+                GapClosure::Hold(GapHold::AtLimit(reason)) => {
+                    self.park_at_capacity_limit(processor.as_ref(), prepared.frame.block, reason)
                         .await?;
                     continue;
                 }
@@ -4670,7 +4689,7 @@ impl SharedLiveRuntime {
             {
                 GapFill::Complete => return Ok(GapClosure::Apply),
                 GapFill::From(next) => next,
-                GapFill::Hold(error) => return Ok(GapClosure::Hold(error)),
+                GapFill::Hold(hold) => return Ok(GapClosure::Hold(hold)),
             },
         };
         if let Ok(rest) = BlockRange::new(unfilled, skipped.end()) {
@@ -4732,8 +4751,8 @@ impl SharedLiveRuntime {
                 "the block after the skipped ones names no parent",
             );
         }
-        if self.store_refuses_lane(descriptor).await? {
-            return Ok(GapFill::Hold(None));
+        if let Some(reason) = self.store_refuses_lane(descriptor, skipped.start()).await? {
+            return Ok(GapFill::Hold(GapHold::AtLimit(reason)));
         }
         info!(
             processor_instance = %descriptor.instance,
@@ -4789,7 +4808,20 @@ impl SharedLiveRuntime {
                 let outcome = match self.apply_recovered_delta(processor, &delta).await {
                     Ok(outcome) => outcome,
                     Err(error) if fill_holds_the_lane(&error) => {
-                        return Ok(GapFill::Hold(Some(error)));
+                        // The store refuses the block until a delivery limit
+                        // has room for its bytes; until then, fetching it
+                        // again is for nothing.
+                        if let RuntimeError::Store(StoreError::DeliveryLimit {
+                            incoming_bytes,
+                            ..
+                        }) = &error
+                        {
+                            self.refused_fills
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .insert(descriptor.instance.to_string(), (next, *incoming_bytes));
+                        }
+                        return Ok(GapFill::Hold(GapHold::Refused(error)));
                     }
                     Err(error) if fill_gives_up(&error) => {
                         return give_up(next, &error.to_string());
@@ -4893,52 +4925,67 @@ impl SharedLiveRuntime {
         Ok(None)
     }
 
-    /// Whether the store would refuse a filled block for the lane's capacity,
-    /// so a fill would fetch history for nothing: the lane is paused at its
-    /// delivery limit, which delivery pruning lifts, or at a storage limit
-    /// while storage is above its low-water mark. A lane paused for another
-    /// reason is filled: its first apply resumes it, as the replay of the
-    /// block that follows would. Only an apply resumes a lane paused at a
-    /// storage limit, so it is filled again once storage has room.
+    /// The capacity limit at which the store would refuse the lane's next
+    /// filled block, `next`, so a fill would fetch history for nothing; `None`
+    /// when it may fetch.
+    ///
+    /// Delivery is asked of the store as an apply decides it, whatever pause
+    /// reason the lane records, so a lane is held only while the store would
+    /// refuse it: above its stream's resume mark, or while a node-wide
+    /// delivery or physical budget has no room. A block the store refused at
+    /// a delivery limit is weighed by the bytes it needs; any other by none.
+    /// A failed lane is not held: its apply reports the failure. Only an
+    /// apply resumes a lane paused at a storage limit, so, as storage-paused
+    /// work does, it is filled again once storage is below its low-water
+    /// mark.
     async fn store_refuses_lane(
         &self,
         descriptor: &ProcessorDescriptor,
-    ) -> Result<bool, RuntimeError> {
+        next: BlockNumber,
+    ) -> Result<Option<&'static str>, RuntimeError> {
         let state = self.store.processor_runtime_state(descriptor).await?;
-        if state.state != ProcessorRunState::Paused {
-            return Ok(false);
+        if state.state == ProcessorRunState::Failed {
+            return Ok(None);
         }
-        Ok(match state.reason.as_deref() {
-            Some("delivery_spool_hard_limit") => true,
-            Some("physical_store_hard_limit" | "artifact_store_hard_limit") => {
-                !self.store.storage_below_low_water().await?
-            }
-            _ => false,
-        })
+        let storage_limit = match state.reason.as_deref() {
+            Some("physical_store_hard_limit") => Some("physical_store_hard_limit"),
+            Some("artifact_store_hard_limit") => Some("artifact_store_hard_limit"),
+            _ => None,
+        };
+        if state.state == ProcessorRunState::Paused
+            && let Some(reason) = storage_limit
+            && !self.store.storage_below_low_water().await?
+        {
+            return Ok(Some(reason));
+        }
+        let needed_bytes = self
+            .refused_fills
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(descriptor.instance.as_str())
+            .filter(|(block, _)| *block == next)
+            .map_or(0, |(_, bytes)| *bytes);
+        Ok(self
+            .store
+            .refuses_live_delivery(descriptor, needed_bytes)
+            .await?
+            .then_some("delivery_spool_hard_limit"))
     }
 
-    /// Park a lane that is paused at a capacity limit at `block`, which
-    /// follows blocks it skipped and has not filled. Once the limit lifts,
-    /// its gap fills those blocks, then replays `block`. A lane that pruning
-    /// resumed since the limit was checked keeps no reason, and waits for
-    /// the next pruning.
+    /// Park a lane at `block`, which follows blocks it skipped and has not
+    /// filled, while the store would refuse its next block at the capacity
+    /// limit `reason` names. Every drain asks the store again, so its gap
+    /// fills those blocks, then replays `block`, once the limit has room,
+    /// even when pruning resumed the lane since the limit was checked.
     async fn park_at_capacity_limit(
         &self,
         processor: &dyn Processor,
         block: BlockRef,
+        reason: &str,
     ) -> Result<(), RuntimeError> {
         let descriptor = processor.descriptor();
-        let state = self.store.processor_runtime_state(descriptor).await?;
         self.store
-            .park_processor_live_lane_at(
-                descriptor,
-                block,
-                state
-                    .reason
-                    .as_deref()
-                    .unwrap_or("delivery_spool_hard_limit"),
-                false,
-            )
+            .park_processor_live_lane_at(descriptor, block, reason, false)
             .await?;
         self.unavailable_processors
             .lock()
@@ -5292,20 +5339,23 @@ impl SharedLiveRuntime {
             .await?
         {
             GapClosure::Apply => {}
-            GapClosure::Hold(Some(error)) => {
+            GapClosure::Hold(GapHold::Refused(error)) => {
                 self.isolate_replay_failure(processor, delta.block, &error)
                     .await?;
                 // A lane the store refused for capacity without pausing it
                 // there, as one paused above its resume mark for another
-                // reason, pauses at the limit, so later drains wait for it to
-                // lift instead of fetching the same history again.
+                // reason, pauses at the limit, so it reports what it waits for.
                 let (reason, _, failed) = live_lane_park_reason(&error)?;
                 if !failed {
                     self.pause_live_gap(processor, delta.block, reason).await?;
                 }
                 return Ok(false);
             }
-            GapClosure::Hold(None) => return Ok(false),
+            // The lane reports the limit it waits for, as a refused fill does.
+            GapClosure::Hold(GapHold::AtLimit(reason)) => {
+                self.pause_live_gap(processor, delta.block, reason).await?;
+                return Ok(false);
+            }
         }
         let applied = if finality == Finality::Finalized {
             self.apply_recovered_delta(processor, delta).await
@@ -22101,17 +22151,17 @@ mod tests {
         );
 
         // Startup reconciliation pauses the lane to replay block 9. Paused
-        // above its resume mark, the store refuses the first filled block, so
-        // the lane waits for delivery capacity...
+        // above its resume mark, the store would refuse the first filled
+        // block, so the lane waits for delivery capacity without fetching...
         let restarted = runtime(block_events(&chain[10..]));
         restarted
             .reconcile_startup()
             .await
             .expect("startup reconciliation");
-        assert_eq!(history.calls(), 1);
-        // ...and the drains that follow fetch no history again.
+        assert_eq!(history.calls(), 0);
+        // ...and so do the drains that follow, paused at that limit.
         run_live(&restarted).await.expect("run after the restart");
-        assert_eq!(history.calls(), 1);
+        assert_eq!(history.calls(), 0);
         assert_parked_at(
             &store,
             counter.as_ref(),
@@ -22131,7 +22181,7 @@ mod tests {
             .reconcile_pending()
             .await
             .expect("drain");
-        assert_eq!(history.calls(), 2);
+        assert_eq!(history.calls(), 1);
         assert_eq!(
             published(&store, counter.as_ref()).await,
             [
@@ -22420,6 +22470,276 @@ mod tests {
         );
         assert!(
             reopened
+                .live_lane_gap(counter.descriptor())
+                .await
+                .expect("gap")
+                .is_none()
+        );
+    }
+
+    /// A lane that fills the ranges it skips, and a lane whose live stream
+    /// holds a backlog its consumer has read, which maintenance prunes once
+    /// finality reaches it. Each block adds 56 bytes to each live stream.
+    fn budget_lanes(test: &str) -> (Arc<BlockLocalCounter>, Arc<BlockLocalCounter>) {
+        let filler =
+            Arc::new(BlockLocalCounter::named(&format!("{test}-counter")).with_split_delivery());
+        let backlog = {
+            let counter = BlockLocalCounter::named(&format!("{test}-backlog"));
+            let mut lifecycle = counter.descriptor().lifecycle.clone();
+            lifecycle.delivery.pruning.retain_finalized_blocks = 0;
+            Arc::new(counter.with_lifecycle(lifecycle))
+        };
+        (filler, backlog)
+    }
+
+    /// The lanes follow blocks 0..=7, 448 bytes on each live stream, then the
+    /// node stops. It restarts on a store whose node-wide delivery budget is
+    /// `budget` bytes, at the finalized anchor, block 10.
+    async fn follow_then_restart_under_a_delivery_budget(
+        path: &std::path::Path,
+        chain: &[leani_primitives::BlockFrame],
+        budget: u64,
+        runtime: impl Fn(&SqliteStore, Vec<LiveStep>) -> SharedLiveRuntime,
+    ) -> SqliteStore {
+        let store = SqliteStore::open(leani_store_sqlite::StoreConfig::new(path))
+            .await
+            .expect("store");
+        run_live(&runtime(&store, block_events(&chain[..=7])))
+            .await
+            .expect("run before the downtime");
+        drop(store);
+        let store = SqliteStore::open(
+            leani_store_sqlite::StoreConfig::new(path).with_delivery_budget(
+                leani_store_sqlite::DeliveryStorageBudget {
+                    maximum_retained_bytes: budget,
+                    maximum_history_retained_bytes: budget,
+                },
+            ),
+        )
+        .await
+        .expect("store under a delivery budget");
+        store
+            .store_canonical_anchor(ChainId(1), chain[10].block, Finality::Finalized)
+            .await
+            .expect("seed the anchor");
+        store
+    }
+
+    /// One delivery maintenance pass, as the node runs it for every lane:
+    /// each of its streams is pruned up to its finalized boundary.
+    async fn maintain_delivery(store: &SqliteStore, lanes: &[Arc<dyn Processor>]) {
+        for lane in lanes {
+            let Some(finalized) = store
+                .finalized_through(lane.descriptor())
+                .await
+                .expect("finalized boundary")
+            else {
+                continue;
+            };
+            for stream in store
+                .delivery_streams(lane.descriptor())
+                .await
+                .expect("delivery streams")
+            {
+                store
+                    .prune_delivery_changes_in_stream(
+                        lane.descriptor(),
+                        &stream.stream_id,
+                        finalized,
+                    )
+                    .await
+                    .expect("prune delivery");
+            }
+        }
+    }
+
+    /// Finality reaches the backlog's blocks, so maintenance prunes its
+    /// stream and the node-wide budget has room again. Nothing prunes the
+    /// filling lane's stream: it holds no finalized block.
+    async fn prune_the_backlog(
+        store: &SqliteStore,
+        chain: &[leani_primitives::BlockFrame],
+        backlog: &dyn Processor,
+        lanes: &[Arc<dyn Processor>],
+    ) {
+        store
+            .mark_finalized(
+                backlog.descriptor(),
+                chain[7].block.number,
+                chain[7].block.hash,
+            )
+            .await
+            .expect("finalize the backlog");
+        maintain_delivery(store, lanes).await;
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn a_live_gap_fill_held_at_a_node_wide_delivery_budget_resumes_once_the_budget_has_room()
+    {
+        let chain = live_blocks(12);
+        let (counter, backlog) = budget_lanes("node-budget");
+        let lanes: Vec<Arc<dyn Processor>> = vec![counter.clone(), backlog.clone()];
+        let history = Arc::new(CountingLiveGapRecovery::serving(finalized_copies(
+            &chain[8..=10],
+        )));
+        let directory = tempfile::tempdir().expect("tempdir");
+        let runtime = |store: &SqliteStore, steps| {
+            filling_live(
+                store,
+                &lanes,
+                fill_config(counter.as_ref(), 8),
+                &history,
+                steps,
+            )
+        };
+        // The node restarts with a delivery budget below the 896 bytes its
+        // streams hold. The store paused the lane at that budget without a
+        // marker, as a commit on its stream can, though its own stream is far
+        // below its limit.
+        let store = follow_then_restart_under_a_delivery_budget(
+            &directory.path().join("node.sqlite"),
+            &chain,
+            800,
+            &runtime,
+        )
+        .await;
+        store
+            .pause_processor_live_lane(counter.descriptor(), "delivery_spool_hard_limit")
+            .await
+            .expect("store-recorded pause");
+        run_live(&runtime(&store, block_events(&chain[11..])))
+            .await
+            .expect("run after the downtime");
+
+        // The store would refuse any block, so the lane holds block 11,
+        // fetches nothing, and announces nothing.
+        assert_parked_at(
+            &store,
+            counter.as_ref(),
+            chain[11].block,
+            ProcessorRunState::Paused,
+            "delivery_spool_hard_limit",
+        )
+        .await;
+        assert_eq!(history.calls(), 0);
+        assert!(announced(&store, counter.as_ref()).await.is_empty());
+
+        // Pruning the backlog gives the budget room. It neither prunes nor
+        // resumes the lane, yet the next drain fills the skipped blocks, then
+        // replays blocks 11 and 12.
+        prune_the_backlog(&store, &chain, backlog.as_ref(), &lanes).await;
+        assert_parked_at(
+            &store,
+            counter.as_ref(),
+            chain[11].block,
+            ProcessorRunState::Paused,
+            "delivery_spool_hard_limit",
+        )
+        .await;
+        runtime(&store, Vec::new())
+            .reconcile_pending()
+            .await
+            .expect("drain");
+        assert_eq!(history.calls(), 1);
+        assert_eq!(
+            published(&store, counter.as_ref()).await,
+            (0..=7)
+                .map(live_apply)
+                .chain((8..=10).map(recovered_apply))
+                .chain([live_apply(11), live_apply(12)])
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            store
+                .processor_runtime_state(counter.descriptor())
+                .await
+                .expect("state")
+                .state,
+            ProcessorRunState::Running
+        );
+        assert!(
+            store
+                .live_lane_gap(counter.descriptor())
+                .await
+                .expect("gap")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn a_live_gap_fill_refused_at_a_node_wide_delivery_budget_waits_for_room_without_refetching()
+     {
+        let chain = live_blocks(12);
+        let (counter, backlog) = budget_lanes("node-budget-refused");
+        let lanes: Vec<Arc<dyn Processor>> = vec![counter.clone(), backlog.clone()];
+        let history = Arc::new(CountingLiveGapRecovery::serving(finalized_copies(
+            &chain[8..=10],
+        )));
+        let directory = tempfile::tempdir().expect("tempdir");
+        let runtime = |store: &SqliteStore, steps| {
+            filling_live(
+                store,
+                &lanes,
+                fill_config(counter.as_ref(), 8),
+                &history,
+                steps,
+            )
+        };
+        // The node restarts with a delivery budget 4 bytes above the 896 bytes
+        // its streams hold, so no filled block fits.
+        let store = follow_then_restart_under_a_delivery_budget(
+            &directory.path().join("node.sqlite"),
+            &chain,
+            900,
+            &runtime,
+        )
+        .await;
+        let restarted = runtime(&store, block_events(&chain[11..]));
+        run_live(&restarted).await.expect("run after the downtime");
+
+        // The store refuses the first filled block, so the lane holds block 11
+        // and announces nothing. The drains after blocks 11 and 12, and one
+        // more, fetch no history again: the budget still has no room for it.
+        restarted
+            .reconcile_pending()
+            .await
+            .expect("drain while the lane waits");
+        assert_parked_at(
+            &store,
+            counter.as_ref(),
+            chain[11].block,
+            ProcessorRunState::Paused,
+            "delivery_spool_hard_limit",
+        )
+        .await;
+        assert_eq!(history.calls(), 1);
+        assert!(announced(&store, counter.as_ref()).await.is_empty());
+
+        // Once pruning the backlog gives the budget room, the next drain fills
+        // the skipped blocks, then replays blocks 11 and 12.
+        prune_the_backlog(&store, &chain, backlog.as_ref(), &lanes).await;
+        restarted.reconcile_pending().await.expect("drain");
+        assert_eq!(history.calls(), 2);
+        assert_eq!(
+            published(&store, counter.as_ref()).await,
+            (0..=7)
+                .map(live_apply)
+                .chain((8..=10).map(recovered_apply))
+                .chain([live_apply(11), live_apply(12)])
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            store
+                .processor_runtime_state(counter.descriptor())
+                .await
+                .expect("state")
+                .state,
+            ProcessorRunState::Running
+        );
+        assert!(
+            store
                 .live_lane_gap(counter.descriptor())
                 .await
                 .expect("gap")
