@@ -80,8 +80,7 @@ record, and documented RPC contracts.
   like a transient failure using up the job's attempts. Xatu now reports the
   range as one it does not cover, as eraE does for a range its catalog does
   not list yet: a job still moves on to its next configured source, but its
-  error reads `source does not cover requested range`; a raw-history job
-  waits for the range as for any lagging source; and the node logs
+  error reads `source does not cover requested range`, and the node logs
   `xatu has not published this object yet` with the object's location at
   debug level. Over JSON-RPC, such a range now fails a historical read with
   `no_viable_historical_source`, as for eraE, instead of the retryable
