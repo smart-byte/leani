@@ -996,7 +996,9 @@ export interface paths {
          *     progress with the same history stream, consumer, and acknowledgement,
          *     and its error is cleared. A subscription that is still active returns
          *     its status unchanged; a completed or cancelled one gets 409
-         *     `backfill_conflict`.
+         *     `backfill_conflict`. A failed subscription whose processor instance is
+         *     not configured (see `processorConfigured`) gets 400 `invalid_request`
+         *     and stays failed.
          */
         post: operations["retryBackfillSubscription"];
         delete?: never;
@@ -1016,7 +1018,12 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** Cancel a backfill subscription */
+        /**
+         * Cancel a backfill subscription
+         * @description A draining subscription, whose job finished but whose required
+         *     consumer has not acknowledged the completion, becomes `cancelled`,
+         *     even when its processor instance is not configured.
+         */
         post: operations["cancelBackfillSubscription"];
         delete?: never;
         options?: never;
