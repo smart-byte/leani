@@ -886,8 +886,9 @@ block. The lane logs `filling the blocks the live lane skips from history` at
 info level, with `from_block`, `to_block`, and `blocks`, and `filled the blocks
 the live lane skipped` when it is done, with `applied`, `duplicates` (blocks a
 history subscription had applied), and `elapsed_ms`. Every live lane waits
-while a fill runs, at most five minutes plus one request of 128 blocks, so
-`elapsed_ms` is how long the node held all of them. A longer range logs `the
+while a fill runs, at most five minutes plus applying the blocks of its last
+request: a request still running at five minutes is given up. `elapsed_ms` is
+how long the node held all of them. A longer range logs `the
 live lane skips more blocks than live_gap_fill.max_blocks; announcing them` at
 info level, and announces as above. A fill that cannot start or finish,
 because no history source serves the range, the range is not finalized yet, a
@@ -896,19 +897,28 @@ source fails or serves a block that does not link, or the time is up, logs
 level, with `filled_blocks` and the `reason`. The stream then announces from
 the first block it did not fill, and the warning above follows.
 
-A lane paused at its delivery limit, or at a storage limit while storage stays
-above its low-water mark, does not fetch history again on every live block, and
-a lane that reaches one of those limits mid-fill stops there. Either way it
+A lane that reaches a delivery or storage limit mid-fill stops there. While
+the store would refuse its next block, at the stream's delivery limit, at a
+node-wide `[budgets.delivery]` or `[budgets.store]` budget, or at a storage
+limit while storage stays above its low-water mark, the lane fetches no
+history for the fill, as long as the block after the range is among the
+retained frames. Once finality prunes that frame during a long hold, the lane
+recovers it from history on every live block, as any paused lane recovers its
+first unapplied block. After a restart of the live lanes, a lane held at a
+node-wide budget can fetch once more before it waits again. Either way it
 reports `paused` with that reason (see
 [Parked processor live lane](#parked-processor-live-lane)), announces
-nothing, and continues the fill once consumers acknowledge or storage frees
-up. A single filled block larger than the stream's `max_bytes` fails the lane
-with `single_block_exceeds_delivery_limit`, as an equally large live block
-would: raise `max_bytes` or remove the table, then reset the lane. A fill also
-makes a hold more likely, and a held block's pending delta counts against the
-shared `[budgets] pending_delta_bytes`. When that budget cannot take it, the
-lane fails with `live_gap_marker_exceeds_pending_delta_budget`: raise the
-budget, then reset the lane.
+nothing, and continues the fill once the store would take the block: once
+consumers acknowledge and pruning makes room in its stream or in the
+node-wide budget, or once storage frees up. A single filled block larger than
+the stream's `max_bytes` fails the lane with
+`single_block_exceeds_delivery_limit`, as an equally large live block would:
+raise `max_bytes` or remove the table, then reset the lane. A fill also makes
+a pause at a delivery or storage limit more likely, and a held block's pending
+delta counts against the shared `[budgets] pending_delta_bytes`. When that
+budget cannot take it, the lane fails with
+`live_gap_marker_exceeds_pending_delta_budget`: raise the budget, then reset
+the lane.
 
 Each processor that needed a repair logs one warning, "startup reconciliation
 repaired processor state against the canonical chain", with the fields

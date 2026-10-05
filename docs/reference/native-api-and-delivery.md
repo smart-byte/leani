@@ -703,7 +703,10 @@ reason: "not_filled" }`. Only block-local processors with `history_mode =
 "on_demand"` announce them, before the block that follows the range, live or
 replayed, and in a batch of their own. After a crash between the two, the
 next block past the cursor announces again, the same range or a longer one;
-a retry the stream's last notice already covers adds none.
+a retry the stream's last notice already covers adds none. A processor that
+fills live gaps (below) may instead fill the range then, after a crash or a
+restart of its live lane, so `live_recovery` batches can follow a notice for
+the same blocks.
 Deduplicate batches by cursor: the notice and the following block share a
 block number.
 A processor with
