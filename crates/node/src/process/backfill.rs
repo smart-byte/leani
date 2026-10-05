@@ -429,7 +429,13 @@ async fn standalone(
                 // the blocks again.
                 tokio::select! {
                     ancestry = proving => ancestry.context("backfill cancelled while proving retained blocks")?,
-                    signal = signals.recv() => { signal?; bail!("backfill cancelled while proving retained blocks"); }
+                    signal = signals.recv() => {
+                        // The proof may have started the execution network:
+                        // flush its peer store, as the end of the run does.
+                        bridge.source.shutdown().await;
+                        signal?;
+                        bail!("backfill cancelled while proving retained blocks");
+                    }
                 }
             }
             None => Vec::new(),
