@@ -6971,25 +6971,65 @@ impl SqliteStore {
 
     /// Revert every retained unfinalized canonical block that is not proven
     /// to be on the chain of `anchor`, a verified finalized block about to be
-    /// seeded.
+    /// seeded, and finalize the retained blocks `ancestry` proves.
     ///
     /// A block is proven when parent hashes link it, through consecutive
     /// canonical rows, to a finalized row or to the anchor's row, if that row
     /// is the anchor: it is then their ancestor. A block above the anchor is
-    /// also proven when it descends from the anchor's row. Anything else, such
-    /// as a retained tip on a branch the network reorged away while the node
-    /// was down, below an anchor it cannot link to, is reverted as a reorg
-    /// reverts: its canonical row and transaction locators go, and its frame
-    /// stays as a fork candidate. Returns the reverted blocks, highest first.
+    /// also proven when it descends from the anchor's row. `ancestry` holds
+    /// the canonical hashes of the blocks that end at the anchor, lowest
+    /// first, proven by hash linkage down from it: `ancestry[i]` is the hash
+    /// at height `anchor.number + 1 - ancestry.len() + i`. A block at or below
+    /// the anchor that holds the ancestry's hash at its height is the
+    /// anchor's ancestor, so it is proven too, and parent links prove the
+    /// blocks below it. Anything else, such as a retained tip on a branch the
+    /// network reorged away while the node was down, below an anchor it
+    /// cannot link to, is reverted as a reorg reverts: its canonical row and
+    /// transaction locators go, and its frame stays as a fork candidate.
+    /// Returns the reverted blocks, highest first.
+    ///
+    /// In the same transaction, every kept block at or below the highest
+    /// block the ancestry proves is finalized: it is an ancestor of the
+    /// finalized anchor. The finality lane may never finalize it: it promotes
+    /// only through parent links, and no link crosses the heights between the
+    /// old tip and the anchor that the store never retained. An empty ancestry
+    /// proves and finalizes nothing.
     ///
     /// # Errors
     ///
-    /// Returns an error for corrupt canonical metadata or a database failure.
+    /// Returns [`StoreError::Invariant`], before any write, for an ancestry
+    /// that does not end at the anchor's hash or is longer than the chain up
+    /// to the anchor, and an error for corrupt canonical metadata or a
+    /// database failure.
+    #[allow(clippy::too_many_lines)]
     pub async fn revert_unproven_recent_blocks(
         &self,
         chain_id: ChainId,
         anchor: BlockRef,
+        ancestry: &[BlockHash],
     ) -> Result<Vec<BlockRef>, StoreError> {
+        if ancestry.last().is_some_and(|hash| *hash != anchor.hash) {
+            return Err(StoreError::Invariant(format!(
+                "retained ancestry does not end at anchor block {}",
+                anchor.number.0
+            )));
+        }
+        let ancestry_start = anchor
+            .number
+            .0
+            .saturating_add(1)
+            .checked_sub(u64::try_from(ancestry.len()).unwrap_or(u64::MAX))
+            .ok_or_else(|| {
+                StoreError::Invariant("retained ancestry is longer than the chain".to_owned())
+            })?;
+        let ancestral = |block: &BlockRef| {
+            block.number <= anchor.number
+                && block.number.0 >= ancestry_start
+                && usize::try_from(block.number.0 - ancestry_start)
+                    .ok()
+                    .and_then(|offset| ancestry.get(offset))
+                    == Some(&block.hash)
+        };
         let _guard = self.inner.writer.lock().await;
         let rows: Vec<(i64, Vec<u8>, Vec<u8>, i64)> = sqlx::query_as(
             "SELECT block_number, block_hash, parent_hash, timestamp
@@ -7025,7 +7065,8 @@ impl SqliteStore {
             .is_some_and(|(row, _)| row.hash == anchor.hash);
         let mut proven = BTreeSet::new();
         // Ancestors, highest first: a block's child is proven, finalized, or
-        // the matching anchor, and names it as parent.
+        // the matching anchor, and names it as parent; or the ancestry holds
+        // the block's hash at its height.
         for block in unfinalized.iter().rev() {
             let child_number = block.number.0.saturating_add(1);
             let links = if let Some(child) = retained.get(&child_number) {
@@ -7039,7 +7080,7 @@ impl SqliteStore {
                             && child.parent_hash == block.hash
                     })
             };
-            if links || (anchor_matches && block.number == anchor.number) {
+            if links || (anchor_matches && block.number == anchor.number) || ancestral(block) {
                 proven.insert(block.number.0);
             }
         }
@@ -7065,12 +7106,19 @@ impl SqliteStore {
                 }
             }
         }
+        // The highest block the ancestry proves. Every block kept at or below
+        // it is an ancestor of the anchor.
+        let finalize_through = unfinalized
+            .iter()
+            .rev()
+            .find(|block| ancestral(block))
+            .map(|block| block.number);
         let reverted = unfinalized
             .into_iter()
             .rev()
             .filter(|block| !proven.contains(&block.number.0))
             .collect::<Vec<_>>();
-        if reverted.is_empty() {
+        if reverted.is_empty() && finalize_through.is_none() {
             return Ok(reverted);
         }
         let mut transaction = self.inner.pool.begin().await?;
@@ -7083,6 +7131,20 @@ impl SqliteStore {
             .bind(u64_i64(chain_id.0, "chain_id")?)
             .bind(u64_i64(block.number.0, "reverted block_number")?)
             .bind(block.hash.0.as_slice())
+            .execute(&mut *transaction)
+            .await?;
+        }
+        if let Some(through) = finalize_through {
+            // With the reverted rows gone, every unfinalized row up to it is
+            // a kept one.
+            sqlx::query(
+                "UPDATE canonical_blocks SET finality = ?
+                 WHERE chain_id = ? AND block_number <= ? AND finality < ?",
+            )
+            .bind(finality_i64(Finality::Finalized))
+            .bind(u64_i64(chain_id.0, "chain_id")?)
+            .bind(u64_i64(through.0, "proven block_number")?)
+            .bind(finality_i64(Finality::Finalized))
             .execute(&mut *transaction)
             .await?;
         }
@@ -28170,7 +28232,7 @@ mod tests {
         // descendants.
         assert_eq!(
             store
-                .revert_unproven_recent_blocks(ChainId(1), chain[2].block)
+                .revert_unproven_recent_blocks(ChainId(1), chain[2].block, &[])
                 .await
                 .expect("revert"),
             Vec::new()
@@ -28178,7 +28240,7 @@ mod tests {
         // After downtime, an anchor above the tip that nothing links to
         // proves none of them: every unfinalized block goes, highest first.
         let reverted = store
-            .revert_unproven_recent_blocks(ChainId(1), above)
+            .revert_unproven_recent_blocks(ChainId(1), above, &[])
             .await
             .expect("revert");
         assert_eq!(
@@ -28218,7 +28280,7 @@ mod tests {
             .await
             .expect("finalize block 4");
         let reverted = finalized_store
-            .revert_unproven_recent_blocks(ChainId(1), above)
+            .revert_unproven_recent_blocks(ChainId(1), above, &[])
             .await
             .expect("revert");
         assert_eq!(
@@ -28228,5 +28290,237 @@ mod tests {
                 .collect::<Vec<_>>(),
             [5]
         );
+    }
+
+    /// Blocks 1..=5, each naming the one below as parent, retained in a fresh
+    /// store.
+    async fn retained_chain() -> (tempfile::TempDir, SqliteStore, Vec<BlockFrame>) {
+        let chain = (1..=5)
+            .scan(BlockHash::ZERO, |parent, number| {
+                let block = frame(number, *parent);
+                *parent = block.block.hash;
+                Some(block)
+            })
+            .collect::<Vec<_>>();
+        let (directory, store) = store().await;
+        for block in &chain {
+            store.store_recent_frame(block).await.expect("retain");
+        }
+        (directory, store, chain)
+    }
+
+    #[tokio::test]
+    async fn a_seeded_anchor_keeps_and_finalizes_the_retained_blocks_its_ancestry_proves() {
+        // After downtime, the anchor is above the retained tip 5 and no row
+        // links to it. Its ancestry, proven down from it, holds the retained
+        // blocks' hashes at their heights.
+        let anchor = BlockRef {
+            number: BlockNumber(9),
+            hash: BlockHash::new([0x99; 32]),
+            parent_hash: BlockHash::ZERO,
+            timestamp: 9,
+        };
+        let (_directory, store, chain) = retained_chain().await;
+        let ancestry = chain
+            .iter()
+            .map(|block| block.block.hash)
+            .chain([0x96, 0x97, 0x98].map(|byte| BlockHash::new([byte; 32])))
+            .chain([anchor.hash])
+            .collect::<Vec<_>>();
+        assert_eq!(
+            store
+                .revert_unproven_recent_blocks(ChainId(1), anchor, &ancestry)
+                .await
+                .expect("revert"),
+            Vec::new()
+        );
+        // No finality event can link them across the heights 6..=8 the store
+        // never retained, so they are finalized now. Their frames stay.
+        for block in &chain {
+            let number = block.block.number;
+            assert_eq!(
+                canonical_finality(&store, number.0).await,
+                Finality::Finalized
+            );
+            assert_eq!(
+                store
+                    .recent_frame(ChainId(1), number)
+                    .await
+                    .expect("frame lookup")
+                    .map(|frame| frame.block),
+                Some(block.block)
+            );
+        }
+
+        // An ancestry of blocks 4..=9 proves the blocks it covers, and parent
+        // links prove the blocks below them.
+        let (_linked_directory, linked, _) = retained_chain().await;
+        assert_eq!(
+            linked
+                .revert_unproven_recent_blocks(ChainId(1), anchor, &ancestry[3..])
+                .await
+                .expect("revert"),
+            Vec::new()
+        );
+        for number in 1..=5 {
+            assert_eq!(
+                canonical_finality(&linked, number).await,
+                Finality::Finalized
+            );
+        }
+
+        // Blocks above an anchor the retained chain holds descend from it:
+        // they are kept, but they are not final.
+        let (_held_directory, held, chain) = retained_chain().await;
+        let ancestry = chain[..3]
+            .iter()
+            .map(|block| block.block.hash)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            held.revert_unproven_recent_blocks(ChainId(1), chain[2].block, &ancestry)
+                .await
+                .expect("revert"),
+            Vec::new()
+        );
+        for (number, finality) in [
+            (1, Finality::Finalized),
+            (2, Finality::Finalized),
+            (3, Finality::Finalized),
+            (4, Finality::Included),
+            (5, Finality::Included),
+        ] {
+            assert_eq!(
+                canonical_finality(&held, number).await,
+                finality,
+                "block {number}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_seeded_anchor_reverts_only_the_retained_blocks_its_ancestry_contradicts() {
+        // While the node was down, the chain forked above block 3, and the
+        // anchor is above the retained tip on the other branch.
+        let above = BlockRef {
+            number: BlockNumber(9),
+            hash: BlockHash::new([0x99; 32]),
+            parent_hash: BlockHash::ZERO,
+            timestamp: 9,
+        };
+        let (_directory, store, chain) = retained_chain().await;
+        let ancestry = chain[..3]
+            .iter()
+            .map(|block| block.block.hash)
+            .chain([0xa4, 0xa5, 0xa6, 0xa7, 0xa8].map(|byte| BlockHash::new([byte; 32])))
+            .chain([above.hash])
+            .collect::<Vec<_>>();
+        let reverted = store
+            .revert_unproven_recent_blocks(ChainId(1), above, &ancestry)
+            .await
+            .expect("revert");
+        assert_eq!(
+            reverted
+                .iter()
+                .map(|block| block.number.0)
+                .collect::<Vec<_>>(),
+            [5, 4]
+        );
+        for block in &chain[3..] {
+            assert!(
+                store
+                    .canonical_block(ChainId(1), block.block.number)
+                    .await
+                    .expect("canonical lookup")
+                    .is_none()
+            );
+            // Their frames stay as fork candidates.
+            assert!(
+                store
+                    .recent_frame_by_hash(ChainId(1), block.block.hash)
+                    .await
+                    .expect("frame lookup")
+                    .is_some()
+            );
+        }
+        for number in 1..=3 {
+            assert_eq!(
+                canonical_finality(&store, number).await,
+                Finality::Finalized
+            );
+        }
+
+        // An anchor at a retained height that holds another block there: the
+        // common prefix below it is kept and finalized.
+        let (_forked_directory, forked, chain) = retained_chain().await;
+        let anchor = BlockRef {
+            number: BlockNumber(4),
+            hash: BlockHash::new([0x44; 32]),
+            parent_hash: BlockHash::ZERO,
+            timestamp: 4,
+        };
+        let ancestry = chain[..3]
+            .iter()
+            .map(|block| block.block.hash)
+            .chain([anchor.hash])
+            .collect::<Vec<_>>();
+        let reverted = forked
+            .revert_unproven_recent_blocks(ChainId(1), anchor, &ancestry)
+            .await
+            .expect("revert");
+        assert_eq!(
+            reverted
+                .iter()
+                .map(|block| block.number.0)
+                .collect::<Vec<_>>(),
+            [5, 4]
+        );
+        for number in 1..=3 {
+            assert_eq!(
+                canonical_finality(&forked, number).await,
+                Finality::Finalized
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_seeded_anchor_rejects_an_ancestry_that_does_not_end_at_it() {
+        let (_directory, store, chain) = retained_chain().await;
+        // The ancestry of another block at the anchor's height: it would prove
+        // every retained block, but not on the anchor's chain.
+        let anchor = BlockRef {
+            number: BlockNumber(9),
+            hash: BlockHash::new([0x99; 32]),
+            parent_hash: BlockHash::ZERO,
+            timestamp: 9,
+        };
+        let ancestry = chain
+            .iter()
+            .map(|block| block.block.hash)
+            .chain([0x96, 0x97, 0x98, 0x9a].map(|byte| BlockHash::new([byte; 32])))
+            .collect::<Vec<_>>();
+        let result = store
+            .revert_unproven_recent_blocks(ChainId(1), anchor, &ancestry)
+            .await;
+        assert!(
+            matches!(result, Err(StoreError::Invariant(_))),
+            "an ancestry of another block was accepted: {result:?}"
+        );
+        // Nor does an ancestry longer than the chain up to the anchor: the
+        // chain up to block 1 holds two blocks, genesis and block 1.
+        let first = chain[0].block;
+        let result = store
+            .revert_unproven_recent_blocks(
+                ChainId(1),
+                first,
+                &[BlockHash::new([0xa0; 32]), BlockHash::ZERO, first.hash],
+            )
+            .await;
+        assert!(
+            matches!(result, Err(StoreError::Invariant(_))),
+            "an ancestry longer than the chain was accepted: {result:?}"
+        );
+        for number in 1..=5 {
+            assert_eq!(canonical_finality(&store, number).await, Finality::Included);
+        }
     }
 }

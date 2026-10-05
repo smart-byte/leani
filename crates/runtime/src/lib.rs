@@ -3763,7 +3763,7 @@ impl SharedLiveRuntime {
         let _lane = self.lane_lock.lock().await;
         let reverted = self
             .store
-            .revert_unproven_recent_blocks(chain_id, anchor)
+            .revert_unproven_recent_blocks(chain_id, anchor, &[])
             .await?;
         if let (Some(highest), Some(lowest)) = (reverted.first(), reverted.last()) {
             warn!(
