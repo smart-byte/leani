@@ -235,7 +235,8 @@ struct OnDemandP2pBridge {
 }
 
 /// How often the durable job scheduler looks again at jobs that wait on
-/// storage headroom or failed to resume for a reason that may pass.
+/// storage headroom or the P2P history bridge, or failed to resume for a
+/// reason that may pass.
 const DURABLE_JOB_RECHECK: Duration = Duration::from_secs(5);
 
 /// How long deleting a historical job waits for its task to end.
@@ -260,6 +261,12 @@ struct NativeBackfillControl {
     /// ended, which frees a slot and changes its job.
     jobs_changed: Arc<tokio::sync::Notify>,
     p2p_bridge: Arc<tokio::sync::RwLock<Option<OnDemandP2pBridge>>>,
+    /// Whether the node's network lanes publish finalized anchors to
+    /// `p2p_bridge`. A job the bridge would serve then waits for it.
+    p2p_bridge_expected: bool,
+    /// The jobs logged as waiting for the P2P history bridge, so that each
+    /// is logged once.
+    bridge_waits_logged: Arc<std::sync::Mutex<std::collections::BTreeSet<String>>>,
     raw_history_store: Option<leani_store_history::HistoryStore>,
     material_coordinator: Option<leani_runtime::HistoricalMaterialCoordinator>,
     pipeline_budget: leani_runtime::HistoricalPipelineBudget,
@@ -271,6 +278,9 @@ enum JobResume {
     Done,
     /// It waits for storage headroom, which no job change signals.
     WaitingForStorage,
+    /// It waits for the P2P history bridge's finalized anchor to cover it,
+    /// which no job change signals either.
+    WaitingForBridge,
     /// Every backfill slot is taken; a task that ends wakes the scheduler.
     AtCapacity,
 }
@@ -329,10 +339,20 @@ impl NativeBackfillControl {
             tasks: Arc::new(tokio::sync::Mutex::new(BTreeMap::new())),
             jobs_changed: Arc::new(tokio::sync::Notify::new()),
             p2p_bridge: Arc::new(tokio::sync::RwLock::new(None)),
+            p2p_bridge_expected: false,
+            bridge_waits_logged: Arc::default(),
             raw_history_store,
             material_coordinator,
             pipeline_budget,
         }
+    }
+
+    /// Hold the jobs the on-demand P2P history bridge would serve until its
+    /// finalized anchor covers them, for a node whose network lanes publish
+    /// that anchor. Set before the durable job scheduler's first pass.
+    fn with_p2p_bridge_expected(mut self, expected: bool) -> Self {
+        self.p2p_bridge_expected = expected;
+        self
     }
 
     async fn update_p2p_bridge(
@@ -384,6 +404,62 @@ impl NativeBackfillControl {
             requested,
         )
         .map_err(|error| leani_api::BackfillControlError::Invalid(error.to_string()))
+    }
+
+    /// Whether `job` must wait before its sources are fixed, as
+    /// [`bridge_wait`] decides. Its first wait is logged.
+    async fn waits_for_p2p_bridge(
+        &self,
+        job: &leani_runtime::BackfillJob,
+        configured: &ProcessorConfig,
+    ) -> Result<bool, leani_api::BackfillControlError> {
+        let bridge_anchor = self
+            .p2p_bridge
+            .read()
+            .await
+            .as_ref()
+            .map(|bridge| bridge.anchor.block.number.0);
+        // The fallback window ends at the bridge's anchor. Before the first
+        // one, the finalized head stands in for it.
+        let reference = match bridge_anchor {
+            Some(anchor) => Some(anchor),
+            None if self.p2p_bridge_expected => self
+                .store
+                .finalized_canonical_head(job.request.chain_id)
+                .await
+                .map_err(|error| leani_api::BackfillControlError::Internal(error.to_string()))?
+                .map(|head| head.number.0),
+            None => None,
+        };
+        let Some(reference) = reference else {
+            return Ok(false);
+        };
+        let Some(through_block) = bridge_wait(
+            self.p2p_bridge_expected,
+            configured.require_retained_input,
+            bridge_anchor,
+            self.config
+                .sources
+                .live
+                .history_fallback_start(reference, configured.start_block),
+            job.request.range.end().0,
+        ) else {
+            return Ok(false);
+        };
+        if self
+            .bridge_waits_logged
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(job.id.clone())
+        {
+            info!(
+                job_id = %job.id,
+                through_block,
+                bridge_anchor,
+                "historical job waits for the P2P history bridge"
+            );
+        }
+        Ok(true)
     }
 
     fn processor(
@@ -1257,9 +1333,9 @@ impl NativeBackfillControl {
 
     /// One scheduler pass over the durable historical jobs. A job that cannot
     /// be read or resumed is skipped with a warning, so it never holds back
-    /// the others. Returns whether a job waits on storage headroom or failed
-    /// for a reason that may pass, so that the scheduler looks again even
-    /// without a job change.
+    /// the others. Returns whether a job waits on storage headroom or the P2P
+    /// history bridge, or failed for a reason that may pass, so that the
+    /// scheduler looks again even without a job change.
     async fn resume_durable_jobs(&self) -> Result<bool, leani_api::BackfillControlError> {
         let mut records = self
             .store
@@ -1281,7 +1357,7 @@ impl NativeBackfillControl {
         for record in records {
             match self.resume_durable_job(&record).await {
                 Ok(JobResume::Done) => {}
-                Ok(JobResume::WaitingForStorage) => recheck = true,
+                Ok(JobResume::WaitingForStorage | JobResume::WaitingForBridge) => recheck = true,
                 Ok(JobResume::AtCapacity) => break,
                 Err(error) => {
                     warn!(
@@ -1428,6 +1504,9 @@ impl NativeBackfillControl {
         {
             return Ok(JobResume::WaitingForStorage);
         }
+        if self.waits_for_p2p_bridge(&job, configured).await? {
+            return Ok(JobResume::WaitingForBridge);
+        }
         match self.spawn(job, processor).await {
             Ok(()) => Ok(JobResume::Done),
             Err(leani_api::BackfillControlError::Unavailable(message))
@@ -1440,9 +1519,10 @@ impl NativeBackfillControl {
     }
 
     /// Resume durable jobs at startup, and again only after a change: a job
-    /// was created or a job's task ended. Jobs that wait on storage headroom,
-    /// or failed to resume for a reason that may pass, are looked at again
-    /// every [`DURABLE_JOB_RECHECK`]. Passes run at most once a second.
+    /// was created or a job's task ended. Jobs that wait on storage headroom
+    /// or the P2P history bridge, or failed to resume for a reason that may
+    /// pass, are looked at again every [`DURABLE_JOB_RECHECK`]. Passes run at
+    /// most once a second.
     async fn supervise_durable_jobs(self: Arc<Self>) {
         loop {
             if self.cancellation.is_cancelled() {
@@ -2133,7 +2213,14 @@ impl leani_api::BackfillControl for NativeBackfillControl {
                     record.id
                 ))
             })?;
-            self.spawn(scheduled_job, processor).await?;
+            // As a resumed job does, it waits for the P2P history bridge to
+            // cover it: its range may end above the bridge's latest anchor.
+            if !self
+                .waits_for_p2p_bridge(&scheduled_job, configured)
+                .await?
+            {
+                self.spawn(scheduled_job, processor).await?;
+            }
         }
         let outcome = self.outcome(&record.id).await?;
         self.status(&record, outcome.as_ref()).await
@@ -2322,7 +2409,8 @@ impl leani_api::BackfillControl for NativeBackfillControl {
             .map_err(|error| leani_api::BackfillControlError::Internal(error.to_string()))?
             .ok_or_else(|| leani_api::BackfillControlError::NotFound(id.to_owned()))?;
         // Start it now when a slot is free, as creation does; the scheduler
-        // takes it up once one frees or storage allows.
+        // takes it up once one frees, storage allows, or the P2P history
+        // bridge covers it.
         self.resume_durable_job(&record).await?;
         self.jobs_changed.notify_one();
         let outcome = self.outcome(id).await?;
@@ -4267,6 +4355,31 @@ fn history_sources_with_bridge(
     Ok((sources, policy))
 }
 
+/// The block the on-demand P2P history bridge must reach before a job
+/// ending at `job_end` starts, or `None` when the job need not wait.
+///
+/// A job's sources are fixed for its run, so one that starts before the
+/// bridge covers it never gets the bridge. The bridge serves a job that ends
+/// at or after `fallback_start`, unless its processor reads retained input
+/// only.
+fn bridge_wait(
+    expected: bool,
+    require_retained_input: bool,
+    bridge_anchor: Option<u64>,
+    fallback_start: u64,
+    job_end: u64,
+) -> Option<u64> {
+    if !expected
+        || require_retained_input
+        || job_end < fallback_start
+        || bridge_anchor.is_some_and(|anchor| anchor >= job_end)
+    {
+        None
+    } else {
+        Some(job_end)
+    }
+}
+
 type HistorySources = Vec<Arc<dyn leani_source_api::HistorySource>>;
 
 /// Also returns why each configured source it left out cannot serve the
@@ -5655,15 +5768,20 @@ async fn serve(path: &Path, registry: &ProcessorRegistry) -> Result<Exit> {
         None
     };
     let (pipeline_budget, material_coordinator) = historical_services(config.get())?;
-    let backfill_control = Arc::new(NativeBackfillControl::new(
-        config.get().clone(),
-        store.clone(),
-        processors.clone(),
-        cancellation.clone(),
-        raw_history_store,
-        material_coordinator,
-        pipeline_budget,
-    ));
+    // Only the network lanes publish the P2P history bridge's anchors.
+    let network_lanes = live_required && finality_required;
+    let backfill_control = Arc::new(
+        NativeBackfillControl::new(
+            config.get().clone(),
+            store.clone(),
+            processors.clone(),
+            cancellation.clone(),
+            raw_history_store,
+            material_coordinator,
+            pipeline_budget,
+        )
+        .with_p2p_bridge_expected(network_lanes),
+    );
     let mut background = BackgroundTasks::default();
     background.spawn("durable backfill scheduler", {
         let control = backfill_control.clone();
@@ -5934,7 +6052,7 @@ async fn serve(path: &Path, registry: &ProcessorRegistry) -> Result<Exit> {
             Err(error) => warn!(%error, "failed to install shutdown signal handler"),
         }
     });
-    if live_required && finality_required {
+    if network_lanes {
         let supervisor_config = config.get().clone();
         let supervisor_store = store.clone();
         let supervisor_processors = processors.clone();
@@ -11511,6 +11629,207 @@ markets = ["ETH/USDT"]
         .await;
         control.cancellation.cancel();
         supervisor.await.expect("scheduler stops");
+    }
+
+    #[test]
+    fn a_job_waits_for_a_p2p_bridge_that_would_serve_it_until_its_anchor_covers_it() {
+        // The bridge's fallback window starts at block 100.
+        for (case, expected, retained_input, anchor, job_end, wait) in [
+            ("not expected", false, false, None, 150, None),
+            ("retained input only", true, true, None, 150, None),
+            ("end below the window", true, false, None, 99, None),
+            ("no anchor yet", true, false, None, 100, Some(100)),
+            ("anchor < end", true, false, Some(149), 150, Some(150)),
+            ("anchor == end", true, false, Some(150), 150, None),
+            ("anchor > end", true, false, Some(151), 150, None),
+        ] {
+            assert_eq!(
+                bridge_wait(expected, retained_input, anchor, 100, job_end),
+                wait,
+                "{case}"
+            );
+        }
+    }
+
+    /// [`on_demand_control_with`] for application subscriptions, on a node
+    /// whose P2P live lane is to bring the on-demand P2P history bridge. The
+    /// bridge falls back over the last `history_fallback_blocks` finalized
+    /// blocks when given, else over every block from the processor's start.
+    async fn bridge_expecting_control(
+        directory: &Path,
+        processor: Arc<dyn Processor>,
+        through: u64,
+        history_fallback_blocks: Option<u64>,
+    ) -> Arc<NativeBackfillControl> {
+        let (store, unbridged) = on_demand_control_with(
+            directory,
+            processor.clone(),
+            through,
+            crate::config::ProcessorHistoryControl::ApplicationSubscriptions,
+        )
+        .await;
+        let mut config = Config::clone(&unbridged.config);
+        config.sources.live.history_fallback_blocks = history_fallback_blocks;
+        let budget = pipeline_budget(&config);
+        Arc::new(
+            NativeBackfillControl::new(
+                config,
+                store,
+                vec![processor],
+                CancellationToken::new(),
+                None,
+                None,
+                budget,
+            )
+            .with_p2p_bridge_expected(true),
+        )
+    }
+
+    /// A subscription to blocks `from..=to` of `instance`, for the required
+    /// consumer `destination`.
+    fn subscription(
+        instance: &str,
+        key: &str,
+        from: u64,
+        to: u64,
+    ) -> leani_api::CreateBackfillRequest {
+        leani_api::CreateBackfillRequest {
+            processor: instance.to_owned(),
+            from_block: Some(from),
+            to_block: Some(to.into()),
+            ranges: Vec::new(),
+            mode: leani_api::BackfillExecutionMode::FillMissing,
+            consumer: Some(leani_api::CreateBackfillConsumerRequest {
+                id: "destination".to_owned(),
+                role: leani_store_sqlite::ConsumerRole::Required,
+                lease_ttl_seconds: 60,
+                credential: None,
+            }),
+            limits: None,
+            batching: None,
+            idempotency_key: key.to_owned(),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_recent_job_waits_for_the_p2p_bridge_instead_of_failing() {
+        // Integration feedback: a node resumed a subscription over recent
+        // blocks seconds before verified finality gave the P2P history bridge
+        // its first anchor. A job's sources are fixed for its run, so it ran
+        // on Xatu and eraE alone, which cannot serve recent blocks yet, used
+        // up its attempts, and failed.
+        use leani_api::BackfillControl as _;
+
+        let logs = CapturedLogs::default();
+        let _logs = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_ansi(false)
+                .with_writer({
+                    let logs = logs.clone();
+                    move || logs.clone()
+                })
+                .finish(),
+        );
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let processor: Arc<dyn Processor> = Arc::new(BlockLocalCounter::default().with_instance(
+            leani_processor_api::ProcessorInstanceId::new("recent-counter").expect("instance"),
+            leani_primitives::BlockHash::new([0x0d; 32]),
+        ));
+        let instance = processor.descriptor().instance.to_string();
+        let control = bridge_expecting_control(directory.path(), processor, 4, None).await;
+        let created = control
+            .create_subscription(subscription(&instance, "recent", 1, 4))
+            .await
+            .expect("subscription");
+        // Scheduler passes, as at a start before the bridge's first anchor.
+        let rechecks = [
+            control.resume_durable_jobs().await.expect("scheduler pass"),
+            control.resume_durable_jobs().await.expect("scheduler pass"),
+        ];
+        let waiting = control
+            .inspect(&created.id)
+            .await
+            .expect("subscription status");
+        assert_eq!(waiting.state, leani_api::BackfillState::Queued);
+        assert_eq!(waiting.attempts, 0);
+        assert!(waiting.report.is_none(), "{:?}", waiting.report);
+        assert_eq!(waiting.last_error, None);
+        // No job change announces the bridge, so the scheduler looks again.
+        assert_eq!(rechecks, [true, true]);
+        let logged = logs.text();
+        assert_eq!(
+            logged
+                .matches("historical job waits for the P2P history bridge")
+                .count(),
+            1,
+            "{logged}"
+        );
+
+        // The job starts once the bridge's anchor covers its last block. The
+        // archive serves it; the bridge is the last resort.
+        let chain = fixture_chain(4);
+        let execution_source =
+            leani_source_p2p::RethP2pSource::mainnet(leani_source_p2p::RethP2pConfig::default())
+                .expect("execution source");
+        let anchor = |block: leani_primitives::BlockRef| leani_source_p2p::P2pHistoryAnchor {
+            block,
+            consensus: leani_primitives::ConsensusAnchor {
+                finality: leani_primitives::Finality::Finalized,
+                execution_block_hash: block.hash,
+                beacon_slot: block.number.0,
+                beacon_block_root: [1; 32],
+            },
+        };
+        control
+            .update_p2p_bridge(execution_source.clone(), anchor(chain[3].block))
+            .await;
+        assert!(control.resume_durable_jobs().await.expect("scheduler pass"));
+        assert_eq!(
+            control
+                .inspect(&created.id)
+                .await
+                .expect("subscription status")
+                .state,
+            leani_api::BackfillState::Queued,
+            "an anchor short of the job's last block started it"
+        );
+        control
+            .update_p2p_bridge(execution_source, anchor(chain[4].block))
+            .await;
+        control.resume_durable_jobs().await.expect("scheduler pass");
+        wait_for_subscription_state(&control, &created.id, leani_api::BackfillState::Draining)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn an_old_job_does_not_wait_for_the_p2p_bridge() {
+        // A job that ends below the bridge's fallback window never gets the
+        // bridge, so it starts on the other sources at once, as before.
+        use leani_api::BackfillControl as _;
+
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let processor: Arc<dyn Processor> = Arc::new(BlockLocalCounter::default().with_instance(
+            leani_processor_api::ProcessorInstanceId::new("old-counter").expect("instance"),
+            leani_primitives::BlockHash::new([0x0e; 32]),
+        ));
+        let instance = processor.descriptor().instance.to_string();
+        // Before the bridge's first anchor, its window is the last two blocks
+        // through the finalized head: 3 and 4.
+        let control = bridge_expecting_control(directory.path(), processor, 4, Some(2)).await;
+        let old = control
+            .create_subscription(subscription(&instance, "old", 1, 2))
+            .await
+            .expect("old subscription");
+        let recent = control
+            .create_subscription(subscription(&instance, "recent", 3, 4))
+            .await
+            .expect("recent subscription");
+        assert_eq!(
+            recent.state,
+            leani_api::BackfillState::Queued,
+            "a job in the window did not wait"
+        );
+        wait_for_subscription_state(&control, &old.id, leani_api::BackfillState::Draining).await;
     }
 
     #[tokio::test]
