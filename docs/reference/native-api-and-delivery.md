@@ -249,7 +249,7 @@ subscription `cancelled`, and a stream opened after that ends with
 `?discardUnacknowledged=true` to abandon them. Cancelling it and deleting it
 with `?discardUnacknowledged=true` work even after its processor instance was
 removed from the configuration, when its stream and acknowledgement routes
-answer `404 not_found`.
+refuse (normally `404 not_found`).
 
 A subscription's status names its required consumer in `consumer`, so an
 application finds its own subscriptions in `GET

@@ -13,11 +13,12 @@ record, and documented RPC contracts.
   subscription's processor instance now, another instance of the same kind
   not counting. An application finds its own subscriptions by `consumer`
   instead of parsing job IDs, and sees in the status, not only in its
-  stream's `404`, that the instance is gone. The response shape changes:
-  every subscription and materialization job status carries both fields,
-  also in `/v1/network/status`'s `history.jobs`, with `consumer` `null` for a
-  materialization job. The OpenAPI document describes these responses as
-  `BackfillStatus`, and the SDK's `BackfillStatus` adds both fields.
+  stream's refusal (normally `404 not_found`), that the instance is gone.
+  The response shape changes: every subscription and materialization job
+  status carries both fields, also in `/v1/network/status`'s `history.jobs`,
+  with `consumer` `null` for a materialization job. The OpenAPI document
+  describes these responses as `BackfillStatus`, and the SDK's
+  `BackfillStatus` adds both fields.
 
 ### Changed
 
