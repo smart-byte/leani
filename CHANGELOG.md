@@ -16,6 +16,19 @@ record, and documented RPC contracts.
 - The release coordinator opens the Homebrew tap PR once a release's archives
   are public, under the same stable-first rule.
 
+### Fixed
+
+- A draining backfill subscription, whose job finished but whose required
+  consumer has not acknowledged the completion, can be cancelled and then
+  deleted. Cancelling changed only a job that still ran, so the subscription
+  stayed draining and its deletion was refused. Once its processor instance
+  was replaced, its consumer could no longer read or acknowledge the stream,
+  and the subscription held its records against
+  `maximum_history_retained_bytes` for good. Cancelling now makes it
+  `cancelled`, also without its processor instance configured, and `DELETE
+  /admin/v1/backfill-subscriptions/{id}?discardUnacknowledged=true` removes it
+  with its records.
+
 ## [0.1.0-rc.3] - 2026-10-05
 
 ### Added

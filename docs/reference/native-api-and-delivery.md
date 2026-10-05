@@ -229,6 +229,19 @@ right after cancelling it waits up to 10 seconds for its task to stop, and
 answers `503 backfill_unavailable`, which is retryable, if it has not; a retry
 waits the same way for a failed job's task.
 
+A subscription whose job has finished is `draining` until its required
+consumer acknowledges the `backfill_complete` record, which makes it
+`complete_reclaimable`. A draining subscription can be cancelled as well, for
+example when its application will never read it to the end. It becomes
+`cancelled` and keeps its job's report. Its stream still serves the records
+committed before the cancellation, `backfill_complete` among them, but
+acknowledging them leaves the subscription `cancelled`, and a stream opened
+after that ends with `backfill_cancelled`. Delete it once they are
+acknowledged, or with `?discardUnacknowledged=true` to abandon them. Cancelling
+it and deleting it with `?discardUnacknowledged=true` work even after its
+processor instance was removed from the configuration, when its stream and
+acknowledgement routes answer `404 not_found`.
+
 ## 3. Common response model
 
 Every processor query includes coverage:

@@ -2227,18 +2227,20 @@ impl leani_api::BackfillControl for NativeBackfillControl {
                 .save_job(&record)
                 .await
                 .map_err(|error| leani_api::BackfillControlError::Internal(error.to_string()))?;
-            if job.owner == leani_runtime::HistoricalJobOwner::Subscription {
-                self.store
-                    .set_backfill_subscription_state(
-                        id,
-                        leani_store_sqlite::BackfillSubscriptionState::Cancelled,
-                        None,
-                    )
-                    .await
-                    .map_err(|error| {
-                        leani_api::BackfillControlError::Internal(error.to_string())
-                    })?;
-            }
+        }
+        // A completed job's subscription may still be draining: its consumer
+        // has not acknowledged the completion, and never will once its
+        // processor instance is gone. The store keeps a reclaimable,
+        // cancelled, or failed subscription as it is.
+        if job.owner == leani_runtime::HistoricalJobOwner::Subscription {
+            self.store
+                .set_backfill_subscription_state(
+                    id,
+                    leani_store_sqlite::BackfillSubscriptionState::Cancelled,
+                    None,
+                )
+                .await
+                .map_err(|error| leani_api::BackfillControlError::Internal(error.to_string()))?;
         }
         let outcome = self.outcome(&record.id).await?;
         self.status(&record, outcome.as_ref()).await
@@ -10877,6 +10879,162 @@ markets = ["ETH/USDT"]
                 .state,
             leani_api::BackfillState::Draining
         );
+    }
+
+    /// A subscription to blocks 1 to 4 whose required consumer is
+    /// `destination`.
+    fn subscription(instance: &str, key: &str) -> leani_api::CreateBackfillRequest {
+        leani_api::CreateBackfillRequest {
+            processor: instance.to_owned(),
+            from_block: Some(1),
+            to_block: Some(4.into()),
+            ranges: Vec::new(),
+            mode: leani_api::BackfillExecutionMode::FillMissing,
+            consumer: Some(leani_api::CreateBackfillConsumerRequest {
+                id: "destination".to_owned(),
+                role: leani_store_sqlite::ConsumerRole::Required,
+                lease_ttl_seconds: 60,
+                credential: None,
+            }),
+            limits: None,
+            batching: None,
+            idempotency_key: key.to_owned(),
+        }
+    }
+
+    /// An on-demand node with a [`subscription`] that finished and drains:
+    /// its consumer has acknowledged nothing, its completion included.
+    async fn draining_subscription(
+        directory: &Path,
+    ) -> (
+        leani_store_sqlite::SqliteStore,
+        Arc<NativeBackfillControl>,
+        Arc<dyn Processor>,
+        String,
+    ) {
+        use leani_api::BackfillControl as _;
+
+        // Subscription IDs name the instance, so it must be portable.
+        let processor: Arc<dyn Processor> = Arc::new(BlockLocalCounter::default().with_instance(
+            leani_processor_api::ProcessorInstanceId::new("drained-counter").expect("instance"),
+            leani_primitives::BlockHash::new([0x0d; 32]),
+        ));
+        let instance = processor.descriptor().instance.to_string();
+        let (store, control) = on_demand_control_with(
+            directory,
+            processor.clone(),
+            4,
+            crate::config::ProcessorHistoryControl::ApplicationSubscriptions,
+        )
+        .await;
+        let created = control
+            .create_subscription(subscription(&instance, "drained"))
+            .await
+            .expect("subscription");
+        wait_for_subscription_state(&control, &created.id, leani_api::BackfillState::Draining)
+            .await;
+        // Its task records the report after the last commit drains it.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !control.tasks.lock().await.is_empty() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the finished job's task ends");
+        (store, control, processor, created.id)
+    }
+
+    /// A control over `control`'s store on a node that no longer configures
+    /// any processor instance, as after its operator replaced them.
+    fn without_processors(control: &NativeBackfillControl) -> NativeBackfillControl {
+        let mut config = (*control.config).clone();
+        config.processors.clear();
+        NativeBackfillControl::new(
+            config,
+            control.store.clone(),
+            Vec::new(),
+            CancellationToken::new(),
+            None,
+            None,
+            control.pipeline_budget.clone(),
+        )
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_draining_subscription_lets_it_be_deleted() {
+        // Integration feedback: cancel changed only a job that still ran. A
+        // finished subscription drains until its consumer acknowledges the
+        // completion, so it stayed draining, and deletion refused it.
+        use leani_api::BackfillControl as _;
+
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let (store, control, processor, id) = draining_subscription(directory.path()).await;
+        let cancelled = control.cancel(&id).await.expect("cancel");
+        assert_eq!(cancelled.state, leani_api::BackfillState::Cancelled);
+        // The job keeps its completion and its report.
+        assert!(cancelled.report.is_some());
+        assert_eq!(
+            store.job(&id).await.expect("job").expect("record").state,
+            leani_store_sqlite::JobState::Completed
+        );
+        // Its consumer can still read every record the job committed.
+        let records = store
+            .consumer_changes_after_in_stream(
+                processor.descriptor(),
+                cancelled
+                    .delivery_stream_id
+                    .as_deref()
+                    .expect("history stream"),
+                leani_primitives::ChainId(1),
+                "destination",
+                0,
+                100,
+            )
+            .await
+            .expect("stream records");
+        assert_eq!(
+            records.last().map(|record| record.change.kind.as_str()),
+            Some("system.backfill_complete")
+        );
+        // It has acknowledged none of them.
+        let protected = control
+            .delete(&id, leani_store_sqlite::UnacknowledgedDelivery::Protect)
+            .await;
+        assert!(
+            matches!(protected, Err(leani_api::BackfillControlError::Conflict(_))),
+            "{protected:?}"
+        );
+        control
+            .delete(&id, leani_store_sqlite::UnacknowledgedDelivery::Discard)
+            .await
+            .expect("discarding delete");
+        let deleted = control.inspect(&id).await;
+        assert!(
+            matches!(deleted, Err(leani_api::BackfillControlError::NotFound(_))),
+            "{deleted:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_draining_subscription_of_a_removed_instance_can_be_cancelled_and_deleted() {
+        // Integration feedback: once its processor instance was replaced, a
+        // draining subscription's consumer could no longer read or
+        // acknowledge its stream, so it drained, and held its records, for
+        // good.
+        use leani_api::BackfillControl as _;
+
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let (_store, control, _processor, id) = draining_subscription(directory.path()).await;
+        let removed = without_processors(&control);
+        assert_eq!(
+            removed.cancel(&id).await.expect("cancel").state,
+            leani_api::BackfillState::Cancelled
+        );
+        let deletion = removed
+            .delete(&id, leani_store_sqlite::UnacknowledgedDelivery::Discard)
+            .await
+            .expect("discarding delete");
+        assert!(deletion.removed_delivery_records > 0, "{deletion:?}");
     }
 
     fn durable_job(
