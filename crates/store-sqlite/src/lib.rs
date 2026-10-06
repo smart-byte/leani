@@ -1341,6 +1341,8 @@ pub struct BackfillSubscriptionRecord {
     pub mode: BackfillSubscriptionMode,
     pub publication_revision: u64,
     pub state: BackfillSubscriptionState,
+    /// Error saved atomically with the subscription's lifecycle state.
+    pub last_error: Option<String>,
     pub consumer_id: String,
     /// Immutable normalized requested ranges. Legacy records may leave this
     /// empty and use `range` as a single range.
@@ -9138,7 +9140,7 @@ impl SqliteStore {
                 delivery_maximum_buffered_bytes, delivery_compression, completion_sequence,
                 processed_work_blocks, created_at_unix_ms, updated_at_unix_ms,
                 last_error
-             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT DO NOTHING",
         )
         .bind(&subscription.subscription_id)
@@ -9223,6 +9225,7 @@ impl SqliteStore {
         )?)
         .bind(now)
         .bind(now)
+        .bind(subscription.last_error.as_deref())
         .execute(&mut *transaction)
         .await?;
         let stored_subscription = sqlx::query(
@@ -9497,7 +9500,7 @@ impl SqliteStore {
                     delivery_maximum_events, delivery_maximum_processed_blocks,
                     delivery_maximum_delay_ms, delivery_maximum_buffered_batches,
                     delivery_maximum_buffered_bytes, delivery_compression, initial_sequence,
-                    completion_sequence, processed_work_blocks
+                    completion_sequence, processed_work_blocks, last_error
              FROM backfill_subscriptions
              WHERE job_id = ?",
         )
@@ -17721,6 +17724,7 @@ fn decode_backfill_subscription(row: &SqliteRow) -> Result<BackfillSubscriptionR
             "subscription publication revision",
         )?,
         state: BackfillSubscriptionState::parse(row.try_get("state")?)?,
+        last_error: row.try_get("last_error")?,
         consumer_id: row.try_get("consumer_id")?,
         ranges: Vec::new(),
         range,
@@ -21778,6 +21782,7 @@ mod tests {
                     mode: BackfillSubscriptionMode::FillMissing,
                     publication_revision: 0,
                     state: BackfillSubscriptionState::Queued,
+                    last_error: None,
                     consumer_id: "destination".to_owned(),
                     ranges: vec![range],
                     range,
@@ -23647,6 +23652,7 @@ mod tests {
             mode: BackfillSubscriptionMode::FillMissing,
             publication_revision: 0,
             state: BackfillSubscriptionState::Queued,
+            last_error: None,
             consumer_id: "destination".to_owned(),
             ranges: vec![BlockRange::new(BlockNumber(1), BlockNumber(2)).expect("range")],
             range: BlockRange::new(BlockNumber(1), BlockNumber(2)).expect("range"),
@@ -24029,6 +24035,7 @@ mod tests {
                     mode: BackfillSubscriptionMode::FillMissing,
                     publication_revision: 0,
                     state: BackfillSubscriptionState::Queued,
+                    last_error: None,
                     consumer_id: "destination".to_owned(),
                     ranges: vec![BlockRange::single(BlockNumber(1))],
                     range: BlockRange::single(BlockNumber(1)),
@@ -24282,6 +24289,7 @@ mod tests {
             mode: BackfillSubscriptionMode::FillMissing,
             publication_revision: 0,
             state: BackfillSubscriptionState::Queued,
+            last_error: None,
             consumer_id: "destination".to_owned(),
             ranges: vec![last, adjacent, first],
             range: BlockRange::new(first.start(), last.end()).expect("bounding"),
@@ -26388,6 +26396,7 @@ mod tests {
                     mode: BackfillSubscriptionMode::FillMissing,
                     publication_revision: 0,
                     state: BackfillSubscriptionState::Queued,
+                    last_error: None,
                     consumer_id: "destination".to_owned(),
                     ranges: vec![range],
                     range,
@@ -26504,6 +26513,7 @@ mod tests {
                     mode: BackfillSubscriptionMode::FillMissing,
                     publication_revision: 0,
                     state: BackfillSubscriptionState::Queued,
+                    last_error: None,
                     consumer_id: "destination".to_owned(),
                     ranges: vec![range],
                     range,

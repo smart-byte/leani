@@ -1119,7 +1119,10 @@ impl NativeBackfillControl {
             report: outcome
                 .and_then(|outcome| outcome.report.as_ref())
                 .map(Self::api_report),
-            last_error: outcome.and_then(|outcome| outcome.error.clone()),
+            last_error: subscription.as_ref().map_or_else(
+                || outcome.and_then(|outcome| outcome.error.clone()),
+                |subscription| subscription.last_error.clone(),
+            ),
         })
     }
 
@@ -2203,6 +2206,7 @@ impl leani_api::BackfillControl for NativeBackfillControl {
                         },
                         publication_revision: 0,
                         state: leani_store_sqlite::BackfillSubscriptionState::Queued,
+                        last_error: None,
                         consumer_id,
                         ranges: ranges.clone(),
                         range,
@@ -11229,6 +11233,30 @@ markets = ["ETH/USDT"]
             .await
             .expect("discarding delete");
         assert!(deletion.removed_delivery_records > 0, "{deletion:?}");
+    }
+
+    #[tokio::test]
+    async fn failed_subscription_status_reports_its_durable_error() {
+        use leani_api::BackfillControl as _;
+
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let (store, control, _processor, id) = draining_subscription(directory.path()).await;
+        // An acquisition outcome must not hide the subscription's later error.
+        store
+            .set_backfill_subscription_state(
+                &id,
+                leani_store_sqlite::BackfillSubscriptionState::Failed,
+                Some("durable subscription failure"),
+            )
+            .await
+            .expect("durable failure");
+
+        let status = control.inspect(&id).await.expect("status");
+        assert_eq!(status.state, leani_api::BackfillState::Failed);
+        assert_eq!(
+            status.last_error.as_deref(),
+            Some("durable subscription failure")
+        );
     }
 
     #[tokio::test]
