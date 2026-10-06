@@ -55,6 +55,7 @@ use reth_dns_discovery::{
     tree::LinkEntry as DnsDiscoveryLink,
 };
 use reth_ethereum_primitives::{BlockBody, Receipt};
+use reth_network::config::SecretKey;
 use reth_network::types::{
     EthVersion, GetBlockBodies, GetBlockHeaders, GetReceipts, GetReceipts70, NatResolver, PeerKind,
     ReputationChangeKind,
@@ -75,7 +76,6 @@ use reth_network_p2p::{
 };
 use reth_network_peers::{NodeRecord, TrustedPeer};
 use reth_tasks::Runtime;
-use secp256k1::SecretKey;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;

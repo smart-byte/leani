@@ -1075,7 +1075,7 @@ fn bounded_quality_detail(detail: &str) -> String {
 mod tests {
     use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 
-    use secp256k1::SecretKey;
+    use reth_network::config::SecretKey;
 
     use super::*;
 

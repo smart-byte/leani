@@ -31,7 +31,6 @@ reth-network.workspace = true
 reth-network-p2p.workspace = true
 reth-network-peers.workspace = true
 reth-tasks.workspace = true
-secp256k1.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sqlx.workspace = true
