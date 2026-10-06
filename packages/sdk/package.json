@@ -60,7 +60,7 @@
     "prepublishOnly": "bun run openapi:check && bun run typecheck && bun test && bun run test:package"
   },
   "devDependencies": {
-    "@redocly/cli": "2.54.3",
+    "@redocly/cli": "2.57.0",
     "@types/bun": "^1.3.5",
     "openapi-typescript": "7.13.0",
     "typescript": "5.9.3",
