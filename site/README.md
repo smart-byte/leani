@@ -23,6 +23,15 @@ touch icon, and social-media avatar under `public`. `src/components/Wordmark.ast
 and `scripts/og-card.html` inline the wordmark; `bun test` checks that every
 copy matches.
 
+Diagrams are hand-written SVGs in `src/assets/diagrams` that use the class
+names styled in `scripts/generate-diagrams.ts`. Run `bun run diagrams:update`
+after editing one to write its light and dark renders to `public/diagrams`;
+`bun run check` fails while a render is stale. Keep them about 680 units wide
+so their 11–12 px text stays legible in the docs column. Docs pages show one
+with `<Diagram name="…" alt="…" />`, and the README uses a `<picture>` element
+so GitHub picks the render for its theme. `src/components/docs/MarkdownContent.astro`
+opens any docs image enlarged on click, tap, or Enter.
+
 The pinned `typescript` 5.9 package provides the JavaScript compiler API used
 by Astro and the executable documentation generator. TypeScript examples use
 the native TypeScript 7 compiler through `@typescript/native`. Keep these
