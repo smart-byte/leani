@@ -1,0 +1,46 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 680 200" width="680" height="200" role="img" aria-labelledby="title desc">
+  <title id="title">Cold and hot lanes overlap before handoff</title>
+  <desc id="desc">The cold lane covers blocks up to E and the hot lane starts at C. Blocks C, D, and E are in both lanes; the overlap is at least the reorg window, and their hashes must match. The verified handoff follows E, after which the hot lane continues with F, G, and H.</desc>
+  <defs>
+    <marker id="ma" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path class="mka" d="M0 0L8 4L0 8Z"/></marker>
+  </defs>
+
+  <!-- column c sits at x = 88 + 58c; C, D, E are columns 3 to 5 -->
+  <rect class="open" x="256" y="30" width="174" height="122" rx="8"/>
+  <text class="s d" x="343" y="22" text-anchor="middle">overlap ≥ reorg window</text>
+
+  <text class="k h" x="16" y="61">COLD</text>
+  <text class="h" x="112" y="61" text-anchor="middle">…</text>
+  <rect class="boxh" x="146" y="40" width="48" height="32" rx="5"/>
+  <rect class="boxh" x="204" y="40" width="48" height="32" rx="5"/>
+  <rect class="boxh" x="262" y="40" width="48" height="32" rx="5"/>
+  <rect class="boxh" x="320" y="40" width="48" height="32" rx="5"/>
+  <rect class="boxh" x="378" y="40" width="48" height="32" rx="5"/>
+  <text class="h" x="170" y="61" text-anchor="middle">A</text>
+  <text class="h" x="228" y="61" text-anchor="middle">B</text>
+  <text class="h" x="286" y="61" text-anchor="middle">C</text>
+  <text class="h" x="344" y="61" text-anchor="middle">D</text>
+  <text class="h" x="402" y="61" text-anchor="middle">E</text>
+
+  <text class="a b" x="286" y="96" text-anchor="middle">=</text>
+  <text class="a b" x="344" y="96" text-anchor="middle">=</text>
+  <text class="a b" x="402" y="96" text-anchor="middle">=</text>
+
+  <text class="k a" x="16" y="131">HOT</text>
+  <rect class="boxa" x="262" y="110" width="48" height="32" rx="5"/>
+  <rect class="boxa" x="320" y="110" width="48" height="32" rx="5"/>
+  <rect class="boxa" x="378" y="110" width="48" height="32" rx="5"/>
+  <rect class="boxa" x="436" y="110" width="48" height="32" rx="5"/>
+  <rect class="boxa" x="494" y="110" width="48" height="32" rx="5"/>
+  <rect class="boxa" x="552" y="110" width="48" height="32" rx="5"/>
+  <text class="a" x="286" y="131" text-anchor="middle">C</text>
+  <text class="a" x="344" y="131" text-anchor="middle">D</text>
+  <text class="a" x="402" y="131" text-anchor="middle">E</text>
+  <text class="a" x="460" y="131" text-anchor="middle">F</text>
+  <text class="a" x="518" y="131" text-anchor="middle">G</text>
+  <text class="a" x="576" y="131" text-anchor="middle">H</text>
+  <text class="a" x="634" y="131" text-anchor="middle">…</text>
+
+  <line class="lna" x1="431" y1="176" x2="431" y2="156" marker-end="url(#ma)"/>
+  <text class="s a" x="439" y="190">verified handoff</text>
+</svg>

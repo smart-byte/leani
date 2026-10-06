@@ -10,18 +10,16 @@ status: preview
 ---
 
 import { Aside, Steps } from '@astrojs/starlight/components';
+import Diagram from '@docs/components/docs/Diagram.astro';
 
 Leani does not make a large historical scan block head following. The live lane
 starts independently, commits canonical head work, and can recover a short live
 gap. Historical jobs fill missing committed intervals for each processor.
 
-```text
-processor start                                             observed head
-      │                                                           │
-      ├──── archive / retained / P2P history ────────┐            │
-      │                                              ├─ hash join ┤
-      └──────────────── live P2P + finality ─────────┴────────────┘
-```
+<Diagram
+  name="backfill-live"
+  alt="The live lane follows the observed head over P2P with finality from block J+1. The history lane fills chunks from the processor start block through J from archive, retained, or P2P sources. They meet once where the parent of J+1 equals the hash of J."
+/>
 
 <Steps>
 1. Run `doctor` and inspect which historical sources satisfy the processor's

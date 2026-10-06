@@ -10,6 +10,7 @@ status: preview
 ---
 
 import { Aside } from '@astrojs/starlight/components';
+import Diagram from '@docs/components/docs/Diagram.astro';
 
 Coverage answers “which block intervals did this processor commit?” Finality
 answers “what chain-confidence status does each committed interval have?” They
@@ -52,12 +53,10 @@ section explains the proof and its fallback. The lanes halt and report not
 ready instead when the contradicted block is itself finalized, or when
 restarting twice did not resolve the contradiction.
 
-```text
-requested       100 ─────────────────────────────── 140
-coverage        100 ───── 112     120 ───────────── 140
-finalized       100 ───────────────── 128
-included                                  129 ───── 140
-```
+<Diagram
+  name="coverage-finality"
+  alt="Requested blocks 100 to 140. Coverage is 100 to 112 and 120 to 140, so 113 to 119 are missing. Finality is separate: finalized 100 to 128, included 129 to 140."
+/>
 
 In that example, `complete` is false because `113..119` is absent. A high
 `processedThrough` value does not hide the internal gap, and finalized coverage

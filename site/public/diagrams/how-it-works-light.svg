@@ -1,0 +1,99 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 680 690" width="680" height="690" role="img" aria-labelledby="title desc">
+<style>
+svg{font-family:'JetBrains Mono',ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12px}
+text{fill:#101713}.d{fill:#536b5e}.f{fill:#8ca396}.a{fill:#08763c}.h{fill:#8a5a00}
+.k{font-size:10px;letter-spacing:.08em}.s{font-size:11px}.b{font-weight:700}
+.box{fill:#f1f6f3;stroke:#cbd8d0}.boxa{fill:#d8f8e5;stroke:#08763c}.boxh{fill:#fcf5e5;stroke:#dcbd7a}
+.ln{fill:none;stroke:#8ca396;stroke-width:1.25}.lna{fill:none;stroke:#08763c;stroke-width:1.5}.lnh{fill:none;stroke:#8a5a00;stroke-width:1.5}
+.rule{stroke:#cbd8d0;stroke-dasharray:2 4}.dash{stroke-dasharray:4 4}
+.open{fill:none;stroke:#8ca396;stroke-dasharray:4 3}.opena{fill:none;stroke:#08763c;stroke-dasharray:4 3}
+.mk{fill:#8ca396}.mka{fill:#08763c}.mkh{fill:#8a5a00}.hatch{stroke:#dcbd7a;stroke-width:3}
+</style>
+  <title id="title">How Leani works</title>
+  <desc id="desc">A history lane reads public datasets up to block N and a live lane follows Ethereum P2P from block N+1; they join once where the live block's parent equals the hash of block N. Source adapters normalize blocks, which are validated, mapped in parallel, and reduced in canonical order. Raw chunks are dropped after mapping; only processor stores and the change stream are kept on disk. They serve a JSON-RPC facade and an HTTP and SSE API, which SDK consumers commit into an application database.</desc>
+  <defs>
+    <marker id="m" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path class="mk" d="M0 0L8 4L0 8Z"/></marker>
+    <marker id="ma" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path class="mka" d="M0 0L8 4L0 8Z"/></marker>
+    <marker id="mh" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path class="mkh" d="M0 0L8 4L0 8Z"/></marker>
+  </defs>
+
+  <!-- 01 acquire -->
+  <text x="16" y="16"><tspan class="a b">01</tspan> acquire <tspan class="s d">· two lanes, one join</tspan></text>
+  <rect class="boxh" x="16" y="28" width="310" height="100" rx="8"/>
+  <text class="k h" x="32" y="50">HISTORY LANE</text>
+  <text class="b" x="32" y="72">Public datasets</text>
+  <text class="s d" x="32" y="90">Xatu Parquet · EraE · AWS · Google</text>
+  <text class="s d" x="32" y="108">bounded chunks, checked commitments</text>
+
+  <rect class="boxa" x="354" y="28" width="310" height="100" rx="8"/>
+  <text class="k a" x="370" y="50">LIVE LANE</text>
+  <text class="b" x="370" y="72">Ethereum P2P</text>
+  <text class="s d" x="370" y="90">execution peers, no API key</text>
+  <text class="s d" x="370" y="108">finality: Beacon API or light client</text>
+
+  <path class="lnh" d="M171 128C171 156 285 150 285 174" marker-end="url(#mh)"/>
+  <path class="lna" d="M509 128C509 156 395 150 395 174" marker-end="url(#ma)"/>
+  <text class="s h" x="161" y="156" text-anchor="end">blocks ≤ N</text>
+  <text class="s a" x="519" y="156">blocks ≥ N+1</text>
+  <rect class="boxa" x="280" y="138" width="120" height="22" rx="11"/>
+  <text class="s" x="340" y="153" text-anchor="middle">parent = hash(N)</text>
+
+  <rect class="box" x="165" y="176" width="350" height="50" rx="6"/>
+  <text x="340" y="197" text-anchor="middle">source adapters → BlockEnvelope</text>
+  <text class="s d" x="340" y="215" text-anchor="middle">normalized, capabilities + provenance</text>
+
+  <!-- 02 validate -->
+  <line class="rule" x1="16" y1="242" x2="664" y2="242"/>
+  <text x="16" y="262"><tspan class="a b">02</tspan> validate <tspan class="s d">· before publish</tspan></text>
+  <line class="ln" x1="340" y1="226" x2="340" y2="270" marker-end="url(#m)"/>
+  <rect class="box" x="165" y="272" width="350" height="50" rx="6"/>
+  <text x="340" y="293" text-anchor="middle">validation + canonicality</text>
+  <text class="s d" x="340" y="311" text-anchor="middle">hashes · commitments · ancestry · finality</text>
+
+  <!-- 03 reduce -->
+  <line class="rule" x1="16" y1="338" x2="664" y2="338"/>
+  <text x="16" y="358"><tspan class="a b">03</tspan> reduce <tspan class="s d">· deterministic</tspan></text>
+  <path class="ln" d="M340 322V366" marker-end="url(#m)"/>
+  <path class="ln" d="M340 322C340 344 215 342 215 366" marker-end="url(#m)"/>
+  <path class="ln" d="M340 322C340 344 465 342 465 366" marker-end="url(#m)"/>
+  <rect class="box" x="165" y="368" width="100" height="36" rx="6"/>
+  <rect class="box" x="290" y="368" width="100" height="36" rx="6"/>
+  <rect class="box" x="415" y="368" width="100" height="36" rx="6"/>
+  <text x="215" y="390" text-anchor="middle">map N</text>
+  <text x="340" y="390" text-anchor="middle">map N+1</text>
+  <text x="465" y="390" text-anchor="middle">map N+2</text>
+  <line class="ln dash" x1="517" y1="386" x2="548" y2="386"/>
+  <text class="s d" x="556" y="383">raw chunk dropped</text>
+  <text class="s f" x="556" y="398">after map</text>
+
+  <path class="ln" d="M215 404C215 422 315 418 315 434" marker-end="url(#m)"/>
+  <path class="ln" d="M340 404V434" marker-end="url(#m)"/>
+  <path class="ln" d="M465 404C465 422 365 418 365 434" marker-end="url(#m)"/>
+  <rect class="box" x="165" y="436" width="350" height="50" rx="6"/>
+  <text x="340" y="457" text-anchor="middle">ordered state reduce</text>
+  <text class="s d" x="340" y="475" text-anchor="middle">apply · undo · checkpoint</text>
+  <text class="s d" x="153" y="465" text-anchor="end">canonical order</text>
+
+  <!-- 04 deliver -->
+  <line class="rule" x1="16" y1="502" x2="664" y2="502"/>
+  <text x="16" y="522"><tspan class="a b">04</tspan> deliver <tspan class="s d">· query, stream, acknowledge</tspan></text>
+  <line class="ln" x1="340" y1="486" x2="340" y2="530" marker-end="url(#m)"/>
+  <rect class="boxa" x="165" y="532" width="350" height="50" rx="6"/>
+  <text x="340" y="553" text-anchor="middle">processor stores + change stream</text>
+  <text class="s d" x="340" y="571" text-anchor="middle">state · outputs · checkpoints · reorg window</text>
+  <text class="s a b" x="531" y="553">kept on disk</text>
+  <text class="s d" x="531" y="569">raw history is not</text>
+
+  <path class="ln" d="M340 582C340 602 116 598 116 618" marker-end="url(#m)"/>
+  <line class="ln" x1="340" y1="582" x2="340" y2="618" marker-end="url(#m)"/>
+  <rect class="box" x="16" y="620" width="200" height="52" rx="6"/>
+  <text x="116" y="642" text-anchor="middle">JSON-RPC facade</text>
+  <text class="s d" x="116" y="660" text-anchor="middle">:18545 · viem, ethers</text>
+  <rect class="box" x="240" y="620" width="200" height="52" rx="6"/>
+  <text x="340" y="642" text-anchor="middle">HTTP + SSE API</text>
+  <text class="s d" x="340" y="660" text-anchor="middle">:18080 · SDK, CLI</text>
+  <line class="ln" x1="440" y1="646" x2="462" y2="646" marker-end="url(#m)"/>
+  <rect class="box" x="464" y="620" width="200" height="52" rx="6"/>
+  <text x="564" y="642" text-anchor="middle">your database</text>
+  <text class="s d" x="564" y="660" text-anchor="middle">commit, then acknowledge</text>
+</svg>

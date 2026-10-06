@@ -179,22 +179,10 @@ native processor and a query extension to the stock node through
 
 ## How it works
 
-```text
-             Historical lane                         Live lane
-    Xatu Parquet / EraE / AWS / Google       Ethereum P2P + CL finality
-                       \                       /
-                        Source adapters
-                              |
-                  normalized BlockEnvelope
-                              |
-                 validation + canonicality
-                              |
-        parallel per-block map -> ordered state reduce
-                              |
-             processor stores and change stream
-                              |
-     RPC facade / HTTP+SSE SDK API / SQL sinks
-```
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="site/public/diagrams/how-it-works-dark.svg">
+  <img src="site/public/diagrams/how-it-works-light.svg" alt="A history lane reads public datasets through block N and a live lane follows Ethereum P2P from block N+1; they join where the live block's parent equals hash(N). Blocks are normalized, validated, mapped in parallel, and reduced in canonical order. Raw chunks are dropped after mapping; only processor stores and the change stream stay on disk and serve JSON-RPC, HTTP and SSE, and your database.">
+</picture>
 
 Historical sources are public Xatu Parquet datasets and EraE archives, read
 range by range and verified against block commitments. The live lane follows

@@ -121,20 +121,15 @@ The node replaces the current WebSocket block notification plus subsequent HTTP 
 
 Example startup:
 
-```text
-t0:
-  target finalized block = B
-  start P2P capture at B - 128
-  start Xatu backfill at Dencun
+1. **t0:** with target finalized block B, start P2P capture at B − 128 and the
+   Xatu backfill at Dencun.
+2. **t1:** when the Xatu mapper and reducer reach B − 128, compare hashes over
+   the overlap.
+3. **t2:** consume the buffered P2P deltas through the current head and switch
+   the reducer to live.
 
-t1:
-  Xatu mapper/reducer reaches B - 128
-  compare hashes over overlap
-
-t2:
-  consume buffered P2P deltas through current head
-  switch reducer to live
-```
+<img class="dark:sl-hidden" src="/diagrams/blobs-handoff-light.svg" width="680" height="242" alt="At t0, P2P capture starts at B − 128 and buffers deltas while the Xatu backfill starts at Dencun. At t1, Xatu reaches B − 128 and hashes are compared over the overlap. At t2, the buffered deltas drain through the head and the reducer goes live.">
+<img class="light:sl-hidden" src="/diagrams/blobs-handoff-dark.svg" width="680" height="242" data-llms-skip alt="At t0, P2P capture starts at B − 128 and buffers deltas while the Xatu backfill starts at Dencun. At t1, Xatu reaches B − 128 and hashes are compared over the overlap. At t2, the buffered deltas drain through the head and the reducer goes live.">
 
 Leani is tested independently through its API, SDK, RPC, and exported parity
 reports. The blobs.money repository owns the separate PostgreSQL transaction,
