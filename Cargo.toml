@@ -91,7 +91,7 @@ reth-network = { git = "https://github.com/paradigmxyz/reth", rev = "5a6940e351f
 reth-network-p2p = { git = "https://github.com/paradigmxyz/reth", rev = "5a6940e351fed80458fe6c9da8581cbe4b8bd036" }
 reth-network-peers = { git = "https://github.com/paradigmxyz/reth", rev = "5a6940e351fed80458fe6c9da8581cbe4b8bd036" }
 reth-tasks = { git = "https://github.com/paradigmxyz/reth", rev = "5a6940e351fed80458fe6c9da8581cbe4b8bd036" }
-secp256k1 = { version = "0.30", default-features = false, features = ["global-context"] }
+secp256k1 = { version = "0.31", default-features = false, features = ["global-context"] }
 semver = { version = "1.0", features = ["serde"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
