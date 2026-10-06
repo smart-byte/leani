@@ -1,0 +1,54 @@
+---
+import Default from '@astrojs/starlight/components/MarkdownContent.astro';
+---
+<Default><slot /></Default>
+<dialog class="zoom" aria-label="Enlarged image">
+  <button type="button" aria-label="Close">×</button>
+  <div class="frame"><img alt="" /></div>
+</dialog>
+
+<script>
+  // Tap or press Enter on a docs image to see it enlarged. Diagrams are
+  // vectors, so they open at twice their size; on a phone that is wider than
+  // the screen and pans, which keeps their text readable. Any click closes.
+  const dialog = document.querySelector<HTMLDialogElement>('dialog.zoom')!;
+  const zoomed = dialog.querySelector('img')!;
+  const open = (image: HTMLImageElement) => {
+    zoomed.src = image.currentSrc;
+    zoomed.alt = image.alt;
+    zoomed.style.width = `${image.naturalWidth * (/\.svg(\?|$)/.test(image.currentSrc) ? 2 : 1)}px`;
+    dialog.showModal();
+  };
+  for (const image of document.querySelectorAll<HTMLImageElement>('.sl-markdown-content img:not(a img)')) {
+    image.tabIndex = 0;
+    image.classList.add('zoomable');
+    image.addEventListener('click', () => open(image));
+    image.addEventListener('keydown', (event) => {
+      if (event.key !== 'Enter' && event.key !== ' ') return;
+      event.preventDefault();
+      open(image);
+    });
+  }
+  dialog.addEventListener('click', () => dialog.close());
+</script>
+
+<style>
+  :global(.sl-markdown-content img.zoomable) { cursor: zoom-in; }
+  :global(:root:has(dialog.zoom[open])) { overflow: hidden; }
+  .zoom {
+    width: 100vw; height: 100dvh; max-width: none; max-height: none;
+    margin: 0; padding: 0; border: 0;
+    background: var(--sl-color-bg); color: var(--sl-color-white);
+    cursor: zoom-out;
+  }
+  .zoom::backdrop { background: var(--sl-color-bg); }
+  .frame { box-sizing: border-box; width: 100%; height: 100%; overflow: auto; display: flex; padding: 3.5rem 1rem 1rem; }
+  /* Fit wide renders to the screen, but never below 56rem: a phone pans instead.
+     Auto margins center without pushing an overflowing image past the scroll start. */
+  .frame img { margin: auto; flex: none; max-width: max(100%, 56rem); height: auto; }
+  button {
+    position: fixed; top: 0.75rem; right: 0.75rem;
+    width: 2.5rem; height: 2.5rem; border: 1px solid var(--sl-color-gray-5); border-radius: 999px;
+    background: var(--sl-color-bg-sidebar); color: inherit; font-size: 1.4rem; line-height: 1; cursor: pointer;
+  }
+</style>

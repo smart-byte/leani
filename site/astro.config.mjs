@@ -98,6 +98,7 @@ export default defineConfig({
         Banner: './src/components/docs/PreviewBanner.astro',
         EditLink: './src/components/docs/EditLink.astro',
         Footer: './src/components/docs/Footer.astro',
+        MarkdownContent: './src/components/docs/MarkdownContent.astro',
         Pagination: './src/components/docs/Pagination.astro',
         Sidebar: './src/components/docs/Sidebar.astro',
       },
