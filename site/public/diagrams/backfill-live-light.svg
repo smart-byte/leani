@@ -1,0 +1,50 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 660 236" width="660" height="236" role="img" aria-labelledby="title desc">
+<style>
+svg{font-family:'JetBrains Mono',ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12px}
+text{fill:#101713}.d{fill:#536b5e}.f{fill:#8ca396}.a{fill:#08763c}.h{fill:#8a5a00}
+.k{font-size:10px;letter-spacing:.08em}.s{font-size:11px}.b{font-weight:700}
+.box{fill:#f1f6f3;stroke:#cbd8d0}.boxa{fill:#d8f8e5;stroke:#08763c}.boxh{fill:#fcf5e5;stroke:#dcbd7a}
+.ln{fill:none;stroke:#8ca396;stroke-width:1.25}.lna{fill:none;stroke:#08763c;stroke-width:1.5}.lnh{fill:none;stroke:#8a5a00;stroke-width:1.5}
+.rule{stroke:#cbd8d0;stroke-dasharray:2 4}.dash{stroke-dasharray:4 4}
+.open{fill:none;stroke:#8ca396;stroke-dasharray:4 3}.opena{fill:none;stroke:#08763c;stroke-dasharray:4 3}
+.mk{fill:#8ca396}.mka{fill:#08763c}.mkh{fill:#8a5a00}.hatch{stroke:#dcbd7a;stroke-width:3}
+</style>
+  <title id="title">History and live lanes meet at one hash join</title>
+  <desc id="desc">The live lane starts first and follows the observed head over P2P with verified finality. Independently, the history lane fills the range from the processor start block up to block J in chunks from archive, retained, or P2P sources. The lanes meet once at J, where the first live block's parent hash equals the hash of block J.</desc>
+  <defs>
+    <marker id="ma" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path class="mka" d="M0 0L8 4L0 8Z"/></marker>
+    <marker id="m" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path class="mk" d="M0 0L8 4L0 8Z"/></marker>
+  </defs>
+
+  <line class="rule" x1="600" y1="24" x2="600" y2="196"/>
+
+  <text class="k a" x="450" y="44">LIVE LANE</text>
+  <text class="s d" x="524" y="44">starts first</text>
+  <rect class="boxa" x="440" y="54" width="160" height="26" rx="5"/>
+  <text class="s" x="520" y="71" text-anchor="middle">P2P + finality</text>
+  <line class="lna" x1="600" y1="67" x2="628" y2="67" marker-end="url(#ma)"/>
+
+  <text class="k h" x="48" y="106">HISTORY LANE</text>
+  <text class="s d" x="140" y="106">archive · retained · P2P, in chunks</text>
+  <g>
+    <rect class="boxh" x="48" y="116" width="40" height="26" rx="4"/>
+    <rect class="boxh" x="92" y="116" width="40" height="26" rx="4"/>
+    <rect class="boxh" x="136" y="116" width="40" height="26" rx="4"/>
+    <rect class="boxh" x="180" y="116" width="40" height="26" rx="4"/>
+    <rect class="boxh" x="224" y="116" width="40" height="26" rx="4"/>
+    <rect class="boxh" x="268" y="116" width="40" height="26" rx="4"/>
+    <rect class="boxh" x="312" y="116" width="40" height="26" rx="4"/>
+    <rect class="boxh" x="356" y="116" width="40" height="26" rx="4"/>
+    <rect class="boxh" x="400" y="116" width="40" height="26" rx="4"/>
+  </g>
+
+  <line class="lna" x1="440" y1="50" x2="440" y2="158"/>
+  <rect class="boxa" x="345" y="160" width="190" height="24" rx="12"/>
+  <text class="s" x="440" y="176" text-anchor="middle">parent(J+1) = hash(J)</text>
+
+  <line class="ln" x1="48" y1="204" x2="640" y2="204" marker-end="url(#m)"/>
+  <line class="ln" x1="48" y1="199" x2="48" y2="209"/>
+  <text class="s d" x="48" y="226">processor start</text>
+  <text class="s a" x="440" y="226" text-anchor="middle">J</text>
+  <text class="s d" x="600" y="226" text-anchor="middle">observed head</text>
+</svg>

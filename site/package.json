@@ -5,10 +5,11 @@
   "type": "module",
   "scripts": {
     "brand:update": "bun scripts/generate-brand-assets.ts",
+    "diagrams:update": "bun scripts/generate-diagrams.ts",
     "dev": "bun run docs:prepare && astro dev",
     "build": "bun run docs:prepare && astro build",
     "preview": "astro preview",
-    "check": "bun run docs:check && astro check && bun test",
+    "check": "bun run docs:check && bun scripts/generate-diagrams.ts --check && astro check && bun test",
     "docs:prepare": "bun ../scripts/docs/prepare.ts",
     "docs:check": "bun ../scripts/docs/check.ts",
     "docs:update": "bun ../scripts/docs/update.ts",

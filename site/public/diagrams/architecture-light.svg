@@ -1,0 +1,83 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 680 650" width="680" height="650" role="img" aria-labelledby="title desc">
+<style>
+svg{font-family:'JetBrains Mono',ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12px}
+text{fill:#101713}.d{fill:#536b5e}.f{fill:#8ca396}.a{fill:#08763c}.h{fill:#8a5a00}
+.k{font-size:10px;letter-spacing:.08em}.s{font-size:11px}.b{font-weight:700}
+.box{fill:#f1f6f3;stroke:#cbd8d0}.boxa{fill:#d8f8e5;stroke:#08763c}.boxh{fill:#fcf5e5;stroke:#dcbd7a}
+.ln{fill:none;stroke:#8ca396;stroke-width:1.25}.lna{fill:none;stroke:#08763c;stroke-width:1.5}.lnh{fill:none;stroke:#8a5a00;stroke-width:1.5}
+.rule{stroke:#cbd8d0;stroke-dasharray:2 4}.dash{stroke-dasharray:4 4}
+.open{fill:none;stroke:#8ca396;stroke-dasharray:4 3}.opena{fill:none;stroke:#08763c;stroke-dasharray:4 3}
+.mk{fill:#8ca396}.mka{fill:#08763c}.mkh{fill:#8a5a00}.hatch{stroke:#dcbd7a;stroke-width:3}
+</style>
+  <title id="title">Leani component view</title>
+  <desc id="desc">A processor manifest declares filters, capabilities, retention, and finality to the source planner and coordinators. The planner draws on history sources (Xatu Parquet, EraE, AWS, Google) and live sources (Ethereum P2P, consensus-layer finality, optional RPC). Blocks pass through the normalizer into BlockEnvelopes, then the verifier and fork graph. Verified blocks go to parallel mappers that emit compact BlockDeltas, and recent envelopes go to a recent raw window for RPC and reorgs. Ordered reducers apply, undo, and checkpoint the deltas, and feed the output store, change stream, and RPC facade.</desc>
+  <defs>
+    <marker id="m" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path class="mk" d="M0 0L8 4L0 8Z"/></marker>
+    <marker id="ma" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path class="mka" d="M0 0L8 4L0 8Z"/></marker>
+    <marker id="mh" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path class="mkh" d="M0 0L8 4L0 8Z"/></marker>
+  </defs>
+
+  <rect class="box" x="220" y="20" width="240" height="64" rx="6"/>
+  <text x="340" y="42" text-anchor="middle">processor manifest</text>
+  <text class="s d" x="340" y="60" text-anchor="middle">filters · capabilities</text>
+  <text class="s d" x="340" y="75" text-anchor="middle">retention · finality</text>
+  <line class="ln" x1="340" y1="84" x2="340" y2="112" marker-end="url(#m)"/>
+  <text class="s f" x="350" y="102">requirements</text>
+
+  <rect class="boxh" x="16" y="114" width="150" height="80" rx="8"/>
+  <text class="k h" x="30" y="135">HISTORY</text>
+  <text class="s" x="30" y="154">Xatu / Parquet</text>
+  <text class="s" x="30" y="170">EraE</text>
+  <text class="s" x="30" y="186">AWS / Google</text>
+  <rect class="boxa" x="514" y="114" width="150" height="80" rx="8"/>
+  <text class="k a" x="528" y="135">LIVE</text>
+  <text class="s" x="528" y="154">Ethereum P2P</text>
+  <text class="s" x="528" y="170">CL finality</text>
+  <text class="s" x="528" y="186">optional RPC</text>
+
+  <line class="lnh" x1="166" y1="154" x2="216" y2="154" marker-end="url(#mh)"/>
+  <text class="s h" x="191" y="146" text-anchor="middle">ranges</text>
+  <line class="lna" x1="514" y1="154" x2="464" y2="154" marker-end="url(#ma)"/>
+  <text class="s a" x="489" y="146" text-anchor="middle">head</text>
+  <rect class="box" x="220" y="114" width="240" height="80" rx="6"/>
+  <text x="340" y="150" text-anchor="middle">source planner</text>
+  <text class="s d" x="340" y="168" text-anchor="middle">+ coordinators</text>
+
+  <line class="ln" x1="340" y1="194" x2="340" y2="222" marker-end="url(#m)"/>
+  <rect class="box" x="220" y="224" width="240" height="64" rx="6"/>
+  <text x="340" y="246" text-anchor="middle">normalizer</text>
+  <text class="s d" x="340" y="264" text-anchor="middle">BlockEnvelope</text>
+  <text class="s d" x="340" y="279" text-anchor="middle">capabilities · trust</text>
+
+  <line class="ln" x1="340" y1="288" x2="340" y2="316" marker-end="url(#m)"/>
+  <rect class="box" x="220" y="318" width="240" height="40" rx="6"/>
+  <text x="340" y="343" text-anchor="middle">verifier + fork graph</text>
+
+  <path class="ln" d="M340 358C340 380 200 374 200 398" marker-end="url(#m)"/>
+  <path class="ln" d="M340 358C340 380 480 374 480 398" marker-end="url(#m)"/>
+  <rect class="box" x="90" y="400" width="220" height="52" rx="6"/>
+  <text x="200" y="421" text-anchor="middle">parallel mappers</text>
+  <text class="s d" x="200" y="439" text-anchor="middle">compact BlockDelta</text>
+  <rect class="box" x="370" y="400" width="220" height="52" rx="6"/>
+  <text x="480" y="421" text-anchor="middle">recent raw window</text>
+  <text class="s d" x="480" y="439" text-anchor="middle">recent RPC · reorg</text>
+
+  <line class="ln" x1="200" y1="452" x2="200" y2="480" marker-end="url(#m)"/>
+  <text class="s f" x="210" y="470">deltas</text>
+  <rect class="boxa" x="90" y="482" width="220" height="52" rx="6"/>
+  <text x="200" y="503" text-anchor="middle">ordered reducers</text>
+  <text class="s d" x="200" y="521" text-anchor="middle">apply · undo · checkpoint</text>
+
+  <path class="ln" d="M200 534C200 556 116 552 116 574" marker-end="url(#m)"/>
+  <path class="ln" d="M200 534C200 556 340 552 340 574" marker-end="url(#m)"/>
+  <path class="ln" d="M200 534C200 556 564 548 564 574" marker-end="url(#m)"/>
+  <rect class="box" x="16" y="576" width="200" height="52" rx="6"/>
+  <text x="116" y="597" text-anchor="middle">OutputStore</text>
+  <text class="s d" x="116" y="615" text-anchor="middle">SQL · embedded</text>
+  <rect class="box" x="240" y="576" width="200" height="52" rx="6"/>
+  <text x="340" y="597" text-anchor="middle">ChangeStream</text>
+  <text class="s d" x="340" y="615" text-anchor="middle">HTTP · SSE</text>
+  <rect class="box" x="464" y="576" width="200" height="52" rx="6"/>
+  <text x="564" y="597" text-anchor="middle">RPC facade</text>
+  <text class="s d" x="564" y="615" text-anchor="middle">JSON-RPC</text>
+</svg>

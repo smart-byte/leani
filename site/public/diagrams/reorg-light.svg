@@ -1,0 +1,67 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 680 252" width="680" height="252" role="img" aria-labelledby="title desc">
+<style>
+svg{font-family:'JetBrains Mono',ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12px}
+text{fill:#101713}.d{fill:#536b5e}.f{fill:#8ca396}.a{fill:#08763c}.h{fill:#8a5a00}
+.k{font-size:10px;letter-spacing:.08em}.s{font-size:11px}.b{font-weight:700}
+.box{fill:#f1f6f3;stroke:#cbd8d0}.boxa{fill:#d8f8e5;stroke:#08763c}.boxh{fill:#fcf5e5;stroke:#dcbd7a}
+.ln{fill:none;stroke:#8ca396;stroke-width:1.25}.lna{fill:none;stroke:#08763c;stroke-width:1.5}.lnh{fill:none;stroke:#8a5a00;stroke-width:1.5}
+.rule{stroke:#cbd8d0;stroke-dasharray:2 4}.dash{stroke-dasharray:4 4}
+.open{fill:none;stroke:#8ca396;stroke-dasharray:4 3}.opena{fill:none;stroke:#08763c;stroke-dasharray:4 3}
+.mk{fill:#8ca396}.mka{fill:#08763c}.mkh{fill:#8a5a00}.hatch{stroke:#dcbd7a;stroke-width:3}
+</style>
+  <title id="title">A reorg undoes, then applies</title>
+  <desc id="desc">Blocks A, B, and C are shared; C is the common ancestor. The old branch D, E is undone in reverse order, newest first: undo E, then undo D. The new branch D′, E′, F′ is then applied in forward order. The published events follow the same order: undo E, undo D, apply D′, apply E′, apply F′.</desc>
+  <defs>
+    <marker id="ma" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path class="mka" d="M0 0L8 4L0 8Z"/></marker>
+    <marker id="mh" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path class="mkh" d="M0 0L8 4L0 8Z"/></marker>
+  </defs>
+
+  <!-- shared chain -->
+  <rect class="box" x="16" y="104" width="44" height="32" rx="5"/>
+  <rect class="box" x="72" y="104" width="44" height="32" rx="5"/>
+  <rect class="box" x="128" y="104" width="44" height="32" rx="5" style="stroke-width:2"/>
+  <text x="38" y="125" text-anchor="middle">A</text>
+  <text x="94" y="125" text-anchor="middle">B</text>
+  <text class="b" x="150" y="125" text-anchor="middle">C</text>
+  <line class="ln" x1="60" y1="120" x2="72" y2="120"/>
+  <line class="ln" x1="116" y1="120" x2="128" y2="120"/>
+  <text class="s d" x="172" y="156" text-anchor="end">common ancestor</text>
+
+  <!-- old branch: undone newest first -->
+  <text class="s h" x="208" y="20">undo, newest first</text>
+  <line class="lnh" x1="308" y1="30" x2="212" y2="30" marker-end="url(#mh)"/>
+  <path class="ln dash" d="M172 120C190 120 188 56 206 56"/>
+  <rect class="boxh" x="208" y="40" width="44" height="32" rx="5"/>
+  <rect class="boxh" x="264" y="40" width="44" height="32" rx="5"/>
+  <text class="h" x="230" y="61" text-anchor="middle">D</text>
+  <text class="h" x="286" y="61" text-anchor="middle">E</text>
+  <line class="ln dash" x1="252" y1="56" x2="264" y2="56"/>
+  <text class="s h" x="320" y="61">old branch</text>
+
+  <!-- new branch: applied oldest first -->
+  <path class="lna" d="M172 120C190 120 188 184 206 184"/>
+  <rect class="boxa" x="208" y="168" width="44" height="32" rx="5"/>
+  <rect class="boxa" x="264" y="168" width="44" height="32" rx="5"/>
+  <rect class="boxa" x="320" y="168" width="44" height="32" rx="5"/>
+  <text class="a" x="230" y="189" text-anchor="middle">D′</text>
+  <text class="a" x="286" y="189" text-anchor="middle">E′</text>
+  <text class="a" x="342" y="189" text-anchor="middle">F′</text>
+  <line class="lna" x1="252" y1="184" x2="264" y2="184"/>
+  <line class="lna" x1="308" y1="184" x2="320" y2="184"/>
+  <text class="s a" x="376" y="189">new branch</text>
+  <line class="lna" x1="212" y1="214" x2="360" y2="214" marker-end="url(#ma)"/>
+  <text class="s a" x="208" y="236">apply, oldest first</text>
+
+  <!-- what consumers see -->
+  <text class="k d" x="460" y="40">PUBLISHED EVENTS</text>
+  <rect class="boxh" x="460" y="52" width="204" height="26" rx="5"/>
+  <text class="s" x="474" y="69"><tspan class="f">1</tspan>  undo E</text>
+  <rect class="boxh" x="460" y="86" width="204" height="26" rx="5"/>
+  <text class="s" x="474" y="103"><tspan class="f">2</tspan>  undo D</text>
+  <rect class="boxa" x="460" y="120" width="204" height="26" rx="5"/>
+  <text class="s" x="474" y="137"><tspan class="f">3</tspan>  apply D′</text>
+  <rect class="boxa" x="460" y="154" width="204" height="26" rx="5"/>
+  <text class="s" x="474" y="171"><tspan class="f">4</tspan>  apply E′</text>
+  <rect class="boxa" x="460" y="188" width="204" height="26" rx="5"/>
+  <text class="s" x="474" y="205"><tspan class="f">5</tspan>  apply F′</text>
+</svg>

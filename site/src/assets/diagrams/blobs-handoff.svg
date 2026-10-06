@@ -1,0 +1,33 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 680 242" width="680" height="242" role="img" aria-labelledby="title desc">
+  <title id="title">blobs.money hot/cold handoff</title>
+  <desc id="desc">At t0 the target finalized block is B; P2P capture starts at B − 128 and buffers deltas, and the Xatu backfill starts at Dencun. At t1 the Xatu mapper and reducer reach B − 128 and compare hashes over the overlap with the P2P capture. At t2 the reducer consumes the buffered P2P deltas through the current head and switches to live.</desc>
+  <defs>
+    <marker id="m" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path class="mk" d="M0 0L8 4L0 8Z"/></marker>
+    <marker id="ma" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path class="mka" d="M0 0L8 4L0 8Z"/></marker>
+  </defs>
+
+  <line class="rule" x1="500" y1="50" x2="500" y2="186"/>
+  <line class="rule" x1="620" y1="104" x2="620" y2="186"/>
+
+  <text class="s" x="400" y="40"><tspan class="a b">t0</tspan> start P2P capture</text>
+  <rect class="boxa" x="400" y="50" width="220" height="26" rx="5"/>
+  <text class="s" x="510" y="67" text-anchor="middle">buffer deltas</text>
+  <line class="lna" x1="620" y1="63" x2="648" y2="63" marker-end="url(#ma)"/>
+  <text class="s" x="664" y="96" text-anchor="end"><tspan class="a b">t2</tspan> drain buffer, go live</text>
+
+  <text class="s" x="56" y="104"><tspan class="h b">t0</tspan> start Xatu backfill</text>
+  <rect class="boxh" x="56" y="114" width="344" height="26" rx="5"/>
+  <text class="s" x="228" y="131" text-anchor="middle">mapper + reducer</text>
+
+  <line class="lna" x1="400" y1="50" x2="400" y2="150"/>
+  <rect class="boxa" x="290" y="150" width="220" height="24" rx="12"/>
+  <text class="s" x="400" y="166" text-anchor="middle"><tspan class="b">t1</tspan> compare hashes</text>
+
+  <line class="ln" x1="56" y1="196" x2="660" y2="196" marker-end="url(#m)"/>
+  <line class="ln" x1="56" y1="191" x2="56" y2="201"/>
+  <text class="s d" x="56" y="218">Dencun</text>
+  <text class="s a" x="400" y="218" text-anchor="middle">B − 128</text>
+  <text class="s d" x="500" y="218" text-anchor="middle">B</text>
+  <text class="s f" x="500" y="233" text-anchor="middle">target finalized</text>
+  <text class="s d" x="620" y="218" text-anchor="middle">head</text>
+</svg>

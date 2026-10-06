@@ -1,0 +1,20 @@
+---
+// One diagram from src/assets/diagrams, rendered light and dark by
+// `bun run diagrams:update`; Starlight's theme shows the matching render.
+interface Props { name: string; alt: string }
+const { name, alt } = Astro.props;
+
+const sources = import.meta.glob<string>('../../assets/diagrams/*.svg', { query: '?raw', import: 'default', eager: true });
+const source = sources[`../../assets/diagrams/${name}.svg`];
+if (!source) throw new Error(`unknown diagram: ${name}`);
+const [, width, height] = source.match(/width="(\d+)" height="(\d+)"/)!;
+---
+<figure class="diagram">
+  <img class="dark:sl-hidden" src={`/diagrams/${name}-light.svg`} alt={alt} width={width} height={height} />
+  <img class="light:sl-hidden" src={`/diagrams/${name}-dark.svg`} alt={alt} width={width} height={height} data-llms-skip />
+</figure>
+
+<style>
+  /* No display here: Starlight's theme classes hide one render from a lower cascade layer. */
+  .diagram img { width: 100%; height: auto; }
+</style>

@@ -36,54 +36,8 @@ status: preview
 
 ## 3. Component view
 
-```text
-                         +----------------------+
-                         | Processor manifest   |
-                         | filters/capabilities |
-                         | retention/finality   |
-                         +----------+-----------+
-                                    |
-                                    v
-+--------------+   +-------------------------------+   +----------------+
-| Xatu/Parquet |-->|                               |<--| Ethereum P2P   |
-| EraE         |-->| Source planner + coordinators |<--| CL finality    |
-| AWS/Google   |-->|                               |<--| optional RPC   |
-+--------------+   +---------------+---------------+   +----------------+
-                                    |
-                                    v
-                         +----------------------+
-                         | Normalizer           |
-                         | BlockEnvelope        |
-                         | capabilities/trust   |
-                         +----------+-----------+
-                                    |
-                                    v
-                         +----------------------+
-                         | Verifier + fork graph|
-                         +----------+-----------+
-                                    |
-                  +-----------------+-----------------+
-                  |                                   |
-                  v                                   v
-       +----------------------+             +----------------------+
-       | Parallel mappers     |             | Recent raw window    |
-       | compact BlockDelta   |             | recent RPC/reorg     |
-       +----------+-----------+             +----------------------+
-                  |
-                  v
-       +----------------------+
-       | Ordered reducers     |
-       | apply/undo/checkpoint|
-       +----------+-----------+
-                  |
-        +---------+----------+----------------+
-        |                    |                |
-        v                    v                v
- +-------------+      +-------------+   +-------------+
- | OutputStore |      | ChangeStream|   | RPC facade  |
- | SQL/embedded|      | HTTP/SSE    |   | JSON-RPC    |
- +-------------+      +-------------+   +-------------+
-```
+<img class="dark:sl-hidden" src="/diagrams/architecture-light.svg" width="680" height="650" alt="A processor manifest declares requirements to the source planner, which draws on history sources (Xatu Parquet, EraE, AWS, Google) and live sources (Ethereum P2P, CL finality, optional RPC). The normalizer builds BlockEnvelopes for the verifier and fork graph. Verified blocks feed parallel mappers and a recent raw window; ordered reducers apply mapper deltas and feed the OutputStore, ChangeStream, and RPC facade.">
+<img class="light:sl-hidden" src="/diagrams/architecture-dark.svg" width="680" height="650" data-llms-skip alt="A processor manifest declares requirements to the source planner, which draws on history sources (Xatu Parquet, EraE, AWS, Google) and live sources (Ethereum P2P, CL finality, optional RPC). The normalizer builds BlockEnvelopes for the verifier and fork graph. Verified blocks feed parallel mappers and a recent raw window; ordered reducers apply mapper deltas and feed the OutputStore, ChangeStream, and RPC facade.">
 
 ## 4. Source contracts
 
@@ -253,12 +207,8 @@ The hot lane starts immediately:
 
 The lanes must overlap by at least the configured reorg window or a smaller finalized overlap:
 
-```text
-cold: ... A B C D E
-hot:          C D E F G H ...
-                   ^
-              verified handoff
-```
+<img class="dark:sl-hidden" src="/diagrams/cold-hot-overlap-light.svg" width="680" height="200" alt="The cold lane covers blocks up to E and the hot lane starts at C. Blocks C, D, and E are in both lanes, at least the reorg window, and their hashes must match. The verified handoff follows E; the hot lane continues with F, G, and H.">
+<img class="light:sl-hidden" src="/diagrams/cold-hot-overlap-dark.svg" width="680" height="200" data-llms-skip alt="The cold lane covers blocks up to E and the hot lane starts at C. Blocks C, D, and E are in both lanes, at least the reorg window, and their hashes must match. The verified handoff follows E; the hot lane continues with F, G, and H.">
 
 The scheduler deduplicates by `(chain_id, block_number, block_hash, processor_version)`. A block number alone is never an identity.
 
@@ -377,15 +327,12 @@ commit
 publish apply event
 ```
 
-On reorg:
+On reorg, Leani identifies the common ancestor, undoes the old branch in
+reverse order and publishes undo events, then applies the new branch in forward
+order and publishes apply events:
 
-```text
-identify common ancestor
-undo old branch in reverse order
-publish undo events
-apply new branch in forward order
-publish apply events
-```
+<img class="dark:sl-hidden" src="/diagrams/reorg-light.svg" width="680" height="252" alt="C is the common ancestor. The old branch D, E is undone newest first, then the new branch D′, E′, F′ is applied oldest first. Published events: undo E, undo D, apply D′, apply E′, apply F′.">
+<img class="light:sl-hidden" src="/diagrams/reorg-dark.svg" width="680" height="252" data-llms-skip alt="C is the common ancestor. The old branch D, E is undone newest first, then the new branch D′, E′, F′ is applied oldest first. Published events: undo E, undo D, apply D′, apply E′, apply F′.">
 
 Each such transaction covers one processor. The shared live lane retains a block's canonical frame, and switches the canonical chain for a reorg, before any processor applies or undoes it, and a delta can be persisted as pending before its apply; each of those steps commits separately. Startup reconciliation repairs an interruption between them before the live lanes open: it undoes unfinalized processor blocks that are not canonical, deletes pending deltas no processor can apply, and replays retained canonical frames to lanes that trail them.
 
