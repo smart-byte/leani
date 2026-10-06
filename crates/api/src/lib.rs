@@ -10259,6 +10259,7 @@ mod tests {
                     mode: leani_store_sqlite::BackfillSubscriptionMode::FillMissing,
                     publication_revision: 0,
                     state: leani_store_sqlite::BackfillSubscriptionState::Queued,
+                    last_error: None,
                     consumer_id: "destination".to_owned(),
                     ranges: vec![
                         leani_primitives::BlockRange::new(BlockNumber(1), BlockNumber(3))
@@ -10552,6 +10553,7 @@ mod tests {
                     mode: leani_store_sqlite::BackfillSubscriptionMode::FillMissing,
                     publication_revision: 0,
                     state: leani_store_sqlite::BackfillSubscriptionState::Queued,
+                    last_error: None,
                     consumer_id: "destination".to_owned(),
                     ranges: vec![range],
                     range,
@@ -11185,6 +11187,7 @@ mod tests {
                         mode: leani_store_sqlite::BackfillSubscriptionMode::FillMissing,
                         publication_revision: 0,
                         state: leani_store_sqlite::BackfillSubscriptionState::Queued,
+                        last_error: None,
                         consumer_id: "destination".to_owned(),
                         ranges: vec![range],
                         range,
@@ -13158,6 +13161,7 @@ mod tests {
                     mode: leani_store_sqlite::BackfillSubscriptionMode::FillMissing,
                     publication_revision: 0,
                     state: leani_store_sqlite::BackfillSubscriptionState::Queued,
+                    last_error: None,
                     consumer_id: "destination".to_owned(),
                     ranges: vec![range],
                     range,

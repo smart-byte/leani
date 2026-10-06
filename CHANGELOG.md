@@ -81,6 +81,9 @@ record, and documented RPC contracts.
 
 ### Fixed
 
+- A failed history subscription's status returns the error stored with its
+  lifecycle state, even when polling races the separate job outcome write.
+
 - A draining backfill subscription, whose job finished but whose required
   consumer has not acknowledged the completion, can be cancelled and then
   deleted. Cancelling changed only a job that still ran, so the subscription
