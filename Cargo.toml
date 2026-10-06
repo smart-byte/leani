@@ -116,7 +116,7 @@ toml = "0.9"
 tower = { version = "0.5", features = ["util"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
-tree_hash = "0.10"
+tree_hash = "0.12"
 url = { version = "2.5", features = ["serde"] }
 ssz = { package = "ethereum_ssz", version = "0.9.1" }
 
