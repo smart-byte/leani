@@ -36,14 +36,6 @@ impl Drop for Node {
     }
 }
 
-fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .expect("port probe")
-        .local_addr()
-        .expect("probed address")
-        .port()
-}
-
 fn repository() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
 }
@@ -55,7 +47,12 @@ fn container_config(directory: &Path, instance: Option<&str>) -> (PathBuf, u16) 
     let profile = fs::read_to_string(repository().join("deploy/container.toml"))
         .expect("read the container profile");
     let mut profile: toml::Table = toml::from_str(&profile).expect("container profile");
-    let api = free_port();
+    // Hold all three probes until the ports are chosen: dropping one before
+    // binding the next can give two listeners the same port.
+    let probes = [0; 3].map(|_| TcpListener::bind("127.0.0.1:0").expect("port probe"));
+    let [api, http, ws] = probes
+        .each_ref()
+        .map(|probe| probe.local_addr().expect("probed address").port());
     profile["data_dir"] = directory.join("data").display().to_string().into();
     if let Some(instance) = instance {
         profile["processors"].as_array_mut().expect("processors")[0]
@@ -64,14 +61,8 @@ fn container_config(directory: &Path, instance: Option<&str>) -> (PathBuf, u16) 
             .insert("instance".to_owned(), instance.into());
     }
     let rpc = profile["rpc"].as_table_mut().expect("rpc");
-    rpc.insert(
-        "http_bind".to_owned(),
-        format!("127.0.0.1:{}", free_port()).into(),
-    );
-    rpc.insert(
-        "ws_bind".to_owned(),
-        format!("127.0.0.1:{}", free_port()).into(),
-    );
+    rpc.insert("http_bind".to_owned(), format!("127.0.0.1:{http}").into());
+    rpc.insert("ws_bind".to_owned(), format!("127.0.0.1:{ws}").into());
     rpc.insert("historical_mode".to_owned(), "disabled".into());
     profile["api"]
         .as_table_mut()
