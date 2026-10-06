@@ -22,7 +22,10 @@ use helios_consensus_core::{
     consensus_spec::{ConsensusSpec, MainnetConsensusSpec},
     errors::ConsensusError,
     get_bits,
-    types::{Bootstrap, FinalityUpdate, Fork, Forks, LightClientStore, OptimisticUpdate, Update},
+    types::{
+        BeaconBlockHeader, Bootstrap, FinalityUpdate, Fork, Forks, LightClientStore,
+        OptimisticUpdate, Update,
+    },
     verify_bootstrap, verify_finality_update, verify_optimistic_update, verify_update,
 };
 use leani_primitives::{
@@ -39,6 +42,19 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 use tree_hash::TreeHash;
 use url::Url;
+
+// Helios headers implement an older TreeHash trait. Hash the five SSZ container
+// fields in consensus order so the adapter can use tree_hash independently.
+fn beacon_header_root(header: &BeaconBlockHeader) -> [u8; 32] {
+    let fields: [[u8; 32]; 5] = [
+        header.slot.tree_hash_root().into(),
+        header.proposer_index.tree_hash_root().into(),
+        header.parent_root.into(),
+        header.state_root.into(),
+        header.body_root.into(),
+    ];
+    tree_hash::merkle_root(fields.as_flattened(), fields.len()).into()
+}
 
 mod anchor;
 mod http;
@@ -375,7 +391,7 @@ impl MainnetLightClientVerifier {
     /// Returns an error until the finalized header contains a valid execution
     /// payload proof.
     pub fn finalized_anchor(&self) -> Result<VerifiedFinalityAnchor, BeaconApiError> {
-        let root: [u8; 32] = self.store.finalized_header.beacon().tree_hash_root().into();
+        let root = beacon_header_root(self.store.finalized_header.beacon());
         anchor_from_header(&self.store.finalized_header, root)
     }
 
@@ -500,7 +516,7 @@ impl MainnetLightClientVerifier {
                 now,
             )
         })?;
-        let root: [u8; 32] = update.attested_header.beacon().tree_hash_root().into();
+        let root = beacon_header_root(update.attested_header.beacon());
         let attested = anchor_from_header(&update.attested_header, root)?;
         Ok(AttestedHead {
             beacon_slot: attested.beacon_slot,
@@ -1704,7 +1720,7 @@ mod tests {
             serde_json::from_str(OPTIMISTIC_JSON).expect("fixture optimistic update");
         AttestedHead {
             beacon_slot: ATTESTED_SLOT,
-            beacon_block_root: update.data.attested_header.beacon().tree_hash_root().into(),
+            beacon_block_root: beacon_header_root(update.data.attested_header.beacon()),
             block_number: BlockNumber(ATTESTED_BLOCK),
             block_hash: BlockHash::new(ATTESTED_EXECUTION_HASH.into()),
         }
@@ -2416,6 +2432,23 @@ mod tests {
         );
         let encoded = fs::read_to_string(&path).expect("anchor file");
         assert!(encoded.contains("\"version\": 1"), "{encoded}");
+    }
+
+    #[test]
+    fn bootstrap_anchor_preserves_the_mainnet_checkpoint_root() {
+        let bootstrap: BootstrapResponse<MainnetConsensusSpec> =
+            serde_json::from_str(BOOTSTRAP_JSON).expect("fixture bootstrap");
+        let verifier = MainnetLightClientVerifier::bootstrap(
+            BOOTSTRAP_ROOT.into(),
+            &bootstrap.data,
+            DEFAULT_MAX_CHECKPOINT_AGE,
+            UNIX_EPOCH + Duration::from_secs(slot_time(BOOTSTRAP_SLOT) + 60),
+        )
+        .expect("verified mainnet bootstrap");
+        assert_eq!(
+            verifier.finalized_anchor().expect("anchor"),
+            bootstrap_anchor()
+        );
     }
 
     fn fixture_verifier(now: SystemTime) -> MainnetLightClientVerifier {
