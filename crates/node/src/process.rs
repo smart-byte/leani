@@ -11885,9 +11885,9 @@ markets = ["ETH/USDT"]
 
     #[tokio::test]
     async fn a_job_held_for_the_p2p_bridge_starts_without_it_after_the_bound() {
-        // Review of task 5: a node whose network lanes never publish an
-        // anchor, such as one without verified finality, held every job in
-        // the window for good, while its status said nothing.
+        // A node whose network lanes never publish an anchor, such as one
+        // without verified finality, must not hold the jobs in the window
+        // for good while their status says nothing.
         use leani_api::BackfillControl as _;
 
         let logs = CapturedLogs::default();
