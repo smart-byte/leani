@@ -11062,27 +11062,6 @@ markets = ["ETH/USDT"]
         );
     }
 
-    /// A subscription to blocks 1 to 4 whose required consumer is
-    /// `destination`.
-    fn subscription(instance: &str, key: &str) -> leani_api::CreateBackfillRequest {
-        leani_api::CreateBackfillRequest {
-            processor: instance.to_owned(),
-            from_block: Some(1),
-            to_block: Some(4.into()),
-            ranges: Vec::new(),
-            mode: leani_api::BackfillExecutionMode::FillMissing,
-            consumer: Some(leani_api::CreateBackfillConsumerRequest {
-                id: "destination".to_owned(),
-                role: leani_store_sqlite::ConsumerRole::Required,
-                lease_ttl_seconds: 60,
-                credential: None,
-            }),
-            limits: None,
-            batching: None,
-            idempotency_key: key.to_owned(),
-        }
-    }
-
     /// An on-demand node with a [`subscription`] that finished and drains:
     /// its consumer has acknowledged nothing, its completion included.
     async fn draining_subscription(
@@ -11123,7 +11102,7 @@ markets = ["ETH/USDT"]
         )
         .await;
         let created = control
-            .create_subscription(subscription(&instance, "drained"))
+            .create_subscription(subscription(&instance, "drained", 1, 4))
             .await
             .expect("subscription");
         wait_for_subscription_state(&control, &created.id, leani_api::BackfillState::Draining)
@@ -11283,7 +11262,7 @@ markets = ["ETH/USDT"]
         )
         .await;
         let created = control
-            .create_subscription(subscription(&instance, "failed"))
+            .create_subscription(subscription(&instance, "failed", 1, 4))
             .await
             .expect("subscription");
         let failed =
