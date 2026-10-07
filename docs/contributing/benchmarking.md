@@ -99,6 +99,49 @@ Synthetic runs measure the local source/coordinator path, not Xatu, EraE, or
 P2P transport. Keep machine, source, commit, configuration, and cold/warm-run
 context with any result shared outside the local checkout.
 
+## Real-source backfills
+
+The fixed mainnet profile supports `block-summary`, `blobs-money`, and
+`uniswap-observations`. The real-source command measures acquisition through
+durable delivery, acknowledgement, and pruning, using fresh node storage:
+
+```bash
+cargo build --release --locked -p leani
+target/release/leani --config config/benchmarks/real-source.toml \
+  benchmark real-source \
+  --processor block-summary --source-policy erae-only \
+  --from-block 19426589 --to-block 19430684 \
+  --data-dir /tmp/leani-erae-blocks-run1 \
+  --report /tmp/leani-erae-blocks-run1.json
+```
+
+Compare the same processor, range, configuration, and release build profile.
+Pass the baseline report's `outputDigest` as `--expected-output-digest` on
+candidate runs. A mismatched delivered-output digest fails the benchmark.
+Reports include source reads, fetched and normalized bytes, time to first
+frame, consumer completion, and sampled peak RSS. Use unique data directories
+and report paths for every run. Repeat public-mirror measurements on a quiet
+host: network bandwidth, archive-cache state, and other work affect results.
+
+To isolate EraE acquisition and frame construction from the node and delivery,
+the source crate includes a streaming example:
+
+```bash
+cargo run --release --locked -p leani-source-erae --example throughput -- \
+  file:///absolute/path/to/erae-mirror/ 19426589 19428636 full 4 4
+```
+
+The last three arguments select `headers`, `bodies`, `logs`, or `full`, active
+chunks, and buffered frames per stream. HTTPS and loopback HTTP mirrors also
+work. A local mirror must contain the checksum catalog and named archive
+objects. The example verifies block counts and parent continuity, fingerprints
+the requested frames, and reports physical reads and bytes. Compare full-frame
+fingerprints when checking complete-data equivalence; partial projections can
+legitimately omit optional fields that an older reader populated. Keep feature
+sets equal when comparing CPU measurements, particularly the signature-recovery
+backend. Node delivery measurements and source-only measurements are different
+workloads and should be reported separately.
+
 ## Controlled suites
 
 Performance evidence is never collected or uploaded by GitHub Actions. CI

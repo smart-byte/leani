@@ -11,6 +11,7 @@ Usage:
 Suites:
   subscription-startup
                      Alternating cold/warm block-subscription startup comparison.
+  erae-backfill      Alternating EraE block, blobs, and Uniswap backfills.
   smoke              Small, resumable two-candidate sweep.
   synthetic-million  Full synthetic processor/delivery matrix (sequential).
   delivery-faults    SDK/PostgreSQL reconnect and lost-ACK matrix.
@@ -22,14 +23,20 @@ LEANI_BENCHMARK_OUTPUT_DIRECTORY, to resume a controlled run in place.
 
 Useful environment overrides:
   LEANI_BENCHMARK_BASELINE_BINARY
-                               Baseline binary for subscription-startup (required).
+                               Baseline binary for startup/EraE comparisons (required).
   LEANI_BENCHMARK_BINARY       Existing binary; otherwise build target/release/leani.
   LEANI_BENCHMARK_CASES        Space-separated synthetic case filter.
   LEANI_BENCHMARK_CORPORA      Space-separated corpus filter.
   LEANI_BENCHMARK_BLOCKS       Synthetic block count (default: 1000000).
   LEANI_BENCHMARK_CHUNK_BLOCKS Source chunk size (default: min(blocks, 8192)).
   LEANI_BENCHMARK_WARMUPS      Synthetic warm-up count (default: 1).
-  LEANI_BENCHMARK_RUNS         Startup pairs (default: 10) or synthetic runs (default: 3).
+  LEANI_BENCHMARK_RUNS         Startup pairs (default: 10), EraE pairs or synthetic runs (3).
+  LEANI_BENCHMARK_PROCESSORS  Space-separated EraE processors (default: all three).
+  LEANI_BENCHMARK_FROM_BLOCK  EraE range start (default: 19426589).
+  LEANI_BENCHMARK_TO_BLOCK    EraE range end (default: 19430684).
+  LEANI_BENCHMARK_CONFIG      EraE benchmark configuration.
+  LEANI_BENCHMARK_TIMEOUT_SECONDS
+                               Per-run EraE timeout (default: 900).
   LEANI_BENCHMARK_CUTOFF_SECONDS
                                Subscription startup cutoff (default: 90).
   LEANI_BENCHMARK_FAULT_BLOCKS Delivery-fault block count (default: 10000).
@@ -53,7 +60,7 @@ case "${1:-}" in
     usage
     exit 0
     ;;
-  subscription-startup|smoke|synthetic-million|delivery-faults|all)
+  subscription-startup|erae-backfill|smoke|synthetic-million|delivery-faults|all)
     suite=$1
     ;;
   '')
@@ -301,8 +308,27 @@ run_delivery_faults() {
   done
 }
 
+run_erae_backfill() {
+  local directory=$1
+  local processors=${LEANI_BENCHMARK_PROCESSORS:-"block-summary blobs-money uniswap-observations"}
+  [ -n "${LEANI_BENCHMARK_BASELINE_BINARY:-}" ] || fail \
+    "erae-backfill requires LEANI_BENCHMARK_BASELINE_BINARY"
+  prepare_output_directory "$directory"
+  python3 benchmarks/erae-backfill/benchmark.py \
+    --baseline-binary "$LEANI_BENCHMARK_BASELINE_BINARY" \
+    --candidate-binary "$benchmark_binary" \
+    --config "${LEANI_BENCHMARK_CONFIG:-config/benchmarks/real-source.toml}" \
+    --output-directory "$directory" \
+    --from-block "${LEANI_BENCHMARK_FROM_BLOCK:-19426589}" \
+    --to-block "${LEANI_BENCHMARK_TO_BLOCK:-19430684}" \
+    --runs "${LEANI_BENCHMARK_RUNS:-3}" \
+    --timeout-seconds "${LEANI_BENCHMARK_TIMEOUT_SECONDS:-900}" \
+    --processors $processors
+}
+
 case "$suite" in
   subscription-startup) run_subscription_startup "$output_directory" ;;
+  erae-backfill) run_erae_backfill "$output_directory" ;;
   smoke) run_smoke "$output_directory" ;;
   synthetic-million) run_synthetic_million "$output_directory" ;;
   delivery-faults) run_delivery_faults "$output_directory" ;;
