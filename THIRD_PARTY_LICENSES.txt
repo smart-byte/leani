@@ -8761,10 +8761,10 @@ SOFTWARE.__
 ==============================================================================
 MIT License (MIT)
 ==============================================================================
-leani-primitives 0.1.0-rc.3 — https://github.com/smart-byte/leani
-leani-processor-api 0.1.0-rc.3 — https://github.com/smart-byte/leani
-leani-source-api 0.1.0-rc.3 — https://github.com/smart-byte/leani
-leani-testkit 0.1.0-rc.3 — https://github.com/smart-byte/leani
+leani-primitives 0.1.0-rc.4 — https://github.com/smart-byte/leani
+leani-processor-api 0.1.0-rc.4 — https://github.com/smart-byte/leani
+leani-source-api 0.1.0-rc.4 — https://github.com/smart-byte/leani
+leani-testkit 0.1.0-rc.4 — https://github.com/smart-byte/leani
 
 MIT License
 
@@ -8830,26 +8830,26 @@ reth-transaction-pool 2.5.2 — https://github.com/paradigmxyz/reth
 reth-trie-common 2.5.2 — https://github.com/paradigmxyz/reth
 reth-trie-sparse 2.5.2 — https://github.com/paradigmxyz/reth
 reth-trie 2.5.2 — https://github.com/paradigmxyz/reth
-leani-api 0.1.0-rc.3 — https://github.com/smart-byte/leani
-leani-finality-beacon-api 0.1.0-rc.3 — https://github.com/smart-byte/leani
-leani-finality-consensus-p2p 0.1.0-rc.3 — https://github.com/smart-byte/leani
-leani 0.1.0-rc.3 — https://github.com/smart-byte/leani
-leani-processor-blobs 0.1.0-rc.3 — https://github.com/smart-byte/leani
-leani-processor-block-summary 0.1.0-rc.3 — https://github.com/smart-byte/leani
-leani-processor-erc20 0.1.0-rc.3 — https://github.com/smart-byte/leani
-leani-processor-evm-events 0.1.0-rc.3 — https://github.com/smart-byte/leani
-leani-processor-rollup-txs 0.1.0-rc.3 — https://github.com/smart-byte/leani
-leani-processor-transaction-stats 0.1.0-rc.3 — https://github.com/smart-byte/leani
-leani-processor-uniswap 0.1.0-rc.3 — https://github.com/smart-byte/leani
-leani-rpc 0.1.0-rc.3 — https://github.com/smart-byte/leani
-leani-runtime 0.1.0-rc.3 — https://github.com/smart-byte/leani
-leani-source-archive 0.1.0-rc.3 — https://github.com/smart-byte/leani
-leani-source-erae 0.1.0-rc.3 — https://github.com/smart-byte/leani
-leani-source-p2p 0.1.0-rc.3 — https://github.com/smart-byte/leani
-leani-source-xatu 0.1.0-rc.3 — https://github.com/smart-byte/leani
-leani-store-artifacts 0.1.0-rc.3 — https://github.com/smart-byte/leani
-leani-store-history 0.1.0-rc.3 — https://github.com/smart-byte/leani
-leani-store-sqlite 0.1.0-rc.3 — https://github.com/smart-byte/leani
+leani-api 0.1.0-rc.4 — https://github.com/smart-byte/leani
+leani-finality-beacon-api 0.1.0-rc.4 — https://github.com/smart-byte/leani
+leani-finality-consensus-p2p 0.1.0-rc.4 — https://github.com/smart-byte/leani
+leani 0.1.0-rc.4 — https://github.com/smart-byte/leani
+leani-processor-blobs 0.1.0-rc.4 — https://github.com/smart-byte/leani
+leani-processor-block-summary 0.1.0-rc.4 — https://github.com/smart-byte/leani
+leani-processor-erc20 0.1.0-rc.4 — https://github.com/smart-byte/leani
+leani-processor-evm-events 0.1.0-rc.4 — https://github.com/smart-byte/leani
+leani-processor-rollup-txs 0.1.0-rc.4 — https://github.com/smart-byte/leani
+leani-processor-transaction-stats 0.1.0-rc.4 — https://github.com/smart-byte/leani
+leani-processor-uniswap 0.1.0-rc.4 — https://github.com/smart-byte/leani
+leani-rpc 0.1.0-rc.4 — https://github.com/smart-byte/leani
+leani-runtime 0.1.0-rc.4 — https://github.com/smart-byte/leani
+leani-source-archive 0.1.0-rc.4 — https://github.com/smart-byte/leani
+leani-source-erae 0.1.0-rc.4 — https://github.com/smart-byte/leani
+leani-source-p2p 0.1.0-rc.4 — https://github.com/smart-byte/leani
+leani-source-xatu 0.1.0-rc.4 — https://github.com/smart-byte/leani
+leani-store-artifacts 0.1.0-rc.4 — https://github.com/smart-byte/leani
+leani-store-history 0.1.0-rc.4 — https://github.com/smart-byte/leani
+leani-store-sqlite 0.1.0-rc.4 — https://github.com/smart-byte/leani
 alloy-consensus-any 1.8.3 — https://github.com/alloy-rs/alloy
 alloy-consensus-any 2.4.1 — https://github.com/alloy-rs/alloy
 alloy-consensus 1.8.3 — https://github.com/alloy-rs/alloy
