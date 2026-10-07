@@ -10,6 +10,8 @@ record, and documented RPC contracts.
 
 ### Added
 
+- Documentation diagrams now render in light and dark themes, and docs images
+  open enlarged on click, tap, or Enter.
 - A backfill subscription's status reports its required `consumer` and
   `processorConfigured`: whether the node configures exactly the
   subscription's processor instance now, another instance of the same kind
@@ -97,6 +99,11 @@ record, and documented RPC contracts.
 
 ### Changed
 
+- EraE history acquisition coalesces and overlaps bounded compressed reads,
+  shares validated indexes, and normalizes only requested material. Current
+  and prefetched compressed inputs share the resident input budget; normalized
+  queues retain their frame limit. EraE source plans and partitions now use
+  v2: replan chunks created by earlier releases before resuming them.
 - SDK: until the first stable release, each prerelease is published under
   npm's `latest` tag, so an unversioned `@smart-byte/leani-sdk` install
   resolves to the newest prerelease instead of `0.1.0-rc.1`, which does not
@@ -111,6 +118,14 @@ record, and documented RPC contracts.
 
 ### Fixed
 
+- Projected EraE bodies preserve committed withdrawals and required sender
+  material, optional log hashes are honored, and speculative prefetch falls
+  back to sequential acquisition when its shared input budget is full.
+  Cancellation closes stalled downloads.
+- EraE, P2P, and Xatu apply shared effective filter-scope rules. Xatu refuses
+  log requests with unsupported transaction-type, sender, or recipient
+  predicates during planning, allowing source selection to fall back.
+  Transaction-hash predicates remain supported.
 - A failed history subscription's status returns the error stored with its
   lifecycle state, even when polling races the separate job outcome write.
 
