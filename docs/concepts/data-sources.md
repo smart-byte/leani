@@ -201,6 +201,8 @@ the next window downloads while the current one is decoded and consumed:
 - the current and prefetched compressed windows together must fit the
   resident budget; smaller budgets disable lookahead or shrink a window,
   and one large block may exceed the 16 MiB target but never the budget;
+- a block that exceeds the remaining prefetch room is read sequentially after
+  the current compressed window is released;
 - the checksum catalog is read with a 16 MiB cap, and each range response
   with a cap at its requested length, as the bodies stream in;
 - an e2store record may not declare more bytes than its indexed extent
@@ -218,7 +220,9 @@ backend, retaining its signature validation checks.
 
 Header-only requests read only headers. Body requests verify the complete
 body without recovering senders unless transactions or a sender predicate
-require them. Log-only requests can read headers and receipts without
+require them. Acquired bodies also retain complete withdrawals for execution
+RPC and raw-history consumers, even without an explicit withdrawal request.
+Log-only requests can read headers and receipts without
 transaction bodies when neither transaction hashes nor transaction filters
 are needed. Receipt roots and logs blooms are still checked over every
 receipt before log filtering. Requested transaction, receipt, and log

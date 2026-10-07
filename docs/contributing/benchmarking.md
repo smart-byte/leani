@@ -115,13 +115,19 @@ target/release/leani --config config/benchmarks/real-source.toml \
   --report /tmp/leani-erae-blocks-run1.json
 ```
 
-Compare the same processor, range, configuration, and release build profile.
+Compare the same processor, source policy, range, configuration, and release build profile.
 Pass the baseline report's `outputDigest` as `--expected-output-digest` on
 candidate runs. A mismatched delivered-output digest fails the benchmark.
 Reports include source reads, fetched and normalized bytes, time to first
 frame, consumer completion, and sampled peak RSS. Use unique data directories
 and report paths for every run. Repeat public-mirror measurements on a quiet
 host: network bandwidth, archive-cache state, and other work affect results.
+
+The [alternating comparison harness](../../benchmarks/erae-backfill/README.md)
+supports the same policies. Its shell entry point defaults to EraE; set
+`LEANI_BENCHMARK_SOURCE_POLICY=xatu-only`, `p2p-only`, or `history-portfolio`
+to compare another policy. The manifest pins that choice, and resumed reports
+must match it. Each policy needs a compatible source configuration.
 
 To isolate EraE acquisition and frame construction from the node and delivery,
 the source crate includes a streaming example:
@@ -135,7 +141,8 @@ The last three arguments select `headers`, `bodies`, `logs`, or `full`, active
 chunks, and buffered frames per stream. HTTPS and loopback HTTP mirrors also
 work. A local mirror must contain the checksum catalog and named archive
 objects. The example verifies block counts and parent continuity, fingerprints
-the requested frames, and reports physical reads and bytes. Compare full-frame
+the requested frames, and reports physical reads and bytes. The `full` mode
+also requests transaction hashes on logs. Compare full-frame
 fingerprints when checking complete-data equivalence; partial projections can
 legitimately omit optional fields that an older reader populated. Keep feature
 sets equal when comparing CPU measurements, particularly the signature-recovery

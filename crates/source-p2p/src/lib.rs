@@ -11135,6 +11135,8 @@ fn normalize_block(
     let normalized_block_hash = block_hash(hash);
     let header_requested = requested_material(request, Capability::Header);
     let transactions_requested = requested_material(request, Capability::Transactions);
+    let senders_requested =
+        request.is_none_or(|request| request.required.contains(Capability::Transactions));
     let receipts_requested = requested_material(request, Capability::Receipts);
     let logs_requested = requested_material(request, Capability::Logs);
     let withdrawals_requested = requested_material(request, Capability::Withdrawals);
@@ -11181,7 +11183,7 @@ fn normalize_block(
                         .is_some_and(|recipient| scope.recipients.contains(&recipient)))
         });
         let sender = if preliminary_transaction_match
-            && (transactions_requested || scope.is_some_and(|scope| !scope.senders.is_empty()))
+            && (senders_requested || scope.is_some_and(|scope| !scope.senders.is_empty()))
         {
             Some(transaction.recover_signer().map_err(|error| {
                 P2pError::InvalidResponse(format!(
@@ -11724,6 +11726,87 @@ mod tests {
                     .with_derivable()
                     .contains(Capability::Body)
         }));
+    }
+
+    #[test]
+    fn body_and_calldata_projections_recover_senders_only_when_required() {
+        let transaction = reth_ethereum_primitives::TransactionSigned::Legacy(
+            alloy_consensus::Signed::new_unhashed(
+                alloy_consensus::TxLegacy::default(),
+                alloy_primitives::Signature::new(U256::ZERO, U256::ZERO, false),
+            ),
+        );
+        let encoded = transaction.encoded_2718();
+        let body = BlockBody {
+            transactions: vec![transaction],
+            ..Default::default()
+        };
+        let receipts = vec![Receipt {
+            tx_type: alloy_consensus::TxType::Legacy,
+            success: true,
+            cumulative_gas_used: 21_000,
+            logs: Vec::new(),
+        }];
+        let with_bloom = receipts
+            .iter()
+            .map(alloy_consensus::TxReceipt::with_bloom_ref)
+            .collect::<Vec<_>>();
+        let header = Header {
+            transactions_root: calculate_transaction_root(&body.transactions),
+            receipts_root: calculate_receipt_root(&with_bloom),
+            gas_used: 21_000,
+            ..Default::default()
+        };
+        let headers = [header];
+        let bodies = [body];
+        let receipts = [receipts];
+        validate_bodies(&headers, &bodies).expect("committed body");
+        validate_receipts(&headers, &bodies, &receipts).expect("committed receipts");
+        for (capability, filter_sender, allow_filtered, recover_sender) in [
+            (Capability::Body, false, false, false),
+            (Capability::Calldata, false, false, false),
+            (Capability::Transactions, false, false, true),
+            (Capability::Body, true, true, true),
+            (Capability::Calldata, true, false, false),
+        ] {
+            let mut request = live_request(BlockRange::single(BlockNumber(0)));
+            request.required = CapabilitySet::of(Capability::Header)
+                .with(capability)
+                .with(Capability::Receipts);
+            request.allow_filtered = allow_filtered;
+            if filter_sender {
+                request.filters.senders = vec![Address::new([0x42; 20])];
+            }
+            let result = normalize_verified_for_request(
+                &headers,
+                &bodies,
+                &receipts,
+                &request,
+                SourceBudget {
+                    max_input_bytes: 1 << 20,
+                    max_frame_bytes: 1 << 20,
+                    max_frames: 1,
+                    max_buffered_frames: 1,
+                    max_in_flight_requests: 1,
+                    temporary_disk_bytes: 0,
+                    max_resident_bytes: 1 << 20,
+                },
+            );
+            if recover_sender {
+                assert!(
+                    matches!(result, Err(P2pError::InvalidResponse(ref detail)) if detail.contains("cannot recover sender")),
+                    "{result:?}"
+                );
+            } else {
+                let frames = result.expect("unrequested senders do not require signature recovery");
+                let transactions = frames[0].transactions.as_complete().expect("complete body");
+                assert_eq!(transactions.len(), 1);
+                assert_eq!(transactions[0].encoded.as_ref(), Some(&encoded));
+                assert_eq!(transactions[0].from, None);
+                assert_eq!(frames[0].receipts.as_complete().expect("receipts").len(), 1);
+                frames[0].validate_shape().expect("consistent frame");
+            }
+        }
     }
 
     #[test]

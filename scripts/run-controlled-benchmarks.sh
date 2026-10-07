@@ -11,7 +11,7 @@ Usage:
 Suites:
   subscription-startup
                      Alternating cold/warm block-subscription startup comparison.
-  erae-backfill      Alternating EraE block, blobs, and Uniswap backfills.
+  erae-backfill      Alternating real-source backfills (EraE by default).
   smoke              Small, resumable two-candidate sweep.
   synthetic-million  Full synthetic processor/delivery matrix (sequential).
   delivery-faults    SDK/PostgreSQL reconnect and lost-ACK matrix.
@@ -31,12 +31,15 @@ Useful environment overrides:
   LEANI_BENCHMARK_CHUNK_BLOCKS Source chunk size (default: min(blocks, 8192)).
   LEANI_BENCHMARK_WARMUPS      Synthetic warm-up count (default: 1).
   LEANI_BENCHMARK_RUNS         Startup pairs (default: 10), EraE pairs or synthetic runs (3).
-  LEANI_BENCHMARK_PROCESSORS  Space-separated EraE processors (default: all three).
-  LEANI_BENCHMARK_FROM_BLOCK  EraE range start (default: 19426589).
-  LEANI_BENCHMARK_TO_BLOCK    EraE range end (default: 19430684).
-  LEANI_BENCHMARK_CONFIG      EraE benchmark configuration.
+  LEANI_BENCHMARK_PROCESSORS  Space-separated backfill processors (default: all three).
+  LEANI_BENCHMARK_SOURCE_POLICY
+                               Real-source policy (default: erae-only); also
+                               xatu-only, p2p-only, or history-portfolio.
+  LEANI_BENCHMARK_FROM_BLOCK  Backfill range start (default: 19426589).
+  LEANI_BENCHMARK_TO_BLOCK    Backfill range end (default: 19430684).
+  LEANI_BENCHMARK_CONFIG      Real-source benchmark configuration.
   LEANI_BENCHMARK_TIMEOUT_SECONDS
-                               Per-run EraE timeout (default: 900).
+                               Per-run real-source timeout (default: 900).
   LEANI_BENCHMARK_CUTOFF_SECONDS
                                Subscription startup cutoff (default: 90).
   LEANI_BENCHMARK_FAULT_BLOCKS Delivery-fault block count (default: 10000).
@@ -318,6 +321,7 @@ run_erae_backfill() {
     --baseline-binary "$LEANI_BENCHMARK_BASELINE_BINARY" \
     --candidate-binary "$benchmark_binary" \
     --config "${LEANI_BENCHMARK_CONFIG:-config/benchmarks/real-source.toml}" \
+    --source-policy "${LEANI_BENCHMARK_SOURCE_POLICY:-erae-only}" \
     --output-directory "$directory" \
     --from-block "${LEANI_BENCHMARK_FROM_BLOCK:-19426589}" \
     --to-block "${LEANI_BENCHMARK_TO_BLOCK:-19430684}" \
