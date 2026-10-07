@@ -6,6 +6,8 @@ record, and documented RPC contracts.
 
 ## [Unreleased]
 
+## [0.1.0-rc.4] - 2026-10-07
+
 ### Added
 
 - A backfill subscription's status reports its required `consumer` and

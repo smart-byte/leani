@@ -18,7 +18,7 @@ include = ["src/**/*.rs", "README.md", "LICENSE"]
 async-trait.workspace = true
 blake3.workspace = true
 hex.workspace = true
-leani-primitives = { version = "=0.1.0-rc.3", path = "../primitives" }
+leani-primitives = { version = "=0.1.0-rc.4", path = "../primitives" }
 semver.workspace = true
 serde.workspace = true
 serde_json.workspace = true

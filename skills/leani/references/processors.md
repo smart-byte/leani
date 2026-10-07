@@ -48,8 +48,8 @@ node config has many required tables (budgets, sources, finality, API) that
 historical WETH transfers from the public Xatu dataset with no API key and no
 live source. Without a checkout, download that file from the GitHub tag of the
 installed version, `v` plus what `leani --version` prints
-(`https://raw.githubusercontent.com/smart-byte/leani/v0.1.0-rc.3/examples/weth-transfers/node.toml`
-for 0.1.0-rc.3).
+(`https://raw.githubusercontent.com/smart-byte/leani/v0.1.0-rc.4/examples/weth-transfers/node.toml`
+for 0.1.0-rc.4).
 Copy it to `leani.toml` in an empty directory and edit its processor:
 
 ```toml

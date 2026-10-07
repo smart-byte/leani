@@ -4378,7 +4378,7 @@ checksum = "bbd2bcb4c963f2ddae06a2efc7e9f3591312473c50c6685e1f298068316e66fe"
 
 [[package]]
 name = "leani"
-version = "0.1.0-rc.3"
+version = "0.1.0-rc.4"
 dependencies = [
  "alloy-primitives",
  "anyhow",
@@ -4432,7 +4432,7 @@ dependencies = [
 
 [[package]]
 name = "leani-api"
-version = "0.1.0-rc.3"
+version = "0.1.0-rc.4"
 dependencies = [
  "alloy-primitives",
  "async-trait",
@@ -4465,7 +4465,7 @@ dependencies = [
 
 [[package]]
 name = "leani-custom-example"
-version = "0.1.0-rc.3"
+version = "0.1.0-rc.4"
 dependencies = [
  "async-trait",
  "axum",
@@ -4488,7 +4488,7 @@ dependencies = [
 
 [[package]]
 name = "leani-finality-beacon-api"
-version = "0.1.0-rc.3"
+version = "0.1.0-rc.4"
 dependencies = [
  "alloy-primitives",
  "async-trait",
@@ -4513,7 +4513,7 @@ dependencies = [
 
 [[package]]
 name = "leani-finality-consensus-p2p"
-version = "0.1.0-rc.3"
+version = "0.1.0-rc.4"
 dependencies = [
  "alloy-primitives",
  "async-trait",
@@ -4541,7 +4541,7 @@ dependencies = [
 
 [[package]]
 name = "leani-primitives"
-version = "0.1.0-rc.3"
+version = "0.1.0-rc.4"
 dependencies = [
  "alloy-primitives",
  "blake3",
@@ -4553,7 +4553,7 @@ dependencies = [
 
 [[package]]
 name = "leani-processor-api"
-version = "0.1.0-rc.3"
+version = "0.1.0-rc.4"
 dependencies = [
  "async-trait",
  "blake3",
@@ -4567,7 +4567,7 @@ dependencies = [
 
 [[package]]
 name = "leani-processor-blobs"
-version = "0.1.0-rc.3"
+version = "0.1.0-rc.4"
 dependencies = [
  "alloy-primitives",
  "async-trait",
@@ -4584,7 +4584,7 @@ dependencies = [
 
 [[package]]
 name = "leani-processor-block-summary"
-version = "0.1.0-rc.3"
+version = "0.1.0-rc.4"
 dependencies = [
  "alloy-primitives",
  "async-trait",
@@ -4601,7 +4601,7 @@ dependencies = [
 
 [[package]]
 name = "leani-processor-erc20"
-version = "0.1.0-rc.3"
+version = "0.1.0-rc.4"
 dependencies = [
  "alloy-primitives",
  "async-trait",
@@ -4620,7 +4620,7 @@ dependencies = [
 
 [[package]]
 name = "leani-processor-evm-events"
-version = "0.1.0-rc.3"
+version = "0.1.0-rc.4"
 dependencies = [
  "alloy-primitives",
  "async-trait",
@@ -4640,7 +4640,7 @@ dependencies = [
 
 [[package]]
 name = "leani-processor-rollup-txs"
-version = "0.1.0-rc.3"
+version = "0.1.0-rc.4"
 dependencies = [
  "alloy-primitives",
  "async-trait",
@@ -4658,7 +4658,7 @@ dependencies = [
 
 [[package]]
 name = "leani-processor-transaction-stats"
-version = "0.1.0-rc.3"
+version = "0.1.0-rc.4"
 dependencies = [
  "alloy-primitives",
  "async-trait",
@@ -4675,7 +4675,7 @@ dependencies = [
 
 [[package]]
 name = "leani-processor-uniswap"
-version = "0.1.0-rc.3"
+version = "0.1.0-rc.4"
 dependencies = [
  "alloy-primitives",
  "async-trait",
@@ -4692,7 +4692,7 @@ dependencies = [
 
 [[package]]
 name = "leani-rpc"
-version = "0.1.0-rc.3"
+version = "0.1.0-rc.4"
 dependencies = [
  "alloy-consensus 2.5.0",
  "alloy-eips 2.5.0",
@@ -4721,7 +4721,7 @@ dependencies = [
 
 [[package]]
 name = "leani-runtime"
-version = "0.1.0-rc.3"
+version = "0.1.0-rc.4"
 dependencies = [
  "async-trait",
  "axum",
@@ -4747,7 +4747,7 @@ dependencies = [
 
 [[package]]
 name = "leani-source-api"
-version = "0.1.0-rc.3"
+version = "0.1.0-rc.4"
 dependencies = [
  "async-trait",
  "blake3",
@@ -4762,7 +4762,7 @@ dependencies = [
 
 [[package]]
 name = "leani-source-archive"
-version = "0.1.0-rc.3"
+version = "0.1.0-rc.4"
 dependencies = [
  "async-trait",
  "blake3",
@@ -4779,7 +4779,7 @@ dependencies = [
 
 [[package]]
 name = "leani-source-erae"
-version = "0.1.0-rc.3"
+version = "0.1.0-rc.4"
 dependencies = [
  "alloy-consensus 2.5.0",
  "alloy-eips 2.5.0",
@@ -4807,7 +4807,7 @@ dependencies = [
 
 [[package]]
 name = "leani-source-p2p"
-version = "0.1.0-rc.3"
+version = "0.1.0-rc.4"
 dependencies = [
  "alloy-consensus 2.5.0",
  "alloy-eips 2.5.0",
@@ -4840,7 +4840,7 @@ dependencies = [
 
 [[package]]
 name = "leani-source-xatu"
-version = "0.1.0-rc.3"
+version = "0.1.0-rc.4"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -4864,7 +4864,7 @@ dependencies = [
 
 [[package]]
 name = "leani-store-artifacts"
-version = "0.1.0-rc.3"
+version = "0.1.0-rc.4"
 dependencies = [
  "async-trait",
  "blake3",
@@ -4882,7 +4882,7 @@ dependencies = [
 
 [[package]]
 name = "leani-store-history"
-version = "0.1.0-rc.3"
+version = "0.1.0-rc.4"
 dependencies = [
  "alloy-consensus 2.5.0",
  "alloy-eips 2.5.0",
@@ -4909,7 +4909,7 @@ dependencies = [
 
 [[package]]
 name = "leani-store-sqlite"
-version = "0.1.0-rc.3"
+version = "0.1.0-rc.4"
 dependencies = [
  "async-trait",
  "blake3",
@@ -4932,7 +4932,7 @@ dependencies = [
 
 [[package]]
 name = "leani-testkit"
-version = "0.1.0-rc.3"
+version = "0.1.0-rc.4"
 dependencies = [
  "alloy-primitives",
  "async-trait",
