@@ -1185,6 +1185,7 @@ fn parse_generic_transactions(
     filters: &FilterSet,
     output: &mut BTreeMap<u64, Vec<TransactionEnvelope>>,
 ) -> Result<u64, XatuError> {
+    let scope = filters.effective_scope();
     let mut selected = 0_u64;
     for row in 0..batch.num_rows() {
         let block_number = required_u64(batch, "block_number", row)?;
@@ -1192,33 +1193,13 @@ fn parse_generic_transactions(
             continue;
         }
         let transaction_type = required_u8(batch, "transaction_type", row)?;
-        if !filters.scope.transaction_types.is_empty()
-            && !filters.scope.transaction_types.contains(&transaction_type)
-        {
-            continue;
-        }
         let hash = required_transaction_hash(batch, "transaction_hash", row)?;
-        if !filters.scope.transaction_hashes.is_empty()
-            && !filters.scope.transaction_hashes.contains(&hash)
-        {
+        let to = optional_address(batch, "to_address", row)?;
+        if !scope.matches_transaction(transaction_type, to.as_ref(), || hash) {
             continue;
         }
         let from = required_address(batch, "from_address", row)?;
-        let to = optional_address(batch, "to_address", row)?;
-        let senders = if filters.senders.is_empty() {
-            &filters.scope.senders
-        } else {
-            &filters.senders
-        };
-        let recipients = if filters.recipients.is_empty() {
-            &filters.scope.recipients
-        } else {
-            &filters.recipients
-        };
-        if !senders.is_empty() && !senders.contains(&from) {
-            continue;
-        }
-        if !recipients.is_empty() && to.is_none_or(|address| !recipients.contains(&address)) {
+        if !scope.matches_sender(Some(&from)) {
             continue;
         }
         output
@@ -1253,6 +1234,9 @@ fn parse_generic_logs(
     log_fields: LogFieldSet,
     output: &mut BTreeMap<u64, Vec<Log>>,
 ) -> Result<u64, XatuError> {
+    // The planner admits no other transaction predicate for logs, whose table
+    // names their transaction only by hash.
+    let scope = filters.effective_scope();
     let mut selected = 0_u64;
     for row in 0..batch.num_rows() {
         let block_number = required_u64(batch, "block_number", row)?;
@@ -1260,19 +1244,17 @@ fn parse_generic_logs(
             continue;
         }
         let address = required_address(batch, "address", row)?;
-        if !filters.scope.addresses.is_empty() && !filters.scope.addresses.contains(&address) {
+        if !scope.matches_log_address(&address) {
             continue;
         }
         let transaction_hash = if log_fields.contains(LogField::TransactionHash)
-            || !filters.scope.transaction_hashes.is_empty()
+            || !scope.transaction_hashes.is_empty()
         {
             Some(required_transaction_hash(batch, "transaction_hash", row)?)
         } else {
             None
         };
-        if !filters.scope.transaction_hashes.is_empty()
-            && transaction_hash.is_none_or(|hash| !filters.scope.transaction_hashes.contains(&hash))
-        {
+        if transaction_hash.is_some_and(|hash| !scope.matches_transaction_hash(&hash)) {
             continue;
         }
         // A log carries zero to four topics; `LOG0` has none.
@@ -1289,11 +1271,7 @@ fn parse_generic_logs(
                 (None, _) => absent = absent.or(Some(name)),
             }
         }
-        if filters.scope.topics.iter().any(|filter| {
-            topics
-                .get(usize::from(filter.position))
-                .is_none_or(|topic| !filter.alternatives.contains(topic))
-        }) {
+        if !scope.matches_log(&address, &topics) {
             continue;
         }
         output.entry(block_number).or_default().push(Log {
@@ -1343,6 +1321,7 @@ fn normalize_generic_frames(
             actual: inputs.beacon_blocks.len(),
         });
     }
+    let effective = inputs.filters.effective_scope();
     let mut frames = Vec::with_capacity(expected);
     for number in inputs.range.iter() {
         let execution = inputs
@@ -1358,14 +1337,10 @@ fn normalize_generic_frames(
                 "execution/beacon block disagreement at {number}"
             )));
         }
-        let mut scope = inputs.filters.scope.clone();
+        // Rows are claimed for their own block instead of the request's block
+        // range, which Xatu does not apply.
+        let mut scope = effective.clone();
         scope.block_range = Some(BlockRange::single(number));
-        if scope.senders.is_empty() {
-            scope.senders.clone_from(&inputs.filters.senders);
-        }
-        if scope.recipients.is_empty() {
-            scope.recipients.clone_from(&inputs.filters.recipients);
-        }
         let header = if inputs.include_header {
             Material::Filtered {
                 value: HeaderEnvelope {
@@ -1408,7 +1383,7 @@ fn normalize_generic_frames(
                     number,
                     &values,
                     beacon.transaction_count,
-                    selects_transactions(inputs.filters),
+                    effective.constrains_transactions(),
                 )?;
                 (
                     Material::Filtered {
@@ -1462,17 +1437,6 @@ fn normalize_generic_frames(
         });
     }
     Ok(frames)
-}
-
-/// Whether `filters` select transactions, so that a block's projected list
-/// may be shorter than its payload.
-fn selects_transactions(filters: &FilterSet) -> bool {
-    !filters.scope.transaction_types.is_empty()
-        || !filters.scope.transaction_hashes.is_empty()
-        || !filters.scope.senders.is_empty()
-        || !filters.scope.recipients.is_empty()
-        || !filters.senders.is_empty()
-        || !filters.recipients.is_empty()
 }
 
 /// Check a block's projected transactions, sorted by index without
@@ -3298,6 +3262,23 @@ mod tests {
         assert_eq!(transaction.to, Some(Address::new([0x33; 20])));
         assert_eq!(transaction.value, Some(quantity_from_u64(99)));
         assert_eq!(transaction.input.as_deref(), Some(&[0x12, 0x34][..]));
+
+        // The scope's own senders win over the separate list, as in the
+        // scope the projected rows are claimed under.
+        let separate = FilterSet {
+            senders: vec![Address::new([0x99; 20])],
+            ..filters
+        };
+        assert_eq!(
+            parse_generic_transactions(
+                &batch,
+                BlockRange::single(BlockNumber(42)),
+                &separate,
+                &mut BTreeMap::new(),
+            )
+            .expect("parse"),
+            1
+        );
     }
 
     #[test]

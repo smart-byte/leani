@@ -63,7 +63,9 @@ projections:
 1. headers from minimal execution/beacon block columns;
 2. transactions with sender, recipient, exact value, calldata, nonce, gas
    limit, and type;
-3. logs with address and all four topic positions; and
+3. logs with address and all four topic positions. The logs table names a
+   log's transaction only by hash, so a log request that also selects
+   transactions by type, sender, or recipient fails during planning; and
 4. the existing blob/type-3 projection.
 
 Xatu history is Ethereum mainnet only. Its projections stamp every frame as

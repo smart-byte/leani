@@ -410,6 +410,17 @@ fn projection_mode(request: &DataRequest) -> Result<ProjectionMode, SourceError>
                     .to_owned(),
             ));
         }
+        // The logs table names each log's transaction only by hash, so no
+        // other transaction predicate could be applied to the logs claimed.
+        let scope = request.filters.effective_scope();
+        if !scope.transaction_types.is_empty()
+            || !scope.senders.is_empty()
+            || !scope.recipients.is_empty()
+        {
+            return Err(SourceError::InvalidPlan(
+                "Xatu log projection can select a log's transaction only by hash".to_owned(),
+            ));
+        }
         return Ok(ProjectionMode::Logs);
     }
     if required.contains(Capability::Transactions)
@@ -623,24 +634,16 @@ fn physical_plan(mode: ProjectionMode, request: &DataRequest) -> Vec<PhysicalPla
 }
 
 fn transaction_predicates(request: &DataRequest, range: String) -> Vec<String> {
+    let scope = request.filters.effective_scope();
     let mut predicates = vec![range];
-    if !request.filters.senders.is_empty() {
-        predicates.push(format!(
-            "from_address IN ({} values)",
-            request.filters.senders.len()
-        ));
+    if !scope.senders.is_empty() {
+        predicates.push(format!("from_address IN ({} values)", scope.senders.len()));
     }
-    if !request.filters.recipients.is_empty() {
-        predicates.push(format!(
-            "to_address IN ({} values)",
-            request.filters.recipients.len()
-        ));
+    if !scope.recipients.is_empty() {
+        predicates.push(format!("to_address IN ({} values)", scope.recipients.len()));
     }
-    if !request.filters.scope.transaction_types.is_empty() {
-        predicates.push(format!(
-            "transaction_type IN {:?}",
-            request.filters.scope.transaction_types
-        ));
+    if !scope.transaction_types.is_empty() {
+        predicates.push(format!("transaction_type IN {:?}", scope.transaction_types));
     }
     predicates
 }
@@ -1014,5 +1017,44 @@ mod tests {
             })
             .await;
         assert!(matches!(result, Err(SourceError::InvalidPlan(_))));
+
+        // Logs name their transaction only by hash, so a log projection never
+        // claims another transaction predicate it could not apply.
+        let address = leani_primitives::Address::new([8; 20]);
+        let logs = |filters| DataRequest {
+            required: CapabilitySet::of(Capability::Logs),
+            filters,
+            ..request(range)
+        };
+        for filters in [
+            request(range).filters,
+            FilterSet {
+                senders: vec![address],
+                ..FilterSet::default()
+            },
+            FilterSet {
+                scope: FilterScope {
+                    recipients: vec![address],
+                    ..FilterScope::default()
+                },
+                ..FilterSet::default()
+            },
+        ] {
+            let result = source.plan(&logs(filters)).await;
+            assert!(
+                matches!(&result, Err(SourceError::InvalidPlan(detail)) if detail.contains("only by hash")),
+                "{result:?}"
+            );
+        }
+        source
+            .plan(&logs(FilterSet {
+                scope: FilterScope {
+                    transaction_hashes: vec![leani_primitives::TransactionHash::new([9; 32])],
+                    ..FilterScope::default()
+                },
+                ..FilterSet::default()
+            }))
+            .await
+            .expect("a log's transaction can be selected by hash");
     }
 }

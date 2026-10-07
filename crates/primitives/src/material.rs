@@ -9,7 +9,11 @@ use crate::{Address, BlockNumber, BlockRange, TransactionHash};
 /// Exact predicate applied before source material reached the node.
 ///
 /// An item matches when it satisfies every field. A missing block range and an
-/// empty list are wildcards: they do not constrain their field.
+/// empty list are wildcards: they do not constrain their field. Sources apply
+/// a scope with [`Self::matches_block`] to the block, with
+/// [`Self::matches_transaction`] and [`Self::matches_sender`] to each
+/// transaction, and with [`Self::matches_log`] to each log of a matching
+/// transaction.
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct FilterScope {
     pub block_range: Option<BlockRange>,
@@ -77,6 +81,92 @@ impl FilterScope {
             && list_covers(&self.senders, &filter.senders)
             && list_covers(&self.recipients, &filter.recipients)
     }
+
+    /// Whether `block` lies in [`Self::block_range`]. Nothing in a block
+    /// outside it matches.
+    #[must_use]
+    pub fn matches_block(&self, block: BlockNumber) -> bool {
+        self.block_range.is_none_or(|range| range.contains(block))
+    }
+
+    /// Whether a transaction's type, recipient, and hash match. A contract
+    /// creation has no recipient, so only a recipient wildcard matches it.
+    /// `hash` is called only when [`Self::transaction_hashes`] constrains it.
+    /// The sender, which is costly to recover, is matched separately by
+    /// [`Self::matches_sender`].
+    #[must_use]
+    pub fn matches_transaction(
+        &self,
+        transaction_type: u8,
+        recipient: Option<&Address>,
+        hash: impl FnOnce() -> TransactionHash,
+    ) -> bool {
+        list_matches(&self.transaction_types, Some(&transaction_type))
+            && list_matches(&self.recipients, recipient)
+            && (self.transaction_hashes.is_empty() || self.matches_transaction_hash(&hash()))
+    }
+
+    /// Whether a transaction hash matches, for a source that knows only the
+    /// hash of a log's transaction.
+    #[must_use]
+    pub fn matches_transaction_hash(&self, hash: &TransactionHash) -> bool {
+        list_matches(&self.transaction_hashes, Some(hash))
+    }
+
+    /// Whether a transaction's sender matches. An unknown sender matches only
+    /// the wildcard.
+    #[must_use]
+    pub fn matches_sender(&self, sender: Option<&Address>) -> bool {
+        list_matches(&self.senders, sender)
+    }
+
+    /// Whether a log's address and topics match. Each topic filter needs a
+    /// topic at its position, so a log with fewer topics does not match it.
+    #[must_use]
+    pub fn matches_log<T: AsRef<[u8]>>(&self, address: &Address, topics: &[T]) -> bool {
+        self.matches_log_address(address)
+            && self.topics.iter().all(|filter| {
+                topics
+                    .get(usize::from(filter.position))
+                    .is_some_and(|topic| {
+                        filter
+                            .alternatives
+                            .iter()
+                            .any(|alternative| alternative.as_slice() == topic.as_ref())
+                    })
+            })
+    }
+
+    /// Whether a log's address matches, for a source that rules a log out
+    /// before decoding its topics.
+    #[must_use]
+    pub fn matches_log_address(&self, address: &Address) -> bool {
+        list_matches(&self.addresses, Some(address))
+    }
+
+    /// Whether this scope selects transactions by their type, hash, sender,
+    /// or recipient, so matching it needs the transactions themselves. A
+    /// block's matching transactions, with their receipts and logs, may then
+    /// be fewer than its own.
+    #[must_use]
+    pub fn constrains_transactions(&self) -> bool {
+        !self.transaction_types.is_empty()
+            || !self.transaction_hashes.is_empty()
+            || !self.senders.is_empty()
+            || !self.recipients.is_empty()
+    }
+
+    /// Whether this scope selects logs by their address or topics, so a
+    /// block's matching logs may be fewer than its matching transactions'.
+    #[must_use]
+    pub fn constrains_logs(&self) -> bool {
+        !self.addresses.is_empty() || !self.topics.is_empty()
+    }
+}
+
+/// An empty list is a wildcard: it matches any value, even an unknown one.
+fn list_matches<T: PartialEq>(list: &[T], value: Option<&T>) -> bool {
+    list.is_empty() || value.is_some_and(|value| list.contains(value))
 }
 
 /// An empty list is a wildcard: it covers every list and only it covers itself.
@@ -443,6 +533,101 @@ mod tests {
             ..filter
         };
         assert!(!scope.covers_at(&other, BlockNumber(5)));
+    }
+
+    #[test]
+    fn items_match_only_when_every_field_matches() {
+        let scope = narrow();
+        let hash = TransactionHash::new([3; 32]);
+        assert!(scope.matches_block(BlockNumber(10)) && scope.matches_block(BlockNumber(20)));
+        assert!(!scope.matches_block(BlockNumber(9)) && !scope.matches_block(BlockNumber(21)));
+
+        assert!(scope.matches_transaction(2, Some(&address(5)), || hash));
+        assert!(!scope.matches_transaction(1, Some(&address(5)), || hash));
+        assert!(!scope.matches_transaction(2, Some(&address(6)), || hash));
+        assert!(
+            !scope.matches_transaction(2, None, || hash),
+            "a contract creation has no recipient"
+        );
+        let other_hash = TransactionHash::new([9; 32]);
+        assert!(!scope.matches_transaction(2, Some(&address(5)), || other_hash));
+        assert!(scope.matches_sender(Some(&address(4))));
+        assert!(!scope.matches_sender(Some(&address(5))));
+        assert!(
+            !scope.matches_sender(None),
+            "an unknown sender matches only the wildcard"
+        );
+
+        assert!(scope.matches_log(&address(2), &[TOPIC_B]));
+        assert!(!scope.matches_log(&address(3), &[TOPIC_B]));
+        assert!(!scope.matches_log(&address(2), &[TOPIC_C]));
+        assert!(
+            !scope.matches_log::<[u8; 32]>(&address(2), &[]),
+            "a log without the filtered topic"
+        );
+
+        let wildcard = FilterScope::default();
+        assert!(wildcard.matches_block(BlockNumber(0)));
+        assert!(wildcard.matches_transaction(0, None, || unreachable!("no hash is compared")));
+        assert!(wildcard.matches_sender(None));
+        assert!(wildcard.matches_log::<[u8; 32]>(&address(3), &[]));
+    }
+
+    #[test]
+    fn log_topics_match_at_their_positions() {
+        let second = topics(&[topic(1, &[TOPIC_B])]);
+        assert!(second.matches_log(&address(1), &[TOPIC_A, TOPIC_B]));
+        assert!(!second.matches_log(&address(1), &[TOPIC_B, TOPIC_A]));
+        assert!(!second.matches_log(&address(1), &[TOPIC_B]));
+        // Several filters at one position must all allow its topic.
+        let both = topics(&[topic(0, &[TOPIC_A, TOPIC_B]), topic(0, &[TOPIC_B, TOPIC_C])]);
+        assert!(both.matches_log(&address(1), &[TOPIC_B]));
+        assert!(!both.matches_log(&address(1), &[TOPIC_A]));
+        assert!(!topics(&[topic(0, &[])]).matches_log(&address(1), &[TOPIC_A]));
+    }
+
+    #[test]
+    fn only_item_fields_constrain_their_items() {
+        let wildcard = FilterScope::default();
+        let constraints =
+            |scope: &FilterScope| (scope.constrains_transactions(), scope.constrains_logs());
+        assert_eq!(constraints(&wildcard), (false, false));
+        assert_eq!(constraints(&narrow()), (true, true));
+        // A block range is matched against the block, not against its items.
+        let ranged = FilterScope {
+            block_range: Some(range(1, 2)),
+            ..FilterScope::default()
+        };
+        assert_eq!(constraints(&ranged), (false, false));
+        for scope in [
+            FilterScope {
+                transaction_types: vec![3],
+                ..FilterScope::default()
+            },
+            FilterScope {
+                transaction_hashes: vec![TransactionHash::new([3; 32])],
+                ..FilterScope::default()
+            },
+            FilterScope {
+                senders: vec![address(4)],
+                ..FilterScope::default()
+            },
+            FilterScope {
+                recipients: vec![address(5)],
+                ..FilterScope::default()
+            },
+        ] {
+            assert_eq!(constraints(&scope), (true, false), "{scope:?}");
+        }
+        for scope in [
+            FilterScope {
+                addresses: vec![address(1)],
+                ..FilterScope::default()
+            },
+            topics(&[topic(0, &[TOPIC_A])]),
+        ] {
+            assert_eq!(constraints(&scope), (false, true), "{scope:?}");
+        }
     }
 
     #[test]
