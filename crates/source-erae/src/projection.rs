@@ -1,4 +1,4 @@
-//! Normalize only requested material, after checking the complete execution
+//! Normalize projected material after checking the complete execution
 //! commitments. Filtered material records a verified predicate over those inputs.
 
 use alloy_consensus::{
@@ -80,7 +80,10 @@ pub(super) fn normalize_block(
     let transactions_requested = projection.transactions_requested();
     let receipts_requested = projection.required.contains(Capability::Receipts);
     let logs_requested = projection.required.contains(Capability::Logs);
-    let withdrawals_requested = projection.required.contains(Capability::Withdrawals);
+    // Execution RPC and raw-history consumers need the withdrawals committed
+    // by a complete body even when their request does not name the capability.
+    let withdrawals_requested =
+        projection.required.contains(Capability::Withdrawals) || body.is_some();
     let scope = projection.scope.as_ref();
     let transaction_filtered = scope.is_some_and(|scope| {
         scope.block_range.is_some()
@@ -156,7 +159,9 @@ pub(super) fn normalize_block(
                         .is_some_and(|sender| scope.senders.contains(&sender))
             });
         let transaction_hash = transaction
-            .filter(|_| transaction_matches)
+            .filter(|_| {
+                transaction_matches && projection.log_fields.contains(LogField::TransactionHash)
+            })
             .map(|transaction| TransactionHash::new(transaction.tx_hash().0));
         if let Some(transaction) =
             transaction.filter(|_| transactions_requested && transaction_matches)

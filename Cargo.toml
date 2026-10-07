@@ -38,7 +38,9 @@ repository = "https://github.com/smart-byte/leani"
 homepage = "https://leani.dev"
 
 [workspace.dependencies]
-alloy-consensus = { version = "2.3.0", features = ["k256"] }
+# Use the same native signature recovery backend in the node and when testing
+# each source crate independently.
+alloy-consensus = { version = "2.3.0", features = ["k256", "secp256k1"] }
 alloy-eips = "2.3.0"
 alloy-primitives = { version = "1.6.1", default-features = false, features = ["std", "serde"] }
 alloy-rlp = "0.3.16"

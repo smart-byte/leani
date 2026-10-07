@@ -60,7 +60,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
             chain_id: ChainId(1),
             range,
             required,
-            log_fields: LogFieldSet::NONE,
+            log_fields: if args[3] == "full" {
+                LogFieldSet::ALL
+            } else {
+                LogFieldSet::NONE
+            },
             allow_filtered: false,
             projection: FieldProjection::default(),
             filters: FilterSet::default(),

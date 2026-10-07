@@ -9,9 +9,7 @@ homepage.workspace = true
 publish = false
 
 [dependencies]
-# Bulk transaction backfills need native signature recovery. Enabling the
-# primitives backend alone does not select Alloy consensus's recovery backend.
-alloy-consensus = { workspace = true, features = ["secp256k1"] }
+alloy-consensus.workspace = true
 alloy-eips.workspace = true
 alloy-primitives.workspace = true
 alloy-rlp.workspace = true

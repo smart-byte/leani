@@ -1122,12 +1122,28 @@ impl EraeStreamState {
     async fn acquire_next(&mut self) -> Result<(), SourceError> {
         // Release the prior input before reserving the next window's bytes.
         self.acquired = None;
-        let acquired = if let Some(prefetched) = self.prefetched.take() {
-            tokio::select! {
+        let prefetched = if let Some(prefetched) = self.prefetched.take() {
+            let result = tokio::select! {
                 () = self.cancellation.cancelled() => return Err(SourceError::Cancelled),
                 result = prefetched => result
-                    .map_err(|error| SourceError::Unavailable(error.to_string()))??,
+                    .map_err(|error| SourceError::Unavailable(error.to_string()))?,
+            };
+            match result {
+                Ok(acquired) => Some(acquired),
+                // A single block may fit the full budget but not the room
+                // beside the previous window. This refusal precedes all
+                // downloads; retry now that the previous input is released.
+                Err(SourceError::BudgetExceeded {
+                    resource: "resident_bytes",
+                    ..
+                }) => None,
+                Err(error) => return Err(error),
             }
+        } else {
+            None
+        };
+        let acquired = if let Some(acquired) = prefetched {
+            acquired
         } else {
             let window = if self.previous_hash.is_none() {
                 INITIAL_ACQUISITION_BLOCKS
@@ -1910,12 +1926,9 @@ fn encode_partition(filename: &str, request: &DataRequest) -> Result<Vec<u8>, So
 fn decode_partition(bytes: &[u8]) -> Result<EraePartition, SourceError> {
     let (identity, remaining) = postcard::take_from_bytes::<EraePartition>(bytes)
         .map_err(|error| SourceError::InvalidPlan(format!("invalid eraE partition: {error}")))?;
-    if identity.version != 2
-        || !remaining.is_empty()
-        || CapabilitySet::from_bits(identity.projection.required.bits()).is_none()
-    {
+    if identity.version != 2 || !remaining.is_empty() {
         return Err(SourceError::InvalidPlan(
-            "invalid eraE partition version or capabilities".to_owned(),
+            "invalid eraE partition version or trailing bytes".to_owned(),
         ));
     }
     Ok(identity)
@@ -2974,7 +2987,7 @@ mod tests {
         body: &BlockBody,
         receipts: Option<&[EthereumReceipt]>,
     ) -> (EraeSource, BlockNumber) {
-        let number = MAINNET_BYZANTIUM_BLOCK.div_ceil(BLOCKS_PER_FILE) * BLOCKS_PER_FILE;
+        let number = 18_000_000_u64.div_ceil(BLOCKS_PER_FILE) * BLOCKS_PER_FILE;
         let with_bloom = receipts
             .unwrap_or_default()
             .iter()
@@ -2982,6 +2995,8 @@ mod tests {
             .collect::<Vec<_>>();
         let header = Header {
             number,
+            timestamp: 1_700_000_000,
+            base_fee_per_gas: Some(1),
             transactions_root: calculate_transaction_root(&body.transactions),
             ommers_hash: body.calculate_ommers_root(),
             withdrawals_root: body.calculate_withdrawals_root(),
@@ -3096,6 +3111,10 @@ mod tests {
                 false,
             ),
             (
+                CapabilitySet::of(Capability::Header).with(Capability::Calldata),
+                false,
+            ),
+            (
                 CapabilitySet::of(Capability::Header).with(Capability::Transactions),
                 true,
             ),
@@ -3129,6 +3148,74 @@ mod tests {
                     VerificationCheck::VERIFIED
                 );
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn body_reads_preserve_committed_withdrawals_for_execution_consumers() {
+        let directory = tempfile::tempdir().expect("directory");
+        let (mut body, receipts) = logged_transactions();
+        body.withdrawals = Some(alloy_eips::eip4895::Withdrawals::new(vec![
+            alloy_eips::eip4895::Withdrawal {
+                index: 7,
+                validator_index: 11,
+                address: AlloyAddress::repeat_byte(0x42),
+                amount: 123,
+            },
+        ]));
+        let (source, number) = one_execution_block(directory.path(), &body, Some(&receipts));
+        for required in [
+            CapabilitySet::of(Capability::Transactions),
+            CapabilitySet::of(Capability::Transactions).with(Capability::Receipts),
+            CapabilitySet::of(Capability::Body),
+            CapabilitySet::of(Capability::Calldata),
+        ] {
+            // RPC and raw-history consumers require withdrawals committed by
+            // a complete post-Shanghai header, without an explicit capability.
+            let plan = source
+                .plan(&request(
+                    BlockRange::single(number),
+                    required.with(Capability::Header),
+                ))
+                .await
+                .expect("plan");
+            let frames = source
+                .open(
+                    &plan.chunks[0],
+                    budget(1 << 20, 1 << 20),
+                    CancellationToken::new(),
+                )
+                .await
+                .expect("open")
+                .try_collect::<Vec<_>>()
+                .await
+                .expect("body with withdrawals");
+            let frame = &frames[0];
+            assert!(
+                frame
+                    .header
+                    .as_complete()
+                    .expect("header")
+                    .withdrawals_root
+                    .is_some()
+            );
+            assert_eq!(
+                frame.verification.withdrawals_root,
+                VerificationCheck::VERIFIED
+            );
+            assert_eq!(
+                frame
+                    .withdrawals
+                    .as_complete()
+                    .expect("complete withdrawals"),
+                &[leani_primitives::Withdrawal {
+                    index: 7,
+                    validator_index: 11,
+                    address: Address::new([0x42; 20]),
+                    amount_gwei: 123,
+                },]
+            );
+            frame.validate_shape().expect("consistent frame");
         }
     }
 
@@ -3301,6 +3388,51 @@ mod tests {
             matches!(error, SourceError::CorruptFrame(ref message) if message.contains("receipts root mismatch")),
             "{error}"
         );
+    }
+
+    #[tokio::test]
+    async fn log_hash_projection_is_respected_when_a_body_is_read() {
+        use leani_primitives::{LogFieldSet, TransactionHash};
+
+        let directory = tempfile::tempdir().expect("directory");
+        let (body, receipts) = logged_transactions();
+        let (source, number) = one_execution_block(directory.path(), &body, Some(&receipts));
+        let mut request = request(
+            BlockRange::single(number),
+            CapabilitySet::of(Capability::Header)
+                .with(Capability::Transactions)
+                .with(Capability::Receipts)
+                .with(Capability::Logs),
+        );
+        for (log_fields, hashes_requested) in [(LogFieldSet::NONE, false), (LogFieldSet::ALL, true)]
+        {
+            request.log_fields = log_fields;
+            let plan = source.plan(&request).await.expect("plan");
+            let frames = source
+                .open(
+                    &plan.chunks[0],
+                    budget(1 << 20, 1 << 20),
+                    CancellationToken::new(),
+                )
+                .await
+                .expect("open")
+                .try_collect::<Vec<_>>()
+                .await
+                .expect("projected logs and receipts");
+            let logs = frames[0].logs.as_complete().expect("logs");
+            let receipts = frames[0].receipts.as_complete().expect("receipts");
+            assert_eq!(logs.len(), 2);
+            assert_eq!(receipts.len(), 2);
+            for (index, receipt) in receipts.iter().enumerate() {
+                let hash = TransactionHash::new(body.transactions[index].tx_hash().0);
+                assert_eq!(receipt.transaction_hash, hash);
+                assert_eq!(
+                    logs[index].transaction_hash,
+                    hashes_requested.then_some(hash)
+                );
+                assert_eq!(receipt.logs, [logs[index].clone()]);
+            }
+        }
     }
 
     #[tokio::test]
@@ -3558,6 +3690,105 @@ mod tests {
             .collect::<Result<Vec<_>, _>>()
             .expect("the blocks are fetched a batch at a time");
         assert_eq!(frames.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_block_that_outgrows_prefetch_room_is_read_after_releasing_the_current_window() {
+        let directory = tempfile::tempdir().expect("directory");
+        let incompressible = |length| {
+            let mut state = 0x1234_5678_u32;
+            (0..length)
+                .map(|_| {
+                    state ^= state << 13;
+                    state ^= state >> 17;
+                    state ^= state << 5;
+                    state.to_le_bytes()[0]
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut parent_hash = alloy_primitives::B256::ZERO;
+        let blocks = (0..33)
+            .map(|number| {
+                let input_bytes = match number {
+                    0 => 1 << 20,
+                    32 => 17 << 20,
+                    _ => 0,
+                };
+                let body = BlockBody {
+                    transactions: vec![reth_ethereum_primitives::TransactionSigned::Legacy(
+                        alloy_consensus::Signed::new_unhashed(
+                            alloy_consensus::TxLegacy {
+                                input: incompressible(input_bytes).into(),
+                                ..Default::default()
+                            },
+                            alloy_primitives::Signature::test_signature(),
+                        ),
+                    )],
+                    ..Default::default()
+                };
+                let header = Header {
+                    number,
+                    parent_hash,
+                    transactions_root: calculate_transaction_root(&body.transactions),
+                    ..Default::default()
+                };
+                parent_hash = header.hash_slow();
+                vec![
+                    (
+                        COMPRESSED_HEADER,
+                        reth_era::common::compression::snappy_compress(&alloy_rlp::encode(header))
+                            .expect("header"),
+                    ),
+                    (
+                        COMPRESSED_BODY,
+                        reth_era::common::compression::snappy_compress(&alloy_rlp::encode(body))
+                            .expect("body"),
+                    ),
+                ]
+            })
+            .collect::<Vec<_>>();
+        let name = format!(
+            "mainnet-00000-{}.erae",
+            hex::encode(&parent_hash.as_slice()[..4])
+        );
+        std::fs::write(directory.path().join(&name), erae_object(0, &blocks)).expect("object");
+        write_catalog(directory.path(), &[&name]);
+        let source = file_source(directory.path());
+        let plan = source
+            .plan(&request(
+                range(0, 32),
+                CapabilitySet::of(Capability::Header).with(Capability::Body),
+            ))
+            .await
+            .expect("plan");
+        // The final block fits 18 MiB, but not beside the first window's
+        // roughly 1 MiB. A speculative read must not reject this valid budget.
+        let frames = source
+            .open(
+                &plan.chunks[0],
+                SourceBudget {
+                    max_resident_bytes: 18 << 20,
+                    max_buffered_frames: 1,
+                    ..budget(64 << 20, 64 << 20)
+                },
+                CancellationToken::new(),
+            )
+            .await
+            .expect("open")
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("read the large block sequentially when prefetch does not fit");
+        assert_eq!(frames.len(), 33);
+        let last = frames.last().expect("last frame");
+        assert_eq!(last.block.number, BlockNumber(32));
+        assert_eq!(
+            last.transactions.as_complete().expect("body")[0]
+                .input
+                .as_ref()
+                .expect("input")
+                .len(),
+            17 << 20
+        );
     }
 
     /// A `file:` mirror holding era zero as one valid block with a

@@ -7,8 +7,16 @@ use serde::{Deserialize, Serialize};
 #[repr(u8)]
 pub enum Capability {
     Header = 0,
+    /// Transaction-body material without requiring recovered sender addresses.
+    ///
+    /// [`crate::TransactionEnvelope::from`] may be absent. Require
+    /// [`Self::Transactions`] when consuming senders; sources still evaluate
+    /// active sender predicates before filtering Body or Calldata material.
     Body = 1,
+    /// Decoded transactions; request this capability when senders are required.
     Transactions = 2,
+    /// Transaction input bytes. Like [`Self::Body`], this does not require
+    /// recovered sender addresses.
     Calldata = 3,
     Receipts = 4,
     Logs = 5,

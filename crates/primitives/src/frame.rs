@@ -110,6 +110,8 @@ pub struct TransactionEnvelope {
     pub transaction_type: u8,
     pub index: u32,
     pub encoded: Option<Vec<u8>>,
+    /// Sender address, which Body/Calldata projections may omit. Request
+    /// [`Capability::Transactions`] when this field is needed.
     pub from: Option<Address>,
     pub to: Option<Address>,
     pub nonce: Option<u64>,

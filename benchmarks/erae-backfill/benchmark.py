@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Alternate baseline/candidate EraE backfills and verify delivered-output digests."""
+"""Alternate baseline/candidate historical backfills and verify delivered-output digests."""
 
 from __future__ import annotations
 
@@ -32,6 +32,7 @@ def arguments() -> argparse.Namespace:
     parser.add_argument("--candidate-binary", type=Path, required=True)
     parser.add_argument("--config", type=Path, default=ROOT / "config/benchmarks/real-source.toml")
     parser.add_argument("--output-directory", type=Path, required=True)
+    parser.add_argument("--source-policy", choices=["erae-only", "xatu-only", "p2p-only", "history-portfolio"], default="erae-only")
     parser.add_argument("--processors", nargs="+", choices=PROCESSORS, default=PROCESSORS)
     parser.add_argument("--from-block", type=int, default=19_426_589)
     parser.add_argument("--to-block", type=int, default=19_430_684)
@@ -51,7 +52,8 @@ def arguments() -> argparse.Namespace:
 
 def prepare(args: argparse.Namespace) -> dict:
     identity = {
-        "schema": "leani.erae-backfill-comparison.v1",
+        "schema": "leani.real-source-backfill-comparison.v2",
+        "source_policy": args.source_policy,
         "binaries": {
             label: {"path": str(binary), "sha256": sha256(binary)}
             for label, binary in [("baseline", args.baseline_binary), ("candidate", args.candidate_binary)]
@@ -76,6 +78,11 @@ def prepare(args: argparse.Namespace) -> dict:
     return identity
 
 
+def optional_metric_total(metrics: list[dict], field: str) -> int | None:
+    values = [source.get(field) for source in metrics]
+    return sum(values) if values and None not in values else None
+
+
 def measure(args: argparse.Namespace, label: str, processor: str, run: int, expected: str | None) -> dict:
     name = f"{run:02d}-{processor}-{label}"
     report_path = args.output_directory / f"{name}.json"
@@ -86,7 +93,7 @@ def measure(args: argparse.Namespace, label: str, processor: str, run: int, expe
         binary = args.baseline_binary if label == "baseline" else args.candidate_binary
         command = [
             str(binary), "--config", str(args.config), "benchmark", "real-source",
-            "--processor", processor, "--source-policy", "erae-only",
+            "--processor", processor, "--source-policy", args.source_policy,
             "--from-block", str(args.from_block), "--to-block", str(args.to_block),
             "--data-dir", str(data_path), "--report", str(report_path),
             "--timeout-seconds", str(args.timeout_seconds),
@@ -105,7 +112,7 @@ def measure(args: argparse.Namespace, label: str, processor: str, run: int, expe
     report = json.loads(report_path.read_text())
     if report.get("status") != "passed" or not report.get("correctnessPassed"):
         raise SystemExit(f"benchmark correctness failed: {report_path}")
-    if report["range"] != {"start": args.from_block, "end": args.to_block} or report["sourcePolicy"] != "erae_only":
+    if report["range"] != {"start": args.from_block, "end": args.to_block} or report["sourcePolicy"] != args.source_policy.replace("-", "_"):
         raise SystemExit(f"unexpected benchmark range or source: {report_path}")
     if processor in ["block-summary", "blobs-money"] and report["delivery"]["domainEvents"] != args.to_block - args.from_block + 1:
         raise SystemExit(f"benchmark must hash one delivered domain event per block: {report_path}")
@@ -114,19 +121,21 @@ def measure(args: argparse.Namespace, label: str, processor: str, run: int, expe
     metrics = [source["metrics"] for source in report["sources"]]
     return {
         "run": run, "processor": processor, "label": label, "report": report_path.name,
+        "source_policy": args.source_policy,
         "elapsed_seconds": report["elapsedMilliseconds"] / 1000,
         "blocks_per_second": report["blocksPerSecondMilli"] / 1000,
         "first_frame_ms": report["timeToFirstSourceFrameMs"],
         "peak_rss_bytes": report["peakRssBytes"],
-        "physical_reads": sum(source["physical_reads"] for source in metrics),
-        "fetched_bytes": sum(source["fetched_bytes"] for source in metrics),
+        "physical_reads": optional_metric_total(metrics, "physical_reads"),
+        "fetched_bytes": optional_metric_total(metrics, "fetched_bytes"),
         "normalized_bytes": sum(source["normalized_bytes"] for source in metrics),
         "output_digest": report["outputDigest"],
     }
 
 
 def summarize(args: argparse.Namespace, results: list[dict]) -> None:
-    lines = ["# EraE backfill comparison", "",
+    lines = ["# Historical-source backfill comparison", "",
+             f"Source policy: `{args.source_policy}`.", "",
              f"Range: {args.from_block:,}–{args.to_block:,}. Each cell uses the median of completed runs.", "",
              "| Processor | Baseline seconds | Candidate seconds | Speedup |",
              "| --- | ---: | ---: | ---: |"]
