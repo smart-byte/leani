@@ -123,7 +123,7 @@ frame, consumer completion, and sampled peak RSS. Use unique data directories
 and report paths for every run. Repeat public-mirror measurements on a quiet
 host: network bandwidth, archive-cache state, and other work affect results.
 
-The [alternating comparison harness](../../benchmarks/erae-backfill/README.md)
+The [alternating comparison harness](https://github.com/smart-byte/leani/blob/main/benchmarks/erae-backfill/README.md)
 supports the same policies. Its shell entry point defaults to EraE; set
 `LEANI_BENCHMARK_SOURCE_POLICY=xatu-only`, `p2p-only`, or `history-portfolio`
 to compare another policy. The manifest pins that choice, and resumed reports
