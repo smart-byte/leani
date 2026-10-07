@@ -31,6 +31,7 @@ use leani_processor_blobs::{
     BLOCK_COLLECTION, BlobFork, BlobSchedule, BlobTransactionEntity, BlobsBlockEntity, BlobsDelta,
     BlobsProcessor, TRANSACTION_BLOCK_INDEX, TRANSACTION_COLLECTION,
 };
+use leani_processor_block_summary::BlockSummaryProcessor;
 use leani_processor_uniswap::{
     HISTORY_COLLECTION as UNISWAP_HISTORY_COLLECTION, PoolConfig, PoolKind, PoolPriceEntity,
     UniswapConfig, UniswapObservationsProcessor, UniswapPriceDelta,
@@ -1216,6 +1217,10 @@ pub(crate) async fn run_real_source(
             delivery.processed_blocks == range.len()
                 && delivery.completion_records == 1
                 && delivery.acknowledgements > 0
+                && (!matches!(
+                    processor.descriptor().id.as_str(),
+                    "block-summary" | "blobs-money"
+                ) || delivery.domain_events == range.len())
         })
         && processor_store
             .as_ref()
@@ -1385,8 +1390,15 @@ fn externalized_real_source_processor(processor: &dyn Processor) -> Result<Arc<d
             lifecycle,
         )));
     }
+    if let Some(blocks) = processor.as_any().downcast_ref::<BlockSummaryProcessor>() {
+        return Ok(Arc::new(blocks.clone().with_contract(
+            instance,
+            PublicationPolicy::FinalizedOnly,
+            lifecycle,
+        )));
+    }
     bail!(
-        "real-source externalized benchmark currently supports blobs-money and uniswap-observations processors"
+        "real-source externalized benchmark currently supports blobs-money, uniswap-observations, and block-summary processors"
     )
 }
 
@@ -5069,15 +5081,30 @@ fn canonical_http_change(change: &serde_json::Value) -> Result<Option<Vec<u8>>> 
         bail!("benchmark change has no kind");
     };
     let key = match kind {
-        "synthetic.counter.put" | "blobs.block.put" | "uniswap.price.observation.put" => {
-            decode_hex_json(change, "key")?
-        }
+        "synthetic.counter.put"
+        | "blobs.block.put"
+        | "uniswap.price.observation.put"
+        | "ethereum.block.summary.put" => decode_hex_json(change, "key")?,
         _ => return Ok(None),
     };
     let data = change
         .get("data")
         .context("benchmark domain change has no data")?;
     match kind {
+        "ethereum.block.summary.put" => {
+            // Block-summary's public fields are scalar values. Sort the keys
+            // so HTTP object ordering cannot change the digest, and include
+            // every field rather than checking only block identity.
+            let fields = data
+                .as_object()
+                .context("block summary is not an object")?
+                .iter()
+                .collect::<std::collections::BTreeMap<_, _>>();
+            let mut event = vec![3];
+            event.extend_from_slice(&key);
+            event.extend_from_slice(&serde_json::to_vec(&fields)?);
+            Ok(Some(event))
+        }
         "synthetic.counter.put" => {
             let payload = data
                 .get("value")
@@ -7038,19 +7065,58 @@ mod tests {
 
     #[test]
     fn real_source_processor_is_externalized_without_changing_identity() {
-        let configured: Arc<dyn Processor> = Arc::new(BlobsProcessor::default());
-        let expected_instance = configured.descriptor().instance.clone();
-        let processor =
-            externalized_real_source_processor(configured.as_ref()).expect("externalized");
-        assert_eq!(processor.descriptor().instance, expected_instance);
-        assert_eq!(
-            processor.descriptor().lifecycle.output.mode,
-            OutputPolicyMode::None
-        );
-        assert_eq!(
-            processor.descriptor().lifecycle.delivery.mode,
-            DeliveryPolicyMode::UntilAcknowledged
-        );
+        let processors: [Arc<dyn Processor>; 2] = [
+            Arc::new(BlobsProcessor::default()),
+            Arc::new(
+                BlockSummaryProcessor::new(leani_processor_block_summary::BlockSummaryConfig {
+                    start_block: BlockNumber(0),
+                })
+                .expect("block-summary"),
+            ),
+        ];
+        for configured in processors {
+            let expected_instance = configured.descriptor().instance.clone();
+            let processor =
+                externalized_real_source_processor(configured.as_ref()).expect("externalized");
+            assert_eq!(processor.descriptor().instance, expected_instance);
+            assert_eq!(
+                processor.descriptor().lifecycle.output.mode,
+                OutputPolicyMode::None
+            );
+            assert_eq!(
+                processor.descriptor().lifecycle.delivery.mode,
+                DeliveryPolicyMode::UntilAcknowledged
+            );
+        }
+    }
+
+    #[test]
+    fn block_summary_delivery_is_hashed_and_changes_with_its_content() {
+        let change = serde_json::json!({
+            "kind": "ethereum.block.summary.put",
+            "key": format!("0x{}", "01".repeat(32)),
+            "data": {
+                "blockNumber": 42,
+                "gasUsed": 21000,
+                "transactionCount": 1,
+                "sizeBytes": 512,
+                "finality": "finalized",
+            },
+        });
+        let original = canonical_http_change(&change)
+            .expect("decode block summary")
+            .expect("block summary must contribute to the delivered digest");
+        for field in ["gasUsed", "transactionCount", "sizeBytes"] {
+            let mut changed = change.clone();
+            changed["data"][field] = serde_json::json!(999);
+            assert_ne!(
+                canonical_http_change(&changed)
+                    .expect("changed summary")
+                    .as_ref(),
+                Some(&original),
+                "the delivered digest must cover {field}",
+            );
+        }
     }
 
     #[test]

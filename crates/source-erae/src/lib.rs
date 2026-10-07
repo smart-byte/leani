@@ -5,8 +5,12 @@
 //! are never retained after the returned stream is consumed.
 //!
 //! The mirror and its checksum catalog are the trust root. The catalog names
-//! each era's object, and the source checks every execution commitment inside
-//! the blocks it reads, but nothing anchors a block hash to consensus.
+//! each era's object, and the source checks the execution commitments of the
+//! components it reads, but nothing anchors a block hash to consensus.
+
+mod projection;
+
+use projection::{EraeProjection, normalize_block};
 
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
@@ -19,19 +23,15 @@ use std::{
 };
 
 use alloy_consensus::{
-    Block, EthereumReceipt, Header, Transaction as _, TxReceipt as _,
+    EthereumReceipt, Header,
     proofs::{calculate_receipt_root, calculate_transaction_root},
-    transaction::SignerRecoverable,
 };
-use alloy_eips::Encodable2718;
 use alloy_primitives::{Address as AlloyAddress, U256};
 use async_trait::async_trait;
-use futures::{StreamExt, stream};
+use futures::{StreamExt, TryStreamExt, stream};
 use leani_primitives::{
-    Address, BlockFrame, BlockHash, BlockNumber, BlockRange, BlockRef, Capability, CapabilitySet,
-    ChainId, CheckStatus, Finality, HeaderEnvelope, Log, Material, MissingReason, ObjectIdentity,
-    Provenance, Quantity, ReceiptEnvelope, SourceId, SourceKind, TransactionEnvelope,
-    TransactionHash, TrustModel, VerificationCheck, VerificationReport, Withdrawal,
+    Address, BlockFrame, BlockHash, BlockNumber, BlockRange, Capability, CapabilitySet, ChainId,
+    Finality, Quantity, SourceId, SourceKind, TrustModel, VerificationCheck,
 };
 use leani_source_api::{
     BlockFrameStream, DataRequest, FieldProjection, FilterSet, FinalityModel, HistorySource,
@@ -78,6 +78,14 @@ const E2STORE_HEADER_BYTES: usize = 8;
 /// their normalized frame must meet as well. Bodies stay below 10 MiB even at
 /// the highest gas limits, and the frame budget usually binds first.
 const MAX_BLOCK_DECODE_BYTES: u64 = 32 * 1_024 * 1_024;
+/// Compressed input and decoded output have independent bounds. A small
+/// consumer frame buffer must not cause a separate HTTP round trip per block.
+const MAX_ACQUISITION_BLOCKS: u64 = 256;
+const INITIAL_ACQUISITION_BLOCKS: u64 = 32;
+const TARGET_ACQUISITION_BYTES: u64 = 16 * 1_024 * 1_024;
+/// Each index has at most 8,192 * 5 offsets and their sorted positions. Keep
+/// metadata for a few adjacent eras, bounded independently of archive size.
+const MAX_CACHED_INDEXES: usize = 8;
 const RETH_REVISION: &str = "5a6940e351fed80458fe6c9da8581cbe4b8bd036";
 
 /// Construction settings for one archive mirror.
@@ -246,12 +254,29 @@ struct ObjectIndex {
     index: DynamicBlockIndex,
     component_types: Vec<[u8; 2]>,
     initial_input_bytes: u64,
+    positions: Vec<u64>,
+}
+
+#[derive(Debug)]
+struct CachedIndex {
+    filename: String,
+    checksum: [u8; 32],
+    value: Arc<tokio::sync::OnceCell<Arc<ObjectIndex>>>,
+}
+
+/// Compressed, contiguous archive ranges. Decoding consumes only a bounded
+/// number of frames at a time, regardless of this acquisition's block span.
+#[derive(Debug)]
+struct AcquiredBatch {
+    range: BlockRange,
+    fetched: Vec<(u64, Vec<u8>)>,
+    input_bytes: u64,
 }
 
 /// One block's decoded archive components.
 struct ArchivedBlock {
     header: Header,
-    body: BlockBody,
+    body: Option<BlockBody>,
     receipts: Option<Vec<SlimReceipt>>,
 }
 
@@ -261,6 +286,7 @@ pub struct EraeSource {
     descriptor: SourceDescriptor,
     client: Client,
     catalog: Arc<tokio::sync::Mutex<Option<CachedCatalog>>>,
+    indexes: Arc<Mutex<VecDeque<CachedIndex>>>,
     acquisition_metrics: Arc<Mutex<SourceAcquisitionMetrics>>,
 }
 
@@ -289,13 +315,13 @@ impl EraeSource {
             capabilities: execution_capabilities(),
             complete_capabilities: execution_capabilities(),
             // Canonicality follows the mirror's published catalog. Every
-            // execution-layer commitment is checked locally, but nothing
+            // fetched execution-layer commitment is checked locally, but nothing
             // anchors a block hash to consensus.
             trust: TrustModel::TrustedDataset,
             finality: FinalityModel::Finalized,
             partitioning: Partitioning::SourceDefined("erae-dynamic-index".to_owned()),
             expected_lag: Duration::from_hours(2),
-            schema_version: format!("erae.e2store.v1+reth.{RETH_REVISION}"),
+            schema_version: format!("erae.e2store.v2+reth.{RETH_REVISION}"),
             priority: config.priority,
         };
         Ok(Self {
@@ -303,6 +329,7 @@ impl EraeSource {
             descriptor,
             client,
             catalog: Arc::new(tokio::sync::Mutex::new(None)),
+            indexes: Arc::new(Mutex::new(VecDeque::new())),
             acquisition_metrics: Arc::new(Mutex::new(SourceAcquisitionMetrics::default())),
         })
     }
@@ -377,7 +404,9 @@ impl EraeSource {
             range,
             required: CapabilitySet::of(Capability::Header)
                 .with(Capability::Transactions)
-                .with(Capability::Receipts),
+                .with(Capability::Receipts)
+                .with(Capability::Logs)
+                .with(Capability::Withdrawals),
             allow_filtered: false,
             projection: FieldProjection::default(),
             log_fields: leani_primitives::LogFieldSet::NONE,
@@ -664,12 +693,15 @@ impl EraeSource {
         let response = response.ok_or_else(|| {
             SourceError::Protocol("eraE byte-range retry loop ended without a response".to_owned())
         })?;
-        let bytes = read_capped(response, label, expected, |observed| {
+        let read = read_capped(response, label, expected, |observed| {
             SourceError::Protocol(format!(
                 "{label} returned at least {observed} bytes for range {start}-{end}, expected {expected}"
             ))
-        })
-        .await?;
+        });
+        let bytes = tokio::select! {
+            () = cancellation.cancelled() => return Err(SourceError::Cancelled),
+            bytes = read => bytes?,
+        };
         let observed = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
         if observed != expected {
             return Err(SourceError::Protocol(format!(
@@ -681,6 +713,51 @@ impl EraeSource {
     }
 
     async fn load_index(
+        &self,
+        object: &CatalogObject,
+        budget: SourceBudget,
+        cancellation: &CancellationToken,
+    ) -> Result<Arc<ObjectIndex>, SourceError> {
+        let cell = {
+            let mut indexes = self
+                .indexes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let entry = indexes
+                .iter()
+                .position(|entry| {
+                    entry.filename == object.filename && entry.checksum == object.checksum
+                })
+                .and_then(|position| indexes.remove(position))
+                .unwrap_or_else(|| CachedIndex {
+                    filename: object.filename.clone(),
+                    checksum: object.checksum,
+                    value: Arc::new(tokio::sync::OnceCell::new()),
+                });
+            let cell = Arc::clone(&entry.value);
+            indexes.push_back(entry);
+            while indexes.len() > MAX_CACHED_INDEXES {
+                indexes.pop_front();
+            }
+            cell
+        };
+        let index = tokio::select! {
+            () = cancellation.cancelled() => return Err(SourceError::Cancelled),
+            index = cell.get_or_try_init(|| async {
+                self.read_index(object, budget, cancellation).await.map(Arc::new)
+            }) => Arc::clone(index?),
+        };
+        // A cache hit never lets a caller bypass its own input budget. Charge
+        // the metadata logically to every open, even when transport is shared.
+        enforce_budget(
+            index.initial_input_bytes,
+            budget.max_input_bytes,
+            "input_bytes",
+        )?;
+        Ok(index)
+    }
+
+    async fn read_index(
         &self,
         object: &CatalogObject,
         budget: SourceBudget,
@@ -751,12 +828,15 @@ impl EraeSource {
             component_types.push([header[0], header[1]]);
         }
         validate_component_layout(&component_types)?;
-        Ok(ObjectIndex {
+        let mut object_index = ObjectIndex {
             index_position: layout.position,
             index,
             component_types,
             initial_input_bytes,
-        })
+            positions: Vec::new(),
+        };
+        object_index.positions = sorted_positions(&object_index)?;
+        Ok(object_index)
     }
 }
 
@@ -840,16 +920,16 @@ impl HistorySource for EraeSource {
             metrics.opened_chunks = metrics.opened_chunks.saturating_add(1);
             metrics.opened_ranges.push(chunk.range);
         }
-        let (filename, required) = decode_partition(&chunk.partition)?;
+        let identity = decode_partition(&chunk.partition)?;
         // The chunk was planned from the cached catalog, so its age does not
         // matter here, and a failed refresh cannot fail the chunk.
         let catalog = self.catalog(None).await?;
         let object = catalog
             .iter()
-            .find(|object| object.filename == filename)
+            .find(|object| object.filename == identity.filename)
             .cloned()
             .ok_or_else(|| SourceError::InvalidPlan("unknown eraE object".to_owned()))?;
-        let index = Arc::new(self.load_index(&object, budget, &cancellation).await?);
+        let index = self.load_index(&object, budget, &cancellation).await?;
         let actual_end = index
             .index
             .starting_number()
@@ -863,14 +943,16 @@ impl HistorySource for EraeSource {
             source: self.clone(),
             object,
             index,
-            required,
+            projection: Arc::new(identity.projection),
             next: chunk.range.start().0,
             end: chunk.range.end().0,
             budget,
             observed_input_bytes: 0,
             previous_hash: None,
             pending: VecDeque::new(),
-            cancellation,
+            acquired: None,
+            prefetched: None,
+            cancellation: cancellation.child_token(),
         };
         Ok(Box::pin(stream::try_unfold(state, next_stream_frame)))
     }
@@ -901,7 +983,7 @@ fn plan_chunks(
                 source_id: descriptor.id.clone(),
                 range: BlockRange::new(BlockNumber(next), BlockNumber(end))
                     .map_err(|error| SourceError::InvalidPlan(error.to_string()))?,
-                partition: encode_partition(&object.filename, request.required),
+                partition: encode_partition(&object.filename, request)?,
                 schema_version: descriptor.schema_version.clone(),
                 expected_parent: None,
                 estimated_bytes: None,
@@ -926,71 +1008,89 @@ struct EraeStreamState {
     source: EraeSource,
     object: CatalogObject,
     index: Arc<ObjectIndex>,
-    required: CapabilitySet,
+    projection: Arc<EraeProjection>,
     next: u64,
     end: u64,
     budget: SourceBudget,
     observed_input_bytes: u64,
     previous_hash: Option<BlockHash>,
     pending: VecDeque<BlockFrame>,
+    acquired: Option<Arc<AcquiredBatch>>,
+    prefetched: Option<tokio::task::JoinHandle<Result<AcquiredBatch, SourceError>>>,
     cancellation: CancellationToken,
+}
+
+impl Drop for EraeStreamState {
+    fn drop(&mut self) {
+        self.cancellation.cancel();
+        if let Some(prefetched) = &self.prefetched {
+            prefetched.abort();
+        }
+    }
 }
 
 async fn next_stream_frame(
     mut state: EraeStreamState,
 ) -> Result<Option<(BlockFrame, EraeStreamState)>, SourceError> {
+    if state.cancellation.is_cancelled() {
+        return Err(SourceError::Cancelled);
+    }
     if let Some(frame) = state.pending.pop_front() {
         return Ok(Some((frame, state)));
     }
     if state.next > state.end {
         return Ok(None);
     }
-    if state.cancellation.is_cancelled() {
-        return Err(SourceError::Cancelled);
-    }
     if state.observed_input_bytes == 0 {
         state.observed_input_bytes = state.index.initial_input_bytes;
     }
-    let buffered = u64::try_from(state.budget.max_buffered_frames).unwrap_or(u64::MAX);
-    let mut batch_end = state
-        .end
-        .min(state.next.saturating_add(buffered.saturating_sub(1)));
     let started = Instant::now();
-    let (mut frames, input_bytes) = loop {
-        let range = BlockRange::new(BlockNumber(state.next), BlockNumber(batch_end))
-            .map_err(|error| SourceError::InvalidPlan(error.to_string()))?;
-        match read_sparse_batch(
-            &state.source,
-            &state.object,
-            &state.index,
+    if state
+        .acquired
+        .as_ref()
+        .is_none_or(|batch| state.next > batch.range.end().0)
+    {
+        state.acquire_next().await?;
+    }
+    let acquired = Arc::clone(state.acquired.as_ref().ok_or_else(|| {
+        SourceError::CorruptFrame("eraE acquisition returned no input".to_owned())
+    })?);
+    let buffered = u64::try_from(state.budget.max_buffered_frames).unwrap_or(u64::MAX);
+    let batch_end = acquired
+        .range
+        .end()
+        .0
+        .min(state.next.saturating_add(buffered.saturating_sub(1)));
+    let range = BlockRange::new(BlockNumber(state.next), BlockNumber(batch_end))
+        .map_err(|error| SourceError::InvalidPlan(error.to_string()))?;
+    let source = state.source.clone();
+    let object = state.object.clone();
+    let index = Arc::clone(&state.index);
+    let projection = Arc::clone(&state.projection);
+    let budget = state.budget;
+    let cancellation = state.cancellation.clone();
+    // Snappy, RLP, trie commitments and signature recovery are CPU work. Keep
+    // them off the async workers that service sibling chunks and the live lane.
+    let decode = tokio::task::spawn_blocking(move || {
+        decode_sparse_batch(
+            &source,
+            &object,
+            &index,
+            &acquired,
             range,
-            state.required,
-            state.budget,
-            state.observed_input_bytes,
-            &state.cancellation,
+            &projection,
+            budget,
+            &cancellation,
         )
-        .await
-        {
-            // A batch too large to hold is refused before it is fetched, so
-            // fewer blocks are tried, down to one.
-            Err(SourceError::BudgetExceeded {
-                resource: "resident_bytes",
-                ..
-            }) if batch_end > state.next => {
-                batch_end = state.next + (batch_end - state.next) / 2;
-            }
-            batch => break batch?,
-        }
+    });
+    let mut frames = tokio::select! {
+        () = state.cancellation.cancelled() => return Err(SourceError::Cancelled),
+        frames = decode => frames
+            .map_err(|error| SourceError::Unavailable(error.to_string()))??,
     };
     state
         .source
         .record_decoded_batch(&frames, started.elapsed());
-    state.observed_input_bytes = state.observed_input_bytes.saturating_add(input_bytes);
-    enforce_budget(
-        state.observed_input_bytes,
-        state.budget.max_input_bytes,
-        "input_bytes",
-    )?;
     if let (Some(previous), Some(first)) = (state.previous_hash, frames.first_mut()) {
         if first.block.parent_hash != previous {
             return Err(SourceError::CorruptFrame(format!(
@@ -1010,25 +1110,171 @@ async fn next_stream_frame(
         .ok_or_else(|| SourceError::CorruptFrame("eraE batch returned no frames".to_owned()))
 }
 
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn acquisition_range(start: u64, end: u64, window: u64) -> Result<BlockRange, SourceError> {
+    BlockRange::new(
+        BlockNumber(start),
+        BlockNumber(end.min(start.saturating_add(window - 1))),
+    )
+    .map_err(|error| SourceError::InvalidPlan(error.to_string()))
+}
+
+impl EraeStreamState {
+    async fn acquire_next(&mut self) -> Result<(), SourceError> {
+        // Release the prior input before reserving the next window's bytes.
+        self.acquired = None;
+        let acquired = if let Some(prefetched) = self.prefetched.take() {
+            tokio::select! {
+                () = self.cancellation.cancelled() => return Err(SourceError::Cancelled),
+                result = prefetched => result
+                    .map_err(|error| SourceError::Unavailable(error.to_string()))??,
+            }
+        } else {
+            let window = if self.previous_hash.is_none() {
+                INITIAL_ACQUISITION_BLOCKS
+            } else {
+                MAX_ACQUISITION_BLOCKS
+            };
+            let range = acquisition_range(self.next, self.end, window)?;
+            read_sparse_batch(
+                &self.source,
+                &self.object,
+                &self.index,
+                range,
+                &self.projection,
+                self.budget,
+                self.observed_input_bytes,
+                &self.cancellation,
+            )
+            .await?
+        };
+        self.observed_input_bytes = self
+            .observed_input_bytes
+            .saturating_add(acquired.input_bytes);
+        self.acquired = Some(Arc::new(acquired));
+        self.prefetch_next()?;
+        Ok(())
+    }
+
+    /// Overlap the next download with decoding and consumer backpressure. Both
+    /// compressed windows together must fit the same resident input budget.
+    fn prefetch_next(&mut self) -> Result<(), SourceError> {
+        let Some(acquired) = &self.acquired else {
+            return Ok(());
+        };
+        let available = self
+            .budget
+            .max_resident_bytes
+            .saturating_sub(acquired.input_bytes);
+        if acquired.range.end().0 >= self.end || available < TARGET_ACQUISITION_BYTES {
+            return Ok(());
+        }
+        let range =
+            acquisition_range(acquired.range.end().0 + 1, self.end, MAX_ACQUISITION_BLOCKS)?;
+        let source = self.source.clone();
+        let object = self.object.clone();
+        let index = Arc::clone(&self.index);
+        let projection = Arc::clone(&self.projection);
+        let budget = SourceBudget {
+            max_resident_bytes: available,
+            ..self.budget
+        };
+        let observed_input_bytes = self.observed_input_bytes;
+        let cancellation = self.cancellation.clone();
+        self.prefetched = Some(tokio::spawn(async move {
+            read_sparse_batch(
+                &source,
+                &object,
+                &index,
+                range,
+                &projection,
+                budget,
+                observed_input_bytes,
+                &cancellation,
+            )
+            .await
+        }));
+        Ok(())
+    }
+}
+
+/// Plan input separately from the number of decoded frames a consumer buffers.
+/// The resident bound applies to all concurrent responses together.
+#[allow(clippy::too_many_arguments)]
 async fn read_sparse_batch(
     source: &EraeSource,
     object: &CatalogObject,
     object_index: &ObjectIndex,
-    range: BlockRange,
-    required: CapabilitySet,
+    mut range: BlockRange,
+    projection: &EraeProjection,
     budget: SourceBudget,
     observed_input_bytes: u64,
     cancellation: &CancellationToken,
-) -> Result<(Vec<BlockFrame>, u64), SourceError> {
-    let needs_receipts = requires_receipts(required);
-    let needed_types = if needs_receipts {
-        [COMPRESSED_HEADER, COMPRESSED_BODY, COMPRESSED_SLIM_RECEIPTS].as_slice()
-    } else {
-        [COMPRESSED_HEADER, COMPRESSED_BODY].as_slice()
+) -> Result<AcquiredBatch, SourceError> {
+    let (intervals, input_bytes) = loop {
+        let intervals = sparse_intervals(object_index, range, projection)?;
+        let input_bytes = intervals
+            .iter()
+            .try_fold(0_u64, |total, (start, end)| {
+                end.checked_sub(*start)
+                    .and_then(|length| length.checked_add(1))
+                    .and_then(|length| total.checked_add(length))
+            })
+            .ok_or_else(|| SourceError::CorruptFrame("eraE batch size overflows".to_owned()))?;
+        if input_bytes > budget.max_resident_bytes.min(TARGET_ACQUISITION_BYTES) && range.len() > 1
+        {
+            range = BlockRange::new(
+                range.start(),
+                BlockNumber(range.start().0 + (range.len() - 1) / 2),
+            )
+            .map_err(|error| SourceError::InvalidPlan(error.to_string()))?;
+            continue;
+        }
+        break (intervals, input_bytes);
     };
-    let all_positions = sorted_positions(object_index)?;
-    let mut targets = BTreeMap::<u64, [u8; 2]>::new();
+    // These checks precede every request, including all concurrently fetched
+    // spans. A single large block can exceed the soft target, never the budget.
+    enforce_budget(
+        observed_input_bytes.saturating_add(input_bytes),
+        budget.max_input_bytes,
+        "input_bytes",
+    )?;
+    enforce_budget(input_bytes, budget.max_resident_bytes, "resident_bytes")?;
+    let fetched = stream::iter(intervals)
+        .map(|(start, end)| async move {
+            source
+                .read_range(object, start, end, cancellation)
+                .await
+                .map(|bytes| (start, bytes))
+        })
+        .buffered(budget.max_in_flight_requests)
+        .try_collect::<Vec<_>>()
+        .await?;
+    Ok(AcquiredBatch {
+        range,
+        fetched,
+        input_bytes,
+    })
+}
+
+fn needed_component_types(projection: &EraeProjection) -> &'static [[u8; 2]] {
+    match (
+        projection.needs_body(),
+        requires_receipts(projection.required),
+    ) {
+        (false, false) => &[COMPRESSED_HEADER],
+        (false, true) => &[COMPRESSED_HEADER, COMPRESSED_SLIM_RECEIPTS],
+        (true, false) => &[COMPRESSED_HEADER, COMPRESSED_BODY],
+        (true, true) => &[COMPRESSED_HEADER, COMPRESSED_BODY, COMPRESSED_SLIM_RECEIPTS],
+    }
+}
+
+fn sparse_intervals(
+    object_index: &ObjectIndex,
+    range: BlockRange,
+    projection: &EraeProjection,
+) -> Result<Vec<(u64, u64)>, SourceError> {
+    let needed_types = needed_component_types(projection);
+    let mut targets = BTreeMap::new();
     for number in range.iter() {
         let offsets = object_index
             .index
@@ -1043,33 +1289,21 @@ async fn read_sparse_batch(
             }
         }
     }
-    let intervals =
-        coalesce_target_intervals(&targets, &all_positions, object_index.index_position)?;
-    // The index sizes every component, so the whole batch is checked against
-    // the remaining budget before any of it is requested.
-    let input_bytes = intervals
-        .iter()
-        .try_fold(0_u64, |total, (start, end)| {
-            end.checked_sub(*start)
-                .and_then(|length| length.checked_add(1))
-                .and_then(|length| total.checked_add(length))
-        })
-        .ok_or_else(|| SourceError::CorruptFrame("eraE batch size overflows".to_owned()))?;
-    enforce_budget(
-        observed_input_bytes.saturating_add(input_bytes),
-        budget.max_input_bytes,
-        "input_bytes",
-    )?;
-    // The fetched batch is held whole until it decodes.
-    enforce_budget(input_bytes, budget.max_resident_bytes, "resident_bytes")?;
-    let mut fetched = Vec::with_capacity(intervals.len());
-    for (start, end) in intervals {
-        let bytes = source.read_range(object, start, end, cancellation).await?;
-        fetched.push((start, bytes));
-    }
-    let mut components = BTreeMap::new();
-    for (position, expected_type) in targets {
-        let (start, bytes) = fetched
+    coalesce_target_intervals(
+        &targets,
+        &object_index.positions,
+        object_index.index_position,
+    )
+}
+
+impl AcquiredBatch {
+    fn component(
+        &self,
+        index: &ObjectIndex,
+        position: u64,
+    ) -> Result<([u8; 2], &[u8]), SourceError> {
+        let (start, bytes) = self
+            .fetched
             .iter()
             .find(|(start, bytes)| {
                 position >= *start
@@ -1077,27 +1311,36 @@ async fn read_sparse_batch(
                         < start.saturating_add(u64::try_from(bytes.len()).unwrap_or(u64::MAX))
             })
             .ok_or_else(|| SourceError::CorruptFrame("eraE target was not fetched".to_owned()))?;
-        let extent = component_end(position, &all_positions, object_index.index_position)?
-            .saturating_sub(*start);
-        let relative = usize::try_from(position.saturating_sub(*start))
+        let end = component_end(position, &index.positions, index.index_position)?;
+        let start_offset = usize::try_from(position.saturating_sub(*start))
             .map_err(|_| SourceError::CorruptFrame("eraE offset is too large".to_owned()))?;
-        let extent = usize::try_from(extent)
-            .ok()
-            .and_then(|extent| bytes.get(relative..extent))
-            .ok_or_else(|| {
-                SourceError::CorruptFrame("eraE component was not fetched".to_owned())
-            })?;
-        let (entry_type, payload) = e2store_record(extent)?;
-        if entry_type != expected_type {
-            return Err(SourceError::CorruptFrame(format!(
-                "eraE component type mismatch: expected {expected_type:02x?}, got {entry_type:02x?}"
-            )));
-        }
-        components.insert(position, payload);
+        let end_offset = usize::try_from(end.saturating_sub(*start))
+            .map_err(|_| SourceError::CorruptFrame("eraE extent is too large".to_owned()))?;
+        let extent = bytes.get(start_offset..end_offset).ok_or_else(|| {
+            SourceError::CorruptFrame("eraE component was not fetched".to_owned())
+        })?;
+        e2store_record(extent)
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn decode_sparse_batch(
+    source: &EraeSource,
+    object: &CatalogObject,
+    object_index: &ObjectIndex,
+    acquired: &AcquiredBatch,
+    range: BlockRange,
+    projection: &EraeProjection,
+    budget: SourceBudget,
+    cancellation: &CancellationToken,
+) -> Result<Vec<BlockFrame>, SourceError> {
+    let needed_types = needed_component_types(projection);
     let decode_limit = budget.max_frame_bytes.min(MAX_BLOCK_DECODE_BYTES);
     let mut blocks = Vec::with_capacity(usize::try_from(range.len()).unwrap_or(0));
     for number in range.iter() {
+        if cancellation.is_cancelled() {
+            return Err(SourceError::Cancelled);
+        }
         let offsets = object_index
             .index
             .offsets_for_block(number.0)
@@ -1106,17 +1349,20 @@ async fn read_sparse_batch(
         let mut body = None;
         let mut receipts = None;
         let mut decoded = 0_u64;
-        for (offset, entry_type) in offsets.iter().zip(&object_index.component_types) {
-            if !needed_types.contains(entry_type) {
+        for (offset, expected_type) in offsets.iter().zip(&object_index.component_types) {
+            if !needed_types.contains(expected_type) {
                 continue;
             }
             let position = resolve_offset(object_index.index_position, *offset)?;
-            let component = components
-                .remove(&position)
-                .ok_or_else(|| SourceError::CorruptFrame("eraE component missing".to_owned()))?;
+            let (entry_type, component) = acquired.component(object_index, position)?;
+            if entry_type != *expected_type {
+                return Err(SourceError::CorruptFrame(format!(
+                    "eraE component type mismatch: expected {expected_type:02x?}, got {entry_type:02x?}"
+                )));
+            }
             let decompressed = decompress_component(component, decoded, decode_limit)?;
             decoded = decoded.saturating_add(u64::try_from(decompressed.len()).unwrap_or(u64::MAX));
-            match *entry_type {
+            match entry_type {
                 COMPRESSED_HEADER => header = Some(decode_component::<Header>(&decompressed)?),
                 COMPRESSED_BODY => body = Some(decode_component::<BlockBody>(&decompressed)?),
                 COMPRESSED_SLIM_RECEIPTS => {
@@ -1128,12 +1374,11 @@ async fn read_sparse_batch(
         blocks.push(ArchivedBlock {
             header: header
                 .ok_or_else(|| SourceError::CorruptFrame("eraE header missing".to_owned()))?,
-            body: body.ok_or_else(|| SourceError::CorruptFrame("eraE body missing".to_owned()))?,
+            body,
             receipts,
         });
     }
-    let frames =
-        decode_verify_normalize(source, object, object_index, range, blocks, needs_receipts)?;
+    let frames = decode_verify_normalize(source, object, object_index, range, blocks, projection)?;
     for frame in &frames {
         enforce_budget(
             frame.estimated_heap_bytes(),
@@ -1141,7 +1386,7 @@ async fn read_sparse_batch(
             "frame_bytes",
         )?;
     }
-    Ok((frames, input_bytes))
+    Ok(frames)
 }
 
 fn decode_component<T: alloy_rlp::Decodable>(bytes: &[u8]) -> Result<T, SourceError> {
@@ -1155,15 +1400,22 @@ fn decode_verify_normalize(
     object_index: &ObjectIndex,
     range: BlockRange,
     blocks: Vec<ArchivedBlock>,
-    needs_receipts: bool,
+    projection: &EraeProjection,
 ) -> Result<Vec<BlockFrame>, SourceError> {
+    let needs_receipts = requires_receipts(projection.required);
     let observed_at_unix_ms = now_milliseconds();
     let mut headers = Vec::with_capacity(blocks.len());
     let mut bodies = Vec::with_capacity(blocks.len());
     let mut receipts = Vec::with_capacity(blocks.len());
     for block in blocks {
         headers.push(block.header);
-        bodies.push(block.body);
+        if projection.needs_body() {
+            bodies.push(
+                block
+                    .body
+                    .ok_or_else(|| SourceError::CorruptFrame("eraE body missing".to_owned()))?,
+            );
+        }
         if needs_receipts {
             let slim = block.receipts.ok_or_else(|| {
                 SourceError::InvalidPlan(
@@ -1174,7 +1426,9 @@ fn decode_verify_normalize(
         }
     }
     validate_headers(range, &headers)?;
-    validate_bodies(&headers, &bodies)?;
+    if projection.needs_body() {
+        validate_bodies(&headers, &bodies)?;
+    }
     if needs_receipts {
         validate_receipts(&headers, &bodies, &receipts)?;
     }
@@ -1196,18 +1450,18 @@ fn decode_verify_normalize(
     }
     headers
         .iter()
-        .zip(&bodies)
         .enumerate()
-        .map(|(index, (header, body))| {
+        .map(|(index, header)| {
             let block_receipts = needs_receipts.then(|| receipts[index].as_slice());
             normalize_block(
                 source,
                 object,
                 header,
-                body,
+                bodies.get(index),
                 block_receipts,
                 observed_at_unix_ms,
                 index > 0,
+                projection,
             )
         })
         .collect()
@@ -1292,19 +1546,21 @@ fn validate_receipts(
             "eraE header/receipt count mismatch".to_owned(),
         ));
     }
-    for ((header, body), block_receipts) in headers.iter().zip(bodies).zip(receipts) {
-        if body.transactions.len() != block_receipts.len() {
-            return Err(SourceError::CorruptFrame(format!(
-                "eraE transaction/receipt count mismatch at block {}",
-                header.number
-            )));
-        }
-        for (transaction, receipt) in body.transactions.iter().zip(block_receipts) {
-            if transaction.tx_type() != receipt.tx_type {
+    for (index, (header, block_receipts)) in headers.iter().zip(receipts).enumerate() {
+        if let Some(body) = bodies.get(index) {
+            if body.transactions.len() != block_receipts.len() {
                 return Err(SourceError::CorruptFrame(format!(
-                    "eraE transaction/receipt type mismatch at block {}",
+                    "eraE transaction/receipt count mismatch at block {}",
                     header.number
                 )));
+            }
+            for (transaction, receipt) in body.transactions.iter().zip(block_receipts) {
+                if transaction.tx_type() != receipt.tx_type {
+                    return Err(SourceError::CorruptFrame(format!(
+                        "eraE transaction/receipt type mismatch at block {}",
+                        header.number
+                    )));
+                }
             }
         }
         let with_bloom = block_receipts
@@ -1330,220 +1586,6 @@ fn validate_receipts(
         }
     }
     Ok(())
-}
-
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
-fn normalize_block(
-    source: &EraeSource,
-    object: &CatalogObject,
-    header: &Header,
-    body: &BlockBody,
-    receipts: Option<&[EthereumReceipt]>,
-    observed_at_unix_ms: u64,
-    parent_checked: bool,
-) -> Result<BlockFrame, SourceError> {
-    let hash = header.hash_slow();
-    let block_size = alloy_rlp::encode(Block {
-        header: header.clone(),
-        body: body.clone(),
-    })
-    .len();
-    let mut normalized_transactions = Vec::with_capacity(body.transactions.len());
-    let mut normalized_receipts = Vec::new();
-    let mut normalized_logs = Vec::new();
-    let mut previous_gas = 0_u64;
-    let mut block_log_index = 0_u32;
-    for (index, transaction) in body.transactions.iter().enumerate() {
-        let transaction_index = u32::try_from(index)
-            .map_err(|_| SourceError::CorruptFrame("transaction index overflow".to_owned()))?;
-        let transaction_hash = TransactionHash::new(transaction.tx_hash().0);
-        let sender = transaction
-            .recover_signer()
-            .map_err(|error| SourceError::CorruptFrame(error.to_string()))?;
-        let encoded = transaction.encoded_2718();
-        normalized_transactions.push(TransactionEnvelope {
-            hash: transaction_hash,
-            transaction_type: transaction.tx_type() as u8,
-            index: transaction_index,
-            encoded: Some(encoded.clone()),
-            from: Some(address(sender)),
-            to: transaction.to().map(address),
-            nonce: Some(transaction.nonce()),
-            gas_limit: Some(transaction.gas_limit()),
-            value: Some(quantity(transaction.value())),
-            input: Some(transaction.input().to_vec()),
-            max_fee_per_gas: Some(quantity(U256::from(transaction.max_fee_per_gas()))),
-            max_priority_fee_per_gas: transaction
-                .max_priority_fee_per_gas()
-                .map(U256::from)
-                .map(quantity),
-            max_fee_per_blob_gas: transaction
-                .max_fee_per_blob_gas()
-                .map(U256::from)
-                .map(quantity),
-            blob_versioned_hashes: transaction
-                .blob_versioned_hashes()
-                .unwrap_or_default()
-                .iter()
-                .map(|hash| BlockHash::new(hash.0))
-                .collect(),
-            size_bytes: Some(u32::try_from(encoded.len()).unwrap_or(u32::MAX)),
-        });
-        if let Some(receipt) = receipts.and_then(|receipts| receipts.get(index)) {
-            let gas_used = receipt.cumulative_gas_used.saturating_sub(previous_gas);
-            previous_gas = receipt.cumulative_gas_used;
-            let mut receipt_logs = Vec::with_capacity(receipt.logs.len());
-            for source_log in &receipt.logs {
-                let log = Log {
-                    address: address(source_log.address),
-                    topics: source_log
-                        .data
-                        .topics()
-                        .iter()
-                        .map(|topic| topic.0)
-                        .collect(),
-                    data: source_log.data.data.to_vec(),
-                    transaction_hash: Some(transaction_hash),
-                    transaction_index,
-                    log_index: block_log_index,
-                };
-                block_log_index = block_log_index.checked_add(1).ok_or_else(|| {
-                    SourceError::CorruptFrame("log index overflows u32".to_owned())
-                })?;
-                receipt_logs.push(log.clone());
-                normalized_logs.push(log);
-            }
-            normalized_receipts.push(ReceiptEnvelope {
-                transaction_hash,
-                transaction_type: receipt.tx_type as u8,
-                transaction_index,
-                encoded: Some(receipt.with_bloom_ref().encoded_2718()),
-                success: Some(receipt.success),
-                gas_used: Some(gas_used),
-                effective_gas_price: Some(quantity(U256::from(
-                    transaction.effective_gas_price(header.base_fee_per_gas),
-                ))),
-                blob_gas_used: transaction.blob_gas_used(),
-                blob_gas_price: None,
-                logs: receipt_logs,
-            });
-        }
-    }
-    let withdrawals = body
-        .withdrawals
-        .as_ref()
-        .map(|withdrawals| {
-            withdrawals
-                .iter()
-                .map(|withdrawal| Withdrawal {
-                    index: withdrawal.index,
-                    validator_index: withdrawal.validator_index,
-                    address: address(withdrawal.address),
-                    amount_gwei: withdrawal.amount,
-                })
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    let receipts_material = receipts.map_or_else(
-        || Material::Missing(MissingReason::NotRequested),
-        |_| Material::Complete(normalized_receipts),
-    );
-    let logs_material = receipts.map_or_else(
-        || Material::Missing(MissingReason::NotRequested),
-        |_| Material::Complete(normalized_logs),
-    );
-    Ok(BlockFrame {
-        chain_id: source.config.chain_id,
-        block: BlockRef {
-            number: BlockNumber(header.number),
-            hash: BlockHash::new(hash.0),
-            parent_hash: BlockHash::new(header.parent_hash.0),
-            timestamp: header.timestamp,
-        },
-        finality: Finality::Finalized,
-        header: Material::Complete(HeaderEnvelope {
-            rlp: Some(alloy_rlp::encode(header)),
-            transactions_root: Some(BlockHash::new(header.transactions_root.0)),
-            receipts_root: Some(BlockHash::new(header.receipts_root.0)),
-            withdrawals_root: header.withdrawals_root.map(|hash| BlockHash::new(hash.0)),
-            gas_limit: Some(header.gas_limit),
-            gas_used: Some(header.gas_used),
-            base_fee_per_gas: header.base_fee_per_gas.map(U256::from).map(quantity),
-            blob_gas_used: header.blob_gas_used,
-            excess_blob_gas: header.excess_blob_gas,
-            size_bytes: Some(u64::try_from(block_size).unwrap_or(u64::MAX)),
-            consensus_size_bytes: None,
-            transaction_count: Some(u32::try_from(body.transactions.len()).unwrap_or(u32::MAX)),
-        }),
-        transactions: Material::Complete(normalized_transactions),
-        receipts: receipts_material,
-        logs: logs_material,
-        withdrawals: Material::Complete(withdrawals),
-        blob_sidecars: Material::Missing(MissingReason::Unsupported),
-        traces: Material::Missing(MissingReason::Unsupported),
-        state_diffs: Material::Missing(MissingReason::Unsupported),
-        provenance: vec![Provenance {
-            source_id: source.descriptor.id.clone(),
-            source_kind: SourceKind::HistoryArchive,
-            trust: TrustModel::TrustedDataset,
-            range: Some(BlockRange::single(BlockNumber(header.number))),
-            object: Some(ObjectIdentity {
-                locator: object.label.clone(),
-                // The catalog's digest names the object version. Sparse reads
-                // never recompute it, so it is not a verified checksum.
-                version: Some(format!("sha256:{}", hex::encode(object.checksum))),
-                checksum: None,
-                schema: Some("erae/e2store".to_owned()),
-            }),
-            observed_at_unix_ms,
-            projection: if receipts.is_some() {
-                vec![
-                    "header".to_owned(),
-                    "body".to_owned(),
-                    "receipts".to_owned(),
-                ]
-            } else {
-                vec!["header".to_owned(), "body".to_owned()]
-            },
-        }],
-        verification: VerificationReport {
-            // The hash is computed from the archived header itself; nothing
-            // independent anchors it.
-            header_hash: VerificationCheck {
-                status: CheckStatus::NotChecked,
-                detail: Some(
-                    "computed from the archived header; no consensus anchor was checked".to_owned(),
-                ),
-            },
-            parent_continuity: if parent_checked || header.number == 0 {
-                VerificationCheck::VERIFIED
-            } else {
-                VerificationCheck::UNAVAILABLE
-            },
-            transactions_root: VerificationCheck::VERIFIED,
-            receipts_root: if receipts.is_some() {
-                VerificationCheck::VERIFIED
-            } else {
-                VerificationCheck::NOT_CHECKED
-            },
-            withdrawals_root: if header.withdrawals_root.is_some() {
-                VerificationCheck::VERIFIED
-            } else {
-                VerificationCheck {
-                    status: CheckStatus::Unavailable,
-                    detail: Some("blocks before Shanghai commit to no withdrawals".to_owned()),
-                }
-            },
-            dataset_checksum: VerificationCheck {
-                status: CheckStatus::Unavailable,
-                detail: Some(
-                    "sparse reads verify execution roots; full-object SHA-256 was not downloaded"
-                        .to_owned(),
-                ),
-            },
-            consensus_anchor: None,
-        },
-    })
 }
 
 fn parse_catalog(config: &EraeConfig, bytes: &[u8]) -> Result<Vec<CatalogObject>, SourceError> {
@@ -1849,33 +1891,34 @@ fn read_u64(bytes: &[u8]) -> Result<u64, SourceError> {
     Ok(u64::from_le_bytes(bytes))
 }
 
-fn encode_partition(filename: &str, required: CapabilitySet) -> Vec<u8> {
-    let mut output = filename.as_bytes().to_vec();
-    output.push(0);
-    output.extend_from_slice(&required.bits().to_be_bytes());
-    output
+#[derive(Debug, Deserialize, Serialize)]
+struct EraePartition {
+    version: u8,
+    filename: String,
+    projection: EraeProjection,
 }
 
-fn decode_partition(bytes: &[u8]) -> Result<(&str, CapabilitySet), SourceError> {
-    let separator = bytes
-        .len()
-        .checked_sub(3)
-        .ok_or_else(|| SourceError::InvalidPlan("invalid eraE partition".to_owned()))?;
-    if bytes.get(separator) != Some(&0) {
+fn encode_partition(filename: &str, request: &DataRequest) -> Result<Vec<u8>, SourceError> {
+    postcard::to_allocvec(&EraePartition {
+        version: 2,
+        filename: filename.to_owned(),
+        projection: EraeProjection::from_request(request),
+    })
+    .map_err(|error| SourceError::InvalidPlan(format!("invalid eraE partition: {error}")))
+}
+
+fn decode_partition(bytes: &[u8]) -> Result<EraePartition, SourceError> {
+    let (identity, remaining) = postcard::take_from_bytes::<EraePartition>(bytes)
+        .map_err(|error| SourceError::InvalidPlan(format!("invalid eraE partition: {error}")))?;
+    if identity.version != 2
+        || !remaining.is_empty()
+        || CapabilitySet::from_bits(identity.projection.required.bits()).is_none()
+    {
         return Err(SourceError::InvalidPlan(
-            "invalid eraE partition capability bytes".to_owned(),
+            "invalid eraE partition version or capabilities".to_owned(),
         ));
     }
-    let filename = std::str::from_utf8(&bytes[..separator])
-        .map_err(|_| SourceError::InvalidPlan("invalid eraE partition filename".to_owned()))?;
-    let bits = u16::from_be_bytes(
-        bytes[separator + 1..]
-            .try_into()
-            .map_err(|_| SourceError::InvalidPlan("invalid eraE capability bits".to_owned()))?,
-    );
-    let required = CapabilitySet::from_bits(bits)
-        .ok_or_else(|| SourceError::InvalidPlan("unknown eraE capability bits".to_owned()))?;
-    Ok((filename, required))
+    Ok(identity)
 }
 
 const fn execution_capabilities() -> CapabilitySet {
@@ -1918,7 +1961,11 @@ async fn read_capped(
     if let Some(length) = response.content_length().filter(|length| *length > limit) {
         return Err(too_large(length));
     }
-    let mut body = Vec::new();
+    let capacity = response
+        .content_length()
+        .and_then(|length| usize::try_from(length).ok())
+        .unwrap_or(0);
+    let mut body = Vec::with_capacity(capacity);
     while let Some(chunk) = response
         .chunk()
         .await
@@ -1992,7 +2039,11 @@ pub struct EraeProbeReport {
 
 #[cfg(test)]
 mod tests {
+    mod http;
+
     use super::*;
+    use alloy_eips::Encodable2718;
+    use leani_primitives::CheckStatus;
 
     #[test]
     fn public_catalog_lines_are_strict_and_ordered() {
@@ -2010,10 +2061,14 @@ mod tests {
     #[test]
     fn partitions_preserve_capabilities() {
         let required = CapabilitySet::of(Capability::Header).with(Capability::Receipts);
-        let encoded = encode_partition("mainnet-00000-a6860fef.erae", required);
-        let (filename, decoded) = decode_partition(&encoded).expect("partition");
-        assert_eq!(filename, "mainnet-00000-a6860fef.erae");
-        assert_eq!(decoded, required);
+        let encoded = encode_partition(
+            "mainnet-00000-a6860fef.erae",
+            &request(range(0, 0), required),
+        )
+        .expect("encoded partition");
+        let decoded = decode_partition(&encoded).expect("partition");
+        assert_eq!(decoded.filename, "mainnet-00000-a6860fef.erae");
+        assert_eq!(decoded.projection.required, required);
     }
 
     #[test]
@@ -2245,10 +2300,11 @@ mod tests {
             &source,
             &objects[0],
             &pre_shanghai,
-            &BlockBody::default(),
+            Some(&BlockBody::default()),
             None,
             0,
             false,
+            &EraeProjection::from_request(&request(range(0, 0), headers_and_bodies())),
         )
         .expect("frame");
         // Audit M-H3: the hash is computed from the archived header itself,
@@ -2283,8 +2339,17 @@ mod tests {
             withdrawals: Some(alloy_eips::eip4895::Withdrawals::default()),
             ..BlockBody::default()
         };
-        let frame = normalize_block(&source, &objects[0], &post_shanghai, &body, None, 0, true)
-            .expect("frame");
+        let frame = normalize_block(
+            &source,
+            &objects[0],
+            &post_shanghai,
+            Some(&body),
+            None,
+            0,
+            true,
+            &EraeProjection::from_request(&request(range(0, 0), headers_and_bodies())),
+        )
+        .expect("frame");
         assert_eq!(
             frame.verification.withdrawals_root,
             VerificationCheck::VERIFIED
@@ -2386,6 +2451,7 @@ mod tests {
             index: DynamicBlockIndex::new(0, 2, offsets),
             component_types: vec![COMPRESSED_HEADER, COMPRESSED_BODY],
             initial_input_bytes: 0,
+            positions: Vec::new(),
         };
         for (name, index_position, offsets) in [
             ("inside the version record", 100, vec![-96, -50]),
@@ -2496,10 +2562,11 @@ mod tests {
             &source,
             &objects[0],
             &Header::default(),
-            &BlockBody::default(),
+            Some(&BlockBody::default()),
             None,
             0,
             false,
+            &EraeProjection::from_request(&request(range(0, 0), headers_and_bodies())),
         )
         .expect("frame");
         let locator = &frame.provenance[0]
@@ -2902,6 +2969,522 @@ mod tests {
         );
     }
 
+    fn one_execution_block(
+        directory: &std::path::Path,
+        body: &BlockBody,
+        receipts: Option<&[EthereumReceipt]>,
+    ) -> (EraeSource, BlockNumber) {
+        let number = MAINNET_BYZANTIUM_BLOCK.div_ceil(BLOCKS_PER_FILE) * BLOCKS_PER_FILE;
+        let with_bloom = receipts
+            .unwrap_or_default()
+            .iter()
+            .map(alloy_consensus::TxReceipt::with_bloom_ref)
+            .collect::<Vec<_>>();
+        let header = Header {
+            number,
+            transactions_root: calculate_transaction_root(&body.transactions),
+            ommers_hash: body.calculate_ommers_root(),
+            withdrawals_root: body.calculate_withdrawals_root(),
+            receipts_root: calculate_receipt_root(&with_bloom),
+            logs_bloom: with_bloom
+                .iter()
+                .fold(alloy_primitives::Bloom::ZERO, |bloom, receipt| {
+                    bloom | receipt.bloom_ref()
+                }),
+            ..Header::default()
+        };
+        let compress =
+            |bytes: &[u8]| reth_era::common::compression::snappy_compress(bytes).expect("compress");
+        let mut components = vec![
+            (COMPRESSED_HEADER, compress(&alloy_rlp::encode(&header))),
+            (COMPRESSED_BODY, compress(&alloy_rlp::encode(body))),
+        ];
+        if let Some(receipts) = receipts {
+            let slim = receipts
+                .iter()
+                .map(|receipt| SlimReceipt {
+                    tx_type: receipt.tx_type,
+                    status: receipt.success.into(),
+                    cumulative_gas_used: receipt.cumulative_gas_used,
+                    logs: receipt.logs.clone(),
+                })
+                .collect::<Vec<_>>();
+            components.push((COMPRESSED_SLIM_RECEIPTS, compress(&alloy_rlp::encode(slim))));
+        }
+        let name = format!(
+            "mainnet-{:05}-{}.erae",
+            number / BLOCKS_PER_FILE,
+            hex::encode(&header.hash_slow().as_slice()[..4])
+        );
+        std::fs::write(directory.join(&name), erae_object(number, &[components])).expect("object");
+        write_catalog(directory, &[&name]);
+        (file_source(directory), BlockNumber(number))
+    }
+
+    #[tokio::test]
+    async fn header_reads_do_not_acquire_or_decode_unrequested_bodies() {
+        let directory = tempfile::tempdir().expect("directory");
+        let header = Header::default();
+        let header_bytes =
+            reth_era::common::compression::snappy_compress(&alloy_rlp::encode(&header))
+                .expect("header");
+        // The unused body is deliberately invalid Snappy and much larger than
+        // the complete acquisition budget. A header request must still work.
+        let components = vec![
+            (COMPRESSED_HEADER, header_bytes),
+            (COMPRESSED_BODY, vec![0xab; 65_536]),
+        ];
+        let name = format!(
+            "mainnet-00000-{}.erae",
+            hex::encode(&header.hash_slow().as_slice()[..4])
+        );
+        std::fs::write(directory.path().join(&name), erae_object(0, &[components]))
+            .expect("object");
+        write_catalog(directory.path(), &[&name]);
+        let source = file_source(directory.path());
+        let plan = source
+            .plan(&request(range(0, 0), CapabilitySet::of(Capability::Header)))
+            .await
+            .expect("plan");
+        let frames = source
+            .open(
+                &plan.chunks[0],
+                budget(4_096, 4_096),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("open")
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("header without body");
+        assert_eq!(frames.len(), 1);
+        assert_eq!(
+            frames[0].header.as_complete().expect("header").rlp,
+            Some(alloy_rlp::encode(header))
+        );
+        assert!(!frames[0].transactions.is_present());
+        assert_eq!(
+            frames[0].verification.transactions_root,
+            VerificationCheck::NOT_CHECKED
+        );
+        assert!(
+            source
+                .acquisition_metrics()
+                .expect("metrics")
+                .fetched_bytes
+                .is_some_and(|bytes| bytes < 4_096)
+        );
+    }
+
+    #[tokio::test]
+    async fn body_requests_verify_commitments_without_recovering_unrequested_senders() {
+        let directory = tempfile::tempdir().expect("directory");
+        let transaction =
+            alloy_consensus::TxEnvelope::Legacy(alloy_consensus::Signed::new_unhashed(
+                alloy_consensus::TxLegacy::default(),
+                alloy_primitives::Signature::new(U256::ZERO, U256::ZERO, false),
+            ));
+        let encoded = transaction.encoded_2718();
+        let body = BlockBody {
+            transactions: vec![transaction.into()],
+            ..BlockBody::default()
+        };
+        let (source, number) = one_execution_block(directory.path(), &body, None);
+        for (required, recover_sender) in [
+            (
+                CapabilitySet::of(Capability::Header).with(Capability::Body),
+                false,
+            ),
+            (
+                CapabilitySet::of(Capability::Header).with(Capability::Transactions),
+                true,
+            ),
+        ] {
+            let plan = source
+                .plan(&request(BlockRange::single(number), required))
+                .await
+                .expect("plan");
+            let result = source
+                .open(
+                    &plan.chunks[0],
+                    budget(1 << 20, 1 << 20),
+                    CancellationToken::new(),
+                )
+                .await
+                .expect("open")
+                .try_collect::<Vec<_>>()
+                .await;
+            if recover_sender {
+                assert!(
+                    matches!(result, Err(SourceError::CorruptFrame(_))),
+                    "a requested sender needs a valid signature"
+                );
+            } else {
+                let frames = result.expect("body commitments do not require sender recovery");
+                let transactions = frames[0].transactions.as_complete().expect("complete body");
+                assert_eq!(transactions[0].encoded.as_ref(), Some(&encoded));
+                assert_eq!(transactions[0].from, None);
+                assert_eq!(
+                    frames[0].verification.transactions_root,
+                    VerificationCheck::VERIFIED
+                );
+            }
+        }
+    }
+
+    fn logged_transactions() -> (BlockBody, Vec<EthereumReceipt>) {
+        use alloy_consensus::transaction::SignerRecoverable;
+        let transactions = (0..2)
+            .map(|nonce| {
+                let tx = reth_ethereum_primitives::TransactionSigned::Legacy(
+                    alloy_consensus::Signed::new_unhashed(
+                        alloy_consensus::TxLegacy {
+                            nonce,
+                            ..Default::default()
+                        },
+                        alloy_primitives::Signature::test_signature(),
+                    ),
+                );
+                tx.recover_signer()
+                    .expect("fixture signatures recover before filtering");
+                tx
+            })
+            .collect::<Vec<_>>();
+        let body = BlockBody {
+            transactions,
+            ..BlockBody::default()
+        };
+        let receipts = (0_u8..2)
+            .map(|index| EthereumReceipt {
+                tx_type: alloy_consensus::TxType::Legacy,
+                success: true,
+                cumulative_gas_used: (u64::from(index) + 1) * 21_000,
+                logs: vec![alloy_primitives::Log::new_unchecked(
+                    AlloyAddress::repeat_byte(index + 1),
+                    vec![
+                        alloy_primitives::B256::repeat_byte(0xaa),
+                        alloy_primitives::B256::repeat_byte(index),
+                    ],
+                    alloy_primitives::Bytes::from(vec![index]),
+                )],
+            })
+            .collect::<Vec<_>>();
+        (body, receipts)
+    }
+
+    fn replace_execution_component(
+        directory: &std::path::Path,
+        number: BlockNumber,
+        target: [u8; 2],
+        replacement: Vec<u8>,
+    ) {
+        let catalog = std::fs::read_to_string(directory.join(CATALOG_FILE)).expect("catalog");
+        let name = catalog.split_whitespace().last().expect("object name");
+        let path = directory.join(name);
+        let bytes = std::fs::read(&path).expect("object");
+        let mut offset = E2STORE_HEADER_BYTES;
+        let mut components = Vec::new();
+        loop {
+            let (kind, payload) = e2store_record(&bytes[offset..]).expect("record");
+            if kind == DYNAMIC_BLOCK_INDEX {
+                break;
+            }
+            components.push((kind, payload.to_vec()));
+            offset += E2STORE_HEADER_BYTES + payload.len();
+        }
+        components
+            .iter_mut()
+            .find(|(kind, _)| *kind == target)
+            .expect("target component")
+            .1 = replacement;
+        std::fs::write(path, erae_object(number.0, &[components])).expect("replace object");
+    }
+
+    #[tokio::test]
+    async fn logs_without_transaction_hashes_do_not_read_bodies() {
+        use leani_primitives::{LogField, LogFieldSet};
+
+        let directory = tempfile::tempdir().expect("directory");
+        let (body, receipts) = logged_transactions();
+        let (source, number) = one_execution_block(directory.path(), &body, Some(&receipts));
+        replace_execution_component(
+            directory.path(),
+            number,
+            COMPRESSED_BODY,
+            vec![0xab; 65_536],
+        );
+        let mut request = request(
+            BlockRange::single(number),
+            CapabilitySet::of(Capability::Header).with(Capability::Logs),
+        );
+        for require_hash in [false, true] {
+            request.log_fields = if require_hash {
+                LogFieldSet::of(LogField::TransactionHash)
+            } else {
+                LogFieldSet::NONE
+            };
+            let plan = source.plan(&request).await.expect("plan");
+            let result = source
+                .open(
+                    &plan.chunks[0],
+                    budget(4_096, 4_096),
+                    CancellationToken::new(),
+                )
+                .await
+                .expect("open")
+                .try_collect::<Vec<_>>()
+                .await;
+            if require_hash {
+                assert!(matches!(result, Err(SourceError::BudgetExceeded { .. })));
+            } else {
+                let frames = result.expect("receipt commitments suffice for logs without hashes");
+                let logs = frames[0].logs.as_complete().expect("logs");
+                assert_eq!(logs.len(), 2);
+                assert_eq!(logs[1].data, [1]);
+                assert_eq!((logs[1].transaction_index, logs[1].log_index), (1, 1));
+                assert!(logs.iter().all(|log| log.transaction_hash.is_none()));
+                assert_eq!(
+                    frames[0].verification.receipts_root,
+                    VerificationCheck::VERIFIED
+                );
+                assert_eq!(
+                    frames[0].verification.transactions_root,
+                    VerificationCheck::NOT_CHECKED
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn receipt_projection_rejects_corruption_even_in_excluded_logs() {
+        let directory = tempfile::tempdir().expect("directory");
+        let (body, mut receipts) = logged_transactions();
+        let (source, number) = one_execution_block(directory.path(), &body, Some(&receipts));
+        // The selected log is intact. Alter the other transaction's receipt
+        // without changing the header's receipt root or the catalog identity.
+        receipts[0].logs[0].data.data = alloy_primitives::Bytes::from(vec![99]);
+        let slim = receipts
+            .into_iter()
+            .map(|receipt| SlimReceipt {
+                tx_type: receipt.tx_type,
+                status: receipt.success.into(),
+                cumulative_gas_used: receipt.cumulative_gas_used,
+                logs: receipt.logs,
+            })
+            .collect::<Vec<_>>();
+        replace_execution_component(
+            directory.path(),
+            number,
+            COMPRESSED_SLIM_RECEIPTS,
+            reth_era::common::compression::snappy_compress(&alloy_rlp::encode(slim))
+                .expect("receipts"),
+        );
+        let mut request = request(
+            BlockRange::single(number),
+            CapabilitySet::of(Capability::Header).with(Capability::Logs),
+        );
+        request.allow_filtered = true;
+        request.filters.scope.addresses = vec![Address::new([2; 20])];
+        let plan = source.plan(&request).await.expect("plan");
+        let error = source
+            .open(
+                &plan.chunks[0],
+                budget(4_096, 4_096),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("open")
+            .try_collect::<Vec<_>>()
+            .await
+            .expect_err("commitment verification must precede projection");
+        assert!(
+            matches!(error, SourceError::CorruptFrame(ref message) if message.contains("receipts root mismatch")),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn filtered_frames_preserve_original_indices_gas_and_commitment_checks() {
+        use leani_primitives::{Completeness, FilterScope, Material, TopicFilter, TransactionHash};
+
+        let directory = tempfile::tempdir().expect("directory");
+        let (body, receipts) = logged_transactions();
+        let selected_hash = TransactionHash::new(body.transactions[1].tx_hash().0);
+        let (source, number) = one_execution_block(directory.path(), &body, Some(&receipts));
+        let all = CapabilitySet::of(Capability::Header)
+            .with(Capability::Transactions)
+            .with(Capability::Receipts)
+            .with(Capability::Logs);
+        let transaction_scope = FilterScope {
+            transaction_hashes: vec![selected_hash],
+            ..Default::default()
+        };
+        let log_scope = FilterScope {
+            addresses: vec![Address::new([2; 20])],
+            topics: vec![TopicFilter {
+                position: 1,
+                alternatives: vec![[1; 32]],
+            }],
+            ..Default::default()
+        };
+        for (required, scope, allow_filtered, selected) in [
+            (all, transaction_scope.clone(), true, 1),
+            (all, transaction_scope, false, 2),
+            (
+                CapabilitySet::of(Capability::Header).with(Capability::Logs),
+                log_scope,
+                true,
+                1,
+            ),
+            (
+                CapabilitySet::of(Capability::Header).with(Capability::Logs),
+                FilterScope {
+                    topics: vec![TopicFilter {
+                        position: 0,
+                        alternatives: Vec::new(),
+                    }],
+                    ..Default::default()
+                },
+                true,
+                0,
+            ),
+        ] {
+            let mut request = request(BlockRange::single(number), required);
+            request.allow_filtered = allow_filtered;
+            request.filters.scope = scope.clone();
+            let plan = source.plan(&request).await.expect("plan");
+            let frames = source
+                .open(
+                    &plan.chunks[0],
+                    budget(1 << 20, 1 << 20),
+                    CancellationToken::new(),
+                )
+                .await
+                .expect("open")
+                .try_collect::<Vec<_>>()
+                .await
+                .expect("verified projection");
+            let frame = &frames[0];
+            frame.validate_shape().expect("consistent frame");
+            assert_eq!(
+                frame.verification.receipts_root,
+                VerificationCheck::VERIFIED
+            );
+            let header = frame.header.as_complete().expect("header");
+            let expected_count = required.contains(Capability::Transactions).then_some(2);
+            assert_eq!(header.transaction_count, expected_count);
+            let logs = frame.logs.as_present().expect("requested logs");
+            assert_eq!(logs.len(), selected);
+            if allow_filtered {
+                assert!(
+                    matches!(&frame.logs, Material::Filtered { scope: actual, completeness: Completeness::VerifiedPredicate, .. } if actual == &scope)
+                );
+                if selected == 1 {
+                    assert_eq!((logs[0].transaction_index, logs[0].log_index), (1, 1));
+                    assert_eq!(logs[0].data, [1]);
+                }
+            } else {
+                assert!(frame.logs.is_complete());
+            }
+            if required.contains(Capability::Transactions) {
+                let txs = frame.transactions.as_present().expect("transactions");
+                let emitted = frame.receipts.as_present().expect("receipts");
+                assert_eq!(txs.len(), selected);
+                assert_eq!(emitted.len(), selected);
+                assert!(
+                    emitted
+                        .iter()
+                        .all(|receipt| receipt.gas_used == Some(21_000))
+                );
+                if allow_filtered {
+                    assert_eq!(txs[0].hash, selected_hash);
+                    assert_eq!(txs[0].index, 1);
+                }
+            } else {
+                assert!(!frame.transactions.is_present());
+                assert!(!frame.receipts.is_present());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn small_frame_buffers_amortize_reads_and_concurrent_chunks_share_the_index() {
+        let directory = tempfile::tempdir().expect("directory");
+        let body = reth_era::common::compression::snappy_compress(&alloy_rlp::encode(
+            BlockBody::default(),
+        ))
+        .expect("compressed body");
+        let mut parent = alloy_primitives::B256::ZERO;
+        let mut hashes = Vec::new();
+        let mut blocks = Vec::new();
+        for number in 0..128 {
+            let header = Header {
+                number,
+                parent_hash: parent,
+                ..Header::default()
+            };
+            parent = header.hash_slow();
+            hashes.push(BlockHash::new(parent.0));
+            blocks.push(vec![
+                (
+                    COMPRESSED_HEADER,
+                    reth_era::common::compression::snappy_compress(&alloy_rlp::encode(header))
+                        .expect("compressed header"),
+                ),
+                (COMPRESSED_BODY, body.clone()),
+            ]);
+        }
+        let name = format!(
+            "mainnet-00000-{}.erae",
+            hex::encode(&parent.as_slice()[..4])
+        );
+        std::fs::write(directory.path().join(&name), erae_object(0, &blocks))
+            .expect("write object");
+        write_catalog(directory.path(), &[&name]);
+        let source = file_source(directory.path());
+        let plan = source
+            .plan(&request(range(0, 127), headers_and_bodies()))
+            .await
+            .expect("plan");
+        let budget = SourceBudget {
+            max_buffered_frames: 1,
+            max_in_flight_requests: 2,
+            ..budget(1 << 20, 1 << 20)
+        };
+        let read = |range| {
+            let chunk = source.slice_chunk(&plan.chunks[0], range).expect("slice");
+            let source = &source;
+            async move {
+                source
+                    .open(&chunk, budget, CancellationToken::new())
+                    .await
+                    .expect("open")
+                    .collect::<Vec<_>>()
+                    .await
+                    .into_iter()
+                    .collect::<Result<Vec<_>, _>>()
+                    .expect("valid frames")
+            }
+        };
+        let (mut first, second) = tokio::join!(read(range(0, 63)), read(range(64, 127)));
+        first.extend(second);
+        assert_eq!(
+            first
+                .iter()
+                .map(|frame| frame.block.hash)
+                .collect::<Vec<_>>(),
+            hashes
+        );
+        let metrics = source.acquisition_metrics().expect("metrics");
+        // The output buffer must not turn a sequential archive scan into one
+        // transport operation per block, or make sibling chunks reload metadata.
+        assert!(
+            metrics.physical_reads.is_some_and(|reads| reads <= 12),
+            "{metrics:?}"
+        );
+        assert_eq!(metrics.source_objects, Some(1));
+    }
+
     #[tokio::test]
     async fn a_batch_too_large_to_hold_is_fetched_in_smaller_batches() {
         let directory = tempfile::tempdir().expect("directory");
@@ -3025,26 +3608,22 @@ mod tests {
     async fn a_normalized_frame_must_fit_the_frame_budget() {
         let directory = tempfile::tempdir().expect("directory");
         let (source, header_bytes, body_bytes) = one_block_mirror(directory.path());
-        let object = source.catalog(None).await.expect("catalog")[0].clone();
-        let cancellation = CancellationToken::new();
         // The decompressed header and body fit exactly; the frame, which
         // also holds the decoded withdrawal, does not.
         let budget = budget(1 << 20, header_bytes + body_bytes);
-        let index = source
-            .load_index(&object, budget, &cancellation)
+        let plan = source
+            .plan(&request(
+                range(0, 0),
+                headers_and_bodies().with(Capability::Withdrawals),
+            ))
             .await
-            .expect("index");
-        let result = read_sparse_batch(
-            &source,
-            &object,
-            &index,
-            range(0, 0),
-            headers_and_bodies(),
-            budget,
-            index.initial_input_bytes,
-            &cancellation,
-        )
-        .await;
+            .expect("plan");
+        let result = source
+            .open(&plan.chunks[0], budget, CancellationToken::new())
+            .await
+            .expect("index")
+            .try_collect::<Vec<_>>()
+            .await;
         // External review F5: the frame was queued above the frame budget.
         match result {
             Err(SourceError::BudgetExceeded {
@@ -3053,7 +3632,7 @@ mod tests {
                 observed,
             }) => assert!(observed > limit && limit == header_bytes + body_bytes),
             Err(error) => panic!("unexpected error: {error}"),
-            Ok((frames, _)) => panic!(
+            Ok(frames) => panic!(
                 "a frame of {} bytes passed a frame budget of {}",
                 frames[0].estimated_heap_bytes(),
                 header_bytes + body_bytes
@@ -3069,7 +3648,10 @@ mod tests {
         let directory = tempfile::tempdir().expect("directory");
         let (source, header_bytes, body_bytes) = one_block_mirror(directory.path());
         let plan = source
-            .plan(&request(range(0, 0), headers_and_bodies()))
+            .plan(&request(
+                range(0, 0),
+                headers_and_bodies().with(Capability::Withdrawals),
+            ))
             .await
             .expect("plan");
         let decoded = header_bytes + body_bytes;

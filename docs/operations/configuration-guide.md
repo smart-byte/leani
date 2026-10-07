@@ -136,8 +136,10 @@ archive object larger than it is refused before it is read.
 `budgets.memory_bytes` bounds the raw input one read holds in memory at once:
 one line of a local archive object, which it verifies whole and then reads a
 line at a time; the selected columns of one Xatu Parquet row group; one batch
-of EraE byte ranges, fetched a few blocks at a time when a batch would not
-fit; one window of execution P2P frames; or one retained raw-history record.
+of EraE byte ranges, including a prefetched window when both fit the budget;
+one window of execution P2P frames; or one retained raw-history record.
+EraE normally targets 16 MiB compressed windows independently of the decoded
+frame buffer, and shrinks them when the resident budget is smaller.
 Its frames may be at most `memory_bytes`, or 32 MiB when that is less. A read
 that would hold more fails with a `resident_bytes` budget error naming
 `budgets.memory_bytes`, and a backfill then tries its next configured source.

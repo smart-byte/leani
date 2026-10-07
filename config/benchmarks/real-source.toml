@@ -64,6 +64,38 @@ kind = "disabled"
 checkpoint = ""
 
 [[processors]]
+id = "block-summary"
+instance = "benchmark-block-summary-externalized"
+version = "1.2.0"
+history_control = "node_owned"
+history_mode = "on_demand"
+start_block = 0
+publish = "finalized_only"
+
+[processors.state]
+mode = "durable"
+
+[processors.artifacts]
+mode = "none"
+
+[processors.output]
+mode = "full"
+
+[processors.delivery]
+mode = "none"
+
+[processors.checkpoint]
+mode = "automatic"
+keep = 3
+
+[processors.undo]
+mode = "none"
+safety_blocks = 0
+
+[processors.coverage]
+verification_segment_blocks = 8192
+
+[[processors]]
 id = "blobs-money"
 instance = "benchmark-blobs-externalized"
 version = "1.5.0"

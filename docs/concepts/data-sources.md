@@ -179,7 +179,7 @@ Implemented usage:
 1. fetch and validate the checksum catalog;
 2. read the e2store version and dynamic block index with bounded range requests;
 3. fetch only the selected compressed headers, bodies, and receipts;
-4. decode and verify transaction, receipt, ommer, withdrawal, and logs-bloom commitments;
+4. decode requested components and verify their transaction, receipt, ommer, withdrawal, and logs-bloom commitments;
 5. map configured processors;
 6. discard archive bytes;
 7. checkpoint and continue.
@@ -188,11 +188,19 @@ This gives bounded memory/network use, needs no temporary archive file, and
 avoids relying on old execution P2P peers. The reader supports HTTPS mirrors,
 local `file:` catalogs, and plain `http` mirrors on loopback, or elsewhere
 only with `allow_insecure_http = true` on the history source. It never
-follows a redirect. It processes large requests in bounded frame batches,
-reading one byte range at a time within a chunk:
+follows a redirect. Compressed input windows are independent of the decoded
+frame buffer: buffering four frames does not limit an HTTP range to four
+blocks. A chunk starts with up to 32 blocks, then acquires up to 256 blocks
+per window, targeting at most 16 MiB of compressed input. Adjacent components
+share a byte-range request, and independent ranges are fetched concurrently
+up to the source's in-flight request limit. When the resident budget permits,
+the next window downloads while the current one is decoded and consumed:
 
 - each batch's byte ranges are checked against the remaining input budget
   before they are requested;
+- the current and prefetched compressed windows together must fit the
+  resident budget; smaller budgets disable lookahead or shrink a window,
+  and one large block may exceed the 16 MiB target but never the budget;
 - the checksum catalog is read with a 16 MiB cap, and each range response
   with a cap at its requested length, as the bodies stream in;
 - an e2store record may not declare more bytes than its indexed extent
@@ -201,6 +209,22 @@ reading one byte range at a time within a chunk:
   through one shared cap, the frame budget, at most 32 MiB;
 - each normalized frame is checked against the frame budget before it is
   queued, as the other sources check theirs.
+
+Snappy decoding, commitment checks, and normalization run on blocking
+workers so they do not stall the async network workers. Dropping a stream
+cancels its downloads and signals its decoding worker.
+Transaction requests use Alloy consensus's native `secp256k1` recovery
+backend, retaining its signature validation checks.
+
+Header-only requests read only headers. Body requests verify the complete
+body without recovering senders unless transactions or a sender predicate
+require them. Log-only requests can read headers and receipts without
+transaction bodies when neither transaction hashes nor transaction filters
+are needed. Receipt roots and logs blooms are still checked over every
+receipt before log filtering. Requested transaction, receipt, and log
+predicates are applied before material is built for downstream processors;
+transaction and log indices retain their original positions. A request with
+`allow_filtered = false` receives complete requested material.
 
 Errors, logs, and frame provenance show the mirror as
 `scheme://host[:port]/…/<file>`, so credentials in its userinfo, query, or
@@ -217,6 +241,9 @@ lacks the range doubles that interval, up to the 10 minutes, and a refetch
 that brings new eras starts it over. Each refetch sends the `ETag` and
 `Last-Modified` the mirror last sent, so an unchanged catalog costs a 304. A
 chunk already planned opens from the cached catalog whatever its age.
+Validated dynamic indexes are shared by concurrent chunks and kept in an
+eight-entry cache keyed by object filename and catalog SHA-256. Compressed
+archive data is retained only for active streams.
 
 The direct mainnet catalog was populated on 2026-08-01 even though the rendered
 history webpage's generated counter was stale. A live sparse probe decoded and
@@ -235,8 +262,10 @@ The mirror and its checksum catalog are the trust root. The catalog
 advertises each full object's SHA-256; sparse mode records it as the
 object's version, not as a checksum, because it never downloads the whole
 object to recompute it. Local commitment checks establish internal Ethereum
-execution consistency: the transaction, receipt, ommer, withdrawal, and
-logs-bloom commitments, and the parent hashes within an object. The block
+execution consistency for acquired components: transaction, receipt, ommer,
+withdrawal, and logs-bloom commitments, and the parent hashes within an
+object. Checks for omitted bodies or receipts are reported as `NotChecked`.
+The block
 hash is computed from the archived header itself, so frames report
 `header_hash` as not checked, and `withdrawals_root` as unavailable before
 Shanghai. Canonicality follows the mirror's catalog until it is anchored
