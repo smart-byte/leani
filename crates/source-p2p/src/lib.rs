@@ -4332,7 +4332,7 @@ impl RethP2pSource {
                 receipts
                     .iter()
                     .flat_map(|receipt| &receipt.logs)
-                    .any(|log| source_log_matches(Some(scope), log))
+                    .any(|log| source_log_matches(scope, log))
             })
             .then_some(0)
             .into_iter()
@@ -5158,7 +5158,7 @@ impl RethP2pSource {
                 receipts
                     .iter()
                     .flat_map(|receipt| &receipt.logs)
-                    .any(|log| source_log_matches(Some(scope), log))
+                    .any(|log| source_log_matches(scope, log))
                     .then_some(position)
             })
             .collect::<Vec<_>>();
@@ -7904,7 +7904,7 @@ impl RethP2pHistorySource {
                 receipts
                     .iter()
                     .flat_map(|receipt| &receipt.logs)
-                    .any(|log| source_log_matches(Some(scope), log))
+                    .any(|log| source_log_matches(scope, log))
                     .then_some(position)
             })
             .collect::<Vec<_>>();
@@ -10602,13 +10602,14 @@ fn normalize_sparse_receipt_log_block(
             "receipt-only log normalization cannot supply transaction hashes".to_owned(),
         ));
     }
+    let in_range = scope.matches_block(BlockNumber(header.number));
     let mut logs = Vec::new();
     let mut block_log_index = 0_u32;
     for (transaction_index, receipt) in receipts.iter().enumerate() {
         let transaction_index = u32::try_from(transaction_index)
             .map_err(|_| P2pError::InvalidResponse("transaction index overflows u32".to_owned()))?;
         for source_log in &receipt.logs {
-            if source_log_matches(Some(scope), source_log) {
+            if in_range && source_log_matches(scope, source_log) {
                 logs.push(Log {
                     address: address(source_log.address),
                     topics: source_log
@@ -11021,33 +11022,7 @@ fn header_and_body_only_request(request: &DataRequest) -> bool {
     request.required == CapabilitySet::of(Capability::Header).with(Capability::Body)
 }
 
-fn effective_filter_scope(request: Option<&DataRequest>) -> Option<FilterScope> {
-    let request = request.filter(|request| request.allow_filtered)?;
-    let mut scope = request.filters.scope.clone();
-    if scope.senders.is_empty() {
-        scope.senders.clone_from(&request.filters.senders);
-    }
-    if scope.recipients.is_empty() {
-        scope.recipients.clone_from(&request.filters.recipients);
-    }
-    (scope != FilterScope::default()).then_some(scope)
-}
-
-fn transaction_filter_active(scope: Option<&FilterScope>) -> bool {
-    scope.is_some_and(|scope| {
-        !scope.transaction_types.is_empty()
-            || !scope.transaction_hashes.is_empty()
-            || !scope.senders.is_empty()
-            || !scope.recipients.is_empty()
-    })
-}
-
-fn log_filter_active(scope: Option<&FilterScope>) -> bool {
-    scope.is_some_and(|scope| !scope.addresses.is_empty() || !scope.topics.is_empty())
-}
-
 fn sparse_log_scope(request: &DataRequest) -> Option<&FilterScope> {
-    let scope = request.allow_filtered.then_some(&request.filters.scope)?;
     let log_only = request.required.contains(Capability::Logs)
         && ![
             Capability::Body,
@@ -11062,13 +11037,14 @@ fn sparse_log_scope(request: &DataRequest) -> Option<&FilterScope> {
         ]
         .into_iter()
         .any(|capability| request.required.contains(capability));
-    let separate_transaction_filters =
-        !request.filters.senders.is_empty() || !request.filters.recipients.is_empty();
+    // Blooms can rule out only a log's own fields. A predicate without
+    // transaction fields also leaves the separate sender and recipient lists
+    // empty, so the request's scope is its whole predicate.
     (log_only
-        && !separate_transaction_filters
-        && !transaction_filter_active(Some(scope))
-        && log_filter_active(Some(scope)))
-    .then_some(scope)
+        && request
+            .filter_scope()
+            .is_some_and(|scope| scope.constrains_logs() && !scope.constrains_transactions()))
+    .then_some(&request.filters.scope)
 }
 
 fn header_bloom_matches(scope: &FilterScope, header: &Header) -> bool {
@@ -11088,20 +11064,8 @@ fn header_bloom_matches(scope: &FilterScope, header: &Header) -> bool {
         })
 }
 
-fn source_log_matches(scope: Option<&FilterScope>, source_log: &alloy_primitives::Log) -> bool {
-    let Some(scope) = scope else {
-        return true;
-    };
-    if !scope.addresses.is_empty() && !scope.addresses.contains(&address(source_log.address)) {
-        return false;
-    }
-    scope.topics.iter().all(|filter| {
-        source_log
-            .data
-            .topics()
-            .get(usize::from(filter.position))
-            .is_some_and(|topic| filter.alternatives.contains(&topic.0))
-    })
+fn source_log_matches(scope: &FilterScope, source_log: &alloy_primitives::Log) -> bool {
+    scope.matches_log(&address(source_log.address), source_log.data.topics())
 }
 
 fn normalized_material<T>(
@@ -11140,9 +11104,16 @@ fn normalize_block(
     let receipts_requested = requested_material(request, Capability::Receipts);
     let logs_requested = requested_material(request, Capability::Logs);
     let withdrawals_requested = requested_material(request, Capability::Withdrawals);
-    let filter_scope = effective_filter_scope(request);
-    let transaction_filtered = transaction_filter_active(filter_scope.as_ref());
-    let logs_filtered = log_filter_active(filter_scope.as_ref()) || transaction_filtered;
+    let filter_scope = request.and_then(DataRequest::filter_scope);
+    let number = BlockNumber(header.number);
+    // A block outside the scope's range keeps none of its items.
+    let transaction_filtered = filter_scope
+        .as_ref()
+        .is_some_and(|scope| !scope.matches_block(number) || scope.constrains_transactions());
+    let logs_filtered = transaction_filtered
+        || filter_scope
+            .as_ref()
+            .is_some_and(FilterScope::constrains_logs);
     let (header_rlp, block_size) = if header_requested {
         (
             Some(alloy_rlp::encode(header)),
@@ -11170,17 +11141,12 @@ fn normalize_block(
         previous_gas = receipt.cumulative_gas_used;
         let scope = filter_scope.as_ref();
         let preliminary_transaction_match = scope.is_none_or(|scope| {
-            (scope.transaction_types.is_empty()
-                || scope
-                    .transaction_types
-                    .contains(&(transaction.tx_type() as u8)))
-                && (scope.transaction_hashes.is_empty()
-                    || scope.transaction_hashes.contains(&transaction_hash))
-                && (scope.recipients.is_empty()
-                    || transaction
-                        .to()
-                        .map(address)
-                        .is_some_and(|recipient| scope.recipients.contains(&recipient)))
+            scope.matches_block(number)
+                && scope.matches_transaction(
+                    transaction.tx_type() as u8,
+                    transaction.to().map(address).as_ref(),
+                    || transaction_hash,
+                )
         });
         let sender = if preliminary_transaction_match
             && (senders_requested || scope.is_some_and(|scope| !scope.senders.is_empty()))
@@ -11194,17 +11160,13 @@ fn normalize_block(
             None
         };
         let transaction_matches = preliminary_transaction_match
-            && scope.is_none_or(|scope| {
-                scope.senders.is_empty()
-                    || sender
-                        .map(address)
-                        .is_some_and(|sender| scope.senders.contains(&sender))
-            });
+            && scope.is_none_or(|scope| scope.matches_sender(sender.map(address).as_ref()));
         let mut receipt_logs = Vec::new();
         for source_log in &receipt.logs {
             let selected_for_receipt = receipts_requested && transaction_matches;
-            let selected_for_logs =
-                logs_requested && transaction_matches && source_log_matches(scope, source_log);
+            let selected_for_logs = logs_requested
+                && transaction_matches
+                && scope.is_none_or(|scope| source_log_matches(scope, source_log));
             if selected_for_receipt || selected_for_logs {
                 let log = Log {
                     address: address(source_log.address),
@@ -11899,6 +11861,10 @@ mod tests {
             minimum_finality: Finality::Finalized,
             verification_policy: leani_source_api::VerificationPolicy::CompleteCryptographic,
         };
+        assert!(sparse_log_scope(&request).is_some());
+        // An on-demand `eth_getLogs` scope carries its block range, which
+        // blooms need not rule out.
+        request.filters.scope.block_range = Some(range);
         assert!(sparse_log_scope(&request).is_some());
 
         request.required = request.required.with(Capability::Receipts);

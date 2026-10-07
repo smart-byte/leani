@@ -29,16 +29,9 @@ pub(super) struct EraeProjection {
 
 impl EraeProjection {
     pub(super) fn from_request(request: &DataRequest) -> Self {
-        let mut scope = request.filters.scope.clone();
-        if scope.senders.is_empty() {
-            scope.senders.clone_from(&request.filters.senders);
-        }
-        if scope.recipients.is_empty() {
-            scope.recipients.clone_from(&request.filters.recipients);
-        }
         Self {
             required: request.required,
-            scope: (request.allow_filtered && scope != FilterScope::default()).then_some(scope),
+            scope: request.filter_scope(),
             log_fields: request.log_fields,
         }
     }
@@ -49,12 +42,10 @@ impl EraeProjection {
             || self.required.contains(Capability::Withdrawals)
             || (self.required.contains(Capability::Logs)
                 && (self.log_fields.contains(LogField::TransactionHash)
-                    || self.scope.as_ref().is_some_and(|scope| {
-                        !scope.transaction_types.is_empty()
-                            || !scope.transaction_hashes.is_empty()
-                            || !scope.senders.is_empty()
-                            || !scope.recipients.is_empty()
-                    })))
+                    || self
+                        .scope
+                        .as_ref()
+                        .is_some_and(FilterScope::constrains_transactions)))
     }
 
     fn transactions_requested(&self) -> bool {
@@ -85,15 +76,11 @@ pub(super) fn normalize_block(
     let withdrawals_requested =
         projection.required.contains(Capability::Withdrawals) || body.is_some();
     let scope = projection.scope.as_ref();
-    let transaction_filtered = scope.is_some_and(|scope| {
-        scope.block_range.is_some()
-            || !scope.transaction_types.is_empty()
-            || !scope.transaction_hashes.is_empty()
-            || !scope.senders.is_empty()
-            || !scope.recipients.is_empty()
-    });
-    let logs_filtered = transaction_filtered
-        || scope.is_some_and(|scope| !scope.addresses.is_empty() || !scope.topics.is_empty());
+    let number = BlockNumber(header.number);
+    // A block outside the scope's range keeps none of its items.
+    let transaction_filtered =
+        scope.is_some_and(|scope| !scope.matches_block(number) || scope.constrains_transactions());
+    let logs_filtered = transaction_filtered || scope.is_some_and(FilterScope::constrains_logs);
     let body_present = body.is_some();
     let block_size = body
         .filter(|_| header_requested)
@@ -114,27 +101,17 @@ pub(super) fn normalize_block(
         let transaction = body.transactions.get(index);
         let transaction_index = u32::try_from(index)
             .map_err(|_| SourceError::CorruptFrame("transaction index overflow".to_owned()))?;
+        // Without a body, only a scope that leaves transactions open matches;
+        // `needs_body` reads the body for any other.
         let preliminary_match = scope.is_none_or(|scope| {
-            scope
-                .block_range
-                .is_none_or(|range| range.contains(BlockNumber(header.number)))
-                && (scope.transaction_types.is_empty()
-                    || transaction.is_some_and(|transaction| {
-                        scope
-                            .transaction_types
-                            .contains(&(transaction.tx_type() as u8))
-                    }))
-                && (scope.transaction_hashes.is_empty()
-                    || transaction.is_some_and(|transaction| {
-                        scope
-                            .transaction_hashes
-                            .contains(&TransactionHash::new(transaction.tx_hash().0))
-                    }))
-                && (scope.recipients.is_empty()
-                    || transaction
-                        .and_then(alloy_consensus::Transaction::to)
-                        .map(address)
-                        .is_some_and(|to| scope.recipients.contains(&to)))
+            scope.matches_block(number)
+                && transaction.map_or(!scope.constrains_transactions(), |transaction| {
+                    scope.matches_transaction(
+                        transaction.tx_type() as u8,
+                        transaction.to().map(address).as_ref(),
+                        || TransactionHash::new(transaction.tx_hash().0),
+                    )
+                })
         });
         let sender = if preliminary_match
             && (projection.required.contains(Capability::Transactions)
@@ -152,12 +129,7 @@ pub(super) fn normalize_block(
             None
         };
         let transaction_matches = preliminary_match
-            && scope.is_none_or(|scope| {
-                scope.senders.is_empty()
-                    || sender
-                        .map(address)
-                        .is_some_and(|sender| scope.senders.contains(&sender))
-            });
+            && scope.is_none_or(|scope| scope.matches_sender(sender.map(address).as_ref()));
         let transaction_hash = transaction
             .filter(|_| {
                 transaction_matches && projection.log_fields.contains(LogField::TransactionHash)
@@ -203,8 +175,11 @@ pub(super) fn normalize_block(
             let mut receipt_logs = Vec::new();
             for source_log in &receipt.logs {
                 let selected_for_receipt = receipts_requested && transaction_matches;
-                let selected_for_logs =
-                    logs_requested && transaction_matches && source_log_matches(scope, source_log);
+                let selected_for_logs = logs_requested
+                    && transaction_matches
+                    && scope.is_none_or(|scope| {
+                        scope.matches_log(&address(source_log.address), source_log.data.topics())
+                    });
                 if selected_for_receipt || selected_for_logs {
                     let log = Log {
                         address: address(source_log.address),
@@ -377,18 +352,6 @@ pub(super) fn normalize_block(
             },
             consensus_anchor: None,
         },
-    })
-}
-
-fn source_log_matches(scope: Option<&FilterScope>, log: &alloy_primitives::Log) -> bool {
-    scope.is_none_or(|scope| {
-        (scope.addresses.is_empty() || scope.addresses.contains(&address(log.address)))
-            && scope.topics.iter().all(|filter| {
-                log.data
-                    .topics()
-                    .get(usize::from(filter.position))
-                    .is_some_and(|topic| filter.alternatives.contains(&topic.0))
-            })
     })
 }
 

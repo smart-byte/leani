@@ -37,6 +37,23 @@ pub struct FilterSet {
     pub recipients: Vec<Address>,
 }
 
+impl FilterSet {
+    /// The one scope these predicates select, and filtered material claims.
+    /// [`Self::senders`] and [`Self::recipients`] fill only the scope's
+    /// wildcard lists: the scope's own lists take precedence.
+    #[must_use]
+    pub fn effective_scope(&self) -> FilterScope {
+        let mut scope = self.scope.clone();
+        if scope.senders.is_empty() {
+            scope.senders.clone_from(&self.senders);
+        }
+        if scope.recipients.is_empty() {
+            scope.recipients.clone_from(&self.recipients);
+        }
+        scope
+    }
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum VerificationPolicy {
     /// Reject any material that cannot be independently committed-root checked.
@@ -59,6 +76,18 @@ pub struct DataRequest {
     pub filters: FilterSet,
     pub minimum_finality: Finality,
     pub verification_policy: VerificationPolicy,
+}
+
+impl DataRequest {
+    /// The predicate a source applies to this request's material, or `None`
+    /// when the request takes complete material: it does not allow filtered
+    /// material, or its predicates select everything.
+    #[must_use]
+    pub fn filter_scope(&self) -> Option<FilterScope> {
+        self.allow_filtered
+            .then(|| self.filters.effective_scope())
+            .filter(|scope| scope != &FilterScope::default())
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -649,6 +678,49 @@ mod tests {
         for knob in ["budgets.memory_bytes", "--max-input-bytes"] {
             assert!(error.contains(knob), "{error}");
         }
+    }
+
+    #[test]
+    fn a_scope_keeps_its_own_lists_and_filters_only_when_allowed() {
+        let address = |byte| Address::new([byte; 20]);
+        let mut filters = FilterSet {
+            senders: vec![address(1)],
+            recipients: vec![address(2)],
+            ..FilterSet::default()
+        };
+        let merged = filters.effective_scope();
+        assert_eq!(merged.senders, [address(1)]);
+        assert_eq!(merged.recipients, [address(2)]);
+        filters.scope.senders = vec![address(3)];
+        assert_eq!(filters.effective_scope().senders, [address(3)]);
+
+        let mut request = DataRequest {
+            chain_id: ChainId(1),
+            range: BlockRange::single(BlockNumber(1)),
+            required: CapabilitySet::NONE,
+            log_fields: LogFieldSet::NONE,
+            allow_filtered: false,
+            projection: FieldProjection::default(),
+            filters,
+            minimum_finality: Finality::Finalized,
+            verification_policy: VerificationPolicy::TrustedDataset,
+        };
+        assert_eq!(
+            request.filter_scope(),
+            None,
+            "complete material was requested"
+        );
+        request.allow_filtered = true;
+        assert_eq!(
+            request.filter_scope(),
+            Some(request.filters.effective_scope())
+        );
+        request.filters = FilterSet::default();
+        assert_eq!(
+            request.filter_scope(),
+            None,
+            "a wildcard selects everything"
+        );
     }
 
     fn head(beacon_slot: u64, block: u64, marker: u8) -> AttestedHead {
