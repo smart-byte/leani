@@ -190,13 +190,23 @@ impl FrameCapabilityReport {
     /// must also check its [`crate::Completeness`] and that its
     /// [`crate::FilterScope`] covers their own filter, as
     /// `DataRequirement::validate_frame` in `leani-processor-api` does.
+    ///
+    /// The block size lives in the header, so header material supplies
+    /// [`Capability::BlockSize`] without transactions. Only here: a header
+    /// requirement still promises no size, and the report itself stays the
+    /// component set retained segments record.
     #[must_use]
     pub const fn satisfies(self, required: CapabilitySet, allow_filtered: bool) -> bool {
-        if allow_filtered {
-            self.present.with_derivable().contains_all(required)
+        let components = if allow_filtered {
+            self.present
         } else {
-            self.complete.with_derivable().contains_all(required)
+            self.complete
+        };
+        let mut supplied = components.with_derivable();
+        if components.contains(Capability::Header) {
+            supplied = supplied.with(Capability::BlockSize);
         }
+        supplied.contains_all(required)
     }
 }
 

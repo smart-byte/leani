@@ -1491,6 +1491,17 @@ fn normalize_generic_frames(
                     }
                     None => Material::Missing(MissingReason::NotRequested),
                 };
+                // Receipts imply logs, but outcome rows carry none. Partial
+                // logs keep the receipts from satisfying a log requirement.
+                let logs = if receipts.is_present() {
+                    Material::Filtered {
+                        value: Vec::new(),
+                        scope: scope.clone(),
+                        completeness: Completeness::Partial,
+                    }
+                } else {
+                    Material::Missing(MissingReason::NotRequested)
+                };
                 (
                     Material::Filtered {
                         value: values,
@@ -1498,7 +1509,7 @@ fn normalize_generic_frames(
                         completeness: Completeness::DatasetDeclared,
                     },
                     receipts,
-                    Material::Missing(MissingReason::NotRequested),
+                    logs,
                 )
             }
             GenericProjectionKind::Logs => {
@@ -3515,6 +3526,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn generic_receipt_outcome_comes_from_transaction_rows() {
         use Capability::{Body, Calldata, Header, ReceiptOutcome, Senders};
         let range = BlockRange::single(BlockNumber(42));
@@ -3611,6 +3623,21 @@ mod tests {
         assert_eq!(
             frame.group_violation(claimed.with(Senders)),
             Some("transactions lack senders")
+        );
+        // Receipts derive logs, but outcome rows carry none.
+        let requirement = |capabilities| leani_processor_api::DataRequirement {
+            capabilities,
+            log_fields: LogFieldSet::NONE,
+            allow_filtered: true,
+            filter: FilterScope::default(),
+            minimum_finality: Finality::Finalized,
+        };
+        assert_eq!(requirement(claimed).validate_frame(frame), Ok(()));
+        assert!(
+            requirement(CapabilitySet::of(Capability::Logs))
+                .validate_frame(frame)
+                .is_err(),
+            "logs derived from receipts without logs"
         );
     }
 

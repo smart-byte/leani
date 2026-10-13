@@ -11968,6 +11968,26 @@ mod tests {
     }
 
     #[test]
+    fn block_sizes_satisfy_their_request_without_transactions() {
+        let (headers, bodies, _) = unrecoverable_sender_fixture();
+        let mut request = live_request(BlockRange::single(BlockNumber(0)));
+        request.required = CapabilitySet::of(Capability::Header).with(Capability::BlockSize);
+        let frames = normalize_history_bodies(&headers, &bodies, &request, generous_budget())
+            .expect("block sizes");
+        assert!(
+            frames[0]
+                .header
+                .as_complete()
+                .is_some_and(|header| header.size_bytes.is_some())
+        );
+        assert!(frames[0].capabilities().satisfies(request.required, false));
+        assert_eq!(
+            frames[0].group_violation(request.required.with_derivable()),
+            None
+        );
+    }
+
+    #[test]
     fn history_normalization_preserves_verified_processor_predicates() {
         let (range, headers, bodies, receipts) = empty_fixture();
         let request = DataRequest {

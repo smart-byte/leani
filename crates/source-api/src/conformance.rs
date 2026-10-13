@@ -75,8 +75,8 @@ pub enum ConformanceError {
 /// Fingerprint only canonical material, excluding source provenance and
 /// transport-specific verification evidence.
 ///
-/// Body and calldata capabilities select the canonical transaction material
-/// from which they are derived. Finality and consensus-anchor evidence are
+/// A field group selects the whole component holding its fields, and those
+/// fields must be filled. Finality and consensus-anchor evidence are
 /// compared only when `ConsensusFinality` is selected.
 ///
 /// # Errors
@@ -185,30 +185,35 @@ fn comparison_frame(
                     capability,
                 });
             }
-        } else if !frame
-            .capabilities()
-            .complete
-            .with_derivable()
-            .contains(capability)
-        {
-            return Err(ConformanceError::IncompleteMaterial {
-                block_number: frame.block.number,
-                capability,
-            });
+        } else {
+            let selected = CapabilitySet::of(capability);
+            if !frame.capabilities().satisfies(selected, false)
+                || frame.group_violation(selected.with_derivable()).is_some()
+            {
+                return Err(ConformanceError::IncompleteMaterial {
+                    block_number: frame.block.number,
+                    capability,
+                });
+            }
         }
     }
 
+    // A selected field group compares the whole component holding its fields.
+    let selects = |group: &[Capability]| group.iter().any(|group| capabilities.contains(*group));
     let mut normalized = frame.clone();
-    if !capabilities.contains(Capability::Header) {
+    if !selects(&[Capability::Header, Capability::BlockSize]) {
         normalized.header = Material::Missing(MissingReason::NotRequested);
     }
-    if !capabilities.contains(Capability::Transactions)
-        && !capabilities.contains(Capability::Body)
-        && !capabilities.contains(Capability::Calldata)
-    {
+    if !selects(&[
+        Capability::Transactions,
+        Capability::Body,
+        Capability::Calldata,
+        Capability::Senders,
+        Capability::BlobFields,
+    ]) {
         normalized.transactions = Material::Missing(MissingReason::NotRequested);
     }
-    if !capabilities.contains(Capability::Receipts) {
+    if !selects(&[Capability::Receipts, Capability::ReceiptOutcome]) {
         normalized.receipts = Material::Missing(MissingReason::NotRequested);
     }
     if !capabilities.contains(Capability::Logs) {
@@ -243,8 +248,8 @@ fn comparison_frame(
 #[cfg(test)]
 mod tests {
     use leani_primitives::{
-        BlockHash, BlockRef, ChainId, CheckStatus, Log, SourceId, SourceKind, TrustModel,
-        VerificationCheck,
+        BlockHash, BlockRef, ChainId, CheckStatus, Log, SourceId, SourceKind, TransactionEnvelope,
+        TrustModel, VerificationCheck,
     };
 
     use super::*;
@@ -341,5 +346,122 @@ mod tests {
                 capability: Capability::Header,
             }
         );
+    }
+
+    /// A block whose only transaction, a type-3 one, fills every field group.
+    fn filled_frame() -> BlockFrame {
+        use leani_primitives::{
+            Address, HeaderEnvelope, Quantity, ReceiptEnvelope, TransactionHash,
+        };
+        let hash = TransactionHash::new([7; 32]);
+        let mut frame = fixture_frame(1, BlockHash::ZERO);
+        frame.header = Material::Complete(HeaderEnvelope {
+            rlp: None,
+            transactions_root: None,
+            receipts_root: None,
+            withdrawals_root: None,
+            gas_limit: Some(30_000_000),
+            gas_used: Some(21_000),
+            base_fee_per_gas: None,
+            blob_gas_used: Some(131_072),
+            excess_blob_gas: Some(0),
+            size_bytes: Some(600),
+            consensus_size_bytes: None,
+            transaction_count: Some(1),
+        });
+        frame.transactions = Material::Complete(vec![TransactionEnvelope {
+            hash,
+            transaction_type: 3,
+            index: 0,
+            encoded: None,
+            from: Some(Address::new([1; 20])),
+            to: Some(Address::new([2; 20])),
+            nonce: Some(0),
+            gas_limit: Some(21_000),
+            value: Some(Quantity::new([0; 32])),
+            input: Some(Vec::new()),
+            max_fee_per_gas: None,
+            max_priority_fee_per_gas: None,
+            max_fee_per_blob_gas: Some(Quantity::new([0; 32])),
+            blob_versioned_hashes: vec![BlockHash::new([1; 32])],
+            size_bytes: None,
+        }]);
+        frame.receipts = Material::Complete(vec![ReceiptEnvelope {
+            transaction_hash: hash,
+            transaction_type: 3,
+            transaction_index: 0,
+            encoded: None,
+            success: Some(true),
+            gas_used: Some(21_000),
+            effective_gas_price: Some(Quantity::new([0; 32])),
+            blob_gas_used: Some(131_072),
+            blob_gas_price: None,
+            logs: Vec::new(),
+        }]);
+        frame
+    }
+
+    fn change_transaction(frame: &mut BlockFrame, change: impl FnOnce(&mut TransactionEnvelope)) {
+        if let Material::Complete(transactions) = &mut frame.transactions {
+            change(&mut transactions[0]);
+        }
+    }
+
+    #[test]
+    fn field_group_disagreement_is_reported() {
+        let left = filled_frame();
+        let mut reverted = left.clone();
+        if let Material::Complete(receipts) = &mut reverted.receipts {
+            receipts[0].success = Some(false);
+        }
+        let mut other_sender = left.clone();
+        change_transaction(&mut other_sender, |transaction| {
+            transaction.from = Some(leani_primitives::Address::new([9; 20]));
+        });
+        let mut other_blob = left.clone();
+        change_transaction(&mut other_blob, |transaction| {
+            transaction.blob_versioned_hashes = vec![BlockHash::new([9; 32])];
+        });
+        let mut other_size = left.clone();
+        if let Material::Complete(header) = &mut other_size.header {
+            header.size_bytes = Some(601);
+        }
+        for (group, right) in [
+            (Capability::ReceiptOutcome, reverted),
+            (Capability::Senders, other_sender),
+            (Capability::BlobFields, other_blob),
+            (Capability::BlockSize, other_size),
+        ] {
+            let report = compare_frame_sequences(
+                "left",
+                std::slice::from_ref(&left),
+                "right",
+                &[right],
+                CapabilitySet::of(group),
+            );
+            assert!(
+                matches!(
+                    report.differences.as_slice(),
+                    [FrameDifference::Material { .. }]
+                ),
+                "{group:?}: {report:?}"
+            );
+        }
+
+        // a group whose fields are unfilled is incomplete material
+        let mut senderless = left.clone();
+        change_transaction(&mut senderless, |transaction| transaction.from = None);
+        assert_eq!(
+            frame_fingerprint(&senderless, CapabilitySet::of(Capability::Senders)),
+            Err(ConformanceError::IncompleteMaterial {
+                block_number: BlockNumber(1),
+                capability: Capability::Senders,
+            })
+        );
+        // the header alone carries the block size
+        let mut header_only = left;
+        header_only.transactions = Material::Missing(MissingReason::NotRequested);
+        header_only.receipts = Material::Missing(MissingReason::NotRequested);
+        assert!(frame_fingerprint(&header_only, CapabilitySet::of(Capability::BlockSize)).is_ok());
     }
 }
