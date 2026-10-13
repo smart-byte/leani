@@ -123,6 +123,11 @@ const OLDEST_UPGRADABLE_SCHEMA_VERSION: u32 = FINALITY_VOCABULARY_SCHEMA_VERSION
 /// endpoints poll far more often than these counts move, and each scan reads
 /// whole tables.
 pub const STATS_CACHE_TTL: Duration = Duration::from_secs(10);
+/// Most finalized blocks below a compaction bound that stay exact for an
+/// archive audit that has not passed them, about nine days of mainnet blocks.
+/// An audit stalled longer loses that evidence instead of coverage growing
+/// without bound.
+const ARCHIVE_AUDIT_HOLD_BLOCKS: u64 = 65_536;
 
 /// `SQLite` fsync policy.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -1201,6 +1206,17 @@ pub struct ArchiveReconciliationRecord {
     pub compared_blocks: u64,
     pub failure: Option<String>,
     pub updated_at_unix_ms: u64,
+}
+
+/// Where an archive audit stands, from [`SqliteStore::archive_audit_window`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ArchiveAuditWindow {
+    /// Leading blocks without exact coverage, which no audit can compare.
+    pub unauditable: Option<BlockRange>,
+    /// Whether compaction reduced some of those blocks to proof segments.
+    pub compacted: bool,
+    /// Consecutive exact finalized coverage to compare next.
+    pub audit: Option<BlockRange>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -5648,6 +5664,33 @@ impl SqliteStore {
         value.map(decode_hash).transpose()
     }
 
+    /// Whether `descriptor` covers a block at or below `through` that is not
+    /// finalized: one committed after finality passed its height, or one a
+    /// failed finality advance left behind.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the bound exceeds `SQLite`'s numeric range or the
+    /// read fails.
+    pub async fn unfinalized_coverage_through(
+        &self,
+        descriptor: &ProcessorDescriptor,
+        through: BlockNumber,
+    ) -> Result<bool, StoreError> {
+        let found: i64 = sqlx::query_scalar(
+            "SELECT EXISTS (
+                 SELECT 1 FROM processor_coverage
+                 WHERE instance = ? AND block_number <= ? AND finality < ?
+             )",
+        )
+        .bind(processor_instance(descriptor))
+        .bind(u64_i64(through.0, "block_number")?)
+        .bind(finality_i64(Finality::Finalized))
+        .fetch_one(&self.inner.pool)
+        .await?;
+        Ok(found != 0)
+    }
+
     /// Return the highest block whose processor coverage is finalized.
     ///
     /// Two index searches, exact and compact coverage, read in one snapshot.
@@ -8153,6 +8196,7 @@ impl SqliteStore {
         let instance = processor_instance(descriptor);
         self.log_handoff_compaction_holds(&instance, through)
             .await?;
+        let through = self.archive_audit_bound(&instance, through).await?;
         let count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM processor_coverage AS coverage
              WHERE coverage.instance = ?
@@ -8182,6 +8226,42 @@ impl SqliteStore {
         .fetch_one(&self.inner.pool)
         .await?;
         i64_u64(count, "compactable finalized coverage count")
+    }
+
+    /// Lower a compaction bound below the blocks an archive audit has yet to
+    /// compare. Blocks after a processor's first verified hot/cold handoff
+    /// came from live P2P: they keep their exact identities and delta
+    /// checksums until a verified archive reconciliation passes them, unless
+    /// they lie more than [`ARCHIVE_AUDIT_HOLD_BLOCKS`] below `through`.
+    async fn archive_audit_bound(
+        &self,
+        instance: &str,
+        through: BlockNumber,
+    ) -> Result<BlockNumber, StoreError> {
+        let live_after: Option<i64> = sqlx::query_scalar(
+            "SELECT MIN(overlap_to) FROM hot_cold_handoffs
+             WHERE processor_instance = ? AND state = 'verified'",
+        )
+        .bind(instance)
+        .fetch_one(&self.inner.pool)
+        .await?;
+        let Some(live_after) = live_after else {
+            return Ok(through);
+        };
+        let audited_through: Option<i64> = sqlx::query_scalar(
+            "SELECT MAX(overlap_to) FROM archive_reconciliations
+             WHERE processor_instance = ? AND state = 'verified'",
+        )
+        .bind(instance)
+        .fetch_one(&self.inner.pool)
+        .await?;
+        let held_after = i64_u64(
+            audited_through.map_or(live_after, |audited| audited.max(live_after)),
+            "archive audit bound",
+        )?;
+        Ok(BlockNumber(through.0.min(
+            held_after.max(through.0.saturating_sub(ARCHIVE_AUDIT_HOLD_BLOCKS)),
+        )))
     }
 
     /// Log once per handoff that compaction holds back the overlap of a
@@ -8272,6 +8352,7 @@ impl SqliteStore {
         }
         self.log_handoff_compaction_holds(&instance, through)
             .await?;
+        let through = self.archive_audit_bound(&instance, through).await?;
         let rows = sqlx::query(
             "SELECT coverage.block_number, coverage.block_hash, coverage.parent_hash
              FROM processor_coverage AS coverage
@@ -8957,6 +9038,91 @@ impl SqliteStore {
             Some(id) => load_archive_reconciliation(&self.inner.pool, &id, descriptor).await,
             None => Ok(None),
         }
+    }
+
+    /// Find the next blocks, from `from` through at most `through`, whose
+    /// committed deltas an archive audit can compare: at most `limit` blocks
+    /// of consecutive exact finalized coverage. Blocks before them keep no
+    /// exact coverage, because compaction reduced them to proof segments or
+    /// nothing covers them; an audit cannot compare those.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a bound exceeds `SQLite`'s numeric range or the
+    /// database read fails.
+    pub async fn archive_audit_window(
+        &self,
+        descriptor: &ProcessorDescriptor,
+        from: BlockNumber,
+        through: BlockNumber,
+        limit: u64,
+    ) -> Result<ArchiveAuditWindow, StoreError> {
+        let instance = processor_instance(descriptor);
+        let rows: Vec<(i64, i64)> = sqlx::query_as(
+            "SELECT block_number, finality FROM processor_coverage
+             WHERE instance = ? AND block_number BETWEEN ? AND ?
+             ORDER BY block_number
+             LIMIT ?",
+        )
+        .bind(&instance)
+        .bind(u64_i64(from.0, "archive audit start")?)
+        .bind(u64_i64(through.0, "archive audit bound")?)
+        .bind(u64_i64(limit.max(1), "archive audit limit")?)
+        .fetch_all(&self.inner.pool)
+        .await?;
+        let finalized = finality_i64(Finality::Finalized);
+        let first = rows
+            .first()
+            .map(|(number, _)| i64_u64(*number, "exact coverage block"))
+            .transpose()?;
+        let unauditable = match first {
+            Some(first) if first > from.0 => Some(BlockRange::new(from, BlockNumber(first - 1))),
+            None if from <= through => Some(BlockRange::new(from, through)),
+            _ => None,
+        }
+        .transpose()
+        .map_err(|error| StoreError::Invariant(error.to_string()))?;
+        // An unfinalized block is compared once finality reaches it.
+        let mut audit = None;
+        if let (Some(first), Some((_, finality))) = (first, rows.first())
+            && *finality == finalized
+        {
+            let mut end = first;
+            for (number, finality) in rows.iter().skip(1) {
+                if i64_u64(*number, "exact coverage block")? != end.saturating_add(1)
+                    || *finality != finalized
+                {
+                    break;
+                }
+                end = end.saturating_add(1);
+            }
+            audit = Some(
+                BlockRange::new(BlockNumber(first), BlockNumber(end))
+                    .map_err(|error| StoreError::Invariant(error.to_string()))?,
+            );
+        }
+        let compacted = match unauditable {
+            Some(range) => {
+                sqlx::query_scalar::<_, i64>(
+                    "SELECT EXISTS (
+                     SELECT 1 FROM finalized_coverage_intervals
+                     WHERE instance = ? AND end_block >= ? AND start_block <= ?
+                 )",
+                )
+                .bind(&instance)
+                .bind(u64_i64(range.start().0, "archive audit start")?)
+                .bind(u64_i64(range.end().0, "archive audit bound")?)
+                .fetch_one(&self.inner.pool)
+                .await?
+                    != 0
+            }
+            None => false,
+        };
+        Ok(ArchiveAuditWindow {
+            unauditable,
+            compacted,
+            audit,
+        })
     }
 
     /// Read one durable archive reconciliation verdict.
@@ -26470,6 +26636,137 @@ mod tests {
             .await
             .expect("compaction after the handoff");
         assert_eq!(released.compacted_range, Some(overlap));
+    }
+
+    #[tokio::test]
+    async fn compaction_keeps_live_blocks_until_an_archive_audit_passes_them() {
+        // Report 2026-10-13 §2: compaction discarded the identities and delta
+        // checksums the archive audit of live blocks compares, and the audit
+        // ended the network lanes.
+        let (_directory, store) = store().await;
+        let (processor, frames) = finalized_live_history(&store).await;
+        let descriptor = &processor.descriptor;
+        // History ends at the handoff anchor, block 2; live P2P derived 3..=4.
+        let overlap = BlockRange::new(BlockNumber(1), BlockNumber(2)).expect("overlap");
+        let anchor = frames[1].block.hash;
+        store
+            .begin_hot_cold_handoff("live-handoff", descriptor, ChainId(1), overlap, anchor)
+            .await
+            .expect("begin handoff");
+        store
+            .verify_hot_cold_handoff("live-handoff", descriptor, ChainId(1), overlap, anchor)
+            .await
+            .expect("verify handoff");
+        let history = store
+            .compact_finalized_coverage(descriptor, BlockNumber(4), 2, 4)
+            .await
+            .expect("compaction pass");
+        assert_eq!(history.compacted_range, Some(overlap));
+        assert_eq!(
+            store
+                .compactable_finalized_coverage_blocks(descriptor, BlockNumber(4))
+                .await
+                .expect("compactable"),
+            0
+        );
+        let third = frames[2].block;
+        assert_eq!(
+            store
+                .coverage_hash(descriptor, third.number)
+                .await
+                .expect("coverage"),
+            Some(third.hash)
+        );
+        assert!(
+            store
+                .applied_delta_checksum(descriptor, third.number, third.hash)
+                .await
+                .expect("checksum")
+                .is_some()
+        );
+
+        // An audit verified through block 3 releases it, and only it.
+        let audited = BlockRange::single(third.number);
+        store
+            .begin_archive_reconciliation(
+                "audit-3",
+                descriptor,
+                "archive",
+                ChainId(1),
+                audited,
+                third.hash,
+            )
+            .await
+            .expect("begin audit");
+        store
+            .finish_archive_reconciliation(
+                "audit-3",
+                descriptor,
+                "archive",
+                ChainId(1),
+                audited,
+                third.hash,
+                1,
+                None,
+            )
+            .await
+            .expect("verify audit");
+        let released = store
+            .compact_finalized_coverage(descriptor, BlockNumber(4), 2, 4)
+            .await
+            .expect("compaction after the audit");
+        assert_eq!(released.compacted_range, Some(audited));
+
+        // An audit stalled far behind does not hold coverage back forever.
+        let stalled = store
+            .compact_finalized_coverage(
+                descriptor,
+                BlockNumber(4 + ARCHIVE_AUDIT_HOLD_BLOCKS),
+                2,
+                4,
+            )
+            .await
+            .expect("compaction far ahead of the audit");
+        assert_eq!(
+            stalled.compacted_range,
+            Some(BlockRange::single(BlockNumber(4)))
+        );
+    }
+
+    #[tokio::test]
+    async fn archive_audits_compare_only_exact_finalized_coverage() {
+        let (_directory, store) = store().await;
+        let (processor, _) = finalized_live_history(&store).await;
+        let descriptor = &processor.descriptor;
+        store
+            .compact_finalized_coverage(descriptor, BlockNumber(2), 2, 2)
+            .await
+            .expect("compact blocks 1..=2");
+        let window = |from, through, limit| {
+            store.archive_audit_window(descriptor, BlockNumber(from), BlockNumber(through), limit)
+        };
+        let range = |from, to| BlockRange::new(BlockNumber(from), BlockNumber(to)).expect("range");
+        assert_eq!(
+            window(1, 9, 64).await.expect("window"),
+            ArchiveAuditWindow {
+                unauditable: Some(range(1, 2)),
+                compacted: true,
+                audit: Some(range(3, 4)),
+            }
+        );
+        assert_eq!(
+            window(3, 9, 1).await.expect("window").audit,
+            Some(range(3, 3))
+        );
+        // Blocks nothing covers, as an on-demand processor leaves them.
+        assert_eq!(
+            window(5, 9, 64).await.expect("window"),
+            ArchiveAuditWindow {
+                unauditable: Some(range(5, 9)),
+                compacted: false,
+                audit: None,
+            }
+        );
     }
 
     #[tokio::test]

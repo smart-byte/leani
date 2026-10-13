@@ -837,6 +837,9 @@ async fn plan_or_refuse(
 /// Returns an error for source unavailability, cancellation, processor/store
 /// failures, incomplete streams, or any deterministic disagreement, and
 /// [`RuntimeError::SourceCannotServe`] when `source` refuses the request.
+/// Coverage that keeps no committed identity or delta checksum, such as
+/// compacted coverage, is [`RuntimeError::ArchiveEvidenceUnavailable`] and
+/// records no failure.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub async fn reconcile_archive_deltas(
     store: &SqliteStore,
@@ -866,15 +869,15 @@ pub async fn reconcile_archive_deltas(
     )?;
     let plan = plan_or_refuse(source, &job.request).await?;
     plan.validate()?;
+    let unavailable =
+        |block: BlockNumber, missing: &str| RuntimeError::ArchiveEvidenceUnavailable {
+            block,
+            detail: format!("the processor keeps no committed {missing} there"),
+        };
     let anchor_hash = store
         .coverage_hash(processor.descriptor(), range.end())
         .await?
-        .ok_or_else(|| {
-            RuntimeError::InvalidFrame(format!(
-                "processor has no committed anchor at block {}",
-                range.end().0
-            ))
-        })?;
+        .ok_or_else(|| unavailable(range.end(), "anchor"))?;
     let id = job.id;
     let source_id = source.descriptor().id.to_string();
     let existing = store
@@ -927,10 +930,12 @@ pub async fn reconcile_archive_deltas(
                 )
                 .await);
             }
+            // Compaction keeps segment-end hashes only, and no checksums.
             let stored_hash = store
                 .coverage_hash(processor.descriptor(), frame.block.number)
-                .await?;
-            if stored_hash != Some(frame.block.hash) {
+                .await?
+                .ok_or_else(|| unavailable(frame.block.number, "identity"))?;
+            if stored_hash != frame.block.hash {
                 let detail = format!(
                     "block {} identity differs: committed {:?}, archive {:?}",
                     frame.block.number.0, stored_hash, frame.block.hash
@@ -975,8 +980,9 @@ pub async fn reconcile_archive_deltas(
                     frame.block.number,
                     frame.block.hash,
                 )
-                .await?;
-            if !stored_checksum.is_some_and(|checksum| equivalent_checksums.contains(&checksum)) {
+                .await?
+                .ok_or_else(|| unavailable(frame.block.number, "delta checksum"))?;
+            if !equivalent_checksums.contains(&stored_checksum) {
                 let detail = format!(
                     "block {} mapped delta differs: committed {:?}, archive {:?}",
                     frame.block.number.0, stored_checksum, delta.checksum
@@ -7884,6 +7890,11 @@ pub enum RuntimeError {
     },
     #[error("live frame failed validation: {0}")]
     InvalidFrame(String),
+    /// An archive audit cannot compare a block whose committed identity or
+    /// delta checksum compaction discarded. That is no disagreement: the
+    /// audit moves on to coverage that kept them.
+    #[error("archive reconciliation lacks committed evidence at block {}: {detail}", block.0)]
+    ArchiveEvidenceUnavailable { block: BlockNumber, detail: String },
     #[error("live stream gap: expected block {expected}, received {received:?}")]
     LiveGap {
         expected: BlockNumber,
@@ -10415,6 +10426,88 @@ mod tests {
                 .state,
             ArchiveReconciliationState::Failed
         );
+    }
+
+    #[tokio::test]
+    async fn archive_reconciliation_of_compacted_coverage_lacks_evidence() {
+        // Report 2026-10-13 §2: compaction keeps only segment-end hashes and
+        // no delta checksums. Auditing that coverage persisted a failed
+        // reconciliation, which ended the network lanes.
+        let range = BlockRange::new(BlockNumber(1), BlockNumber(4)).expect("range");
+        let processor = Arc::new(
+            BlockLocalCounter::default()
+                .with_split_delivery()
+                .with_output_none(),
+        );
+        let (_directory, store) = store().await;
+        let seed_job = externalized_subscription_job(
+            &store,
+            processor.as_ref(),
+            "compacted-audit-seed",
+            range,
+            BackfillMode::FillMissing,
+            0,
+        )
+        .await;
+        HistoricalRuntime::new(
+            store.clone(),
+            Arc::new(ScriptedHistorySource::from_frames(
+                fixture_source_descriptor("compacted-audit-seed-source", range),
+                frames(range),
+            )),
+            processor.clone(),
+            HistoricalRuntimeConfig {
+                mapper_concurrency: 2,
+                ..HistoricalRuntimeConfig::default()
+            },
+        )
+        .expect("seed runtime")
+        .run(seed_job, default_source_budget(), CancellationToken::new())
+        .await
+        .expect("seed exact coverage");
+        store
+            .compact_finalized_coverage(processor.descriptor(), range.end(), 2, range.len())
+            .await
+            .expect("compact coverage");
+        let archive = ScriptedHistorySource::from_frames(
+            fixture_source_descriptor("compacted-audit-archive", range),
+            frames(range),
+        );
+        // Segments 1..=2 and 3..=4 keep only the hashes of blocks 2 and 4:
+        // block 1 has no anchor, block 1 inside 1..=2 no identity, and block 2
+        // no delta checksum.
+        for (from, to) in [(1, 1), (1, 2), (2, 2)] {
+            let audited = BlockRange::new(BlockNumber(from), BlockNumber(to)).expect("range");
+            let error = reconcile_archive_deltas(
+                &store,
+                &archive,
+                processor.as_ref(),
+                ChainId(1),
+                audited,
+                VerificationPolicy::CompleteCryptographic,
+                default_source_budget(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect_err("compacted coverage cannot be audited");
+            assert!(
+                matches!(error, RuntimeError::ArchiveEvidenceUnavailable { .. }),
+                "{from}..={to}: {error:?}"
+            );
+            let id = format!(
+                "archive-reconciliation:{}:compacted-audit-archive:{from}-{to}",
+                processor.descriptor().instance
+            );
+            assert_ne!(
+                store
+                    .archive_reconciliation(&id, processor.descriptor())
+                    .await
+                    .expect("reconciliation")
+                    .map(|record| record.state),
+                Some(ArchiveReconciliationState::Failed),
+                "{from}..={to} recorded a mismatch"
+            );
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

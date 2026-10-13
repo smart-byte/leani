@@ -8092,7 +8092,7 @@ async fn run_archive_reconciliations(
     processors: &[std::sync::Arc<dyn leani_processor_api::Processor>],
     cancellation: CancellationToken,
 ) -> Result<()> {
-    use leani_primitives::{BlockNumber, BlockRange, ChainId};
+    use leani_primitives::{BlockNumber, ChainId};
     use leani_runtime::{RuntimeError, reconcile_archive_deltas};
     use leani_source_api::SourceError;
     use leani_store_sqlite::{ArchiveReconciliationState, HotColdHandoffState, StoreError};
@@ -8101,6 +8101,8 @@ async fn run_archive_reconciliations(
     let batch_blocks = config.sources.live.archive_reconciliation_blocks;
     let retry_interval =
         std::time::Duration::from_secs(config.sources.live.archive_reconciliation_interval_seconds);
+    // Compacted ranges already reported, by instance and first block.
+    let mut unaudited = std::collections::HashSet::new();
     loop {
         if cancellation.is_cancelled() {
             return Ok(());
@@ -8139,10 +8141,38 @@ async fn run_archive_reconciliations(
             if next > finalized.0 {
                 continue;
             }
-            let end = finalized
-                .0
-                .min(next.saturating_add(batch_blocks.saturating_sub(1)));
-            let range = BlockRange::new(BlockNumber(next), BlockNumber(end))?;
+            // Only exact finalized coverage keeps the identities and delta
+            // checksums an audit compares.
+            let window = store
+                .archive_audit_window(
+                    processor.descriptor(),
+                    BlockNumber(next),
+                    finalized,
+                    batch_blocks,
+                )
+                .await?;
+            if let Some(skipped) = window.unauditable {
+                let instance = processor.descriptor().instance.to_string();
+                if !window.compacted {
+                    debug!(
+                        processor = %processor.descriptor().id,
+                        from = skipped.start().0,
+                        to = skipped.end().0,
+                        "archive reconciliation skips blocks without exact coverage"
+                    );
+                } else if unaudited.insert((instance, skipped.start().0)) {
+                    warn!(
+                        processor = %processor.descriptor().id,
+                        from = skipped.start().0,
+                        to = skipped.end().0,
+                        "archive reconciliation cannot compare blocks compaction reduced to proof \
+                         segments; they stay unaudited"
+                    );
+                }
+            }
+            let Some(range) = window.audit else {
+                continue;
+            };
             let (sources, verification_policy) =
                 configured_history_sources(config, processor.as_ref(), None).with_context(
                     || {
@@ -8201,6 +8231,7 @@ async fn run_archive_reconciliations(
                     Err(
                         RuntimeError::Source(
                             SourceError::MissingRange(_)
+                            | SourceError::IncompleteRange { .. }
                             | SourceError::MissingMaterial { .. }
                             | SourceError::Unavailable(_)
                             | SourceError::Disconnected(_)
@@ -8215,6 +8246,17 @@ async fn run_archive_reconciliations(
                             to = range.end().0,
                             "archive has not produced a complete reconciliation range yet"
                         );
+                    }
+                    // Compaction raced the audit; the next pass plans past it.
+                    Err(error @ RuntimeError::ArchiveEvidenceUnavailable { .. }) => {
+                        warn!(
+                            processor = %processor.descriptor().id,
+                            from = range.start().0,
+                            to = range.end().0,
+                            %error,
+                            "archive reconciliation lost the evidence it compares"
+                        );
+                        break;
                     }
                     Err(
                         error @ (RuntimeError::Store(StoreError::ArchiveReconciliationMismatch {
@@ -11159,6 +11201,66 @@ markets = ["ETH/USDT"]
         let (summary, _live) = hand_over_to_live(&config, &store, &processors, &chain).await;
         assert!(summary.failed.is_empty(), "{:?}", summary.failed);
         reconcile_until_verified(&config, &store, &processors).await;
+    }
+
+    #[tokio::test]
+    async fn archive_reconciliation_skips_compacted_history() {
+        // Report 2026-10-13 §2: the audit began at the start block,
+        // inside history that compaction had reduced to segment ends, and
+        // ended the network lanes at every start.
+        use leani_primitives::BlockNumber;
+        use leani_source_api::LiveStart;
+        use leani_testkit::default_source_budget;
+
+        let directory = tempfile::tempdir().expect("tempdir");
+        let chain = fixture_chain(5);
+        let manifest = write_frame_archive(directory.path(), &chain[1..=5]);
+        let config = archive_config(
+            directory.path(),
+            &manifest,
+            &[("synthetic-counter", "counter-a")],
+        );
+        let store = leani_store_sqlite::SqliteStore::open(leani_store_sqlite::StoreConfig::new(
+            directory.path().join("node.sqlite"),
+        ))
+        .await
+        .expect("store");
+        let processors = vec![Arc::new(BlockLocalCounter::default().with_instance(
+            leani_processor_api::ProcessorInstanceId::new("counter-a").expect("instance"),
+            leani_primitives::BlockHash::new([0xa0; 32]),
+        )) as Arc<dyn Processor>];
+        let descriptor = processors[0].descriptor();
+
+        let (summary, live) = hand_over_to_live(&config, &store, &processors, &chain).await;
+        assert!(summary.failed.is_empty(), "{:?}", summary.failed);
+        live.run(
+            LiveStart::Head,
+            default_source_budget(),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("live block 5");
+        store
+            .mark_finalized(descriptor, BlockNumber(5), chain[5].block.hash)
+            .await
+            .expect("finalize block 5");
+        let history = store
+            .compact_finalized_coverage(descriptor, BlockNumber(5), 2, 5)
+            .await
+            .expect("compact history");
+        assert_eq!(
+            history.exact_coverage_deleted, 4,
+            "history up to the anchor compacts"
+        );
+
+        // Blocks 1..=4 cannot be audited any more; live block 5 can.
+        reconcile_until_verified(&config, &store, &processors).await;
+        let audited = store
+            .latest_verified_archive_reconciliation(descriptor)
+            .await
+            .expect("archive reconciliation")
+            .expect("verified reconciliation");
+        assert_eq!(audited.overlap.start(), BlockNumber(5));
     }
 
     #[tokio::test]
