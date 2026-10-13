@@ -760,6 +760,7 @@ impl XatuBlobsProjector {
             );
         }
 
+        let mut row_indices = BTreeMap::<u64, Vec<u32>>::new();
         let mut transactions = BTreeMap::<u64, Vec<TransactionEnvelope>>::new();
         let mut receipts = BTreeMap::<u64, Vec<ReceiptEnvelope>>::new();
         let mut logs = BTreeMap::<u64, Vec<Log>>::new();
@@ -787,6 +788,7 @@ impl XatuBlobsProjector {
                                     range,
                                     filters,
                                     columns,
+                                    &mut row_indices,
                                     &mut transactions,
                                     &mut receipts,
                                 )
@@ -812,7 +814,14 @@ impl XatuBlobsProjector {
                             &mut projected_bytes,
                             &cancellation,
                             |batch| {
-                                parse_generic_logs(batch, range, filters, log_fields, &mut logs)
+                                parse_generic_logs(
+                                    batch,
+                                    range,
+                                    filters,
+                                    log_fields,
+                                    &mut row_indices,
+                                    &mut logs,
+                                )
                             },
                         )
                         .await?,
@@ -832,6 +841,7 @@ impl XatuBlobsProjector {
             filters,
             execution_blocks: &execution_blocks,
             beacon_blocks: &beacon_blocks,
+            row_indices,
             transactions,
             receipts: (kind == GenericProjectionKind::Transactions && columns.outcome)
                 .then_some(receipts),
@@ -1239,6 +1249,7 @@ fn parse_generic_transactions(
     range: BlockRange,
     filters: &FilterSet,
     columns: TransactionColumns,
+    row_indices: &mut BTreeMap<u64, Vec<u32>>,
     output: &mut BTreeMap<u64, Vec<TransactionEnvelope>>,
     receipts: &mut BTreeMap<u64, Vec<ReceiptEnvelope>>,
 ) -> Result<u64, XatuError> {
@@ -1249,6 +1260,9 @@ fn parse_generic_transactions(
         if !range.contains(BlockNumber(block_number)) {
             continue;
         }
+        // Every row counts towards its block's completeness, matched or not.
+        let index = required_u32(batch, "transaction_index", row)?;
+        row_indices.entry(block_number).or_default().push(index);
         let transaction_type = required_u8(batch, "transaction_type", row)?;
         let hash = required_transaction_hash(batch, "transaction_hash", row)?;
         let to = optional_address(batch, "to_address", row)?;
@@ -1262,7 +1276,6 @@ fn parse_generic_transactions(
         if !scope.matches_sender(from.as_ref()) {
             continue;
         }
-        let index = required_u32(batch, "transaction_index", row)?;
         // Xatu stores empty calldata as null: a 2026-10-13 probe of two
         // partitions found every 21,000-gas transaction with a null input and
         // no empty one.
@@ -1322,6 +1335,7 @@ fn parse_generic_logs(
     range: BlockRange,
     filters: &FilterSet,
     log_fields: LogFieldSet,
+    row_indices: &mut BTreeMap<u64, Vec<u32>>,
     output: &mut BTreeMap<u64, Vec<Log>>,
 ) -> Result<u64, XatuError> {
     // The planner admits no other transaction predicate for logs, whose table
@@ -1333,6 +1347,9 @@ fn parse_generic_logs(
         if !range.contains(BlockNumber(block_number)) {
             continue;
         }
+        // Every row counts towards its block's completeness, matched or not.
+        let log_index = required_u32(batch, "log_index", row)?;
+        row_indices.entry(block_number).or_default().push(log_index);
         let address = required_address(batch, "address", row)?;
         if !scope.matches_log_address(&address) {
             continue;
@@ -1370,7 +1387,7 @@ fn parse_generic_logs(
             data: optional_variable_bytes(batch, "data", row)?.unwrap_or_default(),
             transaction_hash,
             transaction_index: required_u32(batch, "transaction_index", row)?,
-            log_index: required_u32(batch, "log_index", row)?,
+            log_index,
         });
         selected = selected.saturating_add(1);
     }
@@ -1384,6 +1401,9 @@ struct GenericNormalizationInputs<'a> {
     filters: &'a FilterSet,
     execution_blocks: &'a BTreeMap<u64, GenericExecutionBlockRow>,
     beacon_blocks: &'a BTreeMap<u64, GenericBeaconBlockRow>,
+    /// The transaction or log index of every row read for each block, before
+    /// any filter applied: the proof that a selection saw the whole block.
+    row_indices: BTreeMap<u64, Vec<u32>>,
     transactions: BTreeMap<u64, Vec<TransactionEnvelope>>,
     /// Receipt outcomes of the projected transactions, when requested.
     receipts: Option<BTreeMap<u64, Vec<ReceiptEnvelope>>>,
@@ -1465,19 +1485,15 @@ fn normalize_generic_frames(
                 Material::Missing(MissingReason::NotRequested),
             ),
             GenericProjectionKind::Transactions => {
+                validate_row_indices(
+                    XatuTable::CanonicalExecutionTransaction,
+                    number,
+                    inputs.row_indices.remove(&number.0).unwrap_or_default(),
+                    Some(beacon.transaction_count),
+                )?;
+                // Each selected transaction is one of those rows.
                 let mut values = inputs.transactions.remove(&number.0).unwrap_or_default();
                 values.sort_by_key(|transaction| transaction.index);
-                if values.windows(2).any(|pair| pair[0].index == pair[1].index) {
-                    return Err(XatuError::Data(format!(
-                        "duplicate transaction index in block {number}"
-                    )));
-                }
-                validate_transaction_count(
-                    number,
-                    &values,
-                    beacon.transaction_count,
-                    effective.constrains_transactions(),
-                )?;
                 // Each outcome comes from its transaction's own row.
                 let receipts = match inputs.receipts.as_mut() {
                     Some(receipts) => {
@@ -1513,16 +1529,10 @@ fn normalize_generic_frames(
                 )
             }
             GenericProjectionKind::Logs => {
+                let indices = inputs.row_indices.remove(&number.0).unwrap_or_default();
+                validate_row_indices(XatuTable::CanonicalExecutionLogs, number, indices, None)?;
                 let mut values = inputs.logs.remove(&number.0).unwrap_or_default();
                 values.sort_by_key(|log| log.log_index);
-                if values
-                    .windows(2)
-                    .any(|pair| pair[0].log_index == pair[1].log_index)
-                {
-                    return Err(XatuError::Data(format!(
-                        "duplicate log index in block {number}"
-                    )));
-                }
                 (
                     Material::Missing(MissingReason::NotRequested),
                     Material::Missing(MissingReason::NotRequested),
@@ -1558,32 +1568,49 @@ fn normalize_generic_frames(
     Ok(frames)
 }
 
-/// Check a block's projected transactions, sorted by index without
-/// duplicates, against the count its beacon payload declares. A list the
-/// filters did not narrow holds every transaction, so its indices are
-/// exactly `0..count`.
-fn validate_transaction_count(
+/// Check the indices of every row a block's `table` holds, read before any
+/// filter applied: each of `0..count` exactly once. Filters select from
+/// complete rows only, or a missing row would pass for one they did not
+/// match.
+///
+/// A transaction count comes from the beacon payload. Xatu publishes no log
+/// count, so log indices need only run from zero without a gap: a block whose
+/// last logs, or all of them, are missing still passes.
+fn validate_row_indices(
+    table: XatuTable,
     number: BlockNumber,
-    transactions: &[TransactionEnvelope],
-    count: u32,
-    filtered: bool,
+    mut indices: Vec<u32>,
+    count: Option<u32>,
 ) -> Result<(), XatuError> {
-    let expected = usize::try_from(count).unwrap_or(usize::MAX);
-    if transactions.len() > expected
-        || transactions
-            .last()
-            .is_some_and(|transaction| transaction.index >= count)
-    {
+    indices.sort_unstable();
+    if indices.windows(2).any(|pair| pair[0] == pair[1]) {
         return Err(XatuError::Data(format!(
-            "block {number} projects transactions beyond its {count} payload transactions"
+            "duplicate {table} index in block {number}"
         )));
     }
-    if !filtered && transactions.len() != expected {
+    let actual = indices.len();
+    let expected = match count {
+        Some(count) => {
+            if indices.last().is_some_and(|index| *index >= count) {
+                return Err(XatuError::Data(format!(
+                    "block {number} holds {table} rows beyond its {count} payload transactions"
+                )));
+            }
+            usize::try_from(count).unwrap_or(usize::MAX)
+        }
+        // Sorted without duplicates, indices from zero end at `actual - 1`.
+        None => indices.last().map_or(0, |last| {
+            usize::try_from(*last)
+                .unwrap_or(usize::MAX)
+                .saturating_add(1)
+        }),
+    };
+    if actual != expected {
         return Err(XatuError::IncompleteRange {
-            table: XatuTable::CanonicalExecutionTransaction,
+            table,
             range: BlockRange::single(number),
             expected,
-            actual: transactions.len(),
+            actual,
         });
     }
     Ok(())
@@ -2005,6 +2032,20 @@ fn normalize_frames(inputs: NormalizationInputs<'_>) -> Result<Vec<BlockFrame>, 
         let block_transactions = transactions_by_slot
             .remove(&beacon.slot)
             .unwrap_or_default();
+        // A blob the beacon payload lists without its execution row is a gap
+        // in the published table, which another source may fill.
+        let joined = block_transactions
+            .iter()
+            .filter(|transaction| execution_transactions.contains_key(&transaction.hash))
+            .count();
+        if joined != block_transactions.len() {
+            return Err(XatuError::IncompleteRange {
+                table: XatuTable::CanonicalExecutionTransaction,
+                range: BlockRange::single(number),
+                expected: block_transactions.len(),
+                actual: joined,
+            });
+        }
         let mut transactions = Vec::with_capacity(block_transactions.len());
         let mut receipts = Vec::with_capacity(block_transactions.len());
         for transaction in block_transactions {
@@ -3060,11 +3101,13 @@ mod tests {
     }
 
     /// Normalize block 42, whose payload holds `transaction_count`
-    /// transactions, from projected rows at `indices`.
+    /// transactions, from rows at `rows`, of which the filters selected
+    /// those at `selected`.
     fn generic_transaction_frames(
         filters: &FilterSet,
         transaction_count: u32,
-        indices: &[u32],
+        rows: &[u32],
+        selected: &[u32],
     ) -> Result<Vec<BlockFrame>, XatuError> {
         let number = 42;
         let hash = BlockHash::new([0x42; 32]);
@@ -3094,9 +3137,10 @@ mod tests {
                     excess_blob_gas: None,
                 },
             )]),
+            row_indices: BTreeMap::from([(number, rows.to_vec())]),
             transactions: BTreeMap::from([(
                 number,
-                indices.iter().copied().map(generic_transaction).collect(),
+                selected.iter().copied().map(generic_transaction).collect(),
             )]),
             receipts: None,
             logs: BTreeMap::new(),
@@ -3107,10 +3151,12 @@ mod tests {
     #[test]
     fn unfiltered_transactions_account_for_every_payload_transaction() {
         let unfiltered = FilterSet::default();
+        let frames =
+            |count, rows: &[u32]| generic_transaction_frames(&unfiltered, count, rows, rows);
         // Audit M-H8: a block with three transactions was projected as two.
         assert!(
             matches!(
-                generic_transaction_frames(&unfiltered, 3, &[0, 2]),
+                frames(3, &[0, 2]),
                 Err(XatuError::IncompleteRange {
                     table: XatuTable::CanonicalExecutionTransaction,
                     expected: 3,
@@ -3120,25 +3166,123 @@ mod tests {
             ),
             "an unfiltered list shorter than the payload"
         );
-        generic_transaction_frames(&unfiltered, 3, &[0, 1, 2]).expect("complete transactions");
-        generic_transaction_frames(&unfiltered, 0, &[]).expect("an empty block");
-        assert!(generic_transaction_frames(&unfiltered, 1, &[1]).is_err());
+        frames(3, &[0, 1, 2]).expect("complete transactions");
+        frames(0, &[]).expect("an empty block");
+        assert!(frames(1, &[1]).is_err());
 
-        // A filtered list may be shorter, but never longer or outside the
-        // payload.
+        // A filtered list may be shorter, but its rows never longer or
+        // outside the payload.
         let senders = FilterSet {
             senders: vec![Address::new([0x22; 20])],
             ..FilterSet::default()
         };
-        generic_transaction_frames(&senders, 3, &[2]).expect("a filtered subset");
+        generic_transaction_frames(&senders, 3, &[0, 1, 2], &[2]).expect("a filtered subset");
         assert!(
-            generic_transaction_frames(&senders, 1, &[0, 1]).is_err(),
+            generic_transaction_frames(&senders, 1, &[0, 1], &[0, 1]).is_err(),
             "more transactions than the payload"
         );
         assert!(
-            generic_transaction_frames(&senders, 2, &[2]).is_err(),
+            generic_transaction_frames(&senders, 2, &[2], &[2]).is_err(),
             "an index outside the payload"
         );
+    }
+
+    /// Parse `batch` for block 42, whose payload holds three transactions,
+    /// and normalize what `filters` select.
+    fn project_block_42(
+        batch: &RecordBatch,
+        filters: &FilterSet,
+    ) -> Result<Vec<BlockFrame>, XatuError> {
+        let range = BlockRange::single(BlockNumber(42));
+        let mut row_indices = BTreeMap::new();
+        let mut transactions = BTreeMap::new();
+        parse_generic_transactions(
+            batch,
+            range,
+            filters,
+            TransactionColumns::default(),
+            &mut row_indices,
+            &mut transactions,
+            &mut BTreeMap::new(),
+        )?;
+        let hash = BlockHash::new([0x42; 32]);
+        normalize_generic_frames(GenericNormalizationInputs {
+            range,
+            kind: GenericProjectionKind::Transactions,
+            include_header: false,
+            filters,
+            execution_blocks: &BTreeMap::from([(
+                42,
+                GenericExecutionBlockRow {
+                    hash,
+                    timestamp: 1_700_000_000,
+                },
+            )]),
+            beacon_blocks: &BTreeMap::from([(
+                42,
+                GenericBeaconBlockRow {
+                    hash,
+                    parent_hash: BlockHash::ZERO,
+                    timestamp: 1_700_000_000,
+                    transaction_count: 3,
+                    gas_limit: 30_000_000,
+                    gas_used: 104_000,
+                    base_fee_per_gas: quantity_from_u64(7),
+                    blob_gas_used: None,
+                    excess_blob_gas: None,
+                },
+            )]),
+            row_indices,
+            transactions,
+            receipts: None,
+            logs: BTreeMap::new(),
+            provenance: &[],
+        })
+    }
+
+    fn selected_indices(frames: &[BlockFrame]) -> Vec<u32> {
+        let Material::Filtered { value, .. } = &frames[0].transactions else {
+            panic!("generic transactions are a filtered projection");
+        };
+        value.iter().map(|transaction| transaction.index).collect()
+    }
+
+    #[test]
+    fn filtered_transactions_need_every_row_of_their_block() {
+        let recipient = |byte| FilterSet {
+            scope: FilterScope {
+                recipients: vec![Address::new([byte; 20])],
+                ..FilterScope::default()
+            },
+            ..FilterSet::default()
+        };
+        let complete = outcome_batch();
+        assert_eq!(
+            selected_indices(&project_block_42(&complete, &recipient(0x33)).expect("matches")),
+            vec![0, 2]
+        );
+        // A filter that matches nothing in a complete block selects nothing.
+        assert!(
+            selected_indices(&project_block_42(&complete, &recipient(0x99)).expect("no match"))
+                .is_empty()
+        );
+        // Report 2026-10-13 §1: the published object lacked a matching row,
+        // and the block passed as one whose other rows did not match.
+        let missing_match = complete.slice(0, 2);
+        for filters in [recipient(0x33), recipient(0x99), FilterSet::default()] {
+            assert!(
+                matches!(
+                    project_block_42(&missing_match, &filters),
+                    Err(XatuError::IncompleteRange {
+                        table: XatuTable::CanonicalExecutionTransaction,
+                        expected: 3,
+                        actual: 2,
+                        ..
+                    })
+                ),
+                "{filters:?}"
+            );
+        }
     }
 
     fn log_batch(topic_columns: [ArrayRef; 4]) -> RecordBatch {
@@ -3192,6 +3336,7 @@ mod tests {
             BlockRange::single(BlockNumber(42)),
             filters,
             LogFieldSet::ALL,
+            &mut BTreeMap::new(),
             &mut output,
         )?;
         Ok(output)
@@ -3377,6 +3522,7 @@ mod tests {
                 BlockRange::single(BlockNumber(42)),
                 &filters,
                 columns,
+                &mut BTreeMap::new(),
                 &mut output,
                 &mut BTreeMap::new(),
             )
@@ -3402,6 +3548,7 @@ mod tests {
                 BlockRange::single(BlockNumber(42)),
                 &separate,
                 columns,
+                &mut BTreeMap::new(),
                 &mut BTreeMap::new(),
                 &mut BTreeMap::new(),
             )
@@ -3536,6 +3683,7 @@ mod tests {
             calldata: true,
             outcome: true,
         };
+        let mut row_indices = BTreeMap::new();
         let mut transactions = BTreeMap::new();
         let mut receipts = BTreeMap::new();
         assert_eq!(
@@ -3544,6 +3692,7 @@ mod tests {
                 range,
                 &filters,
                 columns,
+                &mut row_indices,
                 &mut transactions,
                 &mut receipts,
             )
@@ -3602,6 +3751,7 @@ mod tests {
                     excess_blob_gas: None,
                 },
             )]),
+            row_indices,
             transactions,
             receipts: Some(receipts),
             logs: BTreeMap::new(),
@@ -3708,6 +3858,7 @@ mod tests {
                 BlockRange::single(BlockNumber(42)),
                 &filters,
                 LogFieldSet::ALL,
+                &mut BTreeMap::new(),
                 &mut output,
             )
             .expect("parse"),
@@ -3716,6 +3867,139 @@ mod tests {
         let log = &output[&42][0];
         assert_eq!(log.topics, vec![[0x66; 32], [0x77; 32]]);
         assert_eq!(log.data, vec![0xde, 0xad, 0xbe, 0xef]);
+    }
+
+    /// Block 42 log rows at `log_indices`, all from contract 0x55…55.
+    fn block_42_log_rows(log_indices: &[u32]) -> RecordBatch {
+        let rows = log_indices.len();
+        let hash = format!("0x{}", "44".repeat(32));
+        let address = format!("0x{}", "55".repeat(20));
+        let topic = format!("0x{}", "66".repeat(32));
+        RecordBatch::try_from_iter(vec![
+            (
+                "block_number",
+                Arc::new(UInt32Array::from(vec![42; rows])) as ArrayRef,
+            ),
+            (
+                "transaction_index",
+                Arc::new(UInt32Array::from(vec![0; rows])) as ArrayRef,
+            ),
+            (
+                "transaction_hash",
+                Arc::new(StringArray::from(vec![hash.as_str(); rows])) as ArrayRef,
+            ),
+            (
+                "log_index",
+                Arc::new(UInt32Array::from(log_indices.to_vec())) as ArrayRef,
+            ),
+            (
+                "address",
+                Arc::new(StringArray::from(vec![address.as_str(); rows])) as ArrayRef,
+            ),
+            (
+                "topic0",
+                Arc::new(StringArray::from(vec![Some(topic.as_str()); rows])) as ArrayRef,
+            ),
+            (
+                "topic1",
+                Arc::new(StringArray::from(vec![None::<&str>; rows])) as ArrayRef,
+            ),
+            (
+                "topic2",
+                Arc::new(StringArray::from(vec![None::<&str>; rows])) as ArrayRef,
+            ),
+            (
+                "topic3",
+                Arc::new(StringArray::from(vec![None::<&str>; rows])) as ArrayRef,
+            ),
+            (
+                "data",
+                Arc::new(StringArray::from(vec![Some("0x"); rows])) as ArrayRef,
+            ),
+        ])
+        .expect("log rows")
+    }
+
+    /// Parse and normalize the logs `filters` select from `batch`, for a
+    /// block whose payload holds `transaction_count` transactions.
+    fn block_42_log_frames(
+        batch: &RecordBatch,
+        filters: &FilterSet,
+        transaction_count: u32,
+    ) -> Result<Vec<BlockFrame>, XatuError> {
+        let range = BlockRange::single(BlockNumber(42));
+        let mut row_indices = BTreeMap::new();
+        let mut logs = BTreeMap::new();
+        parse_generic_logs(
+            batch,
+            range,
+            filters,
+            LogFieldSet::ALL,
+            &mut row_indices,
+            &mut logs,
+        )?;
+        let hash = BlockHash::new([0x42; 32]);
+        normalize_generic_frames(GenericNormalizationInputs {
+            range,
+            kind: GenericProjectionKind::Logs,
+            include_header: false,
+            filters,
+            execution_blocks: &BTreeMap::from([(
+                42,
+                GenericExecutionBlockRow {
+                    hash,
+                    timestamp: 1_700_000_000,
+                },
+            )]),
+            beacon_blocks: &BTreeMap::from([(
+                42,
+                GenericBeaconBlockRow {
+                    hash,
+                    parent_hash: BlockHash::ZERO,
+                    timestamp: 1_700_000_000,
+                    transaction_count,
+                    gas_limit: 30_000_000,
+                    gas_used: 104_000,
+                    base_fee_per_gas: quantity_from_u64(7),
+                    blob_gas_used: None,
+                    excess_blob_gas: None,
+                },
+            )]),
+            row_indices,
+            transactions: BTreeMap::new(),
+            receipts: None,
+            logs,
+            provenance: &[],
+        })
+    }
+
+    #[test]
+    fn log_rows_of_a_block_have_no_gaps() {
+        let other_contract = FilterSet {
+            scope: FilterScope {
+                addresses: vec![Address::new([0x99; 20])],
+                ..FilterScope::default()
+            },
+            ..FilterSet::default()
+        };
+        for filters in [FilterSet::default(), other_contract] {
+            block_42_log_frames(&block_42_log_rows(&[0, 1, 2]), &filters, 1).expect("every log");
+            block_42_log_frames(&block_42_log_rows(&[]), &filters, 1)
+                .expect("a block without logs");
+            // Report 2026-10-13 §1: an omitted log row passed unnoticed.
+            for gap in [&[0, 2][..], &[1, 2]] {
+                assert!(
+                    matches!(
+                        block_42_log_frames(&block_42_log_rows(gap), &filters, 1),
+                        Err(XatuError::IncompleteRange {
+                            table: XatuTable::CanonicalExecutionLogs,
+                            ..
+                        })
+                    ),
+                    "{gap:?} {filters:?}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -3909,6 +4193,15 @@ mod tests {
     fn dencun_blob_frames(
         withdrawals: &BTreeMap<u64, Vec<WithdrawalRow>>,
     ) -> Result<Vec<BlockFrame>, XatuError> {
+        dencun_blob_frames_with(withdrawals, true)
+    }
+
+    /// [`dencun_blob_frames`], with or without the blob transaction's
+    /// execution row.
+    fn dencun_blob_frames_with(
+        withdrawals: &BTreeMap<u64, Vec<WithdrawalRow>>,
+        execution_row: bool,
+    ) -> Result<Vec<BlockFrame>, XatuError> {
         let transaction_hash = TransactionHash::new([0x33; 32]);
         let (execution, beacon) = dencun_blocks(BlockHash::new([0x11; 32]));
         normalize_frames(NormalizationInputs {
@@ -3929,7 +4222,7 @@ mod tests {
             }],
             transaction_sizes: &BTreeMap::from([(DENCUN_SLOT, dencun_transaction_sizes())]),
             withdrawals,
-            execution_transactions: &BTreeMap::from([(
+            execution_transactions: &BTreeMap::from_iter(execution_row.then_some((
                 transaction_hash,
                 ExecutionTransactionRow {
                     block_number: DENCUN_BLOCK,
@@ -3939,9 +4232,26 @@ mod tests {
                     gas_price: quantity_from_u64(1),
                     success: true,
                 },
-            )]),
+            ))),
             provenance: &[],
         })
+    }
+
+    #[test]
+    fn a_blob_without_its_execution_row_is_an_incomplete_range() {
+        // Report 2026-10-13 §1: Xatu lacked the execution rows
+        // of 24,695,859–24,695,890. Calling that corrupt failed the job on
+        // Xatu instead of trying the next source.
+        let withdrawals = dencun_slot_withdrawals(dencun_withdrawals(16));
+        assert!(matches!(
+            dencun_blob_frames_with(&withdrawals, false),
+            Err(XatuError::IncompleteRange {
+                table: XatuTable::CanonicalExecutionTransaction,
+                expected: 1,
+                actual: 0,
+                ..
+            })
+        ));
     }
 
     fn dencun_slot_withdrawals(rows: Vec<WithdrawalRow>) -> BTreeMap<u64, Vec<WithdrawalRow>> {

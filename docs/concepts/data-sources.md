@@ -190,9 +190,15 @@ their size.
 
 The projections check what the dataset declares:
 
-- a transaction projection that no filter narrows must hold every
-  transaction the beacon payload counts, with indices `0..count`; a filtered
-  one may be shorter, but never longer or outside the payload;
+- a block's transaction rows, all of them, before any filter selects some,
+  must hold every transaction the beacon payload counts, with indices
+  `0..count`, so a missing row never passes for one the filter did not match.
+  A block with a missing row is an incomplete range, which a backfill takes to
+  its next configured source, as is a blob transaction the beacon payload
+  lists without its execution row;
+- a block's log rows, all of them, must carry log indices from 0 without a
+  gap. Xatu publishes no log count or bloom per block, so a block whose last
+  logs, or all of them, are missing still passes;
 - the blobs projection proves every block's withdrawals, on which its
   execution size depends, from the global withdrawal index: between two slots
   with rows the indices must continue exactly, so a slot between them

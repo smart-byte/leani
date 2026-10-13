@@ -47,6 +47,12 @@ record, and documented RPC contracts.
   requested group's fields, the read ends with a missing-material error for the
   rest of the chunk, and the job passes that range to its next source: a cache
   miss, never a job failure or a wrong value.
+- A Xatu block whose published rows lack a transaction no longer passes as one
+  whose other transactions the filter did not match: every transaction row is
+  counted against the beacon payload before filtering, and log rows must run
+  without a gap. Such a block is an incomplete range, served by the next
+  configured source. So is a blob transaction without its execution row, which
+  failed backfills at block 24,695,859 on every retry.
 
 ### Upgrading
 
