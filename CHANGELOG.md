@@ -68,6 +68,10 @@ record, and documented RPC contracts.
   failed advance are finalized without waiting for consensus to advance. A
   failed advance is logged as an error and retried with backoff up to five
   minutes.
+- The container image points `SQLITE_TMPDIR` and `TMPDIR` at `/tmp/leani`, and
+  `compose.yaml` mounts that tmpfs writable for the node's user. On the
+  read-only root filesystem, large statements, such as a finality advance over
+  many blocks, failed with `disk I/O error` (code 6410).
 
 ### Upgrading
 

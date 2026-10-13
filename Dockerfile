@@ -34,6 +34,10 @@ COPY LICENSE THIRD_PARTY_LICENSES.txt /usr/share/licenses/leani/
 COPY deploy/container.toml /etc/leani/node.toml
 COPY config/modes /etc/leani/examples
 
+# The root filesystem may be read-only: SQLite spills large statements and
+# sorts here, the one writable temporary directory.
+ENV SQLITE_TMPDIR=/tmp/leani TMPDIR=/tmp/leani
+
 USER 10001:10001
 VOLUME ["/var/lib/leani"]
 EXPOSE 8080 8545 8546
