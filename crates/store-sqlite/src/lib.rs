@@ -119,10 +119,10 @@ const FINALITY_VOCABULARY_SCHEMA_VERSION: u32 = 21;
 /// Oldest existing store schema that upgrades in place through the migration
 /// chain. Older stores are refused with [`older_schema_refusal`].
 const OLDEST_UPGRADABLE_SCHEMA_VERSION: u32 = FINALITY_VOCABULARY_SCHEMA_VERSION;
-/// Longest time [`SqliteStore::cached_stats`] and
-/// [`SqliteStore::cached_processor_stats`] reuse one scan. Health and metrics
-/// endpoints poll far more often than these counts move, and each scan reads
-/// whole tables.
+/// Shortest time [`SqliteStore::cached_stats`] and
+/// [`SqliteStore::cached_processor_stats`] reuse one scan before replacing it
+/// in the background. Health and metrics endpoints poll far more often than
+/// these counts move, and each scan reads whole tables.
 pub const STATS_CACHE_TTL: Duration = Duration::from_secs(10);
 /// Most finalized blocks below a compaction bound that stay exact for an
 /// archive audit that has not passed them, about nine days of mainnet blocks.
@@ -1881,24 +1881,31 @@ struct StoreInner {
 #[derive(Debug)]
 struct CachedStatistics<T> {
     refreshed_at: Instant,
+    /// [`STATS_CACHE_TTL`], or four times the scan when that took longer:
+    /// rescans of a large store then occupy at most a fifth of the time.
+    fresh_for: Duration,
     value: T,
+    /// A background scan replaces this one.
+    refreshing: bool,
 }
 
 impl<T: Clone> CachedStatistics<T> {
-    fn new(value: T) -> Self {
+    fn new(value: T, scanned_for: Duration) -> Self {
         Self {
             refreshed_at: Instant::now(),
+            fresh_for: STATS_CACHE_TTL.max(scanned_for.saturating_mul(4)),
             value,
+            refreshing: false,
         }
     }
 
-    fn is_fresh(&self, now: Instant) -> bool {
-        now.saturating_duration_since(self.refreshed_at) < STATS_CACHE_TTL
-    }
-
-    /// The scanned value while it is younger than [`STATS_CACHE_TTL`].
-    fn fresh(&self, now: Instant) -> Option<T> {
-        self.is_fresh(now).then(|| self.value.clone())
+    /// The scanned value, at once, and whether a background scan should now
+    /// replace it: a stale value answers while the next scan runs.
+    fn read(&mut self, now: Instant) -> (T, bool) {
+        let refresh =
+            !self.refreshing && now.saturating_duration_since(self.refreshed_at) >= self.fresh_for;
+        self.refreshing |= refresh;
+        (self.value.clone(), refresh)
     }
 }
 
@@ -13366,54 +13373,90 @@ impl SqliteStore {
         })
     }
 
-    /// Serve [`Self::stats`] from a scan at most [`STATS_CACHE_TTL`] old.
-    ///
-    /// Concurrent callers share one refresh, so polling health and metrics
-    /// endpoints cost at most one scan per TTL between them.
+    /// Serve [`Self::stats`] from the last scan. The first read waits for a
+    /// scan, which concurrent first reads share; once that scan is older than
+    /// [`STATS_CACHE_TTL`], or four times its own duration, a read answers
+    /// with it at once and a background scan replaces it.
     ///
     /// # Errors
     ///
-    /// Returns an error when a refresh scan fails.
+    /// Returns an error when the first scan fails.
     pub async fn cached_stats(&self) -> Result<StoreStats, StoreError> {
         let mut cache = self.inner.statistics_cache.lock().await;
-        if let Some(stats) = cache
-            .store
-            .as_ref()
-            .and_then(|cached| cached.fresh(Instant::now()))
-        {
+        if let Some(cached) = cache.store.as_mut() {
+            let (stats, refresh) = cached.read(Instant::now());
+            if refresh {
+                let store = self.clone();
+                tokio::spawn(async move {
+                    let started = Instant::now();
+                    let scanned = store.stats().await;
+                    let mut cache = store.inner.statistics_cache.lock().await;
+                    match scanned {
+                        Ok(stats) => {
+                            cache.store = Some(CachedStatistics::new(stats, started.elapsed()));
+                        }
+                        Err(error) => {
+                            tracing::warn!(%error, "store statistics refresh failed");
+                            if let Some(cached) = cache.store.as_mut() {
+                                cached.refreshing = false;
+                            }
+                        }
+                    }
+                });
+            }
             return Ok(stats);
         }
+        let started = Instant::now();
         let stats = self.stats().await?;
-        cache.store = Some(CachedStatistics::new(stats.clone()));
+        cache.store = Some(CachedStatistics::new(stats.clone(), started.elapsed()));
         Ok(stats)
     }
 
-    /// Serve [`Self::processor_stats`] from a scan at most
-    /// [`STATS_CACHE_TTL`] old.
+    /// Serve [`Self::processor_stats`] like [`Self::cached_stats`].
     ///
     /// # Errors
     ///
-    /// Returns an error when a refresh scan fails.
+    /// Returns an error when the processor's first scan fails.
     pub async fn cached_processor_stats(
         &self,
         descriptor: &ProcessorDescriptor,
     ) -> Result<ProcessorStoreStats, StoreError> {
         let instance = processor_instance(descriptor);
         let mut cache = self.inner.statistics_cache.lock().await;
-        let now = Instant::now();
-        if let Some(stats) = cache
-            .processors
-            .get(&instance)
-            .and_then(|cached| cached.fresh(now))
-        {
+        // ponytail: entries of removed instances stay until restart; the
+        // configured set is small.
+        if let Some(cached) = cache.processors.get_mut(&instance) {
+            let (stats, refresh) = cached.read(Instant::now());
+            if refresh {
+                let store = self.clone();
+                let descriptor = descriptor.clone();
+                tokio::spawn(async move {
+                    let started = Instant::now();
+                    let scanned = store.processor_stats(&descriptor).await;
+                    let mut cache = store.inner.statistics_cache.lock().await;
+                    match scanned {
+                        Ok(stats) => {
+                            cache
+                                .processors
+                                .insert(instance, CachedStatistics::new(stats, started.elapsed()));
+                        }
+                        Err(error) => {
+                            tracing::warn!(%error, %instance, "processor statistics refresh failed");
+                            if let Some(cached) = cache.processors.get_mut(&instance) {
+                                cached.refreshing = false;
+                            }
+                        }
+                    }
+                });
+            }
             return Ok(stats);
         }
+        let started = Instant::now();
         let stats = self.processor_stats(descriptor).await?;
-        // Drop entries of processors nobody has asked about for a TTL.
-        cache.processors.retain(|_, cached| cached.is_fresh(now));
-        cache
-            .processors
-            .insert(instance, CachedStatistics::new(stats.clone()));
+        cache.processors.insert(
+            instance,
+            CachedStatistics::new(stats.clone(), started.elapsed()),
+        );
         Ok(stats)
     }
 
@@ -27760,7 +27803,7 @@ mod tests {
             "one store-wide and one processor scan serve both reads"
         );
 
-        // An entry as old as the TTL is refreshed on the next read.
+        // An entry as old as the TTL is refreshed behind the next read.
         {
             let expired = Instant::now()
                 .checked_sub(STATS_CACHE_TTL)
@@ -27782,7 +27825,69 @@ mod tests {
             .cached_processor_stats(&processor.descriptor)
             .await
             .expect("refreshed processor stats");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while store.statistics_scans() - before < 4 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("background refreshes");
         assert_eq!(store.statistics_scans() - before, 4);
+    }
+
+    #[tokio::test]
+    async fn stale_statistics_answer_at_once_and_refresh_behind_the_read() {
+        // Report 2026-10-13 §4: each metrics scrape waited 27–51 s for scans
+        // longer than the TTL, which meanwhile expired the other entry.
+        let (_directory, store) = store().await;
+        let processor = FixtureProcessor::new();
+        let tip = apply_included_blocks(&store, &processor, 1..=2, BlockHash::ZERO).await;
+        let stale = store.cached_stats().await.expect("store stats");
+        let stale_processor = store
+            .cached_processor_stats(&processor.descriptor)
+            .await
+            .expect("processor stats");
+        apply_included_blocks(&store, &processor, 3..=4, tip).await;
+        {
+            let expired = Instant::now()
+                .checked_sub(STATS_CACHE_TTL)
+                .expect("monotonic clock older than the TTL");
+            let mut cache = store.inner.statistics_cache.lock().await;
+            cache.store.as_mut().expect("store entry").refreshed_at = expired;
+            cache
+                .processors
+                .get_mut(&processor_instance(&processor.descriptor))
+                .expect("processor entry")
+                .refreshed_at = expired;
+        }
+        let before = store.statistics_scans();
+        assert_eq!(store.cached_stats().await.expect("stale stats"), stale);
+        assert_eq!(
+            store
+                .cached_processor_stats(&processor.descriptor)
+                .await
+                .expect("stale processor stats"),
+            stale_processor
+        );
+        // A refresh counts its scan when it starts, so wait for its values.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while store.cached_stats().await.expect("stats") == stale
+                || store
+                    .cached_processor_stats(&processor.descriptor)
+                    .await
+                    .expect("processor stats")
+                    == stale_processor
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("both entries refresh behind the reads");
+        assert_eq!(
+            store.statistics_scans() - before,
+            2,
+            "one scan refreshes each"
+        );
     }
 
     async fn query_plan(store: &SqliteStore, statement: &'static str) -> Vec<String> {
