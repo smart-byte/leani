@@ -8562,6 +8562,12 @@ async fn spawn_cold_backfills(
             }
         };
         supersede_automatic_jobs(store, &job_prefix, &job.id).await?;
+        // A lane restart before finality advances reruns the same job, which
+        // finds nothing left to do; its completion was reported already.
+        let reported = store
+            .job(&job.id)
+            .await?
+            .is_some_and(|record| record.state == leani_store_sqlite::JobState::Completed);
         let budget = historical_source_budget(config, range);
         let processor_id = configured.instance.clone();
         let processor_descriptor = processor.descriptor().clone();
@@ -8606,13 +8612,15 @@ async fn spawn_cold_backfills(
                     .into());
                 }
             };
-            NativeBackfillControl::record_success(
-                &handoff_store,
-                "automatic",
-                leani_runtime::HistoricalJobOwner::Materialization,
-                report,
-            )
-            .await;
+            if !reported {
+                NativeBackfillControl::record_success(
+                    &handoff_store,
+                    "automatic",
+                    leani_runtime::HistoricalJobOwner::Materialization,
+                    report,
+                )
+                .await;
+            }
             loop {
                 if handoff_store
                     .canonical_coverage(chain_id, overlap)

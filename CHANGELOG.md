@@ -77,6 +77,8 @@ record, and documented RPC contracts.
 - A completed backfill reports no remaining blocks, although it skipped blocks
   other work had covered, and `leani_historical_remaining_blocks` no longer
   counts failed or cancelled jobs.
+- An automatic backfill that already completed no longer logs its completion
+  again when the network lanes restart.
 
 ### Upgrading
 
