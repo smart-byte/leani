@@ -74,6 +74,9 @@ record, and documented RPC contracts.
   many blocks, failed with `disk I/O error` (code 6410).
 - `execution live readiness changed` is logged when readiness changes, not on
   every block.
+- A completed backfill reports no remaining blocks, although it skipped blocks
+  other work had covered, and `leani_historical_remaining_blocks` no longer
+  counts failed or cancelled jobs.
 
 ### Upgrading
 
