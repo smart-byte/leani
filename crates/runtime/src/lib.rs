@@ -40,9 +40,14 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 const FINALITY_ANCHOR_RETRY_INTERVAL: Duration = Duration::from_millis(250);
+/// How often finality retries its last applied anchor for the processors
+/// that did not take it.
+const FINALITY_PROCESSOR_RETRY_INTERVAL: Duration = Duration::from_secs(1);
+/// Longest wait between retries for a processor whose finality keeps failing.
+const FINALITY_PROCESSOR_RETRY_MAX: Duration = Duration::from_secs(300);
 const RECENT_STORAGE_RETRY_INTERVAL: Duration = Duration::from_millis(250);
 const FINALITY_RECONNECT_BASE: Duration = Duration::from_secs(1);
 const FINALITY_RECONNECT_MAX: Duration = Duration::from_secs(30);
@@ -7182,6 +7187,37 @@ pub struct SharedFinalityReport {
     pub retained_recent_bytes: u64,
 }
 
+impl SharedFinalityReport {
+    /// Record how processor `id` took the anchor `block_hash`.
+    fn record_processor(
+        &mut self,
+        id: String,
+        block_hash: BlockHash,
+        finality: &Result<ProcessorFinality, RuntimeError>,
+    ) {
+        match finality {
+            Ok(ProcessorFinality::Finalized(through)) => {
+                self.processor_finalized_through
+                    .insert(id.clone(), *through);
+                self.deferred_processors.remove(&id);
+                self.failed_processors.remove(&id);
+            }
+            Ok(ProcessorFinality::Deferred) => {
+                self.failed_processors.remove(&id);
+                self.deferred_processors.insert(id, block_hash);
+            }
+            Ok(ProcessorFinality::LaneFailed) => {}
+            Err(error) => {
+                self.failed_processors.insert(id, error.to_string());
+            }
+        }
+    }
+}
+
+/// When each processor whose finality failed is retried next, and after how
+/// many failures.
+type FinalityRetries = BTreeMap<String, (tokio::time::Instant, u32)>;
+
 /// One consensus-verified finalized execution anchor after its canonical
 /// execution block is present in recent storage.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -7308,8 +7344,12 @@ impl SharedFinalityRuntime {
             .await?;
         let mut report = SharedFinalityReport::default();
         let mut pending_finalized = None;
+        let mut last_applied = None;
+        let mut retries = FinalityRetries::new();
         let mut retry = tokio::time::interval(FINALITY_ANCHOR_RETRY_INTERVAL);
         retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut processor_retry = tokio::time::interval(FINALITY_PROCESSOR_RETRY_INTERVAL);
+        processor_retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             let event = tokio::select! {
                 () = cancellation.cancelled() => break,
@@ -7319,6 +7359,13 @@ impl SharedFinalityRuntime {
                     };
                     if self.apply_finalized(finalized, &mut report).await? {
                         pending_finalized = None;
+                        last_applied = Some(finalized);
+                    }
+                    continue;
+                }
+                _ = processor_retry.tick(), if last_applied.is_some() => {
+                    if let Some(anchor) = last_applied {
+                        self.retry_processors(anchor, &mut report, &mut retries).await;
                     }
                     continue;
                 }
@@ -7349,6 +7396,7 @@ impl SharedFinalityRuntime {
                     pending_finalized = Some(finalized);
                     if self.apply_finalized(finalized, &mut report).await? {
                         pending_finalized = None;
+                        last_applied = Some(finalized);
                     }
                 }
                 FinalityEvent::Disagreement {
@@ -7391,6 +7439,8 @@ impl SharedFinalityRuntime {
     ) -> Result<SharedFinalityReport, RuntimeError> {
         let mut report = SharedFinalityReport::default();
         let mut pending_finalized = None;
+        let mut last_applied = None;
+        let mut retries = FinalityRetries::new();
         let mut reconnect_attempt = 0_u32;
 
         loop {
@@ -7432,6 +7482,8 @@ impl SharedFinalityRuntime {
 
             let mut retry = tokio::time::interval(FINALITY_ANCHOR_RETRY_INTERVAL);
             retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            let mut processor_retry = tokio::time::interval(FINALITY_PROCESSOR_RETRY_INTERVAL);
+            processor_retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             let disconnected = loop {
                 let event = tokio::select! {
                     () = cancellation.cancelled() => {
@@ -7450,6 +7502,13 @@ impl SharedFinalityRuntime {
                             .inspect_err(|_| signal_readiness(Some(&readiness), false))?
                         {
                             pending_finalized = None;
+                            last_applied = Some(finalized);
+                        }
+                        continue;
+                    }
+                    _ = processor_retry.tick(), if last_applied.is_some() => {
+                        if let Some(anchor) = last_applied {
+                            self.retry_processors(anchor, &mut report, &mut retries).await;
                         }
                         continue;
                     }
@@ -7481,6 +7540,7 @@ impl SharedFinalityRuntime {
                             .inspect_err(|_| signal_readiness(Some(&readiness), false))?
                         {
                             pending_finalized = None;
+                            last_applied = Some(finalized);
                         }
                     }
                     Some(Ok(FinalityEvent::Disagreement {
@@ -7554,34 +7614,19 @@ impl SharedFinalityRuntime {
         for processor in &self.processors {
             let id = processor.descriptor().id.to_string();
             // One processor's failure must not hold back finality or recent
-            // pruning for the others: record it, and let the next anchor
-            // retry that processor.
-            match self
+            // pruning for the others: record it, and retry that processor.
+            let finality = self
                 .finalize_processor(processor.as_ref(), block_hash, canonical.number)
-                .await
-            {
-                Ok(ProcessorFinality::Finalized(through)) => {
-                    report
-                        .processor_finalized_through
-                        .insert(id.clone(), through);
-                    report.deferred_processors.remove(&id);
-                    report.failed_processors.remove(&id);
-                }
-                Ok(ProcessorFinality::Deferred) => {
-                    report.failed_processors.remove(&id);
-                    report.deferred_processors.insert(id, block_hash);
-                }
-                Ok(ProcessorFinality::LaneFailed) => {}
-                Err(error) => {
-                    warn!(
-                        processor = %id,
-                        finalized_block = canonical.number.0,
-                        %error,
-                        "processor finality failed; finality and recent pruning continue for the others"
-                    );
-                    report.failed_processors.insert(id, error.to_string());
-                }
+                .await;
+            if let Err(error) = &finality {
+                error!(
+                    processor = %id,
+                    finalized_block = canonical.number.0,
+                    %error,
+                    "processor finality failed; finality and recent pruning continue for the others"
+                );
             }
+            report.record_processor(id, block_hash, &finality);
         }
         let pruned = self
             .store
@@ -7621,6 +7666,61 @@ impl SharedFinalityRuntime {
             );
         }
         Ok(true)
+    }
+
+    /// Retry `anchor`, the last one applied, for the processors that did not
+    /// take it: deferred ones, failed ones once their backoff passes, and
+    /// ones that committed coverage below it after it was applied. A late live
+    /// commit is then finalized without waiting for the next anchor.
+    async fn retry_processors(
+        &self,
+        anchor: FinalizedBlock,
+        report: &mut SharedFinalityReport,
+        retries: &mut FinalityRetries,
+    ) {
+        retries.retain(|id, _| report.failed_processors.contains_key(id));
+        let now = tokio::time::Instant::now();
+        for processor in &self.processors {
+            let id = processor.descriptor().id.to_string();
+            if retries.get(&id).is_some_and(|(due, _)| *due > now) {
+                continue;
+            }
+            let pending = report.deferred_processors.contains_key(&id)
+                || report.failed_processors.contains_key(&id)
+                || self
+                    .store
+                    .unfinalized_coverage_through(processor.descriptor(), anchor.number)
+                    .await
+                    .unwrap_or_else(|error| {
+                        warn!(processor = %id, %error, "failed to inspect unfinalized coverage");
+                        false
+                    });
+            if !pending {
+                continue;
+            }
+            let finality = self
+                .finalize_processor(processor.as_ref(), anchor.hash, anchor.number)
+                .await;
+            if let Err(error) = &finality {
+                let failures = retries
+                    .get(&id)
+                    .map_or(1, |(_, failures)| failures.saturating_add(1));
+                let delay = retry_delay(
+                    FINALITY_PROCESSOR_RETRY_INTERVAL,
+                    FINALITY_PROCESSOR_RETRY_MAX,
+                    failures,
+                );
+                retries.insert(id.clone(), (now + delay, failures));
+                error!(
+                    processor = %id,
+                    finalized_block = anchor.number.0,
+                    %error,
+                    ?delay,
+                    "processor finality failed again; retrying"
+                );
+            }
+            report.record_processor(id, anchor.hash, &finality);
+        }
     }
 
     /// Finalize the retained canonical prefix through a verified finalized
@@ -20961,6 +21061,145 @@ mod tests {
             )
             .await
             .expect("apply");
+    }
+
+    #[tokio::test]
+    async fn a_processor_deferred_at_an_anchor_finalizes_when_its_coverage_arrives() {
+        // Report 2026-10-13 §3: a live commit landed after its anchor was
+        // accepted and stayed included until another anchor arrived.
+        let chain = live_blocks(1);
+        let anchor = &chain[1];
+        let processor = Arc::new(BlockLocalCounter::default());
+        let (_directory, store) = store().await;
+        store
+            .store_recent_frame(anchor)
+            .await
+            .expect("retain the anchor block");
+        let checkpoint = ConsensusCheckpoint {
+            beacon_slot: 1,
+            beacon_block_root: [1; 32],
+            execution_block_hash: BlockHash::ZERO,
+            obtained_at_unix_seconds: 1,
+            source: "fixture".to_owned(),
+        };
+        // One anchor, then a stream that stays open without another.
+        let source = Arc::new(ScriptedFinalitySource::new(
+            fixture_source_descriptor("deferred-finality", BlockRange::single(anchor.block.number)),
+            checkpoint.clone(),
+            vec![
+                FinalityStep::Event(FinalityEvent::Finalized {
+                    block_number: anchor.block.number,
+                    block_hash: anchor.block.hash,
+                    beacon_slot: 2,
+                    beacon_block_root: [2; 32],
+                }),
+                FinalityStep::Delay(Duration::from_secs(10)),
+            ],
+        ));
+        let (applied_anchors, mut applied) = tokio::sync::broadcast::channel(1);
+        let runtime = SharedFinalityRuntime::new(
+            store.clone(),
+            source,
+            vec![processor.clone()],
+            SharedFinalityRuntimeConfig::default(),
+        )
+        .expect("shared finality runtime")
+        .with_applied_anchors(applied_anchors);
+        let cancellation = CancellationToken::new();
+        let task = tokio::spawn({
+            let cancellation = cancellation.clone();
+            async move { runtime.run(checkpoint, cancellation).await }
+        });
+        applied.recv().await.expect("applied anchor");
+        apply_live_frame(&store, processor.as_ref(), anchor, 1).await;
+        let finalized = tokio::time::timeout(Duration::from_secs(5), async {
+            while store
+                .finalized_through(processor.descriptor())
+                .await
+                .expect("finalized coverage")
+                != Some(anchor.block.number)
+            {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        cancellation.cancel();
+        let outcome = task.await.expect("finality task");
+        assert!(
+            finalized.is_ok(),
+            "the late commit stayed included: {outcome:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_block_committed_below_finalized_coverage_is_finalized() {
+        // Report 2026-10-13 §3: an older block committed after finality passed
+        // its height stayed an included island until another anchor arrived.
+        let chain = live_blocks(2);
+        let (older, anchor) = (&chain[1], &chain[2]);
+        let processor = Arc::new(BlockLocalCounter::default());
+        let (_directory, store) = store().await;
+        for frame in [older, anchor] {
+            store.store_recent_frame(frame).await.expect("retain block");
+        }
+        apply_live_frame(&store, processor.as_ref(), anchor, 1).await;
+        let checkpoint = ConsensusCheckpoint {
+            beacon_slot: 1,
+            beacon_block_root: [1; 32],
+            execution_block_hash: BlockHash::ZERO,
+            obtained_at_unix_seconds: 1,
+            source: "fixture".to_owned(),
+        };
+        let source = Arc::new(ScriptedFinalitySource::new(
+            fixture_source_descriptor(
+                "island-finality",
+                BlockRange::new(BlockNumber(1), BlockNumber(2)).expect("range"),
+            ),
+            checkpoint.clone(),
+            vec![
+                FinalityStep::Event(FinalityEvent::Finalized {
+                    block_number: anchor.block.number,
+                    block_hash: anchor.block.hash,
+                    beacon_slot: 2,
+                    beacon_block_root: [2; 32],
+                }),
+                FinalityStep::Delay(Duration::from_secs(10)),
+            ],
+        ));
+        let (applied_anchors, mut applied) = tokio::sync::broadcast::channel(1);
+        let runtime = SharedFinalityRuntime::new(
+            store.clone(),
+            source,
+            vec![processor.clone()],
+            SharedFinalityRuntimeConfig::default(),
+        )
+        .expect("shared finality runtime")
+        .with_applied_anchors(applied_anchors);
+        let cancellation = CancellationToken::new();
+        let task = tokio::spawn({
+            let cancellation = cancellation.clone();
+            async move { runtime.run(checkpoint, cancellation).await }
+        });
+        applied.recv().await.expect("applied anchor");
+        apply_live_frame(&store, processor.as_ref(), older, 2).await;
+        let both = BlockRange::new(older.block.number, anchor.block.number).expect("range");
+        let finalized = tokio::time::timeout(Duration::from_secs(5), async {
+            while store
+                .finalized_coverage(processor.descriptor(), both)
+                .await
+                .expect("finalized coverage")
+                != vec![both]
+            {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        cancellation.cancel();
+        let outcome = task.await.expect("finality task");
+        assert!(
+            finalized.is_ok(),
+            "the older block stayed included: {outcome:?}"
+        );
     }
 
     #[tokio::test]
