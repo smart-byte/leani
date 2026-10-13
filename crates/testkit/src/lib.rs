@@ -2,6 +2,7 @@
 
 mod benchmark;
 mod fixtures;
+mod groups;
 mod processors;
 mod sources;
 
@@ -10,6 +11,7 @@ pub use benchmark::{
     synthetic_corpus_manifest, uniswap_weth_usdc_pool, update_frame_digest,
 };
 pub use fixtures::{default_source_budget, fixture_frame, fixture_source_descriptor};
+pub use groups::restrict_to_groups;
 pub use leani_source_api::{
     ConformanceError, CrossSourceReport, FrameDifference, FrameFingerprint,
     compare_frame_sequences, frame_fingerprint,

@@ -657,6 +657,11 @@ impl DataRequirement {
         {
             return Err("frame logs omit a required transaction hash");
         }
+        // Material presence says nothing about filled fields: every group the
+        // requirement derives must hold its promised fields.
+        if let Some(reason) = frame.group_violation(self.capabilities.with_derivable()) {
+            return Err(reason);
+        }
         Ok(())
     }
 
@@ -925,6 +930,48 @@ mod tests {
         );
     }
 
+    #[test]
+    fn frames_must_fill_the_fields_their_groups_promise() {
+        let mut frame = empty_frame();
+        frame.transactions = Material::Complete(vec![leani_primitives::TransactionEnvelope {
+            hash: TransactionHash::new([2; 32]),
+            transaction_type: 2,
+            index: 0,
+            encoded: None,
+            from: None,
+            to: None,
+            nonce: Some(0),
+            gas_limit: Some(21_000),
+            value: Some(leani_primitives::Quantity::new([0; 32])),
+            input: Some(Vec::new()),
+            max_fee_per_gas: None,
+            max_priority_fee_per_gas: None,
+            max_fee_per_blob_gas: None,
+            blob_versioned_hashes: Vec::new(),
+            size_bytes: None,
+        }]);
+        let requirement = |capabilities| DataRequirement {
+            capabilities,
+            log_fields: LogFieldSet::NONE,
+            allow_filtered: false,
+            filter: FilterScope::default(),
+            minimum_finality: Finality::Included,
+        };
+        let body = CapabilitySet::of(Capability::Body).with(Capability::Calldata);
+        assert_eq!(requirement(body).validate_frame(&frame), Ok(()));
+        // a transaction body without senders is not a sender promise, even
+        // under the bundle that derives it
+        for capabilities in [
+            body.with(Capability::Senders),
+            CapabilitySet::of(Capability::Transactions),
+        ] {
+            assert_eq!(
+                requirement(capabilities).validate_frame(&frame),
+                Err("transactions lack senders")
+            );
+        }
+    }
+
     fn empty_frame() -> BlockFrame {
         BlockFrame {
             chain_id: ChainId(1),
@@ -1113,7 +1160,7 @@ mod tests {
         // Audit probe: both decoded without validation.
         assert!(serde_json::from_str::<BlockRange>(r#"{"start":9,"end":1}"#).is_err());
         assert!(serde_json::from_str::<ProcessorId>(r#""../bad""#).is_err());
-        assert!(serde_json::from_str::<CapabilitySet>("4096").is_err());
+        assert!(serde_json::from_str::<CapabilitySet>("65536").is_err());
         assert!(serde_json::from_str::<LogFieldSet>("2").is_err());
 
         assert_eq!(
@@ -1125,7 +1172,7 @@ mod tests {
             ProcessorId::new("fixture").expect("ID")
         );
         assert_eq!(
-            serde_json::from_str::<CapabilitySet>("4095").expect("capabilities"),
+            serde_json::from_str::<CapabilitySet>("65535").expect("capabilities"),
             CapabilitySet::ALL
         );
         assert_eq!(

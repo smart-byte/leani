@@ -14,10 +14,10 @@ use arrow_array::{
 use arrow_schema::{DataType, Schema, TimeUnit};
 use futures::StreamExt;
 use leani_primitives::{
-    Address, BlockFrame, BlockHash, BlockNumber, BlockRange, BlockRef, ChainId, Completeness,
-    FilterScope, Finality, HeaderEnvelope, Log, LogField, LogFieldSet, Material, MissingReason,
-    ObjectIdentity, Provenance, Quantity, ReceiptEnvelope, SourceId, SourceKind,
-    TransactionEnvelope, TransactionHash, TrustModel, VerificationReport,
+    Address, BlockFrame, BlockHash, BlockNumber, BlockRange, BlockRef, Capability, CapabilitySet,
+    ChainId, Completeness, FilterScope, Finality, HeaderEnvelope, Log, LogField, LogFieldSet,
+    Material, MissingReason, ObjectIdentity, Provenance, Quantity, ReceiptEnvelope, SourceId,
+    SourceKind, TransactionEnvelope, TransactionHash, TrustModel, VerificationReport,
 };
 use leani_source_api::{FilterSet, SourceBudget};
 use object_store::{ObjectStore, ObjectStoreExt, path::Path as ObjectPath};
@@ -101,18 +101,61 @@ const GENERIC_BEACON_BLOCK_COLUMNS: &[&str] = &[
     "execution_payload_blob_gas_used",
     "execution_payload_excess_blob_gas",
 ];
+/// Transaction identity and the `Body` group, read for every request.
 const GENERIC_TRANSACTION_COLUMNS: &[&str] = &[
     "block_number",
     "transaction_index",
     "transaction_hash",
     "nonce",
-    "from_address",
     "to_address",
     "value",
-    "input",
     "gas_limit",
     "transaction_type",
 ];
+
+/// The optional transaction-table columns a request's field groups select.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct TransactionColumns {
+    /// `from_address`, for `Senders` or a sender predicate.
+    pub(crate) senders: bool,
+    /// `input`, for `Calldata`.
+    pub(crate) calldata: bool,
+    /// `gas_used`, `gas_price`, and `success`, for `ReceiptOutcome`.
+    pub(crate) outcome: bool,
+}
+
+impl TransactionColumns {
+    #[cfg(test)]
+    pub(crate) const ALL: Self = Self {
+        senders: true,
+        calldata: true,
+        outcome: true,
+    };
+
+    pub(crate) fn for_groups(groups: CapabilitySet, filters: &FilterSet) -> Self {
+        let groups = groups.with_derivable();
+        Self {
+            senders: groups.contains(Capability::Senders)
+                || !filters.effective_scope().senders.is_empty(),
+            calldata: groups.contains(Capability::Calldata),
+            outcome: groups.contains(Capability::ReceiptOutcome),
+        }
+    }
+
+    pub(crate) fn names(self) -> Vec<&'static str> {
+        let mut names = GENERIC_TRANSACTION_COLUMNS.to_vec();
+        if self.senders {
+            names.push("from_address");
+        }
+        if self.calldata {
+            names.push("input");
+        }
+        if self.outcome {
+            names.extend(["gas_used", "gas_price", "success"]);
+        }
+        names
+    }
+}
 const GENERIC_LOG_COLUMNS: &[&str] = &[
     "block_number",
     "transaction_index",
@@ -651,7 +694,7 @@ impl XatuBlobsProjector {
         kind: GenericProjectionKind,
         filters: &FilterSet,
         log_fields: LogFieldSet,
-        include_header: bool,
+        groups: CapabilitySet,
         budget: SourceBudget,
         batch_rows: usize,
         cancellation: CancellationToken,
@@ -718,10 +761,13 @@ impl XatuBlobsProjector {
         }
 
         let mut transactions = BTreeMap::<u64, Vec<TransactionEnvelope>>::new();
+        let mut receipts = BTreeMap::<u64, Vec<ReceiptEnvelope>>::new();
         let mut logs = BTreeMap::<u64, Vec<Log>>::new();
+        let columns = TransactionColumns::for_groups(groups, filters);
         match kind {
             GenericProjectionKind::Headers => {}
             GenericProjectionKind::Transactions => {
+                let names = columns.names();
                 for object in self
                     .catalog
                     .execution_objects(XatuTable::CanonicalExecutionTransaction, range)?
@@ -730,13 +776,20 @@ impl XatuBlobsProjector {
                         read_projected(
                             self.catalog.store(),
                             &object,
-                            GENERIC_TRANSACTION_COLUMNS,
+                            &names,
                             budget,
                             batch_rows,
                             &mut projected_bytes,
                             &cancellation,
                             |batch| {
-                                parse_generic_transactions(batch, range, filters, &mut transactions)
+                                parse_generic_transactions(
+                                    batch,
+                                    range,
+                                    filters,
+                                    columns,
+                                    &mut transactions,
+                                    &mut receipts,
+                                )
                             },
                         )
                         .await?,
@@ -775,11 +828,13 @@ impl XatuBlobsProjector {
         let frames = normalize_generic_frames(GenericNormalizationInputs {
             range,
             kind,
-            include_header,
+            include_header: groups.contains(Capability::Header),
             filters,
             execution_blocks: &execution_blocks,
             beacon_blocks: &beacon_blocks,
             transactions,
+            receipts: (kind == GenericProjectionKind::Transactions && columns.outcome)
+                .then_some(receipts),
             logs,
             provenance: &provenance,
         })?;
@@ -1183,7 +1238,9 @@ fn parse_generic_transactions(
     batch: &RecordBatch,
     range: BlockRange,
     filters: &FilterSet,
+    columns: TransactionColumns,
     output: &mut BTreeMap<u64, Vec<TransactionEnvelope>>,
+    receipts: &mut BTreeMap<u64, Vec<ReceiptEnvelope>>,
 ) -> Result<u64, XatuError> {
     let scope = filters.effective_scope();
     let mut selected = 0_u64;
@@ -1198,9 +1255,42 @@ fn parse_generic_transactions(
         if !scope.matches_transaction(transaction_type, to.as_ref(), || hash) {
             continue;
         }
-        let from = required_address(batch, "from_address", row)?;
-        if !scope.matches_sender(Some(&from)) {
+        let from = columns
+            .senders
+            .then(|| required_address(batch, "from_address", row))
+            .transpose()?;
+        if !scope.matches_sender(from.as_ref()) {
             continue;
+        }
+        let index = required_u32(batch, "transaction_index", row)?;
+        // Xatu stores empty calldata as null: a 2026-10-13 probe of two
+        // partitions found every 21,000-gas transaction with a null input and
+        // no empty one.
+        let input = columns
+            .calldata
+            .then(|| optional_variable_bytes(batch, "input", row))
+            .transpose()?
+            .map(Option::unwrap_or_default);
+        if columns.outcome {
+            receipts
+                .entry(block_number)
+                .or_default()
+                .push(ReceiptEnvelope {
+                    transaction_hash: hash,
+                    transaction_type,
+                    transaction_index: index,
+                    encoded: None,
+                    success: Some(required_bool(batch, "success", row)?),
+                    gas_used: Some(required_u64(batch, "gas_used", row)?),
+                    effective_gas_price: Some(required_quantity_compatible(
+                        batch,
+                        "gas_price",
+                        row,
+                    )?),
+                    blob_gas_used: None,
+                    blob_gas_price: None,
+                    logs: Vec::new(),
+                });
         }
         output
             .entry(block_number)
@@ -1208,14 +1298,14 @@ fn parse_generic_transactions(
             .push(TransactionEnvelope {
                 hash,
                 transaction_type,
-                index: required_u32(batch, "transaction_index", row)?,
+                index,
                 encoded: None,
-                from: Some(from),
+                from,
                 to,
                 nonce: Some(required_u64(batch, "nonce", row)?),
                 gas_limit: Some(required_u64(batch, "gas_limit", row)?),
                 value: Some(required_quantity_compatible(batch, "value", row)?),
-                input: optional_variable_bytes(batch, "input", row)?,
+                input,
                 max_fee_per_gas: None,
                 max_priority_fee_per_gas: None,
                 max_fee_per_blob_gas: None,
@@ -1295,6 +1385,8 @@ struct GenericNormalizationInputs<'a> {
     execution_blocks: &'a BTreeMap<u64, GenericExecutionBlockRow>,
     beacon_blocks: &'a BTreeMap<u64, GenericBeaconBlockRow>,
     transactions: BTreeMap<u64, Vec<TransactionEnvelope>>,
+    /// Receipt outcomes of the projected transactions, when requested.
+    receipts: Option<BTreeMap<u64, Vec<ReceiptEnvelope>>>,
     logs: BTreeMap<u64, Vec<Log>>,
     provenance: &'a [Provenance],
 }
@@ -1366,8 +1458,9 @@ fn normalize_generic_frames(
         } else {
             Material::Missing(MissingReason::NotRequested)
         };
-        let (transactions, logs) = match inputs.kind {
+        let (transactions, receipts, logs) = match inputs.kind {
             GenericProjectionKind::Headers => (
+                Material::Missing(MissingReason::NotRequested),
                 Material::Missing(MissingReason::NotRequested),
                 Material::Missing(MissingReason::NotRequested),
             ),
@@ -1385,12 +1478,26 @@ fn normalize_generic_frames(
                     beacon.transaction_count,
                     effective.constrains_transactions(),
                 )?;
+                // Each outcome comes from its transaction's own row.
+                let receipts = match inputs.receipts.as_mut() {
+                    Some(receipts) => {
+                        let mut outcomes = receipts.remove(&number.0).unwrap_or_default();
+                        outcomes.sort_by_key(|receipt| receipt.transaction_index);
+                        Material::Filtered {
+                            value: outcomes,
+                            scope: scope.clone(),
+                            completeness: Completeness::DatasetDeclared,
+                        }
+                    }
+                    None => Material::Missing(MissingReason::NotRequested),
+                };
                 (
                     Material::Filtered {
                         value: values,
                         scope,
                         completeness: Completeness::DatasetDeclared,
                     },
+                    receipts,
                     Material::Missing(MissingReason::NotRequested),
                 )
             }
@@ -1406,6 +1513,7 @@ fn normalize_generic_frames(
                     )));
                 }
                 (
+                    Material::Missing(MissingReason::NotRequested),
                     Material::Missing(MissingReason::NotRequested),
                     Material::Filtered {
                         value: values,
@@ -1426,7 +1534,7 @@ fn normalize_generic_frames(
             finality: Finality::Finalized,
             header,
             transactions,
-            receipts: Material::Missing(MissingReason::NotRequested),
+            receipts,
             logs,
             withdrawals: Material::Missing(MissingReason::NotRequested),
             blob_sidecars: Material::Missing(MissingReason::NotRequested),
@@ -2545,7 +2653,7 @@ mod tests {
     use arrow_schema::{DataType, Field, Schema};
     use bytes::Bytes;
     use futures::stream::BoxStream;
-    use leani_primitives::{Capability, CapabilitySet, TopicFilter};
+    use leani_primitives::TopicFilter;
     use object_store::{
         CopyOptions, GetOptions, GetRange, GetResult, ListResult, MultipartUpload, ObjectMeta,
         PutMultipartOptions, PutOptions, PutPayload, PutResult, memory::InMemory,
@@ -2857,7 +2965,7 @@ mod tests {
             .chain(WITHDRAWAL_COLUMNS)
             .chain(GENERIC_EXECUTION_BLOCK_COLUMNS)
             .chain(GENERIC_BEACON_BLOCK_COLUMNS)
-            .chain(GENERIC_TRANSACTION_COLUMNS)
+            .chain(&TransactionColumns::ALL.names())
             .chain(GENERIC_LOG_COLUMNS)
         {
             assert!(
@@ -2979,6 +3087,7 @@ mod tests {
                 number,
                 indices.iter().copied().map(generic_transaction).collect(),
             )]),
+            receipts: None,
             logs: BTreeMap::new(),
             provenance: &[],
         })
@@ -3246,12 +3355,19 @@ mod tests {
             ..FilterSet::default()
         };
         let mut output = BTreeMap::new();
+        let columns = TransactionColumns {
+            senders: true,
+            calldata: true,
+            outcome: false,
+        };
         assert_eq!(
             parse_generic_transactions(
                 &batch,
                 BlockRange::single(BlockNumber(42)),
                 &filters,
+                columns,
                 &mut output,
+                &mut BTreeMap::new(),
             )
             .expect("parse"),
             1
@@ -3274,10 +3390,227 @@ mod tests {
                 &batch,
                 BlockRange::single(BlockNumber(42)),
                 &separate,
+                columns,
+                &mut BTreeMap::new(),
                 &mut BTreeMap::new(),
             )
             .expect("parse"),
             1
+        );
+    }
+
+    #[test]
+    fn generic_transaction_columns_follow_field_groups() {
+        use Capability::{Body, Calldata, Header, ReceiptOutcome, Senders, Transactions};
+        let groups = |capabilities: &[Capability]| -> CapabilitySet {
+            capabilities.iter().copied().collect()
+        };
+        let unfiltered = FilterSet::default();
+        assert_eq!(
+            TransactionColumns::for_groups(
+                groups(&[Header, Body, Senders, Calldata, ReceiptOutcome]),
+                &unfiltered
+            ),
+            TransactionColumns::ALL
+        );
+        assert_eq!(
+            TransactionColumns::for_groups(groups(&[Transactions]), &unfiltered),
+            TransactionColumns {
+                senders: true,
+                calldata: true,
+                outcome: false,
+            }
+        );
+        let body = TransactionColumns::for_groups(groups(&[Body]), &unfiltered);
+        let names = body.names();
+        for core in [
+            "block_number",
+            "transaction_index",
+            "transaction_hash",
+            "to_address",
+            "nonce",
+            "gas_limit",
+            "value",
+            "transaction_type",
+        ] {
+            assert!(names.contains(&core), "{core}");
+        }
+        for optional in ["from_address", "input", "gas_used", "gas_price", "success"] {
+            assert!(!names.contains(&optional), "{optional}");
+        }
+        // a sender predicate cannot be applied without senders
+        let senders = FilterSet {
+            senders: vec![Address::new([0x22; 20])],
+            ..FilterSet::default()
+        };
+        assert!(TransactionColumns::for_groups(groups(&[Body]), &senders).senders);
+    }
+
+    /// Block 42 rows: a transfer with null (empty) calldata, a contract
+    /// creation, and a reverted call.
+    fn outcome_batch() -> RecordBatch {
+        let hashes = ["aa", "bb", "cc"].map(|byte| format!("0x{}", byte.repeat(32)));
+        let to = format!("0x{}", "33".repeat(20));
+        RecordBatch::try_from_iter(vec![
+            (
+                "block_number",
+                Arc::new(UInt64Array::from(vec![42, 42, 42])) as ArrayRef,
+            ),
+            (
+                "transaction_index",
+                Arc::new(UInt64Array::from(vec![0, 1, 2])) as ArrayRef,
+            ),
+            (
+                "transaction_hash",
+                Arc::new(StringArray::from(
+                    hashes.iter().map(String::as_str).collect::<Vec<_>>(),
+                )) as ArrayRef,
+            ),
+            (
+                "nonce",
+                Arc::new(UInt64Array::from(vec![1, 2, 3])) as ArrayRef,
+            ),
+            (
+                "to_address",
+                Arc::new(StringArray::from(vec![
+                    Some(to.as_str()),
+                    None,
+                    Some(to.as_str()),
+                ])) as ArrayRef,
+            ),
+            (
+                "value",
+                Arc::new(UInt64Array::from(vec![5, 0, 0])) as ArrayRef,
+            ),
+            (
+                "input",
+                Arc::new(StringArray::from(vec![
+                    None,
+                    Some("0x6080"),
+                    Some("0xa9059cbb"),
+                ])) as ArrayRef,
+            ),
+            (
+                "gas_limit",
+                Arc::new(UInt64Array::from(vec![21_000, 90_000, 60_000])) as ArrayRef,
+            ),
+            (
+                "transaction_type",
+                Arc::new(UInt32Array::from(vec![2, 0, 2])) as ArrayRef,
+            ),
+            (
+                "gas_used",
+                Arc::new(UInt64Array::from(vec![21_000, 53_000, 30_000])) as ArrayRef,
+            ),
+            (
+                "gas_price",
+                Arc::new(UInt64Array::from(vec![7, 9, 11])) as ArrayRef,
+            ),
+            (
+                "success",
+                Arc::new(BooleanArray::from(vec![true, true, false])) as ArrayRef,
+            ),
+        ])
+        .expect("batch")
+    }
+
+    #[test]
+    fn generic_receipt_outcome_comes_from_transaction_rows() {
+        use Capability::{Body, Calldata, Header, ReceiptOutcome, Senders};
+        let range = BlockRange::single(BlockNumber(42));
+        let filters = FilterSet::default();
+        let columns = TransactionColumns {
+            senders: false,
+            calldata: true,
+            outcome: true,
+        };
+        let mut transactions = BTreeMap::new();
+        let mut receipts = BTreeMap::new();
+        assert_eq!(
+            parse_generic_transactions(
+                &outcome_batch(),
+                range,
+                &filters,
+                columns,
+                &mut transactions,
+                &mut receipts,
+            )
+            .expect("rows without senders"),
+            3
+        );
+        let rows = &transactions[&42];
+        assert!(rows.iter().all(|transaction| transaction.from.is_none()));
+        // Xatu stores empty calldata as null
+        assert_eq!(rows[0].input.as_deref(), Some(&[][..]));
+        assert_eq!(rows[1].input.as_deref(), Some(&[0x60, 0x80][..]));
+        assert_eq!(rows[1].to, None);
+        let outcome = &receipts[&42];
+        assert_eq!(
+            outcome
+                .iter()
+                .map(|receipt| (receipt.success, receipt.gas_used))
+                .collect::<Vec<_>>(),
+            vec![
+                (Some(true), Some(21_000)),
+                (Some(true), Some(53_000)),
+                (Some(false), Some(30_000)),
+            ]
+        );
+        assert_eq!(outcome[2].effective_gas_price, Some(quantity_from_u64(11)));
+        assert!(
+            outcome
+                .iter()
+                .all(|receipt| receipt.logs.is_empty() && receipt.encoded.is_none())
+        );
+
+        let hash = BlockHash::new([0x42; 32]);
+        let frames = normalize_generic_frames(GenericNormalizationInputs {
+            range,
+            kind: GenericProjectionKind::Transactions,
+            include_header: true,
+            filters: &filters,
+            execution_blocks: &BTreeMap::from([(
+                42,
+                GenericExecutionBlockRow {
+                    hash,
+                    timestamp: 1_700_000_000,
+                },
+            )]),
+            beacon_blocks: &BTreeMap::from([(
+                42,
+                GenericBeaconBlockRow {
+                    hash,
+                    parent_hash: BlockHash::ZERO,
+                    timestamp: 1_700_000_000,
+                    transaction_count: 3,
+                    gas_limit: 30_000_000,
+                    gas_used: 104_000,
+                    base_fee_per_gas: quantity_from_u64(7),
+                    blob_gas_used: None,
+                    excess_blob_gas: None,
+                },
+            )]),
+            transactions,
+            receipts: Some(receipts),
+            logs: BTreeMap::new(),
+            provenance: &[],
+        })
+        .expect("frames");
+        let frame = &frames[0];
+        assert!(matches!(
+            frame.receipts,
+            Material::Filtered {
+                completeness: Completeness::DatasetDeclared,
+                ..
+            }
+        ));
+        let claimed: CapabilitySet = [Header, Body, Calldata, ReceiptOutcome]
+            .into_iter()
+            .collect();
+        assert_eq!(frame.group_violation(claimed), None);
+        assert_eq!(
+            frame.group_violation(claimed.with(Senders)),
+            Some("transactions lack senders")
         );
     }
 
@@ -3939,10 +4272,24 @@ mod tests {
             },
             minimum_finality: Finality::Finalized,
         };
-        let blobs = CapabilitySet::of(Capability::Header)
+        let blobs = [
+            Capability::Header,
+            Capability::Senders,
+            Capability::BlobFields,
+            Capability::BlockSize,
+            Capability::ReceiptOutcome,
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(requirement(blobs).validate_frame(&frames[0]), Ok(()));
+        // The bundles promise transaction bodies the blobs projection lacks.
+        let bundles = CapabilitySet::of(Capability::Header)
             .with(Capability::Transactions)
             .with(Capability::Receipts);
-        assert_eq!(requirement(blobs).validate_frame(&frames[0]), Ok(()));
+        assert_eq!(
+            requirement(bundles).validate_frame(&frames[0]),
+            Err("transactions lack body fields")
+        );
         // Task 4 carry-forward: receipts derive logs, but Xatu projects no
         // logs into its blob receipts.
         assert!(

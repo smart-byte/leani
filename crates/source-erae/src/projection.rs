@@ -38,7 +38,11 @@ impl EraeProjection {
 
     pub(super) fn needs_body(&self) -> bool {
         self.transactions_requested()
-            || self.required.contains(Capability::Receipts)
+            || self
+                .required
+                .with_derivable()
+                .contains(Capability::BlockSize)
+            || self.receipts_requested()
             || self.required.contains(Capability::Withdrawals)
             || (self.required.contains(Capability::Logs)
                 && (self.log_fields.contains(LogField::TransactionHash)
@@ -49,9 +53,17 @@ impl EraeProjection {
     }
 
     fn transactions_requested(&self) -> bool {
-        self.required.contains(Capability::Transactions)
-            || self.required.contains(Capability::Body)
-            || self.required.contains(Capability::Calldata)
+        let required = self.required.with_derivable();
+        required.contains(Capability::Body)
+            || required.contains(Capability::Calldata)
+            || required.contains(Capability::Senders)
+            || required.contains(Capability::BlobFields)
+    }
+
+    fn receipts_requested(&self) -> bool {
+        self.required
+            .with_derivable()
+            .contains(Capability::ReceiptOutcome)
     }
 }
 
@@ -69,7 +81,7 @@ pub(super) fn normalize_block(
     let hash = header.hash_slow();
     let header_requested = projection.required.contains(Capability::Header);
     let transactions_requested = projection.transactions_requested();
-    let receipts_requested = projection.required.contains(Capability::Receipts);
+    let receipts_requested = projection.receipts_requested();
     let logs_requested = projection.required.contains(Capability::Logs);
     // Execution RPC and raw-history consumers need the withdrawals committed
     // by a complete body even when their request does not name the capability.
@@ -114,7 +126,10 @@ pub(super) fn normalize_block(
                 })
         });
         let sender = if preliminary_match
-            && (projection.required.contains(Capability::Transactions)
+            && (projection
+                .required
+                .with_derivable()
+                .contains(Capability::Senders)
                 || scope.is_some_and(|scope| !scope.senders.is_empty()))
         {
             Some(

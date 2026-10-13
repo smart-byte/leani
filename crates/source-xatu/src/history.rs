@@ -21,7 +21,7 @@ use tracing::debug;
 
 use crate::{
     XatuBlobsProjector, XatuCatalog, XatuCatalogConfig, XatuError,
-    projection::{GenericProjectionKind, generic_log_columns},
+    projection::{GenericProjectionKind, TransactionColumns, generic_log_columns},
 };
 
 const SCHEMA_VERSION: &str = "xatu.history.v4";
@@ -258,7 +258,7 @@ impl HistorySource for XatuHistorySource {
             chunks,
             estimated_bytes: None,
             estimated_lag: self.descriptor.expected_lag,
-            supplied: request.required,
+            supplied: supplied_groups(mode, request),
             complete: self.descriptor.complete_capabilities,
             trust: self.descriptor.trust,
             schema_version: self.descriptor.schema_version.clone(),
@@ -302,7 +302,7 @@ impl HistorySource for XatuHistorySource {
                         identity.mode.generic_kind(),
                         &identity.filters,
                         identity.log_fields,
-                        identity.include_header,
+                        identity.groups,
                         budget,
                         self.batch_rows,
                         cancellation,
@@ -372,8 +372,20 @@ impl ProjectionMode {
     }
 }
 
+/// Version 3 records the requested field groups.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 struct PartitionIdentity {
+    version: u8,
+    mode: ProjectionMode,
+    range: BlockRange,
+    filters: leani_source_api::FilterSet,
+    log_fields: leani_primitives::LogFieldSet,
+    groups: CapabilitySet,
+}
+
+/// Chunks planned before field groups, which persisted jobs may still hold.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct PartitionIdentityV2 {
     version: u8,
     mode: ProjectionMode,
     range: BlockRange,
@@ -382,13 +394,52 @@ struct PartitionIdentity {
     include_header: bool,
 }
 
+impl From<PartitionIdentityV2> for PartitionIdentity {
+    fn from(identity: PartitionIdentityV2) -> Self {
+        let header = if identity.include_header {
+            CapabilitySet::of(Capability::Header)
+        } else {
+            CapabilitySet::NONE
+        };
+        // The groups each version 2 projection filled.
+        let groups = match identity.mode {
+            ProjectionMode::Blobs => BLOBS_GROUPS,
+            ProjectionMode::Headers => CapabilitySet::of(Capability::Header),
+            ProjectionMode::Transactions => header
+                .with(Capability::Body)
+                .with(Capability::Senders)
+                .with(Capability::Calldata),
+            ProjectionMode::Logs => header.with(Capability::Logs),
+        };
+        Self {
+            version: 3,
+            mode: identity.mode,
+            range: identity.range,
+            filters: identity.filters,
+            log_fields: identity.log_fields,
+            groups,
+        }
+    }
+}
+
+/// What the type-3 blobs projection fills.
+const BLOBS_GROUPS: CapabilitySet = CapabilitySet::of(Capability::Header)
+    .with(Capability::Senders)
+    .with(Capability::BlobFields)
+    .with(Capability::BlockSize)
+    .with(Capability::ReceiptOutcome);
+
+/// What the generic transaction projection can fill.
+const TRANSACTION_GROUPS: CapabilitySet = CapabilitySet::of(Capability::Header)
+    .with(Capability::Body)
+    .with(Capability::Senders)
+    .with(Capability::Calldata)
+    .with(Capability::ReceiptOutcome);
+
 fn projection_mode(request: &DataRequest) -> Result<ProjectionMode, SourceError> {
-    let required = request.required;
-    if required.contains(Capability::Receipts) {
-        let allowed = CapabilitySet::of(Capability::Header)
-            .with(Capability::Transactions)
-            .with(Capability::Receipts);
-        if !allowed.contains_all(required)
+    let required = request.required.with_derivable();
+    if required.contains(Capability::BlobFields) || required.contains(Capability::BlockSize) {
+        if !BLOBS_GROUPS.contains_all(required)
             || request.filters.scope.transaction_types.as_slice() != [3]
             || !request.filters.scope.addresses.is_empty()
             || !request.filters.scope.topics.is_empty()
@@ -396,7 +447,7 @@ fn projection_mode(request: &DataRequest) -> Result<ProjectionMode, SourceError>
             || !request.filters.recipients.is_empty()
         {
             return Err(SourceError::InvalidPlan(
-                "Xatu receipt projection supports only blobs/type-3 transaction material"
+                "Xatu blob fields and block sizes come only from the type-3 blobs projection, without transaction bodies, calldata, or logs"
                     .to_owned(),
             ));
         }
@@ -423,15 +474,9 @@ fn projection_mode(request: &DataRequest) -> Result<ProjectionMode, SourceError>
         }
         return Ok(ProjectionMode::Logs);
     }
-    if required.contains(Capability::Transactions)
-        || required.contains(Capability::Body)
-        || required.contains(Capability::Calldata)
+    if required.intersection(TRANSACTION_GROUPS.without(Capability::Header)) != CapabilitySet::NONE
     {
-        let allowed = CapabilitySet::of(Capability::Header)
-            .with(Capability::Body)
-            .with(Capability::Transactions)
-            .with(Capability::Calldata);
-        if !allowed.contains_all(required) {
+        if !TRANSACTION_GROUPS.contains_all(required) {
             return Err(SourceError::InvalidPlan(
                 "Xatu transaction projection lacks requested capabilities".to_owned(),
             ));
@@ -452,27 +497,57 @@ fn encode_partition(
     request: &DataRequest,
 ) -> Result<Vec<u8>, SourceError> {
     postcard::to_allocvec(&PartitionIdentity {
-        version: 2,
+        version: 3,
         mode,
         range,
         filters: request.filters.clone(),
         log_fields: request.log_fields,
-        include_header: request.required.contains(Capability::Header),
+        groups: request.required,
     })
     .map_err(|error| SourceError::InvalidPlan(error.to_string()))
 }
 
 fn decode_partition(bytes: &[u8]) -> Result<PartitionIdentity, SourceError> {
-    let identity: PartitionIdentity = postcard::from_bytes(bytes).map_err(|error| {
+    let invalid = |error: postcard::Error| {
         SourceError::InvalidPlan(format!("invalid Xatu chunk identity: {error}"))
-    })?;
-    if identity.version != 2 {
-        return Err(SourceError::InvalidPlan(format!(
-            "unsupported Xatu chunk identity version {}",
-            identity.version
-        )));
+    };
+    // postcard writes the leading `u8` version as one byte
+    match bytes.first() {
+        Some(3) => postcard::from_bytes::<PartitionIdentity>(bytes).map_err(invalid),
+        Some(2) => postcard::from_bytes::<PartitionIdentityV2>(bytes)
+            .map(PartitionIdentity::from)
+            .map_err(invalid),
+        version => Err(SourceError::InvalidPlan(format!(
+            "unsupported Xatu chunk identity version {version:?}"
+        ))),
     }
-    Ok(identity)
+}
+
+/// The field groups `mode` fills for `request`.
+fn supplied_groups(mode: ProjectionMode, request: &DataRequest) -> CapabilitySet {
+    let header = if request.required.contains(Capability::Header) {
+        CapabilitySet::of(Capability::Header)
+    } else {
+        CapabilitySet::NONE
+    };
+    match mode {
+        ProjectionMode::Blobs => BLOBS_GROUPS,
+        ProjectionMode::Headers => CapabilitySet::of(Capability::Header),
+        ProjectionMode::Logs => header.with(Capability::Logs),
+        ProjectionMode::Transactions => {
+            let columns = TransactionColumns::for_groups(request.required, &request.filters);
+            [
+                (columns.senders, Capability::Senders),
+                (columns.calldata, Capability::Calldata),
+                (columns.outcome, Capability::ReceiptOutcome),
+            ]
+            .into_iter()
+            .filter(|(read, _)| *read)
+            .fold(header.with(Capability::Body), |supplied, (_, group)| {
+                supplied.with(group)
+            })
+        }
+    }
 }
 
 #[allow(clippy::too_many_lines)]
@@ -605,18 +680,7 @@ fn physical_plan(mode: ProjectionMode, request: &DataRequest) -> Vec<PhysicalPla
         ProjectionMode::Transactions => plan.push(operation(
             PhysicalReader::Transaction,
             "canonical_execution_transaction",
-            &[
-                "block_number",
-                "transaction_index",
-                "transaction_hash",
-                "nonce",
-                "from_address",
-                "to_address",
-                "value",
-                "input",
-                "gas_limit",
-                "transaction_type",
-            ],
+            &TransactionColumns::for_groups(request.required, &request.filters).names(),
             transaction_predicates(request, range),
         )),
         ProjectionMode::Logs => {
@@ -757,13 +821,18 @@ mod tests {
         );
     }
 
+    /// The blobs-money shape: type-3 rows with their blob and outcome fields.
     fn request(range: BlockRange) -> DataRequest {
         DataRequest {
             chain_id: ChainId(1),
             range,
-            required: CapabilitySet::of(Capability::Header)
-                .with(Capability::Transactions)
-                .with(Capability::Receipts),
+            required: groups(&[
+                Capability::Header,
+                Capability::Senders,
+                Capability::BlobFields,
+                Capability::BlockSize,
+                Capability::ReceiptOutcome,
+            ]),
             allow_filtered: true,
             projection: FieldProjection::default(),
             log_fields: leani_primitives::LogFieldSet::NONE,
@@ -899,6 +968,7 @@ mod tests {
         assert_eq!(decoded.range, range);
         assert_eq!(decoded.mode, ProjectionMode::Blobs);
         assert_eq!(decoded.filters, request.filters);
+        assert_eq!(decoded.groups, request.required);
         assert!(decode_partition(&[0; 15]).is_err());
     }
 
@@ -932,7 +1002,7 @@ mod tests {
 
         let transactions = source
             .plan(&DataRequest {
-                required: CapabilitySet::of(Capability::Transactions),
+                required: groups(&[Capability::Body, Capability::Senders, Capability::Calldata]),
                 filters: FilterSet {
                     senders: vec![leani_primitives::Address::new([8; 20])],
                     recipients: vec![leani_primitives::Address::new([9; 20])],
@@ -959,6 +1029,154 @@ mod tests {
                 .iter()
                 .any(|operation| operation.reader == PhysicalReader::Receipt)
         );
+    }
+
+    fn groups(capabilities: &[Capability]) -> CapabilitySet {
+        capabilities.iter().copied().collect()
+    }
+
+    fn transaction_columns(plan: &SourcePlan) -> Vec<String> {
+        plan.physical_plan
+            .iter()
+            .find(|operation| operation.reader == PhysicalReader::Transaction)
+            .expect("transaction reader")
+            .columns
+            .clone()
+    }
+
+    #[tokio::test]
+    async fn planner_chooses_the_projection_from_field_groups() {
+        use Capability::{
+            BlobFields, BlockSize, Body, Calldata, Header, Logs, ReceiptOutcome, Receipts, Senders,
+            Transactions,
+        };
+        let source = XatuHistorySource::new(XatuHistoryConfig::public("mainnet").expect("config"))
+            .expect("source");
+        let range =
+            BlockRange::new(BlockNumber(20_000_000), BlockNumber(20_000_010)).expect("range");
+        let recipients = FilterSet {
+            scope: FilterScope {
+                recipients: vec![leani_primitives::Address::new([9; 20])],
+                ..FilterScope::default()
+            },
+            ..FilterSet::default()
+        };
+        let plan = |required: &[Capability], filters: FilterSet| {
+            let request = DataRequest {
+                required: groups(required),
+                filters,
+                ..request(range)
+            };
+            let source = &source;
+            async move { source.plan(&request).await }
+        };
+        let mode = |plan: &SourcePlan| {
+            decode_partition(&plan.chunks[0].partition)
+                .expect("identity")
+                .mode
+        };
+
+        // rollup-txs: receipt outcome comes from the transaction table
+        let rollup = [Header, Body, Senders, Calldata, ReceiptOutcome];
+        let rollup_plan = plan(&rollup, recipients.clone()).await.expect("rollup-txs");
+        assert_eq!(mode(&rollup_plan), ProjectionMode::Transactions);
+        assert_eq!(rollup_plan.supplied, groups(&rollup));
+        let columns = transaction_columns(&rollup_plan);
+        for column in ["from_address", "input", "gas_used", "gas_price", "success"] {
+            assert!(columns.contains(&column.to_owned()), "{column}");
+        }
+
+        // transaction-stats reads neither calldata nor receipts
+        let stats_plan = plan(&[Body, Senders], recipients.clone())
+            .await
+            .expect("transaction-stats");
+        assert_eq!(stats_plan.supplied, groups(&[Body, Senders]));
+        let columns = transaction_columns(&stats_plan);
+        assert!(columns.contains(&"from_address".to_owned()));
+        for column in ["input", "gas_used", "gas_price", "success"] {
+            assert!(!columns.contains(&column.to_owned()), "{column}");
+        }
+        // a sender predicate reads senders even when no group needs them
+        let mut senders = FilterSet::default();
+        senders.scope.senders = vec![leani_primitives::Address::new([8; 20])];
+        let body_plan = plan(&[Body], senders).await.expect("body");
+        assert!(transaction_columns(&body_plan).contains(&"from_address".to_owned()));
+        assert!(
+            !transaction_columns(&plan(&[Body], recipients.clone()).await.expect("body"))
+                .contains(&"from_address".to_owned())
+        );
+
+        // blobs-money keeps the type-3 blobs projection
+        let blobs = [Header, Senders, BlobFields, BlockSize, ReceiptOutcome];
+        let blobs_plan = plan(&blobs, request(range).filters).await.expect("blobs");
+        assert_eq!(mode(&blobs_plan), ProjectionMode::Blobs);
+        assert_eq!(blobs_plan.supplied, groups(&blobs));
+
+        let headers_plan = plan(&[Header], FilterSet::default())
+            .await
+            .expect("headers");
+        assert_eq!(mode(&headers_plan), ProjectionMode::Headers);
+        assert_eq!(headers_plan.supplied, groups(&[Header]));
+
+        // Body and calldata never join the blobs projection, and bundles
+        // promise fields no projection fills: transactions derive blob
+        // fields, receipts derive logs.
+        for required in [
+            &[Body, BlobFields][..],
+            &[Header, Transactions, Receipts],
+            &[Header, Transactions],
+            &[Header, Receipts],
+            &[Logs, ReceiptOutcome],
+            &[BlockSize, Calldata],
+        ] {
+            let result = plan(required, request(range).filters).await;
+            assert!(
+                matches!(result, Err(SourceError::InvalidPlan(_))),
+                "{required:?}: {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn version_two_partitions_open_as_their_field_groups() {
+        use Capability::{
+            BlobFields, BlockSize, Body, Calldata, Header, Logs, ReceiptOutcome, Senders,
+        };
+        let range =
+            BlockRange::new(BlockNumber(20_000_000), BlockNumber(20_000_999)).expect("range");
+        for (mode, include_header, expected) in [
+            (ProjectionMode::Headers, true, groups(&[Header])),
+            (
+                ProjectionMode::Transactions,
+                true,
+                groups(&[Header, Body, Senders, Calldata]),
+            ),
+            (
+                ProjectionMode::Transactions,
+                false,
+                groups(&[Body, Senders, Calldata]),
+            ),
+            (ProjectionMode::Logs, false, groups(&[Logs])),
+            (
+                ProjectionMode::Blobs,
+                true,
+                groups(&[Header, Senders, BlobFields, BlockSize, ReceiptOutcome]),
+            ),
+        ] {
+            let bytes = postcard::to_allocvec(&PartitionIdentityV2 {
+                version: 2,
+                mode,
+                range,
+                filters: FilterSet::default(),
+                log_fields: leani_primitives::LogFieldSet::NONE,
+                include_header,
+            })
+            .expect("v2 identity");
+            let identity = decode_partition(&bytes).expect("v2 decodes");
+            assert_eq!(identity.mode, mode);
+            assert_eq!(identity.range, range);
+            assert_eq!(identity.groups, expected, "{mode:?}");
+        }
     }
 
     #[test]

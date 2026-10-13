@@ -261,6 +261,95 @@ impl BlockFrame {
         FrameCapabilityReport { present, complete }
     }
 
+    /// The first field a requested group promises that this frame lacks.
+    ///
+    /// Groups guarantee fields only on components whose material is present:
+    /// whether material is present at all is [`Self::capabilities`]'s job.
+    /// Pass `groups` with derivable groups already added
+    /// ([`CapabilitySet::with_derivable`]). The checks are chain-agnostic:
+    /// fork-dependent header fields, such as the base fee, are not checked.
+    #[must_use]
+    pub fn group_violation(&self, groups: CapabilitySet) -> Option<&'static str> {
+        let header = self.header.as_present();
+        let transactions = self
+            .transactions
+            .as_present()
+            .map_or(&[][..], Vec::as_slice);
+        let receipts = self.receipts.as_present();
+        if groups.contains(Capability::Header)
+            && header.is_some_and(|header| header.gas_limit.is_none() || header.gas_used.is_none())
+        {
+            return Some("header lacks gas limit or gas used");
+        }
+        if groups.contains(Capability::Body) {
+            if transactions.iter().any(|transaction| {
+                transaction.nonce.is_none()
+                    || transaction.gas_limit.is_none()
+                    || transaction.value.is_none()
+            }) {
+                return Some("transactions lack body fields");
+            }
+            if header.is_some_and(|header| header.transaction_count.is_none()) {
+                return Some("header lacks the transaction count");
+            }
+        }
+        if groups.contains(Capability::Calldata)
+            && transactions
+                .iter()
+                .any(|transaction| transaction.input.is_none())
+        {
+            return Some("transactions lack calldata");
+        }
+        if groups.contains(Capability::Senders)
+            && transactions
+                .iter()
+                .any(|transaction| transaction.from.is_none())
+        {
+            return Some("transactions lack senders");
+        }
+        if groups.contains(Capability::BlobFields) {
+            if transactions.iter().any(|transaction| {
+                transaction.transaction_type == 3
+                    && (transaction.blob_versioned_hashes.is_empty()
+                        || transaction.max_fee_per_blob_gas.is_none())
+            }) {
+                return Some("blob transactions lack blob fields");
+            }
+            if receipts.is_some_and(|receipts| {
+                receipts
+                    .iter()
+                    .any(|receipt| receipt.transaction_type == 3 && receipt.blob_gas_used.is_none())
+            }) {
+                return Some("blob receipts lack blob gas used");
+            }
+        }
+        if groups.contains(Capability::ReceiptOutcome)
+            && let Some(receipts) = receipts
+        {
+            if receipts.iter().any(|receipt| {
+                receipt.success.is_none()
+                    || receipt.gas_used.is_none()
+                    || receipt.effective_gas_price.is_none()
+            }) {
+                return Some("receipts lack outcome fields");
+            }
+            if self.transactions.is_present() && !receipts_match(transactions, receipts) {
+                return Some("receipts do not match the transactions one to one");
+            }
+        }
+        if groups.contains(Capability::BlockSize)
+            && let Some(header) = header
+        {
+            if header.size_bytes.is_none() {
+                return Some("header lacks the block size");
+            }
+            if header.transaction_count.is_none() {
+                return Some("header lacks the transaction count");
+            }
+        }
+        None
+    }
+
     /// Reject structurally contradictory frames before verification.
     ///
     /// # Errors
@@ -399,6 +488,19 @@ fn logs_heap_bytes(logs: &[Log]) -> u64 {
     }))
 }
 
+/// Whether `receipts` hold exactly one receipt per transaction, in order.
+fn receipts_match(transactions: &[TransactionEnvelope], receipts: &[ReceiptEnvelope]) -> bool {
+    transactions.len() == receipts.len()
+        && transactions
+            .iter()
+            .zip(receipts)
+            .all(|(transaction, receipt)| {
+                receipt.transaction_hash == transaction.hash
+                    && receipt.transaction_index == transaction.index
+                    && receipt.transaction_type == transaction.transaction_type
+            })
+}
+
 fn add_material<T>(
     material: &Material<T>,
     capability: Capability,
@@ -500,6 +602,190 @@ mod tests {
             frame.validate_shape(),
             Err("complete transaction and receipt counts differ")
         );
+    }
+
+    fn grouped_transaction(index: u8, transaction_type: u8) -> TransactionEnvelope {
+        let blob = transaction_type == 3;
+        TransactionEnvelope {
+            hash: TransactionHash::new([index + 1; 32]),
+            transaction_type,
+            index: u32::from(index),
+            encoded: None,
+            from: Some(Address::new([3; 20])),
+            // a contract creation: `to` is None as a value, never as "not supplied"
+            to: None,
+            nonce: Some(1),
+            gas_limit: Some(21_000),
+            value: Some(Quantity::new([0; 32])),
+            input: Some(Vec::new()),
+            max_fee_per_gas: None,
+            max_priority_fee_per_gas: None,
+            max_fee_per_blob_gas: blob.then(|| Quantity::new([0; 32])),
+            blob_versioned_hashes: if blob {
+                vec![BlockHash::new([9; 32])]
+            } else {
+                Vec::new()
+            },
+            size_bytes: None,
+        }
+    }
+
+    fn grouped_receipt(transaction: &TransactionEnvelope) -> ReceiptEnvelope {
+        ReceiptEnvelope {
+            transaction_hash: transaction.hash,
+            transaction_type: transaction.transaction_type,
+            transaction_index: transaction.index,
+            encoded: None,
+            // a reverted transaction still has an outcome
+            success: Some(false),
+            gas_used: Some(21_000),
+            effective_gas_price: Some(Quantity::new([0; 32])),
+            blob_gas_used: (transaction.transaction_type == 3).then_some(131_072),
+            blob_gas_price: None,
+            logs: Vec::new(),
+        }
+    }
+
+    /// A frame filling every field group: one type-2 and one type-3 transaction.
+    fn grouped_frame() -> BlockFrame {
+        let transactions = vec![grouped_transaction(0, 2), grouped_transaction(1, 3)];
+        let receipts = transactions.iter().map(grouped_receipt).collect();
+        BlockFrame {
+            header: Material::Complete(HeaderEnvelope {
+                rlp: None,
+                transactions_root: None,
+                receipts_root: None,
+                withdrawals_root: None,
+                gas_limit: Some(30_000_000),
+                gas_used: Some(42_000),
+                base_fee_per_gas: None,
+                blob_gas_used: None,
+                excess_blob_gas: None,
+                size_bytes: Some(1_000),
+                transaction_count: Some(2),
+                consensus_size_bytes: None,
+            }),
+            transactions: Material::Complete(transactions),
+            receipts: Material::Complete(receipts),
+            ..frame()
+        }
+    }
+
+    const FIELD_GROUPS: CapabilitySet = CapabilitySet::of(Capability::Header)
+        .with(Capability::Body)
+        .with(Capability::Calldata)
+        .with(Capability::Senders)
+        .with(Capability::BlobFields)
+        .with(Capability::ReceiptOutcome)
+        .with(Capability::BlockSize);
+
+    fn header(frame: &mut BlockFrame) -> &mut HeaderEnvelope {
+        match &mut frame.header {
+            Material::Complete(header) => header,
+            _ => unreachable!("grouped_frame() has a complete header"),
+        }
+    }
+
+    fn transactions(frame: &mut BlockFrame) -> &mut Vec<TransactionEnvelope> {
+        match &mut frame.transactions {
+            Material::Complete(transactions) => transactions,
+            _ => unreachable!("grouped_frame() has complete transactions"),
+        }
+    }
+
+    fn receipts(frame: &mut BlockFrame) -> &mut Vec<ReceiptEnvelope> {
+        match &mut frame.receipts {
+            Material::Complete(receipts) => receipts,
+            _ => unreachable!("grouped_frame() has complete receipts"),
+        }
+    }
+
+    #[test]
+    fn a_frame_filling_every_group_passes() {
+        assert_eq!(grouped_frame().group_violation(FIELD_GROUPS), None);
+    }
+
+    /// A group, a way to break its promise, and the violation it reports.
+    type BrokenPromise = (Capability, fn(&mut BlockFrame), &'static str);
+
+    #[test]
+    fn each_group_names_the_field_it_misses() {
+        let cases: [BrokenPromise; 11] = [
+            (
+                Capability::Header,
+                |frame| header(frame).gas_used = None,
+                "header lacks gas limit or gas used",
+            ),
+            (
+                Capability::Body,
+                |frame| transactions(frame)[0].nonce = None,
+                "transactions lack body fields",
+            ),
+            (
+                Capability::Body,
+                |frame| header(frame).transaction_count = None,
+                "header lacks the transaction count",
+            ),
+            (
+                Capability::Calldata,
+                |frame| transactions(frame)[0].input = None,
+                "transactions lack calldata",
+            ),
+            (
+                Capability::Senders,
+                |frame| transactions(frame)[1].from = None,
+                "transactions lack senders",
+            ),
+            (
+                Capability::BlobFields,
+                |frame| transactions(frame)[1].blob_versioned_hashes.clear(),
+                "blob transactions lack blob fields",
+            ),
+            (
+                Capability::BlobFields,
+                |frame| receipts(frame)[1].blob_gas_used = None,
+                "blob receipts lack blob gas used",
+            ),
+            (
+                Capability::ReceiptOutcome,
+                |frame| receipts(frame)[0].success = None,
+                "receipts lack outcome fields",
+            ),
+            (
+                Capability::ReceiptOutcome,
+                |frame| receipts(frame).swap(0, 1),
+                "receipts do not match the transactions one to one",
+            ),
+            (
+                Capability::BlockSize,
+                |frame| header(frame).size_bytes = None,
+                "header lacks the block size",
+            ),
+            (
+                Capability::BlockSize,
+                |frame| header(frame).transaction_count = None,
+                "header lacks the transaction count",
+            ),
+        ];
+        for (group, break_promise, reason) in cases {
+            let mut frame = grouped_frame();
+            break_promise(&mut frame);
+            assert_eq!(
+                frame.group_violation(CapabilitySet::of(group)),
+                Some(reason),
+                "{group:?}"
+            );
+            // a group nobody requested is never checked
+            assert_eq!(frame.group_violation(CapabilitySet::NONE), None);
+        }
+    }
+
+    #[test]
+    fn groups_promise_nothing_about_absent_material() {
+        let mut frame = grouped_frame();
+        frame.receipts = Material::Missing(MissingReason::NotRequested);
+        frame.header = Material::Missing(MissingReason::NotRequested);
+        assert_eq!(frame.group_violation(FIELD_GROUPS), None);
     }
 
     #[test]

@@ -21,7 +21,7 @@ use leani_primitives::{
 };
 use leani_source_api::{
     BlockFrameStream, DataRequest, FinalityModel, HistorySource, Partitioning, SourceBudget,
-    SourceChunk, SourceDescriptor, SourceError, SourcePlan,
+    SourceChunk, SourceDescriptor, SourceError, SourcePlan, stop_at_unfilled_groups,
 };
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
@@ -192,11 +192,16 @@ impl HistorySource for LocalArchiveSource {
 
     async fn plan(&self, request: &DataRequest) -> Result<SourcePlan, SourceError> {
         if request.chain_id != self.descriptor.chain_id
-            || !self.descriptor.capabilities.contains_all(request.required)
+            || !self
+                .descriptor
+                .capabilities
+                .with_derivable()
+                .contains_all(request.required)
             || (!request.allow_filtered
                 && !self
                     .descriptor
                     .complete_capabilities
+                    .with_derivable()
                     .contains_all(request.required))
             || !self.descriptor.finality.supports(request.minimum_finality)
         {
@@ -225,10 +230,13 @@ impl HistorySource for LocalArchiveSource {
                 source_id: self.descriptor.id.clone(),
                 range: BlockRange::new(BlockNumber(next), BlockNumber(end))
                     .map_err(|error| SourceError::InvalidPlan(error.to_string()))?,
+                // The object index, then the groups each frame read must fill.
                 partition: u64::try_from(index)
                     .map_err(|_| SourceError::InvalidPlan("too many archive objects".to_owned()))?
                     .to_be_bytes()
-                    .to_vec(),
+                    .into_iter()
+                    .chain(request.required.bits().to_be_bytes())
+                    .collect(),
                 schema_version: self.descriptor.schema_version.clone(),
                 expected_parent: None,
                 estimated_bytes: Some(object.bytes),
@@ -275,11 +283,25 @@ impl HistorySource for LocalArchiveSource {
                 "archive chunk identity or schema changed".to_owned(),
             ));
         }
-        let partition: [u8; 8] = chunk.partition.as_slice().try_into().map_err(|_| {
-            SourceError::InvalidPlan("archive partition must be eight bytes".to_owned())
-        })?;
-        let index = usize::try_from(u64::from_be_bytes(partition))
+        // An eight-byte partition was planned before partitions named their
+        // groups, and is read unchecked.
+        let (index, required) = match chunk.partition.as_slice() {
+            [index @ .., high, low] if index.len() == 8 => {
+                (index, u16::from_be_bytes([*high, *low]))
+            }
+            index if index.len() == 8 => (index, 0),
+            _ => {
+                return Err(SourceError::InvalidPlan(
+                    "archive partition must be eight or ten bytes".to_owned(),
+                ));
+            }
+        };
+        let index = <[u8; 8]>::try_from(index).expect("eight partition bytes");
+        let index = usize::try_from(u64::from_be_bytes(index))
             .map_err(|_| SourceError::InvalidPlan("archive partition is too large".to_owned()))?;
+        let required = CapabilitySet::from_bits(required).ok_or_else(|| {
+            SourceError::InvalidPlan("archive partition names unknown groups".to_owned())
+        })?;
         let object = self
             .objects
             .get(index)
@@ -299,6 +321,7 @@ impl HistorySource for LocalArchiveSource {
         }
         let root = self.root.clone();
         let descriptor = self.descriptor.clone();
+        let available = descriptor.capabilities.with_derivable();
         let range = chunk.range;
         // The whole object verifies before any frame is yielded; its frames
         // then stream a line at a time from the same open file.
@@ -317,9 +340,10 @@ impl HistorySource for LocalArchiveSource {
                 let _ = sender.blocking_send(Err(error));
             }
         });
-        Ok(Box::pin(stream::unfold(receiver, |mut receiver| async {
+        let frames = Box::pin(stream::unfold(receiver, |mut receiver| async {
             receiver.recv().await.map(|item| (item, receiver))
-        })))
+        }));
+        Ok(stop_at_unfilled_groups(frames, required, range, available))
     }
 }
 
@@ -861,6 +885,72 @@ mod tests {
         let first = frame(1, BlockHash::ZERO);
         let second = frame(2, first.block.hash);
         (first, second)
+    }
+
+    #[tokio::test]
+    async fn a_transaction_archive_serves_the_groups_its_bundle_derives() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let (mut first, mut second) = blocks_one_and_two();
+        // complete bodies archived without senders
+        for frame in [&mut first, &mut second] {
+            frame.transactions =
+                leani_primitives::Material::Complete(vec![leani_primitives::TransactionEnvelope {
+                    hash: leani_primitives::TransactionHash::new([7; 32]),
+                    transaction_type: 2,
+                    index: 0,
+                    encoded: None,
+                    from: None,
+                    to: None,
+                    nonce: Some(0),
+                    gas_limit: Some(21_000),
+                    value: Some(leani_primitives::Quantity::new([0; 32])),
+                    input: Some(Vec::new()),
+                    max_fee_per_gas: None,
+                    max_priority_fee_per_gas: None,
+                    max_fee_per_blob_gas: None,
+                    blob_versioned_hashes: Vec::new(),
+                    size_bytes: None,
+                }]);
+            frame.receipts =
+                leani_primitives::Material::Missing(leani_primitives::MissingReason::NotRequested);
+        }
+        let manifest = write_archive(
+            directory.path(),
+            "frames.jsonl",
+            &[first, second],
+            FinalityModel::Finalized,
+        );
+        let source = LocalArchiveSource::open_manifest(&manifest).expect("archive");
+        let plan = source
+            .plan(&DataRequest {
+                chain_id: ChainId(1),
+                range: BlockRange::new(BlockNumber(1), BlockNumber(2)).expect("range"),
+                required: CapabilitySet::of(Capability::Body).with(Capability::Senders),
+                allow_filtered: false,
+                projection: FieldProjection::default(),
+                log_fields: leani_primitives::LogFieldSet::NONE,
+                filters: FilterSet::default(),
+                minimum_finality: Finality::Finalized,
+                verification_policy: VerificationPolicy::TrustedDataset,
+            })
+            .await
+            .expect("plans from the manifest's bundles");
+        // the stored frames lack the senders the plan promised
+        let range = plan.request.range;
+        let frames = source
+            .open(&plan.chunks[0], archive_budget(), CancellationToken::new())
+            .await
+            .expect("open")
+            .collect::<Vec<_>>()
+            .await;
+        assert_eq!(frames.len(), 1, "{frames:?}");
+        assert!(
+            matches!(
+                &frames[0],
+                Err(SourceError::MissingMaterial { gaps, .. }) if gaps == &vec![range]
+            ),
+            "{frames:?}"
+        );
     }
 
     #[tokio::test]

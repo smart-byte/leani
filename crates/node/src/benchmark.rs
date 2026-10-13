@@ -1219,7 +1219,7 @@ pub(crate) async fn run_real_source(
                 && delivery.acknowledgements > 0
                 && (!matches!(
                     processor.descriptor().id.as_str(),
-                    "block-summary" | "blobs-money"
+                    "block-summary" | "blobs-money" | "rollup-txs"
                 ) || delivery.domain_events == range.len())
         })
         && processor_store
@@ -1397,8 +1397,18 @@ fn externalized_real_source_processor(processor: &dyn Processor) -> Result<Arc<d
             lifecycle,
         )));
     }
+    if let Some(rollups) = processor
+        .as_any()
+        .downcast_ref::<leani_processor_rollup_txs::RollupTxsProcessor>()
+    {
+        return Ok(Arc::new(rollups.clone().with_contract(
+            instance,
+            PublicationPolicy::FinalizedOnly,
+            lifecycle,
+        )));
+    }
     bail!(
-        "real-source externalized benchmark currently supports blobs-money, uniswap-observations, and block-summary processors"
+        "real-source externalized benchmark currently supports blobs-money, uniswap-observations, block-summary, and rollup-txs processors"
     )
 }
 
@@ -5076,6 +5086,21 @@ fn decode_hex_json(value: &serde_json::Value, field: &str) -> Result<Vec<u8>> {
     decode_hex(encoded)
 }
 
+/// `value` with every object's keys in sorted order.
+fn sorted_json(value: &serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(fields) => fields
+            .iter()
+            .map(|(name, field)| (name, sorted_json(field)))
+            .collect::<std::collections::BTreeMap<_, _>>()
+            .into_iter()
+            .map(|(name, field)| (name.clone(), field))
+            .collect(),
+        serde_json::Value::Array(items) => items.iter().map(sorted_json).collect(),
+        scalar => scalar.clone(),
+    }
+}
+
 fn canonical_http_change(change: &serde_json::Value) -> Result<Option<Vec<u8>>> {
     let Some(kind) = change.get("kind").and_then(serde_json::Value::as_str) else {
         bail!("benchmark change has no kind");
@@ -5084,13 +5109,22 @@ fn canonical_http_change(change: &serde_json::Value) -> Result<Option<Vec<u8>>> 
         "synthetic.counter.put"
         | "blobs.block.put"
         | "uniswap.price.observation.put"
-        | "ethereum.block.summary.put" => decode_hex_json(change, "key")?,
+        | "ethereum.block.summary.put"
+        | "rollups.block.put" => decode_hex_json(change, "key")?,
         _ => return Ok(None),
     };
     let data = change
         .get("data")
         .context("benchmark domain change has no data")?;
     match kind {
+        "rollups.block.put" => {
+            // The bundle nests objects in arrays: sort every object's keys so
+            // HTTP object ordering cannot change the digest.
+            let mut event = vec![4];
+            event.extend_from_slice(&key);
+            event.extend_from_slice(&serde_json::to_vec(&sorted_json(data))?);
+            Ok(Some(event))
+        }
         "ethereum.block.summary.put" => {
             // Block-summary's public fields are scalar values. Sort the keys
             // so HTTP object ordering cannot change the digest, and include
@@ -6866,6 +6900,40 @@ fn write_sample_report(
 mod tests {
     use super::*;
 
+    #[test]
+    fn real_source_benchmark_runs_rollup_txs() {
+        let address = leani_primitives::Address::new([7; 20]);
+        let rollup = leani_processor_rollup_txs::RollupTxsProcessor::new(
+            leani_processor_rollup_txs::RollupTxsConfig {
+                network: "mainnet".to_owned(),
+                start_block: BlockNumber(20_000_000),
+                rules: vec![leani_processor_rollup_txs::Rule {
+                    rollup: "fixture".to_owned(),
+                    purpose: leani_processor_rollup_txs::Purpose::Data,
+                    to: address,
+                    from: None,
+                    selector: None,
+                    chain_id_arg: None,
+                    since: None,
+                    until: None,
+                }],
+            },
+        )
+        .expect("rollup-txs");
+        // Ordered-state processors such as transaction-stats cannot use the
+        // externalized profile's independent backfill streams.
+        let externalized =
+            externalized_real_source_processor(&rollup).expect("real-source processor");
+        assert_eq!(
+            externalized.descriptor().publication,
+            PublicationPolicy::FinalizedOnly
+        );
+        assert_eq!(
+            externalized.descriptor().requirements,
+            rollup.descriptor().requirements
+        );
+    }
+
     fn measured_run(
         elapsed_milliseconds: u64,
         samples: Vec<BenchmarkSample>,
@@ -7117,6 +7185,45 @@ mod tests {
                 "the delivered digest must cover {field}",
             );
         }
+    }
+
+    #[test]
+    fn rollup_txs_delivery_is_hashed_whatever_its_key_order() {
+        let change = serde_json::json!({
+            "kind": "rollups.block.put",
+            "key": format!("0x{}", "00".repeat(7) + "2a"),
+            "data": {
+                "block": { "blockNumber": 42, "finality": "finalized" },
+                "transactions": [
+                    { "transactionIndex": 3, "success": true, "gasUsed": "21000" },
+                ],
+            },
+        });
+        let original = canonical_http_change(&change)
+            .expect("decode rollup-txs bundle")
+            .expect("rollup-txs bundles must contribute to the delivered digest");
+        let reordered = serde_json::json!({
+            "key": format!("0x{}", "00".repeat(7) + "2a"),
+            "kind": "rollups.block.put",
+            "data": {
+                "transactions": [
+                    { "gasUsed": "21000", "success": true, "transactionIndex": 3 },
+                ],
+                "block": { "finality": "finalized", "blockNumber": 42 },
+            },
+        });
+        assert_eq!(
+            canonical_http_change(&reordered).expect("reordered bundle"),
+            Some(original.clone())
+        );
+        let mut reverted = change.clone();
+        reverted["data"]["transactions"][0]["success"] = serde_json::json!(false);
+        assert_ne!(
+            canonical_http_change(&reverted)
+                .expect("reverted bundle")
+                .as_ref(),
+            Some(&original)
+        );
     }
 
     #[test]

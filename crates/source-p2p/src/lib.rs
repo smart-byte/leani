@@ -7708,11 +7708,12 @@ impl RethP2pHistorySource {
             };
             let mut frames = if header_only_request(request) {
                 normalize_verified_headers(header_chunk, window_budget)?
-            } else if header_and_body_only_request(request) {
+            } else if history_body_only_request(request) {
                 self.fetch_history_body_frames(
                     session,
                     header_chunk,
                     &hashes,
+                    request,
                     window_budget,
                     cancellation,
                 )
@@ -7777,6 +7778,7 @@ impl RethP2pHistorySource {
         session: &P2pSession,
         headers: &[Header],
         hashes: &[B256],
+        request: &DataRequest,
         budget: SourceBudget,
         cancellation: &CancellationToken,
     ) -> Result<Vec<BlockFrame>, P2pError> {
@@ -7797,7 +7799,7 @@ impl RethP2pHistorySource {
         for peer in peers {
             reward_verified_material_peer(&session.handle, peer).await;
         }
-        normalize_verified_bodies(headers, &bodies, budget)
+        normalize_history_bodies(headers, &bodies, request, budget)
     }
 
     async fn fetch_sparse_log_frames(
@@ -10540,7 +10542,7 @@ fn normalize_sparse_log_frames(
                 normalize_block(
                     header,
                     &matching_bodies[body_position],
-                    receipts,
+                    Some(receipts),
                     observed_at_unix_ms,
                     Some(request),
                 )?
@@ -10875,6 +10877,25 @@ fn normalize_verified_bodies(
     Ok(output)
 }
 
+/// Normalize verified bodies for a history request that reads no receipt
+/// field: its filter applies, and senders are recovered only where read.
+fn normalize_history_bodies(
+    headers: &[Header],
+    bodies: &[BlockBody],
+    request: &DataRequest,
+    budget: SourceBudget,
+) -> Result<Vec<BlockFrame>, P2pError> {
+    validate_bodies(headers, bodies)?;
+    let observed_at_unix_ms = observed_at_unix_ms();
+    let mut total_bytes = 0_u64;
+    let mut output = Vec::with_capacity(headers.len());
+    for (header, body) in headers.iter().zip(bodies) {
+        let frame = normalize_block(header, body, None, observed_at_unix_ms, Some(request))?;
+        push_normalized_frame(&mut output, frame, &mut total_bytes, budget)?;
+    }
+    Ok(output)
+}
+
 fn normalize_body_transactions(body: &BlockBody) -> Result<Vec<TransactionEnvelope>, P2pError> {
     body.transactions
         .iter()
@@ -10934,7 +10955,13 @@ fn normalize_verified(
     let mut total_bytes = 0_u64;
     let mut output = Vec::with_capacity(headers.len());
     for ((header, body), block_receipts) in headers.iter().zip(bodies).zip(receipts) {
-        let frame = normalize_block(header, body, block_receipts, observed_at_unix_ms, None)?;
+        let frame = normalize_block(
+            header,
+            body,
+            Some(block_receipts),
+            observed_at_unix_ms,
+            None,
+        )?;
         push_normalized_frame(&mut output, frame, &mut total_bytes, budget)?;
     }
     Ok(output)
@@ -10960,7 +10987,7 @@ fn normalize_verified_for_request(
         let frame = normalize_block(
             header,
             body,
-            block_receipts,
+            Some(block_receipts),
             observed_at_unix_ms,
             Some(request),
         )?;
@@ -11003,14 +11030,22 @@ fn push_normalized_frame(
     Ok(())
 }
 
+/// Transaction field groups: each needs transaction rows.
+const TRANSACTION_GROUPS: CapabilitySet = CapabilitySet::of(Capability::Body)
+    .with(Capability::Calldata)
+    .with(Capability::Senders)
+    .with(Capability::BlobFields);
+
 fn requested_material(request: Option<&DataRequest>, capability: Capability) -> bool {
-    request.is_none_or(|request| match capability {
-        Capability::Transactions => {
-            request.required.contains(Capability::Transactions)
-                || request.required.contains(Capability::Body)
-                || request.required.contains(Capability::Calldata)
+    request.is_none_or(|request| {
+        let required = request.required.with_derivable();
+        match capability {
+            Capability::Transactions => {
+                required.intersection(TRANSACTION_GROUPS) != CapabilitySet::NONE
+            }
+            Capability::Receipts => required.contains(Capability::ReceiptOutcome),
+            _ => request.required.contains(capability),
         }
-        _ => request.required.contains(capability),
     })
 }
 
@@ -11020,6 +11055,18 @@ fn header_only_request(request: &DataRequest) -> bool {
 
 fn header_and_body_only_request(request: &DataRequest) -> bool {
     request.required == CapabilitySet::of(Capability::Header).with(Capability::Body)
+}
+
+/// History requests that read no receipt field and no withdrawal skip
+/// receipts. Live lanes keep the exact block-summary shape.
+fn history_body_only_request(request: &DataRequest) -> bool {
+    let body_groups = TRANSACTION_GROUPS.with(Capability::BlockSize);
+    let required = request.required.with_derivable();
+    required.intersection(body_groups) != CapabilitySet::NONE
+        && body_groups
+            .with(Capability::Header)
+            .with(Capability::Transactions)
+            .contains_all(required)
 }
 
 fn sparse_log_scope(request: &DataRequest) -> Option<&FilterScope> {
@@ -11034,6 +11081,10 @@ fn sparse_log_scope(request: &DataRequest) -> Option<&FilterScope> {
             Capability::Traces,
             Capability::StateDiffs,
             Capability::Mempool,
+            Capability::Senders,
+            Capability::BlobFields,
+            Capability::ReceiptOutcome,
+            Capability::BlockSize,
         ]
         .into_iter()
         .any(|capability| request.required.contains(capability));
@@ -11088,10 +11139,12 @@ fn normalized_material<T>(
 }
 
 #[allow(clippy::too_many_lines)]
+/// Normalize one verified block. Without `receipts`, a body-only read, the
+/// request must name no receipt group.
 fn normalize_block(
     header: &Header,
     body: &BlockBody,
-    receipts: &[Receipt],
+    receipts: Option<&[Receipt]>,
     observed_at_unix_ms: u64,
     request: Option<&DataRequest>,
 ) -> Result<BlockFrame, P2pError> {
@@ -11099,8 +11152,12 @@ fn normalize_block(
     let normalized_block_hash = block_hash(hash);
     let header_requested = requested_material(request, Capability::Header);
     let transactions_requested = requested_material(request, Capability::Transactions);
-    let senders_requested =
-        request.is_none_or(|request| request.required.contains(Capability::Transactions));
+    let senders_requested = request.is_none_or(|request| {
+        request
+            .required
+            .with_derivable()
+            .contains(Capability::Senders)
+    });
     let receipts_requested = requested_material(request, Capability::Receipts);
     let logs_requested = requested_material(request, Capability::Logs);
     let withdrawals_requested = requested_material(request, Capability::Withdrawals);
@@ -11133,12 +11190,18 @@ fn normalize_block(
     let mut normalized_logs = Vec::new();
     let mut previous_gas = 0_u64;
     let mut block_log_index = 0_u32;
-    for (index, (transaction, receipt)) in body.transactions.iter().zip(receipts).enumerate() {
+    let paired = receipts.map_or(body.transactions.len(), <[Receipt]>::len);
+    for (index, transaction) in body.transactions.iter().enumerate().take(paired) {
+        let receipt = receipts.map(|receipts| &receipts[index]);
         let transaction_index = u32::try_from(index)
             .map_err(|_| P2pError::InvalidResponse("transaction index overflows u32".to_owned()))?;
         let transaction_hash = transaction_hash(*transaction.tx_hash());
-        let gas_used = receipt.cumulative_gas_used.saturating_sub(previous_gas);
-        previous_gas = receipt.cumulative_gas_used;
+        let gas_used = receipt.map_or(0, |receipt| {
+            receipt.cumulative_gas_used.saturating_sub(previous_gas)
+        });
+        if let Some(receipt) = receipt {
+            previous_gas = receipt.cumulative_gas_used;
+        }
         let scope = filter_scope.as_ref();
         let preliminary_transaction_match = scope.is_none_or(|scope| {
             scope.matches_block(number)
@@ -11162,7 +11225,7 @@ fn normalize_block(
         let transaction_matches = preliminary_transaction_match
             && scope.is_none_or(|scope| scope.matches_sender(sender.map(address).as_ref()));
         let mut receipt_logs = Vec::new();
-        for source_log in &receipt.logs {
+        for source_log in receipt.map_or(&[][..], |receipt| receipt.logs.as_slice()) {
             let selected_for_receipt = receipts_requested && transaction_matches;
             let selected_for_logs = logs_requested
                 && transaction_matches
@@ -11230,7 +11293,7 @@ fn normalize_block(
                 size_bytes: Some(u32::try_from(encoded.len()).unwrap_or(u32::MAX)),
             });
         }
-        if receipts_requested && transaction_matches {
+        if let Some(receipt) = receipt.filter(|_| receipts_requested && transaction_matches) {
             normalized_receipts.push(ReceiptEnvelope {
                 transaction_hash,
                 transaction_type: receipt.tx_type as u8,
@@ -11269,7 +11332,11 @@ fn normalize_block(
         header_hash: VerificationCheck::VERIFIED,
         parent_continuity: VerificationCheck::VERIFIED,
         transactions_root: VerificationCheck::VERIFIED,
-        receipts_root: VerificationCheck::VERIFIED,
+        receipts_root: if receipts.is_some() {
+            VerificationCheck::VERIFIED
+        } else {
+            VerificationCheck::NOT_CHECKED
+        },
         withdrawals_root: VerificationCheck::VERIFIED,
         dataset_checksum: VerificationCheck::NOT_CHECKED,
         consensus_anchor: None,
@@ -11338,7 +11405,14 @@ fn normalize_block(
                 locator: format!("devp2p://mainnet/block/{hash:#x}"),
                 version: Some(format!("reth/{RETH_VERSION}@{RETH_REVISION}")),
                 checksum: Some(hash.0),
-                schema: Some("eth/68-70".to_owned()),
+                schema: Some(
+                    if receipts.is_some() {
+                        "eth/68-70"
+                    } else {
+                        "eth/68-70/header+body"
+                    }
+                    .to_owned(),
+                ),
             }),
             observed_at_unix_ms,
             projection: request.map_or_else(
@@ -11690,15 +11764,15 @@ mod tests {
         }));
     }
 
-    #[test]
-    fn body_and_calldata_projections_recover_senders_only_when_required() {
+    /// One committed block whose only transaction has an unrecoverable
+    /// signature: normalizing it fails exactly when sender recovery runs.
+    fn unrecoverable_sender_fixture() -> ([Header; 1], [BlockBody; 1], [Vec<Receipt>; 1]) {
         let transaction = reth_ethereum_primitives::TransactionSigned::Legacy(
             alloy_consensus::Signed::new_unhashed(
                 alloy_consensus::TxLegacy::default(),
                 alloy_primitives::Signature::new(U256::ZERO, U256::ZERO, false),
             ),
         );
-        let encoded = transaction.encoded_2718();
         let body = BlockBody {
             transactions: vec![transaction],
             ..Default::default()
@@ -11724,12 +11798,37 @@ mod tests {
         let receipts = [receipts];
         validate_bodies(&headers, &bodies).expect("committed body");
         validate_receipts(&headers, &bodies, &receipts).expect("committed receipts");
+        (headers, bodies, receipts)
+    }
+
+    fn generous_budget() -> SourceBudget {
+        SourceBudget {
+            max_input_bytes: 1 << 20,
+            max_frame_bytes: 1 << 20,
+            max_frames: 1,
+            max_buffered_frames: 1,
+            max_in_flight_requests: 1,
+            temporary_disk_bytes: 0,
+            max_resident_bytes: 1 << 20,
+        }
+    }
+
+    fn sender_recovery_attempted<T: std::fmt::Debug>(result: &Result<T, P2pError>) -> bool {
+        matches!(result, Err(P2pError::InvalidResponse(detail)) if detail.contains("cannot recover sender"))
+    }
+
+    #[test]
+    fn body_and_calldata_projections_recover_senders_only_when_required() {
+        let (headers, bodies, receipts) = unrecoverable_sender_fixture();
+        let encoded = bodies[0].transactions[0].encoded_2718();
         for (capability, filter_sender, allow_filtered, recover_sender) in [
             (Capability::Body, false, false, false),
             (Capability::Calldata, false, false, false),
             (Capability::Transactions, false, false, true),
             (Capability::Body, true, true, true),
             (Capability::Calldata, true, false, false),
+            (Capability::Senders, false, false, true),
+            (Capability::BlobFields, false, false, false),
         ] {
             let mut request = live_request(BlockRange::single(BlockNumber(0)));
             request.required = CapabilitySet::of(Capability::Header)
@@ -11744,20 +11843,12 @@ mod tests {
                 &bodies,
                 &receipts,
                 &request,
-                SourceBudget {
-                    max_input_bytes: 1 << 20,
-                    max_frame_bytes: 1 << 20,
-                    max_frames: 1,
-                    max_buffered_frames: 1,
-                    max_in_flight_requests: 1,
-                    temporary_disk_bytes: 0,
-                    max_resident_bytes: 1 << 20,
-                },
+                generous_budget(),
             );
             if recover_sender {
                 assert!(
-                    matches!(result, Err(P2pError::InvalidResponse(ref detail)) if detail.contains("cannot recover sender")),
-                    "{result:?}"
+                    sender_recovery_attempted(&result),
+                    "{capability:?}: {result:?}"
                 );
             } else {
                 let frames = result.expect("unrequested senders do not require signature recovery");
@@ -11769,6 +11860,111 @@ mod tests {
                 frames[0].validate_shape().expect("consistent frame");
             }
         }
+    }
+
+    #[test]
+    fn receipt_outcome_selects_receipts_and_senders_only_on_request() {
+        let (headers, bodies, receipts) = unrecoverable_sender_fixture();
+        let mut request = live_request(BlockRange::single(BlockNumber(0)));
+        request.required = [
+            Capability::Header,
+            Capability::Body,
+            Capability::Calldata,
+            Capability::ReceiptOutcome,
+        ]
+        .into_iter()
+        .collect();
+        let frames = normalize_verified_for_request(
+            &headers,
+            &bodies,
+            &receipts,
+            &request,
+            generous_budget(),
+        )
+        .expect("no sender recovery without Senders");
+        let receipt = &frames[0].receipts.as_complete().expect("outcome receipts")[0];
+        assert_eq!(receipt.success, Some(true));
+        assert_eq!(receipt.gas_used, Some(21_000));
+        assert!(receipt.effective_gas_price.is_some());
+        let transactions = frames[0].transactions.as_complete().expect("transactions");
+        assert_eq!(transactions[0].from, None);
+        assert!(matches!(
+            frames[0].logs,
+            Material::Missing(MissingReason::NotRequested)
+        ));
+
+        // rollup-txs reads senders through the Senders group alone
+        request.required = request.required.with(Capability::Senders);
+        let result = normalize_verified_for_request(
+            &headers,
+            &bodies,
+            &receipts,
+            &request,
+            generous_budget(),
+        );
+        assert!(sender_recovery_attempted(&result), "{result:?}");
+    }
+
+    #[test]
+    fn history_requests_without_receipt_groups_take_the_body_path() {
+        use Capability::{
+            BlobFields, BlockSize, Body, Calldata, Header, Logs, ReceiptOutcome, Receipts, Senders,
+            Transactions, Withdrawals,
+        };
+        let mut request = live_request(BlockRange::single(BlockNumber(0)));
+        for (required, body_only) in [
+            (&[Header, Body][..], true),
+            (&[Header, Body, Senders], true),
+            (&[Body, Senders], true),
+            (&[Header, Calldata, BlobFields], true),
+            (&[Header, BlockSize], true),
+            (&[Header, Transactions], true),
+            (&[Header], false),
+            (&[Logs], false),
+            (&[Header, Body, ReceiptOutcome], false),
+            (&[Header, Body, Logs], false),
+            (&[Header, Transactions, Receipts], false),
+            (&[Header, Body, Withdrawals], false),
+        ] {
+            request.required = required.iter().copied().collect();
+            assert_eq!(
+                history_body_only_request(&request),
+                body_only,
+                "{required:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn body_path_recovers_senders_only_for_matching_transactions() {
+        let (headers, bodies, _) = unrecoverable_sender_fixture();
+        let mut request = live_request(BlockRange::single(BlockNumber(0)));
+        request.required = CapabilitySet::of(Capability::Header).with(Capability::Body);
+        let frames = normalize_history_bodies(&headers, &bodies, &request, generous_budget())
+            .expect("no sender recovery without Senders");
+        let transactions = frames[0].transactions.as_complete().expect("transactions");
+        assert_eq!(transactions[0].from, None);
+        assert!(matches!(
+            frames[0].receipts,
+            Material::Missing(MissingReason::NotRequested)
+        ));
+
+        request.required = request.required.with(Capability::Senders);
+        let result = normalize_history_bodies(&headers, &bodies, &request, generous_budget());
+        assert!(sender_recovery_attempted(&result), "{result:?}");
+
+        // the contract creation goes to no recipient: its sender is never read
+        request.allow_filtered = true;
+        request.filters.recipients = vec![Address::new([0x99; 20])];
+        let frames = normalize_history_bodies(&headers, &bodies, &request, generous_budget())
+            .expect("no sender recovery for unmatched transactions");
+        assert!(
+            frames[0]
+                .transactions
+                .as_present()
+                .expect("filtered transactions")
+                .is_empty()
+        );
     }
 
     #[test]
@@ -11869,6 +12065,15 @@ mod tests {
 
         request.required = request.required.with(Capability::Receipts);
         assert!(sparse_log_scope(&request).is_none());
+        for group in [
+            Capability::Senders,
+            Capability::BlobFields,
+            Capability::ReceiptOutcome,
+            Capability::BlockSize,
+        ] {
+            request.required = CapabilitySet::of(Capability::Logs).with(group);
+            assert!(sparse_log_scope(&request).is_none(), "{group:?}");
+        }
         request.required = CapabilitySet::of(Capability::Logs);
         request.filters.scope.transaction_types = vec![3];
         assert!(sparse_log_scope(&request).is_none());

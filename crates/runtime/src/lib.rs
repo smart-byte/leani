@@ -779,20 +779,49 @@ pub struct BackfillReport {
     pub sources: Vec<BackfillSourceReport>,
 }
 
+/// Whether `job` is `stored` with requirements narrowed to groups the stored
+/// ones derive, and nothing else changed.
+fn narrows_job(stored: &BackfillJob, job: &BackfillJob) -> bool {
+    let mut normalized = stored.clone();
+    normalized.request.required = job.request.required;
+    stored
+        .request
+        .required
+        .with_derivable()
+        .contains_all(job.request.required)
+        && normalized == *job
+}
+
 /// Plan `request` on `source`. A source can advertise a capability it serves
 /// only for some request shapes, and its plan refuses the rest; another
-/// source may serve them.
+/// source may serve them. So may a plan promising fewer field groups than the
+/// request requires.
 async fn plan_or_refuse(
     source: &dyn HistorySource,
     request: &DataRequest,
 ) -> Result<leani_source_api::SourcePlan, RuntimeError> {
-    source.plan(request).await.map_err(|error| match error {
-        SourceError::InvalidPlan(detail) => RuntimeError::SourceCannotServe {
-            source_id: source.descriptor().id.to_string(),
-            detail,
-        },
+    let cannot_serve = |detail| RuntimeError::SourceCannotServe {
+        source_id: source.descriptor().id.to_string(),
+        detail,
+    };
+    let plan = source.plan(request).await.map_err(|error| match error {
+        SourceError::InvalidPlan(detail) => cannot_serve(detail),
         error => error.into(),
-    })
+    })?;
+    let supplied = plan.supplied.with_derivable();
+    if !supplied.contains_all(request.required) {
+        // name the groups behind a missing bundle too
+        let missing = request
+            .required
+            .with_derivable()
+            .iter()
+            .filter(|capability| !supplied.contains(*capability))
+            .collect::<Vec<_>>();
+        return Err(cannot_serve(format!(
+            "the plan does not supply {missing:?}"
+        )));
+    }
+    Ok(plan)
 }
 
 /// Re-map a finalized archive range and compare its compact processor deltas
@@ -3371,9 +3400,20 @@ impl HistoricalRuntime {
         job: &BackfillJob,
         payload: &[u8],
     ) -> Result<JobRecord, RuntimeError> {
-        if let Some(existing) = self.store.job(&job.id).await? {
-            if existing.kind != job.owner.job_kind() || existing.payload != payload {
+        if let Some(mut existing) = self.store.job(&job.id).await? {
+            if existing.kind != job.owner.job_kind() {
                 return Err(RuntimeError::JobIdentity(job.id.clone()));
+            }
+            if existing.payload != payload {
+                // A processor that narrowed its field groups reads a subset of
+                // the same material: its stored progress still holds.
+                let narrowed = serde_json::from_slice::<BackfillJob>(&existing.payload)
+                    .is_ok_and(|stored| narrows_job(&stored, job));
+                if !narrowed {
+                    return Err(RuntimeError::JobIdentity(job.id.clone()));
+                }
+                existing.payload = payload.to_vec();
+                self.store.save_job(&existing).await?;
             }
             return Ok(existing);
         }
@@ -8929,6 +8969,80 @@ mod tests {
         job
     }
 
+    /// A source whose plans promise everything but senders.
+    struct SenderlessPlans(ScriptedHistorySource);
+
+    #[async_trait::async_trait]
+    impl HistorySource for SenderlessPlans {
+        fn descriptor(&self) -> &SourceDescriptor {
+            self.0.descriptor()
+        }
+
+        async fn plan(
+            &self,
+            request: &DataRequest,
+        ) -> Result<leani_source_api::SourcePlan, SourceError> {
+            let mut plan = self.0.plan(request).await?;
+            plan.supplied = CapabilitySet::of(Capability::Header).with(Capability::Body);
+            Ok(plan)
+        }
+
+        async fn open(
+            &self,
+            chunk: &SourceChunk,
+            budget: SourceBudget,
+            cancellation: CancellationToken,
+        ) -> Result<leani_source_api::BlockFrameStream, SourceError> {
+            self.0.open(chunk, budget, cancellation).await
+        }
+    }
+
+    #[tokio::test]
+    async fn a_plan_promising_fewer_groups_than_requested_cannot_serve() {
+        let range = BlockRange::new(BlockNumber(1), BlockNumber(2)).expect("range");
+        let source = SenderlessPlans(ScriptedHistorySource::new(
+            fixture_source_descriptor("senderless-history", range),
+            vec![ScriptedChunk {
+                range,
+                schema_version: "fixture-v1".to_owned(),
+                estimated_bytes: None,
+                steps: Vec::new(),
+            }],
+        ));
+        let request = |required| DataRequest {
+            chain_id: ChainId(1),
+            range,
+            required,
+            allow_filtered: false,
+            projection: leani_source_api::FieldProjection::default(),
+            log_fields: leani_primitives::LogFieldSet::NONE,
+            filters: leani_source_api::FilterSet::default(),
+            minimum_finality: Finality::Included,
+            verification_policy: VerificationPolicy::CompleteCryptographic,
+        };
+        let body = CapabilitySet::of(Capability::Body);
+        plan_or_refuse(&source, &request(body))
+            .await
+            .expect("the plan promises what is requested");
+        // the bundle derives senders, which the plan does not promise
+        for required in [
+            body.with(Capability::Senders),
+            CapabilitySet::of(Capability::Transactions),
+        ] {
+            let error = plan_or_refuse(&source, &request(required))
+                .await
+                .expect_err("the plan promises no senders");
+            assert!(
+                matches!(
+                    &error,
+                    RuntimeError::SourceCannotServe { source_id, detail }
+                        if source_id == "senderless-history" && detail.contains("Senders")
+                ),
+                "{error:?}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn coordinated_history_opens_later_chunks_before_processing_the_first() {
         let range = BlockRange::new(BlockNumber(1), BlockNumber(4)).expect("range");
@@ -9432,20 +9546,7 @@ mod tests {
         let all_frames = frames(range)
             .into_iter()
             .map(|mut frame| {
-                frame.header = Material::Complete(HeaderEnvelope {
-                    rlp: Some(vec![0_u8; 64]),
-                    transactions_root: None,
-                    receipts_root: None,
-                    withdrawals_root: None,
-                    gas_limit: None,
-                    gas_used: None,
-                    base_fee_per_gas: None,
-                    blob_gas_used: None,
-                    excess_blob_gas: None,
-                    size_bytes: None,
-                    transaction_count: None,
-                    consensus_size_bytes: None,
-                });
+                frame.header = Material::Complete(complete_header(Some(vec![0_u8; 64])));
                 frame
             })
             .collect::<Vec<_>>();
@@ -10080,6 +10181,26 @@ mod tests {
         frame
     }
 
+    /// A header that fills every field the field groups of the testkit
+    /// processors promise. Fixture frames carry no transactions, so none are
+    /// counted.
+    fn complete_header(rlp: Option<Vec<u8>>) -> HeaderEnvelope {
+        HeaderEnvelope {
+            rlp,
+            transactions_root: None,
+            receipts_root: None,
+            withdrawals_root: None,
+            gas_limit: Some(30_000_000),
+            gas_used: Some(0),
+            base_fee_per_gas: None,
+            blob_gas_used: None,
+            excess_blob_gas: None,
+            size_bytes: Some(1_000),
+            transaction_count: Some(0),
+            consensus_size_bytes: None,
+        }
+    }
+
     fn request(range: BlockRange) -> DataRequest {
         DataRequest {
             chain_id: ChainId(1),
@@ -10127,20 +10248,7 @@ mod tests {
                 frame.block.hash = e2e_hash(number);
                 frame.block.parent_hash = parent;
                 frame.finality = Finality::Included;
-                frame.header = Material::Complete(HeaderEnvelope {
-                    rlp: None,
-                    transactions_root: None,
-                    receipts_root: None,
-                    withdrawals_root: None,
-                    gas_limit: None,
-                    gas_used: None,
-                    base_fee_per_gas: None,
-                    blob_gas_used: None,
-                    excess_blob_gas: None,
-                    size_bytes: None,
-                    consensus_size_bytes: None,
-                    transaction_count: None,
-                });
+                frame.header = Material::Complete(complete_header(None));
                 parent = frame.block.hash;
                 frame
             })
@@ -10880,20 +10988,7 @@ mod tests {
         let range = BlockRange::new(BlockNumber(1), BlockNumber(12)).expect("range");
         let mut corpus = frames(range);
         for frame in &mut corpus {
-            frame.header = Material::Complete(HeaderEnvelope {
-                rlp: None,
-                transactions_root: None,
-                receipts_root: None,
-                withdrawals_root: None,
-                gas_limit: None,
-                gas_used: None,
-                base_fee_per_gas: None,
-                blob_gas_used: None,
-                excess_blob_gas: None,
-                size_bytes: None,
-                transaction_count: None,
-                consensus_size_bytes: None,
-            });
+            frame.header = Material::Complete(complete_header(None));
         }
         let processor = Arc::new(OrderedLedgerProcessor::default().with_delivery_none());
         let (_batched_directory, batched_store) = store().await;
@@ -11024,20 +11119,7 @@ mod tests {
         let processor = Arc::new(BlockLocalCounter::default());
         let (_directory, store) = store().await;
         for mut frame in frames(range) {
-            frame.header = Material::Complete(HeaderEnvelope {
-                rlp: Some(vec![1, 2]),
-                transactions_root: None,
-                receipts_root: None,
-                withdrawals_root: None,
-                gas_limit: None,
-                gas_used: None,
-                base_fee_per_gas: None,
-                blob_gas_used: None,
-                excess_blob_gas: None,
-                size_bytes: None,
-                transaction_count: None,
-                consensus_size_bytes: None,
-            });
+            frame.header = Material::Complete(complete_header(Some(vec![1, 2])));
             frame.provenance.push(leani_primitives::Provenance {
                 source_id: leani_primitives::SourceId::new("live-cache").expect("source ID"),
                 source_kind: SourceKind::ExecutionP2p,
@@ -11596,20 +11678,7 @@ mod tests {
             descriptor.complete_capabilities.with(Capability::Header);
         let mut source_frames = frames(range);
         for frame in &mut source_frames {
-            frame.header = Material::Complete(HeaderEnvelope {
-                rlp: None,
-                transactions_root: None,
-                receipts_root: None,
-                withdrawals_root: None,
-                gas_limit: None,
-                gas_used: None,
-                base_fee_per_gas: None,
-                blob_gas_used: None,
-                excess_blob_gas: None,
-                size_bytes: None,
-                transaction_count: None,
-                consensus_size_bytes: None,
-            });
+            frame.header = Material::Complete(complete_header(None));
         }
         let scripted = Arc::new(ScriptedHistorySource::new(
             descriptor,
@@ -12044,20 +12113,7 @@ mod tests {
     async fn historical_material_rejects_a_frame_larger_than_the_global_memory_budget() {
         let range = BlockRange::new(BlockNumber(0), BlockNumber(0)).expect("one-block range");
         let mut material_frames = frames(range);
-        material_frames[0].header = Material::Complete(HeaderEnvelope {
-            rlp: Some(vec![0_u8; 2]),
-            transactions_root: None,
-            receipts_root: None,
-            withdrawals_root: None,
-            gas_limit: None,
-            gas_used: None,
-            base_fee_per_gas: None,
-            blob_gas_used: None,
-            excess_blob_gas: None,
-            size_bytes: None,
-            transaction_count: None,
-            consensus_size_bytes: None,
-        });
+        material_frames[0].header = Material::Complete(complete_header(Some(vec![0_u8; 2])));
         let scripted = Arc::new(ScriptedHistorySource::from_frames(
             fixture_source_descriptor("material-memory-budget", range),
             material_frames,
@@ -14195,6 +14251,153 @@ mod tests {
                 .len(),
             3
         );
+    }
+
+    #[tokio::test]
+    async fn a_narrowed_processor_keeps_its_durable_jobs() {
+        let range = BlockRange::new(BlockNumber(1), BlockNumber(3)).expect("range");
+        let processor = Arc::new(BlockLocalCounter::default());
+        let (_directory, store) = store().await;
+        let source: Arc<dyn HistorySource> = Arc::new(ScriptedHistorySource::from_frames(
+            fixture_source_descriptor("narrowing", range),
+            frames(range),
+        ));
+        let runtime = HistoricalRuntime::new_with_sources(
+            store.clone(),
+            vec![source],
+            processor.clone(),
+            HistoricalRuntimeConfig::default(),
+        )
+        .expect("runtime");
+        let wide = BackfillJob {
+            id: "automatic:1:counter:1-3".to_owned(),
+            owner: HistoricalJobOwner::Materialization,
+            processor_instance: processor.descriptor().instance.to_string(),
+            mode: BackfillMode::FillMissing,
+            delivery_stream_id: None,
+            ranges: vec![range],
+            request: request(range),
+            sink_ids: Vec::new(),
+        };
+        let encode = |job: &BackfillJob| serde_json::to_vec(job).expect("payload");
+        runtime
+            .load_or_create_job(&wide, &encode(&wide))
+            .await
+            .expect("created");
+        runtime
+            .save_checkpoint(
+                &wide,
+                &encode(&wide),
+                JobState::Running,
+                1,
+                &BackfillCheckpoint::default(),
+            )
+            .await
+            .expect("checkpoint");
+
+        // an upgrade narrowed the processor's groups: the job resumes
+        let mut narrowed = wide.clone();
+        narrowed.request.required = CapabilitySet::of(Capability::Body).with(Capability::Senders);
+        let record = runtime
+            .load_or_create_job(&narrowed, &encode(&narrowed))
+            .await
+            .expect("a narrowed job resumes");
+        assert_eq!(record.payload, encode(&narrowed));
+        assert!(record.checkpoint.is_some());
+        assert_eq!(
+            store
+                .job(&wide.id)
+                .await
+                .expect("job")
+                .expect("stored job")
+                .payload,
+            encode(&narrowed)
+        );
+
+        // widening, or any other change, is another job
+        let mut widened = narrowed.clone();
+        widened.request.required = CapabilitySet::of(Capability::Transactions);
+        let mut moved = narrowed.clone();
+        moved.ranges = vec![BlockRange::single(BlockNumber(1))];
+        for job in [widened, moved] {
+            assert!(matches!(
+                runtime.load_or_create_job(&job, &encode(&job)).await,
+                Err(RuntimeError::JobIdentity(_))
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn historical_run_passes_a_stored_material_miss_to_the_next_source() {
+        let range = BlockRange::new(BlockNumber(1), BlockNumber(3)).expect("range");
+        let all_frames = frames(range);
+        let rest = BlockRange::new(BlockNumber(2), BlockNumber(3)).expect("rest");
+        let mut retained_descriptor = fixture_source_descriptor("retained-miss", range);
+        retained_descriptor.priority = 0;
+        // a stored frame lacked a requested group's fields at block 2
+        let retained: Arc<dyn HistorySource> = Arc::new(ScriptedHistorySource::new(
+            retained_descriptor.clone(),
+            vec![ScriptedChunk {
+                range,
+                schema_version: retained_descriptor.schema_version,
+                estimated_bytes: None,
+                steps: vec![
+                    HistoryStep::Frame(Box::new(all_frames[0].clone())),
+                    HistoryStep::Error(SourceError::MissingMaterial {
+                        gaps: vec![rest],
+                        required: CapabilitySet::of(Capability::Senders).bits(),
+                        available: CapabilitySet::of(Capability::Transactions).bits(),
+                    }),
+                ],
+            }],
+        ));
+        let mut network_descriptor = fixture_source_descriptor("network", range);
+        network_descriptor.priority = 1;
+        let network: Arc<dyn HistorySource> = Arc::new(ScriptedHistorySource::from_frames(
+            network_descriptor,
+            all_frames,
+        ));
+        let processor = Arc::new(BlockLocalCounter::default());
+        let (_directory, store) = store().await;
+        let runtime = HistoricalRuntime::new_with_sources(
+            store.clone(),
+            vec![network, retained],
+            processor.clone(),
+            HistoricalRuntimeConfig {
+                mapper_concurrency: 2,
+                max_attempts: 3,
+                retry_base: Duration::from_millis(1),
+                retry_max: Duration::from_millis(1),
+                ..HistoricalRuntimeConfig::default()
+            },
+        )
+        .expect("runtime");
+        let report = runtime
+            .run(
+                BackfillJob {
+                    id: "stored-material-miss".to_owned(),
+                    owner: HistoricalJobOwner::Materialization,
+                    processor_instance: processor.descriptor().instance.to_string(),
+                    mode: BackfillMode::FillMissing,
+                    delivery_stream_id: None,
+                    ranges: vec![range],
+                    request: request(range),
+                    sink_ids: Vec::new(),
+                },
+                default_source_budget(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("the next source completes the job");
+        assert_eq!(report.frames_committed, 3);
+        assert_eq!(report.final_coverage, vec![range]);
+        let retained = report
+            .sources
+            .iter()
+            .find(|source| source.source_id == "retained-miss")
+            .expect("retained source report");
+        assert_eq!(retained.frames_committed, 1);
+        assert_eq!(retained.failures, 1);
     }
 
     #[tokio::test]
@@ -20928,20 +21131,7 @@ mod tests {
 
     fn live_fixture(number: u64, parent: BlockHash) -> leani_primitives::BlockFrame {
         let mut frame = included_frame(number, parent);
-        frame.header = leani_primitives::Material::Complete(leani_primitives::HeaderEnvelope {
-            rlp: None,
-            transactions_root: None,
-            receipts_root: None,
-            withdrawals_root: None,
-            gas_limit: None,
-            gas_used: None,
-            base_fee_per_gas: None,
-            blob_gas_used: None,
-            excess_blob_gas: None,
-            size_bytes: None,
-            consensus_size_bytes: None,
-            transaction_count: None,
-        });
+        frame.header = leani_primitives::Material::Complete(complete_header(None));
         frame
     }
 

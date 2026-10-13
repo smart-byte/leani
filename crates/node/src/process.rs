@@ -2998,6 +2998,36 @@ mod raw_history_control_tests {
     }
 
     #[test]
+    fn sources_serve_field_groups_their_bundles_derive() {
+        use leani_processor_api::Processor as _;
+
+        let blobs = leani_processor_blobs::BlobsProcessor::default();
+        let mut descriptor = blobs.descriptor().clone();
+        descriptor.requirements[0].capabilities = [
+            Capability::Header,
+            Capability::Senders,
+            Capability::BlobFields,
+            Capability::BlockSize,
+            Capability::ReceiptOutcome,
+        ]
+        .into_iter()
+        .collect();
+        let processor = RequirementsOnly { descriptor };
+        let mut config: Config = toml::from_str(VALID_CONFIG_TOML).expect("config");
+        config.processors[0].instance = processor.descriptor().instance.to_string();
+        let (sources, _, excluded) =
+            super::configured_history_candidates(&config, &processor, None).expect("candidates");
+        // Xatu advertises the transaction and receipt bundles, not the groups
+        assert!(
+            sources
+                .iter()
+                .any(|source| source.descriptor().kind
+                    == leani_primitives::SourceKind::PublicDataset),
+            "{excluded:?}"
+        );
+    }
+
+    #[test]
     fn raw_history_profile_covers_every_requirement_like_the_backfill_request() {
         use leani_processor_api::Processor as _;
 
@@ -4522,12 +4552,22 @@ fn configured_history_candidates(
             crate::config::HistorySourceKind::Parquet => continue,
         };
         let descriptor = source.descriptor();
-        if !descriptor.capabilities.contains_all(required) {
+        // Descriptors advertise bundles; requirements may name their groups.
+        if !descriptor
+            .capabilities
+            .with_derivable()
+            .contains_all(required)
+        {
             excluded.push(format!(
                 "{}: it does not serve every material kind the processor requires",
                 descriptor.id
             ));
-        } else if !allow_filtered && !descriptor.complete_capabilities.contains_all(required) {
+        } else if !allow_filtered
+            && !descriptor
+                .complete_capabilities
+                .with_derivable()
+                .contains_all(required)
+        {
             excluded.push(format!(
                 "{}: it serves the required material only filtered, and the processor reads whole blocks",
                 descriptor.id

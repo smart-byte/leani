@@ -18,6 +18,8 @@ factory/registry API; see [Build a custom processor](https://leani.dev/docs/guid
 
 Block-local Dencun-and-later blob economics and type-3 transaction output. It
 accepts the filtered Xatu projection or complete normalized execution frames.
+It declares the `Header`, `Senders`, `BlobFields`, `BlockSize` and
+`ReceiptOutcome` field groups, filtered to type-3 transactions.
 All wei quantities are lossless integers.
 
 `history_mode = "on_demand"` disables only automatic historical processor
@@ -47,7 +49,7 @@ A declarative event decoder. Configuration supplies contract
 addresses, static Solidity event ABI fragments, and output mappings. The
 factory parses and validates the ABI before a source is opened, derives exact
 topic-zero signatures, pushes address/topic predicates into capable sources,
-and decodes without EVM execution.
+and decodes without EVM execution. It declares the `Logs` field group.
 
 Supported ABI values are `address`, `bool`, fixed `bytes1..bytes32`, and
 `uint`/`int` widths from 8 through 256. Every parameter needs a name
@@ -141,10 +143,10 @@ supports deterministic wall-clock buckets from canonical block timestamps.
 
 An ordered A-to-B aggregate that retains constant-sized private working state:
 transaction count, exact total value, cursor, checkpoints, and the bounded
-unfinalized contribution journal. It requests transaction envelopes and
-sender/recipient predicates without receipts, so it cannot tell whether a
-transaction reverted: `count` and `totalValueWei` cover every submitted
-transaction from the sender to the recipient. `totalValueWei` is the
+unfinalized contribution journal. It declares the `Body` and `Senders` field
+groups and sender/recipient predicates, and no receipt group, so it cannot tell
+whether a transaction reverted: `count` and `totalValueWei` cover every
+submitted transaction from the sender to the recipient. `totalValueWei` is the
 submitted value, not the value the recipient received.
 
 ```toml
@@ -189,18 +191,18 @@ explicit operator action.
 
 ## rollup-txs 1.0.0
 
-A block-local processor for rollups' L1 transactions other than blobs:
-calldata batches, state root and output proposals, and proof submissions. It
-requests header, transaction, calldata, and receipt material filtered to the
-rules' recipients. A transaction matches a rule when it is sent to `to`, from
-`from` when set, calls `selector` when set, carries `chain_id_arg` as its first
-ABI word when set (shared settlement contracts serving several chains), in a
-block whose timestamp lies in `[since, until)`. The first matching rule per
-recipient wins, so list the more specific rules first. A rule also names the
-`rollup` its transactions belong to and their `purpose` (`data`, `state`, or
-`proof`), which the reported rows carry. Type-3 transactions never match:
-`blobs-money` reports them. Only top-level calls match; a call made through a
-multisig or another contract is not seen.
+A block-local processor for rollups' L1 transactions other than blobs: calldata
+batches, state root and output proposals, and proof submissions. It declares
+the `Header`, `Body`, `Senders`, `Calldata` and `ReceiptOutcome` field groups,
+filtered to the rules' recipients. A transaction matches a rule when it is sent
+to `to`, from `from` when set, calls `selector` when set, carries
+`chain_id_arg` as its first ABI word when set (shared settlement contracts
+serving several chains), in a block whose timestamp lies in `[since, until)`.
+The first matching rule per recipient wins, so list the more specific rules
+first. A rule also names the `rollup` its transactions belong to and their
+`purpose` (`data`, `state`, or `proof`), which the reported rows carry. Type-3
+transactions never match: `blobs-money` reports them. Only top-level calls
+match; a call made through a multisig or another contract is not seen.
 
 The processor supports Ethereum mainnet only, and only from London (block
 12,965,000) on, because `executionBurnedWei` and `tipWei` need the base fee
@@ -283,15 +285,15 @@ to = "0x43edb88c4b80fdd2adff2412a7bebf9df42cb40e"
 selector = "0x82ecf2f6"
 ```
 
-Xatu serves receipt material only for type-3 transactions, so it cannot plan
-this processor's history: a job moves past it to the next configured source
-(for example eraE, then the execution-P2P fallback).
+Xatu serves this processor's history from its transaction projection, for the
+rule recipients (see [data sources](/docs/concepts/data-sources/#3-xatu)).
 
 ## erc20-balances 1.1.0
 
 An ordered watchlist ledger derived from canonical ERC-20 `Transfer` logs.
 Configuration declares watched addresses, an optional token allowlist, a start
-block, and whether the opening coverage is complete.
+block, and whether the opening coverage is complete. It declares the `Logs`
+field group.
 
 The stored method is explicitly `erc20_transfer_ledger`. Rebasing,
 reflection, and non-standard tokens are not represented as general EVM
@@ -347,21 +349,20 @@ complete_from_start = true
 
 ## block-summary 1.2.0
 
-A receipt-free, block-local view of every Ethereum execution block. It
-requests headers and bodies, then publishes timestamp, parent/hash identity,
-gas limit and usage, decimal base fee, blob gas fields, transaction count, exact
-execution-block size when available, and finality. Blocks come from verified
-material or, under the trusted-dataset policy, from Xatu's dataset-declared
-header and transaction projections, whose body indices and payload
-transaction count must agree. Dataset rows carry no execution-block size, so
-`sizeBytes` is `null` for them. A block a dataset summarized first matches the
-same block from verified material, as when the live lane overlaps a Xatu
-backfill, and keeps `null`. The reverse, remapping a block that verified
+A receipt-free, block-local view of every Ethereum execution block. It declares
+the `Header` and `Body` field groups, then publishes timestamp, parent/hash
+identity, gas limit and usage, decimal base fee, blob gas fields, transaction
+count, exact execution-block size when available, and finality. Blocks come
+from verified material or, under the trusted-dataset policy, from Xatu's
+dataset-declared header and transaction projections, whose body indices and
+payload transaction count must agree. Dataset rows carry no execution-block
+size, so `sizeBytes` is `null` for them. A block a dataset summarized first
+matches the same block from verified material, as when the live lane overlaps a
+Xatu backfill, and keeps `null`. The reverse, remapping a block that verified
 material summarized from a dataset, as a recompute may, is refused as a
-conflicting apply. Summaries are retained by
-block hash with a canonical block-number index; the query extension exposes
-`/latest` and `/blocks/{number}`. It never executes the EVM and does not request
-receipts.
+conflicting apply. Summaries are retained by block hash with a canonical
+block-number index; the query extension exposes `/latest` and
+`/blocks/{number}`. It never executes the EVM and does not request receipts.
 
 The compact `[blocks]` preset supplies the standard checkpointed lifecycle,
 full query output, 64 MiB/24 hour delivery window, and undo records kept until
@@ -387,7 +388,8 @@ and full or windowed SQLite retention. Version 2.1 also maintains a query-only
 latest-observation pointer per pool so new clients can bootstrap immediately
 before following the immutable stream. Transaction hashes are deliberately not
 part of this processor's output, allowing archive and P2P sources to omit
-transaction bodies when acquiring filtered pool logs.
+transaction bodies when acquiring filtered pool logs. Both processors declare
+the `Logs` field group.
 `uniswap-latest` is ordered/canonical and retains only the latest observation
 per pool for slim price queries.
 

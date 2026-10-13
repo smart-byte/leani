@@ -26,7 +26,46 @@ large backfill.
 | Portal Network | Future decentralized history/state | Designed for low-resource history access | Completeness/maturity must be tested |
 | JSON-RPC | Development/rare fallback | Broad compatibility | Reintroduces cost/trust; never default core |
 
-## 2. Xatu
+## 2. Field groups
+
+Processors declare the field groups they read. Sources declare the groups
+they fill. Filters choose rows (which transactions or logs); groups choose
+columns (which fields of those rows).
+
+Each group is a capability flag with the same name. `Senders`, `BlobFields`,
+`ReceiptOutcome` and `BlockSize` are new flags. Each group promises its fields
+only on components whose material is present:
+
+| Group | Promise |
+|---|---|
+| `Header` | `gas_limit` and `gas_used`. The base fee and blob gas fields come with the header but are not checked, because the checks are chain-agnostic. |
+| `Body` | Every transaction's `to`, `nonce`, `gas_limit` and `value`, and the header's `transaction_count`. An absent `to` means a contract creation, never "not supplied". |
+| `Calldata` | Every transaction's `input`. Empty calldata is empty bytes. |
+| `Senders` | Every transaction's `from`. |
+| `BlobFields` | Every type-3 transaction's blob versioned hashes (non-empty) and blob fee cap, and every type-3 receipt's blob gas used. |
+| `ReceiptOutcome` | Every receipt's `success`, `gas_used` and `effective_gas_price`, with one receipt per transaction (same index and type) when transactions are present. |
+| `BlockSize` | The header's `size_bytes` and `transaction_count`. Whoever measures the block holds its body. |
+| `Logs` | Unchanged: the selected logs, with the log fields the requirement names. |
+
+Transaction identity (hash, type and index) and the block reference belong to
+no group, so they are always present. The bundles keep their earlier meaning:
+`Transactions` is `Body`, `Calldata`, `Senders`, `BlobFields` and `BlockSize`,
+and `Receipts` is `Logs` and `ReceiptOutcome`.
+
+A source's plan states the groups its frames fill. The runtime refuses a plan
+that promises less than the request needs and moves the job to the next
+configured source. Every frame a processor receives is checked against the
+fields its declared groups promise, so a source that breaks a promise fails
+loudly instead of being misread.
+
+Stored data is checked when read. Retained raw history and local archives plan
+from the components they recorded, then check each frame's fields as they read
+them. At the first frame that lacks a requested group's fields, the read ends
+with a missing-material error for the rest of the chunk. The job then passes
+that range to the next source: a cache miss, never a job failure or a wrong
+value.
+
+## 3. Xatu
 
 [Xatu Data](https://github.com/ethpandaops/xatu-data) is currently the strongest first backend.
 
@@ -57,16 +96,34 @@ Relevant canonical beacon tables include:
 - blob sidecars;
 - withdrawals.
 
-The implemented `XatuHistorySource` plans four fail-closed physical
-projections:
+The implemented `XatuHistorySource` chooses one fail-closed physical
+projection from the requested groups:
 
-1. headers from minimal execution/beacon block columns;
-2. transactions with sender, recipient, exact value, calldata, nonce, gas
-   limit, and type;
-3. logs with address and all four topic positions. The logs table names a
-   log's transaction only by hash, so a log request that also selects
-   transactions by type, sender, or recipient fails during planning; and
-4. the existing blob/type-3 projection.
+1. blob fields or block sizes (`BlobFields` or `BlockSize`) use the type-3
+   blobs projection. The request must select type-3 transactions only, and
+   may add only `Header`, `Senders` and `ReceiptOutcome`. `Body` and
+   `Calldata` are refused there;
+2. logs use the log projection, with address and all four topic positions.
+   The logs table names a log's transaction only by hash, so a log request
+   that also selects transactions by type, sender, or recipient fails during
+   planning;
+3. any of `Body`, `Senders`, `Calldata` or `ReceiptOutcome` uses the
+   transaction projection over `canonical_execution_transaction`. It always
+   reads the identity and body columns (`block_number`, `transaction_index`,
+   `transaction_hash`, `to_address`, `nonce`, `gas_limit`, `value`, and
+   `transaction_type`). It adds `from_address` for `Senders` or a sender
+   filter, `input` for `Calldata`, and `gas_used`, `gas_price` and `success`
+   for `ReceiptOutcome`. Those rows become receipts without logs or raw bytes,
+   with the effective gas price taken from `gas_price`. Xatu stores empty
+   calldata as null, which is read as empty bytes; and
+4. `Header` alone uses headers, read from the minimal execution and beacon
+   block columns.
+
+Xatu serves `rollup-txs` history, which needs `Header`, `Body`, `Senders`,
+`Calldata` and `ReceiptOutcome`, scoped to the rule recipients. Requests for
+the full `Transactions` or `Receipts` bundles are refused by Xatu, because its
+projections cannot fill blob fields for every transaction or logs inside
+receipts. Such processors use P2P or eraE.
 
 Xatu history is Ethereum mainnet only. Its projections stamp every frame as
 chain 1, so the adapter refuses any Xatu network but `mainnet`, and
@@ -110,17 +167,19 @@ moves on to its next configured source, and the node logs
 debug level. Only a 404 is reported this way; other store failures, such as
 a 5xx response or a timeout, are not.
 
-Every immutable chunk encodes its projection kind and exact filters. `open`
-therefore cannot execute a different physical projection from the one that
-was planned. The source plan reports logical reader, table, selected columns,
-predicates, trust, derived status, and completeness. Unsupported combinations
-fail before object metadata or Parquet data is downloaded.
+Every immutable chunk encodes its projection kind, its requested groups, and
+its exact filters. `open` therefore cannot execute a different physical
+projection from the one that was planned. The source plan reports logical
+reader, table, selected columns, predicates, trust, derived status, and
+completeness. Unsupported combinations fail before object metadata or Parquet
+data is downloaded.
 
-Transaction aggregates select `canonical_execution_transaction` without
-receipts. Declarative events select `canonical_execution_logs` without beacon
-transactions, withdrawals, or blob fields. Both read the minimal execution
-and beacon block columns needed for timestamps, canonical hash, and parent
-identity.
+Transaction aggregates select `canonical_execution_transaction` and read only
+the columns their groups need, so they read no receipt outcome unless they
+request `ReceiptOutcome`. Declarative events select `canonical_execution_logs`
+without beacon transactions, withdrawals, or blob fields. Both read the minimal
+execution and beacon block columns needed for timestamps, canonical hash, and
+parent identity.
 
 Each projected column has a declared encoding that fixes the Arrow types it
 may arrive as, and a column of any other type fails the object before a row
@@ -172,7 +231,7 @@ Sources:
 - [Canonical beacon schema](https://github.com/ethpandaops/xatu-data/blob/master/schema/canonical_beacon_.md)
 - [Canonical execution schema](https://github.com/ethpandaops/xatu-data/blob/master/schema/canonical_execution_.md)
 
-## 3. EraE
+## 4. EraE
 
 [EthPandaOps history endpoints](https://ethpandaops.io/data/history/) describe EraE as complete execution-layer history from genesis, covering pre- and post-Merge blocks and intended for client bootstrapping/verification.
 
@@ -220,9 +279,10 @@ cancels its downloads and signals its decoding worker.
 Transaction requests use Alloy consensus's native `secp256k1` recovery
 backend, retaining its signature validation checks.
 
-Header-only requests read only headers. Body requests verify the complete
-body without recovering senders unless transactions or a sender predicate
-require them. Acquired bodies also retain complete withdrawals for execution
+Header-only requests read only headers. Body requests verify the complete body.
+Bodies and receipts are read only as the requested groups need them, and
+senders are recovered only for `Senders` or a sender predicate. Acquired bodies
+also retain complete withdrawals for execution
 RPC and raw-history consumers, even without an explicit withdrawal request.
 Log-only requests can read headers and receipts without
 transaction bodies when neither transaction hashes nor transaction filters
@@ -296,7 +356,7 @@ EraE should win when reproducibility and raw protocol coverage matter:
 
 EraE still does not contain EVM call traces or state diffs, and it normally requires downloading far more data than a filtered Xatu query. “Independent history path” therefore means an interchangeable raw fallback and verification path, not that EraE must be the default or that its current host is trustless.
 
-## 4. Ethereum P2P, Reth, and SHiNode
+## 5. Ethereum P2P, Reth, and SHiNode
 
 [SHiNode](https://github.com/vicnaum/shinode) demonstrates that Reth/devp2p can retrieve headers, transaction bodies, receipts, and logs without EVM state and follow the head.
 
@@ -341,7 +401,7 @@ The independent node now implements exact receipt/block RPC reconstruction,
 post-commit WebSocket subscriptions, and a bounded recent raw-material window;
 the bullets above describe SHiNode, not this repository.
 
-## 5. P2P history expiry
+## 6. P2P history expiry
 
 [EIP-4444](https://eips.ethereum.org/EIPS/eip-4444) specifies that clients should not serve block bodies and receipts older than one year over execution P2P and may prune them. The [Ethereum Foundation's partial history expiry announcement](https://blog.ethereum.org/2025/07/08/partial-history-exp) states that execution clients support removing pre-Merge history.
 
@@ -362,6 +422,11 @@ durable processor coverage.
 Live requests share the manager but have dispatch priority over queued history
 requests.
 
+The requested field groups also narrow what history acquires. A history
+request that needs no receipt group (`Receipts`, `ReceiptOutcome` or `Logs`)
+and no withdrawals downloads block bodies only. Senders are recovered only for
+`Senders` or a sender filter. Live lanes are unchanged.
+
 An on-demand job keeps the sources it starts with. A job whose range ends in
 the eligible blocks therefore does not start until the node's finalized P2P
 anchor covers its last block, typically seconds after the node starts; without
@@ -376,7 +441,7 @@ and public peers may be full, slow, or missing old history. Keep the persistent
 node identity and scored peer cache across restarts; use archive sources for
 predictable large backfills and P2P when those sources lag or fail.
 
-## 6. Portal Network
+## 7. Portal Network
 
 The [Portal Network documentation](https://ethereum.org/developers/docs/networking-layer/portal-network/) targets lightweight access to:
 
@@ -396,7 +461,7 @@ It is a natural future backend because its goal aligns with this project. It sho
 
 Portal is not the MVP's only source.
 
-## 7. AWS public blockchain data
+## 8. AWS public blockchain data
 
 [AWS Public Blockchain Data](https://registry.opendata.aws/aws-public-blockchain/) provides free, date-partitioned Parquet in public S3 and states that new data is delivered daily.
 
@@ -408,7 +473,7 @@ Use it as:
 
 Before using it for a processor, inspect a current partition rather than assuming its schema has every recent fork field. Earlier inspection for this project found blob-specific coverage less complete than Xatu.
 
-## 8. Google Blockchain Analytics and Ethereum ETL
+## 9. Google Blockchain Analytics and Ethereum ETL
 
 [Google Blockchain Analytics](https://docs.cloud.google.com/blockchain-analytics/docs) exposes Ethereum blocks, transactions, receipts, logs, decoded events, token transfers, traces, and account-state-oriented tables in BigQuery. [Pricing](https://cloud.google.com/blockchain-analytics/pricing) follows BigQuery and includes the first 1 TB of processed query data per month.
 
@@ -423,7 +488,7 @@ It is not the fully free/self-sovereign production core.
 
 [Ethereum ETL](https://github.com/blockchain-etl/ethereum-etl) is extraction/transformation tooling, not itself a free source of Ethereum history. Its schema and decoders are useful references, but running it traditionally still requires a node or RPC. The project now documents blob header and transaction fields, so its schemas can help normalize alternative datasets.
 
-## 9. Firehose, Substreams, and subgraphs
+## 10. Firehose, Substreams, and subgraphs
 
 [Firehose data flow](https://firehose.streamingfast.io/architecture/data-flow) accepts protobuf blocks from a reader process and serves a cursor-based historical/live stream. [Firehose storage](https://firehose.streamingfast.io/firehose/architecture/data-storage) normally retains one-block and merged 100-block files. Substreams adds parallel Wasm transformation and module-output caches.
 
@@ -444,7 +509,7 @@ The project should implement a compatibility experiment after the core normalize
 
 Traditional subgraphs are another possible processor/output compatibility layer. Event handlers and topic filters fit the receipt-only core. Subgraphs that use contract calls do not: [The Graph's documentation](https://thegraph.com/docs/en/subgraphs/developing/creating/advanced/) shows that mappings can declare `eth_call`, which requires EVM state at the indexed block. A future adapter could emit entity/database changes or feed an event-only Graph mapping, but “subgraph compatible” must carry the same capability restrictions as Substreams.
 
-## 10. Source-selection policy
+## 11. Source-selection policy
 
 For each requested range:
 

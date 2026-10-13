@@ -23,10 +23,11 @@ use leani_primitives::{
     DurableKind, Finality, Material, OpaqueCursor, ProcessorCursor, TransactionHash,
 };
 use leani_processor_api::{
-    ArtifactPolicyMode, ChangeOperation, CheckpointPolicyMode, DeliveryLimitAction,
-    DeliveryOrdering, DeliveryPolicyMode, DomainChange, EncodedDelta, LifecyclePolicies,
-    MAXIMUM_CONSUMER_LEASE_TTL, OutputPolicyMode, Processor, ProcessorDescriptor, ProcessorError,
-    PublicationPolicy, ReducerTransaction, ReductionMode, StartPoint, UndoPolicyMode,
+    ArtifactPolicyMode, ChangeOperation, CheckpointPolicyMode, DataRequirement,
+    DeliveryLimitAction, DeliveryOrdering, DeliveryPolicyMode, DomainChange, EncodedDelta,
+    LifecyclePolicies, MAXIMUM_CONSUMER_LEASE_TTL, OutputPolicyMode, Processor,
+    ProcessorDescriptor, ProcessorError, PublicationPolicy, ReducerTransaction, ReductionMode,
+    StartPoint, UndoPolicyMode,
 };
 use leani_store_artifacts::{
     ArtifactBatchReceipt, ArtifactBatchSink, ArtifactCompression, ArtifactSegmentLimits,
@@ -66,8 +67,9 @@ const SCHEMA_V20: &str = include_str!("../migrations/0020_query_snapshot_filters
 const SCHEMA_V21: &str = include_str!("../migrations/0021_deferred_changes.sql");
 const SCHEMA_V22: &str = include_str!("../migrations/0022_coverage_lookup_indexes.sql");
 const SCHEMA_V23: &str = include_str!("../migrations/0023_consumer_delivery_and_node_secret.sql");
+const SCHEMA_V24: &str = include_str!("../migrations/0024_processor_identity_aliases.sql");
 /// Current on-disk `SQLite` schema version written by this crate.
-pub const CURRENT_SCHEMA_VERSION: u32 = 23;
+pub const CURRENT_SCHEMA_VERSION: u32 = 24;
 /// Schema that added the node secret, which its migration generates.
 const NODE_SECRET_SCHEMA_VERSION: u32 = 23;
 /// Name of the one [`NodeSecret`] row in `node_secrets`.
@@ -2043,6 +2045,7 @@ async fn migrate(pool: &SqlitePool) -> Result<(), StoreError> {
         (21, SCHEMA_V21),
         (22, SCHEMA_V22),
         (23, SCHEMA_V23),
+        (24, SCHEMA_V24),
     ];
     for (target, migration) in migrations {
         if target > version {
@@ -2730,6 +2733,26 @@ impl SqliteStore {
         .fetch_one(&self.inner.pool)
         .await?;
         if !check_stored_identity(&stored, descriptor)? {
+            let previous: ProcessorDescriptor = serde_json::from_str(&stored)?;
+            if previous.requirements != descriptor.requirements {
+                // A narrowing: snapshots taken under the superseded
+                // descriptor, hashed either way, stay restorable.
+                for alias in [
+                    descriptor_hash(&previous)?,
+                    full_descriptor_hash(&previous)?,
+                ] {
+                    sqlx::query(
+                        "INSERT OR IGNORE INTO processor_identity_aliases(
+                            instance, descriptor_hash, created_at_unix_ms
+                         ) VALUES (?, ?, ?)",
+                    )
+                    .bind(&instance)
+                    .bind(alias.0.as_slice())
+                    .bind(now_i64()?)
+                    .execute(&self.inner.pool)
+                    .await?;
+                }
+            }
             sqlx::query("UPDATE processor_instances SET descriptor_json = ? WHERE instance = ?")
                 .bind(descriptor_json)
                 .bind(&instance)
@@ -2737,6 +2760,19 @@ impl SqliteStore {
                 .await?;
         }
         Ok(instance)
+    }
+
+    /// Snapshot identities `instance` had before a requirement narrowing.
+    async fn identity_aliases(&self, instance: &str) -> Result<Vec<BlockHash>, StoreError> {
+        sqlx::query_scalar::<_, Vec<u8>>(
+            "SELECT descriptor_hash FROM processor_identity_aliases WHERE instance = ?",
+        )
+        .bind(instance)
+        .fetch_all(&self.inner.pool)
+        .await?
+        .into_iter()
+        .map(decode_hash)
+        .collect()
     }
 
     /// Create or verify the immutable delivery stream for one backfill.
@@ -5223,7 +5259,8 @@ impl SqliteStore {
         })?;
         let encoded: Vec<u8> = row.try_get("state_snapshot")?;
         let checksum = decode_hash(row.try_get("state_checksum")?)?;
-        let snapshot = decode_state_snapshot(descriptor, &instance, &encoded, checksum)?;
+        let aliases = self.identity_aliases(&instance).await?;
+        let snapshot = decode_state_snapshot(descriptor, &instance, &encoded, checksum, &aliases)?;
         // Finality promotion relabels the cursor without touching state, so
         // a checkpoint taken while its block was only included still fits.
         let current = match self.processor_cursor_by_instance(&instance).await? {
@@ -5434,7 +5471,8 @@ impl SqliteStore {
         })?;
         let snapshot: Vec<u8> = row.try_get("state_snapshot")?;
         let checksum = decode_hash(row.try_get("state_checksum")?)?;
-        validate_state_snapshot(descriptor, &instance, &snapshot, checksum)?;
+        let aliases = self.identity_aliases(&instance).await?;
+        validate_state_snapshot(descriptor, &instance, &snapshot, checksum, &aliases)?;
         postcard::to_allocvec(&PortableSavepointArchive {
             format_version: 1,
             snapshot,
@@ -5468,6 +5506,7 @@ impl SqliteStore {
             descriptor.instance.as_str(),
             &archive.snapshot,
             archive.checksum,
+            &[],
         )
     }
 
@@ -16501,15 +16540,19 @@ fn validate_state_snapshot(
     instance: &str,
     encoded: &[u8],
     expected_checksum: BlockHash,
+    aliases: &[BlockHash],
 ) -> Result<ProcessorCursor, StoreError> {
-    Ok(decode_state_snapshot(descriptor, instance, encoded, expected_checksum)?.cursor)
+    Ok(decode_state_snapshot(descriptor, instance, encoded, expected_checksum, aliases)?.cursor)
 }
 
+/// `aliases` are the instance's superseded snapshot identities
+/// ([`SqliteStore::identity_aliases`]); validation without a store passes none.
 fn decode_state_snapshot(
     descriptor: &ProcessorDescriptor,
     instance: &str,
     encoded: &[u8],
     expected_checksum: BlockHash,
+    aliases: &[BlockHash],
 ) -> Result<StateSnapshot, StoreError> {
     let checksum = BlockHash::new(*blake3::hash(encoded).as_bytes());
     if checksum != expected_checksum {
@@ -16520,7 +16563,8 @@ fn decode_state_snapshot(
     if snapshot.format_version != 1
         || snapshot.processor_instance != instance
         || (snapshot.descriptor_hash != descriptor_hash(descriptor)?
-            && snapshot.descriptor_hash != full_descriptor_hash(descriptor)?)
+            && snapshot.descriptor_hash != full_descriptor_hash(descriptor)?
+            && !aliases.contains(&snapshot.descriptor_hash))
         || snapshot.cursor.processor_id != descriptor.id.as_str()
         || snapshot.cursor.processor_version != descriptor.version.to_string()
     {
@@ -17053,7 +17097,27 @@ fn processor_instance(descriptor: &ProcessorDescriptor) -> String {
 fn same_processor_identity(stored: &ProcessorDescriptor, configured: &ProcessorDescriptor) -> bool {
     let mut normalized = stored.clone();
     normalized.lifecycle = configured.lifecycle.clone();
+    if requirements_narrow(&stored.requirements, &configured.requirements) {
+        normalized.requirements.clone_from(&configured.requirements);
+    }
     normalized == *configured
+}
+
+/// Whether `configured` declares at most the field groups `stored` did, with
+/// everything else about each requirement unchanged. A narrowed processor
+/// reads a subset of what it read before, so its output does not change.
+fn requirements_narrow(stored: &[DataRequirement], configured: &[DataRequirement]) -> bool {
+    stored.len() == configured.len()
+        && stored.iter().zip(configured).all(|(stored, configured)| {
+            stored
+                .capabilities
+                .with_derivable()
+                .contains_all(configured.capabilities)
+                && DataRequirement {
+                    capabilities: configured.capabilities,
+                    ..stored.clone()
+                } == *configured
+        })
 }
 
 /// Registration's identity rule: `configured` may differ from the descriptor
@@ -25851,8 +25915,9 @@ mod tests {
         drop(transaction);
 
         let expected = processor_state_rows(&store, &instance).await;
-        let decoded = decode_state_snapshot(&processor.descriptor, &instance, &encoded, checksum)
-            .expect("decode snapshot");
+        let decoded =
+            decode_state_snapshot(&processor.descriptor, &instance, &encoded, checksum, &[])
+                .expect("decode snapshot");
         let entries = decoded
             .entries
             .into_iter()
@@ -25875,6 +25940,60 @@ mod tests {
         })
         .expect("encode whole snapshot");
         assert_eq!(encoded, whole);
+    }
+
+    #[tokio::test]
+    async fn narrowing_requirements_keeps_the_instance_and_its_checkpoints() {
+        let (_directory, store) = store().await;
+        let mut processor = FixtureProcessor::new();
+        // a bundle that a later release narrows to the field groups it reads
+        processor.descriptor.requirements[0].capabilities =
+            CapabilitySet::of(Capability::Header).with(Capability::Transactions);
+        let mut block = frame(1, BlockHash::ZERO);
+        block.finality = Finality::Finalized;
+        let delta = processor.map(&block).await.expect("map");
+        store
+            .apply(&processor, cursor(&processor, &block, 1), &delta, &[])
+            .await
+            .expect("apply");
+
+        let mut narrowed = processor.descriptor.clone();
+        narrowed.requirements[0].capabilities = CapabilitySet::of(Capability::Header)
+            .with(Capability::Body)
+            .with(Capability::Senders);
+        store
+            .register_processor(&narrowed)
+            .await
+            .expect("narrowing keeps the instance");
+        let checkpoint = store
+            .recovery_checkpoints(&narrowed)
+            .await
+            .expect("checkpoints")
+            .first()
+            .cloned()
+            .expect("automatic checkpoint");
+        store
+            .restore_recovery_checkpoint(&narrowed, checkpoint.checkpoint_id)
+            .await
+            .expect("a checkpoint taken before the narrowing restores");
+
+        // Widening, or narrowing together with any other change, is refused.
+        let mut widened = narrowed.clone();
+        widened.requirements[0].capabilities = narrowed.requirements[0]
+            .capabilities
+            .with(Capability::Withdrawals);
+        assert!(matches!(
+            store.register_processor(&widened).await,
+            Err(StoreError::ProcessorIdentity(_))
+        ));
+        let mut refiltered = narrowed.clone();
+        refiltered.requirements[0].capabilities =
+            CapabilitySet::of(Capability::Header).with(Capability::Body);
+        refiltered.requirements[0].filter.transaction_types = vec![3];
+        assert!(matches!(
+            store.register_processor(&refiltered).await,
+            Err(StoreError::ProcessorIdentity(_))
+        ));
     }
 
     #[tokio::test]
@@ -25945,10 +26064,10 @@ mod tests {
         })
         .expect("legacy snapshot");
         let checksum = BlockHash::new(*blake3::hash(&legacy).as_bytes());
-        validate_state_snapshot(&processor.descriptor, &instance, &legacy, checksum)
+        validate_state_snapshot(&processor.descriptor, &instance, &legacy, checksum, &[])
             .expect("legacy snapshot under its own descriptor");
         assert!(matches!(
-            validate_state_snapshot(&raised, &instance, &legacy, checksum),
+            validate_state_snapshot(&raised, &instance, &legacy, checksum, &[]),
             Err(StoreError::SavepointContract)
         ));
     }
@@ -27394,6 +27513,7 @@ mod tests {
              DROP INDEX IF EXISTS processor_coverage_finalized;
              DROP INDEX IF EXISTS finalized_coverage_segments_by_hash;
              DROP TABLE IF EXISTS node_secrets;
+             DROP TABLE IF EXISTS processor_identity_aliases;
              UPDATE node_meta SET value = X'00000015' WHERE key = 'schema_version';",
         )
         .execute(&store.inner.pool)
@@ -27405,7 +27525,7 @@ mod tests {
         let reopened = SqliteStore::open(StoreConfig::new(&path))
             .await
             .expect("schema 21 upgrades in place");
-        assert_eq!(CURRENT_SCHEMA_VERSION, 23);
+        assert_eq!(CURRENT_SCHEMA_VERSION, 24);
         assert_eq!(
             reopened.stats().await.expect("stats").schema_version,
             CURRENT_SCHEMA_VERSION
@@ -27494,6 +27614,7 @@ mod tests {
              DROP INDEX IF EXISTS processor_coverage_finalized;
              DROP INDEX IF EXISTS finalized_coverage_segments_by_hash;
              DROP TABLE IF EXISTS node_secrets;
+             DROP TABLE IF EXISTS processor_identity_aliases;
              UPDATE node_meta SET value = X'00000015' WHERE key = 'schema_version';",
         )
         .execute(&store.inner.pool)
@@ -27618,10 +27739,10 @@ mod tests {
             .connect()
             .await
             .expect("connection");
-        sqlx::query("UPDATE node_meta SET value = X'00000018' WHERE key = 'schema_version'")
+        sqlx::query("UPDATE node_meta SET value = X'00000019' WHERE key = 'schema_version'")
             .execute(&mut connection)
             .await
-            .expect("schema 24");
+            .expect("schema 25");
         connection.close().await.expect("close");
         let refused = SqliteStore::backup(&newer, &directory.path().join("newer-backup.sqlite"))
             .await
@@ -27631,7 +27752,7 @@ mod tests {
             "{refused}"
         );
         assert!(!directory.path().join("newer-backup.sqlite").exists());
-        assert_eq!(schema_on_disk(&newer).await, 24);
+        assert_eq!(schema_on_disk(&newer).await, 25);
     }
 
     #[tokio::test]
@@ -27697,6 +27818,7 @@ mod tests {
         // digests, and delivered watermarks that only acknowledgements moved.
         sqlx::raw_sql(
             "DROP TABLE IF EXISTS node_secrets;
+             DROP TABLE IF EXISTS processor_identity_aliases;
              UPDATE durable_consumers SET delivered_sequence = acknowledged_sequence;
              UPDATE node_meta SET value = X'00000016' WHERE key = 'schema_version';",
         )
@@ -27727,7 +27849,7 @@ mod tests {
         let reopened = SqliteStore::open(StoreConfig::new(&path))
             .await
             .expect("schema 22 upgrades in place");
-        assert_eq!(CURRENT_SCHEMA_VERSION, 23);
+        assert_eq!(CURRENT_SCHEMA_VERSION, 24);
         assert_eq!(
             reopened.stats().await.expect("stats").schema_version,
             CURRENT_SCHEMA_VERSION
