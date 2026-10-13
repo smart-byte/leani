@@ -68,8 +68,9 @@ const SCHEMA_V21: &str = include_str!("../migrations/0021_deferred_changes.sql")
 const SCHEMA_V22: &str = include_str!("../migrations/0022_coverage_lookup_indexes.sql");
 const SCHEMA_V23: &str = include_str!("../migrations/0023_consumer_delivery_and_node_secret.sql");
 const SCHEMA_V24: &str = include_str!("../migrations/0024_processor_identity_aliases.sql");
+const SCHEMA_V25: &str = include_str!("../migrations/0025_output_block_index.sql");
 /// Current on-disk `SQLite` schema version written by this crate.
-pub const CURRENT_SCHEMA_VERSION: u32 = 24;
+pub const CURRENT_SCHEMA_VERSION: u32 = 25;
 /// Schema that added the node secret, which its migration generates.
 const NODE_SECRET_SCHEMA_VERSION: u32 = 23;
 /// Name of the one [`NodeSecret`] row in `node_secrets`.
@@ -2062,6 +2063,7 @@ async fn migrate(pool: &SqlitePool) -> Result<(), StoreError> {
         (22, SCHEMA_V22),
         (23, SCHEMA_V23),
         (24, SCHEMA_V24),
+        (25, SCHEMA_V25),
     ];
     for (target, migration) in migrations {
         if target > version {
@@ -10430,27 +10432,24 @@ impl SqliteStore {
         descriptor: &ProcessorDescriptor,
         collection: &str,
     ) -> Result<Option<OutputBounds>, StoreError> {
-        let row = sqlx::query(
-            "SELECT MIN(block_number) AS earliest_block,
-                    MAX(block_number) AS latest_block,
-                    MIN(block_timestamp) AS earliest_timestamp,
-                    MAX(block_timestamp) AS latest_timestamp
-             FROM output_entity_meta
-             WHERE instance = ? AND collection = ?",
-        )
-        .bind(processor_instance(descriptor))
-        .bind(collection)
-        .fetch_one(&self.inner.pool)
-        .await?;
-        let earliest_block: Option<i64> = row.try_get("earliest_block")?;
-        let latest_block: Option<i64> = row.try_get("latest_block")?;
-        let earliest_timestamp: Option<i64> = row.try_get("earliest_timestamp")?;
-        let latest_timestamp: Option<i64> = row.try_get("latest_timestamp")?;
-        earliest_block
-            .zip(latest_block)
-            .zip(earliest_timestamp.zip(latest_timestamp))
+        let instance = processor_instance(descriptor);
+        // Both ends from one snapshot.
+        let mut transaction = self.inner.pool.begin().await?;
+        let earliest: Option<(i64, i64)> = sqlx::query_as(OUTPUT_FIRST_BLOCK)
+            .bind(&instance)
+            .bind(collection)
+            .fetch_optional(&mut *transaction)
+            .await?;
+        let latest: Option<(i64, i64)> = sqlx::query_as(OUTPUT_LAST_BLOCK)
+            .bind(&instance)
+            .bind(collection)
+            .fetch_optional(&mut *transaction)
+            .await?;
+        transaction.commit().await?;
+        earliest
+            .zip(latest)
             .map(
-                |((earliest_block, latest_block), (earliest_timestamp, latest_timestamp))| {
+                |((earliest_block, earliest_timestamp), (latest_block, latest_timestamp))| {
                     Ok(OutputBounds {
                         earliest_block: BlockNumber(i64_u64(
                             earliest_block,
@@ -11016,25 +11015,60 @@ impl SqliteStore {
             ));
         }
         let bounds = SnapshotBounds::new(query.validate()?)?;
-        let rows = sqlx::query(concat!(
-            "SELECT entity.entity_key, entity.value, meta.block_number,
-                    meta.block_timestamp, meta.finality ",
-            output_rows_sql!()
-        ))
-        .bind(processor_instance(descriptor))
-        .bind(collection)
-        .bind(start_key)
-        .bind(bounds.from_block)
-        .bind(bounds.from_block)
-        .bind(bounds.to_block)
-        .bind(bounds.to_block)
-        .bind(bounds.from_timestamp)
-        .bind(bounds.from_timestamp)
-        .bind(bounds.to_timestamp)
-        .bind(bounds.to_timestamp)
-        .bind(usize_i64(limit.saturating_add(1), "output page limit")?)
-        .fetch_all(&self.inner.pool)
-        .await?;
+        let instance = processor_instance(descriptor);
+        let page_rows = usize_i64(limit.saturating_add(1), "output page limit")?;
+        // A block range a page can sort by key itself is read through the
+        // block index; a key-order walk would visit every row of the
+        // collection to find it.
+        let mut block_range = None;
+        if let (Some(from), Some(to)) = (bounds.from_block, bounds.to_block) {
+            let rows: i64 = sqlx::query_scalar(OUTPUT_BLOCK_RANGE_ROWS)
+                .bind(&instance)
+                .bind(collection)
+                .bind(from)
+                .bind(to)
+                .bind(OUTPUT_RANGE_PAGE_ROWS.saturating_add(1))
+                .fetch_one(&self.inner.pool)
+                .await?;
+            if rows <= OUTPUT_RANGE_PAGE_ROWS {
+                block_range = Some((from, to));
+            }
+        }
+        let rows = if let Some((from, to)) = block_range {
+            sqlx::query(OUTPUT_BLOCK_RANGE_PAGE)
+                .bind(&instance)
+                .bind(collection)
+                .bind(from)
+                .bind(to)
+                .bind(start_key)
+                .bind(bounds.from_timestamp)
+                .bind(bounds.from_timestamp)
+                .bind(bounds.to_timestamp)
+                .bind(bounds.to_timestamp)
+                .bind(page_rows)
+                .fetch_all(&self.inner.pool)
+                .await?
+        } else {
+            sqlx::query(concat!(
+                "SELECT entity.entity_key, entity.value, meta.block_number,
+                        meta.block_timestamp, meta.finality ",
+                output_rows_sql!()
+            ))
+            .bind(&instance)
+            .bind(collection)
+            .bind(start_key)
+            .bind(bounds.from_block)
+            .bind(bounds.from_block)
+            .bind(bounds.to_block)
+            .bind(bounds.to_block)
+            .bind(bounds.from_timestamp)
+            .bind(bounds.from_timestamp)
+            .bind(bounds.to_timestamp)
+            .bind(bounds.to_timestamp)
+            .bind(page_rows)
+            .fetch_all(&self.inner.pool)
+            .await?
+        };
         let more = rows.len() > limit;
         let entities = rows
             .iter()
@@ -16395,18 +16429,6 @@ async fn prune_output_window(
     let window = descriptor.lifecycle.output.window.ok_or_else(|| {
         StoreError::Invariant("window output policy is missing its bound".to_owned())
     })?;
-    let rows = sqlx::query(
-        "SELECT collection, entity_key, block_number, block_timestamp, finality,
-                written_at_unix_ms, value_bytes
-         FROM output_entity_meta
-         WHERE instance = ? AND finality = ?
-         ORDER BY block_number, written_at_unix_ms, collection, entity_key
-         LIMIT 10000",
-    )
-    .bind(instance)
-    .bind(finality_i64(Finality::Finalized))
-    .fetch_all(&mut **transaction)
-    .await?;
     let mut candidates = Vec::new();
     if let Some(max_blocks) = window.max_blocks {
         let retained_from = current_block
@@ -16414,13 +16436,62 @@ async fn prune_output_window(
             .0
             .saturating_add(1)
             .saturating_sub(max_blocks);
-        for row in rows {
-            let block_number = i64_u64(row.try_get("block_number")?, "output block number")?;
-            if block_number < retained_from {
-                candidates.push(entity_meta_image(&row)?);
+        // Each collection's oldest block first, through the block index: with
+        // nothing out of the window, one search per collection.
+        let mut after = String::new();
+        while let Some((collection, earliest)) =
+            sqlx::query_as::<_, (String, i64)>(OUTPUT_NEXT_COLLECTION)
+                .bind(instance)
+                .bind(&after)
+                .fetch_optional(&mut **transaction)
+                .await?
+        {
+            if i64_u64(earliest, "output block number")? < retained_from {
+                for row in sqlx::query(OUTPUT_EXPIRED_ROWS)
+                    .bind(instance)
+                    .bind(&collection)
+                    .bind(u64_i64(retained_from, "output window start")?)
+                    .bind(finality_i64(Finality::Finalized))
+                    .bind(usize_i64(OUTPUT_PRUNE_BATCH, "output pruning batch")?)
+                    .fetch_all(&mut **transaction)
+                    .await?
+                {
+                    candidates.push(entity_meta_image(&row)?);
+                }
             }
+            after = collection;
         }
-    } else if let Some(max_age_seconds) = window.max_age_seconds {
+        candidates.sort_by(|left, right| {
+            (
+                left.block_number,
+                left.written_at_unix_ms,
+                &left.collection,
+                &left.key,
+            )
+                .cmp(&(
+                    right.block_number,
+                    right.written_at_unix_ms,
+                    &right.collection,
+                    &right.key,
+                ))
+        });
+        candidates.truncate(OUTPUT_PRUNE_BATCH);
+        return delete_pruned_output(transaction, instance, candidates).await;
+    }
+    let rows = sqlx::query(
+        "SELECT collection, entity_key, block_number, block_timestamp, finality,
+                written_at_unix_ms, value_bytes
+         FROM output_entity_meta
+         WHERE instance = ? AND finality = ?
+         ORDER BY block_number, written_at_unix_ms, collection, entity_key
+         LIMIT ?",
+    )
+    .bind(instance)
+    .bind(finality_i64(Finality::Finalized))
+    .bind(usize_i64(OUTPUT_PRUNE_BATCH, "output pruning batch")?)
+    .fetch_all(&mut **transaction)
+    .await?;
+    if let Some(max_age_seconds) = window.max_age_seconds {
         let cutoff = now_i64()?.saturating_sub(u64_i64(
             max_age_seconds.saturating_mul(1_000),
             "output maximum age",
@@ -16461,6 +16532,16 @@ async fn prune_output_window(
             excess = excess.saturating_sub(bytes);
         }
     }
+    delete_pruned_output(transaction, instance, candidates).await
+}
+
+/// Delete the output rows `candidates` name, and the index entries left
+/// without an entity, returning the mutations undo restores.
+async fn delete_pruned_output(
+    transaction: &mut Transaction<'_, Sqlite>,
+    instance: &str,
+    candidates: Vec<EntityMetaImage>,
+) -> Result<PrunedOutput, StoreError> {
     let mut pruned = PrunedOutput::default();
     if candidates.is_empty() {
         return Ok(pruned);
@@ -16817,6 +16898,62 @@ const EXACT_COVERAGE_BY_HASH: &str = "SELECT block_number FROM processor_coverag
 const COMPACT_COVERAGE_BY_HASH: &str = "SELECT segment_end FROM finalized_coverage_segments
      WHERE instance = ? AND end_hash = ?
      ORDER BY segment_end DESC LIMIT 1";
+
+// Retained output in block order, one search of `output_entity_meta_by_block`
+// each: block timestamps rise with block numbers, so a collection's first and
+// last rows bound both.
+/// Earliest retained output of one collection.
+const OUTPUT_FIRST_BLOCK: &str = "SELECT block_number, block_timestamp FROM output_entity_meta
+     WHERE instance = ? AND collection = ?
+     ORDER BY block_number LIMIT 1";
+/// Latest retained output of one collection.
+const OUTPUT_LAST_BLOCK: &str = "SELECT block_number, block_timestamp FROM output_entity_meta
+     WHERE instance = ? AND collection = ?
+     ORDER BY block_number DESC LIMIT 1";
+/// The next collection after `?2` holding output, with its earliest block.
+const OUTPUT_NEXT_COLLECTION: &str = "SELECT collection, block_number FROM output_entity_meta
+     WHERE instance = ? AND collection > ?
+     ORDER BY collection, block_number LIMIT 1";
+/// Output rows one window pruning pass deletes at most.
+const OUTPUT_PRUNE_BATCH: usize = 10_000;
+/// Most rows of a block range an entity page sorts by key itself.
+const OUTPUT_RANGE_PAGE_ROWS: i64 = 100_000;
+/// Rows of one collection in a block range, counted up to a limit.
+const OUTPUT_BLOCK_RANGE_ROWS: &str = "SELECT COUNT(*) FROM (
+         SELECT 1 FROM output_entity_meta
+         WHERE instance = ? AND collection = ? AND block_number BETWEEN ? AND ?
+         LIMIT ?
+     )";
+/// One key-ordered page of a block range: its keys sorted from the block index
+/// alone, then only the page's rows read.
+const OUTPUT_BLOCK_RANGE_PAGE: &str = "SELECT entity.entity_key, entity.value, meta.block_number,
+            meta.block_timestamp, meta.finality
+     FROM (
+         SELECT instance, collection, entity_key
+         FROM output_entity_meta INDEXED BY output_entity_meta_by_block
+         WHERE instance = ? AND collection = ?
+           AND block_number BETWEEN ? AND ?
+           AND entity_key >= ?
+           AND (? IS NULL OR block_timestamp >= ?)
+           AND (? IS NULL OR block_timestamp <= ?)
+         ORDER BY entity_key LIMIT ?
+     ) AS page
+     JOIN output_entity_meta AS meta
+       ON meta.instance = page.instance
+      AND meta.collection = page.collection
+      AND meta.entity_key = page.entity_key
+     JOIN entities AS entity
+       ON entity.instance = page.instance
+      AND entity.collection = page.collection
+      AND entity.entity_key = page.entity_key
+     ORDER BY page.entity_key";
+/// Finalized output of one collection below a block, oldest first.
+const OUTPUT_EXPIRED_ROWS: &str = "SELECT collection, entity_key, block_number, block_timestamp,
+            finality, written_at_unix_ms, value_bytes
+     FROM output_entity_meta
+     WHERE instance = ? AND collection = ? AND block_number < ? AND finality = ?
+     ORDER BY block_number, written_at_unix_ms, entity_key
+     LIMIT ?";
 
 async fn highest_coverage_cursor(
     transaction: &mut Transaction<'_, Sqlite>,
@@ -27692,6 +27829,37 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn retained_output_reads_search_the_block_index() {
+        // Report 2026-10-13 §4: retained bounds, read twice per entity page,
+        // the window pruning of every applied block, and each page of a block
+        // range scanned all output of a collection or instance; with nothing
+        // to prune, a 64,000-block window took 4.29 times as long to ingest
+        // as full output.
+        let (_directory, store) = store().await;
+        for statement in [
+            OUTPUT_FIRST_BLOCK,
+            OUTPUT_LAST_BLOCK,
+            OUTPUT_NEXT_COLLECTION,
+            OUTPUT_EXPIRED_ROWS,
+            OUTPUT_BLOCK_RANGE_ROWS,
+            OUTPUT_BLOCK_RANGE_PAGE,
+        ] {
+            let plan = query_plan(&store, statement).await;
+            let scans_a_table = |step: &String| {
+                ["SCAN output_entity_meta", "SCAN meta", "SCAN entit"]
+                    .iter()
+                    .any(|scan| step.starts_with(scan))
+            };
+            assert!(
+                plan.iter().any(|step| step.starts_with("SEARCH")
+                    && step.contains("output_entity_meta_by_block"))
+                    && !plan.iter().any(scans_a_table),
+                "{statement}\n{plan:?}"
+            );
+        }
+    }
+
     /// `finalized_through` before its indexed probes: MAX over a UNION.
     const FINALIZED_THROUGH_UNION_SCAN: &str = "SELECT MAX(block_number) FROM (
             SELECT block_number FROM processor_coverage
@@ -27846,7 +28014,7 @@ mod tests {
         let reopened = SqliteStore::open(StoreConfig::new(&path))
             .await
             .expect("schema 21 upgrades in place");
-        assert_eq!(CURRENT_SCHEMA_VERSION, 24);
+        assert_eq!(CURRENT_SCHEMA_VERSION, 25);
         assert_eq!(
             reopened.stats().await.expect("stats").schema_version,
             CURRENT_SCHEMA_VERSION
@@ -28060,10 +28228,10 @@ mod tests {
             .connect()
             .await
             .expect("connection");
-        sqlx::query("UPDATE node_meta SET value = X'00000019' WHERE key = 'schema_version'")
+        sqlx::query("UPDATE node_meta SET value = X'0000001a' WHERE key = 'schema_version'")
             .execute(&mut connection)
             .await
-            .expect("schema 25");
+            .expect("schema 26");
         connection.close().await.expect("close");
         let refused = SqliteStore::backup(&newer, &directory.path().join("newer-backup.sqlite"))
             .await
@@ -28073,7 +28241,7 @@ mod tests {
             "{refused}"
         );
         assert!(!directory.path().join("newer-backup.sqlite").exists());
-        assert_eq!(schema_on_disk(&newer).await, 25);
+        assert_eq!(schema_on_disk(&newer).await, 26);
     }
 
     #[tokio::test]
@@ -28170,7 +28338,7 @@ mod tests {
         let reopened = SqliteStore::open(StoreConfig::new(&path))
             .await
             .expect("schema 22 upgrades in place");
-        assert_eq!(CURRENT_SCHEMA_VERSION, 24);
+        assert_eq!(CURRENT_SCHEMA_VERSION, 25);
         assert_eq!(
             reopened.stats().await.expect("stats").schema_version,
             CURRENT_SCHEMA_VERSION

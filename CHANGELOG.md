@@ -21,6 +21,13 @@ record, and documented RPC contracts.
 
 ### Changed
 
+- A 64,000-block output window no longer slows ingestion while nothing expires:
+  window pruning and retained bounds search a new block index of retained
+  output instead of scanning all of an instance's output for every applied
+  block and twice for every entity page.
+- An entity page with `fromBlock` and `toBlock` over at most 100,000 rows sorts
+  that range's keys from the block index instead of walking the whole
+  collection in key order. Rows, order, and cursors are unchanged.
 - A backfill admitted while other jobs held every active chunk slot widens its
   read-ahead as slots free up, instead of reading one chunk at a time for the
   rest of its gap.
@@ -85,8 +92,9 @@ record, and documented RPC contracts.
 
 ### Upgrading
 
-- Node stores move to schema 24, which adds a table of superseded descriptor
-  hashes.
+- Node stores move to schema 25: schema 24 adds a table of superseded
+  descriptor hashes, and schema 25 indexes retained output by block, built
+  once during the upgrade.
 - Downgrading is unsupported. Once a descriptor or job with the new capability
   bits is stored, an older binary refuses it.
 - A portable savepoint exported by an older version of a narrowed processor
