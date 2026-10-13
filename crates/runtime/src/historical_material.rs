@@ -471,14 +471,13 @@ impl HistoricalMaterialCoordinator {
     }
 
     /// Bound one runtime's speculative acquisition window so it cannot queue
-    /// later chunks ahead of its own next required chunk. Existing jobs retain
-    /// their active slots; a newcomer opens one chunk when all slots are busy.
-    pub(crate) fn acquisition_window(&self, requested: usize) -> usize {
+    /// later chunks ahead of its own next required chunk: at most `requested`
+    /// chunks, its `open` ones plus the free active slots. Existing jobs
+    /// retain their active slots; a newcomer opens one chunk when all slots
+    /// are busy, and widens its window as slots free up.
+    pub(crate) fn acquisition_window(&self, requested: usize, open: usize) -> usize {
         requested.max(1).min(
-            self.inner
-                .active_chunks
-                .available_permits()
-                .max(1)
+            open.saturating_add(self.inner.active_chunks.available_permits().max(1))
                 .min(self.inner.maximum_active_chunks),
         )
     }
@@ -1809,6 +1808,31 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+
+    #[test]
+    fn a_newcomer_widens_its_window_as_active_slots_free_up() {
+        // Report 2026-10-13 §5: a job admitted while another job held every
+        // active slot kept a one-chunk window for its whole gap.
+        let budget = crate::HistoricalPipelineBudget::new(4, 4, 1 << 30).expect("budget");
+        let coordinator = HistoricalMaterialCoordinator::new_with_pipeline_budget(
+            HistoricalMaterialCoordinatorConfig::default(),
+            &budget,
+        )
+        .expect("coordinator");
+        let busy = budget
+            .active_chunks
+            .clone()
+            .try_acquire_many_owned(4)
+            .expect("every slot");
+        assert_eq!(coordinator.acquisition_window(4, 0), 1);
+        drop(busy);
+        assert_eq!(coordinator.acquisition_window(4, 1), 4);
+        assert_eq!(
+            coordinator.acquisition_window(2, 1),
+            2,
+            "no further than requested"
+        );
+    }
 
     #[tokio::test]
     async fn a_release_that_races_the_capacity_check_still_wakes_the_waiter() {
