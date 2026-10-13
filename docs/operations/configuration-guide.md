@@ -298,6 +298,56 @@ blocks; for later blocks, Xatu; and P2P fills what neither serves. Put Xatu
 first when bandwidth, not completeness, limits a backfill: its projections
 transfer fewer bytes per block for processors that read a few columns.
 
+### Sizing for bandwidth, memory, and disk
+
+Measured with this release on a Hetzner EX44 (Intel i5-13500, 20 threads,
+64 GB, RAID 1 over two NVMe drives, 1 Gbit/s) that other workloads share,
+25,000-block backfills with one consumer and `MALLOC_ARENA_MAX=2`:
+
+| Backfill | Source | Downloaded per block | 4 reads, 2 chunks | 8 reads, 4 chunks |
+|---|---|---|---|---|
+| `rollup-txs`, Feb 2026 | eraE | 122 KiB | 250–300 blocks/s, 170 MiB | 250–330 blocks/s, 280 MiB |
+| `blobs-money`, Feb 2026 | eraE | 122 KiB | 280 blocks/s, 160 MiB | 250–300 blocks/s, 250 MiB |
+| `rollup-txs`, Feb 2026 | Xatu | 61 KiB | 550–560 blocks/s, 230 MiB | 730–780 blocks/s, 340 MiB |
+| `blobs-money`, Feb 2026 | Xatu | 72 KiB | 410–420 blocks/s, 560 MiB | 500–570 blocks/s, 730 MiB |
+| `rollup-txs`, Oct 2026 | Xatu | 56 KiB | 490 blocks/s, 290 MiB | 620–890 blocks/s, 420 MiB |
+| `blobs-money`, Oct 2026 | Xatu | 46 KiB | 570 blocks/s, 420 MiB | 470–650 blocks/s, 620 MiB |
+
+"4 reads, 2 chunks" is `source_concurrency = 4` and `maximum_active_chunks =
+2`, as `deploy/container.toml` ships; the other shipped profiles read with 4
+and keep the built-in 4 chunks. Each cell gives the speed and the peak
+memory. Ranges span repeated runs, which differed by up to a third with the
+archives' throughput and the shared host's load. With jemalloc, which the
+container image preloads, peak memory stayed within a fifth of these and fell
+back once a backfill finished. Execution P2P served 5,000 recent blocks at
+43–55 blocks/s.
+
+More reads and chunks made most Xatu backfills faster, at more memory, and
+left eraE unchanged. An eraE backfill is limited by the frames it may hold
+uncommitted: with `maximum_buffered_frames_per_acquisition = 512` and
+`memory_bytes = "512MiB"` in `[budgets.history_material]`, eraE backfills ran
+at 380–410 blocks/s, a quarter to a half faster, at the same peak memory.
+Profiles:
+
+- **Default:** the shipped profiles, which try eraE before Xatu.
+- **Faster eraE backfills:** set those two `[budgets.history_material]`
+  values. Concurrent backfills share that budget, so each can then hold more
+  of it.
+- **Faster Xatu backfills**, with memory to spare: set
+  `source_concurrency = 8` and `maximum_active_chunks = 4`.
+- **Limited memory**, such as a container under 1 GiB: keep 4 reads and 2
+  chunks. eraE needs the least memory.
+- **Limited bandwidth:** a backfill downloads blocks per second times bytes
+  per block, about 35 MiB/s from eraE at 300 blocks/s and 25–50 MiB/s from
+  Xatu at the speeds above. On a slower link, the link sets the speed: at
+  100 Mbit/s, about 12 MiB/s, eraE reaches about 100 blocks/s and Xatu
+  170–270. There, list Xatu first for processors that read only
+  transactions, such as `rollup-txs` and `transaction-stats`, and keep eraE
+  first for processors that read logs, which Xatu cannot prove complete.
+- **Slow disk syncs**, such as network-attached volumes: keep
+  `target_writer_hold` at 250 ms or raise it. A lower target shrinks batches
+  (see [Advanced root fields](#advanced-root-fields)).
+
 Xatu additionally accepts three acquisition-tuning controls. `chunk_blocks`
 sets the generic header, transaction, and log span, while
 `blobs_chunk_blocks` sets the wider span used by the five-table blobs join.
