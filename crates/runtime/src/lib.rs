@@ -60,8 +60,11 @@ pub const HISTORICAL_COMMIT_MAX_DELAY_MS: u64 = 50;
 pub const HISTORICAL_COMMIT_MAX_CHANGES: usize = 10_000;
 /// Default maximum stable-encoded domain-change bytes in one historical commit.
 pub const HISTORICAL_COMMIT_MAX_ENCODED_BYTES: u64 = 16 * 1024 * 1024;
-/// Default target for the p95 historical `SQLite` writer hold time.
-pub const HISTORICAL_COMMIT_TARGET_WRITER_HOLD_MS: u64 = 20;
+/// Default target for the p95 historical `SQLite` writer hold time. A hold
+/// includes the commit's WAL sync, which a smaller batch does not shorten:
+/// on a disk with slow syncs, a lower target shrinks batches to a block or
+/// two, and each commit then rewrites the same pages for little data.
+pub const HISTORICAL_COMMIT_TARGET_WRITER_HOLD_MS: u64 = 250;
 /// Default maximum concurrently active physical source chunks per node.
 pub const HISTORICAL_MAX_ACTIVE_CHUNKS: usize = 4;
 /// Default maximum bytes retained by mapped historical deltas per node.

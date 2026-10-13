@@ -171,9 +171,20 @@ separate: `maximum_active_chunks` caps physical history reads node-wide and
 `maximum_mapped_bytes` caps processor-owned mapped deltas across every active
 job. Its nested `commit` table flushes a contiguous SQLite transaction at the
 first configured block, domain-change, stable-encoded-byte, or elapsed-time
-limit. `target_writer_hold` controls the adaptive block limit: the runtime
-halves the current limit when observed p95 historical writer hold time exceeds
-the target and cautiously grows it again below half the target. A single
+limit: by default 128 blocks, 10,000 changes, 16 MiB, or 50 ms.
+`target_writer_hold`, 250 ms by default, controls the adaptive block limit:
+the runtime halves the current limit when observed p95 historical writer hold
+time exceeds the target and cautiously grows it again below half the target.
+A hold includes the commit's WAL sync, which a smaller batch does not shorten,
+so on a disk whose syncs are slow a low target shrinks batches to a block or
+two, and every commit rewrites the same pages for little data. On a Hetzner
+EX44 (RAID 1 over two NVMe drives, about 8 ms per sync), the former 20 ms
+target ran a `rollup-txs` backfill from Xatu at 53 blocks/s and wrote 104 KiB
+per block; the 250 ms target ran it at 799 blocks/s and wrote 11 KiB per
+block. A job holds at most `maximum_buffered_frames_per_acquisition` frames
+of `[budgets.history_material]`, 128 by default, that it has not committed,
+so a longer `maximum_delay` makes acquisition wait instead of filling larger
+batches: a one-second delay ran the same backfill at 127 blocks/s. A single
 mapped delta or single-block commit that exceeds its byte limit fails
 immediately because waiting cannot make that item fit. A backfill that reuses
 retained recent frames reads them in batches of at most `commit.maximum_blocks`
