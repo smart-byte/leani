@@ -26,6 +26,24 @@ large backfill.
 | Portal Network | Future decentralized history/state | Designed for low-resource history access | Completeness/maturity must be tested |
 | JSON-RPC | Development/rare fallback | Broad compatibility | Reintroduces cost/trust; never default core |
 
+### Choosing a history source
+
+| Use case | Source order | Why |
+|---|---|---|
+| Processors that read logs, such as event and transfer processors | eraE, then Xatu | eraE checks each block's receipts root, so a missing log cannot pass; Xatu cannot prove that a block's last logs are complete |
+| Processors that read only transactions, such as `rollup-txs` and `transaction-stats`, on a slow link | Xatu, then eraE | Xatu downloads only the columns a processor reads, about half of eraE's bytes per block |
+| Blocks newer than the eraE mirror, which ends at block 24,518,655 (February 2026) | Xatu | The public eraE mirror publishes no later blocks; Xatu runs about a day behind the chain |
+| The last day and the chain head | Execution P2P | Neither archive holds these blocks yet |
+| Blocks no archive serves | Execution P2P, within `sources.live.history_fallback_blocks` | It checks every block against its header, but downloads old history slowly, at 40–55 blocks/s |
+| Blocks after Glamsterdam | Execution P2P | Xatu's public tables lose the payload fields Leani needs, and the eraE mirror does not reach them yet |
+| Checking a range another source built | eraE | It recomputes each block's transactions and receipts roots |
+
+The shipped profiles try eraE, then Xatu, and follow the head over execution
+P2P. [History source order](/docs/operations/configuration-guide/#history-source-order)
+explains how a backfill moves between sources, and
+[Sizing for bandwidth, memory, and disk](/docs/operations/configuration-guide/#sizing-for-bandwidth-memory-and-disk)
+gives measured speeds.
+
 ## 2. Field groups
 
 Processors declare the field groups they read. Sources declare the groups
@@ -371,6 +389,14 @@ Xatu comes second, and serves what eraE cannot:
   logs are missing is not. A block of at least eight transactions without any
   log row counts as missing its logs. Every check that fails passes the range
   to the next source.
+
+On the host measured in
+[Sizing for bandwidth, memory, and disk](/docs/operations/configuration-guide/#sizing-for-bandwidth-memory-and-disk),
+with the shipped settings, Xatu ran `rollup-txs` about twice as fast as eraE
+and `blobs-money` about one and a half times as fast; eraE downloaded about
+twice the bytes per block and used about three times the CPU, for its root
+checks. Which is faster on another host depends on the processor's
+projection and on the host's bandwidth.
 
 Neither source anchors a block's hash to consensus: eraE trusts its mirror's
 checksum catalog, and Xatu its publisher. EraE files may carry header proofs
