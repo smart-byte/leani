@@ -6,6 +6,8 @@ record, and documented RPC contracts.
 
 ## [Unreleased]
 
+## [0.1.0-rc.5] - 2026-10-13
+
 ### Added
 
 - Field groups: processors declare the field groups they read, and sources
