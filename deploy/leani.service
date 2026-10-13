@@ -8,6 +8,8 @@ Type=simple
 User=leani
 Group=leani
 Environment=LEANI_LOG=info
+# Cap glibc malloc arenas: each holds memory its threads freed.
+Environment=MALLOC_ARENA_MAX=2
 EnvironmentFile=-/etc/leani/environment
 ExecStart=/usr/local/bin/leani serve --config /etc/leani/node.toml --log-format json
 Restart=on-failure

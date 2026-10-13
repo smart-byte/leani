@@ -22,7 +22,7 @@ LABEL org.opencontainers.image.title="leani" \
 
 RUN apt-get update \
     && apt-get upgrade --yes \
-    && apt-get install --yes --no-install-recommends ca-certificates curl \
+    && apt-get install --yes --no-install-recommends ca-certificates curl libjemalloc2 \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --gid 10001 leani \
     && useradd --uid 10001 --gid leani --no-create-home --shell /usr/sbin/nologin leani \
@@ -37,6 +37,11 @@ COPY config/modes /etc/leani/examples
 # The root filesystem may be read-only: SQLite spills large statements and
 # sorts here, the one writable temporary directory.
 ENV SQLITE_TMPDIR=/tmp/leani TMPDIR=/tmp/leani
+# glibc keeps what threads free in per-thread arenas, so resident memory stays
+# near its peak and grows with new threads. jemalloc returns it: a 100,000-block
+# Xatu backfill held 711 MiB and fell to 130 MiB afterwards, where glibc reached
+# 1.5 GiB. Debian's arm64 build supports kernel pages up to 64 KiB.
+ENV LD_PRELOAD=libjemalloc.so.2
 
 USER 10001:10001
 VOLUME ["/var/lib/leani"]

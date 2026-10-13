@@ -90,6 +90,13 @@ record, and documented RPC contracts.
   `compose.yaml` mounts that tmpfs writable for the node's user. On the
   read-only root filesystem, large statements, such as a finality advance over
   many blocks, failed with `disk I/O error` (code 6410).
+- The container image preloads jemalloc, and `deploy/leani.service` sets
+  `MALLOC_ARENA_MAX=2`. glibc gives each thread that allocates its own 64 MiB
+  arena and keeps most of what they free, so a node's resident memory kept
+  growing: an rc.4 node held 5.7 GB, 4.7 GB of it in 57 arenas. Over a
+  100,000-block `blobs-money` backfill from Xatu, glibc reached 1.5 GiB and
+  kept it; two arenas held it at 0.8–1.0 GiB, and jemalloc at 711 MiB,
+  falling to 130 MiB when the backfill finished.
 - `execution live readiness changed` is logged when readiness changes, not on
   every block.
 - A completed backfill reports no remaining blocks, although it skipped blocks

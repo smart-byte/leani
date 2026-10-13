@@ -159,6 +159,18 @@ object, 1,000 blocks around blocks 18,000,000 to 19,430,000, holds about
 80–110 MiB of compressed columns and decodes about 230–340 MiB. Keep
 `memory_bytes` above the largest of those, as the shipped 512 MiB is, and
 plan RAM for about `maximum_active_chunks` × 450 MiB during Xatu backfills.
+The allocator keeps memory a finished read freed for the next, so resident
+memory after a burst of reads stays near its peak: set a container's memory
+limit for that peak, not for the budgets. On Linux, glibc gives each thread
+that allocates its own 64 MiB arena and returns little of what they free, so
+a long-running node grows: an rc.4 node on a 20-thread host held 5.7 GB, 4.7
+GB of it in 57 such arenas. Over a 100,000-block `blobs-money` backfill from
+Xatu, glibc reached 1.5 GiB and kept it. The container image preloads
+jemalloc, which returns freed memory: the same backfill held 711 MiB and fell
+to 130 MiB when it finished. `deploy/leani.service` sets `MALLOC_ARENA_MAX=2`,
+which held it at 0.8–1.0 GiB. Wherever you run the binary yourself, set
+`MALLOC_ARENA_MAX=2` or preload jemalloc (Debian's `libjemalloc2` with
+`LD_PRELOAD=libjemalloc.so.2`).
 
 `[budgets.history_material]` is the sole budget for shared immutable source
 frames and acquisition reorder buffers. Chunks read ahead of the one a job is
