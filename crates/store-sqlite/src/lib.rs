@@ -5469,10 +5469,19 @@ impl SqliteStore {
             instance: instance.clone(),
             savepoint_id: savepoint_id.to_owned(),
         })?;
-        let snapshot: Vec<u8> = row.try_get("state_snapshot")?;
-        let checksum = decode_hash(row.try_get("state_checksum")?)?;
+        let mut snapshot: Vec<u8> = row.try_get("state_snapshot")?;
+        let mut checksum = decode_hash(row.try_get("state_checksum")?)?;
         let aliases = self.identity_aliases(&instance).await?;
-        validate_state_snapshot(descriptor, &instance, &snapshot, checksum, &aliases)?;
+        let mut decoded =
+            decode_state_snapshot(descriptor, &instance, &snapshot, checksum, &aliases)?;
+        // Only this store's aliases accept a superseded identity: bind the
+        // archive to the current descriptor so any node validates it.
+        if aliases.contains(&decoded.descriptor_hash) {
+            decoded.descriptor_hash = descriptor_hash(descriptor)?;
+            snapshot = postcard::to_allocvec(&decoded)
+                .map_err(|error| StoreError::Encoding(error.to_string()))?;
+            checksum = BlockHash::new(*blake3::hash(&snapshot).as_bytes());
+        }
         postcard::to_allocvec(&PortableSavepointArchive {
             format_version: 1,
             snapshot,
@@ -25956,6 +25965,10 @@ mod tests {
             .apply(&processor, cursor(&processor, &block, 1), &delta, &[])
             .await
             .expect("apply");
+        store
+            .create_portable_savepoint(&processor.descriptor, "before-narrowing")
+            .await
+            .expect("savepoint");
 
         let mut narrowed = processor.descriptor.clone();
         narrowed.requirements[0].capabilities = CapabilitySet::of(Capability::Header)
@@ -25976,6 +25989,17 @@ mod tests {
             .restore_recovery_checkpoint(&narrowed, checkpoint.checkpoint_id)
             .await
             .expect("a checkpoint taken before the narrowing restores");
+        // Re-exported, an older savepoint validates without this store's aliases.
+        let archive = store
+            .export_portable_savepoint(&narrowed, "before-narrowing")
+            .await
+            .expect("export after the narrowing");
+        assert_eq!(
+            SqliteStore::validate_portable_savepoint(&narrowed, &archive)
+                .expect("the narrowed descriptor accepts the re-export")
+                .block_number,
+            BlockNumber(1)
+        );
 
         // Widening, or narrowing together with any other change, is refused.
         let mut widened = narrowed.clone();

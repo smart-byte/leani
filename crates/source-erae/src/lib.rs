@@ -3310,6 +3310,38 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn block_sizes_satisfy_their_request_without_transactions() {
+        let directory = tempfile::tempdir().expect("directory");
+        let (body, receipts) = logged_transactions();
+        let (source, number) = one_execution_block(directory.path(), &body, Some(&receipts));
+        let required = CapabilitySet::of(Capability::Header).with(Capability::BlockSize);
+        let plan = source
+            .plan(&request(BlockRange::single(number), required))
+            .await
+            .expect("plan");
+        let frames = source
+            .open(
+                &plan.chunks[0],
+                budget(1 << 20, 1 << 20),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("open")
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("block sizes");
+        let frame = &frames[0];
+        assert!(
+            frame
+                .header
+                .as_complete()
+                .is_some_and(|header| header.size_bytes.is_some())
+        );
+        assert!(frame.capabilities().satisfies(required, false));
+        assert_eq!(frame.group_violation(required.with_derivable()), None);
+    }
+
     fn logged_transactions() -> (BlockBody, Vec<EthereumReceipt>) {
         use alloy_consensus::transaction::SignerRecoverable;
         let transactions = (0..2)
