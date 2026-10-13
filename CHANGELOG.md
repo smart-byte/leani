@@ -21,6 +21,11 @@ record, and documented RPC contracts.
 
 ### Changed
 
+- The historical commit writer-hold target defaults to 250 ms, up from
+  20 ms. A hold includes the commit's WAL sync, so on disks with slow syncs
+  the former target shrank commits to a block or two that each rewrote the
+  same pages: on a Hetzner EX44, a `rollup-txs` backfill from Xatu went from
+  53 to 799 blocks/s and from 104 to 11 KiB written per block.
 - A 64,000-block output window no longer slows ingestion while nothing expires:
   window pruning and retained bounds search a new block index of retained
   output instead of scanning all of an instance's output for every applied

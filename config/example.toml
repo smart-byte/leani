@@ -71,7 +71,7 @@ maximum_blocks = 128
 maximum_changes = 10000
 maximum_encoded_bytes = "16MiB"
 maximum_delay = "50ms"
-target_writer_hold = "20ms"
+target_writer_hold = "250ms"
 
 [[sources.history]]
 id = "xatu"

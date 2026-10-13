@@ -2992,7 +2992,7 @@ verification_segment_blocks = 8192"#;
                 .commit
                 .target_writer_hold
                 .milliseconds(),
-            20
+            250
         );
         assert_eq!(
             config
