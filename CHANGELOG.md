@@ -21,6 +21,10 @@ record, and documented RPC contracts.
 
 ### Changed
 
+- The shipped profiles and built-in defaults try eraE before Xatu: each block
+  eraE serves is checked against its header's transactions and receipts
+  roots, and Xatu serves the blocks its mirror does not cover yet. See
+  [History source order](docs/operations/configuration-guide.md#history-source-order).
 - The historical commit writer-hold target defaults to 250 ms, up from
   20 ms. A hold includes the commit's WAL sync, so on disks with slow syncs
   the former target shrank commits to a block or two that each rewrote the

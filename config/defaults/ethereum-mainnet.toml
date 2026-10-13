@@ -18,10 +18,19 @@ recent_raw_hard_bytes = 536870912
 source_concurrency = 4
 mapper_concurrency = 4
 
+# eraE first: each block it serves is checked against its header's transactions
+# and receipts roots. Xatu serves blocks eraE's mirror does not cover yet; see
+# docs/concepts/data-sources.md.
+[[sources.history]]
+id = "erae"
+kind = "era_e"
+priority = 10
+trust = "trusted_dataset"
+
 [[sources.history]]
 id = "xatu"
 kind = "xatu"
-priority = 10
+priority = 20
 trust = "trusted_dataset"
 
 [sources.live]

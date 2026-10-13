@@ -73,18 +73,21 @@ maximum_encoded_bytes = "16MiB"
 maximum_delay = "50ms"
 target_writer_hold = "250ms"
 
-[[sources.history]]
-id = "xatu"
-kind = "xatu"
-priority = 10
-trust = "trusted_dataset"
-
+# eraE first: each block it serves is checked against its header's transactions
+# and receipts roots. Xatu serves blocks eraE's mirror does not cover yet; see
+# docs/concepts/data-sources.md.
 [[sources.history]]
 id = "erae"
 kind = "era_e"
-priority = 20
+priority = 10
 trust = "trusted_dataset"
 endpoint = "https://data.ethpandaops.io/erae/mainnet/"
+
+[[sources.history]]
+id = "xatu"
+kind = "xatu"
+priority = 20
+trust = "trusted_dataset"
 
 [sources.live]
 kind = "p2p"

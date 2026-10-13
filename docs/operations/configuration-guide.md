@@ -273,6 +273,31 @@ whose catalog and archive bytes anyone on the path can replace. `xatu`
 sources are Ethereum mainnet only: another `chain.chain_id` fails
 validation.
 
+### History source order
+
+A backfill splits its range into gaps of missing coverage and tries the
+configured history sources for each gap in `priority` order, lowest first. A
+source that cannot serve a gap, because it has not published those blocks,
+its data for them is incomplete, or it cannot fill the processor's field
+groups, passes the gap to the next source; one that serves part of a gap
+commits that part, and the next source continues from there. Each backfill
+retries up to three times the number of sources, at least five times, before
+it fails. When every history source fails and the live source is execution
+P2P, P2P can serve the gap within `sources.live.history_fallback_blocks`.
+
+The shipped profiles list eraE at priority 10 and Xatu at priority 20:
+
+| Source | Serves | Checks each block for | Notes |
+|---|---|---|---|
+| `era_e` | Whole blocks and receipts up to its mirror's last catalog update | Transactions and receipts roots against the header | The public mirror's catalog ended at block 24,518,655 (2026-02-26) when this was written |
+| `xatu` | Columnar projections, about one day behind the chain | Transaction rows against the beacon payload count; log rows without a gap | Cannot prove a block's last logs complete; Ethereum mainnet only |
+| P2P (live source) | Recent and live blocks from peers | Commitments of every header, body, and receipt | Slowest for old history; peers may no longer serve very old blocks |
+
+So for blocks the eraE mirror covers, a backfill reads verified complete
+blocks; for later blocks, Xatu; and P2P fills what neither serves. Put Xatu
+first when bandwidth, not completeness, limits a backfill: its projections
+transfer fewer bytes per block for processors that read a few columns.
+
 Xatu additionally accepts three acquisition-tuning controls. `chunk_blocks`
 sets the generic header, transaction, and log span, while
 `blobs_chunk_blocks` sets the wider span used by the five-table blobs join.
