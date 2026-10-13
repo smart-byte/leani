@@ -62,6 +62,12 @@ record, and documented RPC contracts.
   processor's first verified hot/cold handoff exact until reconciliation
   passes them, up to 65,536 blocks below finality, and an incomplete archive
   range is waited out like a missing one.
+- A processor that missed a finality advance is retried every second against
+  the last applied anchor instead of at the next one: a live block committed
+  just after its anchor, a block committed below finalized coverage, and a
+  failed advance are finalized without waiting for consensus to advance. A
+  failed advance is logged as an error and retried with backoff up to five
+  minutes.
 
 ### Upgrading
 
