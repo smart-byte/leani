@@ -72,6 +72,8 @@ record, and documented RPC contracts.
   `compose.yaml` mounts that tmpfs writable for the node's user. On the
   read-only root filesystem, large statements, such as a finality advance over
   many blocks, failed with `disk I/O error` (code 6410).
+- `execution live readiness changed` is logged when readiness changes, not on
+  every block.
 
 ### Upgrading
 

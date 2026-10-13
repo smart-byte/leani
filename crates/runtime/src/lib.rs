@@ -6790,9 +6790,11 @@ fn union_filter_scope(
     }
 }
 
+/// Publish readiness, waking watchers only when it changes: the live lane
+/// signals it on every block.
 fn signal_readiness(readiness: Option<&tokio::sync::watch::Sender<bool>>, ready: bool) {
     if let Some(readiness) = readiness {
-        readiness.send_replace(ready);
+        readiness.send_if_modified(|current| std::mem::replace(current, ready) != ready);
     }
 }
 
@@ -21061,6 +21063,23 @@ mod tests {
             )
             .await
             .expect("apply");
+    }
+
+    #[test]
+    fn readiness_wakes_its_watchers_only_when_it_changes() {
+        // Report 2026-10-13 §9: `execution live readiness changed` was logged, ready
+        // and unchanged, on every block.
+        let (sender, mut receiver) = tokio::sync::watch::channel(false);
+        signal_readiness(Some(&sender), true);
+        assert!(receiver.has_changed().expect("sender"));
+        receiver.borrow_and_update();
+        signal_readiness(Some(&sender), true);
+        assert!(
+            !receiver.has_changed().expect("sender"),
+            "an unchanged value woke them"
+        );
+        signal_readiness(Some(&sender), false);
+        assert!(receiver.has_changed().expect("sender"));
     }
 
     #[tokio::test]
