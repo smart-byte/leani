@@ -80,6 +80,14 @@ holds about 450 MiB per active chunk, so two fit its 1 GiB `memory_bytes`
 budget and leave the rest of the compose file's 2 GiB container limit to the
 node.
 
+The container's root filesystem is read-only. The image points
+`SQLITE_TMPDIR` and `TMPDIR` at `/tmp/leani`, where SQLite spills statement
+journals and sorts that outgrow memory, and the compose file mounts a tmpfs
+there that the node's user can write. Without a writable temporary directory,
+large statements fail with `disk I/O error` (SQLite code 6410), such as a
+finality advance over many blocks or a peer store refresh; mount one when you
+run the image another way.
+
 For a direct binary deployment:
 
 1. install the binary as `/usr/local/bin/leani`;
