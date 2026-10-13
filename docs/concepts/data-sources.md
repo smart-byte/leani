@@ -17,8 +17,8 @@ large backfill.
 
 | Source | Role | Strength | Main limitation |
 |---|---|---|---|
-| Xatu public Parquet | Default specialized backfill | Free, canonical, columnar, rich tables, filter/project before retaining | Donated hosting; filtered rows are trusted data; Ethereum mainnet only |
-| EraE archives | General raw historical source | Sparse native reader; complete block bodies and receipts with locally checked execution commitments | The mirror and its catalog remain the canonicality trust root; receipts only from Byzantium |
+| EraE archives | Default historical backfill, tried first | Sparse native reader; complete block bodies and receipts with locally checked execution commitments | The mirror and its catalog remain the canonicality trust root; the public mirror stopped at block 24,518,655; receipts only from Byzantium |
+| Xatu public Parquet | Backfill of blocks eraE lacks, tried second | Free, columnar, about one day behind the chain, filter/project before retaining | Donated hosting; filtered rows are trusted data whose last logs cannot be proven complete; Ethereum mainnet only |
 | Ethereum P2P/Reth | Recent and live | No vendor key, follows head, bodies/receipts | Old history is thinning; consensus finality remains separate |
 | Beacon light client/CL | Canonicality/finality | Anchors post-Merge execution payloads | Adds a consensus component |
 | AWS public blockchain | Secondary Parquet source | Free public S3, daily updates | Validate schema completeness for each fork/use case |
@@ -346,22 +346,41 @@ through independently verified consensus material.
 
 ### EraE versus Xatu
 
-Xatu should usually win for a known aggregation:
+The shipped profiles list eraE first and Xatu second. A backfill tries them in
+that order for each gap and passes a range the first cannot serve to the next
+(see [History source order](/docs/operations/configuration-guide/#history-source-order)).
 
-- it is columnar and already split into logs, transfers, transactions, traces, and state-diff tables;
-- the reader can project and filter before most bytes enter the processor;
-- it can provide executed artifacts that do not exist in raw receipts;
-- it should make blobs, token-transfer, and Uniswap backfills substantially faster.
+EraE comes first because each block it serves is complete by construction:
+the reader recomputes the transactions root and the receipts root from the
+bodies and receipts it reads and compares them with the block's header. A
+missing transaction or log cannot pass. A new event processor also needs no
+new public table, and the format is the one execution clients import history
+from.
 
-EraE should win when reproducibility and raw protocol coverage matter:
+Xatu comes second, and serves what eraE cannot:
 
-- it provides block bodies and receipts rather than a provider-defined analytical projection;
-- transaction and receipt roots can be recomputed from complete block inputs;
-- a new event processor can be run without waiting for a public dataset to expose a new table or field;
-- files can theoretically be mirrored by multiple independent hosts;
-- it is a useful audit source for sampled or full Xatu ranges.
+- the public eraE mirror publishes no blocks after its last catalog update, so
+  Xatu, about one day behind the chain, serves later history;
+- it is columnar, so a narrow projection, such as a transaction processor
+  that reads a few columns over a long range, transfers fewer bytes per block
+  than eraE, which reads whole bodies and receipts;
+- it does not publish a log count or bloom per block, nor the transaction
+  root of a filtered selection. Leani counts every transaction row of a block
+  against the beacon payload before filtering and requires log rows without a
+  gap, so a missing transaction or an inner log is caught; a block whose last
+  logs are missing is not. A block of at least eight transactions without any
+  log row counts as missing its logs. Every check that fails passes the range
+  to the next source.
 
-EraE still does not contain EVM call traces or state diffs, and it normally requires downloading far more data than a filtered Xatu query. “Independent history path” therefore means an interchangeable raw fallback and verification path, not that EraE must be the default or that its current host is trustless.
+Neither source anchors a block's hash to consensus: eraE trusts its mirror's
+checksum catalog, and Xatu its publisher. EraE files may carry header proofs
+against the beacon chain's historical summaries; Leani does not verify them
+yet. EraE contains no EVM call traces or state diffs.
+
+After Glamsterdam, Xatu's public beacon tables no longer carry execution
+payload fields, on which Leani's Xatu projections depend for transaction
+counts and parent hashes; the Xatu source needs an update before blocks after
+the fork can be served from it.
 
 ## 5. Ethereum P2P, Reth, and SHiNode
 
