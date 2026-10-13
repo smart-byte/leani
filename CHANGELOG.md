@@ -52,7 +52,10 @@ record, and documented RPC contracts.
   counted against the beacon payload before filtering, and log rows must run
   without a gap. Such a block is an incomplete range, served by the next
   configured source. So is a blob transaction without its execution row, which
-  failed backfills at block 24,695,859 on every retry.
+  failed backfills at block 24,695,859 on every retry. A block of at least
+  eight transactions without a single Xatu log row is one too: Xatu publishes
+  no log count, and of 279,829 sampled blocks with transactions, the four
+  without logs held one to three transactions.
 
 ### Upgrading
 

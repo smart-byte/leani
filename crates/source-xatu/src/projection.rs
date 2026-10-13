@@ -169,6 +169,12 @@ const GENERIC_LOG_COLUMNS: &[&str] = &[
     "data",
 ];
 
+/// Fewest payload transactions in a block whose missing log rows count as
+/// lost. Xatu publishes no log count, so such a block would otherwise pass
+/// as one that logged nothing; of 279,829 sampled blocks with transactions
+/// since 2022, the four without logs held one to three transactions.
+const LOGLESS_BLOCK_TRANSACTIONS: u32 = 8;
+
 /// Most withdrawals one execution payload holds (`MAX_WITHDRAWALS_PER_PAYLOAD`).
 const MAX_WITHDRAWALS_PER_PAYLOAD: usize = 16;
 
@@ -1530,6 +1536,15 @@ fn normalize_generic_frames(
             }
             GenericProjectionKind::Logs => {
                 let indices = inputs.row_indices.remove(&number.0).unwrap_or_default();
+                if indices.is_empty() && beacon.transaction_count >= LOGLESS_BLOCK_TRANSACTIONS {
+                    return Err(XatuError::IncompleteLogs {
+                        range: BlockRange::single(number),
+                        detail: format!(
+                            "block {number} holds {} transactions but no log row",
+                            beacon.transaction_count
+                        ),
+                    });
+                }
                 validate_row_indices(XatuTable::CanonicalExecutionLogs, number, indices, None)?;
                 let mut values = inputs.logs.remove(&number.0).unwrap_or_default();
                 values.sort_by_key(|log| log.log_index);
@@ -3999,6 +4014,34 @@ mod tests {
                     "{gap:?} {filters:?}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn a_block_of_many_transactions_without_log_rows_is_incomplete() {
+        // Xatu publishes no log count, so a block whose log rows are all
+        // missing looked like one that logged nothing. Of 279,829 sampled
+        // blocks with transactions since 2022, the four without logs held
+        // one to three transactions.
+        let other_contract = FilterSet {
+            scope: FilterScope {
+                addresses: vec![Address::new([0x99; 20])],
+                ..FilterScope::default()
+            },
+            ..FilterSet::default()
+        };
+        for filters in [FilterSet::default(), other_contract] {
+            assert!(
+                matches!(
+                    block_42_log_frames(&block_42_log_rows(&[]), &filters, 8),
+                    Err(XatuError::IncompleteLogs { .. })
+                ),
+                "{filters:?}"
+            );
+            block_42_log_frames(&block_42_log_rows(&[]), &filters, 3)
+                .expect("a small block without logs");
+            block_42_log_frames(&block_42_log_rows(&[0]), &filters, 8)
+                .expect("a large block with its logs");
         }
     }
 
