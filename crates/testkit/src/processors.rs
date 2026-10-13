@@ -520,7 +520,9 @@ fn validate_delta_cursor(
 
 #[cfg(test)]
 mod tests {
-    use leani_primitives::{HeaderEnvelope, Material, TransactionEnvelope, TransactionHash};
+    use leani_primitives::{
+        Address, HeaderEnvelope, Material, Quantity, TransactionEnvelope, TransactionHash,
+    };
 
     use crate::fixture_frame;
 
@@ -548,12 +550,12 @@ mod tests {
                 transaction_type: 2,
                 index: 0,
                 encoded: Some(vec![1]),
-                from: None,
+                from: Some(Address::ZERO),
                 to: None,
-                nonce: None,
-                gas_limit: None,
-                value: None,
-                input: None,
+                nonce: Some(0),
+                gas_limit: Some(21_000),
+                value: Some(Quantity::ZERO),
+                input: Some(Vec::new()),
                 max_fee_per_gas: None,
                 max_priority_fee_per_gas: None,
                 max_fee_per_blob_gas: None,
@@ -565,16 +567,16 @@ mod tests {
                 transaction_type: 3,
                 index: 1,
                 encoded: Some(vec![2]),
-                from: None,
+                from: Some(Address::ZERO),
                 to: None,
-                nonce: None,
-                gas_limit: None,
-                value: None,
-                input: None,
+                nonce: Some(0),
+                gas_limit: Some(21_000),
+                value: Some(Quantity::ZERO),
+                input: Some(Vec::new()),
                 max_fee_per_gas: None,
                 max_priority_fee_per_gas: None,
-                max_fee_per_blob_gas: None,
-                blob_versioned_hashes: Vec::new(),
+                max_fee_per_blob_gas: Some(Quantity::ZERO),
+                blob_versioned_hashes: vec![BlockHash::new([0x01; 32])],
                 size_bytes: None,
             },
         ]);
@@ -670,8 +672,8 @@ mod tests {
             transactions_root: Some(BlockHash::ZERO),
             receipts_root: Some(BlockHash::ZERO),
             withdrawals_root: None,
-            gas_limit: None,
-            gas_used: None,
+            gas_limit: Some(30_000_000),
+            gas_used: Some(0),
             base_fee_per_gas: None,
             blob_gas_used: None,
             excess_blob_gas: None,

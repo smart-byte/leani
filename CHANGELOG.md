@@ -6,6 +6,62 @@ record, and documented RPC contracts.
 
 ## [Unreleased]
 
+### Added
+
+- Field groups: processors declare the field groups they read, and sources
+  declare the groups they fill. Four capability flags join the existing ones:
+  `Senders`, `BlobFields`, `ReceiptOutcome`, and `BlockSize`. A source's plan
+  states the groups its frames fill. The runtime refuses a plan that promises
+  less than the request needs and moves the job to the next configured source.
+  Every frame a processor receives is checked against the fields its declared
+  groups promise, so a source that breaks a promise fails loudly. See
+  [field groups](docs/concepts/data-sources.md#2-field-groups).
+- Xatu serves `rollup-txs` history from its transaction projection, for the
+  groups the processor declares, scoped to the rule recipients.
+
+### Changed
+
+- `rollup-txs` 1.0.0, `blobs-money` 1.5.0 and `transaction-stats` 1.0.0
+  declare narrower field groups: `Header`, `Body`, `Senders`, `Calldata` and
+  `ReceiptOutcome` for `rollup-txs`; `Header`, `Senders`, `BlobFields`,
+  `BlockSize` and `ReceiptOutcome` for type-3 transactions in `blobs-money`;
+  and `Body` and `Senders` for `transaction-stats`. Narrowing a declared
+  requirement keeps the processor instance, and checkpoints taken before the
+  upgrade stay restorable, so existing instances keep running.
+- Execution P2P history requests that need no receipt group (`Receipts`,
+  `ReceiptOutcome` or `Logs`) and no withdrawals download block bodies only.
+  eraE reads bodies and receipts only as the groups need them. Both recover
+  senders only for `Senders` or a sender filter. Live lanes are unchanged.
+- Xatu refuses requests for the full `Transactions` and `Receipts` bundles,
+  because its projections cannot fill blob fields for every transaction or
+  logs inside receipts. Processors that need them use P2P or eraE.
+
+### Fixed
+
+- Frames that claim fields they lack are refused. P2P or eraE bodies without
+  senders no longer satisfy a `Transactions` requirement, and a type-3 Xatu
+  transaction row without blob hashes no longer counts as a complete
+  transaction.
+- Stored history is checked when read. Retained raw history and local archives
+  check each frame's fields as they read it. At the first frame that lacks a
+  requested group's fields, the read ends with a missing-material error for the
+  rest of the chunk, and the job passes that range to its next source: a cache
+  miss, never a job failure or a wrong value.
+
+### Upgrading
+
+- Node stores move to schema 24, which adds a table of superseded descriptor
+  hashes.
+- Downgrading is unsupported. Once a descriptor or job with the new capability
+  bits is stored, an older binary refuses it.
+- A portable savepoint exported by an older version of a narrowed processor
+  (see Changed) must be exported again after the upgrade before it is imported
+  into a node that never ran the older version.
+- A backfill created before the upgrade keeps the requirements it was created
+  with. Xatu no longer serves the earlier `blobs-money` shape, so such a
+  backfill finishes from P2P or eraE; backfills created after the upgrade use
+  the narrower groups.
+
 ## [0.1.0-rc.4] - 2026-10-07
 
 ### Added

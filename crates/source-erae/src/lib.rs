@@ -1993,10 +1993,14 @@ async fn read_capped(
     Ok(body)
 }
 
-/// Whether `required` needs receipts, which logs derive from.
+/// Whether `required` needs receipts, which logs and receipt outcomes derive from.
 const fn requires_receipts(required: CapabilitySet) -> bool {
     required
-        .intersection(CapabilitySet::of(Capability::Receipts).with(Capability::Logs))
+        .intersection(
+            CapabilitySet::of(Capability::Receipts)
+                .with(Capability::Logs)
+                .with(Capability::ReceiptOutcome),
+        )
         .bits()
         != 0
 }
@@ -2094,6 +2098,38 @@ mod tests {
         let intervals =
             coalesce_target_intervals(&targets, &[100, 110, 120, 200, 220], 300).expect("ranges");
         assert_eq!(intervals, vec![(100, 119), (200, 219)]);
+    }
+
+    #[test]
+    fn field_groups_select_erae_components() {
+        let header = CapabilitySet::of(Capability::Header);
+        let select = |required| EraeProjection {
+            required,
+            scope: None,
+            log_fields: leani_primitives::LogFieldSet::NONE,
+        };
+        for required in [
+            header.with(Capability::Senders),
+            header.with(Capability::BlockSize),
+            CapabilitySet::of(Capability::ReceiptOutcome),
+        ] {
+            assert!(select(required).needs_body(), "{required:?} needs the body");
+        }
+        assert!(!select(header).needs_body(), "a header needs no body");
+        for required in [
+            CapabilitySet::of(Capability::ReceiptOutcome),
+            header
+                .with(Capability::Body)
+                .with(Capability::Senders)
+                .with(Capability::Calldata)
+                .with(Capability::ReceiptOutcome),
+        ] {
+            assert!(requires_receipts(required), "{required:?} needs receipts");
+        }
+        assert!(
+            !requires_receipts(header.with(Capability::Body).with(Capability::Senders)),
+            "senders and bodies alone need no receipts"
+        );
     }
 
     const CATALOG_DIGEST: &str = "ee0bf48ac736558538b597261beba4c7352e4e06a2cdb090dab5bc68b6149959";
@@ -3118,6 +3154,14 @@ mod tests {
                 CapabilitySet::of(Capability::Header).with(Capability::Transactions),
                 true,
             ),
+            (
+                CapabilitySet::of(Capability::Header).with(Capability::Senders),
+                true,
+            ),
+            (
+                CapabilitySet::of(Capability::Header).with(Capability::BlobFields),
+                false,
+            ),
         ] {
             let plan = source
                 .plan(&request(BlockRange::single(number), required))
@@ -3217,6 +3261,53 @@ mod tests {
             );
             frame.validate_shape().expect("consistent frame");
         }
+    }
+
+    #[tokio::test]
+    async fn receipt_outcomes_read_the_body_without_recovering_senders() {
+        use leani_primitives::{Material, MissingReason};
+
+        let directory = tempfile::tempdir().expect("directory");
+        let (body, receipts) = logged_transactions();
+        let (source, number) = one_execution_block(directory.path(), &body, Some(&receipts));
+        let required = CapabilitySet::of(Capability::Header)
+            .with(Capability::Body)
+            .with(Capability::Calldata)
+            .with(Capability::ReceiptOutcome);
+        let plan = source
+            .plan(&request(BlockRange::single(number), required))
+            .await
+            .expect("plan");
+        let frames = source
+            .open(
+                &plan.chunks[0],
+                budget(1 << 20, 1 << 20),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("open")
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("receipt outcomes with a body");
+        let frame = &frames[0];
+        let frame_receipts = frame.receipts.as_complete().expect("complete receipts");
+        assert_eq!(frame_receipts.len(), 2);
+        for receipt in frame_receipts {
+            assert!(receipt.success.is_some());
+            assert!(receipt.gas_used.is_some());
+            assert!(receipt.effective_gas_price.is_some());
+        }
+        assert!(matches!(
+            frame.logs,
+            Material::Missing(MissingReason::NotRequested)
+        ));
+        let transactions = frame.transactions.as_complete().expect("complete body");
+        assert_eq!(transactions.len(), 2);
+        assert!(
+            transactions
+                .iter()
+                .all(|transaction| transaction.from.is_none())
+        );
     }
 
     fn logged_transactions() -> (BlockBody, Vec<EthereumReceipt>) {

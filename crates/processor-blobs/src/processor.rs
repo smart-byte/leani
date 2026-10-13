@@ -89,8 +89,10 @@ impl BlobsProcessor {
             start: StartPoint::Block(start),
             requirements: vec![DataRequirement {
                 capabilities: CapabilitySet::of(Capability::Header)
-                    .with(Capability::Transactions)
-                    .with(Capability::Receipts),
+                    .with(Capability::Senders)
+                    .with(Capability::BlobFields)
+                    .with(Capability::BlockSize)
+                    .with(Capability::ReceiptOutcome),
                 log_fields: leani_primitives::LogFieldSet::NONE,
                 allow_filtered: true,
                 filter: FilterScope {
@@ -500,7 +502,7 @@ fn validate_delta_cursor(
 #[cfg(test)]
 pub(crate) mod tests {
     use leani_primitives::{
-        Address, BlockRef, ChainId, HeaderEnvelope, ReceiptEnvelope, TransactionEnvelope,
+        Address, BlockRef, ChainId, HeaderEnvelope, Log, ReceiptEnvelope, TransactionEnvelope,
         VerificationReport,
     };
     use leani_testkit::MemoryReducer;
@@ -606,6 +608,108 @@ pub(crate) mod tests {
         };
         header.excess_blob_gas = Some(excess_blob_gas);
         header.base_fee_per_gas = Some(quantity(execution_base_fee));
+        frame
+    }
+
+    /// A type-3 transaction at block position `index` with one versioned hash
+    /// per byte in `blobs`; every field the processor's groups do not promise
+    /// is filled too.
+    fn type3_transaction(index: u32, hash: TransactionHash, blobs: &[u8]) -> TransactionEnvelope {
+        TransactionEnvelope {
+            hash,
+            transaction_type: 3,
+            index,
+            encoded: Some(vec![0x03]),
+            from: Some(Address::new([0x41; 20])),
+            to: Some(Address::new([0x42; 20])),
+            nonce: Some(7),
+            gas_limit: Some(21_000),
+            value: Some(quantity(5)),
+            input: Some(vec![0xab]),
+            max_fee_per_gas: Some(quantity(30)),
+            max_priority_fee_per_gas: Some(quantity(2)),
+            max_fee_per_blob_gas: Some(quantity(9)),
+            blob_versioned_hashes: blobs
+                .iter()
+                .map(|byte| BlockHash::new([*byte; 32]))
+                .collect(),
+            size_bytes: Some(400),
+        }
+    }
+
+    /// The receipt of a type-3 transaction at block position `index` that used
+    /// `blobs` blobs of blob gas.
+    fn type3_receipt(
+        index: u32,
+        hash: TransactionHash,
+        blobs: u64,
+        success: bool,
+        gas_used: u64,
+        logs: Vec<Log>,
+    ) -> ReceiptEnvelope {
+        ReceiptEnvelope {
+            transaction_hash: hash,
+            transaction_type: 3,
+            transaction_index: index,
+            encoded: Some(vec![0x03]),
+            success: Some(success),
+            gas_used: Some(gas_used),
+            effective_gas_price: Some(quantity(12)),
+            blob_gas_used: Some(blobs * BLOB_GAS_PER_BLOB),
+            blob_gas_price: Some(quantity(1)),
+            logs,
+        }
+    }
+
+    /// A block with every header field present and two type-3 transactions:
+    /// the second is reverted and carries two blobs. Each receipt matches its
+    /// transaction one to one and carries its outcome; the first has a log.
+    fn fully_populated_frame() -> BlockFrame {
+        let mut frame = frame(Completeness::DatasetDeclared);
+        let Material::Filtered { value: header, .. } = &mut frame.header else {
+            panic!("fixture header is filtered");
+        };
+        header.rlp = Some(vec![0xf9, 0x02, 0x1a]);
+        header.transactions_root = Some(BlockHash::new([0x11; 32]));
+        header.receipts_root = Some(BlockHash::new([0x12; 32]));
+        header.withdrawals_root = Some(BlockHash::new([0x13; 32]));
+        header.consensus_size_bytes = Some(900);
+        header.gas_limit = Some(30_000_000);
+        header.gas_used = Some(45_000);
+        header.blob_gas_used = Some(3 * BLOB_GAS_PER_BLOB);
+        header.transaction_count = Some(2);
+
+        let first = TransactionHash::new([0x21; 32]);
+        let reverted = TransactionHash::new([0x22; 32]);
+        let log = Log {
+            address: Address::new([0x51; 20]),
+            topics: vec![[0x52; 32]],
+            data: vec![0x53],
+            transaction_hash: Some(first),
+            transaction_index: 0,
+            log_index: 0,
+        };
+        let Material::Filtered {
+            value: transactions,
+            ..
+        } = &mut frame.transactions
+        else {
+            panic!("fixture transactions are filtered");
+        };
+        *transactions = vec![
+            type3_transaction(0, first, &[0x31]),
+            type3_transaction(1, reverted, &[0x32, 0x33]),
+        ];
+        let Material::Filtered {
+            value: receipts, ..
+        } = &mut frame.receipts
+        else {
+            panic!("fixture receipts are filtered");
+        };
+        *receipts = vec![
+            type3_receipt(0, first, 1, true, 21_000, vec![log]),
+            type3_receipt(1, reverted, 2, false, 24_000, Vec::new()),
+        ];
         frame
     }
 
@@ -772,5 +876,36 @@ pub(crate) mod tests {
             .await
             .expect_err("partial input fails");
         assert!(matches!(error, ProcessorError::Input(_)));
+    }
+
+    #[test]
+    fn declares_only_the_field_groups_it_reads() {
+        let processor = BlobsProcessor::default();
+        assert_eq!(
+            processor.descriptor().requirements[0].capabilities,
+            CapabilitySet::from_iter([
+                Capability::Header,
+                Capability::Senders,
+                Capability::BlobFields,
+                Capability::BlockSize,
+                Capability::ReceiptOutcome,
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn mapping_reads_only_declared_field_groups() {
+        let processor = BlobsProcessor::default();
+        let frame = fully_populated_frame();
+        let groups = processor.descriptor().requirements[0].capabilities;
+        let full = processor.map(&frame).await.expect("full frame maps");
+        let restricted = processor
+            .map(&leani_testkit::restrict_to_groups(&frame, groups))
+            .await
+            .expect("frame restricted to the declared groups maps");
+        assert!(!full.payload.is_empty());
+        let decoded: BlobsDelta = postcard::from_bytes(&full.payload).expect("decode delta");
+        assert_eq!(decoded.transactions.len(), 2);
+        assert_eq!(full, restricted);
     }
 }

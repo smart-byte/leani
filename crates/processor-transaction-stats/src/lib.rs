@@ -87,7 +87,8 @@ impl TransactionStatsProcessor {
             config_hash,
             start: StartPoint::Block(config.start_block),
             requirements: vec![DataRequirement {
-                capabilities: CapabilitySet::of(Capability::Transactions),
+                // Senders (`from`) and Body (`to`, `value`): nothing else is read.
+                capabilities: CapabilitySet::of(Capability::Body).with(Capability::Senders),
                 log_fields: leani_primitives::LogFieldSet::NONE,
                 allow_filtered: true,
                 filter: FilterScope {
@@ -324,7 +325,8 @@ fn entity_json(bytes: &[u8]) -> Result<serde_json::Value, ProcessorError> {
 #[cfg(test)]
 mod tests {
     use leani_primitives::{
-        BlockRef, ChainId, Material, TransactionEnvelope, TransactionHash, VerificationReport,
+        BlockRef, ChainId, HeaderEnvelope, Log, Material, MissingReason, ReceiptEnvelope,
+        TransactionEnvelope, TransactionHash, VerificationReport,
     };
     use leani_testkit::MemoryReducer;
 
@@ -358,6 +360,15 @@ mod tests {
         assert_eq!(json["complete"], true);
         let object = json.as_object().expect("object");
         assert!(!object.contains_key("total_value"), "snake_case leaked");
+    }
+
+    #[test]
+    fn declares_only_the_field_groups_it_reads() {
+        let processor = processor();
+        assert_eq!(
+            processor.descriptor().requirements[0].capabilities,
+            CapabilitySet::from_iter([Capability::Body, Capability::Senders])
+        );
     }
 
     fn processor() -> TransactionStatsProcessor {
@@ -416,6 +427,130 @@ mod tests {
         }
     }
 
+    fn wei(value: u64) -> Quantity {
+        Quantity::from(U256::from(value))
+    }
+
+    /// A transaction with every field its type carries filled, including the
+    /// calldata, fee caps and blob fields that the processor never reads.
+    fn envelope(
+        index: u8,
+        transaction_type: u8,
+        from: Address,
+        to: Option<Address>,
+        value: u64,
+    ) -> TransactionEnvelope {
+        let blob = transaction_type == 3;
+        TransactionEnvelope {
+            hash: TransactionHash::new([0xa0 + index; 32]),
+            transaction_type,
+            index: u32::from(index),
+            encoded: Some(vec![transaction_type, index]),
+            from: Some(from),
+            to,
+            nonce: Some(u64::from(index)),
+            gas_limit: Some(21_000),
+            value: Some(wei(value)),
+            input: Some(if to.is_none() {
+                vec![0x60, 0x80]
+            } else {
+                Vec::new()
+            }),
+            max_fee_per_gas: Some(wei(30)),
+            max_priority_fee_per_gas: Some(wei(2)),
+            max_fee_per_blob_gas: blob.then(|| wei(3)),
+            blob_versioned_hashes: if blob {
+                vec![BlockHash::new([0xb0; 32])]
+            } else {
+                Vec::new()
+            },
+            size_bytes: Some(180),
+        }
+    }
+
+    fn receipt(
+        transaction: &TransactionEnvelope,
+        success: bool,
+        logs: Vec<Log>,
+    ) -> ReceiptEnvelope {
+        let blob = transaction.transaction_type == 3;
+        ReceiptEnvelope {
+            transaction_hash: transaction.hash,
+            transaction_type: transaction.transaction_type,
+            transaction_index: transaction.index,
+            encoded: Some(vec![transaction.transaction_type]),
+            success: Some(success),
+            gas_used: Some(21_000),
+            effective_gas_price: Some(wei(25)),
+            blob_gas_used: blob.then_some(131_072),
+            blob_gas_price: blob.then(|| wei(1)),
+            logs,
+        }
+    }
+
+    /// One block with the header, transactions and receipts filled in full: an
+    /// included transfer, a reverted transfer, a type-3 transfer, a contract
+    /// creation from the same sender, and a transfer from another sender to the
+    /// same recipient.
+    fn full_frame(from: Address, to: Address) -> BlockFrame {
+        let other = Address::new([3; 20]);
+        let transactions = vec![
+            envelope(0, 2, from, Some(to), 1_000),
+            envelope(1, 2, from, Some(to), 500),
+            envelope(2, 3, from, Some(to), 250),
+            envelope(3, 2, from, None, 0),
+            envelope(4, 2, other, Some(to), 42),
+        ];
+        let included_log = Log {
+            address: to,
+            topics: vec![[0xc0; 32]],
+            data: vec![1],
+            transaction_hash: Some(transactions[0].hash),
+            transaction_index: 0,
+            log_index: 0,
+        };
+        let receipts = vec![
+            receipt(&transactions[0], true, vec![included_log.clone()]),
+            receipt(&transactions[1], false, Vec::new()),
+            receipt(&transactions[2], true, Vec::new()),
+            receipt(&transactions[3], true, Vec::new()),
+            receipt(&transactions[4], true, Vec::new()),
+        ];
+        BlockFrame {
+            chain_id: ChainId(1),
+            block: BlockRef {
+                number: BlockNumber(20_000_000),
+                hash: BlockHash::new([0x0b; 32]),
+                parent_hash: BlockHash::new([0x0a; 32]),
+                timestamp: 1_700_000_000,
+            },
+            finality: Finality::Included,
+            header: Material::Complete(HeaderEnvelope {
+                rlp: Some(vec![0xf9]),
+                transactions_root: Some(BlockHash::new([0xd1; 32])),
+                receipts_root: Some(BlockHash::new([0xd2; 32])),
+                withdrawals_root: Some(BlockHash::new([0xd3; 32])),
+                gas_limit: Some(30_000_000),
+                gas_used: Some(105_000),
+                base_fee_per_gas: Some(wei(7)),
+                blob_gas_used: Some(131_072),
+                excess_blob_gas: Some(0),
+                size_bytes: Some(2_000),
+                transaction_count: Some(5),
+                consensus_size_bytes: Some(2_500),
+            }),
+            transactions: Material::Complete(transactions),
+            receipts: Material::Complete(receipts),
+            logs: Material::Complete(vec![included_log]),
+            withdrawals: Material::Missing(MissingReason::NotRequested),
+            blob_sidecars: Material::Missing(MissingReason::NotRequested),
+            traces: Material::Missing(MissingReason::NotRequested),
+            state_diffs: Material::Missing(MissingReason::NotRequested),
+            provenance: Vec::new(),
+            verification: VerificationReport::default(),
+        }
+    }
+
     #[tokio::test]
     async fn aggregate_state_is_one_key_across_arbitrary_blocks() {
         let processor = processor();
@@ -443,5 +578,31 @@ mod tests {
         let entity = decode_entity(bytes).expect("entity");
         assert_eq!(entity.count, 3);
         assert_eq!(U256::from_be_bytes(entity.total_value.0), U256::from(12));
+    }
+
+    #[tokio::test]
+    async fn mapping_reads_only_declared_field_groups() {
+        let processor = processor();
+        let groups = processor.descriptor().requirements[0].capabilities;
+        let frame = full_frame(processor.config.from, processor.config.to);
+        let restricted = leani_testkit::restrict_to_groups(&frame, groups);
+        assert!(restricted != frame, "restriction removed no field");
+
+        let full = processor.map(&frame).await.expect("map full frame");
+        let narrow = processor
+            .map(&restricted)
+            .await
+            .expect("map restricted frame");
+        assert_eq!(narrow, full);
+
+        // The payload is fixed-width, so its length proves nothing: decode it.
+        // The reverted transfer counts, because receipts are never requested.
+        let contribution: BlockContribution =
+            postcard::from_bytes(&full.payload).expect("contribution");
+        assert_eq!(contribution.count, 3);
+        assert_eq!(
+            U256::from_be_bytes(contribution.total_value.0),
+            U256::from(1_750)
+        );
     }
 }

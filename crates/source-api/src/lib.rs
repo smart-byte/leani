@@ -3,6 +3,7 @@
 mod conformance;
 mod contract;
 mod planner;
+mod stored;
 mod telemetry;
 
 pub use conformance::{
@@ -18,6 +19,7 @@ pub use contract::{
     VerificationPolicy,
 };
 pub use planner::{PlanError, SelectionPolicy, coverage_gaps, select_source};
+pub use stored::stop_at_unfilled_groups;
 pub use telemetry::{
     NetworkDisconnectReason, NetworkDisconnectSnapshot, NetworkLane, NetworkPeerLifecycleSnapshot,
     NetworkPeerOrigin, NetworkPeerOriginSnapshot, NetworkPeerQualification,

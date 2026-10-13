@@ -16,6 +16,7 @@ use leani_source_api::{
     BlockFrameStream, DataRequest, FinalityModel, HistoryLookupCapabilities, HistorySource,
     LocatedTransaction, Partitioning, PhysicalPlanOperation, PhysicalReader, SourceBudget,
     SourceChunk, SourceDescriptor, SourceError, SourcePlan, VerificationPolicy, coverage_gaps,
+    stop_at_unfilled_groups,
 };
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
@@ -72,7 +73,12 @@ impl RetainedHistorySourceConfig {
             chain_id,
             material_shape,
             capabilities,
-            log_fields: LogFieldSet::ALL,
+            // stored frames hold every log field, but only logs carry them
+            log_fields: if capabilities.with_derivable().contains(Capability::Logs) {
+                LogFieldSet::ALL
+            } else {
+                LogFieldSet::NONE
+            },
             verification,
             trust,
             priority: 0,
@@ -340,6 +346,29 @@ impl RetainedHistorySource {
 struct RetainedPartition {
     segment_id: SegmentId,
     range: BlockRange,
+    /// The requested groups, which each frame read must fill.
+    required: CapabilitySet,
+}
+
+/// A chunk planned before partitions named their groups: read unchecked.
+#[derive(Deserialize)]
+struct LegacyRetainedPartition {
+    segment_id: SegmentId,
+    range: BlockRange,
+}
+
+impl RetainedPartition {
+    fn decode(bytes: &[u8]) -> Result<Self, SourceError> {
+        postcard::from_bytes(bytes).or_else(|_| {
+            postcard::from_bytes::<LegacyRetainedPartition>(bytes)
+                .map(|legacy| Self {
+                    segment_id: legacy.segment_id,
+                    range: legacy.range,
+                    required: CapabilitySet::NONE,
+                })
+                .map_err(|error| SourceError::InvalidPlan(error.to_string()))
+        })
+    }
 }
 
 #[async_trait]
@@ -545,6 +574,7 @@ impl HistorySource for RetainedHistorySource {
                 partition: postcard::to_allocvec(&RetainedPartition {
                     segment_id: record.metadata.id.clone(),
                     range,
+                    required: request.required,
                 })
                 .map_err(|error| SourceError::InvalidPlan(error.to_string()))?,
                 schema_version: RETAINED_SCHEMA_VERSION.to_owned(),
@@ -582,8 +612,7 @@ impl HistorySource for RetainedHistorySource {
                 "retained chunk identity does not match this source".to_owned(),
             ));
         }
-        let partition: RetainedPartition = postcard::from_bytes(&chunk.partition)
-            .map_err(|error| SourceError::InvalidPlan(error.to_string()))?;
+        let partition = RetainedPartition::decode(&chunk.partition)?;
         if partition.range != chunk.range {
             return Err(SourceError::InvalidPlan(
                 "retained partition range differs from its chunk".to_owned(),
@@ -611,6 +640,7 @@ impl HistorySource for RetainedHistorySource {
                 "retained segment no longer satisfies its planned chunk".to_owned(),
             ));
         }
+        let available = descriptor.present_capabilities.with_derivable();
         self.stats.segment_opens.fetch_add(1, Ordering::Relaxed);
         let stats = self.stats.clone();
         let store = self.store.clone();
@@ -652,9 +682,15 @@ impl HistorySource for RetainedHistorySource {
                 }
             }
         });
-        Ok(Box::pin(stream::unfold(receiver, |mut receiver| async {
+        let frames = Box::pin(stream::unfold(receiver, |mut receiver| async {
             receiver.recv().await.map(|item| (item, receiver))
-        })))
+        }));
+        Ok(stop_at_unfilled_groups(
+            frames,
+            partition.required,
+            range,
+            available,
+        ))
     }
 }
 
@@ -1150,6 +1186,114 @@ mod tests {
             Err(SourceError::MissingMaterial { .. })
         ));
         assert_eq!(stronger.stats().segment_opens, 0);
+    }
+
+    #[tokio::test]
+    async fn stored_frames_without_requested_senders_pass_the_rest_on() {
+        let directory = tempdir().expect("temporary directory");
+        let store = HistoryStore::open(config(directory.path()))
+            .await
+            .expect("store");
+        let shape = MaterialShapeId::COMPLETE_EXECUTION;
+        // captured from a body-only request: complete bodies without senders
+        let mut all = frames(30, 31);
+        for frame in &mut all {
+            frame.transactions = Material::Complete(vec![leani_primitives::TransactionEnvelope {
+                hash: leani_primitives::TransactionHash::new([7; 32]),
+                transaction_type: 2,
+                index: 0,
+                encoded: None,
+                from: None,
+                to: None,
+                nonce: Some(0),
+                gas_limit: Some(21_000),
+                value: Some(leani_primitives::Quantity::new([0; 32])),
+                input: Some(Vec::new()),
+                max_fee_per_gas: None,
+                max_priority_fee_per_gas: None,
+                max_fee_per_blob_gas: None,
+                blob_versioned_hashes: Vec::new(),
+                size_bytes: None,
+            }]);
+            frame.receipts = Material::Missing(leani_primitives::MissingReason::NotRequested);
+        }
+        Box::pin(publish(
+            &store,
+            "senderless",
+            &all,
+            shape,
+            VerificationClass::TrustedDataset,
+            TrustModel::TrustedDataset,
+        ))
+        .await;
+        let source = RetainedHistorySource::new(
+            store,
+            RetainedHistorySourceConfig::local(
+                ChainId(1),
+                shape,
+                all[0].capabilities().complete,
+                VerificationClass::TrustedDataset,
+                TrustModel::TrustedDataset,
+            )
+            .expect("profile"),
+        )
+        .expect("source");
+        let range = BlockRange::new(BlockNumber(30), BlockNumber(31)).expect("range");
+        let read = |required| {
+            let source = source.clone();
+            async move {
+                let plan = source.plan(&request(range, required)).await.expect("plan");
+                source
+                    .open(&plan.chunks[0], budget(), CancellationToken::new())
+                    .await
+                    .expect("open")
+                    .collect::<Vec<_>>()
+                    .await
+            }
+        };
+        let body = CapabilitySet::of(Capability::Body);
+        assert!(read(body).await.iter().all(Result::is_ok));
+        let senders = body.with(Capability::Senders);
+        let frames = read(senders).await;
+        assert_eq!(frames.len(), 1, "{frames:?}");
+        assert!(
+            matches!(
+                &frames[0],
+                Err(SourceError::MissingMaterial { gaps, required, .. })
+                    if gaps == &vec![range] && *required == senders.bits()
+            ),
+            "{frames:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_profile_without_logs_reads_no_log_fields() {
+        let directory = tempdir().expect("temporary directory");
+        let store = HistoryStore::open(config(directory.path()))
+            .await
+            .expect("store");
+        // blobs-money's field groups derive no logs
+        let groups = [
+            Capability::Header,
+            Capability::Senders,
+            Capability::BlobFields,
+            Capability::BlockSize,
+            Capability::ReceiptOutcome,
+        ]
+        .into_iter()
+        .collect();
+        RetainedHistorySource::new(
+            store,
+            RetainedHistorySourceConfig::local(
+                ChainId(1),
+                MaterialShapeId::COMPLETE_EXECUTION,
+                groups,
+                VerificationClass::TrustedDataset,
+                TrustModel::TrustedDataset,
+            )
+            .expect("profile"),
+        )
+        .expect("a profile without logs");
     }
 
     #[test]

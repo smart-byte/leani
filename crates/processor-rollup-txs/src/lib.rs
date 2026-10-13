@@ -278,9 +278,10 @@ impl RollupTxsProcessor {
             start: StartPoint::Block(config.start_block),
             requirements: vec![DataRequirement {
                 capabilities: CapabilitySet::of(Capability::Header)
-                    .with(Capability::Transactions)
+                    .with(Capability::Body)
+                    .with(Capability::Senders)
                     .with(Capability::Calldata)
-                    .with(Capability::Receipts),
+                    .with(Capability::ReceiptOutcome),
                 log_fields: leani_primitives::LogFieldSet::NONE,
                 allow_filtered: true,
                 filter: FilterScope {
@@ -635,7 +636,8 @@ fn validate_delta_cursor(
 #[cfg(test)]
 mod tests {
     use leani_primitives::{
-        BlockRef, ChainId, HeaderEnvelope, MissingReason, TransactionEnvelope, VerificationReport,
+        BlockRef, ChainId, HeaderEnvelope, Log, MissingReason, TransactionEnvelope,
+        VerificationReport,
     };
     use leani_testkit::MemoryReducer;
     use serde_json::{Value, json};
@@ -732,9 +734,9 @@ mod tests {
                 encoded: None,
                 from: Some(tx.from),
                 to: Some(tx.to),
-                nonce: None,
-                gas_limit: None,
-                value: None,
+                nonce: Some(0),
+                gas_limit: Some(1_000_000),
+                value: Some(Quantity::from(U256::ZERO)),
                 input: Some(tx.input.clone()),
                 max_fee_per_gas: None,
                 max_priority_fee_per_gas: None,
@@ -873,6 +875,61 @@ mod tests {
             finality: frame.finality,
             sequence: 1,
         }
+    }
+
+    /// `frame` with the fields a complete block carries filled in, as a source
+    /// delivers it, so that restricting it has something to drop.
+    fn fully_populated(mut frame: BlockFrame) -> BlockFrame {
+        let Material::Complete(header) = &mut frame.header else {
+            unreachable!("frame() builds a complete header");
+        };
+        header.rlp = Some(vec![0xf9, 0x02, 0x00]);
+        header.transactions_root = Some(BlockHash::new([0x71; 32]));
+        header.receipts_root = Some(BlockHash::new([0x72; 32]));
+        header.withdrawals_root = Some(BlockHash::new([0x73; 32]));
+        header.size_bytes = Some(24_000);
+        header.blob_gas_used = Some(131_072);
+        header.consensus_size_bytes = Some(90_000);
+
+        let Material::Complete(transactions) = &mut frame.transactions else {
+            unreachable!("frame() builds complete transactions");
+        };
+        for transaction in transactions {
+            transaction.encoded = Some(vec![0x02]);
+            transaction.max_fee_per_gas = Some(Quantity::from(U256::from(20_u64)));
+            transaction.max_priority_fee_per_gas = Some(Quantity::from(U256::from(2_u64)));
+            transaction.size_bytes = Some(150);
+            if transaction.transaction_type == 3 {
+                transaction.blob_versioned_hashes = vec![BlockHash::new([0xb1; 32])];
+                transaction.max_fee_per_blob_gas = Some(Quantity::from(U256::from(3_u64)));
+            }
+        }
+
+        let Material::Complete(receipts) = &mut frame.receipts else {
+            unreachable!("frame() builds complete receipts");
+        };
+        let mut logs = Vec::new();
+        for receipt in receipts {
+            receipt.encoded = Some(vec![0x02]);
+            if receipt.success == Some(true) {
+                let log = Log {
+                    address: Address::new([0x44; 20]),
+                    topics: vec![[0x55; 32]],
+                    data: vec![0x66],
+                    transaction_hash: Some(receipt.transaction_hash),
+                    transaction_index: receipt.transaction_index,
+                    log_index: 0,
+                };
+                receipt.logs = vec![log.clone()];
+                logs.push(log);
+            }
+            if receipt.transaction_type == 3 {
+                receipt.blob_gas_used = Some(131_072);
+                receipt.blob_gas_price = Some(Quantity::from(U256::from(1_u64)));
+            }
+        }
+        frame.logs = Material::Complete(logs);
+        frame
     }
 
     #[test]
@@ -1082,7 +1139,7 @@ mod tests {
             processor()
                 .derive(&frame)
                 .expect_err("a receipt without its outcome"),
-            ProcessorError::Input("receipt.success is required".to_owned())
+            ProcessorError::Input("receipts lack outcome fields".to_owned())
         );
     }
 
@@ -1200,13 +1257,13 @@ mod tests {
     }
 
     #[test]
-    fn a_receipt_of_another_transaction_type_is_an_invariant_error() {
+    fn a_receipt_of_another_transaction_type_is_rejected() {
         let frame = with_receipt_type(frame(500, &[batch(9)]), 0, 1);
         assert_eq!(
             processor()
                 .derive(&frame)
                 .expect_err("a receipt of another type"),
-            ProcessorError::Invariant("transaction/receipt identity mismatch".to_owned())
+            ProcessorError::Input("receipts do not match the transactions one to one".to_owned())
         );
     }
 
@@ -1558,5 +1615,95 @@ mod tests {
                 "{description}"
             );
         }
+    }
+
+    #[test]
+    fn declares_only_the_field_groups_it_reads() {
+        assert_eq!(
+            processor().descriptor().requirements[0].capabilities,
+            CapabilitySet::from_iter([
+                Capability::Header,
+                Capability::Body,
+                Capability::Senders,
+                Capability::Calldata,
+                Capability::ReceiptOutcome,
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn mapping_reads_only_declared_field_groups() {
+        let stranger = Address::new([0xee; 20]);
+        let processor = processor();
+        let mut block = fully_populated(with_receipt_success(
+            frame(
+                500,
+                &[
+                    // a calldata batch, recorded
+                    batch(9),
+                    // a batch that reverted: recorded, flagged unsuccessful
+                    Tx {
+                        input: vec![0x00, 0x02],
+                        ..batch(9)
+                    },
+                    // an output proposal, matched by its rule's selector
+                    Tx {
+                        kind: 2,
+                        from: stranger,
+                        to: GAME_FACTORY,
+                        input: vec![0x82, 0xec, 0xf2, 0xf6, 0x01],
+                        gas: 300,
+                        price: 7,
+                    },
+                    // a blob transaction: the blobs processor reports those, not this one
+                    Tx {
+                        kind: 3,
+                        from: BATCHER,
+                        to: stranger,
+                        input: Vec::new(),
+                        gas: 50,
+                        price: 9,
+                    },
+                    // a contract creation, given no recipient below
+                    Tx {
+                        kind: 2,
+                        from: stranger,
+                        to: stranger,
+                        input: vec![0x60, 0x80],
+                        gas: 500_000,
+                        price: 9,
+                    },
+                    // sent to a rule's recipient, but not from its sender
+                    Tx {
+                        from: stranger,
+                        ..batch(9)
+                    },
+                ],
+            ),
+            1,
+            Some(false),
+        ));
+        let Material::Complete(transactions) = &mut block.transactions else {
+            unreachable!("frame() builds complete transactions");
+        };
+        transactions[4].to = None;
+
+        let full = processor.map(&block).await.expect("map the full block");
+        let restricted = processor
+            .map(&leani_testkit::restrict_to_groups(
+                &block,
+                processor.descriptor().requirements[0].capabilities,
+            ))
+            .await
+            .expect("map the restricted block");
+        assert_eq!(full, restricted);
+        // not vacuous: the three rule matches are recorded, the reverted one flagged
+        let delta: RollupTxsDelta = postcard::from_bytes(&full.payload).expect("decode");
+        let recorded = delta
+            .transactions
+            .iter()
+            .map(|transaction| (transaction.transaction_index, transaction.success))
+            .collect::<Vec<_>>();
+        assert_eq!(recorded, [(0, true), (1, false), (2, true)]);
     }
 }

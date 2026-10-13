@@ -6,18 +6,23 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 #[repr(u8)]
 pub enum Capability {
+    /// Header material: guarantees gas limit and gas used.
     Header = 0,
-    /// Transaction-body material without requiring recovered sender addresses.
+    /// Transaction-body fields: `to`, nonce, gas limit, and value of every
+    /// transaction, and the header's transaction count.
     ///
-    /// [`crate::TransactionEnvelope::from`] may be absent. Require
-    /// [`Self::Transactions`] when consuming senders; sources still evaluate
-    /// active sender predicates before filtering Body or Calldata material.
+    /// [`crate::TransactionEnvelope::from`] may be absent: require
+    /// [`Self::Senders`] when consuming senders. Sources still evaluate active
+    /// sender predicates before filtering Body or Calldata material.
     Body = 1,
-    /// Decoded transactions; request this capability when senders are required.
+    /// Every transaction field group: [`Self::Body`], [`Self::Calldata`],
+    /// [`Self::Senders`], [`Self::BlobFields`], and [`Self::BlockSize`].
     Transactions = 2,
     /// Transaction input bytes. Like [`Self::Body`], this does not require
     /// recovered sender addresses.
     Calldata = 3,
+    /// Complete receipts: [`Self::ReceiptOutcome`], [`Self::Logs`], and the
+    /// rest of the raw receipt.
     Receipts = 4,
     Logs = 5,
     Withdrawals = 6,
@@ -26,6 +31,17 @@ pub enum Capability {
     StateDiffs = 9,
     ConsensusFinality = 10,
     Mempool = 11,
+    /// Recovered sender of every transaction.
+    Senders = 12,
+    /// Versioned hashes and blob fee cap of every type-3 transaction, and the
+    /// blob gas used of every type-3 receipt.
+    BlobFields = 13,
+    /// Status, gas used, and effective gas price of every receipt, one receipt
+    /// per transaction when both are present.
+    ReceiptOutcome = 14,
+    /// The execution block's RLP size and transaction count: whoever measures
+    /// the block holds its body.
+    BlockSize = 15,
 }
 
 impl Capability {
@@ -58,7 +74,7 @@ impl<'de> Deserialize<'de> for CapabilitySet {
 
 impl CapabilitySet {
     pub const NONE: Self = Self(0);
-    pub const ALL: Self = Self((1 << 12) - 1);
+    pub const ALL: Self = Self(u16::MAX);
 
     #[must_use]
     pub const fn of(capability: Capability) -> Self {
@@ -95,15 +111,20 @@ impl CapabilitySet {
         Self(self.0 & other.0)
     }
 
-    /// Add capabilities that are losslessly derivable from supplied material.
+    /// Add capabilities that are losslessly derivable from supplied material:
+    /// the field groups each bundle stands for.
     #[must_use]
     pub const fn with_derivable(self) -> Self {
         let mut bits = self.0;
         if self.contains(Capability::Transactions) {
-            bits |= Capability::Body.bit() | Capability::Calldata.bit();
+            bits |= Capability::Body.bit()
+                | Capability::Calldata.bit()
+                | Capability::Senders.bit()
+                | Capability::BlobFields.bit()
+                | Capability::BlockSize.bit();
         }
         if self.contains(Capability::Receipts) {
-            bits |= Capability::Logs.bit();
+            bits |= Capability::Logs.bit() | Capability::ReceiptOutcome.bit();
         }
         Self(bits)
     }
@@ -114,17 +135,16 @@ impl CapabilitySet {
     }
 
     /// Construct a set when every bit belongs to a known capability.
+    ///
+    /// Every `u16` bit names a capability, so this cannot fail today; it stays
+    /// fallible for callers decoding durable bits if the set ever widens.
     #[must_use]
     pub const fn from_bits(bits: u16) -> Option<Self> {
-        if bits & !Self::ALL.0 == 0 {
-            Some(Self(bits))
-        } else {
-            None
-        }
+        Some(Self(bits))
     }
 
     pub fn iter(self) -> impl Iterator<Item = Capability> {
-        const VALUES: [Capability; 12] = [
+        const VALUES: [Capability; 16] = [
             Capability::Header,
             Capability::Body,
             Capability::Transactions,
@@ -137,6 +157,10 @@ impl CapabilitySet {
             Capability::StateDiffs,
             Capability::ConsensusFinality,
             Capability::Mempool,
+            Capability::Senders,
+            Capability::BlobFields,
+            Capability::ReceiptOutcome,
+            Capability::BlockSize,
         ];
         VALUES
             .into_iter()
@@ -198,11 +222,45 @@ mod tests {
     }
 
     #[test]
+    fn bundles_derive_their_field_groups() {
+        let transactions = CapabilitySet::of(Capability::Transactions).with_derivable();
+        for group in [
+            Capability::Body,
+            Capability::Calldata,
+            Capability::Senders,
+            Capability::BlobFields,
+            Capability::BlockSize,
+        ] {
+            assert!(transactions.contains(group), "{group:?}");
+        }
+        let receipts = CapabilitySet::of(Capability::Receipts).with_derivable();
+        assert!(receipts.contains(Capability::Logs));
+        assert!(receipts.contains(Capability::ReceiptOutcome));
+        assert!(!receipts.contains(Capability::Senders));
+        // field groups derive nothing, and the header derives no block size
+        let narrow = CapabilitySet::of(Capability::Senders).with(Capability::Header);
+        assert_eq!(narrow.with_derivable(), narrow);
+    }
+
+    #[test]
+    fn field_groups_take_the_last_four_bits() {
+        assert_eq!(CapabilitySet::ALL.bits(), u16::MAX);
+        assert_eq!(CapabilitySet::ALL.iter().count(), 16);
+        let groups = CapabilitySet::of(Capability::BlockSize).with(Capability::ReceiptOutcome);
+        let encoded = postcard::to_allocvec(&groups).expect("encode");
+        assert_eq!(
+            postcard::from_bytes::<CapabilitySet>(&encoded).expect("decode"),
+            groups
+        );
+    }
+
+    #[test]
     fn decoding_rejects_unknown_capability_bits() {
-        let unknown = CapabilitySet::ALL.bits() + 1;
+        // every u16 bit names a capability, so only wider values are unknown
+        let unknown = u32::from(CapabilitySet::ALL.bits()) + 1;
         let encoded = postcard::to_allocvec(&unknown).expect("encode");
         assert!(postcard::from_bytes::<CapabilitySet>(&encoded).is_err());
-        let deserializer: serde::de::value::U16Deserializer<serde::de::value::Error> =
+        let deserializer: serde::de::value::U32Deserializer<serde::de::value::Error> =
             serde::de::IntoDeserializer::into_deserializer(unknown);
         assert!(CapabilitySet::deserialize(deserializer).is_err());
 

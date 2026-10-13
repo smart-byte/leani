@@ -8400,8 +8400,9 @@ mod tests {
     /// Another consumer's credential, equally valid on its own.
     const OTHER_CREDENTIAL: &str = "other-consumer-credential-0123456789abcdef";
 
-    /// Apply finalized blocks through `processor.map`. The frames carry an
-    /// empty complete header, which an ordered ledger requires.
+    /// Apply finalized blocks through `processor.map`. The frames carry a
+    /// complete header for an empty block: the gas, count and size fields
+    /// that the header and transaction groups promise.
     async fn apply_finalized_blocks(
         store: &SqliteStore,
         processor: &dyn Processor,
@@ -8421,13 +8422,13 @@ mod tests {
                 transactions_root: None,
                 receipts_root: None,
                 withdrawals_root: None,
-                gas_limit: None,
-                gas_used: None,
+                gas_limit: Some(30_000_000),
+                gas_used: Some(0),
                 base_fee_per_gas: None,
                 blob_gas_used: None,
                 excess_blob_gas: None,
-                size_bytes: None,
-                transaction_count: None,
+                size_bytes: Some(540),
+                transaction_count: Some(0),
                 consensus_size_bytes: None,
             });
             let delta = processor.map(&frame).await.expect("map");
