@@ -28,6 +28,9 @@ record, and documented RPC contracts.
 - An entity page with `fromBlock` and `toBlock` over at most 100,000 rows sorts
   that range's keys from the block index instead of walking the whole
   collection in key order. Rows, order, and cursors are unchanged.
+- Store statistics behind `/metrics` and network status answer from the last
+  scan at once while the next one runs in the background, at most every four
+  scan durations, so a scrape no longer waits for scans of a large store.
 - A backfill admitted while other jobs held every active chunk slot widens its
   read-ahead as slots free up, instead of reading one chunk at a time for the
   rest of its gap.
