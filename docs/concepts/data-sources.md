@@ -197,8 +197,9 @@ The projections check what the dataset declares:
   its next configured source, as is a blob transaction the beacon payload
   lists without its execution row;
 - a block's log rows, all of them, must carry log indices from 0 without a
-  gap. Xatu publishes no log count or bloom per block, so a block whose last
-  logs, or all of them, are missing still passes;
+  gap, and a block of at least eight transactions must have some. Xatu
+  publishes no log count or bloom per block, so a block whose last logs are
+  missing still passes, as does a smaller block missing all of them;
 - the blobs projection proves every block's withdrawals, on which its
   execution size depends, from the global withdrawal index: between two slots
   with rows the indices must continue exactly, so a slot between them

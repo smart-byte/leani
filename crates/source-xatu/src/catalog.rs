@@ -720,6 +720,8 @@ pub enum XatuError {
     },
     #[error("Xatu withdrawals of {range:?} are incomplete: {detail}")]
     IncompleteWithdrawals { range: BlockRange, detail: String },
+    #[error("Xatu logs of {range:?} are incomplete: {detail}")]
+    IncompleteLogs { range: BlockRange, detail: String },
     #[error("Xatu object {location} has {detail}, so its reads cannot be pinned to one version")]
     Unpinned { location: String, detail: String },
 }

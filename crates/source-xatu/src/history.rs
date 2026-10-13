@@ -749,7 +749,8 @@ fn source_error(error: XatuError, chunk_range: BlockRange) -> SourceError {
             SourceError::MissingRange(chunk_range)
         }
         error @ (XatuError::IncompleteRange { range, .. }
-        | XatuError::IncompleteWithdrawals { range, .. }) => SourceError::IncompleteRange {
+        | XatuError::IncompleteWithdrawals { range, .. }
+        | XatuError::IncompleteLogs { range, .. }) => SourceError::IncompleteRange {
             range,
             detail: error.to_string(),
         },
