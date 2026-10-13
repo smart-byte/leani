@@ -56,6 +56,12 @@ record, and documented RPC contracts.
   eight transactions without a single Xatu log row is one too: Xatu publishes
   no log count, and of 279,829 sampled blocks with transactions, the four
   without logs held one to three transactions.
+- Archive reconciliation skips coverage that compaction reduced to proof
+  segments, logging it once as unaudited, and coverage nothing holds, instead
+  of ending the network lanes at every start. Compaction keeps blocks after a
+  processor's first verified hot/cold handoff exact until reconciliation
+  passes them, up to 65,536 blocks below finality, and an incomplete archive
+  range is waited out like a missing one.
 
 ### Upgrading
 

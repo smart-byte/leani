@@ -580,6 +580,16 @@ again. A durable `failed` archive reconciliation is a correctness incident:
 preserve the database and source object, stop publication, and compare the
 processor version/configuration and block identity before resuming.
 
+Reconciliation compares only exact finalized coverage, which keeps each
+block's identity and mapped-delta checksum. It skips blocks nothing covers,
+and blocks that coverage compaction reduced to proof segments, logging the
+latter once as `archive reconciliation cannot compare blocks compaction
+reduced to proof segments; they stay unaudited`. Compaction keeps the blocks
+after a processor's first verified hot/cold handoff exact until a verified
+reconciliation passes them, unless they lie more than 65,536 blocks below
+finality, so only an audit stalled that long loses blocks to compaction.
+
+
 ### Finality outage or disagreement
 
 Continue only explicitly included publication. Do not advance or prune the
