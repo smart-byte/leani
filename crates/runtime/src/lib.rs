@@ -2486,7 +2486,8 @@ impl HistoricalRuntime {
             })
             .collect::<VecDeque<_>>();
         if let Some(coordinator) = &self.material_coordinator {
-            let acquisition_window = coordinator.acquisition_window(budget.max_in_flight_requests);
+            let acquisition_window =
+                coordinator.acquisition_window(budget.max_in_flight_requests, 0);
             let mut opened = VecDeque::<(
                 SourceChunk,
                 BlockRange,
@@ -2559,7 +2560,12 @@ impl HistoricalRuntime {
                 checkpoint.chunks_completed = checkpoint.chunks_completed.saturating_add(1);
                 self.save_checkpoint(job, job_payload, JobState::Running, attempts, checkpoint)
                     .await?;
-                if let Some((next_chunk, next_logical_range)) = planned.pop_front() {
+                // Replace the committed chunk, and widen the window into
+                // active slots freed meanwhile.
+                while opened.len()
+                    < coordinator.acquisition_window(budget.max_in_flight_requests, opened.len())
+                    && let Some((next_chunk, next_logical_range)) = planned.pop_front()
+                {
                     let next_stream = coordinator.open(
                         source_policy.clone(),
                         source.clone(),

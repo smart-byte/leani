@@ -21,6 +21,9 @@ record, and documented RPC contracts.
 
 ### Changed
 
+- A backfill admitted while other jobs held every active chunk slot widens its
+  read-ahead as slots free up, instead of reading one chunk at a time for the
+  rest of its gap.
 - `rollup-txs` 1.0.0, `blobs-money` 1.5.0 and `transaction-stats` 1.0.0
   declare narrower field groups: `Header`, `Body`, `Senders`, `Calldata` and
   `ReceiptOutcome` for `rollup-txs`; `Header`, `Senders`, `BlobFields`,
