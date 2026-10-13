@@ -2970,7 +2970,10 @@ fn append_history_metrics(
         let owner_progress = progress.entry(owner).or_default();
         owner_progress[0] = owner_progress[0].saturating_add(job.requested_blocks);
         owner_progress[1] = owner_progress[1].saturating_add(job.processed_blocks);
-        owner_progress[2] = owner_progress[2].saturating_add(job.remaining_blocks);
+        // A failed or cancelled job runs no further; a retry is its own job.
+        if !matches!(job.state, BackfillState::Failed | BackfillState::Cancelled) {
+            owner_progress[2] = owner_progress[2].saturating_add(job.remaining_blocks);
+        }
         let Some(report) = &job.report else {
             continue;
         };
@@ -3002,7 +3005,10 @@ fn append_history_metrics(
     for (name, help) in [
         ("requested_blocks", "Requested historical blocks."),
         ("committed_blocks", "Durably processed historical blocks."),
-        ("remaining_blocks", "Historical blocks remaining."),
+        (
+            "remaining_blocks",
+            "Historical blocks remaining in jobs that have not failed or been cancelled.",
+        ),
     ] {
         writeln!(output, "# HELP leani_historical_{name} {help}")?;
         writeln!(output, "# TYPE leani_historical_{name} gauge")?;
@@ -14840,6 +14846,53 @@ mod tests {
         assert_eq!(
             diagnostic_ranges(false, "blobs-production", Some(100), &coverage, &[]),
             vec![(0, 100)]
+        );
+    }
+
+    #[test]
+    fn remaining_history_counts_only_jobs_that_can_still_run() {
+        // Report 2026-10-13 §4: leani_historical_remaining_blocks read
+        // 473,649 with no job running; cancelled jobs stayed counted.
+        let job = |id: &str, state, remaining_blocks| BackfillStatus {
+            id: id.to_owned(),
+            owner: HistoricalWorkOwner::Materialization,
+            processor: "events-v1".to_owned(),
+            processor_configured: true,
+            consumer: None,
+            delivery_stream_id: None,
+            publication_revision: None,
+            from_block: 1,
+            to_block: 20,
+            ranges: vec![BackfillRange {
+                from_block: 1,
+                to_block: 20,
+            }],
+            requested_blocks: 20,
+            processed_blocks: 20 - remaining_blocks,
+            remaining_blocks,
+            captured_finalized_target: None,
+            mode: BackfillExecutionMode::FillMissing,
+            batching: None,
+            state,
+            attempts: 1,
+            updated_at_unix_ms: 1,
+            report: None,
+            last_error: None,
+        };
+        let mut output = String::new();
+        append_history_metrics(
+            &mut output,
+            &[
+                job("running", BackfillState::Running, 11),
+                job("failed", BackfillState::Failed, 5),
+                job("cancelled", BackfillState::Cancelled, 7),
+            ],
+        )
+        .expect("metrics");
+        assert!(
+            output
+                .contains("leani_historical_remaining_blocks{owner_kind=\"materialization\"} 11\n"),
+            "{output}"
         );
     }
 

@@ -202,6 +202,15 @@ pub(crate) fn processor_descriptors(
         .collect()
 }
 
+/// Blocks a backfill has yet to process: none once it completed, although it
+/// skipped, without processing them, blocks other work had covered.
+fn remaining_blocks(state: leani_api::BackfillState, requested: u64, processed: u64) -> u64 {
+    match state {
+        leani_api::BackfillState::Completed | leani_api::BackfillState::CompleteReclaimable => 0,
+        _ => requested.saturating_sub(processed),
+    }
+}
+
 fn config_for_processor_descriptor<'a>(
     config: &'a Config,
     descriptor: &leani_processor_api::ProcessorDescriptor,
@@ -1059,6 +1068,10 @@ impl NativeBackfillControl {
             .processors
             .iter()
             .any(|processor| processor.descriptor().instance.as_str() == job.processor_instance);
+        let state = subscription.as_ref().map_or_else(
+            || Self::api_state(record.state),
+            |subscription| Self::api_subscription_state(subscription.state),
+        );
         Ok(leani_api::BackfillStatus {
             id: record.id.clone(),
             owner: match job.owner {
@@ -1086,7 +1099,7 @@ impl NativeBackfillControl {
                 .collect(),
             requested_blocks,
             processed_blocks,
-            remaining_blocks: requested_blocks.saturating_sub(processed_blocks),
+            remaining_blocks: remaining_blocks(state, requested_blocks, processed_blocks),
             captured_finalized_target,
             mode: Self::api_mode(job.mode),
             batching: subscription.as_ref().map(|subscription| {
@@ -1110,10 +1123,7 @@ impl NativeBackfillControl {
                 }
             }),
             publication_revision,
-            state: subscription.as_ref().map_or_else(
-                || Self::api_state(record.state),
-                |subscription| Self::api_subscription_state(subscription.state),
-            ),
+            state,
             attempts: record.attempts,
             updated_at_unix_ms: record.updated_at_unix_ms,
             report: outcome
@@ -11201,6 +11211,23 @@ markets = ["ETH/USDT"]
         let (summary, _live) = hand_over_to_live(&config, &store, &processors, &chain).await;
         assert!(summary.failed.is_empty(), "{:?}", summary.failed);
         reconcile_until_verified(&config, &store, &processors).await;
+    }
+
+    #[test]
+    fn completed_backfills_have_nothing_remaining() {
+        // Report 2026-10-13 §4: a completed fill_missing job that skipped 380
+        // covered blocks reported them as remaining.
+        use leani_api::BackfillState;
+        assert_eq!(remaining_blocks(BackfillState::Completed, 2_000, 1_620), 0);
+        assert_eq!(
+            remaining_blocks(BackfillState::CompleteReclaimable, 2_000, 1_620),
+            0
+        );
+        assert_eq!(remaining_blocks(BackfillState::Running, 2_000, 1_620), 380);
+        assert_eq!(
+            remaining_blocks(BackfillState::Cancelled, 2_000, 1_620),
+            380
+        );
     }
 
     #[tokio::test]
