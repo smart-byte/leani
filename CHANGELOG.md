@@ -6,6 +6,17 @@ record, and documented RPC contracts.
 
 ## [Unreleased]
 
+### Fixed
+
+- A failed history read moves only the blocks it failed on to the next source,
+  then the gap returns to the first source. A Xatu hole that names its blocks
+  sends just those blocks, with Xatu serving both sides of it; a stalled or
+  failed download sends its chunk. Before, one failed Xatu chunk moved the rest
+  of the job to execution P2P: a single stalled download turned a 25,000-block
+  job of about 90 s into about 450 s. Blocks a source has not published yet, a
+  schema drift, and a second failure before a source commits a block still hand
+  the next source the rest of the gap.
+
 ## [0.1.0-rc.5] - 2026-10-13
 
 ### Added
