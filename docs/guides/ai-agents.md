@@ -15,18 +15,49 @@ how to configure processors, and point them at the machine-readable docs.
 
 ## Install the skill
 
-In Claude Code, add this repository as a plugin marketplace and install the
-plugin:
+One command installs it for Codex, Claude Code, Cursor, and other agents that
+read [Agent Skills](https://agentskills.io):
+
+```bash
+npx skills add smart-byte/leani -g
+```
+
+`-g` installs it for your user, so every project sees it; leave it out to
+install into the current project only. The command installs the skill from
+`main`. To match an older `leani` binary, install from its release tag instead,
+such as
+`npx skills add https://github.com/smart-byte/leani/tree/v0.1.0-rc.6/skills/leani -g`.
+
+Agents with plugin marketplaces can install it as a plugin instead. In Codex:
+
+```bash
+codex plugin marketplace add smart-byte/leani
+codex plugin add leani@leani
+```
+
+In Claude Code:
 
 ```text
 /plugin marketplace add smart-byte/leani
 /plugin install leani@leani
 ```
 
-The skill follows the open [Agent Skills](https://agentskills.io) format. For
-other agents, copy the `skills/leani` directory of a Leani checkout into the
-skills directory your agent reads, such as `.agents/skills/` in your project.
-Keep the copy on the same release as your `leani` binary.
+Start a new agent session after installing. Then name Leani in the request,
+such as "use leani to count the distinct addresses that deposited into Lido in
+the last 7 days". The name alone is ambiguous on the web, so without the skill,
+write `leani.dev` to give the agent a site to read.
+
+## Questions become processors
+
+The skill teaches agents to answer an Ethereum data question in this order:
+
+1. Use a built-in processor when one produces the data, such as `evm-events`
+   for decoded contract events.
+2. Otherwise write a [custom processor](/docs/guides/custom-processor/). This
+   is the normal way to extend Leani: it is needed for aggregates such as
+   distinct counts or sums, for transaction values rather than logs, and for
+   state across contracts.
+3. Backfill the range, check coverage, and query the result.
 
 ## Give agents the docs
 

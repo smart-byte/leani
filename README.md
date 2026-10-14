@@ -29,6 +29,13 @@ cargo build --locked --release -p leani   # target/release/leani
 
 See the [install guide](https://leani.dev/docs/getting-started/install/).
 
+Using a coding agent? Install the Leani skill for Codex, Claude Code, Cursor,
+and others, then ask it to "use leani" for any Ethereum data question:
+
+```bash
+npx skills add smart-byte/leani -g
+```
+
 ## Follow Ethereum blocks
 
 No configuration file:
@@ -172,7 +179,9 @@ the Leani cursor inside your own database transaction.
 
 ## Your own processor
 
-Processors are Rust. [`examples/custom-node`](examples/custom-node) adds a
+When no built-in processor produces the data you need, write your own; that is
+the intended way to extend Leani. Processors are Rust.
+[`examples/custom-node`](examples/custom-node) adds a
 native processor and a query extension to the stock node through
 `leani::run_with_registry`, without forking it. See the
 [processor-author guide](https://leani.dev/docs/guides/custom-processor/).
@@ -207,7 +216,7 @@ and the [architecture notes](docs/contributing/architecture.md).
 
 - [leani.dev/docs](https://leani.dev/docs/): quickstart, guides, CLI, configuration, HTTP API, and SDK references.
 - [`docs/`](docs/): the Markdown sources.
-- [AI agents](https://leani.dev/docs/guides/ai-agents/): the [`skills/leani`](skills/leani/SKILL.md) agent skill (`/plugin marketplace add smart-byte/leani` in Claude Code) and [llms.txt](https://leani.dev/llms.txt).
+- [AI agents](https://leani.dev/docs/guides/ai-agents/): the [`skills/leani`](skills/leani/SKILL.md) agent skill (`npx skills add smart-byte/leani -g`, or the `smart-byte/leani` plugin marketplace in Codex and Claude Code) and [llms.txt](https://leani.dev/llms.txt).
 - [CHANGELOG.md](CHANGELOG.md) and [SECURITY.md](SECURITY.md).
 
 ## Contributing

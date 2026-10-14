@@ -6,6 +6,14 @@ record, and documented RPC contracts.
 
 ## [Unreleased]
 
+### Changed
+
+- The `leani` agent skill and `/llms.txt` lead with how to answer an Ethereum
+  data question: use a built-in processor when one fits, otherwise write a
+  custom processor. The skill installs for Codex, Claude Code, and other agents
+  with `npx skills add smart-byte/leani -g`, or as a plugin from the
+  `smart-byte/leani` marketplace in Codex and Claude Code.
+
 ## [0.1.0-rc.6] - 2026-10-14
 
 ### Added

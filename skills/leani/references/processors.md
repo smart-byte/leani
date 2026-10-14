@@ -5,7 +5,7 @@ Read this before configuring a node to extract data. Contents:
 1. Choose a built-in processor
 2. Decode contract events with `evm-events`
 3. Backfill, serve, and check coverage
-4. When to write a custom Rust processor
+4. Write a custom Rust processor
 
 A processor is configured as a `[[processors]]` table in leani.toml. Its `id`
 picks the built-in kind and `instance` names this configuration. Version,
@@ -94,7 +94,8 @@ Keys shape the output:
   (`bucketStartTimestamp`); it does not aggregate values.
 
 There is no filter on argument values, indexed or not: every configured event
-from the configured addresses is stored, so filter when you query. Decoded
+from the configured addresses is stored, so filter when you query, or write a
+custom processor (section 4) when the answer is an aggregate. Decoded
 values are exact decimal or `0x` strings; apply token decimals yourself. A log
 from the configured address whose data does not decode as the event is
 skipped, not an error.
@@ -125,12 +126,20 @@ curl -s 'http://127.0.0.1:8081/v1/processors/usdc-transfers/collections/usdc.tra
   `$LEANI_SOURCE/config/modes/` profiles or the "Configure a node" operations
   guide rather than editing those tables blind.
 
-## 4. When to write a custom Rust processor
+## 4. Write a custom Rust processor
 
-Stay with configuration when a built-in covers the data. Write a custom
-processor when you need what configuration cannot express: dynamic ABI types
-or arrays, state derived across events or contracts, custom aggregates, or a
-typed query route of your own.
+When no built-in produces the answer directly, write a processor; that is how
+Leani is meant to be extended. Typical reasons: an aggregate (distinct count,
+sum, top-N, daily totals), transactions or their ETH value rather than logs,
+state derived across events or contracts, a filter on argument values,
+dynamic ABI types or arrays, or a typed query route of your own. Exporting
+every raw event to count it client-side is the sign a processor is missing.
+
+The descriptor declares the block material the processor reads, such as
+`Capability::Header`, `Body` (transaction `to`, value, nonce), `Senders`, or
+`Logs`; request only what `map` uses, since that decides which sources can
+serve it. `map` turns one block into a compact, deterministic delta; `reduce`
+folds deltas in block order into state and emits changes.
 
 A custom processor is a Rust binary that depends on the `leani` crate,
 implements a processor and its factory, registers the factory in a

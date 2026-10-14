@@ -1,0 +1,4 @@
+User-agent: *
+Allow: /
+
+Sitemap: https://leani.dev/sitemap-index.xml

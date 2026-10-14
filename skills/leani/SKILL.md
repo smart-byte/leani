@@ -1,6 +1,6 @@
 ---
 name: leani
-description: Runs and queries leani, a self-hosted Ethereum indexing node and CLI. It follows Mainnet blocks over P2P with no API key, backfills historical ranges, and extracts contract events and logs, ERC-20 balances, Uniswap prices, and blob data into a local HTTP API, TypeScript SDK, and JSON-RPC subset. Use this skill whenever a task mentions the `leani` command, a leani.toml, leani.dev, or @smart-byte/leani-sdk, or needs live or historical Ethereum blocks, contract events, or prices without a hosted RPC provider, including writing custom Rust processors for leani.
+description: Runs, queries, and extends leani (leani.dev), a self-hosted Ethereum indexing node and CLI. It follows Mainnet blocks over P2P with no API key, backfills historical ranges, and turns blocks, transactions, and logs into application data through processors, served over a local HTTP API, TypeScript SDK, and JSON-RPC subset. Use this skill whenever a task mentions leani, the `leani` command, a leani.toml, leani.dev, or @smart-byte/leani-sdk, or asks to answer a question from live or historical Ethereum data without a hosted RPC provider. Covers choosing a built-in processor and writing a custom Rust processor when none fits, which is the normal way to get data the built-ins do not provide.
 license: MIT
 ---
 
@@ -12,11 +12,34 @@ datasets, runs *processors* that turn blocks into application data, and keeps
 only their results. One binary provides the CLI, the node (`leani serve`), a
 native HTTP API with streaming, and a JSON-RPC subset. It is alpha software.
 
-## When to use it, and when not
+## Answer a question with leani
 
-Use leani to follow new blocks or Uniswap prices live, to index contract events
-or ERC-20 transfers over a block range, to serve those results to an
-application, or to build a custom processor in Rust.
+A question about Ethereum data becomes a processor: it reads each block and
+keeps only the result the question needs. Work in this order:
+
+1. **Use a built-in processor if one fits.** They cover block summaries,
+   decoded contract events (`evm-events`), ERC-20 balances, transactions
+   between one address pair, Uniswap pools, blobs, and rollup transactions.
+   [references/processors.md](references/processors.md) lists them and their
+   configuration.
+2. **Otherwise write a custom processor.** That is the normal path, not a
+   workaround. A processor is a `map` from block material to a compact delta
+   and a `reduce` that folds deltas into state; Leani supplies the sources,
+   backfill, finality, reorgs, storage, and HTTP API. Write one when the
+   answer needs:
+   - an aggregate, such as a distinct count, sum, top-N, or daily total:
+     compute it in `reduce` rather than exporting every event and counting
+     client-side;
+   - transactions or their ETH value rather than logs: `evm-events` sees only
+     logs;
+   - state across several events or contracts, a filter on argument values,
+     or ABI types `evm-events` rejects;
+   - a typed query route of its own.
+
+   Start from the maintained example, as section 4 of
+   [references/processors.md](references/processors.md) describes.
+3. **Backfill the range, serve, and query.** Check coverage before you report
+   a number.
 
 Leani keeps no EVM state, so it refuses `eth_call`, `eth_getBalance`,
 `eth_getCode`, `eth_getStorageAt`, `eth_estimateGas`, and traces. Use an
