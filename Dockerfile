@@ -1,7 +1,7 @@
 # Base images are pinned to multi-architecture index digests, which
 # Dependabot refreshes. The Rust tag must name the rust-toolchain.toml version;
 # scripts/check-container-toolchain.rb enforces this in CI.
-FROM rust:1.98.1-bookworm@sha256:93ce27a88655056a51dbdd8f5f2d7ddc071c7b0070fb288a37b5a285fc83971e AS builder
+FROM rust:1.99.0-bookworm@sha256:114c7a4425406451c2866b6aafe69fe29b1b298832db1277d411ac73c82d04d6 AS builder
 
 ARG LEANI_GIT_COMMIT=unknown
 WORKDIR /source
