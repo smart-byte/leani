@@ -1,6 +1,6 @@
 ---
 import TerminalFrame from './TerminalFrame.astro';
-import { HOMEBREW_INSTALL, INSTALL_URL, QUICKSTART_URL } from '../config';
+import { AGENT_SKILL_INSTALL, AI_AGENTS_URL, HOMEBREW_INSTALL, INSTALL_URL, QUICKSTART_URL } from '../config';
 import { hlShell, hlTs } from '../lib/highlight';
 import { exampleSource } from '../lib/examples';
 import { blockRowHtml } from '../lib/block-row';
@@ -75,6 +75,14 @@ const firstRows = session.rows.slice(0, 6);
           <button type="button" class="copy mono" data-copy-button aria-label="Copy install command" data-umami-event="copy" data-umami-event-place="follow" data-umami-event-item={HOMEBREW_INSTALL}>copy</button>
         </div>
         <a class="install-more" href={`${INSTALL_URL}#published-releases`} data-umami-event="outbound" data-umami-event-place="follow" data-umami-event-to="install docs">Other platforms →</a>
+      </div>
+      <div class="install mono">
+        <span class="install-label">agent skill</span>
+        <div class="command" data-copy-value={AGENT_SKILL_INSTALL}>
+          <span data-copy-source set:html={hlShell(AGENT_SKILL_INSTALL)} />
+          <button type="button" class="copy mono" data-copy-button aria-label="Copy agent skill install command" data-umami-event="copy" data-umami-event-place="follow" data-umami-event-item={AGENT_SKILL_INSTALL}>copy</button>
+        </div>
+        <a class="install-more" href={AI_AGENTS_URL} data-umami-event="outbound" data-umami-event-place="follow" data-umami-event-to="ai agents docs">Codex, Claude Code →</a>
       </div>
       <p class="status mono" role="status" aria-live="polite" data-copy-status></p>
     </div>
