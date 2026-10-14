@@ -6,6 +6,14 @@ record, and documented RPC contracts.
 
 ## [Unreleased]
 
+### Added
+
+- `leani_history_material_active_acquisitions_limit` reports how many history
+  reads may run at once, next to `leani_history_material_active_acquisitions`.
+  A backfill subscription whose plan leaves read slots idle logs a hint, once
+  per processor, with its chunk size and a subscription size that keeps every
+  slot busy.
+
 ### Fixed
 
 - A failed history read moves only the blocks it failed on to the next source,

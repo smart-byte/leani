@@ -181,7 +181,11 @@ leaves while others wait for it, becomes read-ahead with the frames it already
 holds, so read-ahead can hold more than half. `[budgets.history_pipeline]` is
 separate: `maximum_active_chunks` caps physical history reads node-wide and
 `maximum_mapped_bytes` caps processor-owned mapped deltas across every active
-job. Its nested `commit` table flushes a contiguous SQLite transaction at the
+job. A job reads only its own planned chunks, so a backfill subscription
+smaller than `maximum_active_chunks` source chunks leaves read slots idle; the
+node logs a hint with a size that fills them, once per processor, and
+`leani_history_material_active_acquisitions` against
+`leani_history_material_active_acquisitions_limit` shows the slots in use. Its nested `commit` table flushes a contiguous SQLite transaction at the
 first configured block, domain-change, stable-encoded-byte, or elapsed-time
 limit: by default 128 blocks, 10,000 changes, 16 MiB, or 50 ms.
 `target_writer_hold`, 250 ms by default, controls the adaptive block limit:

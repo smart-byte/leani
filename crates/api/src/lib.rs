@@ -739,6 +739,7 @@ pub struct HistoricalMaterialMetrics {
     pub overfetched_bytes: u64,
     pub logical_frame_deliveries: u64,
     pub active_acquisitions: u64,
+    pub active_acquisitions_limit: u64,
     pub buffered_bytes: u64,
 }
 
@@ -2923,6 +2924,12 @@ fn append_historical_material_metrics(
             "gauge",
             "Historical material acquisitions currently reading a source.",
             metrics.active_acquisitions,
+        ),
+        (
+            "active_acquisitions_limit",
+            "gauge",
+            "Historical material acquisitions that may read a source at once.",
+            metrics.active_acquisitions_limit,
         ),
         (
             "buffer_bytes",
@@ -14620,6 +14627,7 @@ mod tests {
                 overfetched_bytes: 1_024,
                 logical_frame_deliveries: 500,
                 active_acquisitions: 1,
+                active_acquisitions_limit: 8,
                 buffered_bytes: 512,
             }),
         )
@@ -14634,6 +14642,7 @@ mod tests {
         assert!(output.contains("leani_history_material_overfetched_bytes_total 1024"));
         assert!(output.contains("leani_history_material_logical_frame_deliveries_total 500"));
         assert!(output.contains("leani_history_material_active_acquisitions 1"));
+        assert!(output.contains("leani_history_material_active_acquisitions_limit 8"));
         assert!(output.contains("leani_history_material_buffer_bytes 512"));
     }
 
