@@ -6,6 +6,8 @@ record, and documented RPC contracts.
 
 ## [Unreleased]
 
+## [0.1.0-rc.6] - 2026-10-14
+
 ### Added
 
 - `leani_history_material_active_acquisitions_limit` reports how many history
