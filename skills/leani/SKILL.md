@@ -12,6 +12,11 @@ datasets, runs *processors* that turn blocks into application data, and keeps
 only their results. One binary provides the CLI, the node (`leani serve`), a
 native HTTP API with streaming, and a JSON-RPC subset. It is alpha software.
 
+The binary carries this guide for its own release: `leani guide` prints it and
+`leani guide processors` prints the processor reference. A skill copy can be
+newer or older than the binary; `leani guide` and `--help` always describe the
+installed one. Binaries before 0.1.0-rc.7 have no `guide` command.
+
 ## Answer a question with leani
 
 A question about Ethereum data becomes a processor: it reads each block and
@@ -20,8 +25,8 @@ keeps only the result the question needs. Work in this order:
 1. **Use a built-in processor if one fits.** They cover block summaries,
    decoded contract events (`evm-events`), ERC-20 balances, transactions
    between one address pair, Uniswap pools, blobs, and rollup transactions.
-   [references/processors.md](references/processors.md) lists them and their
-   configuration.
+   [references/processors.md](references/processors.md)
+   (`leani guide processors`) lists them and their configuration.
 2. **Otherwise write a custom processor.** That is the normal path, not a
    workaround. A processor is a `map` from block material to a compact delta
    and a `reduce` that folds deltas into state; Leani supplies the sources,
@@ -36,8 +41,8 @@ keeps only the result the question needs. Work in this order:
      or ABI types `evm-events` rejects;
    - a typed query route of its own.
 
-   Start from the maintained example, as section 4 of
-   [references/processors.md](references/processors.md) describes.
+   Start from the maintained example, as section 4 of the processor
+   reference describes.
 3. **Backfill the range, serve, and query.** Check coverage before you report
    a number.
 
@@ -115,9 +120,10 @@ leani subscribe blocks --json      # from this directory, attaches to the runnin
 ```
 
 Index contract events or another historical range: read
-[references/processors.md](references/processors.md) first. It covers choosing
-a built-in processor, the event-decoding configuration and its limits,
-backfills, coverage checks, and when a custom Rust processor is needed.
+[references/processors.md](references/processors.md) (`leani guide processors`)
+first. It covers choosing a built-in processor, the event-decoding
+configuration and its limits, backfills, coverage checks, and custom Rust
+processors.
 
 ## HTTP API and SDK
 

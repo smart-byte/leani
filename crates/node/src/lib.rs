@@ -5,6 +5,7 @@ mod block_summaries;
 mod builtin_processors;
 pub mod cli;
 pub mod config;
+mod guide;
 mod init;
 mod local_state;
 pub mod process;

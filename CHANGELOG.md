@@ -6,6 +6,12 @@ record, and documented RPC contracts.
 
 ## [Unreleased]
 
+### Added
+
+- `leani guide` prints the agent skill's guide as compiled into the binary, and
+  `leani guide processors` its processor reference, so agents and scripts read
+  guidance that matches the installed release.
+
 ### Changed
 
 - The `leani` agent skill and `/llms.txt` lead with how to answer an Ethereum
