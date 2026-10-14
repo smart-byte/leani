@@ -25,6 +25,10 @@ record, and documented RPC contracts.
   schema drift, and a second failure before a source commits a block still hand
   the next source the rest of the gap.
 
+### Security
+
+- Updated rustls to 0.23.46 for RUSTSEC-2026-0346 to RUSTSEC-2026-0349.
+
 ## [0.1.0-rc.5] - 2026-10-13
 
 ### Added
