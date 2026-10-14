@@ -204,6 +204,81 @@
         "subcommands": []
       },
       {
+        "name": "guide",
+        "about": "Print the guide for agents and scripts that matches this binary",
+        "usage": "Usage: leani guide [OPTIONS] [TOPIC]",
+        "arguments": [
+          {
+            "id": "topic",
+            "long": null,
+            "short": null,
+            "help": "Section to print [default: the overview]",
+            "required": false,
+            "action": "Set",
+            "defaultValues": [],
+            "possibleValues": [
+              "processors"
+            ]
+          },
+          {
+            "id": "config",
+            "long": "config",
+            "short": null,
+            "help": "Path to the versioned TOML configuration",
+            "required": false,
+            "action": "Set",
+            "defaultValues": [],
+            "possibleValues": []
+          },
+          {
+            "id": "log_format",
+            "long": "log-format",
+            "short": null,
+            "help": "Log rendering format",
+            "required": false,
+            "action": "Set",
+            "defaultValues": [
+              "pretty"
+            ],
+            "possibleValues": [
+              "pretty",
+              "json"
+            ]
+          },
+          {
+            "id": "log_filter",
+            "long": "log-filter",
+            "short": null,
+            "help": "Tracing filter, e.g. `info,leani=debug`",
+            "required": false,
+            "action": "Set",
+            "defaultValues": [],
+            "possibleValues": []
+          },
+          {
+            "id": "help",
+            "long": "help",
+            "short": "h",
+            "help": "Print help (see more with '--help')",
+            "required": false,
+            "action": "Help",
+            "defaultValues": [],
+            "possibleValues": []
+          },
+          {
+            "id": "version",
+            "long": "version",
+            "short": "V",
+            "help": "Print version",
+            "required": false,
+            "action": "Version",
+            "defaultValues": [],
+            "possibleValues": []
+          }
+        ],
+        "subcommands": []
+      },
+      {
         "name": "init",
         "about": "Create a compact configuration for a built-in processor",
         "usage": "Usage: leani init [OPTIONS] <PROTOCOL> [TARGET]...",
@@ -4056,6 +4131,13 @@
             "name": "serve",
             "about": "Start configured sources, processors, stores, and serving endpoints",
             "usage": "Usage: leani help serve",
+            "arguments": [],
+            "subcommands": []
+          },
+          {
+            "name": "guide",
+            "about": "Print the guide for agents and scripts that matches this binary",
+            "usage": "Usage: leani help guide",
             "arguments": [],
             "subcommands": []
           },

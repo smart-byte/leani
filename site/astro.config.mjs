@@ -66,7 +66,7 @@ export default defineConfig({
           details: [
             'Agents, start here:',
             '',
-            '1. Install the Leani agent skill: `npx skills add smart-byte/leani -g` (Codex, Claude Code, Cursor, and other agents), or see https://leani.dev/docs/guides/ai-agents/.',
+            '1. Install the Leani agent skill: `npx skills add smart-byte/leani -g` (Codex, Claude Code, Cursor, and other agents), or see https://leani.dev/docs/guides/ai-agents/. With the binary installed, `leani guide` prints the same guide for that release.',
             '2. Use a built-in processor if one fits: `block-summary` (gas, base fee, blobs per block), `evm-events` (decode chosen events of chosen contracts, no code), `erc20-balances`, `transaction-stats`, `uniswap-observations`, `uniswap-latest`, `blobs-money`, `rollup-txs`.',
             '3. Otherwise write a custom processor in Rust: `map` turns a block into a compact delta, `reduce` folds deltas into state, and Leani supplies sources, backfill, finality, reorgs, storage, and the HTTP API. Write one for aggregates (distinct counts, sums, top-N), transaction values rather than logs, state across contracts, or value filters. Guide: https://leani.dev/docs/guides/custom-processor/',
             '4. Backfill the block range, run `leani serve`, check coverage, then query the HTTP API.',

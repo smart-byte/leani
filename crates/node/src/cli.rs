@@ -38,6 +38,17 @@ pub enum Command {
     },
     /// Start configured sources, processors, stores, and serving endpoints.
     Serve,
+    /// Print the guide for agents and scripts that matches this binary.
+    #[command(after_help = "Examples:
+  leani guide
+  leani guide processors
+
+Written for agents and scripts. For tutorials and guides, see https://leani.dev/docs/.")]
+    Guide {
+        /// Section to print [default: the overview].
+        #[arg(value_enum)]
+        topic: Option<GuideTopic>,
+    },
     /// Create a compact configuration for a built-in processor.
     #[command(after_help = "Examples:
   leani init blocks
@@ -325,6 +336,13 @@ fn parse_duration(value: &str) -> Result<Duration, humantime::DurationError> {
         |_| humantime::parse_duration(value),
         |seconds| Ok(Duration::from_secs(seconds)),
     )
+}
+
+/// Sections of `leani guide` beyond the overview.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum GuideTopic {
+    /// Built-in processors, event decoding, backfills, and custom processors.
+    Processors,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]

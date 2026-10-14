@@ -3153,6 +3153,7 @@ pub async fn run_cli_with_registry(cli: Cli, registry: &ProcessorRegistry) -> Re
     match cli.command {
         Command::Doctor { json } => doctor(&config_path, json, registry),
         Command::Serve => serve(&config_path, registry).await,
+        Command::Guide { topic } => crate::guide::print(topic),
         Command::Init {
             protocol,
             targets,

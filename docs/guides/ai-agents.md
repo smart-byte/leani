@@ -42,6 +42,11 @@ In Claude Code:
 /plugin install leani@leani
 ```
 
+The `leani` binary carries the same guide for its own release: `leani guide`
+prints the overview and `leani guide processors` the processor reference. An
+agent without the skill can read it there, and one with a newer skill than
+the binary should prefer it.
+
 Start a new agent session after installing. Then name Leani in the request,
 such as "use leani to count the distinct addresses that deposited into Lido in
 the last 7 days". The name alone is ambiguous on the web, so without the skill,
