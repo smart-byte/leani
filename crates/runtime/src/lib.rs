@@ -3,6 +3,7 @@
 
 mod historical_material;
 
+use historical_material::intersect_ranges;
 pub use historical_material::{
     AcquisitionBudgetShape, AcquisitionShape, HistoricalMaterialCoordinator,
     HistoricalMaterialCoordinatorConfig, HistoricalMaterialCoordinatorMode,
@@ -1686,6 +1687,8 @@ impl HistoricalRuntime {
         // to the next only after a source error. A source that refused to
         // plan the job is skipped for the rest of it.
         let mut source_index = 0_usize;
+        // The blocks the last failed attempt could not serve, when known.
+        let mut detour = None::<Detour>;
         let mut refused = BTreeSet::new();
         let mut source_bytes = 0_u64;
         let mut physical_source_bytes = 0_u64;
@@ -1869,10 +1872,51 @@ impl HistoricalRuntime {
                 continue;
             }
 
-            while refused.contains(&source_index) {
-                source_index = source_index.saturating_add(1) % source_count;
+            // Only the blocks a source failed on move to the next source: the
+            // failed source keeps the blocks before them, and the first
+            // source takes the gap back after them. No physical request
+            // widens back into them.
+            let (mut attempt_index, range, physical_window) = match detour {
+                Some(failed) if gap.start() < failed.range.start() => {
+                    let before = BlockNumber(failed.range.start().0 - 1);
+                    (
+                        failed.from,
+                        BlockRange::new(gap.start(), gap.end().min(before)).ok(),
+                        BlockRange::new(BlockNumber(0), before).ok(),
+                    )
+                }
+                Some(failed) if gap.start() <= failed.range.end() => (
+                    failed.from.saturating_add(1) % source_count,
+                    BlockRange::new(gap.start(), gap.end().min(failed.range.end())).ok(),
+                    BlockRange::new(BlockNumber(0), failed.range.end()).ok(),
+                ),
+                Some(failed) => (
+                    source_index,
+                    Some(gap),
+                    failed.range.end().0.checked_add(1).and_then(|after| {
+                        BlockRange::new(BlockNumber(after), BlockNumber(u64::MAX)).ok()
+                    }),
+                ),
+                None => (source_index, Some(gap), None),
+            };
+            let range = range.ok_or_else(|| {
+                RuntimeError::InvalidConfig("historical detour range is invalid".to_owned())
+            })?;
+            let (completes_subscription, expected_successor_parent) = if range == gap {
+                (completes_subscription, expected_successor_parent)
+            } else {
+                request.range = range;
+                (
+                    false,
+                    self.store
+                        .coverage_parent_hash(descriptor, BlockNumber(range.end().0 + 1))
+                        .await?,
+                )
+            };
+            while refused.contains(&attempt_index) {
+                attempt_index = attempt_index.saturating_add(1) % source_count;
             }
-            let source = self.sources.get(source_index).cloned().ok_or_else(|| {
+            let source = self.sources.get(attempt_index).cloned().ok_or_else(|| {
                 RuntimeError::InvalidConfig("historical source index is invalid".to_owned())
             })?;
             let source_id = source.descriptor().id.to_string();
@@ -1888,12 +1932,15 @@ impl HistoricalRuntime {
             let physical_bytes_before = physical_source_bytes;
             let reused_bytes_before = reused_source_bytes;
             let coalesced_before = coalesced_frames;
+            let mut failed_chunk = None;
             let attempt = self
                 .run_gap(
                     source.clone(),
                     &job,
                     &job_payload,
                     &request,
+                    physical_window,
+                    &mut failed_chunk,
                     budget,
                     attempts,
                     &mut checkpoint,
@@ -1954,6 +2001,8 @@ impl HistoricalRuntime {
             source_report.elapsed_milliseconds = source_report
                 .elapsed_milliseconds
                 .saturating_add(elapsed_milliseconds(attempt_started));
+            let progressed = checkpoint.frames_committed > committed_before
+                || duplicate_frames > duplicates_before;
             if let Err(error) = &attempt
                 && !matches!(error, RuntimeError::Cancelled)
             {
@@ -1961,14 +2010,13 @@ impl HistoricalRuntime {
                 source_report.last_error = Some(error.to_string());
                 // A failure after committing blocks opens a fresh budget, so
                 // scattered transient errors never exhaust a long job.
-                let progressed = checkpoint.frames_committed > committed_before
-                    || duplicate_frames > duplicates_before;
                 gap_failures = if progressed {
                     1
                 } else {
                     gap_failures.saturating_add(1)
                 };
             }
+            let source_failures = source_report.failures;
             match attempt {
                 Ok(()) => {
                     gap_failures = 0;
@@ -1977,13 +2025,36 @@ impl HistoricalRuntime {
                 Err(RuntimeError::Source(error))
                     if failover_source_error(&error) && gap_failures < self.config.max_attempts =>
                 {
-                    source_index = source_index.saturating_add(1) % source_count;
+                    let chunk =
+                        failed_chunk.and_then(|chunk| intersect_ranges(chunk, request.range));
+                    let failed = match &error {
+                        // Blocks the source has not published yet run to its
+                        // end, and a schema drift recurs in later objects: the
+                        // next source keeps the rest of the gap.
+                        SourceError::MissingRange(_) | SourceError::SchemaDrift { .. } => None,
+                        // A dataset hole names its blocks.
+                        SourceError::IncompleteRange { range, .. } => {
+                            intersect_ranges(*range, request.range).or(chunk)
+                        }
+                        // A source that fails again before committing a block
+                        // is down, not stuck on one chunk.
+                        _ if progressed || source_failures == 1 => chunk,
+                        _ => None,
+                    };
+                    detour = failed.map(|range| Detour {
+                        range,
+                        from: attempt_index,
+                    });
+                    if detour.is_none() {
+                        source_index = attempt_index.saturating_add(1) % source_count;
+                    }
                     let delay =
                         retry_delay(self.config.retry_base, self.config.retry_max, gap_failures);
                     warn!(
                         job_id = %job.id,
                         attempt = gap_failures,
                         source_id = %source.descriptor().id,
+                        failed_range = ?failed,
                         ?delay,
                         error = %error,
                         "historical source attempt failed; trying the next source"
@@ -2040,8 +2111,8 @@ impl HistoricalRuntime {
                         %detail,
                         "historical source cannot serve this job; the next source serves it"
                     );
-                    refused.insert(source_index);
-                    source_index = source_index.saturating_add(1) % source_count;
+                    refused.insert(attempt_index);
+                    source_index = attempt_index.saturating_add(1) % source_count;
                 }
                 Err(error) => {
                     self.save_checkpoint(
@@ -2437,6 +2508,8 @@ impl HistoricalRuntime {
         job: &BackfillJob,
         job_payload: &[u8],
         request: &DataRequest,
+        physical_window: Option<BlockRange>,
+        failed_chunk: &mut Option<BlockRange>,
         budget: SourceBudget,
         attempts: u32,
         checkpoint: &mut BackfillCheckpoint,
@@ -2473,6 +2546,12 @@ impl HistoricalRuntime {
             }
             (None, _) => request.clone(),
         };
+        let mut physical_request = physical_request;
+        if let Some(window) = physical_window
+            && let Some(range) = intersect_ranges(physical_request.range, window)
+        {
+            physical_request.range = range;
+        }
         let plan = plan_or_refuse(source.as_ref(), &physical_request).await?;
         plan.validate()?;
         let startup_gate = startup_permit.map(HistoricalMaterialStartupPermit::gate);
@@ -2554,7 +2633,8 @@ impl HistoricalRuntime {
                             .flatten(),
                         &mut || opened.clear(),
                     )
-                    .await?
+                    .await
+                    .inspect_err(|_| *failed_chunk = Some(logical_range))?
                 {
                     ChunkOutcome::Committed(last) => last,
                     // The job replans the rest of the gap from its progress.
@@ -2593,7 +2673,10 @@ impl HistoricalRuntime {
                     .await?,
             );
             let stream = HistoricalMaterialCoordinator::standalone(
-                source.open(&chunk, budget, cancellation.clone()).await?,
+                source
+                    .open(&chunk, budget, cancellation.clone())
+                    .await
+                    .inspect_err(|_| *failed_chunk = Some(logical_range))?,
             );
             prior_chunk_last = match self
                 .run_material_chunk(
@@ -2624,7 +2707,8 @@ impl HistoricalRuntime {
                         .flatten(),
                     &mut || active_chunk = None,
                 )
-                .await?
+                .await
+                .inspect_err(|_| *failed_chunk = Some(logical_range))?
             {
                 ChunkOutcome::Committed(last) => last,
                 // The job replans the rest of the gap from its progress.
@@ -7903,6 +7987,14 @@ fn retryable_finality_source_error(error: &SourceError) -> bool {
         error,
         SourceError::Disconnected(_) | SourceError::Unavailable(_)
     )
+}
+
+/// Blocks a history source failed on, and that source's index: the next
+/// source serves them, then the gap returns to the first source.
+#[derive(Clone, Copy, Debug)]
+struct Detour {
+    range: BlockRange,
+    from: usize,
 }
 
 /// Whether another configured source may still serve a range that `error`
@@ -14721,6 +14813,48 @@ mod tests {
         }
     }
 
+    /// Like Xatu's row checks: every chunk that overlaps `hole` fails, naming
+    /// the hole; or, with `missing`, like objects Xatu has not published yet:
+    /// each such chunk fails as a missing range of its own.
+    struct HoledHistorySource {
+        inner: ScriptedHistorySource,
+        hole: BlockRange,
+        missing: bool,
+    }
+
+    #[async_trait]
+    impl HistorySource for HoledHistorySource {
+        fn descriptor(&self) -> &SourceDescriptor {
+            self.inner.descriptor()
+        }
+
+        async fn plan(
+            &self,
+            request: &DataRequest,
+        ) -> Result<leani_source_api::SourcePlan, SourceError> {
+            self.inner.plan(request).await
+        }
+
+        async fn open(
+            &self,
+            chunk: &SourceChunk,
+            budget: SourceBudget,
+            cancellation: CancellationToken,
+        ) -> Result<leani_source_api::BlockFrameStream, SourceError> {
+            if chunk.range.start() <= self.hole.end() && self.hole.start() <= chunk.range.end() {
+                return Err(if self.missing {
+                    SourceError::MissingRange(chunk.range)
+                } else {
+                    SourceError::IncompleteRange {
+                        range: self.hole,
+                        detail: "injected dataset hole".to_owned(),
+                    }
+                });
+            }
+            self.inner.open(chunk, budget, cancellation).await
+        }
+    }
+
     /// Two-block ranges with one unrequested block between them.
     fn spaced_ranges(count: u64) -> Vec<BlockRange> {
         (0..count)
@@ -14840,6 +14974,268 @@ mod tests {
             "only the gap whose primary read failed falls over"
         );
         assert_eq!(report.final_coverage, ranges);
+    }
+
+    #[tokio::test]
+    async fn only_the_failed_chunk_moves_to_the_next_source() {
+        let range = BlockRange::new(BlockNumber(1), BlockNumber(9)).expect("range");
+        let all_frames = frames(range);
+        let mut primary_descriptor = fixture_source_descriptor("primary", range);
+        primary_descriptor.priority = 0;
+        let chunks = [(1_u64, 3_u64), (4, 6), (7, 9)]
+            .into_iter()
+            .map(|(start, end)| ScriptedChunk {
+                range: BlockRange::new(BlockNumber(start), BlockNumber(end)).expect("chunk"),
+                schema_version: primary_descriptor.schema_version.clone(),
+                estimated_bytes: None,
+                steps: all_frames
+                    .iter()
+                    .filter(|frame| (start..=end).contains(&frame.block.number.0))
+                    .cloned()
+                    .map(|frame| HistoryStep::Frame(Box::new(frame)))
+                    .collect(),
+            })
+            .collect();
+        let primary: Arc<dyn HistorySource> = Arc::new(FlakyHistorySource::new(
+            ScriptedHistorySource::new(primary_descriptor, chunks),
+            [BlockNumber(4)],
+        ));
+        let mut fallback_descriptor = fixture_source_descriptor("fallback", range);
+        fallback_descriptor.priority = 1;
+        let fallback: Arc<dyn HistorySource> = Arc::new(ScriptedHistorySource::from_frames(
+            fallback_descriptor,
+            all_frames,
+        ));
+        let processor = Arc::new(BlockLocalCounter::default());
+        let (_directory, store) = store().await;
+        let runtime = HistoricalRuntime::new_with_sources(
+            store,
+            vec![fallback, primary],
+            processor.clone(),
+            HistoricalRuntimeConfig {
+                mapper_concurrency: 1,
+                max_attempts: 3,
+                retry_base: Duration::from_millis(1),
+                retry_max: Duration::from_millis(1),
+                ..HistoricalRuntimeConfig::default()
+            },
+        )
+        .expect("runtime");
+        let job = BackfillJob::for_processor(
+            "chunk-failover",
+            processor.as_ref(),
+            ChainId(1),
+            range,
+            VerificationPolicy::CompleteCryptographic,
+        )
+        .expect("job");
+
+        let report = runtime
+            .run(job, default_source_budget(), CancellationToken::new())
+            .await
+            .expect("backfill");
+
+        let committed = |id: &str| {
+            report
+                .sources
+                .iter()
+                .find(|source| source.source_id == id)
+                .map(|source| source.frames_committed)
+        };
+        assert_eq!(
+            committed("fallback"),
+            Some(3),
+            "only blocks 4..=6 fall over"
+        );
+        assert_eq!(
+            committed("primary"),
+            Some(6),
+            "the primary takes the gap back after them"
+        );
+        assert_eq!(report.final_coverage, vec![range]);
+    }
+
+    #[tokio::test]
+    async fn only_a_named_hole_moves_to_the_next_source() {
+        let range = BlockRange::new(BlockNumber(1), BlockNumber(9)).expect("range");
+        let all_frames = frames(range);
+        let mut primary_descriptor = fixture_source_descriptor("primary", range);
+        primary_descriptor.priority = 0;
+        let primary: Arc<dyn HistorySource> = Arc::new(HoledHistorySource {
+            inner: ScriptedHistorySource::from_frames(primary_descriptor, all_frames.clone()),
+            hole: BlockRange::single(BlockNumber(5)),
+            missing: false,
+        });
+        let mut fallback_descriptor = fixture_source_descriptor("fallback", range);
+        fallback_descriptor.priority = 1;
+        let fallback: Arc<dyn HistorySource> = Arc::new(ScriptedHistorySource::from_frames(
+            fallback_descriptor,
+            all_frames,
+        ));
+        // The coordinator widens short requests (here by one block); none may
+        // widen back into the hole.
+        let pipeline_budget =
+            HistoricalPipelineBudget::new(2, 2, 4 * 1_024 * 1_024).expect("pipeline budget");
+        let coordinator = HistoricalMaterialCoordinator::new_with_pipeline_budget(
+            HistoricalMaterialCoordinatorConfig {
+                memory_bytes: 4 * 1_024 * 1_024,
+                maximum_buffered_frames_per_acquisition: 8,
+                ..HistoricalMaterialCoordinatorConfig::default()
+            },
+            &pipeline_budget,
+        )
+        .expect("coordinator");
+        let processor = Arc::new(BlockLocalCounter::default());
+        let (_directory, store) = store().await;
+        let runtime = HistoricalRuntime::new_with_sources(
+            store,
+            vec![fallback, primary],
+            processor.clone(),
+            HistoricalRuntimeConfig {
+                mapper_concurrency: 1,
+                max_attempts: 3,
+                retry_base: Duration::from_millis(1),
+                retry_max: Duration::from_millis(1),
+                ..HistoricalRuntimeConfig::default()
+            },
+        )
+        .expect("runtime")
+        .with_pipeline_budget(pipeline_budget)
+        .with_material_coordinator(coordinator);
+        let job = BackfillJob::for_processor(
+            "hole-failover",
+            processor.as_ref(),
+            ChainId(1),
+            range,
+            VerificationPolicy::CompleteCryptographic,
+        )
+        .expect("job");
+
+        let report = runtime
+            .run(job, default_source_budget(), CancellationToken::new())
+            .await
+            .expect("backfill");
+
+        let committed = |id: &str| {
+            report
+                .sources
+                .iter()
+                .find(|source| source.source_id == id)
+                .map(|source| source.frames_committed)
+        };
+        assert_eq!(committed("fallback"), Some(1), "only the hole falls over");
+        assert_eq!(
+            committed("primary"),
+            Some(8),
+            "the primary serves both sides of it"
+        );
+        assert_eq!(report.final_coverage, vec![range]);
+    }
+
+    /// Four 3-block chunks on the primary, `primary` wrapping them; a
+    /// fallback holding every block. Returns the committed frames and
+    /// failures per source.
+    async fn run_four_chunk_failover(
+        primary: impl FnOnce(ScriptedHistorySource) -> Arc<dyn HistorySource>,
+    ) -> BTreeMap<String, (u64, u32)> {
+        let range = BlockRange::new(BlockNumber(1), BlockNumber(12)).expect("range");
+        let all_frames = frames(range);
+        let mut primary_descriptor = fixture_source_descriptor("primary", range);
+        primary_descriptor.priority = 0;
+        let chunks = [(1_u64, 3_u64), (4, 6), (7, 9), (10, 12)]
+            .into_iter()
+            .map(|(start, end)| ScriptedChunk {
+                range: BlockRange::new(BlockNumber(start), BlockNumber(end)).expect("chunk"),
+                schema_version: primary_descriptor.schema_version.clone(),
+                estimated_bytes: None,
+                steps: all_frames
+                    .iter()
+                    .filter(|frame| (start..=end).contains(&frame.block.number.0))
+                    .cloned()
+                    .map(|frame| HistoryStep::Frame(Box::new(frame)))
+                    .collect(),
+            })
+            .collect();
+        let primary = primary(ScriptedHistorySource::new(primary_descriptor, chunks));
+        let mut fallback_descriptor = fixture_source_descriptor("fallback", range);
+        fallback_descriptor.priority = 1;
+        let fallback: Arc<dyn HistorySource> = Arc::new(ScriptedHistorySource::from_frames(
+            fallback_descriptor,
+            all_frames,
+        ));
+        let processor = Arc::new(BlockLocalCounter::default());
+        let (_directory, store) = store().await;
+        let runtime = HistoricalRuntime::new_with_sources(
+            store,
+            vec![fallback, primary],
+            processor.clone(),
+            HistoricalRuntimeConfig {
+                mapper_concurrency: 1,
+                max_attempts: 3,
+                retry_base: Duration::from_millis(1),
+                retry_max: Duration::from_millis(1),
+                ..HistoricalRuntimeConfig::default()
+            },
+        )
+        .expect("runtime");
+        let job = BackfillJob::for_processor(
+            "four-chunk-failover",
+            processor.as_ref(),
+            ChainId(1),
+            range,
+            VerificationPolicy::CompleteCryptographic,
+        )
+        .expect("job");
+        let report = runtime
+            .run(job, default_source_budget(), CancellationToken::new())
+            .await
+            .expect("backfill");
+        assert_eq!(report.final_coverage, vec![range]);
+        report
+            .sources
+            .iter()
+            .map(|source| {
+                (
+                    source.source_id.clone(),
+                    (source.frames_committed, source.failures),
+                )
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_source_failing_again_before_committing_hands_over_the_rest_of_the_gap() {
+        // The second failure comes before the primary commits anything: an
+        // outage, so the fallback keeps the rest instead of the primary
+        // stalling on every chunk.
+        let sources = run_four_chunk_failover(|scripted| {
+            Arc::new(FlakyHistorySource::new(
+                scripted,
+                [BlockNumber(4), BlockNumber(7)],
+            ))
+        })
+        .await;
+        assert_eq!(sources["primary"], (3, 2));
+        assert_eq!(sources["fallback"], (9, 0));
+    }
+
+    #[tokio::test]
+    async fn blocks_a_source_has_not_published_hand_over_the_rest_of_the_gap() {
+        // Xatu's export lag: once an object is missing, the later ones are too.
+        let sources = run_four_chunk_failover(|scripted| {
+            Arc::new(HoledHistorySource {
+                inner: scripted,
+                hole: BlockRange::new(BlockNumber(7), BlockNumber(12)).expect("unpublished"),
+                missing: true,
+            })
+        })
+        .await;
+        assert_eq!(
+            sources["primary"],
+            (6, 1),
+            "one failed read, not one per chunk"
+        );
+        assert_eq!(sources["fallback"], (6, 0));
     }
 
     #[tokio::test]

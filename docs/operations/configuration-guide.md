@@ -277,12 +277,14 @@ validation.
 
 A backfill splits its range into gaps of missing coverage and tries the
 configured history sources for each gap in `priority` order, lowest first. A
-source that cannot serve a gap, because it has not published those blocks,
-its data for them is incomplete, or it cannot fill the processor's field
-groups, passes the gap to the next source; one that serves part of a gap
-commits that part, and the next source continues from there. Each backfill
-retries up to three times the number of sources, at least five times, before
-it fails. When every history source fails and the live source is execution
+source that fails on part of a gap passes only those blocks to the next
+source: the blocks a dataset hole names, or the chunk whose read failed. It
+keeps the blocks before them, and the first source takes the gap back after
+them. A source that has not published the blocks, whose schema changed, or
+that fails again before committing a block passes the rest of the gap instead,
+and one that cannot fill the processor's field groups is skipped for the job.
+Each backfill retries up to three times the number of sources, at least five
+times, before it fails. When every history source fails and the live source is execution
 P2P, P2P can serve the gap within `sources.live.history_fallback_blocks`.
 
 The shipped profiles list eraE at priority 10 and Xatu at priority 20:

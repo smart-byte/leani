@@ -1660,7 +1660,7 @@ struct BufferedFrame {
     retention: Arc<MemoryReservation>,
 }
 
-fn intersect_ranges(first: BlockRange, second: BlockRange) -> Option<BlockRange> {
+pub(crate) fn intersect_ranges(first: BlockRange, second: BlockRange) -> Option<BlockRange> {
     BlockRange::new(
         first.start().max(second.start()),
         first.end().min(second.end()),
