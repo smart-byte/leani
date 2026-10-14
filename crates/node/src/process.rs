@@ -1736,6 +1736,7 @@ impl leani_api::BackfillControl for NativeBackfillControl {
             overfetched_bytes: snapshot.overfetched_bytes,
             logical_frame_deliveries: snapshot.logical_frame_deliveries,
             active_acquisitions: snapshot.active_acquisitions,
+            active_acquisitions_limit: snapshot.active_acquisitions_limit,
             buffered_bytes: snapshot.buffered_bytes,
         })
     }

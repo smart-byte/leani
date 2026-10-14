@@ -7,7 +7,7 @@
 //! single-flight baseline.
 
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     pin::Pin,
     sync::{
         Arc, Mutex, Weak,
@@ -208,6 +208,8 @@ pub struct HistoricalMaterialSnapshot {
     pub overfetched_bytes: u64,
     pub logical_frame_deliveries: u64,
     pub active_acquisitions: u64,
+    /// Most acquisitions that may read a source at once.
+    pub active_acquisitions_limit: u64,
     pub buffered_bytes: u64,
 }
 
@@ -466,6 +468,7 @@ impl HistoricalMaterialCoordinator {
                 overfetched_bytes: AtomicU64::new(0),
                 logical_frame_deliveries: AtomicU64::new(0),
                 active_acquisitions: AtomicU64::new(0),
+                idle_slot_hints: Mutex::new(HashSet::new()),
             }),
         })
     }
@@ -475,6 +478,15 @@ impl HistoricalMaterialCoordinator {
     /// chunks, its `open` ones plus the free active slots. Existing jobs
     /// retain their active slots; a newcomer opens one chunk when all slots
     /// are busy, and widens its window as slots free up.
+    /// True the first time `processor` asks: its idle read-slot hint is due.
+    pub(crate) fn first_idle_slot_hint(&self, processor: &str) -> bool {
+        self.inner
+            .idle_slot_hints
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(processor.to_owned())
+    }
+
     pub(crate) fn acquisition_window(&self, requested: usize, open: usize) -> usize {
         requested.max(1).min(
             open.saturating_add(self.inner.active_chunks.available_permits().max(1))
@@ -994,6 +1006,8 @@ impl HistoricalMaterialCoordinator {
             overfetched_bytes: self.inner.overfetched_bytes.load(Ordering::Relaxed),
             logical_frame_deliveries: self.inner.logical_frame_deliveries.load(Ordering::Relaxed),
             active_acquisitions: self.inner.active_acquisitions.load(Ordering::Relaxed),
+            active_acquisitions_limit: u64::try_from(self.inner.maximum_active_chunks)
+                .unwrap_or(u64::MAX),
             buffered_bytes: *self
                 .inner
                 .memory
@@ -1021,6 +1035,9 @@ struct CoordinatorInner {
     overfetched_bytes: AtomicU64,
     logical_frame_deliveries: AtomicU64,
     active_acquisitions: AtomicU64,
+    /// Processor instances already told that their subscriptions leave read
+    /// slots idle.
+    idle_slot_hints: Mutex<HashSet<String>>,
 }
 
 /// Run one acquisition's producer on its own task.
@@ -1808,6 +1825,20 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+
+    #[test]
+    fn the_snapshot_reports_the_active_slot_limit_and_hints_once_per_processor() {
+        let budget = crate::HistoricalPipelineBudget::new(6, 4, 1 << 30).expect("budget");
+        let coordinator = HistoricalMaterialCoordinator::new_with_pipeline_budget(
+            HistoricalMaterialCoordinatorConfig::default(),
+            &budget,
+        )
+        .expect("coordinator");
+        assert_eq!(coordinator.snapshot().active_acquisitions_limit, 6);
+        assert!(coordinator.first_idle_slot_hint("processor-a"));
+        assert!(!coordinator.first_idle_slot_hint("processor-a"));
+        assert!(coordinator.first_idle_slot_hint("processor-b"));
+    }
 
     #[test]
     fn a_newcomer_widens_its_window_as_active_slots_free_up() {

@@ -2570,6 +2570,28 @@ impl HistoricalRuntime {
         if let Some(coordinator) = &self.material_coordinator {
             let acquisition_window =
                 coordinator.acquisition_window(budget.max_in_flight_requests, 0);
+            let chunk_blocks = planned
+                .iter()
+                .map(|(chunk, _)| chunk.range.len())
+                .collect::<Vec<_>>();
+            let instance = self.processor.descriptor().instance.to_string();
+            if let Some((widest, suggested)) = idle_read_slots(
+                job.owner,
+                request.range == job.request.range,
+                &chunk_blocks,
+                acquisition_window,
+            ) && coordinator.first_idle_slot_hint(&instance)
+            {
+                info!(
+                    job_id = %job.id,
+                    processor = %instance,
+                    planned_chunks = chunk_blocks.len(),
+                    read_slots = acquisition_window,
+                    chunk_blocks = widest,
+                    suggested_blocks = suggested,
+                    "backfill subscription plans fewer chunks than it may read at once; subscriptions of suggested_blocks or more, or several at once, keep every read slot busy"
+                );
+            }
             let mut opened = VecDeque::<(
                 SourceChunk,
                 BlockRange,
@@ -7987,6 +8009,28 @@ fn retryable_finality_source_error(error: &SourceError) -> bool {
         error,
         SourceError::Disconnected(_) | SourceError::Unavailable(_)
     )
+}
+
+/// When a subscription's whole range plans at least two chunks but fewer than
+/// the read slots it may use: the widest chunk, and a subscription size that
+/// would fill those slots.
+fn idle_read_slots(
+    owner: HistoricalJobOwner,
+    whole_job: bool,
+    chunk_blocks: &[u64],
+    read_slots: usize,
+) -> Option<(u64, u64)> {
+    if owner != HistoricalJobOwner::Subscription
+        || !whole_job
+        || !(2..read_slots).contains(&chunk_blocks.len())
+    {
+        return None;
+    }
+    let widest = chunk_blocks.iter().copied().max()?;
+    Some((
+        widest,
+        widest.saturating_mul(u64::try_from(read_slots).unwrap_or(u64::MAX)),
+    ))
 }
 
 /// Blocks a history source failed on, and that source's index: the next
@@ -14974,6 +15018,27 @@ mod tests {
             "only the gap whose primary read failed falls over"
         );
         assert_eq!(report.final_coverage, ranges);
+    }
+
+    #[test]
+    fn a_subscription_planning_fewer_chunks_than_read_slots_gets_a_sizing_hint() {
+        let subscription = HistoricalJobOwner::Subscription;
+        // 25,000 blocks of 8,000-block chunks against 8 read slots
+        assert_eq!(
+            idle_read_slots(subscription, true, &[2_109, 8_000, 8_000, 6_891], 8),
+            Some((8_000, 64_000))
+        );
+        // one chunk is a small repair, not a sizing problem
+        assert_eq!(idle_read_slots(subscription, true, &[300], 8), None);
+        // a chunk for every slot
+        assert_eq!(idle_read_slots(subscription, true, &[1_000; 25], 8), None);
+        // a remainder after progress, or a detour, is not the subscription's size
+        assert_eq!(idle_read_slots(subscription, false, &[8_000; 3], 8), None);
+        // node-owned history sizes its own jobs
+        assert_eq!(
+            idle_read_slots(HistoricalJobOwner::Materialization, true, &[8_000; 3], 8),
+            None
+        );
     }
 
     #[tokio::test]
