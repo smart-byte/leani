@@ -258,17 +258,22 @@ impl CanonicalKey {
     }
 }
 
-/// Chain-confidence status of a block. Ordering is intentional.
+/// Chain-confidence level of a block. Ordering is intentional.
+///
+/// The serde names are the storage names of 0.1.0-rc.6: stored descriptors
+/// and their hashes contain them. Public JSON uses [`Finality::name`].
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[repr(u8)]
 pub enum Finality {
-    /// A peer supplied the block; its connection to the chain is still being
-    /// checked. Only the embedded CLI emits this; it is never persisted.
-    Preview = 0,
-    /// The block is on the currently followed chain: the execution P2P live
-    /// lane verifies its ancestry to an execution header the Ethereum sync
-    /// committee attested. A reorg can remove it.
-    Included = 1,
+    /// At least two peers served the block, it passed the header rules, and
+    /// its parent is the delivered tip; the sync committee has not attested
+    /// it yet. It is undone if no attestation covers it.
+    #[serde(rename = "Preview")]
+    Unattested = 0,
+    /// Its ancestry is verified to an execution block at least two thirds of
+    /// the Ethereum sync committee attested. A reorg can still remove it.
+    #[serde(rename = "Included")]
+    Attested = 1,
     /// Ethereum consensus has finalized the block.
     Finalized = 2,
 }
@@ -283,8 +288,8 @@ impl Finality {
     #[must_use]
     pub const fn name(self) -> &'static str {
         match self {
-            Self::Preview => "preview",
-            Self::Included => "included",
+            Self::Unattested => "unattested",
+            Self::Attested => "attested",
             Self::Finalized => "finalized",
         }
     }
@@ -351,12 +356,12 @@ mod tests {
 
     #[test]
     fn finality_is_monotonic_and_named() {
-        assert!(Finality::Finalized.satisfies(Finality::Included));
-        assert!(Finality::Included.satisfies(Finality::Preview));
-        assert!(!Finality::Preview.satisfies(Finality::Included));
-        assert!(!Finality::Included.satisfies(Finality::Finalized));
-        assert_eq!(Finality::Preview.name(), "preview");
-        assert_eq!(Finality::Included.name(), "included");
+        assert!(Finality::Finalized.satisfies(Finality::Attested));
+        assert!(Finality::Attested.satisfies(Finality::Unattested));
+        assert!(!Finality::Unattested.satisfies(Finality::Attested));
+        assert!(!Finality::Attested.satisfies(Finality::Finalized));
+        assert_eq!(Finality::Unattested.name(), "unattested");
+        assert_eq!(Finality::Attested.name(), "attested");
         assert_eq!(Finality::Finalized.name(), "finalized");
     }
 

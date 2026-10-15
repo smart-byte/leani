@@ -807,7 +807,7 @@ test("typed blobs subscription consumes the production serializer fixture", asyn
 });
 
 test("finality vocabulary matches the OpenAPI enum", () => {
-  const values: Finality[] = ["preview", "included", "finalized"];
+  const values: Finality[] = ["unattested", "attested", "finalized"];
   const wire: OpenApiComponents["schemas"]["Finality"][] = values;
-  expect(wire).toEqual(["preview", "included", "finalized"]);
+  expect(wire).toEqual(["unattested", "attested", "finalized"]);
 });

@@ -165,12 +165,22 @@ pub enum ReductionMode {
     OrderedState,
 }
 
+/// What a processor's consumers see, and from which level on.
+///
+/// The serde names are the storage names of 0.1.0-rc.6: stored descriptors
+/// and their hashes contain them.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PublicationPolicy {
-    IncludedAndFinalized,
-    FinalizedOnly,
-    TerminalOnly,
+    /// Blocks from attested on, with undo.
+    #[serde(rename = "included_and_finalized")]
+    Attested,
+    /// Finalized blocks only; never an undo.
+    #[serde(rename = "finalized_only")]
+    Finalized,
+    /// The final aggregate of a bounded history job only.
+    #[serde(rename = "terminal_only")]
+    JobResult,
 }
 
 /// Legacy output-retention setting accepted while version-1 descriptors and
@@ -253,7 +263,7 @@ pub struct OutputPolicy {
     #[serde(default)]
     pub window: Option<OutputWindow>,
     /// Ignored; kept for descriptor compatibility. To publish only finalized
-    /// blocks, use [`PublicationPolicy::FinalizedOnly`]
+    /// blocks, use [`PublicationPolicy::Finalized`]
     /// (`publish = "finalized_only"`).
     #[serde(default)]
     pub finalized_only: bool,
@@ -574,10 +584,10 @@ impl LifecyclePolicies {
         {
             return Err("until_acknowledged delivery requires a required durable consumer");
         }
-        if matches!(publication, PublicationPolicy::IncludedAndFinalized)
+        if matches!(publication, PublicationPolicy::Attested)
             && matches!(self.undo.mode, UndoPolicyMode::None)
         {
-            return Err("included publication requires an unfinalized undo policy");
+            return Err("attested publication requires an unfinalized undo policy");
         }
         if matches!(self.checkpoint.mode, CheckpointPolicyMode::Automatic)
             && self.checkpoint.keep == 0
@@ -829,6 +839,36 @@ mod tests {
     use super::*;
 
     #[test]
+    fn rc6_descriptor_json_decodes() {
+        let requirement: DataRequirement = serde_json::from_value(serde_json::json!({
+            "capabilities": CapabilitySet::of(Capability::Header),
+            "log_fields": LogFieldSet::NONE,
+            "allow_filtered": false,
+            "filter": FilterScope::default(),
+            "minimum_finality": "Included"
+        }))
+        .expect("rc.6 requirement JSON");
+        assert_eq!(requirement.minimum_finality, Finality::Attested);
+        for (stored, policy) in [
+            ("included_and_finalized", PublicationPolicy::Attested),
+            ("finalized_only", PublicationPolicy::Finalized),
+            ("terminal_only", PublicationPolicy::JobResult),
+        ] {
+            let decoded: PublicationPolicy =
+                serde_json::from_value(serde_json::Value::String(stored.to_owned()))
+                    .expect("policy");
+            assert_eq!(decoded, policy);
+            // The stored name is the serialized name: descriptor hashes and
+            // snapshot identities stay as they are.
+            assert_eq!(serde_json::to_value(decoded).expect("encode"), stored);
+        }
+        assert_eq!(
+            serde_json::to_value(Finality::Unattested).expect("encode"),
+            "Preview"
+        );
+    }
+
+    #[test]
     fn processor_instance_rejects_axum_capture_syntax_at_every_decode_boundary() {
         assert!(ProcessorInstanceId::new(":main").is_err());
         assert!(ProcessorInstanceId::new(".").is_err());
@@ -868,7 +908,7 @@ mod tests {
             log_fields: LogFieldSet::NONE,
             allow_filtered: false,
             filter: FilterScope::default(),
-            minimum_finality: Finality::Included,
+            minimum_finality: Finality::Attested,
         };
         assert_eq!(
             requirement.validate_frame(&frame),
@@ -955,7 +995,7 @@ mod tests {
             log_fields: LogFieldSet::NONE,
             allow_filtered: false,
             filter: FilterScope::default(),
-            minimum_finality: Finality::Included,
+            minimum_finality: Finality::Attested,
         };
         let body = CapabilitySet::of(Capability::Body).with(Capability::Calldata);
         assert_eq!(requirement(body).validate_frame(&frame), Ok(()));
@@ -1019,7 +1059,7 @@ mod tests {
             log_fields: LogFieldSet::NONE,
             allow_filtered: true,
             filter: address_scope(addresses),
-            minimum_finality: Finality::Included,
+            minimum_finality: Finality::Attested,
         }
     }
 
@@ -1231,7 +1271,7 @@ mod tests {
 
         lifecycle.artifacts.mode = ArtifactPolicyMode::Window;
         assert_eq!(
-            lifecycle.validate(PublicationPolicy::FinalizedOnly),
+            lifecycle.validate(PublicationPolicy::Finalized),
             Err("windowed artifacts require an artifact window")
         );
 
@@ -1240,7 +1280,7 @@ mod tests {
             ..ArtifactWindow::default()
         });
         lifecycle
-            .validate(PublicationPolicy::FinalizedOnly)
+            .validate(PublicationPolicy::Finalized)
             .expect("one artifact-window bound is valid");
 
         lifecycle.artifacts.window = Some(ArtifactWindow {
@@ -1249,7 +1289,7 @@ mod tests {
             ..ArtifactWindow::default()
         });
         assert_eq!(
-            lifecycle.validate(PublicationPolicy::FinalizedOnly),
+            lifecycle.validate(PublicationPolicy::Finalized),
             Err("artifact window must declare exactly one block, age, or byte limit")
         );
     }
@@ -1269,11 +1309,11 @@ mod tests {
             required: true,
             lease_ttl_seconds: 100 * 365 * 24 * 60 * 60,
         }];
-        assert_eq!(lifecycle.validate(PublicationPolicy::FinalizedOnly), Ok(()));
+        assert_eq!(lifecycle.validate(PublicationPolicy::Finalized), Ok(()));
         for lease_ttl_seconds in [100 * 365 * 24 * 60 * 60 + 1, u64::MAX, 0] {
             lifecycle.delivery.consumers[0].lease_ttl_seconds = lease_ttl_seconds;
             assert_eq!(
-                lifecycle.validate(PublicationPolicy::FinalizedOnly),
+                lifecycle.validate(PublicationPolicy::Finalized),
                 Err("delivery consumer lease TTLs must be non-zero and at most 100 years"),
                 "{lease_ttl_seconds}"
             );
@@ -1289,20 +1329,20 @@ mod tests {
         let mut lifecycle = LifecyclePolicies::default();
         lifecycle.state.mode = StatePolicyMode::Ephemeral;
         assert_eq!(
-            lifecycle.validate(PublicationPolicy::FinalizedOnly),
+            lifecycle.validate(PublicationPolicy::Finalized),
             Err("ephemeral processor state is not implemented; use durable or checkpointed state")
         );
         lifecycle.state.mode = StatePolicyMode::Checkpointed;
         lifecycle.checkpoint.mode = CheckpointPolicyMode::None;
         assert_eq!(
-            lifecycle.validate(PublicationPolicy::FinalizedOnly),
+            lifecycle.validate(PublicationPolicy::Finalized),
             Err("checkpointed processor state requires automatic checkpoints")
         );
         lifecycle.checkpoint.mode = CheckpointPolicyMode::Automatic;
-        assert_eq!(lifecycle.validate(PublicationPolicy::FinalizedOnly), Ok(()));
+        assert_eq!(lifecycle.validate(PublicationPolicy::Finalized), Ok(()));
         lifecycle.state.mode = StatePolicyMode::Durable;
         lifecycle.checkpoint.mode = CheckpointPolicyMode::None;
-        assert_eq!(lifecycle.validate(PublicationPolicy::FinalizedOnly), Ok(()));
+        assert_eq!(lifecycle.validate(PublicationPolicy::Finalized), Ok(()));
     }
 
     #[test]

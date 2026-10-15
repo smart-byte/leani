@@ -8,10 +8,16 @@ record, and documented RPC contracts.
 
 ### Changed
 
+- Breaking (CLI, HTTP API, SSE, SDK): chain-confidence levels are now
+  `unattested`, `attested` and `finalized`. `included` is `attested` (same
+  guarantee: a sync-committee-attested ancestry), and `preview` is
+  `unattested`. `leani subscribe --finality` accepts the new names only. The
+  SDK `Finality` type changes accordingly. Stores and data directories from
+  0.1.0-rc.7 open unchanged.
 - Verified finality learns each sync-committee-attested head within about
   1.5 s of a Beacon endpoint or consensus peer serving it. Between finality
   polls it asks only for the light-client optimistic update, 1.5, 3, 4.5 and
-  6 s into each slot, until the slot's head arrives. Included blocks reach
+  6 s into each slot, until the slot's head arrives. Attested blocks reach
   processors about 6 s earlier on average, and up to 12 s.
 
 ## [0.1.0-rc.7] - 2026-10-14

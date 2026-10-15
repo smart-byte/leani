@@ -3047,7 +3047,7 @@ mod raw_history_control_tests {
             log_fields: leani_primitives::LogFieldSet::NONE,
             allow_filtered: true,
             filter,
-            minimum_finality: leani_primitives::Finality::Included,
+            minimum_finality: leani_primitives::Finality::Attested,
         };
         let mut descriptor = leani_testkit::BlockLocalCounter::named("raw-profile")
             .descriptor()
@@ -9954,7 +9954,7 @@ mod tests {
     async fn retained_proof_range_spans_the_unfinalized_blocks_below_a_higher_anchor() {
         use leani_primitives::{BlockHash, ChainId, Finality};
 
-        let (_directory, store, _) = retained_proof_store(Finality::Included).await;
+        let (_directory, store, _) = retained_proof_store(Finality::Attested).await;
         // After an outage longer than the finality lag, the verified anchor
         // is above the retained tip, and no parent link reaches it.
         let anchor = fixture_frame(20, BlockHash::ZERO).block;
@@ -9970,7 +9970,7 @@ mod tests {
     async fn retained_proof_range_spans_up_to_an_anchor_that_contradicts_a_retained_block() {
         use leani_primitives::{BlockHash, BlockRef, ChainId, Finality};
 
-        let (_directory, store, retained) = retained_proof_store(Finality::Included).await;
+        let (_directory, store, retained) = retained_proof_store(Finality::Attested).await;
         // Finality names another block at 12 than the retained one; the
         // retained blocks below the fork may still be its ancestors.
         let anchor = BlockRef {
@@ -9992,7 +9992,7 @@ mod tests {
         use leani_store_sqlite::{SqliteStore, StoreConfig};
 
         let above_the_tip = fixture_frame(20, BlockHash::ZERO).block;
-        let (_directory, store, retained) = retained_proof_store(Finality::Included).await;
+        let (_directory, store, retained) = retained_proof_store(Finality::Attested).await;
         // The retained block at the anchor's height is the anchor: parent
         // links prove the blocks below it.
         let retained_anchor = BlockRef {
@@ -10046,7 +10046,7 @@ mod tests {
     async fn retained_proof_range_is_none_beyond_the_cap() {
         use leani_primitives::{BlockHash, ChainId, Finality};
 
-        let (_directory, store, _) = retained_proof_store(Finality::Included).await;
+        let (_directory, store, _) = retained_proof_store(Finality::Attested).await;
         // The finalized head is 9, so 8,192 headers prove 10..=8,201.
         let at_the_cap = fixture_frame(9 + 8_192, BlockHash::ZERO).block;
         assert_eq!(

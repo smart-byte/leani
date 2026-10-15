@@ -58,7 +58,7 @@ const CHECKPOINT_CACHE_MAX_AGE: Duration = Duration::from_hours(12);
 const MAX_CHECKPOINT_RESPONSE_BYTES: usize = 1_024 * 1_024;
 const LOCALLY_VERIFIED_CHECKPOINT_MAX_AGE: Duration = Duration::from_hours(13 * 24);
 const MAINNET_SLOT_SECONDS: u64 = 12;
-const INCLUDED_UPDATE_MAX_AGE: Duration = Duration::from_secs(90);
+const ATTESTED_UPDATE_MAX_AGE: Duration = Duration::from_secs(90);
 const FINALIZED_UPDATE_MAX_AGE: Duration = Duration::from_mins(30);
 const PRICE_PRECISION: usize = 8;
 const STARTUP_UPDATE_SCAN_LIMIT: usize = 10_000;
@@ -336,7 +336,7 @@ struct AttachedEnvelope {
     extra: BTreeMap<String, Value>,
 }
 
-/// Included envelopes an attached `--finality finalized` subscription holds
+/// Unfinalized envelopes an attached `--finality finalized` subscription holds
 /// until a `system.finality` marker covers their block.
 #[derive(Debug, Default)]
 struct FinalizedGate {
@@ -413,7 +413,7 @@ impl FinalizedGate {
             })
     }
 
-    /// Hold an included envelope. Past the bound, the oldest held block is
+    /// Hold an unfinalized envelope. Past the bound, the oldest held block is
     /// dropped into the unreported gap.
     fn hold(&mut self, block: u64, envelope: AttachedEnvelope, raw: Value) {
         if self.final_at_connect(block) {
@@ -855,7 +855,7 @@ pub(crate) async fn initialize_checkpoint(
             endpoint: None,
             processor: "uniswap-observations".to_owned(),
             token: None,
-            finality: SubscribeFinality::Included,
+            finality: SubscribeFinality::Attested,
             finality_source: SubscribeFinalitySource::BeaconApi,
             checkpoint_urls,
             checkpoint_quorum,
@@ -1593,7 +1593,7 @@ fn subscription_data_dir_for(
     }
     hasher.update(match finality {
         // Previews come from the same lane's startup; they share its state.
-        SubscribeFinality::Preview | SubscribeFinality::Included => b"included",
+        SubscribeFinality::Unattested | SubscribeFinality::Attested => b"included",
         SubscribeFinality::Finalized => b"finalized",
     });
     Ok(root.join(&hasher.finalize().to_hex()[..16]))
@@ -2380,7 +2380,7 @@ async fn preview_items(
     frame: &BlockFrame,
 ) -> Result<Vec<SubscriptionItem>> {
     if !update_is_fresh(
-        SubscribeFinality::Included,
+        SubscribeFinality::Attested,
         frame.block.timestamp,
         unix_seconds(),
     ) {
@@ -2421,7 +2421,7 @@ fn render_preview_items(
 ) -> Result<Vec<ObservationKey>> {
     let mut rendered = Vec::new();
     for item in items {
-        render_item(format, item, block, Finality::Preview, operation, None)?;
+        render_item(format, item, block, Finality::Unattested, operation, None)?;
         rendered.push(observation_key(item));
     }
     Ok(rendered)
@@ -2570,7 +2570,7 @@ fn render_preview_reverts(
     reverted: &[(BlockRef, SubscriptionItem)],
 ) -> Result<()> {
     for (block, item) in reverted {
-        render_item(format, item, *block, Finality::Preview, "revert", None)?;
+        render_item(format, item, *block, Finality::Unattested, "revert", None)?;
     }
     Ok(())
 }
@@ -2612,8 +2612,8 @@ fn render_durable_change(
     }
     let shown = match options.finality {
         // An included row is a live update; a stale one is catch-up.
-        SubscribeFinality::Preview | SubscribeFinality::Included => {
-            update_is_fresh(SubscribeFinality::Included, record.block.timestamp, now)
+        SubscribeFinality::Unattested | SubscribeFinality::Attested => {
+            update_is_fresh(SubscribeFinality::Attested, record.block.timestamp, now)
         }
         // A finalized row prints however late finality arrives.
         SubscribeFinality::Finalized => record.finality == Finality::Finalized,
@@ -2987,15 +2987,15 @@ fn readable_timestamp(timestamp: u64) -> Result<String> {
 fn shows_previews(options: &SubscribeOptions) -> bool {
     options.format != SubscribeFormat::Raw
         && match options.finality {
-            SubscribeFinality::Preview => true,
-            SubscribeFinality::Included => !options.once,
+            SubscribeFinality::Unattested => true,
+            SubscribeFinality::Attested => !options.once,
             SubscribeFinality::Finalized => false,
         }
 }
 
 fn update_is_fresh(finality: SubscribeFinality, timestamp: u64, now: u64) -> bool {
     let maximum_age = match finality {
-        SubscribeFinality::Preview | SubscribeFinality::Included => INCLUDED_UPDATE_MAX_AGE,
+        SubscribeFinality::Unattested | SubscribeFinality::Attested => ATTESTED_UPDATE_MAX_AGE,
         SubscribeFinality::Finalized => FINALIZED_UPDATE_MAX_AGE,
     };
     now.saturating_sub(timestamp) <= maximum_age.as_secs()
@@ -3818,8 +3818,8 @@ fn render_attached(
     let item = item.filter(|item| match options.finality {
         // An included row is a live update; a stale one is the node
         // catching up. A node never streams previews.
-        SubscribeFinality::Preview | SubscribeFinality::Included => {
-            update_is_fresh(SubscribeFinality::Included, item.timestamp(), now)
+        SubscribeFinality::Unattested | SubscribeFinality::Attested => {
+            update_is_fresh(SubscribeFinality::Attested, item.timestamp(), now)
         }
         // A finalized row prints however late finality arrives. Blocks final
         // before the subscription connected never reach here.
@@ -4177,7 +4177,7 @@ mod tests {
             endpoint: None,
             processor: "uniswap-observations".to_owned(),
             token: None,
-            finality: SubscribeFinality::Included,
+            finality: SubscribeFinality::Attested,
             finality_source: SubscribeFinalitySource::Auto,
             checkpoint_urls,
             checkpoint_quorum: 2,
@@ -4192,18 +4192,18 @@ mod tests {
 
     #[test]
     fn once_counts_unverified_previews_only_when_asked() {
-        use SubscribeFinality::{Finalized, Included, Preview};
+        use SubscribeFinality::{Attested, Finalized, Unattested};
         use SubscribeFormat::{Json, Pretty, Raw};
 
         let mut options = subscribe_options(Vec::new());
         for (finality, once, format, shown) in [
             // Following shows early previews; `--once` waits for verified rows.
-            (Included, false, Json, true),
-            (Included, true, Json, false),
-            (Preview, true, Json, true),
-            (Preview, false, Pretty, true),
+            (Attested, false, Json, true),
+            (Attested, true, Json, false),
+            (Unattested, true, Json, true),
+            (Unattested, false, Pretty, true),
             (Finalized, false, Json, false),
-            (Preview, true, Raw, false),
+            (Unattested, true, Raw, false),
         ] {
             options.finality = finality;
             options.once = once;
@@ -4251,8 +4251,8 @@ mod tests {
         let SubscriptionItem::Block(entity) = &item else {
             panic!("expected a block item");
         };
-        let rendered = rendered_block_summary(entity, Finality::Preview, "apply", None);
-        assert_eq!(rendered.finality, "preview");
+        let rendered = rendered_block_summary(entity, Finality::Unattested, "apply", None);
+        assert_eq!(rendered.finality, "unattested");
         assert_eq!(rendered.operation, "apply");
     }
 
@@ -4279,7 +4279,7 @@ mod tests {
         let (operation, finality) = if kind.starts_with("system.finality") {
             ("finalized", "finalized")
         } else {
-            ("undo", "included")
+            ("undo", "attested")
         };
         format!(
             "data: {{\"sequence\":\"{sequence}\",\"cursor\":\"cursor-{sequence}\",\"operation\":\"{operation}\",\
@@ -4389,7 +4389,7 @@ mod tests {
                 excess_blob_gas: None,
                 transaction_count: Some(3),
                 size_bytes: None,
-                finality: Finality::Included,
+                finality: Finality::Attested,
             }),
             SubscribeProtocol::UniswapV3 => {
                 let word =
@@ -4415,7 +4415,7 @@ mod tests {
                         block_number: block.number,
                         block_hash: block.hash,
                         log_index: 7,
-                        finality: Finality::Included,
+                        finality: Finality::Attested,
                     }],
                 })
             }
@@ -4451,7 +4451,7 @@ mod tests {
     ) {
         let processor = ProcessorRegistry::standard()
             .instantiate(
-                &subscription_processor(protocol, markets, SubscribeFinality::Included)
+                &subscription_processor(protocol, markets, SubscribeFinality::Attested)
                     .expect("processor configuration"),
                 1,
             )
@@ -4488,7 +4488,7 @@ mod tests {
                     chain_id: ChainId(1),
                     block_number: block.number,
                     block_hash: block.hash,
-                    finality: Finality::Included,
+                    finality: Finality::Attested,
                     sequence: 1,
                 },
                 &delta,
@@ -4625,7 +4625,7 @@ mod tests {
                     protocol,
                     markets,
                     records.clone(),
-                    SubscribeFinality::Included,
+                    SubscribeFinality::Attested,
                     unix_seconds(),
                 )
                 .expect("startup selection survives an undo")
@@ -4834,8 +4834,8 @@ mod tests {
         let mut state = AttachedState::default();
         let mut buffer = EventBuffer::default();
         buffer.push(&attached_hello(1, "block-summary", Some(100)));
-        buffer.push(&attached_block_event(1, 100, "included", now));
-        buffer.push(&attached_block_event(2, 101, "included", now));
+        buffer.push(&attached_block_event(1, 100, "attested", now));
+        buffer.push(&attached_block_event(2, 101, "attested", now));
         render_blocks(&mut buffer, &mut state, &options).expect("replay the retained log");
         assert_eq!(
             state.gate.pending_blocks(),
@@ -4845,7 +4845,7 @@ mod tests {
         // A reconnect's hello does not move what counted as final.
         state.greeted = false;
         buffer.push(&attached_hello(1, "block-summary", Some(105)));
-        buffer.push(&attached_block_event(3, 102, "included", now));
+        buffer.push(&attached_block_event(3, 102, "attested", now));
         render_blocks(&mut buffer, &mut state, &options).expect("reconnect");
         assert_eq!(state.gate.pending_blocks(), 2);
 
@@ -4869,7 +4869,7 @@ mod tests {
         buffer.push(&attached_hello(1, "block-summary", None));
         let held = u64::try_from(FINALIZED_GATE_MAX_BLOCKS).expect("gate bound") + 1;
         for block in 1..=held {
-            buffer.push(&attached_block_event(block, block, "included", now));
+            buffer.push(&attached_block_event(block, block, "attested", now));
         }
         let (outcome, rows) = captured(|| render_blocks(&mut buffer, &mut state, &options));
         assert!(!outcome.expect("hold unfinalized blocks").stop);
@@ -4928,7 +4928,7 @@ mod tests {
         ] {
             let mut buffer = EventBuffer::default();
             buffer.push(&hello);
-            buffer.push(&attached_block_event(1, 100, "included", now));
+            buffer.push(&attached_block_event(1, 100, "attested", now));
             let (outcome, rows) =
                 captured(|| render_blocks(&mut buffer, &mut AttachedState::default(), &options));
             let error = outcome.expect_err("an unidentified stream is refused");
@@ -4950,7 +4950,7 @@ mod tests {
                 excess_blob_gas: None,
                 transaction_count: None,
                 size_bytes: None,
-                finality: "included".to_owned(),
+                finality: "attested".to_owned(),
             })],
             ..AttachedState::default()
         };
@@ -4968,7 +4968,7 @@ mod tests {
         // Every connection identifies its node again.
         state.greeted = false;
         let mut buffer = EventBuffer::default();
-        buffer.push(&attached_block_event(2, 100, "included", now));
+        buffer.push(&attached_block_event(2, 100, "attested", now));
         assert!(render_blocks(&mut buffer, &mut state, &options).is_err());
     }
 
@@ -5051,7 +5051,7 @@ mod tests {
     /// An included block summary change at `block`, keyed by its hash like
     /// the processor's.
     fn block_change(sequence: u64, block: u64, operation: &str, timestamp: u64) -> Value {
-        block_change_at(sequence, block, operation, "included", timestamp)
+        block_change_at(sequence, block, operation, "attested", timestamp)
     }
 
     /// [`block_change`] with `finality`.
@@ -5220,7 +5220,7 @@ mod tests {
                     "amount1": "-1250000000000000000",
                     "sqrtPriceX96": "2045662359789070170858018546451766",
                     "blockNumber": 20_000_000, "blockHash": hash, "logIndex": log_index,
-                    "finality": "included",
+                    "finality": "attested",
                 }),
             )
         };
@@ -5231,7 +5231,7 @@ mod tests {
             "block": {
                 "number": 20_000_000, "hash": hash, "parentHash": hash, "timestamp": timestamp,
             },
-            "finality": "included",
+            "finality": "attested",
             "kind": format!("{UNISWAP_OBSERVATION_KIND}.{suffix}"),
             "key": key,
             "data": data,
@@ -5407,7 +5407,7 @@ mod tests {
         let mut state = AttachedState::default();
         let mut buffer = EventBuffer::default();
         buffer.push(&attached_hello(1, "block-summary", Some(99)));
-        buffer.push(&attached_block_event(1, 100, "included", late));
+        buffer.push(&attached_block_event(1, 100, "attested", late));
         buffer.push(&attached_marker_event(2, 100, "system.finality.put", 100));
         let (outcome, rows) = captured(|| render_blocks(&mut buffer, &mut state, &options));
         outcome.expect("finality releases block 100");
@@ -5569,7 +5569,7 @@ mod tests {
         buffer.push(&attached_hello(1, "block-summary", None));
         let held = u64::try_from(FINALIZED_GATE_MAX_BLOCKS).expect("gate bound") + 2;
         for block in 1..=held {
-            buffer.push(&attached_block_event(block, block, "included", now));
+            buffer.push(&attached_block_event(block, block, "attested", now));
         }
         buffer.push(&attached_marker_event(
             held + 1,
@@ -5602,7 +5602,7 @@ mod tests {
         let mut state = AttachedState::default();
         let mut buffer = EventBuffer::default();
         buffer.push(&attached_hello(1, "block-summary", Some(100)));
-        buffer.push(&attached_block_event(1, 105, "included", now));
+        buffer.push(&attached_block_event(1, 105, "attested", now));
         buffer.push(&attached_marker_event(2, 105, "system.finality.put", 105));
         let (outcome, rows) = captured(|| render_blocks(&mut buffer, &mut state, &options));
         outcome.expect("render");
@@ -5698,7 +5698,7 @@ mod tests {
         let mut buffer = EventBuffer::default();
 
         buffer.push(&attached_hello(1, "block-summary", None));
-        buffer.push(&attached_block_event(1, 100, "included", now));
+        buffer.push(&attached_block_event(1, 100, "attested", now));
         let (outcome, rows) = captured(|| render_blocks(&mut buffer, &mut state, &options));
         assert!(
             !outcome.expect("included apply is buffered").stop,
@@ -5725,7 +5725,7 @@ mod tests {
         let mut buffer = EventBuffer::default();
 
         buffer.push(&attached_hello(1, "block-summary", None));
-        buffer.push(&attached_block_event(1, 100, "included", now));
+        buffer.push(&attached_block_event(1, 100, "attested", now));
         buffer.push(&attached_marker_event(
             2,
             100,
@@ -5805,7 +5805,7 @@ mod tests {
             block_number: BlockNumber(sequence),
             block_hash,
             log_index: 0,
-            finality: Finality::Included,
+            finality: Finality::Attested,
         };
         ChangeRecord {
             delivery_encoding_version: 1,
@@ -5825,7 +5825,7 @@ mod tests {
                 parent_hash: BlockHash::new([0; 32]),
                 timestamp,
             },
-            finality: Finality::Included,
+            finality: Finality::Attested,
             direction: ChangeDirection::Apply,
             change: DomainChange {
                 kind: "uniswap.price.observation".to_owned(),
@@ -5852,7 +5852,7 @@ mod tests {
             excess_blob_gas: Some(393_216),
             transaction_count: Some(123),
             size_bytes: None,
-            finality: Finality::Included,
+            finality: Finality::Attested,
         };
         ChangeRecord {
             delivery_encoding_version: 1,
@@ -5872,7 +5872,7 @@ mod tests {
                 parent_hash: BlockHash::new([0; 32]),
                 timestamp,
             },
-            finality: Finality::Included,
+            finality: Finality::Attested,
             direction: ChangeDirection::Apply,
             change: DomainChange {
                 kind: BLOCK_SUMMARY_KIND.to_owned(),
@@ -5952,13 +5952,13 @@ mod tests {
     fn catch_up_updates_stay_silent_until_the_stream_is_current() {
         let now = 10_000;
         assert!(update_is_fresh(
-            SubscribeFinality::Included,
-            now - INCLUDED_UPDATE_MAX_AGE.as_secs(),
+            SubscribeFinality::Attested,
+            now - ATTESTED_UPDATE_MAX_AGE.as_secs(),
             now
         ));
         assert!(!update_is_fresh(
-            SubscribeFinality::Included,
-            now - INCLUDED_UPDATE_MAX_AGE.as_secs() - 1,
+            SubscribeFinality::Attested,
+            now - ATTESTED_UPDATE_MAX_AGE.as_secs() - 1,
             now
         ));
         assert!(update_is_fresh(
@@ -5981,7 +5981,7 @@ mod tests {
                 price_record(wbtc, 3, 9_960),
                 price_record(eth, 4, 9_990),
             ],
-            SubscribeFinality::Included,
+            SubscribeFinality::Attested,
             10_000,
         )
         .expect("select startup prices");
@@ -6009,7 +6009,7 @@ mod tests {
                 block_record(41, 9_912),
                 block_record(42, 9_924),
             ],
-            SubscribeFinality::Included,
+            SubscribeFinality::Attested,
             10_000,
         )
         .expect("select startup block");
@@ -6179,7 +6179,7 @@ mod tests {
             SubscribeProtocol::UniswapV3,
             &market,
             records,
-            SubscribeFinality::Included,
+            SubscribeFinality::Attested,
             unix_seconds(),
         )
         .expect("startup state");
@@ -6195,9 +6195,9 @@ mod tests {
             operation: "apply".to_owned(),
             block: json!({
                 "timestamp": unix_seconds()
-                    .saturating_sub(INCLUDED_UPDATE_MAX_AGE.as_secs() + 1),
+                    .saturating_sub(ATTESTED_UPDATE_MAX_AGE.as_secs() + 1),
             }),
-            finality: "included".to_owned(),
+            finality: "attested".to_owned(),
             kind: "uniswap.price.observation.apply".to_owned(),
             key: Some("0x01".to_owned()),
             data: Some(
@@ -6212,7 +6212,7 @@ mod tests {
                     block_number: 1,
                     block_hash: format!("0x{}", hex::encode([1; 32])),
                     log_index: 0,
-                    finality: "included".to_owned(),
+                    finality: "attested".to_owned(),
                 })
                 .expect("price JSON"),
             ),
@@ -6772,7 +6772,7 @@ mod tests {
             SubscribeProtocol::UniswapV3,
             &left,
             None,
-            SubscribeFinality::Included,
+            SubscribeFinality::Attested,
             Path::new("."),
         )
         .expect("left identity");
@@ -6781,7 +6781,7 @@ mod tests {
             SubscribeProtocol::UniswapV3,
             &right,
             None,
-            SubscribeFinality::Included,
+            SubscribeFinality::Attested,
             Path::new("."),
         )
         .expect("right identity");
@@ -6796,7 +6796,7 @@ mod tests {
             SubscribeProtocol::Blocks,
             &[],
             None,
-            SubscribeFinality::Included,
+            SubscribeFinality::Attested,
             Path::new("."),
         )
         .expect("blocks identity");
@@ -6805,7 +6805,7 @@ mod tests {
             SubscribeProtocol::UniswapV3,
             &market,
             None,
-            SubscribeFinality::Included,
+            SubscribeFinality::Attested,
             Path::new("."),
         )
         .expect("Uniswap identity");
@@ -6823,7 +6823,7 @@ mod tests {
             SubscribeProtocol::UniswapV3,
             &markets,
             None,
-            SubscribeFinality::Included,
+            SubscribeFinality::Attested,
             Path::new("."),
         )
         .expect("Uniswap identity");
@@ -6946,7 +6946,7 @@ mod tests {
         let processor = subscription_processor(
             SubscribeProtocol::UniswapV3,
             &markets,
-            SubscribeFinality::Included,
+            SubscribeFinality::Attested,
         )
         .expect("processor");
         let pools = processor.settings["pools"].as_array().expect("pools");
@@ -6961,7 +6961,7 @@ mod tests {
     #[test]
     fn embedded_block_processor_requires_bodies_but_not_receipts() {
         let processor =
-            subscription_processor(SubscribeProtocol::Blocks, &[], SubscribeFinality::Included)
+            subscription_processor(SubscribeProtocol::Blocks, &[], SubscribeFinality::Attested)
                 .expect("processor");
         let registry = ProcessorRegistry::standard();
         let processor = registry.instantiate(&processor, 1).expect("instantiate");

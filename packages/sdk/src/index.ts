@@ -30,7 +30,7 @@ export type {
 } from "./openapi.generated.ts";
 
 export type Hex = `0x${string}`;
-export type Finality = "preview" | "included" | "finalized";
+export type Finality = "unattested" | "attested" | "finalized";
 export type ChangeOperation =
   | "apply"
   | "undo"

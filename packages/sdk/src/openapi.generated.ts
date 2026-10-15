@@ -1422,19 +1422,21 @@ export interface components {
         /** @description Store-, chain-, and processor-bound opaque value. */
         Cursor: string;
         /**
-         * @description Chain-confidence status of the block a record belongs to.
-         *     `included`: the block is on the currently followed chain; a reorg can
-         *     still remove it. `finalized`: Ethereum consensus has finalized the
-         *     block, as verified by this node's configured finality source. When a
-         *     source serves finalized material under dataset trust (Xatu, EraE), the
-         *     label reflects that source's trust model, not an independent proof.
-         *     `preview`: a peer supplied the block and its connection to the chain is
-         *     still being checked; only the embedded CLI emits `preview`, the HTTP
-         *     API never does. A record's `data.finality`, when present, always equals
-         *     the envelope `finality`.
+         * @description Chain-confidence level of the block a record belongs to.
+         *     `unattested`: at least two execution peers served the block, it passed
+         *     Leani's header rules, and it extends the delivered chain; the Ethereum
+         *     sync committee has not attested it yet, and the block is undone if no
+         *     attestation covers it. `attested`: its ancestry is verified to an
+         *     execution block at least two thirds of the sync committee attested; a
+         *     reorg can still remove it. `finalized`: Ethereum consensus has
+         *     finalized the block, as verified by this node's configured finality
+         *     source. When a source serves finalized material under dataset trust
+         *     (Xatu, EraE), the label reflects that source's trust model, not an
+         *     independent proof. A record's `data.finality`, when present, always
+         *     equals the envelope `finality`.
          * @enum {string}
          */
-        Finality: "preview" | "included" | "finalized";
+        Finality: "unattested" | "attested" | "finalized";
         ProcessorSummary: {
             id: string;
             instance: string;

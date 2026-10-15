@@ -848,9 +848,9 @@ pub enum PublishMode {
 impl From<PublishMode> for PublicationPolicy {
     fn from(value: PublishMode) -> Self {
         match value {
-            PublishMode::IncludedAndFinalized => Self::IncludedAndFinalized,
-            PublishMode::FinalizedOnly => Self::FinalizedOnly,
-            PublishMode::TerminalOnly => Self::TerminalOnly,
+            PublishMode::IncludedAndFinalized => Self::Attested,
+            PublishMode::FinalizedOnly => Self::Finalized,
+            PublishMode::TerminalOnly => Self::JobResult,
         }
     }
 }
@@ -1766,7 +1766,7 @@ impl Config {
         {
             errors.push(ValidationError::new(
                 "sources.live/finality",
-                "the P2P live source requires verified beacon_api or consensus_p2p finality: a block is included only once its ancestry reaches an execution header the sync committee attested, which the finality source verifies; set finality.kind, or sources.live.kind = \"disabled\" for finalized-dataset backfills",
+                "the P2P live source requires verified beacon_api or consensus_p2p finality: a block is attested only once its ancestry reaches an execution header the sync committee attested, which the finality source verifies; set finality.kind, or sources.live.kind = \"disabled\" for finalized-dataset backfills",
             ));
         }
         if self.processors.is_empty() {

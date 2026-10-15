@@ -239,7 +239,7 @@ fn comparison_frame(
             ..VerificationReport::default()
         };
     } else {
-        normalized.finality = Finality::Included;
+        normalized.finality = Finality::Attested;
         normalized.verification = VerificationReport::default();
     }
     Ok(normalized)

@@ -91,7 +91,7 @@ Without a terminal, pass --yes only after the user has approved the checkpoint p
   leani subscribe blocks --finality finalized
   leani subscribe uniswap-v3 ETH/USDC --json
   leani subscribe blocks --json --once --timeout 5m
-  leani subscribe blocks --once --finality preview
+  leani subscribe blocks --once --finality unattested
 
 Exit codes: 0 success or stopped, 124 --timeout elapsed before --once was
 satisfied, 130 interrupted before --once was satisfied.")]
@@ -120,9 +120,9 @@ satisfied, 130 interrupted before --once was satisfied.")]
         /// Optional bearer token for a running node.
         #[arg(long, env = "LEANI_API_TOKEN", hide_env_values = true)]
         token: Option<String>,
-        /// Lowest status that counts as a result: `preview`, `included`
+        /// Lowest level that counts as a result: `unattested`, `attested`
         /// (default), or `finalized`.
-        #[arg(long, value_enum, default_value_t = SubscribeFinality::Included)]
+        #[arg(long, value_enum, default_value_t = SubscribeFinality::Attested)]
         finality: SubscribeFinality,
         /// Finality transport for the embedded runtime.
         #[arg(long, value_enum, default_value_t = SubscribeFinalitySource::Auto)]
@@ -368,16 +368,16 @@ pub enum SubscribeMode {
     Embedded,
 }
 
-/// Lowest chain-confidence status that counts as a subscription result.
+/// Lowest chain-confidence level that counts as a subscription result.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 pub enum SubscribeFinality {
-    /// Like `included`, but an unverified peer preview from embedded startup
+    /// Like `attested`, but an unverified peer preview from embedded startup
     /// also counts, so `--once` can return it. Fastest first output.
-    Preview,
-    /// Print blocks as soon as they are on the followed chain; a reorg can
-    /// still remove them. While following, embedded startup may show labelled
-    /// peer previews first; they never satisfy `--once`.
-    Included,
+    Unattested,
+    /// Print blocks once the sync committee attested them; a reorg can still
+    /// remove them. While following, embedded startup may show labelled peer
+    /// previews first; they never satisfy `--once`.
+    Attested,
     /// Print blocks only after Ethereum consensus has finalized them.
     Finalized,
 }
@@ -411,8 +411,8 @@ pub enum ResetCommand {
         /// The exact targets used by `leani subscribe`; empty for `blocks`.
         #[arg(num_args = 0.., value_name = "TARGET")]
         targets: Vec<String>,
-        /// Finality of the subscription state being reset (`included` or `finalized`).
-        #[arg(long, value_enum, default_value_t = SubscribeFinality::Included)]
+        /// Finality of the subscription state being reset (`attested` or `finalized`).
+        #[arg(long, value_enum, default_value_t = SubscribeFinality::Attested)]
         finality: SubscribeFinality,
         /// Exact embedded subscription directory to reset.
         #[arg(long)]

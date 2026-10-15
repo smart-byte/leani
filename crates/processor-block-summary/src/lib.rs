@@ -78,11 +78,11 @@ impl BlockSummaryProcessor {
                 log_fields: leani_primitives::LogFieldSet::NONE,
                 allow_filtered: true,
                 filter: FilterScope::default(),
-                minimum_finality: Finality::Included,
+                minimum_finality: Finality::Attested,
             }],
             mode: ReductionMode::BlockLocal,
             delivery_ordering: DeliveryOrdering::BlockVersionedIdempotent,
-            publication: PublicationPolicy::IncludedAndFinalized,
+            publication: PublicationPolicy::Attested,
             lifecycle: LifecyclePolicies::from_legacy(RetentionPolicy::FullOutputHistory),
             schemas: ProcessorSchemas {
                 delta_version: 1,
@@ -202,7 +202,7 @@ impl Processor for BlockSummaryProcessor {
         // summarized first matches the same block from verified material,
         // such as the live lane's handoff overlap after a Xatu backfill.
         for size_bytes in [decoded.size_bytes, None] {
-            for finality in [Finality::Included, Finality::Finalized] {
+            for finality in [Finality::Attested, Finality::Finalized] {
                 let mut entity = decoded.clone();
                 entity.finality = finality;
                 entity.size_bytes = size_bytes;
@@ -331,7 +331,7 @@ mod tests {
 
     fn frame() -> BlockFrame {
         let mut frame = fixture_frame(42, BlockHash::new([41; 32]));
-        frame.finality = Finality::Included;
+        frame.finality = Finality::Attested;
         frame.transactions = Material::Complete(
             (0..2_u32)
                 .map(|index| TransactionEnvelope {
@@ -405,7 +405,7 @@ mod tests {
             .expect("change JSON")
             .expect("owned JSON");
         assert_eq!(json["blockNumber"], 42);
-        assert_eq!(json["finality"], "included");
+        assert_eq!(json["finality"], "attested");
         assert_eq!(json["blockHash"], frame.block.hash.to_string());
         assert!(
             reducer

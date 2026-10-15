@@ -407,7 +407,7 @@ impl VerifiedObject {
         // archive; a frame that claims otherwise is corrupt.
         let finality = match descriptor.finality {
             FinalityModel::Finalized => Finality::Finalized,
-            FinalityModel::Included => Finality::Included,
+            FinalityModel::Attested => Finality::Attested,
             FinalityModel::None => {
                 return Err(SourceError::InvalidPlan(
                     "the archive manifest declares no finality".to_owned(),
@@ -972,7 +972,7 @@ mod tests {
         ));
 
         let (first, mut included) = blocks_one_and_two();
-        included.finality = Finality::Included;
+        included.finality = Finality::Attested;
         let directory = tempfile::tempdir().expect("tempdir");
         let manifest = write_archive(
             directory.path(),
@@ -992,10 +992,10 @@ mod tests {
             directory.path(),
             "frames.jsonl",
             &[first, second],
-            FinalityModel::Included,
+            FinalityModel::Attested,
         );
         assert!(matches!(
-            read_archive(&manifest, range, Finality::Included).await,
+            read_archive(&manifest, range, Finality::Attested).await,
             Err(SourceError::CorruptFrame(_))
         ));
     }
