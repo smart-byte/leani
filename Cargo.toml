@@ -117,7 +117,7 @@ tokio = { version = "1.48", features = [
 ] }
 tokio-util = { version = "0.7", features = ["rt"] }
 tokio-tungstenite = "0.30"
-toml = "0.9"
+toml = "1.1"
 tower = { version = "0.5", features = ["util"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }

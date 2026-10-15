@@ -23,7 +23,7 @@ leani-api = { path = "../leani/crates/api" }
 leani-store-sqlite = { path = "../leani/crates/store-sqlite" }
 leani-testkit = { path = "../leani/crates/testkit" }
 tempfile = "3.23"
-toml = "0.9"
+toml = "1.1"
 tower = { version = "0.5", features = ["util"] }
 
 # Keep the same upstream compatibility patch as the Leani workspace.
