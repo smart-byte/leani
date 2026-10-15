@@ -314,6 +314,8 @@ struct AttachedEnvelope {
 #[derive(Debug, Default)]
 struct LevelGate {
     pending: BTreeMap<u64, Vec<(AttachedEnvelope, Value)>>,
+    /// Startup rows below the level, held as `pending` holds envelopes.
+    snapshot: BTreeMap<u64, Vec<AttachedItem>>,
     /// The node's finalized block when the subscription first connected.
     /// The stream replays the retained log, and blocks up to this one were
     /// already final then, so they are not printed.
@@ -422,6 +424,25 @@ impl LevelGate {
 
     fn undo(&mut self, block: u64) {
         self.pending.remove(&block);
+        self.snapshot.remove(&block);
+    }
+
+    fn hold_snapshot(&mut self, item: AttachedItem) {
+        self.snapshot
+            .entry(item.block_number())
+            .or_default()
+            .push(item);
+    }
+
+    /// The startup rows at or below `through`, promoted to `level`, in block
+    /// order.
+    fn release_snapshot(&mut self, through: u64, level: Finality) -> Vec<AttachedItem> {
+        let keep = self.snapshot.split_off(&through.saturating_add(1));
+        std::mem::replace(&mut self.snapshot, keep)
+            .into_values()
+            .flatten()
+            .map(|item| item.with_finality(level.name()))
+            .collect()
     }
 
     /// Everything at or below `through`, promoted to `level`, in block order.
@@ -2815,25 +2836,42 @@ async fn attached_start_cursor(
     }
 }
 
-/// Print the startup rows, and remember them for their undos. Returns
-/// whether any printed.
+/// Print the startup rows, and remember them for their undos. A row below
+/// the subscription's level waits in `gate` for the marker that promotes it,
+/// as a streamed one does. Returns whether any printed.
 fn render_attached_snapshot(
     options: &SubscribeOptions,
     snapshot: Vec<AttachedItem>,
+    gate: &mut LevelGate,
     changes: &mut AttachedChanges,
 ) -> Result<bool> {
+    let level = options.finality.level();
     let mut rendered = false;
     for item in snapshot {
-        render_attached_item(options.format, &item, "apply", None)?;
-        rendered = true;
-        if let Some(key) = item.change_key() {
-            changes.remember_printed(key, item);
+        if level_named(item.finality()).is_none_or(|finality| finality < level) {
+            gate.hold_snapshot(item);
+            continue;
         }
+        render_startup_item(options, item, changes)?;
+        rendered = true;
         if options.once {
             break;
         }
     }
     Ok(rendered)
+}
+
+/// Print a startup row and remember it for its undo.
+fn render_startup_item(
+    options: &SubscribeOptions,
+    item: AttachedItem,
+    changes: &mut AttachedChanges,
+) -> Result<()> {
+    render_attached_item(options.format, &item, "apply", None)?;
+    if let Some(key) = item.change_key() {
+        changes.remember_printed(key, item);
+    }
+    Ok(())
 }
 
 fn announce_attached(protocol: SubscribeProtocol, endpoint: &Url, markets: &[Market]) {
@@ -2888,8 +2926,12 @@ fn render_attached_sse_events(
                         options.protocol == SubscribeProtocol::Blocks,
                     );
                     let snapshot = std::mem::take(&mut state.snapshot);
-                    if render_attached_snapshot(options, snapshot, &mut state.changes)?
-                        && options.once
+                    if render_attached_snapshot(
+                        options,
+                        snapshot,
+                        &mut state.gate,
+                        &mut state.changes,
+                    )? && options.once
                     {
                         outcome.stop = true;
                         return Ok(outcome);
@@ -2977,6 +3019,20 @@ fn render_attached_sse_events(
                 .and_then(|data| data.get("throughBlock"))
                 .and_then(Value::as_u64)
         {
+            // Held startup rows predate every streamed change.
+            for item in state.gate.release_snapshot(through, marker) {
+                if !update_is_fresh(options.finality, item.timestamp(), now) {
+                    if let Some(key) = item.change_key() {
+                        state.changes.remember_hidden(key);
+                    }
+                    continue;
+                }
+                render_startup_item(options, item, &mut state.changes)?;
+                if options.once {
+                    outcome.stop = true;
+                    return Ok(outcome);
+                }
+            }
             to_render = state.gate.release(through, marker);
         }
         to_render.push((envelope, value));
@@ -3428,10 +3484,24 @@ impl AttachedItem {
         }
     }
 
+    const fn block_number(&self) -> u64 {
+        match self {
+            Self::Block(entity) => entity.block_number,
+            Self::Price { entity, .. } => entity.block_number,
+        }
+    }
+
     fn block_hash(&self) -> &str {
         match self {
             Self::Block(entity) => &entity.block_hash,
             Self::Price { entity, .. } => &entity.block_hash,
+        }
+    }
+
+    fn finality(&self) -> &str {
+        match self {
+            Self::Block(entity) => &entity.finality,
+            Self::Price { entity, .. } => &entity.finality,
         }
     }
 
@@ -4941,6 +5011,53 @@ mod tests {
         assert_eq!(undone["schema"], "leani.block-summary.v1");
         assert_eq!(undone["operation"], "undo");
         assert_eq!(undone["blockNumber"], 100);
+    }
+
+    #[test]
+    fn an_unattested_startup_row_waits_for_the_attested_marker() {
+        // Review: startup rows skipped the finality gate, so `--once
+        // --finality attested` printed an unattested row and exited.
+        let now = unix_seconds();
+        let mut options = attached_included_options();
+        options.finality = SubscribeFinality::Attested;
+        let startup = || AttachedState {
+            snapshot: vec![AttachedItem::Block(
+                serde_json::from_value(
+                    block_change_at(1, 100, "apply", "unattested", now)["data"].clone(),
+                )
+                .expect("summary"),
+            )],
+            ..AttachedState::default()
+        };
+        let mut state = startup();
+        let mut buffer = EventBuffer::default();
+        buffer.push(&attached_hello(1, "block-summary", None));
+        let (outcome, rows) = captured(|| render_blocks(&mut buffer, &mut state, &options));
+        assert!(!outcome.expect("hello").stop);
+        assert!(rows.is_empty(), "{rows:?}");
+        buffer.push(&attested_marker_event(2, 100, 100));
+        let (outcome, rows) = captured(|| render_blocks(&mut buffer, &mut state, &options));
+        assert!(outcome.expect("the attested marker").stop);
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        let row: Value = serde_json::from_str(&rows[0]).expect("JSON row");
+        assert_eq!(row["blockNumber"], 100);
+        assert_eq!(row["finality"], "attested");
+
+        // An undo drops the held row: the marker then prints nothing.
+        let mut state = startup();
+        let mut buffer = EventBuffer::default();
+        buffer.push(&attached_hello(1, "block-summary", None));
+        buffer.push(&sse_frame(&block_change_at(
+            2,
+            100,
+            "undo",
+            "unattested",
+            now,
+        )));
+        buffer.push(&attested_marker_event(3, 100, 100));
+        let (outcome, rows) = captured(|| render_blocks(&mut buffer, &mut state, &options));
+        assert!(!outcome.expect("undo, then the marker").stop);
+        assert!(rows.is_empty(), "{rows:?}");
     }
 
     #[test]
