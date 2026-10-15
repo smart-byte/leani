@@ -1376,7 +1376,7 @@ fn externalized_real_source_processor(processor: &dyn Processor) -> Result<Arc<d
     if let Some(blobs) = processor.as_any().downcast_ref::<BlobsProcessor>() {
         return Ok(Arc::new(blobs.clone().with_contract(
             instance,
-            PublicationPolicy::FinalizedOnly,
+            PublicationPolicy::Finalized,
             lifecycle,
         )));
     }
@@ -1386,14 +1386,14 @@ fn externalized_real_source_processor(processor: &dyn Processor) -> Result<Arc<d
     {
         return Ok(Arc::new(uniswap.clone().with_contract(
             instance,
-            PublicationPolicy::FinalizedOnly,
+            PublicationPolicy::Finalized,
             lifecycle,
         )));
     }
     if let Some(blocks) = processor.as_any().downcast_ref::<BlockSummaryProcessor>() {
         return Ok(Arc::new(blocks.clone().with_contract(
             instance,
-            PublicationPolicy::FinalizedOnly,
+            PublicationPolicy::Finalized,
             lifecycle,
         )));
     }
@@ -1403,7 +1403,7 @@ fn externalized_real_source_processor(processor: &dyn Processor) -> Result<Arc<d
     {
         return Ok(Arc::new(rollups.clone().with_contract(
             instance,
-            PublicationPolicy::FinalizedOnly,
+            PublicationPolicy::Finalized,
             lifecycle,
         )));
     }
@@ -6559,7 +6559,7 @@ fn benchmark_processor(
             let descriptor = processor.descriptor().clone();
             Ok(Arc::new(processor.with_contract(
                 descriptor.instance.clone(),
-                PublicationPolicy::FinalizedOnly,
+                PublicationPolicy::Finalized,
                 benchmark_profile_lifecycle(&descriptor.lifecycle, profile),
             )))
         }
@@ -6574,7 +6574,7 @@ fn benchmark_processor(
             let descriptor = processor.descriptor().clone();
             Ok(Arc::new(processor.with_contract(
                 descriptor.instance.clone(),
-                PublicationPolicy::FinalizedOnly,
+                PublicationPolicy::Finalized,
                 benchmark_profile_lifecycle(&descriptor.lifecycle, profile),
             )))
         }
@@ -6926,7 +6926,7 @@ mod tests {
             externalized_real_source_processor(&rollup).expect("real-source processor");
         assert_eq!(
             externalized.descriptor().publication,
-            PublicationPolicy::FinalizedOnly
+            PublicationPolicy::Finalized
         );
         assert_eq!(
             externalized.descriptor().requirements,

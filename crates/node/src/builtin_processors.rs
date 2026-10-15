@@ -6,10 +6,10 @@ use leani_processor_api::{
 };
 
 use crate::config::{
-    ArtifactPolicyConfig, CheckpointPolicyConfig, DeliveryPolicyConfig, DeliveryPruningConfig,
-    HumanBytes, HumanDuration, OutputPolicyConfig, ProcessorConfig, ProcessorCoverageConfig,
-    ProcessorHistoryControl, ProcessorHistoryMode, PublishMode, StatePolicyConfig,
-    UndoPolicyConfig,
+    ArtifactPolicyConfig, CheckpointPolicyConfig, DeliveryEmit, DeliveryPolicyConfig,
+    DeliveryPruningConfig, HumanBytes, HumanDuration, OutputPolicyConfig, ProcessorConfig,
+    ProcessorCoverageConfig, ProcessorHistoryControl, ProcessorHistoryMode, PublishMode,
+    StatePolicyConfig, UndoPolicyConfig,
 };
 
 pub(crate) fn processor_contract(
@@ -17,8 +17,9 @@ pub(crate) fn processor_contract(
     instance: &str,
     version: &str,
     start_block: u64,
-    finalized_only: bool,
+    publish: PublishMode,
 ) -> ProcessorConfig {
+    let finalized_only = publish == PublishMode::Finalized;
     ProcessorConfig {
         id: id.to_owned(),
         instance: instance.to_owned(),
@@ -27,11 +28,7 @@ pub(crate) fn processor_contract(
         history_mode: ProcessorHistoryMode::OnDemand,
         require_retained_input: false,
         start_block,
-        publish: if finalized_only {
-            PublishMode::FinalizedOnly
-        } else {
-            PublishMode::IncludedAndFinalized
-        },
+        publish: Some(publish),
         state: StatePolicyConfig {
             mode: StatePolicyMode::Checkpointed,
         },
@@ -46,6 +43,7 @@ pub(crate) fn processor_contract(
         },
         delivery: DeliveryPolicyConfig {
             mode: DeliveryPolicyMode::Window,
+            emit: DeliveryEmit::Changes,
             max_bytes: HumanBytes::from_bytes(64 * 1_024 * 1_024),
             max_age: HumanDuration::from_seconds(24 * 60 * 60),
             on_limit: DeliveryLimitAction::Pause,

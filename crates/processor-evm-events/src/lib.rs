@@ -201,11 +201,11 @@ impl EvmEventsProcessor {
                     }],
                     ..FilterScope::default()
                 },
-                minimum_finality: Finality::Included,
+                minimum_finality: Finality::Unattested,
             }],
             mode,
             delivery_ordering,
-            publication: PublicationPolicy::IncludedAndFinalized,
+            publication: PublicationPolicy::Attested,
             lifecycle: LifecyclePolicies::from_legacy(RetentionPolicy::FullOutputHistory),
             schemas: ProcessorSchemas {
                 delta_version: 2,
@@ -335,8 +335,12 @@ impl Processor for EvmEventsProcessor {
         delta.validate(&self.descriptor)?;
         let decoded: EventDelta = postcard::from_bytes(&delta.payload)
             .map_err(|error| ProcessorError::DeltaPayload(error.to_string()))?;
-        let mut checksums = Vec::with_capacity(2);
-        for finality in [Finality::Included, Finality::Finalized] {
+        let mut checksums = Vec::with_capacity(3);
+        for finality in [
+            Finality::Unattested,
+            Finality::Attested,
+            Finality::Finalized,
+        ] {
             let mut variant = decoded.clone();
             for event in &mut variant.events {
                 event.entity.finality = finality;
@@ -829,7 +833,7 @@ mod tests {
                 parent_hash: BlockHash::ZERO,
                 timestamp: 125,
             },
-            finality: Finality::Included,
+            finality: Finality::Attested,
             header: Material::Missing(leani_primitives::MissingReason::NotRequested),
             transactions: Material::Missing(leani_primitives::MissingReason::NotRequested),
             receipts: Material::Missing(leani_primitives::MissingReason::NotRequested),
@@ -913,7 +917,7 @@ mod tests {
 
     fn transfer_frame(number: u64, parent: BlockHash, logs: Vec<Log>) -> BlockFrame {
         let mut frame = fixture_frame(number, parent);
-        frame.finality = Finality::Included;
+        frame.finality = Finality::Attested;
         frame.logs = Material::Complete(logs);
         frame
     }
@@ -1203,7 +1207,7 @@ mod tests {
             let variants = processor
                 .finality_variant_checksums(delta)
                 .expect("finality variants");
-            assert_eq!(variants.len(), 2);
+            assert_eq!(variants.len(), 3);
             assert!(variants.contains(&included_delta.checksum));
             assert!(variants.contains(&finalized_delta.checksum));
             assert!(!variants.contains(&other.checksum));

@@ -67,7 +67,7 @@ runtime, store, and API boundaries:
 
 | Failure | Evidence test |
 |---|---|
-| disconnect/source outage and failover | `historical_run_fails_over_at_a_committed_chunk_boundary` |
+| disconnect/source outage and failover | `historical_run_fails_over_at_a_committed_chunk_boundary`, `only_the_failed_chunk_moves_to_the_next_source`, `only_a_named_hole_moves_to_the_next_source`, `a_source_failing_again_before_committing_hands_over_the_rest_of_the_gap`, `blocks_a_source_has_not_published_hand_over_the_rest_of_the_gap` |
 | source corruption and input budget overrun | `history_stream_rejects_corruption_and_budget_overrun` |
 | reorg apply/undo and removed logs | `shared_live_runtime_fans_out_and_reorgs_one_source_subscription`, `websocket_reorg_marks_old_logs_removed_before_replacements` |
 | process interruption/restart, and startup reconciliation of what it left | `historical_run_resumes_from_durable_coverage_after_process_reopen`, the 10,000-block gate, `startup_reconciliation_deletes_pending_deltas_no_lane_can_apply`, `startup_reconciliation_replays_retained_frames_to_lanes_that_applied_none`, `startup_reconciliation_replays_retained_frames_above_a_hole`, `startup_reconciliation_leaves_a_consistent_store_untouched`, `a_hole_below_the_retained_window_is_left_to_the_cold_backfill`, `a_lane_the_store_paused_at_the_tip_resumes_after_a_restart_without_a_hole`, `a_lane_the_store_failed_at_the_tip_can_be_reset_after_a_restart`, `a_retained_tip_the_finalized_anchor_proves_is_kept_not_undone`, `a_proof_from_above_a_finalized_head_keeps_and_finalizes_the_retained_tail`, `a_branch_reorged_away_during_downtime_is_undone_only_above_the_fork`, `an_anchored_overlap_redelivers_proven_blocks_without_applying_them_twice`, `a_failed_or_stalled_retained_proof_falls_back_to_an_empty_ancestry`, `a_cancelled_retained_proof_seeds_nothing` |
@@ -85,7 +85,7 @@ runtime, store, and API boundaries:
 | disk/delivery pressure | `delivery_limit_pauses_and_auto_resumes_below_low_water`, `a_known_unavailable_lane_the_store_paused_without_a_marker_is_mapped_again`, `a_failed_ledger_behind_its_history_gets_no_marker_ahead_of_its_cursor` |
 | acknowledgement/pruning/upgrade replay faults | `acknowledgement_cannot_exceed_the_consumers_delivered_head`, `delivery_pruner_applies_finality_age_and_bounded_batch_limits`, `unacknowledged_changes_survive_a_v6_to_v7_upgrade` |
 | stable query during concurrent commits | `query_snapshot_keeps_values_and_stream_boundary_stable`, `generic_query_and_follow_snapshot_is_stable_across_new_commits` |
-| terminal publication | `terminal_historical_job_spools_only_its_final_result` |
+| job-result publication | `terminal_historical_job_spools_only_its_final_result` |
 | backup/restore | `backup_reopens_as_a_complete_verified_restore` |
 
 These are deterministic correctness gates. Filesystem exhaustion, process

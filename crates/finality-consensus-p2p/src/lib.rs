@@ -30,7 +30,7 @@ use leani_finality_beacon_api::{
     AnchorFile, AnchorWriter, BeaconApiError, CheckpointOrigin, Clock, DEFAULT_MAX_CHECKPOINT_AGE,
     HELIOS_REVISION, MainnetLightClientVerifier, StartAnchor, TrustedCheckpoint,
     VerifiedFinalityAnchor, current_slot, known_mainnet_fork_digests, mainnet_fork_digest,
-    resolve_start_anchor, signed_implausibly_ahead, verification_slot,
+    resolve_start_anchor, signed_implausibly_ahead, until_next_attested_poll, verification_slot,
 };
 use leani_primitives::{
     BlockNumber, Capability, CapabilitySet, ChainId, SourceId, SourceKind, TrustModel,
@@ -378,11 +378,36 @@ async fn next_finality(
                 state,
             ));
         }
-        tokio::select! {
-            () = tokio::time::sleep(state.client.network.poll_interval) => {}
-            () = state.cancellation.cancelled() => {
-                state.terminal = true;
-                return Some((Err(SourceError::Cancelled), state));
+        let full_poll_at = tokio::time::Instant::now() + state.client.network.poll_interval;
+        loop {
+            let published = state
+                .client
+                .source
+                .attested_heads
+                .as_ref()
+                .and_then(AttestedHeadPublisher::latest)
+                .map(|head| head.beacon_slot);
+            let head_poll_at = tokio::time::Instant::now()
+                + until_next_attested_poll(state.client.source.clock.now(), published);
+            // Heads are polled only once finality verified.
+            if state.client.source.attested_heads.is_none()
+                || state.last_emitted.is_none()
+                || head_poll_at >= full_poll_at
+            {
+                tokio::select! {
+                    () = tokio::time::sleep_until(full_poll_at) => break,
+                    () = state.cancellation.cancelled() => {
+                        state.terminal = true;
+                        return Some((Err(SourceError::Cancelled), state));
+                    }
+                }
+            }
+            tokio::select! {
+                () = tokio::time::sleep_until(head_poll_at) => state.client.refresh_attested_head().await,
+                () = state.cancellation.cancelled() => {
+                    state.terminal = true;
+                    return Some((Err(SourceError::Cancelled), state));
+                }
             }
         }
         match state.client.refresh().await {
@@ -515,6 +540,20 @@ impl P2pLightClient {
             );
         }
         Ok(anchor)
+    }
+
+    /// Publish a newer verified attested head without a finality refresh.
+    async fn refresh_attested_head(&mut self) {
+        if let Some(heads) = self.source.attested_heads.clone()
+            && let Some(head) = self.attested_head(heads.latest()).await
+            && heads.publish(head)
+        {
+            debug!(
+                beacon_slot = head.beacon_slot,
+                block = head.block_number.0,
+                "published a sync-committee-attested execution head between finality refreshes"
+            );
+        }
     }
 
     /// Verify the latest optimistic update from the first peer that serves
@@ -2371,6 +2410,32 @@ mod tests {
         assert!(quiet.is_err(), "the stream yielded {quiet:?}");
         assert!(script.count(&format!("{} optimistic", peers[0])) >= 2);
         assert_eq!(heads.latest(), None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn attested_heads_arrive_between_finality_refreshes() {
+        let (script, peers) = Script::new(&[Behaviour::LowParticipation]);
+        let heads = AttestedHeadPublisher::new();
+        let source = scripted_source(
+            &script,
+            simulated_clock(slot_time(SIGNATURE_SLOT) + 60),
+            AnchorFile::Disabled,
+            Duration::from_secs(DAY),
+        )
+        .with_attested_heads(heads.clone());
+        let mut events = source
+            .subscribe(checkpoint(bootstrap_anchor()), CancellationToken::new())
+            .await
+            .expect("subscribe");
+        assert_eq!(finalized_slot(events.next().await), FINALIZED_SLOT);
+        assert_eq!(heads.latest(), None);
+        let refreshes = script.count(&format!("{} finality", peers[0]));
+        script.set(peers[0], Behaviour::Honest);
+        let quiet = tokio::time::timeout(Duration::from_secs(SLOT_SECONDS), events.next()).await;
+        assert!(quiet.is_err(), "no finality event is due: {quiet:?}");
+        let head = heads.latest().expect("a head between refreshes");
+        assert_eq!(head.beacon_slot, ATTESTED_SLOT);
+        assert_eq!(script.count(&format!("{} finality", peers[0])), refreshes);
     }
 
     #[tokio::test(start_paused = true)]

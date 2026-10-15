@@ -547,6 +547,46 @@ describe("SSE", () => {
     expect(received).toEqual(["1"]);
   });
 
+  test("subscription accepts the attested marker and rejects unknown operations", async () => {
+    const serving = (event: ChangeEnvelope, name: string) =>
+      createLeaniClient({
+        baseUrl: "http://node.test",
+        reconnect: { initialDelayMs: 0, maxDelayMs: 0, jitter: 0 },
+        fetch: async () =>
+          new Response(
+            `id: ${event.cursor}\nevent: ${name}\ndata: ${JSON.stringify(event)}\n\n`,
+            { headers: { "content-type": "text/event-stream" } },
+          ),
+      });
+    const attested = {
+      ...change("2"),
+      operation: "attested",
+      finality: "attested",
+      kind: "system.finality.put",
+      data: { throughBlock: 1 },
+    } as unknown as ChangeEnvelope;
+    const controller = new AbortController();
+    const received: string[] = [];
+    for await (const event of serving(attested, "attested").blobs.subscribe({
+      signal: controller.signal,
+    })) {
+      received.push(event.operation);
+      controller.abort();
+    }
+    expect(received).toEqual(["attested"]);
+
+    const bogus = { ...change("3"), operation: "bogus" } as unknown as ChangeEnvelope;
+    let failure: unknown;
+    try {
+      for await (const _ of serving(bogus, "bogus").blobs.subscribe()) {
+        break;
+      }
+    } catch (error) {
+      failure = error;
+    }
+    expect(String(failure)).toContain("invalid change envelope");
+  });
+
   test("subscription suppresses duplicate sequences and advances resume cursor", async () => {
     const controller = new AbortController();
     let calls = 0;
@@ -807,7 +847,7 @@ test("typed blobs subscription consumes the production serializer fixture", asyn
 });
 
 test("finality vocabulary matches the OpenAPI enum", () => {
-  const values: Finality[] = ["preview", "included", "finalized"];
+  const values: Finality[] = ["unattested", "attested", "finalized"];
   const wire: OpenApiComponents["schemas"]["Finality"][] = values;
-  expect(wire).toEqual(["preview", "included", "finalized"]);
+  expect(wire).toEqual(["unattested", "attested", "finalized"]);
 });

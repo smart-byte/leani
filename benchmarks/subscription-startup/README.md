@@ -1,9 +1,10 @@
 # Subscription startup benchmark
 
 This benchmark measures `leani subscribe blocks --mode embedded --once
---finality preview` from process start to the first block-summary line, which
-is usually an unverified peer preview. Binaries without `--finality preview`
-already count previews for `--once`, so they run without it. Each comparison alternates the
+--finality unattested` from process start to the first block-summary line,
+the first block the verified live lane accepts. Binaries from before the
+`unattested` level run with `--finality preview` (an unverified peer preview)
+when they have it, and without `--finality` otherwise. Each comparison alternates the
 binary order and runs a cold start followed by a warm start against the same
 data directory.
 

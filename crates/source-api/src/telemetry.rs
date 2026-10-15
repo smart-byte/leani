@@ -8,7 +8,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use leani_primitives::{BlockNumber, BlockRange};
+use leani_primitives::{BlockNumber, BlockRange, Finality};
 use serde::Serialize;
 
 const RETAINED_INACTIVE_SESSIONS: usize = 32;
@@ -182,6 +182,13 @@ struct NetworkTelemetryInner {
     preferred_peer_slots: AtomicU64,
     max_outbound_peer_slots: AtomicU64,
     max_concurrent_dials: AtomicU64,
+    /// Blocks the live lane delivered, by finality code.
+    live_blocks: [AtomicU64; 3],
+    /// Their summed delay after their slot started, by finality code.
+    live_delay_ms: [AtomicU64; 3],
+    /// Unattested blocks undone, by [`UnattestedUndo`].
+    unattested_undone: [AtomicU64; 3],
+    unattested_held: AtomicU64,
     disconnect_reasons: RwLock<BTreeMap<NetworkDisconnectReason, u64>>,
     peer_origins: RwLock<BTreeMap<NetworkPeerOrigin, PeerOriginRecord>>,
     sessions: RwLock<BTreeMap<u64, SessionRecord>>,
@@ -213,6 +220,10 @@ impl Default for NetworkTelemetry {
                 preferred_peer_slots: AtomicU64::new(0),
                 max_outbound_peer_slots: AtomicU64::new(0),
                 max_concurrent_dials: AtomicU64::new(0),
+                live_blocks: [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)],
+                live_delay_ms: [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)],
+                unattested_undone: [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)],
+                unattested_held: AtomicU64::new(0),
                 disconnect_reasons: RwLock::new(BTreeMap::new()),
                 peer_origins: RwLock::new(BTreeMap::new()),
                 sessions: RwLock::new(BTreeMap::new()),
@@ -230,6 +241,27 @@ impl Default for NetworkTelemetry {
 }
 
 impl NetworkTelemetry {
+    /// Count a block the live lane delivered at `level`, `delay` after its
+    /// slot started.
+    pub fn record_live_block(&self, level: Finality, delay: Duration) {
+        let index = usize::from(level as u8);
+        self.inner.live_blocks[index].fetch_add(1, Ordering::Relaxed);
+        self.inner.live_delay_ms[index].fetch_add(
+            u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+    }
+
+    /// Count `blocks` unattested blocks the live lane undid for `reason`.
+    pub fn record_unattested_undone(&self, reason: UnattestedUndo, blocks: u64) {
+        self.inner.unattested_undone[reason as usize].fetch_add(blocks, Ordering::Relaxed);
+    }
+
+    /// Count a late block the live lane held for its child.
+    pub fn record_unattested_held(&self) {
+        self.inner.unattested_held.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Publish execution peer availability and pool targets.
     pub fn set_peer_targets(
         &self,
@@ -529,6 +561,21 @@ impl NetworkTelemetry {
                 update_age_seconds: supervisor.updated.elapsed().as_secs(),
             },
             sessions,
+            live_levels: self.live_levels(),
+        }
+    }
+
+    fn live_levels(&self) -> NetworkLiveLevelsSnapshot {
+        let load = |counters: &[AtomicU64; 3]| {
+            counters
+                .each_ref()
+                .map(|counter| counter.load(Ordering::Relaxed))
+        };
+        NetworkLiveLevelsSnapshot {
+            blocks: load(&self.inner.live_blocks),
+            delay_milliseconds: load(&self.inner.live_delay_ms),
+            unattested_undone: load(&self.inner.unattested_undone),
+            unattested_held: self.inner.unattested_held.load(Ordering::Relaxed),
         }
     }
 }
@@ -662,6 +709,44 @@ pub struct NetworkTelemetrySnapshot {
     pub peer_origins: Vec<NetworkPeerOriginSnapshot>,
     pub supervisor: NetworkSupervisorSnapshot,
     pub sessions: Vec<NetworkSessionSnapshot>,
+    pub live_levels: NetworkLiveLevelsSnapshot,
+}
+
+/// Blocks the live lane delivered, by level, and the unattested ones it undid.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NetworkLiveLevelsSnapshot {
+    /// Blocks delivered at `unattested`, `attested` and `finalized`.
+    pub blocks: [u64; 3],
+    /// Their summed delay after their slot started, in milliseconds.
+    pub delay_milliseconds: [u64; 3],
+    /// Unattested blocks undone, by [`UnattestedUndo`]: grace, orphaned,
+    /// head reorg.
+    pub unattested_undone: [u64; 3],
+    /// Late blocks held for their child.
+    pub unattested_held: u64,
+}
+
+/// Why the live lane undid unattested blocks.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UnattestedUndo {
+    /// No attested head covered them within the undo grace.
+    Grace,
+    /// The attested chain holds another block at their height.
+    Orphaned,
+    /// A peer quorum served a block on another parent at the head.
+    HeadReorg,
+}
+
+impl UnattestedUndo {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Grace => "grace",
+            Self::Orphaned => "orphaned",
+            Self::HeadReorg => "head_reorg",
+        }
+    }
 }
 
 /// How a peer candidate first entered this process's network manager.

@@ -93,7 +93,10 @@ impl DataRequest {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum FinalityModel {
     None,
-    Included,
+    /// The source delivers sync-committee-attested blocks. The serde name is
+    /// the archive manifests' storage name.
+    #[serde(rename = "Included")]
+    Attested,
     Finalized,
 }
 
@@ -102,7 +105,7 @@ impl FinalityModel {
     pub const fn supports(self, required: Finality) -> bool {
         match self {
             Self::None => false,
-            Self::Included => !matches!(required, Finality::Finalized),
+            Self::Attested => !matches!(required, Finality::Finalized),
             Self::Finalized => true,
         }
     }
@@ -342,6 +345,12 @@ pub enum ChainEvent {
     Reorg {
         reverted: Vec<BlockRef>,
         applied: Vec<BlockFrame>,
+    },
+    /// Every delivered block through `through` is on the chain of a verified
+    /// sync-committee-attested head. Nothing is reverted or applied; the
+    /// blocks' level rises from unattested to attested.
+    Attested {
+        through: BlockRef,
     },
     Disconnected {
         reason: String,

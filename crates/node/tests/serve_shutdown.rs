@@ -100,7 +100,6 @@ instance = "shutdown-blocks"
 version = "1.2.0"
 history_mode = "on_demand"
 start_block = 0
-publish = "included_and_finalized"
 
 [processors.state]
 mode = "checkpointed"

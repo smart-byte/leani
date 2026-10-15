@@ -673,7 +673,7 @@ mod tests {
         // would supply.
         let range = BlockRange::single(BlockNumber(1));
         let mut descriptor = fixture_source_descriptor("live", range);
-        descriptor.finality = FinalityModel::Included;
+        descriptor.finality = FinalityModel::Attested;
         // Headers are supplied only filtered, which a live request, like one
         // to the P2P source, cannot use.
         descriptor.capabilities = descriptor.capabilities.with(Capability::Header);
@@ -687,7 +687,7 @@ mod tests {
             )
         };
         let supported = DataRequest {
-            minimum_finality: Finality::Included,
+            minimum_finality: Finality::Attested,
             ..request(range)
         };
         assert!(subscribe(supported.clone()).await.is_ok());

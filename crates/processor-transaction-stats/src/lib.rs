@@ -96,11 +96,11 @@ impl TransactionStatsProcessor {
                     recipients: vec![config.to],
                     ..FilterScope::default()
                 },
-                minimum_finality: Finality::Included,
+                minimum_finality: Finality::Unattested,
             }],
             mode: ReductionMode::OrderedState,
             delivery_ordering: DeliveryOrdering::Canonical,
-            publication: PublicationPolicy::IncludedAndFinalized,
+            publication: PublicationPolicy::Attested,
             lifecycle: LifecyclePolicies::from_legacy(RetentionPolicy::LatestState),
             schemas: ProcessorSchemas {
                 delta_version: 1,
@@ -413,7 +413,7 @@ mod tests {
                 ),
                 timestamp: number,
             },
-            finality: Finality::Included,
+            finality: Finality::Attested,
             header: Material::Missing(leani_primitives::MissingReason::NotRequested),
             transactions: Material::Complete(transactions),
             receipts: Material::Missing(leani_primitives::MissingReason::NotRequested),
@@ -524,7 +524,7 @@ mod tests {
                 parent_hash: BlockHash::new([0x0a; 32]),
                 timestamp: 1_700_000_000,
             },
-            finality: Finality::Included,
+            finality: Finality::Attested,
             header: Material::Complete(HeaderEnvelope {
                 rlp: Some(vec![0xf9]),
                 transactions_root: Some(BlockHash::new([0xd1; 32])),
