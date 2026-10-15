@@ -619,7 +619,7 @@ impl BackfillJob {
             });
         let minimum_finality = requirements
             .iter()
-            .fold(Finality::Attested, |required, requirement| {
+            .fold(Finality::Unattested, |required, requirement| {
                 required.max(requirement.minimum_finality)
             });
         let log_fields = requirements
@@ -1130,7 +1130,11 @@ async fn map_with_finality_variants(
             "finality variants must include the exact delta checksum".to_owned(),
         ));
     }
-    for finality in [Finality::Attested, Finality::Finalized] {
+    for finality in [
+        Finality::Unattested,
+        Finality::Attested,
+        Finality::Finalized,
+    ] {
         if finality == frame.finality {
             continue;
         }
@@ -1265,7 +1269,7 @@ mod failpoints {
 
 /// Apply one mapped delta. The live lane persists it first; history only
 /// checks the pending one, since a live drain applies any pending delta that
-/// continues an ordered cursor, as an included block.
+/// continues an ordered cursor, at its block's canonical level.
 async fn commit_mapped_delta(
     store: &SqliteStore,
     processor: &dyn Processor,
@@ -3677,6 +3681,9 @@ pub struct SharedProcessorLiveReport {
 pub struct SharedLiveReport {
     pub chain_blocks: u64,
     pub reorgs: u64,
+    /// `ChainEvent::Attested` watermarks applied.
+    #[serde(default)]
+    pub attestations: u64,
     pub disconnects: u64,
     pub last_block: Option<BlockNumber>,
     pub last_hash: Option<BlockHash>,
@@ -4398,6 +4405,11 @@ impl SharedLiveRuntime {
                             applied: committed_applied,
                         });
                         report.reorgs = report.reorgs.saturating_add(1);
+                    }
+                    ChainEvent::Attested { through } => {
+                        let _lane = self.lane_lock.lock().await;
+                        self.apply_attested(through, &mut report).await?;
+                        self.publish_committed(ChainEvent::Attested { through });
                     }
                     ChainEvent::Disconnected { reason } => {
                         signal_readiness(readiness.as_ref(), false);
@@ -6210,9 +6222,8 @@ impl SharedLiveRuntime {
                             .is_none_or(|cursor| delta.block.parent_hash == cursor.block_hash)
                 });
                 if let Some(delta) = candidate {
-                    let outcome = match self
-                        .apply_delta(processor.as_ref(), &delta, Finality::Attested)
-                        .await
+                    let finality = self.canonical_finality(delta.block).await?;
+                    let outcome = match self.apply_delta(processor.as_ref(), &delta, finality).await
                     {
                         Ok(outcome) => outcome,
                         Err(error) if live_lane_isolatable_error(&error) => {
@@ -6352,8 +6363,8 @@ impl SharedLiveRuntime {
             return Ok(false);
         };
         let outcome = if stored_checksum == delta.checksum {
-            self.apply_delta(processor, delta, Finality::Attested)
-                .await?
+            let finality = self.canonical_finality(delta.block).await?;
+            self.apply_delta(processor, delta, finality).await?
         } else {
             let mut equivalent_checksums = processor.finality_variant_checksums(delta)?;
             if !equivalent_checksums.contains(&delta.checksum) {
@@ -6428,6 +6439,52 @@ impl SharedLiveRuntime {
             )));
         }
         Ok(())
+    }
+
+    /// Promote the lane's blocks through `through` to attested. A processor
+    /// that has not covered `through` yet is skipped: its pending blocks
+    /// replay at their canonical level, which is attested from here on.
+    async fn apply_attested(
+        &self,
+        through: leani_primitives::BlockRef,
+        report: &mut SharedLiveReport,
+    ) -> Result<(), RuntimeError> {
+        self.store
+            .mark_recent_attested(
+                self.source.descriptor().chain_id,
+                through.number,
+                through.hash,
+            )
+            .await?;
+        for processor in &self.processors {
+            if self
+                .store
+                .coverage_block_by_hash(processor.descriptor(), through.hash)
+                .await?
+                .is_some()
+            {
+                self.store
+                    .mark_attested(processor.descriptor(), through.number, through.hash)
+                    .await?;
+            }
+        }
+        report.attestations = report.attestations.saturating_add(1);
+        Ok(())
+    }
+
+    /// The level of a retained canonical block, for a pending delta, which
+    /// stores none. A block no longer retained counts as unattested: the
+    /// lowest claim.
+    async fn canonical_finality(
+        &self,
+        block: leani_primitives::BlockRef,
+    ) -> Result<Finality, RuntimeError> {
+        Ok(self
+            .store
+            .canonical_block(self.source.descriptor().chain_id, block.number)
+            .await?
+            .filter(|(row, _)| row.hash == block.hash)
+            .map_or(Finality::Unattested, |(_, finality)| finality))
     }
 
     async fn apply_reorg(
@@ -6794,7 +6851,7 @@ fn compile_live_request(
         });
     let minimum_finality = requirements
         .iter()
-        .fold(Finality::Attested, |all, requirement| {
+        .fold(Finality::Unattested, |all, requirement| {
             all.max(requirement.minimum_finality)
         });
     let allow_filtered = requirements
@@ -7009,6 +7066,26 @@ impl LiveRuntime {
                 },
                 ChainEvent::Reorg { reverted, applied } => {
                     self.apply_reorg(&reverted, applied, &mut report).await?;
+                }
+                ChainEvent::Attested { through } => {
+                    let chain_id = self.source.descriptor().chain_id;
+                    self.store
+                        .mark_recent_attested(chain_id, through.number, through.hash)
+                        .await?;
+                    if self
+                        .store
+                        .coverage_block_by_hash(self.processor.descriptor(), through.hash)
+                        .await?
+                        .is_some()
+                    {
+                        self.store
+                            .mark_attested(
+                                self.processor.descriptor(),
+                                through.number,
+                                through.hash,
+                            )
+                            .await?;
+                    }
                 }
                 ChainEvent::Disconnected { reason } => {
                     report.disconnects = report.disconnects.saturating_add(1);
@@ -15703,6 +15780,100 @@ mod tests {
                 .expect("changes")
                 .len(),
             5
+        );
+    }
+
+    #[tokio::test]
+    async fn attested_events_promote_unattested_blocks() {
+        let range = BlockRange::new(BlockNumber(0), BlockNumber(2)).expect("range");
+        let mut chain = Vec::new();
+        let mut parent = BlockHash::ZERO;
+        for number in 0..=2 {
+            let mut frame = live_fixture(number, parent);
+            frame.finality = Finality::Unattested;
+            parent = frame.block.hash;
+            chain.push(frame);
+        }
+        let mut steps = chain
+            .iter()
+            .cloned()
+            .map(|frame| LiveStep::Event(ChainEvent::Block(Box::new(frame))))
+            .collect::<Vec<_>>();
+        steps.push(LiveStep::Event(ChainEvent::Attested {
+            through: chain[1].block,
+        }));
+        let head = Arc::new(
+            BlockLocalCounter::named("attested-head")
+                .with_publication(PublicationPolicy::Unattested),
+        );
+        let strict = Arc::new(
+            BlockLocalCounter::named("attested-strict")
+                .with_publication(PublicationPolicy::Attested),
+        );
+        let (_directory, store) = store().await;
+        let runtime = SharedLiveRuntime::new(
+            store.clone(),
+            Arc::new(ScriptedLiveSource::new(
+                e2e_descriptor("attested-live", range),
+                steps,
+            )),
+            vec![head.clone(), strict.clone()],
+            SharedLiveRuntimeConfig::default(),
+        )
+        .expect("runtime");
+        let report = runtime
+            .run(
+                LiveStart::Head,
+                default_source_budget(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("run");
+        assert_eq!(report.attestations, 1);
+        let level = |number| {
+            let store = store.clone();
+            async move {
+                store
+                    .canonical_block(ChainId(1), BlockNumber(number))
+                    .await
+                    .expect("row")
+                    .map(|(_, finality)| finality)
+            }
+        };
+        assert_eq!(level(1).await, Some(Finality::Attested));
+        assert_eq!(level(2).await, Some(Finality::Unattested));
+        let operations = |changes: Vec<leani_store_sqlite::ChangeRecord>| {
+            changes
+                .into_iter()
+                .map(|change| (change.block.number.0, change.finality, change.direction))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            operations(
+                store
+                    .changes(head.descriptor(), ChainId(1), 0, 100)
+                    .await
+                    .expect("head")
+            ),
+            vec![
+                (0, Finality::Unattested, ChangeDirection::Apply),
+                (1, Finality::Unattested, ChangeDirection::Apply),
+                (2, Finality::Unattested, ChangeDirection::Apply),
+                (1, Finality::Attested, ChangeDirection::Finalized),
+            ]
+        );
+        assert_eq!(
+            operations(
+                store
+                    .changes(strict.descriptor(), ChainId(1), 0, 100)
+                    .await
+                    .expect("strict")
+            ),
+            vec![
+                (0, Finality::Attested, ChangeDirection::Apply),
+                (1, Finality::Attested, ChangeDirection::Apply),
+            ],
+            "block 2 stays parked until a later attested head covers it"
         );
     }
 

@@ -346,6 +346,12 @@ pub enum ChainEvent {
         reverted: Vec<BlockRef>,
         applied: Vec<BlockFrame>,
     },
+    /// Every delivered block through `through` is on the chain of a verified
+    /// sync-committee-attested head. Nothing is reverted or applied; the
+    /// blocks' level rises from unattested to attested.
+    Attested {
+        through: BlockRef,
+    },
     Disconnected {
         reason: String,
     },

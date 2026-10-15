@@ -78,7 +78,7 @@ impl BlockSummaryProcessor {
                 log_fields: leani_primitives::LogFieldSet::NONE,
                 allow_filtered: true,
                 filter: FilterScope::default(),
-                minimum_finality: Finality::Attested,
+                minimum_finality: Finality::Unattested,
             }],
             mode: ReductionMode::BlockLocal,
             delivery_ordering: DeliveryOrdering::BlockVersionedIdempotent,
@@ -197,12 +197,16 @@ impl Processor for BlockSummaryProcessor {
         delta.validate(&self.descriptor)?;
         let decoded: BlockSummaryEntity = postcard::from_bytes(&delta.payload)
             .map_err(|error| ProcessorError::DeltaPayload(error.to_string()))?;
-        let mut checksums = Vec::with_capacity(4);
+        let mut checksums = Vec::with_capacity(6);
         // Dataset rows carry no execution-block size. A block a dataset
         // summarized first matches the same block from verified material,
         // such as the live lane's handoff overlap after a Xatu backfill.
         for size_bytes in [decoded.size_bytes, None] {
-            for finality in [Finality::Attested, Finality::Finalized] {
+            for finality in [
+                Finality::Unattested,
+                Finality::Attested,
+                Finality::Finalized,
+            ] {
                 let mut entity = decoded.clone();
                 entity.finality = finality;
                 entity.size_bytes = size_bytes;
@@ -431,7 +435,7 @@ mod tests {
         let checksums = processor
             .finality_variant_checksums(&delta)
             .expect("variants");
-        assert_eq!(checksums.len(), 2);
+        assert_eq!(checksums.len(), 3);
 
         let unrelated = EncodedDelta::new(
             processor.descriptor(),

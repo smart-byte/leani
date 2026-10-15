@@ -359,7 +359,7 @@ mod tests {
                 log_fields: leani_primitives::LogFieldSet::NONE,
                 allow_filtered: false,
                 filter: FilterScope::default(),
-                minimum_finality: Finality::Attested,
+                minimum_finality: Finality::Unattested,
             }],
             mode: ReductionMode::BlockLocal,
             delivery_ordering: DeliveryOrdering::BlockVersionedIdempotent,
