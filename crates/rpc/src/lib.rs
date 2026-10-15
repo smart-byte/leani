@@ -5536,7 +5536,8 @@ mod tests {
         let seventh = with_log(rpc_frame(7), 7);
         let finalized = with_log(rpc_frame_after(&seventh), 8);
         let mut head = with_log(rpc_frame_after(&finalized), 9);
-        head.finality = Finality::Attested;
+        // `latest` is the retained tip at any level, unattested included.
+        head.finality = Finality::Unattested;
         store.store_recent_frame(&head).await.expect("head frame");
         assert_unavailable(
             call(

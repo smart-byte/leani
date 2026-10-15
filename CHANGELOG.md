@@ -22,6 +22,14 @@ record, and documented RPC contracts.
   `[processors.delivery] emit = "job_result"`, and the `terminal` operating
   profile is `job-result`. A processor that emits a job result takes no
   `publish`: its bounded history job covers finalized blocks.
+- Breaking (SDK, HTTP API): the change stream carries a new operation,
+  `attested` (`system.finality.put` with `throughBlock`), for processors that
+  publish `unattested` blocks. SDKs before this release reject it as an
+  invalid envelope. Coverage intervals label `unattested`, `attested` and
+  `finalized`.
+- Breaking (HTTP API): query-and-follow answers `409
+  deferred_publication_snapshot` (was `finalized_only_snapshot`) for every
+  processor that publishes from `attested` or `finalized`.
 - Verified finality learns each sync-committee-attested head within about
   1.5 s of a Beacon endpoint or consensus peer serving it. Between finality
   polls it asks only for the light-client optimistic update, 1.5, 3, 4.5 and

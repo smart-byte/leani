@@ -512,12 +512,13 @@ return `boundaryCursor: null` and `recovery.follow: null`. Query-and-follow, cha
 change-page, and stream requests return non-retryable HTTP 409
 `delivery_disabled`; enable a delivery policy before subscribing.
 
-A `finalized_only` processor's snapshots also return `boundaryCursor: null`
-and `recovery.follow: null`, and query-and-follow returns HTTP 409
-`finalized_only_snapshot`: its retained state already holds included blocks
-whose changes are published only once finalized, and the stream never undoes
-a block it never published, so a copy followed from a boundary could keep
-rows of a reorged block.
+The snapshots of a processor that publishes from `attested` or `finalized`
+also return `boundaryCursor: null` and `recovery.follow: null`, and
+query-and-follow returns HTTP 409 `deferred_publication_snapshot`: its
+retained state already holds blocks whose changes are published only once
+they reach that level, and the stream never undoes a block it never
+published, so a copy followed from a boundary could keep rows of a reorged
+block.
 
 Release a no-longer-needed snapshot early:
 

@@ -250,10 +250,10 @@ export interface paths {
          * Snapshot processor entities
          * @description Copies the matching retained output into a stable, short-lived
          *     snapshot and returns its first page. Read later pages with GET and the
-         *     page's `nextCursor`, and release the snapshot when done. A
-         *     `finalized_only` processor's snapshot holds blocks whose changes are
-         *     not published yet, so it offers no boundary to follow:
-         *     `boundaryCursor` and `recovery.follow` are null.
+         *     page's `nextCursor`, and release the snapshot when done. The snapshot
+         *     of a processor that publishes from `attested` or `finalized` holds
+         *     blocks whose changes are not published yet, so it offers no boundary
+         *     to follow: `boundaryCursor` and `recovery.follow` are null.
          */
         post: operations["createProcessorEntitySnapshot"];
         delete?: never;
@@ -1579,8 +1579,9 @@ export interface components {
             nextCursor: components["schemas"]["Cursor"] | null;
             snapshotId: string;
             /**
-             * @description Null when the processor has delivery disabled or is
-             *     `finalized_only`, whose retained state holds unpublished blocks.
+             * @description Null when the processor has delivery disabled or publishes from
+             *     `attested` or `finalized`: its retained state holds unpublished
+             *     blocks.
              */
             boundaryCursor: components["schemas"]["Cursor"] | null;
             rowCount: components["schemas"]["DecimalQuantity"];
@@ -1875,7 +1876,7 @@ export interface components {
             sequence: components["schemas"]["DecimalQuantity"];
             cursor: components["schemas"]["Cursor"];
             /** @enum {string} */
-            operation: "apply" | "undo" | "finalized" | "reset_required";
+            operation: "apply" | "undo" | "attested" | "finalized" | "reset_required";
             /**
              * @description Processing lane that produced this publication.
              * @enum {string}
@@ -1892,8 +1893,11 @@ export interface components {
             schema: string;
             key: string | null;
             /**
-             * @description The processor's entity for `apply` and `undo`. For `finalized`,
-             *     the `system.finality.put` kind carries `{ throughBlock }`, and the
+             * @description The processor's entity for `apply` and `undo`. For `attested`,
+             *     the `system.finality.put` kind carries `{ throughBlock }`, the
+             *     highest block the sync committee has attested; processors that
+             *     publish `unattested` blocks emit it. For `finalized`, the
+             *     `system.finality.put` kind carries `{ throughBlock }`, and the
              *     `system.live_gap.put` kind carries
              *     `{ fromBlock, toBlock, reason: "not_filled" }`: blocks the live
              *     lane skipped and did not fill, such as after a restart at a later
@@ -2484,7 +2488,13 @@ export interface operations {
                     "application/json": components["schemas"]["FollowSnapshotPage"];
                 };
             };
-            /** @description This processor has delivery disabled; query retained entities without following, or enable delivery. */
+            /**
+             * @description This processor has delivery disabled; query retained entities
+             *     without following, or enable delivery. Or it publishes from
+             *     `attested` or `finalized` (`deferred_publication_snapshot`): its
+             *     retained state holds blocks not published yet, so follow the
+             *     change stream from its head instead.
+             */
             409: {
                 headers: {
                     [name: string]: unknown;

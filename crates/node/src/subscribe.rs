@@ -336,10 +336,10 @@ struct AttachedEnvelope {
     extra: BTreeMap<String, Value>,
 }
 
-/// Unfinalized envelopes an attached `--finality finalized` subscription holds
-/// until a `system.finality` marker covers their block.
+/// Envelopes below an attached subscription's `--finality` level, held until
+/// a `system.finality` marker at that level or above covers their block.
 #[derive(Debug, Default)]
-struct FinalizedGate {
+struct LevelGate {
     pending: BTreeMap<u64, Vec<(AttachedEnvelope, Value)>>,
     /// The node's finalized block when the subscription first connected.
     /// The stream replays the retained log, and blocks up to this one were
@@ -376,7 +376,7 @@ enum FinalityGapReason {
     ChangeLogPruned,
 }
 
-impl FinalizedGate {
+impl LevelGate {
     #[cfg(test)]
     fn pending_blocks(&self) -> usize {
         self.pending.len()
@@ -451,27 +451,44 @@ impl FinalizedGate {
         self.pending.remove(&block);
     }
 
-    /// Everything at or below `through`, promoted to `finalized`, in block order.
-    fn release(&mut self, through: u64) -> Vec<(AttachedEnvelope, Value)> {
+    /// Everything at or below `through`, promoted to `level`, in block order.
+    fn release(&mut self, through: u64, level: Finality) -> Vec<(AttachedEnvelope, Value)> {
         let keep = self.pending.split_off(&through.saturating_add(1));
         let released = std::mem::replace(&mut self.pending, keep);
         released
             .into_values()
             .flatten()
             .map(|(mut envelope, mut raw)| {
-                "finalized".clone_into(&mut envelope.finality);
+                level.name().clone_into(&mut envelope.finality);
                 if let Some(raw) = raw.as_object_mut() {
-                    raw.insert("finality".to_owned(), Value::String("finalized".to_owned()));
+                    raw.insert(
+                        "finality".to_owned(),
+                        Value::String(level.name().to_owned()),
+                    );
                     if let Some(data) = raw.get_mut("data").and_then(Value::as_object_mut)
                         && data.contains_key("finality")
                     {
-                        data.insert("finality".to_owned(), Value::String("finalized".to_owned()));
+                        data.insert(
+                            "finality".to_owned(),
+                            Value::String(level.name().to_owned()),
+                        );
                     }
                 }
                 (envelope, raw)
             })
             .collect()
     }
+}
+
+/// The level a wire name names.
+fn level_named(name: &str) -> Option<Finality> {
+    [
+        Finality::Unattested,
+        Finality::Attested,
+        Finality::Finalized,
+    ]
+    .into_iter()
+    .find(|level| level.name() == name)
 }
 
 fn envelope_block_number(envelope: &AttachedEnvelope) -> Option<u64> {
@@ -582,7 +599,7 @@ enum AttachedItem {
 struct AttachedState {
     cursor: Option<String>,
     last_sequence: Option<u64>,
-    gate: FinalizedGate,
+    gate: LevelGate,
     changes: AttachedChanges,
     /// Still-fresh latest rows read at startup, printed once the first hello
     /// shows the node serves this feed.
@@ -2609,14 +2626,13 @@ fn render_durable_change(
         }
         return Ok(false);
     }
-    let shown = match options.finality {
-        // An included row is a live update; a stale one is catch-up.
-        SubscribeFinality::Unattested | SubscribeFinality::Attested => {
-            update_is_fresh(SubscribeFinality::Attested, record.block.timestamp, now)
-        }
-        // A finalized row prints however late finality arrives.
-        SubscribeFinality::Finalized => record.finality == Finality::Finalized,
-    };
+    // A row below the subscription's level is no result. A live-level row is
+    // a live update while fresh; a stale one is catch-up. A finalized row
+    // prints however late finality arrives.
+    let level = options.finality.level();
+    let shown = record.finality >= level
+        && (level == Finality::Finalized
+            || update_is_fresh(options.finality, record.block.timestamp, now));
     if !shown {
         return Ok(false);
     }
@@ -2728,7 +2744,11 @@ fn render_local_item(
         item,
         record.block,
         record.finality,
-        direction_name(record.direction),
+        leani_store_sqlite::change_operation(
+            record.direction,
+            record.finality,
+            &record.change.kind,
+        ),
         Some(record.cursor.sequence.to_string()),
     )
 }
@@ -3093,15 +3113,6 @@ fn quote_token(market: &Market) -> Token {
     }
 }
 
-const fn direction_name(direction: ChangeDirection) -> &'static str {
-    match direction {
-        ChangeDirection::Apply => "apply",
-        ChangeDirection::Undo => "undo",
-        ChangeDirection::Finalized => "finalized",
-        ChangeDirection::ResetRequired => "reset_required",
-    }
-}
-
 enum AttachedStreamConnection {
     Connected(reqwest::Response),
     Retry,
@@ -3417,7 +3428,7 @@ fn render_attached_sse_events(
         if envelope.cursor.is_empty()
             || !matches!(
                 envelope.operation.as_str(),
-                "apply" | "undo" | "finalized" | "reset_required"
+                "apply" | "undo" | "attested" | "finalized" | "reset_required"
             )
         {
             bail!("node sent an invalid SSE change envelope");
@@ -3437,19 +3448,22 @@ fn render_attached_sse_events(
         }
         state.last_sequence = Some(sequence);
         state.cursor = Some(envelope.cursor.clone());
-        if options.finality == SubscribeFinality::Finalized {
+        let level = options.finality.level();
+        if level > Finality::Unattested {
             let block = envelope_block_number(&envelope);
             let system = envelope.kind.starts_with("system.");
-            // The first change applied above the floor, included or already
-            // finalized, shows whether the node pruned blocks before it.
-            // Nothing above the floor printed yet: report them at once.
-            if !system
+            let finalized_output = level == Finality::Finalized;
+            // The first change applied above the floor, at any level, shows
+            // whether the node pruned blocks before it. Nothing above the
+            // floor printed yet: report them at once.
+            if finalized_output
+                && !system
                 && envelope.operation == "apply"
                 && let Some(pruned) = block.and_then(|block| state.gate.pruned_below(block))
             {
                 render_finality_gap(options, &pruned)?;
             }
-            if envelope.finality != "finalized" {
+            if level_named(&envelope.finality).is_none_or(|finality| finality < level) {
                 match (envelope.operation.as_str(), block) {
                     ("apply", Some(block)) if !system => state.gate.hold(block, envelope, value),
                     ("undo", Some(block)) => state.gate.undo(block),
@@ -3457,7 +3471,10 @@ fn render_attached_sse_events(
                 }
                 continue;
             }
-            if !system && block.is_some_and(|block| state.gate.final_at_connect(block)) {
+            if finalized_output
+                && !system
+                && block.is_some_and(|block| state.gate.final_at_connect(block))
+            {
                 continue;
             }
             // Report dropped blocks before the finalized rows after them.
@@ -3466,14 +3483,18 @@ fn render_attached_sse_events(
             }
         }
         let mut to_render = Vec::new();
+        // A marker releases held blocks only at the subscription's level or
+        // above: an attested watermark never releases a finalized gate.
         if envelope.kind.starts_with("system.finality")
+            && let Some(marker) = level_named(&envelope.finality)
+            && marker >= level
             && let Some(through) = envelope
                 .data
                 .as_ref()
                 .and_then(|data| data.get("throughBlock"))
                 .and_then(Value::as_u64)
         {
-            to_render = state.gate.release(through);
+            to_render = state.gate.release(through, marker);
         }
         to_render.push((envelope, value));
         for (envelope, value) in to_render {
@@ -3814,15 +3835,15 @@ fn render_attached(
             }
         }
     };
-    let item = item.filter(|item| match options.finality {
-        // An included row is a live update; a stale one is the node
-        // catching up. A node never streams previews.
-        SubscribeFinality::Unattested | SubscribeFinality::Attested => {
-            update_is_fresh(SubscribeFinality::Attested, item.timestamp(), now)
-        }
-        // A finalized row prints however late finality arrives. Blocks final
-        // before the subscription connected never reach here.
-        SubscribeFinality::Finalized => envelope.finality == "finalized",
+    // A row below the subscription's level is no result. A live-level row is
+    // a live update while fresh; a stale one is the node catching up. A
+    // finalized row prints however late finality arrives; blocks final
+    // before the subscription connected never reach here.
+    let level = options.finality.level();
+    let item = item.filter(|item| {
+        level_named(&envelope.finality).is_some_and(|finality| finality >= level)
+            && (level == Finality::Finalized
+                || update_is_fresh(options.finality, item.timestamp(), now))
     });
     let Some(item) = item else {
         if let Some(key) = envelope.key {
@@ -4284,6 +4305,18 @@ mod tests {
             "data: {{\"sequence\":\"{sequence}\",\"cursor\":\"cursor-{sequence}\",\"operation\":\"{operation}\",\
              \"block\":{{\"number\":{block},\"hash\":\"0x{zero}\",\"parentHash\":\"0x{zero}\",\"timestamp\":1}},\
              \"finality\":\"{finality}\",\"kind\":\"{kind}\",\"data\":{{\"throughBlock\":{through}}}}}\n\n"
+        )
+        .into_bytes()
+    }
+
+    /// An attested watermark, as a processor that publishes unattested
+    /// blocks streams it.
+    fn attested_marker_event(sequence: u64, block: u64, through: u64) -> Vec<u8> {
+        let zero = hex::encode([0; 32]);
+        format!(
+            "data: {{\"sequence\":\"{sequence}\",\"cursor\":\"cursor-{sequence}\",\"operation\":\"attested\",\
+             \"block\":{{\"number\":{block},\"hash\":\"0x{zero}\",\"parentHash\":\"0x{zero}\",\"timestamp\":1}},\
+             \"finality\":\"attested\",\"kind\":\"system.finality.put\",\"data\":{{\"throughBlock\":{through}}}}}\n\n"
         )
         .into_bytes()
     }
@@ -4824,6 +4857,43 @@ mod tests {
             "the stream must start before unfinalized blocks"
         );
         assert_eq!(contacted.await.expect("server"), 0);
+    }
+
+    #[test]
+    fn attested_markers_release_only_attested_gates() {
+        let now = unix_seconds();
+        // A finalized gate holds an unattested block through an attested
+        // marker, and releases it on the finalized one.
+        let options = attached_finalized_options();
+        let mut state = AttachedState::default();
+        let mut buffer = EventBuffer::default();
+        buffer.push(&attached_hello(1, "block-summary", Some(99)));
+        buffer.push(&attached_block_event(1, 100, "unattested", now));
+        buffer.push(&attested_marker_event(2, 100, 100));
+        let (outcome, rows) = captured(|| render_blocks(&mut buffer, &mut state, &options));
+        assert!(!outcome.expect("an attested marker").stop);
+        assert!(rows.is_empty(), "{rows:?}");
+        assert_eq!(state.gate.pending_blocks(), 1);
+        buffer.push(&attached_marker_event(3, 100, "system.finality.put", 100));
+        let (outcome, rows) = captured(|| render_blocks(&mut buffer, &mut state, &options));
+        assert!(outcome.expect("a finalized marker").stop);
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        // An attested gate holds an unattested apply until the attested
+        // marker covers it.
+        let mut options = attached_included_options();
+        options.finality = SubscribeFinality::Attested;
+        let mut state = AttachedState::default();
+        buffer.push(&attached_hello(1, "block-summary", Some(99)));
+        buffer.push(&attached_block_event(4, 101, "unattested", now));
+        let (outcome, rows) = captured(|| render_blocks(&mut buffer, &mut state, &options));
+        assert!(!outcome.expect("an unattested apply").stop);
+        assert!(rows.is_empty(), "{rows:?}");
+        buffer.push(&attested_marker_event(5, 101, 101));
+        let (outcome, rows) = captured(|| render_blocks(&mut buffer, &mut state, &options));
+        assert!(outcome.expect("the attested marker").stop);
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        let row: Value = serde_json::from_str(&rows[0]).expect("JSON row");
+        assert_eq!(row["finality"], "attested");
     }
 
     #[test]

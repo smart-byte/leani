@@ -34,6 +34,7 @@ export type Finality = "unattested" | "attested" | "finalized";
 export type ChangeOperation =
   | "apply"
   | "undo"
+  | "attested"
   | "finalized"
   | "reset_required";
 
@@ -465,6 +466,7 @@ export interface LiveGapChangeData {
 /** System transitions never pretend to contain a processor entity payload. */
 export type ChangeEnvelope<T = unknown> = ChangeMetadata & (
   | { operation: "apply" | "undo"; data: T | null }
+  | { operation: "attested"; data: { throughBlock: number } }
   | { operation: "finalized"; data: { throughBlock: number } }
   | { operation: "finalized"; data: LiveGapChangeData }
   | { operation: "reset_required"; data: {
@@ -1568,7 +1570,7 @@ function validateChangeEnvelope(value: ChangeEnvelope): void {
     !/^\d+$/.test(value.sequence) ||
     typeof value.cursor !== "string" ||
     value.cursor.length === 0 ||
-    !["apply", "undo", "finalized", "reset_required"].includes(value.operation) ||
+    !["apply", "undo", "attested", "finalized", "reset_required"].includes(value.operation) ||
     typeof value.schema !== "string" ||
     value.schema.length === 0
   ) {

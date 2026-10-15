@@ -572,6 +572,25 @@ pub enum ChangeDirection {
     ResetRequired,
 }
 
+/// The public operation of a change. The attested watermark is stored with
+/// direction `finalized` and level attested (see `mark_attested`), and is
+/// published as `attested`.
+#[must_use]
+pub fn change_operation(
+    direction: ChangeDirection,
+    finality: Finality,
+    kind: &str,
+) -> &'static str {
+    match direction {
+        ChangeDirection::Finalized
+            if finality == Finality::Attested && kind == "system.finality" =>
+        {
+            "attested"
+        }
+        direction => direction.as_str(),
+    }
+}
+
 impl ChangeDirection {
     const fn as_str(self) -> &'static str {
         match self {
@@ -8337,6 +8356,35 @@ impl SqliteStore {
             );
         }
         normalize_ranges(coverage)
+    }
+
+    /// Return the blocks of `requested` a processor covers at the unattested
+    /// level, merged into ranges. Unattested rows are never compacted.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an out-of-range height or a failed query.
+    pub async fn unattested_coverage(
+        &self,
+        descriptor: &ProcessorDescriptor,
+        requested: BlockRange,
+    ) -> Result<Vec<BlockRange>, StoreError> {
+        let rows: Vec<i64> = sqlx::query_scalar(
+            "SELECT block_number FROM processor_coverage
+             WHERE instance = ? AND finality = ? AND block_number BETWEEN ? AND ?
+             ORDER BY block_number",
+        )
+        .bind(processor_instance(descriptor))
+        .bind(finality_i64(Finality::Unattested))
+        .bind(u64_i64(requested.start().0, "block_number")?)
+        .bind(u64_i64(requested.end().0, "block_number")?)
+        .fetch_all(&self.inner.pool)
+        .await?;
+        merge_block_numbers(
+            rows.into_iter()
+                .map(|number| i64_u64(number, "block_number"))
+                .collect::<Result<Vec<_>, _>>()?,
+        )
     }
 
     /// Return every compact finalized proof segment intersecting a range.
