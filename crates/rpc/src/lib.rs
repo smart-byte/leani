@@ -1468,6 +1468,8 @@ async fn queue_notifications(
                 .map_err(|error| unavailable_close(&error))?,
             applied.as_slice(),
         ),
+        // newHeads and logs carry no level.
+        ChainEvent::Attested { .. } => return Ok(()),
         ChainEvent::Disconnected { .. } => {
             return Err(unavailable_close(&RpcError::data_unavailable_reason(
                 "live_subscription_disconnected",

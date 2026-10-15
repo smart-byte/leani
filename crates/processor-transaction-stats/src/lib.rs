@@ -96,7 +96,7 @@ impl TransactionStatsProcessor {
                     recipients: vec![config.to],
                     ..FilterScope::default()
                 },
-                minimum_finality: Finality::Attested,
+                minimum_finality: Finality::Unattested,
             }],
             mode: ReductionMode::OrderedState,
             delivery_ordering: DeliveryOrdering::Canonical,

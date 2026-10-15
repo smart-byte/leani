@@ -123,7 +123,7 @@ impl UniswapLatestProcessor {
                     }],
                     ..FilterScope::default()
                 },
-                minimum_finality: Finality::Attested,
+                minimum_finality: Finality::Unattested,
             }],
             mode: ReductionMode::OrderedState,
             delivery_ordering: DeliveryOrdering::Canonical,
@@ -438,7 +438,7 @@ fn uniswap_requirement(config: &UniswapConfig) -> DataRequirement {
             }],
             ..FilterScope::default()
         },
-        minimum_finality: Finality::Attested,
+        minimum_finality: Finality::Unattested,
     }
 }
 
@@ -509,8 +509,12 @@ fn finality_variant_checksums(
     delta.validate(descriptor)?;
     let decoded: UniswapPriceDelta = postcard::from_bytes(&delta.payload)
         .map_err(|error| ProcessorError::DeltaPayload(error.to_string()))?;
-    let mut checksums = Vec::with_capacity(2);
-    for finality in [Finality::Attested, Finality::Finalized] {
+    let mut checksums = Vec::with_capacity(3);
+    for finality in [
+        Finality::Unattested,
+        Finality::Attested,
+        Finality::Finalized,
+    ] {
         let mut variant = decoded.clone();
         for observation in &mut variant.observations {
             observation.finality = finality;
@@ -692,7 +696,7 @@ mod tests {
         let variants = processor
             .finality_variant_checksums(&delta)
             .expect("finality variants");
-        assert_eq!(variants.len(), 2);
+        assert_eq!(variants.len(), 3);
         assert!(variants.contains(&delta.checksum));
         let mut reducer = MemoryReducer::default();
         let changes = processor

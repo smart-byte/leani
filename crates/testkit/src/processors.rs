@@ -471,7 +471,7 @@ fn descriptor(id: &str, capabilities: CapabilitySet, mode: ReductionMode) -> Pro
             log_fields: leani_primitives::LogFieldSet::NONE,
             allow_filtered: false,
             filter: FilterScope::default(),
-            minimum_finality: Finality::Attested,
+            minimum_finality: Finality::Unattested,
         }],
         mode,
         delivery_ordering: if mode == ReductionMode::BlockLocal {

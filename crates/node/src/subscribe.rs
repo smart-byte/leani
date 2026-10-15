@@ -1340,6 +1340,7 @@ async fn subscribe_embedded(
                             %reason,
                             "peer preview tail transiently disconnected"
                         ),
+                        Ok(ChainEvent::Attested { .. }) => {}
                         Ok(ChainEvent::Reset { reason, .. }) => {
                             tracing::debug!(
                                 %reason,
