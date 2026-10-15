@@ -6,6 +6,14 @@ record, and documented RPC contracts.
 
 ## [Unreleased]
 
+### Changed
+
+- Verified finality learns each sync-committee-attested head within about
+  1.5 s of a Beacon endpoint or consensus peer serving it. Between finality
+  polls it asks only for the light-client optimistic update, 1.5, 3, 4.5 and
+  6 s into each slot, until the slot's head arrives. Included blocks reach
+  processors about 6 s earlier on average, and up to 12 s.
+
 ## [0.1.0-rc.7] - 2026-10-14
 
 ### Added

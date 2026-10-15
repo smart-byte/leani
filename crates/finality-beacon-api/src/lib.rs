@@ -10,7 +10,10 @@ use std::{
     fmt,
     ops::Range,
     str::FromStr,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -546,6 +549,9 @@ pub struct VerifiedBeaconApi {
     anchor_writer: AnchorWriter,
     /// Where every accepted poll publishes its newest verified attested head.
     attested_heads: Option<AttestedHeadPublisher>,
+    /// Whether the last finality poll was accepted. Heads polled between
+    /// finality polls are published only while it is.
+    last_poll_accepted: Arc<AtomicBool>,
 }
 
 /// One endpoint's light client.
@@ -653,6 +659,7 @@ impl VerifiedBeaconApi {
             clock,
             verifiers: Arc::new(tokio::sync::Mutex::new(VerifierPool::default())),
             attested_heads: None,
+            last_poll_accepted: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -845,8 +852,51 @@ impl VerifiedBeaconApi {
         {
             pool.newest_agreed = Some(selected);
         }
+        self.last_poll_accepted
+            .store(report.accepted, Ordering::SeqCst);
         self.publish_attested_head(&report);
         report
+    }
+
+    /// Verify every ready endpoint's latest optimistic update, without a
+    /// finality poll, and publish the newest head. Only after an accepted
+    /// finality poll: a head never steers the lane past unverified finality.
+    async fn poll_attested_heads(&self) {
+        let Some(heads) = &self.attested_heads else {
+            return;
+        };
+        if !self.last_poll_accepted.load(Ordering::SeqCst) {
+            return;
+        }
+        let pool = self.verifiers.lock().await;
+        let verified = self
+            .config
+            .endpoints
+            .iter()
+            .zip(&pool.endpoints)
+            .filter_map(|(endpoint, verifier)| match verifier {
+                EndpointVerifier::Ready(verifier) => Some(attested_endpoint_head(
+                    self.transport.as_ref(),
+                    endpoint,
+                    verifier,
+                    &self.clock,
+                )),
+                _ => None,
+            })
+            .collect::<FuturesUnordered<_>>()
+            .filter_map(|head| async move { head.ok() })
+            .collect::<Vec<_>>()
+            .await;
+        drop(pool);
+        if let Some(head) = select_attested_head(&verified)
+            && heads.publish(head)
+        {
+            debug!(
+                beacon_slot = head.beacon_slot,
+                block = head.block_number.0,
+                "published a sync-committee-attested execution head between finality polls"
+            );
+        }
     }
 
     /// Publish a poll's attested head. Only a poll whose finality was
@@ -997,11 +1047,31 @@ async fn next_finality_event(
                 }
             }
         }
-        tokio::select! {
-            () = tokio::time::sleep(state.source.config.poll_interval) => {}
-            () = state.cancellation.cancelled() => {
-                state.terminal = true;
-                return Some((Err(SourceError::Cancelled), state));
+        let full_poll_at = tokio::time::Instant::now() + state.source.config.poll_interval;
+        loop {
+            let published = state
+                .source
+                .attested_heads
+                .as_ref()
+                .and_then(AttestedHeadPublisher::latest)
+                .map(|head| head.beacon_slot);
+            let head_poll_at = tokio::time::Instant::now()
+                + until_next_attested_poll(state.source.clock.now(), published);
+            if state.source.attested_heads.is_none() || head_poll_at >= full_poll_at {
+                tokio::select! {
+                    () = tokio::time::sleep_until(full_poll_at) => break,
+                    () = state.cancellation.cancelled() => {
+                        state.terminal = true;
+                        return Some((Err(SourceError::Cancelled), state));
+                    }
+                }
+            }
+            tokio::select! {
+                () = tokio::time::sleep_until(head_poll_at) => state.source.poll_attested_heads().await,
+                () = state.cancellation.cancelled() => {
+                    state.terminal = true;
+                    return Some((Err(SourceError::Cancelled), state));
+                }
             }
         }
         let report = state.source.poll_current().await;
@@ -1240,6 +1310,29 @@ fn verify_checkpoint_age(
     Ok(())
 }
 
+/// When to poll the optimistic update, in milliseconds into a slot. An update
+/// for slot S − 1 reaches Beacon endpoints 1.6–4.5 s into slot S (measured
+/// 2026-10-05), so these catch it within about 1.5 s.
+pub const ATTESTED_POLL_OFFSETS_MS: [u64; 4] = [1_500, 3_000, 4_500, 6_000];
+
+/// Time until the next optimistic-update poll. Once the published head is
+/// the previous slot's, the window is done until the next slot.
+#[must_use]
+pub fn until_next_attested_poll(now: SystemTime, published_beacon_slot: Option<u64>) -> Duration {
+    let since_genesis = now
+        .duration_since(UNIX_EPOCH + Duration::from_secs(MAINNET_GENESIS_TIME))
+        .unwrap_or_default();
+    let slot = since_genesis.as_secs() / SLOT_SECONDS;
+    let into_slot = since_genesis.saturating_sub(Duration::from_secs(slot * SLOT_SECONDS));
+    let slot_done =
+        published_beacon_slot.is_some_and(|published| published.saturating_add(1) >= slot);
+    let offsets = ATTESTED_POLL_OFFSETS_MS.map(Duration::from_millis);
+    if !slot_done && let Some(offset) = offsets.iter().find(|offset| **offset > into_slot) {
+        return offset.saturating_sub(into_slot);
+    }
+    Duration::from_secs(SLOT_SECONDS).saturating_sub(into_slot) + offsets[0]
+}
+
 /// The mainnet beacon slot at `now`.
 #[must_use]
 pub fn current_slot(now: SystemTime) -> u64 {
@@ -1348,7 +1441,12 @@ fn select_endpoint_agreement(
         minimum_agreement,
         accepted: selected.is_some() && disagreements.is_empty(),
         selected,
-        attested_head: select_attested_head(&endpoints),
+        attested_head: select_attested_head(
+            &endpoints
+                .iter()
+                .filter_map(|endpoint| endpoint.attested_head)
+                .collect::<Vec<_>>(),
+        ),
         agreeing_endpoints,
         disagreements,
         endpoints,
@@ -1360,11 +1458,7 @@ fn select_endpoint_agreement(
 /// sync committee, so one endpoint suffices and a lagging one never holds the
 /// head back. Two different heads at the newest slot fail closed: no head is
 /// followed from this poll.
-fn select_attested_head(endpoints: &[EndpointProbe]) -> Option<AttestedHead> {
-    let heads = endpoints
-        .iter()
-        .filter_map(|endpoint| endpoint.attested_head)
-        .collect::<Vec<_>>();
+fn select_attested_head(heads: &[AttestedHead]) -> Option<AttestedHead> {
     let newest = heads.iter().copied().max_by_key(|head| head.beacon_slot)?;
     if heads
         .iter()
@@ -1829,6 +1923,68 @@ mod tests {
             Some(Ok(FinalityEvent::Finalized { beacon_slot, .. })) => beacon_slot,
             other => panic!("expected a finalized event, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn attested_polls_follow_the_slot_offsets() {
+        let current = SIGNATURE_SLOT + 5;
+        let at = |millis: u64| {
+            UNIX_EPOCH + Duration::from_secs(slot_time(current)) + Duration::from_millis(millis)
+        };
+        let next = |millis, published| until_next_attested_poll(at(millis), published);
+        assert_eq!(next(0, None), Duration::from_millis(1_500));
+        assert_eq!(next(2_000, None), Duration::from_millis(1_000));
+        // After the last offset, the next slot's first one.
+        assert_eq!(next(6_000, None), Duration::from_millis(7_500));
+        // The head this slot proves is in: skip to the next slot.
+        assert_eq!(
+            next(2_000, Some(current - 1)),
+            Duration::from_millis(11_500)
+        );
+        // An older head keeps the window open.
+        assert_eq!(next(2_000, Some(current - 2)), Duration::from_millis(1_000));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn attested_heads_arrive_between_full_polls() {
+        let transport = Arc::new(FixtureTransport::default());
+        transport
+            .no_optimistic
+            .lock()
+            .expect("endpoints without optimistic updates")
+            .push("https://a.example/".to_owned());
+        let heads = AttestedHeadPublisher::new();
+        let mut source = fixture_source(
+            &["https://a.example/"],
+            &transport,
+            simulated_clock(slot_time(SIGNATURE_SLOT) + 60),
+            AnchorFile::Disabled,
+        )
+        .with_attested_heads(heads.clone());
+        source.config.poll_interval = Duration::from_secs(DAY);
+        let mut events = source
+            .subscribe(
+                checkpoint(BOOTSTRAP_ROOT.into(), BOOTSTRAP_SLOT),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("subscribe");
+        assert_eq!(finalized_slot(events.next().await), FINALIZED_SLOT);
+        assert_eq!(heads.latest(), None);
+        let full_polls = transport.count("light_client/finality_update");
+        transport
+            .no_optimistic
+            .lock()
+            .expect("endpoints without optimistic updates")
+            .clear();
+        let quiet = tokio::time::timeout(Duration::from_secs(SLOT_SECONDS), events.next()).await;
+        assert!(quiet.is_err(), "no finality event is due: {quiet:?}");
+        assert_eq!(heads.latest(), Some(fixture_attested_head()));
+        assert_eq!(
+            transport.count("light_client/finality_update"),
+            full_polls,
+            "the head came from an optimistic-only poll"
+        );
     }
 
     #[tokio::test]
@@ -2736,24 +2892,17 @@ mod tests {
             block_number: BlockNumber(slot * 2),
             block_hash: BlockHash::new([byte; 32]),
         };
-        let serving = |head| EndpointProbe {
-            attested_head: Some(head),
-            ..endpoint("https://a.example", Some(anchor(10, 1)))
-        };
         // A lagging endpoint never holds the head back.
         assert_eq!(
-            select_attested_head(&[serving(at(10, 1)), serving(at(12, 2))]),
+            select_attested_head(&[at(10, 1), at(12, 2)]),
             Some(at(12, 2))
         );
         // Two signed heads at one slot contradict each other.
         assert_eq!(
-            select_attested_head(&[serving(at(12, 2)), serving(at(12, 3)), serving(at(10, 1))]),
+            select_attested_head(&[at(12, 2), at(12, 3), at(10, 1)]),
             None
         );
-        assert_eq!(
-            select_attested_head(&[endpoint("https://a.example", None)]),
-            None
-        );
+        assert_eq!(select_attested_head(&[]), None);
     }
 
     #[test]
