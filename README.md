@@ -9,7 +9,7 @@ Lean, state-minimized Ethereum indexing node. Leani backfills application
 data from public datasets, follows the chain head over native Ethereum P2P,
 and keeps no raw history. No API key, no archive node.
 
-Status: pre-release preview (`v0.1.0-rc.5`). Read the
+Status: pre-release preview (`v0.1.0-rc.7`). Read the
 [preview limitations](docs/operations/preview-limitations.md) before deploying.
 
 ## Install
@@ -20,7 +20,7 @@ brew install smart-byte/tap/leani
 
 Or take a checksummed archive from
 [GitHub releases](https://github.com/smart-byte/leani/releases), run the
-container image `ghcr.io/smart-byte/leani:v0.1.0-rc.5`, or build from source:
+container image `ghcr.io/smart-byte/leani:v0.1.0-rc.7`, or build from source:
 
 ```bash
 git clone https://github.com/smart-byte/leani.git && cd leani
@@ -28,6 +28,13 @@ cargo build --locked --release -p leani   # target/release/leani
 ```
 
 See the [install guide](https://leani.dev/docs/getting-started/install/).
+
+Using a coding agent? Install the Leani skill for Codex, Claude Code, Cursor,
+and others, then ask it to "use leani" for any Ethereum data question:
+
+```bash
+npx skills add smart-byte/leani -g
+```
 
 ## Follow Ethereum blocks
 
@@ -42,7 +49,7 @@ checkpoint and lets you accept it once at least two agree. Peer discovery can
 take a few minutes. After that, every new block streams to stdout:
 
 ```text
-2026-09-07T12:11:59Z  block=25925396  txs=381  gas=43.17M / 60.00M (72.0%)  base_fee=0.069459109 gwei  blobs=3  included
+2026-09-07T12:11:59Z  block=25925396  txs=381  gas=43.17M / 60.00M (72.0%)  base_fee=0.069459109 gwei  blobs=3  unattested
 ```
 
 Add `--finality finalized` to print only blocks Ethereum consensus has
@@ -147,7 +154,7 @@ Install the SDK version that matches your node release; npm's `latest` tag
 can lag behind a prerelease node:
 
 ```bash
-bun add @smart-byte/leani-sdk@0.1.0-rc.5
+bun add @smart-byte/leani-sdk@0.1.0-rc.7
 ```
 
 ```ts
@@ -172,7 +179,9 @@ the Leani cursor inside your own database transaction.
 
 ## Your own processor
 
-Processors are Rust. [`examples/custom-node`](examples/custom-node) adds a
+When no built-in processor produces the data you need, write your own; that is
+the intended way to extend Leani. Processors are Rust.
+[`examples/custom-node`](examples/custom-node) adds a
 native processor and a query extension to the stock node through
 `leani::run_with_registry`, without forking it. See the
 [processor-author guide](https://leani.dev/docs/guides/custom-processor/).
@@ -207,7 +216,7 @@ and the [architecture notes](docs/contributing/architecture.md).
 
 - [leani.dev/docs](https://leani.dev/docs/): quickstart, guides, CLI, configuration, HTTP API, and SDK references.
 - [`docs/`](docs/): the Markdown sources.
-- [AI agents](https://leani.dev/docs/guides/ai-agents/): the [`skills/leani`](skills/leani/SKILL.md) agent skill (`/plugin marketplace add smart-byte/leani` in Claude Code) and [llms.txt](https://leani.dev/llms.txt).
+- [AI agents](https://leani.dev/docs/guides/ai-agents/): the [`skills/leani`](skills/leani/SKILL.md) agent skill (`npx skills add smart-byte/leani -g`, or the `smart-byte/leani` plugin marketplace in Codex and Claude Code) and [llms.txt](https://leani.dev/llms.txt).
 - [CHANGELOG.md](CHANGELOG.md) and [SECURITY.md](SECURITY.md).
 
 ## Contributing

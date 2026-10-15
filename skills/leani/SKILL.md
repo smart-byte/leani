@@ -1,6 +1,6 @@
 ---
 name: leani
-description: Runs and queries leani, a self-hosted Ethereum indexing node and CLI. It follows Mainnet blocks over P2P with no API key, backfills historical ranges, and extracts contract events and logs, ERC-20 balances, Uniswap prices, and blob data into a local HTTP API, TypeScript SDK, and JSON-RPC subset. Use this skill whenever a task mentions the `leani` command, a leani.toml, leani.dev, or @smart-byte/leani-sdk, or needs live or historical Ethereum blocks, contract events, or prices without a hosted RPC provider, including writing custom Rust processors for leani.
+description: Runs, queries, and extends leani (leani.dev), a self-hosted Ethereum indexing node and CLI. It follows Mainnet blocks over P2P with no API key, backfills historical ranges, and turns blocks, transactions, and logs into application data through processors, served over a local HTTP API, TypeScript SDK, and JSON-RPC subset. Use this skill whenever a task mentions leani, the `leani` command, a leani.toml, leani.dev, or @smart-byte/leani-sdk, or asks to answer a question from live or historical Ethereum data without a hosted RPC provider. Covers choosing a built-in processor and writing a custom Rust processor when none fits, which is the normal way to get data the built-ins do not provide.
 license: MIT
 ---
 
@@ -12,11 +12,39 @@ datasets, runs *processors* that turn blocks into application data, and keeps
 only their results. One binary provides the CLI, the node (`leani serve`), a
 native HTTP API with streaming, and a JSON-RPC subset. It is alpha software.
 
-## When to use it, and when not
+The binary carries this guide for its own release: `leani guide` prints it and
+`leani guide processors` prints the processor reference. A skill copy can be
+newer or older than the binary; `leani guide` and `--help` always describe the
+installed one. Binaries before 0.1.0-rc.7 have no `guide` command.
 
-Use leani to follow new blocks or Uniswap prices live, to index contract events
-or ERC-20 transfers over a block range, to serve those results to an
-application, or to build a custom processor in Rust.
+## Answer a question with leani
+
+A question about Ethereum data becomes a processor: it reads each block and
+keeps only the result the question needs. Work in this order:
+
+1. **Use a built-in processor if one fits.** They cover block summaries,
+   decoded contract events (`evm-events`), ERC-20 balances, transactions
+   between one address pair, Uniswap pools, blobs, and rollup transactions.
+   [references/processors.md](references/processors.md)
+   (`leani guide processors`) lists them and their configuration.
+2. **Otherwise write a custom processor.** That is the normal path, not a
+   workaround. A processor is a `map` from block material to a compact delta
+   and a `reduce` that folds deltas into state; Leani supplies the sources,
+   backfill, finality, reorgs, storage, and HTTP API. Write one when the
+   answer needs:
+   - an aggregate, such as a distinct count, sum, top-N, or daily total:
+     compute it in `reduce` rather than exporting every event and counting
+     client-side;
+   - transactions or their ETH value rather than logs: `evm-events` sees only
+     logs;
+   - state across several events or contracts, a filter on argument values,
+     or ABI types `evm-events` rejects;
+   - a typed query route of its own.
+
+   Start from the maintained example, as section 4 of the processor
+   reference describes.
+3. **Backfill the range, serve, and query.** Check coverage before you report
+   a number.
 
 Leani keeps no EVM state, so it refuses `eth_call`, `eth_getBalance`,
 `eth_getCode`, `eth_getStorageAt`, `eth_estimateGas`, and traces. Use an
@@ -44,12 +72,12 @@ than guessing, because flags change between releases. If
    the checkpoint summary to stderr and stop with `checkpoint trust requires an
    interactive terminal or --yes`. Show the user that summary and rerun with
    `--yes` only after they approve it.
-4. **Respect the finality label.** Rows say `preview` (a peer's block, not yet
-   verified; only printed while following, or with `--finality preview`),
-   `included` (verified, can still be reorged), or `finalized`. Do not present
-   `preview` or `included` data as final; pass `--finality finalized` when
-   correctness matters more than latency. `--once` returns the first row that
-   meets `--finality` (default `included`).
+4. **Respect the finality label.** Rows say `unattested` (peers agree and it
+   passes Leani's header rules; it can be undone), `attested` (signed by the
+   sync committee; a reorg can still remove it), or `finalized`. Do not
+   present `unattested` or `attested` data as final; pass `--finality
+   finalized` when correctness matters more than latency. `--once` returns
+   the first row that meets `--finality` (default `unattested`).
 5. **Dispatch JSON rows on `schema`.** A stream mixes
    `leani.block-summary.v1` or `leani.market-price.v2` rows with
    `leani.subscription-undo.v1` and `leani.subscription-gap.v1`. A row with
@@ -92,9 +120,10 @@ leani subscribe blocks --json      # from this directory, attaches to the runnin
 ```
 
 Index contract events or another historical range: read
-[references/processors.md](references/processors.md) first. It covers choosing
-a built-in processor, the event-decoding configuration and its limits,
-backfills, coverage checks, and when a custom Rust processor is needed.
+[references/processors.md](references/processors.md) (`leani guide processors`)
+first. It covers choosing a built-in processor, the event-decoding
+configuration and its limits, backfills, coverage checks, and custom Rust
+processors.
 
 ## HTTP API and SDK
 

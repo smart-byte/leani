@@ -21,9 +21,9 @@ pub use contract::{
 pub use planner::{PlanError, SelectionPolicy, coverage_gaps, select_source};
 pub use stored::stop_at_unfilled_groups;
 pub use telemetry::{
-    NetworkDisconnectReason, NetworkDisconnectSnapshot, NetworkLane, NetworkPeerLifecycleSnapshot,
-    NetworkPeerOrigin, NetworkPeerOriginSnapshot, NetworkPeerQualification,
-    NetworkPeerQualificationSnapshot, NetworkPeerTargetsSnapshot, NetworkPhase,
-    NetworkSessionSnapshot, NetworkSessionTelemetry, NetworkSupervisorSnapshot,
-    NetworkSupervisorState, NetworkTelemetry, NetworkTelemetrySnapshot,
+    NetworkDisconnectReason, NetworkDisconnectSnapshot, NetworkLane, NetworkLiveLevelsSnapshot,
+    NetworkPeerLifecycleSnapshot, NetworkPeerOrigin, NetworkPeerOriginSnapshot,
+    NetworkPeerQualification, NetworkPeerQualificationSnapshot, NetworkPeerTargetsSnapshot,
+    NetworkPhase, NetworkSessionSnapshot, NetworkSessionTelemetry, NetworkSupervisorSnapshot,
+    NetworkSupervisorState, NetworkTelemetry, NetworkTelemetrySnapshot, UnattestedUndo,
 };

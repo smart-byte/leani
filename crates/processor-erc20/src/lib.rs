@@ -147,11 +147,11 @@ impl Erc20BalanceProcessor {
                     }],
                     ..FilterScope::default()
                 },
-                minimum_finality: Finality::Included,
+                minimum_finality: Finality::Unattested,
             }],
             mode: ReductionMode::OrderedState,
             delivery_ordering: DeliveryOrdering::Canonical,
-            publication: PublicationPolicy::IncludedAndFinalized,
+            publication: PublicationPolicy::Attested,
             lifecycle: LifecyclePolicies::from_legacy(RetentionPolicy::LatestState),
             schemas: ProcessorSchemas {
                 delta_version: 2,
@@ -536,7 +536,7 @@ mod tests {
 
     fn included_frame(number: u64, parent: BlockHash, logs: Vec<Log>) -> BlockFrame {
         let mut frame = fixture_frame(number, parent);
-        frame.finality = Finality::Included;
+        frame.finality = Finality::Attested;
         frame.logs = Material::Complete(logs);
         frame
     }

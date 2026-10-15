@@ -11,6 +11,9 @@ export const BLOBS_MONEY_URL = 'https://blobs.money';
 
 // The published preview's install command, as docs/getting-started/install.mdx documents it.
 export const HOMEBREW_INSTALL = 'brew install smart-byte/tap/leani';
+// The agent skill's install command, as docs/guides/ai-agents.md documents it.
+export const AGENT_SKILL_INSTALL = 'npx skills add smart-byte/leani -g';
+export const AI_AGENTS_URL = '/docs/guides/ai-agents/';
 
 export function sourceUrl(path: string, view: 'blob' | 'tree' | 'edit' = 'blob'): string {
   const encodedPath = path.split('/').map(encodeURIComponent).join('/');

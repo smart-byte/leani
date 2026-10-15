@@ -6,6 +6,115 @@ record, and documented RPC contracts.
 
 ## [Unreleased]
 
+### Added
+
+- Processors publish each new block at the `unattested` level a few seconds
+  into its slot, as an Ethereum RPC serves it, and later mark it `attested`
+  and `finalized`. An unattested block that no attested head covers within
+  60 s, or that the attested chain replaces, is undone. `publish =
+  "unattested"` is the default; `attested` keeps 0.1.0-rc.7's behaviour.
+- `/metrics` reports `leani_live_block_delay_seconds{level}`,
+  `leani_live_unattested_undone_total{reason}` and
+  `leani_live_unattested_held_total`.
+- `leani doctor` names a live processor that requires attested frames: it
+  keeps the whole live lane waiting for attested heads.
+
+### Changed
+
+- Breaking (CLI, HTTP API, SSE, SDK): chain-confidence levels are now
+  `unattested`, `attested` and `finalized`. `included` is `attested` (same
+  guarantee: a sync-committee-attested ancestry), and `preview` is
+  `unattested`. `leani subscribe --finality` accepts the new names only. The
+  SDK `Finality` type changes accordingly. Stores and data directories from
+  0.1.0-rc.7 keep their data (see Upgrading).
+- Breaking (configuration): `publish` names the first level a processor's
+  consumers see: `unattested`, `attested` or `finalized`. Omitted, it is
+  `unattested`. `included_and_finalized` is now `attested`, and
+  `finalized_only` is `finalized`; the old values are refused.
+- Breaking (configuration): `publish = "terminal_only"` is now
+  `[processors.delivery] emit = "job_result"`, and the `terminal` operating
+  profile is `job-result`. A processor that emits a job result takes no
+  `publish`: its bounded history job covers finalized blocks.
+- Breaking (SDK, HTTP API): the change stream carries a new operation,
+  `attested` (`system.finality.put` with `throughBlock`), for processors that
+  publish `unattested` blocks. SDKs before this release reject it as an
+  invalid envelope. Coverage intervals label `unattested`, `attested` and
+  `finalized`.
+- Breaking (HTTP API): query-and-follow answers `409
+  deferred_publication_snapshot` (was `finalized_only_snapshot`) for every
+  processor that publishes from `attested` or `finalized`.
+- Verified finality learns each sync-committee-attested head within about
+  1.5 s of a Beacon endpoint or consensus peer serving it. Between finality
+  polls it asks only for the light-client optimistic update, 1.5, 3, 4.5 and
+  6 s into each slot, until the slot's head arrives. Attested blocks reach
+  processors about 6 s earlier on average, and up to 12 s.
+
+### Removed
+
+- The embedded `leani subscribe` no longer prints unverified peer previews
+  during startup. Rows at `unattested` come from the verified lane, which
+  checks a peer quorum, Leani's header rules and the link to the delivered
+  chain before printing them. The first rows therefore take longer after a
+  start: on mainnet (5 runs each) the median wait grew from 38 s to 68 s with
+  a warm data directory, and from 53 s to more than 90 s from a cold one.
+
+### Upgrading from 0.1.0-rc.7
+
+- Rename `publish = "included_and_finalized"` to `publish = "attested"` to keep
+  0.1.0-rc.7 behaviour, or remove the line to publish `unattested` blocks.
+  Either way the processor instance and its history stay as they are.
+- Rename `publish = "finalized_only"` to `publish = "finalized"`.
+- Replace `publish = "terminal_only"` with `[processors.delivery] emit =
+  "job_result"`.
+- Update SDK consumers before switching a processor to `unattested`: older
+  SDKs reject the `attested` operation.
+- `leani subscribe` prints `unattested` rows by default; pass `--finality
+  attested` for 0.1.0-rc.7's output.
+- Node stores move to schema 26, which indexes unattested rows, built once
+  during the upgrade. Downgrading is unsupported: 0.1.0-rc.7 refuses a
+  schema-26 store.
+
+## [0.1.0-rc.7] - 2026-10-14
+
+### Added
+
+- `leani guide` prints the agent skill's guide as compiled into the binary, and
+  `leani guide processors` its processor reference, so agents and scripts read
+  guidance that matches the installed release.
+
+### Changed
+
+- The `leani` agent skill and `/llms.txt` lead with how to answer an Ethereum
+  data question: use a built-in processor when one fits, otherwise write a
+  custom processor. The skill installs for Codex, Claude Code, and other agents
+  with `npx skills add smart-byte/leani -g`, or as a plugin from the
+  `smart-byte/leani` marketplace in Codex and Claude Code.
+
+## [0.1.0-rc.6] - 2026-10-14
+
+### Added
+
+- `leani_history_material_active_acquisitions_limit` reports how many history
+  reads may run at once, next to `leani_history_material_active_acquisitions`.
+  A backfill subscription whose plan leaves read slots idle logs a hint, once
+  per processor, with its chunk size and a subscription size that keeps every
+  slot busy.
+
+### Fixed
+
+- A failed history read moves only the blocks it failed on to the next source,
+  then the gap returns to the first source. A Xatu hole that names its blocks
+  sends just those blocks, with Xatu serving both sides of it; a stalled or
+  failed download sends its chunk. Before, one failed Xatu chunk moved the rest
+  of the job to execution P2P: a single stalled download turned a 25,000-block
+  job of about 90 s into about 450 s. Blocks a source has not published yet, a
+  schema drift, and a second failure before a source commits a block still hand
+  the next source the rest of the gap.
+
+### Security
+
+- Updated rustls to 0.23.46 for RUSTSEC-2026-0346 to RUSTSEC-2026-0349.
+
 ## [0.1.0-rc.5] - 2026-10-13
 
 ### Added

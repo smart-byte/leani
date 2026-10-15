@@ -86,7 +86,7 @@ any other start. Finalized-coverage compaction is block-local only, so a keyed
 instance keeps one coverage row per block it applies, without bound, as other
 ordered processors do.
 
-`publish = "finalized_only"` holds included-block changes in the store until
+`publish = "finalized"` holds unfinalized changes in the store until
 verified finality promotes them. The stream then contains only finalized
 `apply` records and `system.finality` markers; no `undo` is ever published.
 Held bytes count against `[processors.delivery] max_bytes` from admission.
@@ -97,7 +97,7 @@ id = "evm-events"
 instance = "weth-transfers"
 version = "1.1.0"
 start_block = 12965000
-publish = "finalized_only"
+publish = "finalized"
 
 [processors.state]
 mode = "durable"
@@ -155,7 +155,7 @@ id = "transaction-stats"
 instance = "treasury-flow-total"
 version = "1.0.0"
 start_block = 15537394
-publish = "finalized_only"
+publish = "finalized"
 
 [processors.state]
 mode = "checkpointed"
@@ -184,7 +184,7 @@ complete_from_start = true
 ```
 
 Use `output = "latest"` for a continuing aggregate or
-`publish = "terminal_only"` for a bounded backfill. Terminal jobs commit state
+`[processors.delivery] emit = "job_result"` for a bounded backfill. Job-result jobs commit state
 and coverage for every block but spool only the final aggregate; after
 acknowledgement the job is complete/reclaimable and deletion remains an
 explicit operator action.
@@ -254,7 +254,6 @@ version = "1.0.0"
 history_control = "application_subscriptions"
 history_mode = "on_demand"
 start_block = 26000000
-publish = "included_and_finalized"
 
 [processors.state]
 mode = "durable"
@@ -319,7 +318,6 @@ id = "erc20-balances"
 instance = "erc20-watchlist"
 version = "1.1.0"
 start_block = 1234567
-publish = "included_and_finalized"
 
 [processors.state]
 mode = "durable"
@@ -399,7 +397,6 @@ id = "uniswap-observations" # or "uniswap-latest"
 instance = "usdc-weth-observations"
 version = "2.1.0" # use 2.0.0 with uniswap-latest
 start_block = 12369621
-publish = "included_and_finalized"
 history_control = "node_owned"
 history_mode = "on_demand"
 

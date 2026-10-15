@@ -21,11 +21,11 @@ leani subscribe blocks
 ```
 
 First output can take several minutes while Leani finds serving peers and
-validates a current block. The included head is printed when it is available,
-followed by one line per new block:
+validates a current block. The newest block is printed once the live lane
+accepts it, followed by one line per new block:
 
 ```text
-2026-09-01T09:14:35Z  block=25881412  txs=187  gas=32.47M / 60.00M (54.1%)  base_fee=0.143592817 gwei  blobs=6  included
+2026-09-01T09:14:35Z  block=25881412  txs=187  gas=32.47M / 60.00M (54.1%)  base_fee=0.143592817 gwei  blobs=6  unattested
 ```
 
 The summary contains the block number, hash and parent, timestamp, transaction
@@ -40,17 +40,14 @@ leani subscribe blocks --format json |
   jq '{block: .blockNumber, transactions: .transactionCount, gas: .gasUsed, baseFee: .baseFeePerGas}'
 ```
 
-Embedded startup can print a header-commitment-checked peer preview before the
-verified processor lane is ready. Those rows say `preview`; JSON reports
-`finality: "preview"`. Rows from the verified lane say `included` or
-`finalized`. Previews show progress while following, but they are not
-results: `--once` hides them and waits for the first `included` row unless you
-pass `--finality preview`. In embedded mode, use `--finality finalized` when
-the first result must be a block Ethereum consensus has finalized. Attached output follows the
-node's configured source trust; a dataset's finality label does not become a
-cryptographic proof simply by subscribing to it. Against a node that publishes
-included blocks, an attached `--finality finalized` subscription prints each
-block once the node's finality marker covers it.
+Rows say `unattested`, `attested` or `finalized`, and JSON reports the same
+`finality`; see [finality levels](/docs/concepts/coverage-finality-and-reorgs/#finality-levels-and-publish-modes). Use `--finality attested` or
+`--finality finalized` when the first result must have that level. Attached
+output follows the node's configured source trust; a dataset's finality label
+does not become a cryptographic proof simply by subscribing to it. Against a
+node that publishes unattested blocks, an attached `--finality attested` or
+`--finality finalized` subscription prints each block once the node's marker
+for that level covers it.
 
 During a reorg, each reverted block prints again with `"operation": "undo"`
 (an `undo` suffix in the terminal), however late the undo arrives. The undo
@@ -63,7 +60,7 @@ described below, with `leani.block-summary.v1` rows, so scripts should
 dispatch on each row's `schema`.
 
 `--once` exits after the first summary that meets `--finality`, so by default
-after the first verified `included` row. A cold start can take minutes; bound
+after the first `unattested` row. A cold start can take minutes; bound
 it with `--timeout`, which exits 124 when nothing matched in time. An undo or
 gap row never ends `--once`:
 
@@ -71,11 +68,11 @@ gap row never ends `--once`:
 leani subscribe blocks --json --once --timeout 5m
 ```
 
-`--finality preview` also lets an unverified peer preview end `--once`, the
-fastest first output, which is useful for startup timing:
+The default `unattested` level is the fastest first output, which is useful
+for startup timing:
 
 ```bash
-time leani subscribe blocks --once --finality preview
+time leani subscribe blocks --once
 ```
 
 ## Attach to a prepared node
@@ -136,7 +133,7 @@ with an error instead of printing its stream. A stream error the node marks
 `retryable` reconnects from the last cursor.
 
 `--finality finalized` replays the node's retained change log, so a block
-that was included but not yet final when the subscription connected still
+that was not yet final when the subscription connected still
 prints once finality covers it, however late that is; blocks already final
 at that point are skipped. The subscription holds at most 1,024 unfinalized
 blocks. If the node stops reporting finality for longer, the oldest held
