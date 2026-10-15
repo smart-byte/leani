@@ -69,8 +69,9 @@ const SCHEMA_V22: &str = include_str!("../migrations/0022_coverage_lookup_indexe
 const SCHEMA_V23: &str = include_str!("../migrations/0023_consumer_delivery_and_node_secret.sql");
 const SCHEMA_V24: &str = include_str!("../migrations/0024_processor_identity_aliases.sql");
 const SCHEMA_V25: &str = include_str!("../migrations/0025_output_block_index.sql");
+const SCHEMA_V26: &str = include_str!("../migrations/0026_unattested_indexes.sql");
 /// Current on-disk `SQLite` schema version written by this crate.
-pub const CURRENT_SCHEMA_VERSION: u32 = 25;
+pub const CURRENT_SCHEMA_VERSION: u32 = 26;
 /// Schema that added the node secret, which its migration generates.
 const NODE_SECRET_SCHEMA_VERSION: u32 = 23;
 /// Name of the one [`NodeSecret`] row in `node_secrets`.
@@ -2090,6 +2091,7 @@ async fn migrate(pool: &SqlitePool) -> Result<(), StoreError> {
         (23, SCHEMA_V23),
         (24, SCHEMA_V24),
         (25, SCHEMA_V25),
+        (26, SCHEMA_V26),
     ];
     for (target, migration) in migrations {
         if target > version {
@@ -5312,27 +5314,17 @@ impl SqliteStore {
             .transpose()?;
         let delivery_enabled = descriptor.lifecycle.delivery.mode != DeliveryPolicyMode::None;
         let mut transaction = self.inner.pool.begin().await?;
-        let promoted = sqlx::query(
-            "UPDATE processor_coverage SET finality = ?
-             WHERE instance = ? AND block_number <= ? AND finality < ?",
-        )
-        .bind(finality_i64(Finality::Attested))
-        .bind(&instance)
-        .bind(u64_i64(through.0, "block_number")?)
-        .bind(finality_i64(Finality::Attested))
-        .execute(&mut *transaction)
-        .await?
-        .rows_affected();
-        sqlx::query(
-            "UPDATE output_entity_meta SET finality = ?
-             WHERE instance = ? AND block_number <= ? AND finality < ?",
-        )
-        .bind(finality_i64(Finality::Attested))
-        .bind(&instance)
-        .bind(u64_i64(through.0, "block_number")?)
-        .bind(finality_i64(Finality::Attested))
-        .execute(&mut *transaction)
-        .await?;
+        let promoted = sqlx::query(ATTESTED_COVERAGE_PROMOTION)
+            .bind(&instance)
+            .bind(u64_i64(through.0, "block_number")?)
+            .execute(&mut *transaction)
+            .await?
+            .rows_affected();
+        sqlx::query(ATTESTED_OUTPUT_PROMOTION)
+            .bind(&instance)
+            .bind(u64_i64(through.0, "block_number")?)
+            .execute(&mut *transaction)
+            .await?;
         let flushed_deferred =
             if descriptor.publication == PublicationPolicy::Attested && delivery_enabled {
                 release_deferred_changes(&mut transaction, &instance, through, Finality::Attested)
@@ -7984,16 +7976,11 @@ impl SqliteStore {
             }
             Some(_) => {}
         }
-        let result = sqlx::query(
-            "UPDATE canonical_blocks SET finality = ?
-             WHERE chain_id = ? AND block_number <= ? AND finality < ?",
-        )
-        .bind(finality_i64(Finality::Attested))
-        .bind(u64_i64(chain_id.0, "chain_id")?)
-        .bind(u64_i64(through.0, "attested block_number")?)
-        .bind(finality_i64(Finality::Attested))
-        .execute(&self.inner.pool)
-        .await?;
+        let result = sqlx::query(ATTESTED_CANONICAL_PROMOTION)
+            .bind(u64_i64(chain_id.0, "chain_id")?)
+            .bind(u64_i64(through.0, "attested block_number")?)
+            .execute(&self.inner.pool)
+            .await?;
         Ok(result.rows_affected())
     }
 
@@ -17184,6 +17171,20 @@ fn query_snapshot_id(epoch: [u8; 16], instance: &str, collection: &str, boundary
         .try_into()
         .expect("BLAKE3 digest contains sixteen bytes")
 }
+
+// Attested promotions run every slot, so each searches the partial index of
+// unattested rows instead of every row at or below the attested block. The
+// literals 1 and 0 are `finality_i64` of Attested and Unattested: a partial
+// index is only usable for the literal of its WHERE clause.
+/// Promote a processor's unattested coverage at or below a block.
+const ATTESTED_COVERAGE_PROMOTION: &str = "UPDATE processor_coverage SET finality = 1
+     WHERE instance = ? AND block_number <= ? AND finality = 0";
+/// Promote a processor's unattested output at or below a block.
+const ATTESTED_OUTPUT_PROMOTION: &str = "UPDATE output_entity_meta SET finality = 1
+     WHERE instance = ? AND block_number <= ? AND finality = 0";
+/// Promote unattested canonical blocks at or below a block.
+const ATTESTED_CANONICAL_PROMOTION: &str = "UPDATE canonical_blocks SET finality = 1
+     WHERE chain_id = ? AND block_number <= ? AND finality = 0";
 
 // Coverage probes run on every metrics scrape and status poll, so each one is
 // a single index search: exact and compact coverage are probed separately and
@@ -28554,6 +28555,27 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn attested_promotions_search_only_unattested_rows() {
+        // Final review 2026-10-15: attested promotion runs every slot under
+        // the writer lock, and walked every coverage, output, and canonical
+        // row at or below the attested block.
+        let (_directory, store) = store().await;
+        for (statement, index) in [
+            (ATTESTED_COVERAGE_PROMOTION, "processor_coverage_unattested"),
+            (ATTESTED_OUTPUT_PROMOTION, "output_entity_meta_unattested"),
+            (ATTESTED_CANONICAL_PROMOTION, "canonical_blocks_unattested"),
+        ] {
+            let plan = query_plan(&store, statement).await;
+            assert!(
+                plan.iter()
+                    .any(|step| step.starts_with("SEARCH") && step.contains(index))
+                    && !plan.iter().any(|step| step.starts_with("SCAN")),
+                "{statement}\n{plan:?}"
+            );
+        }
+    }
+
     /// `finalized_through` before its indexed probes: MAX over a UNION.
     const FINALIZED_THROUGH_UNION_SCAN: &str = "SELECT MAX(block_number) FROM (
             SELECT block_number FROM processor_coverage
@@ -28708,7 +28730,7 @@ mod tests {
         let reopened = SqliteStore::open(StoreConfig::new(&path))
             .await
             .expect("schema 21 upgrades in place");
-        assert_eq!(CURRENT_SCHEMA_VERSION, 25);
+        assert_eq!(CURRENT_SCHEMA_VERSION, 26);
         assert_eq!(
             reopened.stats().await.expect("stats").schema_version,
             CURRENT_SCHEMA_VERSION
@@ -28922,10 +28944,10 @@ mod tests {
             .connect()
             .await
             .expect("connection");
-        sqlx::query("UPDATE node_meta SET value = X'0000001a' WHERE key = 'schema_version'")
+        sqlx::query("UPDATE node_meta SET value = X'0000001b' WHERE key = 'schema_version'")
             .execute(&mut connection)
             .await
-            .expect("schema 26");
+            .expect("schema 27");
         connection.close().await.expect("close");
         let refused = SqliteStore::backup(&newer, &directory.path().join("newer-backup.sqlite"))
             .await
@@ -28935,7 +28957,7 @@ mod tests {
             "{refused}"
         );
         assert!(!directory.path().join("newer-backup.sqlite").exists());
-        assert_eq!(schema_on_disk(&newer).await, 26);
+        assert_eq!(schema_on_disk(&newer).await, 27);
     }
 
     #[tokio::test]
@@ -29032,7 +29054,7 @@ mod tests {
         let reopened = SqliteStore::open(StoreConfig::new(&path))
             .await
             .expect("schema 22 upgrades in place");
-        assert_eq!(CURRENT_SCHEMA_VERSION, 25);
+        assert_eq!(CURRENT_SCHEMA_VERSION, 26);
         assert_eq!(
             reopened.stats().await.expect("stats").schema_version,
             CURRENT_SCHEMA_VERSION
