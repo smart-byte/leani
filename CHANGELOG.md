@@ -6,6 +6,8 @@ record, and documented RPC contracts.
 
 ## [Unreleased]
 
+## [0.1.0-rc.7] - 2026-10-14
+
 ### Added
 
 - `leani guide` prints the agent skill's guide as compiled into the binary, and
