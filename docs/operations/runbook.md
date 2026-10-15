@@ -133,11 +133,13 @@ backfills for every processor that has a capable history source. A source
 failure drops readiness immediately and the supervisor retries with bounded
 exponential backoff (see [Shutdown and supervision](#shutdown-and-supervision)).
 
-The live lane includes blocks only up to the newest attested head: the
-execution header of a light-client optimistic update that at least two thirds
-of the sync committee signed, which the finality source verifies each slot.
-Included blocks therefore trail the chain tip by one to two slots. When no
-new attested head arrives for four slots, for example while the finality
+The live lane delivers `unattested` blocks at most two slots past the newest
+attested head: the execution header of a light-client optimistic update that
+at least two thirds of the sync committee signed, which the finality source
+verifies within the slot it appears (see
+[finality levels](/docs/concepts/coverage-finality-and-reorgs/#finality-levels-and-publish-modes)). When a processor requires attested frames, it
+includes blocks only up to that head. When no new attested head arrives for
+four slots, for example while the finality
 transports are down or sync-committee participation stays below two thirds,
 the lane reports itself disconnected and live readiness drops until one does.
 Configuration refuses `sources.live.kind = "p2p"` with
@@ -576,7 +578,7 @@ Never mark failed chunks complete.
 Readiness must become false when the live session is unavailable. Open
 `/debug/network` or inspect `/v1/network/status` before treating every
 zero-peer message as a live outage. Preserve the recent and undo windows, stop
-included publication before a hard storage limit, and compare local queue
+unfinalized publication before a hard storage limit, and compare local queue
 wait with peer timeouts. The production source keeps one persistent broad peer
 pool, penalizes invalid material through Reth, retries without discarding
 healthy connections, and caps recovery backoff. Invalid commitments are
@@ -600,7 +602,7 @@ finality, so only an audit stalled that long loses blocks to compaction.
 
 ### Finality outage or disagreement
 
-Continue only explicitly included publication. Do not advance or prune the
+Continue only unattested or attested publication. Do not advance or prune the
 finalized cursor. A disagreement or contradiction is fail-closed and requires
 operator review of checkpoint provenance and independent endpoints. A single
 bad transport is not an outage: consensus P2P bans a peer whose light-client
@@ -699,7 +701,7 @@ keeps serving what is stored.
 Inspect per-processor attribution with `db inspect` and `/metrics`. Prune
 change history only through `db prune-changes`, respecting active leases.
 Never evict rollback data required by unfinalized blocks. Add capacity or stop
-included advancement before the hard limit. If the database file stays at its
+unfinalized advancement before the hard limit. If the database file stays at its
 high-water mark after pruning, check the startup log for the auto-vacuum
 warning, stop the node, and run `db compact` once.
 

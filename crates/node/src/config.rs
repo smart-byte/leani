@@ -162,7 +162,7 @@ impl StarterConfig {
         let processor = match (self.blocks, self.uniswap) {
             (Some(_), None) => Ok(crate::block_summaries::processor_config(
                 crate::block_summaries::COMPACT_INSTANCE,
-                PublishMode::Attested,
+                PublishMode::Unattested,
             )),
             (None, Some(uniswap)) => {
                 let markets = crate::uniswap_markets::resolve_markets(&uniswap.markets)
@@ -170,7 +170,7 @@ impl StarterConfig {
                 crate::uniswap_markets::processor_config(
                     &markets,
                     crate::uniswap_markets::COMPACT_INSTANCE,
-                    PublishMode::Attested,
+                    PublishMode::Unattested,
                 )
             }
             _ => {

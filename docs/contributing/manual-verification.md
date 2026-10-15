@@ -118,7 +118,6 @@ id = "blobs-money"
 instance = "blobs-production"
 version = "1.5.0"
 start_block = 0 # Replace 0 with the numeric FROM value printed above.
-publish = "attested"
 ```
 
 `serve` uses this configured value. The finite `e2e mainnet` command overrides
@@ -217,7 +216,7 @@ typical envelope contains:
   "sequence": "12345",
   "cursor": "<opaque cursor>",
   "operation": "apply",
-  "finality": "included",
+  "finality": "unattested",
   "kind": "blobs.block.put",
   "block": {
     "number": 123,
@@ -250,7 +249,7 @@ change and save its opaque cursor in the same database transaction.
 
 The current API and SDK do not accept a `finality` subscription query option.
 Inspect or filter `event.finality` in the consumer. Do not append
-`?finality=included`; unknown change-stream query fields are rejected.
+`?finality=attested`; unknown change-stream query fields are rejected.
 
 ## Exercise the TypeScript SDK
 
@@ -391,7 +390,6 @@ instance = "blobs-container-1-5"
 version = "1.5.0"
 history_mode = "on_demand"
 start_block = 0 # Replace 0 with the numeric FROM value printed above.
-publish = "attested"
 
 [rpc]
 http_bind = "127.0.0.1:8545"

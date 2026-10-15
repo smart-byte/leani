@@ -72,12 +72,12 @@ than guessing, because flags change between releases. If
    the checkpoint summary to stderr and stop with `checkpoint trust requires an
    interactive terminal or --yes`. Show the user that summary and rerun with
    `--yes` only after they approve it.
-4. **Respect the finality label.** Rows say `preview` (a peer's block, not yet
-   verified; only printed while following, or with `--finality preview`),
-   `included` (verified, can still be reorged), or `finalized`. Do not present
-   `preview` or `included` data as final; pass `--finality finalized` when
-   correctness matters more than latency. `--once` returns the first row that
-   meets `--finality` (default `included`).
+4. **Respect the finality label.** Rows say `unattested` (peers agree and it
+   passes Leani's header rules; it can be undone), `attested` (signed by the
+   sync committee; a reorg can still remove it), or `finalized`. Do not
+   present `unattested` or `attested` data as final; pass `--finality
+   finalized` when correctness matters more than latency. `--once` returns
+   the first row that meets `--finality` (default `unattested`).
 5. **Dispatch JSON rows on `schema`.** A stream mixes
    `leani.block-summary.v1` or `leani.market-price.v2` rows with
    `leani.subscription-undo.v1` and `leani.subscription-gap.v1`. A row with

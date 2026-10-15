@@ -81,7 +81,7 @@ The skill covers these rules; they matter for any script too:
 - `leani subscribe --json` prints NDJSON; progress and logs go to stderr.
 - `subscribe` follows until interrupted. Use `--once --timeout 5m` for one
   result: `--once` returns the first row that meets `--finality` (default
-  `included`), and an unverified `preview` only with `--finality preview`.
+  `unattested`; see [finality levels](/docs/concepts/coverage-finality-and-reorgs/#finality-levels-and-publish-modes)).
 - Checkpoint trust needs a person's approval. Without a terminal, `init` and
   `subscribe` stop until you rerun them with `--yes`; an agent should show you
   the checkpoint first.

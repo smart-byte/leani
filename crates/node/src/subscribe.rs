@@ -845,7 +845,7 @@ pub(crate) async fn initialize_checkpoint(
             endpoint: None,
             processor: "uniswap-observations".to_owned(),
             token: None,
-            finality: SubscribeFinality::Attested,
+            finality: SubscribeFinality::Unattested,
             finality_source: SubscribeFinalitySource::BeaconApi,
             checkpoint_urls,
             checkpoint_quorum,
@@ -1407,8 +1407,10 @@ fn subscription_data_dir_for(
         hasher.update(pool.as_bytes());
     }
     hasher.update(match finality {
-        // Unattested subscriptions share the attested state directory.
-        SubscribeFinality::Unattested | SubscribeFinality::Attested => b"included",
+        SubscribeFinality::Unattested => b"unattested",
+        // Attested keeps the bytes of 0.1.0-rc.7's `included`, so its
+        // embedded state directories reopen.
+        SubscribeFinality::Attested => b"included",
         SubscribeFinality::Finalized => b"finalized",
     });
     Ok(root.join(&hasher.finalize().to_hex()[..16]))
@@ -6108,6 +6110,20 @@ mod tests {
         assert_eq!(
             directory.file_name().and_then(|name| name.to_str()),
             Some("f7a9f202aa323e4d")
+        );
+        // The default level, unattested, has a directory of its own.
+        let unattested = subscription_data_dir_for(
+            None,
+            SubscribeProtocol::UniswapV3,
+            &markets,
+            None,
+            SubscribeFinality::Unattested,
+            Path::new("."),
+        )
+        .expect("unattested Uniswap identity");
+        assert_eq!(
+            unattested.file_name().and_then(|name| name.to_str()),
+            Some("89b509272f022776")
         );
     }
 

@@ -16,13 +16,36 @@ Coverage answers “which block intervals did this processor commit?” Finality
 answers “what chain-confidence status does each committed interval have?” They
 are related but deliberately not collapsed into one boolean.
 
-Every record carries one of three statuses:
+## Finality levels and publish modes
 
-| Status | Meaning |
-|---|---|
-| `preview` | A peer supplied the block; nothing verified connects it to the chain yet. Only the embedded CLI prints this during startup, and `--once` returns it only with `--finality preview`. |
-| `included` | The block's ancestry is verified to an execution header the Ethereum sync committee attested. A reorg can still remove it. |
-| `finalized` | Ethereum consensus has finalized the block. |
+Every record carries one level. A block only ever rises: unattested,
+attested, finalized. It is never published twice; each rise is a marker.
+
+| Level | Evidence | Typical delay after the slot starts | Can be undone |
+|---|---|---|---|
+| `unattested` | At least two execution peers served the same header, it passes Leani's header rules (base fee, gas limit, blob gas, slot timing, fork fields), and it extends the delivered chain within two slots of the newest attested head | ~2–5 s today; ~5–14 s after Glamsterdam | Yes: by a reorg, by an attested head on another block, or after 60 s without an attestation |
+| `attested` | At least 342 of 512 sync-committee members signed it (or a descendant), verified locally from a light-client update. After Glamsterdam the committee signs the next beacon block, which builds on this payload | ~15 s today; ~25–29 s after Glamsterdam | Yes, by a reorg |
+| `finalized` | Casper FFG finality, verified from a light-client finality update | ~13–19 min | No |
+
+`publish` sets the first level a processor's consumers see:
+
+| `publish` | First level | Markers | Query-then-follow |
+|---|---|---|---|
+| `unattested` (default) | `unattested` | `attested`, then `finalized` | Yes |
+| `attested` | `attested` | `finalized` | No: its state holds unpublished unattested blocks |
+| `finalized` | `finalized` | none | No |
+
+An Ethereum RPC's `latest` corresponds to `unattested`; Leani's JSON-RPC
+`latest` is the delivered tip at any level, and `safe` and `finalized` name
+the finalized head.
+
+Choose `attested` when a consumer must never act on a block that is later
+undone for want of an attestation. Late blocks — first served more than 7 s
+into their slot, the ones the network most often orphans — wait for their
+child or their attestation before they are published unattested.
+
+A bounded history job that only needs its final aggregate sets
+`[processors.delivery] emit = "job_result"` instead of a level.
 
 `finalized` reflects the node's configured finality source. Embedded and
 native-P2P runs verify it locally through light-client proofs. Sources that
@@ -31,13 +54,15 @@ under that source's trust model; subscribing to them does not turn the label
 into an independent proof.
 
 Post-merge execution headers carry no seal, so any peer could serve a
-self-consistent block of its own after the chain tip. The live lane therefore
-includes a block only when its header chain leads to an attested head: an
+self-consistent block of its own after the chain tip. An `unattested` block
+therefore rests on several peers, Leani's header rules and its link to the
+delivered chain, and stays within two slots of the newest attested head: an
 execution header that at least two thirds of the sync committee signed in a
-light-client optimistic update. The finality source verifies that update each
-slot, with the header's execution branch. A block above the newest attested
-head waits for the next one, one to two slots. Without verified finality there
-is no attested head, so live following requires a finality source.
+light-client optimistic update, which the finality source verifies with the
+header's execution branch within the slot it appears. When a processor on the
+lane requires attested frames, the lane includes a block only when its header
+chain leads to an attested head. Without verified finality there is no
+attested head, so live following requires a finality source.
 
 If verified finality ever names another block at a height than the chain the
 node followed, neither block is finalized. When the node's blocks there are
@@ -55,12 +80,12 @@ restarting twice did not resolve the contradiction.
 
 <Diagram
   name="coverage-finality"
-  alt="Requested blocks 100 to 140. Coverage is 100 to 112 and 120 to 140, so 113 to 119 are missing. Finality is separate: finalized 100 to 128, included 129 to 140."
+  alt="Requested blocks 100 to 140. Coverage is 100 to 112 and 120 to 140, so 113 to 119 are missing. Finality is separate: finalized 100 to 128, attested 129 to 140."
 />
 
 In that example, `complete` is false because `113..119` is absent. A high
 `processedThrough` value does not hide the internal gap, and finalized coverage
-does not imply the included tail is absent.
+does not imply the unfinalized tail is absent.
 
 ## Filling history gaps
 
@@ -100,11 +125,11 @@ commit together. A consumer must implement these operations idempotently and
 must not infer finality from age alone.
 
 With `publish = "finalized"` the change stream carries only finalized
-`apply` records and `system.finality` markers. Included blocks are applied to
+`apply` records and `system.finality` markers. Unfinalized blocks are applied to
 processor state and journaled for undo, but their changes stay in the store
 until verified finality promotes them. Their bytes count against the delivery
 budget from the moment they are applied, so a slow consumer pauses the
-processor exactly as it would with included publication. For a processor with
+processor exactly as it would with unattested publication. For a processor with
 the default canonical delivery ordering, a block that is already finalized
 when it is applied, for example after gap recovery, first publishes the older
 blocks still waiting, so the stream stays in block order. A reorg of an

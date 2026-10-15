@@ -434,7 +434,7 @@ mod tests {
             history_control: leani::config::ProcessorHistoryControl::NodeOwned,
             require_retained_input: false,
             start_block: 1,
-            publish: Some(leani::config::PublishMode::Attested),
+            publish: None,
             state: leani::config::StatePolicyConfig {
                 mode: leani_processor_api::StatePolicyMode::Durable,
             },
