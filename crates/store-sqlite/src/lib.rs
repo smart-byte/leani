@@ -2802,13 +2802,49 @@ impl SqliteStore {
                     .await?;
                 }
             }
-            sqlx::query("UPDATE processor_instances SET descriptor_json = ? WHERE instance = ?")
-                .bind(descriptor_json)
-                .bind(&instance)
-                .execute(&self.inner.pool)
-                .await?;
+            // Boxed: registration runs inside many futures.
+            Box::pin(self.replace_descriptor(
+                &instance,
+                descriptor_json,
+                previous.publication != descriptor.publication
+                    && descriptor.publication == PublicationPolicy::Unattested,
+            ))
+            .await?;
         }
         Ok(instance)
+    }
+
+    /// Store a registration's new descriptor. With `release_parked`, the
+    /// changes parked for attestation under the old policy go out with it,
+    /// ahead of every block the new one publishes: under `unattested` nothing
+    /// releases them, and later blocks would overtake them.
+    async fn replace_descriptor(
+        &self,
+        instance: &str,
+        descriptor_json: String,
+        release_parked: bool,
+    ) -> Result<(), StoreError> {
+        let mut transaction = self.inner.pool.begin().await?;
+        sqlx::query("UPDATE processor_instances SET descriptor_json = ? WHERE instance = ?")
+            .bind(descriptor_json)
+            .bind(instance)
+            .execute(&mut *transaction)
+            .await?;
+        // ponytail: released as unattested, which the next attested marker
+        // covers; per-block levels if a consumer needs them here.
+        let released = release_parked
+            && release_deferred_changes(
+                &mut transaction,
+                instance,
+                BlockNumber(i64::MAX.unsigned_abs()),
+                Finality::Unattested,
+            )
+            .await?;
+        transaction.commit().await?;
+        if released {
+            self.inner.delivery_changes_available.notify_waiters();
+        }
+        Ok(())
     }
 
     /// Snapshot identities `instance` had before a requirement narrowing.
@@ -21751,6 +21787,42 @@ mod tests {
             check_stored_identity(&stored_json, &raised),
             Err(StoreError::ProcessorIdentity(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn switching_to_unattested_publication_releases_parked_changes() {
+        // Review: changes parked under `attested` stayed parked after a switch
+        // to `unattested`, which never releases any, so consumers saw only
+        // finality markers for their blocks.
+        let (_directory, store) = store().await;
+        let mut processor = processor_publishing(PublicationPolicy::Attested);
+        let first = unattested(frame(1, BlockHash::ZERO));
+        let second = unattested(frame(2, first.block.hash));
+        apply_unattested(&store, &processor, &[&first, &second]).await;
+        assert_eq!(deferred_rows(&store, &processor).await, 2);
+        processor.descriptor.publication = PublicationPolicy::Unattested;
+        store
+            .register_processor(&processor.descriptor)
+            .await
+            .expect("switch to unattested");
+        assert_eq!(deferred_rows(&store, &processor).await, 0);
+        assert_eq!(
+            change_summary(&store, &processor).await,
+            vec![
+                (
+                    1,
+                    Finality::Unattested,
+                    ChangeDirection::Apply,
+                    "fixture.counter".to_owned()
+                ),
+                (
+                    2,
+                    Finality::Unattested,
+                    ChangeDirection::Apply,
+                    "fixture.counter".to_owned()
+                ),
+            ]
+        );
     }
 
     #[tokio::test]
