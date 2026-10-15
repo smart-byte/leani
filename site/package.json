@@ -21,10 +21,10 @@
     "test": "bun test"
   },
   "dependencies": {
-    "@astrojs/starlight": "0.42.5",
+    "@astrojs/starlight": "0.42.6",
     "@fontsource-variable/inter": "^5.0.0",
     "@fontsource/jetbrains-mono": "^5.0.0",
-    "astro": "7.3.5",
+    "astro": "7.3.8",
     "astro-expressive-code": "0.44.2",
     "github-slugger": "2.0.0",
     "starlight-llms-txt": "0.12.0"
