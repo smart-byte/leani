@@ -24116,6 +24116,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_restart_keeps_the_output_of_unattested_blocks_below_the_anchor() {
+        // Review: with the finalized anchor among the retained blocks, startup
+        // also reverted the unattested blocks it descends from, and
+        // reconciliation undid their output.
+        let mut chain = live_blocks(2);
+        chain[0].finality = Finality::Finalized;
+        for frame in &mut chain[1..] {
+            frame.finality = Finality::Unattested;
+        }
+        let counter = Arc::new(
+            BlockLocalCounter::named("anchored-counter")
+                .with_publication(PublicationPolicy::Unattested),
+        );
+        let lanes: Vec<Arc<dyn Processor>> = vec![counter.clone()];
+        let (_directory, store) = store().await;
+        run_live(&scripted_live(&store, &lanes, block_events(&chain)))
+            .await
+            .expect("live run before the restart");
+        // Meanwhile finality reached block 2, which the store holds.
+        let restarted = scripted_live(&store, &lanes, Vec::new());
+        let reverted = restarted
+            .seed_finalized_anchor(chain[2].block, &[])
+            .await
+            .expect("seed the verified finalized anchor");
+        restarted
+            .reconcile_startup()
+            .await
+            .expect("startup reconciliation");
+        for frame in &chain {
+            assert_eq!(
+                store
+                    .coverage_block_by_hash(counter.descriptor(), frame.block.hash)
+                    .await
+                    .expect("coverage lookup"),
+                Some(frame.block.number),
+                "block {} lost its output",
+                frame.block.number.0
+            );
+        }
+        assert!(reverted.is_empty(), "{reverted:?}");
+    }
+
+    #[tokio::test]
     #[allow(clippy::too_many_lines)]
     async fn a_retained_tip_the_finalized_anchor_proves_is_kept_not_undone() {
         let chain = live_blocks(10);
