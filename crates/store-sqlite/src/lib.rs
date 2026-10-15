@@ -2759,9 +2759,12 @@ impl SqliteStore {
         .await?;
         if !check_stored_identity(&stored, descriptor)? {
             let previous: ProcessorDescriptor = serde_json::from_str(&stored)?;
-            if previous.requirements != descriptor.requirements {
-                // A narrowing: snapshots taken under the superseded
-                // descriptor, hashed either way, stay restorable.
+            if previous.requirements != descriptor.requirements
+                || previous.publication != descriptor.publication
+            {
+                // A narrowing or a switch between the live levels: snapshots
+                // taken under the superseded descriptor, hashed either way,
+                // stay restorable.
                 for alias in [
                     descriptor_hash(&previous)?,
                     full_descriptor_hash(&previous)?,
@@ -3274,14 +3277,14 @@ impl SqliteStore {
             ));
         }
         let batch = overlay.into_batch();
-        // finalized_only processors park included-block changes until
-        // mark_finalized promotes them. Their bytes are still admitted against
-        // the delivery budget here so backpressure behaves like any other
-        // processor; the flush never re-checks capacity.
-        let defer_publication = matches!(descriptor.publication, PublicationPolicy::Finalized)
+        // Instances whose consumers start above this block's level park its
+        // changes until mark_attested or mark_finalized promotes it. Their
+        // bytes are admitted against the delivery budget here, so backpressure
+        // behaves like any other processor's; the flush never re-checks
+        // capacity.
+        let defer_publication = cursor.finality < descriptor.publication.first_level()
             && delivery_enabled
-            && publish_changes
-            && cursor.finality != Finality::Finalized;
+            && publish_changes;
         let admitted_changes = if delivery_enabled && publish_changes {
             batch.changes.as_slice()
         } else {
@@ -3340,7 +3343,7 @@ impl SqliteStore {
         let mut undo = if reversible {
             Some(UndoRecord {
                 mutations: batch.mutations.clone(),
-                inverse_changes: if delivery_enabled && publish_changes && !defer_publication {
+                inverse_changes: if delivery_enabled && publish_changes {
                     build_inverse_changes(&batch)?
                 } else {
                     Vec::new()
@@ -3521,18 +3524,25 @@ impl SqliteStore {
             .execute(&mut *transaction)
             .await?;
         }
-        // A finalized block proves every older held block final as well.
-        // Canonical ordering publishes those first, in block order, so this
-        // block cannot overtake them; block-versioned output keeps waiting
-        // for mark_finalized.
-        let released_held = if matches!(descriptor.publication, PublicationPolicy::Finalized)
+        // A block at a level proves every older held block at least at that
+        // level. Canonical ordering publishes those first, in block order, so
+        // this block cannot overtake them; block-versioned output keeps
+        // waiting for mark_attested or mark_finalized.
+        let first_level = descriptor.publication.first_level();
+        let released_held = if first_level > Finality::Unattested
             && descriptor.delivery_ordering == DeliveryOrdering::Canonical
             && delivery_enabled
             && publish_changes
-            && cursor.finality == Finality::Finalized
+            && cursor.finality >= first_level
             && let Some(below) = cursor.block_number.0.checked_sub(1)
         {
-            release_deferred_changes(&mut transaction, &instance, BlockNumber(below)).await?
+            release_deferred_changes(
+                &mut transaction,
+                &instance,
+                BlockNumber(below),
+                cursor.finality,
+            )
+            .await?
         } else {
             false
         };
@@ -4791,6 +4801,21 @@ impl SqliteStore {
         }
         let bytes: Vec<u8> = row.try_get("encoded_undo")?;
         let (undo, metadata) = decode_undo(&bytes)?;
+        // The block's current level: mark_attested promotes coverage, not the
+        // stored undo record.
+        let covered_finality: Option<i64> = sqlx::query_scalar(
+            "SELECT finality FROM processor_coverage
+             WHERE instance = ? AND block_number = ? AND block_hash = ?",
+        )
+        .bind(&instance)
+        .bind(u64_i64(block_number.0, "block_number")?)
+        .bind(block_hash.0.as_slice())
+        .fetch_optional(&self.inner.pool)
+        .await?;
+        let undo_finality = covered_finality
+            .map(decode_finality)
+            .transpose()?
+            .map_or(undo.finality, |covered| covered.max(undo.finality));
         let retain_output = retains_processor_output(descriptor);
         let metadata = metadata.filter(|_| retain_output);
         let finalized_through = if metadata.as_ref().is_some_and(|metadata| {
@@ -4877,10 +4902,11 @@ impl SqliteStore {
         }
         let (first, last) = if descriptor.lifecycle.delivery.mode == DeliveryPolicyMode::None {
             (None, None)
-        } else if matches!(descriptor.publication, PublicationPolicy::Finalized) {
-            // Nothing was published for this block, so nothing is undone
-            // downstream; only the parked changes go away.
-            sqlx::query(
+        } else {
+            // A block whose changes are still parked was never published:
+            // only the parked changes go away. A released block publishes its
+            // inverse.
+            let parked = sqlx::query(
                 "DELETE FROM deferred_changes
                  WHERE instance = ? AND block_number = ? AND block_hash = ?",
             )
@@ -4888,22 +4914,25 @@ impl SqliteStore {
             .bind(u64_i64(block_number.0, "block_number")?)
             .bind(block_hash.0.as_slice())
             .execute(&mut *transaction)
-            .await?;
-            (None, None)
-        } else {
-            append_changes(
-                &mut transaction,
-                &instance,
-                &default_delivery_stream_id(descriptor),
-                &DeliveryOrigin::live(&instance),
-                chain_id,
-                undo.block,
-                undo.finality,
-                ChangeDirection::Undo,
-                &undo.inverse_changes,
-                sink_ids,
-            )
             .await?
+            .rows_affected();
+            if parked > 0 {
+                (None, None)
+            } else {
+                append_changes(
+                    &mut transaction,
+                    &instance,
+                    &default_delivery_stream_id(descriptor),
+                    &DeliveryOrigin::live(&instance),
+                    chain_id,
+                    undo.block,
+                    undo_finality,
+                    ChangeDirection::Undo,
+                    &undo.inverse_changes,
+                    sink_ids,
+                )
+                .await?
+            }
         };
         transaction.commit().await?;
         self.inner.coverage_removals.fetch_add(1, Ordering::AcqRel);
@@ -5134,10 +5163,11 @@ impl SqliteStore {
         .bind(finality_i64(Finality::Finalized))
         .execute(&mut *transaction)
         .await?;
-        let flushed_deferred = if matches!(descriptor.publication, PublicationPolicy::Finalized)
+        let flushed_deferred = if descriptor.publication.first_level() > Finality::Unattested
             && descriptor.lifecycle.delivery.mode != DeliveryPolicyMode::None
         {
-            release_deferred_changes(&mut transaction, &instance, through).await?
+            release_deferred_changes(&mut transaction, &instance, through, Finality::Finalized)
+                .await?
         } else {
             false
         };
@@ -5200,6 +5230,144 @@ impl SqliteStore {
             self.inner.delivery_changes_available.notify_waiters();
         }
         Ok(result.rows_affected())
+    }
+
+    /// Mark every block through `through` attested: the sync committee
+    /// attested `through`, so it and its ancestors are on the attested chain.
+    /// Rows applied unattested move to attested, and nothing is republished.
+    /// - An `attested` instance's parked changes go out as attested applies.
+    /// - An `unattested` instance gets one `system.finality` marker at the
+    ///   attested level.
+    ///
+    /// `hash` is the attested block at `through`. Coverage held there for
+    /// another block is never promoted.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::AttestedCoverageConflict`] when the coverage at
+    /// `through` holds another hash, and an error when the height exceeds
+    /// `SQLite`'s numeric range or the update fails.
+    #[allow(clippy::too_many_lines)]
+    pub async fn mark_attested(
+        &self,
+        descriptor: &ProcessorDescriptor,
+        through: BlockNumber,
+        hash: BlockHash,
+    ) -> Result<u64, StoreError> {
+        let instance = processor_instance(descriptor);
+        let _guard = self.inner.writer.lock().await;
+        let covered: Option<Vec<u8>> = sqlx::query_scalar(
+            "SELECT block_hash FROM processor_coverage
+             WHERE instance = ? AND block_number = ?",
+        )
+        .bind(&instance)
+        .bind(u64_i64(through.0, "block_number")?)
+        .fetch_optional(&self.inner.pool)
+        .await?;
+        if let Some(covered) = covered.map(decode_hash).transpose()?
+            && covered != hash
+        {
+            return Err(StoreError::AttestedCoverageConflict {
+                instance,
+                block: through,
+                attested: hash,
+                covered,
+            });
+        }
+        let cursor = self.processor_cursor_by_instance(&instance).await?;
+        let marker_context: Option<Vec<u8>> = sqlx::query_scalar(
+            "SELECT encoded_undo FROM undo_journal
+             WHERE instance = ? AND block_number <= ? AND finalized = 0
+             ORDER BY block_number DESC LIMIT 1",
+        )
+        .bind(&instance)
+        .bind(u64_i64(through.0, "block_number")?)
+        .fetch_optional(&self.inner.pool)
+        .await?;
+        let marker_context = marker_context
+            .as_deref()
+            .map(|bytes| {
+                postcard::from_bytes::<UndoRecord>(bytes)
+                    .map_err(|error| StoreError::Encoding(error.to_string()))
+            })
+            .transpose()?;
+        let delivery_enabled = descriptor.lifecycle.delivery.mode != DeliveryPolicyMode::None;
+        let mut transaction = self.inner.pool.begin().await?;
+        let promoted = sqlx::query(
+            "UPDATE processor_coverage SET finality = ?
+             WHERE instance = ? AND block_number <= ? AND finality < ?",
+        )
+        .bind(finality_i64(Finality::Attested))
+        .bind(&instance)
+        .bind(u64_i64(through.0, "block_number")?)
+        .bind(finality_i64(Finality::Attested))
+        .execute(&mut *transaction)
+        .await?
+        .rows_affected();
+        sqlx::query(
+            "UPDATE output_entity_meta SET finality = ?
+             WHERE instance = ? AND block_number <= ? AND finality < ?",
+        )
+        .bind(finality_i64(Finality::Attested))
+        .bind(&instance)
+        .bind(u64_i64(through.0, "block_number")?)
+        .bind(finality_i64(Finality::Attested))
+        .execute(&mut *transaction)
+        .await?;
+        let flushed_deferred =
+            if descriptor.publication == PublicationPolicy::Attested && delivery_enabled {
+                release_deferred_changes(&mut transaction, &instance, through, Finality::Attested)
+                    .await?
+            } else {
+                false
+            };
+        if let Some(mut attested_cursor) = cursor.clone()
+            && attested_cursor.block_number <= through
+            && attested_cursor.finality < Finality::Attested
+        {
+            attested_cursor.finality = Finality::Attested;
+            let encoded = OpaqueCursor::encode(CursorKind::Processor, &attested_cursor)?;
+            upsert_cursor(
+                &mut transaction,
+                &instance,
+                &attested_cursor,
+                encoded.expose(),
+            )
+            .await?;
+        }
+        // ponytail: the marker reuses direction 'finalized', because the 0001
+        // CHECK allows only four directions. Its finality (attested) tells the
+        // levels apart, and the API and CLI render it as `attested`. Rebuild
+        // change_log if a marker ever needs a fifth direction.
+        if descriptor.publication == PublicationPolicy::Unattested
+            && delivery_enabled
+            && promoted > 0
+            && let (Some(cursor), Some(context)) = (&cursor, marker_context)
+        {
+            append_changes(
+                &mut transaction,
+                &instance,
+                &default_delivery_stream_id(descriptor),
+                &DeliveryOrigin::live(&instance),
+                cursor.chain_id,
+                context.block,
+                Finality::Attested,
+                ChangeDirection::Finalized,
+                &[DomainChange {
+                    kind: "system.finality".to_owned(),
+                    key: through.0.to_be_bytes().to_vec(),
+                    operation: ChangeOperation::Upsert,
+                    payload: through.0.to_be_bytes().to_vec(),
+                }],
+                &[],
+            )
+            .await?;
+        }
+        transaction.commit().await?;
+        if promoted > 0 || flushed_deferred {
+            self.inner.delivery_changes_available.notify_waiters();
+        }
+        Ok(promoted)
     }
 
     /// List automatic recovery checkpoints newest first.
@@ -7137,8 +7305,8 @@ impl SqliteStore {
                     == Some(&block.hash)
         };
         let _guard = self.inner.writer.lock().await;
-        let rows: Vec<(i64, Vec<u8>, Vec<u8>, i64)> = sqlx::query_as(
-            "SELECT block_number, block_hash, parent_hash, timestamp
+        let rows: Vec<CanonicalRow> = sqlx::query_as(
+            "SELECT block_number, block_hash, parent_hash, timestamp, finality
              FROM canonical_blocks
              WHERE chain_id = ? AND finality < ?
              ORDER BY block_number",
@@ -7147,11 +7315,16 @@ impl SqliteStore {
         .bind(finality_i64(Finality::Finalized))
         .fetch_all(&self.inner.pool)
         .await?;
+        let mut unattested = BTreeSet::new();
         let unfinalized = rows
             .into_iter()
-            .map(|(number, hash, parent, timestamp)| {
+            .map(|(number, hash, parent, timestamp, finality)| {
+                let number = i64_u64(number, "canonical block number")?;
+                if decode_finality(finality)? == Finality::Unattested {
+                    unattested.insert(number);
+                }
                 Ok(BlockRef {
-                    number: BlockNumber(i64_u64(number, "canonical block number")?),
+                    number: BlockNumber(number),
                     hash: decode_hash(hash)?,
                     parent_hash: decode_hash(parent)?,
                     timestamp: i64_u64(timestamp, "canonical timestamp")?,
@@ -7219,10 +7392,17 @@ impl SqliteStore {
             .rev()
             .find(|block| ancestral(block))
             .map(|block| block.number);
+        // An unattested row was proven by peers only, so after a restart it
+        // is fetched again. Unattested rows are a contiguous suffix, because
+        // mark_recent_attested promotes everything below its block, so
+        // reverting them never orphans a kept row.
         let reverted = unfinalized
             .into_iter()
             .rev()
-            .filter(|block| !proven.contains(&block.number.0))
+            .filter(|block| {
+                !proven.contains(&block.number.0)
+                    || (unattested.contains(&block.number.0) && !ancestral(block))
+            })
             .collect::<Vec<_>>();
         if reverted.is_empty() && finalize_through.is_none() {
             return Ok(reverted);
@@ -7749,6 +7929,53 @@ impl SqliteStore {
             })
         })
         .transpose()
+    }
+
+    /// Mark the retained canonical blocks through `through` attested. Returns
+    /// the rows promoted; none when `through` is not retained. The canonical
+    /// rows hold one block per height, so rows at or below an attested block
+    /// are its ancestors.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::CanonicalConflict`] when the row at `through`
+    /// holds another block, and an error for a database failure.
+    pub async fn mark_recent_attested(
+        &self,
+        chain_id: ChainId,
+        through: BlockNumber,
+        expected_hash: BlockHash,
+    ) -> Result<u64, StoreError> {
+        let _guard = self.inner.writer.lock().await;
+        let stored: Option<Vec<u8>> = sqlx::query_scalar(
+            "SELECT block_hash FROM canonical_blocks WHERE chain_id = ? AND block_number = ?",
+        )
+        .bind(u64_i64(chain_id.0, "chain_id")?)
+        .bind(u64_i64(through.0, "block_number")?)
+        .fetch_optional(&self.inner.pool)
+        .await?;
+        match stored.map(decode_hash).transpose()? {
+            None => return Ok(0),
+            Some(stored) if stored != expected_hash => {
+                return Err(StoreError::CanonicalConflict {
+                    block: through,
+                    stored,
+                    incoming: expected_hash,
+                });
+            }
+            Some(_) => {}
+        }
+        let result = sqlx::query(
+            "UPDATE canonical_blocks SET finality = ?
+             WHERE chain_id = ? AND block_number <= ? AND finality < ?",
+        )
+        .bind(finality_i64(Finality::Attested))
+        .bind(u64_i64(chain_id.0, "chain_id")?)
+        .bind(u64_i64(through.0, "attested block_number")?)
+        .bind(finality_i64(Finality::Attested))
+        .execute(&self.inner.pool)
+        .await?;
+        Ok(result.rows_affected())
     }
 
     /// Mark a hash-bound canonical recent prefix finalized.
@@ -15748,8 +15975,8 @@ async fn restore_entity_metadata(
     Ok(())
 }
 
-/// Publish the parked changes of a `finalized_only` instance for every block
-/// through `through`, in block order, as finalized applies.
+/// Publish the parked changes of an instance for every block through
+/// `through`, in block order, as applies at `finality`.
 ///
 /// Bytes were admitted when the rows were parked, so no capacity check runs
 /// here: finality advancement must never fail on delivery pressure. Returns
@@ -15758,6 +15985,7 @@ async fn release_deferred_changes(
     transaction: &mut Transaction<'_, Sqlite>,
     instance: &str,
     through: BlockNumber,
+    finality: Finality,
 ) -> Result<bool, StoreError> {
     let mut released = false;
     loop {
@@ -15798,7 +16026,7 @@ async fn release_deferred_changes(
                 &origin,
                 chain_id,
                 block,
-                Finality::Finalized,
+                finality,
                 ChangeDirection::Apply,
                 &changes,
                 &sink_ids,
@@ -17452,7 +17680,25 @@ fn processor_instance(descriptor: &ProcessorDescriptor) -> String {
 fn same_processor_identity(stored: &ProcessorDescriptor, configured: &ProcessorDescriptor) -> bool {
     let mut normalized = stored.clone();
     normalized.lifecycle = configured.lifecycle.clone();
-    if requirements_narrow(&stored.requirements, &configured.requirements) {
+    // The two live levels store the same output and differ only in what a
+    // consumer sees first, so switching between them keeps the instance.
+    if stored.publication.publishes_unfinalized() && configured.publication.publishes_unfinalized()
+    {
+        normalized.publication = configured.publication;
+    }
+    // A lower minimum finality sees blocks earlier and maps them the same.
+    if normalized.requirements.len() == configured.requirements.len() {
+        for (requirement, configured) in normalized
+            .requirements
+            .iter_mut()
+            .zip(&configured.requirements)
+        {
+            requirement.minimum_finality = requirement
+                .minimum_finality
+                .min(configured.minimum_finality);
+        }
+    }
+    if requirements_narrow(&normalized.requirements, &configured.requirements) {
         normalized.requirements.clone_from(&configured.requirements);
     }
     normalized == *configured
@@ -19011,6 +19257,9 @@ fn decode_operation(value: i64) -> Result<ChangeOperation, StoreError> {
     }
 }
 
+/// A `canonical_blocks` row: number, hash, parent hash, timestamp, finality.
+type CanonicalRow = (i64, Vec<u8>, Vec<u8>, i64, i64);
+
 fn finality_i64(finality: Finality) -> i64 {
     match finality {
         Finality::Unattested => 0,
@@ -19579,6 +19828,16 @@ pub enum StoreError {
         instance: String,
         block: BlockNumber,
         finalized: BlockHash,
+        covered: BlockHash,
+    },
+    #[error(
+        "processor instance {instance} covers block {} with {covered}, not the attested {attested}",
+        block.0
+    )]
+    AttestedCoverageConflict {
+        instance: String,
+        block: BlockNumber,
+        attested: BlockHash,
         covered: BlockHash,
     },
     /// A retained canonical block at a height the finalized block's chain
@@ -21116,6 +21375,288 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    fn processor_publishing(publication: PublicationPolicy) -> FixtureProcessor {
+        let mut processor = FixtureProcessor::new();
+        processor.descriptor.publication = publication;
+        for requirement in &mut processor.descriptor.requirements {
+            requirement.minimum_finality = Finality::Unattested;
+        }
+        processor
+    }
+
+    fn unattested(mut frame: BlockFrame) -> BlockFrame {
+        frame.finality = Finality::Unattested;
+        frame
+    }
+
+    async fn apply_unattested(
+        store: &SqliteStore,
+        processor: &FixtureProcessor,
+        blocks: &[&BlockFrame],
+    ) {
+        for (sequence, block) in (1..).zip(blocks) {
+            let delta = processor.map(block).await.expect("map");
+            store
+                .apply(processor, cursor(processor, block, sequence), &delta, &[])
+                .await
+                .expect("apply unattested block");
+        }
+    }
+
+    async fn change_summary(
+        store: &SqliteStore,
+        processor: &FixtureProcessor,
+    ) -> Vec<(u64, Finality, ChangeDirection, String)> {
+        store
+            .changes(&processor.descriptor, ChainId(1), 0, 100)
+            .await
+            .expect("changes")
+            .into_iter()
+            .map(|change| {
+                (
+                    change.block.number.0,
+                    change.finality,
+                    change.direction,
+                    change.change.kind,
+                )
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn unattested_publication_marks_attested_blocks_without_republishing() {
+        let (_directory, store) = store().await;
+        let processor = processor_publishing(PublicationPolicy::Unattested);
+        let first = unattested(frame(1, BlockHash::ZERO));
+        let second = unattested(frame(2, first.block.hash));
+        apply_unattested(&store, &processor, &[&first, &second]).await;
+        let promoted = store
+            .mark_attested(&processor.descriptor, BlockNumber(2), second.block.hash)
+            .await
+            .expect("mark attested");
+        assert_eq!(promoted, 2);
+        assert_eq!(
+            change_summary(&store, &processor).await,
+            vec![
+                (
+                    1,
+                    Finality::Unattested,
+                    ChangeDirection::Apply,
+                    "fixture.counter".to_owned()
+                ),
+                (
+                    2,
+                    Finality::Unattested,
+                    ChangeDirection::Apply,
+                    "fixture.counter".to_owned()
+                ),
+                (
+                    2,
+                    Finality::Attested,
+                    ChangeDirection::Finalized,
+                    "system.finality".to_owned()
+                ),
+            ]
+        );
+        // Marking again is a no-op: no second marker.
+        assert_eq!(
+            store
+                .mark_attested(&processor.descriptor, BlockNumber(2), second.block.hash)
+                .await
+                .expect("repeat"),
+            0
+        );
+        assert_eq!(change_summary(&store, &processor).await.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn attested_publication_parks_unattested_blocks_until_attested() {
+        let (_directory, store) = store().await;
+        let processor = processor_publishing(PublicationPolicy::Attested);
+        let first = unattested(frame(1, BlockHash::ZERO));
+        let second = unattested(frame(2, first.block.hash));
+        let third = unattested(frame(3, second.block.hash));
+        apply_unattested(&store, &processor, &[&first, &second, &third]).await;
+        assert!(change_summary(&store, &processor).await.is_empty());
+        assert_eq!(deferred_rows(&store, &processor).await, 3);
+        store
+            .mark_attested(&processor.descriptor, BlockNumber(2), second.block.hash)
+            .await
+            .expect("mark attested");
+        assert_eq!(
+            change_summary(&store, &processor).await,
+            vec![
+                (
+                    1,
+                    Finality::Attested,
+                    ChangeDirection::Apply,
+                    "fixture.counter".to_owned()
+                ),
+                (
+                    2,
+                    Finality::Attested,
+                    ChangeDirection::Apply,
+                    "fixture.counter".to_owned()
+                ),
+            ],
+            "an attested instance never saw unattested rows, so it gets no marker"
+        );
+        assert_eq!(deferred_rows(&store, &processor).await, 1);
+    }
+
+    #[tokio::test]
+    async fn undo_of_a_released_block_publishes_its_inverse_and_a_parked_block_nothing() {
+        let (_directory, store) = store().await;
+        let processor = processor_publishing(PublicationPolicy::Attested);
+        let first = unattested(frame(1, BlockHash::ZERO));
+        let second = unattested(frame(2, first.block.hash));
+        apply_unattested(&store, &processor, &[&first, &second]).await;
+        store
+            .mark_attested(&processor.descriptor, BlockNumber(1), first.block.hash)
+            .await
+            .expect("attest block 1");
+        // Block 2 is still parked: its undo publishes nothing and drops it.
+        store
+            .undo(
+                &processor.descriptor,
+                ChainId(1),
+                BlockNumber(2),
+                second.block.hash,
+                &[],
+            )
+            .await
+            .expect("undo parked block");
+        assert_eq!(deferred_rows(&store, &processor).await, 0);
+        // Block 1 went out: its undo publishes the inverse, at its stored level.
+        store
+            .undo(
+                &processor.descriptor,
+                ChainId(1),
+                BlockNumber(1),
+                first.block.hash,
+                &[],
+            )
+            .await
+            .expect("undo released block");
+        let summary = change_summary(&store, &processor).await;
+        assert_eq!(
+            summary
+                .last()
+                .map(|(number, finality, direction, _)| (*number, *finality, *direction)),
+            Some((1, Finality::Attested, ChangeDirection::Undo))
+        );
+    }
+
+    #[tokio::test]
+    async fn attested_marks_refuse_another_covered_block() {
+        let (_directory, store) = store().await;
+        let processor = processor_publishing(PublicationPolicy::Unattested);
+        let first = unattested(frame(1, BlockHash::ZERO));
+        apply_unattested(&store, &processor, &[&first]).await;
+        assert!(matches!(
+            store
+                .mark_attested(
+                    &processor.descriptor,
+                    BlockNumber(1),
+                    BlockHash::new([9; 32])
+                )
+                .await,
+            Err(StoreError::AttestedCoverageConflict { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn recent_canonical_blocks_promote_to_attested() {
+        let (_directory, store) = store().await;
+        let first = unattested(frame(1, BlockHash::ZERO));
+        let second = unattested(frame(2, first.block.hash));
+        for block in [&first, &second] {
+            store
+                .store_canonical_anchor(ChainId(1), block.block, Finality::Unattested)
+                .await
+                .expect("seed unattested row");
+        }
+        assert_eq!(
+            store
+                .mark_recent_attested(ChainId(1), BlockNumber(2), second.block.hash)
+                .await
+                .expect("promote"),
+            2
+        );
+        assert_eq!(
+            store
+                .canonical_block(ChainId(1), BlockNumber(1))
+                .await
+                .expect("row")
+                .map(|(_, finality)| finality),
+            Some(Finality::Attested)
+        );
+    }
+
+    #[tokio::test]
+    async fn restart_reverts_unattested_rows() {
+        let (_directory, store) = store().await;
+        let anchor = frame(10, BlockHash::ZERO).block;
+        let attested = frame(11, anchor.hash).block;
+        let head = frame(12, attested.hash).block;
+        let tip = frame(13, head.hash).block;
+        for (block, finality) in [
+            (anchor, Finality::Finalized),
+            (attested, Finality::Attested),
+            (head, Finality::Unattested),
+            (tip, Finality::Unattested),
+        ] {
+            store
+                .store_canonical_anchor(ChainId(1), block, finality)
+                .await
+                .expect("seed row");
+        }
+        let reverted = store
+            .revert_unproven_recent_blocks(ChainId(1), anchor, &[])
+            .await
+            .expect("revert");
+        assert_eq!(
+            reverted,
+            vec![tip, head],
+            "unattested rows never survive a restart"
+        );
+        assert!(
+            store
+                .canonical_block(ChainId(1), BlockNumber(11))
+                .await
+                .expect("row")
+                .is_some(),
+            "the attested row links to the anchor and stays"
+        );
+    }
+
+    #[test]
+    fn switching_unattested_and_attested_keeps_identity() {
+        let mut stored = FixtureProcessor::new().descriptor;
+        stored.publication = PublicationPolicy::Attested;
+        let stored_json = serde_json::to_string(&stored).expect("descriptor JSON");
+        let mut configured = stored.clone();
+        configured.publication = PublicationPolicy::Unattested;
+        for requirement in &mut configured.requirements {
+            requirement.minimum_finality = Finality::Unattested;
+        }
+        assert!(!check_stored_identity(&stored_json, &configured).expect("compatible"));
+        let mut finalized = stored.clone();
+        finalized.publication = PublicationPolicy::Finalized;
+        assert!(matches!(
+            check_stored_identity(&stored_json, &finalized),
+            Err(StoreError::ProcessorIdentity(_))
+        ));
+        let mut raised = stored;
+        for requirement in &mut raised.requirements {
+            requirement.minimum_finality = Finality::Finalized;
+        }
+        assert!(matches!(
+            check_stored_identity(&stored_json, &raised),
+            Err(StoreError::ProcessorIdentity(_))
+        ));
     }
 
     #[tokio::test]
