@@ -534,7 +534,7 @@ mod tests {
         BlockFrame {
             chain_id: 1.into(),
             block: block(),
-            finality: Finality::Included,
+            finality: Finality::Attested,
             header: Material::Missing(MissingReason::NotRequested),
             transactions: Material::Complete(Vec::new()),
             receipts: Material::Complete(Vec::new()),

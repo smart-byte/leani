@@ -15,8 +15,9 @@ pub mod provenance;
 
 pub use capability::{Capability, CapabilitySet, FrameCapabilityReport};
 pub use chain::{
-    Address, BlockHash, BlockNumber, BlockRange, BlockRangeError, BlockRef, CanonicalChainEvent,
-    CanonicalKey, ChainId, Finality, Quantity, TransactionHash,
+    Address, BlockHash, BlockNumber, BlockRange, BlockRangeError, BlockRef, CanonicalKey, ChainId,
+    Finality, MAINNET_GENESIS_TIME, Quantity, SLOT_SECONDS, TransactionHash, slot_at,
+    slot_starting_at,
 };
 pub use cursor::{
     ChangeCursor, CursorError, CursorKind, OpaqueCursor, ProcessorCursor, SourceCursor,

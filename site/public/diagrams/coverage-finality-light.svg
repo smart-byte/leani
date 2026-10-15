@@ -10,7 +10,7 @@ text{fill:#101713}.d{fill:#536b5e}.f{fill:#8ca396}.a{fill:#08763c}.h{fill:#8a5a0
 .mk{fill:#8ca396}.mka{fill:#08763c}.mkh{fill:#8a5a00}.hatch{stroke:#dcbd7a;stroke-width:3}
 </style>
   <title id="title">Coverage and finality are separate</title>
-  <desc id="desc">A processor requested blocks 100 to 140. Its coverage is 100 to 112 and 120 to 140, so blocks 113 to 119 are missing and coverage is not complete. Independently, the chain is finalized through block 128 and blocks 129 to 140 are included but not yet finalized.</desc>
+  <desc id="desc">A processor requested blocks 100 to 140. Its coverage is 100 to 112 and 120 to 140, so blocks 113 to 119 are missing and coverage is not complete. Independently, the chain is finalized through block 128 and blocks 129 to 140 are attested but not yet finalized.</desc>
   <defs>
     <pattern id="gap" width="8" height="8" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><line class="hatch" x1="0" y1="0" x2="0" y2="8"/></pattern>
   </defs>
@@ -43,6 +43,6 @@ text{fill:#101713}.d{fill:#536b5e}.f{fill:#8ca396}.a{fill:#08763c}.h{fill:#8a5a0
   <text class="s" x="480" y="131" text-anchor="end">128</text>
   <rect class="opena" x="502" y="114" width="138" height="26" rx="5"/>
   <text class="s" x="512" y="131">129</text>
-  <text class="s a" x="571" y="131" text-anchor="middle">included</text>
+  <text class="s a" x="571" y="131" text-anchor="middle">attested</text>
   <text class="s" x="630" y="131" text-anchor="end">140</text>
 </svg>

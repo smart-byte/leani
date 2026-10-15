@@ -41,7 +41,7 @@ fn processor_cursor_v1_encoding_is_stable() {
         chain_id: ChainId(1),
         block_number: BlockNumber(42),
         block_hash: BlockHash::new([0x11; 32]),
-        finality: Finality::Included,
+        finality: Finality::Attested,
         sequence: 77,
     };
     let encoded = encode(DurableKind::ProcessorCursor, 1, &cursor).expect("encode fixture");

@@ -78,10 +78,14 @@ def command_output(command: list[str]) -> str | None:
 
 
 def once_arguments(binary: Path) -> list[str]:
-    """Let `--once` end on the first peer preview, as it did by default before
-    `--finality preview` existed; newer binaries wait for a verified row."""
+    """Let `--once` end on the first row at the fastest level the binary
+    prints: an `unattested` row from the verified lane, or, before that level
+    existed, a `preview` row. Older binaries count previews by default."""
     help_text = command_output([str(binary), "subscribe", "--help"]) or ""
-    return ["--once", "--finality", "preview"] if "- preview:" in help_text else ["--once"]
+    for level in ("unattested", "preview"):
+        if f"- {level}:" in help_text:
+            return ["--once", "--finality", level]
+    return ["--once"]
 
 
 def binary_metadata(path: Path) -> dict[str, str | None]:
@@ -123,7 +127,7 @@ def manifest_for(
                 "pretty",
                 "--once",
                 "--finality",
-                "preview",
+                "unattested",
                 "--yes",
                 "--data-dir",
                 "<data-directory>",

@@ -38,6 +38,17 @@ pub enum Command {
     },
     /// Start configured sources, processors, stores, and serving endpoints.
     Serve,
+    /// Print the guide for agents and scripts that matches this binary.
+    #[command(after_help = "Examples:
+  leani guide
+  leani guide processors
+
+Written for agents and scripts. For tutorials and guides, see https://leani.dev/docs/.")]
+    Guide {
+        /// Section to print [default: the overview].
+        #[arg(value_enum)]
+        topic: Option<GuideTopic>,
+    },
     /// Create a compact configuration for a built-in processor.
     #[command(after_help = "Examples:
   leani init blocks
@@ -80,7 +91,7 @@ Without a terminal, pass --yes only after the user has approved the checkpoint p
   leani subscribe blocks --finality finalized
   leani subscribe uniswap-v3 ETH/USDC --json
   leani subscribe blocks --json --once --timeout 5m
-  leani subscribe blocks --once --finality preview
+  leani subscribe blocks --once --finality unattested
 
 Exit codes: 0 success or stopped, 124 --timeout elapsed before --once was
 satisfied, 130 interrupted before --once was satisfied.")]
@@ -109,9 +120,9 @@ satisfied, 130 interrupted before --once was satisfied.")]
         /// Optional bearer token for a running node.
         #[arg(long, env = "LEANI_API_TOKEN", hide_env_values = true)]
         token: Option<String>,
-        /// Lowest status that counts as a result: `preview`, `included`
-        /// (default), or `finalized`.
-        #[arg(long, value_enum, default_value_t = SubscribeFinality::Included)]
+        /// Lowest level that counts as a result: `unattested` (default),
+        /// `attested`, or `finalized`.
+        #[arg(long, value_enum, default_value_t = SubscribeFinality::Unattested)]
         finality: SubscribeFinality,
         /// Finality transport for the embedded runtime.
         #[arg(long, value_enum, default_value_t = SubscribeFinalitySource::Auto)]
@@ -327,6 +338,13 @@ fn parse_duration(value: &str) -> Result<Duration, humantime::DurationError> {
     )
 }
 
+/// Sections of `leani guide` beyond the overview.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum GuideTopic {
+    /// Built-in processors, event decoding, backfills, and custom processors.
+    Processors,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 pub enum SubscribeProtocol {
     Blocks,
@@ -350,18 +368,40 @@ pub enum SubscribeMode {
     Embedded,
 }
 
-/// Lowest chain-confidence status that counts as a subscription result.
+/// Lowest chain-confidence level that counts as a subscription result.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 pub enum SubscribeFinality {
-    /// Like `included`, but an unverified peer preview from embedded startup
-    /// also counts, so `--once` can return it. Fastest first output.
-    Preview,
-    /// Print blocks as soon as they are on the followed chain; a reorg can
-    /// still remove them. While following, embedded startup may show labelled
-    /// peer previews first; they never satisfy `--once`.
-    Included,
+    /// Print blocks as soon as the live lane accepts them: peers agree on the
+    /// header, it passes Leani's header rules and extends the delivered chain.
+    /// The sync committee has not attested them yet, so they can be undone.
+    Unattested,
+    /// Print blocks once the sync committee attested them; a reorg can still
+    /// remove them.
+    Attested,
     /// Print blocks only after Ethereum consensus has finalized them.
     Finalized,
+}
+
+impl SubscribeFinality {
+    /// The lowest level a printed row has.
+    #[must_use]
+    pub const fn level(self) -> leani_primitives::Finality {
+        match self {
+            Self::Unattested => leani_primitives::Finality::Unattested,
+            Self::Attested => leani_primitives::Finality::Attested,
+            Self::Finalized => leani_primitives::Finality::Finalized,
+        }
+    }
+
+    /// The publish mode of the embedded processor for this level.
+    #[must_use]
+    pub const fn publish_mode(self) -> crate::config::PublishMode {
+        match self {
+            Self::Unattested => crate::config::PublishMode::Unattested,
+            Self::Attested => crate::config::PublishMode::Attested,
+            Self::Finalized => crate::config::PublishMode::Finalized,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -393,8 +433,9 @@ pub enum ResetCommand {
         /// The exact targets used by `leani subscribe`; empty for `blocks`.
         #[arg(num_args = 0.., value_name = "TARGET")]
         targets: Vec<String>,
-        /// Finality of the subscription state being reset (`included` or `finalized`).
-        #[arg(long, value_enum, default_value_t = SubscribeFinality::Included)]
+        /// Finality of the subscription state being reset (`unattested`,
+        /// `attested` or `finalized`).
+        #[arg(long, value_enum, default_value_t = SubscribeFinality::Unattested)]
         finality: SubscribeFinality,
         /// Exact embedded subscription directory to reset.
         #[arg(long)]
@@ -926,6 +967,15 @@ mod tests {
         assert_eq!(protocol, SubscribeProtocol::UniswapV3);
         assert_eq!(targets, ["ETH/USDC", "ETH/USDT"]);
         assert!(yes);
+    }
+
+    #[test]
+    fn subscribe_defaults_to_unattested() {
+        let cli = Cli::try_parse_from(["leani", "subscribe", "blocks"]).expect("parse");
+        let Command::Subscribe { finality, .. } = cli.command else {
+            panic!("subscribe command");
+        };
+        assert_eq!(finality, SubscribeFinality::Unattested);
     }
 
     #[test]

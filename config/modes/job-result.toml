@@ -1,5 +1,5 @@
 config_version = 1
-data_dir = "./data/terminal"
+data_dir = "./data/job-result"
 
 [chain]
 name = "ethereum-mainnet"
@@ -55,7 +55,6 @@ version = "1.0.0"
 history_control = "node_owned"
 history_mode = "on_demand"
 start_block = 15537394
-publish = "terminal_only"
 
 [processors.state]
 mode = "checkpointed"
@@ -65,6 +64,7 @@ mode = "latest"
 
 [processors.delivery]
 mode = "until_acknowledged"
+emit = "job_result"
 max_bytes = "64MiB"
 max_age = "24h"
 on_limit = "pause"
@@ -78,7 +78,7 @@ retain_finalized_blocks = 256
 retain_acknowledged_age = "1h"
 
 [[processors.delivery.consumers]]
-id = "terminal-result"
+id = "job-result"
 required = true
 lease_ttl = "5m"
 

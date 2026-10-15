@@ -80,10 +80,11 @@ processor entities alone are not a lossless raw-log store: enable on-demand
 history or retain suitable raw material for historical RPC.
 
 `eth_blockNumber`, `latest`, and `eth_syncing.currentBlock` report the
-canonical tip, independently of raw-frame pruning, or the highest block the
+canonical tip: the newest delivered block at any level, `unattested`
+included, as an Ethereum RPC's `latest` (see
+[finality levels](/docs/concepts/coverage-finality-and-reorgs/#finality-levels-and-publish-modes)). They report it independently of raw-frame pruning, or the highest block the
 progress processor has finalized when that is higher or no tip is known, as
-on a node without live following. Finalized blocks are canonical, so the
-head never names a block a reorg could remove. A node that knows no block
+on a node without live following. A node that knows no block
 reports `0x0`, as a fresh Ethereum client does; `eth_blockNumber` never
 fails for want of a head. A reported head can lag the network, while
 disconnected or on a historical-only node; consult `eth_syncing`, which
@@ -152,7 +153,7 @@ Wherever a block number is accepted, including `fromBlock` and `toBlock` of
 
 | Tag | Block |
 |---|---|
-| `latest` | the head `eth_blockNumber` reports |
+| `latest` | the head `eth_blockNumber` reports, at any level |
 | `finalized` | the newest canonical block the node has verified as finalized |
 | `safe` | the same block as `finalized` |
 | `earliest` | block 0 |

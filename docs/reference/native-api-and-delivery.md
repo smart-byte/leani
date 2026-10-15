@@ -282,7 +282,7 @@ export interface ProcessorCoverage {
   available: Array<{
     fromBlock: number;
     toBlock: number;
-    finality: "preview" | "included" | "finalized";
+    finality: "unattested" | "attested" | "finalized";
   }>;
   configuredStartBlock: number;
   processedThrough: number | null;
@@ -512,12 +512,13 @@ return `boundaryCursor: null` and `recovery.follow: null`. Query-and-follow, cha
 change-page, and stream requests return non-retryable HTTP 409
 `delivery_disabled`; enable a delivery policy before subscribing.
 
-A `finalized_only` processor's snapshots also return `boundaryCursor: null`
-and `recovery.follow: null`, and query-and-follow returns HTTP 409
-`finalized_only_snapshot`: its retained state already holds included blocks
-whose changes are published only once finalized, and the stream never undoes
-a block it never published, so a copy followed from a boundary could keep
-rows of a reorged block.
+The snapshots of a processor that publishes from `attested` or `finalized`
+also return `boundaryCursor: null` and `recovery.follow: null`, and
+query-and-follow returns HTTP 409 `deferred_publication_snapshot`: its
+retained state already holds blocks whose changes are published only once
+they reach that level, and the stream never undoes a block it never
+published, so a copy followed from a boundary could keep rows of a reorged
+block.
 
 Release a no-longer-needed snapshot early:
 
@@ -577,7 +578,7 @@ select `processor_job` or `operator_pin` ownership. Delivery acknowledgement,
 output pruning, raw-history deletion, and checkpoint pruning never delete
 artifacts.
 
-`[budgets.artifacts]` caps retained finalized bytes and pending included-block
+`[budgets.artifacts]` caps retained finalized bytes and pending unfinalized-block
 candidates across all processors. Admission is atomic: exceeding either limit
 rolls back artifacts, processor mutations, coverage, and cursor advancement.
 The metrics endpoint reports current and maximum artifact bytes separately;
@@ -625,7 +626,7 @@ export interface ChangeEnvelope<T = unknown> {
   apiVersion: "1";
   sequence: string;
   cursor: string;
-  operation: "apply" | "undo" | "finalized" | "reset_required";
+  operation: "apply" | "undo" | "attested" | "finalized" | "reset_required";
   originKind: "live" | "live_recovery" | "historical_backfill" | "recompute";
   originId: string;
   publicationRevision: string;
@@ -636,7 +637,7 @@ export interface ChangeEnvelope<T = unknown> {
     parentHash: `0x${string}`;
     timestamp: number;
   } | null;
-  finality: "preview" | "included" | "finalized";
+  finality: "unattested" | "attested" | "finalized";
   kind: string;
   schema: string;
   key: string | null;
@@ -681,7 +682,16 @@ from another store, chain, processor version, or expired epoch is rejected.
 
 - introduces or updates the keyed domain value;
 - is emitted only after the state transaction commits;
-- may be included but not yet finalized.
+- may be `unattested` or `attested` but not yet finalized (see
+  [finality levels](/docs/concepts/coverage-finality-and-reorgs/#finality-levels-and-publish-modes)).
+
+`attested`
+
+- marks every block through `throughBlock` attested, as kind
+  `system.finality.put` with `data: { throughBlock }`: the highest block the
+  sync committee has attested;
+- is emitted only by processors that publish `unattested` blocks;
+- never repeats an entity.
 
 `undo`
 
@@ -935,7 +945,7 @@ export interface BlobsBlock {
   targetBlobsPerBlock: number;
   maxBlobsPerBlock: number;
   transformVersion: number;
-  finality: "preview" | "included" | "finalized";
+  finality: "unattested" | "attested" | "finalized";
 }
 
 export interface BlobTransaction {

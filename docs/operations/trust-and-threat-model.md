@@ -42,12 +42,17 @@ runtime exists.
 - block/header/transaction/receipt commitment checks on P2P material;
 - local checkpoint, sync-committee, BLS, finality-branch, and execution-payload
   proof verification for both finality transports;
-- included blocks anchored to attested heads: each slot, the finality source
-  verifies a light-client optimistic update, signed by at least 342 of the 512
-  sync-committee members, and its execution branch. Execution P2P fetches
-  blocks only up to the newest attested head, and requests the attested header
-  and the header chain below it by hash, down from the attested hash; a peer
-  that serves another header for a requested hash is banned. Only the finality
+- attested blocks anchored to attested heads: within each slot, the finality
+  source verifies a light-client optimistic update, signed by at least 342 of
+  the 512 sync-committee members, and its execution branch. Execution P2P
+  requests the attested header and the header chain below it by hash, down
+  from the attested hash; a peer that serves another header for a requested
+  hash is banned;
+- unattested blocks checked before any attestation: at least two peers serve
+  the same header, it passes reth's consensus header rules and Leani's slot
+  rules on the source's chain spec, it links to the delivered tip, and it is
+  at most two slots past the newest attested head. A block whose header
+  fails a rule waits for an attested head; no peer is penalised for it. Only the finality
   source can publish attested heads; the execution source only reads them.
   Only anchored headers earn peer rewards or clear withheld-header strikes,
   and only a mismatch anchored that way can reset the live lane;
@@ -122,18 +127,23 @@ runtime exists.
   balance changes;
 - the Beacon API finality profile still depends on configured transports even
   though proofs are checked locally;
-- `included` rests on the sync committee: at least two thirds of it signing a
+- `attested` rests on the sync committee: at least two thirds of it signing a
   header that is not on the canonical chain would make that header an attested
-  head. An attested head is not final, so honest reorgs still remove included
+  head. An attested head is not final, so honest reorgs still remove attested
   blocks; a peer that follows another branch lacks the attested block and is
   cooled down, not banned. Attested heads need no agreement between Beacon
   endpoints, since each carries the committee's signature; two different ones
   at one slot are ignored;
-- live following adds one to two slots of latency, and stops, reporting not
-  ready, while the finality source verifies no attested head;
-- the embedded CLI still prints `preview` blocks that one peer supplied before
-  the anchored lane is ready; they are never stored or applied, and
-  `subscribe --once` returns one only with `--finality preview`;
+- `unattested` blocks can be forged only by two colluding peers whose block
+  satisfies every header rule, and only for two slots: an attested head on
+  another block, or 60 s without one, undoes them. They can also be undone
+  honestly, when the network orphans a late payload; see
+  [finality levels](/docs/concepts/coverage-finality-and-reorgs/#finality-levels-and-publish-modes);
+- live following at `attested` adds one to two slots of latency, and stops,
+  reporting not ready, while the finality source verifies no attested head;
+  unattested delivery waits too once the newest attested head is more than
+  two slots old;
+- the embedded CLI no longer prints unverified peer previews;
 - native consensus and execution P2P peer availability can prevent timely
   progress, and a stale or incorrectly sourced weak-subjectivity checkpoint
   can select the wrong consensus history;

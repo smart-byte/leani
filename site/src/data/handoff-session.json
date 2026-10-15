@@ -9,7 +9,7 @@
       "parentHash": "0xff9707e951f5ba0202e58ef091f666bc5351e0de9f6131bfc45c789c5b48bec8",
       "timestamp": 1790754731,
       "sequence": "279",
-      "finality": "included",
+      "finality": "attested",
       "operation": "apply"
     },
     {
@@ -18,7 +18,7 @@
       "parentHash": "0x3b704df798d658dc31a62c054209f78afa1b593597881abade3a32e8d9317ea5",
       "timestamp": 1790754743,
       "sequence": "280",
-      "finality": "included",
+      "finality": "attested",
       "operation": "apply"
     },
     {
@@ -27,7 +27,7 @@
       "parentHash": "0xf69370db8ca405deb920861698849ce9c43fa972e7d4760ebd834c039b38a51f",
       "timestamp": 1790754755,
       "sequence": "281",
-      "finality": "included",
+      "finality": "attested",
       "operation": "apply"
     },
     {
@@ -36,7 +36,7 @@
       "parentHash": "0x605090c4d9169d06c21a2c736825797f993af08e77afab5ce38683a1aff8e500",
       "timestamp": 1790754767,
       "sequence": "282",
-      "finality": "included",
+      "finality": "attested",
       "operation": "apply"
     },
     {
@@ -45,7 +45,7 @@
       "parentHash": "0xee28ad9dc514e397358881b3da0ca62e164e47fa28b98bcb4cab36a4ab2bfb30",
       "timestamp": 1790754779,
       "sequence": "283",
-      "finality": "included",
+      "finality": "attested",
       "operation": "apply"
     },
     {
@@ -54,7 +54,7 @@
       "parentHash": "0x386040c6103bb7286106c10e2d9814f3bcb9a52b186eb0e70a4f077fa294e05c",
       "timestamp": 1790754791,
       "sequence": "284",
-      "finality": "included",
+      "finality": "attested",
       "operation": "apply"
     },
     {
@@ -63,7 +63,7 @@
       "parentHash": "0x67bb27f13dc27e97351ea897cd94cbd06d746e91a379ad07b898fb33fe71d3d9",
       "timestamp": 1790754803,
       "sequence": "285",
-      "finality": "included",
+      "finality": "attested",
       "operation": "apply"
     },
     {
@@ -72,7 +72,7 @@
       "parentHash": "0xecc5e07931e35392ae4ba896a2f3b4c060858e457d62b39495e140224235aad0",
       "timestamp": 1790754815,
       "sequence": "286",
-      "finality": "included",
+      "finality": "attested",
       "operation": "apply"
     }
   ]

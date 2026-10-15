@@ -70,7 +70,7 @@ version = "1.2.0"
 history_control = "node_owned"
 history_mode = "on_demand"
 start_block = 0
-publish = "finalized_only"
+publish = "finalized"
 
 [processors.state]
 mode = "durable"
@@ -102,7 +102,7 @@ version = "1.5.0"
 history_control = "node_owned"
 history_mode = "on_demand"
 start_block = 19426589
-publish = "finalized_only"
+publish = "finalized"
 
 [processors.state]
 mode = "durable"
@@ -134,7 +134,7 @@ version = "2.1.0"
 history_control = "node_owned"
 history_mode = "on_demand"
 start_block = 12376729
-publish = "finalized_only"
+publish = "finalized"
 
 [processors.state]
 mode = "durable"

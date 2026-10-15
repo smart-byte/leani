@@ -509,6 +509,7 @@
         "mode": {
           "enum": ["none", "best_effort", "window", "until_acknowledged"]
         },
+        "emit": { "enum": ["changes", "job_result"], "default": "changes" },
         "max_bytes": { "$ref": "#/$defs/humanBytes" },
         "max_age": { "$ref": "#/$defs/humanDuration" },
         "on_limit": { "enum": ["pause", "fail", "expire_and_reset"] },
@@ -545,7 +546,6 @@
         "instance",
         "version",
         "start_block",
-        "publish",
         "state",
         "output",
         "delivery",
@@ -563,11 +563,9 @@
         "require_retained_input": { "type": "boolean" },
         "start_block": { "$ref": "#/$defs/nonNegativeInteger" },
         "publish": {
-          "enum": [
-            "included_and_finalized",
-            "finalized_only",
-            "terminal_only"
-          ]
+          "enum": ["unattested", "attested", "finalized"],
+          "default": "unattested",
+          "description": "First chain-confidence level the processor's consumers see."
         },
         "state": { "$ref": "#/$defs/statePolicy" },
         "artifacts": { "$ref": "#/$defs/artifactPolicy" },
