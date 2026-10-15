@@ -15783,6 +15783,37 @@ mod tests {
         );
     }
 
+    #[test]
+    fn lane_stays_attested_gated_for_an_attested_processor() {
+        let head = BlockLocalCounter::named("gate-head");
+        let strict = Requiring::new(
+            BlockLocalCounter::named("gate-strict"),
+            vec![leani_processor_api::DataRequirement {
+                minimum_finality: Finality::Attested,
+                ..BlockLocalCounter::named("gate-strict")
+                    .descriptor()
+                    .requirements[0]
+                    .clone()
+            }],
+        );
+        let both: Vec<Arc<dyn Processor>> = vec![Arc::new(head), Arc::new(strict)];
+        assert_eq!(
+            compile_live_request(&both, ChainId(1), &LiveStart::Head)
+                .expect("request")
+                .minimum_finality,
+            Finality::Attested,
+            "the P2P lane enables head acceptance only for Finality::Unattested"
+        );
+        let built_ins: Vec<Arc<dyn Processor>> =
+            vec![Arc::new(BlockLocalCounter::named("gate-only-head"))];
+        assert_eq!(
+            compile_live_request(&built_ins, ChainId(1), &LiveStart::Head)
+                .expect("request")
+                .minimum_finality,
+            Finality::Unattested
+        );
+    }
+
     #[tokio::test]
     async fn attested_events_promote_unattested_blocks() {
         let range = BlockRange::new(BlockNumber(0), BlockNumber(2)).expect("range");

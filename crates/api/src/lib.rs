@@ -51,7 +51,7 @@ use leani_processor_erc20::{BALANCE_CHANGE_KIND, TokenBalanceEntity};
 use leani_processor_uniswap::PoolPriceEntity;
 #[cfg(test)]
 use leani_source_api::{NetworkPeerOrigin, NetworkPeerQualification};
-use leani_source_api::{NetworkTelemetry, NetworkTelemetrySnapshot, coverage_gaps};
+use leani_source_api::{NetworkTelemetry, NetworkTelemetrySnapshot, UnattestedUndo, coverage_gaps};
 use leani_store_history::{
     RawHistoryIndexPolicy, RawHistoryJob, RawHistoryJobDeletion, RawHistoryMaterialProfile,
     RawHistoryRetention, RawHistorySegmentPolicy, VerificationClass,
@@ -3536,6 +3536,53 @@ fn append_network_session_metrics(
             )?;
         }
     }
+    let levels = &network.live_levels;
+    writeln!(output, "# TYPE leani_live_block_delay_seconds summary")?;
+    for (index, level) in [
+        Finality::Unattested,
+        Finality::Attested,
+        Finality::Finalized,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let milliseconds = levels.delay_milliseconds[index];
+        writeln!(
+            output,
+            "leani_live_block_delay_seconds_sum{{level=\"{}\"}} {}.{:03}",
+            level.name(),
+            milliseconds / 1_000,
+            milliseconds % 1_000
+        )?;
+        writeln!(
+            output,
+            "leani_live_block_delay_seconds_count{{level=\"{}\"}} {}",
+            level.name(),
+            levels.blocks[index]
+        )?;
+    }
+    writeln!(output, "# TYPE leani_live_unattested_undone_total counter")?;
+    for (index, reason) in [
+        UnattestedUndo::Grace,
+        UnattestedUndo::Orphaned,
+        UnattestedUndo::HeadReorg,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        writeln!(
+            output,
+            "leani_live_unattested_undone_total{{reason=\"{}\"}} {}",
+            reason.as_str(),
+            levels.unattested_undone[index]
+        )?;
+    }
+    writeln!(output, "# TYPE leani_live_unattested_held_total counter")?;
+    writeln!(
+        output,
+        "leani_live_unattested_held_total {}",
+        levels.unattested_held
+    )?;
     Ok(())
 }
 
@@ -14513,6 +14560,7 @@ mod tests {
         assert!(metrics.contains(
             "leani_p2p_session_observed_head_block{session=\"1\",lane=\"live\"} 19426620"
         ));
+        assert!(metrics.contains("leani_live_block_delay_seconds_count{level=\"unattested\"} 0"));
         assert!(
             metrics.contains("leani_history_jobs{owner=\"materialization\",state=\"completed\"} 0")
         );
