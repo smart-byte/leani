@@ -55,7 +55,7 @@ version = "1.0.0"
 history_control = "node_owned"
 history_mode = "on_demand"
 start_block = 15537394
-publish = "finalized_only"
+publish = "finalized"
 
 [processors.state]
 mode = "checkpointed"

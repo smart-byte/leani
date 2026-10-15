@@ -11,7 +11,7 @@ const demoDir = new URL('../src/data/processors/', import.meta.url);
 
 // One `leani subscribe blocks` pretty row, as printed by the CLI.
 const BLOCK_ROW =
-  /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ {2}block=(\d+) {2}txs=\d+ {2}gas=[\d.]+[kKMG]? \/ [\d.]+[kKMG]? \([\d.]+%\) {2}base_fee=[\d.]+ gwei {2}blobs=\d+ {2}(?:preview|included|finalized)$/;
+  /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ {2}block=(\d+) {2}txs=\d+ {2}gas=[\d.]+[kKMG]? \/ [\d.]+[kKMG]? \([\d.]+%\) {2}base_fee=[\d.]+ gwei {2}blobs=\d+ {2}(?:unattested|attested|finalized)$/;
 
 describe('canned data', () => {
   test('follow examples each carry id, label, title, note, and lines', () => {

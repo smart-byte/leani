@@ -51,17 +51,17 @@ use leani_processor_erc20::{BALANCE_CHANGE_KIND, TokenBalanceEntity};
 use leani_processor_uniswap::PoolPriceEntity;
 #[cfg(test)]
 use leani_source_api::{NetworkPeerOrigin, NetworkPeerQualification};
-use leani_source_api::{NetworkTelemetry, NetworkTelemetrySnapshot, coverage_gaps};
+use leani_source_api::{NetworkTelemetry, NetworkTelemetrySnapshot, UnattestedUndo, coverage_gaps};
 use leani_store_history::{
     RawHistoryIndexPolicy, RawHistoryJob, RawHistoryJobDeletion, RawHistoryMaterialProfile,
     RawHistoryRetention, RawHistorySegmentPolicy, VerificationClass,
 };
 use leani_store_sqlite::{
-    ArtifactOwnerKind, ArtifactPruneOutcome, ArtifactReplayOutcome, ChangeBounds, ChangeDirection,
-    ChangeRecord, ConsumerRole, ConsumerStartPosition, DeliveryStreamKind, DurableConsumer,
-    LIVE_GAP_CHANGE_KIND, OutputBounds, OutputQuery, PortableSavepoint, ProcessorArtifactStats,
-    ProcessorRunState, QuerySnapshotEntity, RecoveryCheckpoint, SqliteStore, StoreError,
-    UnacknowledgedDelivery, decode_live_gap_notice, default_delivery_stream_id,
+    ArtifactOwnerKind, ArtifactPruneOutcome, ArtifactReplayOutcome, ChangeBounds, ChangeRecord,
+    ConsumerRole, ConsumerStartPosition, DeliveryStreamKind, DurableConsumer, LIVE_GAP_CHANGE_KIND,
+    OutputBounds, OutputQuery, PortableSavepoint, ProcessorArtifactStats, ProcessorRunState,
+    QuerySnapshotEntity, RecoveryCheckpoint, SqliteStore, StoreError, UnacknowledgedDelivery,
+    decode_live_gap_notice, default_delivery_stream_id,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -739,6 +739,7 @@ pub struct HistoricalMaterialMetrics {
     pub overfetched_bytes: u64,
     pub logical_frame_deliveries: u64,
     pub active_acquisitions: u64,
+    pub active_acquisitions_limit: u64,
     pub buffered_bytes: u64,
 }
 
@@ -2423,30 +2424,50 @@ pub struct RequestedRange {
     to_block: u64,
 }
 
-/// Split covered ranges at finality boundaries so each interval carries the
-/// exact finality of every block inside it. Both inputs must be normalized
+/// Split covered ranges at level boundaries so each interval carries the
+/// exact level of every block inside it. Every input must be normalized
 /// (ascending, non-overlapping); `finalized` labels its intersection with
-/// `coverage` and everything else stays included.
+/// `coverage` first, then `unattested` its own, and everything else is
+/// attested.
 fn labeled_coverage_intervals(
     coverage: &[BlockRange],
     finalized: &[BlockRange],
+    unattested: &[BlockRange],
 ) -> Vec<CoverageInterval> {
     let mut intervals = Vec::new();
-    let mut remaining = finalized.iter().peekable();
+    let mut finalized = finalized.iter().peekable();
+    let mut unattested = unattested.iter().peekable();
     for range in coverage {
         let mut cursor = range.start().0;
         let end = range.end().0;
         loop {
-            while remaining.next_if(|range| range.end().0 < cursor).is_some() {}
-            let (to_block, finality) = match remaining.peek() {
-                Some(range) if range.start().0 <= cursor => (range.end().0.min(end), "finalized"),
-                Some(range) if range.start().0 <= end => (range.start().0 - 1, "included"),
-                _ => (end, "included"),
+            while finalized.next_if(|range| range.end().0 < cursor).is_some() {}
+            while unattested.next_if(|range| range.end().0 < cursor).is_some() {}
+            // The level at `cursor`, and the last block that level holds for.
+            let (last, level) = match (finalized.peek(), unattested.peek()) {
+                (Some(range), _) if range.start().0 <= cursor => {
+                    (range.end().0, Finality::Finalized)
+                }
+                (next_finalized, Some(range)) if range.start().0 <= cursor => (
+                    next_finalized
+                        .map_or(range.end().0, |next| range.end().0.min(next.start().0 - 1)),
+                    Finality::Unattested,
+                ),
+                (next_finalized, next_unattested) => (
+                    [next_finalized, next_unattested]
+                        .into_iter()
+                        .flatten()
+                        .map(|next| next.start().0 - 1)
+                        .min()
+                        .unwrap_or(u64::MAX),
+                    Finality::Attested,
+                ),
             };
+            let to_block = last.min(end);
             intervals.push(CoverageInterval {
                 from_block: cursor,
                 to_block,
-                finality,
+                finality: level.name(),
             });
             match to_block.checked_add(1) {
                 Some(next) if next <= end => cursor = next,
@@ -2513,13 +2534,14 @@ async fn coverage(
             BlockRange::new(BlockNumber(configured_start), cursor.block_number).ok()
         })
     });
-    let (ranges, finalized_ranges) = if let Some(range) = query_range {
+    let (ranges, finalized_ranges, unattested_ranges) = if let Some(range) = query_range {
         (
             state.store.coverage(descriptor, range).await?,
             state.store.finalized_coverage(descriptor, range).await?,
+            state.store.unattested_coverage(descriptor, range).await?,
         )
     } else {
-        (Vec::new(), Vec::new())
+        (Vec::new(), Vec::new(), Vec::new())
     };
     let finalized_through = state.store.finalized_through(descriptor).await?;
     let chain_finalized_head = state
@@ -2551,7 +2573,7 @@ async fn coverage(
             from_block: range.start().0,
             to_block: range.end().0,
         }),
-        available: labeled_coverage_intervals(&ranges, &finalized_ranges),
+        available: labeled_coverage_intervals(&ranges, &finalized_ranges, &unattested_ranges),
         configured_start_block: configured_start,
         finalized_through: finalized_through.map(|block| block.0),
         processed_through,
@@ -2923,6 +2945,12 @@ fn append_historical_material_metrics(
             "gauge",
             "Historical material acquisitions currently reading a source.",
             metrics.active_acquisitions,
+        ),
+        (
+            "active_acquisitions_limit",
+            "gauge",
+            "Historical material acquisitions that may read a source at once.",
+            metrics.active_acquisitions_limit,
         ),
         (
             "buffer_bytes",
@@ -3529,6 +3557,53 @@ fn append_network_session_metrics(
             )?;
         }
     }
+    let levels = &network.live_levels;
+    writeln!(output, "# TYPE leani_live_block_delay_seconds summary")?;
+    for (index, level) in [
+        Finality::Unattested,
+        Finality::Attested,
+        Finality::Finalized,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let milliseconds = levels.delay_milliseconds[index];
+        writeln!(
+            output,
+            "leani_live_block_delay_seconds_sum{{level=\"{}\"}} {}.{:03}",
+            level.name(),
+            milliseconds / 1_000,
+            milliseconds % 1_000
+        )?;
+        writeln!(
+            output,
+            "leani_live_block_delay_seconds_count{{level=\"{}\"}} {}",
+            level.name(),
+            levels.blocks[index]
+        )?;
+    }
+    writeln!(output, "# TYPE leani_live_unattested_undone_total counter")?;
+    for (index, reason) in [
+        UnattestedUndo::Grace,
+        UnattestedUndo::Orphaned,
+        UnattestedUndo::HeadReorg,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        writeln!(
+            output,
+            "leani_live_unattested_undone_total{{reason=\"{}\"}} {}",
+            reason.as_str(),
+            levels.unattested_undone[index]
+        )?;
+    }
+    writeln!(output, "# TYPE leani_live_unattested_held_total counter")?;
+    writeln!(
+        output,
+        "leani_live_unattested_held_total {}",
+        levels.unattested_held
+    )?;
     Ok(())
 }
 
@@ -6930,9 +7005,9 @@ async fn read_generic_snapshot_page(
         .output_bounds(processor.descriptor(), collection)
         .await?
         .map(OutputBoundsResponse::from);
-    // A finalized_only processor's snapshot holds blocks whose changes are
-    // still unpublished, so it offers no boundary to follow, as
-    // query-and-follow refuses it.
+    // A snapshot of a processor that publishes from attested or finalized
+    // holds blocks whose changes are still unpublished, so it offers no
+    // boundary to follow, as query-and-follow refuses it.
     let boundary_cursor = (processor.descriptor().lifecycle.delivery.mode
         != leani_processor_api::DeliveryPolicyMode::None
         && ensure_snapshot_follow_supported(processor.as_ref()).is_ok())
@@ -7019,18 +7094,19 @@ fn ensure_output_retained(processor: &dyn Processor) -> Result<(), ApiError> {
     }
 }
 
-/// Snapshots read retained state, which for a `finalized_only` processor
-/// already contains included blocks whose changes are still unpublished. The
-/// stream never emits an undo for those blocks, so a consumer that seeded from
-/// such a snapshot could keep reorged rows forever.
+/// Snapshots read retained state, which for a processor that publishes from
+/// `attested` or `finalized` already contains blocks whose changes are still
+/// unpublished. The stream may never emit an undo for those blocks, so a
+/// consumer that seeded from such a snapshot could keep reorged rows forever.
 fn ensure_snapshot_follow_supported(processor: &dyn Processor) -> Result<(), ApiError> {
-    if matches!(
-        processor.descriptor().publication,
-        leani_processor_api::PublicationPolicy::FinalizedOnly
-    ) {
+    let first_level = processor.descriptor().publication.first_level();
+    if first_level > Finality::Unattested {
         Err(ApiError::conflict(
-            "finalized_only_snapshot",
-            "query-and-follow is unavailable for finalized_only processors: retained state includes unpublished blocks; follow the change stream from its head instead",
+            "deferred_publication_snapshot",
+            &format!(
+                "query-and-follow is unavailable for processors that publish from {}: retained state includes blocks not published yet; follow the change stream from its head instead",
+                first_level.name()
+            ),
         ))
     } else {
         Ok(())
@@ -7659,12 +7735,11 @@ fn render_change_envelope(
         api_version: API_VERSION,
         sequence: record.cursor.sequence.to_string(),
         cursor,
-        operation: match record.direction {
-            ChangeDirection::Apply => "apply",
-            ChangeDirection::Undo => "undo",
-            ChangeDirection::Finalized => "finalized",
-            ChangeDirection::ResetRequired => "reset_required",
-        },
+        operation: leani_store_sqlite::change_operation(
+            record.direction,
+            record.finality,
+            &record.change.kind,
+        ),
         origin_kind: record.origin.kind.as_str().to_owned(),
         origin_id: record.origin.id,
         publication_revision: record.origin.publication_revision.to_string(),
@@ -8663,7 +8738,7 @@ mod tests {
         };
         if canonical_row {
             store
-                .store_canonical_anchor(ChainId(1), block, Finality::Included)
+                .store_canonical_anchor(ChainId(1), block, Finality::Attested)
                 .await
                 .expect("canonical observation block");
         }
@@ -8679,7 +8754,7 @@ mod tests {
                 block_number: block.number,
                 block_hash: block.hash,
                 log_index: 7,
-                finality: Finality::Included,
+                finality: Finality::Attested,
             }],
         })
         .expect("observation delta");
@@ -8698,7 +8773,7 @@ mod tests {
                     chain_id: ChainId(1),
                     block_number: block.number,
                     block_hash: block.hash,
-                    finality: Finality::Included,
+                    finality: Finality::Attested,
                     sequence: 1,
                 },
                 &delta,
@@ -8720,7 +8795,7 @@ mod tests {
             timestamp: 1_800_000_012,
         };
         store
-            .store_canonical_anchor(ChainId(1), block, Finality::Included)
+            .store_canonical_anchor(ChainId(1), block, Finality::Attested)
             .await
             .expect("canonical block-summary block");
         let payload = postcard::to_allocvec(&leani_processor_block_summary::BlockSummaryEntity {
@@ -8736,7 +8811,7 @@ mod tests {
             excess_blob_gas: Some(393_216),
             transaction_count: Some(123),
             size_bytes: None,
-            finality: Finality::Included,
+            finality: Finality::Attested,
         })
         .expect("block-summary delta");
         let delta = leani_processor_api::EncodedDelta::new(
@@ -8754,7 +8829,7 @@ mod tests {
                     chain_id: ChainId(1),
                     block_number: block.number,
                     block_hash: block.hash,
-                    finality: Finality::Included,
+                    finality: Finality::Attested,
                     sequence: 1,
                 },
                 &delta,
@@ -8773,7 +8848,7 @@ mod tests {
         let mut recipient = [0; 32];
         recipient[12..].copy_from_slice(&[0x11; 20]);
         let mut frame = leani_testkit::fixture_frame(1, BlockHash::ZERO);
-        frame.finality = Finality::Included;
+        frame.finality = Finality::Attested;
         frame.logs = leani_primitives::Material::Complete(vec![leani_primitives::Log {
             address: Address::new([0x33; 20]),
             topics: vec![
@@ -8796,7 +8871,7 @@ mod tests {
                     chain_id: ChainId(1),
                     block_number: frame.block.number,
                     block_hash: frame.block.hash,
-                    finality: Finality::Included,
+                    finality: Finality::Attested,
                     sequence: 1,
                 },
                 &delta,
@@ -9519,7 +9594,7 @@ mod tests {
         assert_eq!(body["data"]["blockHash"], block.hash.to_string());
         assert_eq!(body["data"]["gasUsed"], 31_000_000);
         assert_eq!(body["data"]["transactionCount"], 123);
-        assert_eq!(body["data"]["finality"], "included");
+        assert_eq!(body["data"]["finality"], "attested");
     }
 
     #[tokio::test]
@@ -9607,7 +9682,7 @@ mod tests {
     #[allow(clippy::too_many_lines)]
     async fn typed_endpoints_report_finality_from_entity_metadata() {
         // Audit M-P1: typed endpoints reported the finality a block had when
-        // it was reduced, so finalized data stayed "included".
+        // it was reduced, so finalized data stayed "attested".
         let directory = tempfile::tempdir().expect("tempdir");
         let store = SqliteStore::open(leani_store_sqlite::StoreConfig::new(
             directory.path().join("node.sqlite"),
@@ -9638,7 +9713,7 @@ mod tests {
         seed_uniswap_observation(&store, latest.as_ref(), Address::new([0x22; 20]), false).await;
         let blobs = Arc::new(BlobsProcessor::default());
         let blob_block = blobs.schedule().first_block();
-        seed_blob_block(&store, &blobs, blob_block, 0, Finality::Included).await;
+        seed_blob_block(&store, &blobs, blob_block, 0, Finality::Attested).await;
         let blob_hash =
             BlockHash::new([u8::try_from(blob_block % 251).expect("small hash byte"); 32]);
         // Review 1, minor 2: ERC-20 balances too.
@@ -9806,7 +9881,7 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(body["timestamp"], observed.timestamp);
         assert_eq!(body["data"]["blockNumber"], observed.number.0);
-        assert_eq!(body["data"]["finality"], "included");
+        assert_eq!(body["data"]["finality"], "attested");
     }
 
     #[tokio::test]
@@ -10721,6 +10796,77 @@ mod tests {
             records.last().map(|record| record.cursor.sequence),
             "every committed record is acknowledged"
         );
+    }
+
+    #[tokio::test]
+    async fn an_unattested_processor_streams_the_attested_marker() {
+        use leani_primitives::ProcessorCursor;
+
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = SqliteStore::open(leani_store_sqlite::StoreConfig::new(
+            directory.path().join("node.sqlite"),
+        ))
+        .await
+        .expect("store");
+        let processor = Arc::new(
+            leani_testkit::BlockLocalCounter::default()
+                .with_publication(leani_processor_api::PublicationPolicy::Unattested),
+        );
+        store
+            .register_processor(processor.descriptor())
+            .await
+            .expect("register processor");
+        let mut frame = leani_testkit::fixture_frame(1, BlockHash::ZERO);
+        frame.finality = Finality::Unattested;
+        let delta = processor.map(&frame).await.expect("map");
+        store
+            .apply(
+                processor.as_ref(),
+                ProcessorCursor {
+                    chain_id: frame.chain_id,
+                    processor_id: processor.descriptor().id.to_string(),
+                    processor_version: processor.descriptor().version.to_string(),
+                    block_number: frame.block.number,
+                    block_hash: frame.block.hash,
+                    finality: Finality::Unattested,
+                    sequence: 1,
+                },
+                &delta,
+                &[],
+            )
+            .await
+            .expect("unattested apply");
+        store
+            .mark_attested(processor.descriptor(), frame.block.number, frame.block.hash)
+            .await
+            .expect("mark attested");
+        let configured: Arc<dyn Processor> = processor;
+        let app = router_with_processors(store, vec![configured], Vec::new(), ApiConfig::default())
+            .expect("router");
+        let page = app
+            .oneshot(
+                Request::get("/v1/processors/synthetic-counter/changes")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(page.status(), StatusCode::OK);
+        let page: Value = serde_json::from_slice(
+            &to_bytes(page.into_body(), usize::MAX)
+                .await
+                .expect("page body"),
+        )
+        .expect("page JSON");
+        let marker = page["data"]
+            .as_array()
+            .and_then(|changes| changes.last())
+            .expect("the attested marker")
+            .clone();
+        assert_eq!(marker["operation"], "attested");
+        assert_eq!(marker["kind"], "system.finality.put");
+        assert_eq!(marker["finality"], "attested");
+        assert_eq!(marker["data"]["throughBlock"], 1);
     }
 
     #[tokio::test]
@@ -12335,7 +12481,7 @@ mod tests {
         .expect("store");
         let processor = Arc::new(
             leani_testkit::BlockLocalCounter::default()
-                .with_publication(PublicationPolicy::FinalizedOnly),
+                .with_publication(PublicationPolicy::Finalized),
         );
         apply_finalized_blocks(&store, processor.as_ref(), 1..=2).await;
         let configured: Arc<dyn Processor> = processor;
@@ -12531,23 +12677,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn query_and_follow_rejects_finalized_only_processors() {
+    async fn query_and_follow_rejects_deferring_processors() {
         use leani_processor_api::PublicationPolicy;
         use leani_testkit::BlockLocalCounter;
 
-        let directory = tempfile::tempdir().expect("tempdir");
-        let store = SqliteStore::open(leani_store_sqlite::StoreConfig::new(
-            directory.path().join("finalized-only-follow.sqlite"),
-        ))
-        .await
-        .expect("store");
-        let processor: Arc<dyn Processor> = Arc::new(
-            BlockLocalCounter::default().with_publication(PublicationPolicy::FinalizedOnly),
-        );
-        let router =
-            router_with_processors(store, vec![processor], Vec::new(), ApiConfig::default())
-                .expect("router");
-        let response = router
+        for publication in [PublicationPolicy::Finalized, PublicationPolicy::Attested] {
+            let directory = tempfile::tempdir().expect("tempdir");
+            let store = SqliteStore::open(leani_store_sqlite::StoreConfig::new(
+                directory.path().join("deferred-follow.sqlite"),
+            ))
+            .await
+            .expect("store");
+            let processor: Arc<dyn Processor> =
+                Arc::new(BlockLocalCounter::default().with_publication(publication));
+            let router =
+                router_with_processors(store, vec![processor], Vec::new(), ApiConfig::default())
+                    .expect("router");
+            let response = router
             .oneshot(
                 Request::post(
                     "/v1/processors/synthetic-counter/collections/counter.blocks/query-and-follow",
@@ -12558,14 +12704,18 @@ mod tests {
             )
             .await
             .expect("response");
-        assert_eq!(response.status(), StatusCode::CONFLICT);
-        let body: Value = serde_json::from_slice(
-            &to_bytes(response.into_body(), usize::MAX)
-                .await
-                .expect("body"),
-        )
-        .expect("JSON");
-        assert_eq!(body["error"]["code"], "finalized_only_snapshot");
+            assert_eq!(response.status(), StatusCode::CONFLICT);
+            let body: Value = serde_json::from_slice(
+                &to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .expect("body"),
+            )
+            .expect("JSON");
+            assert_eq!(
+                body["error"]["code"], "deferred_publication_snapshot",
+                "{publication:?}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -13347,7 +13497,7 @@ mod tests {
             balance: Quantity::new([0; 32]),
             as_of_block: BlockNumber(7),
             block_hash: BlockHash::new([7; 32]),
-            finality: Finality::Included,
+            finality: Finality::Attested,
             coverage_from: BlockNumber(1),
             complete: false,
             incomplete_from: Some(BlockNumber(7)),
@@ -14507,6 +14657,7 @@ mod tests {
         assert!(metrics.contains(
             "leani_p2p_session_observed_head_block{session=\"1\",lane=\"live\"} 19426620"
         ));
+        assert!(metrics.contains("leani_live_block_delay_seconds_count{level=\"unattested\"} 0"));
         assert!(
             metrics.contains("leani_history_jobs{owner=\"materialization\",state=\"completed\"} 0")
         );
@@ -14620,6 +14771,7 @@ mod tests {
                 overfetched_bytes: 1_024,
                 logical_frame_deliveries: 500,
                 active_acquisitions: 1,
+                active_acquisitions_limit: 8,
                 buffered_bytes: 512,
             }),
         )
@@ -14634,6 +14786,7 @@ mod tests {
         assert!(output.contains("leani_history_material_overfetched_bytes_total 1024"));
         assert!(output.contains("leani_history_material_logical_frame_deliveries_total 500"));
         assert!(output.contains("leani_history_material_active_acquisitions 1"));
+        assert!(output.contains("leani_history_material_active_acquisitions_limit 8"));
         assert!(output.contains("leani_history_material_buffer_bytes 512"));
     }
 
@@ -14648,7 +14801,7 @@ mod tests {
             CoverageInterval {
                 from_block: 25,
                 to_block: 40,
-                finality: "included",
+                finality: "attested",
             },
         ];
         assert_eq!(missing_coverage_blocks(10, 30, &available), 4);
@@ -14693,6 +14846,27 @@ mod tests {
     }
 
     #[test]
+    fn coverage_labels_all_three_levels() {
+        let range = |from: u64, to: u64| {
+            BlockRange::new(BlockNumber(from), BlockNumber(to)).expect("range")
+        };
+        let intervals =
+            labeled_coverage_intervals(&[range(1, 10)], &[range(1, 4)], &[range(9, 10)]);
+        let labels = intervals
+            .iter()
+            .map(|interval| (interval.from_block, interval.to_block, interval.finality))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            labels,
+            vec![
+                (1, 4, "finalized"),
+                (5, 8, "attested"),
+                (9, 10, "unattested")
+            ]
+        );
+    }
+
+    #[test]
     fn labeled_coverage_intervals_split_around_finalized_holes() {
         let range = |from: u64, to: u64| {
             BlockRange::new(BlockNumber(from), BlockNumber(to)).expect("range")
@@ -14707,24 +14881,25 @@ mod tests {
         let coverage = [range(5, 20), range(30, 35)];
         let finalized = [range(5, 8), range(12, 14), range(33, 40)];
         assert_eq!(
-            labels(&labeled_coverage_intervals(&coverage, &finalized)),
+            labels(&labeled_coverage_intervals(&coverage, &finalized, &[])),
             vec![
                 (5, 8, "finalized"),
-                (9, 11, "included"),
+                (9, 11, "attested"),
                 (12, 14, "finalized"),
-                (15, 20, "included"),
-                (30, 32, "included"),
+                (15, 20, "attested"),
+                (30, 32, "attested"),
                 (33, 35, "finalized"),
             ],
         );
         assert_eq!(
-            labels(&labeled_coverage_intervals(&coverage, &[])),
-            vec![(5, 20, "included"), (30, 35, "included")],
+            labels(&labeled_coverage_intervals(&coverage, &[], &[])),
+            vec![(5, 20, "attested"), (30, 35, "attested")],
         );
         assert_eq!(
             labels(&labeled_coverage_intervals(
                 &[range(5, 20)],
-                &[range(0, 25)]
+                &[range(0, 25)],
+                &[]
             )),
             vec![(5, 20, "finalized")],
         );
@@ -14732,6 +14907,7 @@ mod tests {
             labels(&labeled_coverage_intervals(
                 &[range(0, u64::MAX)],
                 &[range(0, u64::MAX)],
+                &[],
             )),
             vec![(0, u64::MAX, "finalized")],
         );
@@ -14756,7 +14932,7 @@ mod tests {
                 CoverageInterval {
                     from_block: 90,
                     to_block: 100,
-                    finality: "included",
+                    finality: "attested",
                 },
             ],
             configured_start_block: 0,
@@ -15061,7 +15237,7 @@ mod tests {
         let mut hashes = Vec::new();
         for number in 0..=4 {
             let mut frame = fixture_frame(number, parent);
-            frame.finality = Finality::Included;
+            frame.finality = Finality::Attested;
             let delta = processor.map(&frame).await.expect("map");
             let descriptor = processor.descriptor();
             store
@@ -15110,7 +15286,7 @@ mod tests {
             body["available"],
             json!([
                 { "fromBlock": 0, "toBlock": 2, "finality": "finalized" },
-                { "fromBlock": 3, "toBlock": 4, "finality": "included" }
+                { "fromBlock": 3, "toBlock": 4, "finality": "attested" }
             ]),
         );
         assert_eq!(body["finalizedThrough"], 2);
@@ -15144,7 +15320,7 @@ mod tests {
             excess_blob_gas: None,
             transaction_count: Some(3),
             size_bytes: None,
-            finality: Finality::Included,
+            finality: Finality::Attested,
         };
         let record = ChangeRecord {
             delivery_encoding_version: 1,

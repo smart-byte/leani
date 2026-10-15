@@ -84,7 +84,7 @@ Compact Ethereum Mainnet configurations expand to:
 |---|---|
 | execution | native P2P, one-peer availability floor, 16-peer healthy target, 100-peer cap |
 | history | public Xatu source, on-demand processor scheduling |
-| processor | selected built-in feed, included and finalized output, checkpointed state, 256-block undo safety |
+| processor | selected built-in feed, unattested publication, checkpointed state, 256-block undo safety |
 | resources | 512 MiB memory, 2 GiB temporary disk, four source and mapper tasks |
 | retention | full query output; 64 MiB or 24 hours of change delivery |
 | listeners | ephemeral P2P ports, RPC `127.0.0.1:18545`/`18546`, API `127.0.0.1:18080` |
@@ -181,7 +181,11 @@ leaves while others wait for it, becomes read-ahead with the frames it already
 holds, so read-ahead can hold more than half. `[budgets.history_pipeline]` is
 separate: `maximum_active_chunks` caps physical history reads node-wide and
 `maximum_mapped_bytes` caps processor-owned mapped deltas across every active
-job. Its nested `commit` table flushes a contiguous SQLite transaction at the
+job. A job reads only its own planned chunks, so a backfill subscription
+smaller than `maximum_active_chunks` source chunks leaves read slots idle; the
+node logs a hint with a size that fills them, once per processor, and
+`leani_history_material_active_acquisitions` against
+`leani_history_material_active_acquisitions_limit` shows the slots in use. Its nested `commit` table flushes a contiguous SQLite transaction at the
 first configured block, domain-change, stable-encoded-byte, or elapsed-time
 limit: by default 128 blocks, 10,000 changes, 16 MiB, or 50 ms.
 `target_writer_hold`, 250 ms by default, controls the adaptive block limit:
@@ -212,7 +216,7 @@ pruning returns pages to the filesystem and admission recovers; a store created
 before that needs one `leani db compact` (see the operations runbook).
 
 `[budgets.artifacts]` independently caps immutable finalized artifact bytes and
-included-block candidate bytes awaiting finality. A transaction that would exceed
+unfinalized-block candidate bytes awaiting finality. A transaction that would exceed
 either logical limit rolls back without advancing processor coverage. Finality
 is the exception: when the retained limit is full, finality still advances,
 the finalized candidates stay pending with a logged warning, and a later
@@ -277,12 +281,14 @@ validation.
 
 A backfill splits its range into gaps of missing coverage and tries the
 configured history sources for each gap in `priority` order, lowest first. A
-source that cannot serve a gap, because it has not published those blocks,
-its data for them is incomplete, or it cannot fill the processor's field
-groups, passes the gap to the next source; one that serves part of a gap
-commits that part, and the next source continues from there. Each backfill
-retries up to three times the number of sources, at least five times, before
-it fails. When every history source fails and the live source is execution
+source that fails on part of a gap passes only those blocks to the next
+source: the blocks a dataset hole names, or the chunk whose read failed. It
+keeps the blocks before them, and the first source takes the gap back after
+them. A source that has not published the blocks, whose schema changed, or
+that fails again before committing a block passes the rest of the gap instead,
+and one that cannot fill the processor's field groups is skipped for the job.
+Each backfill retries up to three times the number of sources, at least five
+times, before it fails. When every history source fails and the live source is execution
 P2P, P2P can serve the gap within `sources.live.history_fallback_blocks`.
 
 The shipped profiles list eraE at priority 10 and Xatu at priority 20:
@@ -417,7 +423,6 @@ id = "evm-events"              # registered processor kind
 instance = "weth-transfer-v1"  # stable operator-selected identity
 version = "1.1.0"
 start_block = 12965000
-publish = "included_and_finalized"
 ```
 
 Processor code, semantic version, settings, start point, and source identity
@@ -434,13 +439,17 @@ part of the identity and can change in place.
 
 Publication values are:
 
-- `finalized_only`: publish only finalized `apply` records. Included-block
-  changes wait in the store for verified finality, count against the delivery
-  budget meanwhile, and undo is never published.
-- `included_and_finalized`: publish apply/undo/finality transitions and keep
-  an unfinalized undo window.
-- `terminal_only`: a bounded backfill publishes its terminal aggregate and
-  then becomes complete/reclaimable. Deletion remains explicit.
+- `unattested` (default): publish apply/undo/finality transitions from the
+  first level the live lane delivers, and keep an unfinalized undo window.
+- `attested`: publish apply/undo/finality transitions from `attested` on, and
+  keep an unfinalized undo window.
+- `finalized`: publish only finalized `apply` records. Unfinalized changes
+  wait in the store for verified finality, count against the delivery budget
+  meanwhile, and undo is never published.
+
+`[processors.delivery] emit = "job_result"` replaces `publish` for a bounded
+backfill: it publishes its terminal aggregate and then becomes
+complete/reclaimable. Deletion remains explicit.
 
 `[processors.settings]` belongs to the selected factory and is decoded
 strictly. `doctor` constructs every configured processor, so malformed ABI,
@@ -603,7 +612,7 @@ explicit artifact deletion operation.
 `window` requires a `[processors.output.window]` table with exactly one
 limit: `max_blocks`, `max_age`, `max_rows`, or `max_bytes`. Validation
 refuses `[processors.output] finalized_only`, which was never applied; to
-publish only finalized blocks, set `publish = "finalized_only"`.
+publish only finalized blocks, set `publish = "finalized"`.
 
 ### Delivery
 
@@ -652,7 +661,7 @@ Editing lifecycle policies, for example to raise a limit, leaves existing
 checkpoints and savepoints valid.
 
 `[processors.undo] mode` is `none` or `unfinalized`, and
-`included_and_finalized` requires `unfinalized`. Unfinalized blocks always
+`unattested` and `attested` publication require `unfinalized`. Unfinalized blocks always
 keep their undo records, so a reorg can revert them in either mode. Once
 finality passes a block, `unfinalized` keeps its record for another
 `safety_blocks` blocks and `none` deletes it at once. Blocks applied as

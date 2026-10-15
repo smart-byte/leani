@@ -5,7 +5,15 @@
 //! requests a bounded fixed range, verifies all response commitments, and
 //! converts the result into source-neutral [`BlockFrame`] values.
 
+mod header_rules;
+mod live_head;
 mod peer_store;
+
+use header_rules::{HeaderRules, HeaderVerdict, blob_gas_matches};
+use live_head::{
+    Attestation, HEAD_PEER_QUORUM, HEAD_POLL_RETRY, HeadGate, HeadVotes, MAX_UNATTESTED_SLOTS,
+    UnattestedTail, frame_header, head_poll_delay, late_reveal, unix_now, unix_now_ms,
+};
 
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt as _;
@@ -40,7 +48,7 @@ use leani_primitives::{
     ChainId, Completeness, ConsensusAnchor, FilterScope, Finality, HeaderEnvelope, Log, Material,
     MissingReason, ObjectIdentity, Provenance, Quantity, ReceiptEnvelope, SourceId, SourceKind,
     TransactionEnvelope, TransactionHash, TrustModel, VerificationCheck, VerificationReport,
-    Withdrawal,
+    Withdrawal, slot_at, slot_starting_at,
 };
 use leani_source_api::{
     AttestedHead, AttestedHeadReceiver, BlockFrameStream, ChainEvent, ChainEventStream,
@@ -48,8 +56,9 @@ use leani_source_api::{
     NetworkLane, NetworkPeerOrigin, NetworkPeerQualification, NetworkPhase,
     NetworkSessionTelemetry, NetworkTelemetry, NetworkTelemetrySnapshot, Partitioning,
     SourceAcquisitionMetrics, SourceBudget, SourceChunk, SourceDescriptor, SourceError, SourcePlan,
+    UnattestedUndo,
 };
-use reth_chainspec::MAINNET;
+use reth_chainspec::{ChainSpec, MAINNET};
 use reth_dns_discovery::{
     DnsDiscoveryConfig, DnsDiscoveryService, Resolver as DnsDiscoveryResolver,
     tree::LinkEntry as DnsDiscoveryLink,
@@ -685,6 +694,12 @@ impl P2pRequestMetrics {
 #[derive(Clone, Debug)]
 pub struct RethP2pSource {
     config: RethP2pConfig,
+    /// Every fork rule follows this spec: the `ForkID`, the DNS fork filter,
+    /// Status, and the header rules. Glamsterdam G1 gives it the Amsterdam
+    /// timestamp.
+    chain_spec: Arc<ChainSpec>,
+    /// The rules an unattested head must pass, on `chain_spec`.
+    header_rules: Arc<HeaderRules>,
     descriptor: SourceDescriptor,
     network: Arc<PersistentNetwork>,
     material_tuning: Arc<MaterialBatchTuning>,
@@ -2403,20 +2418,32 @@ enum LiveStep {
         from: BlockNumber,
         head: AttestedHead,
     },
+    /// Nothing attested is above the tip and the lane accepts unattested
+    /// blocks: poll the next block by number.
+    Head { block: BlockNumber },
 }
 
 /// What the live lane at `last` fetches next, with the newest attested head
 /// and the proven ancestry it holds. A block is fetched only up to the
 /// attested head, and only by a verified hash: the head's own, or through
-/// headers its chain proves. `batch_blocks` bounds a catch-up batch.
+/// headers its chain proves. `batch_blocks` bounds a catch-up batch. Above
+/// the newest attested head, `gate` decides whether the lane polls the next
+/// block unattested.
 fn live_step(
     last: BlockRef,
     attested: Option<AttestedHead>,
     ancestry: &AttestedAncestry,
     batch_blocks: u64,
+    gate: HeadGate,
 ) -> LiveStep {
     let Some(head) = attested.filter(|head| head.block_number > last.number) else {
-        return LiveStep::Wait;
+        return if gate.allows(attested) {
+            LiveStep::Head {
+                block: BlockNumber(last.number.0.saturating_add(1)),
+            }
+        } else {
+            LiveStep::Wait
+        };
     };
     let next = last.number.0.saturating_add(1);
     if ancestry.first() == Some(next) {
@@ -3011,6 +3038,7 @@ fn join_dns_txt_segments<'a>(segments: impl IntoIterator<Item = &'a [u8]>) -> Op
 
 #[derive(Debug)]
 struct DnsPeerSeederRuntime {
+    chain_spec: Arc<ChainSpec>,
     dns_head: Head,
     bootstrap_dns_tree: Option<String>,
     peer_candidates: Arc<PeerCandidateRegistry>,
@@ -3058,6 +3086,7 @@ fn spawn_mainnet_dns_peer_seeder(
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let DnsPeerSeederRuntime {
+            chain_spec,
             dns_head,
             bootstrap_dns_tree,
             peer_candidates,
@@ -3101,7 +3130,7 @@ fn spawn_mainnet_dns_peer_seeder(
         );
         dns_retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-        let fork_filter = MAINNET.fork_filter(dns_head);
+        let fork_filter = chain_spec.fork_filter(dns_head);
         let mut seeded_peers = 0_usize;
         loop {
             tokio::select! {
@@ -3275,6 +3304,7 @@ where
             telemetry,
             network_telemetry,
             peer_recovery_timeout,
+            chain_spec,
             dns_head,
             direct_peers,
             trusted_peer_ids,
@@ -3326,6 +3356,7 @@ where
         let dns_peer_seeder = spawn_mainnet_dns_peer_seeder(
             manager.as_ref().get_ref().handle().clone(),
             DnsPeerSeederRuntime {
+                chain_spec,
                 dns_head,
                 bootstrap_dns_tree,
                 peer_candidates: peer_candidates.clone(),
@@ -3705,6 +3736,7 @@ struct NetworkManagerRuntime {
     telemetry: NetworkSessionTelemetry,
     network_telemetry: NetworkTelemetry,
     peer_recovery_timeout: Duration,
+    chain_spec: Arc<ChainSpec>,
     dns_head: Head,
     direct_peers: Arc<DirectPeerPool>,
     trusted_peer_ids: Vec<B512>,
@@ -3972,6 +4004,8 @@ fn parse_secret_key(encoded: &str, path: &Path) -> Result<SecretKey, P2pError> {
     })
 }
 
+// The flags are independent lane facts, not a mode.
+#[allow(clippy::struct_excessive_bools)]
 struct P2pLiveState {
     source: RethP2pSource,
     session: P2pSession,
@@ -3998,6 +4032,21 @@ struct P2pLiveState {
     /// emitted a block or reorg, or reconnected.
     disconnect_reported: bool,
     terminal: bool,
+    /// Every processor on the lane accepts unattested frames.
+    head_acceptance: bool,
+    /// Blocks delivered unattested, oldest first.
+    tail: UnattestedTail,
+    /// Headers served for the next block, by hash.
+    head_votes: HeadVotes,
+    /// Headers served for the child of a late block.
+    child_votes: HeadVotes,
+    /// The tip's header: the parent the header rules check the next block
+    /// against. `None` until the lane holds one.
+    parent_header: Option<Header>,
+    /// An attested event owed after a reorg kept part of the tail.
+    pending_attested: Option<BlockRef>,
+    /// Whether a header of an unscheduled fork was logged.
+    unknown_fork_logged: bool,
 }
 
 impl std::fmt::Debug for P2pLiveState {
@@ -4079,13 +4128,15 @@ impl RethP2pSource {
                     .with(Capability::Logs)
                     .with(Capability::Withdrawals),
                 trust: TrustModel::ProtocolVerified,
-                finality: FinalityModel::Included,
+                finality: FinalityModel::Attested,
                 partitioning: Partitioning::FixedBlockSpan(MAX_FIXED_RANGE_BLOCKS),
                 expected_lag: Duration::from_secs(12),
                 schema_version: format!("reth-p2p.v1+{RETH_VERSION}.{RETH_REVISION}"),
                 priority: 0,
             },
             config,
+            chain_spec: MAINNET.clone(),
+            header_rules: Arc::new(HeaderRules::new(MAINNET.clone())),
             network,
             material_tuning,
             request_metrics: P2pRequestMetrics::default(),
@@ -4193,189 +4244,6 @@ impl RethP2pSource {
         self.connect(advertised, NetworkLane::Live, cancellation)
             .await
             .map(|(_, connected)| connected)
-    }
-
-    /// Fetch the newest self-consistent execution block advertised by the
-    /// active peer pool without first replaying every block since the finalized
-    /// anchor.
-    ///
-    /// The returned frame is deliberately optimistic: requested material is
-    /// commitment-checked, but its ancestry has not yet been joined to the
-    /// independently verified finalized anchor. Callers may use it for a
-    /// low-latency preview while the ordinary anchored live lane catches up.
-    ///
-    /// # Errors
-    ///
-    /// Returns bounded connection, peer-head, material, verification, budget,
-    /// or cancellation errors.
-    pub async fn optimistic_head_snapshot(
-        &self,
-        advertised: BlockRef,
-        request: &DataRequest,
-        budget: SourceBudget,
-        cancellation: &CancellationToken,
-    ) -> Result<BlockFrame, P2pError> {
-        let budget = budget
-            .validate()
-            .map_err(|error| P2pError::InvalidConfig(error.to_string()))?;
-        let sparse_scope = sparse_log_scope(request);
-        if sparse_scope.is_none() && !header_and_body_only_request(request) {
-            return Err(P2pError::InvalidConfig(
-                "peer preview requires a block-summary or compatible filtered-log request"
-                    .to_owned(),
-            ));
-        }
-        if request.chain_id != self.descriptor.chain_id {
-            return Err(P2pError::InvalidConfig(
-                "peer preview request belongs to another chain".to_owned(),
-            ));
-        }
-        if sparse_scope.is_some()
-            && request
-                .log_fields
-                .contains(leani_primitives::LogField::TransactionHash)
-        {
-            return Err(P2pError::InvalidConfig(
-                "receipt-only peer preview cannot supply transaction hashes".to_owned(),
-            ));
-        }
-        let (session, _) = self
-            .connect(advertised, NetworkLane::Live, cancellation)
-            .await?;
-        // A preview is a peer claim: nothing here is anchored.
-        let (head_number, head_hash) = self
-            .wait_for_peer_head(
-                &session,
-                BlockNumber(advertised.number.0.saturating_add(1)),
-                None,
-                cancellation,
-            )
-            .await?;
-        let range = BlockRange::single(head_number);
-        session.set_range(Some(range));
-        session.set_phase(NetworkPhase::FetchingHeaders);
-        let (header_peer, headers) = self
-            .fetch_headers(
-                &session.fetch,
-                range,
-                // The head was discovered from peer claims.
-                Some(ExpectedTip {
-                    hash: head_hash,
-                    trust: ExpectationTrust::Unverified,
-                }),
-                false,
-                MaterialRequestPolicy {
-                    concurrency: budget.max_in_flight_requests,
-                    priority: Priority::High,
-                },
-                cancellation,
-            )
-            .await?;
-        if header_and_body_only_request(request) {
-            return self
-                .finish_optimistic_body_snapshot(
-                    &session,
-                    &headers,
-                    Some(header_peer),
-                    budget,
-                    cancellation,
-                )
-                .await;
-        }
-        let scope = sparse_scope.ok_or_else(|| {
-            P2pError::InvalidConfig("peer preview filtered-log scope disappeared".to_owned())
-        })?;
-        self.finish_optimistic_sparse_snapshot(
-            &session,
-            &headers,
-            request,
-            scope,
-            budget,
-            cancellation,
-        )
-        .await
-    }
-
-    async fn finish_optimistic_sparse_snapshot(
-        &self,
-        session: &P2pSession,
-        headers: &[Header],
-        request: &DataRequest,
-        scope: &FilterScope,
-        budget: SourceBudget,
-        cancellation: &CancellationToken,
-    ) -> Result<BlockFrame, P2pError> {
-        let header = headers.first().ok_or_else(|| {
-            P2pError::InvalidResponse("peer preview request returned no header".to_owned())
-        })?;
-        let hashes = [header.hash_slow()];
-        let bloom_positive = header_bloom_matches(scope, header);
-        let positive_receipts = if bloom_positive {
-            session.set_phase(NetworkPhase::FetchingReceipts);
-            self.fetch_sparse_receipts(
-                session,
-                headers,
-                &hashes,
-                MaterialRequestPolicy {
-                    concurrency: budget.max_in_flight_requests,
-                    priority: Priority::High,
-                },
-                cancellation,
-            )
-            .await?
-        } else {
-            Vec::new()
-        };
-        let exact_match_positions = positive_receipts
-            .first()
-            .is_some_and(|receipts| {
-                receipts
-                    .iter()
-                    .flat_map(|receipt| &receipt.logs)
-                    .any(|log| source_log_matches(scope, log))
-            })
-            .then_some(0)
-            .into_iter()
-            .collect::<Vec<_>>();
-        let bloom_positive_indices = bloom_positive.then_some(0).into_iter().collect::<Vec<_>>();
-        let mut frames = normalize_sparse_log_frames(
-            headers,
-            request,
-            budget,
-            &bloom_positive_indices,
-            &positive_receipts,
-            &exact_match_positions,
-            &[],
-        )?;
-        let mut frame = frames.pop().ok_or_else(|| {
-            P2pError::InvalidResponse("peer preview request returned no frame".to_owned())
-        })?;
-        frame.finality = Finality::Included;
-        session.clear_error();
-        session.set_range(None);
-        session.set_phase(NetworkPhase::FollowingHead);
-        Ok(frame)
-    }
-
-    async fn finish_optimistic_body_snapshot(
-        &self,
-        session: &P2pSession,
-        headers: &[Header],
-        preferred_peer: Option<B512>,
-        budget: SourceBudget,
-        cancellation: &CancellationToken,
-    ) -> Result<BlockFrame, P2pError> {
-        let (mut frames, _) = self
-            .fetch_live_body_frames(session, headers, preferred_peer, true, budget, cancellation)
-            .await?;
-        let mut frame = frames.pop().ok_or_else(|| {
-            P2pError::InvalidResponse("peer preview request returned no frame".to_owned())
-        })?;
-        frame.finality = Finality::Included;
-        session.clear_error();
-        session.set_range(None);
-        session.set_phase(NetworkPhase::FollowingHead);
-        Ok(frame)
     }
 
     #[allow(clippy::too_many_lines)]
@@ -4799,7 +4667,7 @@ impl RethP2pSource {
             // runs to completion in its own task. Nobody receives a build
             // whose caller was dropped: its manager drops, and discovery
             // with it.
-            let config = builder.build_with_noop_provider(MAINNET.clone());
+            let config = builder.build_with_noop_provider(self.chain_spec.clone());
             match tokio::spawn(async move { Box::pin(config.manager()).await }).await {
                 Ok(built) => built.map_err(|error| error.to_string()),
                 Err(error) => Err(format!("the network manager build stopped: {error}")),
@@ -4842,6 +4710,7 @@ impl RethP2pSource {
                 telemetry: telemetry.clone(),
                 network_telemetry: self.config.network_telemetry.clone(),
                 peer_recovery_timeout: self.config.peer_recovery_timeout,
+                chain_spec: self.chain_spec.clone(),
                 dns_head: advertised_head,
                 direct_peers: self.network.direct_peers.clone(),
                 trusted_peer_ids: self
@@ -4980,6 +4849,7 @@ impl RethP2pSource {
                 session,
                 range,
                 expected_tip,
+                None,
                 None,
                 MaterialRequestPolicy {
                     concurrency: budget.max_in_flight_requests,
@@ -5258,6 +5128,7 @@ impl RethP2pSource {
                 range,
                 Some(expected_tip),
                 Some(head_poll),
+                None,
                 MaterialRequestPolicy {
                     concurrency: budget.max_in_flight_requests,
                     priority: Priority::High,
@@ -5266,10 +5137,35 @@ impl RethP2pSource {
             )
             .await
             .inspect_err(|error| session.record_error(error))?;
-        let header_peer = header_serve.peer_id;
         let header = headers
             .pop()
             .expect("one validated live header was returned");
+        self.frame_for_header(
+            session,
+            header,
+            header_serve,
+            next,
+            request,
+            budget,
+            cancellation,
+        )
+        .await
+    }
+
+    /// The frame on `header`, which `header_serve` served for block `next`:
+    /// its body, receipts or logs as `request` needs them.
+    #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
+    async fn frame_for_header(
+        &self,
+        session: &P2pSession,
+        header: Header,
+        header_serve: HeaderServe,
+        next: BlockNumber,
+        request: &DataRequest,
+        budget: SourceBudget,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<BlockFrame>, P2pError> {
+        let header_peer = header_serve.peer_id;
         if header_only_request(request) {
             let mut frames = normalize_verified_headers(&[header], budget)?;
             self.complete_header_serve(session, header_serve).await;
@@ -5651,6 +5547,7 @@ impl RethP2pSource {
                 // finalized anchor: it exists, so this is no head poll, and an
                 // empty reply is a lagging peer.
                 None,
+                None,
                 minimum_live_head_policy(),
                 cancellation,
             )
@@ -5735,6 +5632,7 @@ impl RethP2pSource {
                         trust: ExpectationTrust::Verified,
                     }),
                     None,
+                    None,
                     minimum_live_head_policy(),
                     cancellation,
                 )
@@ -5771,44 +5669,109 @@ impl RethP2pSource {
             )
             .await?;
         let (ancestor, reverted) = plan_reorg(&state.recent, &descending)?;
-        let applied = if ancestor.number == head_number {
-            Vec::new()
-        } else {
-            let range = BlockRange::new(
-                BlockNumber(ancestor.number.0.saturating_add(1)),
-                head_number,
-            )
-            .map_err(|error| P2pError::InvalidResponse(error.to_string()))?;
-            if range.len() > MAX_FIXED_RANGE_BLOCKS {
-                return Err(P2pError::ReorgTooDeep {
-                    maximum: self.config.max_reorg_depth,
-                });
-            }
-            let (frames, _) = self
-                .fetch_requested_live_range(
-                    &state.session,
-                    range,
-                    Some(ExpectedTip {
-                        hash: head_hash,
-                        trust: evidence,
-                    }),
-                    &state.request,
-                    state.budget,
-                    &state.cancellation,
-                )
-                .await?;
-            if frames
-                .first()
-                .is_none_or(|frame| frame.block.parent_hash != ancestor.hash)
-            {
-                return Err(P2pError::InvalidResponse(
-                    "replacement branch does not join the discovered common ancestor".to_owned(),
-                ));
-            }
-            frames
-        };
+        let applied = self
+            .fetch_reorg_branch(state, ancestor, head_number, head_hash, evidence)
+            .await?;
         let new_tip = applied.last().map_or(ancestor, |frame| frame.block);
         Ok((reverted, applied, new_tip))
+    }
+
+    /// The frames of the branch above `ancestor` up to `head_hash` at
+    /// `head_number`, which joins `ancestor`.
+    async fn fetch_reorg_branch(
+        &self,
+        state: &P2pLiveState,
+        ancestor: BlockRef,
+        head_number: BlockNumber,
+        head_hash: BlockHash,
+        evidence: ExpectationTrust,
+    ) -> Result<Vec<BlockFrame>, P2pError> {
+        if ancestor.number == head_number {
+            return Ok(Vec::new());
+        }
+        let range = BlockRange::new(
+            BlockNumber(ancestor.number.0.saturating_add(1)),
+            head_number,
+        )
+        .map_err(|error| P2pError::InvalidResponse(error.to_string()))?;
+        if range.len() > MAX_FIXED_RANGE_BLOCKS {
+            return Err(P2pError::ReorgTooDeep {
+                maximum: self.config.max_reorg_depth,
+            });
+        }
+        let (frames, _) = self
+            .fetch_requested_live_range(
+                &state.session,
+                range,
+                Some(ExpectedTip {
+                    hash: head_hash,
+                    trust: evidence,
+                }),
+                &state.request,
+                state.budget,
+                &state.cancellation,
+            )
+            .await?;
+        if frames
+            .first()
+            .is_none_or(|frame| frame.block.parent_hash != ancestor.hash)
+        {
+            return Err(P2pError::InvalidResponse(
+                "replacement branch does not join the discovered common ancestor".to_owned(),
+            ));
+        }
+        Ok(frames)
+    }
+
+    /// The header with `hash`, from any peer, checked against its hash.
+    async fn fetch_header_by_hash(
+        &self,
+        session: &P2pSession,
+        hash: BlockHash,
+        cancellation: &CancellationToken,
+    ) -> Result<Header, P2pError> {
+        let mut last_error = None;
+        for _ in 0..self.config.retries {
+            let response = cancellable_peer_request(
+                session.fetch.get_headers(HeadersRequest::falling(
+                    BlockHashOrNumber::Hash(B256::from(*hash.as_array())),
+                    1,
+                )),
+                self.config.request_timeout,
+                cancellation,
+                "parent header",
+            )
+            .await;
+            match response {
+                Ok(response) => {
+                    let (peer, mut headers) = response.split();
+                    match headers.pop() {
+                        Some(header) if block_hash(header.hash_slow()) == hash => {
+                            return Ok(header);
+                        }
+                        Some(_) => {
+                            session.fetch.report_bad_message(peer);
+                            last_error = Some(P2pError::InvalidResponse(
+                                "the parent header does not match its hash".to_owned(),
+                            ));
+                        }
+                        None => {
+                            last_error = Some(P2pError::IncompleteResponse {
+                                component: "parent header",
+                                returned: 0,
+                                expected: 1,
+                            });
+                        }
+                    }
+                }
+                Err(error) => last_error = Some(error),
+            }
+            retry_pause(self.config.retry_backoff, cancellation).await?;
+        }
+        Err(last_error.unwrap_or_else(|| P2pError::Request {
+            component: "parent header",
+            detail: "retry budget exhausted".to_owned(),
+        }))
     }
 
     async fn fetch_descending_headers<C>(
@@ -6163,13 +6126,14 @@ impl RethP2pSource {
     /// `expected_tip` is requested by hash (see [`live_header_request`]). The
     /// serving peer is rewarded by the caller, once the frames on these
     /// headers complete.
-    #[allow(clippy::too_many_lines)]
+    #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
     async fn fetch_live_headers_from_untried_peers(
         &self,
         session: &P2pSession,
         range: BlockRange,
         expected_tip: Option<ExpectedTip>,
         mut head_poll: Option<&mut HeadPollRotation>,
+        mut head_votes: Option<&mut HeadVotes>,
         policy: MaterialRequestPolicy,
         cancellation: &CancellationToken,
     ) -> Result<(HeaderServe, Vec<Header>), P2pError> {
@@ -6338,6 +6302,22 @@ impl RethP2pSource {
                                 elapsed,
                                 anchored: expectation == ExpectationTrust::Verified,
                             };
+                            // At the head, a header counts once enough
+                            // distinct peers served it.
+                            if let Some(votes) = head_votes.as_deref_mut() {
+                                let header = headers.last().cloned().expect("one validated header");
+                                if let Some(agreed) =
+                                    votes.record(range.end(), peer_id, header, HEAD_PEER_QUORUM)
+                                {
+                                    return Ok((serve, vec![agreed]));
+                                }
+                                last_error = Some(P2pError::IncompleteResponse {
+                                    component: "headers",
+                                    returned: 1,
+                                    expected: HEAD_PEER_QUORUM,
+                                });
+                                continue;
+                            }
                             return Ok((serve, headers));
                         }
                         Err(error) => {
@@ -8895,6 +8875,7 @@ impl LiveSource for RethP2pSource {
         session.set_range(None);
         session.set_phase(NetworkPhase::FollowingHead);
         session.clear_error();
+        let head_acceptance = request.minimum_finality == Finality::Unattested;
         let state = P2pLiveState {
             source: self.clone(),
             session,
@@ -8913,6 +8894,13 @@ impl LiveSource for RethP2pSource {
             reconnect_error: None,
             disconnect_reported: false,
             terminal: false,
+            head_acceptance,
+            tail: UnattestedTail::default(),
+            head_votes: HeadVotes::default(),
+            child_votes: HeadVotes::default(),
+            parent_header: None,
+            pending_attested: None,
+            unknown_fork_logged: false,
         };
         Ok(stream::unfold(state, next_live_event).boxed())
     }
@@ -8936,6 +8924,78 @@ async fn next_live_event(
                 }
             }
         }
+        if let Some(through) = state.pending_attested.take() {
+            return Some((Ok(ChainEvent::Attested { through }), state));
+        }
+        if let Some(attested) = state.attested.peek() {
+            match state.tail.attestation(attested) {
+                Attestation::Confirm(through) => {
+                    state.tail.confirm_through(through.number);
+                    return Some((Ok(ChainEvent::Attested { through }), state));
+                }
+                Attestation::Conflict { number, hash } => {
+                    // Verified evidence: the attested chain holds another
+                    // block at a tail height. Undo from there and follow it.
+                    let source = state.source.clone();
+                    match source
+                        .reconstruct_reorg(&state, number, hash, ExpectationTrust::Verified)
+                        .await
+                    {
+                        Ok((reverted, applied, new_tip)) => {
+                            source.config.network_telemetry.record_unattested_undone(
+                                UnattestedUndo::Orphaned,
+                                u64::try_from(reverted.len()).unwrap_or(u64::MAX),
+                            );
+                            let event = adopt_reorg(
+                                &mut state,
+                                reverted,
+                                applied,
+                                new_tip,
+                                ExpectationTrust::Verified,
+                            );
+                            return Some((Ok(event), state));
+                        }
+                        Err(P2pError::Cancelled) => return None,
+                        // Retry from the next attested head or the grace below.
+                        Err(error) => debug!(%error, "attested conflict not reconstructed yet"),
+                    }
+                }
+                Attestation::None => {}
+            }
+        }
+        if let Some(reverted) = state.tail.expired(unix_now()) {
+            for _ in 0..reverted.len() {
+                state.recent.pop_back();
+            }
+            let Some(attested_tip) = state.recent.back().copied() else {
+                state.terminal = true;
+                return Some((
+                    Ok(ChainEvent::Reset {
+                        last_valid: None,
+                        reason: "unattested tail expired below the retained chain".to_owned(),
+                    }),
+                    state,
+                ));
+            };
+            state.last = attested_tip;
+            state.parent_header = None;
+            state.tail.clear();
+            state
+                .source
+                .config
+                .network_telemetry
+                .record_unattested_undone(
+                    UnattestedUndo::Grace,
+                    u64::try_from(reverted.len()).unwrap_or(u64::MAX),
+                );
+            return Some((
+                Ok(ChainEvent::Reorg {
+                    reverted,
+                    applied: Vec::new(),
+                }),
+                state,
+            ));
+        }
         if let Some(frame) = state.queued.pop_front() {
             state.last = frame.block;
             state.recent.push_back(frame.block);
@@ -8946,6 +9006,18 @@ async fn next_live_event(
                 &mut state.disconnect_reported,
                 &mut state.head_poll_silent_since,
             );
+            state.parent_header = frame_header(&frame);
+            // The tail holds delivered blocks only: an attested event never
+            // precedes its block.
+            if frame.finality == Finality::Unattested {
+                state.tail.push(frame.block);
+            }
+            state.source.config.network_telemetry.record_live_block(
+                frame.finality,
+                Duration::from_millis(
+                    unix_now_ms().saturating_sub(frame.block.timestamp.saturating_mul(1_000)),
+                ),
+            );
             return Some((Ok(ChainEvent::Block(Box::new(frame))), state));
         }
         let batch_blocks = if state.pending_material_attempts == 0 {
@@ -8955,7 +9027,87 @@ async fn next_live_event(
             1
         };
         let attested = state.attested.latest();
-        match live_step(state.last, attested, &state.ancestry, batch_blocks) {
+        let gate = HeadGate {
+            enabled: state.head_acceptance,
+            wall_slot: slot_at(unix_now()),
+        };
+        match live_step(state.last, attested, &state.ancestry, batch_blocks, gate) {
+            LiveStep::Head { block } => {
+                state.head_unavailable_since = None;
+                let delay = head_poll_delay(state.last.timestamp, unix_now_ms());
+                if !delay.is_zero() {
+                    tokio::select! {
+                        () = state.cancellation.cancelled() => return None,
+                        _ = state.attested.changed() => continue,
+                        () = tokio::time::sleep(delay) => {}
+                    }
+                }
+                match poll_unattested_head(&mut state, block).await {
+                    Ok(HeadPoll::Accepted(frame)) => state.queued.push_back(*frame),
+                    Ok(HeadPoll::NotYet) => {
+                        if retry_pause(HEAD_POLL_RETRY, &state.cancellation)
+                            .await
+                            .is_err()
+                        {
+                            return None;
+                        }
+                    }
+                    Ok(HeadPoll::WaitForAttested) => {
+                        tokio::select! {
+                            () = state.cancellation.cancelled() => return None,
+                            _ = state.attested.changed() => {}
+                            () = tokio::time::sleep(state.source.config.poll_interval) => {}
+                        }
+                    }
+                    Ok(HeadPoll::Reorg(event)) => return Some((Ok(event), state)),
+                    Err(P2pError::Cancelled) => return None,
+                    Err(error) => {
+                        // A cohort with nothing yet, or a missing quorum, is a
+                        // normal "not yet" at the head; anything else takes the
+                        // Poll arm's path.
+                        if matches!(error, P2pError::IncompleteResponse { .. }) {
+                            if retry_pause(HEAD_POLL_RETRY, &state.cancellation)
+                                .await
+                                .is_err()
+                            {
+                                return None;
+                            }
+                            continue;
+                        }
+                        state.head_poll.serve_failed();
+                        let manager_current = state.session.manager_is_current().await;
+                        let grace = state
+                            .source
+                            .descriptor
+                            .expected_lag
+                            .max(state.source.config.poll_interval);
+                        match head_poll_failure(
+                            &state.source.config,
+                            &mut state.pending_material_attempts,
+                            &mut state.head_poll_silent_since,
+                            Instant::now(),
+                            grace,
+                            &error,
+                            manager_current,
+                        ) {
+                            HeadPollFailure::Retry(delay) | HeadPollFailure::Report(delay) => {
+                                if retry_pause(delay, &state.cancellation).await.is_err() {
+                                    return None;
+                                }
+                            }
+                            HeadPollFailure::Reconnect => {
+                                let reason = error.to_string();
+                                state.reconnect_error = Some(reason.clone());
+                                if let Some(event) =
+                                    report_disconnect(&mut state.disconnect_reported, reason)
+                                {
+                                    return Some((Ok(event), state));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             LiveStep::Wait => {
                 // Nothing above the tip is attested yet: include nothing, and
                 // wait for the next attested head, one to two slots.
@@ -9081,6 +9233,12 @@ async fn next_live_event(
                             continue;
                         }
                         state.queued.push_back(frame);
+                        // An attested frame on the tip proves the tip, and
+                        // with it the tail.
+                        if let Some(through) = state.tail.newest() {
+                            state.tail.clear();
+                            return Some((Ok(ChainEvent::Attested { through }), state));
+                        }
                     }
                     Ok(None) => {
                         state.pending_material_attempts = 0;
@@ -9245,9 +9403,267 @@ async fn next_live_event(
                     state.session.observe_head(tip.block.number);
                 }
                 state.queued.extend(frames);
+                // Attested frames on the tip prove the tip, and with it the
+                // tail.
+                if let Some(through) = state.tail.newest() {
+                    state.tail.clear();
+                    return Some((Ok(ChainEvent::Attested { through }), state));
+                }
             }
         }
     }
+}
+
+/// What one unattested head poll found.
+enum HeadPoll {
+    Accepted(Box<BlockFrame>),
+    NotYet,
+    /// The block fails a rule, or the lane is too far past the attested
+    /// head: it waits for the attested path. No peer is penalised.
+    WaitForAttested,
+    Reorg(ChainEvent),
+}
+
+/// Poll the block after the tip from a peer quorum and accept it unattested
+/// when it links to the tip, stays within `MAX_UNATTESTED_SLOTS` of the
+/// attested head, and passes the header rules.
+#[allow(clippy::too_many_lines)]
+async fn poll_unattested_head(
+    state: &mut P2pLiveState,
+    block: BlockNumber,
+) -> Result<HeadPoll, P2pError> {
+    let source = state.source.clone();
+    for peer_id in state.head_poll.begin_poll(block) {
+        source
+            .network
+            .direct_peers
+            .record_material_failure(peer_id, PeerMaterialKind::Header);
+    }
+    let policy = MaterialRequestPolicy {
+        concurrency: state.budget.max_in_flight_requests,
+        priority: Priority::High,
+    };
+    let (serve, mut headers) = source
+        .fetch_live_headers_from_untried_peers(
+            &state.session,
+            BlockRange::single(block),
+            None,
+            Some(&mut state.head_poll),
+            Some(&mut state.head_votes),
+            policy,
+            &state.cancellation,
+        )
+        .await?;
+    let header = headers.pop().expect("one agreed header");
+    if block_hash(header.parent_hash) != state.last.hash {
+        return unattested_reorg(state, header).await;
+    }
+    let attested = state.attested.peek();
+    let Some(slot) = slot_starting_at(header.timestamp) else {
+        return Ok(HeadPoll::WaitForAttested);
+    };
+    if attested.is_none_or(|head| slot.saturating_sub(head.beacon_slot) > MAX_UNATTESTED_SLOTS) {
+        return Ok(HeadPoll::WaitForAttested);
+    }
+    let parent = match state.parent_header.clone() {
+        Some(parent) if block_hash(parent.hash_slow()) == state.last.hash => parent,
+        _ => {
+            source
+                .fetch_header_by_hash(&state.session, state.last.hash, &state.cancellation)
+                .await?
+        }
+    };
+    let attested_parent_root = attested
+        .filter(|head| head.beacon_slot.saturating_add(1) == slot)
+        .map(|head| head.beacon_block_root);
+    match source
+        .header_rules
+        .check(&header, &parent, unix_now(), attested_parent_root)
+    {
+        HeaderVerdict::Valid => {}
+        HeaderVerdict::UnknownFork(reason) => {
+            if !std::mem::replace(&mut state.unknown_fork_logged, true) {
+                warn!(
+                    %reason,
+                    "a header carries fields of a fork this release does not schedule; the live lane waits for attested heads"
+                );
+            }
+            return Ok(HeadPoll::WaitForAttested);
+        }
+        HeaderVerdict::Invalid(reason) => {
+            debug!(
+                block = block.0,
+                %reason,
+                "unattested header fails a header rule; waiting for an attested head"
+            );
+            return Ok(HeadPoll::WaitForAttested);
+        }
+    }
+    if late_reveal(header.timestamp, unix_now()) {
+        // Publish a late block only once its child builds on it.
+        source.config.network_telemetry.record_unattested_held();
+        let (_, mut children) = match source
+            .fetch_live_headers_from_untried_peers(
+                &state.session,
+                BlockRange::single(BlockNumber(block.0.saturating_add(1))),
+                None,
+                None,
+                Some(&mut state.child_votes),
+                policy,
+                &state.cancellation,
+            )
+            .await
+        {
+            Ok(children) => children,
+            Err(P2pError::IncompleteResponse { .. }) => return Ok(HeadPoll::NotYet),
+            Err(error) => return Err(error),
+        };
+        let child = children.pop().expect("one agreed child header");
+        if child.parent_hash != header.hash_slow() {
+            return Ok(HeadPoll::WaitForAttested);
+        }
+    }
+    let Some(mut frame) = source
+        .frame_for_header(
+            &state.session,
+            header.clone(),
+            serve,
+            block,
+            &state.request,
+            state.budget,
+            &state.cancellation,
+        )
+        .await?
+    else {
+        return Ok(HeadPoll::NotYet);
+    };
+    if let Material::Complete(transactions) = &frame.transactions {
+        let blobs = transactions
+            .iter()
+            .map(|transaction| {
+                u64::try_from(transaction.blob_versioned_hashes.len()).unwrap_or(u64::MAX)
+            })
+            .sum::<u64>();
+        if !blob_gas_matches(&header, blobs) {
+            return Ok(HeadPoll::WaitForAttested);
+        }
+    }
+    frame.finality = Finality::Unattested;
+    state.parent_header = Some(header);
+    Ok(HeadPoll::Accepted(Box::new(frame)))
+}
+
+/// A quorum of peers serves a block whose parent is not the tip: a reorg at
+/// the head. The evidence is unverified, so it may undo only unattested
+/// blocks; anything deeper waits for an attested head.
+async fn unattested_reorg(state: &mut P2pLiveState, header: Header) -> Result<HeadPoll, P2pError> {
+    if state.tail.is_empty() {
+        return Ok(HeadPoll::WaitForAttested);
+    }
+    let source = state.source.clone();
+    let head_number = BlockNumber(header.number);
+    let head_hash = block_hash(header.hash_slow());
+    let descending = match source
+        .fetch_descending_headers(
+            &state.session.fetch,
+            head_number,
+            head_hash,
+            ExpectationTrust::Unverified,
+            &state.cancellation,
+        )
+        .await
+    {
+        Ok(headers) => headers,
+        Err(P2pError::Cancelled) => return Err(P2pError::Cancelled),
+        Err(_) => return Ok(HeadPoll::WaitForAttested),
+    };
+    let Ok((ancestor, reverted)) = plan_reorg(&state.recent, &descending) else {
+        return Ok(HeadPoll::WaitForAttested);
+    };
+    if !state.tail.contains_all(&reverted) {
+        return Ok(HeadPoll::WaitForAttested);
+    }
+    // The branch passes the head path's checks, header by header, before any
+    // of its bodies is fetched.
+    let mut branch = descending
+        .iter()
+        .filter(|branch_header| branch_header.number >= ancestor.number.0)
+        .cloned()
+        .collect::<Vec<_>>();
+    branch.reverse();
+    if !source
+        .header_rules
+        .accepts_branch(&branch, state.attested.peek(), unix_now())
+    {
+        return Ok(HeadPoll::WaitForAttested);
+    }
+    let mut applied = match source
+        .fetch_reorg_branch(
+            state,
+            ancestor,
+            head_number,
+            head_hash,
+            ExpectationTrust::Unverified,
+        )
+        .await
+    {
+        Ok(frames) => frames,
+        Err(P2pError::Cancelled) => return Err(P2pError::Cancelled),
+        Err(_) => return Ok(HeadPoll::WaitForAttested),
+    };
+    let new_tip = applied.last().map_or(ancestor, |frame| frame.block);
+    for frame in &mut applied {
+        frame.finality = Finality::Unattested;
+    }
+    source.config.network_telemetry.record_unattested_undone(
+        UnattestedUndo::HeadReorg,
+        u64::try_from(reverted.len()).unwrap_or(u64::MAX),
+    );
+    for _ in 0..reverted.len() {
+        state.recent.pop_back();
+    }
+    state.recent.extend(applied.iter().map(|frame| frame.block));
+    state.last = new_tip;
+    state.parent_header = applied.last().and_then(frame_header);
+    state.tail.remove(&reverted);
+    for frame in &applied {
+        state.tail.push(frame.block);
+    }
+    note_live_progress(
+        &mut state.disconnect_reported,
+        &mut state.head_poll_silent_since,
+    );
+    Ok(HeadPoll::Reorg(ChainEvent::Reorg { reverted, applied }))
+}
+
+/// Take a reconstructed reorg into the lane: the tip, the reorg window and
+/// the tail. Tail blocks below the fork are ancestors of the new branch,
+/// which an attested head proved, so they are owed an attested event.
+fn adopt_reorg(
+    state: &mut P2pLiveState,
+    reverted: Vec<BlockRef>,
+    applied: Vec<BlockFrame>,
+    new_tip: BlockRef,
+    evidence: ExpectationTrust,
+) -> ChainEvent {
+    for _ in 0..reverted.len() {
+        state.recent.pop_back();
+    }
+    state.recent.extend(applied.iter().map(|frame| frame.block));
+    state.last = new_tip;
+    state.ancestry = AttestedAncestry::default();
+    state.parent_header = applied.last().and_then(frame_header);
+    state.tail.remove(&reverted);
+    // Only a verified branch proves the tail blocks below the fork.
+    if evidence == ExpectationTrust::Verified {
+        state.pending_attested = state.tail.newest();
+        state.tail.clear();
+    }
+    note_live_progress(
+        &mut state.disconnect_reported,
+        &mut state.head_poll_silent_since,
+    );
+    ChainEvent::Reorg { reverted, applied }
 }
 
 /// Heads that peers declared in their handshake statuses.
@@ -9602,17 +10018,7 @@ async fn reconstruct_reorg_event(
         .await
     {
         Ok((reverted, applied, new_tip)) => {
-            for _ in 0..reverted.len() {
-                state.recent.pop_back();
-            }
-            state.recent.extend(applied.iter().map(|frame| frame.block));
-            state.last = new_tip;
-            state.ancestry = AttestedAncestry::default();
-            note_live_progress(
-                &mut state.disconnect_reported,
-                &mut state.head_poll_silent_since,
-            );
-            return Some(ChainEvent::Reorg { reverted, applied });
+            return Some(adopt_reorg(state, reverted, applied, new_tip, evidence));
         }
         Err(error) => error,
     };
@@ -10654,7 +11060,7 @@ fn normalize_sparse_log_block(
             parent_hash: block_hash(header.parent_hash),
             timestamp: header.timestamp,
         },
-        finality: Finality::Included,
+        finality: Finality::Attested,
         header: if header_requested {
             Material::Complete(HeaderEnvelope {
                 rlp: Some(alloy_rlp::encode(header)),
@@ -10742,7 +11148,7 @@ fn normalize_verified_headers(
                 parent_hash: block_hash(header.parent_hash),
                 timestamp: header.timestamp,
             },
-            finality: Finality::Included,
+            finality: Finality::Attested,
             header: Material::Complete(HeaderEnvelope {
                 rlp: Some(alloy_rlp::encode(header)),
                 transactions_root: Some(block_hash(header.transactions_root)),
@@ -10825,7 +11231,7 @@ fn normalize_verified_bodies(
                 parent_hash: block_hash(header.parent_hash),
                 timestamp: header.timestamp,
             },
-            finality: Finality::Included,
+            finality: Finality::Attested,
             header: Material::Complete(HeaderEnvelope {
                 rlp: Some(alloy_rlp::encode(header)),
                 transactions_root: Some(block_hash(header.transactions_root)),
@@ -11349,7 +11755,7 @@ fn normalize_block(
             parent_hash: block_hash(header.parent_hash),
             timestamp: header.timestamp,
         },
-        finality: Finality::Included,
+        finality: Finality::Attested,
         header: if header_requested {
             Material::Complete(HeaderEnvelope {
                 rlp: header_rlp,
@@ -11682,7 +12088,7 @@ mod tests {
             projection: leani_source_api::FieldProjection::default(),
             log_fields: leani_primitives::LogFieldSet::NONE,
             filters: leani_source_api::FilterSet::default(),
-            minimum_finality: Finality::Included,
+            minimum_finality: Finality::Attested,
             verification_policy: leani_source_api::VerificationPolicy::CompleteCryptographic,
         };
         assert!(header_only_request(&request));
@@ -11726,7 +12132,7 @@ mod tests {
             projection: leani_source_api::FieldProjection::default(),
             log_fields: leani_primitives::LogFieldSet::NONE,
             filters: leani_source_api::FilterSet::default(),
-            minimum_finality: Finality::Included,
+            minimum_finality: Finality::Attested,
             verification_policy: leani_source_api::VerificationPolicy::CompleteCryptographic,
         };
         assert!(header_and_body_only_request(&request));
@@ -13841,7 +14247,7 @@ mod tests {
             allow_filtered: false,
             projection: leani_source_api::FieldProjection::default(),
             filters: leani_source_api::FilterSet::default(),
-            minimum_finality: Finality::Included,
+            minimum_finality: Finality::Attested,
             verification_policy: leani_source_api::VerificationPolicy::CompleteCryptographic,
         }
     }
@@ -15983,6 +16389,12 @@ mod tests {
         );
     }
 
+    /// The gate of a lane with a processor that needs attested frames.
+    const CLOSED_GATE: HeadGate = HeadGate {
+        enabled: false,
+        wall_slot: 0,
+    };
+
     /// `header` as a head the sync committee attested at `beacon_slot`.
     fn attested(header: &Header, beacon_slot: u64) -> AttestedHead {
         AttestedHead {
@@ -16012,6 +16424,32 @@ mod tests {
     }
 
     #[test]
+    fn live_step_polls_the_head_only_when_the_gate_allows() {
+        let chain = header_chain(B256::ZERO, 100..=102, 0);
+        let last = block_ref(&chain[1]);
+        let ancestry = AttestedAncestry::default();
+        let at_tip = attested(&chain[1], 1_000);
+        let open = HeadGate {
+            enabled: true,
+            wall_slot: 1_001,
+        };
+        assert_eq!(
+            live_step(last, Some(at_tip), &ancestry, 8, open),
+            LiveStep::Head {
+                block: BlockNumber(102)
+            }
+        );
+        let closed = HeadGate {
+            enabled: false,
+            wall_slot: 1_001,
+        };
+        assert_eq!(
+            live_step(last, Some(at_tip), &ancestry, 8, closed),
+            LiveStep::Wait
+        );
+    }
+
+    #[test]
     fn blocks_above_the_attested_head_are_never_fetched_as_included() {
         let chain = header_chain(B256::ZERO, 100..=102, 0);
         let last = block_ref(&chain[1]);
@@ -16025,14 +16463,15 @@ mod tests {
             Some(attested(&chain[1], 10)),
         ] {
             assert_eq!(
-                live_step(last, attested_head, &ancestry, 8),
+                live_step(last, attested_head, &ancestry, 8, CLOSED_GATE),
                 LiveStep::Wait,
                 "the lane fetched above {attested_head:?}"
             );
         }
         // Once block 102 is attested, it is polled by the attested hash.
         let head = attested(&chain[2], 11);
-        let LiveStep::Poll { block, tip } = live_step(last, Some(head), &ancestry, 8) else {
+        let LiveStep::Poll { block, tip } = live_step(last, Some(head), &ancestry, 8, CLOSED_GATE)
+        else {
             panic!("the attested head is not polled");
         };
         assert_eq!(block, BlockNumber(102));
@@ -16171,7 +16610,7 @@ mod tests {
         // the attested head.
         let mut ancestry = AttestedAncestry::default();
         assert_eq!(
-            live_step(last, Some(head), &ancestry, 8),
+            live_step(last, Some(head), &ancestry, 8, CLOSED_GATE),
             LiveStep::Anchor {
                 from: BlockNumber(101),
                 head
@@ -16183,7 +16622,7 @@ mod tests {
         // Batches then come from those headers, which are fetched once. The
         // serve that proved them is settled with the first frames.
         assert_eq!(
-            live_step(last, Some(head), &ancestry, 8),
+            live_step(last, Some(head), &ancestry, 8, CLOSED_GATE),
             LiveStep::CatchUp {
                 range: BlockRange::new(BlockNumber(101), BlockNumber(108)).expect("range")
             }
@@ -16202,7 +16641,7 @@ mod tests {
             ..last
         };
         assert_eq!(
-            live_step(last, Some(head), &ancestry, 1),
+            live_step(last, Some(head), &ancestry, 1, CLOSED_GATE),
             LiveStep::CatchUp {
                 range: BlockRange::single(BlockNumber(110))
             }
@@ -16211,7 +16650,7 @@ mod tests {
         // one proved.
         let lower = attested(&chain[15], 21);
         assert_eq!(
-            live_step(last, Some(lower), &ancestry, 8),
+            live_step(last, Some(lower), &ancestry, 8, CLOSED_GATE),
             LiveStep::CatchUp {
                 range: BlockRange::new(BlockNumber(110), BlockNumber(115)).expect("range")
             }
@@ -16220,7 +16659,7 @@ mod tests {
         ancestry.invalidate();
         assert_eq!(ancestry.head, None);
         assert_eq!(
-            live_step(last, Some(head), &ancestry, 8),
+            live_step(last, Some(head), &ancestry, 8, CLOSED_GATE),
             LiveStep::Anchor {
                 from: BlockNumber(110),
                 head
@@ -16310,7 +16749,8 @@ mod tests {
         // The next batch still comes from branch A's proven headers. An
         // honest peer asked for them by hash lacks the reorged blocks and
         // answers with none: a disagreement, never a ban.
-        let LiveStep::CatchUp { range } = live_step(last, Some(head_b), &ancestry, 8) else {
+        let LiveStep::CatchUp { range } = live_step(last, Some(head_b), &ancestry, 8, CLOSED_GATE)
+        else {
             panic!("no catch-up from the proven headers");
         };
         assert_eq!(
@@ -16327,7 +16767,9 @@ mod tests {
         // The failed batch invalidates the proof, and the lane proves the
         // chain of the newest attested head instead.
         ancestry.invalidate();
-        let LiveStep::Anchor { from, head } = live_step(last, Some(head_b), &ancestry, 8) else {
+        let LiveStep::Anchor { from, head } =
+            live_step(last, Some(head_b), &ancestry, 8, CLOSED_GATE)
+        else {
             panic!("the lane kept following the reorged branch");
         };
         assert_eq!((from, head), (BlockNumber(109), head_b));

@@ -20,7 +20,7 @@ Every checked profile is a complete configuration that `leani doctor` validates.
 | `aggregate-only` | Reducer state and latest aggregate | Counters or totals without retained events |
 | `windowed` | State plus a block/row/age/byte-bounded query window | Recent event and dashboard queries |
 | `externalized` | State plus acknowledgement-fenced delivery until the sink commits | PostgreSQL or another application-owned store |
-| `terminal` | One bounded result and delivery contract for a finite job | Reports and batch outcomes |
+| `job-result` | One bounded result and delivery contract for a finite job | Reports and batch outcomes |
 | `full` | Complete configured output collection | Small, intentionally permanent application datasets |
 
 The `windowed` profile keeps one entity per decoded event, without

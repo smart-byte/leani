@@ -471,7 +471,7 @@ fn descriptor(id: &str, capabilities: CapabilitySet, mode: ReductionMode) -> Pro
             log_fields: leani_primitives::LogFieldSet::NONE,
             allow_filtered: false,
             filter: FilterScope::default(),
-            minimum_finality: Finality::Included,
+            minimum_finality: Finality::Unattested,
         }],
         mode,
         delivery_ordering: if mode == ReductionMode::BlockLocal {
@@ -479,7 +479,7 @@ fn descriptor(id: &str, capabilities: CapabilitySet, mode: ReductionMode) -> Pro
         } else {
             DeliveryOrdering::Canonical
         },
-        publication: PublicationPolicy::IncludedAndFinalized,
+        publication: PublicationPolicy::Unattested,
         lifecycle: LifecyclePolicies::from_legacy(RetentionPolicy::FullOutputHistory),
         schemas: ProcessorSchemas {
             delta_version: 1,

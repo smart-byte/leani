@@ -3,6 +3,7 @@
 
 mod historical_material;
 
+use historical_material::intersect_ranges;
 pub use historical_material::{
     AcquisitionBudgetShape, AcquisitionShape, HistoricalMaterialCoordinator,
     HistoricalMaterialCoordinatorConfig, HistoricalMaterialCoordinatorMode,
@@ -618,7 +619,7 @@ impl BackfillJob {
             });
         let minimum_finality = requirements
             .iter()
-            .fold(Finality::Included, |required, requirement| {
+            .fold(Finality::Unattested, |required, requirement| {
                 required.max(requirement.minimum_finality)
             });
         let log_fields = requirements
@@ -1129,7 +1130,11 @@ async fn map_with_finality_variants(
             "finality variants must include the exact delta checksum".to_owned(),
         ));
     }
-    for finality in [Finality::Included, Finality::Finalized] {
+    for finality in [
+        Finality::Unattested,
+        Finality::Attested,
+        Finality::Finalized,
+    ] {
         if finality == frame.finality {
             continue;
         }
@@ -1264,7 +1269,7 @@ mod failpoints {
 
 /// Apply one mapped delta. The live lane persists it first; history only
 /// checks the pending one, since a live drain applies any pending delta that
-/// continues an ordered cursor, as an included block.
+/// continues an ordered cursor, at its block's canonical level.
 async fn commit_mapped_delta(
     store: &SqliteStore,
     processor: &dyn Processor,
@@ -1686,6 +1691,8 @@ impl HistoricalRuntime {
         // to the next only after a source error. A source that refused to
         // plan the job is skipped for the rest of it.
         let mut source_index = 0_usize;
+        // The blocks the last failed attempt could not serve, when known.
+        let mut detour = None::<Detour>;
         let mut refused = BTreeSet::new();
         let mut source_bytes = 0_u64;
         let mut physical_source_bytes = 0_u64;
@@ -1869,10 +1876,51 @@ impl HistoricalRuntime {
                 continue;
             }
 
-            while refused.contains(&source_index) {
-                source_index = source_index.saturating_add(1) % source_count;
+            // Only the blocks a source failed on move to the next source: the
+            // failed source keeps the blocks before them, and the first
+            // source takes the gap back after them. No physical request
+            // widens back into them.
+            let (mut attempt_index, range, physical_window) = match detour {
+                Some(failed) if gap.start() < failed.range.start() => {
+                    let before = BlockNumber(failed.range.start().0 - 1);
+                    (
+                        failed.from,
+                        BlockRange::new(gap.start(), gap.end().min(before)).ok(),
+                        BlockRange::new(BlockNumber(0), before).ok(),
+                    )
+                }
+                Some(failed) if gap.start() <= failed.range.end() => (
+                    failed.from.saturating_add(1) % source_count,
+                    BlockRange::new(gap.start(), gap.end().min(failed.range.end())).ok(),
+                    BlockRange::new(BlockNumber(0), failed.range.end()).ok(),
+                ),
+                Some(failed) => (
+                    source_index,
+                    Some(gap),
+                    failed.range.end().0.checked_add(1).and_then(|after| {
+                        BlockRange::new(BlockNumber(after), BlockNumber(u64::MAX)).ok()
+                    }),
+                ),
+                None => (source_index, Some(gap), None),
+            };
+            let range = range.ok_or_else(|| {
+                RuntimeError::InvalidConfig("historical detour range is invalid".to_owned())
+            })?;
+            let (completes_subscription, expected_successor_parent) = if range == gap {
+                (completes_subscription, expected_successor_parent)
+            } else {
+                request.range = range;
+                (
+                    false,
+                    self.store
+                        .coverage_parent_hash(descriptor, BlockNumber(range.end().0 + 1))
+                        .await?,
+                )
+            };
+            while refused.contains(&attempt_index) {
+                attempt_index = attempt_index.saturating_add(1) % source_count;
             }
-            let source = self.sources.get(source_index).cloned().ok_or_else(|| {
+            let source = self.sources.get(attempt_index).cloned().ok_or_else(|| {
                 RuntimeError::InvalidConfig("historical source index is invalid".to_owned())
             })?;
             let source_id = source.descriptor().id.to_string();
@@ -1888,12 +1936,15 @@ impl HistoricalRuntime {
             let physical_bytes_before = physical_source_bytes;
             let reused_bytes_before = reused_source_bytes;
             let coalesced_before = coalesced_frames;
+            let mut failed_chunk = None;
             let attempt = self
                 .run_gap(
                     source.clone(),
                     &job,
                     &job_payload,
                     &request,
+                    physical_window,
+                    &mut failed_chunk,
                     budget,
                     attempts,
                     &mut checkpoint,
@@ -1954,6 +2005,8 @@ impl HistoricalRuntime {
             source_report.elapsed_milliseconds = source_report
                 .elapsed_milliseconds
                 .saturating_add(elapsed_milliseconds(attempt_started));
+            let progressed = checkpoint.frames_committed > committed_before
+                || duplicate_frames > duplicates_before;
             if let Err(error) = &attempt
                 && !matches!(error, RuntimeError::Cancelled)
             {
@@ -1961,14 +2014,13 @@ impl HistoricalRuntime {
                 source_report.last_error = Some(error.to_string());
                 // A failure after committing blocks opens a fresh budget, so
                 // scattered transient errors never exhaust a long job.
-                let progressed = checkpoint.frames_committed > committed_before
-                    || duplicate_frames > duplicates_before;
                 gap_failures = if progressed {
                     1
                 } else {
                     gap_failures.saturating_add(1)
                 };
             }
+            let source_failures = source_report.failures;
             match attempt {
                 Ok(()) => {
                     gap_failures = 0;
@@ -1977,13 +2029,36 @@ impl HistoricalRuntime {
                 Err(RuntimeError::Source(error))
                     if failover_source_error(&error) && gap_failures < self.config.max_attempts =>
                 {
-                    source_index = source_index.saturating_add(1) % source_count;
+                    let chunk =
+                        failed_chunk.and_then(|chunk| intersect_ranges(chunk, request.range));
+                    let failed = match &error {
+                        // Blocks the source has not published yet run to its
+                        // end, and a schema drift recurs in later objects: the
+                        // next source keeps the rest of the gap.
+                        SourceError::MissingRange(_) | SourceError::SchemaDrift { .. } => None,
+                        // A dataset hole names its blocks.
+                        SourceError::IncompleteRange { range, .. } => {
+                            intersect_ranges(*range, request.range).or(chunk)
+                        }
+                        // A source that fails again before committing a block
+                        // is down, not stuck on one chunk.
+                        _ if progressed || source_failures == 1 => chunk,
+                        _ => None,
+                    };
+                    detour = failed.map(|range| Detour {
+                        range,
+                        from: attempt_index,
+                    });
+                    if detour.is_none() {
+                        source_index = attempt_index.saturating_add(1) % source_count;
+                    }
                     let delay =
                         retry_delay(self.config.retry_base, self.config.retry_max, gap_failures);
                     warn!(
                         job_id = %job.id,
                         attempt = gap_failures,
                         source_id = %source.descriptor().id,
+                        failed_range = ?failed,
                         ?delay,
                         error = %error,
                         "historical source attempt failed; trying the next source"
@@ -2040,8 +2115,8 @@ impl HistoricalRuntime {
                         %detail,
                         "historical source cannot serve this job; the next source serves it"
                     );
-                    refused.insert(source_index);
-                    source_index = source_index.saturating_add(1) % source_count;
+                    refused.insert(attempt_index);
+                    source_index = attempt_index.saturating_add(1) % source_count;
                 }
                 Err(error) => {
                     self.save_checkpoint(
@@ -2437,6 +2512,8 @@ impl HistoricalRuntime {
         job: &BackfillJob,
         job_payload: &[u8],
         request: &DataRequest,
+        physical_window: Option<BlockRange>,
+        failed_chunk: &mut Option<BlockRange>,
         budget: SourceBudget,
         attempts: u32,
         checkpoint: &mut BackfillCheckpoint,
@@ -2473,6 +2550,12 @@ impl HistoricalRuntime {
             }
             (None, _) => request.clone(),
         };
+        let mut physical_request = physical_request;
+        if let Some(window) = physical_window
+            && let Some(range) = intersect_ranges(physical_request.range, window)
+        {
+            physical_request.range = range;
+        }
         let plan = plan_or_refuse(source.as_ref(), &physical_request).await?;
         plan.validate()?;
         let startup_gate = startup_permit.map(HistoricalMaterialStartupPermit::gate);
@@ -2491,6 +2574,28 @@ impl HistoricalRuntime {
         if let Some(coordinator) = &self.material_coordinator {
             let acquisition_window =
                 coordinator.acquisition_window(budget.max_in_flight_requests, 0);
+            let chunk_blocks = planned
+                .iter()
+                .map(|(chunk, _)| chunk.range.len())
+                .collect::<Vec<_>>();
+            let instance = self.processor.descriptor().instance.to_string();
+            if let Some((widest, suggested)) = idle_read_slots(
+                job.owner,
+                request.range == job.request.range,
+                &chunk_blocks,
+                acquisition_window,
+            ) && coordinator.first_idle_slot_hint(&instance)
+            {
+                info!(
+                    job_id = %job.id,
+                    processor = %instance,
+                    planned_chunks = chunk_blocks.len(),
+                    read_slots = acquisition_window,
+                    chunk_blocks = widest,
+                    suggested_blocks = suggested,
+                    "backfill subscription plans fewer chunks than it may read at once; subscriptions of suggested_blocks or more, or several at once, keep every read slot busy"
+                );
+            }
             let mut opened = VecDeque::<(
                 SourceChunk,
                 BlockRange,
@@ -2554,7 +2659,8 @@ impl HistoricalRuntime {
                             .flatten(),
                         &mut || opened.clear(),
                     )
-                    .await?
+                    .await
+                    .inspect_err(|_| *failed_chunk = Some(logical_range))?
                 {
                     ChunkOutcome::Committed(last) => last,
                     // The job replans the rest of the gap from its progress.
@@ -2593,7 +2699,10 @@ impl HistoricalRuntime {
                     .await?,
             );
             let stream = HistoricalMaterialCoordinator::standalone(
-                source.open(&chunk, budget, cancellation.clone()).await?,
+                source
+                    .open(&chunk, budget, cancellation.clone())
+                    .await
+                    .inspect_err(|_| *failed_chunk = Some(logical_range))?,
             );
             prior_chunk_last = match self
                 .run_material_chunk(
@@ -2624,7 +2733,8 @@ impl HistoricalRuntime {
                         .flatten(),
                     &mut || active_chunk = None,
                 )
-                .await?
+                .await
+                .inspect_err(|_| *failed_chunk = Some(logical_range))?
             {
                 ChunkOutcome::Committed(last) => last,
                 // The job replans the rest of the gap from its progress.
@@ -2789,7 +2899,7 @@ impl HistoricalRuntime {
             }
             let publish_changes = !matches!(
                 self.processor.descriptor().publication,
-                PublicationPolicy::TerminalOnly
+                PublicationPolicy::JobResult
             ) || mapped.delta.block.number == job.request.range.end();
             let mut backpressured = false;
             let outcome = loop {
@@ -3090,7 +3200,7 @@ impl HistoricalRuntime {
                     finality: mapped.finality,
                     publish_changes: !matches!(
                         self.processor.descriptor().publication,
-                        PublicationPolicy::TerminalOnly
+                        PublicationPolicy::JobResult
                     ) || mapped.delta.block.number == job.request.range.end(),
                 })
                 .collect::<Vec<_>>();
@@ -3209,7 +3319,7 @@ impl HistoricalRuntime {
                     for mapped in &batch {
                         let publish_changes = !matches!(
                             self.processor.descriptor().publication,
-                            PublicationPolicy::TerminalOnly
+                            PublicationPolicy::JobResult
                         ) || mapped.delta.block.number
                             == job.request.range.end();
                         let fair_turn = self
@@ -3571,6 +3681,9 @@ pub struct SharedProcessorLiveReport {
 pub struct SharedLiveReport {
     pub chain_blocks: u64,
     pub reorgs: u64,
+    /// `ChainEvent::Attested` watermarks applied.
+    #[serde(default)]
+    pub attestations: u64,
     pub disconnects: u64,
     pub last_block: Option<BlockNumber>,
     pub last_hash: Option<BlockHash>,
@@ -3721,9 +3834,9 @@ impl SharedLiveRuntime {
         let mut identities = HashSet::new();
         for processor in &processors {
             let descriptor = processor.descriptor();
-            if matches!(descriptor.publication, PublicationPolicy::TerminalOnly) {
+            if matches!(descriptor.publication, PublicationPolicy::JobResult) {
                 return Err(RuntimeError::InvalidConfig(format!(
-                    "terminal-only processor {} requires a bounded historical job",
+                    "job-result processor {} requires a bounded historical job",
                     descriptor.id
                 )));
             }
@@ -4292,6 +4405,11 @@ impl SharedLiveRuntime {
                             applied: committed_applied,
                         });
                         report.reorgs = report.reorgs.saturating_add(1);
+                    }
+                    ChainEvent::Attested { through } => {
+                        let _lane = self.lane_lock.lock().await;
+                        self.apply_attested(through, &mut report).await?;
+                        self.publish_committed(ChainEvent::Attested { through });
                     }
                     ChainEvent::Disconnected { reason } => {
                         signal_readiness(readiness.as_ref(), false);
@@ -6104,9 +6222,8 @@ impl SharedLiveRuntime {
                             .is_none_or(|cursor| delta.block.parent_hash == cursor.block_hash)
                 });
                 if let Some(delta) = candidate {
-                    let outcome = match self
-                        .apply_delta(processor.as_ref(), &delta, Finality::Included)
-                        .await
+                    let finality = self.canonical_finality(delta.block).await?;
+                    let outcome = match self.apply_delta(processor.as_ref(), &delta, finality).await
                     {
                         Ok(outcome) => outcome,
                         Err(error) if live_lane_isolatable_error(&error) => {
@@ -6246,8 +6363,8 @@ impl SharedLiveRuntime {
             return Ok(false);
         };
         let outcome = if stored_checksum == delta.checksum {
-            self.apply_delta(processor, delta, Finality::Included)
-                .await?
+            let finality = self.canonical_finality(delta.block).await?;
+            self.apply_delta(processor, delta, finality).await?
         } else {
             let mut equivalent_checksums = processor.finality_variant_checksums(delta)?;
             if !equivalent_checksums.contains(&delta.checksum) {
@@ -6322,6 +6439,66 @@ impl SharedLiveRuntime {
             )));
         }
         Ok(())
+    }
+
+    /// Promote the lane's blocks through `through` to attested. A processor
+    /// that has not covered `through` yet promotes through its cursor, when
+    /// that block is on the attested chain: one its delivery limit paused
+    /// frees capacity only once its parked changes go out. Its pending blocks
+    /// replay at their canonical level, which is attested from here on.
+    async fn apply_attested(
+        &self,
+        through: leani_primitives::BlockRef,
+        report: &mut SharedLiveReport,
+    ) -> Result<(), RuntimeError> {
+        let chain_id = self.source.descriptor().chain_id;
+        self.store
+            .mark_recent_attested(chain_id, through.number, through.hash)
+            .await?;
+        for processor in &self.processors {
+            let descriptor = processor.descriptor();
+            let covered = if self
+                .store
+                .coverage_block_by_hash(descriptor, through.hash)
+                .await?
+                .is_some()
+            {
+                Some((through.number, through.hash))
+            } else if let Some(cursor) = self.store.processor_cursor(descriptor).await?
+                && cursor.block_number < through.number
+                && self
+                    .store
+                    .canonical_block(chain_id, cursor.block_number)
+                    .await?
+                    .is_some_and(|(row, finality)| {
+                        row.hash == cursor.block_hash && finality >= Finality::Attested
+                    })
+            {
+                Some((cursor.block_number, cursor.block_hash))
+            } else {
+                None
+            };
+            if let Some((number, hash)) = covered {
+                self.store.mark_attested(descriptor, number, hash).await?;
+            }
+        }
+        report.attestations = report.attestations.saturating_add(1);
+        Ok(())
+    }
+
+    /// The level of a retained canonical block, for a pending delta, which
+    /// stores none. A block no longer retained counts as unattested: the
+    /// lowest claim.
+    async fn canonical_finality(
+        &self,
+        block: leani_primitives::BlockRef,
+    ) -> Result<Finality, RuntimeError> {
+        Ok(self
+            .store
+            .canonical_block(self.source.descriptor().chain_id, block.number)
+            .await?
+            .filter(|(row, _)| row.hash == block.hash)
+            .map_or(Finality::Unattested, |(_, finality)| finality))
     }
 
     async fn apply_reorg(
@@ -6688,7 +6865,7 @@ fn compile_live_request(
         });
     let minimum_finality = requirements
         .iter()
-        .fold(Finality::Included, |all, requirement| {
+        .fold(Finality::Unattested, |all, requirement| {
             all.max(requirement.minimum_finality)
         });
     let allow_filtered = requirements
@@ -6838,10 +7015,10 @@ impl LiveRuntime {
         }
         if matches!(
             processor.descriptor().publication,
-            PublicationPolicy::TerminalOnly
+            PublicationPolicy::JobResult
         ) {
             return Err(RuntimeError::InvalidConfig(
-                "terminal-only processors require a bounded historical job".to_owned(),
+                "job-result processors require a bounded historical job".to_owned(),
             ));
         }
         Ok(Self {
@@ -6903,6 +7080,26 @@ impl LiveRuntime {
                 },
                 ChainEvent::Reorg { reverted, applied } => {
                     self.apply_reorg(&reverted, applied, &mut report).await?;
+                }
+                ChainEvent::Attested { through } => {
+                    let chain_id = self.source.descriptor().chain_id;
+                    self.store
+                        .mark_recent_attested(chain_id, through.number, through.hash)
+                        .await?;
+                    if self
+                        .store
+                        .coverage_block_by_hash(self.processor.descriptor(), through.hash)
+                        .await?
+                        .is_some()
+                    {
+                        self.store
+                            .mark_attested(
+                                self.processor.descriptor(),
+                                through.number,
+                                through.hash,
+                            )
+                            .await?;
+                    }
                 }
                 ChainEvent::Disconnected { reason } => {
                     report.disconnects = report.disconnects.saturating_add(1);
@@ -7905,6 +8102,36 @@ fn retryable_finality_source_error(error: &SourceError) -> bool {
     )
 }
 
+/// When a subscription's whole range plans at least two chunks but fewer than
+/// the read slots it may use: the widest chunk, and a subscription size that
+/// would fill those slots.
+fn idle_read_slots(
+    owner: HistoricalJobOwner,
+    whole_job: bool,
+    chunk_blocks: &[u64],
+    read_slots: usize,
+) -> Option<(u64, u64)> {
+    if owner != HistoricalJobOwner::Subscription
+        || !whole_job
+        || !(2..read_slots).contains(&chunk_blocks.len())
+    {
+        return None;
+    }
+    let widest = chunk_blocks.iter().copied().max()?;
+    Some((
+        widest,
+        widest.saturating_mul(u64::try_from(read_slots).unwrap_or(u64::MAX)),
+    ))
+}
+
+/// Blocks a history source failed on, and that source's index: the next
+/// source serves them, then the gap returns to the first source.
+#[derive(Clone, Copy, Debug)]
+struct Detour {
+    range: BlockRange,
+    from: usize,
+}
+
 /// Whether another configured source may still serve a range that `error`
 /// failed. Schema drift, such as a Xatu column of another type or an object
 /// without a strong `ETag`, is terminal for its own source only.
@@ -8697,7 +8924,7 @@ mod tests {
     ) -> Result<Vec<BlockHash>, ProcessorError> {
         delta.validate(descriptor)?;
         let mut checksums = Vec::with_capacity(2);
-        for finality in [Finality::Included, Finality::Finalized] {
+        for finality in [Finality::Attested, Finality::Finalized] {
             let mut payload = delta.payload.clone();
             let encoded_finality = payload
                 .last_mut()
@@ -9139,7 +9366,7 @@ mod tests {
             projection: leani_source_api::FieldProjection::default(),
             log_fields: leani_primitives::LogFieldSet::NONE,
             filters: leani_source_api::FilterSet::default(),
-            minimum_finality: Finality::Included,
+            minimum_finality: Finality::Attested,
             verification_policy: VerificationPolicy::CompleteCryptographic,
         };
         let body = CapabilitySet::of(Capability::Body);
@@ -9377,7 +9604,7 @@ mod tests {
             log_fields: LogFieldSet::NONE,
             allow_filtered: true,
             filter,
-            minimum_finality: Finality::Included,
+            minimum_finality: Finality::Attested,
         };
         let sender_scope = leani_primitives::FilterScope {
             senders: vec![sender],
@@ -9458,7 +9685,7 @@ mod tests {
                 senders: vec![sender],
                 ..leani_primitives::FilterScope::default()
             },
-            minimum_finality: Finality::Included,
+            minimum_finality: Finality::Attested,
         }
     }
 
@@ -10299,7 +10526,7 @@ mod tests {
 
     fn included_frame(number: u64, parent: BlockHash) -> leani_primitives::BlockFrame {
         let mut frame = fixture_frame(number, parent);
-        frame.finality = Finality::Included;
+        frame.finality = Finality::Attested;
         frame
     }
 
@@ -10332,7 +10559,7 @@ mod tests {
             projection: FieldProjection::default(),
             log_fields: leani_primitives::LogFieldSet::NONE,
             filters: FilterSet::default(),
-            minimum_finality: Finality::Included,
+            minimum_finality: Finality::Attested,
             verification_policy: VerificationPolicy::CompleteCryptographic,
         }
     }
@@ -10369,7 +10596,7 @@ mod tests {
                 let mut frame = fixture_frame(number, parent);
                 frame.block.hash = e2e_hash(number);
                 frame.block.parent_hash = parent;
-                frame.finality = Finality::Included;
+                frame.finality = Finality::Attested;
                 frame.header = Material::Complete(complete_header(None));
                 parent = frame.block.hash;
                 frame
@@ -12854,7 +13081,7 @@ mod tests {
         // finality promoted them afterwards.
         let mut tip = None;
         for mut frame in frames(range) {
-            frame.finality = Finality::Included;
+            frame.finality = Finality::Attested;
             frame.provenance.push(leani_primitives::Provenance {
                 source_id: leani_primitives::SourceId::new("live-cache").expect("source ID"),
                 source_kind: SourceKind::ExecutionP2p,
@@ -12915,9 +13142,8 @@ mod tests {
             fixture_source_descriptor("terminal-history", range),
             frames(range),
         ));
-        let processor = Arc::new(
-            BlockLocalCounter::default().with_publication(PublicationPolicy::TerminalOnly),
-        );
+        let processor =
+            Arc::new(BlockLocalCounter::default().with_publication(PublicationPolicy::JobResult));
         let (_directory, store) = store().await;
         let runtime = HistoricalRuntime::new(
             store.clone(),
@@ -14721,6 +14947,48 @@ mod tests {
         }
     }
 
+    /// Like Xatu's row checks: every chunk that overlaps `hole` fails, naming
+    /// the hole; or, with `missing`, like objects Xatu has not published yet:
+    /// each such chunk fails as a missing range of its own.
+    struct HoledHistorySource {
+        inner: ScriptedHistorySource,
+        hole: BlockRange,
+        missing: bool,
+    }
+
+    #[async_trait]
+    impl HistorySource for HoledHistorySource {
+        fn descriptor(&self) -> &SourceDescriptor {
+            self.inner.descriptor()
+        }
+
+        async fn plan(
+            &self,
+            request: &DataRequest,
+        ) -> Result<leani_source_api::SourcePlan, SourceError> {
+            self.inner.plan(request).await
+        }
+
+        async fn open(
+            &self,
+            chunk: &SourceChunk,
+            budget: SourceBudget,
+            cancellation: CancellationToken,
+        ) -> Result<leani_source_api::BlockFrameStream, SourceError> {
+            if chunk.range.start() <= self.hole.end() && self.hole.start() <= chunk.range.end() {
+                return Err(if self.missing {
+                    SourceError::MissingRange(chunk.range)
+                } else {
+                    SourceError::IncompleteRange {
+                        range: self.hole,
+                        detail: "injected dataset hole".to_owned(),
+                    }
+                });
+            }
+            self.inner.open(chunk, budget, cancellation).await
+        }
+    }
+
     /// Two-block ranges with one unrequested block between them.
     fn spaced_ranges(count: u64) -> Vec<BlockRange> {
         (0..count)
@@ -14840,6 +15108,289 @@ mod tests {
             "only the gap whose primary read failed falls over"
         );
         assert_eq!(report.final_coverage, ranges);
+    }
+
+    #[test]
+    fn a_subscription_planning_fewer_chunks_than_read_slots_gets_a_sizing_hint() {
+        let subscription = HistoricalJobOwner::Subscription;
+        // 25,000 blocks of 8,000-block chunks against 8 read slots
+        assert_eq!(
+            idle_read_slots(subscription, true, &[2_109, 8_000, 8_000, 6_891], 8),
+            Some((8_000, 64_000))
+        );
+        // one chunk is a small repair, not a sizing problem
+        assert_eq!(idle_read_slots(subscription, true, &[300], 8), None);
+        // a chunk for every slot
+        assert_eq!(idle_read_slots(subscription, true, &[1_000; 25], 8), None);
+        // a remainder after progress, or a detour, is not the subscription's size
+        assert_eq!(idle_read_slots(subscription, false, &[8_000; 3], 8), None);
+        // node-owned history sizes its own jobs
+        assert_eq!(
+            idle_read_slots(HistoricalJobOwner::Materialization, true, &[8_000; 3], 8),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn only_the_failed_chunk_moves_to_the_next_source() {
+        let range = BlockRange::new(BlockNumber(1), BlockNumber(9)).expect("range");
+        let all_frames = frames(range);
+        let mut primary_descriptor = fixture_source_descriptor("primary", range);
+        primary_descriptor.priority = 0;
+        let chunks = [(1_u64, 3_u64), (4, 6), (7, 9)]
+            .into_iter()
+            .map(|(start, end)| ScriptedChunk {
+                range: BlockRange::new(BlockNumber(start), BlockNumber(end)).expect("chunk"),
+                schema_version: primary_descriptor.schema_version.clone(),
+                estimated_bytes: None,
+                steps: all_frames
+                    .iter()
+                    .filter(|frame| (start..=end).contains(&frame.block.number.0))
+                    .cloned()
+                    .map(|frame| HistoryStep::Frame(Box::new(frame)))
+                    .collect(),
+            })
+            .collect();
+        let primary: Arc<dyn HistorySource> = Arc::new(FlakyHistorySource::new(
+            ScriptedHistorySource::new(primary_descriptor, chunks),
+            [BlockNumber(4)],
+        ));
+        let mut fallback_descriptor = fixture_source_descriptor("fallback", range);
+        fallback_descriptor.priority = 1;
+        let fallback: Arc<dyn HistorySource> = Arc::new(ScriptedHistorySource::from_frames(
+            fallback_descriptor,
+            all_frames,
+        ));
+        let processor = Arc::new(BlockLocalCounter::default());
+        let (_directory, store) = store().await;
+        let runtime = HistoricalRuntime::new_with_sources(
+            store,
+            vec![fallback, primary],
+            processor.clone(),
+            HistoricalRuntimeConfig {
+                mapper_concurrency: 1,
+                max_attempts: 3,
+                retry_base: Duration::from_millis(1),
+                retry_max: Duration::from_millis(1),
+                ..HistoricalRuntimeConfig::default()
+            },
+        )
+        .expect("runtime");
+        let job = BackfillJob::for_processor(
+            "chunk-failover",
+            processor.as_ref(),
+            ChainId(1),
+            range,
+            VerificationPolicy::CompleteCryptographic,
+        )
+        .expect("job");
+
+        let report = runtime
+            .run(job, default_source_budget(), CancellationToken::new())
+            .await
+            .expect("backfill");
+
+        let committed = |id: &str| {
+            report
+                .sources
+                .iter()
+                .find(|source| source.source_id == id)
+                .map(|source| source.frames_committed)
+        };
+        assert_eq!(
+            committed("fallback"),
+            Some(3),
+            "only blocks 4..=6 fall over"
+        );
+        assert_eq!(
+            committed("primary"),
+            Some(6),
+            "the primary takes the gap back after them"
+        );
+        assert_eq!(report.final_coverage, vec![range]);
+    }
+
+    #[tokio::test]
+    async fn only_a_named_hole_moves_to_the_next_source() {
+        let range = BlockRange::new(BlockNumber(1), BlockNumber(9)).expect("range");
+        let all_frames = frames(range);
+        let mut primary_descriptor = fixture_source_descriptor("primary", range);
+        primary_descriptor.priority = 0;
+        let primary: Arc<dyn HistorySource> = Arc::new(HoledHistorySource {
+            inner: ScriptedHistorySource::from_frames(primary_descriptor, all_frames.clone()),
+            hole: BlockRange::single(BlockNumber(5)),
+            missing: false,
+        });
+        let mut fallback_descriptor = fixture_source_descriptor("fallback", range);
+        fallback_descriptor.priority = 1;
+        let fallback: Arc<dyn HistorySource> = Arc::new(ScriptedHistorySource::from_frames(
+            fallback_descriptor,
+            all_frames,
+        ));
+        // The coordinator widens short requests (here by one block); none may
+        // widen back into the hole.
+        let pipeline_budget =
+            HistoricalPipelineBudget::new(2, 2, 4 * 1_024 * 1_024).expect("pipeline budget");
+        let coordinator = HistoricalMaterialCoordinator::new_with_pipeline_budget(
+            HistoricalMaterialCoordinatorConfig {
+                memory_bytes: 4 * 1_024 * 1_024,
+                maximum_buffered_frames_per_acquisition: 8,
+                ..HistoricalMaterialCoordinatorConfig::default()
+            },
+            &pipeline_budget,
+        )
+        .expect("coordinator");
+        let processor = Arc::new(BlockLocalCounter::default());
+        let (_directory, store) = store().await;
+        let runtime = HistoricalRuntime::new_with_sources(
+            store,
+            vec![fallback, primary],
+            processor.clone(),
+            HistoricalRuntimeConfig {
+                mapper_concurrency: 1,
+                max_attempts: 3,
+                retry_base: Duration::from_millis(1),
+                retry_max: Duration::from_millis(1),
+                ..HistoricalRuntimeConfig::default()
+            },
+        )
+        .expect("runtime")
+        .with_pipeline_budget(pipeline_budget)
+        .with_material_coordinator(coordinator);
+        let job = BackfillJob::for_processor(
+            "hole-failover",
+            processor.as_ref(),
+            ChainId(1),
+            range,
+            VerificationPolicy::CompleteCryptographic,
+        )
+        .expect("job");
+
+        let report = runtime
+            .run(job, default_source_budget(), CancellationToken::new())
+            .await
+            .expect("backfill");
+
+        let committed = |id: &str| {
+            report
+                .sources
+                .iter()
+                .find(|source| source.source_id == id)
+                .map(|source| source.frames_committed)
+        };
+        assert_eq!(committed("fallback"), Some(1), "only the hole falls over");
+        assert_eq!(
+            committed("primary"),
+            Some(8),
+            "the primary serves both sides of it"
+        );
+        assert_eq!(report.final_coverage, vec![range]);
+    }
+
+    /// Four 3-block chunks on the primary, `primary` wrapping them; a
+    /// fallback holding every block. Returns the committed frames and
+    /// failures per source.
+    async fn run_four_chunk_failover(
+        primary: impl FnOnce(ScriptedHistorySource) -> Arc<dyn HistorySource>,
+    ) -> BTreeMap<String, (u64, u32)> {
+        let range = BlockRange::new(BlockNumber(1), BlockNumber(12)).expect("range");
+        let all_frames = frames(range);
+        let mut primary_descriptor = fixture_source_descriptor("primary", range);
+        primary_descriptor.priority = 0;
+        let chunks = [(1_u64, 3_u64), (4, 6), (7, 9), (10, 12)]
+            .into_iter()
+            .map(|(start, end)| ScriptedChunk {
+                range: BlockRange::new(BlockNumber(start), BlockNumber(end)).expect("chunk"),
+                schema_version: primary_descriptor.schema_version.clone(),
+                estimated_bytes: None,
+                steps: all_frames
+                    .iter()
+                    .filter(|frame| (start..=end).contains(&frame.block.number.0))
+                    .cloned()
+                    .map(|frame| HistoryStep::Frame(Box::new(frame)))
+                    .collect(),
+            })
+            .collect();
+        let primary = primary(ScriptedHistorySource::new(primary_descriptor, chunks));
+        let mut fallback_descriptor = fixture_source_descriptor("fallback", range);
+        fallback_descriptor.priority = 1;
+        let fallback: Arc<dyn HistorySource> = Arc::new(ScriptedHistorySource::from_frames(
+            fallback_descriptor,
+            all_frames,
+        ));
+        let processor = Arc::new(BlockLocalCounter::default());
+        let (_directory, store) = store().await;
+        let runtime = HistoricalRuntime::new_with_sources(
+            store,
+            vec![fallback, primary],
+            processor.clone(),
+            HistoricalRuntimeConfig {
+                mapper_concurrency: 1,
+                max_attempts: 3,
+                retry_base: Duration::from_millis(1),
+                retry_max: Duration::from_millis(1),
+                ..HistoricalRuntimeConfig::default()
+            },
+        )
+        .expect("runtime");
+        let job = BackfillJob::for_processor(
+            "four-chunk-failover",
+            processor.as_ref(),
+            ChainId(1),
+            range,
+            VerificationPolicy::CompleteCryptographic,
+        )
+        .expect("job");
+        let report = runtime
+            .run(job, default_source_budget(), CancellationToken::new())
+            .await
+            .expect("backfill");
+        assert_eq!(report.final_coverage, vec![range]);
+        report
+            .sources
+            .iter()
+            .map(|source| {
+                (
+                    source.source_id.clone(),
+                    (source.frames_committed, source.failures),
+                )
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_source_failing_again_before_committing_hands_over_the_rest_of_the_gap() {
+        // The second failure comes before the primary commits anything: an
+        // outage, so the fallback keeps the rest instead of the primary
+        // stalling on every chunk.
+        let sources = run_four_chunk_failover(|scripted| {
+            Arc::new(FlakyHistorySource::new(
+                scripted,
+                [BlockNumber(4), BlockNumber(7)],
+            ))
+        })
+        .await;
+        assert_eq!(sources["primary"], (3, 2));
+        assert_eq!(sources["fallback"], (9, 0));
+    }
+
+    #[tokio::test]
+    async fn blocks_a_source_has_not_published_hand_over_the_rest_of_the_gap() {
+        // Xatu's export lag: once an object is missing, the later ones are too.
+        let sources = run_four_chunk_failover(|scripted| {
+            Arc::new(HoledHistorySource {
+                inner: scripted,
+                hole: BlockRange::new(BlockNumber(7), BlockNumber(12)).expect("unpublished"),
+                missing: true,
+            })
+        })
+        .await;
+        assert_eq!(
+            sources["primary"],
+            (6, 1),
+            "one failed read, not one per chunk"
+        );
+        assert_eq!(sources["fallback"], (6, 0));
     }
 
     #[tokio::test]
@@ -15243,6 +15794,202 @@ mod tests {
                 .expect("changes")
                 .len(),
             5
+        );
+    }
+
+    #[test]
+    fn lane_stays_attested_gated_for_an_attested_processor() {
+        let head = BlockLocalCounter::named("gate-head");
+        let strict = Requiring::new(
+            BlockLocalCounter::named("gate-strict"),
+            vec![leani_processor_api::DataRequirement {
+                minimum_finality: Finality::Attested,
+                ..BlockLocalCounter::named("gate-strict")
+                    .descriptor()
+                    .requirements[0]
+                    .clone()
+            }],
+        );
+        let both: Vec<Arc<dyn Processor>> = vec![Arc::new(head), Arc::new(strict)];
+        assert_eq!(
+            compile_live_request(&both, ChainId(1), &LiveStart::Head)
+                .expect("request")
+                .minimum_finality,
+            Finality::Attested,
+            "the P2P lane enables head acceptance only for Finality::Unattested"
+        );
+        let built_ins: Vec<Arc<dyn Processor>> =
+            vec![Arc::new(BlockLocalCounter::named("gate-only-head"))];
+        assert_eq!(
+            compile_live_request(&built_ins, ChainId(1), &LiveStart::Head)
+                .expect("request")
+                .minimum_finality,
+            Finality::Unattested
+        );
+    }
+
+    #[tokio::test]
+    async fn attested_events_promote_unattested_blocks() {
+        let range = BlockRange::new(BlockNumber(0), BlockNumber(2)).expect("range");
+        let mut chain = Vec::new();
+        let mut parent = BlockHash::ZERO;
+        for number in 0..=2 {
+            let mut frame = live_fixture(number, parent);
+            frame.finality = Finality::Unattested;
+            parent = frame.block.hash;
+            chain.push(frame);
+        }
+        let mut steps = chain
+            .iter()
+            .cloned()
+            .map(|frame| LiveStep::Event(ChainEvent::Block(Box::new(frame))))
+            .collect::<Vec<_>>();
+        steps.push(LiveStep::Event(ChainEvent::Attested {
+            through: chain[1].block,
+        }));
+        let head = Arc::new(
+            BlockLocalCounter::named("attested-head")
+                .with_publication(PublicationPolicy::Unattested),
+        );
+        let strict = Arc::new(
+            BlockLocalCounter::named("attested-strict")
+                .with_publication(PublicationPolicy::Attested),
+        );
+        let (_directory, store) = store().await;
+        let runtime = SharedLiveRuntime::new(
+            store.clone(),
+            Arc::new(ScriptedLiveSource::new(
+                e2e_descriptor("attested-live", range),
+                steps,
+            )),
+            vec![head.clone(), strict.clone()],
+            SharedLiveRuntimeConfig::default(),
+        )
+        .expect("runtime");
+        let report = runtime
+            .run(
+                LiveStart::Head,
+                default_source_budget(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("run");
+        assert_eq!(report.attestations, 1);
+        let level = |number| {
+            let store = store.clone();
+            async move {
+                store
+                    .canonical_block(ChainId(1), BlockNumber(number))
+                    .await
+                    .expect("row")
+                    .map(|(_, finality)| finality)
+            }
+        };
+        assert_eq!(level(1).await, Some(Finality::Attested));
+        assert_eq!(level(2).await, Some(Finality::Unattested));
+        let operations = |changes: Vec<leani_store_sqlite::ChangeRecord>| {
+            changes
+                .into_iter()
+                .map(|change| (change.block.number.0, change.finality, change.direction))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            operations(
+                store
+                    .changes(head.descriptor(), ChainId(1), 0, 100)
+                    .await
+                    .expect("head")
+            ),
+            vec![
+                (0, Finality::Unattested, ChangeDirection::Apply),
+                (1, Finality::Unattested, ChangeDirection::Apply),
+                (2, Finality::Unattested, ChangeDirection::Apply),
+                (1, Finality::Attested, ChangeDirection::Finalized),
+            ]
+        );
+        assert_eq!(
+            operations(
+                store
+                    .changes(strict.descriptor(), ChainId(1), 0, 100)
+                    .await
+                    .expect("strict")
+            ),
+            vec![
+                (0, Finality::Attested, ChangeDirection::Apply),
+                (1, Finality::Attested, ChangeDirection::Apply),
+            ],
+            "block 2 stays parked until a later attested head covers it"
+        );
+    }
+
+    #[tokio::test]
+    async fn attestation_releases_what_a_paused_processor_parked() {
+        // Review: a processor its delivery limit paused below the attested
+        // block was skipped, so its parked changes never went out, and no
+        // acknowledgement could free the capacity they hold.
+        let range = BlockRange::new(BlockNumber(0), BlockNumber(2)).expect("range");
+        let mut steps = Vec::new();
+        let mut parent = BlockHash::ZERO;
+        let mut through = None;
+        for number in 0..=2 {
+            let mut frame = live_fixture(number, parent);
+            frame.finality = Finality::Unattested;
+            parent = frame.block.hash;
+            through = Some(frame.block);
+            steps.push(LiveStep::Event(ChainEvent::Block(Box::new(frame))));
+        }
+        steps.push(LiveStep::Event(ChainEvent::Attested {
+            through: through.expect("block 2"),
+        }));
+        // One parked block holds 56 bytes: block 1 crosses the limit.
+        let paused = Arc::new(
+            BlockLocalCounter::named("attested-paused")
+                .with_publication(PublicationPolicy::Attested)
+                .with_delivery_max_bytes(100),
+        );
+        let (_directory, store) = store().await;
+        SharedLiveRuntime::new(
+            store.clone(),
+            Arc::new(ScriptedLiveSource::new(
+                e2e_descriptor("paused-live", range),
+                steps,
+            )),
+            vec![paused.clone()],
+            SharedLiveRuntimeConfig::default(),
+        )
+        .expect("runtime")
+        .run(
+            LiveStart::Head,
+            default_source_budget(),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("run");
+        assert_eq!(
+            store
+                .processor_runtime_state(paused.descriptor())
+                .await
+                .expect("state")
+                .state,
+            ProcessorRunState::Paused
+        );
+        assert_eq!(
+            store
+                .processor_cursor(paused.descriptor())
+                .await
+                .expect("cursor")
+                .map(|cursor| cursor.block_number),
+            Some(BlockNumber(0))
+        );
+        assert_eq!(
+            store
+                .changes(paused.descriptor(), ChainId(1), 0, 100)
+                .await
+                .expect("changes")
+                .into_iter()
+                .map(|change| (change.block.number.0, change.finality, change.direction))
+                .collect::<Vec<_>>(),
+            vec![(0, Finality::Attested, ChangeDirection::Apply)]
         );
     }
 
@@ -15945,7 +16692,7 @@ mod tests {
     #[tokio::test]
     async fn unfinalized_gap_replay_pauses_until_finality_then_recovers_from_history() {
         let range = BlockRange::new(BlockNumber(0), BlockNumber(4)).expect("range");
-        let chain = live_chain(Finality::Included);
+        let chain = live_chain(Finality::Attested);
         let fourth = live_fixture(3, chain[2].block.hash);
         let fifth = live_fixture(4, fourth.block.hash);
         let block_local = Arc::new(Requiring::new(
@@ -16028,7 +16775,7 @@ mod tests {
     #[tokio::test]
     async fn block_local_gap_replay_isolates_a_mapping_failure_instead_of_failing_the_lane() {
         let range = BlockRange::new(BlockNumber(0), BlockNumber(2)).expect("range");
-        let chain = live_chain(Finality::Included);
+        let chain = live_chain(Finality::Attested);
         let processor = Arc::new(FailOnceCounter::named("replay-mapping-failure"));
         let (_directory, store) = store().await;
         for frame in &chain {
@@ -18190,7 +18937,7 @@ mod tests {
             frame.finality = Finality::Finalized;
             apply_live_frame(&clean, ledger.as_ref(), &frame, sequence).await;
             if frame.block.number == BlockNumber(2) {
-                frame.finality = Finality::Included;
+                frame.finality = Finality::Attested;
             }
             apply_live_frame(&store, ledger.as_ref(), &frame, sequence).await;
         }
@@ -18401,7 +19148,7 @@ mod tests {
         // frame shows a pending delta to be a finality variant.
         for (sequence, frame) in (1..).zip(&chain) {
             store
-                .store_canonical_anchor(ChainId(1), frame.block, Finality::Included)
+                .store_canonical_anchor(ChainId(1), frame.block, Finality::Attested)
                 .await
                 .expect("canonical block");
             apply_live_frame(&store, ledger.as_ref(), frame, sequence).await;
@@ -18599,7 +19346,7 @@ mod tests {
     #[tokio::test]
     async fn a_lane_paused_at_subscribe_receives_material_it_requires_after_resuming() {
         let range = BlockRange::new(BlockNumber(0), BlockNumber(2)).expect("range");
-        let chain = live_chain(Finality::Included);
+        let chain = live_chain(Finality::Attested);
         let paused = Arc::new(FilteredCounter::named(
             "paused-at-subscribe",
             vec![sender_requirement(REPLAY_SENDER)],
@@ -18654,7 +19401,7 @@ mod tests {
     #[tokio::test]
     async fn a_reorg_leaves_a_paused_lane_paused() {
         let range = BlockRange::new(BlockNumber(0), BlockNumber(2)).expect("range");
-        let chain = live_chain(Finality::Included);
+        let chain = live_chain(Finality::Attested);
         let mut replacement = live_fixture(2, chain[1].block.hash);
         replacement.block.hash = BlockHash::new([0x72; 32]);
         // Parked ahead of its cursor, so it stays paused until history
@@ -18671,7 +19418,7 @@ mod tests {
         // A lane parks at a block the store holds as canonical, so its marker
         // is on the canonical chain.
         store
-            .store_canonical_anchor(ChainId(1), chain[1].block, Finality::Included)
+            .store_canonical_anchor(ChainId(1), chain[1].block, Finality::Attested)
             .await
             .expect("canonical block");
         store
@@ -18726,7 +19473,7 @@ mod tests {
     #[tokio::test]
     async fn a_mapping_failure_during_a_reorg_does_not_fail_a_paused_lane() {
         let range = BlockRange::new(BlockNumber(0), BlockNumber(2)).expect("range");
-        let chain = live_chain(Finality::Included);
+        let chain = live_chain(Finality::Attested);
         let mut replacement = live_fixture(2, chain[1].block.hash);
         replacement.block.hash = BlockHash::new([0x73; 32]);
         let paused = Arc::new(FailOnceCounter::named("reorg-mapping-paused"));
@@ -19101,7 +19848,7 @@ mod tests {
     #[tokio::test]
     async fn concurrent_drains_of_one_live_gap_do_not_fail_the_lane() {
         let range = BlockRange::new(BlockNumber(0), BlockNumber(2)).expect("range");
-        let chain = live_chain(Finality::Included);
+        let chain = live_chain(Finality::Attested);
         let processor = Arc::new(RendezvousCounter {
             inner: BlockLocalCounter::named("concurrent-gap-counter"),
             rendezvous: tokio::sync::Barrier::new(2),
@@ -19552,7 +20299,7 @@ mod tests {
                     &MappedFrame {
                         delta,
                         equivalent_checksums,
-                        finality: Finality::Included,
+                        finality: Finality::Attested,
                         estimated_bytes: 0,
                         material: None,
                         _mapped_byte_permit: None,
@@ -19656,7 +20403,7 @@ mod tests {
                             chain_id: delta.chain_id,
                             block_number: delta.block.number,
                             block_hash: delta.block.hash,
-                            finality: Finality::Included,
+                            finality: Finality::Attested,
                             sequence: 1,
                         },
                         &delta,
@@ -19721,7 +20468,7 @@ mod tests {
         };
         let stream_id = job.delivery_stream_id.clone();
         let mut included = history[2].clone();
-        included.finality = Finality::Included;
+        included.finality = Finality::Attested;
         let mut live = processor.map(&included).await.expect("map included");
         if let Some(payload) = live_payload {
             live = EncodedDelta::new(processor.descriptor(), live.chain_id, live.block, payload);
@@ -19817,7 +20564,7 @@ mod tests {
     #[tokio::test]
     async fn history_microbatches_still_reject_other_content_applied_live() {
         // Seven transactions where history has none: not a finality variant.
-        let other = [7_u64.to_be_bytes().as_slice(), &[Finality::Included as u8]].concat();
+        let other = [7_u64.to_be_bytes().as_slice(), &[Finality::Attested as u8]].concat();
         for subscription in [true, false] {
             let run = history_over_live_block(subscription, Some(other.clone())).await;
             let error = run.result.expect_err("other content conflicts");
@@ -20702,7 +21449,7 @@ mod tests {
         let held = keyed.map(&other).await.expect("map other logs");
         let error = run
             .live(Vec::new())
-            .apply_delta(keyed.as_ref(), &held, Finality::Included)
+            .apply_delta(keyed.as_ref(), &held, Finality::Attested)
             .await
             .expect_err("other content conflicts");
         assert!(
@@ -20970,7 +21717,7 @@ mod tests {
             .expect("map the included block");
         let outcome = run
             .live(Vec::new())
-            .apply_delta(keyed.as_ref(), &held, Finality::Included)
+            .apply_delta(keyed.as_ref(), &held, Finality::Attested)
             .await
             .expect("the finalized variant is applied");
         assert!(matches!(outcome, ApplyOutcome::AlreadyApplied));
@@ -21540,9 +22287,8 @@ mod tests {
                 LiveStep::Event(ChainEvent::Block(Box::new(third))),
             ],
         ));
-        let processor = Arc::new(
-            BlockLocalCounter::default().with_publication(PublicationPolicy::FinalizedOnly),
-        );
+        let processor =
+            Arc::new(BlockLocalCounter::default().with_publication(PublicationPolicy::Finalized));
         let (_directory, store) = store().await;
         LiveRuntime::new(
             store.clone(),
@@ -22185,7 +22931,7 @@ mod tests {
             "synthetic.counter".to_owned(),
             block,
             leani_store_sqlite::DeliveryOriginKind::Live,
-            Finality::Included,
+            Finality::Attested,
         )
     }
 
@@ -22952,7 +23698,7 @@ mod tests {
         )));
         let (_directory, store) = store().await;
         // History serves only finalized blocks, and nothing up to block 4 is.
-        follow_across_downtime(&store, &chain, 4, Finality::Included, |steps| {
+        follow_across_downtime(&store, &chain, 4, Finality::Attested, |steps| {
             filling_live(
                 &store,
                 &lanes,
@@ -23452,6 +24198,49 @@ mod tests {
                 frame.block.number.0
             );
         }
+    }
+
+    #[tokio::test]
+    async fn a_restart_keeps_the_output_of_unattested_blocks_below_the_anchor() {
+        // Review: with the finalized anchor among the retained blocks, startup
+        // also reverted the unattested blocks it descends from, and
+        // reconciliation undid their output.
+        let mut chain = live_blocks(2);
+        chain[0].finality = Finality::Finalized;
+        for frame in &mut chain[1..] {
+            frame.finality = Finality::Unattested;
+        }
+        let counter = Arc::new(
+            BlockLocalCounter::named("anchored-counter")
+                .with_publication(PublicationPolicy::Unattested),
+        );
+        let lanes: Vec<Arc<dyn Processor>> = vec![counter.clone()];
+        let (_directory, store) = store().await;
+        run_live(&scripted_live(&store, &lanes, block_events(&chain)))
+            .await
+            .expect("live run before the restart");
+        // Meanwhile finality reached block 2, which the store holds.
+        let restarted = scripted_live(&store, &lanes, Vec::new());
+        let reverted = restarted
+            .seed_finalized_anchor(chain[2].block, &[])
+            .await
+            .expect("seed the verified finalized anchor");
+        restarted
+            .reconcile_startup()
+            .await
+            .expect("startup reconciliation");
+        for frame in &chain {
+            assert_eq!(
+                store
+                    .coverage_block_by_hash(counter.descriptor(), frame.block.hash)
+                    .await
+                    .expect("coverage lookup"),
+                Some(frame.block.number),
+                "block {} lost its output",
+                frame.block.number.0
+            );
+        }
+        assert!(reverted.is_empty(), "{reverted:?}");
     }
 
     #[tokio::test]
