@@ -12,7 +12,7 @@ use crate::{BlockFrameStream, SourceError};
 /// segment captured for a narrower request plans like any other, so its frames
 /// are checked as they are read. The runtime passes the rest of the range to
 /// the next source.
-#[must_use]
+#[must_use = "streams must be polled to read and validate stored frames"]
 pub fn stop_at_unfilled_groups(
     frames: BlockFrameStream,
     required: CapabilitySet,

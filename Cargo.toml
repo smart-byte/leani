@@ -135,6 +135,9 @@ all = { level = "warn", priority = -1 }
 pedantic = { level = "warn", priority = -1 }
 module_name_repetitions = "allow"
 must_use_candidate = "allow"
+# Emptiness assertions express the invariant directly and support elements
+# without equality implementations.
+assert_is_empty = "allow"
 
 # Reth 2.5.2 still reaches proc-macro-error2 through its rustdoc-only
 # aquamarine macros. The crate was archived before its Rust 2024

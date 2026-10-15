@@ -977,7 +977,7 @@ impl HistoricalMaterialCoordinator {
     }
 
     /// Wrap a direct source stream in the same frame type.
-    #[must_use]
+    #[must_use = "streams must be polled to consume historical frames"]
     pub fn standalone(stream: leani_source_api::BlockFrameStream) -> HistoricalMaterialStream {
         stream
             .map(|item| item.map(HistoricalMaterialFrame::standalone))

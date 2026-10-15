@@ -2307,7 +2307,7 @@ fn rlp_integer_len(value: u64) -> u64 {
     if value < 0x80 {
         1
     } else {
-        1 + u64::from((u64::BITS - value.leading_zeros()).div_ceil(8))
+        1 + u64::from(value.bit_width().div_ceil(8))
     }
 }
 
@@ -2336,7 +2336,7 @@ fn rlp_header_len(payload: u64) -> u64 {
     if payload <= 55 {
         1
     } else {
-        1 + u64::from((u64::BITS - payload.leading_zeros()).div_ceil(8))
+        1 + u64::from(payload.bit_width().div_ceil(8))
     }
 }
 
