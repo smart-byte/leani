@@ -85,6 +85,9 @@ parquet = { version = "60.0.0", default-features = false, features = [
 ] }
 postcard = { version = "1.1", features = ["alloc"] }
 reth-chainspec = { git = "https://github.com/paradigmxyz/reth", rev = "5a6940e351fed80458fe6c9da8581cbe4b8bd036" }
+reth-consensus = { git = "https://github.com/paradigmxyz/reth", rev = "5a6940e351fed80458fe6c9da8581cbe4b8bd036" }
+reth-ethereum-consensus = { git = "https://github.com/paradigmxyz/reth", rev = "5a6940e351fed80458fe6c9da8581cbe4b8bd036" }
+reth-primitives-traits = { version = "0.6.0", default-features = false }
 reth-discv5 = { git = "https://github.com/paradigmxyz/reth", rev = "5a6940e351fed80458fe6c9da8581cbe4b8bd036" }
 reth-dns-discovery = { git = "https://github.com/paradigmxyz/reth", rev = "5a6940e351fed80458fe6c9da8581cbe4b8bd036" }
 reth-era = { git = "https://github.com/paradigmxyz/reth", rev = "5a6940e351fed80458fe6c9da8581cbe4b8bd036" }

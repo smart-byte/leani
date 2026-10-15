@@ -72,11 +72,11 @@ pub use http::{
     endpoint_labels, normalized_endpoint, read_response, redacted_url, request_label, request_url,
 };
 
-pub const MAINNET_GENESIS_TIME: u64 = 1_606_824_023;
+pub use leani_primitives::MAINNET_GENESIS_TIME;
 pub const MAINNET_GENESIS_ROOT: B256 =
     alloy_primitives::b256!("4b363db94e286120d76eb905340fdd4e54bfe9f06bf33ff6cf5ad27f511bfe95");
 const MAX_UPDATES_PER_REQUEST: u64 = 128;
-const SLOT_SECONDS: u64 = 12;
+use leani_primitives::SLOT_SECONDS;
 const SLOTS_PER_EPOCH: u64 = 32;
 /// Slots an update may be signed ahead of the local clock.
 const CLOCK_SKEW_SLOTS: u64 = 1;

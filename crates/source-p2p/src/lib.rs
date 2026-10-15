@@ -5,6 +5,9 @@
 //! requests a bounded fixed range, verifies all response commitments, and
 //! converts the result into source-neutral [`BlockFrame`] values.
 
+// Until the live lane accepts unattested heads, only tests use these rules.
+#[cfg_attr(not(test), allow(dead_code))]
+mod header_rules;
 mod peer_store;
 
 #[cfg(unix)]
@@ -49,7 +52,7 @@ use leani_source_api::{
     NetworkSessionTelemetry, NetworkTelemetry, NetworkTelemetrySnapshot, Partitioning,
     SourceAcquisitionMetrics, SourceBudget, SourceChunk, SourceDescriptor, SourceError, SourcePlan,
 };
-use reth_chainspec::MAINNET;
+use reth_chainspec::{ChainSpec, MAINNET};
 use reth_dns_discovery::{
     DnsDiscoveryConfig, DnsDiscoveryService, Resolver as DnsDiscoveryResolver,
     tree::LinkEntry as DnsDiscoveryLink,
@@ -685,6 +688,10 @@ impl P2pRequestMetrics {
 #[derive(Clone, Debug)]
 pub struct RethP2pSource {
     config: RethP2pConfig,
+    /// Every fork rule follows this spec: the `ForkID`, the DNS fork filter,
+    /// Status, and the header rules. Glamsterdam G1 gives it the Amsterdam
+    /// timestamp.
+    chain_spec: Arc<ChainSpec>,
     descriptor: SourceDescriptor,
     network: Arc<PersistentNetwork>,
     material_tuning: Arc<MaterialBatchTuning>,
@@ -3011,6 +3018,7 @@ fn join_dns_txt_segments<'a>(segments: impl IntoIterator<Item = &'a [u8]>) -> Op
 
 #[derive(Debug)]
 struct DnsPeerSeederRuntime {
+    chain_spec: Arc<ChainSpec>,
     dns_head: Head,
     bootstrap_dns_tree: Option<String>,
     peer_candidates: Arc<PeerCandidateRegistry>,
@@ -3058,6 +3066,7 @@ fn spawn_mainnet_dns_peer_seeder(
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let DnsPeerSeederRuntime {
+            chain_spec,
             dns_head,
             bootstrap_dns_tree,
             peer_candidates,
@@ -3101,7 +3110,7 @@ fn spawn_mainnet_dns_peer_seeder(
         );
         dns_retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-        let fork_filter = MAINNET.fork_filter(dns_head);
+        let fork_filter = chain_spec.fork_filter(dns_head);
         let mut seeded_peers = 0_usize;
         loop {
             tokio::select! {
@@ -3275,6 +3284,7 @@ where
             telemetry,
             network_telemetry,
             peer_recovery_timeout,
+            chain_spec,
             dns_head,
             direct_peers,
             trusted_peer_ids,
@@ -3326,6 +3336,7 @@ where
         let dns_peer_seeder = spawn_mainnet_dns_peer_seeder(
             manager.as_ref().get_ref().handle().clone(),
             DnsPeerSeederRuntime {
+                chain_spec,
                 dns_head,
                 bootstrap_dns_tree,
                 peer_candidates: peer_candidates.clone(),
@@ -3705,6 +3716,7 @@ struct NetworkManagerRuntime {
     telemetry: NetworkSessionTelemetry,
     network_telemetry: NetworkTelemetry,
     peer_recovery_timeout: Duration,
+    chain_spec: Arc<ChainSpec>,
     dns_head: Head,
     direct_peers: Arc<DirectPeerPool>,
     trusted_peer_ids: Vec<B512>,
@@ -4086,6 +4098,7 @@ impl RethP2pSource {
                 priority: 0,
             },
             config,
+            chain_spec: MAINNET.clone(),
             network,
             material_tuning,
             request_metrics: P2pRequestMetrics::default(),
@@ -4799,7 +4812,7 @@ impl RethP2pSource {
             // runs to completion in its own task. Nobody receives a build
             // whose caller was dropped: its manager drops, and discovery
             // with it.
-            let config = builder.build_with_noop_provider(MAINNET.clone());
+            let config = builder.build_with_noop_provider(self.chain_spec.clone());
             match tokio::spawn(async move { Box::pin(config.manager()).await }).await {
                 Ok(built) => built.map_err(|error| error.to_string()),
                 Err(error) => Err(format!("the network manager build stopped: {error}")),
@@ -4842,6 +4855,7 @@ impl RethP2pSource {
                 telemetry: telemetry.clone(),
                 network_telemetry: self.config.network_telemetry.clone(),
                 peer_recovery_timeout: self.config.peer_recovery_timeout,
+                chain_spec: self.chain_spec.clone(),
                 dns_head: advertised_head,
                 direct_peers: self.network.direct_peers.clone(),
                 trusted_peer_ids: self
