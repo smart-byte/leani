@@ -383,6 +383,16 @@ pub enum SubscribeFinality {
 }
 
 impl SubscribeFinality {
+    /// The lowest level a printed row has.
+    #[must_use]
+    pub const fn level(self) -> leani_primitives::Finality {
+        match self {
+            Self::Unattested => leani_primitives::Finality::Unattested,
+            Self::Attested => leani_primitives::Finality::Attested,
+            Self::Finalized => leani_primitives::Finality::Finalized,
+        }
+    }
+
     /// The publish mode of the embedded processor for this level.
     #[must_use]
     pub const fn publish_mode(self) -> crate::config::PublishMode {

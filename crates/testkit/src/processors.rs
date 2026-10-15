@@ -479,7 +479,7 @@ fn descriptor(id: &str, capabilities: CapabilitySet, mode: ReductionMode) -> Pro
         } else {
             DeliveryOrdering::Canonical
         },
-        publication: PublicationPolicy::Attested,
+        publication: PublicationPolicy::Unattested,
         lifecycle: LifecyclePolicies::from_legacy(RetentionPolicy::FullOutputHistory),
         schemas: ProcessorSchemas {
             delta_version: 1,
