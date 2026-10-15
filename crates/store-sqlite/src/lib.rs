@@ -219,7 +219,7 @@ impl Default for DeliveryStorageBudget {
     }
 }
 
-/// Independent logical byte limits for finalized artifacts and included-block
+/// Independent logical byte limits for finalized artifacts and unfinalized-block
 /// candidates awaiting finality.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ArtifactStorageBudget {
@@ -2038,7 +2038,7 @@ async fn migrate(pool: &SqlitePool) -> Result<(), StoreError> {
         ));
     }
     // Stores before the finality vocabulary encode finality 0 = optimistic
-    // inside postcard cursors and undo records; that value now means Preview
+    // inside postcard cursors and undo records; that value now means Unattested
     // and cannot be rewritten by SQL. Stores from the oldest upgradable
     // schema on continue through the migration chain, as does the schema-1
     // bootstrap of a store created by this transaction.
@@ -3278,7 +3278,7 @@ impl SqliteStore {
         // mark_finalized promotes them. Their bytes are still admitted against
         // the delivery budget here so backpressure behaves like any other
         // processor; the flush never re-checks capacity.
-        let defer_publication = matches!(descriptor.publication, PublicationPolicy::FinalizedOnly)
+        let defer_publication = matches!(descriptor.publication, PublicationPolicy::Finalized)
             && delivery_enabled
             && publish_changes
             && cursor.finality != Finality::Finalized;
@@ -3525,7 +3525,7 @@ impl SqliteStore {
         // Canonical ordering publishes those first, in block order, so this
         // block cannot overtake them; block-versioned output keeps waiting
         // for mark_finalized.
-        let released_held = if matches!(descriptor.publication, PublicationPolicy::FinalizedOnly)
+        let released_held = if matches!(descriptor.publication, PublicationPolicy::Finalized)
             && descriptor.delivery_ordering == DeliveryOrdering::Canonical
             && delivery_enabled
             && publish_changes
@@ -3729,7 +3729,7 @@ impl SqliteStore {
             for item in items {
                 // A different checksum need not be a conflict: a processor can
                 // record finality in its delta, so a block applied live as
-                // included differs from its finalized history. Only the
+                // attested differs from its finalized history. Only the
                 // per-block path, which has the processor's finality variants,
                 // can tell, so any applied block falls back to it.
                 if applied_checksum(
@@ -4877,7 +4877,7 @@ impl SqliteStore {
         }
         let (first, last) = if descriptor.lifecycle.delivery.mode == DeliveryPolicyMode::None {
             (None, None)
-        } else if matches!(descriptor.publication, PublicationPolicy::FinalizedOnly) {
+        } else if matches!(descriptor.publication, PublicationPolicy::Finalized) {
             // Nothing was published for this block, so nothing is undone
             // downstream; only the parked changes go away.
             sqlx::query(
@@ -5134,7 +5134,7 @@ impl SqliteStore {
         .bind(finality_i64(Finality::Finalized))
         .execute(&mut *transaction)
         .await?;
-        let flushed_deferred = if matches!(descriptor.publication, PublicationPolicy::FinalizedOnly)
+        let flushed_deferred = if matches!(descriptor.publication, PublicationPolicy::Finalized)
             && descriptor.lifecycle.delivery.mode != DeliveryPolicyMode::None
         {
             release_deferred_changes(&mut transaction, &instance, through).await?
@@ -5287,7 +5287,7 @@ impl SqliteStore {
         let aliases = self.identity_aliases(&instance).await?;
         let snapshot = decode_state_snapshot(descriptor, &instance, &encoded, checksum, &aliases)?;
         // Finality promotion relabels the cursor without touching state, so
-        // a checkpoint taken while its block was only included still fits.
+        // a checkpoint taken while its block was only attested still fits.
         let current = match self.processor_cursor_by_instance(&instance).await? {
             Some(current)
                 if current.finality >= snapshot.cursor.finality
@@ -15713,7 +15713,7 @@ async fn entity_meta_images(
 
 /// Restore output metadata before-images after undo restored the values.
 ///
-/// A before-image taken while its block was still included is restored as
+/// A before-image taken while its block was still unfinalized is restored as
 /// finalized once finality has passed that block, as `mark_finalized` would
 /// have recorded it meanwhile.
 async fn restore_entity_metadata(
@@ -16916,7 +16916,7 @@ fn query_snapshot_id(epoch: [u8; 16], instance: &str, collection: &str, boundary
 /// Highest finalized exact coverage block. The literal 2 is
 /// `finality_i64(Finality::Finalized)`: the partial index
 /// `processor_coverage_finalized` is only usable for that literal, and it
-/// skips included rows, which grow without bound while finality is disabled.
+/// skips unfinalized rows, which grow without bound while finality is disabled.
 const FINALIZED_EXACT_COVERAGE_HEAD: &str = "SELECT block_number FROM processor_coverage
      WHERE instance = ? AND finality = 2
      ORDER BY block_number DESC LIMIT 1";
@@ -17123,7 +17123,7 @@ async fn compacted_coverage_contains(
 ///
 /// Payloads keep the finality they were retained with, while finality
 /// promotion only updates `canonical_blocks`; without the overlay a promoted
-/// frame would still read as included.
+/// frame would still read at its retained level.
 fn decode_recent_frame(
     encoded: &[u8],
     canonical: Option<(Vec<u8>, i64)>,
@@ -19013,16 +19013,16 @@ fn decode_operation(value: i64) -> Result<ChangeOperation, StoreError> {
 
 fn finality_i64(finality: Finality) -> i64 {
     match finality {
-        Finality::Preview => 0,
-        Finality::Included => 1,
+        Finality::Unattested => 0,
+        Finality::Attested => 1,
         Finality::Finalized => 2,
     }
 }
 
 fn decode_finality(value: i64) -> Result<Finality, StoreError> {
     match value {
-        0 => Ok(Finality::Preview),
-        1 => Ok(Finality::Included),
+        0 => Ok(Finality::Unattested),
+        1 => Ok(Finality::Attested),
         2 => Ok(Finality::Finalized),
         _ => Err(StoreError::Invariant(format!(
             "invalid finality value {value}"
@@ -19789,11 +19789,11 @@ mod tests {
                         log_fields: leani_primitives::LogFieldSet::NONE,
                         allow_filtered: false,
                         filter: FilterScope::default(),
-                        minimum_finality: Finality::Included,
+                        minimum_finality: Finality::Attested,
                     }],
                     mode: ReductionMode::OrderedState,
                     delivery_ordering: DeliveryOrdering::Canonical,
-                    publication: PublicationPolicy::IncludedAndFinalized,
+                    publication: PublicationPolicy::Attested,
                     lifecycle: LifecyclePolicies::from_legacy(RetentionPolicy::LatestState),
                     schemas: ProcessorSchemas {
                         delta_version: 1,
@@ -19913,7 +19913,7 @@ mod tests {
                 parent_hash: parent,
                 timestamp: number,
             },
-            finality: Finality::Included,
+            finality: Finality::Attested,
             header: leani_primitives::Material::Complete(leani_primitives::HeaderEnvelope {
                 rlp: None,
                 transactions_root: None,
@@ -20024,7 +20024,7 @@ mod tests {
 
         assert!(matches!(
             store
-                .retain_finalized_artifact(&processor.descriptor, &first, Finality::Included)
+                .retain_finalized_artifact(&processor.descriptor, &first, Finality::Attested)
                 .await,
             Err(StoreError::InvalidConfig(_))
         ));
@@ -20556,7 +20556,7 @@ mod tests {
         .await
         .expect("open artifact-bounded store");
         let mut processor = FixtureProcessor::full_artifacts();
-        processor.descriptor.publication = PublicationPolicy::FinalizedOnly;
+        processor.descriptor.publication = PublicationPolicy::Finalized;
         let included = frame(1, BlockHash::ZERO);
         let delta = processor.map(&included).await.expect("map included");
         store
@@ -20904,7 +20904,7 @@ mod tests {
 
     fn finalized_only_processor() -> FixtureProcessor {
         let mut processor = FixtureProcessor::new();
-        processor.descriptor.publication = PublicationPolicy::FinalizedOnly;
+        processor.descriptor.publication = PublicationPolicy::Finalized;
         processor
     }
 
@@ -20933,7 +20933,7 @@ mod tests {
         let (_directory, store) = store().await;
         let processor = finalized_only_processor();
         let block = frame(1, BlockHash::ZERO);
-        assert_eq!(block.finality, Finality::Included);
+        assert_eq!(block.finality, Finality::Attested);
         let delta = processor.map(&block).await.expect("map");
         store
             .apply(&processor, cursor(&processor, &block, 1), &delta, &[])
@@ -21029,7 +21029,7 @@ mod tests {
     async fn block_versioned_finalized_only_output_keeps_holding_older_blocks() {
         let (_directory, store) = store().await;
         let mut processor = FixtureProcessor::block_output();
-        processor.descriptor.publication = PublicationPolicy::FinalizedOnly;
+        processor.descriptor.publication = PublicationPolicy::Finalized;
         let held = frame(1, BlockHash::ZERO);
         let mut finalized = frame(2, held.block.hash);
         finalized.finality = Finality::Finalized;
@@ -21266,7 +21266,7 @@ mod tests {
         // flush that publishes the earlier blocks around it.
         let (_directory, store) = store().await;
         let mut processor = FixtureProcessor::block_output();
-        processor.descriptor.publication = PublicationPolicy::FinalizedOnly;
+        processor.descriptor.publication = PublicationPolicy::Finalized;
         let batch = u64::try_from(DEFERRED_FLUSH_BATCH).expect("batch fits u64");
         let last = batch + 4;
         let mut order = vec![last];
@@ -25699,7 +25699,7 @@ mod tests {
         let (_directory, store) = store().await;
         let first = frame(1, BlockHash::ZERO);
         let second = frame(2, first.block.hash);
-        assert_eq!(first.finality, Finality::Included);
+        assert_eq!(first.finality, Finality::Attested);
         for current in [&first, &second] {
             store
                 .store_recent_frame(current)
@@ -25735,7 +25735,7 @@ mod tests {
         for (hash, finality) in [
             (first.block.hash, Finality::Finalized),
             (replacement.block.hash, Finality::Finalized),
-            (second.block.hash, Finality::Included),
+            (second.block.hash, Finality::Attested),
         ] {
             assert_eq!(
                 store
@@ -25787,7 +25787,7 @@ mod tests {
         let (_directory, store) = store().await;
         let block = frame(1, BlockHash::ZERO).block;
         store
-            .store_canonical_anchor(ChainId(1), block, Finality::Included)
+            .store_canonical_anchor(ChainId(1), block, Finality::Attested)
             .await
             .expect("optimistic block");
         let conflicting = BlockRef {
@@ -25829,7 +25829,7 @@ mod tests {
             .await
             .expect("finalized anchor");
         store
-            .store_canonical_anchor(ChainId(1), second.block, Finality::Included)
+            .store_canonical_anchor(ChainId(1), second.block, Finality::Attested)
             .await
             .expect("optimistic head");
         assert_eq!(
@@ -29273,8 +29273,8 @@ mod tests {
             (1, Finality::Finalized),
             (2, Finality::Finalized),
             (3, Finality::Finalized),
-            (4, Finality::Included),
-            (5, Finality::Included),
+            (4, Finality::Attested),
+            (5, Finality::Attested),
         ] {
             assert_eq!(
                 canonical_finality(&held, number).await,
@@ -29407,7 +29407,7 @@ mod tests {
             "an ancestry longer than the chain was accepted: {result:?}"
         );
         for number in 1..=5 {
-            assert_eq!(canonical_finality(&store, number).await, Finality::Included);
+            assert_eq!(canonical_finality(&store, number).await, Finality::Attested);
         }
     }
 
@@ -29477,7 +29477,7 @@ mod tests {
         for number in 1..=3 {
             assert_eq!(
                 canonical_finality(&finalized, number).await,
-                Finality::Included,
+                Finality::Attested,
                 "block {number}"
             );
         }

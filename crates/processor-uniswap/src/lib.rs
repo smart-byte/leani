@@ -123,11 +123,11 @@ impl UniswapLatestProcessor {
                     }],
                     ..FilterScope::default()
                 },
-                minimum_finality: Finality::Included,
+                minimum_finality: Finality::Attested,
             }],
             mode: ReductionMode::OrderedState,
             delivery_ordering: DeliveryOrdering::Canonical,
-            publication: PublicationPolicy::IncludedAndFinalized,
+            publication: PublicationPolicy::Attested,
             lifecycle: LifecyclePolicies::from_legacy(RetentionPolicy::LatestState),
             schemas: ProcessorSchemas {
                 delta_version: 2,
@@ -205,7 +205,7 @@ impl UniswapObservationsProcessor {
             requirements: vec![uniswap_requirement(&config)],
             mode: ReductionMode::BlockLocal,
             delivery_ordering: DeliveryOrdering::BlockVersionedIdempotent,
-            publication: PublicationPolicy::IncludedAndFinalized,
+            publication: PublicationPolicy::Attested,
             lifecycle: LifecyclePolicies::from_legacy(RetentionPolicy::FullOutputHistory),
             schemas: ProcessorSchemas {
                 delta_version: 2,
@@ -438,7 +438,7 @@ fn uniswap_requirement(config: &UniswapConfig) -> DataRequirement {
             }],
             ..FilterScope::default()
         },
-        minimum_finality: Finality::Included,
+        minimum_finality: Finality::Attested,
     }
 }
 
@@ -510,7 +510,7 @@ fn finality_variant_checksums(
     let decoded: UniswapPriceDelta = postcard::from_bytes(&delta.payload)
         .map_err(|error| ProcessorError::DeltaPayload(error.to_string()))?;
     let mut checksums = Vec::with_capacity(2);
-    for finality in [Finality::Included, Finality::Finalized] {
+    for finality in [Finality::Attested, Finality::Finalized] {
         let mut variant = decoded.clone();
         for observation in &mut variant.observations {
             observation.finality = finality;

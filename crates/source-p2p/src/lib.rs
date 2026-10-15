@@ -4079,7 +4079,7 @@ impl RethP2pSource {
                     .with(Capability::Logs)
                     .with(Capability::Withdrawals),
                 trust: TrustModel::ProtocolVerified,
-                finality: FinalityModel::Included,
+                finality: FinalityModel::Attested,
                 partitioning: Partitioning::FixedBlockSpan(MAX_FIXED_RANGE_BLOCKS),
                 expected_lag: Duration::from_secs(12),
                 schema_version: format!("reth-p2p.v1+{RETH_VERSION}.{RETH_REVISION}"),
@@ -4350,7 +4350,7 @@ impl RethP2pSource {
         let mut frame = frames.pop().ok_or_else(|| {
             P2pError::InvalidResponse("peer preview request returned no frame".to_owned())
         })?;
-        frame.finality = Finality::Included;
+        frame.finality = Finality::Attested;
         session.clear_error();
         session.set_range(None);
         session.set_phase(NetworkPhase::FollowingHead);
@@ -4371,7 +4371,7 @@ impl RethP2pSource {
         let mut frame = frames.pop().ok_or_else(|| {
             P2pError::InvalidResponse("peer preview request returned no frame".to_owned())
         })?;
-        frame.finality = Finality::Included;
+        frame.finality = Finality::Attested;
         session.clear_error();
         session.set_range(None);
         session.set_phase(NetworkPhase::FollowingHead);
@@ -10654,7 +10654,7 @@ fn normalize_sparse_log_block(
             parent_hash: block_hash(header.parent_hash),
             timestamp: header.timestamp,
         },
-        finality: Finality::Included,
+        finality: Finality::Attested,
         header: if header_requested {
             Material::Complete(HeaderEnvelope {
                 rlp: Some(alloy_rlp::encode(header)),
@@ -10742,7 +10742,7 @@ fn normalize_verified_headers(
                 parent_hash: block_hash(header.parent_hash),
                 timestamp: header.timestamp,
             },
-            finality: Finality::Included,
+            finality: Finality::Attested,
             header: Material::Complete(HeaderEnvelope {
                 rlp: Some(alloy_rlp::encode(header)),
                 transactions_root: Some(block_hash(header.transactions_root)),
@@ -10825,7 +10825,7 @@ fn normalize_verified_bodies(
                 parent_hash: block_hash(header.parent_hash),
                 timestamp: header.timestamp,
             },
-            finality: Finality::Included,
+            finality: Finality::Attested,
             header: Material::Complete(HeaderEnvelope {
                 rlp: Some(alloy_rlp::encode(header)),
                 transactions_root: Some(block_hash(header.transactions_root)),
@@ -11349,7 +11349,7 @@ fn normalize_block(
             parent_hash: block_hash(header.parent_hash),
             timestamp: header.timestamp,
         },
-        finality: Finality::Included,
+        finality: Finality::Attested,
         header: if header_requested {
             Material::Complete(HeaderEnvelope {
                 rlp: header_rlp,
@@ -11682,7 +11682,7 @@ mod tests {
             projection: leani_source_api::FieldProjection::default(),
             log_fields: leani_primitives::LogFieldSet::NONE,
             filters: leani_source_api::FilterSet::default(),
-            minimum_finality: Finality::Included,
+            minimum_finality: Finality::Attested,
             verification_policy: leani_source_api::VerificationPolicy::CompleteCryptographic,
         };
         assert!(header_only_request(&request));
@@ -11726,7 +11726,7 @@ mod tests {
             projection: leani_source_api::FieldProjection::default(),
             log_fields: leani_primitives::LogFieldSet::NONE,
             filters: leani_source_api::FilterSet::default(),
-            minimum_finality: Finality::Included,
+            minimum_finality: Finality::Attested,
             verification_policy: leani_source_api::VerificationPolicy::CompleteCryptographic,
         };
         assert!(header_and_body_only_request(&request));
@@ -13841,7 +13841,7 @@ mod tests {
             allow_filtered: false,
             projection: leani_source_api::FieldProjection::default(),
             filters: leani_source_api::FilterSet::default(),
-            minimum_finality: Finality::Included,
+            minimum_finality: Finality::Attested,
             verification_policy: leani_source_api::VerificationPolicy::CompleteCryptographic,
         }
     }

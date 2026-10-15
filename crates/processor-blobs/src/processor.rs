@@ -99,11 +99,11 @@ impl BlobsProcessor {
                     transaction_types: vec![3],
                     ..FilterScope::default()
                 },
-                minimum_finality: Finality::Included,
+                minimum_finality: Finality::Attested,
             }],
             mode: ReductionMode::BlockLocal,
             delivery_ordering: DeliveryOrdering::BlockVersionedIdempotent,
-            publication: PublicationPolicy::IncludedAndFinalized,
+            publication: PublicationPolicy::Attested,
             lifecycle: LifecyclePolicies::from_legacy(RetentionPolicy::FullOutputHistory),
             schemas: ProcessorSchemas {
                 delta_version: 2,
@@ -288,7 +288,7 @@ impl Processor for BlobsProcessor {
         let decoded: BlobsDelta = postcard::from_bytes(&delta.payload)
             .map_err(|error| ProcessorError::DeltaPayload(error.to_string()))?;
         let mut checksums = Vec::with_capacity(2);
-        for finality in [Finality::Included, Finality::Finalized] {
+        for finality in [Finality::Attested, Finality::Finalized] {
             let mut variant = decoded.clone();
             variant.block.finality = finality;
             let payload = postcard::to_allocvec(&variant)

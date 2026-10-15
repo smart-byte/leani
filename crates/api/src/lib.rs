@@ -2441,8 +2441,8 @@ fn labeled_coverage_intervals(
             while remaining.next_if(|range| range.end().0 < cursor).is_some() {}
             let (to_block, finality) = match remaining.peek() {
                 Some(range) if range.start().0 <= cursor => (range.end().0.min(end), "finalized"),
-                Some(range) if range.start().0 <= end => (range.start().0 - 1, "included"),
-                _ => (end, "included"),
+                Some(range) if range.start().0 <= end => (range.start().0 - 1, "attested"),
+                _ => (end, "attested"),
             };
             intervals.push(CoverageInterval {
                 from_block: cursor,
@@ -7033,7 +7033,7 @@ fn ensure_output_retained(processor: &dyn Processor) -> Result<(), ApiError> {
 fn ensure_snapshot_follow_supported(processor: &dyn Processor) -> Result<(), ApiError> {
     if matches!(
         processor.descriptor().publication,
-        leani_processor_api::PublicationPolicy::FinalizedOnly
+        leani_processor_api::PublicationPolicy::Finalized
     ) {
         Err(ApiError::conflict(
             "finalized_only_snapshot",
@@ -8670,7 +8670,7 @@ mod tests {
         };
         if canonical_row {
             store
-                .store_canonical_anchor(ChainId(1), block, Finality::Included)
+                .store_canonical_anchor(ChainId(1), block, Finality::Attested)
                 .await
                 .expect("canonical observation block");
         }
@@ -8686,7 +8686,7 @@ mod tests {
                 block_number: block.number,
                 block_hash: block.hash,
                 log_index: 7,
-                finality: Finality::Included,
+                finality: Finality::Attested,
             }],
         })
         .expect("observation delta");
@@ -8705,7 +8705,7 @@ mod tests {
                     chain_id: ChainId(1),
                     block_number: block.number,
                     block_hash: block.hash,
-                    finality: Finality::Included,
+                    finality: Finality::Attested,
                     sequence: 1,
                 },
                 &delta,
@@ -8727,7 +8727,7 @@ mod tests {
             timestamp: 1_800_000_012,
         };
         store
-            .store_canonical_anchor(ChainId(1), block, Finality::Included)
+            .store_canonical_anchor(ChainId(1), block, Finality::Attested)
             .await
             .expect("canonical block-summary block");
         let payload = postcard::to_allocvec(&leani_processor_block_summary::BlockSummaryEntity {
@@ -8743,7 +8743,7 @@ mod tests {
             excess_blob_gas: Some(393_216),
             transaction_count: Some(123),
             size_bytes: None,
-            finality: Finality::Included,
+            finality: Finality::Attested,
         })
         .expect("block-summary delta");
         let delta = leani_processor_api::EncodedDelta::new(
@@ -8761,7 +8761,7 @@ mod tests {
                     chain_id: ChainId(1),
                     block_number: block.number,
                     block_hash: block.hash,
-                    finality: Finality::Included,
+                    finality: Finality::Attested,
                     sequence: 1,
                 },
                 &delta,
@@ -8780,7 +8780,7 @@ mod tests {
         let mut recipient = [0; 32];
         recipient[12..].copy_from_slice(&[0x11; 20]);
         let mut frame = leani_testkit::fixture_frame(1, BlockHash::ZERO);
-        frame.finality = Finality::Included;
+        frame.finality = Finality::Attested;
         frame.logs = leani_primitives::Material::Complete(vec![leani_primitives::Log {
             address: Address::new([0x33; 20]),
             topics: vec![
@@ -8803,7 +8803,7 @@ mod tests {
                     chain_id: ChainId(1),
                     block_number: frame.block.number,
                     block_hash: frame.block.hash,
-                    finality: Finality::Included,
+                    finality: Finality::Attested,
                     sequence: 1,
                 },
                 &delta,
@@ -9526,7 +9526,7 @@ mod tests {
         assert_eq!(body["data"]["blockHash"], block.hash.to_string());
         assert_eq!(body["data"]["gasUsed"], 31_000_000);
         assert_eq!(body["data"]["transactionCount"], 123);
-        assert_eq!(body["data"]["finality"], "included");
+        assert_eq!(body["data"]["finality"], "attested");
     }
 
     #[tokio::test]
@@ -9614,7 +9614,7 @@ mod tests {
     #[allow(clippy::too_many_lines)]
     async fn typed_endpoints_report_finality_from_entity_metadata() {
         // Audit M-P1: typed endpoints reported the finality a block had when
-        // it was reduced, so finalized data stayed "included".
+        // it was reduced, so finalized data stayed "attested".
         let directory = tempfile::tempdir().expect("tempdir");
         let store = SqliteStore::open(leani_store_sqlite::StoreConfig::new(
             directory.path().join("node.sqlite"),
@@ -9645,7 +9645,7 @@ mod tests {
         seed_uniswap_observation(&store, latest.as_ref(), Address::new([0x22; 20]), false).await;
         let blobs = Arc::new(BlobsProcessor::default());
         let blob_block = blobs.schedule().first_block();
-        seed_blob_block(&store, &blobs, blob_block, 0, Finality::Included).await;
+        seed_blob_block(&store, &blobs, blob_block, 0, Finality::Attested).await;
         let blob_hash =
             BlockHash::new([u8::try_from(blob_block % 251).expect("small hash byte"); 32]);
         // Review 1, minor 2: ERC-20 balances too.
@@ -9813,7 +9813,7 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(body["timestamp"], observed.timestamp);
         assert_eq!(body["data"]["blockNumber"], observed.number.0);
-        assert_eq!(body["data"]["finality"], "included");
+        assert_eq!(body["data"]["finality"], "attested");
     }
 
     #[tokio::test]
@@ -12342,7 +12342,7 @@ mod tests {
         .expect("store");
         let processor = Arc::new(
             leani_testkit::BlockLocalCounter::default()
-                .with_publication(PublicationPolicy::FinalizedOnly),
+                .with_publication(PublicationPolicy::Finalized),
         );
         apply_finalized_blocks(&store, processor.as_ref(), 1..=2).await;
         let configured: Arc<dyn Processor> = processor;
@@ -12548,9 +12548,8 @@ mod tests {
         ))
         .await
         .expect("store");
-        let processor: Arc<dyn Processor> = Arc::new(
-            BlockLocalCounter::default().with_publication(PublicationPolicy::FinalizedOnly),
-        );
+        let processor: Arc<dyn Processor> =
+            Arc::new(BlockLocalCounter::default().with_publication(PublicationPolicy::Finalized));
         let router =
             router_with_processors(store, vec![processor], Vec::new(), ApiConfig::default())
                 .expect("router");
@@ -13354,7 +13353,7 @@ mod tests {
             balance: Quantity::new([0; 32]),
             as_of_block: BlockNumber(7),
             block_hash: BlockHash::new([7; 32]),
-            finality: Finality::Included,
+            finality: Finality::Attested,
             coverage_from: BlockNumber(1),
             complete: false,
             incomplete_from: Some(BlockNumber(7)),
@@ -14657,7 +14656,7 @@ mod tests {
             CoverageInterval {
                 from_block: 25,
                 to_block: 40,
-                finality: "included",
+                finality: "attested",
             },
         ];
         assert_eq!(missing_coverage_blocks(10, 30, &available), 4);
@@ -14719,16 +14718,16 @@ mod tests {
             labels(&labeled_coverage_intervals(&coverage, &finalized)),
             vec![
                 (5, 8, "finalized"),
-                (9, 11, "included"),
+                (9, 11, "attested"),
                 (12, 14, "finalized"),
-                (15, 20, "included"),
-                (30, 32, "included"),
+                (15, 20, "attested"),
+                (30, 32, "attested"),
                 (33, 35, "finalized"),
             ],
         );
         assert_eq!(
             labels(&labeled_coverage_intervals(&coverage, &[])),
-            vec![(5, 20, "included"), (30, 35, "included")],
+            vec![(5, 20, "attested"), (30, 35, "attested")],
         );
         assert_eq!(
             labels(&labeled_coverage_intervals(
@@ -14765,7 +14764,7 @@ mod tests {
                 CoverageInterval {
                     from_block: 90,
                     to_block: 100,
-                    finality: "included",
+                    finality: "attested",
                 },
             ],
             configured_start_block: 0,
@@ -15070,7 +15069,7 @@ mod tests {
         let mut hashes = Vec::new();
         for number in 0..=4 {
             let mut frame = fixture_frame(number, parent);
-            frame.finality = Finality::Included;
+            frame.finality = Finality::Attested;
             let delta = processor.map(&frame).await.expect("map");
             let descriptor = processor.descriptor();
             store
@@ -15119,7 +15118,7 @@ mod tests {
             body["available"],
             json!([
                 { "fromBlock": 0, "toBlock": 2, "finality": "finalized" },
-                { "fromBlock": 3, "toBlock": 4, "finality": "included" }
+                { "fromBlock": 3, "toBlock": 4, "finality": "attested" }
             ]),
         );
         assert_eq!(body["finalizedThrough"], 2);
@@ -15153,7 +15152,7 @@ mod tests {
             excess_blob_gas: None,
             transaction_count: Some(3),
             size_bytes: None,
-            finality: Finality::Included,
+            finality: Finality::Attested,
         };
         let record = ChangeRecord {
             delivery_encoding_version: 1,

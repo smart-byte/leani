@@ -85,7 +85,7 @@ impl BlockSummaryProcessor {
                     log_fields: leani_primitives::LogFieldSet::NONE,
                     allow_filtered: false,
                     filter: FilterScope::default(),
-                    minimum_finality: Finality::Included,
+                    minimum_finality: Finality::Attested,
                 }],
                 mode: ReductionMode::BlockLocal,
                 delivery_ordering: DeliveryOrdering::BlockVersionedIdempotent,

@@ -524,15 +524,15 @@
             "id": "finality",
             "long": "finality",
             "short": null,
-            "help": "Lowest status that counts as a result: `preview`, `included` (default), or `finalized`",
+            "help": "Lowest level that counts as a result: `unattested`, `attested` (default), or `finalized`",
             "required": false,
             "action": "Set",
             "defaultValues": [
-              "included"
+              "attested"
             ],
             "possibleValues": [
-              "preview",
-              "included",
+              "unattested",
+              "attested",
               "finalized"
             ]
           },
@@ -868,15 +868,15 @@
                 "id": "finality",
                 "long": "finality",
                 "short": null,
-                "help": "Finality of the subscription state being reset (`included` or `finalized`)",
+                "help": "Finality of the subscription state being reset (`attested` or `finalized`)",
                 "required": false,
                 "action": "Set",
                 "defaultValues": [
-                  "included"
+                  "attested"
                 ],
                 "possibleValues": [
-                  "preview",
-                  "included",
+                  "unattested",
+                  "attested",
                   "finalized"
                 ]
               },

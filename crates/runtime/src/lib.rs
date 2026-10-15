@@ -619,7 +619,7 @@ impl BackfillJob {
             });
         let minimum_finality = requirements
             .iter()
-            .fold(Finality::Included, |required, requirement| {
+            .fold(Finality::Attested, |required, requirement| {
                 required.max(requirement.minimum_finality)
             });
         let log_fields = requirements
@@ -1130,7 +1130,7 @@ async fn map_with_finality_variants(
             "finality variants must include the exact delta checksum".to_owned(),
         ));
     }
-    for finality in [Finality::Included, Finality::Finalized] {
+    for finality in [Finality::Attested, Finality::Finalized] {
         if finality == frame.finality {
             continue;
         }
@@ -2895,7 +2895,7 @@ impl HistoricalRuntime {
             }
             let publish_changes = !matches!(
                 self.processor.descriptor().publication,
-                PublicationPolicy::TerminalOnly
+                PublicationPolicy::JobResult
             ) || mapped.delta.block.number == job.request.range.end();
             let mut backpressured = false;
             let outcome = loop {
@@ -3196,7 +3196,7 @@ impl HistoricalRuntime {
                     finality: mapped.finality,
                     publish_changes: !matches!(
                         self.processor.descriptor().publication,
-                        PublicationPolicy::TerminalOnly
+                        PublicationPolicy::JobResult
                     ) || mapped.delta.block.number == job.request.range.end(),
                 })
                 .collect::<Vec<_>>();
@@ -3315,7 +3315,7 @@ impl HistoricalRuntime {
                     for mapped in &batch {
                         let publish_changes = !matches!(
                             self.processor.descriptor().publication,
-                            PublicationPolicy::TerminalOnly
+                            PublicationPolicy::JobResult
                         ) || mapped.delta.block.number
                             == job.request.range.end();
                         let fair_turn = self
@@ -3827,7 +3827,7 @@ impl SharedLiveRuntime {
         let mut identities = HashSet::new();
         for processor in &processors {
             let descriptor = processor.descriptor();
-            if matches!(descriptor.publication, PublicationPolicy::TerminalOnly) {
+            if matches!(descriptor.publication, PublicationPolicy::JobResult) {
                 return Err(RuntimeError::InvalidConfig(format!(
                     "terminal-only processor {} requires a bounded historical job",
                     descriptor.id
@@ -6211,7 +6211,7 @@ impl SharedLiveRuntime {
                 });
                 if let Some(delta) = candidate {
                     let outcome = match self
-                        .apply_delta(processor.as_ref(), &delta, Finality::Included)
+                        .apply_delta(processor.as_ref(), &delta, Finality::Attested)
                         .await
                     {
                         Ok(outcome) => outcome,
@@ -6352,7 +6352,7 @@ impl SharedLiveRuntime {
             return Ok(false);
         };
         let outcome = if stored_checksum == delta.checksum {
-            self.apply_delta(processor, delta, Finality::Included)
+            self.apply_delta(processor, delta, Finality::Attested)
                 .await?
         } else {
             let mut equivalent_checksums = processor.finality_variant_checksums(delta)?;
@@ -6794,7 +6794,7 @@ fn compile_live_request(
         });
     let minimum_finality = requirements
         .iter()
-        .fold(Finality::Included, |all, requirement| {
+        .fold(Finality::Attested, |all, requirement| {
             all.max(requirement.minimum_finality)
         });
     let allow_filtered = requirements
@@ -6944,7 +6944,7 @@ impl LiveRuntime {
         }
         if matches!(
             processor.descriptor().publication,
-            PublicationPolicy::TerminalOnly
+            PublicationPolicy::JobResult
         ) {
             return Err(RuntimeError::InvalidConfig(
                 "terminal-only processors require a bounded historical job".to_owned(),
@@ -8833,7 +8833,7 @@ mod tests {
     ) -> Result<Vec<BlockHash>, ProcessorError> {
         delta.validate(descriptor)?;
         let mut checksums = Vec::with_capacity(2);
-        for finality in [Finality::Included, Finality::Finalized] {
+        for finality in [Finality::Attested, Finality::Finalized] {
             let mut payload = delta.payload.clone();
             let encoded_finality = payload
                 .last_mut()
@@ -9275,7 +9275,7 @@ mod tests {
             projection: leani_source_api::FieldProjection::default(),
             log_fields: leani_primitives::LogFieldSet::NONE,
             filters: leani_source_api::FilterSet::default(),
-            minimum_finality: Finality::Included,
+            minimum_finality: Finality::Attested,
             verification_policy: VerificationPolicy::CompleteCryptographic,
         };
         let body = CapabilitySet::of(Capability::Body);
@@ -9513,7 +9513,7 @@ mod tests {
             log_fields: LogFieldSet::NONE,
             allow_filtered: true,
             filter,
-            minimum_finality: Finality::Included,
+            minimum_finality: Finality::Attested,
         };
         let sender_scope = leani_primitives::FilterScope {
             senders: vec![sender],
@@ -9594,7 +9594,7 @@ mod tests {
                 senders: vec![sender],
                 ..leani_primitives::FilterScope::default()
             },
-            minimum_finality: Finality::Included,
+            minimum_finality: Finality::Attested,
         }
     }
 
@@ -10435,7 +10435,7 @@ mod tests {
 
     fn included_frame(number: u64, parent: BlockHash) -> leani_primitives::BlockFrame {
         let mut frame = fixture_frame(number, parent);
-        frame.finality = Finality::Included;
+        frame.finality = Finality::Attested;
         frame
     }
 
@@ -10468,7 +10468,7 @@ mod tests {
             projection: FieldProjection::default(),
             log_fields: leani_primitives::LogFieldSet::NONE,
             filters: FilterSet::default(),
-            minimum_finality: Finality::Included,
+            minimum_finality: Finality::Attested,
             verification_policy: VerificationPolicy::CompleteCryptographic,
         }
     }
@@ -10505,7 +10505,7 @@ mod tests {
                 let mut frame = fixture_frame(number, parent);
                 frame.block.hash = e2e_hash(number);
                 frame.block.parent_hash = parent;
-                frame.finality = Finality::Included;
+                frame.finality = Finality::Attested;
                 frame.header = Material::Complete(complete_header(None));
                 parent = frame.block.hash;
                 frame
@@ -12990,7 +12990,7 @@ mod tests {
         // finality promoted them afterwards.
         let mut tip = None;
         for mut frame in frames(range) {
-            frame.finality = Finality::Included;
+            frame.finality = Finality::Attested;
             frame.provenance.push(leani_primitives::Provenance {
                 source_id: leani_primitives::SourceId::new("live-cache").expect("source ID"),
                 source_kind: SourceKind::ExecutionP2p,
@@ -13051,9 +13051,8 @@ mod tests {
             fixture_source_descriptor("terminal-history", range),
             frames(range),
         ));
-        let processor = Arc::new(
-            BlockLocalCounter::default().with_publication(PublicationPolicy::TerminalOnly),
-        );
+        let processor =
+            Arc::new(BlockLocalCounter::default().with_publication(PublicationPolicy::JobResult));
         let (_directory, store) = store().await;
         let runtime = HistoricalRuntime::new(
             store.clone(),
@@ -16406,7 +16405,7 @@ mod tests {
     #[tokio::test]
     async fn unfinalized_gap_replay_pauses_until_finality_then_recovers_from_history() {
         let range = BlockRange::new(BlockNumber(0), BlockNumber(4)).expect("range");
-        let chain = live_chain(Finality::Included);
+        let chain = live_chain(Finality::Attested);
         let fourth = live_fixture(3, chain[2].block.hash);
         let fifth = live_fixture(4, fourth.block.hash);
         let block_local = Arc::new(Requiring::new(
@@ -16489,7 +16488,7 @@ mod tests {
     #[tokio::test]
     async fn block_local_gap_replay_isolates_a_mapping_failure_instead_of_failing_the_lane() {
         let range = BlockRange::new(BlockNumber(0), BlockNumber(2)).expect("range");
-        let chain = live_chain(Finality::Included);
+        let chain = live_chain(Finality::Attested);
         let processor = Arc::new(FailOnceCounter::named("replay-mapping-failure"));
         let (_directory, store) = store().await;
         for frame in &chain {
@@ -18651,7 +18650,7 @@ mod tests {
             frame.finality = Finality::Finalized;
             apply_live_frame(&clean, ledger.as_ref(), &frame, sequence).await;
             if frame.block.number == BlockNumber(2) {
-                frame.finality = Finality::Included;
+                frame.finality = Finality::Attested;
             }
             apply_live_frame(&store, ledger.as_ref(), &frame, sequence).await;
         }
@@ -18862,7 +18861,7 @@ mod tests {
         // frame shows a pending delta to be a finality variant.
         for (sequence, frame) in (1..).zip(&chain) {
             store
-                .store_canonical_anchor(ChainId(1), frame.block, Finality::Included)
+                .store_canonical_anchor(ChainId(1), frame.block, Finality::Attested)
                 .await
                 .expect("canonical block");
             apply_live_frame(&store, ledger.as_ref(), frame, sequence).await;
@@ -19060,7 +19059,7 @@ mod tests {
     #[tokio::test]
     async fn a_lane_paused_at_subscribe_receives_material_it_requires_after_resuming() {
         let range = BlockRange::new(BlockNumber(0), BlockNumber(2)).expect("range");
-        let chain = live_chain(Finality::Included);
+        let chain = live_chain(Finality::Attested);
         let paused = Arc::new(FilteredCounter::named(
             "paused-at-subscribe",
             vec![sender_requirement(REPLAY_SENDER)],
@@ -19115,7 +19114,7 @@ mod tests {
     #[tokio::test]
     async fn a_reorg_leaves_a_paused_lane_paused() {
         let range = BlockRange::new(BlockNumber(0), BlockNumber(2)).expect("range");
-        let chain = live_chain(Finality::Included);
+        let chain = live_chain(Finality::Attested);
         let mut replacement = live_fixture(2, chain[1].block.hash);
         replacement.block.hash = BlockHash::new([0x72; 32]);
         // Parked ahead of its cursor, so it stays paused until history
@@ -19132,7 +19131,7 @@ mod tests {
         // A lane parks at a block the store holds as canonical, so its marker
         // is on the canonical chain.
         store
-            .store_canonical_anchor(ChainId(1), chain[1].block, Finality::Included)
+            .store_canonical_anchor(ChainId(1), chain[1].block, Finality::Attested)
             .await
             .expect("canonical block");
         store
@@ -19187,7 +19186,7 @@ mod tests {
     #[tokio::test]
     async fn a_mapping_failure_during_a_reorg_does_not_fail_a_paused_lane() {
         let range = BlockRange::new(BlockNumber(0), BlockNumber(2)).expect("range");
-        let chain = live_chain(Finality::Included);
+        let chain = live_chain(Finality::Attested);
         let mut replacement = live_fixture(2, chain[1].block.hash);
         replacement.block.hash = BlockHash::new([0x73; 32]);
         let paused = Arc::new(FailOnceCounter::named("reorg-mapping-paused"));
@@ -19562,7 +19561,7 @@ mod tests {
     #[tokio::test]
     async fn concurrent_drains_of_one_live_gap_do_not_fail_the_lane() {
         let range = BlockRange::new(BlockNumber(0), BlockNumber(2)).expect("range");
-        let chain = live_chain(Finality::Included);
+        let chain = live_chain(Finality::Attested);
         let processor = Arc::new(RendezvousCounter {
             inner: BlockLocalCounter::named("concurrent-gap-counter"),
             rendezvous: tokio::sync::Barrier::new(2),
@@ -20013,7 +20012,7 @@ mod tests {
                     &MappedFrame {
                         delta,
                         equivalent_checksums,
-                        finality: Finality::Included,
+                        finality: Finality::Attested,
                         estimated_bytes: 0,
                         material: None,
                         _mapped_byte_permit: None,
@@ -20117,7 +20116,7 @@ mod tests {
                             chain_id: delta.chain_id,
                             block_number: delta.block.number,
                             block_hash: delta.block.hash,
-                            finality: Finality::Included,
+                            finality: Finality::Attested,
                             sequence: 1,
                         },
                         &delta,
@@ -20182,7 +20181,7 @@ mod tests {
         };
         let stream_id = job.delivery_stream_id.clone();
         let mut included = history[2].clone();
-        included.finality = Finality::Included;
+        included.finality = Finality::Attested;
         let mut live = processor.map(&included).await.expect("map included");
         if let Some(payload) = live_payload {
             live = EncodedDelta::new(processor.descriptor(), live.chain_id, live.block, payload);
@@ -20278,7 +20277,7 @@ mod tests {
     #[tokio::test]
     async fn history_microbatches_still_reject_other_content_applied_live() {
         // Seven transactions where history has none: not a finality variant.
-        let other = [7_u64.to_be_bytes().as_slice(), &[Finality::Included as u8]].concat();
+        let other = [7_u64.to_be_bytes().as_slice(), &[Finality::Attested as u8]].concat();
         for subscription in [true, false] {
             let run = history_over_live_block(subscription, Some(other.clone())).await;
             let error = run.result.expect_err("other content conflicts");
@@ -21163,7 +21162,7 @@ mod tests {
         let held = keyed.map(&other).await.expect("map other logs");
         let error = run
             .live(Vec::new())
-            .apply_delta(keyed.as_ref(), &held, Finality::Included)
+            .apply_delta(keyed.as_ref(), &held, Finality::Attested)
             .await
             .expect_err("other content conflicts");
         assert!(
@@ -21431,7 +21430,7 @@ mod tests {
             .expect("map the included block");
         let outcome = run
             .live(Vec::new())
-            .apply_delta(keyed.as_ref(), &held, Finality::Included)
+            .apply_delta(keyed.as_ref(), &held, Finality::Attested)
             .await
             .expect("the finalized variant is applied");
         assert!(matches!(outcome, ApplyOutcome::AlreadyApplied));
@@ -22001,9 +22000,8 @@ mod tests {
                 LiveStep::Event(ChainEvent::Block(Box::new(third))),
             ],
         ));
-        let processor = Arc::new(
-            BlockLocalCounter::default().with_publication(PublicationPolicy::FinalizedOnly),
-        );
+        let processor =
+            Arc::new(BlockLocalCounter::default().with_publication(PublicationPolicy::Finalized));
         let (_directory, store) = store().await;
         LiveRuntime::new(
             store.clone(),
@@ -22646,7 +22644,7 @@ mod tests {
             "synthetic.counter".to_owned(),
             block,
             leani_store_sqlite::DeliveryOriginKind::Live,
-            Finality::Included,
+            Finality::Attested,
         )
     }
 
@@ -23413,7 +23411,7 @@ mod tests {
         )));
         let (_directory, store) = store().await;
         // History serves only finalized blocks, and nothing up to block 4 is.
-        follow_across_downtime(&store, &chain, 4, Finality::Included, |steps| {
+        follow_across_downtime(&store, &chain, 4, Finality::Attested, |steps| {
             filling_live(
                 &store,
                 &lanes,

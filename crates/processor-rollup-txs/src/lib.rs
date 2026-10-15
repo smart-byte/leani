@@ -288,11 +288,11 @@ impl RollupTxsProcessor {
                     recipients: by_recipient.keys().copied().collect(),
                     ..FilterScope::default()
                 },
-                minimum_finality: Finality::Included,
+                minimum_finality: Finality::Attested,
             }],
             mode: ReductionMode::BlockLocal,
             delivery_ordering: DeliveryOrdering::BlockVersionedIdempotent,
-            publication: PublicationPolicy::IncludedAndFinalized,
+            publication: PublicationPolicy::Attested,
             lifecycle: LifecyclePolicies::from_legacy(RetentionPolicy::FullOutputHistory),
             schemas: ProcessorSchemas {
                 // The unreleased first implementation's deltas, version 1, have
@@ -449,7 +449,7 @@ impl Processor for RollupTxsProcessor {
         ))
     }
 
-    /// An included block re-delivered as finalized differs only in its finality.
+    /// An attested block re-delivered as finalized differs only in its finality.
     fn finality_variant_checksums(
         &self,
         delta: &EncodedDelta,
@@ -458,7 +458,7 @@ impl Processor for RollupTxsProcessor {
         let decoded: RollupTxsDelta = postcard::from_bytes(&delta.payload)
             .map_err(|error| ProcessorError::DeltaPayload(error.to_string()))?;
         let mut checksums = Vec::with_capacity(2);
-        for finality in [Finality::Included, Finality::Finalized] {
+        for finality in [Finality::Attested, Finality::Finalized] {
             let mut variant = decoded.clone();
             variant.block.finality = finality;
             let payload = postcard::to_allocvec(&variant)
@@ -771,7 +771,7 @@ mod tests {
                 parent_hash: BlockHash::new([0x41; 32]),
                 timestamp,
             },
-            finality: Finality::Included,
+            finality: Finality::Attested,
             header: Material::Complete(HeaderEnvelope {
                 rlp: None,
                 transactions_root: None,
