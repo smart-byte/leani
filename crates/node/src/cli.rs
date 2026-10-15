@@ -371,12 +371,12 @@ pub enum SubscribeMode {
 /// Lowest chain-confidence level that counts as a subscription result.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 pub enum SubscribeFinality {
-    /// Like `attested`, but an unverified peer preview from embedded startup
-    /// also counts, so `--once` can return it. Fastest first output.
+    /// Print blocks as soon as the live lane accepts them: peers agree on the
+    /// header, it passes Leani's header rules and extends the delivered chain.
+    /// The sync committee has not attested them yet, so they can be undone.
     Unattested,
     /// Print blocks once the sync committee attested them; a reorg can still
-    /// remove them. While following, embedded startup may show labelled peer
-    /// previews first; they never satisfy `--once`.
+    /// remove them.
     Attested,
     /// Print blocks only after Ethereum consensus has finalized them.
     Finalized,

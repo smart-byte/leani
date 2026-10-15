@@ -316,14 +316,6 @@ impl Finality {
     }
 }
 
-/// Canonicality transition consumed by the runtime and change stream.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub enum CanonicalChainEvent {
-    Applied { block: BlockRef, finality: Finality },
-    Reverted { block: BlockRef },
-    FinalityAdvanced { block: BlockRef, finality: Finality },
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

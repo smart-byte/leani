@@ -6619,11 +6619,6 @@ impl EmbeddedNetworkRuntime {
         self.task.is_finished()
     }
 
-    #[must_use]
-    pub(crate) fn cancellation_token(&self) -> CancellationToken {
-        self.cancellation.clone()
-    }
-
     pub(crate) async fn shutdown(mut self) {
         self.cancellation.cancel();
         let _ =

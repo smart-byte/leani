@@ -36,6 +36,13 @@ record, and documented RPC contracts.
   6 s into each slot, until the slot's head arrives. Attested blocks reach
   processors about 6 s earlier on average, and up to 12 s.
 
+### Removed
+
+- The embedded `leani subscribe` no longer prints unverified peer previews
+  during startup. Rows at `unattested` come from the verified lane, which
+  checks a peer quorum, Leani's header rules and the link to the delivered
+  chain before printing them.
+
 ## [0.1.0-rc.7] - 2026-10-14
 
 ### Added
