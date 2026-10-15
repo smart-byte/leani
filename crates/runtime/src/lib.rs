@@ -6442,30 +6442,44 @@ impl SharedLiveRuntime {
     }
 
     /// Promote the lane's blocks through `through` to attested. A processor
-    /// that has not covered `through` yet is skipped: its pending blocks
+    /// that has not covered `through` yet promotes through its cursor, when
+    /// that block is on the attested chain: one its delivery limit paused
+    /// frees capacity only once its parked changes go out. Its pending blocks
     /// replay at their canonical level, which is attested from here on.
     async fn apply_attested(
         &self,
         through: leani_primitives::BlockRef,
         report: &mut SharedLiveReport,
     ) -> Result<(), RuntimeError> {
+        let chain_id = self.source.descriptor().chain_id;
         self.store
-            .mark_recent_attested(
-                self.source.descriptor().chain_id,
-                through.number,
-                through.hash,
-            )
+            .mark_recent_attested(chain_id, through.number, through.hash)
             .await?;
         for processor in &self.processors {
-            if self
+            let descriptor = processor.descriptor();
+            let covered = if self
                 .store
-                .coverage_block_by_hash(processor.descriptor(), through.hash)
+                .coverage_block_by_hash(descriptor, through.hash)
                 .await?
                 .is_some()
             {
-                self.store
-                    .mark_attested(processor.descriptor(), through.number, through.hash)
-                    .await?;
+                Some((through.number, through.hash))
+            } else if let Some(cursor) = self.store.processor_cursor(descriptor).await?
+                && cursor.block_number < through.number
+                && self
+                    .store
+                    .canonical_block(chain_id, cursor.block_number)
+                    .await?
+                    .is_some_and(|(row, finality)| {
+                        row.hash == cursor.block_hash && finality >= Finality::Attested
+                    })
+            {
+                Some((cursor.block_number, cursor.block_hash))
+            } else {
+                None
+            };
+            if let Some((number, hash)) = covered {
+                self.store.mark_attested(descriptor, number, hash).await?;
             }
         }
         report.attestations = report.attestations.saturating_add(1);
@@ -15905,6 +15919,77 @@ mod tests {
                 (1, Finality::Attested, ChangeDirection::Apply),
             ],
             "block 2 stays parked until a later attested head covers it"
+        );
+    }
+
+    #[tokio::test]
+    async fn attestation_releases_what_a_paused_processor_parked() {
+        // Review: a processor its delivery limit paused below the attested
+        // block was skipped, so its parked changes never went out, and no
+        // acknowledgement could free the capacity they hold.
+        let range = BlockRange::new(BlockNumber(0), BlockNumber(2)).expect("range");
+        let mut steps = Vec::new();
+        let mut parent = BlockHash::ZERO;
+        let mut through = None;
+        for number in 0..=2 {
+            let mut frame = live_fixture(number, parent);
+            frame.finality = Finality::Unattested;
+            parent = frame.block.hash;
+            through = Some(frame.block);
+            steps.push(LiveStep::Event(ChainEvent::Block(Box::new(frame))));
+        }
+        steps.push(LiveStep::Event(ChainEvent::Attested {
+            through: through.expect("block 2"),
+        }));
+        // One parked block holds 56 bytes: block 1 crosses the limit.
+        let paused = Arc::new(
+            BlockLocalCounter::named("attested-paused")
+                .with_publication(PublicationPolicy::Attested)
+                .with_delivery_max_bytes(100),
+        );
+        let (_directory, store) = store().await;
+        SharedLiveRuntime::new(
+            store.clone(),
+            Arc::new(ScriptedLiveSource::new(
+                e2e_descriptor("paused-live", range),
+                steps,
+            )),
+            vec![paused.clone()],
+            SharedLiveRuntimeConfig::default(),
+        )
+        .expect("runtime")
+        .run(
+            LiveStart::Head,
+            default_source_budget(),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("run");
+        assert_eq!(
+            store
+                .processor_runtime_state(paused.descriptor())
+                .await
+                .expect("state")
+                .state,
+            ProcessorRunState::Paused
+        );
+        assert_eq!(
+            store
+                .processor_cursor(paused.descriptor())
+                .await
+                .expect("cursor")
+                .map(|cursor| cursor.block_number),
+            Some(BlockNumber(0))
+        );
+        assert_eq!(
+            store
+                .changes(paused.descriptor(), ChainId(1), 0, 100)
+                .await
+                .expect("changes")
+                .into_iter()
+                .map(|change| (change.block.number.0, change.finality, change.direction))
+                .collect::<Vec<_>>(),
+            vec![(0, Finality::Attested, ChangeDirection::Apply)]
         );
     }
 
