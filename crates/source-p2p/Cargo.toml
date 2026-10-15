@@ -24,6 +24,9 @@ leani-primitives = { path = "../primitives" }
 leani-source-api = { path = "../source-api" }
 postcard.workspace = true
 reth-chainspec.workspace = true
+reth-consensus.workspace = true
+reth-ethereum-consensus.workspace = true
+reth-primitives-traits.workspace = true
 reth-discv5.workspace = true
 reth-dns-discovery.workspace = true
 reth-ethereum-primitives.workspace = true

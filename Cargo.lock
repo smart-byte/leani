@@ -3817,7 +3817,7 @@ dependencies = [
  "libc",
  "percent-encoding",
  "pin-project-lite",
- "socket2 0.6.5",
+ "socket2 0.5.10",
  "tokio",
  "tower-service",
  "tracing",
@@ -4821,12 +4821,15 @@ dependencies = [
  "leani-source-api",
  "postcard",
  "reth-chainspec",
+ "reth-consensus",
  "reth-discv5",
  "reth-dns-discovery",
+ "reth-ethereum-consensus",
  "reth-ethereum-primitives",
  "reth-network",
  "reth-network-p2p",
  "reth-network-peers",
+ "reth-primitives-traits",
  "reth-tasks",
  "serde",
  "serde_json",
@@ -6318,7 +6321,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash",
  "rustls",
- "socket2 0.6.5",
+ "socket2 0.5.10",
  "thiserror 2.0.19",
  "tokio",
  "tracing",
@@ -6358,7 +6361,7 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.6.5",
+ "socket2 0.5.10",
  "tracing",
  "windows-sys 0.61.2",
 ]
@@ -6801,6 +6804,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "reth-consensus-common"
+version = "2.5.2"
+source = "git+https://github.com/paradigmxyz/reth?rev=5a6940e351fed80458fe6c9da8581cbe4b8bd036#5a6940e351fed80458fe6c9da8581cbe4b8bd036"
+dependencies = [
+ "alloy-consensus 2.5.0",
+ "alloy-eips 2.5.0",
+ "alloy-primitives",
+ "reth-chainspec",
+ "reth-consensus",
+ "reth-primitives-traits",
+]
+
+[[package]]
 name = "reth-db-models"
 version = "2.5.2"
 source = "git+https://github.com/paradigmxyz/reth?rev=5a6940e351fed80458fe6c9da8581cbe4b8bd036#5a6940e351fed80458fe6c9da8581cbe4b8bd036"
@@ -6985,6 +7001,22 @@ dependencies = [
  "reth-primitives-traits",
  "serde",
  "thiserror 2.0.19",
+]
+
+[[package]]
+name = "reth-ethereum-consensus"
+version = "2.5.2"
+source = "git+https://github.com/paradigmxyz/reth?rev=5a6940e351fed80458fe6c9da8581cbe4b8bd036#5a6940e351fed80458fe6c9da8581cbe4b8bd036"
+dependencies = [
+ "alloy-consensus 2.5.0",
+ "alloy-eips 2.5.0",
+ "alloy-primitives",
+ "reth-chainspec",
+ "reth-consensus",
+ "reth-consensus-common",
+ "reth-execution-types",
+ "reth-primitives-traits",
+ "tracing",
 ]
 
 [[package]]

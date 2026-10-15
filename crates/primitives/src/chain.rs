@@ -258,6 +258,27 @@ impl CanonicalKey {
     }
 }
 
+/// Mainnet beacon genesis time, in UNIX seconds.
+pub const MAINNET_GENESIS_TIME: u64 = 1_606_824_023;
+/// Seconds per beacon slot. Glamsterdam keeps 12 s (EIP-7782 was declined).
+pub const SLOT_SECONDS: u64 = 12;
+
+/// The beacon slot that starts at `timestamp`, or `None` before genesis or
+/// off a slot boundary.
+#[must_use]
+pub const fn slot_starting_at(timestamp: u64) -> Option<u64> {
+    match timestamp.checked_sub(MAINNET_GENESIS_TIME) {
+        Some(since) if since % SLOT_SECONDS == 0 => Some(since / SLOT_SECONDS),
+        _ => None,
+    }
+}
+
+/// The beacon slot in progress at `timestamp`.
+#[must_use]
+pub const fn slot_at(timestamp: u64) -> u64 {
+    timestamp.saturating_sub(MAINNET_GENESIS_TIME) / SLOT_SECONDS
+}
+
 /// Chain-confidence level of a block. Ordering is intentional.
 ///
 /// The serde names are the storage names of 0.1.0-rc.6: stored descriptors
@@ -352,6 +373,15 @@ mod tests {
         assert_eq!(almost.len(), u64::MAX);
         let small = BlockRange::new(BlockNumber(4), BlockNumber(6)).expect("range");
         assert_eq!(small.checked_len(), Some(3));
+    }
+
+    #[test]
+    fn slots_follow_mainnet_genesis() {
+        assert_eq!(slot_starting_at(MAINNET_GENESIS_TIME), Some(0));
+        assert_eq!(slot_starting_at(MAINNET_GENESIS_TIME + 24), Some(2));
+        assert_eq!(slot_starting_at(MAINNET_GENESIS_TIME + 25), None);
+        assert_eq!(slot_starting_at(MAINNET_GENESIS_TIME - 12), None);
+        assert_eq!(slot_at(MAINNET_GENESIS_TIME + 35), 2);
     }
 
     #[test]

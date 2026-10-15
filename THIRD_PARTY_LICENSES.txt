@@ -3594,6 +3594,7 @@ jobserver 0.1.35 — https://github.com/rust-lang/jobserver-rs
 js-sys 0.3.103 — https://github.com/wasm-bindgen/wasm-bindgen/tree/master/crates/js-sys
 openssl-probe 0.2.1 — https://github.com/rustls/openssl-probe
 pkg-config 0.3.33 — https://github.com/rust-lang/pkg-config-rs
+socket2 0.5.10 — https://github.com/rust-lang/socket2
 socket2 0.6.5 — https://github.com/rust-lang/socket2
 wasm-bindgen-futures 0.4.76 — https://github.com/wasm-bindgen/wasm-bindgen/tree/master/crates/futures
 wasm-bindgen-macro-support 0.2.126 — https://github.com/wasm-bindgen/wasm-bindgen/tree/master/crates/macro-support
@@ -8794,6 +8795,7 @@ MIT License (MIT)
 ==============================================================================
 reth-chain-state 2.5.2 — https://github.com/paradigmxyz/reth
 reth-chainspec 2.5.2 — https://github.com/paradigmxyz/reth
+reth-consensus-common 2.5.2 — https://github.com/paradigmxyz/reth
 reth-consensus 2.5.2 — https://github.com/paradigmxyz/reth
 reth-db-models 2.5.2 — https://github.com/paradigmxyz/reth
 reth-discv4 2.5.2 — https://github.com/paradigmxyz/reth
@@ -8804,6 +8806,7 @@ reth-era 2.5.2 — https://github.com/paradigmxyz/reth
 reth-errors 2.5.2 — https://github.com/paradigmxyz/reth
 reth-eth-wire-types 2.5.2 — https://github.com/paradigmxyz/reth
 reth-eth-wire 2.5.2 — https://github.com/paradigmxyz/reth
+reth-ethereum-consensus 2.5.2 — https://github.com/paradigmxyz/reth
 reth-ethereum-forks 2.5.2 — https://github.com/paradigmxyz/reth
 reth-ethereum-primitives 2.5.2 — https://github.com/paradigmxyz/reth
 reth-evm-ethereum 2.5.2 — https://github.com/paradigmxyz/reth
