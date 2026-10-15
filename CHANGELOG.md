@@ -26,7 +26,7 @@ record, and documented RPC contracts.
   guarantee: a sync-committee-attested ancestry), and `preview` is
   `unattested`. `leani subscribe --finality` accepts the new names only. The
   SDK `Finality` type changes accordingly. Stores and data directories from
-  0.1.0-rc.7 open unchanged.
+  0.1.0-rc.7 keep their data (see Upgrading).
 - Breaking (configuration): `publish` names the first level a processor's
   consumers see: `unattested`, `attested` or `finalized`. Omitted, it is
   `unattested`. `included_and_finalized` is now `attested`, and
@@ -68,6 +68,9 @@ record, and documented RPC contracts.
   SDKs reject the `attested` operation.
 - `leani subscribe` prints `unattested` rows by default; pass `--finality
   attested` for 0.1.0-rc.7's output.
+- Node stores move to schema 26, which indexes unattested rows, built once
+  during the upgrade. Downgrading is unsupported: 0.1.0-rc.7 refuses a
+  schema-26 store.
 
 ## [0.1.0-rc.7] - 2026-10-14
 
