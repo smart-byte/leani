@@ -7403,16 +7403,18 @@ impl SqliteStore {
             .rev()
             .find(|block| ancestral(block))
             .map(|block| block.number);
-        // An unattested row was proven by peers only, so after a restart it
-        // is fetched again. Unattested rows are a contiguous suffix, because
-        // mark_recent_attested promotes everything below its block, so
-        // reverting them never orphans a kept row.
+        // An unattested row above the anchor was proven by peers only, so
+        // after a restart it is fetched again. One at or below it that is
+        // proven is the anchor's ancestor, final like any other. Unattested
+        // rows are a contiguous suffix, because mark_recent_attested promotes
+        // everything below its block, so reverting them never orphans a kept
+        // row.
         let reverted = unfinalized
             .into_iter()
             .rev()
             .filter(|block| {
                 !proven.contains(&block.number.0)
-                    || (unattested.contains(&block.number.0) && !ancestral(block))
+                    || (unattested.contains(&block.number.0) && block.number > anchor.number)
             })
             .collect::<Vec<_>>();
         if reverted.is_empty() && finalize_through.is_none() {
@@ -21679,6 +21681,49 @@ mod tests {
                 .is_some(),
             "the attested row links to the anchor and stays"
         );
+    }
+
+    #[tokio::test]
+    async fn restart_keeps_unattested_ancestors_of_a_retained_anchor() {
+        // Review: startup reverted every unattested row the ancestry did not
+        // name, also below an anchor the retained chain holds, where parent
+        // links prove them, and reconciliation then undid their output.
+        let (_directory, store) = store().await;
+        let finalized = frame(10, BlockHash::ZERO).block;
+        let first = frame(11, finalized.hash).block;
+        let anchor = frame(12, first.hash).block;
+        let above = frame(13, anchor.hash).block;
+        for (block, finality) in [
+            (finalized, Finality::Finalized),
+            (first, Finality::Unattested),
+            (anchor, Finality::Unattested),
+            (above, Finality::Unattested),
+        ] {
+            store
+                .store_canonical_anchor(ChainId(1), block, finality)
+                .await
+                .expect("seed row");
+        }
+        let reverted = store
+            .revert_unproven_recent_blocks(ChainId(1), anchor, &[])
+            .await
+            .expect("revert");
+        assert_eq!(
+            reverted,
+            vec![above],
+            "only the unattested row above the anchor goes"
+        );
+        for block in [first, anchor] {
+            assert!(
+                store
+                    .canonical_block(ChainId(1), block.number)
+                    .await
+                    .expect("row")
+                    .is_some(),
+                "block {} is the finalized anchor or its ancestor",
+                block.number.0
+            );
+        }
     }
 
     #[test]
