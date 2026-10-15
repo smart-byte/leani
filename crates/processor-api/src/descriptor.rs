@@ -167,12 +167,14 @@ pub enum ReductionMode {
 
 /// What a processor's consumers see, and from which level on.
 ///
-/// The serde names are the storage names of 0.1.0-rc.6: stored descriptors
-/// and their hashes contain them.
+/// The serde names of the rc.6 variants are their storage names; see
+/// [`Finality`].
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PublicationPolicy {
-    /// Blocks from attested on, with undo.
+    /// Every block from the first level the lane delivers, with undo.
+    Unattested,
+    /// Blocks from attested on, with undo; unattested ones wait in the store.
     #[serde(rename = "included_and_finalized")]
     Attested,
     /// Finalized blocks only; never an undo.
@@ -181,6 +183,26 @@ pub enum PublicationPolicy {
     /// The final aggregate of a bounded history job only.
     #[serde(rename = "terminal_only")]
     JobResult,
+}
+
+impl PublicationPolicy {
+    /// The first level a consumer sees: changes of a lower level wait in the
+    /// store until their block reaches it. A job result covers finalized
+    /// history.
+    #[must_use]
+    pub const fn first_level(self) -> Finality {
+        match self {
+            Self::Unattested => Finality::Unattested,
+            Self::Attested => Finality::Attested,
+            Self::Finalized | Self::JobResult => Finality::Finalized,
+        }
+    }
+
+    /// Whether unfinalized blocks reach consumers, with undo.
+    #[must_use]
+    pub const fn publishes_unfinalized(self) -> bool {
+        matches!(self, Self::Unattested | Self::Attested)
+    }
 }
 
 /// Legacy output-retention setting accepted while version-1 descriptors and
@@ -264,7 +286,7 @@ pub struct OutputPolicy {
     pub window: Option<OutputWindow>,
     /// Ignored; kept for descriptor compatibility. To publish only finalized
     /// blocks, use [`PublicationPolicy::Finalized`]
-    /// (`publish = "finalized_only"`).
+    /// (`publish = "finalized"`).
     #[serde(default)]
     pub finalized_only: bool,
 }
@@ -584,10 +606,8 @@ impl LifecyclePolicies {
         {
             return Err("until_acknowledged delivery requires a required durable consumer");
         }
-        if matches!(publication, PublicationPolicy::Attested)
-            && matches!(self.undo.mode, UndoPolicyMode::None)
-        {
-            return Err("attested publication requires an unfinalized undo policy");
+        if publication.publishes_unfinalized() && matches!(self.undo.mode, UndoPolicyMode::None) {
+            return Err("unattested and attested publication require an unfinalized undo policy");
         }
         if matches!(self.checkpoint.mode, CheckpointPolicyMode::Automatic)
             && self.checkpoint.keep == 0

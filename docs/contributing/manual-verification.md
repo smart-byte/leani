@@ -118,7 +118,7 @@ id = "blobs-money"
 instance = "blobs-production"
 version = "1.5.0"
 start_block = 0 # Replace 0 with the numeric FROM value printed above.
-publish = "included_and_finalized"
+publish = "attested"
 ```
 
 `serve` uses this configured value. The finite `e2e mainnet` command overrides
@@ -391,7 +391,7 @@ instance = "blobs-container-1-5"
 version = "1.5.0"
 history_mode = "on_demand"
 start_block = 0 # Replace 0 with the numeric FROM value printed above.
-publish = "included_and_finalized"
+publish = "attested"
 
 [rpc]
 http_bind = "127.0.0.1:8545"

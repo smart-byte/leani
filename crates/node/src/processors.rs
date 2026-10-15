@@ -948,7 +948,10 @@ mod tests {
     fn standard_registry_contains_block_summary() {
         let registry = ProcessorRegistry::standard();
         assert!(registry.contains("block-summary"));
-        let configured = crate::block_summaries::processor_config("demo-blocks", false);
+        let configured = crate::block_summaries::processor_config(
+            "demo-blocks",
+            crate::config::PublishMode::Attested,
+        );
         let components = registry
             .instantiate_components(&configured, 1)
             .expect("block processor");
@@ -976,7 +979,7 @@ mod tests {
             "rollup-txs-test",
             "1.0.0",
             22_000_000,
-            false,
+            crate::config::PublishMode::Attested,
         );
         let mut rule = toml::Table::from_iter([
             ("rollup".to_owned(), "base".into()),
@@ -1117,7 +1120,7 @@ mod tests {
         for file in [
             "externalized.toml",
             "aggregate-only.toml",
-            "terminal.toml",
+            "job-result.toml",
             "head-only.toml",
             "windowed.toml",
             "full.toml",

@@ -423,7 +423,7 @@ id = "evm-events"              # registered processor kind
 instance = "weth-transfer-v1"  # stable operator-selected identity
 version = "1.1.0"
 start_block = 12965000
-publish = "included_and_finalized"
+publish = "attested"
 ```
 
 Processor code, semantic version, settings, start point, and source identity
@@ -440,13 +440,17 @@ part of the identity and can change in place.
 
 Publication values are:
 
-- `finalized_only`: publish only finalized `apply` records. Included-block
-  changes wait in the store for verified finality, count against the delivery
-  budget meanwhile, and undo is never published.
-- `included_and_finalized`: publish apply/undo/finality transitions and keep
-  an unfinalized undo window.
-- `terminal_only`: a bounded backfill publishes its terminal aggregate and
-  then becomes complete/reclaimable. Deletion remains explicit.
+- `unattested` (default): publish apply/undo/finality transitions from the
+  first level the live lane delivers, and keep an unfinalized undo window.
+- `attested`: publish apply/undo/finality transitions from `attested` on, and
+  keep an unfinalized undo window.
+- `finalized`: publish only finalized `apply` records. Unfinalized changes
+  wait in the store for verified finality, count against the delivery budget
+  meanwhile, and undo is never published.
+
+`[processors.delivery] emit = "job_result"` replaces `publish` for a bounded
+backfill: it publishes its terminal aggregate and then becomes
+complete/reclaimable. Deletion remains explicit.
 
 `[processors.settings]` belongs to the selected factory and is decoded
 strictly. `doctor` constructs every configured processor, so malformed ABI,
@@ -609,7 +613,7 @@ explicit artifact deletion operation.
 `window` requires a `[processors.output.window]` table with exactly one
 limit: `max_blocks`, `max_age`, `max_rows`, or `max_bytes`. Validation
 refuses `[processors.output] finalized_only`, which was never applied; to
-publish only finalized blocks, set `publish = "finalized_only"`.
+publish only finalized blocks, set `publish = "finalized"`.
 
 ### Delivery
 
@@ -658,7 +662,7 @@ Editing lifecycle policies, for example to raise a limit, leaves existing
 checkpoints and savepoints valid.
 
 `[processors.undo] mode` is `none` or `unfinalized`, and
-`included_and_finalized` requires `unfinalized`. Unfinalized blocks always
+`unattested` and `attested` publication require `unfinalized`. Unfinalized blocks always
 keep their undo records, so a reorg can revert them in either mode. Once
 finality passes a block, `unfinalized` keeps its record for another
 `safety_blocks` blocks and `none` deletes it at once. Blocks applied as

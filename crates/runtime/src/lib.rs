@@ -3829,7 +3829,7 @@ impl SharedLiveRuntime {
             let descriptor = processor.descriptor();
             if matches!(descriptor.publication, PublicationPolicy::JobResult) {
                 return Err(RuntimeError::InvalidConfig(format!(
-                    "terminal-only processor {} requires a bounded historical job",
+                    "job-result processor {} requires a bounded historical job",
                     descriptor.id
                 )));
             }
@@ -6947,7 +6947,7 @@ impl LiveRuntime {
             PublicationPolicy::JobResult
         ) {
             return Err(RuntimeError::InvalidConfig(
-                "terminal-only processors require a bounded historical job".to_owned(),
+                "job-result processors require a bounded historical job".to_owned(),
             ));
         }
         Ok(Self {

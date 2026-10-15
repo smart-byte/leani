@@ -1538,13 +1538,11 @@ fn subscription_processor(
     match protocol {
         SubscribeProtocol::Blocks => Ok(crate::block_summaries::processor_config(
             BLOCK_PROCESSOR_INSTANCE,
-            finality == SubscribeFinality::Finalized,
+            finality.publish_mode(),
         )),
-        SubscribeProtocol::UniswapV3 => processor_config(
-            markets,
-            UNISWAP_PROCESSOR_INSTANCE,
-            finality == SubscribeFinality::Finalized,
-        ),
+        SubscribeProtocol::UniswapV3 => {
+            processor_config(markets, UNISWAP_PROCESSOR_INSTANCE, finality.publish_mode())
+        }
     }
 }
 
@@ -2261,8 +2259,8 @@ fn latest_fresh_items(
         if !update_is_fresh(finality, record.block.timestamp, now) {
             continue;
         }
-        // Store deferral already withholds included records for finalized_only
-        // processors; this keeps the flag honest if that ever regresses.
+        // Store deferral already withholds unfinalized records for processors
+        // that publish `finalized`; this keeps the flag honest if that ever regresses.
         if finality == SubscribeFinality::Finalized && record.finality != Finality::Finalized {
             continue;
         }
@@ -6952,10 +6950,7 @@ mod tests {
         let pools = processor.settings["pools"].as_array().expect("pools");
         assert_eq!(pools.len(), 2);
         assert_eq!(processor.history_mode, ProcessorHistoryMode::OnDemand);
-        assert!(matches!(
-            processor.publish,
-            PublishMode::IncludedAndFinalized
-        ));
+        assert_eq!(processor.publish, Some(PublishMode::Attested));
     }
 
     #[test]

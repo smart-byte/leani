@@ -14,6 +14,14 @@ record, and documented RPC contracts.
   `unattested`. `leani subscribe --finality` accepts the new names only. The
   SDK `Finality` type changes accordingly. Stores and data directories from
   0.1.0-rc.7 open unchanged.
+- Breaking (configuration): `publish` names the first level a processor's
+  consumers see: `unattested`, `attested` or `finalized`. Omitted, it is
+  `unattested`. `included_and_finalized` is now `attested`, and
+  `finalized_only` is `finalized`; the old values are refused.
+- Breaking (configuration): `publish = "terminal_only"` is now
+  `[processors.delivery] emit = "job_result"`, and the `terminal` operating
+  profile is `job-result`. A processor that emits a job result takes no
+  `publish`: its bounded history job covers finalized blocks.
 - Verified finality learns each sync-committee-attested head within about
   1.5 s of a Beacon endpoint or consensus peer serving it. Between finality
   polls it asks only for the light-client optimistic update, 1.5, 3, 4.5 and

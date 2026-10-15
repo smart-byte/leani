@@ -382,6 +382,18 @@ pub enum SubscribeFinality {
     Finalized,
 }
 
+impl SubscribeFinality {
+    /// The publish mode of the embedded processor for this level.
+    #[must_use]
+    pub const fn publish_mode(self) -> crate::config::PublishMode {
+        match self {
+            Self::Unattested => crate::config::PublishMode::Unattested,
+            Self::Attested => crate::config::PublishMode::Attested,
+            Self::Finalized => crate::config::PublishMode::Finalized,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 pub enum SubscribeFinalitySource {
     /// Reuse an explicit node profile, otherwise use verified Beacon API proofs.

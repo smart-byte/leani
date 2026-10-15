@@ -10512,9 +10512,12 @@ markets = ["ETH/USDT"]
         let mut markets =
             crate::uniswap_markets::resolve_markets(&["ETH/USDT".to_owned()]).expect("market");
         markets[0].start_block = 12_376_729;
-        let earlier =
-            crate::uniswap_markets::processor_config(&markets, "uniswap-observations", false)
-                .expect("earlier starter");
+        let earlier = crate::uniswap_markets::processor_config(
+            &markets,
+            "uniswap-observations",
+            crate::config::PublishMode::Attested,
+        )
+        .expect("earlier starter");
         let earlier = ProcessorRegistry::standard()
             .instantiate(&earlier, 1)
             .expect("earlier processor");
@@ -13282,7 +13285,7 @@ markets = ["ETH/USDT"]
         config.sources.history.clear();
         config.processors = vec![crate::block_summaries::processor_config(
             "blocks-test",
-            false,
+            crate::config::PublishMode::Attested,
         )];
         config.processors[0].start_block = 26_000_000;
         let processor = ProcessorRegistry::standard()
