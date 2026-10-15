@@ -85,7 +85,7 @@ runtime, store, and API boundaries:
 | disk/delivery pressure | `delivery_limit_pauses_and_auto_resumes_below_low_water`, `a_known_unavailable_lane_the_store_paused_without_a_marker_is_mapped_again`, `a_failed_ledger_behind_its_history_gets_no_marker_ahead_of_its_cursor` |
 | acknowledgement/pruning/upgrade replay faults | `acknowledgement_cannot_exceed_the_consumers_delivered_head`, `delivery_pruner_applies_finality_age_and_bounded_batch_limits`, `unacknowledged_changes_survive_a_v6_to_v7_upgrade` |
 | stable query during concurrent commits | `query_snapshot_keeps_values_and_stream_boundary_stable`, `generic_query_and_follow_snapshot_is_stable_across_new_commits` |
-| terminal publication | `terminal_historical_job_spools_only_its_final_result` |
+| job-result publication | `terminal_historical_job_spools_only_its_final_result` |
 | backup/restore | `backup_reopens_as_a_complete_verified_restore` |
 
 These are deterministic correctness gates. Filesystem exhaustion, process

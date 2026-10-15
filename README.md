@@ -49,7 +49,7 @@ checkpoint and lets you accept it once at least two agree. Peer discovery can
 take a few minutes. After that, every new block streams to stdout:
 
 ```text
-2026-09-07T12:11:59Z  block=25925396  txs=381  gas=43.17M / 60.00M (72.0%)  base_fee=0.069459109 gwei  blobs=3  included
+2026-09-07T12:11:59Z  block=25925396  txs=381  gas=43.17M / 60.00M (72.0%)  base_fee=0.069459109 gwei  blobs=3  unattested
 ```
 
 Add `--finality finalized` to print only blocks Ethereum consensus has

@@ -55,7 +55,6 @@ version = "2.0.0"
 history_control = "node_owned"
 history_mode = "on_demand"
 start_block = 17000000
-publish = "attested"
 
 [processors.state]
 mode = "checkpointed"

@@ -30,19 +30,16 @@ Peer discovery can take several minutes, even on a later run with cached state.
 Leani prints progress to stderr, then one line per block, shaped like:
 
 ```text
-2026-09-07T12:11:59Z  block=25925396  txs=381  gas=43.17M / 60.00M (72.0%)  base_fee=0.069459109 gwei  blobs=3  included
+2026-09-07T12:11:59Z  block=25925396  txs=381  gas=43.17M / 60.00M (72.0%)  base_fee=0.069459109 gwei  blobs=3  unattested
 ```
 
 Your block numbers and values will differ. Leani keeps following new blocks
 until you press Ctrl-C. Add `--format json` for scripts.
 
 <Aside type="note" title="Read the finality label">
-  The first result may say `preview`: a peer supplied the block and Leani is
-  still checking its place in Ethereum's chain. JSON reports
-  `finality: "preview"`. Later rows say `included` (on the followed chain, a
-  reorg can still remove them) or `finalized`. Use
-  `leani subscribe blocks --finality finalized` when you need only blocks
-  Ethereum consensus has finalized.
+  Rows say `unattested`, `attested` or `finalized`; see
+  [finality levels](/docs/concepts/coverage-finality-and-reorgs/#finality-levels-and-publish-modes). Use `leani subscribe blocks --finality finalized`
+  when you need only blocks Ethereum consensus has finalized.
 </Aside>
 
 ## Prepare a node for your application

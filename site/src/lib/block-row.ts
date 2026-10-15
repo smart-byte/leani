@@ -3,7 +3,7 @@
 // with inner spaces stay unbreakable so narrow terminals wrap between fields.
 import { esc } from './highlight';
 
-const FINALITY = /^(preview|included|finalized)( undo)?$/;
+const FINALITY = /^(unattested|attested|finalized)( undo)?$/;
 
 function field(text: string): string {
   const finality = text.match(FINALITY);

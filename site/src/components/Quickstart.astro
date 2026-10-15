@@ -118,8 +118,8 @@ const firstRows = session.rows.slice(0, 6);
       </div>
     ))}
     <p class="after">
-      Your first row may be a <span class="mono">preview</span> while Leani checks the block's place in Ethereum's chain.
-      Rows marked <span class="mono">included</span> are on the followed chain and can still be reorged.
+      Rows marked <span class="mono">unattested</span> passed Leani's checks a few seconds into their slot and can still be undone;
+      <span class="mono">attested</span> ones carry the sync committee's signature and can still be reorged.
       Add <span class="mono">--finality finalized</span> to print only blocks Ethereum consensus has finalized.
       See the <a href={QUICKSTART_URL}>full quickstart</a>, then{' '}
       <a href="/docs/getting-started/bounded-mainnet/">index a bounded historical range</a>.
@@ -143,8 +143,8 @@ const firstRows = session.rows.slice(0, 6);
   .lines :global(.ln) { display: block; min-height: 1.7em; padding-inline: 1.1rem; white-space: pre-wrap; }
   .lines :global(.br-f) { white-space: nowrap; }
   .lines :global(.br-ts), .lines :global(.br-key), .lines :global(.br-unit) { color: var(--ink-dim); }
-  .lines :global(.br-preview) { color: #edcb89; }
-  .lines :global(.br-included) { color: var(--accent); }
+  .lines :global(.br-unattested) { color: #edcb89; }
+  .lines :global(.br-attested) { color: var(--accent); }
   .lines :global(.br-finalized) { color: var(--syntax-string); }
   .lines :global(.br-undo) { color: #e58f7a; }
   .lines :global(.is-new) { animation: row-in 1100ms ease-out; }

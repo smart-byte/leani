@@ -86,7 +86,7 @@ any other start. Finalized-coverage compaction is block-local only, so a keyed
 instance keeps one coverage row per block it applies, without bound, as other
 ordered processors do.
 
-`publish = "finalized"` holds included-block changes in the store until
+`publish = "finalized"` holds unfinalized changes in the store until
 verified finality promotes them. The stream then contains only finalized
 `apply` records and `system.finality` markers; no `undo` is ever published.
 Held bytes count against `[processors.delivery] max_bytes` from admission.
@@ -254,7 +254,6 @@ version = "1.0.0"
 history_control = "application_subscriptions"
 history_mode = "on_demand"
 start_block = 26000000
-publish = "attested"
 
 [processors.state]
 mode = "durable"
@@ -319,7 +318,6 @@ id = "erc20-balances"
 instance = "erc20-watchlist"
 version = "1.1.0"
 start_block = 1234567
-publish = "attested"
 
 [processors.state]
 mode = "durable"
@@ -399,7 +397,6 @@ id = "uniswap-observations" # or "uniswap-latest"
 instance = "usdc-weth-observations"
 version = "2.1.0" # use 2.0.0 with uniswap-latest
 start_block = 12369621
-publish = "attested"
 history_control = "node_owned"
 history_mode = "on_demand"
 

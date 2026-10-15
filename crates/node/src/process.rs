@@ -5545,6 +5545,45 @@ fn finality_anchor_warnings(config: &Config, now: SystemTime) -> Vec<String> {
     warnings
 }
 
+/// Name each live processor that keeps the live lane attested-gated: it
+/// requires attested frames, so every processor on the lane waits for
+/// attested heads.
+fn attested_gating_warnings<'a>(
+    descriptors: impl IntoIterator<Item = &'a leani_processor_api::ProcessorDescriptor>,
+) -> Vec<String> {
+    descriptors
+        .into_iter()
+        .filter(|descriptor| {
+            descriptor
+                .requirements
+                .iter()
+                .any(|requirement| requirement.minimum_finality > leani_primitives::Finality::Unattested)
+        })
+        .map(|descriptor| {
+            format!(
+                "the live lane waits for attested heads because processor {} requires attested frames; built-in processors accept unattested ones",
+                descriptor.instance
+            )
+        })
+        .collect()
+}
+
+/// The live lane's warnings for a configuration whose processors build.
+fn live_lane_warnings(config: &Config, registry: &ProcessorRegistry) -> Vec<String> {
+    if matches!(
+        config.sources.live.kind,
+        crate::config::LiveSourceKind::Disabled
+    ) {
+        return Vec::new();
+    }
+    let processors = config
+        .processors
+        .iter()
+        .filter_map(|configured| registry.instantiate(configured, config.chain.chain_id).ok())
+        .collect::<Vec<_>>();
+    attested_gating_warnings(processors.iter().map(|processor| processor.descriptor()))
+}
+
 fn doctor(path: &Path, json: bool, registry: &ProcessorRegistry) -> Result<Exit> {
     // The report carries what loading would log.
     let working_directory = std::env::current_dir().ok();
@@ -5574,6 +5613,7 @@ fn doctor(path: &Path, json: bool, registry: &ProcessorRegistry) -> Result<Exit>
     let mut errors = config.validation_errors();
     errors.extend(registry.validation_errors(&config));
     let mut warnings = finality_anchor_warnings(&config, SystemTime::now());
+    warnings.extend(live_lane_warnings(&config, registry));
     warnings.extend(load_warnings);
     let report = DoctorReport {
         project: leani_primitives::PROJECT_NAME,
@@ -9131,6 +9171,27 @@ mod tests {
             .expect("the stall watch");
         assert_eq!(started.elapsed(), timeout);
         assert_eq!(stalled.timeout, timeout);
+    }
+
+    #[test]
+    fn doctor_names_a_processor_that_keeps_the_lane_attested_gated() {
+        let built_in = leani_testkit::BlockLocalCounter::named("head")
+            .descriptor()
+            .clone();
+        let mut strict = leani_testkit::BlockLocalCounter::named("strict")
+            .descriptor()
+            .clone();
+        for requirement in &mut strict.requirements {
+            requirement.minimum_finality = leani_primitives::Finality::Attested;
+        }
+        assert!(attested_gating_warnings([&built_in]).is_empty());
+        let warnings = attested_gating_warnings([&built_in, &strict]);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].contains(&strict.instance.to_string()),
+            "{warnings:?}"
+        );
+        assert!(warnings[0].contains("attested heads"), "{warnings:?}");
     }
 
     #[test]

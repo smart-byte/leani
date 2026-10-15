@@ -120,9 +120,9 @@ satisfied, 130 interrupted before --once was satisfied.")]
         /// Optional bearer token for a running node.
         #[arg(long, env = "LEANI_API_TOKEN", hide_env_values = true)]
         token: Option<String>,
-        /// Lowest level that counts as a result: `unattested`, `attested`
-        /// (default), or `finalized`.
-        #[arg(long, value_enum, default_value_t = SubscribeFinality::Attested)]
+        /// Lowest level that counts as a result: `unattested` (default),
+        /// `attested`, or `finalized`.
+        #[arg(long, value_enum, default_value_t = SubscribeFinality::Unattested)]
         finality: SubscribeFinality,
         /// Finality transport for the embedded runtime.
         #[arg(long, value_enum, default_value_t = SubscribeFinalitySource::Auto)]
@@ -433,8 +433,9 @@ pub enum ResetCommand {
         /// The exact targets used by `leani subscribe`; empty for `blocks`.
         #[arg(num_args = 0.., value_name = "TARGET")]
         targets: Vec<String>,
-        /// Finality of the subscription state being reset (`attested` or `finalized`).
-        #[arg(long, value_enum, default_value_t = SubscribeFinality::Attested)]
+        /// Finality of the subscription state being reset (`unattested`,
+        /// `attested` or `finalized`).
+        #[arg(long, value_enum, default_value_t = SubscribeFinality::Unattested)]
         finality: SubscribeFinality,
         /// Exact embedded subscription directory to reset.
         #[arg(long)]
@@ -966,6 +967,15 @@ mod tests {
         assert_eq!(protocol, SubscribeProtocol::UniswapV3);
         assert_eq!(targets, ["ETH/USDC", "ETH/USDT"]);
         assert!(yes);
+    }
+
+    #[test]
+    fn subscribe_defaults_to_unattested() {
+        let cli = Cli::try_parse_from(["leani", "subscribe", "blocks"]).expect("parse");
+        let Command::Subscribe { finality, .. } = cli.command else {
+            panic!("subscribe command");
+        };
+        assert_eq!(finality, SubscribeFinality::Unattested);
     }
 
     #[test]

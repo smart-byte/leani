@@ -84,7 +84,7 @@ Compact Ethereum Mainnet configurations expand to:
 |---|---|
 | execution | native P2P, one-peer availability floor, 16-peer healthy target, 100-peer cap |
 | history | public Xatu source, on-demand processor scheduling |
-| processor | selected built-in feed, included and finalized output, checkpointed state, 256-block undo safety |
+| processor | selected built-in feed, unattested publication, checkpointed state, 256-block undo safety |
 | resources | 512 MiB memory, 2 GiB temporary disk, four source and mapper tasks |
 | retention | full query output; 64 MiB or 24 hours of change delivery |
 | listeners | ephemeral P2P ports, RPC `127.0.0.1:18545`/`18546`, API `127.0.0.1:18080` |
@@ -216,7 +216,7 @@ pruning returns pages to the filesystem and admission recovers; a store created
 before that needs one `leani db compact` (see the operations runbook).
 
 `[budgets.artifacts]` independently caps immutable finalized artifact bytes and
-included-block candidate bytes awaiting finality. A transaction that would exceed
+unfinalized-block candidate bytes awaiting finality. A transaction that would exceed
 either logical limit rolls back without advancing processor coverage. Finality
 is the exception: when the retained limit is full, finality still advances,
 the finalized candidates stay pending with a logged warning, and a later
@@ -423,7 +423,6 @@ id = "evm-events"              # registered processor kind
 instance = "weth-transfer-v1"  # stable operator-selected identity
 version = "1.1.0"
 start_block = 12965000
-publish = "attested"
 ```
 
 Processor code, semantic version, settings, start point, and source identity

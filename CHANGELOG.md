@@ -6,6 +6,19 @@ record, and documented RPC contracts.
 
 ## [Unreleased]
 
+### Added
+
+- Processors publish each new block at the `unattested` level a few seconds
+  into its slot, as an Ethereum RPC serves it, and later mark it `attested`
+  and `finalized`. An unattested block that no attested head covers within
+  60 s, or that the attested chain replaces, is undone. `publish =
+  "unattested"` is the default; `attested` keeps 0.1.0-rc.7's behaviour.
+- `/metrics` reports `leani_live_block_delay_seconds{level}`,
+  `leani_live_unattested_undone_total{reason}` and
+  `leani_live_unattested_held_total`.
+- `leani doctor` names a live processor that requires attested frames: it
+  keeps the whole live lane waiting for attested heads.
+
 ### Changed
 
 - Breaking (CLI, HTTP API, SSE, SDK): chain-confidence levels are now
@@ -42,6 +55,19 @@ record, and documented RPC contracts.
   during startup. Rows at `unattested` come from the verified lane, which
   checks a peer quorum, Leani's header rules and the link to the delivered
   chain before printing them.
+
+### Upgrading from 0.1.0-rc.7
+
+- Rename `publish = "included_and_finalized"` to `publish = "attested"` to keep
+  0.1.0-rc.7 behaviour, or remove the line to publish `unattested` blocks.
+  Either way the processor instance and its history stay as they are.
+- Rename `publish = "finalized_only"` to `publish = "finalized"`.
+- Replace `publish = "terminal_only"` with `[processors.delivery] emit =
+  "job_result"`.
+- Update SDK consumers before switching a processor to `unattested`: older
+  SDKs reject the `attested` operation.
+- `leani subscribe` prints `unattested` rows by default; pass `--finality
+  attested` for 0.1.0-rc.7's output.
 
 ## [0.1.0-rc.7] - 2026-10-14
 
