@@ -1736,6 +1736,7 @@ impl leani_api::BackfillControl for NativeBackfillControl {
             overfetched_bytes: snapshot.overfetched_bytes,
             logical_frame_deliveries: snapshot.logical_frame_deliveries,
             active_acquisitions: snapshot.active_acquisitions,
+            active_acquisitions_limit: snapshot.active_acquisitions_limit,
             buffered_bytes: snapshot.buffered_bytes,
         })
     }
@@ -3046,7 +3047,7 @@ mod raw_history_control_tests {
             log_fields: leani_primitives::LogFieldSet::NONE,
             allow_filtered: true,
             filter,
-            minimum_finality: leani_primitives::Finality::Included,
+            minimum_finality: leani_primitives::Finality::Attested,
         };
         let mut descriptor = leani_testkit::BlockLocalCounter::named("raw-profile")
             .descriptor()
@@ -3152,6 +3153,7 @@ pub async fn run_cli_with_registry(cli: Cli, registry: &ProcessorRegistry) -> Re
     match cli.command {
         Command::Doctor { json } => doctor(&config_path, json, registry),
         Command::Serve => serve(&config_path, registry).await,
+        Command::Guide { topic } => crate::guide::print(topic),
         Command::Init {
             protocol,
             targets,
@@ -5543,6 +5545,45 @@ fn finality_anchor_warnings(config: &Config, now: SystemTime) -> Vec<String> {
     warnings
 }
 
+/// Name each live processor that keeps the live lane attested-gated: it
+/// requires attested frames, so every processor on the lane waits for
+/// attested heads.
+fn attested_gating_warnings<'a>(
+    descriptors: impl IntoIterator<Item = &'a leani_processor_api::ProcessorDescriptor>,
+) -> Vec<String> {
+    descriptors
+        .into_iter()
+        .filter(|descriptor| {
+            descriptor
+                .requirements
+                .iter()
+                .any(|requirement| requirement.minimum_finality > leani_primitives::Finality::Unattested)
+        })
+        .map(|descriptor| {
+            format!(
+                "the live lane waits for attested heads because processor {} requires attested frames; built-in processors accept unattested ones",
+                descriptor.instance
+            )
+        })
+        .collect()
+}
+
+/// The live lane's warnings for a configuration whose processors build.
+fn live_lane_warnings(config: &Config, registry: &ProcessorRegistry) -> Vec<String> {
+    if matches!(
+        config.sources.live.kind,
+        crate::config::LiveSourceKind::Disabled
+    ) {
+        return Vec::new();
+    }
+    let processors = config
+        .processors
+        .iter()
+        .filter_map(|configured| registry.instantiate(configured, config.chain.chain_id).ok())
+        .collect::<Vec<_>>();
+    attested_gating_warnings(processors.iter().map(|processor| processor.descriptor()))
+}
+
 fn doctor(path: &Path, json: bool, registry: &ProcessorRegistry) -> Result<Exit> {
     // The report carries what loading would log.
     let working_directory = std::env::current_dir().ok();
@@ -5572,6 +5613,7 @@ fn doctor(path: &Path, json: bool, registry: &ProcessorRegistry) -> Result<Exit>
     let mut errors = config.validation_errors();
     errors.extend(registry.validation_errors(&config));
     let mut warnings = finality_anchor_warnings(&config, SystemTime::now());
+    warnings.extend(live_lane_warnings(&config, registry));
     warnings.extend(load_warnings);
     let report = DoctorReport {
         project: leani_primitives::PROJECT_NAME,
@@ -6615,11 +6657,6 @@ impl EmbeddedNetworkRuntime {
     #[must_use]
     pub(crate) fn is_finished(&self) -> bool {
         self.task.is_finished()
-    }
-
-    #[must_use]
-    pub(crate) fn cancellation_token(&self) -> CancellationToken {
-        self.cancellation.clone()
     }
 
     pub(crate) async fn shutdown(mut self) {
@@ -9137,6 +9174,27 @@ mod tests {
     }
 
     #[test]
+    fn doctor_names_a_processor_that_keeps_the_lane_attested_gated() {
+        let built_in = leani_testkit::BlockLocalCounter::named("head")
+            .descriptor()
+            .clone();
+        let mut strict = leani_testkit::BlockLocalCounter::named("strict")
+            .descriptor()
+            .clone();
+        for requirement in &mut strict.requirements {
+            requirement.minimum_finality = leani_primitives::Finality::Attested;
+        }
+        assert!(attested_gating_warnings([&built_in]).is_empty());
+        let warnings = attested_gating_warnings([&built_in, &strict]);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].contains(&strict.instance.to_string()),
+            "{warnings:?}"
+        );
+        assert!(warnings[0].contains("attested heads"), "{warnings:?}");
+    }
+
+    #[test]
     fn doctor_warns_when_the_active_finality_anchor_expires_within_three_days() {
         use leani_finality_beacon_api::{
             FINALITY_ANCHOR_FILE, MAINNET_GENESIS_TIME, PersistedFinalityAnchor,
@@ -9952,7 +10010,7 @@ mod tests {
     async fn retained_proof_range_spans_the_unfinalized_blocks_below_a_higher_anchor() {
         use leani_primitives::{BlockHash, ChainId, Finality};
 
-        let (_directory, store, _) = retained_proof_store(Finality::Included).await;
+        let (_directory, store, _) = retained_proof_store(Finality::Attested).await;
         // After an outage longer than the finality lag, the verified anchor
         // is above the retained tip, and no parent link reaches it.
         let anchor = fixture_frame(20, BlockHash::ZERO).block;
@@ -9968,7 +10026,7 @@ mod tests {
     async fn retained_proof_range_spans_up_to_an_anchor_that_contradicts_a_retained_block() {
         use leani_primitives::{BlockHash, BlockRef, ChainId, Finality};
 
-        let (_directory, store, retained) = retained_proof_store(Finality::Included).await;
+        let (_directory, store, retained) = retained_proof_store(Finality::Attested).await;
         // Finality names another block at 12 than the retained one; the
         // retained blocks below the fork may still be its ancestors.
         let anchor = BlockRef {
@@ -9990,7 +10048,7 @@ mod tests {
         use leani_store_sqlite::{SqliteStore, StoreConfig};
 
         let above_the_tip = fixture_frame(20, BlockHash::ZERO).block;
-        let (_directory, store, retained) = retained_proof_store(Finality::Included).await;
+        let (_directory, store, retained) = retained_proof_store(Finality::Attested).await;
         // The retained block at the anchor's height is the anchor: parent
         // links prove the blocks below it.
         let retained_anchor = BlockRef {
@@ -10044,7 +10102,7 @@ mod tests {
     async fn retained_proof_range_is_none_beyond_the_cap() {
         use leani_primitives::{BlockHash, ChainId, Finality};
 
-        let (_directory, store, _) = retained_proof_store(Finality::Included).await;
+        let (_directory, store, _) = retained_proof_store(Finality::Attested).await;
         // The finalized head is 9, so 8,192 headers prove 10..=8,201.
         let at_the_cap = fixture_frame(9 + 8_192, BlockHash::ZERO).block;
         assert_eq!(
@@ -10510,9 +10568,12 @@ markets = ["ETH/USDT"]
         let mut markets =
             crate::uniswap_markets::resolve_markets(&["ETH/USDT".to_owned()]).expect("market");
         markets[0].start_block = 12_376_729;
-        let earlier =
-            crate::uniswap_markets::processor_config(&markets, "uniswap-observations", false)
-                .expect("earlier starter");
+        let earlier = crate::uniswap_markets::processor_config(
+            &markets,
+            "uniswap-observations",
+            crate::config::PublishMode::Attested,
+        )
+        .expect("earlier starter");
         let earlier = ProcessorRegistry::standard()
             .instantiate(&earlier, 1)
             .expect("earlier processor");
@@ -13280,7 +13341,7 @@ markets = ["ETH/USDT"]
         config.sources.history.clear();
         config.processors = vec![crate::block_summaries::processor_config(
             "blocks-test",
-            false,
+            crate::config::PublishMode::Attested,
         )];
         config.processors[0].start_block = 26_000_000;
         let processor = ProcessorRegistry::standard()

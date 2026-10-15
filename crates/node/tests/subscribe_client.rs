@@ -139,7 +139,7 @@ fn block_envelope() -> Value {
         "cursor": "cursor-2",
         "operation": "apply",
         "block": { "number": 100, "hash": hash, "parentHash": parent, "timestamp": now },
-        "finality": "included",
+        "finality": "attested",
         "kind": "ethereum.block.summary.put",
         "key": hash,
         "data": {
@@ -155,7 +155,7 @@ fn block_envelope() -> Value {
             "excessBlobGas": null,
             "transactionCount": 3,
             "sizeBytes": null,
-            "finality": "included",
+            "finality": "attested",
         },
     })
 }

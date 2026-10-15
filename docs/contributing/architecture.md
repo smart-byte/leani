@@ -27,7 +27,7 @@ status: preview
 2. Missing capabilities cause an error, never silently empty fields.
 3. Raw historical material is transient unless retention is explicitly enabled.
 4. State transitions are applied in canonical block order.
-5. Every included state transition is reversible until finalized.
+5. Every unfinalized state transition is reversible until finalized.
 6. Historical and live lanes overlap and verify before handoff.
 7. Outputs carry provenance, processor version, and a canonical cursor.
 8. Source trust and cryptographic verification are different dimensions.
@@ -99,7 +99,7 @@ BlockEnvelope
     parent_hash
     timestamp
   finality
-    included | finalized
+    unattested | attested | finalized
   header?
   body?
   transactions?
@@ -121,7 +121,7 @@ header_hash       verified | failed | not_checked
 parent_continuity verified | failed | not_checked
 transactions_root verified | failed | unavailable
 receipts_root     verified | failed | unavailable
-consensus_anchor  finalized | included | unavailable
+consensus_anchor  finalized | attested | unavailable
 dataset_checksum  verified | failed | unavailable
 ```
 
@@ -263,7 +263,7 @@ Processor descriptors include:
 - address/topic filters;
 - output schema;
 - current-only, bucketed, or full-history retention;
-- included/finalized publication policy;
+- publication policy: unattested, attested or finalized;
 - whether deltas are commutative or strictly ordered.
 
 The concrete first-release modes are:
@@ -315,14 +315,14 @@ Default pruning rules:
 
 Post-Merge canonicality is anchored to consensus safe/finalized execution payloads. A future pre-Merge/genesis profile must additionally validate canonical total difficulty or an appropriate history accumulator/checkpoint; parent and trie-root validity alone is insufficient to select the canonical proof-of-work branch.
 
-Every included block application is one atomic transaction:
+Every unfinalized block application is one atomic transaction:
 
 ```text
 validate parent
 persist delta
 apply output changes
 persist undo
-advance included cursor
+advance unfinalized cursor
 commit
 publish apply event
 ```
@@ -343,7 +343,7 @@ When consensus finality advances:
 - remove undo/raw data older than policy;
 - detect and halt on any finalized-chain contradiction.
 
-An operator may choose finalized-only output for simpler downstream semantics at the cost of roughly two epochs of latency.
+An operator may choose `publish = "finalized"` for simpler downstream semantics at the cost of roughly two epochs of latency.
 
 ## 11. Lean processing runtime and ecosystem adapters
 

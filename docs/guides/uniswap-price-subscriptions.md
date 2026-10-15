@@ -96,7 +96,7 @@ Beacon API. Override the provider set with repeatable `--checkpoint-url` flags
 The default pretty stream looks like this:
 
 ```text
-2026-08-28T19:22:11Z  ETH/USDC 2439.03084279  volume=0.601207569812525017 ETH  block=25855798  included
+2026-08-28T19:22:11Z  ETH/USDC 2439.03084279  volume=0.601207569812525017 ETH  block=25855798  unattested
 ```
 
 Volume is the absolute swap amount in the first, or base, token of the market.
@@ -120,8 +120,8 @@ leani subscribe uniswap-v3 ETH/USDC --format json |
 `--format raw` exposes the underlying change envelope, and `--once` exits after
 one matching update. `--finality finalized` builds an embedded finalized-only
 processor that prints a price only after Ethereum consensus has finalized its
-block. The default `included` mode emits head updates and marks undo
-records during a reorg.
+block. The default `unattested` mode emits head updates and marks undo
+records when a block is undone (see [finality levels](/docs/concepts/coverage-finality-and-reorgs/#finality-levels-and-publish-modes)).
 
 An undo repeats the row of the observation it reverts, with
 `"operation": "undo"`, however late it arrives; in raw mode it is the undo
@@ -139,13 +139,8 @@ undo or gap row.
 
 Embedded mode does not bind API or RPC ports, activate unrelated processors, or
 start a historical backfill. It starts from an independently verified finalized
-execution anchor and connects native execution P2P. For an included
-subscription it also fetches one root-checked current head block and can print
-matching swaps while the durable anchored lane catches up. Such output says
-`preview` in the terminal and `finality: "preview"` in JSON: commitment checks
-alone do not prove canonical ancestry. Output from the configured processor
-lane says `included` or `finalized`. `--once` hides previews and waits for
-the first `included` update unless you pass `--finality preview`; use
+execution anchor and connects native execution P2P. Output from the configured
+processor lane says `unattested`, `attested` or `finalized`; use
 `--finality finalized` to wait for a block Ethereum consensus has finalized.
 Finalized output
 still waits for the fully joined path. Its small SQLite store, locally verified
@@ -181,7 +176,7 @@ otherwise it starts the embedded runtime. Use `--mode client --endpoint URL`
 when attaching to a remote node should be mandatory rather than automatic;
 with `--endpoint`, neither mode reads a local configuration. The
 client takes a head cursor, reads the node's query-only latest observation for
-an immediate still-fresh included price, then opens SSE and applies the same timestamp
+an immediate still-fresh price, then opens SSE and applies the same timestamp
 freshness gate as embedded mode, so retained history and in-progress node
 catch-up are not presented as live prices. Before opening the stream, it reads
 the processor's immutable pool catalog and rejects any requested market that
@@ -197,7 +192,7 @@ with an error instead of printing its stream. A stream error the node marks
 subscription replays the node's retained change log and prints each
 observation once the node's finality marker covers its block, however late
 finality arrives, skipping blocks that were already final when it connected;
-the freshness gate applies only to included output. See
+the freshness gate applies only to unattested and attested output. See
 [the block feed](/docs/guides/live-block-subscriptions/#attach-to-a-prepared-node) for
 the gap row it prints when the node stops reporting finality.
 
@@ -238,7 +233,7 @@ which `leani init` fills with the ordinary PublicNode
 (`https://lodestar-mainnet.chainsafe.io/`) Beacon API endpoints and the
 responding checkpoint providers that serve the Beacon light-client API, Xatu
 history fallback, bounded 512 MiB memory and 2 GiB temporary-disk budgets,
-on-demand Uniswap history, included/finalized publication, undo records kept
+on-demand Uniswap history, unattested publication, undo records kept
 until 256 blocks past finality, 64 MiB/24 hour delivery retention, ephemeral
 P2P listener ports, RPC on `18545`/`18546`, and the native API on `18080`.
 Pool addresses, fee tiers, and the earliest processor block come from the

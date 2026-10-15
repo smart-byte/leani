@@ -62,12 +62,24 @@ export default defineConfig({
       plugins: [
         // Serves /llms.txt, /llms-full.txt, and /llms-small.txt for AI agents.
         starlightLlmsTxt({
+          description: 'Leani is a self-hosted Ethereum indexing node. It answers questions about Ethereum data with processors: built-in ones cover common data, and for anything else you write your own processor. Writing one is the normal path, not an edge case.',
           details: [
-            'Leani is alpha software built from source; the `leani` CLI is the primary interface.',
+            'Agents, start here:',
+            '',
+            '1. Install the Leani agent skill: `npx skills add smart-byte/leani -g` (Codex, Claude Code, Cursor, and other agents), or see https://leani.dev/docs/guides/ai-agents/. With the binary installed, `leani guide` prints the same guide for that release.',
+            '2. Use a built-in processor if one fits: `block-summary` (gas, base fee, blobs per block), `evm-events` (decode chosen events of chosen contracts, no code), `erc20-balances`, `transaction-stats`, `uniswap-observations`, `uniswap-latest`, `blobs-money`, `rollup-txs`.',
+            '3. Otherwise write a custom processor in Rust: `map` turns a block into a compact delta, `reduce` folds deltas into state, and Leani supplies sources, backfill, finality, reorgs, storage, and the HTTP API. Write one for aggregates (distinct counts, sums, top-N), transaction values rather than logs, state across contracts, or value filters. Guide: https://leani.dev/docs/guides/custom-processor/',
+            '4. Backfill the block range, run `leani serve`, check coverage, then query the HTTP API.',
+            '',
+            'Leani keeps no EVM state: it cannot answer `eth_call`, account balances, or traces.',
+            '',
+            'Command-line rules:',
+            '',
+            'Leani is alpha software; the `leani` CLI is the primary interface. Install with `brew install smart-byte/tap/leani` or build from source.',
             '',
             '- `leani subscribe blocks` follows Ethereum Mainnet blocks over P2P with no API key and runs until interrupted. Add `--json` for NDJSON on stdout (progress goes to stderr), `--once` to exit after the first verified result, and `--timeout 5m` to bound the run; an unsatisfied `--once` exits 124 on timeout.',
             '- First use asks the user to accept a checkpoint, the trust anchor for verification. Without a terminal the command fails unless `--yes` is passed. Agents should pass `--yes` only after the user has approved the checkpoint.',
-            '- Rows are labelled `preview` (unverified peer data shown during embedded startup), `included` (can still be reorged), or `finalized`. `--once` never returns a preview unless `--finality preview` is passed. JSON output mixes row schemas, so dispatch on each row\'s `schema` field.',
+            '- Rows are labelled `unattested` (peers agree and it passes Leani\'s header rules; it can be undone), `attested` (signed by the sync committee; can still be reorged), or `finalized`. `--once` returns the first row that meets `--finality` (default `unattested`). JSON output mixes row schemas, so dispatch on each row\'s `schema` field.',
             '- `leani init blocks` then `leani serve` runs a reusable node: HTTP API at http://127.0.0.1:18080, JSON-RPC subset at http://127.0.0.1:18545.',
           ].join('\n'),
           promote: DOC_STARTER_PAGES.map((page) => page.id),

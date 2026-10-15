@@ -3594,6 +3594,7 @@ jobserver 0.1.35 — https://github.com/rust-lang/jobserver-rs
 js-sys 0.3.103 — https://github.com/wasm-bindgen/wasm-bindgen/tree/master/crates/js-sys
 openssl-probe 0.2.1 — https://github.com/rustls/openssl-probe
 pkg-config 0.3.33 — https://github.com/rust-lang/pkg-config-rs
+socket2 0.5.10 — https://github.com/rust-lang/socket2
 socket2 0.6.5 — https://github.com/rust-lang/socket2
 wasm-bindgen-futures 0.4.76 — https://github.com/wasm-bindgen/wasm-bindgen/tree/master/crates/futures
 wasm-bindgen-macro-support 0.2.126 — https://github.com/wasm-bindgen/wasm-bindgen/tree/master/crates/macro-support
@@ -4435,7 +4436,7 @@ MIT License (MIT)
 ==============================================================================
 hyper-rustls 0.27.9 — https://github.com/rustls/hyper-rustls
 rustls-native-certs 0.8.4 — https://github.com/rustls/rustls-native-certs
-rustls 0.23.45 — https://github.com/rustls/rustls
+rustls 0.23.46 — https://github.com/rustls/rustls
 
 Copyright (c) 2016 Joseph Birr-Pixton <jpixton@gmail.com>
 
@@ -8761,10 +8762,10 @@ SOFTWARE.__
 ==============================================================================
 MIT License (MIT)
 ==============================================================================
-leani-primitives 0.1.0-rc.5 — https://github.com/smart-byte/leani
-leani-processor-api 0.1.0-rc.5 — https://github.com/smart-byte/leani
-leani-source-api 0.1.0-rc.5 — https://github.com/smart-byte/leani
-leani-testkit 0.1.0-rc.5 — https://github.com/smart-byte/leani
+leani-primitives 0.1.0-rc.7 — https://github.com/smart-byte/leani
+leani-processor-api 0.1.0-rc.7 — https://github.com/smart-byte/leani
+leani-source-api 0.1.0-rc.7 — https://github.com/smart-byte/leani
+leani-testkit 0.1.0-rc.7 — https://github.com/smart-byte/leani
 
 MIT License
 
@@ -8794,6 +8795,7 @@ MIT License (MIT)
 ==============================================================================
 reth-chain-state 2.5.2 — https://github.com/paradigmxyz/reth
 reth-chainspec 2.5.2 — https://github.com/paradigmxyz/reth
+reth-consensus-common 2.5.2 — https://github.com/paradigmxyz/reth
 reth-consensus 2.5.2 — https://github.com/paradigmxyz/reth
 reth-db-models 2.5.2 — https://github.com/paradigmxyz/reth
 reth-discv4 2.5.2 — https://github.com/paradigmxyz/reth
@@ -8804,6 +8806,7 @@ reth-era 2.5.2 — https://github.com/paradigmxyz/reth
 reth-errors 2.5.2 — https://github.com/paradigmxyz/reth
 reth-eth-wire-types 2.5.2 — https://github.com/paradigmxyz/reth
 reth-eth-wire 2.5.2 — https://github.com/paradigmxyz/reth
+reth-ethereum-consensus 2.5.2 — https://github.com/paradigmxyz/reth
 reth-ethereum-forks 2.5.2 — https://github.com/paradigmxyz/reth
 reth-ethereum-primitives 2.5.2 — https://github.com/paradigmxyz/reth
 reth-evm-ethereum 2.5.2 — https://github.com/paradigmxyz/reth
@@ -8830,26 +8833,26 @@ reth-transaction-pool 2.5.2 — https://github.com/paradigmxyz/reth
 reth-trie-common 2.5.2 — https://github.com/paradigmxyz/reth
 reth-trie-sparse 2.5.2 — https://github.com/paradigmxyz/reth
 reth-trie 2.5.2 — https://github.com/paradigmxyz/reth
-leani-api 0.1.0-rc.5 — https://github.com/smart-byte/leani
-leani-finality-beacon-api 0.1.0-rc.5 — https://github.com/smart-byte/leani
-leani-finality-consensus-p2p 0.1.0-rc.5 — https://github.com/smart-byte/leani
-leani 0.1.0-rc.5 — https://github.com/smart-byte/leani
-leani-processor-blobs 0.1.0-rc.5 — https://github.com/smart-byte/leani
-leani-processor-block-summary 0.1.0-rc.5 — https://github.com/smart-byte/leani
-leani-processor-erc20 0.1.0-rc.5 — https://github.com/smart-byte/leani
-leani-processor-evm-events 0.1.0-rc.5 — https://github.com/smart-byte/leani
-leani-processor-rollup-txs 0.1.0-rc.5 — https://github.com/smart-byte/leani
-leani-processor-transaction-stats 0.1.0-rc.5 — https://github.com/smart-byte/leani
-leani-processor-uniswap 0.1.0-rc.5 — https://github.com/smart-byte/leani
-leani-rpc 0.1.0-rc.5 — https://github.com/smart-byte/leani
-leani-runtime 0.1.0-rc.5 — https://github.com/smart-byte/leani
-leani-source-archive 0.1.0-rc.5 — https://github.com/smart-byte/leani
-leani-source-erae 0.1.0-rc.5 — https://github.com/smart-byte/leani
-leani-source-p2p 0.1.0-rc.5 — https://github.com/smart-byte/leani
-leani-source-xatu 0.1.0-rc.5 — https://github.com/smart-byte/leani
-leani-store-artifacts 0.1.0-rc.5 — https://github.com/smart-byte/leani
-leani-store-history 0.1.0-rc.5 — https://github.com/smart-byte/leani
-leani-store-sqlite 0.1.0-rc.5 — https://github.com/smart-byte/leani
+leani-api 0.1.0-rc.7 — https://github.com/smart-byte/leani
+leani-finality-beacon-api 0.1.0-rc.7 — https://github.com/smart-byte/leani
+leani-finality-consensus-p2p 0.1.0-rc.7 — https://github.com/smart-byte/leani
+leani 0.1.0-rc.7 — https://github.com/smart-byte/leani
+leani-processor-blobs 0.1.0-rc.7 — https://github.com/smart-byte/leani
+leani-processor-block-summary 0.1.0-rc.7 — https://github.com/smart-byte/leani
+leani-processor-erc20 0.1.0-rc.7 — https://github.com/smart-byte/leani
+leani-processor-evm-events 0.1.0-rc.7 — https://github.com/smart-byte/leani
+leani-processor-rollup-txs 0.1.0-rc.7 — https://github.com/smart-byte/leani
+leani-processor-transaction-stats 0.1.0-rc.7 — https://github.com/smart-byte/leani
+leani-processor-uniswap 0.1.0-rc.7 — https://github.com/smart-byte/leani
+leani-rpc 0.1.0-rc.7 — https://github.com/smart-byte/leani
+leani-runtime 0.1.0-rc.7 — https://github.com/smart-byte/leani
+leani-source-archive 0.1.0-rc.7 — https://github.com/smart-byte/leani
+leani-source-erae 0.1.0-rc.7 — https://github.com/smart-byte/leani
+leani-source-p2p 0.1.0-rc.7 — https://github.com/smart-byte/leani
+leani-source-xatu 0.1.0-rc.7 — https://github.com/smart-byte/leani
+leani-store-artifacts 0.1.0-rc.7 — https://github.com/smart-byte/leani
+leani-store-history 0.1.0-rc.7 — https://github.com/smart-byte/leani
+leani-store-sqlite 0.1.0-rc.7 — https://github.com/smart-byte/leani
 alloy-consensus-any 1.8.3 — https://github.com/alloy-rs/alloy
 alloy-consensus-any 2.4.1 — https://github.com/alloy-rs/alloy
 alloy-consensus 1.8.3 — https://github.com/alloy-rs/alloy
