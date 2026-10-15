@@ -16013,9 +16013,10 @@ async fn entity_meta_images(
 
 /// Restore output metadata before-images after undo restored the values.
 ///
-/// A before-image taken while its block was still unfinalized is restored as
-/// finalized once finality has passed that block, as `mark_finalized` would
-/// have recorded it meanwhile.
+/// A before-image taken while its block was still unfinalized is restored at
+/// that block's current level: finalized once finality has passed it, as
+/// `mark_finalized` would have recorded it meanwhile, or its coverage's level,
+/// which `mark_attested` raises.
 async fn restore_entity_metadata(
     transaction: &mut Transaction<'_, Sqlite>,
     instance: &str,
@@ -16026,7 +16027,18 @@ async fn restore_entity_metadata(
         let finality = if finalized_through.is_some_and(|through| image.block_number <= through.0) {
             Finality::Finalized
         } else {
-            image.finality
+            let covered: Option<i64> = sqlx::query_scalar(
+                "SELECT finality FROM processor_coverage
+                 WHERE instance = ? AND block_number = ?",
+            )
+            .bind(instance)
+            .bind(u64_i64(image.block_number, "output block number")?)
+            .fetch_optional(&mut **transaction)
+            .await?;
+            covered
+                .map(decode_finality)
+                .transpose()?
+                .map_or(image.finality, |covered| covered.max(image.finality))
         };
         sqlx::query(
             "UPDATE output_entity_meta
@@ -24027,6 +24039,39 @@ mod tests {
                 .expect("restored metadata");
         assert_eq!(block_number, 1);
         assert_eq!(finality, finality_i64(Finality::Finalized));
+    }
+
+    #[tokio::test]
+    async fn undo_restores_metadata_as_attested_once_attestation_passed_its_block() {
+        // Review: restoration lifted a stale before-image to finalized only,
+        // so an entity whose block was attested since came back unattested
+        // next to attested coverage.
+        let (_directory, store) = store().await;
+        let processor = processor_publishing(PublicationPolicy::Unattested);
+        let first = unattested(frame(1, BlockHash::ZERO));
+        let second = unattested(frame(2, first.block.hash));
+        apply_unattested(&store, &processor, &[&first, &second]).await;
+        store
+            .mark_attested(&processor.descriptor, first.block.number, first.block.hash)
+            .await
+            .expect("attest block 1");
+
+        store
+            .undo(
+                &processor.descriptor,
+                ChainId(1),
+                second.block.number,
+                second.block.hash,
+                &[],
+            )
+            .await
+            .expect("undo block 2");
+        let (block_number, _, finality, _, _) =
+            output_meta(&store, &processor, "state", b"counter")
+                .await
+                .expect("restored metadata");
+        assert_eq!(block_number, 1);
+        assert_eq!(finality, finality_i64(Finality::Attested));
     }
 
     #[tokio::test]
