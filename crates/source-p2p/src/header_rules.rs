@@ -8,10 +8,13 @@ use std::sync::Arc;
 use alloy_consensus::Header;
 use alloy_eips::eip4844::DATA_GAS_PER_BLOB;
 use leani_primitives::slot_starting_at;
+use leani_source_api::AttestedHead;
 use reth_chainspec::ChainSpec;
 use reth_consensus::{ConsensusError, HeaderValidator};
 use reth_ethereum_consensus::EthBeaconConsensus;
 use reth_primitives_traits::SealedHeader;
+
+use crate::live_head::{MAX_UNATTESTED_SLOTS, late_reveal};
 
 /// How far ahead of the local clock a header's slot may start.
 // ponytail: fixed clock-skew allowance; make it config if operators run skewed clocks.
@@ -100,6 +103,32 @@ impl HeaderRules {
             ) => HeaderVerdict::UnknownFork(error.to_string()),
             Err(error) => HeaderVerdict::Invalid(error.to_string()),
         }
+    }
+}
+
+impl HeaderRules {
+    /// Whether a branch that peers serve without verified evidence may join
+    /// the unattested tail, judged before any body is fetched. `headers` runs
+    /// from the common ancestor up, the ancestor first. Every later header
+    /// must pass the rules against its parent and start a slot at most
+    /// `MAX_UNATTESTED_SLOTS` past the newest attested one, and the tip must
+    /// not be a late reveal: the head path's checks, for the whole branch.
+    pub(crate) fn accepts_branch(
+        &self,
+        headers: &[Header],
+        attested: Option<AttestedHead>,
+        now: u64,
+    ) -> bool {
+        let (Some(attested), Some(tip)) = (attested, headers.last()) else {
+            return false;
+        };
+        headers.len() >= 2
+            && !late_reveal(tip.timestamp, now)
+            && headers.windows(2).all(|pair| {
+                slot_starting_at(pair[1].timestamp).is_some_and(|slot| {
+                    slot.saturating_sub(attested.beacon_slot) <= MAX_UNATTESTED_SLOTS
+                }) && self.check(&pair[1], &pair[0], now, None) == HeaderVerdict::Valid
+            })
     }
 }
 
@@ -246,6 +275,46 @@ mod tests {
         assert!(matches!(
             rules.check(&stale, &parent, child.timestamp + 1, None),
             HeaderVerdict::Invalid(_)
+        ));
+    }
+
+    fn attested_at(beacon_slot: u64) -> leani_source_api::AttestedHead {
+        leani_source_api::AttestedHead {
+            beacon_slot,
+            beacon_block_root: [0; 32],
+            block_number: leani_primitives::BlockNumber(0),
+            block_hash: leani_primitives::BlockHash::ZERO,
+        }
+    }
+
+    #[test]
+    fn an_unverified_branch_passes_the_rules_the_head_path_does() {
+        let ancestor = parent();
+        let child = child_of(&ancestor, &MAINNET);
+        let grandchild = child_of(&child, &MAINNET);
+        let branch = [ancestor.clone(), child.clone(), grandchild.clone()];
+        let now = grandchild.timestamp + 1;
+        assert!(rules().accepts_branch(&branch, Some(attested_at(SLOT)), now));
+        // No attested anchor, or one too far behind the branch's tip.
+        assert!(!rules().accepts_branch(&branch, None, now));
+        assert!(
+            !rules().accepts_branch(&branch, Some(attested_at(SLOT - 1)), now),
+            "the tip is three slots past the attested head"
+        );
+        // A late tip waits for the attested path.
+        assert!(!rules().accepts_branch(
+            &branch,
+            Some(attested_at(SLOT)),
+            grandchild.timestamp + 8
+        ));
+        // Any applied header that breaks a rule rejects the branch.
+        let mut forged = child;
+        forged.base_fee_per_gas = forged.base_fee_per_gas.map(|fee| fee + 1);
+        let after_forged = child_of(&forged, &MAINNET);
+        assert!(!rules().accepts_branch(
+            &[ancestor, forged, after_forged],
+            Some(attested_at(SLOT)),
+            now
         ));
     }
 
