@@ -54,7 +54,9 @@ record, and documented RPC contracts.
 - The embedded `leani subscribe` no longer prints unverified peer previews
   during startup. Rows at `unattested` come from the verified lane, which
   checks a peer quorum, Leani's header rules and the link to the delivered
-  chain before printing them.
+  chain before printing them. The first rows therefore take longer after a
+  start: on mainnet (5 runs each) the median wait grew from 38 s to 68 s with
+  a warm data directory, and from 53 s to more than 90 s from a cold one.
 
 ### Upgrading from 0.1.0-rc.7
 
