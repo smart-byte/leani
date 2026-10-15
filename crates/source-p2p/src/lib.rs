@@ -1888,7 +1888,7 @@ impl MaterialRequestGate {
         }
         let capacity = material_request_capacity(self.limit, priority);
         self.in_flight
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
                 (current < capacity).then(|| current.saturating_add(1))
             })
             .ok()
