@@ -65,7 +65,7 @@ impl InputBudget {
     /// Charge `bytes` before they are requested.
     fn charge(&self, bytes: u64) -> Result<()> {
         self.used
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
                 used.checked_add(bytes).filter(|total| *total <= self.limit)
             })
             .map(|_| ())
