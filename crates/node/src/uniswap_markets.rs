@@ -6,7 +6,10 @@ use anyhow::{Context as _, Result, bail};
 use leani_processor_uniswap::UNISWAP_OBSERVATIONS_VERSION;
 use leani_store_sqlite::StoreError;
 
-use crate::{builtin_processors::processor_contract, config::ProcessorConfig};
+use crate::{
+    builtin_processors::processor_contract,
+    config::{ProcessorConfig, PublishMode},
+};
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Token {
@@ -118,7 +121,7 @@ pub(crate) fn resolve_markets(requested: &[String]) -> Result<Vec<Market>> {
 pub(crate) fn processor_config(
     markets: &[Market],
     instance: &str,
-    finalized_only: bool,
+    publish: PublishMode,
 ) -> Result<ProcessorConfig> {
     let start_block = markets
         .iter()
@@ -130,7 +133,7 @@ pub(crate) fn processor_config(
         instance,
         UNISWAP_OBSERVATIONS_VERSION,
         start_block,
-        finalized_only,
+        publish,
     );
     let pools = markets
         .iter()

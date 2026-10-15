@@ -168,7 +168,7 @@ version = "1.5.0"
 history_control = "node_owned"
 history_mode = "automatic"
 start_block = 19426589
-publish = "included_and_finalized"
+publish = "attested"
 
 [processors.state]
 mode = "checkpointed"

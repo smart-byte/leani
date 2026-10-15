@@ -89,7 +89,7 @@ Common configuration remains strict:
 id = "my-protocol"
 version = "1.0.0"
 start_block = 18000000
-publish = "included_and_finalized"
+publish = "attested"
 retention = "full_output_history"
 
 [processors.settings]

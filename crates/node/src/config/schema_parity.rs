@@ -594,6 +594,10 @@ fn the_probe_reaches_nested_tables_and_enum_values() {
         at(&["processors", "[]", "settings"]),
         Some(Shape::Map)
     ));
+    assert!(matches!(
+        at(&["processors", "[]", "delivery", "emit"]),
+        Some(Shape::Enum(_, variants)) if variants.contains(&"job_result")
+    ));
 }
 
 #[test]

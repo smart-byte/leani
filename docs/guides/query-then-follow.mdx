@@ -18,7 +18,7 @@ boundary to `subscribe({ after })` closes the gap.
 
 <Aside type="caution" title="Included-and-finalized processors only">
   `query-and-follow` answers `409 finalized_only_snapshot` for a processor
-  with `publish = "finalized_only"`. Its retained state already holds included
+  with `publish = "finalized"`. Its retained state already holds included
   blocks whose changes are unpublished, and the stream never emits an undo for
   them, so a snapshot could seed rows no later event corrects. Follow such a
   processor's change stream from its head instead.

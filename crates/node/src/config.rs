@@ -162,7 +162,7 @@ impl StarterConfig {
         let processor = match (self.blocks, self.uniswap) {
             (Some(_), None) => Ok(crate::block_summaries::processor_config(
                 crate::block_summaries::COMPACT_INSTANCE,
-                false,
+                PublishMode::Attested,
             )),
             (None, Some(uniswap)) => {
                 let markets = crate::uniswap_markets::resolve_markets(&uniswap.markets)
@@ -170,7 +170,7 @@ impl StarterConfig {
                 crate::uniswap_markets::processor_config(
                     &markets,
                     crate::uniswap_markets::COMPACT_INSTANCE,
-                    false,
+                    PublishMode::Attested,
                 )
             }
             _ => {
@@ -708,7 +708,10 @@ pub struct ProcessorConfig {
     #[serde(default)]
     pub require_retained_input: bool,
     pub start_block: u64,
-    pub publish: PublishMode,
+    /// The first level the processor's consumers see; omitted, `unattested`.
+    /// Refused next to `delivery.emit = "job_result"`.
+    #[serde(default)]
+    pub publish: Option<PublishMode>,
     pub state: StatePolicyConfig,
     #[serde(default)]
     pub artifacts: ArtifactPolicyConfig,
@@ -800,7 +803,12 @@ impl ProcessorConfig {
 
     #[must_use]
     pub fn publication_policy(&self) -> PublicationPolicy {
-        self.publish.into()
+        match (self.delivery.emit, self.publish.unwrap_or_default()) {
+            (DeliveryEmit::JobResult, _) => PublicationPolicy::JobResult,
+            (DeliveryEmit::Changes, PublishMode::Unattested) => PublicationPolicy::Unattested,
+            (DeliveryEmit::Changes, PublishMode::Attested) => PublicationPolicy::Attested,
+            (DeliveryEmit::Changes, PublishMode::Finalized) => PublicationPolicy::Finalized,
+        }
     }
 }
 
@@ -837,22 +845,26 @@ impl From<ArtifactPolicyConfig> for ArtifactPolicy {
     }
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+/// The first level a processor's consumers see. Omitted, `unattested`: the
+/// level an Ethereum RPC's `latest` has.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PublishMode {
-    IncludedAndFinalized,
-    FinalizedOnly,
-    TerminalOnly,
+    #[default]
+    Unattested,
+    Attested,
+    Finalized,
 }
 
-impl From<PublishMode> for PublicationPolicy {
-    fn from(value: PublishMode) -> Self {
-        match value {
-            PublishMode::IncludedAndFinalized => Self::Attested,
-            PublishMode::FinalizedOnly => Self::Finalized,
-            PublishMode::TerminalOnly => Self::JobResult,
-        }
-    }
+/// What a processor's delivery carries.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeliveryEmit {
+    /// Every block's changes.
+    #[default]
+    Changes,
+    /// Only the final aggregate of a bounded history job.
+    JobResult,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
@@ -887,7 +899,7 @@ pub struct OutputPolicyConfig {
     #[serde(default)]
     pub window: Option<OutputWindowConfig>,
     /// Never applied. Decoded only so validation can refuse it and name
-    /// `publish = "finalized_only"`, which publishes only finalized blocks.
+    /// `publish = "finalized"`, which publishes only finalized blocks.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub finalized_only: Option<bool>,
 }
@@ -943,6 +955,10 @@ impl Default for DeliveryPruningConfig {
 #[serde(deny_unknown_fields)]
 pub struct DeliveryPolicyConfig {
     pub mode: DeliveryPolicyMode,
+    /// Lifecycle config, but it maps into the descriptor's `publication`
+    /// (see [`ProcessorConfig::publication_policy`]), so it is identity.
+    #[serde(default)]
+    pub emit: DeliveryEmit,
     #[serde(default = "default_delivery_max_bytes")]
     pub max_bytes: HumanBytes,
     #[serde(default = "default_delivery_max_age")]
@@ -1786,7 +1802,13 @@ impl Config {
             if processor.output.finalized_only.is_some() {
                 errors.push(ValidationError::new(
                     format!("processors[{index}].output.finalized_only"),
-                    "was never applied and is no longer accepted; remove it, and set publish = \"finalized_only\" to publish only finalized blocks",
+                    "was never applied and is no longer accepted; remove it, and set publish = \"finalized\" to publish only finalized blocks",
+                ));
+            }
+            if processor.delivery.emit == DeliveryEmit::JobResult && processor.publish.is_some() {
+                errors.push(ValidationError::new(
+                    format!("processors[{index}].publish"),
+                    "does not apply with delivery.emit = \"job_result\": a job result covers finalized history; remove publish",
                 ));
             }
             if processor.require_retained_input && !self.raw_history.enabled {
@@ -2852,7 +2874,6 @@ id = "fixture"
 instance = "fixture-main"
 version = "0.1.0"
 start_block = 1
-publish = "included_and_finalized"
 
 [processors.state]
 mode = "durable"
@@ -2894,7 +2915,6 @@ mod tests {
     const BASE_PROCESSOR_CONTRACT: &str = r#"instance = "fixture-main"
 version = "0.1.0"
 start_block = 1
-publish = "included_and_finalized"
 
 [processors.state]
 mode = "durable"
@@ -2918,6 +2938,72 @@ verification_segment_blocks = 8192"#;
 
     fn config() -> Config {
         toml::from_str(VALID_CONFIG_TOML).expect("valid fixture")
+    }
+
+    /// `VALID_CONFIG_TOML` with `extra` in its processor: lines before a
+    /// `[processors.delivery]` header go after `start_block`, lines after it
+    /// into the existing delivery table.
+    fn processor_contract_config(extra: &str) -> String {
+        let (processor, delivery) = extra
+            .split_once("[processors.delivery]\n")
+            .unwrap_or((extra, ""));
+        VALID_CONFIG_TOML
+            .replace(
+                "start_block = 1\n",
+                &format!("start_block = 1\n{processor}\n"),
+            )
+            .replace(
+                "[processors.delivery]\nmode = \"window\"\n",
+                &format!("[processors.delivery]\nmode = \"window\"\n{delivery}\n"),
+            )
+    }
+
+    fn try_parse_processor_contract(extra: &str) -> Result<Config, toml::de::Error> {
+        toml::from_str(&processor_contract_config(extra))
+    }
+
+    fn parse_processor_contract(extra: &str) -> ProcessorConfig {
+        try_parse_processor_contract(extra)
+            .expect("processor contract")
+            .processors
+            .remove(0)
+    }
+
+    fn validate_processor_contract(extra: &str) -> Result<(), ValidationErrors> {
+        try_parse_processor_contract(extra)
+            .expect("processor contract")
+            .validate()
+            .map(drop)
+    }
+
+    #[test]
+    fn publish_defaults_to_unattested_and_names_levels_only() {
+        let omitted = parse_processor_contract("");
+        assert_eq!(omitted.publication_policy(), PublicationPolicy::Unattested);
+        for (value, policy) in [
+            ("unattested", PublicationPolicy::Unattested),
+            ("attested", PublicationPolicy::Attested),
+            ("finalized", PublicationPolicy::Finalized),
+        ] {
+            let config = parse_processor_contract(&format!("publish = \"{value}\""));
+            assert_eq!(config.publication_policy(), policy);
+        }
+        for removed in ["included_and_finalized", "finalized_only", "terminal_only"] {
+            let error = try_parse_processor_contract(&format!("publish = \"{removed}\""))
+                .expect_err("rc.6 publish values are refused");
+            assert!(error.to_string().contains("unattested"), "{error}");
+        }
+    }
+
+    #[test]
+    fn job_results_are_a_delivery_choice_and_take_no_level() {
+        let config = parse_processor_contract("[processors.delivery]\nemit = \"job_result\"");
+        assert_eq!(config.publication_policy(), PublicationPolicy::JobResult);
+        let error = validate_processor_contract(
+            "publish = \"finalized\"\n[processors.delivery]\nemit = \"job_result\"",
+        )
+        .expect_err("publish next to a job result");
+        assert!(error.to_string().contains("job result"), "{error}");
     }
 
     #[test]
@@ -3153,7 +3239,6 @@ maximum_overfetch_ratio = 1.5"#,
             r#"instance = "fixture-production"
 version = "0.1.0"
 start_block = 1
-publish = "included_and_finalized"
 
 [processors.state]
 mode = "checkpointed"
@@ -3225,7 +3310,6 @@ version = "0.1.0"
 history_control = "node_owned"
 history_mode = "on_demand"
 start_block = 1
-publish = "included_and_finalized"
 
 [processors.state]
 mode = "durable"
@@ -3273,7 +3357,6 @@ verification_segment_blocks = 8192"#,
 version = "0.1.0"
 history_control = "application_subscriptions"
 start_block = 1
-publish = "included_and_finalized"
 
 [processors.state]
 mode = "durable"
@@ -3313,7 +3396,6 @@ verification_segment_blocks = 8192"#,
             r#"instance = "fixture-analysis"
 version = "0.1.0"
 start_block = 1
-publish = "included_and_finalized"
 
 [processors.state]
 mode = "durable"
@@ -3343,8 +3425,8 @@ verification_segment_blocks = 8192"#,
     #[test]
     fn rejects_removed_legacy_retention() {
         let stale = VALID_CONFIG_TOML.replace(
-            "publish = \"included_and_finalized\"",
-            "publish = \"included_and_finalized\"\nretention = \"full_output_history\"",
+            "start_block = 1\n",
+            "start_block = 1\nretention = \"full_output_history\"\n",
         );
         let error = toml::from_str::<Config>(&stale).expect_err("legacy retention is rejected");
         assert!(error.to_string().contains("retention"));
@@ -3528,7 +3610,7 @@ version = "0.1.0"
 history_control = "application_subscriptions"
 history_mode = "on_demand"
 start_block = 1
-publish = "finalized_only"
+publish = "finalized"
 
 [processors.state]
 mode = "durable"
@@ -3924,7 +4006,7 @@ markets = ["LINK/ETH"]
         for relative in [
             "config/modes/externalized.toml",
             "config/modes/aggregate-only.toml",
-            "config/modes/terminal.toml",
+            "config/modes/job-result.toml",
             "config/modes/head-only.toml",
             "config/modes/windowed.toml",
             "config/modes/full.toml",
@@ -4270,7 +4352,7 @@ markets = ["LINK/ETH"]
             assert!(
                 errors.iter().any(|error| {
                     error.field == "processors[0].output.finalized_only"
-                        && error.message.contains("publish = \"finalized_only\"")
+                        && error.message.contains("publish = \"finalized\"")
                 }),
                 "{value}: {errors:?}"
             );

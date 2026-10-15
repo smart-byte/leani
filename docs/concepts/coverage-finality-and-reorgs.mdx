@@ -93,13 +93,13 @@ only what it did not fill; see
 
 ## Reorgs are delivery events
 
-For included publication (`publish = "included_and_finalized"`), downstream
+For attested publication (`publish = "attested"`), downstream
 consumers can see `apply`, `undo`, and
 later `finalized` changes. Processor state, undo records, and published changes
 commit together. A consumer must implement these operations idempotently and
 must not infer finality from age alone.
 
-With `publish = "finalized_only"` the change stream carries only finalized
+With `publish = "finalized"` the change stream carries only finalized
 `apply` records and `system.finality` markers. Included blocks are applied to
 processor state and journaled for undo, but their changes stay in the store
 until verified finality promotes them. Their bytes count against the delivery

@@ -3077,7 +3077,7 @@ impl SqliteStore {
     /// Reduce and commit a block while optionally suppressing its delivery
     /// changes.
     ///
-    /// This is used by bounded `terminal_only` jobs: state and coverage commit
+    /// This is used by bounded job-result (`emit = "job_result"`) jobs: state and coverage commit
     /// for every block, while only the terminal aggregate enters the delivery
     /// spool. Other callers should use [`Self::apply`].
     ///

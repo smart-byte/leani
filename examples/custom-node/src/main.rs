@@ -434,7 +434,7 @@ mod tests {
             history_control: leani::config::ProcessorHistoryControl::NodeOwned,
             require_retained_input: false,
             start_block: 1,
-            publish: leani::config::PublishMode::IncludedAndFinalized,
+            publish: Some(leani::config::PublishMode::Attested),
             state: leani::config::StatePolicyConfig {
                 mode: leani_processor_api::StatePolicyMode::Durable,
             },
@@ -446,6 +446,7 @@ mod tests {
             },
             delivery: leani::config::DeliveryPolicyConfig {
                 mode: leani_processor_api::DeliveryPolicyMode::Window,
+                emit: leani::config::DeliveryEmit::Changes,
                 max_bytes: leani::config::HumanBytes::from_bytes(1 << 30),
                 max_age: leani::config::HumanDuration::from_seconds(24 * 60 * 60),
                 on_limit: leani_processor_api::DeliveryLimitAction::Pause,
