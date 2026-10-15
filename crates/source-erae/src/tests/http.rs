@@ -102,7 +102,11 @@ async fn serve(
         .expect("headers");
     if stall {
         blocked.notify_one();
-        assert_eq!(stream.read(&mut buffer).await.expect("cancelled read"), 0);
+        match stream.read(&mut buffer).await {
+            Ok(0) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => {}
+            result => panic!("cancelled response connection must close: {result:?}"),
+        }
         closed.notify_one();
     } else if !head {
         stream.write_all(body).await.expect("body");
