@@ -5669,44 +5669,58 @@ impl RethP2pSource {
             )
             .await?;
         let (ancestor, reverted) = plan_reorg(&state.recent, &descending)?;
-        let applied = if ancestor.number == head_number {
-            Vec::new()
-        } else {
-            let range = BlockRange::new(
-                BlockNumber(ancestor.number.0.saturating_add(1)),
-                head_number,
-            )
-            .map_err(|error| P2pError::InvalidResponse(error.to_string()))?;
-            if range.len() > MAX_FIXED_RANGE_BLOCKS {
-                return Err(P2pError::ReorgTooDeep {
-                    maximum: self.config.max_reorg_depth,
-                });
-            }
-            let (frames, _) = self
-                .fetch_requested_live_range(
-                    &state.session,
-                    range,
-                    Some(ExpectedTip {
-                        hash: head_hash,
-                        trust: evidence,
-                    }),
-                    &state.request,
-                    state.budget,
-                    &state.cancellation,
-                )
-                .await?;
-            if frames
-                .first()
-                .is_none_or(|frame| frame.block.parent_hash != ancestor.hash)
-            {
-                return Err(P2pError::InvalidResponse(
-                    "replacement branch does not join the discovered common ancestor".to_owned(),
-                ));
-            }
-            frames
-        };
+        let applied = self
+            .fetch_reorg_branch(state, ancestor, head_number, head_hash, evidence)
+            .await?;
         let new_tip = applied.last().map_or(ancestor, |frame| frame.block);
         Ok((reverted, applied, new_tip))
+    }
+
+    /// The frames of the branch above `ancestor` up to `head_hash` at
+    /// `head_number`, which joins `ancestor`.
+    async fn fetch_reorg_branch(
+        &self,
+        state: &P2pLiveState,
+        ancestor: BlockRef,
+        head_number: BlockNumber,
+        head_hash: BlockHash,
+        evidence: ExpectationTrust,
+    ) -> Result<Vec<BlockFrame>, P2pError> {
+        if ancestor.number == head_number {
+            return Ok(Vec::new());
+        }
+        let range = BlockRange::new(
+            BlockNumber(ancestor.number.0.saturating_add(1)),
+            head_number,
+        )
+        .map_err(|error| P2pError::InvalidResponse(error.to_string()))?;
+        if range.len() > MAX_FIXED_RANGE_BLOCKS {
+            return Err(P2pError::ReorgTooDeep {
+                maximum: self.config.max_reorg_depth,
+            });
+        }
+        let (frames, _) = self
+            .fetch_requested_live_range(
+                &state.session,
+                range,
+                Some(ExpectedTip {
+                    hash: head_hash,
+                    trust: evidence,
+                }),
+                &state.request,
+                state.budget,
+                &state.cancellation,
+            )
+            .await?;
+        if frames
+            .first()
+            .is_none_or(|frame| frame.block.parent_hash != ancestor.hash)
+        {
+            return Err(P2pError::InvalidResponse(
+                "replacement branch does not join the discovered common ancestor".to_owned(),
+            ));
+        }
+        Ok(frames)
     }
 
     /// The header with `hash`, from any peer, checked against its hash.
@@ -9547,22 +9561,57 @@ async fn unattested_reorg(state: &mut P2pLiveState, header: Header) -> Result<He
         return Ok(HeadPoll::WaitForAttested);
     }
     let source = state.source.clone();
-    let (reverted, mut applied, new_tip) = match source
-        .reconstruct_reorg(
-            state,
-            BlockNumber(header.number),
-            block_hash(header.hash_slow()),
+    let head_number = BlockNumber(header.number);
+    let head_hash = block_hash(header.hash_slow());
+    let descending = match source
+        .fetch_descending_headers(
+            &state.session.fetch,
+            head_number,
+            head_hash,
             ExpectationTrust::Unverified,
+            &state.cancellation,
         )
         .await
     {
-        Ok(reorg) => reorg,
+        Ok(headers) => headers,
         Err(P2pError::Cancelled) => return Err(P2pError::Cancelled),
         Err(_) => return Ok(HeadPoll::WaitForAttested),
+    };
+    let Ok((ancestor, reverted)) = plan_reorg(&state.recent, &descending) else {
+        return Ok(HeadPoll::WaitForAttested);
     };
     if !state.tail.contains_all(&reverted) {
         return Ok(HeadPoll::WaitForAttested);
     }
+    // The branch passes the head path's checks, header by header, before any
+    // of its bodies is fetched.
+    let mut branch = descending
+        .iter()
+        .filter(|branch_header| branch_header.number >= ancestor.number.0)
+        .cloned()
+        .collect::<Vec<_>>();
+    branch.reverse();
+    if !source
+        .header_rules
+        .accepts_branch(&branch, state.attested.peek(), unix_now())
+    {
+        return Ok(HeadPoll::WaitForAttested);
+    }
+    let mut applied = match source
+        .fetch_reorg_branch(
+            state,
+            ancestor,
+            head_number,
+            head_hash,
+            ExpectationTrust::Unverified,
+        )
+        .await
+    {
+        Ok(frames) => frames,
+        Err(P2pError::Cancelled) => return Err(P2pError::Cancelled),
+        Err(_) => return Ok(HeadPoll::WaitForAttested),
+    };
+    let new_tip = applied.last().map_or(ancestor, |frame| frame.block);
     for frame in &mut applied {
         frame.finality = Finality::Unattested;
     }
