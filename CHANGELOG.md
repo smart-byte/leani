@@ -6,6 +6,8 @@ record, and documented RPC contracts.
 
 ## [Unreleased]
 
+## [0.1.0-rc.8] - 2026-10-16
+
 ### Added
 
 - Processors publish each new block at the `unattested` level a few seconds
