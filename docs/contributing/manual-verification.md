@@ -511,9 +511,8 @@ payload size. Record cold and persisted-peer-store runs separately, preserve
 `execution-p2p-secret` plus `execution-network.sqlite` for the latter, and never
 compare a recent receipt-complete run directly with a header-only or
 state-snapshot sync headline. `material_request_blocks` is intentionally
-tunable: the evidence-backed default is eight; partial/failed responses shrink
-the working width, and larger ceilings must earn promotion through repeated
-real-network runs.
+tunable: the evidence-backed default is eight, and larger values must earn
+promotion through repeated real-network runs.
 
 For an immediate versus slow-consumer comparison, repeat the exact same range
 and build with a fresh directory/report and add, for example,

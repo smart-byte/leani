@@ -117,11 +117,9 @@ const MAINNET_DNS_DISCOVERY_TREE: &str =
 const MAINNET_DNS_RETRY_INTERVAL: Duration = Duration::from_secs(15);
 const PEER_QUALIFICATION_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 static SECRET_KEY_WRITE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
-// Mainnet ETH responses have a 2 MiB soft limit. Start from the fastest
-// evidence-backed width, then shrink body and receipt requests independently
-// when a peer truncates or rejects an oversized response.
+// Mainnet ETH responses have a 2 MiB soft limit, so a peer may serve only a
+// request's first blocks. Those are kept and the rest is asked for again.
 const DEFAULT_MATERIAL_REQUEST_BLOCKS: usize = 8;
-const MATERIAL_BATCH_GROW_SUCCESS_WINDOWS: usize = 8;
 // ETH request IDs allow several independent requests on one session. A small
 // pipeline hides public-peer latency without letting a single connection
 // consume the entire global history budget.
@@ -286,11 +284,11 @@ pub struct RethP2pConfig {
     /// Keep retrying the persistent pool until cancellation instead of making
     /// temporary public-network availability a terminal node error.
     pub persistent_retries: bool,
-    /// Maximum simultaneous adaptive body or receipt requests. The effective
-    /// limit is also bounded by connected peers and the source budget.
+    /// Maximum simultaneous body or receipt requests. The effective limit is
+    /// also bounded by connected peers and the source budget.
     pub material_request_concurrency: usize,
-    /// Initial and maximum blocks per ETH body/receipt request. Oversized or
-    /// partial responses are split and reduce the adaptive working size.
+    /// Blocks per ETH body/receipt request. A peer may serve only the first
+    /// of them; the rest is requested again.
     pub material_request_blocks: usize,
     /// Maximum simultaneous header requests while proving a finalized
     /// historical range. Requests are low priority and yield to the live lane.
@@ -702,7 +700,6 @@ pub struct RethP2pSource {
     header_rules: Arc<HeaderRules>,
     descriptor: SourceDescriptor,
     network: Arc<PersistentNetwork>,
-    material_tuning: Arc<MaterialBatchTuning>,
     request_metrics: P2pRequestMetrics,
     /// Sync-committee-attested heads a verified finality source publishes.
     /// The live lane includes no block above the newest, and none without
@@ -1998,87 +1995,45 @@ struct LiveReceiptMaterial<'a> {
     preferred_peer: B512,
 }
 
-#[derive(Debug)]
-struct MaterialBatchTuning {
-    maximum_blocks: usize,
-    body_blocks: AtomicUsize,
-    receipt_blocks: AtomicUsize,
-    body_success_windows: AtomicUsize,
-    receipt_success_windows: AtomicUsize,
+/// Blocks a reply of `returned` items is checked against, out of `requested`.
+/// A peer may stop a reply at its response size limit, so a shorter reply is
+/// checked as a prefix; an empty or oversized one against every block, which
+/// fails.
+const fn served_prefix(requested: usize, returned: usize) -> usize {
+    if returned == 0 || returned > requested {
+        requested
+    } else {
+        returned
+    }
 }
 
-impl MaterialBatchTuning {
-    fn new(maximum_blocks: usize) -> Self {
-        Self {
-            maximum_blocks,
-            body_blocks: AtomicUsize::new(maximum_blocks),
-            receipt_blocks: AtomicUsize::new(maximum_blocks),
-            body_success_windows: AtomicUsize::new(0),
-            receipt_success_windows: AtomicUsize::new(0),
+/// Request `blocks` blocks of material until replies cover all of them.
+/// `fetch` gets the offset of the first missing block and returns a verified
+/// prefix of the blocks from there, with the peer that served it. An error
+/// drops the blocks already served: callers retry every block of the request.
+async fn fetch_complete<T, F>(
+    blocks: usize,
+    mut fetch: impl FnMut(usize) -> F,
+) -> Result<(Vec<B512>, Vec<T>), P2pError>
+where
+    F: Future<Output = Result<(B512, Vec<T>), P2pError>>,
+{
+    let mut peers = Vec::new();
+    let mut material = Vec::with_capacity(blocks);
+    while material.len() < blocks {
+        let (peer, mut served) = fetch(material.len()).await?;
+        // A reply without blocks would never finish the request.
+        if served.is_empty() {
+            return Err(P2pError::IncompleteResponse {
+                component: "material",
+                returned: 0,
+                expected: blocks.saturating_sub(material.len()),
+            });
         }
+        peers.push(peer);
+        material.append(&mut served);
     }
-
-    fn body_blocks(&self) -> usize {
-        self.body_blocks
-            .load(Ordering::Acquire)
-            .clamp(1, self.maximum_blocks)
-    }
-
-    fn receipt_blocks(&self) -> usize {
-        self.receipt_blocks
-            .load(Ordering::Acquire)
-            .clamp(1, self.maximum_blocks)
-    }
-
-    fn body_succeeded(&self) {
-        grow_material_batch(
-            &self.body_blocks,
-            &self.body_success_windows,
-            self.maximum_blocks,
-        );
-    }
-
-    fn receipts_succeeded(&self) {
-        grow_material_batch(
-            &self.receipt_blocks,
-            &self.receipt_success_windows,
-            self.maximum_blocks,
-        );
-    }
-
-    fn body_failed(&self) {
-        self.body_success_windows.store(0, Ordering::Release);
-        shrink_material_batch(&self.body_blocks, self.maximum_blocks);
-    }
-
-    fn receipts_failed(&self) {
-        self.receipt_success_windows.store(0, Ordering::Release);
-        shrink_material_batch(&self.receipt_blocks, self.maximum_blocks);
-    }
-}
-
-fn grow_material_batch(batch: &AtomicUsize, success_windows: &AtomicUsize, maximum_blocks: usize) {
-    let current = batch.load(Ordering::Acquire);
-    if current >= maximum_blocks {
-        success_windows.store(0, Ordering::Release);
-        return;
-    }
-    let successes = success_windows
-        .fetch_add(1, Ordering::AcqRel)
-        .saturating_add(1);
-    if successes < MATERIAL_BATCH_GROW_SUCCESS_WINDOWS {
-        return;
-    }
-    success_windows.store(0, Ordering::Release);
-    batch.store(
-        current.saturating_mul(2).clamp(1, maximum_blocks),
-        Ordering::Release,
-    );
-}
-
-fn shrink_material_batch(batch: &AtomicUsize, maximum_blocks: usize) {
-    let current = batch.load(Ordering::Acquire);
-    batch.store((current / 2).clamp(1, maximum_blocks), Ordering::Release);
+    Ok((peers, material))
 }
 
 fn effective_material_concurrency(
@@ -4079,7 +4034,6 @@ impl RethP2pSource {
     /// Returns an error when peer, retry, or timeout bounds are invalid.
     pub fn mainnet(config: RethP2pConfig) -> Result<Self, P2pError> {
         config.validate()?;
-        let material_tuning = Arc::new(MaterialBatchTuning::new(config.material_request_blocks));
         config.network_telemetry.set_peer_targets(
             config.minimum_peers,
             config.body_serving_peer_target,
@@ -4138,7 +4092,6 @@ impl RethP2pSource {
             chain_spec: MAINNET.clone(),
             header_rules: Arc::new(HeaderRules::new(MAINNET.clone())),
             network,
-            material_tuning,
             request_metrics: P2pRequestMetrics::default(),
             attested_heads: None,
         })
@@ -4202,8 +4155,8 @@ impl RethP2pSource {
     #[must_use]
     pub fn request_metrics(&self) -> P2pRequestMetricsSnapshot {
         let mut snapshot = self.request_metrics.snapshot();
-        snapshot.body_request_blocks = self.material_tuning.body_blocks();
-        snapshot.receipt_request_blocks = self.material_tuning.receipt_blocks();
+        snapshot.body_request_blocks = self.config.material_request_blocks;
+        snapshot.receipt_request_blocks = self.config.material_request_blocks;
         snapshot
     }
 
@@ -4254,7 +4207,7 @@ impl RethP2pSource {
         hashes: &[B256],
         policy: MaterialRequestPolicy,
         cancellation: &CancellationToken,
-    ) -> Result<Vec<Vec<Receipt>>, P2pError> {
+    ) -> Result<(B512, Vec<Vec<Receipt>>), P2pError> {
         let mut last_error = None;
         let mut incomplete_responses = HashMap::new();
         let attempts = if headers.len() > 1 {
@@ -4307,13 +4260,14 @@ impl RethP2pSource {
                         P2pRequestKind::Receipts,
                         response.response_payload_bytes,
                     );
-                    match validate_receipts_against_headers(headers, &response.receipts) {
+                    let served = &headers[..served_prefix(headers.len(), response.receipts.len())];
+                    match validate_receipts_against_headers(served, &response.receipts) {
                         Ok(()) => {
                             lease.succeeded();
                             self.network.peer_store.record_success(
                                 peer,
                                 PeerMaterialKind::Receipts,
-                                headers.last().map_or(0, |header| header.number),
+                                served.last().map_or(0, |header| header.number),
                                 request_started_at.elapsed(),
                             );
                             reward_verified_material_peer(&session.handle, peer).await;
@@ -4326,7 +4280,7 @@ impl RethP2pSource {
                                 request_started_at.elapsed(),
                                 P2pRequestOutcome::Succeeded,
                             );
-                            return Ok(response.receipts);
+                            return Ok((peer, response.receipts));
                         }
                         Err(error) => {
                             self.config.network_telemetry.request_failed();
@@ -4409,7 +4363,7 @@ impl RethP2pSource {
                 "sparse receipt batch header/hash length mismatch".to_owned(),
             ));
         }
-        let batch_blocks = self.material_tuning.receipt_blocks();
+        let batch_blocks = self.config.material_request_blocks;
         let requests = headers
             .chunks(batch_blocks)
             .zip(hashes.chunks(batch_blocks))
@@ -4422,15 +4376,16 @@ impl RethP2pSource {
         );
         let outcomes = stream::iter(requests)
             .map(|(header_chunk, hash_chunk)| async move {
-                let result = self
-                    .fetch_sparse_receipts(
+                let result = fetch_complete(header_chunk.len(), |offset| {
+                    self.fetch_sparse_receipts(
                         session,
-                        &header_chunk,
-                        &hash_chunk,
+                        &header_chunk[offset..],
+                        &hash_chunk[offset..],
                         policy,
                         cancellation,
                     )
-                    .await;
+                })
+                .await;
                 (header_chunk, hash_chunk, result)
             })
             .buffered(concurrency)
@@ -4441,7 +4396,7 @@ impl RethP2pSource {
         let mut fallback = Vec::new();
         for (header_chunk, hash_chunk, result) in outcomes {
             match result {
-                Ok(receipts) => completed.push((header_chunk[0].number, receipts)),
+                Ok((_, receipts)) => completed.push((header_chunk[0].number, receipts)),
                 Err(error) if header_chunk.len() > 1 => {
                     debug!(
                         blocks = header_chunk.len(),
@@ -4450,10 +4405,7 @@ impl RethP2pSource {
                     );
                     fallback.extend(header_chunk.into_iter().zip(hash_chunk));
                 }
-                Err(error) => {
-                    self.material_tuning.receipts_failed();
-                    return Err(error);
-                }
+                Err(error) => return Err(error),
             }
         }
         let recovered = stream::iter(fallback)
@@ -4472,20 +4424,9 @@ impl RethP2pSource {
             .buffered(concurrency)
             .collect::<Vec<_>>()
             .await;
-        let recovered_any = !recovered.is_empty();
         for (number, result) in recovered {
-            match result {
-                Ok(receipts) => completed.push((number, receipts)),
-                Err(error) => {
-                    self.material_tuning.receipts_failed();
-                    return Err(error);
-                }
-            }
-        }
-        if recovered_any {
-            self.material_tuning.receipts_failed();
-        } else {
-            self.material_tuning.receipts_succeeded();
+            let (_, receipts) = result?;
+            completed.push((number, receipts));
         }
         completed.sort_by_key(|(number, _)| *number);
         let mut receipts = Vec::with_capacity(headers.len());
@@ -6899,7 +6840,6 @@ impl RethP2pSource {
     async fn fetch_bodies<C>(
         &self,
         fetch: &C,
-        range: BlockRange,
         headers: &[Header],
         hashes: &[B256],
         policy: MaterialRequestPolicy,
@@ -6908,6 +6848,7 @@ impl RethP2pSource {
     where
         C: BodiesClient<Body = BlockBody> + DownloadClient,
     {
+        let range = history_header_range(headers, "body")?;
         let mut last_error = None;
         let attempts = if headers.len() > 1 {
             1
@@ -6942,7 +6883,8 @@ impl RethP2pSource {
                     let (peer, bodies) = response.split();
                     self.request_metrics
                         .add_response_payload_bytes(P2pRequestKind::Bodies, bodies.length());
-                    match validate_bodies(headers, &bodies) {
+                    let served = &headers[..served_prefix(headers.len(), bodies.len())];
+                    match validate_bodies(served, &bodies) {
                         Ok(()) => {
                             self.config.network_telemetry.request_succeeded();
                             self.request_metrics.record(
@@ -7012,7 +6954,7 @@ impl RethP2pSource {
                 "body batch header/hash length mismatch".to_owned(),
             ));
         }
-        let batch_blocks = self.material_tuning.body_blocks();
+        let batch_blocks = self.config.material_request_blocks;
         let requests = headers
             .chunks(batch_blocks)
             .zip(hashes.chunks(batch_blocks))
@@ -7025,15 +6967,16 @@ impl RethP2pSource {
         );
         let outcomes = stream::iter(requests)
             .map(|(header_chunk, hash_chunk)| async move {
-                let result = history_header_range(&header_chunk, "body")
-                    .map(|range| (range, &header_chunk, &hash_chunk));
-                let result = match result {
-                    Ok((range, headers, hashes)) => {
-                        self.fetch_bodies(fetch, range, headers, hashes, policy, cancellation)
-                            .await
-                    }
-                    Err(error) => Err(error),
-                };
+                let result = fetch_complete(header_chunk.len(), |offset| {
+                    self.fetch_bodies(
+                        fetch,
+                        &header_chunk[offset..],
+                        &hash_chunk[offset..],
+                        policy,
+                        cancellation,
+                    )
+                })
+                .await;
                 (header_chunk, hash_chunk, result)
             })
             .buffered(concurrency)
@@ -7044,7 +6987,7 @@ impl RethP2pSource {
         let mut fallback = Vec::new();
         for (header_chunk, hash_chunk, result) in outcomes {
             match result {
-                Ok((peer, bodies)) => completed.push((header_chunk[0].number, peer, bodies)),
+                Ok((peers, bodies)) => completed.push((header_chunk[0].number, peers, bodies)),
                 Err(error) if header_chunk.len() > 1 => {
                     debug!(
                         blocks = header_chunk.len(),
@@ -7053,19 +6996,14 @@ impl RethP2pSource {
                     );
                     fallback.extend(header_chunk.into_iter().zip(hash_chunk));
                 }
-                Err(error) => {
-                    self.material_tuning.body_failed();
-                    return Err(error);
-                }
+                Err(error) => return Err(error),
             }
         }
         let recovered = stream::iter(fallback)
             .map(|(header, hash)| async move {
-                let range = BlockRange::single(BlockNumber(header.number));
                 let result = self
                     .fetch_bodies(
                         fetch,
-                        range,
                         std::slice::from_ref(&header),
                         std::slice::from_ref(&hash),
                         policy,
@@ -7077,26 +7015,15 @@ impl RethP2pSource {
             .buffered(concurrency)
             .collect::<Vec<_>>()
             .await;
-        let recovered_any = !recovered.is_empty();
         for (number, result) in recovered {
-            match result {
-                Ok((peer, bodies)) => completed.push((number, peer, bodies)),
-                Err(error) => {
-                    self.material_tuning.body_failed();
-                    return Err(error);
-                }
-            }
-        }
-        if recovered_any {
-            self.material_tuning.body_failed();
-        } else {
-            self.material_tuning.body_succeeded();
+            let (peer, bodies) = result?;
+            completed.push((number, vec![peer], bodies));
         }
         completed.sort_by_key(|(number, _, _)| *number);
         let mut peers = HashSet::new();
         let mut bodies = Vec::with_capacity(headers.len());
-        for (_, peer, mut batch) in completed {
-            peers.insert(peer);
+        for (_, chunk_peers, mut batch) in completed {
+            peers.extend(chunk_peers);
             bodies.append(&mut batch);
         }
         validate_bodies(headers, &bodies)?;
@@ -7173,9 +7100,17 @@ impl RethP2pSource {
                         P2pRequestKind::Receipts,
                         response.response_payload_bytes,
                     );
+                    let served = served_prefix(headers.len(), response.receipts.len());
                     let validation = match bodies {
-                        Some(bodies) => validate_receipts(headers, bodies, &response.receipts),
-                        None => validate_receipts_against_headers(headers, &response.receipts),
+                        Some(bodies) => validate_receipts(
+                            &headers[..served],
+                            &bodies[..served],
+                            &response.receipts,
+                        ),
+                        None => validate_receipts_against_headers(
+                            &headers[..served],
+                            &response.receipts,
+                        ),
                     };
                     match validation {
                         Ok(()) => {
@@ -7183,7 +7118,7 @@ impl RethP2pSource {
                             self.network.peer_store.record_success(
                                 peer_id,
                                 PeerMaterialKind::Receipts,
-                                headers.last().map_or(0, |header| header.number),
+                                headers[..served].last().map_or(0, |header| header.number),
                                 request_started_at.elapsed(),
                             );
                             reward_verified_material_peer(&session.handle, peer_id).await;
@@ -7266,7 +7201,7 @@ impl RethP2pSource {
                 "receipt batch material length mismatch".to_owned(),
             ));
         }
-        let batch_blocks = self.material_tuning.receipt_blocks();
+        let batch_blocks = self.config.material_request_blocks;
         let requests = headers
             .chunks(batch_blocks)
             .zip(bodies.chunks(batch_blocks))
@@ -7286,16 +7221,17 @@ impl RethP2pSource {
         );
         let outcomes = stream::iter(requests)
             .map(|(header_chunk, body_chunk, hash_chunk)| async move {
-                let result = self
-                    .fetch_receipts(
+                let result = fetch_complete(header_chunk.len(), |offset| {
+                    self.fetch_receipts(
                         session,
-                        &header_chunk,
-                        Some(&body_chunk),
-                        &hash_chunk,
+                        &header_chunk[offset..],
+                        Some(&body_chunk[offset..]),
+                        &hash_chunk[offset..],
                         policy,
                         cancellation,
                     )
-                    .await;
+                })
+                .await;
                 (header_chunk, body_chunk, hash_chunk, result)
             })
             .buffered(concurrency)
@@ -7306,7 +7242,9 @@ impl RethP2pSource {
         let mut fallback = Vec::new();
         for (header_chunk, body_chunk, hash_chunk, result) in outcomes {
             match result {
-                Ok((peer, receipts)) => completed.push((header_chunk[0].number, peer, receipts)),
+                Ok((peers, receipts)) => {
+                    completed.push((header_chunk[0].number, peers, receipts));
+                }
                 Err(error) if header_chunk.len() > 1 => {
                     debug!(
                         blocks = header_chunk.len(),
@@ -7321,10 +7259,7 @@ impl RethP2pSource {
                             .map(|((header, body), hash)| (header, body, hash)),
                     );
                 }
-                Err(error) => {
-                    self.material_tuning.receipts_failed();
-                    return Err(error);
-                }
+                Err(error) => return Err(error),
             }
         }
         let recovered = stream::iter(fallback)
@@ -7344,26 +7279,15 @@ impl RethP2pSource {
             .buffered(concurrency)
             .collect::<Vec<_>>()
             .await;
-        let recovered_any = !recovered.is_empty();
         for (number, result) in recovered {
-            match result {
-                Ok((peer, receipts)) => completed.push((number, peer, receipts)),
-                Err(error) => {
-                    self.material_tuning.receipts_failed();
-                    return Err(error);
-                }
-            }
-        }
-        if recovered_any {
-            self.material_tuning.receipts_failed();
-        } else {
-            self.material_tuning.receipts_succeeded();
+            let (peer, receipts) = result?;
+            completed.push((number, vec![peer], receipts));
         }
         completed.sort_by_key(|(number, _, _)| *number);
         let mut peers = HashSet::new();
         let mut receipts = Vec::with_capacity(headers.len());
-        for (_, peer, mut batch) in completed {
-            peers.insert(peer);
+        for (_, chunk_peers, mut batch) in completed {
+            peers.extend(chunk_peers);
             receipts.append(&mut batch);
         }
         validate_receipts(headers, bodies, &receipts)?;
@@ -7993,7 +7917,7 @@ impl RethP2pHistorySource {
             .filter(|(header, _)| has_receipts(header))
             .map(|(header, hash)| (header.clone(), *hash))
             .unzip();
-        let batch_blocks = self.source.material_tuning.receipt_blocks();
+        let batch_blocks = self.source.config.material_request_blocks;
         let requests = requested_headers
             .chunks(batch_blocks)
             .zip(requested_hashes.chunks(batch_blocks))
@@ -8006,17 +7930,17 @@ impl RethP2pHistorySource {
         );
         let outcomes = stream::iter(requests)
             .map(|(header_chunk, hash_chunk)| async move {
-                let result = self
-                    .source
-                    .fetch_receipts(
+                let result = fetch_complete(header_chunk.len(), |offset| {
+                    self.source.fetch_receipts(
                         session,
-                        &header_chunk,
+                        &header_chunk[offset..],
                         None,
-                        &hash_chunk,
+                        &hash_chunk[offset..],
                         policy,
                         cancellation,
                     )
-                    .await;
+                })
+                .await;
                 (header_chunk, hash_chunk, result)
             })
             .buffered(concurrency)
@@ -8027,7 +7951,7 @@ impl RethP2pHistorySource {
         let mut fallback = Vec::new();
         for (header_chunk, hash_chunk, result) in outcomes {
             match result {
-                Ok((peer, receipts)) => completed.push((header_chunk[0].number, peer, receipts)),
+                Ok((_, receipts)) => completed.push((header_chunk[0].number, receipts)),
                 Err(error) if header_chunk.len() > 1 => {
                     debug!(
                         blocks = header_chunk.len(),
@@ -8036,10 +7960,7 @@ impl RethP2pHistorySource {
                     );
                     fallback.extend(header_chunk.into_iter().zip(hash_chunk));
                 }
-                Err(error) => {
-                    self.source.material_tuning.receipts_failed();
-                    return Err(error);
-                }
+                Err(error) => return Err(error),
             }
         }
         let recovered = stream::iter(fallback)
@@ -8060,24 +7981,13 @@ impl RethP2pHistorySource {
             .buffered(concurrency)
             .collect::<Vec<_>>()
             .await;
-        let recovered_any = !recovered.is_empty();
         for (number, result) in recovered {
-            match result {
-                Ok((peer, receipts)) => completed.push((number, peer, receipts)),
-                Err(error) => {
-                    self.source.material_tuning.receipts_failed();
-                    return Err(error);
-                }
-            }
+            let (_, receipts) = result?;
+            completed.push((number, receipts));
         }
-        if recovered_any {
-            self.source.material_tuning.receipts_failed();
-        } else {
-            self.source.material_tuning.receipts_succeeded();
-        }
-        completed.sort_by_key(|(number, _, _)| *number);
+        completed.sort_by_key(|(number, _)| *number);
         let mut fetched = Vec::with_capacity(requested_headers.len());
-        for (_, _, mut batch) in completed {
+        for (_, mut batch) in completed {
             fetched.append(&mut batch);
         }
         let receipts = with_known_empty_receipts(headers, fetched);
@@ -12707,32 +12617,6 @@ mod tests {
             head_unavailable_for(&mut unavailable_since, started + grace),
             grace
         );
-    }
-
-    #[test]
-    fn material_batch_tuning_starts_wide_and_uses_aimd() {
-        let tuning = MaterialBatchTuning::new(DEFAULT_MATERIAL_REQUEST_BLOCKS);
-        assert_eq!(tuning.body_blocks(), DEFAULT_MATERIAL_REQUEST_BLOCKS);
-        tuning.body_failed();
-        assert_eq!(tuning.body_blocks(), DEFAULT_MATERIAL_REQUEST_BLOCKS / 2);
-        for _ in 0..MATERIAL_BATCH_GROW_SUCCESS_WINDOWS {
-            tuning.body_succeeded();
-        }
-        assert_eq!(tuning.body_blocks(), DEFAULT_MATERIAL_REQUEST_BLOCKS);
-
-        assert_eq!(tuning.receipt_blocks(), DEFAULT_MATERIAL_REQUEST_BLOCKS);
-        tuning.receipts_failed();
-        assert_eq!(tuning.receipt_blocks(), DEFAULT_MATERIAL_REQUEST_BLOCKS / 2);
-
-        let wider = MaterialBatchTuning::new(16);
-        wider.body_failed();
-        assert_eq!(wider.body_blocks(), 8);
-        for _ in 0..MATERIAL_BATCH_GROW_SUCCESS_WINDOWS.saturating_sub(1) {
-            wider.body_succeeded();
-        }
-        assert_eq!(wider.body_blocks(), 8);
-        wider.body_succeeded();
-        assert_eq!(wider.body_blocks(), 16);
     }
 
     #[test]

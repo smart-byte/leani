@@ -6,6 +6,14 @@ record, and documented RPC contracts.
 
 ## [Unreleased]
 
+### Changed
+
+- Execution P2P keeps the blocks a peer served when it stops a body or
+  receipt reply at its response size limit, and asks only for the rest. Such
+  a reply no longer counts as a failed request or cools the peer down.
+- A failed P2P body or receipt request no longer halves the request size for
+  every peer; it is still retried block by block.
+
 ## [0.1.0-rc.8] - 2026-10-16
 
 ### Added

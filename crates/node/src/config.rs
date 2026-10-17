@@ -584,11 +584,12 @@ pub struct LiveSourceConfig {
     /// live lane stays not ready this long while verified finality is ready.
     #[serde(default = "default_live_stall_timeout_seconds")]
     pub stall_timeout_seconds: u64,
-    /// Concurrent adaptive body/receipt requests. The runtime further bounds
-    /// this by connected peers and source budgets.
+    /// Concurrent body/receipt requests. The runtime further bounds this by
+    /// connected peers and source budgets.
     #[serde(default = "default_execution_material_request_concurrency")]
     pub material_request_concurrency: usize,
-    /// Adaptive maximum blocks carried by one execution body/receipt request.
+    /// Blocks carried by one execution body/receipt request. A peer may serve
+    /// only the first of them; the rest is requested again.
     #[serde(default = "default_execution_material_request_blocks")]
     pub material_request_blocks: usize,
     /// Initial deadline for one execution-peer request. Reth adapts this per
