@@ -63,7 +63,7 @@ minimum_physical_chunk_blocks = 128
 maximum_overfetch_ratio = 1.25
 
 [budgets.history_pipeline]
-maximum_active_chunks = 4
+maximum_active_chunks = 8
 maximum_mapped_bytes = "128MiB"
 
 [budgets.history_pipeline.commit]

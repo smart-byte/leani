@@ -11,7 +11,7 @@ temporary_disk_bytes = 2147483648
 pending_delta_bytes = 268435456
 recent_raw_soft_bytes = 268435456
 recent_raw_hard_bytes = 536870912
-source_concurrency = 4
+source_concurrency = 8
 mapper_concurrency = 4
 
 [budgets.delivery]
@@ -26,7 +26,7 @@ maximum_retained_bytes = "1GiB"
 maximum_pending_bytes = "256MiB"
 
 [budgets.history_pipeline]
-maximum_active_chunks = 4
+maximum_active_chunks = 8
 maximum_mapped_bytes = "128MiB"
 
 [budgets.history_pipeline.commit]

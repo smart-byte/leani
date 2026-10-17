@@ -13,6 +13,13 @@ record, and documented RPC contracts.
   a reply no longer counts as a failed request or cools the peer down.
 - A failed P2P body or receipt request no longer halves the request size for
   every peer; it is still retried block by block.
+- `budgets.source_concurrency` is 8 in the mainnet defaults and every
+  `config/modes` profile, and `budgets.history_pipeline.maximum_active_chunks`
+  defaults to 8, so history reads up to 8 chunks at once instead of 4. Plan
+  about 450 MiB of RAM per active chunk during Xatu backfills, or set
+  `maximum_active_chunks = 4`. Up to 8 processor backfills run at once, and a
+  historical RPC request may hold `memory_bytes` divided by 8. Configurations
+  that set `source_concurrency = 4` keep reading 4 chunks per job.
 
 ## [0.1.0-rc.8] - 2026-10-16
 

@@ -158,7 +158,8 @@ not a process RSS limit. On mainnet, a Xatu read of a 2023–24 transaction
 object, 1,000 blocks around blocks 18,000,000 to 19,430,000, holds about
 80–110 MiB of compressed columns and decodes about 230–340 MiB. Keep
 `memory_bytes` above the largest of those, as the shipped 512 MiB is, and
-plan RAM for about `maximum_active_chunks` × 450 MiB during Xatu backfills.
+plan RAM for about `maximum_active_chunks` × 450 MiB during Xatu backfills,
+3.6 GiB at the default 8.
 The allocator keeps memory a finished read freed for the next, so resident
 memory after a burst of reads stays near its peak: set a container's memory
 limit for that peak, not for the budgets. On Linux, glibc gives each thread
@@ -320,8 +321,8 @@ Measured with this release on a Hetzner EX44 (Intel i5-13500, 20 threads,
 | `blobs-money`, Oct 2026 | Xatu | 46 KiB | 570 blocks/s, 420 MiB | 470–650 blocks/s, 620 MiB |
 
 "4 reads, 2 chunks" is `source_concurrency = 4` and `maximum_active_chunks =
-2`, as `deploy/container.toml` ships; the other shipped profiles read with 4
-and keep the built-in 4 chunks. Each cell gives the speed and the peak
+2`, as `deploy/container.toml` ships; the other shipped profiles read with 8
+and keep the built-in 8 chunks. Each cell gives the speed and the peak
 memory. Ranges span repeated runs, which differed by up to a third with the
 archives' throughput and the shared host's load. With jemalloc, which the
 container image preloads, peak memory stayed within a fifth of these and fell
@@ -335,13 +336,15 @@ uncommitted: with `maximum_buffered_frames_per_acquisition = 512` and
 at 380–410 blocks/s, a quarter to a half faster, at the same peak memory.
 Profiles:
 
-- **Default:** the shipped profiles, which try eraE before Xatu.
+- **Default:** the shipped profiles, which try eraE before Xatu and read up
+  to 8 chunks at once with 8 reads each.
 - **Faster eraE backfills:** set those two `[budgets.history_material]`
   values. Concurrent backfills share that budget, so each can then hold more
   of it.
-- **Faster Xatu backfills**, with memory to spare: set
-  `source_concurrency = 8` and `maximum_active_chunks = 4`.
-- **Limited memory**, such as a container under 1 GiB: keep 4 reads and 2
+- **Less memory:** set `maximum_active_chunks = 4`, the "8 reads, 4 chunks"
+  column. Xatu backfills then hold about half as much, and execution P2P
+  backfills fetch about half as much at once.
+- **Limited memory**, such as a container under 1 GiB: use 4 reads and 2
   chunks. eraE needs the least memory.
 - **Limited bandwidth:** a backfill downloads blocks per second times bytes
   per block, about 35 MiB/s from eraE at 300 blocks/s and 25–50 MiB/s from

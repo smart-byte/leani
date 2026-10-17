@@ -2584,7 +2584,7 @@ const fn default_history_material_overfetch_ratio() -> f64 {
 }
 
 const fn default_history_pipeline_active_chunks() -> usize {
-    4
+    8
 }
 
 const fn default_history_pipeline_mapped_bytes() -> HumanBytes {
@@ -3044,7 +3044,7 @@ verification_segment_blocks = 8192"#;
         assert!(
             (config.budgets.history_material.maximum_overfetch_ratio - 1.25).abs() < f64::EPSILON
         );
-        assert_eq!(config.budgets.history_pipeline.maximum_active_chunks, 4);
+        assert_eq!(config.budgets.history_pipeline.maximum_active_chunks, 8);
         assert_eq!(
             config.budgets.history_pipeline.maximum_mapped_bytes.bytes(),
             128 * 1_024 * 1_024

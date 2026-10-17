@@ -67,7 +67,7 @@ pub const HISTORICAL_COMMIT_MAX_ENCODED_BYTES: u64 = 16 * 1024 * 1024;
 /// two, and each commit then rewrites the same pages for little data.
 pub const HISTORICAL_COMMIT_TARGET_WRITER_HOLD_MS: u64 = 250;
 /// Default maximum concurrently active physical source chunks per node.
-pub const HISTORICAL_MAX_ACTIVE_CHUNKS: usize = 4;
+pub const HISTORICAL_MAX_ACTIVE_CHUNKS: usize = 8;
 /// Default maximum bytes retained by mapped historical deltas per node.
 pub const HISTORICAL_MAX_MAPPED_BYTES: u64 = 128 * 1024 * 1024;
 /// Byte quantum used by node-global historical commit deficit round-robin.
