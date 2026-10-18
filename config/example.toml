@@ -63,7 +63,7 @@ minimum_physical_chunk_blocks = 128
 maximum_overfetch_ratio = 1.25
 
 [budgets.history_pipeline]
-maximum_active_chunks = 4
+maximum_active_chunks = 8
 maximum_mapped_bytes = "128MiB"
 
 [budgets.history_pipeline.commit]
@@ -128,9 +128,9 @@ peer_recovery_timeout_seconds = 300
 # process-wide P2P network. A wait at the recent-frame hard limit does not count.
 stall_timeout_seconds = 600
 material_request_concurrency = 32
-# Adaptive request-width ceiling. Eight nearly doubled throughput in the
-# pinned Mainnet receipt-complete benchmark; partial/failed responses shrink
-# the live working width before it cautiously grows again.
+# Blocks per body/receipt request. Eight nearly doubled throughput in the
+# pinned Mainnet receipt-complete benchmark. A peer at its response size limit
+# serves only the first of them; the rest is requested again.
 material_request_blocks = 8
 # Reth adapts this initial deadline per peer after successful responses.
 request_timeout_seconds = 8

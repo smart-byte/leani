@@ -234,11 +234,12 @@ link have spare capacity; it also multiplies decoded response buffers. Treat
 as memory-affecting settings and tune them together while watching RSS and the
 material high-water metrics.
 
-`material_request_blocks` controls adaptive body/receipt request width. The
-evidence-backed default is eight; partial or failed responses reduce the
-working width automatically, and eight successful material windows are needed
-before it grows again. Raise the ceiling only with repeated real-source
-evidence for the deployment's peer and bandwidth profile.
+`material_request_blocks` sets the blocks per body or receipt request; the
+evidence-backed default is eight. A peer that stops a reply at its response
+size limit serves only the first of them: those are kept and the rest is
+requested again. A failed request is retried block by block without narrowing
+other requests. Raise it only with repeated real-source evidence for the
+deployment's peer and bandwidth profile.
 
 For address/topic-filtered log processors, P2P checks the verified header bloom
 before requesting receipts. A negative avoids the receipt bundle; a positive
