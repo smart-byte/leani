@@ -3,5 +3,5 @@ export const SOCIAL_IMAGE = {
   path: '/og-image.png',
   width: 1200,
   height: 630,
-  alt: 'leani: keep only the Ethereum data your app needs. Acquire, validate, reduce, deliver.',
+  alt: 'leani: keep only the Ethereum data your app needs. A chain of dark blocks with one green block lifted out of it.',
 } as const;

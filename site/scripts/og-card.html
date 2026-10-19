@@ -5,9 +5,14 @@
     chrome-headless-shell --headless --hide-scrollbars --window-size=1200,630 \
       --virtual-time-budget=3000 --screenshot=public/og-image.png \
       "file://$PWD/scripts/og-card.html"
+  Then quantize it, which keeps the glow smooth at a quarter of the size and the
+  site inside its asset budget (bun run size:check):
+    bun -e "const sharp = require('sharp'); const png = await sharp('public/og-image.png').png({ palette: true, quality: 95, effort: 10 }).toBuffer(); await Bun.write('public/og-image.png', png)"
   Fonts load from node_modules, so run `bun install` first.
-  The wordmark paths match src/assets/brand/leani-wordmark-on-dark.svg. The flow
-  starts at one epoch's 32 slots and thins out to the one block an app keeps.
+  The wordmark paths match src/assets/brand/leani-wordmark-on-dark.svg. The scene
+  is a chain of blocks in the hero engine's isometric projection and cube colors:
+  one block lifts out in green, the one an app keeps, and a dashed ghost holds its
+  place, because keeping a block's data doesn't take it out of the chain.
 -->
 <html lang="en">
 <head>
@@ -15,50 +20,104 @@
 <style>
   @font-face { font-family: 'Inter'; font-weight: 100 900; src: url('../node_modules/@fontsource-variable/inter/files/inter-latin-wght-normal.woff2') format('woff2'); }
   @font-face { font-family: 'JetBrains Mono'; font-weight: 400; src: url('../node_modules/@fontsource/jetbrains-mono/files/jetbrains-mono-latin-400-normal.woff2') format('woff2'); }
-  @font-face { font-family: 'JetBrains Mono'; font-weight: 700; src: url('../node_modules/@fontsource/jetbrains-mono/files/jetbrains-mono-latin-700-normal.woff2') format('woff2'); }
   * { box-sizing: border-box; }
   body { margin: 0; }
-  .card { width: 1200px; height: 630px; position: relative; overflow: hidden; padding: 64px; background: #0b0f0d; color: #e6f0ea; font-family: 'Inter', sans-serif; }
-  .field { position: absolute; inset: 0; background-image: radial-gradient(circle, #18231e 2.2px, transparent 2.6px); background-size: 48px 48px; background-position: 24px 24px; }
-  .top { position: relative; display: flex; justify-content: space-between; align-items: center; }
-  .brand { display: block; height: 46px; width: auto; }
-  .url { font: 400 22px 'JetBrains Mono', monospace; color: #8fa89a; }
-  h1 { position: relative; max-width: 860px; margin: 52px 0 0; font-size: 58px; font-weight: 800; line-height: 1.06; letter-spacing: -0.03em; }
-  .flow { position: absolute; left: 64px; right: 64px; bottom: 56px; height: 200px; }
-  .flow svg { width: 100%; height: 100%; overflow: visible; }
-  .slots { fill: #3c5247; }
-  .num { font: 400 16px 'JetBrains Mono', monospace; fill: #3ee07f; }
-  .step { font: 700 24px 'JetBrains Mono', monospace; fill: #e6f0ea; }
-  .caption { font: 400 17px 'Inter', sans-serif; fill: #8fa89a; }
+  .card { width: 1200px; height: 630px; position: relative; overflow: hidden; background: #0b0f0d; color: #e6f0ea; font-family: 'Inter', sans-serif; }
+  .card > * { position: absolute; }
+  .glow { inset: 0; background: radial-gradient(ellipse 540px 380px at 880px 380px, #1c543480, transparent 72%); }
+  .scene { left: 0; top: 0; width: 1200px; height: 630px; overflow: visible; }
+  .brand { left: 64px; top: 60px; height: 44px; width: auto; }
+  h1 { left: 64px; top: 150px; margin: 0; font-size: 62px; font-weight: 800; line-height: 1.04; letter-spacing: -0.035em; }
+  .url { right: 64px; bottom: 60px; font: 400 22px/1 'JetBrains Mono', monospace; color: #8fa89a; }
+  .floor line { stroke: #35533f; stroke-opacity: 0.32; stroke-width: 1; }
+  .block { stroke-width: 1; stroke-linejoin: round; }
+  .link { stroke-width: 2.5; stroke-linecap: round; }
+  .ghost { fill: #3ee07f0d; stroke: #3ee07f; stroke-opacity: 0.55; stroke-width: 1.5; stroke-dasharray: 5 4; stroke-linejoin: round; }
+  .kept { filter: drop-shadow(0 0 28px #3ee07f80); }
+  .kept polygon { stroke: #d6ffe5; stroke-opacity: 0.55; stroke-width: 1; stroke-linejoin: round; }
 </style>
 </head>
 <body>
 <div class="card">
-  <div class="field"></div>
-  <div class="top">
-    <svg class="brand" viewBox="0 0 220.37 75.2" aria-label="Leani">
-      <path d="M5 0V74M24 50H64.4A20.2 20.2 0 1 0 59.67 62.98M120.8 50A20.2 20.2 0 1 0 80.4 50A20.2 20.2 0 1 0 120.8 50M120.8 26V74M141.8 74V26M141.8 74V48.8A19 19 0 0 1 179.8 48.8V74" fill="none" stroke="#e6f0ea" stroke-width="10"/>
-      <path d="M195.8 74L205.8 74L216 26L206 26Z" fill="#e6f0ea"/>
-      <rect x="207.37" y="6" width="13" height="13" rx="1.2" fill="#3ee07f"/>
-    </svg>
-    <div class="url">leani.dev</div>
-  </div>
-  <h1>Keep only the Ethereum data your app needs.</h1>
-  <div class="flow">
-    <svg viewBox="0 0 1072 200" aria-hidden="true">
-      <g class="slots"><circle cx="12" cy="116" r="2.6"/><circle cx="24" cy="116" r="2.6"/><circle cx="36" cy="116" r="2.6"/><circle cx="48" cy="116" r="2.6"/><circle cx="0" cy="128" r="2.6"/><circle cx="12" cy="128" r="2.6"/><circle cx="24" cy="128" r="2.6"/><circle cx="36" cy="128" r="2.6"/><circle cx="48" cy="128" r="2.6"/><circle cx="60" cy="128" r="2.6"/><circle cx="0" cy="140" r="2.6"/><circle cx="12" cy="140" r="2.6"/><circle cx="24" cy="140" r="2.6"/><circle cx="36" cy="140" r="2.6"/><circle cx="48" cy="140" r="2.6"/><circle cx="60" cy="140" r="2.6"/><circle cx="0" cy="152" r="2.6"/><circle cx="12" cy="152" r="2.6"/><circle cx="24" cy="152" r="2.6"/><circle cx="36" cy="152" r="2.6"/><circle cx="48" cy="152" r="2.6"/><circle cx="60" cy="152" r="2.6"/><circle cx="0" cy="164" r="2.6"/><circle cx="12" cy="164" r="2.6"/><circle cx="24" cy="164" r="2.6"/><circle cx="36" cy="164" r="2.6"/><circle cx="48" cy="164" r="2.6"/><circle cx="60" cy="164" r="2.6"/><circle cx="12" cy="176" r="2.6"/><circle cx="24" cy="176" r="2.6"/><circle cx="36" cy="176" r="2.6"/><circle cx="48" cy="176" r="2.6"/></g>
-      <g class="slots"><circle cx="84" cy="146" r="3"/><circle cx="98" cy="146" r="3"/><circle cx="113.7" cy="146" r="3"/><circle cx="131.2" cy="146" r="3"/><circle cx="150.9" cy="146" r="3"/><circle cx="172.9" cy="146" r="3"/><circle cx="197.6" cy="146" r="3"/><circle cx="225.2" cy="146" r="3"/><circle cx="256.2" cy="146" r="3"/><circle cx="290.9" cy="146" r="3"/><circle cx="329.7" cy="146" r="3"/><circle cx="373.2" cy="146" r="3"/><circle cx="421.9" cy="146" r="3"/><circle cx="476.4" cy="146" r="3"/><circle cx="537.5" cy="146" r="3"/><circle cx="605.9" cy="146" r="3"/><circle cx="682.5" cy="146" r="3"/><circle cx="768.4" cy="146" r="3"/><circle cx="864.5" cy="146" r="3"/><circle cx="972.2" cy="146" r="3"/></g>
-      <rect x="1029" y="129" width="34" height="34" rx="2" fill="#3ee07f"/>
-      <text class="num" x="150" y="92">01</text><text class="step" x="150" y="122">acquire</text>
-      <text class="num" x="380" y="92">02</text><text class="step" x="380" y="122">validate</text>
-      <text class="num" x="610" y="92">03</text><text class="step" x="610" y="122">reduce</text>
-      <text class="num" x="840" y="92">04</text><text class="step" x="840" y="122">deliver</text>
-      <text class="caption" x="150" y="190">history + live head</text>
-      <text class="caption" x="380" y="190">light-client verified</text>
-      <text class="caption" x="610" y="190">your processors</text>
-      <text class="caption" x="840" y="190">API, SDK, JSON-RPC</text>
-    </svg>
-  </div>
+  <div class="glow"></div>
+  <svg class="scene" viewBox="0 0 1200 630" aria-hidden="true"></svg>
+  <svg class="brand" viewBox="0 0 220.37 75.2" aria-label="Leani">
+    <path d="M5 0V74M24 50H64.4A20.2 20.2 0 1 0 59.67 62.98M120.8 50A20.2 20.2 0 1 0 80.4 50A20.2 20.2 0 1 0 120.8 50M120.8 26V74M141.8 74V26M141.8 74V48.8A19 19 0 0 1 179.8 48.8V74" fill="none" stroke="#e6f0ea" stroke-width="10"/>
+    <path d="M195.8 74L205.8 74L216 26L206 26Z" fill="#e6f0ea"/>
+    <rect x="207.37" y="6" width="13" height="13" rx="1.2" fill="#3ee07f"/>
+  </svg>
+  <h1>Keep only the Ethereum<br>data your app needs.</h1>
+  <div class="url">leani.dev</div>
 </div>
+<script>
+  const NS = 'http://www.w3.org/2000/svg';
+  const scene = document.querySelector('.scene');
+  const add = (parent, tag, attrs = {}) => {
+    const node = parent.appendChild(document.createElementNS(NS, tag));
+    for (const [name, value] of Object.entries(attrs)) node.setAttribute(name, value);
+    return node;
+  };
+  const points = (list) => list.map((p) => p.map((v) => v.toFixed(1)).join(',')).join(' ');
+  // Mixes a color toward the background, so far blocks fade without turning see-through.
+  const fade = (hex, t) => '#' + [1, 3, 5].map((i) => {
+    const from = parseInt(hex.slice(i, i + 2), 16);
+    const to = parseInt('0b0f0d'.slice(i - 1, i + 1), 16);
+    return Math.round(from + (to - from) * t).toString(16).padStart(2, '0');
+  }).join('');
+
+  // Isometric, as in the hero engine: x runs up the chain, y across it, z up.
+  // SIZE is a block's edge, PITCH the step between blocks, LIFT the kept block's height.
+  const SIZE = 56, PITCH = 84, LIFT = 150, HALF = SIZE / 2;
+  const KEPT = [880, 474];
+  const COS30 = Math.cos(Math.PI / 6);
+  const P = (x, y, z) => [KEPT[0] + (x + y - SIZE) * COS30, KEPT[1] + (y - x) / 2 - z];
+
+  const defs = add(scene, 'defs');
+  const gradient = (tag, attrs, stops) => {
+    const node = add(defs, tag, attrs);
+    for (const [offset, color, opacity] of stops) add(node, 'stop', { offset, 'stop-color': color, 'stop-opacity': opacity });
+  };
+  gradient('radialGradient', { id: 'fade', gradientUnits: 'userSpaceOnUse', cx: KEPT[0], cy: KEPT[1] - 30, r: 470 }, [[0, '#fff', 1], [1, '#000', 1]]);
+  gradient('linearGradient', { id: 'beam', x1: 0, y1: 0, x2: 0, y2: 1 }, [[0, '#3ee07f', 0], [1, '#3ee07f', 0.3]]);
+  gradient('radialGradient', { id: 'pool' }, [[0, '#3ee07f', 0.38], [1, '#3ee07f', 0]]);
+  add(add(defs, 'mask', { id: 'floor' }), 'rect', { width: 1200, height: 630, fill: 'url(#fade)' });
+
+  // The floor grid runs at half a block, so block edges sit on its lines.
+  const floor = add(scene, 'g', { class: 'floor', mask: 'url(#floor)' });
+  for (let i = -30; i <= 30; i++) {
+    for (const [a, b] of [[P(i * HALF, -30 * HALF, 0), P(i * HALF, 30 * HALF, 0)], [P(-30 * HALF, i * HALF, 0), P(30 * HALF, i * HALF, 0)]]) {
+      add(floor, 'line', { x1: a[0], y1: a[1], x2: b[0], y2: b[1] });
+    }
+  }
+  add(scene, 'ellipse', { cx: KEPT[0], cy: KEPT[1], rx: 170, ry: 98, fill: 'url(#pool)' });
+
+  // A block's three visible faces: left (-x), right (+y) and top.
+  const block = (parent, x0, z0, paint) => {
+    const faces = {
+      l: [P(x0, 0, z0), P(x0, SIZE, z0), P(x0, SIZE, z0 + SIZE), P(x0, 0, z0 + SIZE)],
+      r: [P(x0, SIZE, z0), P(x0 + SIZE, SIZE, z0), P(x0 + SIZE, SIZE, z0 + SIZE), P(x0, SIZE, z0 + SIZE)],
+      t: [P(x0, 0, z0 + SIZE), P(x0 + SIZE, 0, z0 + SIZE), P(x0 + SIZE, SIZE, z0 + SIZE), P(x0, SIZE, z0 + SIZE)],
+    };
+    for (const [face, list] of Object.entries(faces)) add(parent, 'polygon', { points: points(list), ...paint(face) });
+  };
+  const DARK = { l: '#17291f', r: '#101c15', t: '#23392d' };
+  const GREEN = { l: '#37b86b', r: '#22763e', t: '#91ffb9' };
+
+  // Far to near, so nearer blocks cover farther ones; each link sits between its two blocks.
+  for (let k = 8; k >= -8; k--) {
+    const x0 = k * PITCH, t = Math.min(0.78, Math.abs(k) * 0.12);
+    const g = add(scene, 'g');
+    if (k === 0) {
+      block(g, x0, 0, () => ({ class: 'ghost' }));
+      add(g, 'polygon', { fill: 'url(#beam)', points: points([P(0, 0, SIZE), P(0, SIZE, SIZE), P(0, SIZE, LIFT), P(0, 0, LIFT)]) });
+      add(g, 'polygon', { fill: 'url(#beam)', points: points([P(0, SIZE, SIZE), P(SIZE, SIZE, SIZE), P(SIZE, SIZE, LIFT), P(0, SIZE, LIFT)]) });
+    } else {
+      block(g, x0, 0, (face) => ({ class: 'block', fill: fade(DARK[face], t), stroke: fade('#456c59', t) }));
+    }
+    const [x1, y1] = P(x0 - PITCH + SIZE, HALF, HALF), [x2, y2] = P(x0, HALF, HALF);
+    add(g, 'line', { class: 'link', x1, y1, x2, y2, stroke: fade('#4b725e', t) });
+  }
+  block(add(scene, 'g', { class: 'kept' }), 0, LIFT, (face) => ({ fill: GREEN[face] }));
+</script>
 </body>
 </html>
