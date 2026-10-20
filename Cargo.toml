@@ -146,6 +146,12 @@ assert_is_empty = "allow"
 [patch.crates-io]
 proc-macro-error2 = { git = "https://github.com/fgardt/proc-macro-error-2", rev = "53ff94b61c678593158db1a3d50269c6f0de0db7" }
 
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
+
 [profile.release]
 codegen-units = 1
 lto = "thin"
