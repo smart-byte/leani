@@ -38,7 +38,8 @@ keeps only the result the question needs. Work in this order:
    - transactions or their ETH value rather than logs: `evm-events` sees only
      logs;
    - state across several events or contracts, a filter on argument values,
-     or ABI types `evm-events` rejects;
+     or fields of packed log data that no ABI describes (`evm-events` stores
+     such `log0` data only raw);
    - a typed query route of its own.
 
    Start from the maintained example, as section 4 of the processor
