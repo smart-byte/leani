@@ -5119,9 +5119,9 @@ async fn poll_backfill_consumer(
     let heartbeat_due = tokio::time::Instant::now() + stream_state.state.config.heartbeat_interval;
     loop {
         if let Some(completion_sequence) = stream_state.completion_sequence {
-            let acknowledged = stream_state
-                .state
-                .store
+            let store = stream_state.state.store.clone();
+            let capacity_changed = store.wait_for_delivery_capacity_change();
+            let acknowledged = store
                 .consumer_in_stream(
                     stream_state.processor.descriptor(),
                     &stream_state.stream_id,
@@ -5136,7 +5136,7 @@ async fn poll_backfill_consumer(
                 return None;
             }
             tokio::select! {
-                () = stream_state.state.store.wait_for_delivery_capacity_change() => {}
+                () = capacity_changed => {}
                 () = tokio::time::sleep_until(heartbeat_due) => {
                     if !backfill_stream_session_is_current(&stream_state).await {
                         stream_state.terminal = true;
@@ -5378,9 +5378,9 @@ async fn end_backfill_stream(
         return emit_history_batch(stream_state).await;
     }
     loop {
-        let acknowledged = stream_state
-            .state
-            .store
+        let store = stream_state.state.store.clone();
+        let capacity_changed = store.wait_for_delivery_capacity_change();
+        let acknowledged = store
             .consumer_in_stream(
                 stream_state.processor.descriptor(),
                 &stream_state.stream_id,
@@ -5394,7 +5394,7 @@ async fn end_backfill_stream(
             break;
         }
         tokio::select! {
-            () = stream_state.state.store.wait_for_delivery_capacity_change() => {}
+            () = capacity_changed => {}
             () = tokio::time::sleep_until(heartbeat_due) => {
                 if !backfill_stream_session_is_current(&stream_state).await {
                     stream_state.terminal = true;
