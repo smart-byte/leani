@@ -14710,14 +14710,22 @@ impl SqliteStore {
 
     /// Wait until acknowledgement or pruning may have released delivery
     /// capacity. Callers must always re-check admission after waking.
-    pub async fn wait_for_delivery_capacity_change(&self) {
-        self.inner.delivery_capacity_changed.notified().await;
+    ///
+    /// The returned future observes every change made after this call, even
+    /// before it is first polled, so callers that check state and then wait
+    /// create it before the check.
+    pub fn wait_for_delivery_capacity_change(&self) -> tokio::sync::futures::Notified<'_> {
+        self.inner.delivery_capacity_changed.notified()
     }
 
     /// Wait until a committed delivery transaction may have advanced a
     /// stream. Callers always re-read their scoped cursor after waking.
-    pub async fn wait_for_delivery_changes(&self) {
-        self.inner.delivery_changes_available.notified().await;
+    ///
+    /// The returned future observes every change made after this call, even
+    /// before it is first polled, so callers that check state and then wait
+    /// create it before the check.
+    pub fn wait_for_delivery_changes(&self) -> tokio::sync::futures::Notified<'_> {
+        self.inner.delivery_changes_available.notified()
     }
 
     /// Whether the physical store and artifact layers are below their shared
