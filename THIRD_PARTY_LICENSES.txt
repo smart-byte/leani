@@ -4562,7 +4562,7 @@ SOFTWARE.
 ==============================================================================
 MIT License (MIT)
 ==============================================================================
-indexmap 2.14.0 — https://github.com/indexmap-rs/indexmap
+indexmap 2.14.2 — https://github.com/indexmap-rs/indexmap
 
 Copyright (c) 2016--2017
 
