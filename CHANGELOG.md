@@ -21,6 +21,11 @@ record, and documented RPC contracts.
   historical RPC request may hold `memory_bytes` divided by 8. Configurations
   that set `source_concurrency = 4` keep reading 4 chunks per job.
 
+### Security
+
+- Updated rustls-webpki to 0.103.16, and webpki-roots and webpki-root-certs
+  to 1.0.10, for RUSTSEC-2026-0381 to RUSTSEC-2026-0383.
+
 ## [0.1.0-rc.8] - 2026-10-16
 
 ### Added
