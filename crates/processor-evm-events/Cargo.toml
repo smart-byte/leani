@@ -9,6 +9,8 @@ homepage.workspace = true
 publish = false
 
 [dependencies]
+alloy-dyn-abi.workspace = true
+alloy-json-abi.workspace = true
 alloy-primitives.workspace = true
 async-trait.workspace = true
 blake3.workspace = true

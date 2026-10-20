@@ -46,25 +46,58 @@ bound; blobs.money's own formula still clamps the fee to the reserve.
 ## evm-events 1.1.0
 
 A declarative event decoder. Configuration supplies contract
-addresses, static Solidity event ABI fragments, and output mappings. The
+addresses, Solidity event ABI fragments, and output mappings. The
 factory parses and validates the ABI before a source is opened, derives exact
 topic-zero signatures, pushes address/topic predicates into capable sources,
 and decodes without EVM execution. It declares the `Logs` field group.
 
-Supported ABI values are `address`, `bool`, fixed `bytes1..bytes32`, and
-`uint`/`int` widths from 8 through 256. Every parameter needs a name
-(`type name` or `type indexed name`), because decoded values are keyed by
-name. Dynamic values, tuples, arrays, unnamed parameters, anonymous events,
-duplicate signatures, malformed keys, and more than three indexed fields fail
-deterministically during `doctor`. The order of the configured events is part
-of the configuration hash, so reordering them creates a new processor
-instance.
+An event's `abi` is a human-readable fragment, one JSON ABI event object as a
+block explorer shows it, or `log0` (below). Fragments may use every ABI type
+Solidity events use except `function` and fixed-point: `address`, `bool`,
+`bytes1..bytes32`, `uint`/`int` widths from 8 through 256, `bytes`, `string`,
+fixed-size and dynamic arrays, and tuples, nested at most six levels deep.
+One element of a dynamic array holds at most 64 values, counting each nested
+array and tuple as one, because the decoder copies that layout for every
+element. A tuple is written with its component names, as
+`(uint256 amount, bool exactOutput) params` or `tuple(…) params`. Every
+parameter and tuple component needs a name (`type name` or
+`type indexed name`), because decoded values are keyed by name. Unnamed
+parameters, anonymous events, duplicate signatures, malformed keys, and more
+than three indexed fields fail deterministically during `doctor`. The order of
+the configured events is part of the configuration hash, so reordering them
+creates a new processor instance.
+
+Decoded `values` are exact strings: integers in decimal; `address`, `bytesN`,
+and `bytes` as lowercase `0x` hex; `bool` as `true` or `false`; and `string` as
+text, with invalid UTF-8 replaced by U+FFFD. A tuple that is not indexed
+flattens to one key per component, such as `params.amount`, and nested tuples
+extend the path. An array, also one inside a tuple, is one JSON string whose
+elements render as above, with tuple elements as objects in ABI order:
+`["1","2"]` or `[{"maker":"0x…","data":"0x01"}]`. Ethereum stores an indexed
+`string`, `bytes`, array, or tuple only as the keccak hash of its value, so
+its value is that 32-byte topic as `0x` hex. `key_fields` may name any value
+key, including a flattened one.
 
 Any contract can emit a log with a configured event's topic zero. A log whose
 topics or data do not decode as that event, such as an ERC-721 `Transfer`
 (four topics, no data) against the ERC-20 `Transfer` ABI or a `bool` word
 other than 0 or 1, is not that event: it is skipped rather than failing the
-block, and the block's mapped delta counts the skipped logs.
+block, and the block's mapped delta counts the skipped logs. Only the
+canonical encoding decodes, the one Solidity's encoder produces: offsets
+without gaps or shared tails, zero padding, and no trailing bytes. A log that
+breaks these rules, as a few old compilers' event data did, is skipped and
+counted rather than guessed at. The layout is checked before anything
+decodes, so decoding takes memory in proportion to the log's size.
+
+`abi = "log0"` stores every topicless log of the configured contracts raw:
+the entity's `event` and `signature` are `log0`, and its `values` hold one
+key, `data`, with the log data as `0x` hex. Contracts such as Ekubo Core emit
+LOG0 with a packed layout that no ABI describes, so the application decodes
+those bytes. A `log0` entry requires `addresses`, a processor may have one,
+and its `key_fields` may name `data`. A topicless log cannot match a
+topic-zero filter, so a processor with a `log0` entry reads every log of its
+contracts and selects the configured events itself. An anonymous event with
+indexed parameters has topics but no signature, and is not decoded.
 
 Without `key_fields`, an event's key is its transaction hash and log index,
 which no other event shares, so the processor is block-local: its history and

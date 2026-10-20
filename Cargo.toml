@@ -41,7 +41,9 @@ homepage = "https://leani.dev"
 # Use the same native signature recovery backend in the node and when testing
 # each source crate independently.
 alloy-consensus = { version = "2.3.0", features = ["k256", "secp256k1"] }
+alloy-dyn-abi = { version = "1.7.3", default-features = false, features = ["std"] }
 alloy-eips = "2.3.0"
+alloy-json-abi = { version = "1.7.3", default-features = false, features = ["std"] }
 alloy-primitives = { version = "1.6.1", default-features = false, features = ["std", "serde"] }
 alloy-rlp = "0.3.16"
 alloy-rpc-types-eth = "2.3.0"

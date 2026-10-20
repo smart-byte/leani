@@ -73,14 +73,33 @@ key_fields = []                    # empty: one entity per log
 
 Limits `doctor` enforces:
 
-- Supported ABI types: `address`, `bool`, `bytes1`..`bytes32`, and
-  `uint`/`int` from 8 to 256 bits. Dynamic types (`string`, `bytes`), arrays,
-  tuples, and anonymous events are rejected; so are unnamed parameters,
-  because decoded values are keyed by parameter name.
+- `abi` is a human-readable fragment or one JSON ABI event object, as a block
+  explorer shows it. Every ABI type events use works except `function` and
+  fixed-point: `address`, `bool`, `bytes1`..`bytes32`, `uint`/`int` from 8 to
+  256 bits, `bytes`, `string`, arrays, and tuples, nested at most six levels.
+  One element of a dynamic array holds at most 64 values, counting each
+  nested array and tuple as one.
+  Write a tuple with its component names:
+  `(uint256 amount, bool exactOutput) params`.
+- Every parameter and tuple component needs a name, because decoded values
+  are keyed by name. Anonymous events are rejected.
 - At most three `indexed` parameters, and no duplicate event signatures.
 - Several events can share one processor: add more
   `[[processors.settings.events]]` tables. Their order is part of the
   instance's identity.
+- `abi = "log0"` stores every topicless log of the configured contracts raw,
+  as `values.data` in `0x` hex, for contracts that log a packed layout no ABI
+  describes, such as Ekubo Core's swaps. It requires `addresses`, and the
+  processor then reads every log of those contracts.
+
+Values are strings:
+
+- Integers are decimal; addresses, `bytesN`, and `bytes` are `0x` hex;
+  strings are text. Apply token decimals yourself.
+- A tuple flattens to one key per component, such as `params.amount`.
+- An array is one JSON string, such as `["1","2"]`; parse it before use.
+- An indexed `string`, `bytes`, array, or tuple is only its 32-byte keccak
+  hash on chain, so its value is that hash.
 
 Keys shape the output:
 
@@ -95,10 +114,9 @@ Keys shape the output:
 
 There is no filter on argument values, indexed or not: every configured event
 from the configured addresses is stored, so filter when you query, or write a
-custom processor (section 4) when the answer is an aggregate. Decoded
-values are exact decimal or `0x` strings; apply token decimals yourself. A log
-from the configured address whose data does not decode as the event is
-skipped, not an error.
+custom processor (section 4) when the answer is an aggregate. A log from the
+configured address whose data does not decode as the event, including data
+that is not the canonical ABI encoding, is skipped, not an error.
 
 ## 3. Backfill, serve, and check coverage
 
@@ -132,8 +150,9 @@ When no built-in produces the answer directly, write a processor; that is how
 Leani is meant to be extended. Typical reasons: an aggregate (distinct count,
 sum, top-N, daily totals), transactions or their ETH value rather than logs,
 state derived across events or contracts, a filter on argument values,
-dynamic ABI types or arrays, or a typed query route of your own. Exporting
-every raw event to count it client-side is the sign a processor is missing.
+fields of packed, non-ABI log data, or a typed query route of your own.
+Exporting every raw event to count it client-side is the sign a processor is
+missing.
 
 The descriptor declares the block material the processor reads, such as
 `Capability::Header`, `Body` (transaction `to`, value, nonce), `Senders`, or

@@ -6,8 +6,31 @@ record, and documented RPC contracts.
 
 ## [Unreleased]
 
+### Added
+
+- `evm-events` decodes every ABI type events use except `function` and
+  fixed-point: `string`, `bytes`, fixed-size and dynamic arrays, and tuples,
+  nested up to six levels, with at most 64 values in one element of a
+  dynamic array. A tuple that is not indexed flattens to
+  `name.component` keys, and an array is one JSON string whose elements
+  render like top-level values. An indexed `string`, `bytes`, array, or tuple
+  is its 32-byte topic hash. Version 1.1.0 keeps its identity: existing
+  configurations hash, decode, and skip exactly as before.
+- An `evm-events` `abi` can be one JSON ABI event object, as block explorers
+  show it.
+- `abi = "log0"` stores every topicless log of the configured contracts raw,
+  as `values.data`, for contracts such as Ekubo Core that log a packed,
+  non-ABI layout. It requires `addresses`, and the processor then reads every
+  log of those contracts.
+
 ### Changed
 
+- `evm-events` decodes with Alloy's `alloy-dyn-abi` and still accepts only
+  the canonical encoding: a log with gaps or shared tails between offsets,
+  dirty padding, or trailing bytes is skipped and counted. The layout is
+  checked before decoding, so a crafted log cannot expand into more values
+  than it holds. `alloy-sol-types`, `alloy-json-abi`, and
+  `alloy-sol-type-parser` move to 1.7.3.
 - Execution P2P keeps the blocks a peer served when it stops a body or
   receipt reply at its response size limit, and asks only for the rest. Such
   a reply no longer counts as a failed request or cools the peer down.
