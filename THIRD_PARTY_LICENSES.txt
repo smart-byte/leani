@@ -3854,7 +3854,7 @@ THE SOFTWARE.
 ==============================================================================
 MIT License (MIT)
 ==============================================================================
-flate2 1.1.9 — https://github.com/rust-lang/flate2-rs
+flate2 1.1.10 — https://github.com/rust-lang/flate2-rs
 
 Copyright (c) 2014-2026 Alex Crichton
 
@@ -9047,7 +9047,7 @@ SOFTWARE.
 ==============================================================================
 MIT License (MIT)
 ==============================================================================
-miniz_oxide 0.8.9 — https://github.com/Frommi/miniz_oxide/tree/master/miniz_oxide
+miniz_oxide 0.9.1 — https://github.com/Frommi/miniz_oxide/tree/master/miniz_oxide
 
 MIT License
 
@@ -9079,7 +9079,7 @@ SOFTWARE.
 ==============================================================================
 MIT License (MIT)
 ==============================================================================
-miniz_oxide 0.8.9 — https://github.com/Frommi/miniz_oxide/tree/master/miniz_oxide
+miniz_oxide 0.9.1 — https://github.com/Frommi/miniz_oxide/tree/master/miniz_oxide
 
 MIT License
 
