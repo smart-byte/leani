@@ -2,6 +2,7 @@
 
 mod backfill;
 mod shutdown;
+mod wasm_run;
 
 use std::{
     collections::BTreeMap,
@@ -27,7 +28,7 @@ use crate::{
     benchmark::{BenchmarkOptions, RealSourceBenchmarkOptions},
     cli::{
         BenchmarkCommand, Cli, Command, ConformanceCommand, DbCommand, E2eCommand, LogFormat,
-        ProbeSource, ResetCommand, SourceCommand, SubscribeProtocol,
+        ProbeSource, ProcessorCommand, ResetCommand, SourceCommand, SubscribeProtocol,
     },
     config::{
         ArtifactStorageBackend, Config, HistoryMaterialCoordinatorMode, ProcessorConfig,
@@ -3269,6 +3270,33 @@ pub async fn run_cli_with_registry(cli: Cli, registry: &ProcessorRegistry) -> Re
                 token.as_deref(),
                 registry,
             )
+            .await
+        }
+        Command::Processor {
+            command:
+                ProcessorCommand::Run {
+                    module,
+                    template,
+                    from_block,
+                    to_block,
+                    params,
+                    params_json,
+                    data_dir,
+                },
+        } => {
+            Box::pin(wasm_run::run(
+                &config_path,
+                wasm_run::RunOptions {
+                    module,
+                    template,
+                    from_block,
+                    to_block,
+                    params,
+                    params_json,
+                    data_dir,
+                },
+                registry,
+            ))
             .await
         }
         Command::Source {
