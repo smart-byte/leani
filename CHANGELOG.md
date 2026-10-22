@@ -17,6 +17,8 @@ record, and documented RPC contracts.
 
 - The live lane keeps every block's header, which the P2P source fetches
   anyway, so header-only processors run ad hoc on any node.
+- The live subscriptions of one P2P source share their downloads: a block's
+  bodies or receipts that two of them need are downloaded once.
 
 ## [0.1.1] - 2026-10-29
 
