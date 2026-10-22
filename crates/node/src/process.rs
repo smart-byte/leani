@@ -5667,6 +5667,7 @@ fn doctor(path: &Path, json: bool, registry: &ProcessorRegistry) -> Result<Exit>
     let mut warnings = finality_anchor_warnings(&config, SystemTime::now());
     warnings.extend(live_lane_warnings(&config, registry));
     warnings.extend(load_warnings);
+    warnings.extend(registry.validation_warnings(&config));
     let report = DoctorReport {
         project: leani_primitives::PROJECT_NAME,
         version: env!("CARGO_PKG_VERSION"),
