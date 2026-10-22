@@ -18,10 +18,10 @@ use futures::StreamExt;
 use libp2p::{
     Multiaddr, PeerId, SwarmBuilder,
     gossipsub::{self, IdentTopic, MessageAcceptance, MessageAuthenticity, MessageId},
-    identity,
+    identify, identity,
     multiaddr::Protocol,
-    noise,
-    swarm::SwarmEvent,
+    noise, ping,
+    swarm::{NetworkBehaviour, SwarmEvent},
     tcp, yamux,
 };
 use op_alloy_rpc_types_engine::OpNetworkPayloadEnvelope;
@@ -160,6 +160,14 @@ fn peer_address(enr: &Enr) -> Option<(PeerId, Multiaddr)> {
     Some((peer_id, address))
 }
 
+/// Peers drop connections that answer neither identify nor ping.
+#[derive(NetworkBehaviour)]
+struct Behaviour {
+    gossipsub: gossipsub::Behaviour,
+    identify: identify::Behaviour,
+    ping: ping::Behaviour,
+}
+
 #[derive(Clone, Debug)]
 pub struct OpGossipConfig {
     pub chain_id: u64,
@@ -231,10 +239,16 @@ pub async fn follow(
         .message_id_fn(message_id)
         .build()
         .map_err(|error| OpGossipError::Transport(error.to_string()))?;
-    let behaviour: gossipsub::Behaviour =
+    let gossipsub: gossipsub::Behaviour =
         gossipsub::Behaviour::new(MessageAuthenticity::Anonymous, gossip_config)
             .map_err(|error| OpGossipError::Transport(error.to_owned()))?;
-    let mut swarm = SwarmBuilder::with_new_identity()
+    let keypair = identity::Keypair::generate_secp256k1();
+    let behaviour = Behaviour {
+        gossipsub,
+        identify: identify::Behaviour::new(identify::Config::new(String::new(), keypair.public())),
+        ping: ping::Behaviour::default(),
+    };
+    let mut swarm = SwarmBuilder::with_existing_identity(keypair)
         .with_tokio()
         .with_tcp(
             tcp::Config::default(),
@@ -251,6 +265,7 @@ pub async fn follow(
         let topic = IdentTopic::new(topic(config.chain_id, version));
         swarm
             .behaviour_mut()
+            .gossipsub
             .subscribe(&topic)
             .map_err(|error| OpGossipError::Transport(error.to_string()))?;
         versions.push((topic.hash(), version));
@@ -306,11 +321,11 @@ pub async fn follow(
                         connected.remove(&peer_id);
                         dialed.remove(&peer_id);
                     }
-                    SwarmEvent::Behaviour(gossipsub::Event::Message {
+                    SwarmEvent::Behaviour(BehaviourEvent::Gossipsub(gossipsub::Event::Message {
                         propagation_source,
                         message_id,
                         message,
-                    }) => {
+                    })) => {
                         let Some(version) = versions
                             .iter()
                             .find(|(hash, _)| *hash == message.topic)
@@ -339,7 +354,7 @@ pub async fn follow(
                                 MessageAcceptance::Reject
                             }
                         };
-                        swarm.behaviour_mut().report_message_validation_result(
+                        swarm.behaviour_mut().gossipsub.report_message_validation_result(
                             &message_id,
                             &propagation_source,
                             acceptance,

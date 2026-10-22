@@ -75,6 +75,9 @@ humantime = "2.4"
 indexmap = { version = "2.12", features = ["serde"] }
 libp2p = { version = "0.56.0", default-features = false, features = [
   "gossipsub",
+  "identify",
+  "macros",
+  "ping",
   "noise",
   "secp256k1",
   "tcp",

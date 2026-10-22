@@ -3224,6 +3224,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "futures-bounded"
+version = "0.2.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "91f328e7fb845fc832912fb6a34f40cf6d1888c92f974d1893a54e97b5ff542e"
+dependencies = [
+ "futures-timer",
+ "futures-util",
+]
+
+[[package]]
 name = "futures-channel"
 version = "0.3.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5130,10 +5140,12 @@ dependencies = [
  "libp2p-core",
  "libp2p-dns",
  "libp2p-gossipsub",
+ "libp2p-identify",
  "libp2p-identity",
  "libp2p-mdns",
  "libp2p-metrics",
  "libp2p-noise",
+ "libp2p-ping",
  "libp2p-quic",
  "libp2p-swarm",
  "libp2p-tcp",
@@ -5239,6 +5251,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "libp2p-identify"
+version = "0.47.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8ab792a8b68fdef443a62155b01970c81c3aadab5e659621b063ef252a8e65e8"
+dependencies = [
+ "asynchronous-codec",
+ "either",
+ "futures",
+ "futures-bounded",
+ "futures-timer",
+ "libp2p-core",
+ "libp2p-identity",
+ "libp2p-swarm",
+ "quick-protobuf",
+ "quick-protobuf-codec",
+ "smallvec",
+ "thiserror 2.0.21",
+ "tracing",
+]
+
+[[package]]
 name = "libp2p-identity"
 version = "0.2.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5286,7 +5319,9 @@ dependencies = [
  "futures",
  "libp2p-core",
  "libp2p-gossipsub",
+ "libp2p-identify",
  "libp2p-identity",
+ "libp2p-ping",
  "libp2p-swarm",
  "pin-project",
  "prometheus-client",
@@ -5314,6 +5349,22 @@ dependencies = [
  "tracing",
  "x25519-dalek",
  "zeroize",
+]
+
+[[package]]
+name = "libp2p-ping"
+version = "0.47.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "74bb7fcdfd9fead4144a3859da0b49576f171a8c8c7c0bfc7c541921d25e60d3"
+dependencies = [
+ "futures",
+ "futures-timer",
+ "libp2p-core",
+ "libp2p-identity",
+ "libp2p-swarm",
+ "rand 0.8.7",
+ "tracing",
+ "web-time",
 ]
 
 [[package]]
@@ -5366,12 +5417,24 @@ dependencies = [
  "hashlink 0.10.0",
  "libp2p-core",
  "libp2p-identity",
+ "libp2p-swarm-derive",
  "multistream-select",
  "rand 0.8.7",
  "smallvec",
  "tokio",
  "tracing",
  "web-time",
+]
+
+[[package]]
+name = "libp2p-swarm-derive"
+version = "0.35.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dd297cf53f0cb3dee4d2620bb319ae47ef27c702684309f682bdb7e55a18ae9c"
+dependencies = [
+ "heck",
+ "quote",
+ "syn 2.0.119",
 ]
 
 [[package]]
