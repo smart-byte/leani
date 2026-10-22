@@ -623,6 +623,13 @@ limit: `max_blocks`, `max_age`, `max_rows`, or `max_bytes`. Validation
 refuses `[processors.output] finalized_only`, which was never applied; to
 publish only finalized blocks, set `publish = "finalized"`.
 
+How much `latest` keeps depends on the processor's keys, not on the mode: an
+ordered aggregate such as `transaction-stats` writes one key and keeps one
+row, a per-pool processor keeps one row per pool, and a block-local processor
+such as `evm-events` usually writes new keys every block, one per event, so
+under `latest` its output grows as under `full`. `leani doctor` warns about
+`latest` on a block-local processor; use `window` to bound such output.
+
 ### Delivery
 
 `[processors.delivery] mode` is `best_effort`, `window`, or

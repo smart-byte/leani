@@ -17,7 +17,8 @@ use leani_api::{
 };
 use leani_primitives::{Address, BlockNumber};
 use leani_processor_api::{
-    LifecyclePolicies, Processor, ProcessorInstanceId, PublicationPolicy, ReductionMode, StartPoint,
+    LifecyclePolicies, OutputPolicyMode, Processor, ProcessorInstanceId, PublicationPolicy,
+    ReductionMode, StartPoint,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -331,6 +332,36 @@ impl ProcessorRegistry {
             })
             .collect()
     }
+
+    /// Settings that are valid but unlikely to do what they suggest. A
+    /// processor that fails to load is a validation error instead.
+    pub(crate) fn validation_warnings(&self, config: &Config) -> Vec<String> {
+        config
+            .processors
+            .iter()
+            .enumerate()
+            .filter_map(|(index, configured)| {
+                let processor = self.instantiate(configured, config.chain.chain_id).ok()?;
+                output_warning(index, processor.as_ref())
+            })
+            .collect()
+    }
+}
+
+/// `latest` keeps the current value of each key, which stays small only for a
+/// processor that writes a fixed set of keys, such as an ordered aggregate. A
+/// block-local processor usually writes new keys every block, one per event
+/// or block, so its output grows as under `full`.
+pub(crate) fn output_warning(index: usize, processor: &dyn Processor) -> Option<String> {
+    let descriptor = processor.descriptor();
+    (descriptor.lifecycle.output.mode == OutputPolicyMode::Latest
+        && descriptor.mode == ReductionMode::BlockLocal)
+        .then(|| {
+            format!(
+                "processors[{index}] ({}): output \"latest\" keeps the current value of each key, and this block-local processor usually writes new keys every block, so its output grows as with \"full\"; bound it with output \"window\", or keep one value per key with an ordered processor",
+                descriptor.instance
+            )
+        })
 }
 
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
@@ -1347,5 +1378,33 @@ minValue = 1000000
         block_local.processors[0].live_gap_fill = fill;
         let errors = registry.validation_errors(&block_local);
         assert!(errors.is_empty(), "{errors:?}");
+    }
+
+    #[test]
+    fn latest_output_on_a_block_local_processor_is_warned_about() {
+        let modes = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config/modes");
+        let registry = ProcessorRegistry::standard();
+
+        // transaction-stats is ordered: `latest` keeps its one running total.
+        let aggregate = Config::load(&modes.join("aggregate-only.toml")).expect("profile");
+        assert_eq!(
+            registry.validation_warnings(&aggregate),
+            Vec::<String>::new()
+        );
+
+        // The windowed evm-events instance writes one entity per event.
+        let mut events = Config::load(&modes.join("windowed.toml")).expect("profile");
+        assert_eq!(registry.validation_warnings(&events), Vec::<String>::new());
+        events.processors[0].output.mode = OutputPolicyMode::Latest;
+        events.processors[0].output.window = None;
+        assert!(registry.validation_errors(&events).is_empty());
+        let warnings = registry.validation_warnings(&events);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].starts_with("processors[0] (uniswap-v2-sync-30d): output \"latest\"")
+                && warnings[0].contains("block-local"),
+            "{}",
+            warnings[0]
+        );
     }
 }

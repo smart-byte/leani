@@ -30,6 +30,9 @@ record, and documented RPC contracts.
   ones. A running run takes another module or other parameters
   (`PUT /admin/v1/wasm/runs/{run}/processor`), reruns the blocks it holds
   with them, and follows on with them.
+- `leani doctor` warns when a block-local processor has `output = "latest"`:
+  such a processor usually writes new keys every block, so `latest` keeps all
+  of them, as `full` does.
 
 ### Changed
 
