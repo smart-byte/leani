@@ -90,12 +90,15 @@ pub(crate) struct StarterBlocksConfig {}
 pub(crate) struct StarterApiConfig {
     #[serde(default = "default_starter_api_bind")]
     pub bind: SocketAddr,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub allow_wasm_builds: bool,
 }
 
 impl Default for StarterApiConfig {
     fn default() -> Self {
         Self {
             bind: default_starter_api_bind(),
+            allow_wasm_builds: false,
         }
     }
 }
@@ -185,6 +188,7 @@ impl StarterConfig {
         config.finality.endpoints = self.finality.endpoints;
         config.processors = vec![processor];
         config.api.bind = self.api.bind;
+        config.api.allow_wasm_builds = self.api.allow_wasm_builds;
         Ok(config)
     }
 }
@@ -1278,6 +1282,10 @@ pub struct ApiConfig {
     /// Browser origins, besides loopback ones, that may call the API.
     #[serde(default)]
     pub allowed_origins: Vec<String>,
+    /// Compile processor source sent to the API, as the playground's editor
+    /// does: a development feature, off unless set.
+    #[serde(default)]
+    pub allow_wasm_builds: bool,
     #[serde(default)]
     pub delivery: ApiDeliveryConfig,
 }
@@ -1444,7 +1452,7 @@ impl Config {
     }
 
     /// [`Self::load`], returning its warnings instead of logging them:
-    /// deprecated settings, and state a relative `data_dir` left under
+    /// [`Self::setting_warnings`], and state a relative `data_dir` left under
     /// `working_directory` beside state it uses.
     pub(crate) fn load_with_warnings(
         path: &Path,
@@ -1486,7 +1494,6 @@ impl Config {
                 *manifest = resolve_relative_to_file(path, manifest);
             }
         }
-        let mut warnings = config.deprecation_warnings();
         for processor in &mut config.processors {
             if processor.id == leani_processor_wasm::PROCESSOR_ID
                 && let Some(toml::Value::String(module)) = processor.settings.get_mut("module")
@@ -1496,6 +1503,7 @@ impl Config {
                     .into_owned();
             }
         }
+        let mut warnings = config.setting_warnings();
         if let Some(working_directory) = working_directory
             && written.is_relative()
             && !written.as_os_str().is_empty()
@@ -1508,14 +1516,19 @@ impl Config {
         Ok((config, warnings))
     }
 
-    /// Deprecated settings this configuration still carries, which the node
-    /// ignores.
+    /// Settings the operator should know about: deprecated ones, which the
+    /// node ignores, and node-side builds.
     #[must_use]
-    pub fn deprecation_warnings(&self) -> Vec<String> {
+    pub fn setting_warnings(&self) -> Vec<String> {
         let mut warnings = Vec::new();
         if self.rpc.transaction_locator.is_some() {
             warnings
                 .push("rpc.transaction_locator is deprecated and ignored; remove it".to_owned());
+        }
+        if self.api.allow_wasm_builds {
+            warnings.push(
+                "api.allow_wasm_builds is on: the node compiles processor source sent to its API, a development feature, not for production; rustc can read this host's files while it compiles and only a denylist guards it, so Rust builds only for requests from this machine".to_owned(),
+            );
         }
         warnings
     }
@@ -3993,6 +4006,7 @@ markets = ["LINK/ETH"]
         assert!(encoded.contains("network = \"ethereum-mainnet\""));
         assert!(encoded.contains("markets = [\"ETH/USDC\"]"));
         assert!(!encoded.contains("[budgets]"));
+        assert!(!encoded.contains("allow_wasm_builds"));
         assert!(!encoded.contains("[sources.live]"));
         assert!(!encoded.contains("[[processors.settings.pools]]"));
     }
@@ -4255,7 +4269,7 @@ markets = ["LINK/ETH"]
         assert!(!without.contains("transaction_locator"));
         let config: Config = toml::from_str(without).expect("the locator is optional");
         assert!(error_fields(&config).is_empty());
-        assert!(config.deprecation_warnings().is_empty());
+        assert!(config.setting_warnings().is_empty());
         for value in [true, false] {
             let with = without.replace(
                 "minimum_recent_blocks = 128",
@@ -4264,11 +4278,54 @@ markets = ["LINK/ETH"]
             let config: Config = toml::from_str(&with).expect("an existing configuration loads");
             assert!(error_fields(&config).is_empty(), "{value}");
             assert_eq!(
-                config.deprecation_warnings(),
+                config.setting_warnings(),
                 ["rpc.transaction_locator is deprecated and ignored; remove it"],
                 "{value}"
             );
         }
+    }
+
+    #[test]
+    fn wasm_builds_are_off_unless_opted_in_and_warn_when_on() {
+        let config = config();
+        assert!(!config.api.allow_wasm_builds);
+        assert!(config.setting_warnings().is_empty());
+        let on: Config = toml::from_str(&format!("{VALID_CONFIG_TOML}allow_wasm_builds = true\n"))
+            .expect("the switch is a setting");
+        assert!(on.api.allow_wasm_builds);
+        assert!(error_fields(&on).is_empty());
+        let warnings = on.setting_warnings();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].starts_with("api.allow_wasm_builds is on"),
+            "{warnings:?}"
+        );
+
+        // The compact profile, which `leani init` writes, carries it too, and
+        // loading warns, so startup logs it and `leani doctor` reports it.
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let path = temp.path().join("leani.toml");
+        fs::write(
+            &path,
+            r#"config_version = 1
+network = "ethereum-mainnet"
+
+[finality]
+checkpoint = "0x1111111111111111111111111111111111111111111111111111111111111111"
+checkpoint_slot = 15000000
+endpoints = ["https://ethereum-beacon-api.publicnode.com/"]
+
+[uniswap]
+markets = ["ETH/USDC"]
+
+[api]
+allow_wasm_builds = true
+"#,
+        )
+        .expect("write compact config");
+        let (compact, warnings) = Config::load_with_warnings(&path, None).expect("compact loads");
+        assert!(compact.api.allow_wasm_builds);
+        assert_eq!(warnings, on.setting_warnings());
     }
 
     fn toml_string(path: &Path) -> String {

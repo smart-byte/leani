@@ -3155,6 +3155,29 @@ pub async fn run_cli_with_registry(cli: Cli, registry: &ProcessorRegistry) -> Re
         Command::Doctor { json } => doctor(&config_path, json, registry),
         Command::Serve => serve(&config_path, registry).await,
         Command::Guide { topic } => crate::guide::print(topic),
+        Command::Processor {
+            command:
+                ProcessorCommand::Create {
+                    directory,
+                    spec,
+                    template,
+                    language,
+                    json,
+                },
+        } => wasm_run::new_project(
+            &directory,
+            spec.as_deref(),
+            template.as_deref(),
+            language.map(|language| match language {
+                crate::cli::ProcessorLanguage::Rust => {
+                    leani_processor_wasm::scaffold::Language::Rust
+                }
+                crate::cli::ProcessorLanguage::Typescript => {
+                    leani_processor_wasm::scaffold::Language::TypeScript
+                }
+            }),
+            json,
+        ),
         Command::Init {
             protocol,
             targets,
@@ -6196,6 +6219,17 @@ async fn serve(path: &Path, registry: &ProcessorRegistry) -> Result<Exit> {
             live_feed: execution_source
                 .clone()
                 .map(|source| live_feed(source, live_source_budget(config.get()))),
+            wasm_build: config
+                .get()
+                .api
+                .allow_wasm_builds
+                .then(|| -> leani_api::WasmBuild {
+                    let builder = crate::wasm_build::WasmBuilder::new(&config.get().data_dir);
+                    Arc::new(move |source: String, language| {
+                        let builder = builder.clone();
+                        Box::pin(async move { builder.build(source, language).await })
+                    })
+                }),
             ..NativeApiConfig::default()
         },
     )?;
@@ -6394,8 +6428,12 @@ async fn serve(path: &Path, registry: &ProcessorRegistry) -> Result<Exit> {
             "live ingestion requires both execution P2P and verified finality; readiness remains false"
         );
     }
-    let api_server = axum::serve(api_listener, api)
-        .with_graceful_shutdown(cancellation.clone().cancelled_owned());
+    // Peers' addresses: the API builds Rust only for requests from this machine.
+    let api_server = axum::serve(
+        api_listener,
+        api.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .with_graceful_shutdown(cancellation.clone().cancelled_owned());
     let rpc_server = axum::serve(rpc_listener, rpc)
         .with_graceful_shutdown(cancellation.clone().cancelled_owned());
     let rpc_websocket_server = axum::serve(rpc_websocket_listener, rpc_websocket)

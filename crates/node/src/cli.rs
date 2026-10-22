@@ -231,7 +231,7 @@ satisfied, 130 interrupted before --once was satisfied.")]
         #[arg(long, env = "LEANI_API_TOKEN", hide_env_values = true)]
         token: Option<String>,
     },
-    /// Run Wasm processors over finalized history.
+    /// Create Wasm processors and run them over finalized history.
     Processor {
         #[command(subcommand)]
         command: ProcessorCommand,
@@ -392,6 +392,45 @@ fn parse_duration(value: &str) -> Result<Duration, humantime::DurationError> {
 
 #[derive(Clone, Debug, Subcommand)]
 pub enum ProcessorCommand {
+    /// Create a Wasm processor as a Rust crate or a TypeScript package.
+    ///
+    /// The processor is generated from a spec of the onchain data to keep,
+    /// copied from a template's source, or the starter.
+    #[command(after_help = "Examples:
+  leani processor create usdc-transfers
+  leani processor create usdc-transfers --language typescript
+  leani processor create usdc-volume --spec spec.json
+  leani processor create my-decoder --template event-decoder --language typescript
+  echo '{\"data\":{\"kind\":\"blocks\"}}' | leani processor create gas --spec - --json
+
+A spec names the data and what to keep of it:
+
+  {\"name\": \"usdc-volume\",
+   \"data\": {\"kind\": \"events\", \"contracts\": [\"0xa0b8...\"],
+            \"events\": [\"Transfer(address indexed from, address indexed to, uint256 value)\"]},
+   \"keep\": {\"kind\": \"totals\", \"by\": \"to\", \"sum\": [\"value\"]}}
+
+data.kind is events, transactions (to, from, functions), or blocks; each takes
+fields to keep, all by default. keep.kind is rows or totals. The project
+carries the guest SDK of this binary: Rust builds with cargo, TypeScript (as
+AssemblyScript compiles it) with npm. `leani guide processors` describes specs
+and the processor contract.")]
+    Create {
+        /// Directory to create; its last component names the project.
+        directory: PathBuf,
+        /// The spec as JSON, or `-` for standard input.
+        #[arg(long, conflicts_with = "template")]
+        spec: Option<PathBuf>,
+        /// Start from a bundled template's source instead.
+        #[arg(long)]
+        template: Option<String>,
+        /// The language to write it in; a spec may name one.
+        #[arg(long, value_enum)]
+        language: Option<ProcessorLanguage>,
+        /// Print the result as JSON.
+        #[arg(long)]
+        json: bool,
+    },
     /// Run a Wasm processor over finalized history and print its changes.
     #[command(after_help = "Examples:
   leani processor run transfers.wasm --from-block 21000000 --to-block 21000099
@@ -429,6 +468,15 @@ a bundled template: block-gas, erc20-transfers, token-volume, event-decoder.")]
         #[arg(long)]
         data_dir: Option<PathBuf>,
     },
+}
+
+/// The language `leani processor create` writes a processor in.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum ProcessorLanguage {
+    /// A crate that cargo builds.
+    Rust,
+    /// A package that npm builds with the `assemblyscript` compiler.
+    Typescript,
 }
 
 /// Sections of `leani guide` beyond the overview.
@@ -1116,6 +1164,54 @@ mod tests {
             panic!("subscribe command");
         };
         assert_eq!(finality, SubscribeFinality::Unattested);
+    }
+
+    #[test]
+    fn processor_create_takes_a_spec_or_a_template() {
+        let cli = Cli::try_parse_from([
+            "leani",
+            "processor",
+            "create",
+            "volume",
+            "--spec",
+            "-",
+            "--language",
+            "typescript",
+            "--json",
+        ])
+        .expect("CLI parses");
+        let Command::Processor {
+            command:
+                ProcessorCommand::Create {
+                    directory,
+                    spec,
+                    template,
+                    language,
+                    json,
+                },
+        } = cli.command
+        else {
+            panic!("expected processor create command");
+        };
+        assert_eq!(directory, PathBuf::from("volume"));
+        assert_eq!(spec, Some(PathBuf::from("-")));
+        assert_eq!(template, None);
+        assert_eq!(language, Some(ProcessorLanguage::Typescript));
+        assert!(json);
+        assert!(
+            Cli::try_parse_from([
+                "leani",
+                "processor",
+                "create",
+                "x",
+                "--spec",
+                "s.json",
+                "--template",
+                "block-gas"
+            ])
+            .is_err(),
+            "a spec or a template"
+        );
     }
 
     #[test]

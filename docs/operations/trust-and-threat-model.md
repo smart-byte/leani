@@ -125,6 +125,12 @@ runtime exists.
   cryptographic completeness proof;
 - event-derived ERC-20 balances do not model rebases or non-standard hidden
   balance changes;
+- node-side Wasm builds, off unless `api.allow_wasm_builds = true`, run the
+  host's compilers on posted source. Rust's compiler reads files the source
+  names, and only a denylist guards against that, so Rust builds only for
+  requests from the node's own machine; TypeScript builds, for any client the
+  API admits, run the pinned AssemblyScript compiler on hostile input. Leave
+  builds off where clients are not trusted;
 - the Beacon API finality profile still depends on configured transports even
   though proofs are checked locally;
 - `attested` rests on the sync committee: at least two thirds of it signing a

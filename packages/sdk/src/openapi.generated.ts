@@ -1202,6 +1202,46 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/wasm/compose": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Generate a Wasm processor's source from a spec
+         * @description Takes a spec of the onchain data to keep (`name`; `language`, `rust` by default or `typescript`; `data` with `kind` `events`, `transactions`, or `blocks`, their filters, signatures, and `fields`; `keep` with `kind` `rows` or `totals`, `by`, and `sum`), as `leani processor create --help` describes, and returns the processor's source, written against the guest SDK of this node. Both languages keep the same rows and totals. Reads and writes nothing.
+         */
+        post: operations["composeWasmProcessor"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/admin/v1/wasm/build": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Build a Wasm processor's source on the node's host
+         * @description Compiles `source` in its `language`: `rust` (the default), a processor's `src/lib.rs`, with the host's cargo; or `typescript`, an `assembly/index.ts`, with the AssemblyScript compiler the SDK pins, which npm installs on the first build. Either builds against this node's guest SDK, in a project under the data directory that rebuilds incrementally. Builds run one at a time. Rust that would read files or the environment while it compiles (`include!`, `include_str!`, `include_bytes!`, `env!`, `option_env!`, `#[path]`, or a module in another file) is refused; the TypeScript compiler is served only the processor and the SDK. Needs Rust and its `wasm32-unknown-unknown` target, or Node.js 20 or later with npm, on the host. Pass the module to `POST /admin/v1/wasm/runs` or `PUT /admin/v1/wasm/runs/{run}/processor`. A development feature, not for production, off unless the node's configuration sets `api.allow_wasm_builds = true`: rustc reads any file the source names while it compiles, and the guard is a denylist, so the node builds Rust only for requests from its own machine (a loopback peer, addressed to a loopback host, not relayed by a proxy) and TypeScript for any client the API admits. Without builds, build the module where the source is written and pass it.
+         */
+        post: operations["buildWasmModule"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/admin/v1/wasm/runs": {
         parameters: {
             query?: never;
@@ -3960,6 +4000,72 @@ export interface operations {
         responses: {
             /** @description `data`, one entry per template: its `name`, `description`, example `params`, `moduleHash` (BLAKE3) and `moduleBytes`, and the processor's `sources`: `rust`, which the module is built from, and `typescript`, the same processor in TypeScript, which publishes the same changes. */
             200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            default: components["responses"]["Error"];
+        };
+    };
+    composeWasmProcessor: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The project `name`, its `language`, the processor's `source` and its `path` (`src/lib.rs` or `assembly/index.ts`), the project's `files`, and every field the data offers (`fields`, each with `name` and whether it is `unsigned`). */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description The spec is invalid; the message names the field, signature, or address. */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            default: components["responses"]["Error"];
+        };
+    };
+    buildWasmModule: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description `built`; when true, the `module` as hex, its `moduleHash` and `moduleBytes`; when false, the `problem` (`compile`, `toolchain`, `cargo`, `compiler`, or `timeout`) and a `message`. Either way the compiler's `diagnostics` for the source (`level`, `message`, `line`, `column`, `rendered`) and `elapsedMs`. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description The source is refused; the message names the construct. */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description A Rust build requested from another machine. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description `wasm_builds_disabled`: `api.allow_wasm_builds` is off on this node. */
+            409: {
                 headers: {
                     [name: string]: unknown;
                 };

@@ -234,6 +234,10 @@ bind = "127.0.0.1:8080"
 # allowed_hosts = ["indexer.internal"]
 # Browser origins, besides loopback ones, that may call the API.
 # allowed_origins = ["https://app.example"]
+# Compile processor source sent to the API, as the playground's editor does.
+# A development feature, not for production: rustc can read this host's
+# files while it compiles.
+# allow_wasm_builds = true
 
 [api.delivery.history_batches]
 target_encoded_bytes = "4MiB"

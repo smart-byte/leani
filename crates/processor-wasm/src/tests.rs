@@ -1036,6 +1036,124 @@ async fn the_event_decoder_decodes_signed_static_and_dynamic_arguments() {
     );
 }
 
+/// Build a generated crate with cargo, sharing one target directory.
+fn build_generated(root: &std::path::Path, spec: Value) -> Vec<u8> {
+    let generated =
+        crate::scaffold::generate(&serde_json::from_value(spec).expect("spec")).expect("generate");
+    let directory = root.join(&generated.name);
+    for (path, text) in &generated.files {
+        let path = directory.join(path);
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("directory");
+        std::fs::write(path, text).expect("write");
+    }
+    let target = root.join("target");
+    // As a user builds: through rustup's proxy, without this crate's
+    // toolchain. The proxy pins the default toolchain for every rustc
+    // beneath, so dependencies' own toolchain files, such as quote's asking
+    // for rust-src, never apply.
+    let output = std::process::Command::new("cargo")
+        .args([
+            "build",
+            "--locked",
+            "--release",
+            "--target",
+            "wasm32-unknown-unknown",
+        ])
+        .current_dir(&directory)
+        .env("CARGO_TARGET_DIR", &target)
+        .env_remove("RUSTUP_TOOLCHAIN")
+        .output()
+        .expect("cargo runs");
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stderr),
+        generated.source()
+    );
+    std::fs::read(
+        target
+            .join("wasm32-unknown-unknown/release")
+            .join(format!("{}.wasm", generated.name.replace('-', "_"))),
+    )
+    .expect("module")
+}
+
+#[tokio::test]
+#[ignore = "builds with cargo and the wasm32-unknown-unknown target"]
+async fn generated_processors_build_and_keep_what_their_spec_asks_for() {
+    let root = tempfile::tempdir().expect("directory");
+    let transfer_event = "Transfer(address indexed from, address indexed to, uint256 value)";
+    let token = Address::new(TOKEN).to_string();
+
+    let rows = build_generated(
+        root.path(),
+        json!({ "name": "token-transfers",
+                "data": { "kind": "events", "contracts": [token], "events": [transfer_event],
+                          "fields": ["contract", "to", "value"] } }),
+    );
+    let processor = processor_with(&rows, &json!({}), WasmLimits::default()).expect("processor");
+    let directory = tempfile::tempdir().expect("directory");
+    let store = open_store(&directory).await;
+    let block = frame(
+        9,
+        BlockHash::ZERO,
+        vec![transfer(TOKEN, 9, 0), transfer(OTHER, 5, 1)],
+    );
+    apply(&store, &processor, &block).await.expect("apply");
+    let applied = changes(&store, &processor).await;
+    assert_eq!(
+        applied.len(),
+        1,
+        "the other token's transfer is filtered: {applied:?}"
+    );
+    let (number, kind, row) = &applied[0];
+    assert_eq!((*number, kind.as_str()), (9, "event"));
+    assert_eq!(
+        row,
+        &json!({ "contract": token, "to": Address::new([2; 20]).to_string(), "value": "9",
+                 "blockNumber": 9, "timestamp": block.block.timestamp })
+    );
+
+    let totals = build_generated(
+        root.path(),
+        json!({ "name": "volume-by-recipient",
+                "data": { "kind": "events", "events": [transfer_event] },
+                "keep": { "kind": "totals", "by": "to", "sum": ["value"] } }),
+    );
+    let processor = processor_with(&totals, &json!({}), WasmLimits::default()).expect("processor");
+    let directory = tempfile::tempdir().expect("directory");
+    let store = open_store(&directory).await;
+    let first = frame(
+        1,
+        BlockHash::ZERO,
+        vec![transfer(TOKEN, 5, 0), transfer(OTHER, 6, 1)],
+    );
+    let second = frame(2, first.block.hash, vec![transfer(TOKEN, 100, 0)]);
+    apply(&store, &processor, &first).await.expect("first");
+    apply(&store, &processor, &second).await.expect("second");
+    let recipient = Address::new([2; 20]).to_string();
+    assert_eq!(
+        entity(&store, &processor, "totals", recipient.as_bytes()).await,
+        Some(json!({ "to": recipient, "count": 3, "value": "111", "lastBlock": 2 }))
+    );
+
+    let blocks = build_generated(
+        root.path(),
+        json!({ "name": "gas-per-block", "data": { "kind": "blocks", "fields": ["gasUsed", "gasLimit"] } }),
+    );
+    let processor = processor_with(&blocks, &json!({}), WasmLimits::default()).expect("processor");
+    let directory = tempfile::tempdir().expect("directory");
+    let store = open_store(&directory).await;
+    apply(&store, &processor, &block).await.expect("apply");
+    assert_eq!(
+        entity(&store, &processor, "blocks", &9_u64.to_be_bytes()).await,
+        Some(
+            json!({ "gasUsed": 21_000, "gasLimit": 30_000_000, "blockNumber": 9,
+                     "timestamp": block.block.timestamp })
+        )
+    );
+}
+
 fn repository() -> std::path::PathBuf {
     std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
 }
@@ -1306,4 +1424,167 @@ fn event_logs() -> Vec<Log> {
     let mut label = "quote \" back\\ \n\t\u{1} é ✓ 😀 h".as_bytes().to_vec();
     label.extend([0xff, 0xe2, 0x82, b'A']);
     vec![swap, named(b"hello", 1), truncated, named(&label, 3)]
+}
+
+/// Generate a spec's TypeScript package and build it with its own SDK copy.
+fn build_generated_typescript(root: &std::path::Path, mut spec: Value) -> Vec<u8> {
+    spec["language"] = json!("typescript");
+    let generated =
+        crate::scaffold::generate(&serde_json::from_value(spec).expect("spec")).expect("generate");
+    let directory = root.join(format!("{}-ts", generated.name));
+    for (path, text) in &generated.files {
+        let path = directory.join(path);
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("directory");
+        std::fs::write(path, text).expect("write");
+    }
+    build_typescript(
+        &directory.join("assembly/index.ts"),
+        &directory.join("assembly/leani"),
+    )
+}
+
+fn calls_frame() -> BlockFrame {
+    use leani_primitives::{Quantity, TransactionEnvelope};
+    let call = |index: u32, to: [u8; 20], input: Vec<u8>| TransactionEnvelope {
+        hash: TransactionHash::new([u8::try_from(index).expect("index") + 1; 32]),
+        transaction_type: 2,
+        index,
+        encoded: None,
+        from: Some(Address::new([7; 20])),
+        to: Some(Address::new(to)),
+        nonce: Some(1),
+        gas_limit: Some(90_000),
+        value: Some(Quantity::new(word(u64::from(index) * 1_000))),
+        input: Some(input),
+        max_fee_per_gas: None,
+        max_priority_fee_per_gas: None,
+        max_fee_per_blob_gas: None,
+        blob_versioned_hashes: Vec::new(),
+        size_bytes: None,
+    };
+    let selector = |signature: &[u8]| alloy_primitives::keccak256(signature)[..4].to_vec();
+    let transfer_call = |amount: u64| {
+        [
+            selector(b"transfer(address,uint256)"),
+            topic([2; 20]).to_vec(),
+            word(amount).to_vec(),
+        ]
+        .concat()
+    };
+    let mut frame = frame(
+        9,
+        BlockHash::ZERO,
+        vec![
+            transfer(TOKEN, 9, 0),
+            transfer(OTHER, 5, 1),
+            transfer(TOKEN, 11, 2),
+        ],
+    );
+    if let Material::Complete(header) = &mut frame.header {
+        header.size_bytes = Some(1_234);
+    }
+    frame.transactions = Material::Complete(vec![
+        call(0, TOKEN, transfer_call(500)),
+        call(
+            1,
+            TOKEN,
+            [
+                selector(b"approve(address,uint256)"),
+                word(1).to_vec(),
+                word(2).to_vec(),
+            ]
+            .concat(),
+        ),
+        call(2, OTHER, transfer_call(7)),
+        call(3, TOKEN, vec![0x12]),
+        call(4, TOKEN, transfer_call(u64::MAX)),
+    ]);
+    frame.receipts = Material::Complete(
+        (0_u32..5)
+            .map(|index| ReceiptEnvelope {
+                transaction_hash: TransactionHash::new(
+                    [u8::try_from(index).expect("index") + 1; 32],
+                ),
+                transaction_type: 2,
+                transaction_index: index,
+                encoded: None,
+                success: Some(index != 3),
+                gas_used: Some(50_000 + u64::from(index)),
+                effective_gas_price: Some(Quantity::new(word(3_000_000_000))),
+                blob_gas_used: None,
+                blob_gas_price: None,
+                logs: Vec::new(),
+            })
+            .collect(),
+    );
+    frame
+}
+
+#[tokio::test]
+#[ignore = "builds with cargo, Node.js, and their pinned dependencies"]
+async fn generated_typescript_matches_generated_rust() {
+    let root = tempfile::tempdir().expect("directory");
+    let token = Address::new(TOKEN).to_string();
+    let transfer_event = "Transfer(address indexed from, address indexed to, uint256 value)";
+    let first = calls_frame();
+    let mut second = frame(10, first.block.hash, vec![transfer(TOKEN, 100, 0)]);
+    second.header = first.header.clone();
+    second.transactions = first.transactions.clone();
+    second.receipts = first.receipts.clone();
+    for (spec, expected) in [
+        (
+            json!({ "name": "token-transfers",
+                    "data": { "kind": "events", "contracts": [token], "events": [transfer_event],
+                              "fields": ["contract", "to", "value", "transactionHash"] } }),
+            3,
+        ),
+        (
+            json!({ "name": "every-transfer", "data": { "kind": "events", "events": [transfer_event] } }),
+            4,
+        ),
+        (
+            json!({ "name": "volume-by-recipient",
+                    "data": { "kind": "events", "events": [transfer_event] },
+                    "keep": { "kind": "totals", "by": "to", "sum": ["value"] } }),
+            2,
+        ),
+        (
+            json!({ "name": "usdc-calls",
+                    "data": { "kind": "transactions", "to": [token],
+                              "functions": ["transfer(address to, uint256 amount)"] },
+                    "keep": { "kind": "totals", "by": "from", "sum": ["amount", "gasUsed"] } }),
+            2,
+        ),
+        (
+            json!({ "name": "call-rows",
+                    "data": { "kind": "transactions", "to": [token],
+                              "functions": ["transfer(address to, uint256 amount)", "approve(address spender, uint256 amount)"],
+                              "fields": ["hash", "function", "amount", "success"] } }),
+            6,
+        ),
+        (
+            json!({ "name": "plain-transactions", "data": { "kind": "transactions", "from": [Address::new([7; 20]).to_string()] } }),
+            10,
+        ),
+        (
+            json!({ "name": "one-total", "data": { "kind": "transactions", "to": [token] },
+                    "keep": { "kind": "totals", "sum": ["value", "effectiveGasPrice"] } }),
+            2,
+        ),
+        (
+            json!({ "name": "gas-per-block", "data": { "kind": "blocks" } }),
+            2,
+        ),
+    ] {
+        let rust = build_generated(root.path(), spec.clone());
+        let typescript = build_generated_typescript(root.path(), spec.clone());
+        let (published, _) = twins(
+            &rust,
+            &typescript,
+            &json!({}),
+            &[first.clone(), second.clone()],
+        )
+        .await;
+        assert_eq!(published.len(), expected, "{spec}: {published:#?}");
+    }
 }

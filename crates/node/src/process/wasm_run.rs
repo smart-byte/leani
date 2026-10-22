@@ -1,5 +1,5 @@
-//! `leani processor run`: one Wasm processor over finalized history, with
-//! its changes printed as JSON lines.
+//! `leani processor run`, one Wasm processor over finalized history with its
+//! changes printed as JSON lines, and `leani processor create`.
 //!
 //! The run is an ordinary on-demand backfill of a synthesized `wasm`
 //! instance into a throwaway data directory, so it uses the configuration's
@@ -224,9 +224,201 @@ fn bundled(name: &str) -> Result<&'static leani_processor_wasm::Template> {
         })
 }
 
+pub(super) fn new_project(
+    directory: &Path,
+    spec: Option<&Path>,
+    template: Option<&str>,
+    language: Option<leani_processor_wasm::scaffold::Language>,
+    json: bool,
+) -> Result<Exit> {
+    use leani_processor_wasm::scaffold::{self, Language};
+    let name = directory
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("the directory needs a name")?;
+    let generated = match (spec, template) {
+        (Some(spec), _) => {
+            let text = if spec == Path::new("-") {
+                std::io::read_to_string(std::io::stdin()).context("read the spec from stdin")?
+            } else {
+                std::fs::read_to_string(spec).with_context(|| format!("read {}", spec.display()))?
+            };
+            let value: serde_json::Value =
+                serde_json::from_str(&text).context("the spec is not valid JSON")?;
+            // The directory names the project unless the spec does.
+            let named = value.get("name").is_some();
+            let mut spec: scaffold::Spec =
+                serde_json::from_value(value).context("the spec is not valid")?;
+            if !named {
+                name.clone_into(&mut spec.name);
+            }
+            if let Some(language) = language {
+                spec.language = language;
+            }
+            scaffold::generate(&spec)
+        }
+        (None, Some(template)) => {
+            let found = bundled(template)?;
+            let language = language.unwrap_or_default();
+            let source = match language {
+                Language::Rust => found.source,
+                Language::TypeScript => found.typescript,
+            };
+            scaffold::project_for(name, language, source)
+        }
+        (None, None) => scaffold::generate(&scaffold::Spec {
+            name: name.to_owned(),
+            language: language.unwrap_or_default(),
+            ..scaffold::starter()
+        }),
+    }
+    .map_err(anyhow::Error::msg)?;
+    if directory.exists()
+        && std::fs::read_dir(directory)
+            .with_context(|| format!("read {}", directory.display()))?
+            .next()
+            .is_some()
+    {
+        bail!("{} exists and is not empty", directory.display());
+    }
+    for (path, text) in &generated.files {
+        let path = directory.join(path);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("create {}", parent.display()))?;
+        }
+        std::fs::write(&path, text).with_context(|| format!("write {}", path.display()))?;
+    }
+    let module = generated.module_path();
+    let build = generated.build_command();
+    let run = format!(
+        "leani processor run {}/{module} --from-block <first> --to-block <last>",
+        directory.display()
+    );
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "path": directory.display().to_string(),
+                "name": generated.name,
+                "language": generated.language,
+                "source": generated.language.source_path(),
+                "files": generated.files.iter().map(|(path, _)| path).collect::<Vec<_>>(),
+                // What a spec's `fields`, `by`, and `sum` may name.
+                "fields": generated.available,
+                "build": build,
+                "module": module,
+                "run": run,
+            }))?
+        );
+    } else {
+        let sdk = match generated.language {
+            Language::Rust => "leani-wasm-guest/",
+            Language::TypeScript => "assembly/leani/",
+        };
+        let layout = format!(
+            "the processor is {}, and {sdk} is the SDK it builds against",
+            generated.language.source_path()
+        );
+        println!(
+            // The build in a subshell, so that `leani processor run` finds the
+            // module and the node's configuration from where you are.
+            "Created {}: {layout}.\n\nNext:\n  (cd {} && {build})\n  {run}\n  or watch the module in the node's /playground, which applies each rebuild live.",
+            directory.display(),
+            directory.display()
+        );
+    }
+    Ok(Exit::Success)
+}
+
 #[cfg(test)]
 mod tests {
+    use leani_processor_wasm::scaffold::Language;
+
     use super::*;
+
+    const VOLUME_SPEC: &str = r#"{"data":{"kind":"events","events":["Transfer(address indexed from, address indexed to, uint256 value)"]},"keep":{"kind":"totals","by":"to","sum":["value"]}}"#;
+
+    fn spec_file(root: &Path, name: &str, spec: &str) -> PathBuf {
+        let path = root.join(name);
+        std::fs::write(&path, spec).expect("spec");
+        path
+    }
+
+    fn read(path: &Path) -> String {
+        std::fs::read_to_string(path).expect("source")
+    }
+
+    #[test]
+    fn a_spec_writes_a_project_named_after_its_directory_with_its_sdk() {
+        let root = tempfile::tempdir().expect("directory");
+        let spec = spec_file(root.path(), "spec.json", VOLUME_SPEC);
+        let rust = root.path().join("usdc-volume");
+        new_project(&rust, Some(&spec), None, None, true).expect("rust");
+        assert!(read(&rust.join("src/lib.rs")).contains("export_processor!(UsdcVolumeProcessor);"));
+        assert!(rust.join("leani-wasm-guest/src/solidity.rs").exists());
+        let typescript = root.path().join("usdc-volume-ts");
+        new_project(
+            &typescript,
+            Some(&spec),
+            None,
+            Some(Language::TypeScript),
+            true,
+        )
+        .expect("typescript");
+        assert!(
+            read(&typescript.join("assembly/index.ts"))
+                .contains("register(new UsdcVolumeTsProcessor());")
+        );
+        assert!(typescript.join("assembly/leani/solidity.ts").exists());
+        assert!(typescript.join("package-lock.json").exists());
+    }
+
+    #[test]
+    fn a_kept_argument_called_name_does_not_name_the_project() {
+        let root = tempfile::tempdir().expect("directory");
+        let spec = spec_file(
+            root.path(),
+            "labels.json",
+            r#"{"data":{"kind":"events","events":["Named(string name)"],"fields":["name"]}}"#,
+        );
+        let labels = root.path().join("labels");
+        new_project(&labels, Some(&spec), None, None, true).expect("new");
+        assert!(read(&labels.join("src/lib.rs")).contains("export_processor!(LabelsProcessor);"));
+    }
+
+    #[test]
+    fn a_template_writes_its_source_in_either_language() {
+        let root = tempfile::tempdir().expect("directory");
+        let template = bundled("erc20-transfers").expect("template");
+        let rust = root.path().join("transfers");
+        new_project(&rust, None, Some(template.name), None, true).expect("rust");
+        assert_eq!(read(&rust.join("src/lib.rs")), template.source);
+        let typescript = root.path().join("transfers-ts");
+        new_project(
+            &typescript,
+            None,
+            Some(template.name),
+            Some(Language::TypeScript),
+            true,
+        )
+        .expect("typescript");
+        assert_eq!(
+            read(&typescript.join("assembly/index.ts")),
+            template.typescript
+        );
+        assert!(new_project(&root.path().join("x"), None, Some("nope"), None, true).is_err());
+    }
+
+    #[test]
+    fn a_project_never_overwrites_a_directory_with_files() {
+        let root = tempfile::tempdir().expect("directory");
+        let full = root.path().join("full");
+        std::fs::create_dir(&full).expect("directory");
+        std::fs::write(full.join("kept"), "").expect("file");
+        let refused = new_project(&full, None, None, None, true).expect_err("not empty");
+        assert!(refused.to_string().contains("not empty"), "{refused}");
+    }
 
     #[test]
     fn parameters_merge_json_with_typed_pairs() {

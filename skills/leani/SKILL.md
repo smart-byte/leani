@@ -1,6 +1,6 @@
 ---
 name: leani
-description: Runs, queries, and extends leani (leani.dev), a self-hosted Ethereum indexing node and CLI. It follows Mainnet blocks over P2P with no API key, backfills historical ranges, and turns blocks, transactions, and logs into application data through processors, served over a local HTTP API, TypeScript SDK, and JSON-RPC subset. Use this skill whenever a task mentions leani, the `leani` command, a leani.toml, leani.dev, or @smart-byte/leani-sdk, or asks to answer a question from live or historical Ethereum data without a hosted RPC provider. Covers choosing a built-in processor and writing a custom Rust processor when none fits, which is the normal way to get data the built-ins do not provide.
+description: Runs, queries, and extends leani (leani.dev), a self-hosted Ethereum indexing node and CLI. It follows Mainnet blocks over P2P with no API key, backfills historical ranges, and turns blocks, transactions, and logs into application data through processors, served over a local HTTP API, TypeScript SDK, and JSON-RPC subset. Use this skill whenever a task mentions leani, the `leani` command, a leani.toml, leani.dev, or @smart-byte/leani-sdk, or asks to answer a question from live or historical Ethereum data without a hosted RPC provider. Covers choosing a built-in processor and writing your own processor, as Wasm or native Rust, when none fits, which is the normal way to get data the built-ins do not provide.
 license: MIT
 ---
 
@@ -42,8 +42,10 @@ keeps only the result the question needs. Work in this order:
      such `log0` data only raw);
    - a typed query route of its own.
 
-   Start from the maintained example, as section 4 of the processor
-   reference describes.
+   `leani processor create --spec` generates a Wasm processor from a spec of the
+   data to keep, in Rust or, with `--language typescript`, TypeScript, which the
+   stock binary runs; a native Rust processor starts from the maintained
+   example. Section 4 of the processor reference describes both.
 3. **Backfill the range, serve, and query.** Check coverage before you report
    a number.
 
