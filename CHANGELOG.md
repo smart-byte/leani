@@ -33,6 +33,12 @@ record, and documented RPC contracts.
 - `leani doctor` warns when a block-local processor has `output = "latest"`:
   such a processor usually writes new keys every block, so `latest` keeps all
   of them, as `full` does.
+- Configuration builder: `leani init` builds a complete configuration from
+  what an application needs, with `--keep`, `--follow`,
+  `--history-from-block`, `--memory`, `--disk`, `--bandwidth`, and `--tuning`,
+  or from JSON for any processor with `--requirements`. Every setting is
+  written out, each derived one commented with its reason, and `--json`
+  reports them for agents (`leani guide config`).
 
 ### Changed
 

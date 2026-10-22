@@ -9,6 +9,7 @@ use crate::{cli::GuideTopic, process::Exit};
 
 const OVERVIEW: &str = include_str!("../../../skills/leani/SKILL.md");
 const PROCESSORS: &str = include_str!("../../../skills/leani/references/processors.md");
+const CONFIGURATION: &str = include_str!("../../../skills/leani/references/configuration.md");
 
 pub(crate) fn print(topic: Option<GuideTopic>) -> Result<Exit> {
     let mut stdout = io::stdout().lock();
@@ -27,6 +28,7 @@ fn text(topic: Option<GuideTopic>) -> &'static str {
     match topic {
         None => without_front_matter(OVERVIEW),
         Some(GuideTopic::Processors) => PROCESSORS,
+        Some(GuideTopic::Config) => CONFIGURATION,
     }
 }
 
@@ -51,5 +53,6 @@ mod tests {
         );
         assert!(overview.contains("`leani guide processors`"));
         assert!(text(Some(GuideTopic::Processors)).contains("## 4. Write a custom Rust processor"));
+        assert!(text(Some(GuideTopic::Config)).contains("leani init --requirements -"));
     }
 }
