@@ -191,7 +191,9 @@ with `id = "wasm"`, `settings.module` (the file, relative to the
 configuration), `settings.params` (JSON for the module), and optionally
 `settings.blake3` (a pin of the module bytes) and `settings.limits`;
 `leani init --requirements` builds that configuration with the `custom`
-preset (`leani guide config`).
+preset (`leani guide config`). The guide has the details:
+`$LEANI_SOURCE/docs/guides/wasm-processors.mdx`, or "Run your own processor as
+Wasm" in https://leani.dev/_llms-txt/guides.txt.
 
 A running node also generates the source (`POST /v1/wasm/compose`) and, with
 `api.allow_wasm_builds = true`, builds it (`POST /admin/v1/wasm/build`), as

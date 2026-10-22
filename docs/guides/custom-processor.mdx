@@ -171,9 +171,11 @@ Complete files: <SourceLink path="examples/custom-node/standalone.toml" label="s
 <SourceLink path="examples/custom-node/src/main.rs" label="Rust implementation and tests" />,
 and <SourceLink path="examples/custom-node/node.toml" label="node configuration" />.
 
-The implementation is compiled into your binary. For contract events an ABI
-describes, the [event decoder](/docs/getting-started/bounded-mainnet/)
-may be sufficient without Rust code. For custom aggregation or additional
+The implementation is compiled into your binary. A
+[Wasm processor](/docs/guides/wasm-processors/) runs in the stock binary
+instead. For contract events an ABI describes, the
+[event decoder](/docs/getting-started/bounded-mainnet/) may be sufficient
+without Rust code. For custom aggregation or additional
 queries, continue with the [processor contract](/docs/contributing/processor-extension-contract/).
 
 Native processors run in the node process. Review their code and test their

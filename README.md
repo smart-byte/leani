@@ -180,11 +180,14 @@ the Leani cursor inside your own database transaction.
 ## Your own processor
 
 When no built-in processor produces the data you need, write your own; that is
-the intended way to extend Leani. Processors are Rust.
-[`examples/custom-node`](examples/custom-node) adds a
-native processor and a query extension to the stock node through
-`leani::run_with_registry`, without forking it. See the
-[processor-author guide](https://leani.dev/docs/guides/custom-processor/).
+the intended way to extend Leani. A
+[Wasm processor](https://leani.dev/docs/guides/wasm-processors/), in Rust or
+TypeScript, runs in the stock binary without rebuilding it, and
+`leani processor create` writes one from a description of the data to keep. A
+native Rust processor runs fastest and can add typed query routes:
+[`examples/custom-node`](examples/custom-node) adds one and a query extension
+to the stock node through `leani::run_with_registry`, without forking it. See
+the [processor-author guide](https://leani.dev/docs/guides/custom-processor/).
 
 ## How it works
 

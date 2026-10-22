@@ -18,6 +18,7 @@ record, and documented RPC contracts.
   processors are unchanged. The binary ships four example modules as
   templates, among them an event decoder that decodes any contract's events
   from their Solidity signatures with the SDK's `solidity` module.
+  See [Wasm processors](docs/guides/wasm-processors.mdx).
 - Wasm processors in TypeScript: `packages/wasm-guest`, a TypeScript guest SDK
   compiled with AssemblyScript, implements the ABI of `leani-wasm-guest`, and
   every example processor has a TypeScript twin that publishes exactly its
