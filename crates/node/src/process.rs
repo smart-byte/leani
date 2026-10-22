@@ -3162,17 +3162,42 @@ pub async fn run_cli_with_registry(cli: Cli, registry: &ProcessorRegistry) -> Re
             checkpoint_url,
             checkpoint_quorum,
             yes,
+            keep,
+            window_days,
+            follow,
+            history_from_block,
+            memory,
+            disk,
+            bandwidth,
+            tuning,
+            requirements,
+            json,
         } => {
-            crate::init::init(crate::init::InitOptions {
-                protocol,
-                targets,
-                data_dir,
-                checkpoint_urls: checkpoint_url,
-                checkpoint_quorum,
-                accept_checkpoint: yes,
-                config_path: requested_config.unwrap_or_else(|| PathBuf::from("leani.toml")),
-                working_directory,
-            })
+            crate::init::init(
+                crate::init::InitOptions {
+                    protocol,
+                    targets,
+                    data_dir,
+                    checkpoint_urls: checkpoint_url,
+                    checkpoint_quorum,
+                    accept_checkpoint: yes,
+                    config_path: requested_config.unwrap_or_else(|| PathBuf::from("leani.toml")),
+                    working_directory,
+                    flags: crate::init::RequirementFlags {
+                        keep,
+                        window_days,
+                        follow,
+                        history_from_block,
+                        memory,
+                        disk,
+                        bandwidth,
+                        tuning,
+                        requirements,
+                        json,
+                    },
+                },
+                registry,
+            )
             .await
         }
         Command::Subscribe {

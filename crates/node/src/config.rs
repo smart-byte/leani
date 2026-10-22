@@ -155,10 +155,7 @@ impl StarterConfig {
     }
 
     fn expand(self) -> Result<Config, String> {
-        let mut config: Config = toml::from_str(include_str!(
-            "../../../config/defaults/ethereum-mainnet.toml"
-        ))
-        .map_err(|error| format!("built-in Ethereum Mainnet defaults are invalid: {error}"))?;
+        let mut config = Config::ethereum_mainnet_defaults()?;
         let processor = match (self.blocks, self.uniswap) {
             (Some(_), None) => Ok(crate::block_summaries::processor_config(
                 crate::block_summaries::COMPACT_INSTANCE,
@@ -194,11 +191,7 @@ impl StarterConfig {
 
 /// The managed Beacon transport pool of the built-in Mainnet defaults.
 pub(crate) fn default_finality_endpoints() -> Result<Vec<Url>, String> {
-    let defaults: Config = toml::from_str(include_str!(
-        "../../../config/defaults/ethereum-mainnet.toml"
-    ))
-    .map_err(|error| format!("built-in Ethereum Mainnet defaults are invalid: {error}"))?;
-    Ok(defaults.finality.endpoints)
+    Ok(Config::ethereum_mainnet_defaults()?.finality.endpoints)
 }
 
 /// A Beacon endpoint's identity: scheme, host, port, and path. Credentials,
@@ -1064,6 +1057,15 @@ impl Serialize for HumanBytes {
     }
 }
 
+/// A byte count, or a size such as `512MiB`, as a command-line flag takes it.
+impl std::str::FromStr for HumanBytes {
+    type Err = &'static str;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        value.parse().or_else(|_| parse_bytes(value)).map(Self)
+    }
+}
+
 impl<'de> Deserialize<'de> for HumanBytes {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -1409,6 +1411,13 @@ impl ValidatedConfig {
 }
 
 impl Config {
+    pub(crate) fn ethereum_mainnet_defaults() -> Result<Self, String> {
+        toml::from_str(include_str!(
+            "../../../config/defaults/ethereum-mainnet.toml"
+        ))
+        .map_err(|error| format!("built-in Ethereum Mainnet defaults are invalid: {error}"))
+    }
+
     /// Read TOML without opening the configured data directory or any network
     /// connection. Relative paths in the file, its `data_dir`, archive
     /// `manifest`s, and Wasm processor `module`s, are resolved against the

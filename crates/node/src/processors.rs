@@ -348,6 +348,11 @@ impl ProcessorRegistry {
     }
 }
 
+/// A configuration checked away from its host names Wasm module paths that
+/// mean nothing there.
+pub(crate) const WASM_CHECKED_WHERE_INSTALLED: &str =
+    "Wasm modules are checked where they are installed; run `leani doctor` there";
+
 /// `latest` keeps the current value of each key, which stays small only for a
 /// processor that writes a fixed set of keys, such as an ordered aggregate. A
 /// block-local processor usually writes new keys every block, one per event

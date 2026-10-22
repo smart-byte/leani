@@ -106,6 +106,29 @@ or shell should consistently use a configuration elsewhere. An explicit
 default operational tuning but never the chain identity, checkpoint trust
 root, or selected processor targets. Advanced documents keep every choice explicit.
 
+## Build a configuration from requirements
+
+Instead of copying a profile and editing it, state what the application needs
+and let `init` build a complete advanced document:
+
+```bash
+leani init uniswap-v3 ETH/USDC --keep window --window-days 30 \
+  --follow finalized --memory 1GiB --disk 20GiB --bandwidth 100
+```
+
+`--keep` is `everything`, `window`, `latest`, `result`, `stream`, or `live`;
+`--follow` is `head`, `finalized`, or `none`, which builds a history-only node
+without a live lane or finality; `--history-from-block` starts a backfill;
+`--memory`, `--disk`, and `--bandwidth` (Mbit/s) state the host's limits; and
+`--tuning` replaces the recipes the limits call for. `--requirements FILE`
+takes the same needs as JSON for any processor, including contract events and
+Wasm or custom processors. The builder writes every setting and comments each
+one it derived with the reason, using only the shipped profiles' storage
+settings and the measured recipes of
+[Sizing for bandwidth, memory, and disk](#sizing-for-bandwidth-memory-and-disk).
+`--json` prints the configuration, the derived settings with their reasons,
+warnings, and next steps. `leani guide config` describes the requirements.
+
 ## Advanced root fields
 
 | Field | Type | Meaning |

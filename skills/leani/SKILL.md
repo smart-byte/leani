@@ -126,6 +126,17 @@ first. It covers choosing a built-in processor, the event-decoding
 configuration and its limits, backfills, coverage checks, and custom Rust
 processors.
 
+Configure a node for stated needs, such as "keep 30 days of these events on a
+1 GiB host": let `leani init` build the configuration from requirements, with
+flags or JSON for any processor, rather than editing settings by hand.
+[references/configuration.md](references/configuration.md)
+(`leani guide config`) describes the requirements and the report `--json`
+prints:
+
+```bash
+leani init uniswap-v3 ETH/USDC --keep window --window-days 30 --memory 1GiB --yes --json
+```
+
 ## HTTP API and SDK
 
 - `GET /v1/capabilities` lists the configured processors; check it instead of

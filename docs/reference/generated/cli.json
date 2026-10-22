@@ -217,7 +217,8 @@
             "action": "Set",
             "defaultValues": [],
             "possibleValues": [
-              "processors"
+              "processors",
+              "config"
             ]
           },
           {
@@ -280,15 +281,15 @@
       },
       {
         "name": "init",
-        "about": "Create a compact configuration for a built-in processor",
-        "usage": "Usage: leani init [OPTIONS] <PROTOCOL> [TARGET]...",
+        "about": "Create a configuration",
+        "usage": "Usage: leani init [OPTIONS] [PROTOCOL] [TARGET]...",
         "arguments": [
           {
             "id": "protocol",
             "long": null,
             "short": null,
-            "help": "Processor preset to configure",
-            "required": true,
+            "help": "Processor preset to configure; --requirements names its own",
+            "required": false,
             "action": "Set",
             "defaultValues": [],
             "possibleValues": [
@@ -347,6 +348,128 @@
             "long": "yes",
             "short": null,
             "help": "Accept a new checkpoint provider quorum without interactive confirmation",
+            "required": false,
+            "action": "SetTrue",
+            "defaultValues": [
+              "false"
+            ],
+            "possibleValues": [
+              "true",
+              "false"
+            ]
+          },
+          {
+            "id": "keep",
+            "long": "keep",
+            "short": null,
+            "help": "How much to keep for queries or your app",
+            "required": false,
+            "action": "Set",
+            "defaultValues": [],
+            "possibleValues": [
+              "everything",
+              "window",
+              "latest",
+              "result",
+              "stream",
+              "live"
+            ]
+          },
+          {
+            "id": "window_days",
+            "long": "window-days",
+            "short": null,
+            "help": "Days `--keep window` keeps [default: 30]",
+            "required": false,
+            "action": "Set",
+            "defaultValues": [],
+            "possibleValues": []
+          },
+          {
+            "id": "follow",
+            "long": "follow",
+            "short": null,
+            "help": "Which blocks to follow as they arrive",
+            "required": false,
+            "action": "Set",
+            "defaultValues": [],
+            "possibleValues": [
+              "head",
+              "finalized",
+              "none"
+            ]
+          },
+          {
+            "id": "history_from_block",
+            "long": "history-from-block",
+            "short": null,
+            "help": "First block to backfill",
+            "required": false,
+            "action": "Set",
+            "defaultValues": [],
+            "possibleValues": []
+          },
+          {
+            "id": "memory",
+            "long": "memory",
+            "short": null,
+            "help": "Memory the node may use, such as `1GiB`",
+            "required": false,
+            "action": "Set",
+            "defaultValues": [],
+            "possibleValues": []
+          },
+          {
+            "id": "disk",
+            "long": "disk",
+            "short": null,
+            "help": "Disk the node may use, such as `20GiB`",
+            "required": false,
+            "action": "Set",
+            "defaultValues": [],
+            "possibleValues": []
+          },
+          {
+            "id": "bandwidth",
+            "long": "bandwidth",
+            "short": null,
+            "help": "The host's link, in megabits per second",
+            "required": false,
+            "action": "Set",
+            "defaultValues": [],
+            "possibleValues": []
+          },
+          {
+            "id": "tuning",
+            "long": "tuning",
+            "short": null,
+            "help": "Tuning recipes to apply instead of the ones the limits call for (comma-delimited)",
+            "required": false,
+            "action": "Append",
+            "defaultValues": [],
+            "possibleValues": [
+              "limited-memory",
+              "faster-erae",
+              "less-memory",
+              "transactions-from-xatu",
+              "slow-disk"
+            ]
+          },
+          {
+            "id": "requirements",
+            "long": "requirements",
+            "short": null,
+            "help": "Requirements as JSON, as `leani guide config` describes, from a file or `-` for stdin. They replace the preset and the requirement flags",
+            "required": false,
+            "action": "Set",
+            "defaultValues": [],
+            "possibleValues": []
+          },
+          {
+            "id": "json",
+            "long": "json",
+            "short": null,
+            "help": "Print what was built as JSON: the configuration, the settings it derived and why, warnings, and next steps",
             "required": false,
             "action": "SetTrue",
             "defaultValues": [
@@ -4362,7 +4485,7 @@
           },
           {
             "name": "init",
-            "about": "Create a compact configuration for a built-in processor",
+            "about": "Create a configuration",
             "usage": "Usage: leani help init",
             "arguments": [],
             "subcommands": []
