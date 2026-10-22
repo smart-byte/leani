@@ -127,7 +127,9 @@ one it derived with the reason, using only the shipped profiles' storage
 settings and the measured recipes of
 [Sizing for bandwidth, memory, and disk](#sizing-for-bandwidth-memory-and-disk).
 `--json` prints the configuration, the derived settings with their reasons,
-warnings, and next steps. `leani guide config` describes the requirements.
+warnings, and next steps. `leani guide config` describes the requirements, and
+a running node builds the same document at `POST /admin/v1/config/build`,
+which its `/playground` uses.
 
 ## Advanced root fields
 

@@ -117,6 +117,29 @@ pub(crate) fn finality(
     })
 }
 
+/// A node passes its own finality section, so a configuration that follows
+/// the chain starts from the checkpoint this node verified.
+pub(crate) fn build_json(
+    requirements: &serde_json::Value,
+    head: Option<u64>,
+    registry: &ProcessorRegistry,
+    finality: &FinalityConfig,
+) -> Result<serde_json::Value, String> {
+    let requirements: Requirements = serde_json::from_value(requirements.clone())
+        .map_err(|error| format!("requirements: {error}"))?;
+    let finality = matches!(finality.kind, FinalitySourceKind::BeaconApi).then(|| finality.clone());
+    let build = build(
+        &requirements,
+        &BuildContext {
+            registry,
+            finality,
+            head,
+            data_dir: None,
+        },
+    )?;
+    serde_json::to_value(build).map_err(|error| error.to_string())
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct Build {
@@ -1189,6 +1212,31 @@ mod tests {
         assert_eq!(build.tuning, [Recipe::LessMemory]);
         assert_eq!(config.budgets.source_concurrency, 8);
         assert_eq!(config.budgets.history_pipeline.maximum_active_chunks, 4);
+    }
+
+    #[test]
+    fn the_api_hook_refuses_malformed_requirements() {
+        let registry = ProcessorRegistry::standard();
+        let refused = build_json(
+            &serde_json::json!({ "processor": { "preset": "blocks" }, "keep": "forever" }),
+            None,
+            &registry,
+            &finality(),
+        )
+        .expect_err("unknown keep");
+        assert!(refused.starts_with("requirements:"), "{refused}");
+        let built = build_json(
+            &serde_json::json!({ "processor": { "preset": "blocks" } }),
+            Some(1),
+            &registry,
+            &finality(),
+        )
+        .expect("build");
+        assert!(
+            built["toml"]
+                .as_str()
+                .is_some_and(|toml| toml.contains("[[processors]]"))
+        );
     }
 
     #[test]

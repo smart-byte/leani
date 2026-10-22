@@ -1195,6 +1195,16 @@ paths:
           description: Operational HTML network dashboard.
         default:
           $ref: "#/components/responses/Error"
+  /playground:
+    get:
+      summary: Render the Wasm processor and configuration playground
+      operationId: getPlayground
+      security: []
+      responses:
+        "200":
+          description: Operational HTML playground; its runs call the authenticated API with the visitor's token.
+        default:
+          $ref: "#/components/responses/Error"
   /v1/wasm/templates:
     get:
       summary: List the bundled Wasm processor templates
@@ -1271,6 +1281,44 @@ paths:
           description: A Rust build requested from another machine.
         "409":
           description: "`wasm_builds_disabled`: `api.allow_wasm_builds` is off on this node."
+        default:
+          $ref: "#/components/responses/Error"
+  /admin/v1/config/check:
+    post:
+      summary: Check a configuration document as `leani doctor --json` does
+      operationId: checkConfiguration
+      description: >-
+        Validates a posted TOML configuration without starting anything. Its
+        relative paths resolve in a throwaway directory, and Wasm modules are
+        not read; check those with `leani doctor` where they are installed.
+      responses:
+        "200":
+          description: "`valid`, `errors`, `warnings`, the chain, and the processor instances."
+        "503":
+          description: "`config_check_unavailable`: this server checks no configurations."
+        default:
+          $ref: "#/components/responses/Error"
+  /admin/v1/config/build:
+    post:
+      summary: Build a node configuration from requirements
+      operationId: buildConfiguration
+      description: >-
+        Takes what an application needs (the processor, `keep`, `windowDays`,
+        `follow`, `history`, `limits`, and optional `tuning`, as `leani guide
+        config` describes) and returns a complete configuration with every
+        setting written out, each derived one commented with its reason. History
+        in days counts back from the newest block the node retains, and a
+        configuration that follows the chain reuses this node's finality
+        checkpoint.
+      responses:
+        "200":
+          description: >-
+            `toml`, `decisions` (`setting`, `value`, `because`), the `tuning`
+            recipes applied, `warnings`, validation `errors`, and `next` commands.
+        "400":
+          description: The requirements cannot be met; the message says why.
+        "503":
+          description: "`config_build_unavailable`: this server builds no configurations."
         default:
           $ref: "#/components/responses/Error"
   /admin/v1/wasm/runs:
