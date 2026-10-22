@@ -36,7 +36,10 @@ def prepare(requested, output):
     update("Cargo.toml", lambda text: replace_once(text, f'version = "{old}"', f'version = "{requested}"'))
     manifests = [path for path in git("ls-files", "**/Cargo.toml").splitlines()
                  if path.startswith(("crates/", "examples/"))]
-    names = {tomllib.loads(Path(path).read_text())["package"]["name"] for path in manifests}
+    packages = [tomllib.loads(Path(path).read_text()).get("package", {}) for path in manifests]
+    # Workspace roots have no package, and crates with their own version, such
+    # as the Wasm guest SDK, keep it.
+    names = {package["name"] for package in packages if package.get("version") == {"workspace": True}}
     def internal_requirements(text):
         for name in names:
             pattern = r'(?m)^(' + re.escape(name) + r'\s*=\s*\{(?=[^}\n]*\bpath\s*=)[^}\n]*\bversion\s*=\s*)"=' + re.escape(old) + r'"'

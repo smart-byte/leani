@@ -1,0 +1,33 @@
+[package]
+name = "leani-wasm-guest"
+description = "Write Leani processors in Rust and run them as sandboxed Wasm modules"
+# Not the release version: the prebuilt example modules change with it, and a
+# release must not rebuild them.
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+publish = false
+readme = "README.md"
+
+[dependencies]
+postcard.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+# Guest exports and host imports are FFI, so this crate cannot inherit the
+# workspace's `unsafe_code = "forbid"`. It denies unsafe code everywhere but
+# its one FFI module; the other lints mirror the workspace's.
+[lints.rust]
+unsafe_code = "deny"
+missing_debug_implementations = "warn"
+unreachable_pub = "warn"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+assert_is_empty = "allow"

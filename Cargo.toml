@@ -25,6 +25,7 @@ members = [
   "crates/store-artifacts",
   "crates/store-sqlite",
   "crates/testkit",
+  "crates/wasm-guest",
   "examples/custom-node",
 ]
 default-members = ["crates/node"]
