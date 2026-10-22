@@ -49,6 +49,9 @@ pub struct Template {
     pub module: &'static [u8],
     /// The Rust source the module is built from, its `src/lib.rs`.
     pub source: &'static str,
+    /// The same processor in TypeScript, its `assembly/index.ts`, which
+    /// publishes the same changes.
+    pub typescript: &'static str,
 }
 
 /// The example processors of `examples/wasm-processors`, prebuilt by
@@ -60,6 +63,7 @@ pub const TEMPLATES: [Template; 4] = [
         params: r#"{"minUtilizationPercent":0}"#,
         module: include_bytes!("../modules/block_gas.wasm"),
         source: include_str!("../../../examples/wasm-processors/block-gas/src/lib.rs"),
+        typescript: include_str!("../../../examples/wasm-processors/block-gas/assembly/index.ts"),
     },
     Template {
         name: "erc20-transfers",
@@ -67,6 +71,9 @@ pub const TEMPLATES: [Template; 4] = [
         params: r#"{"tokens":["0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"],"minValue":"1000000000"}"#,
         module: include_bytes!("../modules/erc20_transfers.wasm"),
         source: include_str!("../../../examples/wasm-processors/erc20-transfers/src/lib.rs"),
+        typescript: include_str!(
+            "../../../examples/wasm-processors/erc20-transfers/assembly/index.ts"
+        ),
     },
     Template {
         name: "token-volume",
@@ -74,6 +81,9 @@ pub const TEMPLATES: [Template; 4] = [
         params: r#"{"tokens":["0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48","0xdac17f958d2ee523a2206206994597c13d831ec7"]}"#,
         module: include_bytes!("../modules/token_volume.wasm"),
         source: include_str!("../../../examples/wasm-processors/token-volume/src/lib.rs"),
+        typescript: include_str!(
+            "../../../examples/wasm-processors/token-volume/assembly/index.ts"
+        ),
     },
     Template {
         name: "event-decoder",
@@ -81,6 +91,9 @@ pub const TEMPLATES: [Template; 4] = [
         params: r#"{"addresses":["0x88e6a0c2ddd26feeb64f039a2c41296fcb3f5640"],"events":["Swap(address indexed sender, address indexed recipient, int256 amount0, int256 amount1, uint160 sqrtPriceX96, uint128 liquidity, int24 tick)"]}"#,
         module: include_bytes!("../modules/event_decoder.wasm"),
         source: include_str!("../../../examples/wasm-processors/event-decoder/src/lib.rs"),
+        typescript: include_str!(
+            "../../../examples/wasm-processors/event-decoder/assembly/index.ts"
+        ),
     },
 ];
 

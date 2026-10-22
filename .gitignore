@@ -10,6 +10,7 @@
 !/config/example.toml
 /packages/sdk/dist/
 /packages/sdk/node_modules/
+/packages/wasm-guest/node_modules/
 /site/node_modules/
 /site/dist/
 /site/.astro/

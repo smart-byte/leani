@@ -6,6 +6,13 @@ record, and documented RPC contracts.
 
 ## [Unreleased]
 
+### Added
+
+- Wasm processors in TypeScript: `packages/wasm-guest`, a TypeScript guest SDK
+  compiled with AssemblyScript, implements the ABI of `leani-wasm-guest`, and
+  every example processor has a TypeScript twin that publishes exactly its
+  Rust original's changes.
+
 ## [0.1.1] - 2026-10-29
 
 ### Changed
