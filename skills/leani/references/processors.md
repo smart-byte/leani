@@ -194,10 +194,10 @@ configuration), `settings.params` (JSON for the module), and optionally
 preset (`leani guide config`).
 
 A running node also generates the source (`POST /v1/wasm/compose`) and, with
-`api.allow_wasm_builds = true`, builds it (`POST /admin/v1/wasm/build`).
-Node-side builds are a development feature: in production, build the module
-locally or in CI and configure it. A native processor, below, suits typed
-query routes and the hottest paths.
+`api.allow_wasm_builds = true`, builds it (`POST /admin/v1/wasm/build`), as
+its `/playground` does. Node-side builds are a development feature: in
+production, build the module locally or in CI and configure it. A native
+processor, below, suits typed query routes and the hottest paths.
 
 The descriptor declares the block material the processor reads, such as
 `Capability::Header`, `Body` (transaction `to`, value, nonce), `Senders`, or

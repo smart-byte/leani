@@ -745,6 +745,112 @@ async fn runs_past_the_node_limit_are_refused_until_one_ends() {
     assert_eq!(start(&app, &following).await.status(), StatusCode::OK);
 }
 
+#[tokio::test]
+async fn configuration_checks_use_the_node_hook() {
+    let check = |app: Router| async move {
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/admin/v1/config/check")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({ "toml": "config_version = 1" }).to_string(),
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        (
+            status,
+            serde_json::from_slice::<Value>(&body).expect("JSON"),
+        )
+    };
+    let (_directory, without) = node(&[], ApiConfig::default()).await;
+    assert_eq!(check(without).await.0, StatusCode::SERVICE_UNAVAILABLE);
+    let (_directory, with) = node(
+        &[],
+        ApiConfig {
+            config_check: Some(Arc::new(
+                |toml: &str| json!({ "valid": true, "echo": toml }),
+            )),
+            ..ApiConfig::default()
+        },
+    )
+    .await;
+    assert_eq!(
+        check(with).await,
+        (
+            StatusCode::OK,
+            json!({ "valid": true, "echo": "config_version = 1" })
+        )
+    );
+}
+
+#[tokio::test]
+async fn configuration_builds_use_the_node_hook_and_its_head() {
+    let build = |app: Router, requirements: Value| async move {
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/admin/v1/config/build")
+                    .header("content-type", "application/json")
+                    .body(Body::from(requirements.to_string()))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        (
+            status,
+            serde_json::from_slice::<Value>(&body).expect("JSON"),
+        )
+    };
+    let (_directory, without) = node(&[], ApiConfig::default()).await;
+    assert_eq!(
+        build(without, json!({})).await.0,
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+
+    let first = frame(1, BlockHash::ZERO, 0, &[]);
+    let second = frame(2, first.block.hash, 0, &[]);
+    let (_directory, with) = node(
+        &[first, second],
+        ApiConfig {
+            config_build: Some(Arc::new(|requirements: &Value, head: Option<u64>| {
+                if requirements["refuse"] == true {
+                    Err("these requirements cannot be met".to_owned())
+                } else {
+                    Ok(json!({ "head": head, "echo": requirements }))
+                }
+            })),
+            ..ApiConfig::default()
+        },
+    )
+    .await;
+    assert_eq!(
+        build(with.clone(), json!({ "keep": "window" })).await,
+        (
+            StatusCode::OK,
+            json!({ "head": 2, "echo": { "keep": "window" } })
+        )
+    );
+    let (status, refused) = build(with, json!({ "refuse": true })).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        refused["error"]["message"],
+        "these requirements cannot be met"
+    );
+}
+
 async fn post(app: Router, uri: &str, body: Value) -> (StatusCode, Value) {
     post_from(app, uri, body, None, &[]).await
 }

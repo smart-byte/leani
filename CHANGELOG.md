@@ -50,6 +50,15 @@ record, and documented RPC contracts.
   `leani doctor`. It refuses Rust that would read files or the environment
   while it compiles, and builds Rust only for requests from the node's own
   machine, TypeScript for any client the API admits.
+- Playground: `GET /playground` runs templates and your own processors on the
+  node's live blocks. Its build-your-own panel clicks a processor together and
+  runs it, the code panel shows every processor's source in Rust or TypeScript,
+  highlighted, and its editor builds edited code and swaps it into the run,
+  marking what each version changed, block by block. Its configuration tab
+  builds a node configuration from your needs and limits
+  (`POST /admin/v1/config/build`), shows what each kind of storage keeps,
+  toggles tuning recipes, and downloads, copies, or checks the result
+  (`POST /admin/v1/config/check`) as `leani doctor` would.
 
 ### Changed
 

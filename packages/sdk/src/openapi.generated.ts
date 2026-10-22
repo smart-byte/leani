@@ -1185,6 +1185,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/playground": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Render the Wasm processor and configuration playground */
+        get: operations["getPlayground"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/wasm/templates": {
         parameters: {
             query?: never;
@@ -1236,6 +1253,46 @@ export interface paths {
          * @description Compiles `source` in its `language`: `rust` (the default), a processor's `src/lib.rs`, with the host's cargo; or `typescript`, an `assembly/index.ts`, with the AssemblyScript compiler the SDK pins, which npm installs on the first build. Either builds against this node's guest SDK, in a project under the data directory that rebuilds incrementally. Builds run one at a time. Rust that would read files or the environment while it compiles (`include!`, `include_str!`, `include_bytes!`, `env!`, `option_env!`, `#[path]`, or a module in another file) is refused; the TypeScript compiler is served only the processor and the SDK. Needs Rust and its `wasm32-unknown-unknown` target, or Node.js 20 or later with npm, on the host. Pass the module to `POST /admin/v1/wasm/runs` or `PUT /admin/v1/wasm/runs/{run}/processor`. A development feature, not for production, off unless the node's configuration sets `api.allow_wasm_builds = true`: rustc reads any file the source names while it compiles, and the guard is a denylist, so the node builds Rust only for requests from its own machine (a loopback peer, addressed to a loopback host, not relayed by a proxy) and TypeScript for any client the API admits. Without builds, build the module where the source is written and pass it.
          */
         post: operations["buildWasmModule"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/admin/v1/config/check": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Check a configuration document as `leani doctor --json` does
+         * @description Validates a posted TOML configuration without starting anything. Its relative paths resolve in a throwaway directory, and Wasm modules are not read; check those with `leani doctor` where they are installed.
+         */
+        post: operations["checkConfiguration"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/admin/v1/config/build": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Build a node configuration from requirements
+         * @description Takes what an application needs (the processor, `keep`, `windowDays`, `follow`, `history`, `limits`, and optional `tuning`, as `leani guide config` describes) and returns a complete configuration with every setting written out, each derived one commented with its reason. History in days counts back from the newest block the node retains, and a configuration that follows the chain reuses this node's finality checkpoint.
+         */
+        post: operations["buildConfiguration"];
         delete?: never;
         options?: never;
         head?: never;
@@ -3989,6 +4046,25 @@ export interface operations {
             default: components["responses"]["Error"];
         };
     };
+    getPlayground: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Operational HTML playground; its runs call the authenticated API with the visitor's token. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            default: components["responses"]["Error"];
+        };
+    };
     listWasmTemplates: {
         parameters: {
             query?: never;
@@ -4066,6 +4142,65 @@ export interface operations {
             };
             /** @description `wasm_builds_disabled`: `api.allow_wasm_builds` is off on this node. */
             409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            default: components["responses"]["Error"];
+        };
+    };
+    checkConfiguration: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description `valid`, `errors`, `warnings`, the chain, and the processor instances. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description `config_check_unavailable`: this server checks no configurations. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            default: components["responses"]["Error"];
+        };
+    };
+    buildConfiguration: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description `toml`, `decisions` (`setting`, `value`, `because`), the `tuning` recipes applied, `warnings`, validation `errors`, and `next` commands. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description The requirements cannot be met; the message says why. */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description `config_build_unavailable`: this server builds no configurations. */
+            503: {
                 headers: {
                     [name: string]: unknown;
                 };

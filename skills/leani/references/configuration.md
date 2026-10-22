@@ -109,3 +109,11 @@ sizing table:
 
 A disk limit gives three quarters to the store and caps temporary files at a
 quarter. Pass `tuning` to replace the derived recipes.
+
+## 4. Through a running node
+
+`POST /admin/v1/config/build` takes the same JSON and returns the same report
+without `path` and `written`. A node knows its head, so `history.lastDays`
+works there, and a configuration that follows the chain reuses the node's own
+verified finality checkpoint. The node's `/playground` builds configurations
+with it.

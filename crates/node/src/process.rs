@@ -5660,6 +5660,69 @@ fn live_lane_warnings(config: &Config, registry: &ProcessorRegistry) -> Vec<Stri
     attested_gating_warnings(processors.iter().map(|processor| processor.descriptor()))
 }
 
+/// Check a posted configuration the way `leani doctor --json` checks a file,
+/// for the playground. It is written to a throwaway directory, so its
+/// relative paths name nothing on this host, and Wasm modules are not read:
+/// their paths would.
+fn check_configuration(input: &str, registry: &ProcessorRegistry) -> serde_json::Value {
+    let failed = |message: String| {
+        serde_json::json!({
+            "valid": false,
+            "errors": [{ "field": "config", "message": message }],
+            "warnings": [],
+        })
+    };
+    let directory = match tempfile::tempdir() {
+        Ok(directory) => directory,
+        Err(error) => return failed(error.to_string()),
+    };
+    let path = directory.path().join("leani.toml");
+    if let Err(error) = fs::write(&path, input) {
+        return failed(error.to_string());
+    }
+    let hide = |text: String| text.replace(&directory.path().display().to_string(), ".");
+    let (config, load_warnings) = match Config::load_with_warnings(&path, None) {
+        Ok(loaded) => loaded,
+        Err(error) => return failed(hide(format!("{:#}", anyhow::Error::from(error)))),
+    };
+    let mut errors = config.validation_errors();
+    let mut warnings = finality_anchor_warnings(&config, SystemTime::now());
+    warnings.extend(load_warnings);
+    for (index, configured) in config.processors.iter().enumerate() {
+        if configured.id == leani_processor_wasm::PROCESSOR_ID {
+            warnings.push(format!(
+                "processors[{index}]: {}",
+                crate::processors::WASM_CHECKED_WHERE_INSTALLED
+            ));
+        } else {
+            match registry.instantiate(configured, config.chain.chain_id) {
+                Ok(processor) => {
+                    warnings.extend(crate::processors::output_warning(index, processor.as_ref()));
+                }
+                Err(error) => errors.push(ValidationError::new(
+                    format!("processors[{index}]"),
+                    error.to_string(),
+                )),
+            }
+        }
+    }
+    for error in &mut errors {
+        error.message = hide(std::mem::take(&mut error.message));
+    }
+    serde_json::json!({
+        "valid": errors.is_empty(),
+        "errors": errors,
+        "warnings": warnings.into_iter().map(hide).collect::<Vec<_>>(),
+        "chain": config.chain.name,
+        "chainId": config.chain.chain_id,
+        "processors": config
+            .processors
+            .iter()
+            .map(|processor| processor.instance.as_str())
+            .collect::<Vec<_>>(),
+    })
+}
+
 /// The feed an ad-hoc Wasm run opens when the live lane lacks its material:
 /// its own subscription to `source` for its processor's kinds of material,
 /// unfiltered. A run that swaps in another filter then reruns the blocks it
@@ -6219,6 +6282,17 @@ async fn serve(path: &Path, registry: &ProcessorRegistry) -> Result<Exit> {
             live_feed: execution_source
                 .clone()
                 .map(|source| live_feed(source, live_source_budget(config.get()))),
+            config_check: Some({
+                let registry = registry.clone();
+                Arc::new(move |input: &str| check_configuration(input, &registry))
+            }),
+            config_build: Some({
+                let registry = registry.clone();
+                let finality = config.get().finality.clone();
+                Arc::new(move |requirements: &serde_json::Value, head: Option<u64>| {
+                    crate::config_builder::build_json(requirements, head, &registry, &finality)
+                })
+            }),
             wasm_build: config
                 .get()
                 .api
@@ -9003,6 +9077,57 @@ mod tests {
         // Every log of each block, so the run can swap in another filter
         // without fetching its blocks again.
         assert_eq!(requests[0].filter_scope(), None);
+    }
+
+    #[test]
+    fn posted_configurations_are_checked_like_doctor_without_reading_modules() {
+        let registry = ProcessorRegistry::standard();
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let profile =
+            fs::read_to_string(repository.join("config/modes/windowed.toml")).expect("profile");
+        let report = check_configuration(&profile, &registry);
+        assert_eq!(report["valid"], true, "{report}");
+        assert_eq!(
+            report["processors"],
+            serde_json::json!(["uniswap-v2-sync-30d"])
+        );
+
+        let broken = check_configuration("config_version = 1\n[chain\n", &registry);
+        assert_eq!(broken["valid"], false);
+        let message = broken["errors"][0]["message"].as_str().expect("message");
+        assert!(message.contains("leani.toml"), "{message}");
+        assert!(
+            !message.contains(std::env::temp_dir().to_string_lossy().as_ref()),
+            "{message}"
+        );
+
+        let wasm = check_configuration(
+            &format!(
+                "{profile}\n[[processors]]\nid = \"wasm\"\ninstance = \"mine\"\nversion = \"1.0.0\"\nhistory_mode = \"on_demand\"\nstart_block = 1\npublish = \"finalized\"\nstate = {{ mode = \"durable\" }}\noutput = {{ mode = \"full\" }}\ndelivery = {{ mode = \"window\" }}\ncheckpoint = {{ mode = \"none\", keep = 0 }}\nundo = {{ mode = \"none\", safety_blocks = 0 }}\nsettings = {{ module = \"/etc/hosts\" }}\n"
+            ),
+            &registry,
+        );
+        let warnings = wasm["warnings"].to_string();
+        assert!(
+            warnings.contains("Wasm modules are checked where they are installed"),
+            "{wasm}"
+        );
+        assert!(!wasm["errors"].to_string().contains("/etc/hosts"), "{wasm}");
+
+        // `latest` on the block-local event decoder keeps every event.
+        let latest = profile.replace(
+            "[processors.output]\nmode = \"window\"\n\n[processors.output.window]\nmax_blocks = 216000\n",
+            "[processors.output]\nmode = \"latest\"\n",
+        );
+        assert_ne!(latest, profile, "the profile's output section moved");
+        let report = check_configuration(&latest, &registry);
+        assert_eq!(report["valid"], true, "{report}");
+        assert!(
+            report["warnings"]
+                .to_string()
+                .contains("output \\\"latest\\\""),
+            "{report}"
+        );
     }
 
     #[test]

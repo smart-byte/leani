@@ -3,6 +3,7 @@
 mod browser_guard;
 mod extension;
 mod extensions;
+mod playground;
 mod wasm_runs;
 
 pub use extension::{
@@ -284,6 +285,13 @@ pub struct ApiConfig {
     /// The live lane's committed blocks, which ad-hoc Wasm runs follow; without
     /// them, runs that ask to follow are refused.
     pub live_events: Option<tokio::sync::broadcast::Sender<leani_source_api::ChainEvent>>,
+    /// Checks a configuration document as `leani doctor --json` does; the
+    /// node binary supplies it. Without it, the check endpoint answers 503.
+    pub config_check: Option<ConfigCheck>,
+    /// Builds a configuration from requirements, given the chain head when
+    /// the node retains blocks; the node binary supplies it. Without it, the
+    /// build endpoint answers 503.
+    pub config_build: Option<ConfigBuild>,
     /// Builds a processor's Rust or TypeScript source into a Wasm module on
     /// the node's host; the node binary supplies it when `api.allow_wasm_builds`
     /// is set. Without it, the build endpoint answers 409.
@@ -293,6 +301,12 @@ pub struct ApiConfig {
     /// node binary supplies it.
     pub live_feed: Option<LiveFeed>,
 }
+
+pub type ConfigCheck = Arc<dyn Fn(&str) -> serde_json::Value + Send + Sync>;
+
+/// `Err` says why the requirements cannot be met.
+pub type ConfigBuild =
+    Arc<dyn Fn(&serde_json::Value, Option<u64>) -> Result<serde_json::Value, String> + Send + Sync>;
 
 /// A source that does not compile is `Ok`, with its diagnostics; `Err` says
 /// why the source is refused.
@@ -346,6 +360,8 @@ impl Default for ApiConfig {
             raw_history_control: None,
             shutdown: CancellationToken::new(),
             live_events: None,
+            config_check: None,
+            config_build: None,
             wasm_build: None,
             live_feed: None,
         }
@@ -400,6 +416,14 @@ impl std::fmt::Debug for ApiConfig {
             .field(
                 "live_events",
                 &self.live_events.as_ref().map(|_| "[AVAILABLE]"),
+            )
+            .field(
+                "config_check",
+                &self.config_check.as_ref().map(|_| "[AVAILABLE]"),
+            )
+            .field(
+                "config_build",
+                &self.config_build.as_ref().map(|_| "[AVAILABLE]"),
             )
             .field(
                 "wasm_build",
@@ -1225,6 +1249,14 @@ pub fn router_with_processors(
             axum::routing::post(wasm_runs::build_module),
         )
         .route(
+            "/admin/v1/config/check",
+            axum::routing::post(playground::check_config),
+        )
+        .route(
+            "/admin/v1/config/build",
+            axum::routing::post(playground::build_config),
+        )
+        .route(
             "/admin/v1/wasm/runs",
             axum::routing::post(wasm_runs::start_run).layer(axum::extract::DefaultBodyLimit::max(
                 wasm_runs::MAX_REQUEST_BYTES,
@@ -1415,6 +1447,7 @@ pub fn router_with_processors(
         .route("/health/ready", get(readiness))
         .route("/v1/network/status", get(network_status))
         .route("/debug/network", get(network_dashboard))
+        .route("/playground", get(playground::page))
         .route("/metrics", get(metrics))
         .with_state(state);
     Ok(operational
