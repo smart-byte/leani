@@ -1,0 +1,28 @@
+[package]
+name = "leani-finality-op-gossip"
+description = "Sequencer-signed op-stack unsafe blocks from consensus gossip"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+alloy-primitives.workspace = true
+alloy-rlp.workspace = true
+discv5 = { git = "https://github.com/sigp/discv5", rev = "7663c00", features = ["libp2p"] }
+futures.workspace = true
+leani-chain = { path = "../chain" }
+libp2p.workspace = true
+op-alloy-rpc-types-engine.workspace = true
+sha2.workspace = true
+snap.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true

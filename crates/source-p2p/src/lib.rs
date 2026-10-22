@@ -9,6 +9,7 @@ mod header_rules;
 mod live_head;
 mod live_material;
 mod peer_store;
+mod wire;
 
 use header_rules::{HeaderRules, HeaderVerdict, blob_gas_matches};
 use live_head::{
@@ -36,7 +37,7 @@ use std::{
 use alloy_consensus::{
     Block, EMPTY_ROOT_HASH, Header, Transaction as _, TxReceipt as _,
     proofs::{calculate_receipt_root, calculate_transaction_root},
-    transaction::SignerRecoverable,
+    transaction::{SignerRecoverable, TxHashRef as _},
 };
 use alloy_eips::{BlockHashOrNumber, Encodable2718, eip2124::Head};
 use alloy_primitives::{Address as AlloyAddress, B256, B512, BloomInput, Sealable, U256};
@@ -44,7 +45,7 @@ use alloy_rlp::Encodable as _;
 use async_trait::async_trait;
 use futures::{FutureExt as _, StreamExt, stream, stream::FuturesUnordered};
 use hickory_resolver::proto::rr::RData;
-use leani_chain::{BeaconNetwork, Chain};
+use leani_chain::{Cadence, Chain, Family};
 use leani_primitives::{
     Address, BlockFrame, BlockHash, BlockNumber, BlockRange, BlockRef, Capability, CapabilitySet,
     ChainId, Completeness, ConsensusAnchor, FilterScope, Finality, HeaderEnvelope, Log, Material,
@@ -65,14 +66,13 @@ use reth_dns_discovery::{
     DnsDiscoveryConfig, DnsDiscoveryService, Resolver as DnsDiscoveryResolver,
     tree::LinkEntry as DnsDiscoveryLink,
 };
-use reth_ethereum_primitives::{BlockBody, Receipt};
 use reth_network::config::SecretKey;
 use reth_network::types::{
     EthVersion, GetBlockBodies, GetBlockHeaders, GetReceipts, GetReceipts70, NatResolver, PeerKind,
     ReputationChangeKind,
 };
 use reth_network::{
-    DisconnectReason, EthNetworkPrimitives, FetchClient, NetworkConfigBuilder, NetworkEvent,
+    DisconnectReason, FetchClient, NetworkConfigBuilder, NetworkEvent,
     NetworkEventListenerProvider, NetworkHandle, NetworkManager, PeerRequest, PeerRequestSender,
     Peers, PeersConfig, SessionsConfig, config::rng_secret_key, events::PeerEvent,
 };
@@ -91,6 +91,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, trace, warn};
+use wire::{BlockBody, Receipt, WireNetworkPrimitives};
 
 use peer_store::ExecutionPeerStore;
 pub use peer_store::{
@@ -909,15 +910,15 @@ impl AnchoredHeaderProofBuilder {
 /// manager's Discv5 service, and its UDP port, alive: a session a lane still
 /// holds must not keep a fixed port from the next manager.
 #[derive(Clone, Debug)]
-struct ManagerHandle(Arc<Mutex<Option<NetworkHandle<EthNetworkPrimitives>>>>);
+struct ManagerHandle(Arc<Mutex<Option<NetworkHandle<WireNetworkPrimitives>>>>);
 
 impl ManagerHandle {
-    fn new(handle: NetworkHandle<EthNetworkPrimitives>) -> Self {
+    fn new(handle: NetworkHandle<WireNetworkPrimitives>) -> Self {
         Self(Arc::new(Mutex::new(Some(handle))))
     }
 
     /// The handle, while the manager of this generation runs.
-    fn get(&self) -> Option<NetworkHandle<EthNetworkPrimitives>> {
+    fn get(&self) -> Option<NetworkHandle<WireNetworkPrimitives>> {
         self.0
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -945,7 +946,7 @@ struct P2pSession {
     network: Arc<PersistentNetwork>,
     generation: u64,
     handle: ManagerHandle,
-    fetch: FetchClient<EthNetworkPrimitives>,
+    fetch: FetchClient<WireNetworkPrimitives>,
     telemetry: NetworkSessionTelemetry,
 }
 
@@ -1235,7 +1236,7 @@ impl PersistentNetwork {
 struct PersistentNetworkState {
     generation: u64,
     handle: ManagerHandle,
-    fetch: FetchClient<EthNetworkPrimitives>,
+    fetch: FetchClient<WireNetworkPrimitives>,
     peer_store_flush: tokio::sync::mpsc::Sender<tokio::sync::oneshot::Sender<Result<(), String>>>,
     network_task: tokio::task::JoinHandle<()>,
     shutdown: CancellationToken,
@@ -1247,7 +1248,7 @@ struct PersistentNetworkState {
 struct DirectPeer {
     peer_id: B512,
     eth_version: EthVersion,
-    messages: PeerRequestSender<PeerRequest<EthNetworkPrimitives>>,
+    messages: PeerRequestSender<PeerRequest<WireNetworkPrimitives>>,
 }
 
 #[derive(Debug)]
@@ -2765,7 +2766,7 @@ fn spawn_peer_qualification_worker(
     qualifications: Arc<PeerQualificationPool>,
     quality: Arc<ExecutionPeerStore>,
     peer_candidates: Arc<PeerCandidateRegistry>,
-    handle: NetworkHandle<EthNetworkPrimitives>,
+    handle: NetworkHandle<WireNetworkPrimitives>,
     network_telemetry: NetworkTelemetry,
     mut target_updates: tokio::sync::watch::Receiver<BlockRef>,
     request_gate: Arc<MaterialRequestGate>,
@@ -3010,7 +3011,7 @@ struct DnsPeerSeederRuntime {
 }
 
 fn spawn_cached_peer_admitter(
-    handle: NetworkHandle<EthNetworkPrimitives>,
+    handle: NetworkHandle<WireNetworkPrimitives>,
     records: Vec<NodeRecord>,
     batch_size: usize,
     interval: Duration,
@@ -3045,7 +3046,7 @@ fn spawn_cached_peer_admitter(
 }
 
 fn spawn_dns_peer_seeder(
-    handle: NetworkHandle<EthNetworkPrimitives>,
+    handle: NetworkHandle<WireNetworkPrimitives>,
     runtime: DnsPeerSeederRuntime,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
@@ -3145,14 +3146,14 @@ fn spawn_dns_peer_seeder(
     })
 }
 
-fn add_node_record_to_network(handle: &NetworkHandle<EthNetworkPrimitives>, record: NodeRecord) {
+fn add_node_record_to_network(handle: &NetworkHandle<WireNetworkPrimitives>, record: NodeRecord) {
     let tcp_addr = SocketAddr::new(record.address, record.tcp_port);
     let udp_addr = SocketAddr::new(record.address, record.udp_port);
     handle.add_peer_kind(record.id, None, tcp_addr, Some(udp_addr));
 }
 
 fn admit_node_record_to_network(
-    handle: &NetworkHandle<EthNetworkPrimitives>,
+    handle: &NetworkHandle<WireNetworkPrimitives>,
     record: NodeRecord,
     origin: NetworkPeerOrigin,
     peer_candidates: &PeerCandidateRegistry,
@@ -3168,7 +3169,7 @@ fn admit_node_record_to_network(
     admitted
 }
 
-fn connect_node_record(handle: &NetworkHandle<EthNetworkPrimitives>, record: NodeRecord) {
+fn connect_node_record(handle: &NetworkHandle<WireNetworkPrimitives>, record: NodeRecord) {
     let tcp_addr = SocketAddr::new(record.address, record.tcp_port);
     let udp_addr = SocketAddr::new(record.address, record.udp_port);
     handle.connect_peer_kind(record.id, PeerKind::Basic, tcp_addr, Some(udp_addr));
@@ -3257,12 +3258,12 @@ fn spawn_peer_persistence_worker(
     reason = "one select loop synchronizes manager, persistence, telemetry, recovery, and peer events"
 )]
 fn spawn_network_manager<S>(
-    manager: NetworkManager<EthNetworkPrimitives>,
+    manager: NetworkManager<WireNetworkPrimitives>,
     mut network_events: S,
     runtime: NetworkManagerRuntime,
 ) -> tokio::task::JoinHandle<()>
 where
-    S: futures::Stream<Item = NetworkEvent<PeerRequest<EthNetworkPrimitives>>>
+    S: futures::Stream<Item = NetworkEvent<PeerRequest<WireNetworkPrimitives>>>
         + Unpin
         + Send
         + 'static,
@@ -3571,9 +3572,9 @@ fn reconcile_direct_peers(
 /// Its requests reach that session through the network manager, which drops
 /// them, and so fails the request, once the session is gone.
 fn manager_routed_peer_sender(
-    handle: NetworkHandle<EthNetworkPrimitives>,
+    handle: NetworkHandle<WireNetworkPrimitives>,
     peer_id: B512,
-) -> PeerRequestSender<PeerRequest<EthNetworkPrimitives>> {
+) -> PeerRequestSender<PeerRequest<WireNetworkPrimitives>> {
     let (sender, mut requests) = tokio::sync::mpsc::channel(MAX_MATERIAL_REQUESTS_PER_PEER);
     // The forwarder ends once the pool and every lease drop the sender.
     drop(tokio::spawn(async move {
@@ -3587,7 +3588,7 @@ fn manager_routed_peer_sender(
 /// Keep the direct-peer pool in step with Reth's active sessions: drop entries
 /// whose session is gone and adopt sessions whose open event was lost.
 fn spawn_direct_peer_reconciler(
-    handle: NetworkHandle<EthNetworkPrimitives>,
+    handle: NetworkHandle<WireNetworkPrimitives>,
     direct_peers: Arc<DirectPeerPool>,
     qualifications: Arc<PeerQualificationPool>,
     request_timeout: Duration,
@@ -4060,12 +4061,13 @@ impl RethP2pSource {
     /// or when peer, retry, or timeout bounds are invalid.
     pub fn new(chain: Arc<Chain>, config: RethP2pConfig) -> Result<Self, P2pError> {
         config.validate()?;
-        let chain_spec = leani_chain::ethereum_chain_spec(&chain)
+        let chain_spec = leani_chain::execution_chain_spec(&chain)
             .map_err(|error| P2pError::InvalidConfig(error.to_string()))?;
-        let beacon = chain
-            .beacon()
-            .map_err(|error| P2pError::InvalidConfig(error.to_string()))?
-            .clone();
+        let cadence = chain.cadence();
+        let header_rules = match chain.family {
+            Family::Ethereum => HeaderRules::new(chain_spec.clone(), cadence),
+            Family::OpStack => HeaderRules::cadence_only(cadence),
+        };
         config.network_telemetry.set_peer_targets(
             config.minimum_peers,
             config.body_serving_peer_target,
@@ -4122,12 +4124,12 @@ impl RethP2pSource {
                 trust: TrustModel::ProtocolVerified,
                 finality: FinalityModel::Attested,
                 partitioning: Partitioning::FixedBlockSpan(MAX_FIXED_RANGE_BLOCKS),
-                expected_lag: Duration::from_secs(beacon.seconds_per_slot),
+                expected_lag: Duration::from_secs(cadence.seconds),
                 schema_version: format!("reth-p2p.v1+{RETH_VERSION}.{RETH_REVISION}"),
                 priority: 0,
             },
             config,
-            header_rules: Arc::new(HeaderRules::new(chain_spec.clone(), beacon)),
+            header_rules: Arc::new(header_rules),
             chain_spec,
             chain,
             network,
@@ -4218,8 +4220,8 @@ impl RethP2pSource {
         &self.chain
     }
 
-    fn beacon(&self) -> &BeaconNetwork {
-        self.header_rules.beacon()
+    fn cadence(&self) -> &Cadence {
+        self.header_rules.cadence()
     }
 
     /// Execution bootnodes: the entry's, or else the chain spec's.
@@ -4620,7 +4622,7 @@ impl RethP2pSource {
             ..SessionsConfig::default().with_upscaled_event_buffer(peers.max_peers())
         };
         let mut builder =
-            NetworkConfigBuilder::<EthNetworkPrimitives>::new(secret, Runtime::test())
+            NetworkConfigBuilder::<WireNetworkPrimitives>::new(secret, Runtime::test())
                 .listener_addr(listener_addr)
                 .discovery_addr(discovery_addr)
                 .disable_tx_gossip(true)
@@ -4633,13 +4635,29 @@ impl RethP2pSource {
                 .peer_config(peers)
                 .sessions_config(sessions)
                 .set_head(advertised_head);
+        if !self.chain.execution.discv4 {
+            builder = builder.disable_discv4_discovery();
+        }
         if self.config.enable_discv5 {
             let discv5_listen = reth_discv5::discv5::ListenConfig::Ipv4 {
                 ip: Ipv4Addr::UNSPECIFIED,
                 port: self.config.discv5_port,
             };
+            let mut discv5_config = reth_discv5::discv5::ConfigBuilder::new(discv5_listen);
+            if let Some(protocol_id) = self.chain.execution.discv5_protocol_id.as_deref() {
+                let protocol_id = <[u8; 6]>::try_from(protocol_id.as_bytes()).map_err(|_| {
+                    P2pError::InvalidConfig(format!(
+                        "Discv5 protocol id {protocol_id:?} is not six bytes"
+                    ))
+                })?;
+                discv5_config.protocol_identity(reth_discv5::discv5::ProtocolIdentity {
+                    protocol_id,
+                    ..Default::default()
+                });
+            }
             let discv5 = reth_discv5::Config::builder(listener_addr)
-                .discv5_config(reth_discv5::discv5::ConfigBuilder::new(discv5_listen).build());
+                .discv5_config(discv5_config.build())
+                .add_unsigned_boot_nodes(self.boot_nodes());
             builder = builder.discovery_v5(discv5);
         }
         builder = match self.config.nat.clone() {
@@ -5107,7 +5125,7 @@ impl RethP2pSource {
             .filter_map(|(position, receipts)| {
                 receipts
                     .iter()
-                    .flat_map(|receipt| &receipt.logs)
+                    .flat_map(Receipt::logs)
                     .any(|log| source_log_matches(scope, log))
                     .then_some(position)
             })
@@ -7930,7 +7948,7 @@ impl RethP2pHistorySource {
             .filter_map(|(position, receipts)| {
                 receipts
                     .iter()
-                    .flat_map(|receipt| &receipt.logs)
+                    .flat_map(Receipt::logs)
                     .any(|log| source_log_matches(scope, log))
                     .then_some(position)
             })
@@ -9061,14 +9079,14 @@ async fn next_live_event(
         let attested = state.attested.latest();
         let gate = HeadGate {
             enabled: state.head_acceptance,
-            wall_slot: state.source.beacon().slot_at(unix_now()),
+            wall_slot: state.source.cadence().slot_at(unix_now()),
         };
         match live_step(state.last, attested, &state.ancestry, batch_blocks, gate) {
             LiveStep::Head { block } => {
                 state.head_unavailable_since = None;
                 let delay = head_poll_delay(
                     state.last.timestamp,
-                    state.source.beacon().seconds_per_slot,
+                    state.source.cadence().seconds,
                     unix_now_ms(),
                 );
                 if !delay.is_zero() {
@@ -9495,7 +9513,7 @@ async fn poll_unattested_head(
         return unattested_reorg(state, header).await;
     }
     let attested = state.attested.peek();
-    let Some(slot) = source.beacon().slot_starting_at(header.timestamp) else {
+    let Some(slot) = source.cadence().slot_starting_at(header.timestamp) else {
         return Ok(HeadPoll::WaitForAttested);
     };
     if attested.is_none_or(|head| slot.saturating_sub(head.beacon_slot) > MAX_UNATTESTED_SLOTS) {
@@ -10815,7 +10833,9 @@ fn validate_bodies(headers: &[Header], bodies: &[BlockBody]) -> Result<(), P2pEr
                 header.number
             )));
         }
-        if body.calculate_withdrawals_root() != header.withdrawals_root {
+        if body.calculate_withdrawals_root() != header.withdrawals_root
+            && !op_stack_withdrawals_commitment(header, body)
+        {
             return Err(P2pError::InvalidResponse(format!(
                 "withdrawals root mismatch at block {}",
                 header.number
@@ -10858,7 +10878,7 @@ fn validate_body_receipts(
         )));
     }
     for (transaction, receipt) in body.transactions.iter().zip(receipts) {
-        if transaction.tx_type() != receipt.tx_type {
+        if transaction.tx_type() != receipt.tx_type() {
             return Err(P2pError::InvalidResponse(format!(
                 "transaction/receipt type mismatch at block {}",
                 header.number
@@ -10884,7 +10904,9 @@ fn validate_receipts_against_headers(
             .iter()
             .map(alloy_consensus::TxReceipt::with_bloom_ref)
             .collect::<Vec<_>>();
-        if calculate_receipt_root(&with_bloom) != header.receipts_root {
+        if calculate_receipt_root(&with_bloom) != header.receipts_root
+            && regolith_receipts_root(block_receipts) != Some(header.receipts_root)
+        {
             return Err(P2pError::InvalidResponse(format!(
                 "receipt root mismatch at block {}",
                 header.number
@@ -10903,13 +10925,13 @@ fn validate_receipts_against_headers(
         }
         let mut previous_gas = 0_u64;
         for receipt in block_receipts {
-            if receipt.cumulative_gas_used < previous_gas {
+            if receipt.cumulative_gas_used() < previous_gas {
                 return Err(P2pError::InvalidResponse(format!(
                     "receipt cumulative gas regressed at block {}",
                     header.number
                 )));
             }
-            previous_gas = receipt.cumulative_gas_used;
+            previous_gas = receipt.cumulative_gas_used();
         }
         if previous_gas != header.gas_used {
             return Err(P2pError::InvalidResponse(format!(
@@ -10919,6 +10941,44 @@ fn validate_receipts_against_headers(
         }
     }
     Ok(())
+}
+
+/// From Isthmus an op-stack header's withdrawals root commits to the
+/// `L2ToL1MessagePasser` storage root, which no body carries. The transactions
+/// root binds the body, so its leading deposit proves an op-stack block.
+fn op_stack_withdrawals_commitment(header: &Header, body: &BlockBody) -> bool {
+    header.withdrawals_root.is_some()
+        && body
+            .withdrawals
+            .as_ref()
+            .is_some_and(|withdrawals| withdrawals.is_empty())
+        && body
+            .transactions
+            .first()
+            .is_some_and(wire::WireTx::is_op_stack)
+}
+
+/// The receipts root of an op-stack block between Regolith and Canyon, which
+/// left deposit nonces out of its hash. The nonces are then not committed.
+fn regolith_receipts_root(receipts: &[Receipt]) -> Option<B256> {
+    receipts
+        .iter()
+        .any(|receipt| {
+            receipt
+                .deposit_fields()
+                .is_some_and(|(nonce, _)| nonce.is_some())
+        })
+        .then(|| {
+            let stripped = receipts
+                .iter()
+                .map(Receipt::without_deposit_nonce)
+                .collect::<Vec<_>>();
+            let with_bloom = stripped
+                .iter()
+                .map(alloy_consensus::TxReceipt::with_bloom_ref)
+                .collect::<Vec<_>>();
+            calculate_receipt_root(&with_bloom)
+        })
 }
 
 /// Whether a peer must be asked for a block's receipts. A block without
@@ -11064,7 +11124,7 @@ fn normalize_sparse_receipt_log_block(
     for (transaction_index, receipt) in receipts.iter().enumerate() {
         let transaction_index = u32::try_from(transaction_index)
             .map_err(|_| P2pError::InvalidResponse("transaction index overflows u32".to_owned()))?;
-        for source_log in &receipt.logs {
+        for source_log in receipt.logs() {
             if in_range && source_log_matches(scope, source_log) {
                 logs.push(Log {
                     address: address(source_log.address),
@@ -11369,7 +11429,7 @@ fn normalize_body_transactions(body: &BlockBody) -> Result<Vec<TransactionEnvelo
             let encoded = transaction.encoded_2718();
             Ok(TransactionEnvelope {
                 hash: transaction_hash(*transaction.tx_hash()),
-                transaction_type: transaction.tx_type() as u8,
+                transaction_type: transaction.tx_type(),
                 index: u32::try_from(index).map_err(|_| {
                     P2pError::InvalidResponse(
                         "transaction index overflows u32 in verified body".to_owned(),
@@ -11677,16 +11737,16 @@ fn normalize_block(
             .map_err(|_| P2pError::InvalidResponse("transaction index overflows u32".to_owned()))?;
         let transaction_hash = transaction_hash(*transaction.tx_hash());
         let gas_used = receipt.map_or(0, |receipt| {
-            receipt.cumulative_gas_used.saturating_sub(previous_gas)
+            receipt.cumulative_gas_used().saturating_sub(previous_gas)
         });
         if let Some(receipt) = receipt {
-            previous_gas = receipt.cumulative_gas_used;
+            previous_gas = receipt.cumulative_gas_used();
         }
         let scope = filter_scope.as_ref();
         let preliminary_transaction_match = scope.is_none_or(|scope| {
             scope.matches_block(number)
                 && scope.matches_transaction(
-                    transaction.tx_type() as u8,
+                    transaction.tx_type(),
                     transaction.to().map(address).as_ref(),
                     || transaction_hash,
                 )
@@ -11705,7 +11765,7 @@ fn normalize_block(
         let transaction_matches = preliminary_transaction_match
             && scope.is_none_or(|scope| scope.matches_sender(sender.map(address).as_ref()));
         let mut receipt_logs = Vec::new();
-        for source_log in receipt.map_or(&[][..], |receipt| receipt.logs.as_slice()) {
+        for source_log in receipt.map_or(&[][..], |receipt| receipt.logs()) {
             let selected_for_receipt = receipts_requested && transaction_matches;
             let selected_for_logs = logs_requested
                 && transaction_matches
@@ -11745,7 +11805,7 @@ fn normalize_block(
             let encoded = transaction.encoded_2718();
             normalized_transactions.push(TransactionEnvelope {
                 hash: transaction_hash,
-                transaction_type: transaction.tx_type() as u8,
+                transaction_type: transaction.tx_type(),
                 index: transaction_index,
                 encoded: Some(encoded.clone()),
                 from: sender.map(address),
@@ -11776,10 +11836,10 @@ fn normalize_block(
         if let Some(receipt) = receipt.filter(|_| receipts_requested && transaction_matches) {
             normalized_receipts.push(ReceiptEnvelope {
                 transaction_hash,
-                transaction_type: receipt.tx_type as u8,
+                transaction_type: receipt.tx_type(),
                 transaction_index,
                 encoded: Some(receipt.with_bloom_ref().encoded_2718()),
-                success: Some(receipt.success),
+                success: Some(receipt.success()),
                 gas_used: Some(gas_used),
                 effective_gas_price: Some(quantity(U256::from(
                     transaction.effective_gas_price(header.base_fee_per_gas),
@@ -12268,15 +12328,18 @@ mod tests {
             ),
         );
         let body = BlockBody {
-            transactions: vec![transaction],
+            transactions: vec![transaction.into()],
             ..Default::default()
         };
-        let receipts = vec![Receipt {
-            tx_type: alloy_consensus::TxType::Legacy,
-            success: true,
-            cumulative_gas_used: 21_000,
-            logs: Vec::new(),
-        }];
+        let receipts: Vec<Receipt> = vec![
+            EthereumReceipt {
+                tx_type: alloy_consensus::TxType::Legacy,
+                success: true,
+                cumulative_gas_used: 21_000,
+                logs: Vec::new(),
+            }
+            .into(),
+        ];
         let with_bloom = receipts
             .iter()
             .map(alloy_consensus::TxReceipt::with_bloom_ref)
@@ -12671,16 +12734,19 @@ mod tests {
             minimum_finality: Finality::Finalized,
             verification_policy: leani_source_api::VerificationPolicy::CompleteCryptographic,
         };
-        let receipts = vec![EthereumReceipt {
-            tx_type: TxType::Legacy,
-            success: true,
-            cumulative_gas_used: 0,
-            logs: vec![alloy_primitives::Log::new_unchecked(
-                AlloyAddress::from(address.0),
-                vec![B256::from(topic)],
-                vec![0xaa, 0xbb].into(),
-            )],
-        }];
+        let receipts: Vec<Receipt> = vec![
+            EthereumReceipt {
+                tx_type: TxType::Legacy,
+                success: true,
+                cumulative_gas_used: 0,
+                logs: vec![alloy_primitives::Log::new_unchecked(
+                    AlloyAddress::from(address.0),
+                    vec![B256::from(topic)],
+                    vec![0xaa, 0xbb].into(),
+                )],
+            }
+            .into(),
+        ];
         let frame =
             normalize_sparse_receipt_log_block(ChainId(1), &headers[0], &receipts, &request, 1)
                 .expect("receipt-only frame");
@@ -12960,12 +13026,12 @@ mod tests {
         assert!(validate_bodies(&headers, &bodies).is_err());
 
         let (_, mut headers, bodies, mut receipts) = empty_fixture();
-        receipts[0].push(EthereumReceipt {
+        receipts[0].push(Receipt::from(EthereumReceipt {
             tx_type: TxType::Legacy,
             success: true,
             cumulative_gas_used: 0,
             logs: Vec::new(),
-        });
+        }));
         assert!(validate_receipts(&headers, &bodies, &receipts).is_err());
         headers[0].receipts_root = B256::ZERO;
         assert!(validate_receipts_against_headers(&headers, &[vec![], vec![]]).is_err());
@@ -13157,7 +13223,7 @@ mod tests {
         };
         let peer_id = B512::from([0x42; 64]);
         let (sender, mut receiver) =
-            tokio::sync::mpsc::channel::<PeerRequest<EthNetworkPrimitives>>(2);
+            tokio::sync::mpsc::channel::<PeerRequest<WireNetworkPrimitives>>(2);
         let peer = DirectPeer {
             peer_id,
             eth_version: EthVersion::Eth68,
@@ -14011,7 +14077,7 @@ mod tests {
     async fn direct_body_request_uses_the_selected_peer_session() {
         let peer_id = B512::from([0x44; 64]);
         let (sender, mut receiver) =
-            tokio::sync::mpsc::channel::<PeerRequest<EthNetworkPrimitives>>(1);
+            tokio::sync::mpsc::channel::<PeerRequest<WireNetworkPrimitives>>(1);
         let peer = DirectPeer {
             peer_id,
             eth_version: EthVersion::Eth68,
@@ -14045,7 +14111,7 @@ mod tests {
     async fn direct_head_request_uses_the_advertising_peer_session() {
         let peer_id = B512::from([0x66; 64]);
         let (sender, mut receiver) =
-            tokio::sync::mpsc::channel::<PeerRequest<EthNetworkPrimitives>>(1);
+            tokio::sync::mpsc::channel::<PeerRequest<WireNetworkPrimitives>>(1);
         let peer = DirectPeer {
             peer_id,
             eth_version: EthVersion::Eth68,
@@ -14864,10 +14930,10 @@ mod tests {
         assert!(!source.boot_nodes().is_empty());
         // Hoodi's slots start one second after mainnet's.
         let mainnet_slot_start = 1_606_824_023 + 12 * 14_000_000;
-        assert_eq!(source.beacon().slot_starting_at(mainnet_slot_start), None);
+        assert_eq!(source.cadence().slot_starting_at(mainnet_slot_start), None);
         assert!(
             source
-                .beacon()
+                .cadence()
                 .slot_starting_at(mainnet_slot_start + 1)
                 .is_some()
         );
@@ -14939,7 +15005,7 @@ mod tests {
         (pool, peers, receivers)
     }
 
-    type PeerReceiver = tokio::sync::mpsc::Receiver<PeerRequest<EthNetworkPrimitives>>;
+    type PeerReceiver = tokio::sync::mpsc::Receiver<PeerRequest<WireNetworkPrimitives>>;
 
     /// A header lane's failure count and the end of its cooldown.
     fn header_lane(pool: &DirectPeerPool, peer_id: B512) -> (u32, Instant) {
@@ -15623,12 +15689,12 @@ mod tests {
     }
 
     fn receipt(cumulative_gas_used: u64) -> Receipt {
-        EthereumReceipt {
+        Receipt::from(EthereumReceipt {
             tx_type: TxType::Legacy,
             success: true,
             cumulative_gas_used,
             logs: Vec::new(),
-        }
+        })
     }
 
     /// A header whose commitments hold exactly `receipts`.
@@ -15640,9 +15706,7 @@ mod tests {
         Header {
             number,
             receipts_root: calculate_receipt_root(&with_bloom),
-            gas_used: receipts
-                .last()
-                .map_or(0, |receipt| receipt.cumulative_gas_used),
+            gas_used: receipts.last().map_or(0, Receipt::cumulative_gas_used),
             ..Default::default()
         }
     }
@@ -15696,7 +15760,7 @@ mod tests {
                 alloy_primitives::Signature::test_signature(),
             ));
         let body = BlockBody {
-            transactions: vec![transaction],
+            transactions: vec![transaction.into()],
             ..BlockBody::default()
         };
         let single = header_committing(11, &[receipt(21_000)]);

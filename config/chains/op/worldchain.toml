@@ -1,0 +1,50 @@
+name = "World Chain"
+public_rpc = "https://worldchain-mainnet.g.alchemy.com/public"
+sequencer_rpc = "https://worldchain-mainnet-sequencer.g.alchemy.com"
+explorer = "https://worldchain-mainnet.explorer.alchemy.com/"
+governed_by_optimism = false
+data_availability_type = "eth-da"
+chain_id = 480
+batch_inbox_addr = "0xff00000000000000000000000000000000000480"
+block_time = 2
+seq_window_size = 3600
+max_sequencer_drift = 1800
+
+[hardforks]
+  canyon_time = 0 # Thu 1 Jan 1970 00:00:00 UTC
+  delta_time = 0 # Thu 1 Jan 1970 00:00:00 UTC
+  ecotone_time = 0 # Thu 1 Jan 1970 00:00:00 UTC
+  fjord_time = 1721826000 # Wed 24 Jul 2024 13:00:00 UTC
+  granite_time = 1727780400 # Tue 1 Oct 2024 11:00:00 UTC
+  holocene_time = 1738238400 # Thu 30 Jan 2025 12:00:00 UTC
+  isthmus_time = 1764072000 # Tue 25 Nov 2025 12:00:00 UTC
+  jovian_time = 1777593600 # Fri 1 May 2026 00:00:00 UTC
+  karst_time = 1789992000 # Mon 21 Sep 2026 12:00:00 UTC
+
+[optimism]
+  eip1559_elasticity = 10
+  eip1559_denominator = 50
+  eip1559_denominator_canyon = 250
+
+[genesis]
+  l2_time = 1719335639
+  [genesis.l1]
+    hash = "0x793daed4743301e00143be5533cd1dce0a741519e9e9c96588a9ad7dbb4d8db4"
+    number = 20170118
+  [genesis.l2]
+    hash = "0x70d316d2e0973b62332ba2e9768dd7854298d7ffe77f0409ffdb8d859f2d3fa3"
+    number = 0
+  [genesis.system_config]
+    batcherAddress = "0xdBBE3D8c2d2b22A2611c5A94A9a12C2fCD49Eb29"
+    overhead = "0x00000000000000000000000000000000000000000000000000000000000000bc"
+    scalar = "0x00000000000000000000000000000000000000000000000000000000000a6fe0"
+    gasLimit = 100000000
+
+[roles]
+  ProxyAdminOwner = "0xA4fB12D15Eb85dc9284a7df0AdBC8B696EdbbF1d"
+
+[addresses]
+  L1StandardBridgeProxy = "0x470458C91978D2d929704489Ad730DC3E3001113"
+  OptimismPortalProxy = "0xd5ec14a83B7d95BE1E2Ac12523e2dEE12Cbeea6C"
+  SystemConfigProxy = "0x6ab0777fD0e609CE58F939a7F70Fe41F5Aa6300A"
+  DisputeGameFactoryProxy = "0x069c4c579671f8c120b1327a73217D01Ea2EC5ea"

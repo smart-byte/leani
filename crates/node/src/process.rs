@@ -4907,6 +4907,7 @@ async fn db(command: DbCommand, config_path: &Path, registry: &ProcessorRegistry
     Ok(Exit::Success)
 }
 
+#[allow(clippy::too_many_lines)]
 async fn probe_source(source: ProbeSource, config_path: &Path) -> Result<Exit> {
     match source {
         ProbeSource::Xatu {
@@ -4954,6 +4955,9 @@ async fn probe_source(source: ProbeSource, config_path: &Path) -> Result<Exit> {
                 report.as_deref(),
             )
             .await
+        }
+        ProbeSource::OpGossip { seconds, output } => {
+            probe_op_gossip(config_path, seconds, output.as_deref()).await
         }
         ProbeSource::P2p {
             from_block,
@@ -5158,6 +5162,63 @@ fn p2p_probe_config(
         poll_interval: Duration::from_secs(2),
         max_reorg_depth: 64,
         network_telemetry: leani_source_api::NetworkTelemetry::default(),
+    })
+}
+
+async fn probe_op_gossip(config_path: &Path, seconds: u64, output: Option<&Path>) -> Result<Exit> {
+    use std::io::Write as _;
+
+    let config = Config::load(config_path)
+        .with_context(|| format!("load configuration {}", config_path.display()))?;
+    let chain = config.chain_entry()?;
+    let gossip = leani_finality_op_gossip::OpGossipConfig::for_chain(&chain)?;
+    let cancellation = CancellationToken::new();
+    let mut blocks = leani_finality_op_gossip::follow(gossip, cancellation.clone()).await?;
+    let mut file = output.map(std::fs::File::create).transpose()?;
+    let deadline = tokio::time::sleep(Duration::from_secs(seconds));
+    tokio::pin!(deadline);
+    let (mut count, mut first, mut last) = (0_u64, None, None);
+    let mut lag_ms = Vec::new();
+    loop {
+        tokio::select! {
+            () = &mut deadline => break,
+            block = blocks.recv() => {
+                let Some(block) = block else { break };
+                count += 1;
+                first.get_or_insert(block.number);
+                last = Some(block.number);
+                lag_ms.push(block.received_at_unix_ms.saturating_sub(block.timestamp * 1_000));
+                let line = serde_json::json!({
+                    "number": block.number,
+                    "hash": block.hash,
+                    "parentHash": block.parent_hash,
+                    "timestamp": block.timestamp,
+                    "receivedAtUnixMs": block.received_at_unix_ms,
+                });
+                println!("{line}");
+                if let Some(file) = file.as_mut() {
+                    writeln!(file, "{line}")?;
+                }
+            }
+        }
+    }
+    cancellation.cancel();
+    lag_ms.sort_unstable();
+    let p50 = lag_ms.get(lag_ms.len() / 2).copied();
+    eprintln!(
+        "{}",
+        serde_json::json!({
+            "chain": chain.name,
+            "signedBlocks": count,
+            "first": first,
+            "last": last,
+            "receivedAfterTimestampP50Ms": p50,
+        })
+    );
+    Ok(if count > 0 {
+        Exit::Success
+    } else {
+        Exit::Failure
     })
 }
 

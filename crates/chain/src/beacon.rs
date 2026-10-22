@@ -132,6 +132,14 @@ impl BeaconNetwork {
     }
 
     #[must_use]
+    pub const fn cadence(&self) -> crate::Cadence {
+        crate::Cadence {
+            genesis_time: self.genesis_time,
+            seconds: self.seconds_per_slot,
+        }
+    }
+
+    #[must_use]
     pub const fn slot_start(&self, slot: u64) -> u64 {
         self.genesis_time
             .saturating_add(slot.saturating_mul(self.seconds_per_slot))

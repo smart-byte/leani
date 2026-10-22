@@ -3764,6 +3764,7 @@ num-traits 0.2.19 — https://github.com/rust-num/num-traits
 num 0.4.3 — https://github.com/rust-num/num
 regex-automata 0.4.16 — https://github.com/rust-lang/regex
 regex-syntax 0.8.11 — https://github.com/rust-lang/regex
+regex 1.13.1 — https://github.com/rust-lang/regex
 threadpool 1.8.1 — https://github.com/rust-threadpool/rust-threadpool
 
 Copyright (c) 2014 The Rust Project Developers
@@ -8838,6 +8839,7 @@ leani-api 0.1.1 — https://github.com/smart-byte/leani
 leani-chain 0.1.1 — https://github.com/smart-byte/leani
 leani-finality-beacon-api 0.1.1 — https://github.com/smart-byte/leani
 leani-finality-consensus-p2p 0.1.1 — https://github.com/smart-byte/leani
+leani-finality-op-gossip 0.1.1 — https://github.com/smart-byte/leani
 leani 0.1.1 — https://github.com/smart-byte/leani
 leani-processor-blobs 0.1.1 — https://github.com/smart-byte/leani
 leani-processor-block-summary 0.1.1 — https://github.com/smart-byte/leani
@@ -8914,6 +8916,7 @@ libm 0.2.16 — https://github.com/rust-lang/compiler-builtins
 libp2p-allow-block-list 0.6.0 — https://github.com/libp2p/rust-libp2p
 libp2p-connection-limits 0.6.0 — https://github.com/libp2p/rust-libp2p
 libp2p-core 0.43.2 — https://github.com/libp2p/rust-libp2p
+libp2p-gossipsub 0.49.5 — https://github.com/libp2p/rust-libp2p
 libp2p-noise 0.46.1 — https://github.com/libp2p/rust-libp2p
 libp2p-stream 0.4.0-alpha — https://github.com/libp2p/rust-libp2p
 libp2p-swarm 0.47.1 — https://github.com/libp2p/rust-libp2p
@@ -8927,6 +8930,9 @@ netlink-packet-core 0.8.1 — https://github.com/rust-netlink/netlink-packet-cor
 netlink-proto 0.12.1 — https://github.com/rust-netlink/netlink-proto
 netlink-sys 0.8.8 — https://github.com/rust-netlink/netlink-sys
 object_store 0.14.2 — https://github.com/apache/arrow-rs-object-store
+op-alloy-consensus 2.0.0 — https://github.com/ethereum-optimism/optimism
+op-alloy-rpc-types-engine 2.0.0 — https://github.com/ethereum-optimism/optimism
+quick-protobuf-codec 0.3.1 — https://github.com/libp2p/rust-libp2p
 quick-protobuf 0.8.1 — https://github.com/tafia/quick-protobuf
 r-efi 5.3.0 — https://github.com/r-efi/r-efi
 r-efi 6.0.0 — https://github.com/r-efi/r-efi
@@ -9236,6 +9242,7 @@ adler2 2.0.1 — https://github.com/oyvindln/adler2
 alloy-chains 0.2.36 — https://github.com/alloy-rs/chains
 alloy-trie 0.9.8 — https://github.com/alloy-rs/trie
 anyhow 1.0.104 — https://github.com/dtolnay/anyhow
+async-channel 2.5.0 — https://github.com/smol-rs/async-channel
 async-io 2.6.0 — https://github.com/smol-rs/async-io
 async-trait 0.1.92 — https://github.com/dtolnay/async-trait
 atomic-waker 1.1.2 — https://github.com/smol-rs/atomic-waker
@@ -9245,6 +9252,7 @@ const-hex 1.19.1 — https://github.com/danipopes/const-hex
 curve25519-dalek-derive 0.1.1 — https://github.com/dalek-cryptography/curve25519-dalek
 displaydoc 0.2.7 — https://github.com/yaahc/displaydoc
 dyn-clone 1.0.20 — https://github.com/dtolnay/dyn-clone
+event-listener-strategy 0.5.4 — https://github.com/smol-rs/event-listener-strategy
 event-listener 5.4.2 — https://github.com/smol-rs/event-listener
 eyre 0.6.12 — https://github.com/eyre-rs/eyre
 fastrand 2.5.0 — https://github.com/smol-rs/fastrand
@@ -9474,6 +9482,34 @@ Status API Training Shop Blog About Pricing
 ==============================================================================
 MIT License (MIT)
 ==============================================================================
+hex_fmt 0.3.0 — https://github.com/poanetwork/hex_fmt
+
+The MIT License
+
+Copyright (c) 2018, POA Networks, Ltd.
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
+
+
+==============================================================================
+MIT License (MIT)
+==============================================================================
 android_system_properties 0.1.5 — https://github.com/nical/android_system_properties
 
 The MIT License (MIT)
@@ -9640,6 +9676,7 @@ THE SOFTWARE.
 ==============================================================================
 MIT License (MIT)
 ==============================================================================
+aho-corasick 1.1.4 — https://github.com/BurntSushi/aho-corasick
 byteorder 1.5.0 — https://github.com/BurntSushi/byteorder
 memchr 2.8.3 — https://github.com/BurntSushi/memchr
 walkdir 2.5.0 — https://github.com/BurntSushi/walkdir
@@ -10399,6 +10436,7 @@ MIT License (MIT)
 ==============================================================================
 hashlink 0.10.0 — https://github.com/kyren/hashlink
 hashlink 0.11.1 — https://github.com/djc/hashlink
+hashlink 0.9.1 — https://github.com/kyren/hashlink
 
 This work is derived in part from the `linked-hash-map` crate, Copyright (c)
 2015 The Rust Project Developers

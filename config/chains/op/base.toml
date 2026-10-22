@@ -1,0 +1,30 @@
+# Base is not in the superchain registry; this follows the registry's
+# format with Base's own forks (Azul through Denim) from its client's mainnet
+# ChainConfig (base/base).
+name = "Base"
+public_rpc = "https://mainnet.base.org"
+chain_id = 8453
+block_time = 2
+
+[hardforks]
+  canyon_time = 1704992401
+  delta_time = 1708560000
+  ecotone_time = 1710374401
+  fjord_time = 1720627201
+  granite_time = 1726070401
+  holocene_time = 1736445601
+  isthmus_time = 1746806401
+  jovian_time = 1764691201
+  azul_time = 1779991200
+  beryl_time = 1782410400
+  cobalt_time = 1790791200
+  denim_time = 1793901600
+
+[genesis]
+  l2_time = 1686789347
+  [genesis.l2]
+    hash = "0xf712aa9241cc24369b143cf6dce85f0902a9731e70d66818a3a5845b296c73dd"
+    number = 0
+
+[addresses]
+  SystemConfigProxy = "0x73a79Fab69143498Ed3712e519A88a918e1f4072"

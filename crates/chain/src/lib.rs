@@ -9,8 +9,10 @@ use serde::{Deserialize, Serialize};
 use url::Url;
 
 mod beacon;
+mod op_stack;
 
 pub use beacon::{BeaconFork, BeaconNetwork, SLOTS_PER_EPOCH};
+pub use op_stack::OpStackNetwork;
 
 #[derive(Debug, thiserror::Error, Eq, PartialEq)]
 pub enum ChainError {
@@ -26,6 +28,7 @@ pub enum ChainError {
 #[serde(rename_all = "kebab-case")]
 pub enum Family {
     Ethereum,
+    OpStack,
 }
 
 impl Family {
@@ -33,7 +36,40 @@ impl Family {
     pub const fn name(self) -> &'static str {
         match self {
             Self::Ethereum => "ethereum",
+            Self::OpStack => "op-stack",
         }
+    }
+}
+
+/// When blocks are due: one per `seconds` from `genesis_time`. Beacon slots
+/// on Ethereum, L2 blocks on OP-stack chains.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Cadence {
+    pub genesis_time: u64,
+    pub seconds: u64,
+}
+
+impl Cadence {
+    #[must_use]
+    pub const fn slot_start(&self, slot: u64) -> u64 {
+        self.genesis_time
+            .saturating_add(slot.saturating_mul(self.seconds))
+    }
+
+    /// The slot that starts at `timestamp`, or `None` before genesis or off a
+    /// slot boundary.
+    #[must_use]
+    pub const fn slot_starting_at(&self, timestamp: u64) -> Option<u64> {
+        match timestamp.checked_sub(self.genesis_time) {
+            Some(since) if since % self.seconds == 0 => Some(since / self.seconds),
+            _ => None,
+        }
+    }
+
+    /// The slot in progress at `timestamp`.
+    #[must_use]
+    pub const fn slot_at(&self, timestamp: u64) -> u64 {
+        timestamp.saturating_sub(self.genesis_time) / self.seconds
     }
 }
 
@@ -47,6 +83,16 @@ pub struct ExecutionNetwork {
     /// `enode://` URLs. Empty means the execution chain spec's built-ins.
     #[serde(default)]
     pub bootnodes: Vec<String>,
+    #[serde(default = "enabled")]
+    pub discv4: bool,
+    /// A Discv5 packet protocol id other than `discv5`, which partitions
+    /// the chain's discovery network (Base uses `basev0`).
+    #[serde(default)]
+    pub discv5_protocol_id: Option<String>,
+}
+
+const fn enabled() -> bool {
+    true
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -74,20 +120,39 @@ pub struct Chain {
     pub merge_block: Option<u64>,
     pub execution: ExecutionNetwork,
     pub beacon: Option<BeaconNetwork>,
+    pub op_stack: Option<OpStackNetwork>,
     pub defaults: ChainDefaults,
 }
 
 impl Chain {
-    /// Parse an entry file. `beacon_config` is the network's upstream
-    /// consensus `config.yaml`, required when the entry has a `[beacon]`
-    /// section.
+    /// Parse an entry file. `upstream` is the chain's upstream config: the
+    /// consensus `config.yaml` for an entry with a `[beacon]` section, the
+    /// superchain-registry chain config for an op-stack entry.
     ///
     /// # Errors
     ///
-    /// Returns an error when the entry or its beacon config is malformed.
-    pub fn from_entry(entry: &str, beacon_config: Option<&str>) -> Result<Self, ChainError> {
+    /// Returns an error when the entry or its upstream config is malformed.
+    pub fn from_entry(entry: &str, upstream: Option<&str>) -> Result<Self, ChainError> {
         let entry: EntryFile =
             toml::from_str(entry).map_err(|error| ChainError::InvalidEntry(error.to_string()))?;
+        let (beacon_config, registry) = match entry.family {
+            Family::Ethereum => (upstream, None),
+            Family::OpStack => (None, upstream),
+        };
+        let op_stack = match (entry.op_stack, registry) {
+            (Some(op_stack), Some(registry)) => Some(OpStackNetwork::from_registry(
+                entry.chain_id,
+                op_stack,
+                registry,
+            )?),
+            (None, None) if entry.family != Family::OpStack => None,
+            _ => {
+                return Err(ChainError::InvalidEntry(format!(
+                    "{} needs an [op_stack] section and its registry config",
+                    entry.name
+                )));
+            }
+        };
         let beacon = match (entry.beacon, beacon_config) {
             (Some(beacon), Some(yaml)) => Some(BeaconNetwork::from_config_yaml(
                 beacon.genesis_time,
@@ -117,8 +182,23 @@ impl Chain {
             merge_block: entry.merge_block,
             execution: entry.execution,
             beacon,
+            op_stack,
             defaults: entry.defaults,
         })
+    }
+
+    /// The chain's block cadence.
+    ///
+    /// # Panics
+    ///
+    /// Never: entries of both families carry their cadence.
+    #[must_use]
+    pub fn cadence(&self) -> Cadence {
+        match (&self.beacon, &self.op_stack) {
+            (Some(beacon), _) => beacon.cadence(),
+            (None, Some(op_stack)) => op_stack.cadence(),
+            (None, None) => unreachable!("an entry has a beacon chain or an op-stack schedule"),
+        }
     }
 
     fn answers_to(&self, name: &str) -> bool {
@@ -157,6 +237,8 @@ struct EntryFile {
     #[serde(default)]
     beacon: Option<BeaconEntry>,
     #[serde(default)]
+    op_stack: Option<op_stack::OpStackEntry>,
+    #[serde(default)]
     defaults: ChainDefaults,
 }
 
@@ -180,6 +262,38 @@ const BUILT_IN: &[(&str, Option<&str>)] = &[
     (
         include_str!("../../../config/chains/ethereum-hoodi.toml"),
         Some(include_str!("../../../config/chains/beacon/hoodi.yaml")),
+    ),
+    (
+        include_str!("../../../config/chains/op-mainnet.toml"),
+        Some(include_str!("../../../config/chains/op/op.toml")),
+    ),
+    (
+        include_str!("../../../config/chains/base-mainnet.toml"),
+        Some(include_str!("../../../config/chains/op/base.toml")),
+    ),
+    (
+        include_str!("../../../config/chains/unichain-mainnet.toml"),
+        Some(include_str!("../../../config/chains/op/unichain.toml")),
+    ),
+    (
+        include_str!("../../../config/chains/worldchain-mainnet.toml"),
+        Some(include_str!("../../../config/chains/op/worldchain.toml")),
+    ),
+    (
+        include_str!("../../../config/chains/ink-mainnet.toml"),
+        Some(include_str!("../../../config/chains/op/ink.toml")),
+    ),
+    (
+        include_str!("../../../config/chains/soneium-mainnet.toml"),
+        Some(include_str!("../../../config/chains/op/soneium.toml")),
+    ),
+    (
+        include_str!("../../../config/chains/zora-mainnet.toml"),
+        Some(include_str!("../../../config/chains/op/zora.toml")),
+    ),
+    (
+        include_str!("../../../config/chains/mode-mainnet.toml"),
+        Some(include_str!("../../../config/chains/op/mode.toml")),
     ),
 ];
 
@@ -270,6 +384,60 @@ pub fn ethereum_chain_spec(chain: &Chain) -> Result<Arc<reth_chainspec::ChainSpe
         )));
     }
     Ok(spec)
+}
+
+/// The execution chain spec a chain's peers handshake with: genesis, fork
+/// id, and (on Ethereum) the header rules.
+///
+/// # Errors
+///
+/// Returns an error for an Ethereum-family chain without a built-in spec.
+pub fn execution_chain_spec(chain: &Chain) -> Result<Arc<reth_chainspec::ChainSpec>, ChainError> {
+    match (chain.family, &chain.op_stack) {
+        (Family::Ethereum, _) => ethereum_chain_spec(chain),
+        (Family::OpStack, Some(op_stack)) => Ok(Arc::new(op_stack_chain_spec(chain, op_stack))),
+        (Family::OpStack, None) => Err(ChainError::Unsupported(format!(
+            "{} has no op-stack schedule",
+            chain.name
+        ))),
+    }
+}
+
+/// A spec that only carries what the handshake needs: the genesis hash and
+/// every fork in activation order, which is all EIP-2124 hashes.
+fn op_stack_chain_spec(chain: &Chain, op_stack: &OpStackNetwork) -> reth_chainspec::ChainSpec {
+    use reth_chainspec::{ChainHardforks, ForkCondition, Hardfork};
+
+    #[derive(Clone, Copy, Debug)]
+    struct OpFork(&'static str);
+    impl Hardfork for OpFork {
+        fn name(&self) -> &'static str {
+            self.0
+        }
+    }
+
+    let mut forks: Vec<(Box<dyn Hardfork>, ForkCondition)> = Vec::new();
+    let mut blocks = op_stack.block_forks.clone();
+    blocks.sort_by_key(|(_, block)| *block);
+    for (name, block) in blocks {
+        forks.push((Box::new(OpFork(name)), ForkCondition::Block(block)));
+    }
+    for (name, timestamp) in &op_stack.forks {
+        forks.push((Box::new(OpFork(name)), ForkCondition::Timestamp(*timestamp)));
+    }
+    let genesis_header = alloy_consensus::Header {
+        timestamp: op_stack.first_block_time,
+        ..alloy_consensus::Header::default()
+    };
+    reth_chainspec::ChainSpec {
+        chain: reth_chainspec::Chain::from_id(chain.chain_id),
+        genesis_header: reth_primitives_traits::SealedHeader::new(
+            genesis_header,
+            chain.genesis_hash,
+        ),
+        hardforks: ChainHardforks::new(forks),
+        ..reth_chainspec::ChainSpec::default()
+    }
 }
 
 #[cfg(test)]

@@ -102,7 +102,7 @@ fn testnet_schedules_match_their_beacon_apis() {
 #[test]
 fn execution_specs_match_entry_genesis() {
     for chain in ChainRegistry::standard().iter() {
-        let spec = ethereum_chain_spec(chain).unwrap();
+        let spec = execution_chain_spec(chain).unwrap();
         assert_eq!(
             reth_chainspec::EthChainSpec::chain_id(spec.as_ref()),
             chain.chain_id,
@@ -119,4 +119,75 @@ fn entry_with_beacon_section_needs_its_config() {
         Chain::from_entry(entry, None),
         Err(ChainError::InvalidEntry(_))
     ));
+}
+
+#[test]
+fn op_stack_fork_ids_match_live_peers() {
+    // Fork ids once every scheduled fork is active (EIP-2124); OP Mainnet
+    // and Unichain were verified live against their peers.
+    for (name, hash) in [
+        ("op-mainnet", [0xc2, 0x92, 0x39, 0xaf]),
+        ("base", [0x16, 0x9d, 0x85, 0xa3]),
+        ("unichain", [0x1f, 0xaa, 0x45, 0x6e]),
+        ("worldchain", [0xf1, 0x13, 0x24, 0x8b]),
+    ] {
+        let chain = ChainRegistry::standard().get(name).unwrap();
+        let spec = execution_chain_spec(&chain).unwrap();
+        let fork_id = spec.latest_fork_id();
+        assert_eq!((fork_id.hash.0, fork_id.next), (hash, 0), "{name}");
+        assert_eq!(
+            reth_chainspec::EthChainSpec::genesis_hash(spec.as_ref()),
+            chain.genesis_hash
+        );
+    }
+}
+
+#[test]
+fn base_announces_cobalt_until_denim() {
+    // Synced Base nodes serve a node announcing this id; the schedule
+    // without Cobalt (`ea0159eb`) reads as stale software to them.
+    let base = ChainRegistry::standard().get("base").unwrap();
+    let spec = execution_chain_spec(&base).unwrap();
+    let head = reth_chainspec::Head {
+        timestamp: 1_792_962_127,
+        ..Default::default()
+    };
+    let fork_id = spec.fork_id(&head);
+    assert_eq!(
+        (fork_id.hash.0, fork_id.next),
+        ([0x68, 0x64, 0x7e, 0x86], 1_793_901_600)
+    );
+}
+
+#[test]
+fn op_stack_entries_carry_their_schedule() {
+    let op = ChainRegistry::standard().get("optimism").unwrap();
+    let schedule = op.op_stack.as_ref().unwrap();
+    assert_eq!(schedule.first_block, 105_235_063);
+    assert_eq!(schedule.block_time, 2);
+    assert_eq!(schedule.activation("isthmus"), Some(1_746_806_401));
+    assert_eq!(
+        schedule.activation("delta"),
+        None,
+        "consensus-only forks are skipped"
+    );
+    // Block n of the rollup is due at its slot of the cadence.
+    let cadence = op.cadence();
+    assert_eq!(cadence.slot_start(10), 1_686_068_903 + 20);
+    let base = ChainRegistry::standard().get("base").unwrap();
+    assert!(!base.execution.discv4);
+    assert_eq!(base.execution.discv5_protocol_id.as_deref(), Some("basev0"));
+    assert_eq!(base.cadence().slot_at(1_686_789_347 + 7), 3);
+}
+
+#[test]
+fn an_unknown_op_stack_fork_needs_a_release() {
+    let entry = include_str!("../../../config/chains/unichain-mainnet.toml");
+    let registry = include_str!("../../../config/chains/op/unichain.toml")
+        .replace("karst_time", "lagoon_time");
+    let error = Chain::from_entry(entry, Some(&registry)).unwrap_err();
+    assert!(
+        error.to_string().contains("unknown op-stack fork lagoon"),
+        "{error}"
+    );
 }
