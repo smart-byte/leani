@@ -39,6 +39,17 @@ record, and documented RPC contracts.
   or from JSON for any processor with `--requirements`. Every setting is
   written out, each derived one commented with its reason, and `--json`
   reports them for agents (`leani guide config`).
+- Generated Wasm processors: `leani processor create` writes a Rust crate or,
+  with `--language typescript`, a TypeScript package from a spec of the
+  onchain data to keep (events, transactions, or blocks, their filters and
+  fields, kept as rows or running totals), from a bundled template's source,
+  or a starter, carrying the binary's own guest SDK and a lockfile. A running
+  node generates the source at `POST /v1/wasm/compose` and builds it at
+  `POST /admin/v1/wasm/build`, a development feature, off unless
+  `api.allow_wasm_builds = true`, which logs a warning at startup and in
+  `leani doctor`. It refuses Rust that would read files or the environment
+  while it compiles, and builds Rust only for requests from the node's own
+  machine, TypeScript for any client the API admits.
 
 ### Changed
 

@@ -19,9 +19,9 @@ use std::{
 };
 
 use axum::{
-    Json,
-    extract::{Path, State},
-    http::StatusCode,
+    Extension, Json,
+    extract::{ConnectInfo, Path, State},
+    http::{HeaderMap, StatusCode},
     response::{
         IntoResponse, Response,
         sse::{Event, KeepAlive, Sse},
@@ -167,6 +167,63 @@ pub(crate) async fn templates() -> Result<Json<Value>, ApiError> {
 
 fn example_params(template: &leani_processor_wasm::Template) -> Result<Value, ApiError> {
     serde_json::from_str(template.params).map_err(|error| ApiError::internal(&error.to_string()))
+}
+
+pub(crate) async fn compose(
+    Json(spec): Json<leani_processor_wasm::scaffold::Spec>,
+) -> Result<Json<Value>, ApiError> {
+    let generated = leani_processor_wasm::scaffold::generate(&spec)
+        .map_err(|message| ApiError::invalid(&message))?;
+    Ok(Json(json!({
+        "name": generated.name,
+        "language": generated.language,
+        "path": generated.language.source_path(),
+        "source": generated.source(),
+        "files": generated.files.iter().map(|(path, _)| path).collect::<Vec<_>>(),
+        "fields": generated.available,
+    })))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct BuildRequest {
+    source: String,
+    #[serde(default)]
+    language: leani_processor_wasm::scaffold::Language,
+}
+
+/// A source that does not compile is a result, with its diagnostics, not an
+/// error.
+///
+/// Rust builds only for requests from the node's own machine: rustc reads the
+/// host's files when the source asks it to, and the source guard is a
+/// denylist, not an isolation boundary. TypeScript, whose compiler is served
+/// nothing but the processor and the SDK, builds for any client the API
+/// admits.
+pub(crate) async fn build_module(
+    State(state): State<ApiState>,
+    peer: Option<Extension<ConnectInfo<std::net::SocketAddr>>>,
+    headers: HeaderMap,
+    Json(request): Json<BuildRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let build = state.config.wasm_build.clone().ok_or_else(|| {
+        ApiError::conflict(
+            "wasm_builds_disabled",
+            "this node does not build modules: build the processor where you write it (`leani processor create`) and load its .wasm, or, for development, set `api.allow_wasm_builds = true` in the node's configuration",
+        )
+    })?;
+    let peer = peer.map(|Extension(ConnectInfo(address))| address.ip());
+    if request.language == leani_processor_wasm::scaffold::Language::Rust
+        && !crate::browser_guard::from_this_machine(peer, &headers)
+    {
+        return Err(ApiError::forbidden(
+            "this node builds Rust only for requests from its own machine, as rustc can read the host's files while it compiles: build TypeScript here, reach the node through an SSH tunnel, or build the crate where you are (`leani processor create`) and run its module",
+        ));
+    }
+    build(request.source, request.language)
+        .await
+        .map(Json)
+        .map_err(|message| ApiError::invalid(&message))
 }
 
 pub(crate) async fn start_run(

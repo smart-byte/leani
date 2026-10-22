@@ -52,7 +52,7 @@ mod tests {
             "front matter left in: {overview:.80}"
         );
         assert!(overview.contains("`leani guide processors`"));
-        assert!(text(Some(GuideTopic::Processors)).contains("## 4. Write a custom Rust processor"));
+        assert!(text(Some(GuideTopic::Processors)).contains("## 4. Write your own processor"));
         assert!(text(Some(GuideTopic::Config)).contains("leani init --requirements -"));
     }
 }

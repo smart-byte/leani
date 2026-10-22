@@ -811,6 +811,22 @@ select the intended store. When both locations hold state, it uses the one
 beside the configuration and warns, naming both. Equivalent paths and
 symlink aliases of the same directory count as one.
 
+### Node-side Wasm builds
+
+`api.allow_wasm_builds = true` lets the node compile processor source sent to
+`POST /admin/v1/wasm/build`, which the playground's editor uses; the compact
+profile takes it under `[api]` too. It is off by default and a development
+feature, not for production: rustc can read the host's files while it
+compiles, and only a denylist of source constructs guards it. With it on,
+the node builds Rust only for requests from its own machine, an SSH tunnel
+included, and TypeScript for any client the API admits; it logs a warning
+when it starts, and `leani doctor` reports one. A request relayed with a
+`Forwarded`, `X-Forwarded-For`, `X-Forwarded-Host`, or `X-Real-IP` header, or
+addressed to another host name, is not the node's own, but behind a reverse
+proxy on the same machine that sets none of them, a remote client's request
+looks local. In production, build modules where you write them, or in CI, and
+configure the module file with its `blake3` hash.
+
 ### Historical CLI and node backfill
 
 `leani backfill --processor INSTANCE --from-block N --to-block M` uses the

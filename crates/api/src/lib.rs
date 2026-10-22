@@ -284,11 +284,27 @@ pub struct ApiConfig {
     /// The live lane's committed blocks, which ad-hoc Wasm runs follow; without
     /// them, runs that ask to follow are refused.
     pub live_events: Option<tokio::sync::broadcast::Sender<leani_source_api::ChainEvent>>,
+    /// Builds a processor's Rust or TypeScript source into a Wasm module on
+    /// the node's host; the node binary supplies it when `api.allow_wasm_builds`
+    /// is set. Without it, the build endpoint answers 409.
+    pub wasm_build: Option<WasmBuild>,
     /// Opens a feed of the material one processor needs from the node's live
     /// source, for ad-hoc Wasm runs whose material the live lane lacks; the
     /// node binary supplies it.
     pub live_feed: Option<LiveFeed>,
 }
+
+/// A source that does not compile is `Ok`, with its diagnostics; `Err` says
+/// why the source is refused.
+pub type WasmBuild = Arc<
+    dyn Fn(
+            String,
+            leani_processor_wasm::scaffold::Language,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send>,
+        > + Send
+        + Sync,
+>;
 
 /// The feed ends when its token is cancelled.
 pub type LiveFeed = Arc<
@@ -330,6 +346,7 @@ impl Default for ApiConfig {
             raw_history_control: None,
             shutdown: CancellationToken::new(),
             live_events: None,
+            wasm_build: None,
             live_feed: None,
         }
     }
@@ -383,6 +400,10 @@ impl std::fmt::Debug for ApiConfig {
             .field(
                 "live_events",
                 &self.live_events.as_ref().map(|_| "[AVAILABLE]"),
+            )
+            .field(
+                "wasm_build",
+                &self.wasm_build.as_ref().map(|_| "[AVAILABLE]"),
             )
             .field("live_feed", &self.live_feed.as_ref().map(|_| "[AVAILABLE]"))
             .finish()
@@ -1198,6 +1219,11 @@ pub fn router_with_processors(
         .route("/v1/capabilities", get(capabilities))
         .route("/v1/processors", get(list_processors))
         .route("/v1/wasm/templates", get(wasm_runs::templates))
+        .route("/v1/wasm/compose", axum::routing::post(wasm_runs::compose))
+        .route(
+            "/admin/v1/wasm/build",
+            axum::routing::post(wasm_runs::build_module),
+        )
         .route(
             "/admin/v1/wasm/runs",
             axum::routing::post(wasm_runs::start_run).layer(axum::extract::DefaultBodyLimit::max(

@@ -1232,7 +1232,7 @@
       },
       {
         "name": "processor",
-        "about": "Run Wasm processors over finalized history",
+        "about": "Create Wasm processors and run them over finalized history",
         "usage": "Usage: leani processor [OPTIONS] <COMMAND>",
         "arguments": [
           {
@@ -1292,6 +1292,127 @@
           }
         ],
         "subcommands": [
+          {
+            "name": "create",
+            "about": "Create a Wasm processor as a Rust crate or a TypeScript package",
+            "usage": "Usage: leani processor create [OPTIONS] <DIRECTORY>",
+            "arguments": [
+              {
+                "id": "directory",
+                "long": null,
+                "short": null,
+                "help": "Directory to create; its last component names the project",
+                "required": true,
+                "action": "Set",
+                "defaultValues": [],
+                "possibleValues": []
+              },
+              {
+                "id": "spec",
+                "long": "spec",
+                "short": null,
+                "help": "The spec as JSON, or `-` for standard input",
+                "required": false,
+                "action": "Set",
+                "defaultValues": [],
+                "possibleValues": []
+              },
+              {
+                "id": "template",
+                "long": "template",
+                "short": null,
+                "help": "Start from a bundled template's source instead",
+                "required": false,
+                "action": "Set",
+                "defaultValues": [],
+                "possibleValues": []
+              },
+              {
+                "id": "language",
+                "long": "language",
+                "short": null,
+                "help": "The language to write it in; a spec may name one",
+                "required": false,
+                "action": "Set",
+                "defaultValues": [],
+                "possibleValues": [
+                  "rust",
+                  "typescript"
+                ]
+              },
+              {
+                "id": "json",
+                "long": "json",
+                "short": null,
+                "help": "Print the result as JSON",
+                "required": false,
+                "action": "SetTrue",
+                "defaultValues": [
+                  "false"
+                ],
+                "possibleValues": [
+                  "true",
+                  "false"
+                ]
+              },
+              {
+                "id": "config",
+                "long": "config",
+                "short": null,
+                "help": "Path to the versioned TOML configuration",
+                "required": false,
+                "action": "Set",
+                "defaultValues": [],
+                "possibleValues": []
+              },
+              {
+                "id": "log_format",
+                "long": "log-format",
+                "short": null,
+                "help": "Log rendering format",
+                "required": false,
+                "action": "Set",
+                "defaultValues": [
+                  "pretty"
+                ],
+                "possibleValues": [
+                  "pretty",
+                  "json"
+                ]
+              },
+              {
+                "id": "log_filter",
+                "long": "log-filter",
+                "short": null,
+                "help": "Tracing filter, e.g. `info,leani=debug`",
+                "required": false,
+                "action": "Set",
+                "defaultValues": [],
+                "possibleValues": []
+              },
+              {
+                "id": "help",
+                "long": "help",
+                "short": "h",
+                "help": "Print help (see more with '--help')",
+                "required": false,
+                "action": "Help",
+                "defaultValues": [],
+                "possibleValues": []
+              },
+              {
+                "id": "version",
+                "long": "version",
+                "short": "V",
+                "help": "Print version",
+                "required": false,
+                "action": "Version",
+                "defaultValues": [],
+                "possibleValues": []
+              }
+            ],
+            "subcommands": []
+          },
           {
             "name": "run",
             "about": "Run a Wasm processor over finalized history and print its changes",
@@ -1431,6 +1552,13 @@
             "usage": "Usage: leani processor help [COMMAND]",
             "arguments": [],
             "subcommands": [
+              {
+                "name": "create",
+                "about": "Create a Wasm processor as a Rust crate or a TypeScript package",
+                "usage": "Usage: leani processor help create",
+                "arguments": [],
+                "subcommands": []
+              },
               {
                 "name": "run",
                 "about": "Run a Wasm processor over finalized history and print its changes",
@@ -4528,10 +4656,17 @@
           },
           {
             "name": "processor",
-            "about": "Run Wasm processors over finalized history",
+            "about": "Create Wasm processors and run them over finalized history",
             "usage": "Usage: leani help processor [COMMAND]",
             "arguments": [],
             "subcommands": [
+              {
+                "name": "create",
+                "about": "Create a Wasm processor as a Rust crate or a TypeScript package",
+                "usage": "Usage: leani help processor create",
+                "arguments": [],
+                "subcommands": []
+              },
               {
                 "name": "run",
                 "about": "Run a Wasm processor over finalized history and print its changes",

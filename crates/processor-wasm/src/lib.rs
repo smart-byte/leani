@@ -17,6 +17,7 @@
 
 mod frame;
 mod host;
+pub mod scaffold;
 
 use std::{fmt, sync::Arc};
 

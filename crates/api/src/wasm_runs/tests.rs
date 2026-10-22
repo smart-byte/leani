@@ -745,6 +745,216 @@ async fn runs_past_the_node_limit_are_refused_until_one_ends() {
     assert_eq!(start(&app, &following).await.status(), StatusCode::OK);
 }
 
+async fn post(app: Router, uri: &str, body: Value) -> (StatusCode, Value) {
+    post_from(app, uri, body, None, &[]).await
+}
+
+/// `post` from a peer, as a server with connect info sees it, with headers.
+async fn post_from(
+    app: Router,
+    uri: &str,
+    body: Value,
+    peer: Option<&str>,
+    headers: &[(&str, &str)],
+) -> (StatusCode, Value) {
+    let mut request = Request::builder()
+        .method(Method::POST)
+        .uri(uri)
+        .header("content-type", "application/json");
+    for (name, value) in headers {
+        request = request.header(*name, *value);
+    }
+    let mut request = request.body(Body::from(body.to_string())).expect("request");
+    if let Some(peer) = peer {
+        request
+            .extensions_mut()
+            .insert(axum::extract::ConnectInfo::<std::net::SocketAddr>(
+                peer.parse().expect("peer"),
+            ));
+    }
+    let response = app.oneshot(request).await.expect("response");
+    let status = response.status();
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body");
+    (status, serde_json::from_slice(&body).expect("JSON"))
+}
+
+#[tokio::test]
+async fn specs_compose_to_source_and_builds_use_the_node_hook() {
+    let (_directory, app) = node(&[], ApiConfig::default()).await;
+    let (status, composed) = post(
+        app.clone(),
+        "/v1/wasm/compose",
+        json!({ "name": "gas", "data": { "kind": "blocks", "fields": ["gasUsed"] } }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{composed}");
+    assert!(
+        composed["source"]
+            .as_str()
+            .is_some_and(|source| source.contains("export_processor!(GasProcessor);"))
+    );
+    assert_eq!(
+        composed["fields"][0],
+        json!({ "name": "gasUsed", "unsigned": true })
+    );
+    assert_eq!(
+        (&composed["language"], &composed["path"]),
+        (&json!("rust"), &json!("src/lib.rs"))
+    );
+    let (status, typescript) = post(
+        app.clone(),
+        "/v1/wasm/compose",
+        json!({ "name": "gas", "language": "typescript", "data": { "kind": "blocks", "fields": ["gasUsed"] } }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{typescript}");
+    assert_eq!(typescript["path"], "assembly/index.ts");
+    assert!(
+        typescript["source"]
+            .as_str()
+            .is_some_and(|source| source.contains("register(new GasProcessor());"))
+    );
+    let (status, refused) = post(
+        app.clone(),
+        "/v1/wasm/compose",
+        json!({ "data": { "kind": "blocks", "fields": ["difficulty"] } }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        refused["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("`difficulty`"))
+    );
+    let (status, off) = post(app, "/admin/v1/wasm/build", json!({ "source": "" })).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(off["error"]["code"], "wasm_builds_disabled");
+    assert!(
+        off["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("api.allow_wasm_builds")
+                && message.contains("leani processor create")),
+        "{off}"
+    );
+
+    let (_directory, with) = node(
+        &[],
+        ApiConfig {
+            wasm_build: Some(Arc::new(|source: String, language| {
+                Box::pin(async move {
+                    if source.contains("refuse") {
+                        Err("not allowed".to_owned())
+                    } else {
+                        Ok(json!({ "built": true, "bytes": source.len(), "language": language }))
+                    }
+                })
+            })),
+            ..ApiConfig::default()
+        },
+    )
+    .await;
+    let local = Some("127.0.0.1:52000");
+    assert_eq!(
+        post_from(
+            with.clone(),
+            "/admin/v1/wasm/build",
+            json!({ "source": "abc" }),
+            local,
+            &[]
+        )
+        .await,
+        (
+            StatusCode::OK,
+            json!({ "built": true, "bytes": 3, "language": "rust" })
+        )
+    );
+    assert_eq!(
+        post_from(
+            with.clone(),
+            "/admin/v1/wasm/build",
+            json!({ "source": "refuse" }),
+            local,
+            &[]
+        )
+        .await
+        .0,
+        StatusCode::BAD_REQUEST
+    );
+}
+
+#[tokio::test]
+async fn rust_builds_only_for_this_machine_and_typescript_for_any_client() {
+    let (_directory, with) = node(
+        &[],
+        ApiConfig {
+            wasm_build: Some(Arc::new(|source: String, language| {
+                Box::pin(async move {
+                    Ok(json!({ "built": true, "bytes": source.len(), "language": language }))
+                })
+            })),
+            ..ApiConfig::default()
+        },
+    )
+    .await;
+    for (peer, headers) in [
+        (None, vec![]),
+        (Some("203.0.113.7:4000"), vec![]),
+        (
+            Some("127.0.0.1:52000"),
+            vec![("x-forwarded-for", "203.0.113.7")],
+        ),
+        (
+            Some("127.0.0.1:52000"),
+            vec![("forwarded", "for=203.0.113.7")],
+        ),
+        // Addressed to another name: a proxy passing on the client's host.
+        (Some("[::1]:52000"), vec![("host", "10.0.0.5:8080")]),
+    ] {
+        let (status, refused) = post_from(
+            with.clone(),
+            "/admin/v1/wasm/build",
+            json!({ "source": "abc" }),
+            peer,
+            &headers,
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{peer:?} {headers:?}");
+        assert!(
+            refused["error"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("its own machine")),
+            "{refused}"
+        );
+        assert_eq!(
+            post_from(
+                with.clone(),
+                "/admin/v1/wasm/build",
+                json!({ "source": "abc", "language": "typescript" }),
+                peer,
+                &headers,
+            )
+            .await
+            .1["language"],
+            "typescript"
+        );
+    }
+    assert_eq!(
+        post_from(
+            with,
+            "/admin/v1/wasm/build",
+            json!({ "source": "abc" }),
+            Some("[::1]:52000"),
+            &[("host", "localhost:8080")],
+        )
+        .await
+        .0,
+        StatusCode::OK,
+        "an SSH tunnel arrives from loopback, addressed to localhost"
+    );
+}
+
 #[tokio::test]
 async fn templates_carry_their_rust_and_typescript_source() {
     let (_directory, app) = node(&[], ApiConfig::default()).await;
