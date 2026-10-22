@@ -129,6 +129,25 @@ class Preparation(unittest.TestCase):
                 self.assertIn("must be newer", result.stderr)
                 self.assertEqual(self.run_git("diff", "--name-only"), "")
 
+    def test_keeps_workspace_roots_and_crates_with_their_own_version(self):
+        files = {
+            "examples/wasm-processors/Cargo.toml": '[workspace]\nmembers = ["block-gas"]\n[workspace.package]\nversion = "0.1.0"\n',
+            "examples/wasm-processors/block-gas/Cargo.toml": '[package]\nname = "block-gas"\nversion.workspace = true\n',
+            "crates/wasm-guest/Cargo.toml": '[package]\nname = "leani-wasm-guest"\nversion = "0.1.0"\n',
+        }
+        for name, contents in files.items():
+            (self.root / name).parent.mkdir(parents=True, exist_ok=True)
+            (self.root / name).write_text(contents)
+        with (self.root / "Cargo.lock").open("a") as stream:
+            stream.write('\n[[package]]\nname = "leani-wasm-guest"\nversion = "0.1.0"\n')
+        self.run_git("add", ".")
+        self.run_git("-c", "user.name=Release fixture", "-c", "user.email=fixture@example.invalid", "commit", "-qm", "own versions")
+        result = self.prepare("0.1.0-rc.2")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        packages = tomllib.loads((self.root / "Cargo.lock").read_text())["package"]
+        self.assertEqual(next(item["version"] for item in packages if item["name"] == "leani-wasm-guest"), "0.1.0")
+        self.assertEqual(self.run_git("diff", "--name-only", "--", "examples/wasm-processors", "crates/wasm-guest"), "")
+
 
 class Publication(unittest.TestCase):
     def setUp(self):
