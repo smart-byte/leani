@@ -31,8 +31,12 @@ are loaded. Statically linked native processors are fully trusted code: they
 run in the node process with its CPU, memory, filesystem, and network
 privileges. Their descriptors constrain data selection and retention but are
 not a sandbox or a security boundary. Only build processor crates from
-reviewed source; deploy untrusted extension logic only after a sandboxed
-runtime exists.
+reviewed source. Wasm processors are the boundary for logic the operator does
+not fully trust: a module runs in a sandboxed interpreter, without access to
+the node's memory, files, network, clock, or randomness, and reaches the node
+only through the `leani` host ABI. Within its limits it can still spend CPU,
+memory, and storage, publish wrong output under its own instance, and stall
+that instance's lane by failing.
 
 ## Controls
 
@@ -116,6 +120,12 @@ runtime exists.
 - no CORS layer; administrative routes share the native API listener and its
   bearer authentication, so binding it beyond localhost exposes those routes
   as well;
+- Wasm processors: the node refuses any import outside the `leani` ABI, runs
+  every call in a fresh wasmi instance metered by fuel, and bounds its memory,
+  table, values, changes, and host calls; an optional `blake3` pin refuses
+  other module bytes. Ad-hoc runs at `/admin/v1/wasm/runs` take modules of at
+  most 4 MiB with a quarter of the default fuel, two at a time, and reduce into
+  a throwaway store;
 - non-root, read-only container profile with all capabilities dropped;
 - fail-closed unsupported RPC responses instead of synthesized partial state.
 
