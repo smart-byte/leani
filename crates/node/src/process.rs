@@ -4956,6 +4956,11 @@ async fn probe_source(source: ProbeSource, config_path: &Path) -> Result<Exit> {
             )
             .await
         }
+        ProbeSource::Rpc {
+            from_block,
+            to_block,
+            endpoint,
+        } => probe_rpc(config_path, from_block, to_block, endpoint).await,
         ProbeSource::OpGossip { seconds, output } => {
             probe_op_gossip(config_path, seconds, output.as_deref()).await
         }
@@ -5162,6 +5167,58 @@ fn p2p_probe_config(
         poll_interval: Duration::from_secs(2),
         max_reorg_depth: 64,
         network_telemetry: leani_source_api::NetworkTelemetry::default(),
+    })
+}
+
+async fn probe_rpc(
+    config_path: &Path,
+    from_block: Option<u64>,
+    to_block: Option<u64>,
+    endpoint: Option<url::Url>,
+) -> Result<Exit> {
+    let config = Config::load(config_path)
+        .with_context(|| format!("load configuration {}", config_path.display()))?;
+    let chain = config.chain_entry()?;
+    let endpoint = endpoint
+        .or_else(|| chain.defaults.rpc_endpoints.first().cloned())
+        .with_context(|| format!("{} names no JSON-RPC endpoint; pass --endpoint", chain.name))?;
+    let client = leani_source_rpc::RpcClient::new(endpoint)?;
+    let to_block = match to_block {
+        Some(block) => block,
+        None => client.head().await?.saturating_sub(10),
+    };
+    let from_block = from_block.unwrap_or_else(|| to_block.saturating_sub(31));
+    if from_block > to_block || to_block - from_block >= 1_000 {
+        bail!("probe at most 1000 blocks, from-block first");
+    }
+    let (mut verified, mut failed) = (0_u64, 0_u64);
+    for number in from_block..=to_block {
+        let (block, receipts) = client.block(number).await?;
+        let check = leani_source_rpc::check_block(&block, &receipts)?;
+        if check.verified() {
+            verified += 1;
+        } else {
+            failed += 1;
+        }
+        println!(
+            "{}",
+            serde_json::json!({
+                "number": check.number,
+                "hash": check.hash,
+                "header": format!("{:?}", check.header),
+                "transactionsRoot": format!("{:?}", check.transactions_root),
+                "receiptsRoot": format!("{:?}", check.receipts_root),
+            })
+        );
+    }
+    eprintln!(
+        "{}",
+        serde_json::json!({"chain": chain.name, "verified": verified, "notVerified": failed})
+    );
+    Ok(if failed == 0 {
+        Exit::Success
+    } else {
+        Exit::Failure
     })
 }
 

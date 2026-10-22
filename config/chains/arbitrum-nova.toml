@@ -1,0 +1,10 @@
+name = "arbitrum-nova"
+aliases = ["nova"]
+family = "arbitrum"
+chain_id = 42170
+genesis_hash = "0x2ad24e03026118f9b3a48626f0636e38c93660e90a6812e853a99aa8c5371561"
+
+# Nitro chains run no public execution P2P: blocks come from JSON-RPC and
+# are checked against their own header, transactions, and receipts roots.
+[defaults]
+rpc_endpoints = ["https://nova.arbitrum.io/rpc"]

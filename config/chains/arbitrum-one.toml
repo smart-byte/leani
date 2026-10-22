@@ -1,0 +1,10 @@
+name = "arbitrum-one"
+aliases = ["arbitrum", "arb1"]
+family = "arbitrum"
+chain_id = 42161
+genesis_hash = "0x7ee576b35482195fc49205cec9af72ce14f003b9ae69f6ba0faef4514be8b442"
+
+# Nitro chains run no public execution P2P: blocks come from JSON-RPC and
+# are checked against their own header, transactions, and receipts roots.
+[defaults]
+rpc_endpoints = ["https://arb1.arbitrum.io/rpc"]

@@ -8,6 +8,10 @@ record, and documented RPC contracts.
 
 ### Added
 
+- Arbitrum One, Arbitrum Nova, and Robinhood Chain entries. Nitro chains run
+  no public execution P2P, so `leani source probe rpc` fetches their blocks
+  over JSON-RPC and checks each header hash, transactions root, and receipts
+  root locally, Arbitrum's internal and deposit transactions included.
 - OP-stack chain entries: OP Mainnet, Base, Unichain, World Chain, Ink,
   Soneium, Zora, and Mode, with schedules from the superchain registry (Base
   from its own client's config). The execution P2P source handshakes with

@@ -177,7 +177,7 @@ mod tests {
     use super::*;
 
     fn mainnet_beacon() -> Cadence {
-        leani_chain::ethereum_mainnet().cadence()
+        leani_chain::ethereum_mainnet().cadence().unwrap()
     }
 
     /// A post-Osaka mainnet slot (2026-05-28), so every scheduled blob
