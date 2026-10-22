@@ -20,6 +20,7 @@ async-trait.workspace = true
 futures.workspace = true
 hex.workspace = true
 hickory-resolver.workspace = true
+leani-chain = { path = "../chain" }
 leani-primitives = { path = "../primitives" }
 leani-source-api = { path = "../source-api" }
 postcard.workspace = true

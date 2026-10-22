@@ -3594,6 +3594,7 @@ jobserver 0.1.35 — https://github.com/rust-lang/jobserver-rs
 js-sys 0.3.103 — https://github.com/wasm-bindgen/wasm-bindgen/tree/master/crates/js-sys
 openssl-probe 0.2.1 — https://github.com/rustls/openssl-probe
 pkg-config 0.3.33 — https://github.com/rust-lang/pkg-config-rs
+socket2 0.5.10 — https://github.com/rust-lang/socket2
 socket2 0.6.5 — https://github.com/rust-lang/socket2
 wasm-bindgen-futures 0.4.76 — https://github.com/wasm-bindgen/wasm-bindgen/tree/master/crates/futures
 wasm-bindgen-macro-support 0.2.126 — https://github.com/wasm-bindgen/wasm-bindgen/tree/master/crates/macro-support
@@ -8834,6 +8835,7 @@ reth-trie-common 2.5.2 — https://github.com/paradigmxyz/reth
 reth-trie-sparse 2.5.2 — https://github.com/paradigmxyz/reth
 reth-trie 2.5.2 — https://github.com/paradigmxyz/reth
 leani-api 0.1.1 — https://github.com/smart-byte/leani
+leani-chain 0.1.1 — https://github.com/smart-byte/leani
 leani-finality-beacon-api 0.1.1 — https://github.com/smart-byte/leani
 leani-finality-consensus-p2p 0.1.1 — https://github.com/smart-byte/leani
 leani 0.1.1 — https://github.com/smart-byte/leani
@@ -8870,7 +8872,7 @@ alloy-eips 1.8.3 — https://github.com/alloy-rs/alloy
 alloy-eips 2.5.0 — https://github.com/alloy-rs/alloy
 alloy-evm 0.38.0 — https://github.com/alloy-rs/alloy-evm
 alloy-genesis 2.4.1 — https://github.com/alloy-rs/alloy
-alloy-hardforks 0.4.7 — https://github.com/alloy-rs/hardforks
+alloy-hardforks 0.4.10 — https://github.com/alloy-rs/hardforks
 alloy-json-abi 1.7.3 — https://github.com/alloy-rs/core
 alloy-network-primitives 1.8.3 — https://github.com/alloy-rs/alloy
 alloy-network-primitives 2.5.0 — https://github.com/alloy-rs/alloy

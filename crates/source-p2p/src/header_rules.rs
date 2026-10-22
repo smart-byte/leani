@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use alloy_consensus::Header;
 use alloy_eips::eip4844::DATA_GAS_PER_BLOB;
-use leani_primitives::slot_starting_at;
+use leani_chain::BeaconNetwork;
 use leani_source_api::AttestedHead;
 use reth_chainspec::ChainSpec;
 use reth_consensus::{ConsensusError, HeaderValidator};
@@ -35,13 +35,20 @@ pub(crate) enum HeaderVerdict {
 #[derive(Debug)]
 pub(crate) struct HeaderRules {
     consensus: EthBeaconConsensus<ChainSpec>,
+    beacon: BeaconNetwork,
 }
 
 impl HeaderRules {
-    pub(crate) fn new(chain_spec: Arc<ChainSpec>) -> Self {
+    pub(crate) fn new(chain_spec: Arc<ChainSpec>, beacon: BeaconNetwork) -> Self {
         Self {
             consensus: EthBeaconConsensus::new(chain_spec),
+            beacon,
         }
+    }
+
+    /// The slot clock headers are judged against.
+    pub(crate) const fn beacon(&self) -> &BeaconNetwork {
+        &self.beacon
     }
 
     /// Judge `header` as the child of `parent` at `now` UNIX seconds.
@@ -54,7 +61,7 @@ impl HeaderRules {
         now: u64,
         attested_parent_root: Option<[u8; 32]>,
     ) -> HeaderVerdict {
-        let Some(slot) = slot_starting_at(header.timestamp) else {
+        let Some(slot) = self.beacon.slot_starting_at(header.timestamp) else {
             return HeaderVerdict::Invalid(format!(
                 "timestamp {} is not a slot start",
                 header.timestamp
@@ -125,9 +132,12 @@ impl HeaderRules {
         headers.len() >= 2
             && !late_reveal(tip.timestamp, now)
             && headers.windows(2).all(|pair| {
-                slot_starting_at(pair[1].timestamp).is_some_and(|slot| {
-                    slot.saturating_sub(attested.beacon_slot) <= MAX_UNATTESTED_SLOTS
-                }) && self.check(&pair[1], &pair[0], now, None) == HeaderVerdict::Valid
+                self.beacon
+                    .slot_starting_at(pair[1].timestamp)
+                    .is_some_and(|slot| {
+                        slot.saturating_sub(attested.beacon_slot) <= MAX_UNATTESTED_SLOTS
+                    })
+                    && self.check(&pair[1], &pair[0], now, None) == HeaderVerdict::Valid
             })
     }
 }
@@ -146,6 +156,10 @@ mod tests {
     use reth_chainspec::{ChainSpecBuilder, EthChainSpec, MAINNET};
 
     use super::*;
+
+    fn mainnet_beacon() -> BeaconNetwork {
+        leani_chain::ethereum_mainnet().beacon().unwrap().clone()
+    }
 
     /// A post-Osaka mainnet slot (2026-05-28), so every scheduled blob
     /// parameter set applies.
@@ -192,7 +206,7 @@ mod tests {
     }
 
     fn rules() -> HeaderRules {
-        HeaderRules::new(MAINNET.clone())
+        HeaderRules::new(MAINNET.clone(), mainnet_beacon())
     }
 
     #[test]
@@ -261,7 +275,7 @@ mod tests {
     #[test]
     fn amsterdam_slot_numbers_follow_the_timestamp_and_the_parent() {
         let spec = Arc::new(ChainSpecBuilder::mainnet().amsterdam_activated().build());
-        let rules = HeaderRules::new(spec.clone());
+        let rules = HeaderRules::new(spec.clone(), mainnet_beacon());
         let mut parent = parent();
         parent.block_access_list_hash = Some(B256::ZERO);
         parent.slot_number = Some(SLOT);

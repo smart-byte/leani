@@ -44,12 +44,13 @@ use alloy_rlp::Encodable as _;
 use async_trait::async_trait;
 use futures::{FutureExt as _, StreamExt, stream, stream::FuturesUnordered};
 use hickory_resolver::proto::rr::RData;
+use leani_chain::{BeaconNetwork, Chain};
 use leani_primitives::{
     Address, BlockFrame, BlockHash, BlockNumber, BlockRange, BlockRef, Capability, CapabilitySet,
     ChainId, Completeness, ConsensusAnchor, FilterScope, Finality, HeaderEnvelope, Log, Material,
     MissingReason, ObjectIdentity, Provenance, Quantity, ReceiptEnvelope, SourceId, SourceKind,
     TransactionEnvelope, TransactionHash, TrustModel, VerificationCheck, VerificationReport,
-    Withdrawal, slot_at, slot_starting_at,
+    Withdrawal,
 };
 use leani_source_api::{
     AttestedHead, AttestedHeadReceiver, BlockFrameStream, ChainEvent, ChainEventStream,
@@ -117,9 +118,7 @@ const RETAINED_PROOF_BLOCKS: u64 = 131_072;
 // while retaining the ETH response-size-safe body/receipt sub-batches below.
 const MAX_HISTORY_MATERIAL_WINDOW_BLOCKS: usize = 32;
 const NETWORK_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
-const MAINNET_DNS_DISCOVERY_TREE: &str =
-    "enrtree://AKA3AM6LPBYEUDMVNU3BSVQJ5AD45Y7YPOHJLEF6W26QOE4VTUDPE@all.mainnet.ethdisco.net";
-const MAINNET_DNS_RETRY_INTERVAL: Duration = Duration::from_secs(15);
+const DNS_RETRY_INTERVAL: Duration = Duration::from_secs(15);
 const PEER_QUALIFICATION_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 static SECRET_KEY_WRITE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 // Mainnet ETH responses have a 2 MiB soft limit, so a peer may serve only a
@@ -697,6 +696,7 @@ impl P2pRequestMetrics {
 #[derive(Clone, Debug)]
 pub struct RethP2pSource {
     config: RethP2pConfig,
+    chain: Arc<Chain>,
     /// Every fork rule follows this spec: the `ForkID`, the DNS fork filter,
     /// Status, and the header rules. Glamsterdam G1 gives it the Amsterdam
     /// timestamp.
@@ -3004,7 +3004,7 @@ fn join_dns_txt_segments<'a>(segments: impl IntoIterator<Item = &'a [u8]>) -> Op
 struct DnsPeerSeederRuntime {
     chain_spec: Arc<ChainSpec>,
     dns_head: Head,
-    bootstrap_dns_tree: Option<String>,
+    dns_trees: Vec<String>,
     peer_candidates: Arc<PeerCandidateRegistry>,
     network_telemetry: NetworkTelemetry,
 }
@@ -3044,7 +3044,7 @@ fn spawn_cached_peer_admitter(
     })
 }
 
-fn spawn_mainnet_dns_peer_seeder(
+fn spawn_dns_peer_seeder(
     handle: NetworkHandle<EthNetworkPrimitives>,
     runtime: DnsPeerSeederRuntime,
 ) -> tokio::task::JoinHandle<()> {
@@ -3052,7 +3052,7 @@ fn spawn_mainnet_dns_peer_seeder(
         let DnsPeerSeederRuntime {
             chain_spec,
             dns_head,
-            bootstrap_dns_tree,
+            dns_trees,
             peer_candidates,
             network_telemetry,
         } = runtime;
@@ -3068,20 +3068,16 @@ fn spawn_mainnet_dns_peer_seeder(
                 return;
             }
         };
-        let config = mainnet_dns_discovery_config();
+        let config = dns_discovery_config();
         let (service, control) = DnsDiscoveryService::new_pair(Arc::new(resolver), config);
         let mut service_task = AbortTaskOnDrop(service.spawn());
         let mut records = match control.node_record_stream().await {
             Ok(records) => records,
             Err(error) => {
-                warn!(%error, "could not subscribe to mainnet execution peer DNS records");
+                warn!(%error, "could not subscribe to execution peer DNS records");
                 return;
             }
         };
-        let mut dns_trees = vec![MAINNET_DNS_DISCOVERY_TREE.to_owned()];
-        if let Some(tree) = bootstrap_dns_tree {
-            dns_trees.push(tree);
-        }
         for tree in &dns_trees {
             if let Err(error) = control.sync_tree(tree) {
                 warn!(%error, %tree, "could not configure authenticated execution peer DNS tree");
@@ -3089,8 +3085,8 @@ fn spawn_mainnet_dns_peer_seeder(
             }
         }
         let mut dns_retry = tokio::time::interval_at(
-            tokio::time::Instant::now() + MAINNET_DNS_RETRY_INTERVAL,
-            MAINNET_DNS_RETRY_INTERVAL,
+            tokio::time::Instant::now() + DNS_RETRY_INTERVAL,
+            DNS_RETRY_INTERVAL,
         );
         dns_retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -3099,7 +3095,7 @@ fn spawn_mainnet_dns_peer_seeder(
         loop {
             tokio::select! {
                 _ = &mut service_task.0 => {
-                    warn!("mainnet execution peer DNS seeder stopped unexpectedly");
+                    warn!("execution peer DNS seeder stopped unexpectedly");
                     return;
                 }
                 _ = dns_retry.tick() => {
@@ -3115,7 +3111,7 @@ fn spawn_mainnet_dns_peer_seeder(
                 }
                 update = records.next() => {
                     let Some(update) = update else {
-                        warn!("mainnet execution peer DNS record stream closed unexpectedly");
+                        warn!("execution peer DNS record stream closed unexpectedly");
                         return;
                     };
                     let Some(fork_id) = update.fork_id else {
@@ -3139,7 +3135,7 @@ fn spawn_mainnet_dns_peer_seeder(
                         if seeded_peers == 1 || seeded_peers.is_multiple_of(100) {
                             debug!(
                                 seeded_peers,
-                                "seeded compatible execution peers from the mainnet DNS tree"
+                                "seeded compatible execution peers from the DNS tree"
                             );
                         }
                     }
@@ -3200,7 +3196,17 @@ impl Drop for AbortTaskOnDrop {
     }
 }
 
-fn mainnet_dns_discovery_config() -> DnsDiscoveryConfig {
+fn genesis_block(chain_spec: &ChainSpec) -> BlockRef {
+    let header = chain_spec.genesis_header();
+    BlockRef {
+        number: BlockNumber(header.number),
+        hash: BlockHash::new(chain_spec.genesis_hash().0),
+        parent_hash: BlockHash::new(header.parent_hash.0),
+        timestamp: header.timestamp,
+    }
+}
+
+fn dns_discovery_config() -> DnsDiscoveryConfig {
     DnsDiscoveryConfig {
         // The current mainnet tree is broad enough that Reth's conservative
         // three-query default can spend over a minute expanding branches
@@ -3273,7 +3279,7 @@ where
             direct_peers,
             trusted_peer_ids,
             peer_refill_interval,
-            bootstrap_dns_tree,
+            dns_trees,
             cached_records,
             peer_store,
             qualifications,
@@ -3317,12 +3323,12 @@ where
             peer_candidates.clone(),
             network_telemetry.clone(),
         );
-        let dns_peer_seeder = spawn_mainnet_dns_peer_seeder(
+        let dns_peer_seeder = spawn_dns_peer_seeder(
             manager.as_ref().get_ref().handle().clone(),
             DnsPeerSeederRuntime {
                 chain_spec,
                 dns_head,
-                bootstrap_dns_tree,
+                dns_trees,
                 peer_candidates: peer_candidates.clone(),
                 network_telemetry: network_telemetry.clone(),
             },
@@ -3705,7 +3711,7 @@ struct NetworkManagerRuntime {
     direct_peers: Arc<DirectPeerPool>,
     trusted_peer_ids: Vec<B512>,
     peer_refill_interval: Duration,
-    bootstrap_dns_tree: Option<String>,
+    dns_trees: Vec<String>,
     cached_records: CachedPeerRecords,
     peer_store: Arc<ExecutionPeerStore>,
     qualifications: Arc<PeerQualificationPool>,
@@ -4042,7 +4048,24 @@ impl RethP2pSource {
     ///
     /// Returns an error when peer, retry, or timeout bounds are invalid.
     pub fn mainnet(config: RethP2pConfig) -> Result<Self, P2pError> {
+        Self::new(leani_chain::ethereum_mainnet(), config)
+    }
+
+    /// Construct the P2P source of an Ethereum-family `chain` without
+    /// opening sockets.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the chain has no execution spec or beacon chain,
+    /// or when peer, retry, or timeout bounds are invalid.
+    pub fn new(chain: Arc<Chain>, config: RethP2pConfig) -> Result<Self, P2pError> {
         config.validate()?;
+        let chain_spec = leani_chain::ethereum_chain_spec(&chain)
+            .map_err(|error| P2pError::InvalidConfig(error.to_string()))?;
+        let beacon = chain
+            .beacon()
+            .map_err(|error| P2pError::InvalidConfig(error.to_string()))?
+            .clone();
         config.network_telemetry.set_peer_targets(
             config.minimum_peers,
             config.body_serving_peer_target,
@@ -4053,8 +4076,9 @@ impl RethP2pSource {
         let peer_store = Arc::new(ExecutionPeerStore::new(
             config.peer_store_path.clone(),
             config.peer_store_max_entries,
+            chain.chain_id,
         ));
-        let initial_target = Self::mainnet_genesis_block();
+        let initial_target = genesis_block(&chain_spec);
         let network = Arc::new(PersistentNetwork {
             state: tokio::sync::Mutex::new(None),
             next_generation: AtomicU64::new(1),
@@ -4071,10 +4095,15 @@ impl RethP2pSource {
         });
         Ok(Self {
             descriptor: SourceDescriptor {
-                id: SourceId::new("reth-p2p-mainnet")
-                    .map_err(|error| P2pError::InvalidConfig(error.to_string()))?,
+                // Stored descriptors name Mainnet's source `reth-p2p-mainnet`.
+                id: SourceId::new(if chain.chain_id == 1 {
+                    "reth-p2p-mainnet".to_owned()
+                } else {
+                    format!("reth-p2p-{}", chain.name)
+                })
+                .map_err(|error| P2pError::InvalidConfig(error.to_string()))?,
                 kind: SourceKind::ExecutionP2p,
-                chain_id: ChainId(1),
+                chain_id: ChainId(chain.chain_id),
                 range: None,
                 capabilities: CapabilitySet::of(Capability::Header)
                     .with(Capability::Body)
@@ -4093,13 +4122,14 @@ impl RethP2pSource {
                 trust: TrustModel::ProtocolVerified,
                 finality: FinalityModel::Attested,
                 partitioning: Partitioning::FixedBlockSpan(MAX_FIXED_RANGE_BLOCKS),
-                expected_lag: Duration::from_secs(12),
+                expected_lag: Duration::from_secs(beacon.seconds_per_slot),
                 schema_version: format!("reth-p2p.v1+{RETH_VERSION}.{RETH_REVISION}"),
                 priority: 0,
             },
             config,
-            chain_spec: MAINNET.clone(),
-            header_rules: Arc::new(HeaderRules::new(MAINNET.clone())),
+            header_rules: Arc::new(HeaderRules::new(chain_spec.clone(), beacon)),
+            chain_spec,
+            chain,
             network,
             request_metrics: P2pRequestMetrics::default(),
             attested_heads: None,
@@ -4180,13 +4210,29 @@ impl RethP2pSource {
     /// advertisement before a caller has resolved a newer trusted anchor.
     #[must_use]
     pub fn mainnet_genesis_block() -> BlockRef {
-        let header = MAINNET.genesis_header();
-        BlockRef {
-            number: BlockNumber(header.number),
-            hash: BlockHash::new(MAINNET.genesis_hash().0),
-            parent_hash: BlockHash::new(header.parent_hash.0),
-            timestamp: header.timestamp,
+        genesis_block(&MAINNET)
+    }
+
+    #[must_use]
+    pub fn chain(&self) -> &Arc<Chain> {
+        &self.chain
+    }
+
+    fn beacon(&self) -> &BeaconNetwork {
+        self.header_rules.beacon()
+    }
+
+    /// Execution bootnodes: the entry's, or else the chain spec's.
+    fn boot_nodes(&self) -> Vec<NodeRecord> {
+        if self.chain.execution.bootnodes.is_empty() {
+            return self.chain_spec.bootnodes().unwrap_or_default();
         }
+        self.chain
+            .execution
+            .bootnodes
+            .iter()
+            .filter_map(|record| record.parse().ok())
+            .collect()
     }
 
     /// Start the persistent execution network and satisfy the configured peer
@@ -4578,7 +4624,7 @@ impl RethP2pSource {
                 .listener_addr(listener_addr)
                 .discovery_addr(discovery_addr)
                 .disable_tx_gossip(true)
-                .mainnet_boot_nodes()
+                .boot_nodes(self.boot_nodes())
                 // Leani's own EIP-1459 seeder below decodes the DNS tree and
                 // admits its records through the peer manager. It
                 // joins multi-segment TXT records, which Reth 2.4.1 read only
@@ -4672,7 +4718,14 @@ impl RethP2pSource {
                     .map(|peer| peer.id)
                     .collect(),
                 peer_refill_interval: self.config.peer_refill_interval,
-                bootstrap_dns_tree: self.config.bootstrap_dns_tree.clone(),
+                dns_trees: self
+                    .chain
+                    .execution
+                    .dns_tree
+                    .iter()
+                    .chain(&self.config.bootstrap_dns_tree)
+                    .cloned()
+                    .collect(),
                 cached_records,
                 peer_store: self.network.peer_store.clone(),
                 qualifications: self.network.qualifications.clone(),
@@ -4808,7 +4861,13 @@ impl RethP2pSource {
         for ((header, body), block_receipts) in headers.iter().zip(&bodies).zip(&receipts) {
             validate_body_receipts(header, body, block_receipts)?;
         }
-        let frames = normalize_verified(headers, &bodies, &receipts, budget)?;
+        let frames = normalize_verified(
+            self.descriptor.chain_id,
+            headers,
+            &bodies,
+            &receipts,
+            budget,
+        )?;
         Ok((frames, lock(&response_peers).clone()))
     }
 
@@ -4905,7 +4964,10 @@ impl RethP2pSource {
             ..request.clone()
         };
         let (frames, mut response_peers) = if header_only_request(&request) {
-            (normalize_verified_headers(headers, budget)?, HashSet::new())
+            (
+                normalize_verified_headers(self.descriptor.chain_id, headers, budget)?,
+                HashSet::new(),
+            )
         } else if header_and_body_only_request(&request) {
             self.fetch_live_body_frames(
                 session,
@@ -4986,7 +5048,7 @@ impl RethP2pSource {
                 }
             })
             .await?;
-        let frames = normalize_verified_bodies(headers, &bodies, budget)?;
+        let frames = normalize_verified_bodies(self.descriptor.chain_id, headers, &bodies, budget)?;
         Ok((frames, lock(&body_peers).clone()))
     }
 
@@ -5051,6 +5113,7 @@ impl RethP2pSource {
             })
             .collect::<Vec<_>>();
         let frames = normalize_sparse_log_frames(
+            self.descriptor.chain_id,
             headers,
             request,
             budget,
@@ -5198,7 +5261,8 @@ impl RethP2pSource {
     ) -> Result<Option<BlockFrame>, P2pError> {
         let header_peer = header_serve.peer_id;
         if header_only_request(request) {
-            let mut frames = normalize_verified_headers(&[header], budget)?;
+            let mut frames =
+                normalize_verified_headers(self.descriptor.chain_id, &[header], budget)?;
             self.complete_header_serve(session, header_serve).await;
             session.clear_error();
             session.observe_head(next);
@@ -5845,7 +5909,7 @@ impl RethP2pSource {
             }));
         }
         let started = Instant::now();
-        let advertised = Self::probe_advertised_head();
+        let advertised = self.probe_advertised_head();
         let (session, connected_peers) = self
             .connect(advertised, NetworkLane::Probe, &cancellation)
             .await?;
@@ -5902,7 +5966,13 @@ impl RethP2pSource {
                 .await?;
             telemetry.set_phase(NetworkPhase::Ready);
             telemetry.clear_error();
-            let frames = normalize_verified(&headers, &bodies, &receipts, budget)?;
+            let frames = normalize_verified(
+                self.descriptor.chain_id,
+                &headers,
+                &bodies,
+                &receipts,
+                budget,
+            )?;
             let transactions = bodies.iter().fold(0_u64, |total, body| {
                 total.saturating_add(u64::try_from(body.transactions.len()).unwrap_or(u64::MAX))
             });
@@ -5946,8 +6016,8 @@ impl RethP2pSource {
     /// peers' qualification target. A probe has no verified execution head,
     /// so it advertises genesis: never a zero hash or an operator-supplied tip
     /// that peers would be qualified, and penalized, against.
-    fn probe_advertised_head() -> BlockRef {
-        Self::mainnet_genesis_block()
+    fn probe_advertised_head(&self) -> BlockRef {
+        genesis_block(&self.chain_spec)
     }
 
     async fn fetch_headers<C>(
@@ -7661,7 +7731,7 @@ impl RethP2pHistorySource {
                 ..budget
             };
             let mut frames = if header_only_request(request) {
-                normalize_verified_headers(header_chunk, window_budget)?
+                normalize_verified_headers(self.descriptor.chain_id, header_chunk, window_budget)?
             } else if history_body_only_request(request) {
                 self.fetch_history_body_frames(
                     session,
@@ -7693,6 +7763,7 @@ impl RethP2pHistorySource {
                     )
                     .await?;
                 normalize_verified_for_request(
+                    self.descriptor.chain_id,
                     header_chunk,
                     &bodies,
                     &receipts,
@@ -7753,7 +7824,7 @@ impl RethP2pHistorySource {
         for peer in peers {
             reward_verified_material_peer(&session.handle, peer).await;
         }
-        normalize_history_bodies(headers, &bodies, request, budget)
+        normalize_history_bodies(self.descriptor.chain_id, headers, &bodies, request, budget)
     }
 
     async fn fetch_sparse_log_frames(
@@ -7877,6 +7948,7 @@ impl RethP2pHistorySource {
             )
             .await?;
         let frames = normalize_sparse_log_frames(
+            self.descriptor.chain_id,
             headers,
             request,
             budget,
@@ -8989,12 +9061,16 @@ async fn next_live_event(
         let attested = state.attested.latest();
         let gate = HeadGate {
             enabled: state.head_acceptance,
-            wall_slot: slot_at(unix_now()),
+            wall_slot: state.source.beacon().slot_at(unix_now()),
         };
         match live_step(state.last, attested, &state.ancestry, batch_blocks, gate) {
             LiveStep::Head { block } => {
                 state.head_unavailable_since = None;
-                let delay = head_poll_delay(state.last.timestamp, unix_now_ms());
+                let delay = head_poll_delay(
+                    state.last.timestamp,
+                    state.source.beacon().seconds_per_slot,
+                    unix_now_ms(),
+                );
                 if !delay.is_zero() {
                     tokio::select! {
                         () = state.cancellation.cancelled() => return None,
@@ -9419,7 +9495,7 @@ async fn poll_unattested_head(
         return unattested_reorg(state, header).await;
     }
     let attested = state.attested.peek();
-    let Some(slot) = slot_starting_at(header.timestamp) else {
+    let Some(slot) = source.beacon().slot_starting_at(header.timestamp) else {
         return Ok(HeadPoll::WaitForAttested);
     };
     if attested.is_none_or(|head| slot.saturating_sub(head.beacon_slot) > MAX_UNATTESTED_SLOTS) {
@@ -10873,6 +10949,7 @@ fn with_known_empty_receipts(headers: &[Header], fetched: Vec<Vec<Receipt>>) -> 
 
 #[allow(clippy::too_many_arguments)]
 fn normalize_sparse_log_frames(
+    chain_id: ChainId,
     headers: &[Header],
     request: &DataRequest,
     budget: SourceBudget,
@@ -10906,6 +10983,7 @@ fn normalize_sparse_log_frames(
             let receipts = &positive_receipts[positive_position];
             if transaction_hash_required {
                 normalize_block(
+                    chain_id,
                     header,
                     &matching_bodies[body_position],
                     Some(receipts),
@@ -10913,10 +10991,17 @@ fn normalize_sparse_log_frames(
                     Some(request),
                 )?
             } else {
-                normalize_sparse_receipt_log_block(header, receipts, request, observed_at_unix_ms)?
+                normalize_sparse_receipt_log_block(
+                    chain_id,
+                    header,
+                    receipts,
+                    request,
+                    observed_at_unix_ms,
+                )?
             }
         } else {
             normalize_sparse_empty_log_block(
+                chain_id,
                 header,
                 request,
                 observed_at_unix_ms,
@@ -10939,12 +11024,14 @@ fn observed_at_unix_ms() -> u64 {
 }
 
 fn normalize_sparse_empty_log_block(
+    chain_id: ChainId,
     header: &Header,
     request: &DataRequest,
     observed_at_unix_ms: u64,
     receipts_verified: bool,
 ) -> Result<BlockFrame, P2pError> {
     normalize_sparse_log_block(
+        chain_id,
         header,
         request,
         observed_at_unix_ms,
@@ -10954,6 +11041,7 @@ fn normalize_sparse_empty_log_block(
 }
 
 fn normalize_sparse_receipt_log_block(
+    chain_id: ChainId,
     header: &Header,
     receipts: &[Receipt],
     request: &DataRequest,
@@ -10997,10 +11085,11 @@ fn normalize_sparse_receipt_log_block(
                 .ok_or_else(|| P2pError::InvalidResponse("log index overflows u32".to_owned()))?;
         }
     }
-    normalize_sparse_log_block(header, request, observed_at_unix_ms, true, logs)
+    normalize_sparse_log_block(chain_id, header, request, observed_at_unix_ms, true, logs)
 }
 
 fn normalize_sparse_log_block(
+    chain_id: ChainId,
     header: &Header,
     request: &DataRequest,
     observed_at_unix_ms: u64,
@@ -11013,7 +11102,7 @@ fn normalize_sparse_log_block(
     let hash = header.hash_slow();
     let header_requested = requested_material(Some(request), Capability::Header);
     Ok(BlockFrame {
-        chain_id: ChainId(1),
+        chain_id,
         block: BlockRef {
             number: BlockNumber(header.number),
             hash: block_hash(hash),
@@ -11086,6 +11175,7 @@ fn normalize_sparse_log_block(
 }
 
 fn normalize_verified_headers(
+    chain_id: ChainId,
     headers: &[Header],
     budget: SourceBudget,
 ) -> Result<Vec<BlockFrame>, P2pError> {
@@ -11101,7 +11191,7 @@ fn normalize_verified_headers(
     for header in headers {
         let hash = header.hash_slow();
         let frame = BlockFrame {
-            chain_id: ChainId(1),
+            chain_id,
             block: BlockRef {
                 number: BlockNumber(header.number),
                 hash: block_hash(hash),
@@ -11161,6 +11251,7 @@ fn normalize_verified_headers(
 }
 
 fn normalize_verified_bodies(
+    chain_id: ChainId,
     headers: &[Header],
     bodies: &[BlockBody],
     budget: SourceBudget,
@@ -11184,7 +11275,7 @@ fn normalize_verified_bodies(
         })
         .len();
         let frame = BlockFrame {
-            chain_id: ChainId(1),
+            chain_id,
             block: BlockRef {
                 number: BlockNumber(header.number),
                 hash: block_hash(hash),
@@ -11246,6 +11337,7 @@ fn normalize_verified_bodies(
 /// Normalize verified bodies for a history request that reads no receipt
 /// field: its filter applies, and senders are recovered only where read.
 fn normalize_history_bodies(
+    chain_id: ChainId,
     headers: &[Header],
     bodies: &[BlockBody],
     request: &DataRequest,
@@ -11256,7 +11348,14 @@ fn normalize_history_bodies(
     let mut total_bytes = 0_u64;
     let mut output = Vec::with_capacity(headers.len());
     for (header, body) in headers.iter().zip(bodies) {
-        let frame = normalize_block(header, body, None, observed_at_unix_ms, Some(request))?;
+        let frame = normalize_block(
+            chain_id,
+            header,
+            body,
+            None,
+            observed_at_unix_ms,
+            Some(request),
+        )?;
         push_normalized_frame(&mut output, frame, &mut total_bytes, budget)?;
     }
     Ok(output)
@@ -11306,6 +11405,7 @@ fn normalize_body_transactions(body: &BlockBody) -> Result<Vec<TransactionEnvelo
 }
 
 fn normalize_verified(
+    chain_id: ChainId,
     headers: &[Header],
     bodies: &[BlockBody],
     receipts: &[Vec<Receipt>],
@@ -11322,6 +11422,7 @@ fn normalize_verified(
     let mut output = Vec::with_capacity(headers.len());
     for ((header, body), block_receipts) in headers.iter().zip(bodies).zip(receipts) {
         let frame = normalize_block(
+            chain_id,
             header,
             body,
             Some(block_receipts),
@@ -11334,6 +11435,7 @@ fn normalize_verified(
 }
 
 fn normalize_verified_for_request(
+    chain_id: ChainId,
     headers: &[Header],
     bodies: &[BlockBody],
     receipts: &[Vec<Receipt>],
@@ -11351,6 +11453,7 @@ fn normalize_verified_for_request(
     let mut output = Vec::with_capacity(headers.len());
     for ((header, body), block_receipts) in headers.iter().zip(bodies).zip(receipts) {
         let frame = normalize_block(
+            chain_id,
             header,
             body,
             Some(block_receipts),
@@ -11518,6 +11621,7 @@ fn normalized_material<T>(
 /// Normalize one verified block. Without `receipts`, a body-only read, the
 /// request must name no receipt group.
 fn normalize_block(
+    chain_id: ChainId,
     header: &Header,
     body: &BlockBody,
     receipts: Option<&[Receipt]>,
@@ -11718,7 +11822,7 @@ fn normalize_block(
         consensus_anchor: None,
     };
     Ok(BlockFrame {
-        chain_id: ChainId(1),
+        chain_id,
         block: BlockRef {
             number: BlockNumber(header.number),
             hash: normalized_block_hash,
@@ -11897,10 +12001,19 @@ mod tests {
 
     use super::*;
 
+    fn mainnet_dns_tree() -> String {
+        leani_chain::ethereum_mainnet()
+            .execution
+            .dns_tree
+            .clone()
+            .expect("mainnet has a DNS tree")
+    }
+
     fn direct_peer_pool() -> Arc<DirectPeerPool> {
         Arc::new(DirectPeerPool::new(Arc::new(ExecutionPeerStore::new(
             None,
             DEFAULT_PEER_STORE_MAX_ENTRIES,
+            1,
         ))))
     }
 
@@ -11990,6 +12103,7 @@ mod tests {
             .expect("receipts are independently committed by headers");
         validate_receipts(&headers, &bodies, &receipts).expect("receipts");
         let frames = normalize_verified(
+            ChainId(1),
             &headers,
             &bodies,
             &receipts,
@@ -12021,9 +12135,11 @@ mod tests {
             temporary_disk_bytes: 1,
             max_resident_bytes: 1_000_000,
         };
-        let frames = normalize_verified(&headers, &bodies, &receipts, budget).expect("normalize");
+        let frames = normalize_verified(ChainId(1), &headers, &bodies, &receipts, budget)
+            .expect("normalize");
         let one_frame = frames[0].estimated_heap_bytes();
         let error = normalize_verified(
+            ChainId(1),
             &headers,
             &bodies,
             &receipts,
@@ -12063,6 +12179,7 @@ mod tests {
         };
         assert!(header_only_request(&request));
         let frames = normalize_verified_headers(
+            ChainId(1),
             &headers,
             SourceBudget {
                 max_input_bytes: 1_000_000,
@@ -12107,6 +12224,7 @@ mod tests {
         };
         assert!(header_and_body_only_request(&request));
         let frames = normalize_verified_bodies(
+            ChainId(1),
             &headers,
             &bodies,
             SourceBudget {
@@ -12215,6 +12333,7 @@ mod tests {
                 request.filters.senders = vec![Address::new([0x42; 20])];
             }
             let result = normalize_verified_for_request(
+                ChainId(1),
                 &headers,
                 &bodies,
                 &receipts,
@@ -12251,6 +12370,7 @@ mod tests {
         .into_iter()
         .collect();
         let frames = normalize_verified_for_request(
+            ChainId(1),
             &headers,
             &bodies,
             &receipts,
@@ -12272,6 +12392,7 @@ mod tests {
         // rollup-txs reads senders through the Senders group alone
         request.required = request.required.with(Capability::Senders);
         let result = normalize_verified_for_request(
+            ChainId(1),
             &headers,
             &bodies,
             &receipts,
@@ -12316,8 +12437,9 @@ mod tests {
         let (headers, bodies, _) = unrecoverable_sender_fixture();
         let mut request = live_request(BlockRange::single(BlockNumber(0)));
         request.required = CapabilitySet::of(Capability::Header).with(Capability::Body);
-        let frames = normalize_history_bodies(&headers, &bodies, &request, generous_budget())
-            .expect("no sender recovery without Senders");
+        let frames =
+            normalize_history_bodies(ChainId(1), &headers, &bodies, &request, generous_budget())
+                .expect("no sender recovery without Senders");
         let transactions = frames[0].transactions.as_complete().expect("transactions");
         assert_eq!(transactions[0].from, None);
         assert!(matches!(
@@ -12326,14 +12448,16 @@ mod tests {
         ));
 
         request.required = request.required.with(Capability::Senders);
-        let result = normalize_history_bodies(&headers, &bodies, &request, generous_budget());
+        let result =
+            normalize_history_bodies(ChainId(1), &headers, &bodies, &request, generous_budget());
         assert!(sender_recovery_attempted(&result), "{result:?}");
 
         // the contract creation goes to no recipient: its sender is never read
         request.allow_filtered = true;
         request.filters.recipients = vec![Address::new([0x99; 20])];
-        let frames = normalize_history_bodies(&headers, &bodies, &request, generous_budget())
-            .expect("no sender recovery for unmatched transactions");
+        let frames =
+            normalize_history_bodies(ChainId(1), &headers, &bodies, &request, generous_budget())
+                .expect("no sender recovery for unmatched transactions");
         assert!(
             frames[0]
                 .transactions
@@ -12348,8 +12472,9 @@ mod tests {
         let (headers, bodies, _) = unrecoverable_sender_fixture();
         let mut request = live_request(BlockRange::single(BlockNumber(0)));
         request.required = CapabilitySet::of(Capability::Header).with(Capability::BlockSize);
-        let frames = normalize_history_bodies(&headers, &bodies, &request, generous_budget())
-            .expect("block sizes");
+        let frames =
+            normalize_history_bodies(ChainId(1), &headers, &bodies, &request, generous_budget())
+                .expect("block sizes");
         assert!(
             frames[0]
                 .header
@@ -12387,6 +12512,7 @@ mod tests {
             verification_policy: leani_source_api::VerificationPolicy::CompleteCryptographic,
         };
         let frames = normalize_verified_for_request(
+            ChainId(1),
             &headers,
             &bodies,
             &receipts,
@@ -12555,8 +12681,9 @@ mod tests {
                 vec![0xaa, 0xbb].into(),
             )],
         }];
-        let frame = normalize_sparse_receipt_log_block(&headers[0], &receipts, &request, 1)
-            .expect("receipt-only frame");
+        let frame =
+            normalize_sparse_receipt_log_block(ChainId(1), &headers[0], &receipts, &request, 1)
+                .expect("receipt-only frame");
         let Material::Filtered {
             value,
             completeness: Completeness::VerifiedPredicate,
@@ -12683,6 +12810,7 @@ mod tests {
     fn finalized_history_uses_exact_consensus_anchor_only_on_anchor_frame() {
         let (_, headers, bodies, receipts) = empty_fixture();
         let mut frames = normalize_verified(
+            ChainId(1),
             &headers,
             &bodies,
             &receipts,
@@ -12957,7 +13085,7 @@ mod tests {
 
     #[test]
     fn authenticated_bootstrap_tree_configuration_is_strict() {
-        assert!(validate_bootstrap_dns_tree(MAINNET_DNS_DISCOVERY_TREE).is_ok());
+        assert!(validate_bootstrap_dns_tree(&mainnet_dns_tree()).is_ok());
         assert!(validate_bootstrap_dns_tree("https://example.com/peers.json").is_err());
         assert!(validate_bootstrap_dns_tree("enrtree://missing-key.example.com").is_err());
     }
@@ -12967,8 +13095,8 @@ mod tests {
         let directory = tempfile::tempdir().expect("temporary directory");
         let destination = directory.path().join("execution-network.sqlite");
         let sibling = directory.path().join("sibling-network.sqlite");
-        let destination_store = ExecutionPeerStore::new(Some(destination.clone()), 10);
-        let sibling_store = ExecutionPeerStore::new(Some(sibling.clone()), 10);
+        let destination_store = ExecutionPeerStore::new(Some(destination.clone()), 10, 1);
+        let sibling_store = ExecutionPeerStore::new(Some(sibling.clone()), 10, 1);
         let body_record = node_record(3);
         let receipt_record = node_record(4);
         destination_store.record_success(
@@ -12992,10 +13120,11 @@ mod tests {
             .await
             .expect("persist sibling");
 
-        let merged = merge_execution_peer_stores(&destination, std::slice::from_ref(&sibling), 10)
-            .await
-            .expect("merge peer stores")
-            .expect("quality evidence exists");
+        let merged =
+            merge_execution_peer_stores(&destination, std::slice::from_ref(&sibling), 10, 1)
+                .await
+                .expect("merge peer stores")
+                .expect("quality evidence exists");
         assert_eq!(
             merged,
             ExecutionPeerStoreMerge {
@@ -13003,7 +13132,7 @@ mod tests {
                 imported: 1
             }
         );
-        let reopened = ExecutionPeerStore::new(Some(destination), 10);
+        let reopened = ExecutionPeerStore::new(Some(destination), 10, 1);
         reopened.initialize().await.expect("reopen merged store");
         assert!(reopened.has_material_success(body_record.id, PeerMaterialKind::Body));
         assert!(reopened.has_material_success(receipt_record.id, PeerMaterialKind::Receipts));
@@ -13126,10 +13255,10 @@ mod tests {
 
     #[test]
     fn mainnet_dns_bootstrap_uses_bounded_accelerated_rate() {
-        let config = mainnet_dns_discovery_config();
+        let config = dns_discovery_config();
         assert_eq!(config.max_requests_per_sec.get(), 50);
         assert_eq!(config.recheck_interval, Duration::from_mins(5));
-        assert_eq!(MAINNET_DNS_RETRY_INTERVAL, Duration::from_secs(15));
+        assert_eq!(DNS_RETRY_INTERVAL, Duration::from_secs(15));
     }
 
     #[tokio::test]
@@ -13137,11 +13266,11 @@ mod tests {
     async fn live_mainnet_dns_discovery_emits_execution_records() {
         let resolver = SegmentJoiningDnsResolver::from_system_conf().expect("system DNS resolver");
         let (service, control) =
-            DnsDiscoveryService::new_pair(Arc::new(resolver), mainnet_dns_discovery_config());
+            DnsDiscoveryService::new_pair(Arc::new(resolver), dns_discovery_config());
         let service_task = service.spawn();
         let mut records = control.node_record_stream().await.expect("record stream");
         control
-            .sync_tree(MAINNET_DNS_DISCOVERY_TREE)
+            .sync_tree(&mainnet_dns_tree())
             .expect("mainnet DNS tree");
 
         let record = tokio::time::timeout(Duration::from_secs(20), records.next())
@@ -13456,7 +13585,7 @@ mod tests {
 
     #[tokio::test]
     async fn peer_store_pruning_prefers_verified_body_service() {
-        let store = ExecutionPeerStore::new(None, 2);
+        let store = ExecutionPeerStore::new(None, 2, 1);
         let proven = node_record(1);
         let recent = node_record(2);
         let excess = node_record(3);
@@ -13482,7 +13611,7 @@ mod tests {
         let diverse = node_record_at(3, Ipv4Addr::new(10, 2, 1, 1));
         let failed = node_record_at(4, Ipv4Addr::new(10, 3, 1, 1));
         let unproven = node_record_at(5, Ipv4Addr::new(10, 4, 1, 1));
-        let store = ExecutionPeerStore::new(None, 16);
+        let store = ExecutionPeerStore::new(None, 16, 1);
         for record in [&first, &same_subnet, &diverse, &failed] {
             store.record_success(
                 record.id,
@@ -13515,7 +13644,7 @@ mod tests {
         let path = directory.path().join("execution-network.sqlite");
         let broad = node_record(1);
         let current = node_record(2);
-        let store = ExecutionPeerStore::new(Some(path.clone()), 16);
+        let store = ExecutionPeerStore::new(Some(path.clone()), 16, 1);
         store
             .persist(vec![broad])
             .await
@@ -13525,7 +13654,7 @@ mod tests {
             .await
             .expect("persist current peer");
 
-        let reopened = ExecutionPeerStore::new(Some(path), 16);
+        let reopened = ExecutionPeerStore::new(Some(path), 16, 1);
         reopened.initialize().await.expect("reopen peer store");
         assert_eq!(
             reopened.candidate_ids(),
@@ -13839,6 +13968,7 @@ mod tests {
         let peer_store = Arc::new(ExecutionPeerStore::new(
             None,
             DEFAULT_PEER_STORE_MAX_ENTRIES,
+            1,
         ));
         let direct_peers = Arc::new(DirectPeerPool::new(peer_store.clone()));
         let network = PersistentNetwork {
@@ -14720,8 +14850,36 @@ mod tests {
     }
 
     #[test]
+    fn a_testnet_source_follows_its_chain_entry() {
+        let hoodi = leani_chain::ChainRegistry::standard()
+            .get("hoodi")
+            .expect("hoodi is built in");
+        let source = RethP2pSource::new(hoodi, RethP2pConfig::default()).expect("valid source");
+        assert_eq!(source.descriptor.chain_id, ChainId(560_048));
+        assert_eq!(source.descriptor.id.as_str(), "reth-p2p-ethereum-hoodi");
+        assert_eq!(
+            source.probe_advertised_head().hash.0,
+            source.chain().genesis_hash.0
+        );
+        assert!(!source.boot_nodes().is_empty());
+        // Hoodi's slots start one second after mainnet's.
+        let mainnet_slot_start = 1_606_824_023 + 12 * 14_000_000;
+        assert_eq!(source.beacon().slot_starting_at(mainnet_slot_start), None);
+        assert!(
+            source
+                .beacon()
+                .slot_starting_at(mainnet_slot_start + 1)
+                .is_some()
+        );
+        let mainnet = RethP2pSource::mainnet(RethP2pConfig::default()).expect("valid source");
+        assert_eq!(mainnet.descriptor.id.as_str(), "reth-p2p-mainnet");
+    }
+
+    #[test]
     fn probes_advertise_genesis_rather_than_a_zero_or_unverified_head() {
-        let advertised = RethP2pSource::probe_advertised_head();
+        let advertised = RethP2pSource::mainnet(RethP2pConfig::default())
+            .expect("default config is valid")
+            .probe_advertised_head();
         assert_ne!(advertised.hash, BlockHash::ZERO);
         assert_eq!(advertised, RethP2pSource::mainnet_genesis_block());
     }
@@ -15863,6 +16021,7 @@ mod tests {
         let peer_store = Arc::new(ExecutionPeerStore::new(
             None,
             DEFAULT_PEER_STORE_MAX_ENTRIES,
+            1,
         ));
         let direct_peers = Arc::new(DirectPeerPool::new(peer_store.clone()));
         let network = PersistentNetwork {

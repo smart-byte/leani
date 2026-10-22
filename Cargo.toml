@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
   "crates/api",
+  "crates/chain",
   "crates/finality-beacon-api",
   "crates/finality-consensus-p2p",
   "crates/node",

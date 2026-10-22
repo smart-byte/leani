@@ -8,6 +8,16 @@ record, and documented RPC contracts.
 
 ### Added
 
+- Ethereum Sepolia and Hoodi chain entries. `[chain] name` (or a compact
+  config's `network`) now names a built-in chain entry; its chain id, slot
+  clock, Beacon network (genesis validators root, fork schedule from the
+  network's upstream `config.yaml`), execution DNS tree, and bootnodes follow
+  from it. Hoodi follows live over P2P with Beacon API finality; Sepolia
+  needs the Gloas light client first. eraE, Xatu, consensus P2P finality,
+  and built-in subscriptions stay mainnet-only.
+- With the P2P live source, `sources.history` may be empty: execution P2P
+  serves finalized history, and no archive reconciliation runs. On-demand
+  JSON-RPC history then must be `disabled`.
 - Wasm processors: write a processor in Rust with the new `leani-wasm-guest`
   crate, compile it to `wasm32-unknown-unknown`, and run it in the stock
   binary without rebuilding the node. Configure it as a `wasm` processor with
