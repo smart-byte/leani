@@ -1,4 +1,5 @@
 /target/
+/examples/wasm-processors/target/
 /data/
 # A relative data_dir is beside its configuration file: a checked-in profile or
 # example run in place keeps its state next to it.
