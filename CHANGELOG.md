@@ -22,6 +22,14 @@ record, and documented RPC contracts.
   compiled with AssemblyScript, implements the ABI of `leani-wasm-guest`, and
   every example processor has a TypeScript twin that publishes exactly its
   Rust original's changes.
+- Ad-hoc Wasm runs: `POST /admin/v1/wasm/runs` streams a template or an
+  uploaded module over the node's recent blocks and, optionally, its live
+  ones, and `GET /v1/wasm/templates` lists the templates with their Rust and
+  TypeScript sources. A run whose material the live lane lacks fetches its
+  own from the node's P2P peers, for at most its last 64 blocks and then new
+  ones. A running run takes another module or other parameters
+  (`PUT /admin/v1/wasm/runs/{run}/processor`), reruns the blocks it holds
+  with them, and follows on with them.
 
 ### Changed
 

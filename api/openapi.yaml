@@ -14,7 +14,7 @@ info:
     without an `Origin` whose `Sec-Fetch-Site` is `cross-site` or
     `same-site` and whose `Sec-Fetch-Mode` is not `navigate` gets 403
     `cross_site_request`; on the two consumer stream routes, so does one in
-    any mode, navigations included. A POST or DELETE needs
+    any mode, navigations included. A POST, PUT, or DELETE needs
     `content-type: application/json` or `x-leani-request: 1`, and gets 415
     `unsupported_media_type` otherwise.
 
@@ -1195,6 +1195,83 @@ paths:
           description: Operational HTML network dashboard.
         default:
           $ref: "#/components/responses/Error"
+  /v1/wasm/templates:
+    get:
+      summary: List the bundled Wasm processor templates
+      operationId: listWasmTemplates
+      responses:
+        "200":
+          description: >-
+            `data`, one entry per template: its `name`, `description`, example
+            `params`, `moduleHash` (BLAKE3) and `moduleBytes`, and the
+            processor's `sources`: `rust`, which the module is built from, and
+            `typescript`, the same processor in TypeScript, which publishes the
+            same changes.
+        default:
+          $ref: "#/components/responses/Error"
+  /admin/v1/wasm/runs:
+    post:
+      summary: Run a Wasm processor over recent and live blocks
+      operationId: createWasmRun
+      description: >-
+        Runs a bundled `template` or an uploaded `module` (hex), with its
+        `params`, over the node's newest `blocks` retained recent canonical
+        blocks (1 to 1,024, 16 by default), then, with `follow`, follows the
+        live chain for `maxSeconds` (1 to 3,600, 600 by default). When those
+        blocks lack material the module requires, the run fetches its own from
+        the node's P2P peers instead: at most the last 64 blocks, then each new
+        block, with all of each block's material of the kinds the module
+        requires, unfiltered, so that another filter needs no new download.
+        Nothing is persisted. At most two runs at a time and 4 MiB modules.
+      responses:
+        "200":
+          description: >-
+            Server-sent events: `ready` (the `run` id, `version` 1, the
+            `manifest`, the `moduleHash`, the `window` of blocks, `fromBlock`
+            and `toBlock`, and `feed`, `lane` or `own`), then one `block` per
+            applied block with its changes and finality, `undo` for each
+            reverted block, `attested` with the block (`throughBlock`, `hash`)
+            through which applied blocks are attested, `notice`, and finally
+            `done` with the run's summary, or `error` shaped like an error
+            response, with code `wasm_run_failed` and the summary as its
+            `details`. Each processor swapped in starts with `reset`, shaped
+            like `ready`, followed by the blocks it reruns.
+          content:
+            text/event-stream:
+              schema:
+                type: string
+        "503":
+          description: "`wasm_run_capacity`: two runs are already active; retry when one ends."
+        default:
+          $ref: "#/components/responses/Error"
+  /admin/v1/wasm/runs/{run}/processor:
+    parameters:
+      - name: run
+        in: path
+        required: true
+        description: The `run` id of the run's `ready` event.
+        schema:
+          type: string
+    put:
+      summary: Give a running Wasm run another processor
+      operationId: swapWasmRunProcessor
+      description: >-
+        Takes `module` (hex) or `template`, and `params`, as creating a run
+        does. The run takes the newest processor it was given: it reruns the
+        blocks it holds with it, announced by a `reset` event on its stream,
+        and follows on with it. A processor that requires material those
+        blocks lack makes the run open a feed of its own.
+      responses:
+        "202":
+          description: "`version`: the run's version once it takes this processor."
+        "400":
+          description: The template, module, or its parameters are invalid; the run keeps its processor.
+        "404":
+          description: "`run_not_found`: no running run has this id, so start a new run."
+        "503":
+          description: "`wasm_swap_capacity`: two swaps are already compiling; retry when one ends."
+        default:
+          $ref: "#/components/responses/Error"
   /v1/q/blobs/blocks:
     get:
       summary: List indexed blob blocks
@@ -1534,8 +1611,8 @@ components:
       required: false
       description: |
         Marks a mutating request without a JSON body as sent by a Leani
-        client. A POST or DELETE needs `content-type: application/json` or
-        this header, and gets HTTP 415 otherwise.
+        client. A POST, PUT, or DELETE needs `content-type: application/json`
+        or this header, and gets HTTP 415 otherwise.
       schema:
         const: "1"
     Subscription:

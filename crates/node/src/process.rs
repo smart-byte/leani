@@ -5612,6 +5612,30 @@ fn live_lane_warnings(config: &Config, registry: &ProcessorRegistry) -> Vec<Stri
     attested_gating_warnings(processors.iter().map(|processor| processor.descriptor()))
 }
 
+/// The feed an ad-hoc Wasm run opens when the live lane lacks its material:
+/// its own subscription to `source` for its processor's kinds of material,
+/// unfiltered. A run that swaps in another filter then reruns the blocks it
+/// holds without fetching them again; the Wasm host still hands a module
+/// only what its own filter selects.
+fn live_feed(
+    source: Arc<dyn leani_source_api::LiveSource>,
+    budget: leani_source_api::SourceBudget,
+) -> leani_api::LiveFeed {
+    Arc::new(move |processor, start, cancellation| {
+        let source = source.clone();
+        Box::pin(async move {
+            let mut request = leani_runtime::compile_live_request(
+                &[processor],
+                source.descriptor().chain_id,
+                &start,
+            )
+            .map_err(|error| leani_source_api::SourceError::InvalidPlan(error.to_string()))?;
+            request.filters = leani_source_api::FilterSet::default();
+            source.subscribe(request, start, budget, cancellation).await
+        })
+    })
+}
+
 fn doctor(path: &Path, json: bool, registry: &ProcessorRegistry) -> Result<Exit> {
     // The report carries what loading would log.
     let working_directory = std::env::current_dir().ok();
@@ -5933,6 +5957,18 @@ async fn serve(path: &Path, registry: &ProcessorRegistry) -> Result<Exit> {
     };
     let (pipeline_budget, material_coordinator) = historical_services(config.get())?;
     let network_lanes = live_required && finality_required;
+    // The lanes and the feeds of ad-hoc Wasm runs share one execution P2P
+    // source: a run's feed then reuses the lanes' peers.
+    let attested_heads = leani_source_api::AttestedHeadPublisher::new();
+    let execution_source = network_lanes
+        .then(|| {
+            execution_p2p_source(
+                config.get(),
+                network_telemetry.clone(),
+                Some(attested_heads.subscribe()),
+            )
+        })
+        .transpose()?;
     // Only the network lanes publish the P2P history bridge's anchors, and
     // `run_network_lanes` gives up before the first one off Ethereum mainnet.
     let p2p_bridge_expected = network_lanes && config.get().chain.chain_id == 1;
@@ -6130,6 +6166,10 @@ async fn serve(path: &Path, registry: &ProcessorRegistry) -> Result<Exit> {
                 .clone()
                 .map(|control| control as Arc<dyn leani_api::RawHistoryControl>),
             shutdown: cancellation.clone(),
+            live_events: Some(committed_events.clone()),
+            live_feed: execution_source
+                .clone()
+                .map(|source| live_feed(source, live_source_budget(config.get()))),
             ..NativeApiConfig::default()
         },
     )?;
@@ -6232,7 +6272,7 @@ async fn serve(path: &Path, registry: &ProcessorRegistry) -> Result<Exit> {
             backfill_control: Some(backfill_control),
             verified_anchor: None,
             checkpoint_origin: leani_finality_beacon_api::CheckpointOrigin::Operator,
-            attested_heads: leani_source_api::AttestedHeadPublisher::new(),
+            attested_heads,
         };
         background.spawn("network lane supervisor", async move {
             let end = Box::pin(supervise_network_lanes(
@@ -6240,7 +6280,7 @@ async fn serve(path: &Path, registry: &ProcessorRegistry) -> Result<Exit> {
                 supervisor_store,
                 supervisor_processors,
                 supervisor_handles,
-                None,
+                execution_source,
             ))
             .await?;
             match end {
@@ -8771,6 +8811,135 @@ mod tests {
     use leani_testkit::{BlockLocalCounter, fixture_frame};
 
     use super::{shutdown::SHUTDOWN_DEADLINE, *};
+
+    #[tokio::test]
+    async fn a_live_feed_subscribes_with_its_processors_material_only() {
+        use futures::StreamExt as _;
+
+        let range = leani_primitives::BlockRange::new(
+            leani_primitives::BlockNumber(0),
+            leani_primitives::BlockNumber(2),
+        )
+        .expect("range");
+        let frame = fixture_frame(1, leani_primitives::BlockHash::ZERO);
+        // The source supplies transactions, receipts and logs, not headers.
+        let source = Arc::new(leani_testkit::ScriptedLiveSource::new(
+            leani_testkit::fixture_source_descriptor("feed", range),
+            vec![leani_testkit::LiveStep::Event(
+                leani_source_api::ChainEvent::Block(Box::new(frame.clone())),
+            )],
+        ));
+        let feed = live_feed(source, leani_testkit::default_source_budget());
+        let start = || leani_source_api::LiveStart::Block(frame.block);
+        let mut events = feed(
+            Arc::new(BlockLocalCounter::default()),
+            start(),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("a feed of transactions");
+        assert!(matches!(
+            events.next().await,
+            Some(Ok(leani_source_api::ChainEvent::Block(_)))
+        ));
+        let headers = feed(
+            Arc::new(leani_testkit::OrderedLedgerProcessor::default()),
+            start(),
+            CancellationToken::new(),
+        )
+        .await;
+        assert!(
+            headers.is_err(),
+            "this processor needs headers, which the source lacks"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_live_feed_fetches_its_processors_kinds_of_material_unfiltered() {
+        use leani_processor_wasm::{
+            TEMPLATES, WasmContract, WasmLimits, WasmModule, WasmProcessor,
+        };
+        use leani_source_api::{
+            ChainEventStream, DataRequest, LiveSource, LiveStart, SourceBudget, SourceDescriptor,
+            SourceError,
+        };
+
+        struct Recording(
+            leani_testkit::ScriptedLiveSource,
+            std::sync::Mutex<Vec<DataRequest>>,
+        );
+        #[async_trait::async_trait]
+        impl LiveSource for Recording {
+            fn descriptor(&self) -> &SourceDescriptor {
+                self.0.descriptor()
+            }
+
+            async fn subscribe(
+                &self,
+                request: DataRequest,
+                start: LiveStart,
+                budget: SourceBudget,
+                cancellation: CancellationToken,
+            ) -> Result<ChainEventStream, SourceError> {
+                self.1.lock().expect("requests").push(request.clone());
+                self.0.subscribe(request, start, budget, cancellation).await
+            }
+        }
+
+        let range = leani_primitives::BlockRange::new(
+            leani_primitives::BlockNumber(0),
+            leani_primitives::BlockNumber(2),
+        )
+        .expect("range");
+        let source = Arc::new(Recording(
+            leani_testkit::ScriptedLiveSource::new(
+                leani_testkit::fixture_source_descriptor("feed", range),
+                Vec::new(),
+            ),
+            std::sync::Mutex::default(),
+        ));
+        let template = TEMPLATES
+            .iter()
+            .find(|template| template.name == "erc20-transfers")
+            .expect("template");
+        let limits = WasmLimits::default();
+        let transfers = WasmProcessor::new(
+            WasmModule::new(template.module, &limits).expect("module"),
+            &serde_json::from_str(template.params).expect("params"),
+            WasmContract {
+                instance: leani_processor_api::ProcessorInstanceId::new("feed").expect("instance"),
+                version: semver::Version::new(0, 0, 0),
+                start_block: leani_primitives::BlockNumber(0),
+                publication: leani_processor_api::PublicationPolicy::Attested,
+                lifecycle: leani_processor_api::LifecyclePolicies::default(),
+            },
+            limits,
+        )
+        .expect("processor");
+        assert!(
+            transfers.descriptor().requirements[0]
+                .filter
+                .constrains_logs(),
+            "the module selects one token's transfers"
+        );
+        let feed = live_feed(source.clone(), leani_testkit::default_source_budget());
+        let _events = feed(
+            Arc::new(transfers),
+            LiveStart::Block(fixture_frame(1, leani_primitives::BlockHash::ZERO).block),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("a feed of logs");
+        let requests = source.1.lock().expect("requests");
+        assert!(
+            requests[0]
+                .required
+                .contains(leani_primitives::Capability::Logs)
+        );
+        // Every log of each block, so the run can swap in another filter
+        // without fetching its blocks again.
+        assert_eq!(requests[0].filter_scope(), None);
+    }
 
     #[test]
     fn history_reads_acquire_by_disk_and_hold_by_memory() {
