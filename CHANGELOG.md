@@ -13,6 +13,11 @@ record, and documented RPC contracts.
   every example processor has a TypeScript twin that publishes exactly its
   Rust original's changes.
 
+### Changed
+
+- The live lane keeps every block's header, which the P2P source fetches
+  anyway, so header-only processors run ad hoc on any node.
+
 ## [0.1.1] - 2026-10-29
 
 ### Changed
