@@ -772,9 +772,9 @@ async fn token_volume_accumulates_in_chain_order_and_undoes() {
     );
 }
 
-/// Native `evm-events` and the Wasm `erc20-transfers` doing the same work:
-/// decode ERC-20 transfers, write one entity and one change per transfer.
-/// Run in release:
+/// Native `evm-events`, the Wasm `erc20-transfers`, and its TypeScript twin
+/// doing the same work: decode ERC-20 transfers, write one entity and one
+/// change per transfer. Run in release:
 /// `cargo test -p leani-processor-wasm --release -- --ignored --nocapture wasm_versus_native`.
 #[tokio::test]
 #[ignore = "measurement, not a check"]
@@ -801,11 +801,18 @@ async fn wasm_versus_native() {
     })
     .expect("native processor");
     let wasm = processor_with(TRANSFERS, &json!({}), WasmLimits::default()).expect("wasm");
+    let typescript = processor_with(
+        &typescript_example("erc20-transfers"),
+        &json!({}),
+        WasmLimits::default(),
+    )
+    .expect("typescript");
     let per_block = |total: Duration, blocks: u32| total / blocks;
     println!(
         "| logs/block | native map | wasm map | native reduce | wasm reduce | native map+apply | wasm map+apply |"
     );
     println!("|---:|---:|---:|---:|---:|---:|---:|");
+    let mut typescript_rows = Vec::new();
     for logs in [0_u32, 10, 100, 1_000] {
         let blocks = if logs >= 1_000 { 20 } else { 200 };
         let frames = (1..=u64::from(blocks))
@@ -820,7 +827,7 @@ async fn wasm_versus_native() {
             })
             .collect::<Vec<_>>();
         let mut timings = Vec::new();
-        for processor in [&native as &dyn Processor, &wasm as &dyn Processor] {
+        for processor in [&native as &dyn Processor, &wasm, &typescript] {
             let started = Instant::now();
             let mut deltas = Vec::with_capacity(frames.len());
             for frame in &frames {
@@ -870,10 +877,20 @@ async fn wasm_versus_native() {
         let [
             (native_map, native_reduce, native_apply),
             (wasm_map, wasm_reduce, wasm_apply),
+            (typescript_map, typescript_reduce, typescript_apply),
         ] = timings[..]
         else {
-            unreachable!("two processors");
+            unreachable!("three processors");
         };
+        typescript_rows.push(format!(
+            "| {logs} | {:?} ({:.1}x Rust) | {:?} ({:.1}x Rust) | {:?} ({:.1}x Rust) |",
+            per_block(typescript_map, blocks),
+            typescript_map.as_secs_f64() / wasm_map.as_secs_f64(),
+            per_block(typescript_reduce, blocks),
+            typescript_reduce.as_secs_f64() / wasm_reduce.as_secs_f64(),
+            per_block(typescript_apply, blocks),
+            typescript_apply.as_secs_f64() / wasm_apply.as_secs_f64(),
+        ));
         println!(
             "| {logs} | {:?} | {:?} ({:.1}x) | {:?} | {:?} ({:.1}x) | {:?} | {:?} ({:.1}x) |",
             per_block(native_map, blocks),
@@ -886,6 +903,11 @@ async fn wasm_versus_native() {
             per_block(wasm_apply, blocks),
             wasm_apply.as_secs_f64() / native_apply.as_secs_f64(),
         );
+    }
+    println!("\n| logs/block | TypeScript wasm map | reduce | map+apply |");
+    println!("|---:|---:|---:|---:|");
+    for row in typescript_rows {
+        println!("{row}");
     }
 }
 
@@ -1012,4 +1034,276 @@ async fn the_event_decoder_decodes_signed_static_and_dynamic_arguments() {
         ))
         .contains("invalid width")
     );
+}
+
+fn repository() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
+}
+
+fn build_typescript(entry: &std::path::Path, sdk: &std::path::Path) -> Vec<u8> {
+    static INSTALL: std::sync::Once = std::sync::Once::new();
+    let package = repository().join("packages/wasm-guest");
+    // Tests build in parallel: one installs the compiler, the others wait.
+    INSTALL.call_once(|| {
+        if !package.join("node_modules/assemblyscript").exists() {
+            let status = std::process::Command::new("npm")
+                .args(["ci", "--ignore-scripts", "--no-audit", "--no-fund"])
+                .current_dir(&package)
+                .status()
+                .expect("npm runs");
+            assert!(status.success(), "npm ci in {}", package.display());
+        }
+    });
+    let out = tempfile::NamedTempFile::new().expect("output");
+    let output = std::process::Command::new("node")
+        .arg(package.join("build.mjs"))
+        .arg(entry)
+        .arg(sdk)
+        .arg(out.path())
+        .output()
+        .expect("node runs");
+    let report: Value = serde_json::from_slice(&output.stdout)
+        .unwrap_or_else(|_| panic!("{}", String::from_utf8_lossy(&output.stderr)));
+    assert_eq!(report["built"], true, "{}: {report:#}", entry.display());
+    std::fs::read(out.path()).expect("module")
+}
+
+fn typescript_example(name: &str) -> Vec<u8> {
+    let root = repository();
+    build_typescript(
+        &root
+            .join("examples/wasm-processors")
+            .join(name)
+            .join("assembly/index.ts"),
+        &root.join("packages/wasm-guest/assembly"),
+    )
+}
+
+/// Apply `frames` with a Rust module and its TypeScript twin: both describe
+/// the same manifest and publish the same changes, which this returns.
+async fn twins(
+    rust: &[u8],
+    typescript: &[u8],
+    params: &Value,
+    frames: &[BlockFrame],
+) -> (
+    Vec<(u64, String, Value)>,
+    [(WasmProcessor, SqliteStore, tempfile::TempDir); 2],
+) {
+    let mut sides = Vec::new();
+    for module in [rust, typescript] {
+        let processor = processor_with(module, params, WasmLimits::default()).expect("processor");
+        let directory = tempfile::tempdir().expect("directory");
+        let store = open_store(&directory).await;
+        for frame in frames {
+            apply(&store, &processor, frame).await.expect("apply");
+        }
+        sides.push((processor, store, directory));
+    }
+    let typescript = sides.pop().expect("the TypeScript side");
+    let rust = sides.pop().expect("the Rust side");
+    assert_eq!(rust.0.manifest(), typescript.0.manifest());
+    let published = changes(&rust.1, &rust.0).await;
+    assert_eq!(published, changes(&typescript.1, &typescript.0).await);
+    (published, [rust, typescript])
+}
+
+#[tokio::test]
+#[ignore = "builds with Node.js and the compiler the SDK pins"]
+#[expect(clippy::too_many_lines, reason = "one fixture per bundled example")]
+async fn typescript_examples_match_their_rust_twins() {
+    let mut fee = frame(11, BlockHash::ZERO, Vec::new());
+    if let Material::Complete(header) = &mut fee.header {
+        header.base_fee_per_gas = Some(leani_primitives::Quantity::new(word(7_000_000_000)));
+    }
+    let plain = frame(12, fee.block.hash, Vec::new());
+    let (published, _) = twins(
+        BLOCK_GAS,
+        &typescript_example("block-gas"),
+        &json!({}),
+        &[fee.clone(), plain],
+    )
+    .await;
+    assert_eq!(published.len(), 2, "{published:?}");
+    assert_eq!(published[0].2["baseFeePerGas"], "7000000000");
+    let (skipped, _) = twins(
+        BLOCK_GAS,
+        &typescript_example("block-gas"),
+        &json!({ "minUtilizationPercent": 50 }),
+        &[fee],
+    )
+    .await;
+    assert!(skipped.is_empty(), "{skipped:?}");
+
+    let mut erc721 = transfer(TOKEN, 1, 3);
+    erc721.topics.push(word(77));
+    erc721.data.clear();
+    let mut dirty = transfer(TOKEN, 50, 4);
+    dirty.topics[1][0] = 1;
+    let transfers = frame(
+        9,
+        BlockHash::ZERO,
+        vec![transfer(TOKEN, 9, 0), transfer(TOKEN, 10, 1), erc721, dirty],
+    );
+    let (published, _) = twins(
+        TRANSFERS,
+        &typescript_example("erc20-transfers"),
+        &json!({ "tokens": [Address::new(TOKEN).to_string()], "minValue": "10" }),
+        &[transfers],
+    )
+    .await;
+    assert_eq!(published.len(), 1, "{published:?}");
+
+    let first = frame(
+        1,
+        BlockHash::ZERO,
+        vec![
+            transfer(TOKEN, 5, 0),
+            transfer(OTHER, 6, 1),
+            transfer(TOKEN, 7, 2),
+        ],
+    );
+    let second = frame(
+        2,
+        first.block.hash,
+        vec![transfer(OTHER, u64::MAX, 0), transfer(TOKEN, 100, 1)],
+    );
+    let (published, sides) = twins(
+        VOLUME,
+        &typescript_example("token-volume"),
+        &json!({}),
+        &[first, second.clone()],
+    )
+    .await;
+    assert_eq!(published.len(), 4, "{published:?}");
+    let mut restored = Vec::new();
+    for (processor, store, _) in &sides {
+        store
+            .undo(
+                processor.descriptor(),
+                second.chain_id,
+                second.block.number,
+                second.block.hash,
+                &[],
+            )
+            .await
+            .expect("undo");
+        restored.push((
+            entity(store, processor, "volumes", &TOKEN).await,
+            entity(store, processor, "volumes", &OTHER).await,
+        ));
+    }
+    assert_eq!(restored[0], restored[1]);
+    assert_eq!(
+        restored[0]
+            .0
+            .as_ref()
+            .map(|volume| volume["volume"].clone()),
+        Some(json!("12"))
+    );
+
+    let events = event_logs();
+    let (published, _) = twins(
+        EVENT_DECODER,
+        &typescript_example("event-decoder"),
+        &json!({ "events": [
+            "Swap(address indexed sender, address indexed recipient, int256 amount0, int256 amount1, uint160 sqrtPriceX96, uint128 liquidity, int24 tick)",
+            "event Named(string label, bytes data, bool flag);",
+        ], "withTransactionHash": true }),
+        &[frame(12, BlockHash::ZERO, events)],
+    )
+    .await;
+    assert_eq!(published.len(), 3, "{published:?}");
+    assert_eq!(
+        published[2].2["args"]["label"],
+        "quote \" back\\ \n\t\u{1} é ✓ 😀 h\u{fffd}\u{fffd}A"
+    );
+
+    // Parameters a processor cannot use fail as it loads, in both
+    // languages, not in every block it maps.
+    for (rust, name, params) in [
+        (
+            BLOCK_GAS,
+            "block-gas",
+            json!({ "minUtilizationPercent": "oops" }),
+        ),
+        (TRANSFERS, "erc20-transfers", json!({ "minValue": "oops" })),
+        (
+            EVENT_DECODER,
+            "event-decoder",
+            json!({ "events": ["event Hidden(uint256 value) anonymous"] }),
+        ),
+    ] {
+        assert!(
+            processor_with(rust, &params, WasmLimits::default()).is_err(),
+            "{name} in Rust took {params}"
+        );
+        assert!(
+            processor_with(&typescript_example(name), &params, WasmLimits::default()).is_err(),
+            "{name} in TypeScript took {params}"
+        );
+    }
+    // A signature that does not parse names why, in either language.
+    let anonymous = json!({ "events": ["event Hidden(uint256 value) anonymous"] });
+    for module in [EVENT_DECODER.to_vec(), typescript_example("event-decoder")] {
+        assert!(
+            message(processor_with(&module, &anonymous, WasmLimits::default()))
+                .contains("anonymous events are not supported")
+        );
+    }
+}
+
+/// A Swap, a Named event, a Swap that does not decode, and a Named event
+/// whose label needs escaping and holds ill-formed UTF-8.
+fn event_logs() -> Vec<Log> {
+    let signed = |value: i64| {
+        let mut word = [if value < 0 { 0xff } else { 0 }; 32];
+        word[24..].copy_from_slice(&value.to_be_bytes());
+        word
+    };
+    let padded = |bytes: &[u8]| {
+        let mut chunk = word(u64::try_from(bytes.len()).expect("len")).to_vec();
+        let mut value = bytes.to_vec();
+        value.resize(bytes.len().div_ceil(32).max(1) * 32, 0);
+        chunk.extend(value);
+        chunk
+    };
+    let swap = Log {
+        address: Address::new(TOKEN),
+        topics: vec![
+            *alloy_primitives::keccak256(
+                b"Swap(address,address,int256,int256,uint160,uint128,int24)",
+            ),
+            topic([1; 20]),
+            topic([2; 20]),
+        ],
+        data: [signed(-5), signed(7), word(1), word(2), signed(-3)].concat(),
+        transaction_hash: Some(TransactionHash::new([9; 32])),
+        transaction_index: 0,
+        log_index: 0,
+    };
+    let named = |label: &[u8], log_index: u32| {
+        let label = padded(label);
+        Log {
+            address: Address::new(OTHER),
+            topics: vec![*alloy_primitives::keccak256(b"Named(string,bytes,bool)")],
+            data: [
+                word(0x60).to_vec(),
+                word(0x60 + u64::try_from(label.len()).expect("len")).to_vec(),
+                word(1).to_vec(),
+                label,
+                padded(&[0xbe, 0xef]),
+            ]
+            .concat(),
+            transaction_hash: Some(TransactionHash::new([9; 32])),
+            transaction_index: 1,
+            log_index,
+        }
+    };
+    let mut truncated = swap.clone();
+    truncated.data.truncate(64);
+    truncated.log_index = 2;
+    let mut label = "quote \" back\\ \n\t\u{1} é ✓ 😀 h".as_bytes().to_vec();
+    label.extend([0xff, 0xe2, 0x82, b'A']);
+    vec![swap, named(b"hello", 1), truncated, named(&label, 3)]
 }

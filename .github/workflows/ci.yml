@@ -57,6 +57,11 @@ jobs:
           cargo fmt --manifest-path examples/wasm-processors/Cargo.toml --all --check
           cargo clippy --locked --manifest-path examples/wasm-processors/Cargo.toml \
             --target wasm32-unknown-unknown -- -D warnings
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+      - name: Build the TypeScript twins
+        run: cargo test --locked -p leani-processor-wasm -- --ignored --skip wasm_versus_native
 
   sdk:
     name: TypeScript SDK
