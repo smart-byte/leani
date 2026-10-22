@@ -1,0 +1,31 @@
+# Example Leani Wasm processors. Build them with
+# `scripts/build-wasm-processors.sh`, which also refreshes the prebuilt copies
+# the node embeds as templates and tests run against.
+[workspace]
+resolver = "3"
+members = [
+  "abi-probe",
+  "block-gas",
+  "erc20-transfers",
+  "event-decoder",
+  "token-volume",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+publish = false
+
+[workspace.dependencies]
+leani-wasm-guest = { path = "../../crates/wasm-guest" }
+serde = { version = "1.0", features = ["derive"] }
+
+# Small, self-contained modules: the node interprets them, so less code is
+# less to translate, and panics report through the guest SDK before aborting.
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
