@@ -8765,6 +8765,7 @@ leani-primitives 0.1.1 — https://github.com/smart-byte/leani
 leani-processor-api 0.1.1 — https://github.com/smart-byte/leani
 leani-source-api 0.1.1 — https://github.com/smart-byte/leani
 leani-testkit 0.1.1 — https://github.com/smart-byte/leani
+leani-wasm-guest 0.1.0 — https://github.com/smart-byte/leani
 
 MIT License
 
@@ -8843,6 +8844,7 @@ leani-processor-evm-events 0.1.1 — https://github.com/smart-byte/leani
 leani-processor-rollup-txs 0.1.1 — https://github.com/smart-byte/leani
 leani-processor-transaction-stats 0.1.1 — https://github.com/smart-byte/leani
 leani-processor-uniswap 0.1.1 — https://github.com/smart-byte/leani
+leani-processor-wasm 0.1.1 — https://github.com/smart-byte/leani
 leani-rpc 0.1.1 — https://github.com/smart-byte/leani
 leani-runtime 0.1.1 — https://github.com/smart-byte/leani
 leani-source-archive 0.1.1 — https://github.com/smart-byte/leani
@@ -8939,6 +8941,11 @@ sqlx-core 0.9.0 — https://github.com/launchbadge/sqlx
 sqlx-sqlite 0.9.0 — https://github.com/launchbadge/sqlx
 syn-solidity 1.7.3 — https://github.com/alloy-rs/core
 uint 0.10.0 — https://github.com/paritytech/parity-common
+wasmi 2.0.0 — https://github.com/wasmi-labs/wasmi
+wasmi_collections 2.0.0 — https://github.com/wasmi-labs/wasmi
+wasmi_core 2.0.0 — https://github.com/wasmi-labs/wasmi
+wasmi_ir 2.0.0 — https://github.com/wasmi-labs/wasmi
+wasmparser 0.228.0 — https://github.com/bytecodealliance/wasm-tools/tree/main/crates/wasmparser
 wide 0.7.33 — https://github.com/Lokathor/wide
 winapi-i686-pc-windows-gnu 0.4.0 — https://github.com/retep998/winapi-rs
 winapi-x86_64-pc-windows-gnu 0.4.0 — https://github.com/retep998/winapi-rs

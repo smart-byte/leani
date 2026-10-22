@@ -184,6 +184,11 @@ satisfied, 130 interrupted before --once was satisfied.")]
         #[arg(long, env = "LEANI_API_TOKEN", hide_env_values = true)]
         token: Option<String>,
     },
+    /// Run Wasm processors over finalized history.
+    Processor {
+        #[command(subcommand)]
+        command: ProcessorCommand,
+    },
     /// Inspect or probe configured data sources.
     Source {
         #[command(subcommand)]
@@ -336,6 +341,47 @@ fn parse_duration(value: &str) -> Result<Duration, humantime::DurationError> {
         |_| humantime::parse_duration(value),
         |seconds| Ok(Duration::from_secs(seconds)),
     )
+}
+
+#[derive(Clone, Debug, Subcommand)]
+pub enum ProcessorCommand {
+    /// Run a Wasm processor over finalized history and print its changes.
+    #[command(after_help = "Examples:
+  leani processor run transfers.wasm --from-block 21000000 --to-block 21000099
+  leani processor run transfers.wasm --from-block 21000000 --to-block 21000099 --param minValue=1000000000
+  leani processor run --template event-decoder --from 21000000 --to 21000009 \\
+    --params '{\"events\":[\"Transfer(address indexed from, address indexed to, uint256 value)\"]}'
+
+Each change prints as one JSON line on stdout; progress and the report go to
+stderr. Sources, chain, and finality come from the configuration file; its
+processors are ignored. Build modules with the leani-wasm-guest crate, or run
+a bundled template: block-gas, erc20-transfers, token-volume, event-decoder.")]
+    Run {
+        /// Wasm module built with leani-wasm-guest.
+        #[arg(required_unless_present = "template")]
+        module: Option<PathBuf>,
+        /// A bundled template instead of a module file; without parameters
+        /// it runs with its example parameters.
+        #[arg(long, conflicts_with = "module")]
+        template: Option<String>,
+        /// First block of the range, inclusive.
+        #[arg(long, visible_alias = "from")]
+        from_block: u64,
+        /// Last block of the range, inclusive.
+        #[arg(long, visible_alias = "to")]
+        to_block: u64,
+        /// One parameter, as KEY=VALUE (repeatable); VALUE is read as JSON when it parses, else as a string, as are integers past 2^63.
+        #[arg(long = "param", value_name = "KEY=VALUE")]
+        params: Vec<String>,
+        /// Every parameter as one JSON object; --param entries override its keys.
+        #[arg(long = "params", value_name = "JSON")]
+        params_json: Option<String>,
+        /// Keep the run's state here instead of in a temporary directory; a
+        /// later run there must use the same module, parameters, and
+        /// --from-block.
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+    },
 }
 
 /// Sections of `leani guide` beyond the overview.
@@ -976,6 +1022,59 @@ mod tests {
             panic!("subscribe command");
         };
         assert_eq!(finality, SubscribeFinality::Unattested);
+    }
+
+    #[test]
+    fn processor_run_takes_a_module_or_a_template() {
+        let cli = Cli::try_parse_from([
+            "leani",
+            "processor",
+            "run",
+            "--template",
+            "block-gas",
+            "--from",
+            "1",
+            "--to",
+            "2",
+        ])
+        .expect("CLI parses");
+        let Command::Processor {
+            command:
+                ProcessorCommand::Run {
+                    module,
+                    template,
+                    from_block,
+                    to_block,
+                    ..
+                },
+        } = cli.command
+        else {
+            panic!("expected processor run command");
+        };
+        assert_eq!(module, None);
+        assert_eq!(template.as_deref(), Some("block-gas"));
+        assert_eq!((from_block, to_block), (1, 2));
+        assert!(
+            Cli::try_parse_from(["leani", "processor", "run", "--from", "1", "--to", "2"]).is_err(),
+            "a module or a template"
+        );
+    }
+
+    #[test]
+    fn processor_run_help_names_every_bundled_template() {
+        let mut command = <Cli as clap::CommandFactory>::command();
+        let help = command
+            .find_subcommand_mut("processor")
+            .and_then(|processor| processor.find_subcommand_mut("run"))
+            .and_then(|run| run.get_after_help().map(ToString::to_string))
+            .expect("run help");
+        let names = leani_processor_wasm::TEMPLATES
+            .map(|template| template.name)
+            .join(", ");
+        assert!(
+            help.contains(&format!("a bundled template: {names}.")),
+            "{help}"
+        );
     }
 
     #[test]

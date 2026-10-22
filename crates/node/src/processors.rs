@@ -1,9 +1,9 @@
 //! Public processor factory and registry boundary.
 //!
-//! The standard binary registers the checked-in native processors. Downstream
-//! binaries can register additional factories without forking node assembly.
-//! A future Wasm package loader implements the same [`ProcessorFactory`]
-//! contract.
+//! The standard binary registers the checked-in native processors and the
+//! `wasm` factory, which loads Wasm modules through the same
+//! [`ProcessorFactory`] contract. Downstream binaries can register additional
+//! factories without forking node assembly.
 
 // The public factory trait deliberately permits IDs and descriptions owned by
 // dynamically loaded implementations; built-ins happen to return literals.
@@ -117,11 +117,11 @@ impl ProcessorFactoryError {
     }
 }
 
-/// Constructs one configured processor without opening files or networks.
+/// Constructs one configured processor without opening networks; only the
+/// `wasm` factory reads a file, its module.
 ///
-/// Factories are trusted native code in the initial extension model. A Wasm
-/// package runtime can later expose one factory per installed package while
-/// retaining the same node/runtime boundary.
+/// Factories are trusted native code. The `wasm` factory runs each module in
+/// a sandboxed interpreter behind the same node/runtime boundary.
 pub trait ProcessorFactory: Send + Sync {
     fn id(&self) -> &str;
 
@@ -176,6 +176,7 @@ impl ProcessorRegistry {
             Arc::new(TransactionStatsProcessorFactory),
             Arc::new(UniswapObservationsProcessorFactory),
             Arc::new(UniswapLatestProcessorFactory),
+            Arc::new(WasmProcessorFactory),
         ] {
             factories.insert(factory.id().to_owned(), factory);
         }
@@ -889,6 +890,103 @@ fn uniswap_config(
     })
 }
 
+/// `[processors.settings]` of a `wasm` processor.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WasmSettings {
+    /// Module path, relative to the configuration file.
+    module: std::path::PathBuf,
+    /// Optional pin: the module's BLAKE3 hash, as the processor's code hash.
+    #[serde(default)]
+    blake3: Option<String>,
+    #[serde(default)]
+    params: toml::Table,
+    #[serde(default)]
+    limits: leani_processor_wasm::WasmLimits,
+}
+
+/// Loads `settings.module`, a sandboxed Wasm processor, so a stock binary
+/// runs processors it was not compiled with.
+#[derive(Clone, Copy, Debug)]
+struct WasmProcessorFactory;
+
+impl ProcessorFactory for WasmProcessorFactory {
+    fn id(&self) -> &str {
+        leani_processor_wasm::PROCESSOR_ID
+    }
+
+    fn description(&self) -> &str {
+        "A sandboxed Wasm module from settings.module, metered and deterministic, built with leani-wasm-guest"
+    }
+
+    fn create(
+        &self,
+        configured: &ProcessorConfig,
+        _context: ProcessorFactoryContext,
+    ) -> Result<ProcessorComponents, ProcessorFactoryError> {
+        use leani_processor_wasm::{WasmContract, WasmModule, WasmProcessor};
+
+        let settings: WasmSettings = decode_settings(configured)?;
+        // A module is a pinned local artifact, so reading it here keeps
+        // construction deterministic.
+        let bytes = read_module(&settings.module, settings.limits.module_bytes)?;
+        let module = WasmModule::new(&bytes, &settings.limits)
+            .map_err(|error| ProcessorFactoryError::configuration(error.to_string()))?;
+        let hash = hex::encode(module.hash().0);
+        if let Some(pin) = &settings.blake3
+            && !pin.trim_start_matches("0x").eq_ignore_ascii_case(&hash)
+        {
+            return Err(ProcessorFactoryError::configuration(format!(
+                "module {} has BLAKE3 0x{hash}, not the pinned {pin}",
+                settings.module.display()
+            )));
+        }
+        let params = serde_json::to_value(&settings.params)
+            .map_err(|error| ProcessorFactoryError::configuration(error.to_string()))?;
+        let version = semver::Version::parse(&configured.version)
+            .map_err(|error| ProcessorFactoryError::configuration(format!("version: {error}")))?;
+        let (instance, publication, lifecycle) = configured_contract(configured)?;
+        let processor = WasmProcessor::new(
+            module,
+            &params,
+            WasmContract {
+                instance,
+                version,
+                start_block: BlockNumber(configured.start_block),
+                publication,
+                lifecycle,
+            },
+            settings.limits,
+        )
+        .map_err(|error| ProcessorFactoryError::configuration(error.to_string()))?;
+        Ok(ProcessorComponents::new(Arc::new(processor)))
+    }
+}
+
+fn read_module(path: &std::path::Path, limit: u64) -> Result<Vec<u8>, ProcessorFactoryError> {
+    use std::io::Read as _;
+
+    let unreadable = |error: std::io::Error| {
+        ProcessorFactoryError::configuration(format!(
+            "cannot read Wasm module {}: {error}",
+            path.display()
+        ))
+    };
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)
+        .map_err(unreadable)?
+        .take(limit.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(unreadable)?;
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > limit {
+        return Err(ProcessorFactoryError::configuration(format!(
+            "Wasm module {} exceeds the {limit}-byte module limit",
+            path.display()
+        )));
+    }
+    Ok(bytes)
+}
+
 fn decode_settings<T: for<'de> Deserialize<'de>>(
     configured: &ProcessorConfig,
 ) -> Result<T, ProcessorFactoryError> {
@@ -941,6 +1039,96 @@ mod tests {
         assert_eq!(
             registry.register(DuplicateBlobs),
             Err(ProcessorRegistryError::Duplicate("blobs-money".to_owned()))
+        );
+    }
+
+    #[test]
+    fn wasm_modules_load_beside_their_configuration_and_honor_a_pin() {
+        let module = include_bytes!("../../processor-wasm/modules/erc20_transfers.wasm");
+        let directory = tempfile::tempdir().expect("directory");
+        std::fs::create_dir(directory.path().join("modules")).expect("modules");
+        std::fs::write(directory.path().join("modules/transfers.wasm"), module).expect("module");
+        let repository = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let base = std::fs::read_to_string(repository.join("config/modes/windowed.toml"))
+            .expect("base configuration");
+        let path = directory.path().join("leani.toml");
+        std::fs::write(
+            &path,
+            format!(
+                "{base}
+[[processors]]
+id = \"wasm\"
+instance = \"usdc-transfers\"
+version = \"1.0.0\"
+history_mode = \"on_demand\"
+start_block = 19000000
+publish = \"attested\"
+state = {{ mode = \"durable\" }}
+output = {{ mode = \"full\" }}
+delivery = {{ mode = \"window\" }}
+checkpoint = {{ mode = \"automatic\", keep = 3 }}
+undo = {{ mode = \"unfinalized\", safety_blocks = 256 }}
+
+[processors.settings]
+module = \"modules/transfers.wasm\"
+
+[processors.settings.params]
+tokens = [\"0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48\"]
+minValue = 1000000
+"
+            ),
+        )
+        .expect("configuration");
+        let config = Config::load(&path).expect("load");
+        let mut configured = config
+            .processors
+            .iter()
+            .find(|processor| processor.id == "wasm")
+            .expect("wasm processor")
+            .clone();
+        assert_eq!(
+            configured.settings["module"]
+                .as_str()
+                .map(std::path::PathBuf::from),
+            Some(directory.path().join("modules/transfers.wasm"))
+        );
+        let registry = ProcessorRegistry::standard();
+        let processor = registry
+            .instantiate(&configured, config.chain.chain_id)
+            .expect("wasm processor");
+        let hash = blake3::hash(module);
+        assert_eq!(processor.descriptor().code_hash.0, *hash.as_bytes());
+        assert_eq!(processor.descriptor().instance.as_str(), "usdc-transfers");
+
+        configured.settings.insert(
+            "blake3".to_owned(),
+            toml::Value::String(format!("0x{}", hash.to_hex())),
+        );
+        registry
+            .instantiate(&configured, config.chain.chain_id)
+            .expect("matching pin");
+        configured.settings.insert(
+            "blake3".to_owned(),
+            toml::Value::String(format!("0x{}", "00".repeat(32))),
+        );
+        let refused = registry
+            .instantiate(&configured, config.chain.chain_id)
+            .err()
+            .expect("stale pin")
+            .to_string();
+        assert!(refused.contains("not the pinned"), "{refused}");
+        configured.settings.insert(
+            "module".to_owned(),
+            toml::Value::String("missing.wasm".to_owned()),
+        );
+        let missing = registry
+            .instantiate(&configured, config.chain.chain_id)
+            .err()
+            .expect("missing module")
+            .to_string();
+        assert!(
+            missing.contains("cannot read Wasm module missing.wasm"),
+            "{missing}"
         );
     }
 

@@ -1108,6 +1108,225 @@
         "subcommands": []
       },
       {
+        "name": "processor",
+        "about": "Run Wasm processors over finalized history",
+        "usage": "Usage: leani processor [OPTIONS] <COMMAND>",
+        "arguments": [
+          {
+            "id": "config",
+            "long": "config",
+            "short": null,
+            "help": "Path to the versioned TOML configuration",
+            "required": false,
+            "action": "Set",
+            "defaultValues": [],
+            "possibleValues": []
+          },
+          {
+            "id": "log_format",
+            "long": "log-format",
+            "short": null,
+            "help": "Log rendering format",
+            "required": false,
+            "action": "Set",
+            "defaultValues": [
+              "pretty"
+            ],
+            "possibleValues": [
+              "pretty",
+              "json"
+            ]
+          },
+          {
+            "id": "log_filter",
+            "long": "log-filter",
+            "short": null,
+            "help": "Tracing filter, e.g. `info,leani=debug`",
+            "required": false,
+            "action": "Set",
+            "defaultValues": [],
+            "possibleValues": []
+          },
+          {
+            "id": "help",
+            "long": "help",
+            "short": "h",
+            "help": "Print help (see more with '--help')",
+            "required": false,
+            "action": "Help",
+            "defaultValues": [],
+            "possibleValues": []
+          },
+          {
+            "id": "version",
+            "long": "version",
+            "short": "V",
+            "help": "Print version",
+            "required": false,
+            "action": "Version",
+            "defaultValues": [],
+            "possibleValues": []
+          }
+        ],
+        "subcommands": [
+          {
+            "name": "run",
+            "about": "Run a Wasm processor over finalized history and print its changes",
+            "usage": "Usage: leani processor run [OPTIONS] --from-block <FROM_BLOCK> --to-block <TO_BLOCK> [MODULE]",
+            "arguments": [
+              {
+                "id": "module",
+                "long": null,
+                "short": null,
+                "help": "Wasm module built with leani-wasm-guest",
+                "required": false,
+                "action": "Set",
+                "defaultValues": [],
+                "possibleValues": []
+              },
+              {
+                "id": "template",
+                "long": "template",
+                "short": null,
+                "help": "A bundled template instead of a module file; without parameters it runs with its example parameters",
+                "required": false,
+                "action": "Set",
+                "defaultValues": [],
+                "possibleValues": []
+              },
+              {
+                "id": "from_block",
+                "long": "from-block",
+                "short": null,
+                "help": "First block of the range, inclusive",
+                "required": true,
+                "action": "Set",
+                "defaultValues": [],
+                "possibleValues": []
+              },
+              {
+                "id": "to_block",
+                "long": "to-block",
+                "short": null,
+                "help": "Last block of the range, inclusive",
+                "required": true,
+                "action": "Set",
+                "defaultValues": [],
+                "possibleValues": []
+              },
+              {
+                "id": "params",
+                "long": "param",
+                "short": null,
+                "help": "One parameter, as KEY=VALUE (repeatable); VALUE is read as JSON when it parses, else as a string, as are integers past 2^63",
+                "required": false,
+                "action": "Append",
+                "defaultValues": [],
+                "possibleValues": []
+              },
+              {
+                "id": "params_json",
+                "long": "params",
+                "short": null,
+                "help": "Every parameter as one JSON object; --param entries override its keys",
+                "required": false,
+                "action": "Set",
+                "defaultValues": [],
+                "possibleValues": []
+              },
+              {
+                "id": "data_dir",
+                "long": "data-dir",
+                "short": null,
+                "help": "Keep the run's state here instead of in a temporary directory; a later run there must use the same module, parameters, and --from-block",
+                "required": false,
+                "action": "Set",
+                "defaultValues": [],
+                "possibleValues": []
+              },
+              {
+                "id": "config",
+                "long": "config",
+                "short": null,
+                "help": "Path to the versioned TOML configuration",
+                "required": false,
+                "action": "Set",
+                "defaultValues": [],
+                "possibleValues": []
+              },
+              {
+                "id": "log_format",
+                "long": "log-format",
+                "short": null,
+                "help": "Log rendering format",
+                "required": false,
+                "action": "Set",
+                "defaultValues": [
+                  "pretty"
+                ],
+                "possibleValues": [
+                  "pretty",
+                  "json"
+                ]
+              },
+              {
+                "id": "log_filter",
+                "long": "log-filter",
+                "short": null,
+                "help": "Tracing filter, e.g. `info,leani=debug`",
+                "required": false,
+                "action": "Set",
+                "defaultValues": [],
+                "possibleValues": []
+              },
+              {
+                "id": "help",
+                "long": "help",
+                "short": "h",
+                "help": "Print help (see more with '--help')",
+                "required": false,
+                "action": "Help",
+                "defaultValues": [],
+                "possibleValues": []
+              },
+              {
+                "id": "version",
+                "long": "version",
+                "short": "V",
+                "help": "Print version",
+                "required": false,
+                "action": "Version",
+                "defaultValues": [],
+                "possibleValues": []
+              }
+            ],
+            "subcommands": []
+          },
+          {
+            "name": "help",
+            "about": "Print this message or the help of the given subcommand(s)",
+            "usage": "Usage: leani processor help [COMMAND]",
+            "arguments": [],
+            "subcommands": [
+              {
+                "name": "run",
+                "about": "Run a Wasm processor over finalized history and print its changes",
+                "usage": "Usage: leani processor help run",
+                "arguments": [],
+                "subcommands": []
+              },
+              {
+                "name": "help",
+                "about": "Print this message or the help of the given subcommand(s)",
+                "usage": "Usage: leani processor help help",
+                "arguments": [],
+                "subcommands": []
+              }
+            ]
+          }
+        ]
+      },
+      {
         "name": "source",
         "about": "Inspect or probe configured data sources",
         "usage": "Usage: leani source [OPTIONS] <COMMAND>",
@@ -4183,6 +4402,21 @@
             "usage": "Usage: leani help backfill",
             "arguments": [],
             "subcommands": []
+          },
+          {
+            "name": "processor",
+            "about": "Run Wasm processors over finalized history",
+            "usage": "Usage: leani help processor [COMMAND]",
+            "arguments": [],
+            "subcommands": [
+              {
+                "name": "run",
+                "about": "Run a Wasm processor over finalized history and print its changes",
+                "usage": "Usage: leani help processor run",
+                "arguments": [],
+                "subcommands": []
+              }
+            ]
           },
           {
             "name": "source",

@@ -1410,8 +1410,9 @@ impl ValidatedConfig {
 
 impl Config {
     /// Read TOML without opening the configured data directory or any network
-    /// connection. Relative paths in the file, its `data_dir` and archive
-    /// `manifest`s, are resolved against the directory of the file at `path`.
+    /// connection. Relative paths in the file, its `data_dir`, archive
+    /// `manifest`s, and Wasm processor `module`s, are resolved against the
+    /// directory of the file at `path`.
     ///
     /// # Errors
     ///
@@ -1477,6 +1478,15 @@ impl Config {
             }
         }
         let mut warnings = config.deprecation_warnings();
+        for processor in &mut config.processors {
+            if processor.id == leani_processor_wasm::PROCESSOR_ID
+                && let Some(toml::Value::String(module)) = processor.settings.get_mut("module")
+            {
+                *module = resolve_relative_to_file(path, Path::new(module.as_str()))
+                    .to_string_lossy()
+                    .into_owned();
+            }
+        }
         if let Some(working_directory) = working_directory
             && written.is_relative()
             && !written.as_os_str().is_empty()
