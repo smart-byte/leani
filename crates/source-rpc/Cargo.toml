@@ -13,6 +13,13 @@ publish = false
 workspace = true
 
 [dependencies]
+async-trait.workspace = true
+futures.workspace = true
+leani-primitives = { path = "../primitives" }
+leani-source-api = { path = "../source-api" }
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
 alloy-consensus.workspace = true
 alloy-consensus-any = "2.3.0"
 alloy-eips.workspace = true
@@ -21,6 +28,7 @@ alloy-rlp.workspace = true
 alloy-rpc-types-eth.workspace = true
 alloy-trie = "0.9.8"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 url.workspace = true

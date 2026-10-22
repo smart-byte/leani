@@ -4825,9 +4825,17 @@ dependencies = [
  "alloy-rlp",
  "alloy-rpc-types-eth",
  "alloy-trie",
+ "async-trait",
+ "futures",
+ "leani-primitives",
+ "leani-source-api",
  "reqwest 0.12.28",
+ "serde",
  "serde_json",
  "thiserror 2.0.21",
+ "tokio",
+ "tokio-util",
+ "tracing",
  "url",
 ]
 
