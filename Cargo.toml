@@ -20,6 +20,7 @@ members = [
   "crates/runtime",
   "crates/source-api",
   "crates/source-archive",
+  "crates/source-aws",
   "crates/source-erae",
   "crates/source-p2p",
   "crates/source-rpc",

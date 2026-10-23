@@ -44,6 +44,7 @@ leani-source-archive = { path = "../source-archive" }
 leani-source-erae = { path = "../source-erae" }
 leani-source-p2p = { path = "../source-p2p" }
 leani-source-rpc = { path = "../source-rpc" }
+leani-source-aws = { path = "../source-aws" }
 leani-source-xatu = { path = "../source-xatu" }
 leani-store-history = { path = "../store-history" }
 leani-store-artifacts = { path = "../store-artifacts" }

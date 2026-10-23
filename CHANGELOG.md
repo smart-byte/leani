@@ -8,6 +8,13 @@ record, and documented RPC contracts.
 
 ### Added
 
+- `kind = "aws_public"` history reads the chain's public Parquet dataset on
+  AWS Open Data: Ethereum mainnet (AWS's export), Base and Arbitrum One
+  (SonarX's). Each block's receipts are rebuilt from the receipt and log rows
+  and checked against its receipts root and logs bloom, and Base and Arbitrum
+  block hashes are recomputed from their header rows. It serves headers,
+  receipts, and logs, one UTC day per chunk. `leani source probe aws` checks
+  a range.
 - A node can follow a chain over JSON-RPC: `kind = "json_rpc"` for the live
   source, finality, and history, with endpoints and a quorum under
   `[sources.json_rpc]` (defaulting to the chain entry's). A block counts as

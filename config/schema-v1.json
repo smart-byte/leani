@@ -266,7 +266,7 @@
       "properties": {
         "id": { "type": "string", "minLength": 1 },
         "kind": {
-          "enum": ["xatu", "era_e", "archive", "json_rpc"]
+          "enum": ["xatu", "era_e", "archive", "json_rpc", "aws_public"]
         },
         "priority": {
           "type": "integer",
@@ -278,9 +278,7 @@
         },
         "chunk_blocks": {
           "$ref": "#/$defs/positiveInteger",
-          "multipleOf": 1000,
-          "default": 1000,
-          "description": "Xatu only: blocks per acquisition chunk for headers, transactions, and logs, a multiple of Xatu's 1,000-block partitions."
+          "description": "Xatu: blocks per acquisition chunk for headers, transactions, and logs, a multiple of Xatu's 1,000-block partitions (default 1,000). aws_public: most blocks of one day per chunk (default the whole day); each chunk reads its day again."
         },
         "blobs_chunk_blocks": {
           "$ref": "#/$defs/positiveInteger",
@@ -291,13 +289,17 @@
         "batch_rows": {
           "$ref": "#/$defs/positiveInteger",
           "default": 8192,
-          "description": "Xatu only: Parquet rows decoded per bounded Arrow batch."
+          "description": "Xatu and aws_public: Parquet rows decoded per bounded Arrow batch."
         },
         "manifest": {
           "type": "string",
           "description": "Archive only: the archive manifest. A relative path is relative to the directory of this configuration file."
         },
-        "endpoint": { "type": "string", "format": "uri" },
+        "endpoint": {
+          "type": "string",
+          "format": "uri",
+          "description": "era_e: a mirror of the eraE files. aws_public: an https mirror of the AWS public blockchain bucket with the same layout."
+        },
         "allow_insecure_http": { "type": "boolean" }
       }
     },

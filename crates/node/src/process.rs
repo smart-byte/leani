@@ -4593,6 +4593,7 @@ fn configured_history_candidates(
                 crate::config::HistorySourceKind::Xatu
                     | crate::config::HistorySourceKind::EraE
                     | crate::config::HistorySourceKind::Archive
+                    | crate::config::HistorySourceKind::AwsPublic
             )
         })
         .collect::<Vec<_>>();
@@ -4645,6 +4646,7 @@ fn configured_history_candidates(
                 erae.allow_insecure_http = configured.allow_insecure_http;
                 std::sync::Arc::new(EraeSource::new(erae)?)
             }
+            crate::config::HistorySourceKind::AwsPublic => aws_public_source(config, configured)?,
             // Validation refuses `parquet` sources.
             crate::config::HistorySourceKind::Parquet => continue,
         };
@@ -4836,6 +4838,9 @@ fn configured_rpc_history_sources(
                 erae.allow_insecure_http = source.allow_insecure_http;
                 sources.push(std::sync::Arc::new(EraeSource::new(erae)?));
             }
+            crate::config::HistorySourceKind::AwsPublic => {
+                sources.push(aws_public_source(config, source)?);
+            }
             // Validation refuses `parquet` sources.
             crate::config::HistorySourceKind::Parquet => {}
         }
@@ -4982,6 +4987,25 @@ async fn probe_source(source: ProbeSource, config_path: &Path) -> Result<Exit> {
         } => probe_rpc(config_path, from_block, to_block, endpoint).await,
         ProbeSource::OpGossip { seconds, output } => {
             probe_op_gossip(config_path, seconds, output.as_deref()).await
+        }
+        ProbeSource::Aws {
+            from_block,
+            to_block,
+            address,
+            endpoint,
+            max_input_bytes,
+        } => {
+            probe_aws(
+                config_path,
+                leani_primitives::BlockRange::new(
+                    leani_primitives::BlockNumber(from_block),
+                    leani_primitives::BlockNumber(to_block),
+                )?,
+                &address,
+                endpoint,
+                max_input_bytes,
+            )
+            .await
         }
         ProbeSource::P2p {
             from_block,
@@ -5240,6 +5264,118 @@ async fn probe_rpc(
     } else {
         Exit::Failure
     })
+}
+
+fn aws_public_source(
+    config: &Config,
+    source: &crate::config::HistorySourceConfig,
+) -> Result<std::sync::Arc<dyn leani_source_api::HistorySource>> {
+    let chain = config.chain_entry()?;
+    let mut aws = leani_source_aws::AwsPublicConfig::for_chain(&source.id, &chain)
+        .with_context(|| format!("{} has no public dataset", chain.name))?;
+    aws.priority = source.priority;
+    aws.chunk_blocks = source.chunk_blocks;
+    if let Some(endpoint) = &source.endpoint {
+        aws.bucket = endpoint.clone();
+    }
+    if let Some(batch_rows) = source.batch_rows {
+        aws.batch_rows = batch_rows;
+    }
+    Ok(std::sync::Arc::new(leani_source_aws::AwsPublicSource::new(
+        &aws,
+    )?))
+}
+
+async fn probe_aws(
+    config_path: &Path,
+    range: leani_primitives::BlockRange,
+    addresses: &[String],
+    endpoint: Option<url::Url>,
+    max_input_bytes: u64,
+) -> Result<Exit> {
+    use futures::StreamExt as _;
+    use leani_primitives::{Capability, CapabilitySet, Material};
+    use leani_source_api::HistorySource as _;
+
+    let config = Config::load(config_path)
+        .with_context(|| format!("load configuration {}", config_path.display()))?;
+    let chain = config.chain_entry()?;
+    let mut aws = leani_source_aws::AwsPublicConfig::for_chain("aws-public", &chain)
+        .with_context(|| format!("{} has no public dataset", chain.name))?;
+    if let Some(endpoint) = endpoint {
+        aws.bucket = endpoint;
+    }
+    let source = leani_source_aws::AwsPublicSource::new(&aws)?;
+    let mut filters = leani_source_api::FilterSet::default();
+    for address in addresses {
+        filters.scope.addresses.push(leani_primitives::Address::new(
+            address.parse::<alloy_primitives::Address>()?.0.0,
+        ));
+    }
+    let request = leani_source_api::DataRequest {
+        chain_id: leani_primitives::ChainId(chain.chain_id),
+        range,
+        required: if addresses.is_empty() {
+            CapabilitySet::of(Capability::Header).with(Capability::Receipts)
+        } else {
+            CapabilitySet::of(Capability::Header).with(Capability::Logs)
+        },
+        allow_filtered: !addresses.is_empty(),
+        projection: leani_source_api::FieldProjection::default(),
+        log_fields: leani_primitives::LogFieldSet::NONE,
+        filters,
+        minimum_finality: leani_primitives::Finality::Finalized,
+        verification_policy: leani_source_api::VerificationPolicy::TrustedDataset,
+    };
+    let started = std::time::Instant::now();
+    let plan = source.plan(&request).await?;
+    let budget = leani_source_api::SourceBudget {
+        max_input_bytes,
+        max_frame_bytes: 64 * 1_024 * 1_024,
+        max_frames: u64::MAX,
+        max_buffered_frames: 1,
+        max_in_flight_requests: 8,
+        temporary_disk_bytes: 1,
+        max_resident_bytes: max_input_bytes,
+    };
+    let (mut blocks, mut rebuilt, mut rooted, mut receipts, mut logs) = (0_u64, 0, 0, 0, 0);
+    for chunk in &plan.chunks {
+        let mut frames = source.open(chunk, budget, CancellationToken::new()).await?;
+        while let Some(frame) = frames.next().await {
+            let frame = frame?;
+            blocks += 1;
+            if frame.verification.header_hash == leani_primitives::VerificationCheck::VERIFIED {
+                rebuilt += 1;
+            }
+            if frame.verification.receipts_root == leani_primitives::VerificationCheck::VERIFIED {
+                rooted += 1;
+            }
+            if let Material::Complete(values) = &frame.receipts {
+                receipts += values.len() as u64;
+            }
+            logs += match &frame.logs {
+                Material::Complete(values) | Material::Filtered { value: values, .. } => {
+                    values.len() as u64
+                }
+                Material::Missing(_) => 0,
+            };
+        }
+        eprintln!("checked {:?}", chunk.range);
+    }
+    println!(
+        "{}",
+        serde_json::json!({
+            "chain": chain.name,
+            "days": plan.chunks.len(),
+            "blocks": blocks,
+            "headerHashesRecomputed": rebuilt,
+            "receipts": receipts,
+            "logs": logs,
+            "receiptsRootsChecked": rooted,
+            "elapsedMs": started.elapsed().as_millis(),
+        })
+    );
+    Ok(Exit::Success)
 }
 
 async fn probe_op_gossip(config_path: &Path, seconds: u64, output: Option<&Path>) -> Result<Exit> {
