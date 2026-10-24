@@ -8,6 +8,17 @@ record, and documented RPC contracts.
 
 ### Added
 
+- `finality.kind = "op_gossip"` follows an op-stack chain's sequencer-signed
+  block gossip: each signed block is the attested head the P2P live lane
+  follows. Recent frames are pruned `finality.settle_blocks` below the tip,
+  since `finalized` needs an L1 anchor. The gossip node advertises a
+  discovery record so peers can dial in (`finality.listen_port`), and
+  `leani source probe op-gossip` takes `--listen-port` and
+  `--discovery-port`.
+- The execution P2P lane drops a fresh peer whose eth/69 handshake head is
+  far behind the live target while it has fewer than
+  `body_serving_peer_target` peers serving the head, so syncing peers stop
+  holding its slots.
 - `kind = "aws_public"` history reads the chain's public Parquet dataset on
   AWS Open Data: Ethereum mainnet (AWS's export), Base and Arbitrum One
   (SonarX's). Each block's receipts are rebuilt from the receipt and log rows

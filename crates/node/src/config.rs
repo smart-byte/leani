@@ -749,6 +749,7 @@ impl LiveSourceConfig {
 #[serde(deny_unknown_fields)]
 pub struct FinalityConfig {
     pub kind: FinalitySourceKind,
+    #[serde(default)]
     pub checkpoint: String,
     #[serde(default)]
     pub checkpoint_slot: u64,
@@ -762,6 +763,14 @@ pub struct FinalityConfig {
     pub minimum_peers: usize,
     #[serde(default)]
     pub discovery_port: u16,
+    /// TCP port for `op_gossip` connections; 0 picks one, and peers can
+    /// then only be dialed, never dial in.
+    #[serde(default)]
+    pub listen_port: u16,
+    /// For `op_gossip`: how far below the tip recent frames are pruned while
+    /// `finalized` waits for the L1 anchor. Omitted, about one hour of blocks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settle_blocks: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
@@ -770,6 +779,8 @@ pub enum FinalitySourceKind {
     BeaconApi,
     ConsensusP2p,
     JsonRpc,
+    /// An op-stack chain's sequencer-signed block gossip.
+    OpGossip,
     Disabled,
 }
 
@@ -1997,12 +2008,34 @@ impl Config {
         if matches!(self.sources.live.kind, LiveSourceKind::P2p)
             && !matches!(
                 self.finality.kind,
-                FinalitySourceKind::BeaconApi | FinalitySourceKind::ConsensusP2p
+                FinalitySourceKind::BeaconApi
+                    | FinalitySourceKind::ConsensusP2p
+                    | FinalitySourceKind::OpGossip
             )
         {
             errors.push(ValidationError::new(
                 "sources.live/finality",
-                "the P2P live source requires verified beacon_api or consensus_p2p finality: a block is attested only once its ancestry reaches an execution header the sync committee attested, which the finality source verifies; set finality.kind, or sources.live.kind = \"disabled\" for finalized-dataset backfills",
+                "the P2P live source requires verified beacon_api, consensus_p2p, or op_gossip finality: a block is attested only once its ancestry reaches a head the finality source verified; set finality.kind, or sources.live.kind = \"disabled\" for finalized-dataset backfills",
+            ));
+        }
+        let op_stack = self
+            .chain_entry()
+            .is_ok_and(|chain| chain.op_stack.is_some());
+        if matches!(self.finality.kind, FinalitySourceKind::OpGossip) && !op_stack {
+            errors.push(ValidationError::new(
+                "finality.kind",
+                "op_gossip follows an op-stack chain's sequencer gossip; this chain is not one",
+            ));
+        }
+        if op_stack
+            && matches!(
+                self.finality.kind,
+                FinalitySourceKind::BeaconApi | FinalitySourceKind::ConsensusP2p
+            )
+        {
+            errors.push(ValidationError::new(
+                "finality.kind",
+                "an op-stack chain has no beacon chain: use op_gossip",
             ));
         }
         if self.processors.is_empty() {
@@ -2697,6 +2730,22 @@ fn validate_artifact_storage(
 }
 
 fn validate_finality(finality: &FinalityConfig, errors: &mut Vec<ValidationError>) {
+    if matches!(finality.kind, FinalitySourceKind::OpGossip) {
+        if finality.settle_blocks == Some(0) {
+            errors.push(ValidationError::new(
+                "finality.settle_blocks",
+                "must be at least 1",
+            ));
+        }
+        validate_enr_bootnodes(&finality.bootnodes, errors);
+        return;
+    }
+    if finality.settle_blocks.is_some() {
+        errors.push(ValidationError::new(
+            "finality.settle_blocks",
+            "only applies to op_gossip finality; other kinds prune at finality",
+        ));
+    }
     // JSON-RPC finality starts from the endpoints' finalized block.
     if matches!(
         finality.kind,
@@ -2775,16 +2824,22 @@ fn validate_finality(finality: &FinalityConfig, errors: &mut Vec<ValidationError
                     format!("must be between 1 and {maximum}, the consensus peers dialed at once"),
                 ));
             }
-            for (index, bootnode) in finality.bootnodes.iter().enumerate() {
-                if !bootnode.starts_with("enr:") || bootnode.len() > 2_048 {
-                    errors.push(ValidationError::new(
-                        format!("finality.bootnodes[{index}]"),
-                        "must be an `enr:` record no longer than 2,048 bytes",
-                    ));
-                }
-            }
+            validate_enr_bootnodes(&finality.bootnodes, errors);
         }
-        FinalitySourceKind::JsonRpc | FinalitySourceKind::Disabled => {}
+        FinalitySourceKind::JsonRpc
+        | FinalitySourceKind::OpGossip
+        | FinalitySourceKind::Disabled => {}
+    }
+}
+
+fn validate_enr_bootnodes(bootnodes: &[String], errors: &mut Vec<ValidationError>) {
+    for (index, bootnode) in bootnodes.iter().enumerate() {
+        if !bootnode.starts_with("enr:") || bootnode.len() > 2_048 {
+            errors.push(ValidationError::new(
+                format!("finality.bootnodes[{index}]"),
+                "must be an `enr:` record no longer than 2,048 bytes",
+            ));
+        }
     }
 }
 
@@ -4004,7 +4059,7 @@ max_blocks = 64"#,
             .find(|error| error.field == "sources.live/finality")
             .unwrap_or_else(|| panic!("live following without finality validated: {errors:?}"));
         assert!(
-            refusal.message.contains("sync committee attested"),
+            refusal.message.contains("attested only once"),
             "{refusal:?}"
         );
         // Disabling live following as well is a finalized-dataset backfill.
@@ -4233,6 +4288,47 @@ endpoints = ["https://ethereum-hoodi-beacon-api.publicnode.com/"]
                 .validation_errors()
                 .iter()
                 .any(|error| error.field == "sources.json_rpc")
+        );
+    }
+
+    #[test]
+    fn op_gossip_finality_follows_only_op_stack_chains() {
+        let mut config: Config = toml::from_str(VALID_CONFIG_TOML).expect("fixture parses");
+        let finality_errors = |config: &Config| {
+            config
+                .validation_errors()
+                .into_iter()
+                .filter(|error| error.field.contains("finality"))
+                .map(|error| error.message)
+                .collect::<Vec<_>>()
+        };
+        config.chain.name = "base".to_owned();
+        config.chain.chain_id = 8453;
+        assert!(
+            finality_errors(&config)
+                .iter()
+                .any(|message| message.contains("no beacon chain")),
+            "{:?}",
+            finality_errors(&config)
+        );
+        config.finality.kind = FinalitySourceKind::OpGossip;
+        config.finality.checkpoint = String::new();
+        assert!(
+            finality_errors(&config).is_empty(),
+            "{:?}",
+            finality_errors(&config)
+        );
+        config.finality.settle_blocks = Some(0);
+        assert_eq!(finality_errors(&config).len(), 1);
+        config.finality.settle_blocks = None;
+        config.chain.name = "ethereum-mainnet".to_owned();
+        config.chain.chain_id = 1;
+        assert!(
+            finality_errors(&config)
+                .iter()
+                .any(|message| message.contains("not one")),
+            "{:?}",
+            finality_errors(&config)
         );
     }
 

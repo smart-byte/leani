@@ -4,9 +4,9 @@
 //! blocks arrive on the `/optimism/<chain id>/<version>/blocks` topics.
 
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     net::Ipv4Addr,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use alloy_primitives::{Address, B256};
@@ -15,6 +15,13 @@ use discv5::{
     enr::{CombinedKey, CombinedPublicKey, EnrPublicKey, NodeId},
 };
 use futures::StreamExt;
+use leani_primitives::{
+    BlockHash, BlockNumber, Capability, CapabilitySet, ChainId, SourceId, SourceKind, TrustModel,
+};
+use leani_source_api::{
+    AttestedHead, AttestedHeadPublisher, ConsensusCheckpoint, FinalityEvent, FinalityEventStream,
+    FinalityModel, FinalitySource, Partitioning, SourceDescriptor, SourceError,
+};
 use libp2p::{
     Multiaddr, PeerId, SwarmBuilder,
     gossipsub::{self, IdentTopic, MessageAcceptance, MessageAuthenticity, MessageId},
@@ -26,13 +33,18 @@ use libp2p::{
 };
 use op_alloy_rpc_types_engine::OpNetworkPayloadEnvelope;
 use sha2::{Digest, Sha256};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 /// Gossip topic versions: v1 (Bedrock) through v4 (Isthmus).
 const TOPIC_VERSIONS: [u8; 4] = [0, 1, 2, 3];
 const MAX_GOSSIP_BYTES: usize = 10 * 1_024 * 1_024;
+/// Concurrent random lookups per discovery round: few records in the shared
+/// table carry the chain's `opstack` entry.
+const LOOKUPS: usize = 4;
+/// Peers at their connection limit close at once; ask again later.
+const REDIAL_AFTER: Duration = Duration::from_secs(60);
 /// Message-id domains for payloads that do and do not decompress.
 const VALID_SNAPPY_DOMAIN: [u8; 4] = [1, 0, 0, 0];
 const INVALID_SNAPPY_DOMAIN: [u8; 4] = [0, 0, 0, 0];
@@ -148,6 +160,47 @@ fn enr_op_stack_chain(enr: &Enr) -> Option<u64> {
     None
 }
 
+/// The discovery key of the libp2p identity: peers derive the peer id they
+/// dial from the record's key.
+fn discovery_key(keypair: &identity::Keypair) -> Result<CombinedKey, OpGossipError> {
+    let mut secret = keypair
+        .clone()
+        .try_into_secp256k1()
+        .map_err(|error| OpGossipError::Discovery(error.to_string()))?
+        .secret()
+        .to_bytes();
+    CombinedKey::secp256k1_from_bytes(&mut secret)
+        .map_err(|error| OpGossipError::Discovery(error.to_string()))
+}
+
+/// The record peers find us by: the chain's `opstack` entry and the ports.
+/// Discovery fills in the external address once peers agree on it.
+fn local_record(key: &CombinedKey, config: &OpGossipConfig) -> Result<Enr, OpGossipError> {
+    let mut chain = Vec::new();
+    for mut value in [config.chain_id, 0] {
+        loop {
+            let byte = u8::try_from(value & 0x7f).unwrap_or_default();
+            value >>= 7;
+            if value == 0 {
+                chain.push(byte);
+                break;
+            }
+            chain.push(byte | 0x80);
+        }
+    }
+    let mut builder = Enr::builder();
+    builder.add_value("opstack", &alloy_primitives::Bytes::from(chain));
+    if config.listen_port != 0 {
+        builder.tcp4(config.listen_port);
+    }
+    if config.discovery_port != 0 {
+        builder.udp4(config.discovery_port);
+    }
+    builder
+        .build(key)
+        .map_err(|error| OpGossipError::Discovery(error.to_string()))
+}
+
 fn peer_address(enr: &Enr) -> Option<(PeerId, Multiaddr)> {
     let CombinedPublicKey::Secp256k1(key) = enr.public_key() else {
         return None;
@@ -213,9 +266,9 @@ pub async fn follow(
     config: OpGossipConfig,
     cancellation: CancellationToken,
 ) -> Result<mpsc::Receiver<SignedBlock>, OpGossipError> {
-    let key = CombinedKey::generate_secp256k1();
-    let local_enr =
-        Enr::empty(&key).map_err(|error| OpGossipError::Discovery(error.to_string()))?;
+    let keypair = identity::Keypair::generate_secp256k1();
+    let key = discovery_key(&keypair)?;
+    let local_enr = local_record(&key, &config)?;
     let listen = ListenConfig::from_ip(Ipv4Addr::UNSPECIFIED.into(), config.discovery_port);
     let mut discovery = Discv5::new(local_enr, key, ConfigBuilder::new(listen).build())
         .map_err(|error| OpGossipError::Discovery(error.to_string()))?;
@@ -242,7 +295,6 @@ pub async fn follow(
     let gossipsub: gossipsub::Behaviour =
         gossipsub::Behaviour::new(MessageAuthenticity::Anonymous, gossip_config)
             .map_err(|error| OpGossipError::Transport(error.to_owned()))?;
-    let keypair = identity::Keypair::generate_secp256k1();
     let behaviour = Behaviour {
         gossipsub,
         identify: identify::Behaviour::new(identify::Config::new(String::new(), keypair.public())),
@@ -278,48 +330,81 @@ pub async fn follow(
         .map_err(|error| OpGossipError::Transport(error.to_string()))?;
 
     let (blocks, received) = mpsc::channel(256);
+    let (found, mut candidates) = mpsc::channel(64);
+    let discovery_cancellation = cancellation.clone();
+    let rediscovery_interval = config.rediscovery_interval;
+    let chain_id = config.chain_id;
+    // A lookup takes seconds; the swarm must keep running meanwhile.
     tokio::spawn(async move {
-        let mut dialed = HashSet::new();
+        let mut rediscover = tokio::time::interval(rediscovery_interval);
+        let round = async {
+            loop {
+                rediscover.tick().await;
+                let lookups = (0..LOOKUPS).map(|_| discovery.find_node(NodeId::random()));
+                let records = futures::future::join_all(lookups)
+                    .await
+                    .into_iter()
+                    .flat_map(Result::unwrap_or_default)
+                    .chain(discovery.table_entries_enr())
+                    .filter(|enr| enr_op_stack_chain(enr) == Some(chain_id))
+                    .filter_map(|enr| peer_address(&enr))
+                    .collect::<Vec<_>>();
+                debug!(candidates = records.len(), "op-stack gossip discovery");
+                for record in records {
+                    if found.send(record).await.is_err() {
+                        return;
+                    }
+                }
+            }
+        };
+        tokio::select! {
+            () = discovery_cancellation.cancelled() => {}
+            () = round => {}
+        }
+        // Frees the UDP port for a restarted lane.
+        discovery.shutdown();
+    });
+    tokio::spawn(async move {
+        let mut dialed = HashMap::<PeerId, Instant>::new();
         let mut connected = HashSet::new();
-        let mut rediscover = tokio::time::interval(config.rediscovery_interval);
+        let mut joined = false;
         loop {
             tokio::select! {
                 () = cancellation.cancelled() => return,
-                _ = rediscover.tick(), if connected.len() < config.maximum_peers => {
-                    let found = discovery.find_node(NodeId::random()).await.unwrap_or_default();
-                    let records = found
-                        .into_iter()
-                        .chain(discovery.table_entries_enr())
-                        .collect::<Vec<_>>();
-                    let mut chains = std::collections::BTreeMap::<Option<u64>, usize>::new();
-                    for enr in &records {
-                        *chains.entry(enr_op_stack_chain(enr)).or_default() += 1;
-                    }
-                    debug!(records = records.len(), ?chains, "op-stack gossip discovery records");
-                    let candidates = records
-                        .into_iter()
-                        .filter(|enr| enr_op_stack_chain(enr) == Some(config.chain_id))
-                        .filter_map(|enr| peer_address(&enr))
-                        .collect::<Vec<_>>();
-                    debug!(candidates = candidates.len(), connected = connected.len(), "op-stack gossip discovery");
-                    for (peer_id, address) in candidates {
-                        if dialed.insert(peer_id) {
-                            let address = address.with(Protocol::P2p(peer_id));
-                            if let Err(error) = swarm.dial(address) {
-                                debug!(%error, "could not dial op-stack gossip peer");
-                            }
+                Some((peer_id, address)) = candidates.recv() => {
+                    let due = dialed
+                        .get(&peer_id)
+                        .is_none_or(|at| at.elapsed() >= REDIAL_AFTER);
+                    if connected.len() < config.maximum_peers && !connected.contains(&peer_id) && due {
+                        dialed.insert(peer_id, Instant::now());
+                        let address = address.with(Protocol::P2p(peer_id));
+                        if let Err(error) = swarm.dial(address) {
+                            debug!(%error, "could not dial op-stack gossip peer");
                         }
                     }
                 }
                 event = swarm.select_next_some() => match event {
-                    SwarmEvent::ConnectionEstablished { peer_id, .. } => {
-                        if connected.insert(peer_id) && connected.len() == 1 {
+                    SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
+                        debug!(%peer_id, address = %endpoint.get_remote_address(), "op-stack gossip connection established");
+                        if connected.insert(peer_id) && !joined {
+                            joined = true;
                             info!(chain_id = config.chain_id, "joined op-stack block gossip");
                         }
                     }
-                    SwarmEvent::ConnectionClosed { peer_id, num_established: 0, .. } => {
-                        connected.remove(&peer_id);
-                        dialed.remove(&peer_id);
+                    SwarmEvent::ConnectionClosed { peer_id, num_established, cause, endpoint, .. } => {
+                        debug!(%peer_id, ?cause, dialer = endpoint.is_dialer(), "op-stack gossip connection closed");
+                        if num_established == 0 {
+                            connected.remove(&peer_id);
+                        }
+                    }
+                    SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
+                        debug!(?peer_id, %error, "op-stack gossip dial failed");
+                    }
+                    SwarmEvent::Behaviour(BehaviourEvent::Identify(identify::Event::Received { peer_id, info, .. })) => {
+                        debug!(%peer_id, agent = info.agent_version, protocol = info.protocol_version, protocols = ?info.protocols, "op-stack gossip peer identified");
+                    }
+                    SwarmEvent::Behaviour(BehaviourEvent::Gossipsub(gossipsub::Event::Subscribed { peer_id, topic })) => {
+                        debug!(%peer_id, %topic, "op-stack gossip peer subscribed");
                     }
                     SwarmEvent::Behaviour(BehaviourEvent::Gossipsub(gossipsub::Event::Message {
                         propagation_source,
@@ -368,6 +453,114 @@ pub async fn follow(
     Ok(received)
 }
 
+/// Publish every signed block as the live lane's attested head, and keep the
+/// newest one for whoever needs a start. The head's slot is its number.
+///
+/// # Errors
+///
+/// Returns an error when the gossip cannot start.
+pub async fn publish_heads(
+    config: OpGossipConfig,
+    heads: AttestedHeadPublisher,
+    cancellation: CancellationToken,
+) -> Result<watch::Receiver<Option<SignedBlock>>, OpGossipError> {
+    let mut blocks = follow(config, cancellation.clone()).await?;
+    let (latest, receiver) = watch::channel(None);
+    tokio::spawn(async move {
+        loop {
+            let block = tokio::select! {
+                () = cancellation.cancelled() => return,
+                block = blocks.recv() => block,
+            };
+            let Some(block) = block else { return };
+            heads.publish(AttestedHead {
+                beacon_slot: block.number,
+                beacon_block_root: [0; 32],
+                block_number: BlockNumber(block.number),
+                block_hash: BlockHash::new(block.hash.0),
+            });
+            latest.send_if_modified(|current: &mut Option<SignedBlock>| {
+                let newer = current.is_none_or(|current| current.number < block.number);
+                if newer {
+                    *current = Some(block);
+                }
+                newer
+            });
+        }
+    });
+    Ok(receiver)
+}
+
+/// Sequencer-signed heads as the finality lane of an op-stack chain. They are
+/// optimistic only: nothing here finalizes a block.
+#[derive(Debug)]
+pub struct OpGossipFinality {
+    descriptor: SourceDescriptor,
+    heads: watch::Receiver<Option<SignedBlock>>,
+}
+
+impl OpGossipFinality {
+    /// # Errors
+    ///
+    /// Returns an error for an invalid source id.
+    pub fn new(
+        chain_id: ChainId,
+        heads: watch::Receiver<Option<SignedBlock>>,
+    ) -> Result<Self, SourceError> {
+        Ok(Self {
+            descriptor: SourceDescriptor {
+                id: SourceId::new("op-gossip")
+                    .map_err(|error| SourceError::InvalidPlan(error.to_string()))?,
+                kind: SourceKind::SequencerGossip,
+                chain_id,
+                range: None,
+                capabilities: CapabilitySet::of(Capability::ConsensusFinality),
+                complete_capabilities: CapabilitySet::of(Capability::ConsensusFinality),
+                trust: TrustModel::ProtocolVerified,
+                finality: FinalityModel::Attested,
+                partitioning: Partitioning::None,
+                expected_lag: Duration::from_secs(2),
+                schema_version: "op-gossip.v1".to_owned(),
+                priority: 0,
+            },
+            heads,
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl FinalitySource for OpGossipFinality {
+    fn descriptor(&self) -> &SourceDescriptor {
+        &self.descriptor
+    }
+
+    async fn subscribe(
+        &self,
+        _checkpoint: ConsensusCheckpoint,
+        cancellation: CancellationToken,
+    ) -> Result<FinalityEventStream, SourceError> {
+        let heads = self.heads.clone();
+        Ok(futures::stream::unfold(
+            (heads, cancellation),
+            |(mut heads, cancellation)| async move {
+                tokio::select! {
+                    () = cancellation.cancelled() => None,
+                    changed = heads.changed() => {
+                        changed.ok()?;
+                        let block = (*heads.borrow_and_update())?;
+                        let event = FinalityEvent::Optimistic {
+                            block_hash: BlockHash::new(block.hash.0),
+                            beacon_slot: block.number,
+                        };
+                        Some((Ok(event), (heads, cancellation)))
+                    }
+                }
+            },
+        )
+        .boxed())
+    }
+}
+
 fn unix_now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -388,6 +581,25 @@ mod tests {
             .expect("valid record");
         assert_eq!(enr_op_stack_chain(&base), Some(8453));
         assert!(peer_address(&base).is_some());
+    }
+
+    #[test]
+    fn our_record_names_the_chain_and_the_dialed_identity() {
+        let keypair = identity::Keypair::generate_secp256k1();
+        let key = discovery_key(&keypair).expect("secp256k1 key");
+        let base = leani_chain::ChainRegistry::standard()
+            .get("base-mainnet")
+            .expect("base entry");
+        let mut config = OpGossipConfig::for_chain(&base).expect("op-stack entry");
+        config.listen_port = 9222;
+        let mut record = local_record(&key, &config).expect("record");
+        record
+            .set_ip("1.2.3.4".parse().expect("ip"), &key)
+            .expect("ip");
+        assert_eq!(enr_op_stack_chain(&record), Some(8453));
+        let (peer_id, address) = peer_address(&record).expect("dialable");
+        assert_eq!(peer_id, keypair.public().to_peer_id());
+        assert_eq!(address.to_string(), "/ip4/1.2.3.4/tcp/9222");
     }
 
     #[test]

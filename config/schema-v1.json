@@ -404,10 +404,16 @@
     "finality": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["kind", "checkpoint"],
+      "required": ["kind"],
       "properties": {
         "kind": {
-          "enum": ["beacon_api", "consensus_p2p", "json_rpc", "disabled"]
+          "enum": [
+            "beacon_api",
+            "consensus_p2p",
+            "json_rpc",
+            "op_gossip",
+            "disabled"
+          ]
         },
         "checkpoint": { "type": "string" },
         "checkpoint_slot": { "$ref": "#/$defs/nonNegativeInteger" },
@@ -425,6 +431,16 @@
           "type": "integer",
           "minimum": 0,
           "maximum": 65535
+        },
+        "listen_port": {
+          "description": "op_gossip only: TCP port for gossip connections, advertised in the discovery record; 0 picks one, and peers cannot dial in.",
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 65535
+        },
+        "settle_blocks": {
+          "description": "op_gossip only: recent frames are pruned this many blocks below the tip while finalized waits for an L1 anchor; omitted, about one hour of blocks.",
+          "$ref": "#/$defs/positiveInteger"
         }
       }
     },

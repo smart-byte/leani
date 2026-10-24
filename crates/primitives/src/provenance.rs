@@ -66,6 +66,8 @@ pub enum SourceKind {
     Synthetic,
     /// JSON-RPC endpoints, trusted for which block is canonical.
     JsonRpc,
+    /// A rollup sequencer's signed block gossip.
+    SequencerGossip,
 }
 
 /// Trust needed beyond cryptographic checks represented in the report.

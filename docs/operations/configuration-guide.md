@@ -141,7 +141,7 @@ which its `/playground` uses.
 | `artifact_storage` | table | Physical backend and bounded compaction policy for retained processor artifacts. |
 | `budgets` | table | Hard memory, temporary disk, pending-delta, recent-input, and concurrency limits. |
 | `sources` | table | Priority-ordered history sources and the optional live source. |
-| `finality` | table | `consensus_p2p`, `beacon_api`, or `disabled`. |
+| `finality` | table | `consensus_p2p`, `beacon_api`, `json_rpc`, `op_gossip`, or `disabled`. |
 | `processors` | array | One immutable processor kind/instance contract per entry. |
 | `rpc` | table | HTTP/WS binds, browser origins, request and response limits, and bounded historical lookup behavior. |
 | `api` | table | Native API bind, bearer-token environment variable, allowed hosts and browser origins, and delivery batching. |
@@ -413,7 +413,8 @@ object reads, but it also increases per-chunk memory and is not universally
 faster; tune it per projection rather than as a global block-size knob.
 
 `[sources.live] kind = "p2p"` enables the shared persistent Reth peer manager.
-It requires verified `beacon_api` or `consensus_p2p` finality. Stable
+It requires verified `beacon_api` or `consensus_p2p` finality, or `op_gossip`
+on an op-stack chain. Stable
 production ports normally use `listener_port = 30303`,
 `discovery_port = 30303`, and `discv5_port = 30304`. Discv4 and Discv5
 require distinct fixed UDP ports; zero selects an isolated ephemeral port for
@@ -460,6 +461,19 @@ backfills, not verified head following: the live lane includes a block only
 once its ancestry reaches an execution header the sync committee attested,
 which the finality source verifies each slot, so validation refuses
 `sources.live.kind = "p2p"` with `finality.kind = "disabled"`.
+
+On an op-stack chain, such as Base, `finality.kind = "op_gossip"` follows the
+sequencer's signed block gossip and needs no checkpoint. Every block the
+chain entry's sequencer key signed becomes the attested head the P2P live lane
+follows, so blocks reach `attested` about as fast as `unattested`. Nothing
+finalizes a block without an L1 anchor, so recent frames are pruned
+`finality.settle_blocks` below the tip instead, about one hour of blocks when
+omitted; settled blocks keep their level. Gossip peers find the node through
+its discovery record: fixed, reachable `finality.listen_port` (TCP) and
+`finality.discovery_port` (UDP) let them dial in, which Base needs because
+its busy consensus nodes refuse new outbound connections. Peers whose
+handshake head lies far behind the signed head are syncing and are dropped
+while fewer than `body_serving_peer_target` peers serve the head.
 
 ## Processor identity and publication
 

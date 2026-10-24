@@ -1358,7 +1358,9 @@ async fn embedded_config(
             config.finality.endpoints.clear();
             config.finality.minimum_peers = config.finality.minimum_peers.max(1);
         }
-        FinalitySourceKind::JsonRpc | FinalitySourceKind::Disabled => {
+        FinalitySourceKind::JsonRpc
+        | FinalitySourceKind::OpGossip
+        | FinalitySourceKind::Disabled => {
             unreachable!("subscriptions choose beacon_api or consensus_p2p finality")
         }
     }

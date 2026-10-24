@@ -121,6 +121,11 @@ const MAX_HISTORY_MATERIAL_WINDOW_BLOCKS: usize = 32;
 const NETWORK_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 const DNS_RETRY_INTERVAL: Duration = Duration::from_secs(15);
 const PEER_QUALIFICATION_RETRY_INTERVAL: Duration = Duration::from_secs(5);
+/// A fresh session whose handshake head is this many blocks below the live
+/// target belongs to a syncing peer.
+const SYNCING_PEER_LAG_BLOCKS: u64 = 1_024;
+/// How long a handshake head stays a fair account of the peer's progress.
+const SYNCING_PEER_WINDOW: Duration = Duration::from_secs(600);
 static SECRET_KEY_WRITE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 // Mainnet ETH responses have a 2 MiB soft limit, so a peer may serve only a
 // request's first blocks. Those are kept and the rest is asked for again.
@@ -1249,6 +1254,20 @@ struct DirectPeer {
     peer_id: B512,
     eth_version: EthVersion,
     messages: PeerRequestSender<PeerRequest<WireNetworkPrimitives>>,
+    /// The newest block the peer's eth/69 handshake declared, and when.
+    advertised: Option<(u64, Instant)>,
+}
+
+impl DirectPeer {
+    /// Whether the session is new and its handshake head lies so far below
+    /// `target` that the peer is still syncing: it cannot serve the live
+    /// lane, and keeping it takes a slot from a peer that can.
+    fn syncing_below(&self, target: BlockNumber) -> bool {
+        self.advertised.is_some_and(|(latest, at)| {
+            at.elapsed() < SYNCING_PEER_WINDOW
+                && latest.saturating_add(SYNCING_PEER_LAG_BLOCKS) < target.0
+        })
+    }
 }
 
 #[derive(Debug)]
@@ -2913,7 +2932,14 @@ fn spawn_peer_qualification_worker(
                         let delay = PEER_QUALIFICATION_RETRY_INTERVAL
                             .saturating_mul(1_u32 << exponent);
                         retry_at.insert(result.peer_id, Instant::now() + delay);
-                        if matches!(result.outcome, PeerQualification::Rejected) {
+                        let syncing = qualifications.ready(target) < body_serving_peer_target
+                            && direct_peers
+                                .get(result.peer_id)
+                                .is_some_and(|(peer, _)| peer.syncing_below(target.number));
+                        if syncing {
+                            debug!(peer_id = %result.peer_id, target = target.number.0, "dropping a syncing execution peer for its slot");
+                        }
+                        if matches!(result.outcome, PeerQualification::Rejected) || syncing {
                             handle.ban_peer(result.peer_id);
                             direct_peers.invalidate(result.peer_id, connection_id);
                             qualifications.remove(result.peer_id);
@@ -3422,6 +3448,10 @@ where
                                 peer_id: info.peer_id,
                                 eth_version: info.version,
                                 messages,
+                                advertised: info
+                                    .status
+                                    .latest_block
+                                    .map(|latest| (latest, Instant::now())),
                             });
                         }
                         Some(NetworkEvent::Peer(PeerEvent::SessionClosed { peer_id, reason })) => {
@@ -3651,6 +3681,10 @@ fn spawn_direct_peer_reconciler(
                     peer_id: session.remote_id,
                     eth_version: session.eth_version,
                     messages: manager_routed_peer_sender(handle.clone(), session.remote_id),
+                    advertised: session
+                        .status
+                        .latest_block
+                        .map(|latest| (latest, session.session_established)),
                 }) {
                     adopted = adopted.saturating_add(1);
                 }
@@ -13307,6 +13341,7 @@ mod tests {
             peer_id,
             eth_version: EthVersion::Eth68,
             messages: PeerRequestSender::new(peer_id, sender),
+            advertised: None,
         };
         let responder = tokio::spawn(async move {
             let PeerRequest::GetBlockHeaders { response, .. } =
@@ -13388,6 +13423,7 @@ mod tests {
             peer_id,
             eth_version: EthVersion::Eth68,
             messages: PeerRequestSender::new(peer_id, sender),
+            advertised: None,
         });
 
         assert_eq!(pool.len(), 1, "the physical session satisfies the floor");
@@ -13874,6 +13910,7 @@ mod tests {
                 peer_id,
                 eth_version: EthVersion::Eth68,
                 messages: PeerRequestSender::new(peer_id, sender),
+                advertised: None,
             });
             pool.set_qualification(peer_id, PeerQualification::BodyServing);
         }
@@ -13968,6 +14005,7 @@ mod tests {
                 peer_id,
                 eth_version: EthVersion::Eth68,
                 messages: PeerRequestSender::new(peer_id, sender),
+                advertised: None,
             });
             pool.set_qualification(peer_id, PeerQualification::BodyServing);
         }
@@ -13997,6 +14035,7 @@ mod tests {
             peer_id: fresh_peer,
             eth_version: EthVersion::Eth68,
             messages: PeerRequestSender::new(fresh_peer, sender),
+            advertised: None,
         });
         pool.set_qualification(fresh_peer, PeerQualification::BodyServing);
         let lease = pool
@@ -14025,6 +14064,7 @@ mod tests {
             peer_id,
             eth_version: EthVersion::Eth68,
             messages: PeerRequestSender::new(peer_id, sender),
+            advertised: None,
         });
         pool.set_qualification(peer_id, PeerQualification::HeadersOnly);
 
@@ -14068,6 +14108,7 @@ mod tests {
             peer_id,
             eth_version: EthVersion::Eth68,
             messages: PeerRequestSender::new(peer_id, first_sender),
+            advertised: None,
         });
         let mut stale_lease = pool
             .try_acquire_excluding(PeerMaterialKind::Body, 1, &HashSet::new(), None)
@@ -14080,6 +14121,7 @@ mod tests {
             peer_id,
             eth_version: EthVersion::Eth68,
             messages: PeerRequestSender::new(peer_id, second_sender),
+            advertised: None,
         });
         let current = pool
             .try_acquire_excluding(PeerMaterialKind::Body, 1, &HashSet::new(), None)
@@ -14134,6 +14176,7 @@ mod tests {
             peer_id,
             eth_version: EthVersion::Eth68,
             messages: PeerRequestSender::new(peer_id, sender),
+            advertised: None,
         });
         peer_store.record_success(
             peer_id,
@@ -14161,6 +14204,7 @@ mod tests {
             peer_id,
             eth_version: EthVersion::Eth68,
             messages: PeerRequestSender::new(peer_id, sender),
+            advertised: None,
         };
         let hash = B256::from([0x55; 32]);
         let responder = tokio::spawn(async move {
@@ -14195,6 +14239,7 @@ mod tests {
             peer_id,
             eth_version: EthVersion::Eth68,
             messages: PeerRequestSender::new(peer_id, sender),
+            advertised: None,
         };
         let hash = B256::from([0x77; 32]);
         let responder = tokio::spawn(async move {
@@ -14715,6 +14760,7 @@ mod tests {
                 peer_id,
                 eth_version: EthVersion::Eth68,
                 messages: PeerRequestSender::new(peer_id, sender),
+                advertised: None,
             });
         }
         let proven = B512::from([0x52; 64]);
@@ -14746,6 +14792,24 @@ mod tests {
         pool.set_qualification(header_only, PeerQualification::HeadersOnly);
         assert_eq!(lanes(header_only), (true, false));
         drop(receivers);
+    }
+
+    #[test]
+    fn fresh_sessions_far_below_the_target_are_syncing() {
+        let (sender, _receiver) = tokio::sync::mpsc::channel(1);
+        let peer_id = B512::from([0x11; 64]);
+        let peer = |advertised| DirectPeer {
+            peer_id,
+            eth_version: EthVersion::Eth69,
+            messages: PeerRequestSender::new(peer_id, sender.clone()),
+            advertised,
+        };
+        let target = BlockNumber(10_000);
+        assert!(peer(Some((8_000, Instant::now()))).syncing_below(target));
+        assert!(!peer(Some((9_500, Instant::now()))).syncing_below(target));
+        assert!(!peer(None).syncing_below(target));
+        let old = Instant::now().checked_sub(SYNCING_PEER_WINDOW + Duration::from_secs(1));
+        assert!(!peer(old.map(|at| (8_000, at))).syncing_below(target));
     }
 
     #[test]
@@ -14963,6 +15027,7 @@ mod tests {
             peer_id,
             eth_version: EthVersion::Eth68,
             messages: PeerRequestSender::new(peer_id, sender),
+            advertised: None,
         });
         // The session ended without a close event.
         drop(receiver);
@@ -14978,6 +15043,7 @@ mod tests {
             peer_id,
             eth_version: EthVersion::Eth68,
             messages: PeerRequestSender::new(peer_id, sender),
+            advertised: None,
         });
         assert!(!pool.remove_connection(peer_id, stale.connection_id));
         let (routed, _routed_receiver) = tokio::sync::mpsc::channel(1);
@@ -14985,6 +15051,7 @@ mod tests {
             peer_id,
             eth_version: EthVersion::Eth68,
             messages: PeerRequestSender::new(peer_id, routed),
+            advertised: None,
         }));
         let [current] = pool.sessions()[..] else {
             panic!("one pooled session");
@@ -15077,6 +15144,7 @@ mod tests {
                 peer_id,
                 eth_version: EthVersion::Eth68,
                 messages: PeerRequestSender::new(peer_id, sender),
+                advertised: None,
             });
             pool.set_qualification(peer_id, PeerQualification::BodyServing);
             peers.push(peer_id);
@@ -15315,6 +15383,7 @@ mod tests {
                     peer_id,
                     eth_version: EthVersion::Eth68,
                     messages: PeerRequestSender::new(peer_id, sender),
+                    advertised: None,
                 },
                 receiver,
             )
@@ -16156,6 +16225,7 @@ mod tests {
             peer_id,
             eth_version: EthVersion::Eth68,
             messages: PeerRequestSender::new(peer_id, sender),
+            advertised: None,
         });
         let [current] = pool.sessions()[..] else {
             panic!("one pooled session");
@@ -16202,6 +16272,7 @@ mod tests {
                 peer_id,
                 eth_version: EthVersion::Eth70,
                 messages: PeerRequestSender::new(peer_id, sender),
+                advertised: None,
             });
             peer_store.record_success(
                 peer_id,
@@ -16609,6 +16680,7 @@ mod tests {
             peer_id: header_peer,
             eth_version: EthVersion::Eth68,
             messages: PeerRequestSender::new(header_peer, sender),
+            advertised: None,
         });
         let strikes = || withheld_strike(&source.network.direct_peers, header_peer).0;
         let mut bound = LiveMaterialBound::new("bodies", 25_000_001, Some(header_peer));

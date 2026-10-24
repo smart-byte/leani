@@ -2120,6 +2120,30 @@
                     "possibleValues": []
                   },
                   {
+                    "id": "listen_port",
+                    "long": "listen-port",
+                    "short": null,
+                    "help": "TCP port for gossip connections, advertised in the discovery record; 0 picks one and advertises none",
+                    "required": false,
+                    "action": "Set",
+                    "defaultValues": [
+                      "0"
+                    ],
+                    "possibleValues": []
+                  },
+                  {
+                    "id": "discovery_port",
+                    "long": "discovery-port",
+                    "short": null,
+                    "help": "UDP port for discovery; 0 picks one",
+                    "required": false,
+                    "action": "Set",
+                    "defaultValues": [
+                      "0"
+                    ],
+                    "possibleValues": []
+                  },
+                  {
                     "id": "output",
                     "long": "output",
                     "short": null,

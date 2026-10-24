@@ -7515,6 +7515,9 @@ pub struct SharedFinalityReport {
     pub failed_processors: BTreeMap<String, String>,
     pub pruned_recent_frames: u64,
     pub retained_recent_bytes: u64,
+    /// Recent frames are pruned through here without finality.
+    #[serde(default)]
+    pub settled_through: Option<BlockNumber>,
 }
 
 impl SharedFinalityReport {
@@ -7575,6 +7578,7 @@ pub struct SharedFinalityRuntime {
     processors: Vec<Arc<dyn Processor>>,
     config: SharedFinalityRuntimeConfig,
     applied_anchors: Option<tokio::sync::broadcast::Sender<AppliedFinalityAnchor>>,
+    settle_depth: Option<u64>,
 }
 
 impl std::fmt::Debug for SharedFinalityRuntime {
@@ -7593,6 +7597,7 @@ impl std::fmt::Debug for SharedFinalityRuntime {
             )
             .field("config", &self.config)
             .field("publishes_applied_anchors", &self.applied_anchors.is_some())
+            .field("settle_depth", &self.settle_depth)
             .finish()
     }
 }
@@ -7628,7 +7633,17 @@ impl SharedFinalityRuntime {
             processors,
             config,
             applied_anchors: None,
+            settle_depth: None,
         })
+    }
+
+    /// Prune recent frames `depth` blocks below the canonical tip at every
+    /// optimistic head, for chains whose finality lags days. Settled blocks
+    /// keep their level: only verified finality labels a block `finalized`.
+    #[must_use]
+    pub const fn with_settle_depth(mut self, depth: u64) -> Self {
+        self.settle_depth = Some(depth);
+        self
     }
 
     /// Publish consensus-verified anchors after their canonical execution
@@ -7707,6 +7722,9 @@ impl SharedFinalityRuntime {
             match event? {
                 FinalityEvent::Optimistic { .. } => {
                     report.optimistic_events = report.optimistic_events.saturating_add(1);
+                    if let Some(depth) = self.settle_depth {
+                        self.settle(depth, &mut report).await?;
+                    }
                 }
                 FinalityEvent::Safe { .. } => {
                     report.safe_events = report.safe_events.saturating_add(1);
@@ -7847,6 +7865,11 @@ impl SharedFinalityRuntime {
                 match event {
                     Some(Ok(FinalityEvent::Optimistic { .. })) => {
                         report.optimistic_events = report.optimistic_events.saturating_add(1);
+                        if let Some(depth) = self.settle_depth {
+                            self.settle(depth, &mut report)
+                                .await
+                                .inspect_err(|_| signal_readiness(Some(&readiness), false))?;
+                        }
                     }
                     Some(Ok(FinalityEvent::Safe { .. })) => {
                         report.safe_events = report.safe_events.saturating_add(1);
@@ -7925,6 +7948,40 @@ impl SharedFinalityRuntime {
         }
         signal_readiness(Some(&readiness), false);
         Ok(report)
+    }
+
+    async fn settle(
+        &self,
+        depth: u64,
+        report: &mut SharedFinalityReport,
+    ) -> Result<(), RuntimeError> {
+        let chain_id = self.source.descriptor().chain_id;
+        let Some(bounds) = self.store.recent_canonical_bounds(chain_id).await? else {
+            return Ok(());
+        };
+        let through = BlockNumber(bounds.end().0.saturating_sub(depth));
+        if report
+            .settled_through
+            .is_some_and(|settled| settled >= through)
+        {
+            return Ok(());
+        }
+        let pruned = self
+            .store
+            .prune_recent_frames(
+                chain_id,
+                through,
+                self.config.minimum_recent_blocks,
+                self.config.recent_soft_bytes,
+                self.config.recent_hard_bytes,
+            )
+            .await?;
+        report.pruned_recent_frames = report
+            .pruned_recent_frames
+            .saturating_add(pruned.deleted_frames);
+        report.retained_recent_bytes = pruned.retained_bytes;
+        report.settled_through = Some(through);
+        Ok(())
     }
 
     /// Apply a verified finalized block once the canonical chain reaches its
@@ -22724,6 +22781,74 @@ mod tests {
                 .expect("recent lookup")
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn a_settle_depth_prunes_recent_frames_without_finalizing_them() {
+        let range = BlockRange::new(BlockNumber(0), BlockNumber(5)).expect("range");
+        let chain = live_blocks(5);
+        let processor = Arc::new(BlockLocalCounter::named("settled"));
+        let (_directory, store) = store().await;
+        for (sequence, frame) in (1..).zip(&chain) {
+            store.store_recent_frame(frame).await.expect("retain frame");
+            apply_live_frame(&store, processor.as_ref(), frame, sequence).await;
+        }
+        let checkpoint = ConsensusCheckpoint {
+            beacon_slot: 5,
+            beacon_block_root: [0; 32],
+            execution_block_hash: chain[5].block.hash,
+            obtained_at_unix_seconds: 1,
+            source: "fixture".to_owned(),
+        };
+        let report = SharedFinalityRuntime::new(
+            store.clone(),
+            Arc::new(ScriptedFinalitySource::new(
+                fixture_source_descriptor("settled-finality", range),
+                checkpoint.clone(),
+                vec![FinalityStep::Event(FinalityEvent::Optimistic {
+                    block_hash: chain[5].block.hash,
+                    beacon_slot: 5,
+                })],
+            )),
+            vec![processor.clone()],
+            SharedFinalityRuntimeConfig {
+                minimum_recent_blocks: 1,
+                recent_soft_bytes: 1,
+                recent_hard_bytes: 1_000_000,
+            },
+        )
+        .expect("shared finality runtime")
+        .with_settle_depth(2)
+        .run(checkpoint, CancellationToken::new())
+        .await
+        .expect("settling");
+
+        assert_eq!(report.settled_through, Some(BlockNumber(3)));
+        assert_eq!(report.pruned_recent_frames, 4);
+        assert_eq!(report.finalized_through, None);
+        for (number, retained) in [(3, false), (4, true)] {
+            assert_eq!(
+                store
+                    .recent_frame(ChainId(1), BlockNumber(number))
+                    .await
+                    .expect("recent lookup")
+                    .is_some(),
+                retained
+            );
+        }
+        assert_eq!(
+            store
+                .finalized_through(processor.descriptor())
+                .await
+                .expect("finality"),
+            None
+        );
+        let (_, finality) = store
+            .canonical_block(ChainId(1), BlockNumber(3))
+            .await
+            .expect("canonical lookup")
+            .expect("canonical block");
+        assert_ne!(finality, Finality::Finalized);
     }
 
     #[tokio::test]
