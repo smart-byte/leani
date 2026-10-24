@@ -55,6 +55,10 @@ record, and documented RPC contracts.
   instead of one batch per `pruning.interval`. A processor paused at a full
   1 GiB window resumed after 4 s, or 17 s from a throttled disk with a cold
   cache, instead of 13 minutes to about an hour.
+- Finalized promotion of output and undo records, the retained-frame size
+  check before each live block, and recent-frame statistics search indexes
+  instead of whole tables. Each of these held the store for seconds on a store
+  larger than the page cache.
 - Schema 27 adds the indexes these use. A store upgrades in place on its first
   start, which builds them once: about a second per index and million changes
   on SSD.

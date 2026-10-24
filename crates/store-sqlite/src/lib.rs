@@ -5193,14 +5193,11 @@ impl SqliteStore {
                  budget has room; a later finality advance retries their promotion"
             );
         }
-        let result = sqlx::query(
-            "UPDATE undo_journal SET finalized = 1
-             WHERE instance = ? AND block_number <= ? AND finalized = 0",
-        )
-        .bind(&instance)
-        .bind(u64_i64(through.0, "block_number")?)
-        .execute(&mut *transaction)
-        .await?;
+        let result = sqlx::query(FINALIZED_UNDO_PROMOTION)
+            .bind(&instance)
+            .bind(u64_i64(through.0, "block_number")?)
+            .execute(&mut *transaction)
+            .await?;
         prune_finalized_undo(&mut transaction, descriptor, &instance, through).await?;
         sqlx::query(
             "UPDATE processor_coverage SET finality = ?
@@ -5212,16 +5209,11 @@ impl SqliteStore {
         .bind(finality_i64(Finality::Finalized))
         .execute(&mut *transaction)
         .await?;
-        sqlx::query(
-            "UPDATE output_entity_meta SET finality = ?
-             WHERE instance = ? AND block_number <= ? AND finality < ?",
-        )
-        .bind(finality_i64(Finality::Finalized))
-        .bind(&instance)
-        .bind(u64_i64(through.0, "block_number")?)
-        .bind(finality_i64(Finality::Finalized))
-        .execute(&mut *transaction)
-        .await?;
+        sqlx::query(FINALIZED_OUTPUT_PROMOTION)
+            .bind(&instance)
+            .bind(u64_i64(through.0, "block_number")?)
+            .execute(&mut *transaction)
+            .await?;
         let flushed_deferred = if descriptor.publication.first_level() > Finality::Unattested
             && descriptor.lifecycle.delivery.mode != DeliveryPolicyMode::None
         {
@@ -7215,15 +7207,10 @@ impl SqliteStore {
         if retained_already.is_some() {
             return Ok(());
         }
-        // `length` of a blob reads only the row header, not the frame
-        // payload, unlike the `bytes` column stored after it.
-        let retained: i64 = sqlx::query_scalar(
-            "SELECT COALESCE(SUM(length(encoded_frame)), 0)
-             FROM recent_blocks WHERE chain_id = ?",
-        )
-        .bind(u64_i64(frame.chain_id.0, "chain_id")?)
-        .fetch_one(&self.inner.pool)
-        .await?;
+        let retained: i64 = sqlx::query_scalar(RECENT_FRAME_BYTES)
+            .bind(u64_i64(frame.chain_id.0, "chain_id")?)
+            .fetch_one(&self.inner.pool)
+            .await?;
         let projected_bytes = i64_u64(retained, "retained recent bytes")?
             .saturating_add(u64::try_from(encoded_bytes).unwrap_or(u64::MAX));
         if projected_bytes > hard_bytes {
@@ -8128,14 +8115,10 @@ impl SqliteStore {
     ///
     /// Returns an error for invalid stored numbers or a database failure.
     pub async fn recent_stats(&self, chain_id: ChainId) -> Result<RecentStoreStats, StoreError> {
-        let row = sqlx::query(
-            "SELECT COUNT(*) AS frames, COALESCE(SUM(bytes), 0) AS encoded_bytes,
-                    MIN(block_number) AS earliest_block, MAX(block_number) AS latest_block
-             FROM recent_blocks WHERE chain_id = ?",
-        )
-        .bind(u64_i64(chain_id.0, "chain_id")?)
-        .fetch_one(&self.inner.pool)
-        .await?;
+        let row = sqlx::query(RECENT_FRAME_STATS)
+            .bind(u64_i64(chain_id.0, "chain_id")?)
+            .fetch_one(&self.inner.pool)
+            .await?;
         Ok(RecentStoreStats {
             frames: i64_u64(row.try_get("frames")?, "recent frame count")?,
             encoded_bytes: i64_u64(row.try_get("encoded_bytes")?, "recent encoded bytes")?,
@@ -8225,14 +8208,10 @@ impl SqliteStore {
             ));
         }
         let _guard = self.inner.writer.lock().await;
-        let rows = sqlx::query(
-            "SELECT block_number, block_hash, bytes
-             FROM recent_blocks WHERE chain_id = ?
-             ORDER BY block_number, block_hash",
-        )
-        .bind(u64_i64(chain_id.0, "chain_id")?)
-        .fetch_all(&self.inner.pool)
-        .await?;
+        let rows = sqlx::query(RECENT_FRAME_SIZES)
+            .bind(u64_i64(chain_id.0, "chain_id")?)
+            .fetch_all(&self.inner.pool)
+            .await?;
         let latest = rows
             .last()
             .map(|row| i64_u64(row.get("block_number"), "latest recent block"))
@@ -17248,6 +17227,16 @@ const ATTESTED_OUTPUT_PROMOTION: &str = "UPDATE output_entity_meta SET finality 
 const ATTESTED_CANONICAL_PROMOTION: &str = "UPDATE canonical_blocks SET finality = 1
      WHERE chain_id = ? AND block_number <= ? AND finality = 0";
 
+// Finalized promotions hold the writer, so each searches the partial index of
+// unfinalized rows instead of the whole retained window. The literal 2 is
+// `finality_i64(Finality::Finalized)`.
+/// Mark a processor's unfinalized undo records at or below a block finalized.
+const FINALIZED_UNDO_PROMOTION: &str = "UPDATE undo_journal SET finalized = 1
+     WHERE instance = ? AND block_number <= ? AND finalized = 0";
+/// Promote a processor's unfinalized output at or below a block.
+const FINALIZED_OUTPUT_PROMOTION: &str = "UPDATE output_entity_meta SET finality = 2
+     WHERE instance = ? AND block_number <= ? AND finality < 2";
+
 // Delivery pruning runs every interval, and back to back while a stream is
 // over its limit, so no statement walks every change a stream retains.
 
@@ -17283,6 +17272,19 @@ const DELIVERY_PRUNE_BLOCK_SEQUENCES: &str =
 /// Bytes of the changes below a sequence, which a pruning pass deletes.
 const DELIVERY_PRUNED_BYTES: &str = "SELECT COALESCE(SUM(length(entity_key) + length(payload)), 0)
      FROM change_log WHERE stream_id = ? AND stream_sequence < ?";
+
+/// Bytes of a chain's retained recent frames.
+const RECENT_FRAME_BYTES: &str = "SELECT COALESCE(SUM(bytes), 0)
+     FROM recent_blocks WHERE chain_id = ?";
+/// Count, bytes, and block bounds of a chain's retained recent frames.
+const RECENT_FRAME_STATS: &str =
+    "SELECT COUNT(*) AS frames, COALESCE(SUM(bytes), 0) AS encoded_bytes,
+            MIN(block_number) AS earliest_block, MAX(block_number) AS latest_block
+     FROM recent_blocks WHERE chain_id = ?";
+/// A chain's retained recent frames in block order, with their sizes.
+const RECENT_FRAME_SIZES: &str = "SELECT block_number, block_hash, bytes
+     FROM recent_blocks WHERE chain_id = ?
+     ORDER BY block_number, block_hash";
 
 // Coverage probes run on every metrics scrape and status poll, so each one is
 // a single index search: exact and compact coverage are probed separately and
@@ -28793,6 +28795,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn finalized_promotions_search_only_unfinalized_rows() {
+        let (_directory, store) = store().await;
+        for (statement, index) in [
+            (FINALIZED_UNDO_PROMOTION, "undo_journal_unfinalized"),
+            (FINALIZED_OUTPUT_PROMOTION, "output_entity_meta_unfinalized"),
+        ] {
+            let plan = query_plan(&store, statement).await;
+            assert!(
+                plan.iter()
+                    .any(|step| step.starts_with("SEARCH") && step.contains(index))
+                    && !plan.iter().any(|step| step.starts_with("SCAN")),
+                "{statement}\n{plan:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn delivery_pruning_searches_index_ranges() {
         let (_directory, store) = store().await;
         for (statement, index, range) in [
@@ -28840,6 +28859,22 @@ mod tests {
                     && step.contains(index)
                     && step.contains(range))
                     && !plan.iter().any(|step| step.starts_with("SCAN change_log")),
+                "{statement}\n{plan:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn recent_frame_accounting_reads_only_the_size_index() {
+        let (_directory, store) = store().await;
+        for statement in [RECENT_FRAME_BYTES, RECENT_FRAME_STATS, RECENT_FRAME_SIZES] {
+            let plan = query_plan(&store, statement).await;
+            assert!(
+                plan.iter()
+                    .any(|step| step.contains("USING COVERING INDEX recent_blocks_sizes"))
+                    && !plan
+                        .iter()
+                        .any(|step| step.starts_with("SCAN") || step.contains("TEMP B-TREE")),
                 "{statement}\n{plan:?}"
             );
         }
