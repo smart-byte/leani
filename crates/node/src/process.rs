@@ -733,6 +733,7 @@ impl NativeBackfillControl {
             leani_primitives::SourceKind::Synthetic => "synthetic",
             leani_primitives::SourceKind::JsonRpc => "json_rpc",
             leani_primitives::SourceKind::SequencerGossip => "sequencer_gossip",
+            leani_primitives::SourceKind::L1Anchor => "l1_anchor",
         }
     }
 
@@ -4100,6 +4101,7 @@ async fn mainnet_e2e(
                 processors,
                 handles,
                 live_source,
+                None,
             ))
             .await
         })
@@ -5590,7 +5592,7 @@ async fn probe_finality(
     })
 }
 
-fn consensus_p2p_config(
+pub(crate) fn consensus_p2p_config(
     chain: Arc<leani_chain::Chain>,
     finality: &crate::config::FinalityConfig,
 ) -> leani_finality_consensus_p2p::ConsensusP2pConfig {
@@ -6743,6 +6745,16 @@ async fn serve(path: &Path, registry: &ProcessorRegistry) -> Result<Exit> {
         let committed_events = committed_events.clone();
         let lane_cancellation = cancellation.clone();
         background.spawn("json-rpc lane supervisor", async move {
+            let anchored = crate::l1_anchor::spawn(&lane_config, &lane_cancellation)?.map(
+                |(_, observations)| {
+                    crate::l1_anchor::follow_assertions(
+                        lane_store.clone(),
+                        leani_primitives::ChainId(lane_config.chain.chain_id),
+                        observations,
+                        lane_cancellation.child_token(),
+                    )
+                },
+            );
             // A lane that fails restarts from the store after a pause: the
             // endpoints' rate limits and outages are transient.
             while !lane_cancellation.is_cancelled() {
@@ -6753,6 +6765,7 @@ async fn serve(path: &Path, registry: &ProcessorRegistry) -> Result<Exit> {
                     &readiness,
                     &rpc_readiness,
                     committed_events.clone(),
+                    anchored.clone(),
                     &lane_cancellation,
                 )
                 .await;
@@ -7464,6 +7477,7 @@ async fn p2p_history_anchor(
 /// Follow a chain over JSON-RPC: live blocks and promotions from the endpoint
 /// quorum, finality from its `finalized` tag.
 #[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments)]
 async fn run_rpc_lanes(
     config: &Config,
     store: leani_store_sqlite::SqliteStore,
@@ -7471,6 +7485,7 @@ async fn run_rpc_lanes(
     readiness: &leani_api::ReadinessHandle,
     rpc_readiness: &leani_rpc::RpcReadiness,
     committed_events: tokio::sync::broadcast::Sender<leani_source_api::ChainEvent>,
+    anchored: Option<tokio::sync::watch::Receiver<leani_l1_anchor::FinalizedBlock>>,
     cancellation: &CancellationToken,
 ) -> Result<()> {
     use leani_runtime::{
@@ -7481,12 +7496,20 @@ async fn run_rpc_lanes(
     let chain_id = leani_primitives::ChainId(config.chain.chain_id);
     let quorum = config.json_rpc_quorum().map_err(anyhow::Error::msg)?;
     let rpc = &config.sources.json_rpc;
-    let finality = Arc::new(leani_source_rpc::RpcFinalitySource::new(
-        "json-rpc-finality",
-        chain_id,
-        quorum.clone(),
-        Duration::from_millis(rpc.finality_poll_interval_ms),
-    )?);
+    // With the L1 anchor, confirmed assertions finalize blocks, not the
+    // endpoints' `finalized` tag.
+    let settle_blocks = anchored
+        .is_some()
+        .then(|| config.finality.settle_blocks.unwrap_or(3_600));
+    let finality: Arc<dyn leani_source_api::FinalitySource> = match anchored {
+        Some(finalized) => Arc::new(leani_l1_anchor::AnchoredFinality::new(chain_id, finalized)?),
+        None => Arc::new(leani_source_rpc::RpcFinalitySource::new(
+            "json-rpc-finality",
+            chain_id,
+            quorum.clone(),
+            Duration::from_millis(rpc.finality_poll_interval_ms),
+        )?),
+    };
     let live = Arc::new(leani_source_rpc::RpcLiveSource::new(
         "json-rpc-live",
         chain_id,
@@ -7529,7 +7552,7 @@ async fn run_rpc_lanes(
         .reconcile_startup()
         .await
         .context("reconcile processor state with the canonical chain")?;
-    let finality_runtime = SharedFinalityRuntime::new(
+    let mut finality_runtime = SharedFinalityRuntime::new(
         store.clone(),
         finality,
         processors,
@@ -7539,6 +7562,9 @@ async fn run_rpc_lanes(
             recent_hard_bytes: config.budgets.recent_raw_hard_bytes,
         },
     )?;
+    if let Some(depth) = settle_blocks {
+        finality_runtime = finality_runtime.with_settle_depth(depth);
+    }
     // A store that stopped below the endpoints' finalized block resumes from
     // its own tip: the endpoints serve every block in between, and nothing
     // else fills that gap.
@@ -7613,13 +7639,6 @@ async fn run_rpc_lanes(
 /// How long an op-stack node waits for the first sequencer-signed block.
 const FIRST_SIGNED_HEAD_TIMEOUT: Duration = Duration::from_secs(180);
 
-struct OpLaneHandles {
-    readiness: leani_api::ReadinessHandle,
-    rpc_readiness: leani_rpc::RpcReadiness,
-    committed_events: tokio::sync::broadcast::Sender<leani_source_api::ChainEvent>,
-    attested_heads: leani_source_api::AttestedHeadPublisher,
-}
-
 /// Follow an op-stack chain: every block the sequencer signs on its gossip
 /// becomes the attested head the execution P2P live lane follows. Nothing is
 /// finalized without an L1 anchor, so recent frames are pruned a settle depth
@@ -7629,8 +7648,9 @@ async fn run_op_lanes(
     config: &Config,
     store: leani_store_sqlite::SqliteStore,
     processors: Vec<Arc<dyn leani_processor_api::Processor>>,
-    handles: OpLaneHandles,
+    handles: NetworkLaneHandles,
     live_source: Arc<leani_source_p2p::RethP2pSource>,
+    op_heads: crate::l1_anchor::OpHeads,
     cancellation: &CancellationToken,
 ) -> Result<()> {
     use leani_primitives::{BlockHash, BlockNumber, BlockRef, ChainId};
@@ -7646,18 +7666,7 @@ async fn run_op_lanes(
         .context("op_gossip finality needs an op-stack chain")?
         .block_time;
     let chain_id = ChainId(config.chain.chain_id);
-    let mut gossip = leani_finality_op_gossip::OpGossipConfig::for_chain(&chain)?;
-    gossip.listen_port = config.finality.listen_port;
-    gossip.discovery_port = config.finality.discovery_port;
-    if !config.finality.bootnodes.is_empty() {
-        gossip.bootnodes.clone_from(&config.finality.bootnodes);
-    }
-    let mut heads = leani_finality_op_gossip::publish_heads(
-        gossip,
-        handles.attested_heads,
-        cancellation.child_token(),
-    )
-    .await?;
+    let mut heads = op_heads.heads.clone();
     let first = tokio::select! {
         () = cancellation.cancelled() => return Ok(()),
         () = tokio::time::sleep(FIRST_SIGNED_HEAD_TIMEOUT) => bail!(
@@ -7679,6 +7688,7 @@ async fn run_op_lanes(
     let finality = Arc::new(leani_finality_op_gossip::OpGossipFinality::new(
         chain_id,
         heads.clone(),
+        op_heads.finalized.clone(),
     )?);
     let live_runtime = SharedLiveRuntime::new(
         store.clone(),
@@ -7801,6 +7811,27 @@ async fn supervise_network_lanes(
             }
         },
     };
+    let op_heads = if matches!(
+        config.finality.kind,
+        crate::config::FinalitySourceKind::OpGossip
+    ) {
+        match crate::l1_anchor::start_op_heads(
+            &config,
+            handles.attested_heads.clone(),
+            &handles.cancellation,
+        )
+        .await
+        {
+            Ok(heads) => Some(heads),
+            Err(error) => {
+                handles.network_telemetry.supervisor_halted(&error);
+                warn!(error = %format!("{error:#}"), "failed to join the sequencer gossip");
+                return Err(error.context("join the sequencer gossip"));
+            }
+        }
+    } else {
+        None
+    };
     let end = supervise_lane_runs(&handles, || {
         Box::pin(run_network_lanes_once(
             &config,
@@ -7808,6 +7839,7 @@ async fn supervise_network_lanes(
             processors.clone(),
             handles.clone(),
             live_source.clone(),
+            op_heads.clone(),
         ))
     })
     .await;
@@ -8119,9 +8151,22 @@ async fn run_network_lanes_once(
     processors: Vec<std::sync::Arc<dyn leani_processor_api::Processor>>,
     handles: NetworkLaneHandles,
     live_source: std::sync::Arc<leani_source_p2p::RethP2pSource>,
+    op_heads: Option<crate::l1_anchor::OpHeads>,
 ) -> Result<()> {
     let cancellation = handles.cancellation.clone();
     with_cold_backfills(&cancellation, async move |lane_cancellation, backfills| {
+        if let Some(op_heads) = op_heads {
+            return Box::pin(run_op_lanes(
+                config,
+                store,
+                processors,
+                handles,
+                live_source,
+                op_heads,
+                lane_cancellation,
+            ))
+            .await;
+        }
         Box::pin(run_network_lanes(
             config,
             store,
@@ -8248,25 +8293,6 @@ async fn run_network_lanes(
     } = handles;
     if !matches!(config.sources.live.kind, crate::config::LiveSourceKind::P2p) {
         bail!("network supervisor requires p2p live ingestion");
-    }
-    if matches!(
-        config.finality.kind,
-        crate::config::FinalitySourceKind::OpGossip
-    ) {
-        return run_op_lanes(
-            config,
-            store,
-            processors,
-            OpLaneHandles {
-                readiness,
-                rpc_readiness,
-                committed_events,
-                attested_heads,
-            },
-            live_source,
-            lane_cancellation,
-        )
-        .await;
     }
     let startup_started = Instant::now();
     let chain_id = ChainId(config.chain.chain_id);

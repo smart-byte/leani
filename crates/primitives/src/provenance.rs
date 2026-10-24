@@ -68,6 +68,8 @@ pub enum SourceKind {
     JsonRpc,
     /// A rollup sequencer's signed block gossip.
     SequencerGossip,
+    /// A rollup's settlement contracts in finalized Ethereum blocks.
+    L1Anchor,
 }
 
 /// Trust needed beyond cryptographic checks represented in the report.

@@ -2932,12 +2932,14 @@ fn spawn_peer_qualification_worker(
                         let delay = PEER_QUALIFICATION_RETRY_INTERVAL
                             .saturating_mul(1_u32 << exponent);
                         retry_at.insert(result.peer_id, Instant::now() + delay);
+                        let advertised = direct_peers
+                            .get(result.peer_id)
+                            .filter(|(peer, _)| peer.syncing_below(target.number))
+                            .and_then(|(peer, _)| peer.advertised);
                         let syncing = qualifications.ready(target) < body_serving_peer_target
-                            && direct_peers
-                                .get(result.peer_id)
-                                .is_some_and(|(peer, _)| peer.syncing_below(target.number));
-                        if syncing {
-                            debug!(peer_id = %result.peer_id, target = target.number.0, "dropping a syncing execution peer for its slot");
+                            && advertised.is_some();
+                        if let (true, Some((latest, _))) = (syncing, advertised) {
+                            debug!(peer_id = %result.peer_id, latest, target = target.number.0, "dropping a syncing execution peer for its slot");
                         }
                         if matches!(result.outcome, PeerQualification::Rejected) || syncing {
                             handle.ban_peer(result.peer_id);

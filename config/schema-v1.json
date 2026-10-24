@@ -96,6 +96,7 @@
         "budgets": { "$ref": "#/$defs/budgets" },
         "sources": { "$ref": "#/$defs/sources" },
         "finality": { "$ref": "#/$defs/finality" },
+        "l1_anchor": { "$ref": "#/$defs/l1Anchor" },
         "processors": {
           "type": "array",
           "minItems": 1,
@@ -441,6 +442,40 @@
         "settle_blocks": {
           "description": "op_gossip only: recent frames are pruned this many blocks below the tip while finalized waits for an L1 anchor; omitted, about one hour of blocks.",
           "$ref": "#/$defs/positiveInteger"
+        }
+      }
+    },
+    "l1Anchor": {
+      "description": "Opt-in: finalize a rollup's blocks from the settlement contracts its chain entry names, read in finalized Ethereum blocks over execution P2P.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["finality"],
+      "properties": {
+        "finality": {
+          "description": "Ethereum mainnet's verified finality: beacon_api or consensus_p2p.",
+          "$ref": "#/$defs/finality"
+        },
+        "listener_port": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 65535
+        },
+        "discovery_port": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 65535
+        },
+        "discv5_port": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 65535
+        },
+        "nat": { "type": "string" },
+        "lookback_blocks": {
+          "description": "Finalized Ethereum blocks read below the first finalized block on a cold start.",
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 50400
         }
       }
     },

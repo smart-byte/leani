@@ -47,6 +47,8 @@ const FINALITY_ANCHOR_RETRY_INTERVAL: Duration = Duration::from_millis(250);
 /// How often finality retries its last applied anchor for the processors
 /// that did not take it.
 const FINALITY_PROCESSOR_RETRY_INTERVAL: Duration = Duration::from_secs(1);
+/// How often a settle depth prunes recent frames below the tip.
+const SETTLE_INTERVAL: Duration = Duration::from_secs(2);
 /// Longest wait between retries for a processor whose finality keeps failing.
 const FINALITY_PROCESSOR_RETRY_MAX: Duration = Duration::from_secs(300);
 const RECENT_STORAGE_RETRY_INTERVAL: Duration = Duration::from_millis(250);
@@ -7637,9 +7639,9 @@ impl SharedFinalityRuntime {
         })
     }
 
-    /// Prune recent frames `depth` blocks below the canonical tip at every
-    /// optimistic head, for chains whose finality lags days. Settled blocks
-    /// keep their level: only verified finality labels a block `finalized`.
+    /// Prune recent frames `depth` blocks below the canonical tip, for
+    /// chains whose finality lags days. Settled blocks keep their level:
+    /// only verified finality labels a block `finalized`.
     #[must_use]
     pub const fn with_settle_depth(mut self, depth: u64) -> Self {
         self.settle_depth = Some(depth);
@@ -7695,9 +7697,16 @@ impl SharedFinalityRuntime {
         retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut processor_retry = tokio::time::interval(FINALITY_PROCESSOR_RETRY_INTERVAL);
         processor_retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut settle = tokio::time::interval(SETTLE_INTERVAL);
+        settle.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        self.settle(&mut report).await?;
         loop {
             let event = tokio::select! {
                 () = cancellation.cancelled() => break,
+                _ = settle.tick(), if self.settle_depth.is_some() => {
+                    self.settle(&mut report).await?;
+                    continue;
+                }
                 _ = retry.tick(), if pending_finalized.is_some() => {
                     let Some(finalized) = pending_finalized else {
                         continue;
@@ -7722,9 +7731,6 @@ impl SharedFinalityRuntime {
             match event? {
                 FinalityEvent::Optimistic { .. } => {
                     report.optimistic_events = report.optimistic_events.saturating_add(1);
-                    if let Some(depth) = self.settle_depth {
-                        self.settle(depth, &mut report).await?;
-                    }
                 }
                 FinalityEvent::Safe { .. } => {
                     report.safe_events = report.safe_events.saturating_add(1);
@@ -7832,11 +7838,19 @@ impl SharedFinalityRuntime {
             retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             let mut processor_retry = tokio::time::interval(FINALITY_PROCESSOR_RETRY_INTERVAL);
             processor_retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            let mut settle = tokio::time::interval(SETTLE_INTERVAL);
+            settle.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             let disconnected = loop {
                 let event = tokio::select! {
                     () = cancellation.cancelled() => {
                         signal_readiness(Some(&readiness), false);
                         return Ok(report);
+                    }
+                    _ = settle.tick(), if self.settle_depth.is_some() => {
+                        self.settle(&mut report)
+                            .await
+                            .inspect_err(|_| signal_readiness(Some(&readiness), false))?;
+                        continue;
                     }
                     _ = retry.tick(), if pending_finalized.is_some() => {
                         let Some(finalized) = pending_finalized else {
@@ -7865,11 +7879,6 @@ impl SharedFinalityRuntime {
                 match event {
                     Some(Ok(FinalityEvent::Optimistic { .. })) => {
                         report.optimistic_events = report.optimistic_events.saturating_add(1);
-                        if let Some(depth) = self.settle_depth {
-                            self.settle(depth, &mut report)
-                                .await
-                                .inspect_err(|_| signal_readiness(Some(&readiness), false))?;
-                        }
                     }
                     Some(Ok(FinalityEvent::Safe { .. })) => {
                         report.safe_events = report.safe_events.saturating_add(1);
@@ -7950,11 +7959,10 @@ impl SharedFinalityRuntime {
         Ok(report)
     }
 
-    async fn settle(
-        &self,
-        depth: u64,
-        report: &mut SharedFinalityReport,
-    ) -> Result<(), RuntimeError> {
+    async fn settle(&self, report: &mut SharedFinalityReport) -> Result<(), RuntimeError> {
+        let Some(depth) = self.settle_depth else {
+            return Ok(());
+        };
         let chain_id = self.source.descriptor().chain_id;
         let Some(bounds) = self.store.recent_canonical_bounds(chain_id).await? else {
             return Ok(());

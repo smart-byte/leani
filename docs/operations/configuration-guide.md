@@ -475,6 +475,36 @@ its busy consensus nodes refuse new outbound connections. Peers whose
 handshake head lies far behind the signed head are syncing and are dropped
 while fewer than `body_serving_peer_target` peers serve the head.
 
+### L1 anchor
+
+A rollup's own rules decide when its blocks are final, and they run on
+Ethereum. The opt-in `[l1_anchor]` table reads them: verified Ethereum
+finality (`[l1_anchor.finality]`, `beacon_api` or `consensus_p2p`, as for an
+Ethereum node) names finalized L1 blocks, execution P2P serves their receipts
+checked against their roots, and the settlement contracts in the chain
+entry's `[l1_anchor]` say which rollup block is final. Nothing is fetched from
+an RPC endpoint.
+
+- Nitro chains (Arbitrum One and Nova, Robinhood Chain): a confirmed BoLD
+  assertion names its block hash; that block is `finalized` once this node
+  holds it. Confirmation takes about 6.4 days. The endpoints' `finalized`
+  tag no longer finalizes anything, and recent frames are pruned
+  `finality.settle_blocks` (default 3,600) below the tip.
+- Op-stack chains with output-root games (Base): a game of the respected type
+  is checked when it is created against the output root of the block the
+  sequencer signed, and that block is `finalized` once the anchor state
+  registry moves to the game, about five days later on Base. OP Mainnet's
+  games claim super roots, which the anchor does not read.
+
+The lane reads the receipts of the finalized L1 blocks whose logs bloom may
+hold the contracts' logs, at most about 1 GB a day. Base's game creations
+also need their call data, so on Base it reads every block's receipts and
+body, about 2 GB a day. Where
+it stopped survives restarts (`l1-anchor-cursor.json`); a cold start reads
+`lookback_blocks` (600 by default) below the first finalized block. Its
+execution P2P uses its own ports, `listener_port`, `discovery_port`, and
+`discv5_port`, and its own peer store.
+
 ## Processor identity and publication
 
 Every modern entry declares:

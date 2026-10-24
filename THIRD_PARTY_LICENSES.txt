@@ -8840,6 +8840,7 @@ leani-chain 0.1.1 — https://github.com/smart-byte/leani
 leani-finality-beacon-api 0.1.1 — https://github.com/smart-byte/leani
 leani-finality-consensus-p2p 0.1.1 — https://github.com/smart-byte/leani
 leani-finality-op-gossip 0.1.1 — https://github.com/smart-byte/leani
+leani-l1-anchor 0.1.1 — https://github.com/smart-byte/leani
 leani 0.1.1 — https://github.com/smart-byte/leani
 leani-processor-blobs 0.1.1 — https://github.com/smart-byte/leani
 leani-processor-block-summary 0.1.1 — https://github.com/smart-byte/leani

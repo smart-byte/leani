@@ -279,3 +279,30 @@ fn public_datasets_name_their_layout() {
     assert_eq!(base.layout, DatasetLayout::SonarxEvmV1);
     assert_eq!(arbitrum.first_block, 22_207_817);
 }
+
+#[test]
+fn rollups_name_their_l1_anchor() {
+    let registry = ChainRegistry::standard();
+    assert_eq!(
+        registry.get("base").unwrap().l1_anchor,
+        Some(L1Anchor::DisputeGames {
+            factory: "0x43edB88C4B80fDD2AdFF2412A7BebF9dF42cB40e"
+                .parse()
+                .unwrap(),
+            registry: "0x909f6cf47ed12f010a796527f562bfc26c7f4e72"
+                .parse()
+                .unwrap(),
+            game_type: 621,
+        })
+    );
+    assert!(matches!(
+        registry.get("robinhood").unwrap().l1_anchor,
+        Some(L1Anchor::NitroRollup { .. })
+    ));
+    // OP Mainnet's respected games claim super roots, which the anchor does
+    // not read.
+    assert_eq!(registry.get("op-mainnet").unwrap().l1_anchor, None);
+    let misplaced = include_str!("../../../config/chains/arbitrum-one.toml")
+        .replace("family = \"arbitrum\"", "family = \"ethereum\"");
+    assert!(Chain::from_entry(&misplaced, None).is_err());
+}

@@ -72,6 +72,9 @@ pub struct SignedBlock {
     pub hash: B256,
     pub parent_hash: B256,
     pub timestamp: u64,
+    pub state_root: B256,
+    /// The message passer's storage root, in payloads since Isthmus.
+    pub withdrawals_root: Option<B256>,
     pub received_at_unix_ms: u64,
 }
 
@@ -117,11 +120,19 @@ pub fn verify_block(
             recovered,
         });
     }
+    let withdrawals_root = match &envelope.payload {
+        op_alloy_rpc_types_engine::OpExecutionPayload::V4(payload) => {
+            Some(payload.withdrawals_root)
+        }
+        _ => None,
+    };
     Ok(SignedBlock {
         number: payload.block_number,
         hash: payload.block_hash,
         parent_hash: payload.parent_hash,
         timestamp: payload.timestamp,
+        state_root: payload.state_root,
+        withdrawals_root,
         received_at_unix_ms: unix_now_ms(),
     })
 }
@@ -455,6 +466,7 @@ pub async fn follow(
 
 /// Publish every signed block as the live lane's attested head, and keep the
 /// newest one for whoever needs a start. The head's slot is its number.
+/// `every_block` also receives each one.
 ///
 /// # Errors
 ///
@@ -462,6 +474,7 @@ pub async fn follow(
 pub async fn publish_heads(
     config: OpGossipConfig,
     heads: AttestedHeadPublisher,
+    every_block: Option<mpsc::Sender<SignedBlock>>,
     cancellation: CancellationToken,
 ) -> Result<watch::Receiver<Option<SignedBlock>>, OpGossipError> {
     let mut blocks = follow(config, cancellation.clone()).await?;
@@ -473,6 +486,14 @@ pub async fn publish_heads(
                 block = blocks.recv() => block,
             };
             let Some(block) = block else { return };
+            if let Some(every_block) = &every_block
+                && every_block.try_send(block).is_err()
+            {
+                warn!(
+                    block = block.number,
+                    "a signed block skipped the L1 anchor's ledger"
+                );
+            }
             heads.publish(AttestedHead {
                 beacon_slot: block.number,
                 beacon_block_root: [0; 32],
@@ -491,12 +512,13 @@ pub async fn publish_heads(
     Ok(receiver)
 }
 
-/// Sequencer-signed heads as the finality lane of an op-stack chain. They are
-/// optimistic only: nothing here finalizes a block.
+/// Sequencer-signed heads as the finality lane of an op-stack chain. Heads
+/// are optimistic; only the L1 anchor's blocks, when it runs, are finalized.
 #[derive(Debug)]
 pub struct OpGossipFinality {
     descriptor: SourceDescriptor,
     heads: watch::Receiver<Option<SignedBlock>>,
+    finalized: Option<watch::Receiver<Option<(BlockNumber, BlockHash)>>>,
 }
 
 impl OpGossipFinality {
@@ -506,6 +528,7 @@ impl OpGossipFinality {
     pub fn new(
         chain_id: ChainId,
         heads: watch::Receiver<Option<SignedBlock>>,
+        finalized: Option<watch::Receiver<Option<(BlockNumber, BlockHash)>>>,
     ) -> Result<Self, SourceError> {
         Ok(Self {
             descriptor: SourceDescriptor {
@@ -524,6 +547,7 @@ impl OpGossipFinality {
                 priority: 0,
             },
             heads,
+            finalized,
         })
     }
 }
@@ -540,19 +564,49 @@ impl FinalitySource for OpGossipFinality {
         cancellation: CancellationToken,
     ) -> Result<FinalityEventStream, SourceError> {
         let heads = self.heads.clone();
+        let finalized = self.finalized.clone().map(|mut finalized| {
+            finalized.mark_changed();
+            finalized
+        });
         Ok(futures::stream::unfold(
-            (heads, cancellation),
-            |(mut heads, cancellation)| async move {
-                tokio::select! {
-                    () = cancellation.cancelled() => None,
-                    changed = heads.changed() => {
-                        changed.ok()?;
-                        let block = (*heads.borrow_and_update())?;
-                        let event = FinalityEvent::Optimistic {
-                            block_hash: BlockHash::new(block.hash.0),
-                            beacon_slot: block.number,
-                        };
-                        Some((Ok(event), (heads, cancellation)))
+            (heads, finalized, cancellation),
+            |(mut heads, mut finalized, cancellation)| async move {
+                loop {
+                    let anchored = async {
+                        match finalized.as_mut() {
+                            Some(finalized) => finalized.changed().await.is_ok(),
+                            None => std::future::pending().await,
+                        }
+                    };
+                    tokio::select! {
+                        () = cancellation.cancelled() => return None,
+                        changed = heads.changed() => {
+                            changed.ok()?;
+                            let Some(block) = *heads.borrow_and_update() else { continue };
+                            let event = FinalityEvent::Optimistic {
+                                block_hash: BlockHash::new(block.hash.0),
+                                beacon_slot: block.number,
+                            };
+                            return Some((Ok(event), (heads, finalized, cancellation)));
+                        }
+                        open = anchored => {
+                            if !open {
+                                return Some((
+                                    Err(SourceError::Disconnected("the L1 anchor ended".to_owned())),
+                                    (heads, None, cancellation),
+                                ));
+                            }
+                            let latest = finalized.as_mut().and_then(|finalized| *finalized.borrow_and_update());
+                            if let Some((number, hash)) = latest {
+                                let event = FinalityEvent::Finalized {
+                                    block_number: number,
+                                    block_hash: hash,
+                                    beacon_slot: number.0,
+                                    beacon_block_root: [0; 32],
+                                };
+                                return Some((Ok(event), (heads, finalized, cancellation)));
+                            }
+                        }
                     }
                 }
             },

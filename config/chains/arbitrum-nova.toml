@@ -8,3 +8,8 @@ genesis_hash = "0x2ad24e03026118f9b3a48626f0636e38c93660e90a6812e853a99aa8c53715
 # are checked against their own header, transactions, and receipts roots.
 [defaults]
 rpc_endpoints = ["https://nova.arbitrum.io/rpc"]
+
+# The BoLD rollup, as the bridge's rollup() names it.
+[l1_anchor]
+kind = "nitro_rollup"
+rollup = "0xE7E8cCC7c381809BDC4b213CE44016300707B7Bd"

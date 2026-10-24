@@ -37,11 +37,44 @@ pub struct Config {
     pub budgets: BudgetConfig,
     pub sources: SourcesConfig,
     pub finality: FinalityConfig,
+    /// Finalize a rollup's blocks from its Ethereum settlement contracts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub l1_anchor: Option<L1AnchorConfig>,
     #[serde(default)]
     pub processors: Vec<ProcessorConfig>,
     pub rpc: RpcConfig,
     pub api: ApiConfig,
 }
+
+/// The opt-in L1 anchor: verified Ethereum finality names finalized L1
+/// blocks, whose receipts execution P2P serves, and the chain entry's
+/// settlement contracts in them say which rollup blocks are final.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct L1AnchorConfig {
+    /// Ethereum mainnet's verified finality: `beacon_api` or `consensus_p2p`.
+    pub finality: FinalityConfig,
+    #[serde(default)]
+    pub listener_port: u16,
+    #[serde(default)]
+    pub discovery_port: u16,
+    #[serde(default)]
+    pub discv5_port: u16,
+    #[serde(default = "default_execution_nat")]
+    pub nat: String,
+    /// Finalized L1 blocks read below the first finalized block on a cold
+    /// start, so the newest confirmation in them counts at once.
+    #[serde(default = "default_l1_anchor_lookback")]
+    pub lookback_blocks: u64,
+}
+
+const fn default_l1_anchor_lookback() -> u64 {
+    // Two hours: Nitro rollups confirm an assertion about every hour.
+    600
+}
+
+/// The most finalized L1 blocks a cold start reads: one week.
+const MAX_L1_ANCHOR_LOOKBACK: u64 = 50_400;
 
 /// Compact product-level configuration expanded into [`Config`] before
 /// validation. The `network` field deliberately discriminates this document
@@ -767,8 +800,9 @@ pub struct FinalityConfig {
     /// then only be dialed, never dial in.
     #[serde(default)]
     pub listen_port: u16,
-    /// For `op_gossip`: how far below the tip recent frames are pruned while
-    /// `finalized` waits for the L1 anchor. Omitted, about one hour of blocks.
+    /// For `op_gossip`, and `json_rpc` with the L1 anchor: how far below the
+    /// tip recent frames are pruned while `finalized` waits for the anchor.
+    /// Omitted, about one hour of op-stack blocks, or 3,600 Nitro blocks.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub settle_blocks: Option<u64>,
 }
@@ -2018,6 +2052,9 @@ impl Config {
                 "the P2P live source requires verified beacon_api, consensus_p2p, or op_gossip finality: a block is attested only once its ancestry reaches a head the finality source verified; set finality.kind, or sources.live.kind = \"disabled\" for finalized-dataset backfills",
             ));
         }
+        if let Some(anchor) = &self.l1_anchor {
+            validate_l1_anchor(self, anchor, &mut errors);
+        }
         let op_stack = self
             .chain_entry()
             .is_ok_and(|chain| chain.op_stack.is_some());
@@ -2730,21 +2767,10 @@ fn validate_artifact_storage(
 }
 
 fn validate_finality(finality: &FinalityConfig, errors: &mut Vec<ValidationError>) {
+    validate_settle_blocks(finality, errors);
     if matches!(finality.kind, FinalitySourceKind::OpGossip) {
-        if finality.settle_blocks == Some(0) {
-            errors.push(ValidationError::new(
-                "finality.settle_blocks",
-                "must be at least 1",
-            ));
-        }
         validate_enr_bootnodes(&finality.bootnodes, errors);
         return;
-    }
-    if finality.settle_blocks.is_some() {
-        errors.push(ValidationError::new(
-            "finality.settle_blocks",
-            "only applies to op_gossip finality; other kinds prune at finality",
-        ));
     }
     // JSON-RPC finality starts from the endpoints' finalized block.
     if matches!(
@@ -2829,6 +2855,69 @@ fn validate_finality(finality: &FinalityConfig, errors: &mut Vec<ValidationError
         FinalitySourceKind::JsonRpc
         | FinalitySourceKind::OpGossip
         | FinalitySourceKind::Disabled => {}
+    }
+}
+
+fn validate_settle_blocks(finality: &FinalityConfig, errors: &mut Vec<ValidationError>) {
+    if finality.settle_blocks.is_some()
+        && !matches!(
+            finality.kind,
+            FinalitySourceKind::OpGossip | FinalitySourceKind::JsonRpc
+        )
+    {
+        errors.push(ValidationError::new(
+            "finality.settle_blocks",
+            "only applies to op_gossip and L1-anchored json_rpc finality; other kinds prune at finality",
+        ));
+    }
+    if finality.settle_blocks == Some(0) {
+        errors.push(ValidationError::new(
+            "finality.settle_blocks",
+            "must be at least 1",
+        ));
+    }
+}
+
+fn validate_l1_anchor(config: &Config, anchor: &L1AnchorConfig, errors: &mut Vec<ValidationError>) {
+    if config
+        .chain_entry()
+        .is_ok_and(|chain| chain.l1_anchor.is_none())
+    {
+        errors.push(ValidationError::new(
+            "l1_anchor",
+            "this chain's entry names no settlement contracts to anchor to",
+        ));
+    }
+    if !matches!(
+        config.finality.kind,
+        FinalitySourceKind::OpGossip | FinalitySourceKind::JsonRpc
+    ) {
+        errors.push(ValidationError::new(
+            "l1_anchor",
+            "anchors the finality of op_gossip and json_rpc lanes",
+        ));
+    }
+    if !matches!(
+        anchor.finality.kind,
+        FinalitySourceKind::BeaconApi | FinalitySourceKind::ConsensusP2p
+    ) {
+        errors.push(ValidationError::new(
+            "l1_anchor.finality.kind",
+            "must be beacon_api or consensus_p2p: Ethereum's verified finality",
+        ));
+    }
+    let mut finality_errors = Vec::new();
+    validate_finality(&anchor.finality, &mut finality_errors);
+    errors.extend(
+        finality_errors
+            .into_iter()
+            .map(|error| ValidationError::new(format!("l1_anchor.{}", error.field), error.message)),
+    );
+    if !(1..=MAX_L1_ANCHOR_LOOKBACK).contains(&anchor.lookback_blocks) {
+        errors.push(ValidationError::new(
+            "l1_anchor.lookback_blocks",
+            format!("must be in 1..={MAX_L1_ANCHOR_LOOKBACK}"),
+        ));
     }
 }
 
@@ -4329,6 +4418,54 @@ endpoints = ["https://ethereum-hoodi-beacon-api.publicnode.com/"]
                 .any(|message| message.contains("not one")),
             "{:?}",
             finality_errors(&config)
+        );
+    }
+
+    #[test]
+    fn the_l1_anchor_needs_settlement_contracts_and_ethereum_finality() {
+        let mut config: Config = toml::from_str(VALID_CONFIG_TOML).expect("fixture parses");
+        let anchor_errors = |config: &Config| {
+            config
+                .validation_errors()
+                .into_iter()
+                .filter(|error| error.field.starts_with("l1_anchor"))
+                .map(|error| error.message)
+                .collect::<Vec<_>>()
+        };
+        let ethereum_finality = config.finality.clone();
+        config.l1_anchor = Some(L1AnchorConfig {
+            finality: ethereum_finality.clone(),
+            listener_port: 0,
+            discovery_port: 0,
+            discv5_port: 0,
+            nat: "any".to_owned(),
+            lookback_blocks: 600,
+        });
+        // Ethereum mainnet settles on nothing.
+        assert!(
+            anchor_errors(&config)
+                .iter()
+                .any(|message| message.contains("names no settlement contracts")),
+            "{:?}",
+            anchor_errors(&config)
+        );
+        config.chain.name = "base".to_owned();
+        config.chain.chain_id = 8453;
+        config.finality.kind = FinalitySourceKind::OpGossip;
+        config.finality.checkpoint = String::new();
+        assert!(
+            anchor_errors(&config).is_empty(),
+            "{:?}",
+            anchor_errors(&config)
+        );
+        let anchor = config.l1_anchor.as_mut().expect("anchor");
+        anchor.finality.kind = FinalitySourceKind::JsonRpc;
+        anchor.lookback_blocks = 0;
+        assert_eq!(
+            anchor_errors(&config).len(),
+            2,
+            "{:?}",
+            anchor_errors(&config)
         );
     }
 

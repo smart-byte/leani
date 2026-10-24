@@ -4300,6 +4300,7 @@ dependencies = [
  "leani-finality-beacon-api",
  "leani-finality-consensus-p2p",
  "leani-finality-op-gossip",
+ "leani-l1-anchor",
  "leani-primitives",
  "leani-processor-api",
  "leani-processor-blobs",
@@ -4483,6 +4484,24 @@ dependencies = [
  "sha2 0.11.1",
  "snap",
  "thiserror 2.0.21",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
+name = "leani-l1-anchor"
+version = "0.1.1"
+dependencies = [
+ "alloy-primitives",
+ "async-trait",
+ "futures",
+ "leani-chain",
+ "leani-primitives",
+ "leani-source-api",
+ "serde",
+ "serde_json",
+ "tempfile",
  "tokio",
  "tokio-util",
  "tracing",

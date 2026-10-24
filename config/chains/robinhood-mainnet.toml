@@ -13,3 +13,8 @@ rpc_endpoints = [
   "https://rpc.mainnet.chain.robinhood.com",
   "https://robinhood.drpc.org",
 ]
+
+# The BoLD rollup, as the bridge's rollup() names it.
+[l1_anchor]
+kind = "nitro_rollup"
+rollup = "0x23A19d23e89166adedbDcB432518AB01e4272D94"

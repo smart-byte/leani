@@ -8,6 +8,12 @@ record, and documented RPC contracts.
 
 ### Added
 
+- `[l1_anchor]` finalizes a rollup's blocks from its Ethereum settlement
+  contracts, read in finalized Ethereum blocks over verified Ethereum
+  finality and execution P2P: a confirmed BoLD assertion on Arbitrum One,
+  Arbitrum Nova, and Robinhood Chain, and, on Base, the dispute game the
+  anchor state registry moves to, once its claim matched the output root of
+  the block the sequencer signed. Chain entries name the contracts.
 - `finality.kind = "op_gossip"` follows an op-stack chain's sequencer-signed
   block gossip: each signed block is the attested head the P2P live lane
   follows. Recent frames are pruned `finality.settle_blocks` below the tip,

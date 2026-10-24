@@ -4,7 +4,7 @@
 
 use std::sync::{Arc, LazyLock};
 
-use alloy_primitives::B256;
+use alloy_primitives::{Address, B256};
 use serde::{Deserialize, Serialize};
 use url::Url;
 
@@ -140,6 +140,22 @@ pub struct PublicDataset {
     pub first_block: u64,
 }
 
+/// The Ethereum contracts that settle a rollup's chain, which the opt-in
+/// L1 anchor reads to finalize blocks.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum L1Anchor {
+    /// Dispute games of `game_type` claim output roots; the anchor state
+    /// registry moves to a game once the chain's own rules treat it as final.
+    DisputeGames {
+        factory: Address,
+        registry: Address,
+        game_type: u32,
+    },
+    /// A Nitro rollup whose confirmed assertions name an L2 block hash.
+    NitroRollup { rollup: Address },
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Chain {
     pub name: String,
@@ -153,6 +169,7 @@ pub struct Chain {
     pub beacon: Option<BeaconNetwork>,
     pub op_stack: Option<OpStackNetwork>,
     pub public_dataset: Option<PublicDataset>,
+    pub l1_anchor: Option<L1Anchor>,
     pub defaults: ChainDefaults,
 }
 
@@ -206,6 +223,18 @@ impl Chain {
                 )));
             }
         };
+        match (entry.l1_anchor, entry.family) {
+            (None, _)
+            | (Some(L1Anchor::DisputeGames { .. }), Family::OpStack)
+            | (Some(L1Anchor::NitroRollup { .. }), Family::Arbitrum) => {}
+            (Some(_), family) => {
+                return Err(ChainError::InvalidEntry(format!(
+                    "{}: that l1_anchor kind does not settle {} chains",
+                    entry.name,
+                    family.name()
+                )));
+            }
+        }
         Ok(Self {
             name: entry.name,
             aliases: entry.aliases,
@@ -217,6 +246,7 @@ impl Chain {
             beacon,
             op_stack,
             public_dataset: entry.public_dataset,
+            l1_anchor: entry.l1_anchor,
             defaults: entry.defaults,
         })
     }
@@ -277,6 +307,8 @@ struct EntryFile {
     op_stack: Option<op_stack::OpStackEntry>,
     #[serde(default)]
     public_dataset: Option<PublicDataset>,
+    #[serde(default)]
+    l1_anchor: Option<L1Anchor>,
     #[serde(default)]
     defaults: ChainDefaults,
 }
