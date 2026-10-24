@@ -57,8 +57,9 @@ record, and documented RPC contracts.
   cache, instead of 13 minutes to about an hour.
 - Finalized promotion of output and undo records, the retained-frame size
   check before each live block, and recent-frame statistics search indexes
-  instead of whole tables. Each of these held the store for seconds on a store
-  larger than the page cache.
+  instead of whole tables, and a parked live lane reads only its pending
+  deltas instead of full processor statistics. Each of these held the store
+  for seconds on a store larger than the page cache.
 - Schema 27 adds the indexes these use. A store upgrades in place on its first
   start, which builds them once: about a second per index and million changes
   on SSD.

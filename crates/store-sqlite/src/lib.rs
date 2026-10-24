@@ -13761,6 +13761,24 @@ impl SqliteStore {
         self.inner.statistics_scans.load(Ordering::Relaxed)
     }
 
+    /// Count and bytes of a processor's pending deltas, the part of
+    /// [`Self::processor_stats`] that live lanes read while they run.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a failed database query or numeric overflow.
+    pub async fn pending_delta_totals(
+        &self,
+        descriptor: &ProcessorDescriptor,
+    ) -> Result<(u64, u64), StoreError> {
+        instance_count_bytes(
+            &self.inner.pool,
+            PENDING_DELTA_TOTALS,
+            &processor_instance(descriptor),
+        )
+        .await
+    }
+
     /// Inspect logical storage attributable to one processor instance.
     ///
     /// Every call scans the processor's rows; operational readers that poll
@@ -13811,13 +13829,8 @@ impl SqliteStore {
             &instance,
         )
         .await?;
-        let (pending_deltas, pending_delta_bytes) = instance_count_bytes(
-            &self.inner.pool,
-            "SELECT COUNT(*), COALESCE(SUM(length(encoded_delta)), 0)
-             FROM pending_deltas WHERE instance = ?",
-            &instance,
-        )
-        .await?;
+        let (pending_deltas, pending_delta_bytes) =
+            instance_count_bytes(&self.inner.pool, PENDING_DELTA_TOTALS, &instance).await?;
         let (processor_artifacts, processor_artifact_bytes) = instance_count_bytes(
             &self.inner.pool,
             "SELECT COALESCE((SELECT retained_artifacts
@@ -17272,6 +17285,10 @@ const DELIVERY_PRUNE_BLOCK_SEQUENCES: &str =
 /// Bytes of the changes below a sequence, which a pruning pass deletes.
 const DELIVERY_PRUNED_BYTES: &str = "SELECT COALESCE(SUM(length(entity_key) + length(payload)), 0)
      FROM change_log WHERE stream_id = ? AND stream_sequence < ?";
+
+/// Count and bytes of a processor's pending deltas.
+const PENDING_DELTA_TOTALS: &str = "SELECT COUNT(*), COALESCE(SUM(length(encoded_delta)), 0)
+     FROM pending_deltas WHERE instance = ?";
 
 /// Bytes of a chain's retained recent frames.
 const RECENT_FRAME_BYTES: &str = "SELECT COALESCE(SUM(bytes), 0)

@@ -3960,12 +3960,15 @@ impl SharedLiveRuntime {
             Box::pin(self.drain_pending(&mut report)).await?;
         }
         for processor in &self.processors {
-            let statistics = self.store.processor_stats(processor.descriptor()).await?;
+            let (pending, _) = self
+                .store
+                .pending_delta_totals(processor.descriptor())
+                .await?;
             report
                 .processors
                 .entry(processor.descriptor().id.to_string())
                 .or_default()
-                .pending = statistics.pending_deltas;
+                .pending = pending;
         }
         Ok(report)
     }
@@ -4439,12 +4442,15 @@ impl SharedLiveRuntime {
                 Box::pin(self.drain_pending(&mut report)).await?;
             }
             for processor in &self.processors {
-                let statistics = self.store.processor_stats(processor.descriptor()).await?;
+                let (pending, _) = self
+                    .store
+                    .pending_delta_totals(processor.descriptor())
+                    .await?;
                 report
                     .processors
                     .entry(processor.descriptor().id.to_string())
                     .or_default()
-                    .pending = statistics.pending_deltas;
+                    .pending = pending;
             }
             Ok(report)
         })
@@ -5278,9 +5284,9 @@ impl SharedLiveRuntime {
         for configured in &self.processors {
             current = current.saturating_add(
                 self.store
-                    .processor_stats(configured.descriptor())
+                    .pending_delta_totals(configured.descriptor())
                     .await?
-                    .pending_delta_bytes,
+                    .1,
             );
         }
         let persist_delta = encoded_bytes <= self.config.pending_delta_bytes
@@ -5354,9 +5360,9 @@ impl SharedLiveRuntime {
         for configured in &self.processors {
             pending_bytes = pending_bytes.saturating_add(
                 self.store
-                    .processor_stats(configured.descriptor())
+                    .pending_delta_totals(configured.descriptor())
                     .await?
-                    .pending_delta_bytes,
+                    .1,
             );
         }
         if encoded_bytes > self.config.pending_delta_bytes
@@ -15997,6 +16003,47 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![(0, Finality::Attested, ChangeDirection::Apply)]
         );
+    }
+
+    #[tokio::test]
+    async fn parking_a_paused_lane_reads_no_processor_statistics() {
+        let range = BlockRange::new(BlockNumber(0), BlockNumber(3)).expect("range");
+        let mut steps = Vec::new();
+        let mut parent = BlockHash::ZERO;
+        for number in 0..=3 {
+            let frame = live_fixture(number, parent);
+            parent = frame.block.hash;
+            steps.push(LiveStep::Event(ChainEvent::Block(Box::new(frame))));
+        }
+        let paused =
+            Arc::new(BlockLocalCounter::named("parked-without-scans").with_delivery_max_bytes(100));
+        let (_directory, store) = store().await;
+        SharedLiveRuntime::new(
+            store.clone(),
+            Arc::new(ScriptedLiveSource::new(
+                e2e_descriptor("parked-live", range),
+                steps,
+            )),
+            vec![paused.clone()],
+            SharedLiveRuntimeConfig::default(),
+        )
+        .expect("runtime")
+        .run(
+            LiveStart::Head,
+            default_source_budget(),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("run");
+        assert_eq!(
+            store
+                .processor_runtime_state(paused.descriptor())
+                .await
+                .expect("state")
+                .state,
+            ProcessorRunState::Paused
+        );
+        assert_eq!(store.statistics_scans(), 0);
     }
 
     #[tokio::test]
