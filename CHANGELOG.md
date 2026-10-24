@@ -44,6 +44,13 @@ record, and documented RPC contracts.
   historical RPC request may hold `memory_bytes` divided by 8. Configurations
   that set `source_concurrency = 4` keep reading 4 chunks per job.
 
+### Fixed
+
+- An automatic or on-demand backfill whose changes fill the processor's
+  delivery stream now waits while the processor is paused at its delivery
+  limit and continues once pruning resumes it. It used to fail, and its range
+  stayed uncovered until the next start.
+
 ### Security
 
 - Updated rustls-webpki to 0.103.16, and webpki-roots and webpki-root-certs
