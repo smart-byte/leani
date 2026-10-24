@@ -645,7 +645,12 @@ retain_acknowledged_age = "1h"
 ```
 
 `max_age` and `retain_acknowledged_age` use durable node wall-clock
-enqueue/acknowledgement time, not Ethereum block timestamps.
+enqueue/acknowledgement time, not Ethereum block timestamps, so the changes a
+backfill enqueues count as new.
+
+A pass deletes at most `maximum_delete_changes`. A pass that deletes that many
+is followed at once by the next, and a stream that pauses at its limit is
+pruned at once, without waiting for `interval`.
 
 ### Checkpoint and undo
 

@@ -70,8 +70,9 @@ const SCHEMA_V23: &str = include_str!("../migrations/0023_consumer_delivery_and_
 const SCHEMA_V24: &str = include_str!("../migrations/0024_processor_identity_aliases.sql");
 const SCHEMA_V25: &str = include_str!("../migrations/0025_output_block_index.sql");
 const SCHEMA_V26: &str = include_str!("../migrations/0026_unattested_indexes.sql");
+const SCHEMA_V27: &str = include_str!("../migrations/0027_maintenance_indexes.sql");
 /// Current on-disk `SQLite` schema version written by this crate.
-pub const CURRENT_SCHEMA_VERSION: u32 = 26;
+pub const CURRENT_SCHEMA_VERSION: u32 = 27;
 /// Schema that added the node secret, which its migration generates.
 const NODE_SECRET_SCHEMA_VERSION: u32 = 23;
 /// Name of the one [`NodeSecret`] row in `node_secrets`.
@@ -2092,6 +2093,7 @@ async fn migrate(pool: &SqlitePool) -> Result<(), StoreError> {
         (24, SCHEMA_V24),
         (25, SCHEMA_V25),
         (26, SCHEMA_V26),
+        (27, SCHEMA_V27),
     ];
     for (target, migration) in migrations {
         if target > version {
@@ -13233,24 +13235,18 @@ impl SqliteStore {
         let storage_pressure = i64_u64(stream_bytes, "delivery stream bytes")? > policy.max_bytes
             || ProcessorRunState::parse(&run_state)? == ProcessorRunState::Paused;
         let candidate: Option<i64> = if storage_pressure {
-            sqlx::query_scalar(
-                "SELECT MAX(stream_sequence) FROM change_log
-                 WHERE stream_id = ? AND block_number <= ?",
-            )
-            .bind(stream_id)
-            .bind(u64_i64(block_cutoff, "delivery block cutoff")?)
-            .fetch_one(&self.inner.pool)
-            .await?
+            sqlx::query_scalar(DELIVERY_PRESSURE_PRUNE_CANDIDATE)
+                .bind(stream_id)
+                .bind(u64_i64(block_cutoff, "delivery block cutoff")?)
+                .fetch_one(&self.inner.pool)
+                .await?
         } else {
-            sqlx::query_scalar(
-                "SELECT MAX(stream_sequence) FROM change_log
-                 WHERE stream_id = ? AND block_number <= ? AND created_at_unix_ms <= ?",
-            )
-            .bind(stream_id)
-            .bind(u64_i64(block_cutoff, "delivery block cutoff")?)
-            .bind(created_cutoff)
-            .fetch_one(&self.inner.pool)
-            .await?
+            sqlx::query_scalar(DELIVERY_AGE_PRUNE_CANDIDATE)
+                .bind(stream_id)
+                .bind(u64_i64(block_cutoff, "delivery block cutoff")?)
+                .bind(created_cutoff)
+                .fetch_one(&self.inner.pool)
+                .await?
         };
         let Some(candidate) = candidate else {
             return Ok(ChangePruneOutcome {
@@ -13260,26 +13256,36 @@ impl SqliteStore {
             });
         };
         let candidate_before = i64_u64(candidate, "delivery prune candidate")?.saturating_add(1);
-        let (eligible_changes, eligible_blocks): (i64, i64) = sqlx::query_as(
-            "SELECT COUNT(*), COUNT(DISTINCT block_number) FROM change_log
-             WHERE stream_id = ? AND stream_sequence < ?",
-        )
-        .bind(stream_id)
-        .bind(u64_i64(candidate_before, "delivery prune candidate")?)
-        .fetch_one(&self.inner.pool)
-        .await?;
+        // The counts only decide the batch, so neither reads past what the
+        // thresholds compare.
+        let changes_limit = pruning
+            .minimum_batch_changes
+            .max(pruning.maximum_delete_changes.saturating_add(1));
+        let eligible_changes: i64 = sqlx::query_scalar(DELIVERY_PRUNE_ELIGIBLE_CHANGES)
+            .bind(stream_id)
+            .bind(u64_i64(candidate_before, "delivery prune candidate")?)
+            .bind(i64::try_from(changes_limit).unwrap_or(i64::MAX))
+            .fetch_one(&self.inner.pool)
+            .await?;
         let eligible_changes = i64_u64(eligible_changes, "eligible delivery changes")?;
-        let eligible_blocks = i64_u64(eligible_blocks, "eligible delivery blocks")?;
         if terminal_backfill == 0
             && !storage_pressure
             && eligible_changes < pruning.minimum_batch_changes
-            && eligible_blocks < pruning.minimum_batch_blocks
         {
-            return Ok(ChangePruneOutcome {
-                requested_before: candidate_before,
-                effective_before: candidate_before,
-                deleted: 0,
-            });
+            let eligible_blocks: i64 = sqlx::query_scalar(DELIVERY_PRUNE_ELIGIBLE_BLOCKS)
+                .bind(stream_id)
+                .bind(u64_i64(candidate_before, "delivery prune candidate")?)
+                .bind(i64::try_from(pruning.minimum_batch_blocks).unwrap_or(i64::MAX))
+                .fetch_one(&self.inner.pool)
+                .await?;
+            let eligible_blocks = i64_u64(eligible_blocks, "eligible delivery blocks")?;
+            if eligible_blocks < pruning.minimum_batch_blocks {
+                return Ok(ChangePruneOutcome {
+                    requested_before: candidate_before,
+                    effective_before: candidate_before,
+                    deleted: 0,
+                });
+            }
         }
         let requested_before = if eligible_changes > pruning.maximum_delete_changes {
             let offset = pruning.maximum_delete_changes.saturating_sub(1);
@@ -13293,15 +13299,12 @@ impl SqliteStore {
             .bind(u64_i64(offset, "delivery prune batch offset")?)
             .fetch_one(&self.inner.pool)
             .await?;
-            let block_end: i64 = sqlx::query_scalar(
-                "SELECT MAX(stream_sequence) FROM change_log
-                 WHERE stream_id = ? AND block_number = ? AND stream_sequence < ?",
-            )
-            .bind(stream_id)
-            .bind(block_number)
-            .bind(u64_i64(candidate_before, "delivery prune candidate")?)
-            .fetch_one(&self.inner.pool)
-            .await?;
+            let block_end: i64 = sqlx::query_scalar(DELIVERY_PRUNE_BATCH_END)
+                .bind(stream_id)
+                .bind(block_number)
+                .bind(u64_i64(candidate_before, "delivery prune candidate")?)
+                .fetch_one(&self.inner.pool)
+                .await?;
             i64_u64(block_end, "delivery block end")?.saturating_add(1)
         } else {
             candidate_before
@@ -13385,14 +13388,12 @@ impl SqliteStore {
             .fetch_optional(&mut *transaction)
             .await?;
             if let Some(block_number) = trailing_block {
-                let (block_first, block_last): (i64, i64) = sqlx::query_as(
-                    "SELECT MIN(stream_sequence), MAX(stream_sequence) FROM change_log
-                     WHERE stream_id = ? AND block_number = ?",
-                )
-                .bind(stream_id)
-                .bind(block_number)
-                .fetch_one(&mut *transaction)
-                .await?;
+                let (block_first, block_last): (i64, i64) =
+                    sqlx::query_as(DELIVERY_PRUNE_BLOCK_SEQUENCES)
+                        .bind(stream_id)
+                        .bind(block_number)
+                        .fetch_one(&mut *transaction)
+                        .await?;
                 if i64_u64(block_last, "logical block end")? >= effective {
                     effective = effective.min(i64_u64(block_first, "logical block start")?);
                 }
@@ -13406,6 +13407,11 @@ impl SqliteStore {
         .bind(u64_i64(effective, "effective prune sequence")?)
         .fetch_one(&mut *transaction)
         .await?;
+        let pruned_bytes: i64 = sqlx::query_scalar(DELIVERY_PRUNED_BYTES)
+            .bind(stream_id)
+            .bind(u64_i64(effective, "effective prune sequence")?)
+            .fetch_one(&mut *transaction)
+            .await?;
         let result =
             sqlx::query("DELETE FROM change_log WHERE stream_id = ? AND stream_sequence < ?")
                 .bind(stream_id)
@@ -13423,18 +13429,16 @@ impl SqliteStore {
             .execute(&mut *transaction)
             .await?;
         }
-        let live_bytes: i64 = sqlx::query_scalar(
-            "SELECT COALESCE(SUM(length(entity_key) + length(payload)), 0)
-             FROM change_log WHERE stream_id = ?",
-        )
-        .bind(stream_id)
-        .fetch_one(&mut *transaction)
-        .await?;
-        sqlx::query("UPDATE delivery_streams SET live_bytes = ? WHERE stream_id = ?")
-            .bind(live_bytes)
+        sqlx::query("UPDATE delivery_streams SET live_bytes = live_bytes - ? WHERE stream_id = ?")
+            .bind(pruned_bytes)
             .bind(stream_id)
             .execute(&mut *transaction)
             .await?;
+        let live_bytes: i64 =
+            sqlx::query_scalar("SELECT live_bytes FROM delivery_streams WHERE stream_id = ?")
+                .bind(stream_id)
+                .fetch_one(&mut *transaction)
+                .await?;
         let low_water = delivery_resume_mark(descriptor.lifecycle.delivery.max_bytes);
         let resumed = i64_u64(live_bytes, "delivery live bytes")? <= low_water
             && sqlx::query(
@@ -17244,6 +17248,42 @@ const ATTESTED_OUTPUT_PROMOTION: &str = "UPDATE output_entity_meta SET finality 
 const ATTESTED_CANONICAL_PROMOTION: &str = "UPDATE canonical_blocks SET finality = 1
      WHERE chain_id = ? AND block_number <= ? AND finality = 0";
 
+// Delivery pruning runs every interval, and back to back while a stream is
+// over its limit, so no statement walks every change a stream retains.
+
+/// Newest change of a stream at or below a block and older than a time.
+/// Changes are appended in time order, so the newest one at or before the
+/// time bounds the walk back to the first change at or below the block; the
+/// `+` keeps that walk on the sequence index.
+const DELIVERY_AGE_PRUNE_CANDIDATE: &str = "SELECT MAX(stream_sequence) FROM change_log
+     WHERE stream_id = ?1 AND +block_number <= ?2
+       AND stream_sequence <= (
+           SELECT MAX(stream_sequence) FROM change_log
+            WHERE stream_id = ?1 AND created_at_unix_ms <= ?3)";
+/// Newest change of a stream at or below a block.
+const DELIVERY_PRESSURE_PRUNE_CANDIDATE: &str = "SELECT MAX(stream_sequence) FROM change_log
+     WHERE stream_id = ? AND +block_number <= ?";
+/// Changes below a sequence, counted up to a limit.
+const DELIVERY_PRUNE_ELIGIBLE_CHANGES: &str = "SELECT COUNT(*) FROM (
+         SELECT 1 FROM change_log
+          WHERE stream_id = ? AND stream_sequence < ?
+          LIMIT ?)";
+/// Blocks with changes below a sequence, counted up to a limit.
+const DELIVERY_PRUNE_ELIGIBLE_BLOCKS: &str = "SELECT COUNT(*) FROM (
+         SELECT DISTINCT +block_number FROM change_log
+          WHERE stream_id = ? AND stream_sequence < ?
+          LIMIT ?)";
+/// Last change of a block below a sequence: a pruning batch ends with it.
+const DELIVERY_PRUNE_BATCH_END: &str = "SELECT MAX(stream_sequence) FROM change_log
+     WHERE stream_id = ? AND block_number = ? AND stream_sequence < ?";
+/// First and last change of a block, which pruning never splits.
+const DELIVERY_PRUNE_BLOCK_SEQUENCES: &str =
+    "SELECT MIN(stream_sequence), MAX(stream_sequence) FROM change_log
+     WHERE stream_id = ? AND block_number = ?";
+/// Bytes of the changes below a sequence, which a pruning pass deletes.
+const DELIVERY_PRUNED_BYTES: &str = "SELECT COALESCE(SUM(length(entity_key) + length(payload)), 0)
+     FROM change_log WHERE stream_id = ? AND stream_sequence < ?";
+
 // Coverage probes run on every metrics scrape and status poll, so each one is
 // a single index search: exact and compact coverage are probed separately and
 // combined in Rust instead of scanning a UNION of both.
@@ -18464,6 +18504,11 @@ async fn enforce_delivery_capacity(
             ProcessorRunState::Paused
         };
         set_processor_run_state(pool, instance, state, Some("delivery_spool_hard_limit")).await?;
+        if state == ProcessorRunState::Paused {
+            // Maintenance prunes a paused stream at once, not at its next
+            // interval.
+            inner.delivery_capacity_changed.notify_waiters();
+        }
     }
     let (scope, effective_limit, effective_projected) =
         budget_failure.unwrap_or(("stream", limit, projected));
@@ -22374,7 +22419,8 @@ mod tests {
             DROP INDEX change_log_backfill_completion;
             DROP INDEX change_log_stream_origin_sequence;
             DROP INDEX change_log_stream_sequence_unique;
-            DROP INDEX change_log_stream_sequence;
+            DROP INDEX change_log_stream_created;
+            DROP INDEX change_log_stream_block;
             ALTER TABLE change_log DROP COLUMN publication_revision;
             ALTER TABLE change_log DROP COLUMN origin_id;
             ALTER TABLE change_log DROP COLUMN origin_kind;
@@ -28746,6 +28792,132 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn delivery_pruning_searches_index_ranges() {
+        let (_directory, store) = store().await;
+        for (statement, index, range) in [
+            (
+                DELIVERY_AGE_PRUNE_CANDIDATE,
+                "change_log_stream_created",
+                "created_at_unix_ms<?",
+            ),
+            (
+                DELIVERY_PRUNE_BATCH_END,
+                "change_log_stream_block",
+                "block_number=?",
+            ),
+            (
+                DELIVERY_PRUNE_BLOCK_SEQUENCES,
+                "change_log_stream_block",
+                "block_number=?",
+            ),
+            (
+                DELIVERY_PRUNED_BYTES,
+                "change_log_stream_sequence",
+                "stream_sequence<?",
+            ),
+            (
+                DELIVERY_PRUNE_ELIGIBLE_CHANGES,
+                "change_log_stream_sequence",
+                "stream_sequence<?",
+            ),
+            (
+                DELIVERY_PRUNE_ELIGIBLE_BLOCKS,
+                "change_log_stream_sequence",
+                "stream_sequence<?",
+            ),
+            // Walks back from the newest change and stops at the first one
+            // at or below the cutoff block.
+            (
+                DELIVERY_PRESSURE_PRUNE_CANDIDATE,
+                "change_log_stream_sequence",
+                "stream_id=?",
+            ),
+        ] {
+            let plan = query_plan(&store, statement).await;
+            assert!(
+                plan.iter().any(|step| step.starts_with("SEARCH")
+                    && step.contains(index)
+                    && step.contains(range))
+                    && !plan.iter().any(|step| step.starts_with("SCAN change_log")),
+                "{statement}\n{plan:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn pruning_keeps_live_bytes_equal_to_the_retained_changes() {
+        let (_directory, store) = store().await;
+        let mut processor = FixtureProcessor::new();
+        processor.changes_per_block = 3;
+        let pruning = &mut processor.descriptor.lifecycle.delivery.pruning;
+        pruning.minimum_batch_blocks = 1;
+        pruning.minimum_batch_changes = 1;
+        pruning.maximum_delete_changes = 2;
+        pruning.retain_finalized_blocks = 1;
+        processor.descriptor.lifecycle.delivery.max_age_seconds = 1;
+        let mut parent = BlockHash::ZERO;
+        for number in 1..=6 {
+            let current = frame(number, parent);
+            parent = current.block.hash;
+            let delta = processor.map(&current).await.expect("map");
+            store
+                .apply(
+                    &processor,
+                    cursor(&processor, &current, number),
+                    &delta,
+                    &[],
+                )
+                .await
+                .expect("apply");
+        }
+        sqlx::query("UPDATE change_log SET created_at_unix_ms = 0")
+            .execute(&store.inner.pool)
+            .await
+            .expect("age fixture changes");
+        let retained_bytes = || async {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COALESCE(SUM(length(entity_key) + length(payload)), 0) FROM change_log",
+            )
+            .fetch_one(&store.inner.pool)
+            .await
+            .expect("retained bytes")
+        };
+        let mut passes = 0;
+        loop {
+            let outcome = store
+                .prune_delivery_changes(&processor.descriptor, BlockNumber(6))
+                .await
+                .expect("prune");
+            let stats = store
+                .delivery_stream_stats(&processor.descriptor)
+                .await
+                .expect("stream stats");
+            assert_eq!(
+                i64::try_from(stats.live_bytes).expect("live bytes"),
+                retained_bytes().await
+            );
+            if outcome.deleted == 0 {
+                break;
+            }
+            assert_eq!(outcome.deleted % 3, 0, "a pass never splits a block");
+            passes += 1;
+        }
+        assert!(passes > 1, "bounded batches need several passes");
+        store
+            .prune_changes_before(&processor.descriptor, u64::MAX)
+            .await
+            .expect("explicit prune");
+        let stats = store
+            .delivery_stream_stats(&processor.descriptor)
+            .await
+            .expect("stream stats");
+        assert_eq!(
+            i64::try_from(stats.live_bytes).expect("live bytes"),
+            retained_bytes().await
+        );
+    }
+
     /// `finalized_through` before its indexed probes: MAX over a UNION.
     const FINALIZED_THROUGH_UNION_SCAN: &str = "SELECT MAX(block_number) FROM (
             SELECT block_number FROM processor_coverage
@@ -28900,7 +29072,7 @@ mod tests {
         let reopened = SqliteStore::open(StoreConfig::new(&path))
             .await
             .expect("schema 21 upgrades in place");
-        assert_eq!(CURRENT_SCHEMA_VERSION, 26);
+        assert_eq!(CURRENT_SCHEMA_VERSION, 27);
         assert_eq!(
             reopened.stats().await.expect("stats").schema_version,
             CURRENT_SCHEMA_VERSION
@@ -29114,10 +29286,10 @@ mod tests {
             .connect()
             .await
             .expect("connection");
-        sqlx::query("UPDATE node_meta SET value = X'0000001b' WHERE key = 'schema_version'")
+        sqlx::query("UPDATE node_meta SET value = X'0000001c' WHERE key = 'schema_version'")
             .execute(&mut connection)
             .await
-            .expect("schema 27");
+            .expect("schema 28");
         connection.close().await.expect("close");
         let refused = SqliteStore::backup(&newer, &directory.path().join("newer-backup.sqlite"))
             .await
@@ -29127,7 +29299,7 @@ mod tests {
             "{refused}"
         );
         assert!(!directory.path().join("newer-backup.sqlite").exists());
-        assert_eq!(schema_on_disk(&newer).await, 27);
+        assert_eq!(schema_on_disk(&newer).await, 28);
     }
 
     #[tokio::test]
@@ -29224,7 +29396,7 @@ mod tests {
         let reopened = SqliteStore::open(StoreConfig::new(&path))
             .await
             .expect("schema 22 upgrades in place");
-        assert_eq!(CURRENT_SCHEMA_VERSION, 26);
+        assert_eq!(CURRENT_SCHEMA_VERSION, 27);
         assert_eq!(
             reopened.stats().await.expect("stats").schema_version,
             CURRENT_SCHEMA_VERSION

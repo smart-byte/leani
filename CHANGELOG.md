@@ -50,6 +50,14 @@ record, and documented RPC contracts.
   delivery stream now waits while the processor is paused at its delivery
   limit and continues once pruning resumes it. It used to fail, and its range
   stayed uncovered until the next start.
+- Delivery pruning reads the changes it deletes instead of every change the
+  stream retains, and a paused stream is pruned at once, pass after pass,
+  instead of one batch per `pruning.interval`. A processor paused at a full
+  1 GiB window resumed after 4 s, or 17 s from a throttled disk with a cold
+  cache, instead of 13 minutes to about an hour.
+- Schema 27 adds the indexes these use. A store upgrades in place on its first
+  start, which builds them once: about a second per index and million changes
+  on SSD.
 
 ### Security
 
