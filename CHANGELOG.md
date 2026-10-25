@@ -8,6 +8,12 @@ record, and documented RPC contracts.
 
 ### Added
 
+- A `base-sepolia` chain entry. Base's Denim upgrade moves to a block every
+  200 ms (Base Sepolia since 2026-10-21, Base mainnet scheduled for
+  2026-11-05); op-stack lanes size their reorg window and settle depth by
+  time at the current cadence and restart when a signed head changes it,
+  and the L1 anchor keeps four hours of signed blocks at the fastest
+  scheduled cadence.
 - `[l1_anchor]` finalizes a rollup's blocks from its Ethereum settlement
   contracts, read in finalized Ethereum blocks over verified Ethereum
   finality and execution P2P: a confirmed BoLD assertion on Arbitrum One,

@@ -343,6 +343,10 @@ const BUILT_IN: &[(&str, Option<&str>)] = &[
         Some(include_str!("../../../config/chains/op/base.toml")),
     ),
     (
+        include_str!("../../../config/chains/base-sepolia.toml"),
+        Some(include_str!("../../../config/chains/op/base-sepolia.toml")),
+    ),
+    (
         include_str!("../../../config/chains/unichain-mainnet.toml"),
         Some(include_str!("../../../config/chains/op/unichain.toml")),
     ),

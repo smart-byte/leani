@@ -168,11 +168,12 @@ fn entry_with_beacon_section_needs_its_config() {
 
 #[test]
 fn op_stack_fork_ids_match_live_peers() {
-    // Fork ids once every scheduled fork is active (EIP-2124); OP Mainnet
-    // and Unichain were verified live against their peers.
+    // Fork ids once every scheduled fork is active (EIP-2124); OP Mainnet's,
+    // Base Sepolia's, and Unichain's match what their peers advertise.
     for (name, hash) in [
         ("op-mainnet", [0xc2, 0x92, 0x39, 0xaf]),
         ("base", [0x16, 0x9d, 0x85, 0xa3]),
+        ("base-sepolia", [0xc6, 0x75, 0x7f, 0x44]),
         ("unichain", [0x1f, 0xaa, 0x45, 0x6e]),
         ("worldchain", [0xf1, 0x13, 0x24, 0x8b]),
     ] {
@@ -202,6 +203,30 @@ fn base_announces_cobalt_until_denim() {
         (fork_id.hash.0, fork_id.next),
         ([0x68, 0x64, 0x7e, 0x86], 1_793_901_600)
     );
+}
+
+#[test]
+fn base_blocks_come_every_200_ms_from_denim() {
+    // Denim takes the first 2 s slot at or after its time: one second late on
+    // mainnet, whose genesis sits on an odd second. Base Sepolia's head on
+    // 2026-10-25 21:43:05 UTC was block 50,213,581, as its schedule predicts.
+    let registry = ChainRegistry::standard();
+    let base = registry.get("base").unwrap();
+    let base = base.op_stack.as_ref().unwrap();
+    assert_eq!(base.denim_block(), Some(53_556_127));
+    assert_eq!(base.block_interval_ms(53_556_127), 2_000);
+    assert_eq!(base.block_interval_ms(53_556_128), 200);
+    assert_eq!(base.block_interval_ms(u64::MAX), 200);
+    let sepolia = registry.get("base-sepolia").unwrap();
+    let sepolia = sepolia.op_stack.as_ref().unwrap();
+    let denim = sepolia.denim_block().unwrap();
+    assert_eq!(denim, 48_418_656);
+    let elapsed_ms = (1_792_964_585 - 1_792_605_600) * 1_000;
+    assert_eq!(denim + elapsed_ms / 200, 50_213_581);
+    let op = registry.get("optimism").unwrap();
+    let op = op.op_stack.as_ref().unwrap();
+    assert_eq!(op.denim_block(), None);
+    assert_eq!(op.block_interval_ms(u64::MAX), 2_000);
 }
 
 #[test]

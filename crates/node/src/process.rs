@@ -7660,11 +7660,10 @@ async fn run_op_lanes(
     };
 
     let chain = config.chain_entry()?;
-    let block_time = chain
+    let network = chain
         .op_stack
-        .as_ref()
-        .context("op_gossip finality needs an op-stack chain")?
-        .block_time;
+        .clone()
+        .context("op_gossip finality needs an op-stack chain")?;
     let chain_id = ChainId(config.chain.chain_id);
     let mut heads = op_heads.heads.clone();
     let first = tokio::select! {
@@ -7685,6 +7684,9 @@ async fn run_op_lanes(
     };
     info!(block = first.number, "first sequencer-signed head");
     live_source.update_advertised_head(anchor).await;
+    // Windows counted in blocks keep their time at Base's 200 ms Denim cadence;
+    // the lanes restart when a signed head changes the cadence.
+    let block_ms = network.block_interval_ms(first.number).max(1);
     let finality = Arc::new(leani_finality_op_gossip::OpGossipFinality::new(
         chain_id,
         heads.clone(),
@@ -7695,7 +7697,7 @@ async fn run_op_lanes(
         live_source.clone(),
         processors.clone(),
         SharedLiveRuntimeConfig {
-            max_reorg_depth: 64,
+            max_reorg_depth: usize::try_from(128_000 / block_ms).unwrap_or(usize::MAX),
             pending_delta_bytes: config.budgets.pending_delta_bytes,
             committed_events: Some(handles.committed_events),
             recent_hard_bytes: config.budgets.recent_raw_hard_bytes,
@@ -7709,7 +7711,7 @@ async fn run_op_lanes(
     let settle_blocks = config
         .finality
         .settle_blocks
-        .unwrap_or(3_600 / block_time.max(1));
+        .unwrap_or(3_600_000 / block_ms);
     let finality_runtime = SharedFinalityRuntime::new(
         store.clone(),
         finality,
@@ -7758,6 +7760,19 @@ async fn run_op_lanes(
     loop {
         tokio::select! {
             () = cancellation.cancelled() => return Ok(()),
+            changed = heads.changed() => {
+                if changed.is_err() {
+                    bail!("the gossip lane ended");
+                }
+                let head = heads.borrow_and_update().as_ref().map(|head| head.number);
+                if let Some(number) = head
+                    && network.block_interval_ms(number) != block_ms
+                {
+                    bail!(
+                        "block {number} starts a new block cadence; restarting the lanes to size their windows for it"
+                    );
+                }
+            }
             changed = live_ready_updates.changed() => {
                 if changed.is_err() {
                     bail!("live readiness channel closed");

@@ -198,11 +198,11 @@ pub(crate) async fn start_op_heads(
     cancellation: &CancellationToken,
 ) -> Result<OpHeads> {
     let chain = config.chain_entry()?;
-    let block_time = chain
+    let fastest_block_ms = chain
         .op_stack
         .as_ref()
         .context("op_gossip finality needs an op-stack chain")?
-        .block_time;
+        .block_interval_ms(u64::MAX);
     let mut gossip = leani_finality_op_gossip::OpGossipConfig::for_chain(&chain)?;
     gossip.listen_port = config.finality.listen_port;
     gossip.discovery_port = config.finality.discovery_port;
@@ -227,7 +227,7 @@ pub(crate) async fn start_op_heads(
     let finalized = match (anchor, signed) {
         (Some((_, observations)), Some(signed)) => Some(follow_dispute_games(
             config,
-            block_time,
+            fastest_block_ms,
             signed,
             observations,
             cancellation.child_token(),
@@ -329,13 +329,14 @@ async fn l1_finality(
 /// sequencer signed, which `signed` delivers.
 fn follow_dispute_games(
     config: &Config,
-    block_time: u64,
+    fastest_block_ms: u64,
     mut signed: mpsc::Receiver<leani_finality_op_gossip::SignedBlock>,
     mut observations: mpsc::Receiver<Observation>,
     cancellation: CancellationToken,
 ) -> Result<watch::Receiver<FinalizedBlock>> {
-    // Games are created within about an hour of their block; keep four.
-    let capacity = usize::try_from(4 * 3_600 / block_time.max(1)).unwrap_or(usize::MAX);
+    // Games are created within about an hour of their block; keep four
+    // hours at the fastest scheduled cadence, so a fork like Denim fits too.
+    let capacity = usize::try_from(4 * 3_600_000 / fastest_block_ms.max(1)).unwrap_or(usize::MAX);
     let mut ledger =
         GameLedger::load(Some(config.data_dir.join("l1-anchor-games.json")), capacity)?;
     let (finalized, receiver) = watch::channel(None);
