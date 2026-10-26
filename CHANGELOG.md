@@ -8,6 +8,12 @@ record, and documented RPC contracts.
 
 ### Added
 
+- With `sequencer_feed`, a fresh store catches up over JSON-RPC from the
+  lowest automatic `start_block`, bounded by
+  `sources.live.history_fallback_blocks`: the headers down from the first
+  signed block are hashed locally and every 256th hash kept, and each
+  catch-up batch must end at one, so the endpoints are trusted for nothing.
+  A restarted node proves the chain down to its stored tip the same way.
 - JSON-RPC endpoints form a pool: at start each must serve the configured
   chain and `eth_getBlockReceipts`; block ranges spread over the rest in
   parallel, one part per endpoint at a time so that every endpoint serves

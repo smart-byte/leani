@@ -7628,6 +7628,58 @@ async fn run_rpc_lanes(
         );
         anchor
     };
+    // A store that stopped below the anchor resumes from its own tip, and a
+    // fresh one under the feed catches up from the processors' start. Under
+    // the feed the chain down from the signed block is proven first, so no
+    // endpoint can slip in a block on the way.
+    let resume = match store.recent_canonical_bounds(chain_id).await? {
+        Some(bounds) if bounds.end() < anchor.number => store
+            .recent_frame(chain_id, bounds.end())
+            .await?
+            .map(|frame| frame.block),
+        None if signed.is_some() => {
+            let first_block = config
+                .chain_entry()?
+                .sequencer_feed
+                .as_ref()
+                .map_or(0, |feed| feed.first_block);
+            match catch_up_start(config, first_block, anchor.number.0) {
+                Some(from) => Some(
+                    quorum
+                        .agreed_ref(&format!("{:#x}", from - 1))
+                        .await
+                        .context("read the block before the catch-up")?,
+                ),
+                None => None,
+            }
+        }
+        _ => None,
+    };
+    if signed.is_some()
+        && let Some(start) = resume
+    {
+        info!(
+            from = start.number.0 + 1,
+            head = anchor.number.0,
+            "catching up to the signed block over JSON-RPC"
+        );
+        let proven = quorum
+            .prove_down(
+                anchor.number.0,
+                alloy_primitives::B256::from(anchor.hash.0),
+                start.number.0,
+                RPC_CATCH_UP_GRID,
+            )
+            .await
+            .context("prove the catch-up chain down from the signed block")?;
+        if proven.get(&start.number.0).map(|hash| hash.0) != Some(start.hash.0) {
+            bail!(
+                "block {} is not on the chain down from the signed block",
+                start.number.0
+            );
+        }
+        live = live.with_proven_hashes(proven);
+    }
     let live = Arc::new(live);
     let checkpoint = leani_source_api::ConsensusCheckpoint {
         beacon_slot: anchor.number.0,
@@ -7668,18 +7720,8 @@ async fn run_rpc_lanes(
     if let Some(depth) = settle_blocks {
         finality_runtime = finality_runtime.with_settle_depth(depth);
     }
-    // A store that stopped below the endpoints' finalized block resumes from
-    // its own tip: the endpoints serve every block in between, and nothing
-    // else fills that gap.
-    let stored_tip = match store.recent_canonical_bounds(chain_id).await? {
-        Some(bounds) if bounds.end() < anchor.number => store
-            .recent_frame(chain_id, bounds.end())
-            .await?
-            .map(|frame| frame.block),
-        _ => None,
-    };
-    let live_start = match stored_tip {
-        Some(tip) => leani_source_api::LiveStart::Block(tip),
+    let live_start = match resume {
+        Some(start) => leani_source_api::LiveStart::Block(start),
         None => {
             retained_live_start(
                 &store,
@@ -7742,10 +7784,14 @@ async fn run_rpc_lanes(
 /// How long an op-stack node waits for the first sequencer-signed block.
 const FIRST_SIGNED_HEAD_TIMEOUT: Duration = Duration::from_secs(180);
 
-/// The block a fresh op-stack store catches up from, below the signed `head`:
-/// the lowest start of the processors whose history the node fills, at most
+/// Blocks between the hashes a JSON-RPC catch-up proves, at most one
+/// catch-up batch.
+const RPC_CATCH_UP_GRID: u64 = 256;
+
+/// The block a fresh store catches up from, below the signed `head`: the
+/// lowest start of the processors whose history the node fills, at most
 /// `history_fallback_blocks` back and above the chain's first block.
-fn op_catch_up_start(config: &Config, first_block: u64, head: u64) -> Option<u64> {
+fn catch_up_start(config: &Config, first_block: u64, head: u64) -> Option<u64> {
     let start = config
         .processors
         .iter()
@@ -7857,7 +7903,7 @@ async fn run_op_lanes(
             .await?
             .map(|frame| frame.block),
         Some(_) => None,
-        None => match op_catch_up_start(config, op_stack.first_block, anchor.number.0) {
+        None => match catch_up_start(config, op_stack.first_block, anchor.number.0) {
             Some(from) => {
                 let before = BlockNumber(from - 1);
                 info!(
@@ -13688,19 +13734,19 @@ markets = ["ETH/USDT"]
         config.processors[0].start_block = 9_000;
         config.processors.push(on_demand);
         // On-demand history waits for its jobs.
-        assert_eq!(op_catch_up_start(&config, 0, 10_000), Some(9_000));
+        assert_eq!(catch_up_start(&config, 0, 10_000), Some(9_000));
         config.processors[1].history_mode = ProcessorHistoryMode::Automatic;
-        assert_eq!(op_catch_up_start(&config, 0, 10_000), Some(500));
+        assert_eq!(catch_up_start(&config, 0, 10_000), Some(500));
         // Not below the chain's first block, nor more than the fallback back.
-        assert_eq!(op_catch_up_start(&config, 2_000, 10_000), Some(2_001));
+        assert_eq!(catch_up_start(&config, 2_000, 10_000), Some(2_001));
         config.sources.live.history_fallback_blocks = Some(1_000);
-        assert_eq!(op_catch_up_start(&config, 0, 10_000), Some(9_001));
+        assert_eq!(catch_up_start(&config, 0, 10_000), Some(9_001));
         // Starting at the head needs no catch-up.
         config
             .processors
             .iter_mut()
             .for_each(|processor| processor.start_block = 10_000);
-        assert_eq!(op_catch_up_start(&config, 0, 10_000), None);
+        assert_eq!(catch_up_start(&config, 0, 10_000), None);
     }
 
     #[test]

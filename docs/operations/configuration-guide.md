@@ -500,8 +500,19 @@ every block it links to `attested`, so a single endpoint is enough (the
 quorum defaults to 1). The lanes start at a signed block the endpoints
 serve. A feed connection silent for 30 seconds is reopened. Feed relays
 replay only the last few minutes, so after a longer outage blocks become
-`attested` once the lane reaches the feed's blocks again. Without `[l1_anchor]` nothing is `finalized`, and recent frames settle
+`attested` once the lane reaches the feed's blocks again. Without
+`[l1_anchor]` nothing is `finalized`, and recent frames settle
 `finality.settle_blocks` (default 3,600) below the tip.
+
+A fresh store under the feed catches up from the lowest `start_block` among
+processors with automatic history, at most
+`sources.live.history_fallback_blocks` below the first signed block when
+that is set. The node first walks the headers down from the signed block,
+hashing each itself, and keeps every 256th hash; each catch-up batch then
+ends at one of them, so no block reaches a processor before it is proven,
+and the caught-up blocks are `attested`. A restarted node proves the chain
+down to its stored tip the same way, and refuses a tip that is not on it.
+The walk costs one call per block, the catch-up two.
 
 `sources.json_rpc.endpoints` is a pool, by default the chain entry's public
 keyless endpoints. At start each must serve the configured chain and

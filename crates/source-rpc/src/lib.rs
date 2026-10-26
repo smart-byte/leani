@@ -24,6 +24,8 @@ const CONCURRENT_CALLS: usize = 16;
 const MAX_RESPONSE_BYTES: usize = 256 * 1_024 * 1_024;
 /// Blocks one endpoint serves at a time when a range is spread over several.
 const PART_BLOCKS: u64 = 8;
+/// Headers proven per window walking down a chain.
+const PROOF_WINDOW: u64 = 4_096;
 /// The slowest pace a rate-limited endpoint backs off to.
 const SLOWEST_CALL_INTERVAL: Duration = Duration::from_secs(2);
 
@@ -665,6 +667,48 @@ impl RpcQuorum {
         Ok(served.into_iter().flatten().flatten().collect())
     }
 
+    /// The hashes of block `from` and of each block up to `head` that ends a
+    /// `grid`-aligned span, proven by parent links down from `head`'s trusted
+    /// hash. Headers come over the pool a window at a time and are hashed
+    /// locally, so no endpoint is trusted.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a header does not hash to what it claims or
+    /// does not link to the chain above it.
+    pub async fn prove_down(
+        &self,
+        head: u64,
+        head_hash: B256,
+        from: u64,
+        grid: u64,
+    ) -> Result<std::collections::BTreeMap<u64, B256>, RpcError> {
+        let mut proven = std::collections::BTreeMap::new();
+        let mut expected = head_hash;
+        let mut top = head;
+        loop {
+            let low = top.saturating_sub(PROOF_WINDOW - 1).max(from);
+            let headers = self.blocks(low, top, FetchMode::Header).await?;
+            for (block, _) in headers.iter().rev() {
+                let decoded = decode_block(block, &Value::Null)?;
+                let number = decoded.header.number;
+                if decoded.check.header != Check::Verified || decoded.hash != expected {
+                    return Err(RpcError::Unverified(format!(
+                        "block {number} is not on the chain of block {head}"
+                    )));
+                }
+                if number == from || (number + 1) % grid.max(1) == 0 {
+                    proven.insert(number, decoded.hash);
+                }
+                expected = decoded.header.parent_hash;
+            }
+            if low == from {
+                return Ok(proven);
+            }
+            top = low - 1;
+        }
+    }
+
     /// The hash at `number` when at least `quorum` endpoints serve the same
     /// one; `None` while too few endpoints serve the block yet.
     ///
@@ -817,19 +861,35 @@ mod tests {
 
     /// An [`endpoint`] that answers each request after `delay`.
     async fn delayed_endpoint(blocks: Vec<(u64, B256)>, delay: Duration) -> Url {
+        serving(
+            blocks
+                .into_iter()
+                .map(|(number, hash)| {
+                    let served = serde_json::json!({"number": format!("{number:#x}"), "hash": format!("{hash:#x}")});
+                    (number, served)
+                })
+                .collect(),
+            delay,
+        )
+        .await
+    }
+
+    /// An endpoint that answers any by-number request with the block it
+    /// holds at that number, after `delay`.
+    async fn serving(blocks: Vec<(u64, Value)>, delay: Duration) -> Url {
         counted(blocks, delay, Arc::default()).await
     }
 
-    /// A [`delayed_endpoint`] that counts the requests it answers.
+    /// A [`serving`] endpoint that counts the requests it answers.
     async fn counted(
-        blocks: Vec<(u64, B256)>,
+        blocks: Vec<(u64, Value)>,
         delay: Duration,
         requests: Arc<std::sync::atomic::AtomicUsize>,
     ) -> Url {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
-        let by_number = blocks.iter().copied().collect::<HashMap<_, _>>();
         let latest = blocks.iter().map(|(number, _)| *number).max().unwrap();
+        let by_number = blocks.into_iter().collect::<HashMap<_, _>>();
         tokio::spawn(async move {
             while let Ok((mut socket, _)) = listener.accept().await {
                 let by_number = by_number.clone();
@@ -848,9 +908,7 @@ mod tests {
                     } else {
                         u64::from_str_radix(tag.trim_start_matches("0x"), 16).unwrap_or(u64::MAX)
                     };
-                    let result = by_number.get(&number).map_or(Value::Null, |hash| {
-                        serde_json::json!({"number": format!("{number:#x}"), "hash": format!("{hash:#x}")})
-                    });
+                    let result = by_number.get(&number).cloned().unwrap_or(Value::Null);
                     let response = serde_json::json!({"jsonrpc": "2.0", "id": 1, "result": result})
                         .to_string();
                     let reply = format!(
@@ -923,10 +981,61 @@ mod tests {
         assert_eq!(numbers, (1..=40).collect::<Vec<_>>());
     }
 
+    /// Empty headers `1..=count` chained by parent hash, as an endpoint
+    /// serves them, and their hashes.
+    fn header_chain(count: u64) -> (Vec<(u64, Value)>, Vec<B256>) {
+        let mut parent = B256::ZERO;
+        let mut hashes = Vec::new();
+        let served = (1..=count)
+            .map(|number| {
+                let header = alloy_consensus::Header {
+                    number,
+                    parent_hash: parent,
+                    ..Default::default()
+                };
+                parent = header.hash_slow();
+                hashes.push(parent);
+                let mut served =
+                    serde_json::to_value(alloy_rpc_types_eth::Header::new(header)).unwrap();
+                served["transactions"] = serde_json::json!([]);
+                (number, served)
+            })
+            .collect();
+        (served, hashes)
+    }
+
+    #[tokio::test]
+    async fn a_proof_walks_down_from_the_trusted_block_and_keeps_its_grid() {
+        let (served, hashes) = header_chain(600);
+        let pool = RpcQuorum::new(
+            vec![serving(served.clone(), Duration::ZERO).await],
+            1,
+            1_000,
+        )
+        .unwrap();
+        let proven = pool.prove_down(600, hashes[599], 100, 256).await.unwrap();
+        assert_eq!(
+            proven.into_iter().collect::<Vec<_>>(),
+            [(100, hashes[99]), (255, hashes[254]), (511, hashes[510])]
+        );
+        // Another block 300 breaks the chain down from 600.
+        let mut forged = served;
+        forged[299].1["extraData"] = serde_json::json!("0x01");
+        let pool = RpcQuorum::new(vec![serving(forged, Duration::ZERO).await], 1, 1_000).unwrap();
+        assert!(matches!(
+            pool.prove_down(600, hashes[599], 100, 256).await,
+            Err(RpcError::Unverified(_))
+        ));
+    }
+
     #[tokio::test]
     async fn a_range_spreads_over_every_endpoint() {
         let blocks = (1..=64)
-            .map(|number| (number, B256::with_last_byte(u8::try_from(number).unwrap())))
+            .map(|number| {
+                let hash = B256::with_last_byte(u8::try_from(number).unwrap());
+                let served = serde_json::json!({"number": format!("{number:#x}"), "hash": format!("{hash:#x}")});
+                (number, served)
+            })
             .collect::<Vec<_>>();
         let mut endpoints = Vec::new();
         let mut requests = Vec::new();

@@ -1,5 +1,10 @@
-use std::{collections::VecDeque, time::Duration};
+use std::{
+    collections::{BTreeMap, VecDeque},
+    sync::Arc,
+    time::Duration,
+};
 
+use alloy_primitives::B256;
 use async_trait::async_trait;
 use futures::{StreamExt, stream};
 use leani_primitives::{
@@ -31,6 +36,9 @@ pub struct RpcLiveSource {
     quorum: RpcQuorum,
     poll_interval: Duration,
     signed: Option<SignedHashes>,
+    /// Hashes proven down from a signed block, every few hundred blocks: a
+    /// catch-up batch ends at one, so it is checked before it is delivered.
+    proven: Arc<BTreeMap<u64, B256>>,
 }
 
 impl RpcLiveSource {
@@ -62,7 +70,16 @@ impl RpcLiveSource {
             quorum,
             poll_interval,
             signed: None,
+            proven: Arc::default(),
         })
+    }
+
+    /// Catch up along hashes proven down from a signed block, as
+    /// [`crate::RpcQuorum::prove_down`] returns them.
+    #[must_use]
+    pub fn with_proven_hashes(mut self, proven: BTreeMap<u64, B256>) -> Self {
+        self.proven = Arc::new(proven);
+        self
     }
 
     /// Check blocks against the hashes the sequencer signed: a block whose
@@ -193,31 +210,37 @@ impl LiveState {
             self.source.signed.is_none(),
         )
         .await?;
-        if let Some(signed) = &self.source.signed
-            && let Some(frame) = frames.iter().find(|frame| {
-                signed
-                    .get(frame.block.number.0)
-                    .is_some_and(|hash| hash.0 != frame.block.hash.0)
-            })
-        {
+        if let Some(frame) = frames.iter().find(|frame| {
+            self.trusted_hash(frame.block.number.0)
+                .is_some_and(|hash| hash.0 != frame.block.hash.0)
+        }) {
             return Err(SourceError::CorruptFrame(format!(
-                "block {} is not the one the sequencer signed",
+                "block {} is not on the chain the sequencer signed",
                 frame.block.number.0
             )));
         }
         Ok(frames)
     }
 
-    /// The newest delivered block the sequencer signed: it and every block it
+    /// The hash the sequencer signed at `number`, or that a proof down from a
+    /// signed block found there.
+    fn trusted_hash(&self, number: u64) -> Option<B256> {
+        self.source
+            .signed
+            .as_ref()
+            .and_then(|signed| signed.get(number))
+            .or_else(|| self.source.proven.get(&number).copied())
+    }
+
+    /// The newest delivered block on the signed chain: it and every block it
     /// links down to are attested.
-    fn signed_through(&self, signed: &SignedHashes) -> Option<BlockRef> {
+    fn signed_through(&self) -> Option<BlockRef> {
         self.recent
             .iter()
             .rev()
             .take_while(|block| block.number.0 > self.attested_through)
             .find(|block| {
-                signed
-                    .get(block.number.0)
+                self.trusted_hash(block.number.0)
                     .is_some_and(|hash| hash.0 == block.hash.0)
             })
             .copied()
@@ -253,7 +276,11 @@ impl LiveState {
             } else {
                 BATCH_BLOCKS
             };
-            let last = head.min(self.next.saturating_add(batch - 1));
+            let mut last = head.min(self.next.saturating_add(batch - 1));
+            // A catch-up batch ends at a proven block, which checks it all.
+            if let Some((tip, _)) = self.source.proven.range(self.next..).next() {
+                last = last.min(*tip);
+            }
             let frames = self.fetch(self.next, last).await?;
             let links = match (self.recent.back(), frames.first()) {
                 (Some(tip), Some(first)) => first.block.parent_hash == tip.hash,
@@ -269,8 +296,8 @@ impl LiveState {
                 self.reorg().await?;
             }
         }
-        if let Some(signed) = &self.source.signed {
-            if let Some(block) = self.signed_through(signed) {
+        if self.source.signed.is_some() {
+            if let Some(block) = self.signed_through() {
                 self.attested_through = block.number.0;
                 self.pending
                     .push_back(ChainEvent::Attested { through: block });
