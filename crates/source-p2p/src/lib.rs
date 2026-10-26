@@ -2347,6 +2347,10 @@ struct AttestedAncestry {
     header_peer: Option<B512>,
     /// Its serve, settled once frames on these headers first complete.
     serve: Option<HeaderServe>,
+    /// Window tops a proof verified at least a window below its head, lowest
+    /// first. They are past any reorg, so a long catch-up proves each window
+    /// once, up to the rung above it, not again from the newest head.
+    rungs: Vec<AttestedHead>,
 }
 
 impl AttestedAncestry {
@@ -2358,7 +2362,17 @@ impl AttestedAncestry {
             headers: headers.into(),
             header_peer: Some(serve.peer_id),
             serve: Some(serve),
+            rungs: Vec::new(),
         }
+    }
+
+    /// Hold `proven`, keeping the rungs above its head.
+    fn advance(&mut self, mut proven: Self) {
+        let top = proven.head.map_or(0, |head| head.block_number.0);
+        proven
+            .rungs
+            .extend(self.rungs.iter().filter(|rung| rung.block_number.0 > top));
+        *self = proven;
     }
 
     /// The first proven block, if any.
@@ -2450,6 +2464,12 @@ fn live_step(
             },
         };
     }
+    let head = ancestry
+        .rungs
+        .iter()
+        .find(|rung| rung.block_number.0 >= next)
+        .copied()
+        .unwrap_or(head);
     LiveStep::Anchor {
         from: BlockNumber(next),
         head,
@@ -2484,10 +2504,18 @@ where
     let mut size = (total - 1) % MAX_ANCESTRY_HEADERS + 1;
     let mut top = head.block_number.0;
     let mut top_hash = head.block_hash;
+    let mut rungs = Vec::new();
     loop {
         let start = top.saturating_sub(size - 1).max(from.0);
         let range = BlockRange::new(BlockNumber(start), BlockNumber(top))
             .map_err(|error| P2pError::InvalidConfig(error.to_string()))?;
+        if head.block_number.0 - top >= MAX_ANCESTRY_HEADERS {
+            rungs.push(AttestedHead {
+                block_number: BlockNumber(top),
+                block_hash: top_hash,
+                ..head
+            });
+        }
         let (serve, headers) = fetch_window(range, top_hash).await?;
         let Some(lowest) = headers.first() else {
             return Err(P2pError::IncompleteResponse {
@@ -2497,7 +2525,11 @@ where
             });
         };
         if start == from.0 {
-            return Ok(AttestedAncestry::proven(head, serve, headers));
+            rungs.reverse();
+            return Ok(AttestedAncestry {
+                rungs,
+                ..AttestedAncestry::proven(head, serve, headers)
+            });
         }
         top_hash = block_hash(lowest.parent_hash);
         top = start - 1;
@@ -4224,6 +4256,46 @@ impl RethP2pSource {
                 }
             });
         }
+    }
+
+    /// The hash of block `number`, proven by parent links down from `head`, so
+    /// it carries the trust of `head`'s hash, such as a sequencer's signature.
+    /// Only headers are fetched, so unlike history this needs no finalized
+    /// anchor.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `number` is above `head` or the proof fails.
+    pub async fn ancestor_hash(
+        &self,
+        head: BlockRef,
+        number: BlockNumber,
+        cancellation: &CancellationToken,
+    ) -> Result<BlockHash, P2pError> {
+        let proof = BlockRange::new(number, head.number)
+            .map_err(|error| P2pError::InvalidConfig(error.to_string()))?;
+        let anchor = P2pHistoryAnchor {
+            block: head,
+            consensus: ConsensusAnchor {
+                finality: Finality::Attested,
+                execution_block_hash: head.hash,
+                beacon_slot: head.number.0,
+                beacon_block_root: [0; 32],
+            },
+        };
+        let (session, proven) = RethP2pHistorySource::anchored(self.clone(), proof, anchor, true)
+            .connect_and_fetch_anchored_headers(
+                proof,
+                BlockRange::single(number),
+                self.config.history_header_request_concurrency,
+                cancellation,
+            )
+            .await?;
+        session.set_range(None);
+        session.set_phase(NetworkPhase::Ready);
+        proven
+            .expected_hash(number)
+            .ok_or_else(|| P2pError::InvalidResponse("the header proof kept no hash".to_owned()))
     }
 
     #[must_use]
@@ -7574,6 +7646,20 @@ impl RethP2pHistorySource {
                 "P2P history bridge requires a matching finalized consensus anchor".to_owned(),
             ));
         }
+        Ok(Self::anchored(
+            source,
+            available,
+            anchor,
+            prefer_shared_live_session,
+        ))
+    }
+
+    fn anchored(
+        source: RethP2pSource,
+        available: BlockRange,
+        anchor: P2pHistoryAnchor,
+        prefer_shared_live_session: bool,
+    ) -> Self {
         let mut descriptor = source.descriptor.clone();
         descriptor.range = Some(available);
         descriptor.finality = FinalityModel::Finalized;
@@ -7582,7 +7668,7 @@ impl RethP2pHistorySource {
         descriptor.priority = u16::MAX;
         descriptor.schema_version =
             format!("reth-p2p-finalized-history.v4+{RETH_VERSION}.{RETH_REVISION}");
-        Ok(Self {
+        Self {
             source,
             descriptor,
             anchor,
@@ -7590,7 +7676,7 @@ impl RethP2pHistorySource {
             anchored_headers: Arc::new(tokio::sync::Mutex::new(None)),
             history_session: Arc::new(tokio::sync::Mutex::new(None)),
             acquisition_metrics: Arc::new(Mutex::new(SourceAcquisitionMetrics::default())),
-        })
+        }
     }
 
     async fn acquire_history_network(
@@ -9179,9 +9265,10 @@ async fn next_live_event(
             );
             return Some((Ok(ChainEvent::Block(Box::new(frame))), state));
         }
+        // A catch-up batch spans concurrent requests of
+        // `material_request_blocks` each.
         let batch_blocks = if state.pending_material_attempts == 0 {
-            u64::try_from(state.source.config.material_request_blocks)
-                .expect("material request block bound fits u64")
+            state.budget.max_frames
         } else {
             1
         };
@@ -9320,7 +9407,7 @@ async fn next_live_event(
                     .anchor_attested_ancestry(&state.session, from, head, &state.cancellation)
                     .await
                 {
-                    Ok(ancestry) => state.ancestry = ancestry,
+                    Ok(ancestry) => state.ancestry.advance(ancestry),
                     Err(P2pError::Cancelled) => return None,
                     Err(error) => {
                         // The next attempt proves the chain of the newest
@@ -17000,6 +17087,67 @@ mod tests {
             live_step(last, Some(head), &ancestry, 8, CLOSED_GATE),
             LiveStep::Anchor {
                 from: BlockNumber(110),
+                head
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn a_long_catch_up_proves_each_window_once() {
+        let chain = header_chain(B256::ZERO, 1..=5_000, 0);
+        let windows = std::sync::Mutex::new(Vec::new());
+        let fetch = |range: BlockRange, top: BlockHash| {
+            windows.lock().expect("windows").push(range.end().0);
+            let window = chain
+                .iter()
+                .filter(|header| range.contains(BlockNumber(header.number)))
+                .cloned()
+                .collect::<Vec<_>>();
+            assert_eq!(
+                window.last().map(|tip| block_hash(tip.hash_slow())),
+                Some(top)
+            );
+            async move { Ok((header_serve(0x62, range.end().0), window)) }
+        };
+        let head = attested(&chain[4_999], 40);
+        let proven = prove_attested_ancestry(BlockNumber(1), head, fetch)
+            .await
+            .expect("proven");
+        let rung_numbers = |ancestry: &AttestedAncestry| {
+            ancestry
+                .rungs
+                .iter()
+                .map(|rung| rung.block_number.0)
+                .collect::<Vec<_>>()
+        };
+        // The top two windows lie within a window of the head: no rungs.
+        assert_eq!(rung_numbers(&proven), [1_024, 2_048, 3_072]);
+        let mut ancestry = AttestedAncestry::default();
+        ancestry.advance(proven);
+        ancestry.take(1_024);
+        let last = block_ref(&chain[1_023]);
+        let rung = ancestry.rungs[1];
+        assert_eq!(rung.block_hash, block_hash(chain[2_047].hash_slow()));
+        assert_eq!(
+            live_step(last, Some(head), &ancestry, 64, CLOSED_GATE),
+            LiveStep::Anchor {
+                from: BlockNumber(1_025),
+                head: rung
+            }
+        );
+        windows.lock().expect("windows").clear();
+        let next = prove_attested_ancestry(BlockNumber(1_025), rung, fetch)
+            .await
+            .expect("next window");
+        assert_eq!(*windows.lock().expect("windows"), [2_048]);
+        ancestry.advance(next);
+        assert_eq!(rung_numbers(&ancestry), [3_072]);
+        // Invalidated, the lane proves from the newest head again.
+        ancestry.invalidate();
+        assert_eq!(
+            live_step(last, Some(head), &ancestry, 64, CLOSED_GATE),
+            LiveStep::Anchor {
+                from: BlockNumber(1_025),
                 head
             }
         );

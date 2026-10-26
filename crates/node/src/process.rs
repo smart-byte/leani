@@ -7639,6 +7639,26 @@ async fn run_rpc_lanes(
 /// How long an op-stack node waits for the first sequencer-signed block.
 const FIRST_SIGNED_HEAD_TIMEOUT: Duration = Duration::from_secs(180);
 
+/// The block a fresh op-stack store catches up from, below the signed `head`:
+/// the lowest start of the processors whose history the node fills, at most
+/// `history_fallback_blocks` back and above the chain's first block.
+fn op_catch_up_start(config: &Config, first_block: u64, head: u64) -> Option<u64> {
+    let start = config
+        .processors
+        .iter()
+        .filter(|processor| {
+            processor.history_mode == crate::config::ProcessorHistoryMode::Automatic
+        })
+        .map(|processor| processor.start_block)
+        .min()?;
+    let start = config
+        .sources
+        .live
+        .history_fallback_start(head, start)
+        .max(first_block + 1);
+    (start < head).then_some(start)
+}
+
 /// Follow an op-stack chain: every block the sequencer signs on its gossip
 /// becomes the attested head the execution P2P live lane follows. Nothing is
 /// finalized without an L1 anchor, so recent frames are pruned a settle depth
@@ -7660,11 +7680,11 @@ async fn run_op_lanes(
     };
 
     let chain = config.chain_entry()?;
-    let cadence = chain
+    let op_stack = chain
         .op_stack
         .as_ref()
-        .context("op_gossip finality needs an op-stack chain")?
-        .cadence();
+        .context("op_gossip finality needs an op-stack chain")?;
+    let cadence = op_stack.cadence();
     let chain_id = ChainId(config.chain.chain_id);
     let mut heads = op_heads.heads.clone();
     let first = tokio::select! {
@@ -7723,16 +7743,40 @@ async fn run_op_lanes(
             recent_hard_bytes: config.budgets.recent_raw_hard_bytes,
         },
     )?
-    .with_settle_depth(settle_blocks);
-    // A store resumes from its own tip: peers serve the blocks in between.
-    let stored_tip = match store.recent_canonical_bounds(chain_id).await? {
+    .with_settle_depth(settle_blocks)
+    .with_settle_head(handles.attested_heads.subscribe());
+    // A store resumes from its own tip: peers serve the blocks in between. A
+    // fresh one catches up from the processors' start, proven down from the
+    // signed head.
+    let start = match store.recent_canonical_bounds(chain_id).await? {
         Some(bounds) if bounds.end() < anchor.number => store
             .recent_frame(chain_id, bounds.end())
             .await?
             .map(|frame| frame.block),
-        _ => None,
+        Some(_) => None,
+        None => match op_catch_up_start(config, op_stack.first_block, anchor.number.0) {
+            Some(from) => {
+                let before = BlockNumber(from - 1);
+                info!(
+                    from,
+                    head = anchor.number.0,
+                    "catching up from the processors' start block over P2P"
+                );
+                let hash = live_source
+                    .ancestor_hash(anchor, before, cancellation)
+                    .await
+                    .context("prove the catch-up start against the signed head")?;
+                Some(BlockRef {
+                    number: before,
+                    hash,
+                    parent_hash: BlockHash::ZERO,
+                    timestamp: cadence.slot_start(before.0),
+                })
+            }
+            None => None,
+        },
     };
-    let live_start = leani_source_api::LiveStart::Block(stored_tip.unwrap_or(anchor));
+    let live_start = leani_source_api::LiveStart::Block(start.unwrap_or(anchor));
     let checkpoint = leani_source_api::ConsensusCheckpoint {
         beacon_slot: anchor.number.0,
         beacon_block_root: [0; 32],
@@ -13526,6 +13570,33 @@ markets = ["ETH/USDT"]
         .await;
         control.cancellation.cancel();
         supervisor.await.expect("scheduler stops");
+    }
+
+    #[test]
+    fn a_fresh_op_stack_store_catches_up_from_the_lowest_automatic_start() {
+        use crate::config::ProcessorHistoryMode;
+
+        let mut config = toml::from_str::<Config>(super::super::config::VALID_CONFIG_TOML)
+            .expect("configuration parses");
+        let mut on_demand = config.processors[0].clone();
+        on_demand.start_block = 500;
+        on_demand.history_mode = ProcessorHistoryMode::OnDemand;
+        config.processors[0].start_block = 9_000;
+        config.processors.push(on_demand);
+        // On-demand history waits for its jobs.
+        assert_eq!(op_catch_up_start(&config, 0, 10_000), Some(9_000));
+        config.processors[1].history_mode = ProcessorHistoryMode::Automatic;
+        assert_eq!(op_catch_up_start(&config, 0, 10_000), Some(500));
+        // Not below the chain's first block, nor more than the fallback back.
+        assert_eq!(op_catch_up_start(&config, 2_000, 10_000), Some(2_001));
+        config.sources.live.history_fallback_blocks = Some(1_000);
+        assert_eq!(op_catch_up_start(&config, 0, 10_000), Some(9_001));
+        // Starting at the head needs no catch-up.
+        config
+            .processors
+            .iter_mut()
+            .for_each(|processor| processor.start_block = 10_000);
+        assert_eq!(op_catch_up_start(&config, 0, 10_000), None);
     }
 
     #[test]

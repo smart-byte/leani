@@ -8,6 +8,15 @@ record, and documented RPC contracts.
 
 ### Added
 
+- Op-stack history over P2P: a fresh store catches up from the lowest
+  `start_block` of the processors with automatic history, bounded by
+  `sources.live.history_fallback_blocks`, along the chain of the first signed
+  head. Long catch-ups prove each 1,024-header window once instead of again
+  from the newest head, a catch-up batch spans concurrent material requests,
+  and the settle depth counts from the newest signed head, so a catch-up's
+  frames no longer fill recent storage until ingestion stops. When an hour of
+  large blocks, such as Base's, outgrows the recent storage budget, the
+  budget wins over the settle depth.
 - A `base-sepolia` chain entry. Base's Denim upgrade moves to a block every
   200 ms (Base Sepolia since 2026-10-21, Base mainnet scheduled for
   2026-11-05). A peer-served op-stack head must carry its block number's

@@ -467,8 +467,10 @@ sequencer's signed block gossip and needs no checkpoint. Every block the
 chain entry's sequencer key signed becomes the attested head the P2P live lane
 follows, so blocks reach `attested` about as fast as `unattested`. Nothing
 finalizes a block without an L1 anchor, so recent frames are pruned
-`finality.settle_blocks` below the tip instead, about one hour of blocks when
-omitted; settled blocks keep their level. Gossip peers find the node through
+`finality.settle_blocks` below the newest signed head instead, about one hour
+of blocks when omitted, or sooner when that hour outgrows
+`budgets.recent_raw_soft_bytes`, as Base's large blocks do; settled blocks
+keep their level. Gossip peers find the node through
 its discovery record: fixed, reachable `finality.listen_port` (TCP) and
 `finality.discovery_port` (UDP) let them dial in, which Base needs because
 its busy consensus nodes refuse new connections. Since only a few
@@ -477,6 +479,16 @@ of them carry blocks to a new node, the node keeps the ones that did in
 restart and again whenever signed blocks stop for 10 seconds. Peers whose
 handshake head lies far behind the signed head are syncing and are dropped
 while fewer than `body_serving_peer_target` peers serve the head.
+
+Op-stack history comes from execution P2P through the live lane. A fresh
+store starts at the lowest `start_block` among processors with automatic
+history, and at most `sources.live.history_fallback_blocks` below the first
+signed head when that is set. The block before that start is proven by parent
+links down from the signed head, and the lane catches up along the head's
+chain, so caught-up blocks are `attested` like the ones that follow. A restart
+resumes from the store's tip. A processor's status shows the catch-up's
+progress in `processedThrough`. Blocks are not `finalized` until the L1
+anchor finalizes them.
 
 ### L1 anchor
 
