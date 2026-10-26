@@ -2337,7 +2337,7 @@ components:
       type: object
       additionalProperties: false
       required:
-        [network, blockNumber, blockHash, txHash, transactionIndex, senderAddress, blobVersionedHashes, blobCount, totalBurnedWei, executionBurnedWei, blobBurnedWei]
+        [network, blockNumber, blockHash, txHash, transactionIndex, senderAddress, toAddress, blobVersionedHashes, blobCount, totalBurnedWei, executionBurnedWei, blobBurnedWei]
       properties:
         network:
           type: string
@@ -2350,6 +2350,12 @@ components:
         transactionIndex:
           $ref: "#/components/schemas/SafeInteger"
         senderAddress:
+          $ref: "#/components/schemas/Address"
+        toAddress:
+          description: >-
+            The transaction's to address. Every blob transaction has one: a
+            rollup's inbox, or a contract that routes the call, such as
+            Multicall3.
           $ref: "#/components/schemas/Address"
         blobVersionedHashes:
           type: array

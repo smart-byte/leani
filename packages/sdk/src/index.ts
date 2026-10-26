@@ -202,6 +202,11 @@ export interface BlobTransaction {
   txHash: Hex;
   transactionIndex: number;
   senderAddress: Hex;
+  /**
+   * The transaction's to address. Every blob transaction has one: a rollup's
+   * inbox, or a contract that routes the call, such as Multicall3.
+   */
+  toAddress: Hex;
   blobVersionedHashes: Hex[];
   blobCount: number;
   totalBurnedWei: string;

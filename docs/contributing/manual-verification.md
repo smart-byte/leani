@@ -116,7 +116,7 @@ value printed as `FROM`, and keep the entry's other fields and policy tables:
 [[processors]]
 id = "blobs-money"
 instance = "blobs-production"
-version = "1.5.0"
+version = "1.6.0"
 start_block = 0 # Replace 0 with the numeric FROM value printed above.
 ```
 
@@ -386,8 +386,8 @@ minimum_agreement = 1
 
 [[processors]]
 id = "blobs-money"
-instance = "blobs-container-1-5"
-version = "1.5.0"
+instance = "blobs-container-1-6"
+version = "1.6.0"
 history_mode = "on_demand"
 start_block = 0 # Replace 0 with the numeric FROM value printed above.
 

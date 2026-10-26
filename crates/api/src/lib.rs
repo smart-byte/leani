@@ -3797,6 +3797,8 @@ pub struct BlobTransaction {
     tx_hash: String,
     transaction_index: u32,
     sender_address: String,
+    /// The transaction's `to`, such as a rollup inbox or Multicall3.
+    to_address: String,
     blob_versioned_hashes: Vec<String>,
     blob_count: u32,
     total_burned_wei: String,
@@ -3834,6 +3836,7 @@ impl From<&BlobTransactionEntity> for BlobTransaction {
             tx_hash: format!("0x{}", hex::encode(value.transaction_hash.0)),
             transaction_index: value.transaction_index,
             sender_address: format!("0x{}", hex::encode(value.sender.0)),
+            to_address: format!("0x{}", hex::encode(value.to.0)),
             blob_versioned_hashes: value
                 .blob_versioned_hashes
                 .iter()
@@ -8677,6 +8680,7 @@ mod tests {
                     transaction_hash: TransactionHash::new(transaction_hash),
                     transaction_index: index,
                     sender: Address::new([5; 20]),
+                    to: Address::new([0x0a; 20]),
                     blob_versioned_hashes: vec![BlockHash::new([6; 32])],
                     blob_count: 1,
                     total_burn: Quantity::new([7; 32]),
@@ -9331,6 +9335,7 @@ mod tests {
             transaction_hash: TransactionHash::new([2; 32]),
             transaction_index: 3,
             sender: Address::new([4; 20]),
+            to: Address::new([9; 20]),
             blob_versioned_hashes: vec![BlockHash::new([5; 32])],
             blob_count: 1,
             total_burn: Quantity::new([6; 32]),
@@ -9339,6 +9344,7 @@ mod tests {
         };
         let value = serde_json::to_value(BlobTransaction::from(&entity)).expect("JSON");
         assert_eq!(value["transactionIndex"], 3);
+        assert_eq!(value["toAddress"], format!("0x{}", "09".repeat(20)));
         assert_eq!(
             value["blobVersionedHashes"][0],
             format!("0x{}", "05".repeat(32))
@@ -9354,6 +9360,7 @@ mod tests {
             transaction_hash: TransactionHash::new([2; 32]),
             transaction_index: 3,
             sender: Address::new([4; 20]),
+            to: Address::new([9; 20]),
             blob_versioned_hashes: vec![BlockHash::new([5; 32])],
             blob_count: 1,
             total_burn: Quantity::new([6; 32]),
