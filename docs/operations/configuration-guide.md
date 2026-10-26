@@ -496,12 +496,22 @@ P2P, so `sources.live.kind = "json_rpc"` serves their blocks. With
 chain entry names, whose every message carries a block's hash signed by the
 chain's batch poster. The endpoints then only carry blocks: one whose hash
 differs from the signed one is refused, and one that matches makes it and
-every block it links to `attested`, so a single endpoint is enough
-(`sources.json_rpc.quorum = 1`). The lanes start at a signed block the
-endpoints serve. A feed connection silent for 30 seconds is reopened. Feed
-relays replay only the last few minutes, so after a longer outage blocks
-become `attested` once the lane reaches the feed's blocks again. Without `[l1_anchor]` nothing is `finalized`, and recent frames
-settle `finality.settle_blocks` (default 3,600) below the tip.
+every block it links to `attested`, so a single endpoint is enough (the
+quorum defaults to 1). The lanes start at a signed block the endpoints
+serve. A feed connection silent for 30 seconds is reopened. Feed relays
+replay only the last few minutes, so after a longer outage blocks become
+`attested` once the lane reaches the feed's blocks again. Without `[l1_anchor]` nothing is `finalized`, and recent frames settle
+`finality.settle_blocks` (default 3,600) below the tip.
+
+`sources.json_rpc.endpoints` is a pool, by default the chain entry's public
+keyless endpoints. At start each must serve the configured chain and
+`eth_getBlockReceipts`, or it is dropped. Block ranges spread over the
+remaining endpoints in parallel, a faster one taking more, and a range one
+endpoint fails goes to the others. Each endpoint is paced at
+`sources.json_rpc.calls_per_second` (default 40) and slows down when it
+answers with a rate limit, recovering gradually. Public endpoints are shared
+and offered for light use: for long backfills, list endpoints of your own,
+such as a provider account's keyed URL.
 
 ### L1 anchor
 

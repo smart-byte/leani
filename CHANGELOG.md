@@ -8,6 +8,19 @@ record, and documented RPC contracts.
 
 ### Added
 
+- JSON-RPC endpoints form a pool: at start each must serve the configured
+  chain and `eth_getBlockReceipts`; block ranges spread over the rest in
+  parallel, one part per endpoint at a time so that every endpoint serves
+  some, a failed range moves to another endpoint, and an idle endpoint takes
+  over a part a slower one still fetches. Each endpoint paces its calls at
+  `sources.json_rpc.calls_per_second` (default 40), halves that pace once per
+  burst of rate limits and recovers per call served; its calls take their
+  slots in turn, so calls queued during a rate limit speed up once it lifts.
+  The live lane fetches 256 blocks at a time while catching up. With
+  `sequencer_feed`, the quorum defaults to 1 and no
+  endpoint can claim a head the sequencer has not signed. Nitro entries list
+  public keyless endpoints of several operators. Requests name `leani` in
+  their User-Agent.
 - `finality.kind = "sequencer_feed"` follows a Nitro chain's sequencer feed
   (Arbitrum One, Arbitrum Nova, Robinhood Chain; chain entries name the feed
   and its signer). Each message's block hash, signed by the chain's batch

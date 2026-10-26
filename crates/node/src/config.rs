@@ -574,7 +574,7 @@ const fn default_json_rpc_finality_poll_interval_ms() -> u64 {
 }
 
 const fn default_json_rpc_calls_per_second() -> u32 {
-    20
+    40
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -1601,11 +1601,14 @@ impl Config {
                 self.chain.name
             ));
         }
-        let quorum = self
-            .sources
-            .json_rpc
-            .quorum
-            .unwrap_or_else(|| endpoints.len().min(2));
+        // The sequencer feed checks each block: one endpoint is enough.
+        let quorum = self.sources.json_rpc.quorum.unwrap_or_else(|| {
+            if matches!(self.finality.kind, FinalitySourceKind::SequencerFeed) {
+                1
+            } else {
+                endpoints.len().min(2)
+            }
+        });
         leani_source_rpc::RpcQuorum::new(endpoints, quorum, self.sources.json_rpc.calls_per_second)
             .map_err(|error| error.to_string())
     }
@@ -4394,8 +4397,8 @@ endpoints = ["https://ethereum-hoodi-beacon-api.publicnode.com/"]
             config.validation_errors()
         );
         let quorum = config.json_rpc_quorum().expect("entry endpoints");
-        assert_eq!((quorum.endpoints().len(), quorum.quorum()), (2, 2));
-        config.sources.json_rpc.quorum = Some(3);
+        assert_eq!((quorum.endpoints().len(), quorum.quorum()), (3, 2));
+        config.sources.json_rpc.quorum = Some(4);
         assert!(
             config
                 .validation_errors()
@@ -4403,12 +4406,16 @@ endpoints = ["https://ethereum-hoodi-beacon-api.publicnode.com/"]
                 .any(|error| error.field == "sources.json_rpc")
         );
         // The feed checks the blocks, so one endpoint serves them.
-        config.sources.json_rpc.quorum = Some(1);
+        config.sources.json_rpc.quorum = None;
         config.finality.kind = FinalitySourceKind::SequencerFeed;
         assert!(
             config.validation_errors().is_empty(),
             "{:?}",
             config.validation_errors()
+        );
+        assert_eq!(
+            config.json_rpc_quorum().expect("entry endpoints").quorum(),
+            1
         );
         config.chain.name = "ethereum-hoodi".to_owned();
         config.chain.chain_id = 560_048;

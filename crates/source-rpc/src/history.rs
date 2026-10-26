@@ -135,6 +135,7 @@ impl HistorySource for RpcHistorySource {
                 chunk,
                 FetchMode::from_byte(chunk.partition.first().copied().unwrap_or(u8::MAX)),
                 false,
+                true,
             ) => frames?,
         };
         let mut bytes = 0_u64;
@@ -153,14 +154,16 @@ impl HistorySource for RpcHistorySource {
     }
 }
 
-/// Fetch, check, and link a chunk, then check its tip with the quorum: the
-/// parent links extend the quorum's agreement to every block below it.
+/// Fetch, check, and link a chunk, then, with `quorum_tip`, check its tip with
+/// the quorum: the parent links extend the quorum's agreement to every block
+/// below it. Without it, the caller checks the blocks against what it trusts.
 pub(crate) async fn fetch_range(
     quorum: &RpcQuorum,
     descriptor: &SourceDescriptor,
     chunk: &SourceChunk,
     mode: FetchMode,
     live: bool,
+    quorum_tip: bool,
 ) -> Result<Vec<leani_primitives::BlockFrame>, SourceError> {
     let observed = unix_now_ms();
     let blocks = quorum
@@ -188,20 +191,23 @@ pub(crate) async fn fetch_range(
     let tip = blocks
         .last()
         .ok_or_else(|| SourceError::InvalidPlan("empty chunk".to_owned()))?;
-    match quorum.agreed_hash(tip.header.number).await? {
-        Some(agreed) if agreed == tip.hash => {}
-        Some(agreed) => {
-            return Err(SourceError::CorruptFrame(format!(
-                "block {} hash {:#x} is not the quorum's {agreed:#x}",
-                tip.header.number, tip.hash
-            )));
-        }
-        None => {
-            return Err(SourceError::Unavailable(format!(
-                "too few endpoints serve block {} yet",
-                tip.header.number
-            )));
-        }
+    match quorum_tip.then(|| quorum.agreed_hash(tip.header.number)) {
+        None => {}
+        Some(agreed) => match agreed.await? {
+            Some(agreed) if agreed == tip.hash => {}
+            Some(agreed) => {
+                return Err(SourceError::CorruptFrame(format!(
+                    "block {} hash {:#x} is not the quorum's {agreed:#x}",
+                    tip.header.number, tip.hash
+                )));
+            }
+            None => {
+                return Err(SourceError::Unavailable(format!(
+                    "too few endpoints serve block {} yet",
+                    tip.header.number
+                )));
+            }
+        },
     }
     // Live blocks start unattested; the live source promotes them.
     let finalized = if live {

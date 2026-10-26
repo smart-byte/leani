@@ -20,6 +20,8 @@ use crate::{
 const RECENT_BLOCKS: usize = 256;
 /// Blocks fetched and quorum-checked together.
 const BATCH_BLOCKS: u64 = 32;
+/// Blocks fetched together while catching up, spread over the endpoints.
+const CATCH_UP_BLOCKS: u64 = 256;
 /// How often the endpoints' `safe` block is read for promotions.
 const SAFE_POLL: Duration = Duration::from_secs(2);
 
@@ -188,6 +190,7 @@ impl LiveState {
             &chunk,
             self.mode,
             true,
+            self.source.signed.is_none(),
         )
         .await?;
         if let Some(signed) = &self.source.signed
@@ -236,11 +239,21 @@ impl LiveState {
     async fn advance(&mut self) -> Result<(), SourceError> {
         // While catching up, the known head is still ahead: no need to ask.
         if self.next > self.head {
-            self.head = self.source.quorum.agreed_tag("latest").await?.0;
+            let latest = self.source.quorum.agreed_tag("latest").await?.0;
+            // An endpoint cannot claim a head the sequencer has not signed.
+            self.head = match &self.source.signed {
+                Some(signed) => signed.newest().map_or(0, |(number, _)| number.min(latest)),
+                None => latest,
+            };
         }
         let head = self.head;
         if self.next <= head {
-            let last = head.min(self.next.saturating_add(BATCH_BLOCKS - 1));
+            let batch = if head - self.next >= BATCH_BLOCKS {
+                CATCH_UP_BLOCKS
+            } else {
+                BATCH_BLOCKS
+            };
+            let last = head.min(self.next.saturating_add(batch - 1));
             let frames = self.fetch(self.next, last).await?;
             let links = match (self.recent.back(), frames.first()) {
                 (Some(tip), Some(first)) => first.block.parent_hash == tip.hash,

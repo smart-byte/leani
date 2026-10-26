@@ -37,3 +37,6 @@ serde_json.workspace = true
 thiserror.workspace = true
 url.workspace = true
 webpki-roots = "1"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }

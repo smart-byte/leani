@@ -1,13 +1,19 @@
 //! Blocks from JSON-RPC endpoints. Each block's contents are checked against
 //! its own header hash, transactions root, and receipts root; which block is
-//! canonical is what a quorum of independent endpoints agrees on.
+//! canonical is what a quorum of independent endpoints agrees on, or what a
+//! sequencer signed.
 
-use std::{sync::Arc, time::Duration};
+use std::{
+    collections::VecDeque,
+    sync::{Arc, Mutex, PoisonError},
+    time::Duration,
+};
 
 use alloy_primitives::B256;
 use futures::{StreamExt, TryStreamExt, stream};
 use leani_primitives::{Capability, CapabilitySet};
 use serde_json::Value;
+use tracing::{debug, warn};
 use url::Url;
 
 /// Attempts per request while an endpoint rate-limits or fails.
@@ -16,6 +22,14 @@ const RETRIES: u32 = 5;
 const CONCURRENT_CALLS: usize = 16;
 /// Response bodies past this are refused: an endpoint must not exhaust memory.
 const MAX_RESPONSE_BYTES: usize = 256 * 1_024 * 1_024;
+/// Blocks one endpoint serves at a time when a range is spread over several.
+const PART_BLOCKS: u64 = 8;
+/// The slowest pace a rate-limited endpoint backs off to.
+const SLOWEST_CALL_INTERVAL: Duration = Duration::from_secs(2);
+
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
 
 /// What a block fetch reads, from what the request needs: public endpoints
 /// limit calls, and full transactions are the heaviest.
@@ -105,15 +119,27 @@ impl From<RpcError> for leani_source_api::SourceError {
     }
 }
 
+/// The interval between an endpoint's calls, which widens on a rate limit and
+/// narrows back to the configured one, and when it last widened.
+#[derive(Debug)]
+struct Pace {
+    interval: Duration,
+    slowed: tokio::time::Instant,
+}
+
 /// A JSON-RPC endpoint. HTTP/1.1 only: some public Nitro endpoints stall
 /// HTTP/2 requests.
 #[derive(Clone, Debug)]
 pub struct RpcClient {
     endpoint: Url,
     client: reqwest::Client,
-    /// When the next call may go out, to keep within `calls_per_second`.
-    pace: Arc<tokio::sync::Mutex<tokio::time::Instant>>,
-    call_interval: Duration,
+    /// When the next call may go out. Calls wait for it in turn, and each
+    /// takes its slot at the interval of that moment: none is booked ahead,
+    /// so calls queued during a rate limit speed up once it lifts.
+    next: Arc<tokio::sync::Mutex<tokio::time::Instant>>,
+    pace: Arc<Mutex<Pace>>,
+    /// The interval `calls_per_second` allows.
+    fastest: Duration,
     /// Cleared once the endpoint refuses a batch for any reason but a rate
     /// limit; it then gets one request per call.
     batches: Arc<std::sync::atomic::AtomicBool>,
@@ -126,35 +152,102 @@ impl RpcClient {
     pub fn new(endpoint: Url, calls_per_second: u32) -> Result<Self, RpcError> {
         let client = reqwest::Client::builder()
             .http1_only()
+            .user_agent(concat!("leani/", env!("CARGO_PKG_VERSION")))
             .timeout(Duration::from_secs(30))
             .build()
             .map_err(|error| RpcError::Request {
                 method: "client",
                 detail: error.to_string(),
             })?;
+        let fastest = Duration::from_secs(1) / calls_per_second.max(1);
         Ok(Self {
             endpoint,
             client,
-            pace: Arc::new(tokio::sync::Mutex::new(tokio::time::Instant::now())),
-            call_interval: Duration::from_secs(1) / calls_per_second.max(1),
+            next: Arc::new(tokio::sync::Mutex::new(tokio::time::Instant::now())),
+            pace: Arc::new(Mutex::new(Pace {
+                interval: fastest,
+                slowed: tokio::time::Instant::now(),
+            })),
+            fastest,
             batches: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         })
     }
 
     /// Wait for the budget of `calls` calls.
     async fn pace(&self, calls: u32) {
-        let start = {
-            let mut next = self.pace.lock().await;
-            let start = (*next).max(tokio::time::Instant::now());
-            *next = start + self.call_interval * calls;
-            start
-        };
-        tokio::time::sleep_until(start).await;
+        let queued = tokio::time::Instant::now();
+        let mut next = self.next.lock().await;
+        tokio::time::sleep_until(*next).await;
+        *next = tokio::time::Instant::now() + lock(&self.pace).interval * calls;
+        let waited = queued.elapsed();
+        if waited > Duration::from_secs(30) {
+            debug!(
+                endpoint = self.host(),
+                ?waited,
+                calls,
+                "calls waited behind others"
+            );
+        }
+    }
+
+    /// Halve the pace after a rate limit on a request `sent` then: a shared
+    /// public endpoint stays usable when its clients slow down. Requests
+    /// sent before the last slowdown met the same limit and count once.
+    fn throttled(&self, sent: tokio::time::Instant) {
+        let mut pace = lock(&self.pace);
+        if sent < pace.slowed {
+            return;
+        }
+        pace.interval = (pace.interval * 2).min(SLOWEST_CALL_INTERVAL);
+        pace.slowed = tokio::time::Instant::now();
+        debug!(endpoint = self.host(), interval = ?pace.interval, "rate-limited; slowing down");
+    }
+
+    /// Creep back towards the configured pace for each of `calls` served.
+    fn served(&self, calls: u32) {
+        let mut pace = lock(&self.pace);
+        for _ in 0..calls {
+            pace.interval = pace
+                .interval
+                .saturating_sub(pace.interval / 16)
+                .max(self.fastest);
+        }
     }
 
     #[must_use]
     pub const fn endpoint(&self) -> &Url {
         &self.endpoint
+    }
+
+    /// The endpoint's host, for logs: a configured URL may carry an API key.
+    #[must_use]
+    pub fn host(&self) -> &str {
+        self.endpoint.host_str().unwrap_or("endpoint")
+    }
+
+    /// Check that the endpoint serves `chain_id` and, when `receipts`, whole
+    /// blocks' receipts, which the fetches rely on.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error naming what the endpoint lacks.
+    pub async fn qualify(&self, chain_id: u64, receipts: bool) -> Result<(), RpcError> {
+        let served = self.call("eth_chainId", serde_json::json!([])).await?;
+        let served = served
+            .as_str()
+            .and_then(|served| u64::from_str_radix(served.trim_start_matches("0x"), 16).ok())
+            .ok_or_else(|| RpcError::Malformed("chain id".to_owned()))?;
+        if served != chain_id {
+            return Err(RpcError::Request {
+                method: "eth_chainId",
+                detail: format!("serves chain {served}, not {chain_id}"),
+            });
+        }
+        if receipts {
+            self.call("eth_getBlockReceipts", serde_json::json!(["latest"]))
+                .await?;
+        }
+        Ok(())
     }
 
     /// POST `body`, backing off while the endpoint rate-limits or fails:
@@ -171,6 +264,7 @@ impl RpcClient {
         let mut backoff = Duration::from_millis(500);
         for attempt in 0..RETRIES {
             self.pace(calls).await;
+            let sent = tokio::time::Instant::now();
             let response = self
                 .client
                 .post(self.endpoint.clone())
@@ -179,6 +273,11 @@ impl RpcClient {
                 .await
                 .map_err(|error| failed(error.to_string()))?;
             let status = response.status();
+            if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                self.throttled(sent);
+            } else if status.is_success() {
+                self.served(calls);
+            }
             if (status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error())
                 && attempt + 1 < RETRIES
             {
@@ -314,8 +413,9 @@ impl RpcClient {
 
     /// One batched request, or `None` when the endpoint will not take it.
     async fn batch(&self, calls: &[Value]) -> Option<Vec<Value>> {
-        self.pace(u32::try_from(calls.len()).unwrap_or(u32::MAX))
-            .await;
+        let count = u32::try_from(calls.len()).unwrap_or(u32::MAX);
+        self.pace(count).await;
+        let sent = tokio::time::Instant::now();
         let response = self
             .client
             .post(self.endpoint.clone())
@@ -324,12 +424,15 @@ impl RpcClient {
             .await
             .ok()?;
         if !response.status().is_success() {
-            if response.status() != reqwest::StatusCode::TOO_MANY_REQUESTS {
+            if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                self.throttled(sent);
+            } else {
                 self.batches
                     .store(false, std::sync::atomic::Ordering::Relaxed);
             }
             return None;
         }
+        self.served(count);
         let responses = read_json::<Vec<Value>>(response, MAX_RESPONSE_BYTES).await;
         if responses.is_err() {
             self.batches
@@ -392,14 +495,12 @@ impl RpcClient {
 }
 
 /// Independent endpoints of one chain, and how many of them must agree on a
-/// block hash before it counts as canonical.
+/// block hash before it counts as canonical. Blocks are spread over all of
+/// them.
 #[derive(Clone, Debug)]
 pub struct RpcQuorum {
     clients: Vec<RpcClient>,
     quorum: usize,
-    /// The endpoint full blocks came from last; fetches stay there while it
-    /// serves them.
-    fetcher: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl RpcQuorum {
@@ -421,11 +522,44 @@ impl RpcQuorum {
             .into_iter()
             .map(|endpoint| RpcClient::new(endpoint, calls_per_second))
             .collect::<Result<_, _>>()?;
-        Ok(Self {
-            clients,
-            quorum,
-            fetcher: Arc::default(),
-        })
+        Ok(Self { clients, quorum })
+    }
+
+    /// Keep the endpoints that serve `chain_id` and, when `receipts`, whole
+    /// blocks' receipts: public endpoint lists include ones that lack
+    /// `eth_getBlockReceipts`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when fewer endpoints than the quorum qualify.
+    pub async fn qualified(mut self, chain_id: u64, receipts: bool) -> Result<Self, RpcError> {
+        let checks = futures::future::join_all(
+            self.clients
+                .iter()
+                .map(|client| client.qualify(chain_id, receipts)),
+        )
+        .await;
+        let mut kept = Vec::new();
+        for (client, check) in self.clients.into_iter().zip(checks) {
+            match check {
+                Ok(()) => kept.push(client),
+                Err(error) => {
+                    warn!(endpoint = client.host(), %error, "dropping a JSON-RPC endpoint");
+                }
+            }
+        }
+        if kept.len() < self.quorum {
+            return Err(RpcError::Request {
+                method: "qualify",
+                detail: format!(
+                    "{} endpoints qualify, the quorum needs {}",
+                    kept.len(),
+                    self.quorum
+                ),
+            });
+        }
+        self.clients = kept;
+        Ok(self)
     }
 
     #[must_use]
@@ -438,33 +572,97 @@ impl RpcQuorum {
         self.clients.iter().map(RpcClient::endpoint).collect()
     }
 
-    /// Fetch full blocks from the first endpoint that serves them; the others
-    /// only answer hash checks.
+    /// Full blocks, split into parts that each endpoint takes one at a time as
+    /// it finishes the last, so every endpoint serves some and a fast one
+    /// serves more; its pace spaces a part's calls further apart than they
+    /// take, so one in flight hides their latency. Once none is left,
+    /// an idle endpoint also takes a part another is still fetching and the
+    /// first answer counts, so a throttled endpoint does not hold up the
+    /// range. A part an endpoint fails goes to the others, and that endpoint
+    /// takes no more parts of this range.
     ///
     /// # Errors
     ///
-    /// Returns the last error when no endpoint serves the range.
+    /// Returns the last error when no endpoint serves a part.
     pub async fn blocks(
         &self,
         first: u64,
         last: u64,
         mode: FetchMode,
     ) -> Result<Vec<(Value, Value)>, RpcError> {
-        use std::sync::atomic::Ordering;
-
-        let mut failure = None;
-        let preferred = self.fetcher.load(Ordering::Relaxed);
-        for offset in 0..self.clients.len() {
-            let index = (preferred + offset) % self.clients.len();
-            match self.clients[index].blocks(first, last, mode).await {
-                Ok(blocks) => {
-                    self.fetcher.store(index, Ordering::Relaxed);
-                    return Ok(blocks);
+        let parts = std::iter::successors(Some(first), |start| {
+            start.checked_add(PART_BLOCKS).filter(|next| *next <= last)
+        })
+        .map(|start| (start, start.saturating_add(PART_BLOCKS - 1).min(last)))
+        .collect::<Vec<_>>();
+        let queue = Mutex::new(parts.iter().copied().enumerate().collect::<VecDeque<_>>());
+        // Parts in flight that no second endpoint fetches yet.
+        let unhedged = Mutex::new(VecDeque::<(usize, (u64, u64))>::new());
+        let served = Mutex::new(vec![None::<Vec<(Value, Value)>>; parts.len()]);
+        let all_served = tokio::sync::Notify::new();
+        let failure = Mutex::new(None);
+        let workers = self
+            .clients
+            .iter()
+            .map(|client| async {
+                loop {
+                    let next = lock(&queue).pop_front();
+                    let first_try = next.is_some();
+                    let part = next.or_else(|| {
+                        let served = lock(&served);
+                        let mut unhedged = lock(&unhedged);
+                        unhedged.retain(|(index, _)| served[*index].is_none());
+                        unhedged.pop_front()
+                    });
+                    let Some((index, (start, end))) = part else {
+                        return;
+                    };
+                    if first_try {
+                        lock(&unhedged).push_back((index, (start, end)));
+                    }
+                    let mut fetched = client.blocks(start, end, mode).await;
+                    let failed = fetched.is_err();
+                    if let Err(error) = &fetched {
+                        debug!(endpoint = client.host(), start, end, %error, "a part failed; trying the other endpoints");
+                    }
+                    for other in &self.clients {
+                        if fetched.is_ok() {
+                            break;
+                        }
+                        if !std::ptr::eq(other, client) {
+                            fetched = other.blocks(start, end, mode).await;
+                        }
+                    }
+                    match fetched {
+                        Ok(blocks) => {
+                            let mut served = lock(&served);
+                            if served[index].is_none() {
+                                served[index] = Some(blocks);
+                                if served.iter().all(Option::is_some) {
+                                    all_served.notify_one();
+                                }
+                            }
+                        }
+                        Err(error) => *lock(&failure) = Some(error),
+                    }
+                    if failed {
+                        return;
+                    }
                 }
-                Err(error) => failure = Some(error),
-            }
+            });
+        // A slower fetch of a part already served is dropped.
+        tokio::select! {
+            _ = futures::future::join_all(workers) => {}
+            () = all_served.notified() => {}
         }
-        Err(failure.unwrap_or_else(|| RpcError::Malformed("no endpoints".to_owned())))
+        let served = served.into_inner().unwrap_or_else(PoisonError::into_inner);
+        if served.iter().any(Option::is_none) {
+            return Err(failure
+                .into_inner()
+                .unwrap_or_else(PoisonError::into_inner)
+                .unwrap_or_else(|| RpcError::Malformed("no endpoints".to_owned())));
+        }
+        Ok(served.into_iter().flatten().flatten().collect())
     }
 
     /// The hash at `number` when at least `quorum` endpoints serve the same
@@ -614,6 +812,20 @@ mod tests {
     /// An endpoint that serves fixed `(number, hash)` blocks by number and as
     /// `latest`.
     async fn endpoint(blocks: Vec<(u64, B256)>) -> Url {
+        delayed_endpoint(blocks, Duration::ZERO).await
+    }
+
+    /// An [`endpoint`] that answers each request after `delay`.
+    async fn delayed_endpoint(blocks: Vec<(u64, B256)>, delay: Duration) -> Url {
+        counted(blocks, delay, Arc::default()).await
+    }
+
+    /// A [`delayed_endpoint`] that counts the requests it answers.
+    async fn counted(
+        blocks: Vec<(u64, B256)>,
+        delay: Duration,
+        requests: Arc<std::sync::atomic::AtomicUsize>,
+    ) -> Url {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let by_number = blocks.iter().copied().collect::<HashMap<_, _>>();
@@ -621,9 +833,11 @@ mod tests {
         tokio::spawn(async move {
             while let Ok((mut socket, _)) = listener.accept().await {
                 let by_number = by_number.clone();
+                let requests = requests.clone();
                 tokio::spawn(async move {
                     let mut request = vec![0; 16_384];
                     let read = socket.read(&mut request).await.unwrap_or(0);
+                    requests.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     let request = String::from_utf8_lossy(&request[..read]);
                     let body: Value =
                         serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap_or("{}"))
@@ -643,6 +857,7 @@ mod tests {
                         "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{response}",
                         response.len()
                     );
+                    tokio::time::sleep(delay).await;
                     let _ = socket.write_all(reply.as_bytes()).await;
                 });
             }
@@ -684,6 +899,145 @@ mod tests {
             Err(RpcError::Disagreement(_))
         ));
         assert!(quorum.agreed_tag("latest").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn a_range_spreads_over_the_endpoints_and_survives_one_that_fails() {
+        let blocks = (1..=40)
+            .map(|number| (number, B256::with_last_byte(u8::try_from(number).unwrap())))
+            .collect::<Vec<_>>();
+        let serving = endpoint(blocks.clone()).await;
+        let empty = endpoint(vec![(0, B256::ZERO)]).await;
+        let pool = RpcQuorum::new(vec![empty, serving], 1, 1_000).unwrap();
+        let served = pool.blocks(1, 40, FetchMode::Header).await.unwrap();
+        let numbers = served
+            .iter()
+            .map(|(block, _)| {
+                u64::from_str_radix(
+                    block["number"].as_str().unwrap().trim_start_matches("0x"),
+                    16,
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(numbers, (1..=40).collect::<Vec<_>>());
+    }
+
+    #[tokio::test]
+    async fn a_range_spreads_over_every_endpoint() {
+        let blocks = (1..=64)
+            .map(|number| (number, B256::with_last_byte(u8::try_from(number).unwrap())))
+            .collect::<Vec<_>>();
+        let mut endpoints = Vec::new();
+        let mut requests = Vec::new();
+        for _ in 0..7 {
+            let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            endpoints
+                .push(counted(blocks.clone(), Duration::from_millis(50), counter.clone()).await);
+            requests.push(counter);
+        }
+        let pool = RpcQuorum::new(endpoints, 1, 1_000).unwrap();
+        pool.blocks(1, 64, FetchMode::Header).await.unwrap();
+        // Eight parts: each endpoint takes one before any takes a second.
+        assert!(
+            requests
+                .iter()
+                .all(|served| served.load(std::sync::atomic::Ordering::Relaxed) > 0),
+            "{requests:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_slow_endpoint_does_not_hold_up_a_range() {
+        let blocks = (1..=40)
+            .map(|number| (number, B256::with_last_byte(u8::try_from(number).unwrap())))
+            .collect::<Vec<_>>();
+        let slow = delayed_endpoint(blocks.clone(), Duration::from_secs(20)).await;
+        let fast = endpoint(blocks).await;
+        let pool = RpcQuorum::new(vec![slow, fast], 1, 1_000).unwrap();
+        // The fast endpoint takes over the parts the slow one still fetches,
+        // also a range of one part.
+        for last in [40, 8] {
+            let served = tokio::time::timeout(
+                Duration::from_secs(10),
+                pool.blocks(1, last, FetchMode::Header),
+            )
+            .await
+            .expect("the fast endpoint took over")
+            .unwrap();
+            assert_eq!(served.len(), usize::try_from(last).unwrap());
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn calls_queued_during_a_rate_limit_speed_up_once_it_lifts() {
+        let client = RpcClient::new("http://127.0.0.1:1/".parse().unwrap(), 1_000).unwrap();
+        lock(&client.pace).interval = SLOWEST_CALL_INTERVAL;
+        let started = tokio::time::Instant::now();
+        futures::join!(
+            futures::future::join_all((0..20).map(|_| client.pace(1))),
+            async { lock(&client.pace).interval = client.fastest },
+        );
+        // Only the first call goes out at the slow interval.
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_burst_of_rate_limits_slows_an_endpoint_once() {
+        let client = RpcClient::new("http://127.0.0.1:1/".parse().unwrap(), 1_000).unwrap();
+        let sent = tokio::time::Instant::now();
+        tokio::time::advance(Duration::from_millis(1)).await;
+        // Requests sent together meet the same limit.
+        for _ in 0..5 {
+            client.throttled(sent);
+        }
+        assert_eq!(lock(&client.pace).interval, Duration::from_millis(2));
+        tokio::time::advance(Duration::from_millis(1)).await;
+        client.throttled(tokio::time::Instant::now());
+        assert_eq!(lock(&client.pace).interval, Duration::from_millis(4));
+    }
+
+    #[test]
+    fn an_endpoint_recovers_its_pace_per_call_served() {
+        let slowed = || {
+            let client = RpcClient::new("http://127.0.0.1:1/".parse().unwrap(), 1).unwrap();
+            lock(&client.pace).interval = SLOWEST_CALL_INTERVAL * 4;
+            client
+        };
+        let (batched, single) = (slowed(), slowed());
+        batched.served(16);
+        for _ in 0..16 {
+            single.served(1);
+        }
+        assert_eq!(lock(&batched.pace).interval, lock(&single.pace).interval);
+        assert!(lock(&batched.pace).interval < SLOWEST_CALL_INTERVAL * 2);
+    }
+
+    #[tokio::test]
+    async fn a_slow_endpoint_is_not_booked_for_parts_others_served() {
+        let blocks = (1..=40)
+            .map(|number| (number, B256::with_last_byte(u8::try_from(number).unwrap())))
+            .collect::<Vec<_>>();
+        let pool = RpcQuorum {
+            clients: vec![
+                RpcClient::new(endpoint(blocks.clone()).await, 1).unwrap(),
+                RpcClient::new(endpoint(blocks).await, 1_000).unwrap(),
+            ],
+            quorum: 1,
+        };
+        // The fast endpoint serves every range first; the slow one's next
+        // call waits for no part it never fetched, at most for the one part
+        // it started.
+        for _ in 0..5 {
+            pool.blocks(1, 40, FetchMode::Header).await.unwrap();
+        }
+        let next = *pool.clients[0].next.try_lock().expect("no call waits");
+        let waits = next.saturating_duration_since(tokio::time::Instant::now());
+        assert!(waits <= Duration::from_secs(8), "{waits:?}");
     }
 
     #[test]

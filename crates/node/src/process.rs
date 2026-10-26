@@ -7567,7 +7567,17 @@ async fn run_rpc_lanes(
     };
 
     let chain_id = leani_primitives::ChainId(config.chain.chain_id);
-    let quorum = config.json_rpc_quorum().map_err(anyhow::Error::msg)?;
+    let quorum = config
+        .json_rpc_quorum()
+        .map_err(anyhow::Error::msg)?
+        .qualified(config.chain.chain_id, true)
+        .await
+        .context("qualify the JSON-RPC endpoints")?;
+    info!(
+        endpoints = quorum.endpoints().len(),
+        quorum = quorum.quorum(),
+        "json-rpc endpoints qualified"
+    );
     let rpc = &config.sources.json_rpc;
     // With the L1 anchor, confirmed assertions finalize blocks, not the
     // endpoints' `finalized` tag; with the sequencer feed, nothing else does.
