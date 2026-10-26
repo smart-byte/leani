@@ -7,6 +7,11 @@ ignore = [
   # unmaintained notices, not known vulnerabilities; revisit on every Reth bump.
   { id = "RUSTSEC-2023-0089", reason = "atomic-polyfill is inherited through Reth-era dependencies" },
   { id = "RUSTSEC-2024-0436", reason = "paste is inherited through the pinned Reth networking graph" },
+  # Timing side channels in crypto-bigint 0.5.5, which has no patched release.
+  # elliptic-curve 0.13 pins it for k256, which alloy, enr, libp2p-identity and
+  # revm use; leani's only secp256k1 secrets are peer identity keys. Revisit on
+  # every Reth or alloy bump.
+  { id = "RUSTSEC-2026-0387", reason = "crypto-bigint 0.5.5 is pinned by elliptic-curve 0.13 and has no patched release" },
 ]
 
 [licenses]
