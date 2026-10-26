@@ -188,7 +188,12 @@ node logs a hint with a size that fills them, once per processor, and
 `leani_history_material_active_acquisitions` against
 `leani_history_material_active_acquisitions_limit` shows the slots in use. Its nested `commit` table flushes a contiguous SQLite transaction at the
 first configured block, domain-change, stable-encoded-byte, or elapsed-time
-limit: by default 128 blocks, 10,000 changes, 16 MiB, or 50 ms.
+limit: by default 128 blocks, 10,000 changes, 16 MiB, or 50 ms. A batch
+publishes its blocks' delivery changes in the same transaction. Blocks not
+yet finalized, or that the live lane already applied or holds, commit one at a
+time, as do the blocks of a batch whose reducer reads windowed output or
+rewrites it unchanged. A source error or invalid frame ends a batch after the
+blocks before it commit.
 `target_writer_hold`, 250 ms by default, controls the adaptive block limit:
 the runtime halves the current limit when observed p95 historical writer hold
 time exceeds the target and cautiously grows it again below half the target.
