@@ -3406,7 +3406,9 @@ impl HistoricalRuntime {
                     }
                     pending.push_front((batch, completes_subscription));
                 }
-                Err(StoreError::ArtifactStorageLimit { .. }) => {
+                // A materialization job returns the limit, so its run records
+                // the backpressure and frees the job's slot.
+                Err(StoreError::ArtifactStorageLimit { .. }) if stream_id.is_some() => {
                     drop(fair_turn);
                     if !backpressured {
                         self.store
@@ -11550,6 +11552,76 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[tokio::test]
+    async fn a_materialization_job_backs_off_when_artifact_storage_is_full() {
+        let range = BlockRange::new(BlockNumber(1), BlockNumber(3)).expect("range");
+        for counter in [
+            BlockLocalCounter::default().with_delivery_none(),
+            BlockLocalCounter::default(),
+        ] {
+            let delivery = counter.descriptor().lifecycle.delivery.mode;
+            let mut lifecycle = counter.descriptor().lifecycle.clone();
+            lifecycle.artifacts.mode = leani_processor_api::ArtifactPolicyMode::Full;
+            let processor = Arc::new(counter.with_lifecycle(lifecycle));
+            let directory = tempfile::tempdir().expect("tempdir");
+            let store = SqliteStore::open(
+                leani_store_sqlite::StoreConfig::new(directory.path().join("node.sqlite"))
+                    .with_artifact_budget(leani_store_sqlite::ArtifactStorageBudget {
+                        maximum_retained_bytes: 1,
+                        maximum_pending_bytes: u64::MAX,
+                    }),
+            )
+            .await
+            .expect("bounded store");
+            let runtime = HistoricalRuntime::new(
+                store.clone(),
+                Arc::new(ScriptedHistorySource::from_frames(
+                    fixture_source_descriptor("full-artifacts", range),
+                    frames(range),
+                )),
+                processor.clone(),
+                HistoricalRuntimeConfig {
+                    mapper_concurrency: 1,
+                    ..HistoricalRuntimeConfig::default()
+                },
+            )
+            .expect("runtime");
+            let job = BackfillJob::for_processor(
+                "full-artifacts",
+                processor.as_ref(),
+                ChainId(1),
+                range,
+                VerificationPolicy::CompleteCryptographic,
+            )
+            .expect("job");
+            // Pruning never frees retained artifacts, so the job yields its
+            // slot instead of waiting.
+            let result = tokio::time::timeout(
+                Duration::from_secs(5),
+                runtime.run(job, default_source_budget(), CancellationToken::new()),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("delivery {delivery:?}: the job waits on full storage"));
+            assert!(
+                matches!(
+                    result,
+                    Err(RuntimeError::Store(StoreError::ArtifactStorageLimit { .. }))
+                ),
+                "delivery {delivery:?}: {result:?}"
+            );
+            assert_eq!(
+                store
+                    .job("full-artifacts")
+                    .await
+                    .expect("job")
+                    .expect("durable job")
+                    .state,
+                JobState::StorageBackpressured,
+                "delivery {delivery:?}"
+            );
+        }
     }
 
     #[tokio::test]
