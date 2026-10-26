@@ -8114,10 +8114,13 @@ impl SharedFinalityRuntime {
             .coverage_block_by_hash(processor.descriptor(), block_hash)
             .await?
         else {
+            // A live commit of the anchor itself can land between these two
+            // reads; the next retry finalizes it.
             if let Some(covered) = self
                 .store
                 .coverage_hash(processor.descriptor(), canonical)
                 .await?
+                .filter(|covered| *covered != block_hash)
             {
                 self.store
                     .fail_processor_live_lane(processor.descriptor(), "processor_finality_conflict")
