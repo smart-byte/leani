@@ -86,6 +86,9 @@ record, and documented RPC contracts.
 
 - Updated rustls-webpki to 0.103.16, and webpki-roots and webpki-root-certs
   to 1.0.10, for RUSTSEC-2026-0381 to RUSTSEC-2026-0383.
+- Updated zstd to 0.14.3, zstd-safe to 8.2.0, and zstd-sys to 2.1.2 for
+  RUSTSEC-2026-0391, RUSTSEC-2026-0398, RUSTSEC-2026-0403, and
+  RUSTSEC-2026-0410.
 
 ## [0.1.0-rc.8] - 2026-10-16
 
