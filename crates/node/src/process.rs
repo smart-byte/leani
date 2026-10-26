@@ -7660,10 +7660,11 @@ async fn run_op_lanes(
     };
 
     let chain = config.chain_entry()?;
-    let network = chain
+    let cadence = chain
         .op_stack
-        .clone()
-        .context("op_gossip finality needs an op-stack chain")?;
+        .as_ref()
+        .context("op_gossip finality needs an op-stack chain")?
+        .cadence();
     let chain_id = ChainId(config.chain.chain_id);
     let mut heads = op_heads.heads.clone();
     let first = tokio::select! {
@@ -7686,7 +7687,7 @@ async fn run_op_lanes(
     live_source.update_advertised_head(anchor).await;
     // Windows counted in blocks keep their time at Base's 200 ms Denim cadence;
     // the lanes restart when a signed head changes the cadence.
-    let block_ms = network.block_interval_ms(first.number).max(1);
+    let block_ms = cadence.slot_ms(first.number).max(1);
     let finality = Arc::new(leani_finality_op_gossip::OpGossipFinality::new(
         chain_id,
         heads.clone(),
@@ -7766,7 +7767,7 @@ async fn run_op_lanes(
                 }
                 let head = heads.borrow_and_update().as_ref().map(|head| head.number);
                 if let Some(number) = head
-                    && network.block_interval_ms(number) != block_ms
+                    && cadence.slot_ms(number).max(1) != block_ms
                 {
                     bail!(
                         "block {number} starts a new block cadence; restarting the lanes to size their windows for it"

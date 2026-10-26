@@ -9193,9 +9193,10 @@ async fn next_live_event(
         match live_step(state.last, attested, &state.ancestry, batch_blocks, gate) {
             LiveStep::Head { block } => {
                 state.head_unavailable_since = None;
+                let cadence = *state.source.cadence();
                 let delay = head_poll_delay(
-                    state.last.timestamp,
-                    state.source.cadence().seconds,
+                    cadence.next_slot_start_ms(state.last.number.0, state.last.timestamp),
+                    cadence.slot_ms(state.last.number.0),
                     unix_now_ms(),
                 );
                 if !delay.is_zero() {
@@ -9622,7 +9623,10 @@ async fn poll_unattested_head(
         return unattested_reorg(state, header).await;
     }
     let attested = state.attested.peek();
-    let Some(slot) = source.cadence().slot_starting_at(header.timestamp) else {
+    let Some(slot) = source
+        .cadence()
+        .header_slot(header.number, header.timestamp)
+    else {
         return Ok(HeadPoll::WaitForAttested);
     };
     if attested.is_none_or(|head| slot.saturating_sub(head.beacon_slot) > MAX_UNATTESTED_SLOTS) {

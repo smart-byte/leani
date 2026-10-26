@@ -198,11 +198,13 @@ pub(crate) async fn start_op_heads(
     cancellation: &CancellationToken,
 ) -> Result<OpHeads> {
     let chain = config.chain_entry()?;
+    // The slot length once every scheduled fork is active.
     let fastest_block_ms = chain
         .op_stack
         .as_ref()
         .context("op_gossip finality needs an op-stack chain")?
-        .block_interval_ms(u64::MAX);
+        .cadence()
+        .slot_ms(u64::MAX);
     let mut gossip = leani_finality_op_gossip::OpGossipConfig::for_chain(&chain)?;
     gossip.listen_port = config.finality.listen_port;
     gossip.discovery_port = config.finality.discovery_port;

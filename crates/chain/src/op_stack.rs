@@ -13,8 +13,6 @@ const EXECUTION_FORKS: [&str; 13] = [
 ];
 /// Forks that change only the rollup node, not execution peers.
 const CONSENSUS_ONLY_FORKS: [&str; 1] = ["delta"];
-/// Milliseconds between blocks once Base's Denim is active.
-const DENIM_BLOCK_MS: u64 = 200;
 
 /// An OP-stack chain's schedule and sequencer, read from its upstream
 /// superchain-registry chain config plus the entry's `[op_stack]` section.
@@ -127,15 +125,15 @@ impl OpStackNetwork {
         })
     }
 
-    /// One block per slot from the first derived block.
-    // ponytail: whole-second slots only. Past Base's Denim, peer-served heads
-    // fail these rules and the lane follows sequencer-signed heads alone;
-    // model the 200 ms slots if unattested heads matter there.
+    /// One block per slot, numbered like the blocks, from the first derived
+    /// block; 200 ms slots from Base's Denim block on.
     #[must_use]
-    pub const fn cadence(&self) -> Cadence {
+    pub fn cadence(&self) -> Cadence {
         Cadence {
             genesis_time: self.first_block_time,
             seconds: self.block_time,
+            first_block: Some(self.first_block),
+            fast_from: self.denim_block(),
         }
     }
 
@@ -158,15 +156,5 @@ impl OpStackNetwork {
                     .saturating_sub(self.first_block_time)
                     .div_ceil(self.block_time),
         )
-    }
-
-    /// Milliseconds between block `number` and its parent; `u64::MAX` gives
-    /// the cadence once every scheduled fork is active.
-    #[must_use]
-    pub fn block_interval_ms(&self, number: u64) -> u64 {
-        match self.denim_block() {
-            Some(denim) if number > denim => DENIM_BLOCK_MS,
-            _ => self.block_time * 1_000,
-        }
     }
 }

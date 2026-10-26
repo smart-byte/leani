@@ -10,10 +10,11 @@ record, and documented RPC contracts.
 
 - A `base-sepolia` chain entry. Base's Denim upgrade moves to a block every
   200 ms (Base Sepolia since 2026-10-21, Base mainnet scheduled for
-  2026-11-05); op-stack lanes size their reorg window and settle depth by
-  time at the current cadence and restart when a signed head changes it,
-  and the L1 anchor keeps four hours of signed blocks at the fastest
-  scheduled cadence.
+  2026-11-05). A peer-served op-stack head must carry its block number's
+  slot timestamp, at 200 ms after Denim; op-stack lanes size their reorg
+  window and settle depth by time at the current cadence and restart when a
+  signed head changes it, and the L1 anchor keeps four hours of signed
+  blocks at the fastest scheduled cadence.
 - Op-stack block gossip keeps the peers that carried signed blocks in
   `op-gossip-peers.txt` in the data directory, dials them first after a
   restart, and redials them whenever signed blocks stop for 10 seconds:

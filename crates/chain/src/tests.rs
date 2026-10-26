@@ -212,21 +212,41 @@ fn base_blocks_come_every_200_ms_from_denim() {
     // 2026-10-25 21:43:05 UTC was block 50,213,581, as its schedule predicts.
     let registry = ChainRegistry::standard();
     let base = registry.get("base").unwrap();
-    let base = base.op_stack.as_ref().unwrap();
-    assert_eq!(base.denim_block(), Some(53_556_127));
-    assert_eq!(base.block_interval_ms(53_556_127), 2_000);
-    assert_eq!(base.block_interval_ms(53_556_128), 200);
-    assert_eq!(base.block_interval_ms(u64::MAX), 200);
+    assert_eq!(
+        base.op_stack.as_ref().unwrap().denim_block(),
+        Some(53_556_127)
+    );
+    let cadence = base.cadence().unwrap();
+    // Block 53,086,330 as seen on gossip.
+    assert_eq!(cadence.slot_start(53_086_330), 1_792_962_007);
+    assert_eq!(cadence.slot_start(53_556_126), 1_793_901_599);
+    assert_eq!(cadence.slot_ms(53_556_126), 2_000);
+    assert_eq!(cadence.slot_start_ms(53_556_127), 1_793_901_601_000);
+    assert_eq!(cadence.slot_ms(53_556_127), 200);
+    assert_eq!(cadence.slot_start_ms(53_556_128), 1_793_901_601_200);
+    // Five blocks share each second, and the number names the slot.
+    assert_eq!(cadence.slot_start(53_556_131), 1_793_901_601);
+    assert_eq!(cadence.slot_start(53_556_132), 1_793_901_602);
+    assert_eq!(cadence.slot_at(1_793_901_602), 53_556_132);
+    assert_eq!(cadence.slot_starting_at(1_793_901_601), None);
+    assert_eq!(
+        cadence.header_slot(53_556_129, 1_793_901_601),
+        Some(53_556_129)
+    );
+    assert_eq!(cadence.header_slot(53_556_129, 1_793_901_602), None);
+    assert_eq!(cadence.slot_ms(u64::MAX), 200);
     let sepolia = registry.get("base-sepolia").unwrap();
-    let sepolia = sepolia.op_stack.as_ref().unwrap();
-    let denim = sepolia.denim_block().unwrap();
-    assert_eq!(denim, 48_418_656);
-    let elapsed_ms = (1_792_964_585 - 1_792_605_600) * 1_000;
-    assert_eq!(denim + elapsed_ms / 200, 50_213_581);
+    assert_eq!(
+        sepolia.op_stack.as_ref().unwrap().denim_block(),
+        Some(48_418_656)
+    );
+    assert_eq!(
+        sepolia.cadence().unwrap().slot_at(1_792_964_585),
+        50_213_581
+    );
     let op = registry.get("optimism").unwrap();
-    let op = op.op_stack.as_ref().unwrap();
-    assert_eq!(op.denim_block(), None);
-    assert_eq!(op.block_interval_ms(u64::MAX), 2_000);
+    assert_eq!(op.op_stack.as_ref().unwrap().denim_block(), None);
+    assert_eq!(op.cadence().unwrap().slot_ms(u64::MAX), 2_000);
 }
 
 #[test]
@@ -241,9 +261,10 @@ fn op_stack_entries_carry_their_schedule() {
         None,
         "consensus-only forks are skipped"
     );
-    // Block n of the rollup is due at its slot of the cadence.
+    // Block n of the rollup is due at slot n of the cadence.
     let cadence = op.cadence().unwrap();
-    assert_eq!(cadence.slot_start(10), 1_686_068_903 + 20);
+    assert_eq!(cadence.slot_start(105_235_063 + 10), 1_686_068_903 + 20);
+    assert_eq!(cadence.slot_at(1_686_068_903 + 21), 105_235_063 + 10);
     let base = ChainRegistry::standard().get("base").unwrap();
     assert!(!base.execution.discv4);
     assert_eq!(base.execution.discv5_protocol_id.as_deref(), Some("basev0"));

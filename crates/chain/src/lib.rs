@@ -43,35 +43,104 @@ impl Family {
     }
 }
 
-/// When blocks are due: one per `seconds` from `genesis_time`. Beacon slots
-/// on Ethereum, L2 blocks on OP-stack chains.
+/// When blocks are due: a slot every `seconds` from `genesis_time`. On
+/// Ethereum these are beacon slots, which a block may leave empty. On an
+/// OP-stack chain every slot holds one block and carries its number from
+/// `first_block`; Base's Denim shortens the slots to 200 ms from `fast_from`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Cadence {
     pub genesis_time: u64,
     pub seconds: u64,
+    /// OP-stack: the block due at `genesis_time`.
+    pub first_block: Option<u64>,
+    /// The first slot of the 200 ms cadence.
+    pub fast_from: Option<u64>,
 }
 
 impl Cadence {
+    /// Milliseconds per slot from `fast_from` on.
+    pub const FAST_SLOT_MS: u64 = 200;
+
+    /// When `slot` starts, in UNIX milliseconds.
     #[must_use]
-    pub const fn slot_start(&self, slot: u64) -> u64 {
-        self.genesis_time
-            .saturating_add(slot.saturating_mul(self.seconds))
+    pub fn slot_start_ms(&self, slot: u64) -> u64 {
+        let first = self.first_block.unwrap_or(0);
+        let legacy = |slot: u64| {
+            self.genesis_time
+                .saturating_add(slot.saturating_sub(first).saturating_mul(self.seconds))
+                .saturating_mul(1_000)
+        };
+        match self.fast_from {
+            Some(fast) if slot > fast => {
+                legacy(fast).saturating_add((slot - fast).saturating_mul(Self::FAST_SLOT_MS))
+            }
+            _ => legacy(slot),
+        }
     }
 
-    /// The slot that starts at `timestamp`, or `None` before genesis or off a
-    /// slot boundary.
+    /// When `slot` starts, in whole UNIX seconds.
     #[must_use]
-    pub const fn slot_starting_at(&self, timestamp: u64) -> Option<u64> {
-        match timestamp.checked_sub(self.genesis_time) {
-            Some(since) if since % self.seconds == 0 => Some(since / self.seconds),
-            _ => None,
+    pub fn slot_start(&self, slot: u64) -> u64 {
+        self.slot_start_ms(slot) / 1_000
+    }
+
+    /// Milliseconds from `slot`'s start to the next slot's.
+    #[must_use]
+    pub fn slot_ms(&self, slot: u64) -> u64 {
+        match self.fast_from {
+            Some(fast) if slot >= fast => Self::FAST_SLOT_MS,
+            _ => self.seconds.saturating_mul(1_000),
         }
+    }
+
+    /// The slot that starts at `timestamp`, or `None` before genesis, off a
+    /// slot boundary, or once several slots start in each second.
+    #[must_use]
+    pub fn slot_starting_at(&self, timestamp: u64) -> Option<u64> {
+        if self
+            .fast_from
+            .is_some_and(|fast| timestamp >= self.slot_start(fast))
+        {
+            return None;
+        }
+        let since = timestamp.checked_sub(self.genesis_time)?;
+        (since % self.seconds == 0).then(|| self.first_block.unwrap_or(0) + since / self.seconds)
     }
 
     /// The slot in progress at `timestamp`.
     #[must_use]
-    pub const fn slot_at(&self, timestamp: u64) -> u64 {
-        timestamp.saturating_sub(self.genesis_time) / self.seconds
+    pub fn slot_at(&self, timestamp: u64) -> u64 {
+        if let Some(fast) = self.fast_from {
+            let start = self.slot_start_ms(fast);
+            let now = timestamp.saturating_mul(1_000);
+            if now >= start {
+                return fast + (now - start) / Self::FAST_SLOT_MS;
+            }
+        }
+        self.first_block.unwrap_or(0) + timestamp.saturating_sub(self.genesis_time) / self.seconds
+    }
+
+    /// The slot a header fills, or `None` when its timestamp does not start
+    /// one: on Ethereum the slot its timestamp starts; on an OP-stack chain,
+    /// where every slot holds a block, its number, when the timestamp is that
+    /// slot's second.
+    #[must_use]
+    pub fn header_slot(&self, number: u64, timestamp: u64) -> Option<u64> {
+        match self.first_block {
+            Some(first) => {
+                (number >= first && self.slot_start(number) == timestamp).then_some(number)
+            }
+            None => self.slot_starting_at(timestamp),
+        }
+    }
+
+    /// When the slot after a block's starts, in UNIX milliseconds.
+    #[must_use]
+    pub fn next_slot_start_ms(&self, number: u64, timestamp: u64) -> u64 {
+        match self.first_block {
+            Some(_) => self.slot_start_ms(number.saturating_add(1)),
+            None => timestamp.saturating_add(self.seconds).saturating_mul(1_000),
+        }
     }
 }
 

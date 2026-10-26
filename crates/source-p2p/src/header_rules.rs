@@ -70,10 +70,10 @@ impl HeaderRules {
         now: u64,
         attested_parent_root: Option<[u8; 32]>,
     ) -> HeaderVerdict {
-        let Some(slot) = self.cadence.slot_starting_at(header.timestamp) else {
+        let Some(slot) = self.cadence.header_slot(header.number, header.timestamp) else {
             return HeaderVerdict::Invalid(format!(
-                "timestamp {} is not a slot start",
-                header.timestamp
+                "timestamp {} is not the start of block {}'s slot",
+                header.timestamp, header.number
             ));
         };
         if header.timestamp > now.saturating_add(MAX_CLOCK_SKEW_SECONDS) {
@@ -96,6 +96,18 @@ impl HeaderRules {
                 ));
             }
         }
+        // ponytail: block_access_list_hash needs the BAL (eth/71) and
+        // gas_limit == bid.gas_limit an authenticated bid; neither is checked.
+        let Some(consensus) = &self.consensus else {
+            // An op-stack header's parent beacon root is the L1 one, and its
+            // slot already fixed the timestamp.
+            return if header.number == parent.number + 1 && header.parent_hash == parent.hash_slow()
+            {
+                HeaderVerdict::Valid
+            } else {
+                HeaderVerdict::Invalid("header does not follow its parent".to_owned())
+            };
+        };
         if let (Some(expected), Some(root)) =
             (attested_parent_root, header.parent_beacon_block_root)
             && root.0 != expected
@@ -104,18 +116,6 @@ impl HeaderRules {
                 "parent beacon block root is not the attested one".to_owned(),
             );
         }
-        // ponytail: block_access_list_hash needs the BAL (eth/71) and
-        // gas_limit == bid.gas_limit an authenticated bid; neither is checked.
-        let Some(consensus) = &self.consensus else {
-            return if header.number == parent.number + 1
-                && header.parent_hash == parent.hash_slow()
-                && header.timestamp > parent.timestamp
-            {
-                HeaderVerdict::Valid
-            } else {
-                HeaderVerdict::Invalid("header does not follow its parent".to_owned())
-            };
-        };
         let header = SealedHeader::seal_slow(header.clone());
         let parent = SealedHeader::seal_slow(parent.clone());
         match consensus
@@ -152,7 +152,7 @@ impl HeaderRules {
             && !late_reveal(tip.timestamp, now)
             && headers.windows(2).all(|pair| {
                 self.cadence
-                    .slot_starting_at(pair[1].timestamp)
+                    .header_slot(pair[1].number, pair[1].timestamp)
                     .is_some_and(|slot| {
                         slot.saturating_sub(attested.beacon_slot) <= MAX_UNATTESTED_SLOTS
                     })
@@ -357,5 +357,60 @@ mod tests {
         header.blob_gas_used = Some(2 * 131_072);
         assert!(blob_gas_matches(&header, 2));
         assert!(!blob_gas_matches(&header, 1));
+    }
+
+    #[test]
+    fn op_stack_headers_take_their_slot_from_the_number() {
+        // Base: 2 s slots, then a slot every 200 ms from Denim's block 53,556,127.
+        let base = leani_chain::ChainRegistry::standard().get("base").unwrap();
+        let rules = HeaderRules::cadence_only(base.cadence().unwrap());
+        let block = |number, timestamp, parent: &Header| Header {
+            number,
+            timestamp,
+            parent_hash: parent.hash_slow(),
+            ..Default::default()
+        };
+        let now = 1_793_901_700;
+        let legacy = Header {
+            number: 53_556_126,
+            timestamp: 1_793_901_599,
+            ..Default::default()
+        };
+        let activation = block(53_556_127, 1_793_901_601, &legacy);
+        assert_eq!(
+            rules.check(&activation, &legacy, now, None),
+            HeaderVerdict::Valid
+        );
+        // Four more blocks share the activation's second.
+        let child = block(53_556_128, 1_793_901_601, &activation);
+        assert_eq!(
+            rules.check(&child, &activation, now, None),
+            HeaderVerdict::Valid
+        );
+        for invalid in [
+            block(53_556_128, 1_793_901_602, &activation),
+            Header {
+                parent_hash: B256::ZERO,
+                ..child.clone()
+            },
+        ] {
+            assert!(matches!(
+                rules.check(&invalid, &activation, now, None),
+                HeaderVerdict::Invalid(_)
+            ));
+        }
+        assert!(matches!(
+            rules.check(&child, &activation, 1_793_901_590, None),
+            HeaderVerdict::Invalid(_)
+        ));
+        // The parent beacon root is L1's, not the sequencer's attestation.
+        let l1_root = Header {
+            parent_beacon_block_root: Some(B256::repeat_byte(7)),
+            ..child
+        };
+        assert_eq!(
+            rules.check(&l1_root, &activation, now, Some([0; 32])),
+            HeaderVerdict::Valid
+        );
     }
 }
