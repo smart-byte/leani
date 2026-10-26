@@ -50,6 +50,9 @@ record, and documented RPC contracts.
   delivery stream now waits while the processor is paused at its delivery
   limit and continues once pruning resumes it. It used to fail, and its range
   stayed uncovered until the next start.
+- An automatic or on-demand backfill that reaches the artifact storage budget
+  now stops as storage-backpressured and frees its slot, as at the physical
+  storage limit. It used to retry every 250 ms while reporting itself running.
 - Delivery pruning reads the changes it deletes instead of every change the
   stream retains, and a paused stream is pruned at once, pass after pass,
   instead of one batch per `pruning.interval`. A processor paused at a full
