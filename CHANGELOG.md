@@ -44,6 +44,26 @@ record, and documented RPC contracts.
   historical RPC request may hold `memory_bytes` divided by 8. Configurations
   that set `source_concurrency = 4` keep reading 4 chunks per job.
 
+### Fixed
+
+- An automatic or on-demand backfill whose changes fill the processor's
+  delivery stream now waits while the processor is paused at its delivery
+  limit and continues once pruning resumes it. It used to fail, and its range
+  stayed uncovered until the next start.
+- Delivery pruning reads the changes it deletes instead of every change the
+  stream retains, and a paused stream is pruned at once, pass after pass,
+  instead of one batch per `pruning.interval`. A processor paused at a full
+  1 GiB window resumed after 4 s, or 17 s from a throttled disk with a cold
+  cache, instead of 13 minutes to about an hour.
+- Finalized promotion of output and undo records, the retained-frame size
+  check before each live block, and recent-frame statistics search indexes
+  instead of whole tables, and a parked live lane reads only its pending
+  deltas instead of full processor statistics. Each of these held the store
+  for seconds on a store larger than the page cache.
+- Schema 27 adds the indexes these use. A store upgrades in place on its first
+  start, which builds them once: about a second per index and million changes
+  on SSD.
+
 ### Security
 
 - Updated rustls-webpki to 0.103.16, and webpki-roots and webpki-root-certs

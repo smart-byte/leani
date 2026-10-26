@@ -6416,20 +6416,24 @@ async fn supervise_processor_maintenance(
     verification_segment_blocks: u64,
     cancellation: CancellationToken,
 ) {
-    let interval = std::time::Duration::from_secs(
-        processor
-            .descriptor()
-            .lifecycle
-            .delivery
-            .pruning
-            .interval_seconds,
-    );
+    let pruning = processor.descriptor().lifecycle.delivery.pruning;
+    let interval = std::time::Duration::from_secs(pruning.interval_seconds);
+    // A full batch can leave more to delete, as a paused stream does; the
+    // next pass then runs at once instead of an interval later.
+    let mut backlog = false;
     loop {
-        tokio::select! {
-            () = cancellation.cancelled() => return,
-            () = tokio::time::sleep(interval) => {}
-            () = store.wait_for_delivery_capacity_change() => {}
+        if backlog {
+            if cancellation.is_cancelled() {
+                return;
+            }
+        } else {
+            tokio::select! {
+                () = cancellation.cancelled() => return,
+                () = tokio::time::sleep(interval) => {}
+                () = store.wait_for_delivery_capacity_change() => {}
+            }
         }
+        backlog = false;
         let finalized = match store.finalized_through(processor.descriptor()).await {
             Ok(Some(finalized)) => finalized,
             Ok(None) => continue,
@@ -6463,6 +6467,7 @@ async fn supervise_processor_maintenance(
                 .await
             {
                 Ok(outcome) if outcome.deleted > 0 => {
+                    backlog |= outcome.deleted >= pruning.maximum_delete_changes;
                     info!(
                         processor_instance = %processor.descriptor().instance,
                         stream_id = %stream.stream_id,
@@ -12837,6 +12842,78 @@ markets = ["ETH/USDT"]
         .await;
         runtime.shutdown().await;
         resumed.expect("pruning the delivery log resumes the subscription's processor");
+    }
+
+    #[tokio::test]
+    async fn maintenance_resumes_a_paused_processor_without_waiting_for_its_interval() {
+        use leani_primitives::{ChainId, ProcessorCursor};
+
+        let directory = tempfile::tempdir().expect("temporary directory");
+        // About 36 blocks fill the log; the pause leaves several changes to
+        // delete, one per pass.
+        let counter = BlockLocalCounter::default().with_delivery_max_bytes(2_000);
+        let mut lifecycle = counter.descriptor().lifecycle.clone();
+        lifecycle.delivery.pruning.interval_seconds = 3_600;
+        lifecycle.delivery.pruning.maximum_delete_changes = 1;
+        lifecycle.delivery.pruning.retain_finalized_blocks = 1;
+        let processor: Arc<dyn Processor> = Arc::new(counter.with_lifecycle(lifecycle));
+        let store = leani_store_sqlite::SqliteStore::open(leani_store_sqlite::StoreConfig::new(
+            directory.path().join("leani.sqlite"),
+        ))
+        .await
+        .expect("store");
+        let cancellation = CancellationToken::new();
+        let maintenance = tokio::spawn(supervise_processor_maintenance(
+            store.clone(),
+            processor.clone(),
+            1_000_000,
+            cancellation.clone(),
+        ));
+        tokio::task::yield_now().await;
+        let mut paused = false;
+        for frame in fixture_chain(80).into_iter().skip(1) {
+            let delta = processor.map(&frame).await.expect("map");
+            let applied = store
+                .apply(
+                    processor.as_ref(),
+                    ProcessorCursor {
+                        processor_id: processor.descriptor().id.to_string(),
+                        processor_version: processor.descriptor().version.to_string(),
+                        chain_id: ChainId(1),
+                        block_number: frame.block.number,
+                        block_hash: frame.block.hash,
+                        finality: frame.finality,
+                        sequence: frame.block.number.0,
+                    },
+                    &delta,
+                    &[],
+                )
+                .await;
+            if matches!(
+                applied,
+                Err(leani_store_sqlite::StoreError::DeliveryLimit { .. })
+            ) {
+                paused = true;
+                break;
+            }
+            applied.expect("apply");
+        }
+        assert!(paused, "the delivery log never filled");
+        let resumed = tokio::time::timeout(Duration::from_secs(5), async {
+            while store
+                .processor_runtime_state(processor.descriptor())
+                .await
+                .expect("state")
+                .state
+                != leani_store_sqlite::ProcessorRunState::Running
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        cancellation.cancel();
+        maintenance.await.expect("maintenance task");
+        resumed.expect("the paused processor resumes before its next pruning interval");
     }
 
     #[tokio::test]

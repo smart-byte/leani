@@ -2917,12 +2917,18 @@ impl HistoricalRuntime {
                     )
                     .await;
                 match commit {
-                    Err(RuntimeError::Store(StoreError::DeliveryLimit {
-                        action: DeliveryLimitAction::Pause,
-                        ..
-                    })) if job.delivery_stream_id.is_some() => {
+                    // A subscription waits for its consumer. A materialization
+                    // job shares the processor's live stream and waits for
+                    // pruning to resume the processor.
+                    Err(RuntimeError::Store(
+                        StoreError::DeliveryLimit {
+                            action: DeliveryLimitAction::Pause,
+                            ..
+                        }
+                        | StoreError::ProcessorPaused { .. },
+                    )) => {
                         drop(fair_turn);
-                        if !backpressured {
+                        if job.delivery_stream_id.is_some() && !backpressured {
                             self.store
                                 .set_backfill_subscription_state(
                                     &job.id,
@@ -3954,12 +3960,15 @@ impl SharedLiveRuntime {
             Box::pin(self.drain_pending(&mut report)).await?;
         }
         for processor in &self.processors {
-            let statistics = self.store.processor_stats(processor.descriptor()).await?;
+            let (pending, _) = self
+                .store
+                .pending_delta_totals(processor.descriptor())
+                .await?;
             report
                 .processors
                 .entry(processor.descriptor().id.to_string())
                 .or_default()
-                .pending = statistics.pending_deltas;
+                .pending = pending;
         }
         Ok(report)
     }
@@ -4433,12 +4442,15 @@ impl SharedLiveRuntime {
                 Box::pin(self.drain_pending(&mut report)).await?;
             }
             for processor in &self.processors {
-                let statistics = self.store.processor_stats(processor.descriptor()).await?;
+                let (pending, _) = self
+                    .store
+                    .pending_delta_totals(processor.descriptor())
+                    .await?;
                 report
                     .processors
                     .entry(processor.descriptor().id.to_string())
                     .or_default()
-                    .pending = statistics.pending_deltas;
+                    .pending = pending;
             }
             Ok(report)
         })
@@ -5272,9 +5284,9 @@ impl SharedLiveRuntime {
         for configured in &self.processors {
             current = current.saturating_add(
                 self.store
-                    .processor_stats(configured.descriptor())
+                    .pending_delta_totals(configured.descriptor())
                     .await?
-                    .pending_delta_bytes,
+                    .1,
             );
         }
         let persist_delta = encoded_bytes <= self.config.pending_delta_bytes
@@ -5348,9 +5360,9 @@ impl SharedLiveRuntime {
         for configured in &self.processors {
             pending_bytes = pending_bytes.saturating_add(
                 self.store
-                    .processor_stats(configured.descriptor())
+                    .pending_delta_totals(configured.descriptor())
                     .await?
-                    .pending_delta_bytes,
+                    .1,
             );
         }
         if encoded_bytes > self.config.pending_delta_bytes
@@ -15991,6 +16003,121 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![(0, Finality::Attested, ChangeDirection::Apply)]
         );
+    }
+
+    #[tokio::test]
+    async fn parking_a_paused_lane_reads_no_processor_statistics() {
+        let range = BlockRange::new(BlockNumber(0), BlockNumber(3)).expect("range");
+        let mut steps = Vec::new();
+        let mut parent = BlockHash::ZERO;
+        for number in 0..=3 {
+            let frame = live_fixture(number, parent);
+            parent = frame.block.hash;
+            steps.push(LiveStep::Event(ChainEvent::Block(Box::new(frame))));
+        }
+        let paused =
+            Arc::new(BlockLocalCounter::named("parked-without-scans").with_delivery_max_bytes(100));
+        let (_directory, store) = store().await;
+        SharedLiveRuntime::new(
+            store.clone(),
+            Arc::new(ScriptedLiveSource::new(
+                e2e_descriptor("parked-live", range),
+                steps,
+            )),
+            vec![paused.clone()],
+            SharedLiveRuntimeConfig::default(),
+        )
+        .expect("runtime")
+        .run(
+            LiveStart::Head,
+            default_source_budget(),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("run");
+        assert_eq!(
+            store
+                .processor_runtime_state(paused.descriptor())
+                .await
+                .expect("state")
+                .state,
+            ProcessorRunState::Paused
+        );
+        assert_eq!(store.statistics_scans(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_materialization_job_waits_out_its_delivery_pause() {
+        let range = BlockRange::new(BlockNumber(1), BlockNumber(12)).expect("range");
+        let counter =
+            BlockLocalCounter::named("paused-materialization").with_delivery_max_bytes(200);
+        let mut lifecycle = counter.descriptor().lifecycle.clone();
+        lifecycle.delivery.pruning.retain_finalized_blocks = 0;
+        let processor = Arc::new(counter.with_lifecycle(lifecycle));
+        let (_directory, store) = store().await;
+        store
+            .register_processor(processor.descriptor())
+            .await
+            .expect("register");
+        let runtime = HistoricalRuntime::new(
+            store.clone(),
+            Arc::new(ScriptedHistorySource::from_frames(
+                fixture_source_descriptor("paused-materialization-history", range),
+                frames(range),
+            )),
+            processor.clone(),
+            HistoricalRuntimeConfig {
+                mapper_concurrency: 1,
+                ..HistoricalRuntimeConfig::default()
+            },
+        )
+        .expect("runtime");
+        let job = BackfillJob::for_processor(
+            "paused-materialization",
+            processor.as_ref(),
+            ChainId(1),
+            range,
+            VerificationPolicy::CompleteCryptographic,
+        )
+        .expect("job");
+        let mut run = tokio::spawn(async move {
+            runtime
+                .run(job, default_source_budget(), CancellationToken::new())
+                .await
+        });
+        // Prunes a paused stream as node maintenance does.
+        let mut pauses = 0;
+        let report = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if run.is_finished() {
+                    break (&mut run).await;
+                }
+                let state = store
+                    .processor_runtime_state(processor.descriptor())
+                    .await
+                    .expect("state")
+                    .state;
+                if state == ProcessorRunState::Paused {
+                    pauses += 1;
+                    let finalized = store
+                        .finalized_through(processor.descriptor())
+                        .await
+                        .expect("finalized")
+                        .expect("finalized block");
+                    store
+                        .prune_delivery_changes(processor.descriptor(), finalized)
+                        .await
+                        .expect("prune");
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the job finishes")
+        .expect("job task")
+        .expect("materialization backfill");
+        assert!(pauses > 0, "the job never reached its delivery limit");
+        assert_eq!(report.frames_committed, range.len());
     }
 
     #[tokio::test]
