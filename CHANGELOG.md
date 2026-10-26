@@ -43,6 +43,17 @@ record, and documented RPC contracts.
   `maximum_active_chunks = 4`. Up to 8 processor backfills run at once, and a
   historical RPC request may hold `memory_bytes` divided by 8. Configurations
   that set `source_concurrency = 4` keep reading 4 chunks per job.
+- A backfill with delivery on commits batches of blocks with their delivery
+  changes in the same transaction, as one with `delivery = none` already did,
+  instead of a block and a checkpoint at a time. At 0.1.0-rc.8's defaults an
+  `evm-events` backfill writing about 22 KB of changes per block finished
+  60,000 blocks in 21 minutes instead of about 47. Blocks not yet finalized,
+  or that the live lane already applied or holds, still commit one at a time,
+  as do the blocks of a batch whose reducer reads windowed output or rewrites
+  it unchanged.
+- A history batch that ends at a source error or an invalid frame first
+  commits the blocks before it, so failover continues after them instead of
+  fetching them again.
 
 ### Fixed
 
@@ -53,6 +64,10 @@ record, and documented RPC contracts.
 - An automatic or on-demand backfill that reaches the artifact storage budget
   now stops as storage-backpressured and frees its slot, as at the physical
   storage limit. It used to retry every 250 ms while reporting itself running.
+- A backfill with `delivery = none` and windowed output commits one block at a
+  time when its reducer reads that output or rewrites it unchanged. In a batch
+  the reducer could still see rows the window had pruned after an earlier
+  block.
 - Delivery pruning reads the changes it deletes instead of every change the
   stream retains, and a paused stream is pruned at once, pass after pass,
   instead of one batch per `pruning.interval`. A processor paused at a full

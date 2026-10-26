@@ -23,8 +23,8 @@ use leani_primitives::{
     SourceKind, TrustModel, capability::CapabilitySet,
 };
 use leani_processor_api::{
-    DeliveryLimitAction, DeliveryPolicyMode, EncodedDelta, OutputPolicyMode, Processor,
-    ProcessorDescriptor, ProcessorError, PublicationPolicy, ReductionMode, StartPoint,
+    DeliveryLimitAction, EncodedDelta, OutputPolicyMode, Processor, ProcessorDescriptor,
+    ProcessorError, PublicationPolicy, ReductionMode, StartPoint,
 };
 use leani_source_api::{
     ChainEvent, ConsensusCheckpoint, DataRequest, FinalityEvent, FinalitySource, HistorySource,
@@ -1228,7 +1228,8 @@ mod failpoints {
 
     /// After the canonical recent write, before one processor's apply.
     pub(crate) const BEFORE_LIVE_APPLY: &str = "before_live_apply";
-    /// After a delta's `persist_delta` or pending check, before its apply.
+    /// After a delta's `persist_delta` or pending check, or as history adds
+    /// it to a batch: before its apply.
     pub(crate) const AFTER_PERSIST_DELTA: &str = "after_persist_delta";
     /// After a reorg's canonical switch, before one processor's undo.
     pub(crate) const BEFORE_REORG_UNDO: &str = "before_reorg_undo";
@@ -2784,9 +2785,8 @@ impl HistoricalRuntime {
         let descriptor = self.processor.descriptor();
         let subscription_microbatch = job.delivery_stream_id.is_some()
             && matches!(descriptor.lifecycle.output.mode, OutputPolicyMode::None);
-        let materialization_microbatch = job.delivery_stream_id.is_none()
-            && descriptor.lifecycle.delivery.mode == DeliveryPolicyMode::None
-            && job.mode == BackfillMode::FillMissing;
+        let materialization_microbatch =
+            job.delivery_stream_id.is_none() && job.mode == BackfillMode::FillMissing;
         if subscription_microbatch || materialization_microbatch {
             return self
                 .run_material_chunk_microbatched(
@@ -3097,23 +3097,40 @@ impl HistoricalRuntime {
                 }
             }
             let mut mapped_batch = Vec::with_capacity(results.len());
+            // A failure ends the batch, but the blocks mapped before it still
+            // commit, as they would one at a time.
+            let mut failure = None;
             for result in results {
-                let mapped = result?;
-                if mapped.delta.block.number.0 != next_number {
-                    return Err(RuntimeError::Source(SourceError::CorruptFrame(format!(
-                        "chunk expected block {next_number}, received {}",
-                        mapped.delta.block.number.0
-                    ))));
-                }
-                if let Some(parent) = expected_parent
-                    && mapped.delta.block.parent_hash != parent
-                {
-                    return Err(RuntimeError::Source(SourceError::CorruptFrame(format!(
-                        "parent mismatch at block {}",
-                        mapped.delta.block.number.0
-                    ))));
-                }
-                verify_range_end_hash(range, &mapped.delta, expected_end_hash)?;
+                let mapped = match result.and_then(|mapped| {
+                    if mapped.delta.block.number.0 != next_number {
+                        return Err(RuntimeError::Source(SourceError::CorruptFrame(format!(
+                            "chunk expected block {next_number}, received {}",
+                            mapped.delta.block.number.0
+                        ))));
+                    }
+                    if let Some(parent) = expected_parent
+                        && mapped.delta.block.parent_hash != parent
+                    {
+                        return Err(RuntimeError::Source(SourceError::CorruptFrame(format!(
+                            "parent mismatch at block {}",
+                            mapped.delta.block.number.0
+                        ))));
+                    }
+                    verify_range_end_hash(range, &mapped.delta, expected_end_hash)?;
+                    #[cfg(test)]
+                    failpoints::hit(
+                        failpoints::AFTER_PERSIST_DELTA,
+                        self.processor.descriptor(),
+                        mapped.delta.block.number,
+                    )?;
+                    Ok(mapped)
+                }) {
+                    Ok(mapped) => mapped,
+                    Err(error) => {
+                        failure = Some(error);
+                        break;
+                    }
+                };
                 next_number = next_number.saturating_add(1);
                 expected_parent = Some(mapped.delta.block.hash);
                 *frames_mapped = frames_mapped.saturating_add(1);
@@ -3137,26 +3154,32 @@ impl HistoricalRuntime {
                 }
                 mapped_batch.push(mapped);
             }
-            let completes_subscription = completes_subscription
-                && mapped_batch
-                    .last()
-                    .is_some_and(|mapped| mapped.delta.block.number == range.end());
-            self.commit_microbatch_with_backpressure(
-                mapped_batch,
-                job,
-                job_payload,
-                attempts,
-                checkpoint,
-                duplicate_frames,
-                cancellation.clone(),
-                completes_subscription,
-                &mut || {
-                    mapped = futures::stream::empty().boxed();
-                    released = true;
-                    release();
-                },
-            )
-            .await?;
+            if !mapped_batch.is_empty() {
+                let completes_subscription = completes_subscription
+                    && failure.is_none()
+                    && mapped_batch
+                        .last()
+                        .is_some_and(|mapped| mapped.delta.block.number == range.end());
+                self.commit_microbatch_with_backpressure(
+                    mapped_batch,
+                    job,
+                    job_payload,
+                    attempts,
+                    checkpoint,
+                    duplicate_frames,
+                    cancellation.clone(),
+                    completes_subscription,
+                    &mut || {
+                        mapped = futures::stream::empty().boxed();
+                        released = true;
+                        release();
+                    },
+                )
+                .await?;
+            }
+            if let Some(failure) = failure {
+                return Err(failure);
+            }
         }
         if released {
             return Ok(ChunkOutcome::Released);
@@ -3264,6 +3287,7 @@ impl HistoricalRuntime {
                     .commit_historical_materialization_microbatch(
                         self.processor.as_ref(),
                         &items,
+                        &job.sink_ids,
                         &job.id,
                         &encoded_checkpoint,
                         attempts,
@@ -3276,6 +3300,8 @@ impl HistoricalRuntime {
                     )
                     .await
             };
+            // Copies of the batch's deltas, which a wait below must not keep.
+            drop(items);
             match commit {
                 Ok(outcome) => {
                     fair_turn.complete(
@@ -3322,28 +3348,74 @@ impl HistoricalRuntime {
                 }
                 Err(StoreError::HistoricalBatchRequiresFallback) => {
                     drop(fair_turn);
-                    for mapped in &batch {
+                    let mut frames = VecDeque::from(batch);
+                    while let Some(mut mapped) = frames.pop_front() {
                         let publish_changes = !matches!(
                             self.processor.descriptor().publication,
                             PublicationPolicy::JobResult
                         ) || mapped.delta.block.number
                             == job.request.range.end();
-                        let fair_turn = self
-                            .pipeline_budget
-                            .acquire_commit_turn(&job.id, &cancellation)
-                            .await?;
-                        let outcome = self
-                            .commit_mapped_frame(
-                                mapped,
-                                &job.sink_ids,
-                                publish_changes,
-                                job.mode,
-                                stream_id,
-                            )
-                            .await?;
-                        fair_turn.complete(mapped.estimated_bytes.saturating_add(
-                            mapped_delta_bytes(&mapped.delta, &mapped.equivalent_checksums),
-                        ));
+                        let outcome = loop {
+                            let fair_turn = self
+                                .pipeline_budget
+                                .acquire_commit_turn(&job.id, &cancellation)
+                                .await?;
+                            match self
+                                .commit_mapped_frame(
+                                    &mapped,
+                                    &job.sink_ids,
+                                    publish_changes,
+                                    job.mode,
+                                    stream_id,
+                                )
+                                .await
+                            {
+                                Err(RuntimeError::Store(
+                                    StoreError::DeliveryLimit {
+                                        action: DeliveryLimitAction::Pause,
+                                        ..
+                                    }
+                                    | StoreError::ProcessorPaused { .. },
+                                )) => {
+                                    drop(fair_turn);
+                                    if stream_id.is_some() && !backpressured {
+                                        self.store
+                                            .set_backfill_subscription_state(
+                                                &job.id,
+                                                leani_store_sqlite::BackfillSubscriptionState::Backpressured,
+                                                None,
+                                            )
+                                            .await?;
+                                        backpressured = true;
+                                    }
+                                    // Only the refused frame waits; the job
+                                    // maps the rest again when it replans.
+                                    frames.clear();
+                                    release_while_paused(
+                                        release,
+                                        std::slice::from_mut(&mut mapped),
+                                        &mut pending,
+                                    );
+                                    tokio::select! {
+                                        () = cancellation.cancelled() => {
+                                            return Err(RuntimeError::Cancelled);
+                                        }
+                                        () = self.store.wait_for_delivery_capacity_change() => {}
+                                        () = tokio::time::sleep(Duration::from_millis(250)) => {}
+                                    }
+                                }
+                                result => {
+                                    let outcome = result?;
+                                    fair_turn.complete(mapped.estimated_bytes.saturating_add(
+                                        mapped_delta_bytes(
+                                            &mapped.delta,
+                                            &mapped.equivalent_checksums,
+                                        ),
+                                    ));
+                                    break outcome;
+                                }
+                            }
+                        };
                         match outcome {
                             ApplyOutcome::Applied { .. } => {
                                 checkpoint.frames_committed =
@@ -3367,6 +3439,18 @@ impl HistoricalRuntime {
                         )
                         .await?;
                     }
+                    // Single blocks never complete a subscription; the job
+                    // does once no gap remains.
+                    if backpressured {
+                        self.store
+                            .set_backfill_subscription_state(
+                                &job.id,
+                                leani_store_sqlite::BackfillSubscriptionState::Running,
+                                None,
+                            )
+                            .await?;
+                        backpressured = false;
+                    }
                 }
                 Err(
                     StoreError::HistoricalBatchLimit { .. }
@@ -3381,12 +3465,18 @@ impl HistoricalRuntime {
                     pending.push_front((second_half, completes_subscription));
                     pending.push_front((batch, false));
                 }
-                Err(StoreError::DeliveryLimit {
-                    action: DeliveryLimitAction::Pause,
-                    ..
-                }) => {
+                // A subscription waits for its consumer. A materialization
+                // job shares the processor's live stream and waits for
+                // pruning to resume the processor.
+                Err(
+                    StoreError::DeliveryLimit {
+                        action: DeliveryLimitAction::Pause,
+                        ..
+                    }
+                    | StoreError::ProcessorPaused { .. },
+                ) => {
                     drop(fair_turn);
-                    if !backpressured {
+                    if stream_id.is_some() && !backpressured {
                         self.store
                             .set_backfill_subscription_state(
                                 &job.id,
@@ -3396,6 +3486,10 @@ impl HistoricalRuntime {
                             .await?;
                         backpressured = true;
                     }
+                    // Only the first frame waits; the job maps the rest again
+                    // when it replans.
+                    let completes_subscription = completes_subscription && batch.len() == 1;
+                    batch.truncate(1);
                     release_while_paused(release, &mut batch, &mut pending);
                     tokio::select! {
                         () = cancellation.cancelled() => {
@@ -8308,6 +8402,7 @@ mod tests {
         http::{Request, StatusCode},
     };
     use leani_primitives::{Capability, ChainId, HeaderEnvelope, Material};
+    use leani_processor_api::DeliveryPolicyMode;
     use leani_processor_blobs::BlobsProcessor;
     use leani_source_api::{
         FieldProjection, FilterSet, SourceBudget, SourceDescriptor, VerificationPolicy,
@@ -8812,6 +8907,45 @@ mod tests {
             cursor: &ProcessorCursor,
             delta: &EncodedDelta,
         ) -> Result<leani_processor_api::DomainChanges, ProcessorError> {
+            self.inner.reduce(transaction, cursor, delta).await
+        }
+    }
+
+    /// A counter that counts one block's reductions, so a test sees a job
+    /// retry that block's commit.
+    #[derive(Debug)]
+    struct RetryCounter {
+        inner: BlockLocalCounter,
+        block: BlockNumber,
+        reductions: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl Processor for RetryCounter {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
+        fn descriptor(&self) -> &ProcessorDescriptor {
+            self.inner.descriptor()
+        }
+
+        async fn map(
+            &self,
+            block: &leani_primitives::BlockFrame,
+        ) -> Result<EncodedDelta, ProcessorError> {
+            self.inner.map(block).await
+        }
+
+        async fn reduce(
+            &self,
+            transaction: &mut dyn leani_processor_api::ReducerTransaction,
+            cursor: &ProcessorCursor,
+            delta: &EncodedDelta,
+        ) -> Result<leani_processor_api::DomainChanges, ProcessorError> {
+            if delta.block.number == self.block {
+                self.reductions.fetch_add(1, Ordering::SeqCst);
+            }
             self.inner.reduce(transaction, cursor, delta).await
         }
     }
@@ -11515,43 +11649,52 @@ mod tests {
     #[tokio::test]
     async fn one_block_larger_than_the_commit_byte_limit_fails_fast() {
         let range = BlockRange::single(BlockNumber(1));
-        let source = Arc::new(ScriptedHistorySource::from_frames(
-            fixture_source_descriptor("oversized-commit", range),
-            frames(range),
-        ));
-        let processor = Arc::new(BlockLocalCounter::default().with_delivery_none());
-        let (_directory, store) = store().await;
-        let runtime = HistoricalRuntime::new(
-            store,
-            source,
-            processor.clone(),
-            HistoricalRuntimeConfig {
-                mapper_concurrency: 1,
-                commit_maximum_encoded_bytes: 1,
-                ..HistoricalRuntimeConfig::default()
-            },
-        )
-        .expect("runtime");
-        let job = BackfillJob::for_processor(
-            "oversized-commit",
-            processor.as_ref(),
-            ChainId(1),
-            range,
-            VerificationPolicy::CompleteCryptographic,
-        )
-        .expect("job");
-        let error = runtime
-            .run(job, default_source_budget(), CancellationToken::new())
-            .await
-            .expect_err("one block cannot fit the commit byte limit");
-        assert!(matches!(
-            error,
-            RuntimeError::Store(StoreError::HistoricalBatchLimit {
-                maximum_encoded_bytes: 1,
-                observed_encoded_bytes: 2..,
-                ..
-            })
-        ));
+        // With delivery or without, a backfill commits bounded batches.
+        for counter in [
+            BlockLocalCounter::default().with_delivery_none(),
+            BlockLocalCounter::default(),
+        ] {
+            let delivery = counter.descriptor().lifecycle.delivery.mode;
+            let source = Arc::new(ScriptedHistorySource::from_frames(
+                fixture_source_descriptor("oversized-commit", range),
+                frames(range),
+            ));
+            let processor = Arc::new(counter);
+            let (_directory, store) = store().await;
+            let runtime = HistoricalRuntime::new(
+                store,
+                source,
+                processor.clone(),
+                HistoricalRuntimeConfig {
+                    mapper_concurrency: 1,
+                    commit_maximum_encoded_bytes: 1,
+                    ..HistoricalRuntimeConfig::default()
+                },
+            )
+            .expect("runtime");
+            let job = BackfillJob::for_processor(
+                "oversized-commit",
+                processor.as_ref(),
+                ChainId(1),
+                range,
+                VerificationPolicy::CompleteCryptographic,
+            )
+            .expect("job");
+            let result = runtime
+                .run(job, default_source_budget(), CancellationToken::new())
+                .await;
+            assert!(
+                matches!(
+                    result,
+                    Err(RuntimeError::Store(StoreError::HistoricalBatchLimit {
+                        maximum_encoded_bytes: 1,
+                        observed_encoded_bytes: 2..,
+                        ..
+                    }))
+                ),
+                "delivery {delivery:?}: {result:?}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -16152,12 +16295,257 @@ mod tests {
             VerificationPolicy::CompleteCryptographic,
         )
         .expect("job");
-        let mut run = tokio::spawn(async move {
+        let run = tokio::spawn(async move {
             runtime
                 .run(job, default_source_budget(), CancellationToken::new())
                 .await
         });
-        // Prunes a paused stream as node maintenance does.
+        let (report, pauses) =
+            prune_paused_streams_until_done(&store, processor.descriptor(), run).await;
+        let report = report.expect("materialization backfill");
+        assert!(pauses > 0, "the job never reached its delivery limit");
+        assert_eq!(report.frames_committed, range.len());
+    }
+
+    #[tokio::test]
+    async fn a_materialization_job_waits_out_a_pause_in_its_per_block_fallback() {
+        // Block 2, applied live once the job opens its source, sends the
+        // batch around it to single-block commits that fill the stream.
+        let range = BlockRange::new(BlockNumber(0), BlockNumber(11)).expect("range");
+        let history = frames(range);
+        let counter = BlockLocalCounter::named("paused-fallback").with_delivery_max_bytes(200);
+        let mut lifecycle = counter.descriptor().lifecycle.clone();
+        lifecycle.delivery.pruning.retain_finalized_blocks = 0;
+        let processor = Arc::new(counter.with_lifecycle(lifecycle));
+        let mut largest_frame = 0;
+        for frame in &history {
+            let (delta, checksums) = map_with_finality_variants(processor.as_ref(), frame)
+                .await
+                .expect("map frame");
+            largest_frame = largest_frame.max(mapped_delta_bytes(&delta, &checksums));
+        }
+        // Room for the whole range as one microbatch.
+        let budget_bytes = largest_frame * range.len();
+        let pipeline_budget =
+            HistoricalPipelineBudget::new(2, 2, budget_bytes).expect("pipeline budget");
+        let held_bytes = || {
+            budget_bytes.saturating_sub(
+                u64::try_from(pipeline_budget.mapped_bytes.available_permits())
+                    .expect("available mapped bytes"),
+            )
+        };
+        let mut included = history[2].clone();
+        included.finality = Finality::Attested;
+        let live = processor.map(&included).await.expect("map included");
+        let (_directory, store) = store().await;
+        store
+            .register_processor(processor.descriptor())
+            .await
+            .expect("register");
+        let runtime = HistoricalRuntime::new(
+            store.clone(),
+            Arc::new(LiveApplyOnOpenSource {
+                inner: ScriptedHistorySource::from_frames(
+                    fixture_source_descriptor("paused-fallback-history", range),
+                    history,
+                ),
+                store: store.clone(),
+                processor: processor.clone(),
+                live: StdMutex::new(Some(live)),
+            }),
+            processor.clone(),
+            HistoricalRuntimeConfig {
+                mapper_concurrency: 1,
+                commit_maximum_delay: Duration::from_mins(1),
+                ..HistoricalRuntimeConfig::default()
+            },
+        )
+        .expect("runtime")
+        .with_pipeline_budget(pipeline_budget.clone());
+        let job = BackfillJob::for_processor(
+            "paused-fallback",
+            processor.as_ref(),
+            ChainId(1),
+            range,
+            VerificationPolicy::CompleteCryptographic,
+        )
+        .expect("job");
+        let run = tokio::spawn(async move {
+            runtime
+                .run(job, default_source_budget(), CancellationToken::new())
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while store
+                .processor_runtime_state(processor.descriptor())
+                .await
+                .expect("state")
+                .state
+                != ProcessorRunState::Paused
+            {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .expect("the fallback fills the stream");
+        // Only the refused frame waits; the job maps the rest again.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while held_bytes() > largest_frame {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "the paused job holds {} mapped bytes; one frame is {largest_frame}",
+                held_bytes()
+            )
+        });
+        let (report, _) =
+            prune_paused_streams_until_done(&store, processor.descriptor(), run).await;
+        let report = report.expect("materialization backfill");
+        assert_eq!(report.duplicate_frames, 1);
+        assert_eq!(report.frames_committed, range.len() - 1);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn a_paused_processor_leaves_a_materialization_batch_one_frame() {
+        // Blocks 0 to 29 fill the stream and block 30 pauses the processor.
+        // Pruning blocks 0 and 1 makes room for the job's two-block batch
+        // but leaves the stream above its resume mark, so the processor
+        // stays paused and refuses the batch.
+        let range = BlockRange::new(BlockNumber(0), BlockNumber(39)).expect("range");
+        let history = frames(range);
+        let block_bytes = u64::try_from(
+            history[0]
+                .block
+                .canonical_key(history[0].chain_id)
+                .encode_ordered()
+                .len()
+                + 8,
+        )
+        .expect("block bytes");
+        let counter =
+            BlockLocalCounter::named("paused-batch").with_delivery_max_bytes(30 * block_bytes);
+        let mut lifecycle = counter.descriptor().lifecycle.clone();
+        lifecycle.delivery.pruning.retain_finalized_blocks = 0;
+        let processor = Arc::new(RetryCounter {
+            inner: counter.with_lifecycle(lifecycle),
+            block: BlockNumber(30),
+            reductions: AtomicUsize::new(0),
+        });
+        let mut largest_frame = 0;
+        for frame in &history {
+            let (delta, checksums) = map_with_finality_variants(processor.as_ref(), frame)
+                .await
+                .expect("map frame");
+            largest_frame = largest_frame.max(mapped_delta_bytes(&delta, &checksums));
+        }
+        let budget_bytes = largest_frame * range.len();
+        let pipeline_budget =
+            HistoricalPipelineBudget::new(1, 1, budget_bytes).expect("pipeline budget");
+        let (_directory, store) = store().await;
+        for (sequence, frame) in (1_u64..).zip(&history[..=30]) {
+            let delta = processor.map(frame).await.expect("map");
+            let applied = store
+                .apply(
+                    processor.as_ref(),
+                    ProcessorCursor {
+                        processor_id: processor.descriptor().id.to_string(),
+                        processor_version: processor.descriptor().version.to_string(),
+                        chain_id: frame.chain_id,
+                        block_number: frame.block.number,
+                        block_hash: frame.block.hash,
+                        finality: Finality::Finalized,
+                        sequence,
+                    },
+                    &delta,
+                    &[],
+                )
+                .await;
+            if frame.block.number < BlockNumber(30) {
+                applied.expect("fill the stream");
+            } else {
+                assert!(
+                    matches!(applied, Err(StoreError::DeliveryLimit { .. })),
+                    "{applied:?}"
+                );
+            }
+        }
+        store
+            .prune_delivery_changes(processor.descriptor(), BlockNumber(1))
+            .await
+            .expect("prune blocks 0 and 1");
+        assert_eq!(
+            store
+                .delivery_stream_stats(processor.descriptor())
+                .await
+                .expect("stream stats")
+                .live_bytes,
+            28 * block_bytes
+        );
+        processor.reductions.store(0, Ordering::SeqCst);
+        let runtime = HistoricalRuntime::new(
+            store.clone(),
+            Arc::new(ScriptedHistorySource::from_frames(
+                fixture_source_descriptor("paused-batch-history", range),
+                history,
+            )),
+            processor.clone(),
+            HistoricalRuntimeConfig {
+                mapper_concurrency: 1,
+                commit_maximum_blocks: 2,
+                commit_maximum_delay: Duration::from_mins(1),
+                ..HistoricalRuntimeConfig::default()
+            },
+        )
+        .expect("runtime")
+        .with_pipeline_budget(pipeline_budget.clone());
+        let job = BackfillJob::for_processor(
+            "paused-batch",
+            processor.as_ref(),
+            ChainId(1),
+            range,
+            VerificationPolicy::CompleteCryptographic,
+        )
+        .expect("job");
+        let run = tokio::spawn(async move {
+            runtime
+                .run(job, default_source_budget(), CancellationToken::new())
+                .await
+        });
+        // Block 30's second reduction is the waiting job's retry.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while processor.reductions.load(Ordering::SeqCst) < 2 {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .expect("the job retries block 30");
+        let held_bytes = budget_bytes.saturating_sub(
+            u64::try_from(pipeline_budget.mapped_bytes.available_permits())
+                .expect("available mapped bytes"),
+        );
+        assert!(
+            held_bytes <= largest_frame,
+            "the paused job holds {held_bytes} mapped bytes; one frame is {largest_frame}"
+        );
+        let (report, _) =
+            prune_paused_streams_until_done(&store, processor.descriptor(), run).await;
+        assert_eq!(
+            report.expect("materialization backfill").frames_committed,
+            10
+        );
+    }
+
+    /// Awaits `run` while pruning the processor's paused stream, as node
+    /// maintenance does, and counts the pauses it pruned.
+    async fn prune_paused_streams_until_done(
+        store: &SqliteStore,
+        descriptor: &ProcessorDescriptor,
+        mut run: tokio::task::JoinHandle<Result<BackfillReport, RuntimeError>>,
+    ) -> (Result<BackfillReport, RuntimeError>, usize) {
         let mut pauses = 0;
         let report = tokio::time::timeout(Duration::from_secs(10), async {
             loop {
@@ -16165,19 +16553,19 @@ mod tests {
                     break (&mut run).await;
                 }
                 let state = store
-                    .processor_runtime_state(processor.descriptor())
+                    .processor_runtime_state(descriptor)
                     .await
                     .expect("state")
                     .state;
                 if state == ProcessorRunState::Paused {
                     pauses += 1;
                     let finalized = store
-                        .finalized_through(processor.descriptor())
+                        .finalized_through(descriptor)
                         .await
                         .expect("finalized")
                         .expect("finalized block");
                     store
-                        .prune_delivery_changes(processor.descriptor(), finalized)
+                        .prune_delivery_changes(descriptor, finalized)
                         .await
                         .expect("prune");
                 }
@@ -16186,10 +16574,8 @@ mod tests {
         })
         .await
         .expect("the job finishes")
-        .expect("job task")
-        .expect("materialization backfill");
-        assert!(pauses > 0, "the job never reached its delivery limit");
-        assert_eq!(report.frames_committed, range.len());
+        .expect("job task");
+        (report, pauses)
     }
 
     #[tokio::test]
@@ -20559,11 +20945,10 @@ mod tests {
 
     /// Applies one delta as the live lane does when the job first opens the
     /// source: after the job planned its range, before it commits the block.
-    #[derive(Debug)]
     struct LiveApplyOnOpenSource {
         inner: ScriptedHistorySource,
         store: SqliteStore,
-        processor: Arc<FinalitySensitiveCounter>,
+        processor: Arc<dyn Processor>,
         live: StdMutex<Option<EncodedDelta>>,
     }
 

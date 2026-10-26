@@ -4210,24 +4210,29 @@ impl SqliteStore {
         })
     }
 
-    /// Atomically materialize a bounded finalized batch without a delivery
-    /// stream.
+    /// Atomically materialize a bounded finalized batch and publish its
+    /// changes into the processor's delivery stream, as single-block applies
+    /// would.
     ///
     /// Reducer visibility remains canonical across the batch, while output
-    /// metadata, coverage, the processor cursor, and the job checkpoint
-    /// retain their per-block identities inside one transaction. Finalized
-    /// blocks cannot be undone, so the batch journals no undo records.
+    /// metadata, coverage, the processor cursor, published changes, and the
+    /// job checkpoint retain their per-block identities inside one
+    /// transaction. Finalized blocks cannot be undone, so the batch journals
+    /// no undo records.
     ///
     /// # Errors
     ///
-    /// Returns an error for incompatible processor policy, invalid ordering,
-    /// overlapping coverage, an oversized batch, reducer failure, or a failed
-    /// transaction.
+    /// Returns [`StoreError::HistoricalBatchRequiresFallback`] for a block
+    /// that is not finalized, already covered, or held with another delta, or
+    /// for windowed output a reducer read or rewrote unchanged, and an error
+    /// for incompatible processor policy, invalid ordering, an oversized
+    /// batch, delivery capacity, reducer failure, or a failed transaction.
     #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     pub async fn commit_historical_materialization_microbatch<P: Processor + ?Sized>(
         &self,
         processor: &P,
         items: &[HistoricalBatchItem],
+        sink_ids: &[String],
         job_id: &str,
         job_checkpoint: &[u8],
         attempts: u32,
@@ -4245,11 +4250,6 @@ impl SqliteStore {
             ));
         }
         let descriptor = processor.descriptor();
-        if descriptor.lifecycle.delivery.mode != DeliveryPolicyMode::None {
-            return Err(StoreError::InvalidConfig(
-                "materialization microbatching requires a delivery-none processor".to_owned(),
-            ));
-        }
         if artifact_target == HistoricalArtifactTarget::ExternalCommitted
             && matches!(
                 descriptor.lifecycle.artifacts.mode,
@@ -4261,24 +4261,35 @@ impl SqliteStore {
             ));
         }
         let instance = self.register_processor(descriptor).await?;
+        let delivery_enabled = descriptor.lifecycle.delivery.mode != DeliveryPolicyMode::None;
+        let stream_id = default_delivery_stream_id(descriptor);
+        if delivery_enabled {
+            self.validate_delivery_stream(&instance, &stream_id).await?;
+        }
         let first_block = items[0].delta.block.number;
         let chain_id = items[0].delta.chain_id;
         let mut expected_number = first_block.0;
         let mut expected_parent = None;
         for item in items {
             item.delta.validate(descriptor)?;
-            if item.finality != Finality::Finalized
-                || item.delta.chain_id != chain_id
+            if item.delta.chain_id != chain_id
                 || item.delta.block.number.0 != expected_number
                 || expected_parent.is_some_and(|parent| item.delta.block.parent_hash != parent)
             {
                 return Err(StoreError::InvalidConfig(
-                    "historical materialization microbatch must be contiguous, finalized, and single-chain"
+                    "historical materialization microbatch must be contiguous and single-chain"
                         .to_owned(),
                 ));
             }
             expected_number = expected_number.saturating_add(1);
             expected_parent = Some(item.delta.block.hash);
+        }
+        // The batch journals no undo, so a reversible block commits alone.
+        if items
+            .iter()
+            .any(|item| item.finality != Finality::Finalized)
+        {
+            return Err(StoreError::HistoricalBatchRequiresFallback);
         }
         let artifact_encodings = if artifact_target == HistoricalArtifactTarget::ExternalCommitted
             || matches!(
@@ -4349,6 +4360,21 @@ impl SqliteStore {
             {
                 return Err(StoreError::HistoricalBatchRequiresFallback);
             }
+            // Likewise for a delta the live lane holds for this block.
+            let held: Option<Vec<u8>> = sqlx::query_scalar(
+                "SELECT encoded_delta FROM pending_deltas
+                 WHERE instance = ? AND block_number = ? AND block_hash = ?",
+            )
+            .bind(&instance)
+            .bind(u64_i64(item.delta.block.number.0, "block_number")?)
+            .bind(item.delta.block.hash.0.as_slice())
+            .fetch_optional(&self.inner.pool)
+            .await?;
+            if let Some(held) = held
+                && held != item.delta.encode_durable()?
+            {
+                return Err(StoreError::HistoricalBatchRequiresFallback);
+            }
         }
 
         let prior_cursor = self.processor_cursor_by_instance(&instance).await?;
@@ -4371,6 +4397,18 @@ impl SqliteStore {
                 ));
             }
             block_batches.push(overlay.take_batch());
+            // Output-none writes stay invisible to the next block, as in
+            // single-block applies.
+            if !retains_processor_output(descriptor) {
+                overlay.entities.clear();
+                overlay.indexes.clear();
+            }
+        }
+        // A window prunes output after each block, which the batch does only
+        // once every block has reduced.
+        if descriptor.lifecycle.output.mode == OutputPolicyMode::Window && overlay.window_dependent
+        {
+            return Err(StoreError::HistoricalBatchRequiresFallback);
         }
         let observed_changes = block_batches
             .iter()
@@ -4397,8 +4435,73 @@ impl SqliteStore {
                 maximum_encoded_bytes: limits.maximum_encoded_bytes,
             });
         }
+        // History arrives finalized, so each block's changes publish with it.
+        let published = items
+            .iter()
+            .zip(&block_batches)
+            .map(|(item, batch)| {
+                if delivery_enabled && item.publish_changes {
+                    batch.changes.as_slice()
+                } else {
+                    &[]
+                }
+            })
+            .collect::<Vec<_>>();
+        let published_bytes = published
+            .iter()
+            .flat_map(|changes| changes.iter())
+            .try_fold(0_u64, |total, change| {
+                change
+                    .key
+                    .len()
+                    .checked_add(change.payload.len())
+                    .and_then(|bytes| u64::try_from(bytes).ok())
+                    .and_then(|bytes| total.checked_add(bytes))
+                    .ok_or(StoreError::Numeric("historical published change bytes"))
+            })?;
+        if delivery_enabled {
+            // A batch the stream or the node's delivery budget has no room for
+            // splits instead of pausing the processor: its first blocks may
+            // still fit, and pruning, which keeps the newest block, may need
+            // them committed before the processor can resume.
+            if items.len() > 1 {
+                let stream_room = descriptor
+                    .lifecycle
+                    .delivery
+                    .max_bytes
+                    .saturating_sub(stream_delivery_bytes(&self.inner.pool, &stream_id).await?);
+                let node_room = node_delivery_budget_failure(
+                    &self.inner,
+                    &node_delivery_bytes(&self.inner).await?,
+                    published_bytes,
+                    0,
+                )?
+                .map_or(u64::MAX, |(_, limit, projected)| {
+                    limit.saturating_sub(projected.saturating_sub(published_bytes))
+                });
+                let room = stream_room.min(node_room);
+                if published_bytes > room {
+                    return Err(StoreError::HistoricalBatchLimit {
+                        observed_changes,
+                        maximum_changes: limits.maximum_changes,
+                        observed_encoded_bytes: published_bytes,
+                        maximum_encoded_bytes: room,
+                    });
+                }
+            }
+            enforce_delivery_capacity(
+                &self.inner,
+                descriptor,
+                &instance,
+                &stream_id,
+                published_bytes,
+                0,
+            )
+            .await?;
+        }
 
-        // Finalized blocks journal no undo, so only retained output counts.
+        // Finalized blocks journal no undo, so only retained output and
+        // published changes count.
         let output_bytes = if retains_processor_output(descriptor) {
             block_batches
                 .iter()
@@ -4413,11 +4516,19 @@ impl SqliteStore {
         } else {
             0
         };
-        let committed_output_bytes = output_bytes.saturating_add(artifact_bytes);
+        let committed_output_bytes = output_bytes
+            .saturating_add(artifact_bytes)
+            .saturating_add(published_bytes);
         if committed_output_bytes > 0 {
             enforce_physical_store_capacity(&self.inner, committed_output_bytes).await?;
         }
 
+        let holds_for_finality = descriptor.publication.first_level() > Finality::Unattested
+            && descriptor.delivery_ordering == DeliveryOrdering::Canonical;
+        let delivery_origin = DeliveryOrigin::live(&instance);
+        let mut released_held = false;
+        let mut first = None;
+        let mut last = None;
         let mut transaction = self.inner.pool.begin().await?;
         let bulk_artifact_accounting = !artifact_encodings.is_empty()
             && descriptor.lifecycle.artifacts.mode == ArtifactPolicyMode::Full;
@@ -4507,6 +4618,37 @@ impl SqliteStore {
             .bind(item.delta.block.hash.0.as_slice())
             .execute(&mut *transaction)
             .await?;
+            if delivery_enabled {
+                // Changes held below this block for finality publish first,
+                // as before a single block's.
+                if holds_for_finality
+                    && item.publish_changes
+                    && let Some(below) = item.delta.block.number.0.checked_sub(1)
+                {
+                    released_held |= release_deferred_changes(
+                        &mut transaction,
+                        &instance,
+                        BlockNumber(below),
+                        Finality::Finalized,
+                    )
+                    .await?;
+                }
+                let (block_first, block_last) = append_changes(
+                    &mut transaction,
+                    &instance,
+                    &stream_id,
+                    &delivery_origin,
+                    chain_id,
+                    item.delta.block,
+                    Finality::Finalized,
+                    ChangeDirection::Apply,
+                    published[index],
+                    sink_ids,
+                )
+                .await?;
+                first = first.or(block_first);
+                last = block_last.or(last);
+            }
             if committed_cursor
                 .as_ref()
                 .is_none_or(|prior| cursor.block_number >= prior.block_number)
@@ -4590,13 +4732,19 @@ impl SqliteStore {
             enforce_artifact_storage_capacity(&mut transaction, self.inner.artifact_budget).await?;
         }
         transaction.commit().await?;
+        if last.is_some() || released_held {
+            self.inner.delivery_changes_available.notify_waiters();
+        }
         Ok(HistoricalBatchOutcome {
             processed_blocks: u64::try_from(items.len())
                 .map_err(|_| StoreError::Numeric("historical microbatch blocks"))?,
-            published_changes: 0,
+            published_changes: u64::try_from(
+                published.iter().map(|changes| changes.len()).sum::<usize>(),
+            )
+            .map_err(|_| StoreError::Numeric("published historical changes"))?,
             committed_output_bytes,
-            first_change_sequence: None,
-            last_change_sequence: None,
+            first_change_sequence: first,
+            last_change_sequence: last,
             writer_hold_micros: duration_micros(writer_started.elapsed()),
         })
     }
@@ -14931,6 +15079,9 @@ pub struct ReducerOverlay {
     entities: BTreeMap<EntityKey, OverlayValue<Option<Vec<u8>>>>,
     indexes: BTreeMap<IndexKey, OverlayValue<bool>>,
     changes: Vec<DomainChange>,
+    /// Whether a reducer read output or rewrote an entity or index entry
+    /// unchanged, which output pruned between blocks would change.
+    window_dependent: bool,
 }
 
 impl ReducerOverlay {
@@ -14942,6 +15093,7 @@ impl ReducerOverlay {
             entities: BTreeMap::new(),
             indexes: BTreeMap::new(),
             changes: Vec::new(),
+            window_dependent: false,
         }
     }
 
@@ -15281,6 +15433,7 @@ impl ReducerTransaction for ReducerOverlay {
         collection: &str,
         key: &[u8],
     ) -> Result<Option<Vec<u8>>, ProcessorError> {
+        self.window_dependent = true;
         self.load_entity(collection, key).await?;
         Ok(self
             .entities
@@ -15298,13 +15451,15 @@ impl ReducerTransaction for ReducerOverlay {
         value: Vec<u8>,
     ) -> Result<(), ProcessorError> {
         self.load_entity(collection, &key).await?;
-        self.entities
+        let entity = self
+            .entities
             .get_mut(&EntityKey {
                 collection: collection.to_owned(),
                 key,
             })
-            .expect("loaded entity exists")
-            .after = Some(value);
+            .expect("loaded entity exists");
+        self.window_dependent |= entity.after.as_ref() == Some(&value);
+        entity.after = Some(value);
         Ok(())
     }
 
@@ -15327,14 +15482,16 @@ impl ReducerTransaction for ReducerOverlay {
         entity_key: Vec<u8>,
     ) -> Result<(), ProcessorError> {
         self.load_index(index, &index_key, &entity_key).await?;
-        self.indexes
+        let entry = self
+            .indexes
             .get_mut(&IndexKey {
                 index: index.to_owned(),
                 index_key,
                 entity_key,
             })
-            .expect("loaded index exists")
-            .after = true;
+            .expect("loaded index exists");
+        self.window_dependent |= entry.after;
+        entry.after = true;
         Ok(())
     }
 
@@ -15367,6 +15524,7 @@ impl ReducerTransaction for ReducerOverlay {
                 "scan limit must be in 1..=10000".to_owned(),
             ));
         }
+        self.window_dependent = true;
         let overlay = self
             .entities
             .iter()
@@ -20078,7 +20236,7 @@ pub enum StoreError {
     QuerySnapshotMismatch,
     #[error("block {block} was already applied with a different delta")]
     ConflictingApply { block: BlockNumber },
-    #[error("historical microbatch overlaps previously committed processor coverage")]
+    #[error("historical microbatch needs single-block commits")]
     HistoricalBatchRequiresFallback,
     #[error(
         "historical microbatch uses {observed_changes} changes/{observed_encoded_bytes} encoded bytes; limits are {maximum_changes} changes/{maximum_encoded_bytes} bytes"
@@ -20198,6 +20356,10 @@ mod tests {
         output_key_by_block: bool,
         /// Changes each block publishes; the extra ones only publish.
         changes_per_block: u8,
+        /// Counts from its output entity rather than private state.
+        reads_output: bool,
+        /// Writes the same output value every block.
+        constant_output: bool,
     }
 
     impl FixtureProcessor {
@@ -20233,6 +20395,8 @@ mod tests {
                 },
                 output_key_by_block: false,
                 changes_per_block: 1,
+                reads_output: false,
+                constant_output: false,
             }
         }
 
@@ -20277,8 +20441,17 @@ mod tests {
             delta: &EncodedDelta,
         ) -> Result<DomainChanges, ProcessorError> {
             delta.validate(&self.descriptor)?;
+            let key = if self.output_key_by_block {
+                cursor.block_number.0.to_be_bytes().to_vec()
+            } else {
+                b"counter".to_vec()
+            };
             let state_key = b"counter".to_vec();
-            let before = transaction.state_get("state", &state_key).await?;
+            let before = if self.reads_output {
+                transaction.get("state", &key).await?
+            } else {
+                transaction.state_get("state", &state_key).await?
+            };
             let mut count = before
                 .as_deref()
                 .map(|bytes| {
@@ -20294,14 +20467,12 @@ mod tests {
             transaction
                 .state_put("state", state_key, payload.clone())
                 .await?;
-            let key = if self.output_key_by_block {
-                cursor.block_number.0.to_be_bytes().to_vec()
+            let output = if self.constant_output {
+                vec![1]
             } else {
-                b"counter".to_vec()
+                payload.clone()
             };
-            transaction
-                .put("state", key.clone(), payload.clone())
-                .await?;
+            transaction.put("state", key.clone(), output).await?;
             transaction
                 .index_put(
                     "by_block",
@@ -22890,6 +23061,7 @@ mod tests {
             .commit_historical_materialization_microbatch(
                 &processor,
                 &items,
+                &[],
                 &job.id,
                 b"checkpoint",
                 0,
@@ -22952,6 +23124,216 @@ mod tests {
         );
     }
 
+    /// Commits `items` as one materialization microbatch of a fresh job.
+    async fn commit_materialization_batch(
+        store: &SqliteStore,
+        processor: &FixtureProcessor,
+        items: &[HistoricalBatchItem],
+    ) -> Result<HistoricalBatchOutcome, StoreError> {
+        let job = JobRecord {
+            id: "materialization-batch".to_owned(),
+            kind: "materialization_job".to_owned(),
+            state: JobState::Queued,
+            payload: b"materialization-batch-job".to_vec(),
+            checkpoint: None,
+            attempts: 0,
+            updated_at_unix_ms: 1,
+        };
+        store
+            .save_job(&job)
+            .await
+            .expect("save materialization job");
+        store
+            .commit_historical_materialization_microbatch(
+                processor,
+                items,
+                &[],
+                &job.id,
+                b"checkpoint",
+                0,
+                HistoricalArtifactTarget::Sqlite,
+                HistoricalCommitLimits {
+                    maximum_changes: 100,
+                    maximum_encoded_bytes: 1024 * 1024,
+                },
+            )
+            .await
+    }
+
+    #[tokio::test]
+    async fn a_delivery_materialization_microbatch_publishes_what_single_blocks_do() {
+        // Publication starts at attested: unattested block 1 holds its
+        // changes until a later block releases them. The counter reads its
+        // output entity, which only retained output carries to the next
+        // block.
+        let retained = FixtureProcessor::new().descriptor.lifecycle.output.mode;
+        for output in [retained, OutputPolicyMode::None] {
+            let mut processor = FixtureProcessor::new();
+            processor.changes_per_block = 3;
+            processor.reads_output = true;
+            processor.descriptor.lifecycle.output.mode = output;
+            let mut frames = Vec::new();
+            let mut parent = BlockHash::ZERO;
+            for number in 1_u64..=6 {
+                let mut current = frame(number, parent);
+                current.finality = if number == 1 {
+                    Finality::Unattested
+                } else {
+                    Finality::Finalized
+                };
+                parent = current.block.hash;
+                frames.push(current);
+            }
+            let held = processor.map(&frames[0]).await.expect("map");
+            let (_single_directory, single) = store().await;
+            let (_batched_directory, batched) = store().await;
+            for target in [&single, &batched] {
+                target
+                    .apply(&processor, cursor(&processor, &frames[0], 1), &held, &[])
+                    .await
+                    .expect("apply unattested block");
+            }
+            let mut items = Vec::new();
+            for (sequence, current) in (2_u64..).zip(&frames[1..]) {
+                let delta = processor.map(current).await.expect("map");
+                single
+                    .apply(
+                        &processor,
+                        cursor(&processor, current, sequence),
+                        &delta,
+                        &[],
+                    )
+                    .await
+                    .expect("apply one block");
+                items.push(HistoricalBatchItem {
+                    delta,
+                    finality: Finality::Finalized,
+                    publish_changes: true,
+                });
+            }
+            commit_materialization_batch(&batched, &processor, &items)
+                .await
+                .expect("commit materialization microbatch");
+            let mut published = Vec::new();
+            for target in [&single, &batched] {
+                let mut records = target
+                    .changes(&processor.descriptor, ChainId(1), 0, 100)
+                    .await
+                    .expect("published changes");
+                for record in &mut records {
+                    record.emitted_at_unix_ms = 0;
+                }
+                let live_bytes = target
+                    .delivery_stream_stats(&processor.descriptor)
+                    .await
+                    .expect("stream stats")
+                    .live_bytes;
+                published.push((records, live_bytes));
+            }
+            assert_eq!(
+                published[0].0.len(),
+                18,
+                "block 1's held changes and 15 more"
+            );
+            assert_eq!(published[0], published[1], "output {output:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_materialization_microbatch_splits_before_it_overflows_a_delivery_limit() {
+        // Pruning keeps a stream's newest block, so one above the resume
+        // mark resumes the processor only once a later block commits. Block
+        // 1's 271 bytes are above it; block 2's 16 still fit beside them
+        // under a stream or node limit of 300 bytes, blocks 2 and 3 do not.
+        for node_limit in [false, true] {
+            let directory = tempfile::tempdir().expect("tempdir");
+            let mut config = StoreConfig::new(directory.path().join("node.sqlite"));
+            let mut small = FixtureProcessor::block_output();
+            if node_limit {
+                config = config.with_delivery_budget(DeliveryStorageBudget {
+                    maximum_retained_bytes: 300,
+                    maximum_history_retained_bytes: 300,
+                });
+            } else {
+                small.descriptor.lifecycle.delivery.max_bytes = 300;
+            }
+            let store = SqliteStore::open(config).await.expect("open");
+            let mut big = FixtureProcessor::block_output();
+            big.descriptor = small.descriptor.clone();
+            big.changes_per_block = 16;
+            let mut items = Vec::new();
+            let mut parent = BlockHash::ZERO;
+            for number in 1_u64..=3 {
+                let mut current = frame(number, parent);
+                current.finality = Finality::Finalized;
+                parent = current.block.hash;
+                items.push(HistoricalBatchItem {
+                    delta: small.map(&current).await.expect("map"),
+                    finality: Finality::Finalized,
+                    publish_changes: true,
+                });
+            }
+            commit_materialization_batch(&store, &big, &items[..1])
+                .await
+                .expect("commit block 1");
+            let refused = commit_materialization_batch(&store, &small, &items[1..])
+                .await
+                .expect_err("blocks 2 and 3 overflow the limit");
+            assert!(
+                matches!(refused, StoreError::HistoricalBatchLimit { .. }),
+                "node limit {node_limit}: {refused}"
+            );
+            commit_materialization_batch(&store, &small, &items[1..2])
+                .await
+                .expect("block 2 commits on its own");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_materialization_microbatch_leaves_window_dependent_reducers_to_single_blocks() {
+        // A window prunes after each block, which a batch's later reducers
+        // would not see: a read, or a rewrite of an unchanged row, could
+        // differ from single-block applies. Distinct writes cannot.
+        for (reducer, reads_output, constant_output, batches) in [
+            ("reads", true, false, false),
+            ("rewrites", false, true, false),
+            ("writes", false, false, true),
+        ] {
+            let (_directory, store) = store().await;
+            let mut processor = FixtureProcessor::new();
+            processor.reads_output = reads_output;
+            processor.constant_output = constant_output;
+            processor.descriptor.lifecycle.output.mode = OutputPolicyMode::Window;
+            processor.descriptor.lifecycle.output.window = Some(OutputWindow {
+                max_blocks: None,
+                max_age_seconds: None,
+                max_rows: None,
+                max_bytes: Some(1),
+            });
+            let mut items = Vec::new();
+            let mut parent = BlockHash::ZERO;
+            for number in 1_u64..=2 {
+                let mut current = frame(number, parent);
+                current.finality = Finality::Finalized;
+                parent = current.block.hash;
+                items.push(HistoricalBatchItem {
+                    delta: processor.map(&current).await.expect("map"),
+                    finality: Finality::Finalized,
+                    publish_changes: true,
+                });
+            }
+            let committed = commit_materialization_batch(&store, &processor, &items).await;
+            if batches {
+                committed.unwrap_or_else(|error| panic!("{reducer}: {error}"));
+            } else {
+                assert!(
+                    matches!(committed, Err(StoreError::HistoricalBatchRequiresFallback)),
+                    "{reducer}: {committed:?}"
+                );
+            }
+        }
+    }
+
     #[tokio::test]
     async fn artifact_only_historical_microbatch_keeps_only_compact_results() {
         let (_directory, store) = store().await;
@@ -22987,6 +23369,7 @@ mod tests {
             .commit_historical_materialization_microbatch(
                 &processor,
                 &items,
+                &[],
                 &job.id,
                 b"checkpoint",
                 0,
@@ -23065,6 +23448,7 @@ mod tests {
             .commit_historical_materialization_microbatch(
                 &processor,
                 &items,
+                &[],
                 &job.id,
                 b"checkpoint",
                 0,
@@ -26897,6 +27281,7 @@ mod tests {
             .commit_historical_materialization_microbatch(
                 &materialized,
                 &finalized_items(&materialized, 2).await,
+                &[],
                 &job.id,
                 b"checkpoint",
                 0,
@@ -27475,6 +27860,7 @@ mod tests {
             .commit_historical_materialization_microbatch(
                 &materialized,
                 &items,
+                &[],
                 &job.id,
                 b"first",
                 0,
@@ -27492,6 +27878,7 @@ mod tests {
                 .commit_historical_materialization_microbatch(
                     &materialized,
                     &items[..2],
+                    &[],
                     &job.id,
                     b"again",
                     1,
@@ -28025,6 +28412,7 @@ mod tests {
             .commit_historical_materialization_microbatch(
                 &materialized,
                 &finalized_items(&materialized, 2).await,
+                &[],
                 &job.id,
                 b"late",
                 1,
