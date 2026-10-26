@@ -81,6 +81,10 @@ record, and documented RPC contracts.
 - Schema 27 adds the indexes these use. A store upgrades in place on its first
   start, which builds them once: about a second per index and million changes
   on SSD.
+- A processor that committed the finalized anchor block while finality was
+  checking it no longer fails its live lane with `processor_finality_conflict`.
+  The lane could not be reset and needed a rebuild, although it covered the
+  anchor itself.
 
 ### Security
 
