@@ -13,3 +13,9 @@ rpc_endpoints = ["https://nova.arbitrum.io/rpc"]
 [l1_anchor]
 kind = "nitro_rollup"
 rollup = "0xE7E8cCC7c381809BDC4b213CE44016300707B7Bd"
+
+# The signer is a batch poster of SequencerInbox
+# 0x211e1c4c7f1bf5351ac850ed10fd68cffcf6c21b.
+[sequencer_feed]
+url = "wss://nova.arbitrum.io/feed"
+signer = "0x0C5911d57B24FCF1DC8B2608eFbAe57C7098E32D"

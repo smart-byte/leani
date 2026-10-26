@@ -413,6 +413,7 @@
             "consensus_p2p",
             "json_rpc",
             "op_gossip",
+            "sequencer_feed",
             "disabled"
           ]
         },

@@ -141,7 +141,7 @@ which its `/playground` uses.
 | `artifact_storage` | table | Physical backend and bounded compaction policy for retained processor artifacts. |
 | `budgets` | table | Hard memory, temporary disk, pending-delta, recent-input, and concurrency limits. |
 | `sources` | table | Priority-ordered history sources and the optional live source. |
-| `finality` | table | `consensus_p2p`, `beacon_api`, `json_rpc`, `op_gossip`, or `disabled`. |
+| `finality` | table | `consensus_p2p`, `beacon_api`, `json_rpc`, `op_gossip`, `sequencer_feed`, or `disabled`. |
 | `processors` | array | One immutable processor kind/instance contract per entry. |
 | `rpc` | table | HTTP/WS binds, browser origins, request and response limits, and bounded historical lookup behavior. |
 | `api` | table | Native API bind, bearer-token environment variable, allowed hosts and browser origins, and delivery batching. |
@@ -489,6 +489,19 @@ chain, so caught-up blocks are `attested` like the ones that follow. A restart
 resumes from the store's tip. A processor's status shows the catch-up's
 progress in `processedThrough`. Blocks are not `finalized` until the L1
 anchor finalizes them.
+
+Nitro chains (Arbitrum One and Nova, Robinhood Chain) run no public execution
+P2P, so `sources.live.kind = "json_rpc"` serves their blocks. With
+`finality.kind = "sequencer_feed"`, the node follows the sequencer feed the
+chain entry names, whose every message carries a block's hash signed by the
+chain's batch poster. The endpoints then only carry blocks: one whose hash
+differs from the signed one is refused, and one that matches makes it and
+every block it links to `attested`, so a single endpoint is enough
+(`sources.json_rpc.quorum = 1`). The lanes start at a signed block the
+endpoints serve. A feed connection silent for 30 seconds is reopened. Feed
+relays replay only the last few minutes, so after a longer outage blocks
+become `attested` once the lane reaches the feed's blocks again. Without `[l1_anchor]` nothing is `finalized`, and recent frames
+settle `finality.settle_blocks` (default 3,600) below the tip.
 
 ### L1 anchor
 

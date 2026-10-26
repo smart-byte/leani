@@ -5575,6 +5575,7 @@ async fn probe_finality(
         }
         crate::config::FinalitySourceKind::JsonRpc
         | crate::config::FinalitySourceKind::OpGossip
+        | crate::config::FinalitySourceKind::SequencerFeed
         | crate::config::FinalitySourceKind::Disabled => {
             bail!("the finality probe checks beacon_api and consensus_p2p finality");
         }
@@ -6755,6 +6756,7 @@ async fn serve(path: &Path, registry: &ProcessorRegistry) -> Result<Exit> {
                     )
                 },
             );
+            let signed = follow_sequencer_feed(&lane_config, &lane_cancellation)?;
             // A lane that fails restarts from the store after a pause: the
             // endpoints' rate limits and outages are transient.
             while !lane_cancellation.is_cancelled() {
@@ -6766,6 +6768,7 @@ async fn serve(path: &Path, registry: &ProcessorRegistry) -> Result<Exit> {
                     &rpc_readiness,
                     committed_events.clone(),
                     anchored.clone(),
+                    signed.clone(),
                     &lane_cancellation,
                 )
                 .await;
@@ -7451,6 +7454,7 @@ async fn p2p_history_anchor(
         }
         crate::config::FinalitySourceKind::JsonRpc
         | crate::config::FinalitySourceKind::OpGossip
+        | crate::config::FinalitySourceKind::SequencerFeed
         | crate::config::FinalitySourceKind::Disabled => {
             bail!("execution P2P history requires a verified finality source");
         }
@@ -7474,8 +7478,76 @@ async fn p2p_history_anchor(
     })
 }
 
-/// Follow a chain over JSON-RPC: live blocks and promotions from the endpoint
-/// quorum, finality from its `finalized` tag.
+/// Follow the chain entry's sequencer feed for `sequencer_feed` finality,
+/// keeping the hashes it signed across lane restarts.
+fn follow_sequencer_feed(
+    config: &Config,
+    cancellation: &CancellationToken,
+) -> Result<Option<leani_source_rpc::feed::SignedHashes>> {
+    if !matches!(
+        config.finality.kind,
+        crate::config::FinalitySourceKind::SequencerFeed
+    ) {
+        return Ok(None);
+    }
+    let chain = config.chain_entry()?;
+    let feed = chain
+        .sequencer_feed
+        .as_ref()
+        .context("the chain entry names no sequencer feed")?;
+    let hashes = leani_source_rpc::feed::SignedHashes::default();
+    tokio::spawn(leani_source_rpc::feed::follow(
+        leani_source_rpc::feed::FeedConfig {
+            url: feed.url.clone(),
+            chain_id: config.chain.chain_id,
+            signer: feed.signer,
+            first_block: feed.first_block,
+        },
+        hashes.clone(),
+        cancellation.child_token(),
+    ));
+    Ok(Some(hashes))
+}
+
+/// A block the sequencer feed signed and the endpoints serve with that hash:
+/// where feed-checked lanes start. `None` once cancelled.
+async fn signed_anchor(
+    quorum: &leani_source_rpc::RpcQuorum,
+    signed: &leani_source_rpc::feed::SignedHashes,
+    cancellation: &CancellationToken,
+) -> Result<Option<leani_primitives::BlockRef>> {
+    let deadline = tokio::time::Instant::now() + FIRST_SIGNED_HEAD_TIMEOUT;
+    let mut first = None;
+    loop {
+        first = first.or_else(|| signed.newest());
+        let expired = tokio::time::Instant::now() >= deadline;
+        if let Some((number, hash)) = first {
+            // The endpoints follow the feed a moment later.
+            match quorum.agreed_ref(&format!("{number:#x}")).await {
+                Ok(block) if block.hash.0 == hash.0 => return Ok(Some(block)),
+                Ok(_) => bail!("the endpoints' block {number} is not the one the sequencer signed"),
+                Err(error) if expired => {
+                    return Err(anyhow::Error::from(error)
+                        .context(format!("read signed block {number} from the endpoints")));
+                }
+                Err(_) => {}
+            }
+        } else if expired {
+            bail!(
+                "no signed block came from the sequencer feed within {FIRST_SIGNED_HEAD_TIMEOUT:?}"
+            );
+        }
+        tokio::select! {
+            () = cancellation.cancelled() => return Ok(None),
+            () = tokio::time::sleep(Duration::from_secs(1)) => {}
+        }
+    }
+}
+
+/// Follow a chain over JSON-RPC: live blocks from the endpoint quorum, checked
+/// against the sequencer feed when it signs them. Promotions come from the
+/// feed or the endpoints' `safe` tag, finality from the L1 anchor or their
+/// `finalized` tag.
 #[allow(clippy::too_many_lines)]
 #[allow(clippy::too_many_arguments)]
 async fn run_rpc_lanes(
@@ -7486,6 +7558,7 @@ async fn run_rpc_lanes(
     rpc_readiness: &leani_rpc::RpcReadiness,
     committed_events: tokio::sync::broadcast::Sender<leani_source_api::ChainEvent>,
     anchored: Option<tokio::sync::watch::Receiver<leani_l1_anchor::FinalizedBlock>>,
+    signed: Option<leani_source_rpc::feed::SignedHashes>,
     cancellation: &CancellationToken,
 ) -> Result<()> {
     use leani_runtime::{
@@ -7497,35 +7570,55 @@ async fn run_rpc_lanes(
     let quorum = config.json_rpc_quorum().map_err(anyhow::Error::msg)?;
     let rpc = &config.sources.json_rpc;
     // With the L1 anchor, confirmed assertions finalize blocks, not the
-    // endpoints' `finalized` tag.
-    let settle_blocks = anchored
-        .is_some()
+    // endpoints' `finalized` tag; with the sequencer feed, nothing else does.
+    let settle_blocks = (anchored.is_some() || signed.is_some())
         .then(|| config.finality.settle_blocks.unwrap_or(3_600));
-    let finality: Arc<dyn leani_source_api::FinalitySource> = match anchored {
-        Some(finalized) => Arc::new(leani_l1_anchor::AnchoredFinality::new(chain_id, finalized)?),
-        None => Arc::new(leani_source_rpc::RpcFinalitySource::new(
+    let (_unanchored, never_finalized) = tokio::sync::watch::channel(None);
+    let finality: Arc<dyn leani_source_api::FinalitySource> = match (anchored, &signed) {
+        (Some(finalized), _) => {
+            Arc::new(leani_l1_anchor::AnchoredFinality::new(chain_id, finalized)?)
+        }
+        (None, Some(_)) => Arc::new(leani_l1_anchor::AnchoredFinality::new(
+            chain_id,
+            never_finalized,
+        )?),
+        (None, None) => Arc::new(leani_source_rpc::RpcFinalitySource::new(
             "json-rpc-finality",
             chain_id,
             quorum.clone(),
             Duration::from_millis(rpc.finality_poll_interval_ms),
         )?),
     };
-    let live = Arc::new(leani_source_rpc::RpcLiveSource::new(
+    let mut live = leani_source_rpc::RpcLiveSource::new(
         "json-rpc-live",
         chain_id,
         quorum.clone(),
         Duration::from_millis(rpc.poll_interval_ms),
-    )?);
-    let anchor = quorum
-        .agreed_ref("finalized")
-        .await
-        .context("read the endpoints' finalized block")?;
-    info!(
-        finalized = anchor.number.0,
-        endpoints = quorum.endpoints().len(),
-        quorum = quorum.quorum(),
-        "json-rpc finalized anchor agreed"
-    );
+    )?;
+    let anchor = if let Some(signed) = &signed {
+        live = live.with_signed_hashes(signed.clone());
+        let Some(anchor) = signed_anchor(&quorum, signed, cancellation).await? else {
+            return Ok(());
+        };
+        info!(
+            block = anchor.number.0,
+            "the endpoints serve the block the sequencer feed signed"
+        );
+        anchor
+    } else {
+        let anchor = quorum
+            .agreed_ref("finalized")
+            .await
+            .context("read the endpoints' finalized block")?;
+        info!(
+            finalized = anchor.number.0,
+            endpoints = quorum.endpoints().len(),
+            quorum = quorum.quorum(),
+            "json-rpc finalized anchor agreed"
+        );
+        anchor
+    };
+    let live = Arc::new(live);
     let checkpoint = leani_source_api::ConsensusCheckpoint {
         beacon_slot: anchor.number.0,
         beacon_block_root: [0; 32],
@@ -8439,6 +8532,7 @@ async fn run_network_lanes(
         }
         crate::config::FinalitySourceKind::JsonRpc
         | crate::config::FinalitySourceKind::OpGossip
+        | crate::config::FinalitySourceKind::SequencerFeed
         | crate::config::FinalitySourceKind::Disabled => {
             bail!("network supervisor requires a verified finality source");
         }

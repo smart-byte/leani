@@ -68,9 +68,11 @@ impl FetchMode {
 }
 
 mod decode;
+pub mod feed;
 mod finality;
 mod history;
 mod live;
+mod websocket;
 
 pub use decode::{BlockCheck, Check, DecodedBlock, decode_block, frame};
 pub use finality::RpcFinalitySource;

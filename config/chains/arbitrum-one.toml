@@ -20,3 +20,10 @@ first_block = 22207817
 [l1_anchor]
 kind = "nitro_rollup"
 rollup = "0x4DCeB440657f21083db8aDd07665f8ddBe1DCfc0"
+
+# The signer is a batch poster of SequencerInbox
+# 0x1c479675ad559dc151f6ec7ed3fbf8cee79582b6.
+[sequencer_feed]
+url = "wss://arb1.arbitrum.io/feed"
+signer = "0xC1b634853Cb333D3aD8663715b08f41A3Aec47cc"
+first_block = 22207817

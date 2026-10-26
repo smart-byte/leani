@@ -815,6 +815,9 @@ pub enum FinalitySourceKind {
     JsonRpc,
     /// An op-stack chain's sequencer-signed block gossip.
     OpGossip,
+    /// A Nitro chain's sequencer feed, which signs every block's hash; the
+    /// JSON-RPC endpoints only serve the blocks.
+    SequencerFeed,
     Disabled,
 }
 
@@ -2022,11 +2025,14 @@ impl Config {
         }
         validate_finality(&self.finality, &mut errors);
         let rpc_live = matches!(self.sources.live.kind, LiveSourceKind::JsonRpc);
-        let rpc_finality = matches!(self.finality.kind, FinalitySourceKind::JsonRpc);
+        let rpc_finality = matches!(
+            self.finality.kind,
+            FinalitySourceKind::JsonRpc | FinalitySourceKind::SequencerFeed
+        );
         if rpc_live != rpc_finality {
             errors.push(ValidationError::new(
                 "sources.live/finality",
-                "json_rpc live and json_rpc finality run together: both follow the same endpoint quorum",
+                "json_rpc live runs with json_rpc or sequencer_feed finality, and they only with it",
             ));
         }
         let rpc_history = self
@@ -2062,6 +2068,16 @@ impl Config {
             errors.push(ValidationError::new(
                 "finality.kind",
                 "op_gossip follows an op-stack chain's sequencer gossip; this chain is not one",
+            ));
+        }
+        if matches!(self.finality.kind, FinalitySourceKind::SequencerFeed)
+            && !self
+                .chain_entry()
+                .is_ok_and(|chain| chain.sequencer_feed.is_some())
+        {
+            errors.push(ValidationError::new(
+                "finality.kind",
+                "sequencer_feed follows the feed a Nitro chain's entry names; this chain names none",
             ));
         }
         if op_stack
@@ -2772,10 +2788,13 @@ fn validate_finality(finality: &FinalityConfig, errors: &mut Vec<ValidationError
         validate_enr_bootnodes(&finality.bootnodes, errors);
         return;
     }
-    // JSON-RPC finality starts from the endpoints' finalized block.
+    // JSON-RPC finality starts from the endpoints' finalized block, and the
+    // feed from its first signed block.
     if matches!(
         finality.kind,
-        FinalitySourceKind::Disabled | FinalitySourceKind::JsonRpc
+        FinalitySourceKind::Disabled
+            | FinalitySourceKind::JsonRpc
+            | FinalitySourceKind::SequencerFeed
     ) {
         return;
     }
@@ -2854,6 +2873,7 @@ fn validate_finality(finality: &FinalityConfig, errors: &mut Vec<ValidationError
         }
         FinalitySourceKind::JsonRpc
         | FinalitySourceKind::OpGossip
+        | FinalitySourceKind::SequencerFeed
         | FinalitySourceKind::Disabled => {}
     }
 }
@@ -2862,12 +2882,14 @@ fn validate_settle_blocks(finality: &FinalityConfig, errors: &mut Vec<Validation
     if finality.settle_blocks.is_some()
         && !matches!(
             finality.kind,
-            FinalitySourceKind::OpGossip | FinalitySourceKind::JsonRpc
+            FinalitySourceKind::OpGossip
+                | FinalitySourceKind::JsonRpc
+                | FinalitySourceKind::SequencerFeed
         )
     {
         errors.push(ValidationError::new(
             "finality.settle_blocks",
-            "only applies to op_gossip and L1-anchored json_rpc finality; other kinds prune at finality",
+            "only applies to op_gossip, sequencer_feed, and L1-anchored json_rpc finality; other kinds prune at finality",
         ));
     }
     if finality.settle_blocks == Some(0) {
@@ -2890,11 +2912,13 @@ fn validate_l1_anchor(config: &Config, anchor: &L1AnchorConfig, errors: &mut Vec
     }
     if !matches!(
         config.finality.kind,
-        FinalitySourceKind::OpGossip | FinalitySourceKind::JsonRpc
+        FinalitySourceKind::OpGossip
+            | FinalitySourceKind::JsonRpc
+            | FinalitySourceKind::SequencerFeed
     ) {
         errors.push(ValidationError::new(
             "l1_anchor",
-            "anchors the finality of op_gossip and json_rpc lanes",
+            "anchors the finality of op_gossip, sequencer_feed, and json_rpc lanes",
         ));
     }
     if !matches!(
@@ -4377,6 +4401,23 @@ endpoints = ["https://ethereum-hoodi-beacon-api.publicnode.com/"]
                 .validation_errors()
                 .iter()
                 .any(|error| error.field == "sources.json_rpc")
+        );
+        // The feed checks the blocks, so one endpoint serves them.
+        config.sources.json_rpc.quorum = Some(1);
+        config.finality.kind = FinalitySourceKind::SequencerFeed;
+        assert!(
+            config.validation_errors().is_empty(),
+            "{:?}",
+            config.validation_errors()
+        );
+        config.chain.name = "ethereum-hoodi".to_owned();
+        config.chain.chain_id = 560_048;
+        assert!(
+            config
+                .validation_errors()
+                .iter()
+                .any(|error| error.field == "finality.kind"),
+            "a chain without a feed was accepted"
         );
     }
 

@@ -8,6 +8,13 @@ record, and documented RPC contracts.
 
 ### Added
 
+- `finality.kind = "sequencer_feed"` follows a Nitro chain's sequencer feed
+  (Arbitrum One, Arbitrum Nova, Robinhood Chain; chain entries name the feed
+  and its signer). Each message's block hash, signed by the chain's batch
+  poster, checks the blocks the JSON-RPC lanes fetch: a block that differs is
+  refused and one that matches attests the chain below it, so the endpoints
+  are trusted only to serve. Finality comes from the L1 anchor. A feed
+  connection silent for 30 seconds is reopened.
 - Op-stack history over P2P: a fresh store catches up from the lowest
   `start_block` of the processors with automatic history, bounded by
   `sources.live.history_fallback_blocks`, along the chain of the first signed

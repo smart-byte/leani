@@ -306,6 +306,7 @@ async fn l1_finality(
         }
         FinalitySourceKind::JsonRpc
         | FinalitySourceKind::OpGossip
+        | FinalitySourceKind::SequencerFeed
         | FinalitySourceKind::Disabled => {
             bail!("the L1 anchor needs beacon_api or consensus_p2p finality")
         }
