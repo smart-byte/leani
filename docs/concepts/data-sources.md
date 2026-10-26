@@ -119,8 +119,9 @@ projection from the requested groups:
 
 1. blob fields or block sizes (`BlobFields` or `BlockSize`) use the type-3
    blobs projection. The request must select type-3 transactions only, and
-   may add only `Header`, `Senders` and `ReceiptOutcome`. `Body` and
-   `Calldata` are refused there;
+   may add only `Header`, `Body`, `Senders` and `ReceiptOutcome`. It reads
+   `Body`'s nonce and value from `canonical_execution_transaction`.
+   `Calldata` is refused there;
 2. logs use the log projection, with address and all four topic positions.
    The logs table names a log's transaction only by hash, so a log request
    that also selects transactions by type, sender, or recipient fails during

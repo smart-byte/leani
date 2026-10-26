@@ -7,7 +7,7 @@
     "timestamp": 1710500000
   },
   "chainId": 1,
-  "cursor": "02000000000000000000000000000000000110626c6f62732d70726f64756374696f6e05312e352e3001def08a089468418945535e654ff99da7",
+  "cursor": "02000000000000000000000000000000000110626c6f62732d70726f64756374696f6e05312e362e3001c7a55fa8e1d16f0efcc5b5c953b0c473",
   "data": {
     "block": {
       "blobBaseFee": "1",
@@ -30,7 +30,7 @@
       "targetBlobsPerBlock": 3,
       "timestamp": 1710500000,
       "transactionCount": 1,
-      "transformVersion": 3
+      "transformVersion": 4
     },
     "transactions": [
       {
@@ -46,6 +46,7 @@
         "executionBurnedWei": "210000000000000",
         "network": "mainnet",
         "senderAddress": "0x1111111111111111111111111111111111111111",
+        "toAddress": "0x2222222222222222222222222222222222222222",
         "totalBurnedWei": "210000000393216",
         "transactionIndex": 0,
         "txHash": "0x3bbf7db04ef26a674e8e95b3186b58905153f80b22fbd9ed92eaeda6012e7369"

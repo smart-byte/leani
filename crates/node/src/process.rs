@@ -10733,7 +10733,7 @@ markets = ["ETH/USDT"]
         };
         let configured = backfill_processor_config(&config, &processor)
             .expect("backfill accepts the container profile's processor");
-        assert_eq!(configured.instance, "blobs-container-1-5");
+        assert_eq!(configured.instance, "blobs-container-1-6");
         assert!(configured.start_block <= from && from <= to);
 
         // History mode is node policy, not processor identity: the store

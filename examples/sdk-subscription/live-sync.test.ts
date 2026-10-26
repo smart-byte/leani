@@ -38,7 +38,7 @@ test("the holes are the uncovered blocks through the last processed one", () => 
 test("a request that keeps failing holds no live batch back", async () => {
   const hello = {
     type: "hello", apiVersion: "1", chainId: 1,
-    processor: { id: "blobs-money", instance: "blobs-production", version: "1.5.0", codeHash: "0x01", configHash: "0x02", genericApi: "processor-v1", changeSchema: "blobs-money.change.v1", queryExtensions: [], subscriptions: true, artifactRetention: "none", deliveryOrdering: "block_versioned_idempotent" },
+    processor: { id: "blobs-money", instance: "blobs-production", version: "1.6.0", codeHash: "0x01", configHash: "0x02", genericApi: "processor-v1", changeSchema: "blobs-money.change.v1", queryExtensions: [], subscriptions: true, artifactRetention: "none", deliveryOrdering: "block_versioned_idempotent" },
     streamId: "blobs-production:live", streamKind: "live", acknowledgedCursor: "cursor-0", storeEpoch: "00",
     heartbeatIntervalMs: "15000", sessionToken: "live-session", sessionExpiresAtUnixMs: "1000", leaseTtlMs: "300000",
     coverage: coverage([[100, 200]], 200),
@@ -110,7 +110,7 @@ test("a request that keeps failing holds no live batch back", async () => {
 test("a connection that fails in transit reconnects and checks coverage again", async () => {
   const hello = {
     type: "hello", apiVersion: "1", chainId: 1,
-    processor: { id: "blobs-money", instance: "blobs-production", version: "1.5.0", codeHash: "0x01", configHash: "0x02", genericApi: "processor-v1", changeSchema: "blobs-money.change.v1", queryExtensions: [], subscriptions: true, artifactRetention: "none", deliveryOrdering: "block_versioned_idempotent" },
+    processor: { id: "blobs-money", instance: "blobs-production", version: "1.6.0", codeHash: "0x01", configHash: "0x02", genericApi: "processor-v1", changeSchema: "blobs-money.change.v1", queryExtensions: [], subscriptions: true, artifactRetention: "none", deliveryOrdering: "block_versioned_idempotent" },
     streamId: "blobs-production:live", streamKind: "live", acknowledgedCursor: "cursor-0", storeEpoch: "00",
     heartbeatIntervalMs: "15000", sessionToken: "live-session", sessionExpiresAtUnixMs: "1000", leaseTtlMs: "300000",
     coverage: coverage([[100, 150], [160, 200]], 200),

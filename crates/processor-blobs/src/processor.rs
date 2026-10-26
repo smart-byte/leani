@@ -25,7 +25,9 @@ use crate::{
 pub const BLOCK_COLLECTION: &str = "blobs.blocks";
 pub const TRANSACTION_COLLECTION: &str = "blobs.transactions";
 pub const TRANSACTION_BLOCK_INDEX: &str = "blobs.transactions.by_block";
-pub const TRANSFORM_VERSION: u16 = 3;
+/// Stamped on every block: blobs.money refetches blocks stored under an older
+/// one. Version 4 adds each transaction's `to`.
+pub const TRANSFORM_VERSION: u16 = 4;
 
 #[derive(Clone, Debug)]
 pub struct BlobsProcessor {
@@ -75,10 +77,10 @@ impl BlobsProcessor {
         // compatible with databases created before starts were reflected in
         // the descriptor.
         let config_hash = BlockHash::new(*blake3::hash(&encoded_schedule).as_bytes());
-        let code_hash = BlockHash::new(*blake3::hash(b"leani/blobs-processor/1.5.0").as_bytes());
+        let code_hash = BlockHash::new(*blake3::hash(b"leani/blobs-processor/1.6.0").as_bytes());
         let id = ProcessorId::new("blobs-money")
             .map_err(|error| ProcessorError::Input(error.to_string()))?;
-        let version = Version::new(1, 5, 0);
+        let version = Version::new(1, 6, 0);
         let descriptor = ProcessorDescriptor {
             instance: ProcessorInstanceId::legacy(&id, &version, config_hash)
                 .map_err(|error| ProcessorError::Input(error.to_string()))?,
@@ -89,6 +91,7 @@ impl BlobsProcessor {
             start: StartPoint::Block(start),
             requirements: vec![DataRequirement {
                 capabilities: CapabilitySet::of(Capability::Header)
+                    .with(Capability::Body)
                     .with(Capability::Senders)
                     .with(Capability::BlobFields)
                     .with(Capability::BlockSize)
@@ -106,8 +109,8 @@ impl BlobsProcessor {
             publication: PublicationPolicy::Attested,
             lifecycle: LifecyclePolicies::from_legacy(RetentionPolicy::FullOutputHistory),
             schemas: ProcessorSchemas {
-                delta_version: 2,
-                entity_schema: "blobs.entity.v3".to_owned(),
+                delta_version: 3,
+                entity_schema: "blobs.entity.v4".to_owned(),
                 change_schema: "blobs.block-bundle.v1".to_owned(),
             },
         };
@@ -441,6 +444,7 @@ fn map_transaction(
         ));
     }
     let sender = required(transaction.from, "transaction.from")?;
+    let to = required(transaction.to, "transaction.to")?;
     let blob_count = u32::try_from(transaction.blob_versioned_hashes.len()).map_err(|_| {
         ProcessorError::Invariant("transaction blob count overflows u32".to_owned())
     })?;
@@ -470,6 +474,7 @@ fn map_transaction(
         transaction_hash: transaction.hash,
         transaction_index: transaction.index,
         sender,
+        to,
         blob_versioned_hashes: transaction.blob_versioned_hashes.clone(),
         blob_count,
         total_burn: total_burn.into(),
@@ -556,10 +561,10 @@ pub(crate) mod tests {
                     index: 0,
                     encoded: None,
                     from: Some(Address::new([4; 20])),
-                    to: None,
-                    nonce: None,
+                    to: Some(Address::new([6; 20])),
+                    nonce: Some(0),
                     gas_limit: Some(21_000),
-                    value: None,
+                    value: Some(quantity(0)),
                     input: None,
                     max_fee_per_gas: None,
                     max_priority_fee_per_gas: None,
@@ -841,6 +846,7 @@ pub(crate) mod tests {
             quantity_to_u256(decoded.transactions[0].total_burn),
             U256::from(BLOB_GAS_PER_BLOB + 200)
         );
+        assert_eq!(decoded.transactions[0].to, Address::new([6; 20]));
 
         let cursor = ProcessorCursor {
             processor_id: processor.descriptor().id.to_string(),
@@ -889,6 +895,7 @@ pub(crate) mod tests {
             processor.descriptor().requirements[0].capabilities,
             CapabilitySet::from_iter([
                 Capability::Header,
+                Capability::Body,
                 Capability::Senders,
                 Capability::BlobFields,
                 Capability::BlockSize,

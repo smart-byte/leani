@@ -98,7 +98,7 @@ verification_segment_blocks = 8192
 [[processors]]
 id = "blobs-money"
 instance = "benchmark-blobs-externalized"
-version = "1.5.0"
+version = "1.6.0"
 history_control = "node_owned"
 history_mode = "on_demand"
 start_block = 19426589

@@ -1785,6 +1785,8 @@ export interface components {
             txHash: components["schemas"]["Hash32"];
             transactionIndex: components["schemas"]["SafeInteger"];
             senderAddress: components["schemas"]["Address"];
+            /** @description The transaction's to address. Every blob transaction has one: a rollup's inbox, or a contract that routes the call, such as Multicall3. */
+            toAddress: components["schemas"]["Address"];
             blobVersionedHashes: components["schemas"]["Hash32"][];
             blobCount: components["schemas"]["SafeInteger"];
             totalBurnedWei: components["schemas"]["DecimalQuantity"];

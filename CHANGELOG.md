@@ -22,9 +22,29 @@ record, and documented RPC contracts.
   as `values.data`, for contracts such as Ekubo Core that log a packed,
   non-ABI layout. It requires `addresses`, and the processor then reads every
   log of those contracts.
+- `blobs-money` 1.6.0 reports each blob transaction's `toAddress`, besides its
+  `senderAddress`, in its changes, its `blobs.transactions` entities and the
+  blobs query routes. A rollup's inbox stays put while its batchers rotate,
+  so consumers can attribute blobs without keeping sender lists current.
+  EIP-4844 forbids contract creation, so every blob transaction has one; a
+  type-3 transaction without it fails the block as invalid input. Blocks
+  carry `transformVersion` 4, so consumers that refetch blocks of an older
+  transform pick up the new field.
 
 ### Changed
 
+- Breaking: `blobs-money` 1.6.0 also declares the `Body` field group and
+  stores a new entity and delta encoding (`blobs.entity.v4`, delta version 3;
+  the change schema stays `blobs.block-bundle.v1` and only gains the field).
+  Rebuild existing instances as for 1.5.0: set `version = "1.6.0"` and
+  configure a new `instance`, which indexes from its `start_block`; the node
+  refuses 1.6.0 under a 1.5.0 instance ID. `deploy/container.toml` runs it as
+  the new instance `blobs-container-1-6`, so clients that name the instance
+  use the new name, and the 1.5.0 rows of `blobs-container-1-5` stay inert in
+  an earlier volume.
+- Xatu's type-3 blobs projection supplies `Body`: it reads `nonce` and `value`
+  from `canonical_execution_transaction` besides the columns it read before,
+  so `blobs-money` 1.6.0 still backfills from Xatu.
 - `evm-events` decodes with Alloy's `alloy-dyn-abi` and still accepts only
   the canonical encoding: a log with gaps or shared tails between offsets,
   dirty padding, or trailing bytes is skipped and counted. The layout is

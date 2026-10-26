@@ -403,7 +403,8 @@ impl From<PartitionIdentityV2> for PartitionIdentity {
         };
         // The groups each version 2 projection filled.
         let groups = match identity.mode {
-            ProjectionMode::Blobs => BLOBS_GROUPS,
+            // Body joined the blobs projection after version 3.
+            ProjectionMode::Blobs => BLOBS_GROUPS.without(Capability::Body),
             ProjectionMode::Headers => CapabilitySet::of(Capability::Header),
             ProjectionMode::Transactions => header
                 .with(Capability::Body)
@@ -424,6 +425,7 @@ impl From<PartitionIdentityV2> for PartitionIdentity {
 
 /// What the type-3 blobs projection fills.
 const BLOBS_GROUPS: CapabilitySet = CapabilitySet::of(Capability::Header)
+    .with(Capability::Body)
     .with(Capability::Senders)
     .with(Capability::BlobFields)
     .with(Capability::BlockSize)
@@ -447,7 +449,7 @@ fn projection_mode(request: &DataRequest) -> Result<ProjectionMode, SourceError>
             || !request.filters.recipients.is_empty()
         {
             return Err(SourceError::InvalidPlan(
-                "Xatu blob fields and block sizes come only from the type-3 blobs projection, without transaction bodies, calldata, or logs"
+                "Xatu blob fields and block sizes come only from the type-3 blobs projection, without calldata or logs"
                     .to_owned(),
             ));
         }
@@ -629,6 +631,8 @@ fn physical_plan(mode: ProjectionMode, request: &DataRequest) -> Vec<PhysicalPla
                     "block_number",
                     "transaction_index",
                     "transaction_hash",
+                    "nonce",
+                    "value",
                     "gas_used",
                     "gas_price",
                     "transaction_type",
@@ -829,6 +833,7 @@ mod tests {
             range,
             required: groups(&[
                 Capability::Header,
+                Capability::Body,
                 Capability::Senders,
                 Capability::BlobFields,
                 Capability::BlockSize,
@@ -1108,7 +1113,7 @@ mod tests {
         );
 
         // blobs-money keeps the type-3 blobs projection
-        let blobs = [Header, Senders, BlobFields, BlockSize, ReceiptOutcome];
+        let blobs = [Header, Body, Senders, BlobFields, BlockSize, ReceiptOutcome];
         let blobs_plan = plan(&blobs, request(range).filters).await.expect("blobs");
         assert_eq!(mode(&blobs_plan), ProjectionMode::Blobs);
         assert_eq!(blobs_plan.supplied, groups(&blobs));
@@ -1119,11 +1124,11 @@ mod tests {
         assert_eq!(mode(&headers_plan), ProjectionMode::Headers);
         assert_eq!(headers_plan.supplied, groups(&[Header]));
 
-        // Body and calldata never join the blobs projection, and bundles
-        // promise fields no projection fills: transactions derive blob
-        // fields, receipts derive logs.
+        // Calldata never joins the blobs projection, and bundles promise
+        // fields no projection fills: transactions derive blob fields,
+        // receipts derive logs.
         for required in [
-            &[Body, BlobFields][..],
+            &[Calldata, BlobFields][..],
             &[Header, Transactions, Receipts],
             &[Header, Transactions],
             &[Header, Receipts],

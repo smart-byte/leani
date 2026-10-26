@@ -14,11 +14,11 @@ These processors ship in the standard binary. Downstream projects can assemble
 a custom binary and register independent native processors through the public
 factory/registry API; see [Build a custom processor](https://leani.dev/docs/guides/custom-processor/).
 
-## blobs-money 1.5.0
+## blobs-money 1.6.0
 
 Block-local Dencun-and-later blob economics and type-3 transaction output. It
 accepts the filtered Xatu projection or complete normalized execution frames.
-It declares the `Header`, `Senders`, `BlobFields`, `BlockSize` and
+It declares the `Header`, `Body`, `Senders`, `BlobFields`, `BlockSize` and
 `ReceiptOutcome` field groups, filtered to type-3 transactions.
 All wei quantities are lossless integers.
 
@@ -42,6 +42,11 @@ From Fusaka on, the EIP-7918 reserve price (execution base fee × 2^13 / 2^17)
 is reported separately as `reserveFeeWei` and is not applied to the fee.
 Version 1.5 fixes the fee and burn that 1.4 overstated wherever the reserve
 bound; blobs.money's own formula still clamps the fee to the reserve.
+
+Each transaction reports its `toAddress` besides its `senderAddress`. EIP-4844
+forbids contract creation, so every blob transaction has one: usually a
+rollup's inbox, which stays put while its batchers rotate. Version 1.6 adds it
+and reads the `Body` group for it.
 
 ## evm-events 1.1.0
 

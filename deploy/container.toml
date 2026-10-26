@@ -57,9 +57,10 @@ minimum_agreement = 1
 id = "blobs-money"
 # A new instance for each processor version that changes its identity: the
 # store refuses another version under an instance it holds. 0.1.0-rc.1 kept
-# blobs-money 1.4.0 as `blobs-container`, whose rows stay inert in the volume.
-instance = "blobs-container-1-5"
-version = "1.5.0"
+# blobs-money 1.4.0 as `blobs-container`, and 0.1.0-rc.2 to rc.8 kept 1.5.0 as
+# `blobs-container-1-5`; their rows stay inert in the volume.
+instance = "blobs-container-1-6"
+version = "1.6.0"
 # Without live following, no automatic job ever indexes history: `leani
 # backfill` materializes explicit ranges. History mode is node policy, not
 # part of the processor's identity.

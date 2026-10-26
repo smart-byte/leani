@@ -877,7 +877,7 @@ software could theoretically implement:
     {
       "id": "blobs-money",
       "instance": "blobs-production",
-      "version": "1.5.0",
+      "version": "1.6.0",
       "codeHash": "0x...",
       "configHash": "0x...",
       "genericApi": "processor-v1",
@@ -954,6 +954,7 @@ export interface BlobTransaction {
   blockHash: `0x${string}`;
   txHash: `0x${string}`;
   senderAddress: `0x${string}`;
+  toAddress: `0x${string}`;
   blobVersionedHashes: `0x${string}`[];
   blobCount: number;
   totalBurnedWei: string;

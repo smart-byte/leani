@@ -47,6 +47,8 @@ const EXECUTION_TRANSACTION_COLUMNS: &[&str] = &[
     "block_number",
     "transaction_index",
     "transaction_hash",
+    "nonce",
+    "value",
     "gas_used",
     "gas_price",
     "transaction_type",
@@ -1132,6 +1134,8 @@ struct ExecutionTransactionRow {
     block_number: u64,
     index: u32,
     hash: TransactionHash,
+    nonce: u64,
+    value: Quantity,
     gas_used: u64,
     gas_price: Quantity,
     success: bool,
@@ -1954,6 +1958,8 @@ fn parse_execution_transactions(
             block_number,
             index: required_u32(batch, "transaction_index", row)?,
             hash,
+            nonce: required_u64(batch, "nonce", row)?,
+            value: required_quantity_compatible(batch, "value", row)?,
             gas_used: required_u64(batch, "gas_used", row)?,
             gas_price: required_quantity_compatible(batch, "gas_price", row)?,
             success: required_bool(batch, "success", row)?,
@@ -2097,9 +2103,9 @@ fn normalize_frames(inputs: NormalizationInputs<'_>) -> Result<Vec<BlockFrame>, 
                 encoded: None,
                 from: Some(transaction.from),
                 to: transaction.to,
-                nonce: None,
+                nonce: Some(receipt.nonce),
                 gas_limit: Some(transaction.gas_limit),
-                value: None,
+                value: Some(receipt.value),
                 input: None,
                 max_fee_per_gas: None,
                 max_priority_fee_per_gas: None,
@@ -4271,6 +4277,8 @@ mod tests {
                     block_number: DENCUN_BLOCK,
                     index: 60,
                     hash: transaction_hash,
+                    nonce: 7,
+                    value: quantity_from_u64(0),
                     gas_used: 21_000,
                     gas_price: quantity_from_u64(1),
                     success: true,
@@ -4654,6 +4662,7 @@ mod tests {
         };
         let blobs = [
             Capability::Header,
+            Capability::Body,
             Capability::Senders,
             Capability::BlobFields,
             Capability::BlockSize,
@@ -4662,13 +4671,13 @@ mod tests {
         .into_iter()
         .collect();
         assert_eq!(requirement(blobs).validate_frame(&frames[0]), Ok(()));
-        // The bundles promise transaction bodies the blobs projection lacks.
+        // The bundles promise calldata the blobs projection lacks.
         let bundles = CapabilitySet::of(Capability::Header)
             .with(Capability::Transactions)
             .with(Capability::Receipts);
         assert_eq!(
             requirement(bundles).validate_frame(&frames[0]),
-            Err("transactions lack body fields")
+            Err("transactions lack calldata")
         );
         // Task 4 carry-forward: receipts derive logs, but Xatu projects no
         // logs into its blob receipts.

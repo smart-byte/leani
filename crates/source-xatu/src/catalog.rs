@@ -114,6 +114,7 @@ impl XatuTable {
                 "block_number",
                 "transaction_index",
                 "transaction_hash",
+                "nonce",
                 "from_address",
                 "to_address",
                 "value",

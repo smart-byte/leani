@@ -41,6 +41,10 @@ pub struct BlobTransactionEntity {
     pub transaction_hash: TransactionHash,
     pub transaction_index: u32,
     pub sender: Address,
+    /// The transaction's `to`. EIP-4844 forbids contract creation, so every
+    /// blob transaction has one: a rollup's inbox, or a contract that routes
+    /// the call, such as Multicall3.
+    pub to: Address,
     pub blob_versioned_hashes: Vec<BlockHash>,
     pub blob_count: u32,
     pub total_burn: Quantity,
