@@ -14,6 +14,11 @@ record, and documented RPC contracts.
   time at the current cadence and restart when a signed head changes it,
   and the L1 anchor keeps four hours of signed blocks at the fastest
   scheduled cadence.
+- Op-stack block gossip keeps the peers that carried signed blocks in
+  `op-gossip-peers.txt` in the data directory, dials them first after a
+  restart, and redials them whenever signed blocks stop for 10 seconds:
+  most consensus peers are full, and a mesh of one or two left a node
+  waiting minutes for a replacement.
 - `[l1_anchor]` finalizes a rollup's blocks from its Ethereum settlement
   contracts, read in finalized Ethereum blocks over verified Ethereum
   finality and execution P2P: a confirmed BoLD assertion on Arbitrum One,

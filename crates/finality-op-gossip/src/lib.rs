@@ -6,6 +6,7 @@
 use std::{
     collections::{HashMap, HashSet},
     net::Ipv4Addr,
+    path::PathBuf,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -45,6 +46,11 @@ const MAX_GOSSIP_BYTES: usize = 10 * 1_024 * 1_024;
 const LOOKUPS: usize = 4;
 /// Peers at their connection limit close at once; ask again later.
 const REDIAL_AFTER: Duration = Duration::from_secs(60);
+/// Most consensus peers are full and only a few carry blocks to a new
+/// node: the ones that did are kept for redials and the next run.
+const KEPT_CARRIERS: usize = 32;
+/// Without a signed block this long, redial the peers that carried them.
+const STALL_AFTER: Duration = Duration::from_secs(10);
 /// Message-id domains for payloads that do and do not decompress.
 const VALID_SNAPPY_DOMAIN: [u8; 4] = [1, 0, 0, 0];
 const INVALID_SNAPPY_DOMAIN: [u8; 4] = [0, 0, 0, 0];
@@ -242,6 +248,8 @@ pub struct OpGossipConfig {
     pub listen_port: u16,
     pub maximum_peers: usize,
     pub rediscovery_interval: Duration,
+    /// Where the peers that carried signed blocks are kept across runs.
+    pub peers_path: Option<PathBuf>,
 }
 
 impl OpGossipConfig {
@@ -262,8 +270,67 @@ impl OpGossipConfig {
             listen_port: 0,
             maximum_peers: 16,
             rediscovery_interval: Duration::from_secs(5),
+            peers_path: None,
         })
     }
+}
+
+/// Peers whose forwarded blocks the sequencer signed, newest first, as
+/// `/p2p/`-terminated listen addresses: one per line on disk.
+#[derive(Debug, Default)]
+struct Carriers(Vec<(PeerId, Multiaddr)>);
+
+impl Carriers {
+    fn parse(text: &str) -> Self {
+        let peers = text
+            .lines()
+            .filter_map(|line| {
+                let address = line.trim().parse::<Multiaddr>().ok()?;
+                let peer = address.iter().find_map(|part| match part {
+                    Protocol::P2p(peer) => Some(peer),
+                    _ => None,
+                })?;
+                Some((peer, address))
+            })
+            .take(KEPT_CARRIERS)
+            .collect();
+        Self(peers)
+    }
+
+    fn render(&self) -> String {
+        self.0
+            .iter()
+            .map(|(_, address)| address.to_string() + "\n")
+            .collect()
+    }
+
+    /// Make `peer` the newest carrier; whether the kept set changed.
+    fn record(&mut self, peer: PeerId, address: Multiaddr) -> bool {
+        let known = self.0.iter().position(|(kept, _)| *kept == peer);
+        let changed = known.is_none_or(|index| self.0[index].1 != address);
+        if let Some(index) = known {
+            self.0.remove(index);
+        }
+        self.0.insert(0, (peer, address));
+        self.0.truncate(KEPT_CARRIERS);
+        changed
+    }
+}
+
+/// A public IPv4 TCP address among the ones a peer listens on, ending in
+/// its peer id: what another run can dial.
+fn dialable(peer: PeerId, listen: &[Multiaddr]) -> Option<Multiaddr> {
+    listen
+        .iter()
+        .find(|address| {
+            let mut parts = address.iter();
+            matches!(
+                (parts.next(), parts.next()),
+                (Some(Protocol::Ip4(ip)), Some(Protocol::Tcp(_)))
+                    if !(ip.is_private() || ip.is_loopback() || ip.is_link_local() || ip.is_unspecified())
+            )
+        })
+        .map(|address| address.clone().with(Protocol::P2p(peer)))
 }
 
 /// Follow the chain's block gossip until `cancellation`. Every block the
@@ -379,9 +446,51 @@ pub async fn follow(
         let mut dialed = HashMap::<PeerId, Instant>::new();
         let mut connected = HashSet::new();
         let mut joined = false;
+        let mut carriers = config
+            .peers_path
+            .as_deref()
+            .and_then(|path| std::fs::read_to_string(path).ok())
+            .map_or_else(Carriers::default, |text| Carriers::parse(&text));
+        if !carriers.0.is_empty() {
+            info!(
+                peers = carriers.0.len(),
+                "dialing the gossip peers that carried signed blocks before"
+            );
+            for (_, address) in &carriers.0 {
+                if let Err(error) = swarm.dial(address.clone()) {
+                    debug!(%error, "could not dial op-stack gossip peer");
+                }
+            }
+        }
+        let mut listening = HashMap::<PeerId, Multiaddr>::new();
+        let mut last_block = Instant::now();
+        let mut stalled = false;
+        let mut stall_check = tokio::time::interval(STALL_AFTER);
         loop {
             tokio::select! {
                 () = cancellation.cancelled() => return,
+                _ = stall_check.tick() => {
+                    if last_block.elapsed() < STALL_AFTER {
+                        continue;
+                    }
+                    let idle: Vec<_> = carriers
+                        .0
+                        .iter()
+                        .filter(|(peer, _)| !connected.contains(peer))
+                        .map(|(_, address)| address.clone())
+                        .collect();
+                    if !idle.is_empty() && !std::mem::replace(&mut stalled, true) {
+                        info!(
+                            peers = idle.len(),
+                            "no signed block for {STALL_AFTER:?}; redialing the gossip peers that carried them"
+                        );
+                    }
+                    for address in idle {
+                        if let Err(error) = swarm.dial(address) {
+                            debug!(%error, "could not dial op-stack gossip peer");
+                        }
+                    }
+                }
                 Some((peer_id, address)) = candidates.recv() => {
                     let due = dialed
                         .get(&peer_id)
@@ -406,6 +515,7 @@ pub async fn follow(
                         debug!(%peer_id, ?cause, dialer = endpoint.is_dialer(), "op-stack gossip connection closed");
                         if num_established == 0 {
                             connected.remove(&peer_id);
+                            listening.remove(&peer_id);
                         }
                     }
                     SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
@@ -413,6 +523,9 @@ pub async fn follow(
                     }
                     SwarmEvent::Behaviour(BehaviourEvent::Identify(identify::Event::Received { peer_id, info, .. })) => {
                         debug!(%peer_id, agent = info.agent_version, protocol = info.protocol_version, protocols = ?info.protocols, "op-stack gossip peer identified");
+                        if let Some(address) = dialable(peer_id, &info.listen_addrs) {
+                            listening.insert(peer_id, address);
+                        }
                     }
                     SwarmEvent::Behaviour(BehaviourEvent::Gossipsub(gossipsub::Event::Subscribed { peer_id, topic })) => {
                         debug!(%peer_id, %topic, "op-stack gossip peer subscribed");
@@ -436,6 +549,17 @@ pub async fn follow(
                             &message.data,
                         ) {
                             Ok(block) => {
+                                last_block = Instant::now();
+                                if std::mem::replace(&mut stalled, false) {
+                                    info!("signed blocks arrive again");
+                                }
+                                if let Some(address) = listening.get(&propagation_source)
+                                    && carriers.record(propagation_source, address.clone())
+                                    && let Some(path) = &config.peers_path
+                                    && let Err(error) = std::fs::write(path, carriers.render())
+                                {
+                                    warn!(%error, "could not keep the gossip peers that carry blocks");
+                                }
                                 if blocks.send(block).await.is_err() {
                                     return;
                                 }
@@ -659,5 +783,58 @@ mod tests {
     #[test]
     fn topics_follow_the_versioned_layout() {
         assert_eq!(topic(8453, 3), "/optimism/8453/3/blocks");
+    }
+
+    #[test]
+    fn carriers_keep_public_listen_addresses_newest_first() {
+        let peer = || {
+            identity::Keypair::generate_secp256k1()
+                .public()
+                .to_peer_id()
+        };
+        let (first, second) = (peer(), peer());
+        let listen = |text: &str| text.parse::<Multiaddr>().expect("address");
+        assert_eq!(
+            dialable(first, &[listen("/ip4/10.0.0.7/tcp/9222")]),
+            None,
+            "private"
+        );
+        let address = dialable(
+            first,
+            &[
+                listen("/ip4/127.0.0.1/tcp/9222"),
+                listen("/ip4/5.6.7.8/tcp/9222"),
+            ],
+        )
+        .expect("public");
+        assert_eq!(
+            address.to_string(),
+            format!("/ip4/5.6.7.8/tcp/9222/p2p/{first}")
+        );
+
+        let mut carriers = Carriers::default();
+        assert!(carriers.record(first, address.clone()));
+        let other = dialable(second, &[listen("/ip4/9.9.9.9/tcp/9003")]).expect("public");
+        assert!(carriers.record(second, other));
+        assert!(
+            !carriers.record(first, address),
+            "known at the same address"
+        );
+        let kept = Carriers::parse(&carriers.render());
+        let peers: Vec<_> = kept.0.iter().map(|(peer, _)| *peer).collect();
+        assert_eq!(peers, [first, second]);
+
+        for _ in 0..KEPT_CARRIERS {
+            let newer = peer();
+            carriers.record(
+                newer,
+                dialable(newer, &[listen("/ip4/1.1.1.1/tcp/9222")]).expect("public"),
+            );
+        }
+        assert_eq!(carriers.0.len(), KEPT_CARRIERS);
+        assert!(
+            carriers.0.iter().all(|(kept, _)| *kept != second),
+            "the oldest leave first"
+        );
     }
 }

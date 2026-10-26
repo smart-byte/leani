@@ -471,7 +471,10 @@ finalizes a block without an L1 anchor, so recent frames are pruned
 omitted; settled blocks keep their level. Gossip peers find the node through
 its discovery record: fixed, reachable `finality.listen_port` (TCP) and
 `finality.discovery_port` (UDP) let them dial in, which Base needs because
-its busy consensus nodes refuse new outbound connections. Peers whose
+its busy consensus nodes refuse new connections. Since only a few
+of them carry blocks to a new node, the node keeps the ones that did in
+`op-gossip-peers.txt` in its data directory and dials them first after a
+restart and again whenever signed blocks stop for 10 seconds. Peers whose
 handshake head lies far behind the signed head are syncing and are dropped
 while fewer than `body_serving_peer_target` peers serve the head.
 

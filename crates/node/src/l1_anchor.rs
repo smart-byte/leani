@@ -206,6 +206,7 @@ pub(crate) async fn start_op_heads(
     let mut gossip = leani_finality_op_gossip::OpGossipConfig::for_chain(&chain)?;
     gossip.listen_port = config.finality.listen_port;
     gossip.discovery_port = config.finality.discovery_port;
+    gossip.peers_path = Some(config.data_dir.join("op-gossip-peers.txt"));
     if !config.finality.bootnodes.is_empty() {
         gossip.bootnodes.clone_from(&config.finality.bootnodes);
     }
