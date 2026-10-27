@@ -8,6 +8,14 @@ record, and documented RPC contracts.
 
 ### Added
 
+- `sources.json_rpc.public_endpoints` picks the public endpoints behind your
+  own `sources.json_rpc.endpoints`: `chainlist` (default under the
+  sequencer feed) adds chainlist.org's keyless HTTPS endpoints that keep no
+  logs to the chain entry's vetted ones, `bundled` (default otherwise) only
+  the vetted ones, `none` only yours. Your endpoints come first and keep
+  `calls_per_second`; public ones get 40 calls per second, at most eight of
+  them. chainlist.org's list is fetched at most daily and kept in the data
+  directory. `chainlist` is refused where endpoints vouch for blocks.
 - JSON-RPC chains backfill history automatically below the finalized block,
   as Ethereum does: the block of the assertion the L1 anchor confirmed last,
   or else the endpoints' `finalized` block. Each processor with automatic
@@ -30,10 +38,10 @@ record, and documented RPC contracts.
   chain and `eth_getBlockReceipts`; block ranges spread over the rest in
   parallel, one part per endpoint at a time so that every endpoint serves
   some, a failed range moves to another endpoint, and an idle endpoint takes
-  over a part a slower one still fetches. Each endpoint paces its calls at
-  `sources.json_rpc.calls_per_second` (default 40), halves that pace once per
-  burst of rate limits and recovers per call served; its calls take their
-  slots in turn, so calls queued during a rate limit speed up once it lifts.
+  over a part a slower one still fetches (always another endpoint). Each
+  endpoint halves its pace once per burst of rate limits and recovers per
+  call served; its calls take their slots in turn, so calls queued during a
+  rate limit speed up once it lifts.
   The live lane fetches 256 blocks at a time while catching up. With
   `sequencer_feed`, the quorum defaults to 1 and no
   endpoint can claim a head the sequencer has not signed. Nitro entries list

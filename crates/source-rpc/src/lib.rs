@@ -83,6 +83,7 @@ impl FetchMode {
     }
 }
 
+pub mod chainlist;
 mod decode;
 pub mod feed;
 mod finality;
@@ -129,11 +130,31 @@ struct Pace {
     slowed: tokio::time::Instant,
 }
 
+/// Where a pool's endpoint comes from. A pool puts them in this order: its
+/// first endpoints take work first and failed parts go to them first.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum Tier {
+    /// The node operator's own.
+    Own,
+    /// Vetted public endpoints the chain entry names.
+    Bundled,
+    /// Public endpoints a list such as chainlist.org names.
+    Listed,
+}
+
+/// Calls per second each public endpoint gets: they are shared and offered
+/// for light use.
+pub const PUBLIC_CALLS_PER_SECOND: u32 = 40;
+/// Public endpoints a pool keeps at most, so that few operators see its
+/// traffic.
+const MAX_PUBLIC_ENDPOINTS: usize = 8;
+
 /// A JSON-RPC endpoint. HTTP/1.1 only: some public Nitro endpoints stall
 /// HTTP/2 requests.
 #[derive(Clone, Debug)]
 pub struct RpcClient {
     endpoint: Url,
+    tier: Tier,
     client: reqwest::Client,
     /// When the next call may go out. Calls wait for it in turn, and each
     /// takes its slot at the interval of that moment: none is booked ahead,
@@ -164,6 +185,7 @@ impl RpcClient {
         let fastest = Duration::from_secs(1) / calls_per_second.max(1);
         Ok(Self {
             endpoint,
+            tier: Tier::Own,
             client,
             next: Arc::new(tokio::sync::Mutex::new(tokio::time::Instant::now())),
             pace: Arc::new(Mutex::new(Pace {
@@ -519,42 +541,88 @@ impl RpcQuorum {
         quorum: usize,
         calls_per_second: u32,
     ) -> Result<Self, RpcError> {
-        if quorum == 0 || quorum > endpoints.len() {
+        Self::pooled(endpoints, calls_per_second, Vec::new(), Vec::new(), quorum)
+    }
+
+    /// The operator's `own` endpoints at `calls_per_second`, then the public
+    /// `bundled` and `listed` ones at [`PUBLIC_CALLS_PER_SECOND`]. An
+    /// endpoint named twice is kept once, where it comes first.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a quorum outside `1..=endpoints`.
+    pub fn pooled(
+        own: Vec<Url>,
+        calls_per_second: u32,
+        bundled: Vec<Url>,
+        listed: Vec<Url>,
+        quorum: usize,
+    ) -> Result<Self, RpcError> {
+        let mut clients = Vec::<RpcClient>::new();
+        for (tier, endpoints, calls_per_second) in [
+            (Tier::Own, own, calls_per_second),
+            (Tier::Bundled, bundled, PUBLIC_CALLS_PER_SECOND),
+            (Tier::Listed, listed, PUBLIC_CALLS_PER_SECOND),
+        ] {
+            for endpoint in endpoints {
+                if clients.iter().all(|client| client.endpoint != endpoint) {
+                    let mut client = RpcClient::new(endpoint, calls_per_second)?;
+                    client.tier = tier;
+                    clients.push(client);
+                }
+            }
+        }
+        if quorum == 0 || quorum > clients.len() {
             return Err(RpcError::Malformed(format!(
                 "quorum {quorum} must be within 1..={}",
-                endpoints.len()
+                clients.len()
             )));
         }
-        let clients = endpoints
-            .into_iter()
-            .map(|endpoint| RpcClient::new(endpoint, calls_per_second))
-            .collect::<Result<_, _>>()?;
         Ok(Self { clients, quorum })
     }
 
     /// Keep the endpoints that serve `chain_id` and, when `receipts`, whole
     /// blocks' receipts: public endpoint lists include ones that lack
-    /// `eth_getBlockReceipts`.
+    /// `eth_getBlockReceipts`. Of the public ones, the bundled come first and
+    /// then the listed that answered fastest, at most
+    /// [`MAX_PUBLIC_ENDPOINTS`] together.
     ///
     /// # Errors
     ///
     /// Returns an error when fewer endpoints than the quorum qualify.
     pub async fn qualified(mut self, chain_id: u64, receipts: bool) -> Result<Self, RpcError> {
-        let checks = futures::future::join_all(
-            self.clients
-                .iter()
-                .map(|client| client.qualify(chain_id, receipts)),
-        )
+        let checks = futures::future::join_all(self.clients.iter().map(|client| async move {
+            let started = tokio::time::Instant::now();
+            client
+                .qualify(chain_id, receipts)
+                .await
+                .map(|()| started.elapsed())
+        }))
         .await;
         let mut kept = Vec::new();
         for (client, check) in self.clients.into_iter().zip(checks) {
             match check {
-                Ok(()) => kept.push(client),
+                Ok(elapsed) => kept.push((client, elapsed)),
                 Err(error) => {
                     warn!(endpoint = client.host(), %error, "dropping a JSON-RPC endpoint");
                 }
             }
         }
+        kept.sort_by_key(|(client, elapsed)| {
+            (
+                client.tier,
+                (client.tier == Tier::Listed).then_some(*elapsed),
+            )
+        });
+        let mut public = 0;
+        let kept = kept
+            .into_iter()
+            .map(|(client, _)| client)
+            .filter(|client| {
+                public += usize::from(client.tier != Tier::Own);
+                client.tier == Tier::Own || public <= MAX_PUBLIC_ENDPOINTS
+            })
+            .collect::<Vec<_>>();
         if kept.len() < self.quorum {
             return Err(RpcError::Request {
                 method: "qualify",
@@ -577,6 +645,15 @@ impl RpcQuorum {
     #[must_use]
     pub fn endpoints(&self) -> Vec<&Url> {
         self.clients.iter().map(RpcClient::endpoint).collect()
+    }
+
+    /// Each endpoint's host and where it comes from, in pool order.
+    #[must_use]
+    pub fn hosts(&self) -> Vec<(Tier, &str)> {
+        self.clients
+            .iter()
+            .map(|client| (client.tier, client.host()))
+            .collect()
     }
 
     /// Full blocks, split into parts that each endpoint takes one at a time as
@@ -953,11 +1030,15 @@ mod tests {
                     } else {
                         u64::from_str_radix(tag.trim_start_matches("0x"), 16).unwrap_or(u64::MAX)
                     };
-                    let result = by_hash
-                        .get(tag)
-                        .or_else(|| by_number.get(&number))
-                        .cloned()
-                        .unwrap_or(Value::Null);
+                    let result = if body["method"] == "eth_chainId" {
+                        Value::from("0x1")
+                    } else {
+                        by_hash
+                            .get(tag)
+                            .or_else(|| by_number.get(&number))
+                            .cloned()
+                            .unwrap_or(Value::Null)
+                    };
                     let response = serde_json::json!({"jsonrpc": "2.0", "id": 1, "result": result})
                         .to_string();
                     let reply = format!(
@@ -1287,6 +1368,39 @@ mod tests {
         let next = *pool.clients[0].next.try_lock().expect("no call waits");
         let waits = next.saturating_duration_since(tokio::time::Instant::now());
         assert!(waits <= Duration::from_secs(8), "{waits:?}");
+    }
+
+    #[tokio::test]
+    async fn a_pool_puts_own_endpoints_first_and_keeps_few_public_ones() {
+        let serving = || endpoint(vec![(1, B256::repeat_byte(1))]);
+        let own = serving().await;
+        let bundled = serving().await;
+        let mut listed = vec![bundled.clone()];
+        for _ in 0..9 {
+            listed.push(serving().await);
+        }
+        let silent: Url = "http://127.0.0.1:1/".parse().unwrap();
+        listed.push(silent);
+        let pool = RpcQuorum::pooled(vec![own.clone()], 1_000, vec![bundled.clone()], listed, 1)
+            .unwrap()
+            .qualified(1, true)
+            .await
+            .unwrap();
+        let tiers = pool
+            .hosts()
+            .into_iter()
+            .map(|(tier, _)| tier)
+            .collect::<Vec<_>>();
+        // The bundled endpoint is listed too but kept once; eight public
+        // endpoints at most, and the one that does not answer is dropped.
+        assert_eq!(
+            tiers,
+            [Tier::Own, Tier::Bundled]
+                .into_iter()
+                .chain(std::iter::repeat_n(Tier::Listed, 7))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(pool.endpoints()[..2], [&own, &bundled]);
     }
 
     #[tokio::test]

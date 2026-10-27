@@ -5838,9 +5838,52 @@ struct DoctorReport<'a> {
     finality_source: String,
     processors: Vec<&'a str>,
     listeners: Listeners,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    json_rpc: Option<JsonRpcPlan>,
     valid: bool,
     errors: Vec<ValidationError>,
     warnings: Vec<String>,
+}
+
+/// The JSON-RPC endpoints a node starts from: the operator's own, then the
+/// public ones `public_endpoints` names.
+#[derive(Debug, Serialize)]
+struct JsonRpcPlan {
+    own_endpoints: usize,
+    public_endpoints: crate::config::PublicEndpoints,
+}
+
+impl JsonRpcPlan {
+    /// The plan of a node with JSON-RPC sources.
+    fn of(config: &Config) -> Option<Self> {
+        let json_rpc = matches!(
+            config.sources.live.kind,
+            crate::config::LiveSourceKind::JsonRpc
+        ) || config
+            .sources
+            .history
+            .iter()
+            .any(|source| matches!(source.kind, crate::config::HistorySourceKind::JsonRpc));
+        json_rpc.then(|| Self {
+            own_endpoints: config.sources.json_rpc.endpoints.len(),
+            public_endpoints: config.public_endpoints(),
+        })
+    }
+}
+
+impl std::fmt::Display for JsonRpcPlan {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let public = match self.public_endpoints {
+            crate::config::PublicEndpoints::Chainlist => "chainlist",
+            crate::config::PublicEndpoints::Bundled => "bundled",
+            crate::config::PublicEndpoints::None => "none",
+        };
+        write!(
+            formatter,
+            "own endpoints={}, then public={public}",
+            self.own_endpoints
+        )
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -6109,6 +6152,7 @@ fn doctor(path: &Path, json: bool, registry: &ProcessorRegistry) -> Result<Exit>
             rpc_http: config.rpc.http_bind.to_string(),
             rpc_ws: config.rpc.ws_bind.to_string(),
         },
+        json_rpc: JsonRpcPlan::of(&config),
         valid: errors.is_empty(),
         errors,
         warnings,
@@ -6127,6 +6171,9 @@ fn doctor(path: &Path, json: bool, registry: &ProcessorRegistry) -> Result<Exit>
             report.finality_source
         );
         println!("processors: [{}]", report.processors.join(", "));
+        if let Some(plan) = &report.json_rpc {
+            println!("json-rpc: {plan}");
+        }
         println!(
             "listeners: api={}, rpc-http={}, rpc-ws={}",
             report.listeners.native_api, report.listeners.rpc_http, report.listeners.rpc_ws
@@ -7590,14 +7637,34 @@ async fn run_rpc_lanes(
         backfill_control,
     } = handles;
     let chain_id = leani_primitives::ChainId(config.chain.chain_id);
+    let listed = if config.public_endpoints() == crate::config::PublicEndpoints::Chainlist {
+        leani_source_rpc::chainlist::endpoints(
+            config.chain.chain_id,
+            &config.data_dir.join("chainlist-endpoints.json"),
+        )
+        .await
+    } else {
+        Vec::new()
+    };
     let quorum = config
-        .json_rpc_quorum()
+        .json_rpc_pool(listed)
         .map_err(anyhow::Error::msg)?
         .qualified(config.chain.chain_id, true)
         .await
         .context("qualify the JSON-RPC endpoints")?;
+    let hosts = |tier| {
+        quorum
+            .hosts()
+            .into_iter()
+            .filter(|(of, _)| *of == tier)
+            .map(|(_, host)| host)
+            .collect::<Vec<_>>()
+            .join(",")
+    };
     info!(
-        endpoints = quorum.endpoints().len(),
+        own = %hosts(leani_source_rpc::Tier::Own),
+        bundled = %hosts(leani_source_rpc::Tier::Bundled),
+        listed = %hosts(leani_source_rpc::Tier::Listed),
         quorum = quorum.quorum(),
         "json-rpc endpoints qualified"
     );

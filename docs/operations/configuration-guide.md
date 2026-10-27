@@ -520,8 +520,8 @@ confirmed last, about 6.4 days old; without the anchor and the feed, the
 endpoints' `finalized` block. Each processor with automatic history
 backfills from its `start_block` up to it from `sources.history` in priority
 order, and the live lane takes over just below it; under the feed it then
-catches up from there as above. A `json_rpc` history source reads
-`sources.json_rpc.endpoints`. Under the L1 anchor its blocks are proven by
+catches up from there as above. A `json_rpc` history source reads the
+JSON-RPC endpoint pool below. Under the L1 anchor its blocks are proven by
 parent links down from the confirmed hash before a processor sees them, at
 one more call per block, so they are `finalized` without trusting any
 endpoint. A source that has not published the newest blocks keeps the ones
@@ -546,15 +546,43 @@ trust = "verified_material"
 The node keeps the newest confirmed hash in `l1-anchor-confirmed.txt` in its
 data directory, so a restart does not wait for the next confirmation.
 
-`sources.json_rpc.endpoints` is a pool, by default the chain entry's public
-keyless endpoints. At start each must serve the configured chain and
-`eth_getBlockReceipts`, or it is dropped. Block ranges spread over the
-remaining endpoints in parallel, a faster one taking more, and a range one
-endpoint fails goes to the others. Each endpoint is paced at
-`sources.json_rpc.calls_per_second` (default 40) and slows down when it
-answers with a rate limit, recovering gradually. Public endpoints are shared
-and offered for light use: for long backfills, list endpoints of your own,
-such as a provider account's keyed URL.
+The JSON-RPC lanes and history read a pool of endpoints: yours first, then
+public ones. `sources.json_rpc.endpoints` lists your own, such as a provider
+account's keyed URL, paced at `sources.json_rpc.calls_per_second` (default
+40). `sources.json_rpc.public_endpoints` names the public ones behind them:
+
+| `public_endpoints` | Public endpoints | Default |
+| --- | --- | --- |
+| `chainlist` | The chain entry's vetted endpoints, then the keyless HTTPS endpoints chainlist.org lists for the chain whose operators state they keep no logs (`tracking: none`) | With `finality.kind = "sequencer_feed"` |
+| `bundled` | The chain entry's vetted endpoints only | Otherwise |
+| `none` | None: only your own endpoints | |
+
+```toml
+[sources.json_rpc]
+endpoints = ["https://arb-mainnet.example.com/v2/<key>"]
+public_endpoints = "chainlist" # or "bundled", or "none" for yours alone
+```
+
+Anyone can list an endpoint on chainlist.org, so its endpoints only carry
+blocks the node checks itself: `chainlist` needs the sequencer feed, and
+with `json_rpc` finality, where the endpoints vouch for the blocks, it is
+refused. The node fetches chainlist.org's list at most once a day and keeps
+it in `chainlist-endpoints.json` in its data directory; when the list cannot
+be fetched, the kept one serves, and without one only your own and the
+bundled endpoints do. `leani doctor` shows the plan, and the lanes log the
+hosts they kept.
+
+At start each endpoint must serve the configured chain and
+`eth_getBlockReceipts`, or it is dropped. Of the public ones, the bundled
+stay ahead of the listed ones, which go fastest first, eight public
+endpoints at most, so few operators see the node's traffic. Your endpoints
+take work first and a range another endpoint fails goes to them first; the
+public ones take what yours leave: more parallel work than yours can hold,
+and ranges yours fail or rate-limit. Block ranges spread over all of them in
+parallel, a faster endpoint taking more. Each public endpoint is paced at 40
+calls per second, slows down when it answers with a rate limit, and
+recovers gradually; it is shared and offered for light use, so list
+endpoints of your own for long backfills.
 
 ### L1 anchor
 

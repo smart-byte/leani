@@ -538,9 +538,12 @@ pub struct SourcesConfig {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct JsonRpcSourceConfig {
-    /// Omitted, the chain entry's endpoints.
+    /// The operator's own endpoints, ahead of the public ones.
     #[serde(default)]
     pub endpoints: Vec<Url>,
+    /// Omitted, `chainlist` under the sequencer feed, else `bundled`.
+    #[serde(default)]
+    pub public_endpoints: Option<PublicEndpoints>,
     /// Omitted, two where there are two endpoints, else one.
     #[serde(default)]
     pub quorum: Option<usize>,
@@ -548,15 +551,30 @@ pub struct JsonRpcSourceConfig {
     pub poll_interval_ms: u64,
     #[serde(default = "default_json_rpc_finality_poll_interval_ms")]
     pub finality_poll_interval_ms: u64,
-    /// Calls each endpoint gets per second; public endpoints rate-limit.
+    /// Calls each of `endpoints` gets per second; public ones get 40.
     #[serde(default = "default_json_rpc_calls_per_second")]
     pub calls_per_second: u32,
+}
+
+/// The public endpoints that join the operator's own.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PublicEndpoints {
+    /// The chain entry's vetted endpoints, then the keyless ones that log
+    /// nothing from chainlist.org. Anyone can list one there, so only blocks
+    /// the sequencer feed checks may come from them.
+    Chainlist,
+    /// The chain entry's vetted endpoints.
+    Bundled,
+    /// Only the operator's own endpoints.
+    None,
 }
 
 impl Default for JsonRpcSourceConfig {
     fn default() -> Self {
         Self {
             endpoints: Vec::new(),
+            public_endpoints: None,
             quorum: None,
             poll_interval_ms: default_json_rpc_poll_interval_ms(),
             finality_poll_interval_ms: default_json_rpc_finality_poll_interval_ms(),
@@ -1579,23 +1597,47 @@ impl Config {
         Ok(entry)
     }
 
-    /// The JSON-RPC endpoints and quorum this configuration names, or the
-    /// chain entry's.
+    /// The JSON-RPC endpoints and quorum this configuration names, without
+    /// the ones chainlist.org lists.
     ///
     /// # Errors
     ///
     /// Returns an error without endpoints or with a quorum above them.
     pub fn json_rpc_quorum(&self) -> Result<leani_source_rpc::RpcQuorum, String> {
-        let endpoints = if self.sources.json_rpc.endpoints.is_empty() {
-            self.chain_entry()
+        self.json_rpc_pool(Vec::new())
+    }
+
+    /// The public endpoints that join `sources.json_rpc.endpoints`.
+    #[must_use]
+    pub fn public_endpoints(&self) -> PublicEndpoints {
+        self.sources.json_rpc.public_endpoints.unwrap_or(
+            if matches!(self.finality.kind, FinalitySourceKind::SequencerFeed) {
+                PublicEndpoints::Chainlist
+            } else {
+                PublicEndpoints::Bundled
+            },
+        )
+    }
+
+    /// The operator's own endpoints, then, unless `public_endpoints` is
+    /// `none`, the chain entry's, then `listed`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error without endpoints or with a quorum above them.
+    pub fn json_rpc_pool(&self, listed: Vec<Url>) -> Result<leani_source_rpc::RpcQuorum, String> {
+        let own = self.sources.json_rpc.endpoints.clone();
+        let bundled = match self.public_endpoints() {
+            PublicEndpoints::None => Vec::new(),
+            PublicEndpoints::Chainlist | PublicEndpoints::Bundled => self
+                .chain_entry()
                 .map_err(|error| error.to_string())?
                 .defaults
                 .rpc_endpoints
-                .clone()
-        } else {
-            self.sources.json_rpc.endpoints.clone()
+                .clone(),
         };
-        if endpoints.is_empty() {
+        let count = own.len() + bundled.len() + listed.len();
+        if count == 0 {
             return Err(format!(
                 "{} names no JSON-RPC endpoints; set sources.json_rpc.endpoints",
                 self.chain.name
@@ -1606,11 +1648,17 @@ impl Config {
             if matches!(self.finality.kind, FinalitySourceKind::SequencerFeed) {
                 1
             } else {
-                endpoints.len().min(2)
+                count.min(2)
             }
         });
-        leani_source_rpc::RpcQuorum::new(endpoints, quorum, self.sources.json_rpc.calls_per_second)
-            .map_err(|error| error.to_string())
+        leani_source_rpc::RpcQuorum::pooled(
+            own,
+            self.sources.json_rpc.calls_per_second,
+            bundled,
+            listed,
+            quorum,
+        )
+        .map_err(|error| error.to_string())
     }
 
     /// Read TOML without opening the configured data directory or any network
@@ -2047,6 +2095,14 @@ impl Config {
             && let Err(error) = self.json_rpc_quorum()
         {
             errors.push(ValidationError::new("sources.json_rpc", error));
+        }
+        if self.public_endpoints() == PublicEndpoints::Chainlist
+            && !matches!(self.finality.kind, FinalitySourceKind::SequencerFeed)
+        {
+            errors.push(ValidationError::new(
+                "sources.json_rpc.public_endpoints",
+                "anyone can list an endpoint on chainlist.org, so its endpoints only carry blocks the sequencer feed checks; use `bundled` or `none` with this finality",
+            ));
         }
         if matches!(self.sources.live.kind, LiveSourceKind::P2p)
             && !matches!(
@@ -4417,6 +4473,39 @@ endpoints = ["https://ethereum-hoodi-beacon-api.publicnode.com/"]
             config.json_rpc_quorum().expect("entry endpoints").quorum(),
             1
         );
+        assert_eq!(config.public_endpoints(), PublicEndpoints::Chainlist);
+        // Own endpoints come first, the public ones after them or not at all.
+        let own: Url = "https://own.example/key".parse().expect("url");
+        config.sources.json_rpc.endpoints = vec![own.clone()];
+        let pool = config.json_rpc_quorum().expect("own and entry endpoints");
+        assert_eq!((pool.endpoints().len(), pool.endpoints()[0]), (4, &own));
+        config.sources.json_rpc.public_endpoints = Some(PublicEndpoints::None);
+        assert_eq!(
+            config.json_rpc_quorum().expect("own endpoint").endpoints(),
+            [&own]
+        );
+        config.sources.json_rpc.endpoints.clear();
+        assert!(
+            config
+                .validation_errors()
+                .iter()
+                .any(|error| error.field == "sources.json_rpc"),
+            "a pool without endpoints was accepted"
+        );
+        // Endpoints that vouch for blocks are never chainlist's.
+        config.sources.json_rpc.public_endpoints = None;
+        config.finality.kind = FinalitySourceKind::JsonRpc;
+        assert_eq!(config.public_endpoints(), PublicEndpoints::Bundled);
+        config.sources.json_rpc.public_endpoints = Some(PublicEndpoints::Chainlist);
+        assert!(
+            config
+                .validation_errors()
+                .iter()
+                .any(|error| error.field == "sources.json_rpc.public_endpoints"),
+            "chainlist endpoints vouched for blocks"
+        );
+        config.sources.json_rpc.public_endpoints = None;
+        config.finality.kind = FinalitySourceKind::SequencerFeed;
         config.chain.name = "ethereum-hoodi".to_owned();
         config.chain.chain_id = 560_048;
         assert!(
