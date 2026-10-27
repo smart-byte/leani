@@ -105,6 +105,10 @@ record, and documented RPC contracts.
   checking it no longer fails its live lane with `processor_finality_conflict`.
   The lane could not be reset and needed a rebuild, although it covered the
   anchor itself.
+- Delivery pruning by age no longer deletes a live change still inside the
+  window when older history follows it in the log, as a block-local
+  processor's backfills commit it. A best-effort consumer that had not read
+  the change got `reset_required` before the window ran out.
 
 ### Security
 

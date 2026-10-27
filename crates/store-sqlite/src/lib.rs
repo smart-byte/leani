@@ -17411,16 +17411,24 @@ const FINALIZED_OUTPUT_PROMOTION: &str = "UPDATE output_entity_meta SET finality
 // Delivery pruning runs every interval, and back to back while a stream is
 // over its limit, so no statement walks every change a stream retains.
 
-/// Newest change of a stream at or below a block and older than a time.
-/// Changes are appended in time order, so the newest one at or before the
-/// time bounds the walk back to the first change at or below the block; the
-/// `+` keeps that walk on the sequence index.
+/// Newest change of a stream at or below a block and older than a time,
+/// before the first change above the block: history and live commits share
+/// a stream, so a change still inside the window can precede older blocks.
+/// Changes are appended in time order, so the lower of the two bounds starts
+/// the walk back to the first change at or below the block; the `+` keeps
+/// that walk on the sequence index.
 const DELIVERY_AGE_PRUNE_CANDIDATE: &str = "SELECT MAX(stream_sequence) FROM change_log
      WHERE stream_id = ?1 AND +block_number <= ?2
-       AND stream_sequence <= (
-           SELECT MAX(stream_sequence) FROM change_log
-            WHERE stream_id = ?1 AND created_at_unix_ms <= ?3)";
-/// Newest change of a stream at or below a block.
+       AND stream_sequence <= MIN(
+           (SELECT MAX(stream_sequence) FROM change_log
+             WHERE stream_id = ?1 AND created_at_unix_ms <= ?3),
+           COALESCE((SELECT MIN(stream_sequence) FROM change_log
+                      WHERE stream_id = ?1 AND block_number > ?2) - 1,
+                    9223372036854775807))";
+/// Newest change of a stream at or below a block, even past a change still
+/// inside the window: the window follows the processor's finalized block,
+/// which cannot pass its last applied block while the processor is paused at
+/// its limit, so that change would keep it paused.
 const DELIVERY_PRESSURE_PRUNE_CANDIDATE: &str = "SELECT MAX(stream_sequence) FROM change_log
      WHERE stream_id = ? AND +block_number <= ?";
 /// Changes below a sequence, counted up to a limit.
@@ -26219,6 +26227,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn delivery_pruning_crosses_a_window_change_only_at_the_limit() {
+        let (_directory, store) = store().await;
+        let mut processor = FixtureProcessor::block_output();
+        let pruning = &mut processor.descriptor.lifecycle.delivery.pruning;
+        pruning.minimum_batch_blocks = 1;
+        pruning.minimum_batch_changes = 1;
+        let finalized = |number, parent| {
+            let mut current = frame(number, parent);
+            current.finality = Finality::Finalized;
+            current
+        };
+        // History block 1, live block 1000, then history blocks 2 to 4: with
+        // block 1000 finalized, the default window keeps blocks above 744.
+        let first = finalized(1, BlockHash::ZERO);
+        let mut live = finalized(1000, BlockHash::new([0xa9; 32]));
+        live.block.hash = BlockHash::new([0xaa; 32]);
+        let second = finalized(2, first.block.hash);
+        let third = finalized(3, second.block.hash);
+        let fourth = finalized(4, third.block.hash);
+        for (current, sequence) in [first, live, second, third, fourth].iter().zip(1..) {
+            let delta = processor.map(current).await.expect("map");
+            store
+                .apply(
+                    &processor,
+                    cursor(&processor, current, sequence),
+                    &delta,
+                    &[],
+                )
+                .await
+                .expect("apply");
+        }
+        sqlx::query("UPDATE change_log SET created_at_unix_ms = 0")
+            .execute(&store.inner.pool)
+            .await
+            .expect("age fixture changes");
+        let mut at_limit = processor.descriptor.clone();
+        at_limit.lifecycle.delivery.max_bytes = 1;
+
+        let mut outcomes = Vec::new();
+        for descriptor in [&processor.descriptor, &processor.descriptor, &at_limit] {
+            let pruned = store
+                .prune_delivery_changes(descriptor, BlockNumber(1000))
+                .await
+                .expect("prune");
+            let bounds = store
+                .change_bounds(&processor.descriptor)
+                .await
+                .expect("bounds");
+            outcomes.push((pruned.deleted, bounds.map(|bounds| bounds.earliest)));
+        }
+        assert_eq!(outcomes, [(1, Some(2)), (0, Some(2)), (3, Some(5))]);
+    }
+
+    #[tokio::test]
     async fn delivery_limit_pauses_and_auto_resumes_below_low_water() {
         let (_directory, store) = store().await;
         let mut processor = FixtureProcessor::new();
@@ -29224,6 +29286,11 @@ mod tests {
                 DELIVERY_AGE_PRUNE_CANDIDATE,
                 "change_log_stream_created",
                 "created_at_unix_ms<?",
+            ),
+            (
+                DELIVERY_AGE_PRUNE_CANDIDATE,
+                "change_log_stream_block",
+                "block_number>?",
             ),
             (
                 DELIVERY_PRUNE_BATCH_END,
