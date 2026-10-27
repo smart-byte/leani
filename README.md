@@ -9,7 +9,7 @@ Lean, state-minimized Ethereum indexing node. Leani backfills application
 data from public datasets, follows the chain head over native Ethereum P2P,
 and keeps no raw history. No API key, no archive node.
 
-Status: pre-release preview (`v0.1.0-rc.8`). Read the
+Status: pre-release preview (`v0.1.0-rc.9`). Read the
 [preview limitations](docs/operations/preview-limitations.md) before deploying.
 
 ## Install
@@ -20,7 +20,7 @@ brew install smart-byte/tap/leani
 
 Or take a checksummed archive from
 [GitHub releases](https://github.com/smart-byte/leani/releases), run the
-container image `ghcr.io/smart-byte/leani:v0.1.0-rc.8`, or build from source:
+container image `ghcr.io/smart-byte/leani:v0.1.0-rc.9`, or build from source:
 
 ```bash
 git clone https://github.com/smart-byte/leani.git && cd leani
@@ -154,7 +154,7 @@ Install the SDK version that matches your node release; npm's `latest` tag
 can lag behind a prerelease node:
 
 ```bash
-bun add @smart-byte/leani-sdk@0.1.0-rc.8
+bun add @smart-byte/leani-sdk@0.1.0-rc.9
 ```
 
 ```ts

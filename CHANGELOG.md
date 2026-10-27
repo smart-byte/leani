@@ -6,6 +6,8 @@ record, and documented RPC contracts.
 
 ## [Unreleased]
 
+## [0.1.0-rc.9] - 2026-10-27
+
 ### Added
 
 - `evm-events` decodes every ABI type events use except `function` and
