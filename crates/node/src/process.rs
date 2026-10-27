@@ -6711,7 +6711,7 @@ async fn serve(path: &Path, registry: &ProcessorRegistry) -> Result<Exit> {
             committed_events: committed_events.clone(),
             network_telemetry: network_telemetry.clone(),
             cancellation: cancellation.clone(),
-            backfill_control: Some(backfill_control),
+            backfill_control: Some(backfill_control.clone()),
             verified_anchor: None,
             checkpoint_origin: leani_finality_beacon_api::CheckpointOrigin::Operator,
             attested_heads,
@@ -6745,6 +6745,7 @@ async fn serve(path: &Path, registry: &ProcessorRegistry) -> Result<Exit> {
         let rpc_readiness = rpc_readiness.clone();
         let committed_events = committed_events.clone();
         let lane_cancellation = cancellation.clone();
+        let backfill_control = backfill_control.clone();
         background.spawn("json-rpc lane supervisor", async move {
             let anchored = crate::l1_anchor::spawn(&lane_config, &lane_cancellation)?.map(
                 |(_, observations)| {
@@ -6752,6 +6753,7 @@ async fn serve(path: &Path, registry: &ProcessorRegistry) -> Result<Exit> {
                         lane_store.clone(),
                         leani_primitives::ChainId(lane_config.chain.chain_id),
                         observations,
+                        lane_config.data_dir.join("l1-anchor-confirmed.txt"),
                         lane_cancellation.child_token(),
                     )
                 },
@@ -6760,17 +6762,24 @@ async fn serve(path: &Path, registry: &ProcessorRegistry) -> Result<Exit> {
             // A lane that fails restarts from the store after a pause: the
             // endpoints' rate limits and outages are transient.
             while !lane_cancellation.is_cancelled() {
-                let result = run_rpc_lanes(
-                    &lane_config,
-                    lane_store.clone(),
-                    lane_processors.clone(),
-                    &readiness,
-                    &rpc_readiness,
-                    committed_events.clone(),
-                    anchored.clone(),
-                    signed.clone(),
-                    &lane_cancellation,
-                )
+                let result = with_cold_backfills(&lane_cancellation, async |lanes, backfills| {
+                    Box::pin(run_rpc_lanes(
+                        &lane_config,
+                        lane_store.clone(),
+                        lane_processors.clone(),
+                        RpcLaneHandles {
+                            readiness: &readiness,
+                            rpc_readiness: &rpc_readiness,
+                            committed_events: committed_events.clone(),
+                            backfill_control: &backfill_control,
+                        },
+                        anchored.clone(),
+                        signed.clone(),
+                        lanes,
+                        backfills,
+                    ))
+                    .await
+                })
                 .await;
                 readiness.set_live_ready(false);
                 readiness.set_finality_ready(false);
@@ -7544,28 +7553,42 @@ async fn signed_anchor(
     }
 }
 
+/// What the JSON-RPC lanes report to and share with the rest of the node.
+struct RpcLaneHandles<'a> {
+    readiness: &'a leani_api::ReadinessHandle,
+    rpc_readiness: &'a leani_rpc::RpcReadiness,
+    committed_events: tokio::sync::broadcast::Sender<leani_source_api::ChainEvent>,
+    backfill_control: &'a NativeBackfillControl,
+}
+
 /// Follow a chain over JSON-RPC: live blocks from the endpoint quorum, checked
 /// against the sequencer feed when it signs them. Promotions come from the
 /// feed or the endpoints' `safe` tag, finality from the L1 anchor or their
-/// `finalized` tag.
+/// `finalized` tag. History below the finalized block is backfilled from
+/// the configured history sources, and the live lane takes over above it.
 #[allow(clippy::too_many_lines)]
 #[allow(clippy::too_many_arguments)]
 async fn run_rpc_lanes(
     config: &Config,
     store: leani_store_sqlite::SqliteStore,
     processors: Vec<Arc<dyn leani_processor_api::Processor>>,
-    readiness: &leani_api::ReadinessHandle,
-    rpc_readiness: &leani_rpc::RpcReadiness,
-    committed_events: tokio::sync::broadcast::Sender<leani_source_api::ChainEvent>,
-    anchored: Option<tokio::sync::watch::Receiver<leani_l1_anchor::FinalizedBlock>>,
+    handles: RpcLaneHandles<'_>,
+    anchored: Option<crate::l1_anchor::Assertions>,
     signed: Option<leani_source_rpc::feed::SignedHashes>,
     cancellation: &CancellationToken,
+    backfills: &mut ColdBackfills,
 ) -> Result<()> {
     use leani_runtime::{
         SharedFinalityRuntime, SharedFinalityRuntimeConfig, SharedLiveRuntime,
         SharedLiveRuntimeConfig,
     };
 
+    let RpcLaneHandles {
+        readiness,
+        rpc_readiness,
+        committed_events,
+        backfill_control,
+    } = handles;
     let chain_id = leani_primitives::ChainId(config.chain.chain_id);
     let quorum = config
         .json_rpc_quorum()
@@ -7584,10 +7607,11 @@ async fn run_rpc_lanes(
     let settle_blocks = (anchored.is_some() || signed.is_some())
         .then(|| config.finality.settle_blocks.unwrap_or(3_600));
     let (_unanchored, never_finalized) = tokio::sync::watch::channel(None);
-    let finality: Arc<dyn leani_source_api::FinalitySource> = match (anchored, &signed) {
-        (Some(finalized), _) => {
-            Arc::new(leani_l1_anchor::AnchoredFinality::new(chain_id, finalized)?)
-        }
+    let finality: Arc<dyn leani_source_api::FinalitySource> = match (&anchored, &signed) {
+        (Some(assertions), _) => Arc::new(leani_l1_anchor::AnchoredFinality::new(
+            chain_id,
+            assertions.finalized.clone(),
+        )?),
         (None, Some(_)) => Arc::new(leani_l1_anchor::AnchoredFinality::new(
             chain_id,
             never_finalized,
@@ -7628,16 +7652,44 @@ async fn run_rpc_lanes(
         );
         anchor
     };
-    // A store that stopped below the anchor resumes from its own tip, and a
-    // fresh one under the feed catches up from the processors' start. Under
-    // the feed the chain down from the signed block is proven first, so no
-    // endpoint can slip in a block on the way.
-    let resume = match store.recent_canonical_bounds(chain_id).await? {
-        Some(bounds) if bounds.end() < anchor.number => store
+    // The finalized block the backfills reach: the one the L1 anchor
+    // confirmed last, or else the endpoints' `finalized` one; under the feed
+    // alone there is none.
+    let finalized = match (&anchored, &signed) {
+        (Some(assertions), _) => {
+            let Some(block) =
+                confirmed_block(&quorum, assertions.confirmed.clone(), cancellation).await?
+            else {
+                return Ok(());
+            };
+            Some(block)
+        }
+        (None, None) => Some(anchor),
+        (None, Some(_)) => None,
+    }
+    .filter(|finalized| cold_backfills_needed(config, finalized.number.0));
+    let overlap_blocks = config.sources.live.handoff_overlap_blocks;
+    let bounds = store.recent_canonical_bounds(chain_id).await?;
+    // A store that stopped below the anchor resumes from its own tip. A fresh
+    // one starts just below the finalized block, or under the feed alone
+    // catches up from the processors' start. Under the feed the chain down
+    // from the signed block is proven first, so no endpoint can slip in a
+    // block on the way.
+    let resume = match (bounds, finalized) {
+        (Some(bounds), _) if bounds.end() < anchor.number => store
             .recent_frame(chain_id, bounds.end())
             .await?
             .map(|frame| frame.block),
-        None if signed.is_some() => {
+        (None, Some(finalized)) => Some(
+            quorum
+                .agreed_ref(&format!(
+                    "{:#x}",
+                    finalized.number.0.saturating_sub(overlap_blocks)
+                ))
+                .await
+                .context("read the block below the hot/cold overlap")?,
+        ),
+        (None, None) if signed.is_some() => {
             let first_block = config
                 .chain_entry()?
                 .sequencer_feed
@@ -7655,6 +7707,78 @@ async fn run_rpc_lanes(
         }
         _ => None,
     };
+    // A fresh store has nothing to reconcile, so its backfills start before
+    // the proof down to the finalized block, which can take hours; a
+    // restarted one reconciles first.
+    let spawn_cold = async |backfills: &mut ColdBackfills| -> Result<()> {
+        let Some(finalized) = finalized else {
+            return Ok(());
+        };
+        // A store that already follows live hands over at its own tip when
+        // that is lower, so no backfill runs where the live lane does.
+        let (through, through_hash) = match bounds {
+            Some(bounds) if bounds.end() < finalized.number => (
+                bounds.end().0,
+                store
+                    .recent_frame(chain_id, bounds.end())
+                    .await?
+                    .context("read the retained tip")?
+                    .block
+                    .hash,
+            ),
+            _ => (finalized.number.0, finalized.hash),
+        };
+        let rpc_history = config
+            .sources
+            .history
+            .iter()
+            .find(|source| matches!(source.kind, crate::config::HistorySourceKind::JsonRpc))
+            .map(|source| {
+                let history = if anchored.is_some() {
+                    leani_source_rpc::RpcHistorySource::anchored(
+                        &source.id,
+                        chain_id,
+                        quorum.clone(),
+                        source.priority,
+                        (
+                            finalized.number.0,
+                            alloy_primitives::B256::from(finalized.hash.0),
+                        ),
+                    )
+                } else {
+                    leani_source_rpc::RpcHistorySource::new(
+                        &source.id,
+                        chain_id,
+                        quorum.clone(),
+                        source.priority,
+                    )
+                };
+                history.map(|history| Arc::new(history) as Arc<dyn leani_source_api::HistorySource>)
+            })
+            .transpose()?;
+        info!(
+            through,
+            finalized = finalized.number.0,
+            "backfilling history below the finalized block"
+        );
+        spawn_cold_backfills(
+            config,
+            &store,
+            &processors,
+            through,
+            through.saturating_sub(overlap_blocks.saturating_sub(1)),
+            through_hash,
+            |processor, _| rpc_cold_sources(config, processor, rpc_history.as_ref()),
+            backfill_control.material_coordinator.clone(),
+            backfill_control.pipeline_budget.clone(),
+            cancellation,
+            backfills,
+        )
+        .await
+    };
+    if bounds.is_none() {
+        spawn_cold(backfills).await?;
+    }
     if signed.is_some()
         && let Some(start) = resume
     {
@@ -7710,7 +7834,7 @@ async fn run_rpc_lanes(
     let mut finality_runtime = SharedFinalityRuntime::new(
         store.clone(),
         finality,
-        processors,
+        processors.clone(),
         SharedFinalityRuntimeConfig {
             minimum_recent_blocks: config.rpc.minimum_recent_blocks,
             recent_soft_bytes: config.budgets.recent_raw_soft_bytes,
@@ -7720,22 +7844,16 @@ async fn run_rpc_lanes(
     if let Some(depth) = settle_blocks {
         finality_runtime = finality_runtime.with_settle_depth(depth);
     }
+    if bounds.is_some() {
+        spawn_cold(backfills).await?;
+    }
     let live_start = match resume {
         Some(start) => leani_source_api::LiveStart::Block(start),
-        None => {
-            retained_live_start(
-                &store,
-                chain_id,
-                anchor,
-                config.sources.live.handoff_overlap_blocks,
-                64,
-                false,
-            )
-            .await?
-        }
+        None => retained_live_start(&store, chain_id, anchor, overlap_blocks, 64, false).await?,
     };
     let (live_ready, mut live_ready_updates) = tokio::sync::watch::channel(false);
     let (finality_ready, mut finality_ready_updates) = tokio::sync::watch::channel(false);
+    let handoff_runtime = live_runtime.clone();
     let live = live_runtime.run_with_readiness(
         live_start,
         live_source_budget(config),
@@ -7747,14 +7865,18 @@ async fn run_rpc_lanes(
         cancellation.clone(),
         finality_ready,
     );
+    let handoffs = finish_cold_handoffs(&store, &handoff_runtime, &processors, backfills);
     tokio::pin!(live);
     tokio::pin!(finality);
-    loop {
+    tokio::pin!(handoffs);
+    let mut handoffs_finished = finalized.is_none();
+    let mut live_finished = false;
+    let result = loop {
         tokio::select! {
-            () = cancellation.cancelled() => return Ok(()),
+            () = cancellation.cancelled() => break Ok(()),
             changed = live_ready_updates.changed() => {
                 if changed.is_err() {
-                    bail!("live readiness channel closed");
+                    break Err(anyhow::anyhow!("live readiness channel closed"));
                 }
                 let ready = *live_ready_updates.borrow();
                 readiness.set_live_ready(ready);
@@ -7763,22 +7885,120 @@ async fn run_rpc_lanes(
             }
             changed = finality_ready_updates.changed() => {
                 if changed.is_err() {
-                    bail!("finality readiness channel closed");
+                    break Err(anyhow::anyhow!("finality readiness channel closed"));
                 }
                 let ready = *finality_ready_updates.borrow();
                 readiness.set_finality_ready(ready);
                 info!(ready, "json-rpc finality readiness changed");
             }
             result = &mut live => {
-                let report = result?;
-                bail!("json-rpc live lane ended: {report:?}");
+                live_finished = true;
+                break match result {
+                    Ok(report) => Err(anyhow::anyhow!("json-rpc live lane ended: {report:?}")),
+                    Err(error) => Err(error.into()),
+                };
             }
             result = &mut finality => {
-                let report = result?;
-                bail!("json-rpc finality lane ended: {report:?}");
+                break match result {
+                    Ok(report) => Err(anyhow::anyhow!("json-rpc finality lane ended: {report:?}")),
+                    Err(error) => Err(error.into()),
+                };
+            }
+            result = &mut handoffs, if !handoffs_finished => {
+                handoffs_finished = true;
+                match result {
+                    Ok(summary) if summary.failed.is_empty() => {
+                        info!(handoffs = summary.verified.len(), "all hot/cold handoffs verified");
+                    }
+                    Ok(summary) => warn!(
+                        verified = summary.verified.len(),
+                        failed = ?summary.failed,
+                        "hot/cold handoffs finished with failures; the others follow live"
+                    ),
+                    Err(error) => break Err(error.context("hot/cold handoff failed closed")),
+                }
             }
         }
+    };
+    cancellation.cancel();
+    stop_lanes(
+        &result,
+        async {
+            if !live_finished {
+                let _ = live.as_mut().await;
+            }
+        },
+        async {
+            if !handoffs_finished {
+                let _ = handoffs.as_mut().await;
+            }
+        },
+    )
+    .await;
+    result
+}
+
+/// Whether the RPC lanes backfill history below the finalized block
+/// `finalized`: some processor fills its history automatically from at or
+/// below it, and history sources are configured.
+fn cold_backfills_needed(config: &Config, finalized: u64) -> bool {
+    !config.sources.history.is_empty()
+        && config.processors.iter().any(|processor| {
+            !matches!(
+                processor.history_mode,
+                crate::config::ProcessorHistoryMode::OnDemand
+            ) && processor.start_block <= finalized
+        })
+}
+
+/// An RPC lane backfill's sources: the configured history in priority
+/// order, the JSON-RPC one among them. `None` when none serves `processor`.
+fn rpc_cold_sources(
+    config: &Config,
+    processor: &dyn leani_processor_api::Processor,
+    rpc: Option<&Arc<dyn leani_source_api::HistorySource>>,
+) -> Result<ColdSources> {
+    let (mut sources, mut policy, _) = configured_history_candidates(config, processor, None)?;
+    if let Some(rpc) = rpc {
+        let priority = rpc.descriptor().priority;
+        let at = sources
+            .iter()
+            .position(|source| source.descriptor().priority > priority)
+            .unwrap_or(sources.len());
+        sources.insert(at, rpc.clone());
+        if rpc.descriptor().trust == leani_primitives::TrustModel::TrustedDataset {
+            policy = leani_source_api::VerificationPolicy::TrustedDataset;
+        }
     }
+    Ok((!sources.is_empty()).then_some((sources, policy)))
+}
+
+/// The block the L1 anchor confirmed last, read from the endpoints: the
+/// header that hashes to its hash names its number. `None` once cancelled.
+async fn confirmed_block(
+    quorum: &leani_source_rpc::RpcQuorum,
+    mut confirmed: tokio::sync::watch::Receiver<Option<leani_primitives::BlockHash>>,
+    cancellation: &CancellationToken,
+) -> Result<Option<leani_primitives::BlockRef>> {
+    let hash = loop {
+        if let Some(hash) = *confirmed.borrow_and_update() {
+            break hash;
+        }
+        info!("waiting for the L1 anchor to confirm a block");
+        tokio::select! {
+            () = cancellation.cancelled() => return Ok(None),
+            changed = confirmed.changed() => changed.context("the L1 anchor stopped")?,
+        }
+    };
+    let block = quorum
+        .proven_ref(alloy_primitives::B256::from(hash.0))
+        .await
+        .context("read the block the L1 anchor confirmed")?;
+    info!(
+        block = block.number.0,
+        "the L1 anchor confirmed this block last"
+    );
+    Ok(Some(block))
 }
 
 /// How long an op-stack node waits for the first sequencer-signed block.
@@ -8813,6 +9033,10 @@ async fn run_network_lanes(
             crate::config::ProcessorHistoryMode::OnDemand
         ) && configured.start_block <= selected.execution_block_number
     });
+    let bridge = OnDemandP2pBridge {
+        source: live_source.as_ref().clone(),
+        anchor: history_anchor,
+    };
     spawn_cold_backfills(
         config,
         &store,
@@ -8820,8 +9044,9 @@ async fn run_network_lanes(
         selected.execution_block_number,
         overlap_from,
         selected.execution_block_hash,
-        live_source.as_ref().clone(),
-        history_anchor,
+        |processor, range| {
+            history_sources_with_bridge(config, processor, None, Some(&bridge), range).map(Some)
+        },
         backfill_control
             .as_ref()
             .and_then(|control| control.material_coordinator.clone()),
@@ -9623,6 +9848,10 @@ async fn supersede_automatic_jobs(
     Ok(())
 }
 
+/// The history sources of a processor's automatic backfill over a range, or
+/// `None` when none serves it.
+type ColdSources = Option<(HistorySources, leani_source_api::VerificationPolicy)>;
+
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn spawn_cold_backfills(
     config: &Config,
@@ -9631,8 +9860,10 @@ async fn spawn_cold_backfills(
     through: u64,
     overlap_from: u64,
     anchor_hash: leani_primitives::BlockHash,
-    p2p_source: leani_source_p2p::RethP2pSource,
-    history_anchor: leani_source_p2p::P2pHistoryAnchor,
+    sources: impl Fn(
+        &dyn leani_processor_api::Processor,
+        leani_primitives::BlockRange,
+    ) -> Result<ColdSources>,
     material_coordinator: Option<leani_runtime::HistoricalMaterialCoordinator>,
     pipeline_budget: leani_runtime::HistoricalPipelineBudget,
     cancellation: &CancellationToken,
@@ -9660,15 +9891,16 @@ async fn spawn_cold_backfills(
             continue;
         }
         let range = BlockRange::new(BlockNumber(configured.start_block), BlockNumber(through))?;
-        let bridge = OnDemandP2pBridge {
-            source: p2p_source.clone(),
-            anchor: history_anchor.clone(),
+        let Some((source, verification_policy)) = sources(processor.as_ref(), range)
+            .with_context(|| format!("construct history sources for {}", configured.instance))?
+        else {
+            warn!(
+                processor = %configured.instance,
+                through,
+                "no configured history source serves this processor; its history stays unfilled"
+            );
+            continue;
         };
-        let (source, verification_policy) =
-            history_sources_with_bridge(config, processor.as_ref(), None, Some(&bridge), range)
-                .with_context(|| {
-                    format!("construct history sources for {}", configured.instance)
-                })?;
         let overlap = BlockRange::new(
             BlockNumber(overlap_from.max(configured.start_block)),
             BlockNumber(through),
@@ -12462,6 +12694,10 @@ markets = ["ETH/USDT"]
                 .expect("execution source");
         let cancellation = CancellationToken::new();
         let mut backfills = ColdBackfills::default();
+        let bridge = OnDemandP2pBridge {
+            source: p2p,
+            anchor: history_anchor,
+        };
         spawn_cold_backfills(
             config,
             store,
@@ -12469,8 +12705,9 @@ markets = ["ETH/USDT"]
             4,
             3,
             anchor.hash,
-            p2p,
-            history_anchor,
+            |processor, range| {
+                history_sources_with_bridge(config, processor, None, Some(&bridge), range).map(Some)
+            },
             None,
             pipeline_budget(config),
             &cancellation,
@@ -14461,16 +14698,12 @@ markets = ["ETH/USDT"]
         let anchor = chain[4].block;
         let lanes = CancellationToken::new();
         let mut backfills = ColdBackfills::default();
-        let error = spawn_cold_backfills(
-            &config,
-            &store,
-            &[counter, ledger],
-            4,
-            3,
-            anchor.hash,
-            leani_source_p2p::RethP2pSource::mainnet(leani_source_p2p::RethP2pConfig::default())
-                .expect("execution source"),
-            leani_source_p2p::P2pHistoryAnchor {
+        let bridge = OnDemandP2pBridge {
+            source: leani_source_p2p::RethP2pSource::mainnet(
+                leani_source_p2p::RethP2pConfig::default(),
+            )
+            .expect("execution source"),
+            anchor: leani_source_p2p::P2pHistoryAnchor {
                 block: anchor,
                 consensus: leani_primitives::ConsensusAnchor {
                     finality: leani_primitives::Finality::Finalized,
@@ -14478,6 +14711,18 @@ markets = ["ETH/USDT"]
                     beacon_slot: 1,
                     beacon_block_root: [1; 32],
                 },
+            },
+        };
+        let error = spawn_cold_backfills(
+            &config,
+            &store,
+            &[counter, ledger],
+            4,
+            3,
+            anchor.hash,
+            |processor, range| {
+                history_sources_with_bridge(&config, processor, None, Some(&bridge), range)
+                    .map(Some)
             },
             None,
             pipeline_budget(&config),

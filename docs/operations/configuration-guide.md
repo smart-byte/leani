@@ -514,6 +514,38 @@ and the caught-up blocks are `attested`. A restarted node proves the chain
 down to its stored tip the same way, and refuses a tip that is not on it.
 The walk costs one call per block, the catch-up two.
 
+Below the finalized block, history comes from automatic backfills as on
+Ethereum. With `[l1_anchor]` that is the block of the assertion the anchor
+confirmed last, about 6.4 days old; without the anchor and the feed, the
+endpoints' `finalized` block. Each processor with automatic history
+backfills from its `start_block` up to it from `sources.history` in priority
+order, and the live lane takes over just below it; under the feed it then
+catches up from there as above. A `json_rpc` history source reads
+`sources.json_rpc.endpoints`. Under the L1 anchor its blocks are proven by
+parent links down from the confirmed hash before a processor sees them, at
+one more call per block, so they are `finalized` without trusting any
+endpoint. A source that has not published the newest blocks keeps the ones
+it has and hands the rest to the next, so with SonarX first Arbitrum One's
+history comes from AWS up to its last exported day and from the endpoints
+for the days after:
+
+```toml
+[[sources.history]]
+id = "sonarx"
+kind = "aws_public"
+priority = 0
+trust = "trusted_dataset"
+
+[[sources.history]]
+id = "rpc"
+kind = "json_rpc"
+priority = 1
+trust = "verified_material"
+```
+
+The node keeps the newest confirmed hash in `l1-anchor-confirmed.txt` in its
+data directory, so a restart does not wait for the next confirmation.
+
 `sources.json_rpc.endpoints` is a pool, by default the chain entry's public
 keyless endpoints. At start each must serve the configured chain and
 `eth_getBlockReceipts`, or it is dropped. Block ranges spread over the

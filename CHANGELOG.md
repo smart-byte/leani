@@ -8,6 +8,18 @@ record, and documented RPC contracts.
 
 ### Added
 
+- JSON-RPC chains backfill history automatically below the finalized block,
+  as Ethereum does: the block of the assertion the L1 anchor confirmed last,
+  or else the endpoints' `finalized` block. Each processor with automatic
+  history backfills from its `start_block` through the configured history
+  sources in priority order, and the live lane takes over just below that
+  block. Under the L1 anchor a `json_rpc` history source proves its blocks
+  by parent links down from the confirmed hash before a processor sees them,
+  so they are `finalized` without trusting the endpoints.
+- A history source missing the newest blocks of a range keeps the blocks
+  before them, and the next source serves the rest: an `aws_public` source
+  ahead of a `json_rpc` one serves the days SonarX exported, and the
+  endpoints the days after.
 - With `sequencer_feed`, a fresh store catches up over JSON-RPC from the
   lowest automatic `start_block`, bounded by
   `sources.live.history_fallback_blocks`: the headers down from the first

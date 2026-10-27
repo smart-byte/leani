@@ -761,6 +761,41 @@ impl RpcQuorum {
         Ok(block)
     }
 
+    /// The block whose hash is `hash`, from the first endpoint that serves a
+    /// header hashing to it, so no endpoint is trusted.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when no endpoint serves that header.
+    pub async fn proven_ref(&self, hash: B256) -> Result<leani_primitives::BlockRef, RpcError> {
+        let mut refused = Vec::new();
+        for client in &self.clients {
+            let served = client
+                .call(
+                    "eth_getBlockByHash",
+                    serde_json::json!([format!("{hash:#x}"), false]),
+                )
+                .await
+                .and_then(|block| decode_block(&block, &Value::Null));
+            match served {
+                Ok(decoded) if decoded.check.header == Check::Verified && decoded.hash == hash => {
+                    return Ok(leani_primitives::BlockRef {
+                        number: leani_primitives::BlockNumber(decoded.header.number),
+                        hash: leani_primitives::BlockHash::new(hash.0),
+                        parent_hash: leani_primitives::BlockHash::new(decoded.header.parent_hash.0),
+                        timestamp: decoded.header.timestamp,
+                    });
+                }
+                Ok(_) => refused.push(format!("{}: another header", client.host())),
+                Err(error) => refused.push(format!("{}: {error}", client.host())),
+            }
+        }
+        Err(RpcError::Unverified(format!(
+            "no endpoint serves block {hash:#x}: {}",
+            refused.join("; ")
+        )))
+    }
+
     /// The highest block at `tag` that at least `quorum` endpoints have
     /// reached and agree on.
     ///
@@ -874,8 +909,8 @@ mod tests {
         .await
     }
 
-    /// An endpoint that answers any by-number request with the block it
-    /// holds at that number, after `delay`.
+    /// An endpoint that answers any by-number or by-hash request with the
+    /// block it holds, after `delay`.
     async fn serving(blocks: Vec<(u64, Value)>, delay: Duration) -> Url {
         counted(blocks, delay, Arc::default()).await
     }
@@ -889,10 +924,15 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let latest = blocks.iter().map(|(number, _)| *number).max().unwrap();
+        let by_hash = blocks
+            .iter()
+            .filter_map(|(_, block)| Some((block["hash"].as_str()?.to_owned(), block.clone())))
+            .collect::<HashMap<_, _>>();
         let by_number = blocks.into_iter().collect::<HashMap<_, _>>();
         tokio::spawn(async move {
             while let Ok((mut socket, _)) = listener.accept().await {
                 let by_number = by_number.clone();
+                let by_hash = by_hash.clone();
                 let requests = requests.clone();
                 tokio::spawn(async move {
                     let mut request = vec![0; 16_384];
@@ -908,7 +948,11 @@ mod tests {
                     } else {
                         u64::from_str_radix(tag.trim_start_matches("0x"), 16).unwrap_or(u64::MAX)
                     };
-                    let result = by_number.get(&number).cloned().unwrap_or(Value::Null);
+                    let result = by_hash
+                        .get(tag)
+                        .or_else(|| by_number.get(&number))
+                        .cloned()
+                        .unwrap_or(Value::Null);
                     let response = serde_json::json!({"jsonrpc": "2.0", "id": 1, "result": result})
                         .to_string();
                     let reply = format!(
@@ -981,9 +1025,9 @@ mod tests {
         assert_eq!(numbers, (1..=40).collect::<Vec<_>>());
     }
 
-    /// Empty headers `1..=count` chained by parent hash, as an endpoint
-    /// serves them, and their hashes.
-    fn header_chain(count: u64) -> (Vec<(u64, Value)>, Vec<B256>) {
+    /// Empty blocks `1..=count` at `timestamp`, chained by parent hash, as an
+    /// endpoint serves their headers, and their hashes.
+    fn header_chain(count: u64, timestamp: u64) -> (Vec<(u64, Value)>, Vec<B256>) {
         let mut parent = B256::ZERO;
         let mut hashes = Vec::new();
         let served = (1..=count)
@@ -991,6 +1035,8 @@ mod tests {
                 let header = alloy_consensus::Header {
                     number,
                     parent_hash: parent,
+                    timestamp,
+                    transactions_root: alloy_trie::EMPTY_ROOT_HASH,
                     ..Default::default()
                 };
                 parent = header.hash_slow();
@@ -1006,7 +1052,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_proof_walks_down_from_the_trusted_block_and_keeps_its_grid() {
-        let (served, hashes) = header_chain(600);
+        let (served, hashes) = header_chain(600, 0);
         let pool = RpcQuorum::new(
             vec![serving(served.clone(), Duration::ZERO).await],
             1,
@@ -1026,6 +1072,95 @@ mod tests {
             pool.prove_down(600, hashes[599], 100, 256).await,
             Err(RpcError::Unverified(_))
         ));
+    }
+
+    /// Headers `range` from an anchored source over `endpoint`, chunk by
+    /// chunk.
+    async fn anchored_headers(
+        endpoint: Url,
+        anchor: (u64, B256),
+        range: std::ops::RangeInclusive<u64>,
+    ) -> Result<Vec<leani_primitives::BlockFrame>, leani_source_api::SourceError> {
+        use leani_source_api::HistorySource as _;
+
+        let pool = RpcQuorum::new(vec![endpoint], 1, 1_000).unwrap();
+        let source =
+            RpcHistorySource::anchored("rpc", leani_primitives::ChainId(1), pool, 1, anchor)
+                .unwrap();
+        let request = leani_source_api::DataRequest {
+            chain_id: leani_primitives::ChainId(1),
+            range: leani_primitives::BlockRange::new(
+                leani_primitives::BlockNumber(*range.start()),
+                leani_primitives::BlockNumber(*range.end()),
+            )
+            .unwrap(),
+            required: CapabilitySet::of(Capability::Header),
+            log_fields: leani_primitives::LogFieldSet::NONE,
+            allow_filtered: false,
+            projection: leani_source_api::FieldProjection::default(),
+            filters: leani_source_api::FilterSet::default(),
+            minimum_finality: leani_primitives::Finality::Finalized,
+            verification_policy: leani_source_api::VerificationPolicy::CompleteCryptographic,
+        };
+        let budget = leani_source_api::SourceBudget {
+            max_input_bytes: 1 << 30,
+            max_frame_bytes: 1 << 20,
+            max_frames: 1_000,
+            max_buffered_frames: 64,
+            max_in_flight_requests: 4,
+            temporary_disk_bytes: 1,
+            max_resident_bytes: 1 << 30,
+        };
+        let mut frames = Vec::new();
+        for chunk in source.plan(&request).await?.chunks {
+            let mut stream = source
+                .open(&chunk, budget, tokio_util::sync::CancellationToken::new())
+                .await?;
+            while let Some(frame) = stream.next().await {
+                frames.push(frame?);
+            }
+        }
+        Ok(frames)
+    }
+
+    #[tokio::test]
+    async fn anchored_history_proves_each_chunk_down_from_its_anchor() {
+        let (served, hashes) = header_chain(600, 0);
+        let endpoint = serving(served, Duration::ZERO).await;
+        let frames = anchored_headers(endpoint, (600, hashes[599]), 100..=300)
+            .await
+            .unwrap();
+        assert_eq!(
+            frames
+                .iter()
+                .map(|frame| (frame.block.number.0, B256::from(frame.block.hash.0)))
+                .collect::<Vec<_>>(),
+            (100..=300)
+                .map(|number| (number, hashes[usize::try_from(number).unwrap() - 1]))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            frames
+                .iter()
+                .all(|frame| frame.finality == leani_primitives::Finality::Finalized)
+        );
+
+        // A chain that links up by itself but is not the anchor's.
+        let (forked, _) = header_chain(600, 1);
+        let endpoint = serving(forked, Duration::ZERO).await;
+        assert!(
+            anchored_headers(endpoint, (600, hashes[599]), 100..=300)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_hash_resolves_to_the_block_whose_header_hashes_to_it() {
+        let (served, hashes) = header_chain(64, 0);
+        let pool = RpcQuorum::new(vec![serving(served, Duration::ZERO).await], 1, 1_000).unwrap();
+        assert_eq!(pool.proven_ref(hashes[41]).await.unwrap().number.0, 42);
+        assert!(pool.proven_ref(B256::repeat_byte(1)).await.is_err());
     }
 
     #[tokio::test]

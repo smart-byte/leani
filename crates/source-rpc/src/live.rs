@@ -18,7 +18,9 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
 use crate::{
-    FetchMode, RpcQuorum, feed::SignedHashes, history::capabilities, history::fetch_range,
+    FetchMode, RpcQuorum,
+    feed::SignedHashes,
+    history::{Label, capabilities, fetch_range},
 };
 
 /// Delivered blocks kept to find a fork point.
@@ -206,7 +208,7 @@ impl LiveState {
             &self.source.descriptor,
             &chunk,
             self.mode,
-            true,
+            Label::Unattested,
             self.source.signed.is_none(),
         )
         .await?;
