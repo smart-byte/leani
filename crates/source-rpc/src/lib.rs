@@ -259,7 +259,11 @@ impl RpcClient {
         method: &'static str,
         body: &Value,
     ) -> Result<T, RpcError> {
-        let failed = |detail: String| RpcError::Request { method, detail };
+        // An endpoint's URL may carry an API key: errors leave it out.
+        let failed = |error: reqwest::Error| RpcError::Request {
+            method,
+            detail: error.without_url().to_string(),
+        };
         let calls = body
             .as_array()
             .map_or(1, |calls| u32::try_from(calls.len()).unwrap_or(u32::MAX));
@@ -273,7 +277,7 @@ impl RpcClient {
                 .json(body)
                 .send()
                 .await
-                .map_err(|error| failed(error.to_string()))?;
+                .map_err(failed)?;
             let status = response.status();
             if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
                 self.throttled(sent);
@@ -287,14 +291,15 @@ impl RpcClient {
                 backoff = (backoff * 2).min(Duration::from_secs(8));
                 continue;
             }
-            let response = response
-                .error_for_status()
-                .map_err(|error| failed(error.to_string()))?;
+            let response = response.error_for_status().map_err(failed)?;
             return read_json(response, MAX_RESPONSE_BYTES)
                 .await
-                .map_err(failed);
+                .map_err(|detail| RpcError::Request { method, detail });
         }
-        Err(failed("retries exhausted".to_owned()))
+        Err(RpcError::Request {
+            method,
+            detail: "retries exhausted".to_owned(),
+        })
     }
 
     async fn call(&self, method: &'static str, params: Value) -> Result<Value, RpcError> {
@@ -1282,6 +1287,14 @@ mod tests {
         let next = *pool.clients[0].next.try_lock().expect("no call waits");
         let waits = next.saturating_duration_since(tokio::time::Instant::now());
         assert!(waits <= Duration::from_secs(8), "{waits:?}");
+    }
+
+    #[tokio::test]
+    async fn errors_leave_out_an_endpoints_key() {
+        let client =
+            RpcClient::new("http://127.0.0.1:1/v2/secret-key".parse().unwrap(), 1_000).unwrap();
+        let error = client.head().await.unwrap_err().to_string();
+        assert!(!error.contains("secret-key"), "{error}");
     }
 
     #[test]
