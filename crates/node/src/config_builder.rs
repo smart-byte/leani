@@ -10,6 +10,7 @@ use leani_processor_api::{
     DeliveryLimitAction, DeliveryPolicyMode, OutputPolicyMode, UndoPolicyMode,
 };
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 
 use crate::{
     builtin_processors::processor_contract,
@@ -93,8 +94,11 @@ pub(crate) struct Limits {
 
 pub(crate) struct BuildContext<'a> {
     pub registry: &'a ProcessorRegistry,
-    /// The finality section of a configuration that follows the chain:
-    /// `leani init` fetches a checkpoint, a running node passes its own.
+    /// The chain to follow.
+    pub chain: Arc<leani_chain::Chain>,
+    /// Verified Ethereum finality: what an Ethereum chain follows, and what a
+    /// rollup's L1 anchor reads. `leani init` fetches a checkpoint, a running
+    /// node passes its own.
     pub finality: Option<FinalityConfig>,
     /// The chain head, when known, for history given in days.
     pub head: Option<u64>,
@@ -117,21 +121,28 @@ pub(crate) fn finality(
     })
 }
 
-/// A node passes its own finality section, so a configuration that follows
-/// the chain starts from the checkpoint this node verified.
+/// A node passes its own configuration, so a configuration that follows the
+/// chain is for the node's chain and starts from the checkpoint this node
+/// verified.
 pub(crate) fn build_json(
     requirements: &serde_json::Value,
     head: Option<u64>,
     registry: &ProcessorRegistry,
-    finality: &FinalityConfig,
+    node: &Config,
 ) -> Result<serde_json::Value, String> {
     let requirements: Requirements = serde_json::from_value(requirements.clone())
         .map_err(|error| format!("requirements: {error}"))?;
-    let finality = matches!(finality.kind, FinalitySourceKind::BeaconApi).then(|| finality.clone());
+    let chain = node.chain_entry().map_err(|error| error.to_string())?;
+    let finality = match &node.l1_anchor {
+        Some(anchor) => Some(anchor.finality.clone()),
+        None => matches!(node.finality.kind, FinalitySourceKind::BeaconApi)
+            .then(|| node.finality.clone()),
+    };
     let build = build(
         &requirements,
         &BuildContext {
             registry,
+            chain,
             finality,
             head,
             data_dir: None,
@@ -170,9 +181,19 @@ const APP_CONSUMER: &str = "app";
 
 /// Refuse requirements that cannot be met before anything is fetched for
 /// them, such as unknown markets or history in days without a head.
-pub(crate) fn check(requirements: &Requirements, head: Option<u64>) -> Result<(), String> {
+pub(crate) fn check(
+    requirements: &Requirements,
+    head: Option<u64>,
+    chain: &leani_chain::Chain,
+) -> Result<(), String> {
+    if matches!(requirements.processor, ProcessorChoice::Uniswap { .. }) && chain.chain_id != 1 {
+        return Err(format!(
+            "Uniswap markets are Ethereum Mainnet's; choose another processor on {}",
+            chain.name
+        ));
+    }
     processor_entry(&requirements.processor, PublishMode::Finalized)?;
-    history_start(requirements, head).map(drop)
+    history_start(requirements, head, chain).map(drop)
 }
 
 /// Build a configuration for `requirements`.
@@ -185,7 +206,8 @@ pub(crate) fn build(
     requirements: &Requirements,
     context: &BuildContext<'_>,
 ) -> Result<Build, String> {
-    let mut config = Config::ethereum_mainnet_defaults()?;
+    check(requirements, context.head, &context.chain)?;
+    let mut config = Config::chain_defaults(&context.chain)?;
     if let Some(data_dir) = &context.data_dir {
         config.data_dir.clone_from(data_dir);
     }
@@ -199,8 +221,8 @@ pub(crate) fn build(
     let mut processor = processor_entry(&requirements.processor, publish)?;
     let wasm = processor.id == leani_processor_wasm::PROCESSOR_ID;
 
-    let start = history_start(requirements, context.head)?;
-    keep(requirements, &mut processor, &mut decisions);
+    let start = history_start(requirements, context.head, &context.chain)?;
+    keep(requirements, &context.chain, &mut processor, &mut decisions);
     follow(
         requirements,
         &mut config,
@@ -233,7 +255,7 @@ pub(crate) fn build(
     let tuning = requirements
         .tuning
         .clone()
-        .unwrap_or_else(|| recipes_for(&requirements.limits, reads_logs));
+        .unwrap_or_else(|| recipes_for(&requirements.limits, reads_logs, &config));
     for recipe in &tuning {
         apply(*recipe, &mut config, &mut decisions);
     }
@@ -267,7 +289,11 @@ pub(crate) fn build(
     let toml = toml::to_string_pretty(&config)
         .map_err(|error| format!("render the configuration: {error}"))?;
     Ok(Build {
-        toml: format!("{}{}", heading(requirements), annotate(&toml, &decisions.0)),
+        toml: format!(
+            "{}{}",
+            heading(requirements, &context.chain),
+            annotate(&toml, &decisions.0)
+        ),
         decisions: decisions.0,
         tuning,
         warnings,
@@ -377,7 +403,11 @@ fn events_settings(address: &str, events: &[String]) -> Result<toml::Table, Stri
     Ok(settings)
 }
 
-fn history_start(requirements: &Requirements, head: Option<u64>) -> Result<Option<u64>, String> {
+fn history_start(
+    requirements: &Requirements,
+    head: Option<u64>,
+    chain: &leani_chain::Chain,
+) -> Result<Option<u64>, String> {
     match requirements.history {
         None => Ok(None),
         Some(History {
@@ -387,11 +417,26 @@ fn history_start(requirements: &Requirements, head: Option<u64>) -> Result<Optio
         Some(History {
             from_block: None,
             last_days: Some(days),
-        }) => head
-            .map(|head| Some(head.saturating_sub(days.saturating_mul(BLOCKS_PER_DAY))))
-            .ok_or_else(|| {
-                "history in days needs the chain head, which a running node knows once it retains blocks; give history.fromBlock instead".to_owned()
-            }),
+        }) => match chain.family {
+            leani_chain::Family::Ethereum => head
+                .map(|head| Some(head.saturating_sub(days.saturating_mul(BLOCKS_PER_DAY))))
+                .ok_or_else(|| {
+                    "history in days needs the chain head, which a running node knows once it retains blocks; give history.fromBlock instead".to_owned()
+                }),
+            // An op-stack chain's slots are its block numbers.
+            leani_chain::Family::OpStack => {
+                let cadence = chain.cadence().map_err(|error| error.to_string())?;
+                let since = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |now| now.as_secs())
+                    .saturating_sub(days.saturating_mul(86_400));
+                Ok(Some(cadence.slot_at(since)))
+            }
+            leani_chain::Family::Arbitrum => Err(format!(
+                "{}'s blocks follow no fixed cadence, so history in days has no block: give history.fromBlock instead",
+                chain.name
+            )),
+        },
         Some(_) => Err("history takes exactly one of fromBlock and lastDays".to_owned()),
     }
 }
@@ -426,7 +471,12 @@ fn delivery(
     clippy::too_many_lines,
     reason = "one arm per keep option, each with its settings and reasons"
 )]
-fn keep(requirements: &Requirements, processor: &mut ProcessorConfig, decisions: &mut Decisions) {
+fn keep(
+    requirements: &Requirements,
+    chain: &leani_chain::Chain,
+    processor: &mut ProcessorConfig,
+    decisions: &mut Decisions,
+) {
     let output = |mode| OutputPolicyConfig {
         mode,
         window: None,
@@ -443,11 +493,15 @@ fn keep(requirements: &Requirements, processor: &mut ProcessorConfig, decisions:
         }
         Keep::Window => {
             let days = window_days(requirements);
+            let ethereum = chain.family == leani_chain::Family::Ethereum;
             let blocks = days.saturating_mul(BLOCKS_PER_DAY);
             processor.output = OutputPolicyConfig {
                 window: Some(OutputWindowConfig {
-                    max_blocks: Some(blocks),
-                    max_age: None,
+                    max_blocks: ethereum.then_some(blocks),
+                    // A rollup's blocks come faster or at no fixed pace, and
+                    // Base's Denim upgrade shortens them tenfold.
+                    max_age: (!ethereum)
+                        .then(|| HumanDuration::from_seconds(days.saturating_mul(86_400))),
                     max_rows: None,
                     max_bytes: None,
                 }),
@@ -458,11 +512,19 @@ fn keep(requirements: &Requirements, processor: &mut ProcessorConfig, decisions:
                 "window",
                 format!("keep only the last {days} days for queries"),
             );
-            decisions.add(
-                "processors.output.window.max_blocks",
-                blocks,
-                format!("about {days} days at 7,200 blocks a day"),
-            );
+            if ethereum {
+                decisions.add(
+                    "processors.output.window.max_blocks",
+                    blocks,
+                    format!("about {days} days at 7,200 blocks a day"),
+                );
+            } else {
+                decisions.add(
+                    "processors.output.window.max_age",
+                    format!("{days}d"),
+                    format!("{days} days, whatever the block time"),
+                );
+            }
         }
         Keep::Latest => {
             processor.output = output(OutputPolicyMode::Latest);
@@ -593,7 +655,9 @@ fn follow(
                 "history only: finalized history needs no live finality",
             );
         }
-        Follow::Head | Follow::Finalized => {
+        Follow::Head | Follow::Finalized
+            if context.chain.family == leani_chain::Family::Ethereum =>
+        {
             config.finality = context.finality.clone().ok_or_else(|| {
                 "following the chain needs a finality checkpoint: `leani init` fetches one, and a running node passes its own".to_owned()
             })?;
@@ -602,6 +666,9 @@ fn follow(
                 &config.finality.checkpoint,
                 "the verified checkpoint finality starts from",
             );
+        }
+        Follow::Head | Follow::Finalized => {
+            follow_rollup(requirements, config, context, decisions)?;
         }
     }
     if terminal {
@@ -639,6 +706,62 @@ fn follow(
             "none",
             "finalized blocks only: nothing to undo",
         );
+    }
+    Ok(())
+}
+
+/// A rollup's lanes come from its family; only its L1 anchor, fed a verified
+/// Ethereum checkpoint, finalizes its blocks.
+fn follow_rollup(
+    requirements: &Requirements,
+    config: &mut Config,
+    context: &BuildContext<'_>,
+    decisions: &mut Decisions,
+) -> Result<(), String> {
+    let chain = &context.chain;
+    if chain.family == leani_chain::Family::Arbitrum {
+        decisions.add(
+            "sources.live.kind",
+            "json_rpc",
+            "Nitro chains run no public execution P2P",
+        );
+        decisions.add(
+            "finality.kind",
+            "sequencer_feed",
+            "the sequencer feed signs every block the endpoints serve",
+        );
+    } else {
+        decisions.add(
+            "finality.kind",
+            "op_gossip",
+            "the sequencer's signed block gossip attests blocks",
+        );
+    }
+    match context
+        .finality
+        .clone()
+        .filter(|_| chain.l1_anchor.is_some())
+    {
+        Some(finality) => {
+            decisions.add(
+                "l1_anchor.finality.checkpoint",
+                &finality.checkpoint,
+                "the verified Ethereum checkpoint the L1 anchor finalizes from",
+            );
+            config.anchor_to(finality);
+        }
+        None if requirements.follow == Follow::Finalized => {
+            return Err(format!(
+                "only an L1 anchor finalizes {}'s blocks, and it needs a verified Ethereum checkpoint{}",
+                chain.name,
+                if chain.l1_anchor.is_some() {
+                    ""
+                } else {
+                    "; this chain names no settlement contracts, so follow the head"
+                }
+            ));
+        }
+        None => {}
     }
     Ok(())
 }
@@ -684,14 +807,24 @@ fn history(
     }
 }
 
-/// The recipes the configuration guide's sizing table calls for.
-fn recipes_for(limits: &Limits, reads_logs: bool) -> Vec<Recipe> {
+/// The recipes the configuration guide's sizing table calls for, among
+/// those that apply to `config`'s history sources.
+fn recipes_for(limits: &Limits, reads_logs: bool, config: &Config) -> Vec<Recipe> {
+    let has = |kind: HistorySourceKind| {
+        config
+            .sources
+            .history
+            .iter()
+            .any(|source| source.kind.name() == kind.name())
+    };
     let mut recipes = Vec::new();
     let bandwidth = limits.bandwidth_mbit;
     match limits.memory.map(HumanBytes::bytes) {
         Some(memory) if memory < GIB => recipes.push(Recipe::LimitedMemory),
         Some(memory) => {
-            recipes.push(Recipe::FasterErae);
+            if has(HistorySourceKind::EraE) {
+                recipes.push(Recipe::FasterErae);
+            }
             // Xatu backfills hold about 450 MiB per active chunk, and the
             // defaults keep 8 chunks.
             if memory < 4 * GIB {
@@ -700,7 +833,10 @@ fn recipes_for(limits: &Limits, reads_logs: bool) -> Vec<Recipe> {
         }
         None => {}
     }
-    if !reads_logs && bandwidth.is_some_and(|mbit| mbit < SLOW_LINK_MBIT) {
+    if !reads_logs
+        && bandwidth.is_some_and(|mbit| mbit < SLOW_LINK_MBIT)
+        && has(HistorySourceKind::Xatu)
+    {
         recipes.push(Recipe::TransactionsFromXatu);
     }
     recipes.sort();
@@ -831,7 +967,7 @@ fn window_days(requirements: &Requirements) -> u64 {
         .max(1)
 }
 
-fn heading(requirements: &Requirements) -> String {
+fn heading(requirements: &Requirements, chain: &leani_chain::Chain) -> String {
     let what = match &requirements.processor {
         ProcessorChoice::Blocks => "block summaries".to_owned(),
         ProcessorChoice::Uniswap { markets } => format!("Uniswap {}", markets.join(", ")),
@@ -863,7 +999,8 @@ fn heading(requirements: &Requirements) -> String {
         bounds.push(format!("link {mbit} Mbit/s"));
     }
     format!(
-        "# Built by leani for: {what}; keep {keep}; follow {follow}{}.\n# A commented setting was derived from these needs; the rest are leani's defaults.\n\n",
+        "# Built by leani for: {what} on {}; keep {keep}; follow {follow}{}.\n# A commented setting was derived from these needs; the rest are leani's defaults.\n\n",
+        chain.name,
         if bounds.is_empty() {
             String::new()
         } else {
@@ -952,6 +1089,7 @@ mod tests {
             &requirements(json),
             &BuildContext {
                 registry: &registry,
+                chain: leani_chain::ethereum_mainnet(),
                 finality: Some(finality()),
                 head,
                 data_dir: None,
@@ -1139,6 +1277,7 @@ mod tests {
             })),
             &BuildContext {
                 registry: &registry,
+                chain: leani_chain::ethereum_mainnet(),
                 finality: None,
                 head: None,
                 data_dir: None,
@@ -1181,6 +1320,7 @@ mod tests {
             &days,
             &BuildContext {
                 registry: &registry,
+                chain: leani_chain::ethereum_mainnet(),
                 finality: Some(finality()),
                 head: None,
                 data_dir: None,
@@ -1221,7 +1361,10 @@ mod tests {
             &serde_json::json!({ "processor": { "preset": "blocks" }, "keep": "forever" }),
             None,
             &registry,
-            &finality(),
+            &Config {
+                finality: finality(),
+                ..Config::ethereum_mainnet_defaults().expect("defaults")
+            },
         )
         .expect_err("unknown keep");
         assert!(refused.starts_with("requirements:"), "{refused}");
@@ -1229,7 +1372,10 @@ mod tests {
             &serde_json::json!({ "processor": { "preset": "blocks" } }),
             Some(1),
             &registry,
-            &finality(),
+            &Config {
+                finality: finality(),
+                ..Config::ethereum_mainnet_defaults().expect("defaults")
+            },
         )
         .expect("build");
         assert!(
@@ -1266,5 +1412,79 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn rollups_follow_their_family_and_finalize_through_the_l1_anchor() {
+        let registry = ProcessorRegistry::standard();
+        let chain = |name: &str| {
+            leani_chain::ChainRegistry::standard()
+                .get(name)
+                .expect("entry")
+        };
+        let build_for = |name: &str, follow: &str| {
+            build(
+                &requirements(serde_json::json!({
+                    "processor": { "preset": "blocks" },
+                    "keep": "window",
+                    "windowDays": 7,
+                    "follow": follow,
+                })),
+                &BuildContext {
+                    registry: &registry,
+                    chain: chain(name),
+                    finality: Some(finality()),
+                    head: None,
+                    data_dir: None,
+                },
+            )
+        };
+        let parsed = |build: &Build| -> Config {
+            assert!(
+                build.errors.is_empty(),
+                "{:?}\n{}",
+                build.errors,
+                build.toml
+            );
+            toml::from_str(&build.toml).unwrap_or_else(|error| panic!("{error}\n{}", build.toml))
+        };
+        let base = parsed(&build_for("base", "head").expect("base"));
+        assert!(matches!(base.finality.kind, FinalitySourceKind::OpGossip));
+        assert_eq!(
+            base.l1_anchor.map(|anchor| anchor.finality.checkpoint),
+            Some(finality().checkpoint)
+        );
+        // Days, not blocks: Base's Denim upgrade makes its blocks ten times
+        // faster.
+        let window = base.processors[0].output.window.expect("window");
+        assert_eq!(
+            (
+                window.max_blocks,
+                window.max_age.map(HumanDuration::seconds)
+            ),
+            (None, Some(7 * 86_400))
+        );
+        let arbitrum = parsed(&build_for("arbitrum-one", "finalized").expect("arbitrum"));
+        assert!(matches!(
+            arbitrum.sources.live.kind,
+            LiveSourceKind::JsonRpc
+        ));
+        assert!(matches!(
+            arbitrum.finality.kind,
+            FinalitySourceKind::SequencerFeed
+        ));
+        assert!(arbitrum.l1_anchor.is_some());
+        // OP Mainnet's games claim super roots, so nothing finalizes its blocks.
+        let refused = build_for("op", "finalized").expect_err("no L1 anchor");
+        assert!(refused.contains("follow the head"), "{refused}");
+        let refused = check(
+            &requirements(serde_json::json!({
+                "processor": { "preset": "uniswap", "markets": ["ETH/USDC"] },
+            })),
+            None,
+            &chain("base"),
+        )
+        .expect_err("Mainnet markets");
+        assert!(refused.contains("Ethereum Mainnet's"), "{refused}");
     }
 }

@@ -93,6 +93,20 @@ The reviewed expansion is checked in as
 [`config/defaults/ethereum-mainnet.toml`](https://github.com/smart-byte/leani/blob/main/config/defaults/ethereum-mainnet.toml).
 Use the advanced schema below when any expanded field needs an override.
 
+`network` names any built-in chain entry by name or alias, such as
+`ethereum-hoodi`, `base`, `op`, `arbitrum-one`, or `robinhood`, and
+`leani init blocks --network base` writes one. The chain's family picks the
+lanes. An Ethereum testnet follows its own beacon chain from the checkpoint in
+`[finality]`. An op-stack chain follows the sequencer's signed block gossip
+over execution P2P, on gossip port 9222 so that peers can dial in, and its
+history comes through the live lane. A Nitro chain follows its sequencer feed
+over the entry's public JSON-RPC endpoints, with history from the sources the
+entry names: SonarX and then the endpoints for Arbitrum One, the endpoints
+for the others. On a rollup, `[finality]` holds the Ethereum Mainnet
+checkpoint its L1 anchor reads. OP Mainnet and Base Sepolia take none: the
+anchor does not read OP Mainnet's super roots, and Base Sepolia settles on
+Ethereum Sepolia. Uniswap markets are Ethereum Mainnet's.
+
 Validate a file without opening its database or any network connection:
 
 ```bash
@@ -126,8 +140,10 @@ Wasm or custom processors. The builder writes every setting and comments each
 one it derived with the reason, using only the shipped profiles' storage
 settings and the measured recipes of
 [Sizing for bandwidth, memory, and disk](#sizing-for-bandwidth-memory-and-disk).
-`--json` prints the configuration, the derived settings with their reasons,
-warnings, and next steps. `leani guide config` describes the requirements, and
+`--network` builds for another chain, as the compact `network` does; a window
+then keeps days by block age, because a rollup's blocks come faster or at no
+fixed pace. `--json` prints the configuration, the derived settings with their
+reasons, warnings, and next steps. `leani guide config` describes the requirements, and
 a running node builds the same document at `POST /admin/v1/config/build`,
 which its `/playground` uses.
 
@@ -137,7 +153,7 @@ which its `/playground` uses.
 |---|---|---|
 | `config_version` | integer | Must be `1`. |
 | `data_dir` | path | Writable node state. Use a distinct directory per deployment or test. A relative path is relative to the directory of the configuration file, not the working directory. |
-| `chain` | table | Portable name and non-zero EIP-155 `chain_id`. |
+| `chain` | table | A built-in chain entry's `name` or alias. `chain_id` comes from the entry and, when given, must match it. |
 | `artifact_storage` | table | Physical backend and bounded compaction policy for retained processor artifacts. |
 | `budgets` | table | Hard memory, temporary disk, pending-delta, recent-input, and concurrency limits. |
 | `sources` | table | Priority-ordered history sources and the optional live source. |
