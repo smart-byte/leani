@@ -6,6 +6,14 @@ record, and documented RPC contracts.
 
 ## [Unreleased]
 
+### Changed
+
+- The release coordinator promotes leani.dev under the Homebrew tap's
+  stable-first rule: once a stable release exists, a prerelease leaves the
+  site on it. The README status names a release candidate as such.
+- The install guide's source build clones the release tag instead of `main`,
+  so it builds the version the guide documents.
+
 ## [0.1.0] - 2026-10-28
 
 First stable release, the same code as 0.1.0-rc.9.

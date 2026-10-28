@@ -76,7 +76,8 @@ def prepare(requested, output):
     # processor versions, schema numbers, and the API contract remain intact.
     # A whole version token only: 0.1.0 must not rewrite 10.1.0 or 0.1.0-rc.1.
     current_version = r"(?<![\d.])" + re.escape(old) + r"(?!\w|\.\d|-rc\.)"
-    for path in ("README.md", "docs/getting-started/install.mdx", "skills/leani/references/processors.md"):
+    for path in ("README.md", "docs/getting-started/install.mdx", "skills/leani/references/processors.md",
+                 "examples/fixture-quickstart/snippets.sh"):
         update(path, lambda text: re.sub(current_version, requested, text))
     documents = ["packages/sdk/README.md", *git("ls-files", "docs/*.md", "docs/*.mdx", "docs/**/*.md", "docs/**/*.mdx").splitlines()]
     install = r"(\b(?:bun\s+add|npm\s+(?:install|i)|pnpm\s+add|yarn\s+add)\b[^\n`]*?@smart-byte/leani-sdk@)" + re.escape(old) + r"(?=[\s`'\"]|$)"
@@ -92,8 +93,13 @@ def prepare(requested, output):
         current = entries[:boundary].replace("bun add @smart-byte/leani-sdk@<version>", f"bun add @smart-byte/leani-sdk@{requested}")
         return before + f"## [Unreleased]\n\n## [{requested}] - {date}" + current + entries[boundary:]
     update("CHANGELOG.md", changelog)
-    if "-rc." not in requested:
-        update("README.md", lambda text: text.replace("Status: pre-release preview", "Status: stable release", 1))
+    def status(text):
+        label = "release candidate" if "-rc." in requested else "stable release"
+        text, count = re.subn(r"(?m)^Status: [\w -]+(?= \(`v)", f"Status: {label}", text)
+        if count != 1:
+            raise ReleaseError("expected one README status line")
+        return text
+    update("README.md", status)
     # Compute everything before writing, so a malformed manifest cannot leave
     # a half-prepared checkout.
     for path, contents in files.items():
