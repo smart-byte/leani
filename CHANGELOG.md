@@ -6,6 +6,8 @@ record, and documented RPC contracts.
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-10-28
+
 ## [0.1.0-rc.9] - 2026-10-27
 
 ### Added
