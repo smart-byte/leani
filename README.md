@@ -10,7 +10,7 @@ data from public datasets, follows the chain head over native Ethereum P2P,
 and keeps no raw history. No API key, no archive node.
 
 Status: stable release (`v0.1.0`). Read the
-[preview limitations](docs/operations/preview-limitations.md) before deploying.
+[known limitations](docs/operations/preview-limitations.md) before deploying.
 
 ## Install
 

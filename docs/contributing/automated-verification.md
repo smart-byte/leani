@@ -62,7 +62,7 @@ Linux and macOS.
 
 ## Deterministic fault matrix
 
-The default workspace suite injects the alpha failure classes at source,
+The default workspace suite injects these failure classes at source,
 runtime, store, and API boundaries:
 
 | Failure | Evidence test |

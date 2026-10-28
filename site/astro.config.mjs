@@ -75,7 +75,7 @@ export default defineConfig({
             '',
             'Command-line rules:',
             '',
-            'Leani is alpha software; the `leani` CLI is the primary interface. Install with `brew install smart-byte/tap/leani` or build from source.',
+            'The `leani` CLI is the primary interface. Install with `brew install smart-byte/tap/leani` or build from source.',
             '',
             '- `leani subscribe blocks` follows Ethereum Mainnet blocks over P2P with no API key and runs until interrupted. Add `--json` for NDJSON on stdout (progress goes to stderr), `--once` to exit after the first verified result, and `--timeout 5m` to bound the run; an unsatisfied `--once` exits 124 on timeout.',
             '- First use asks the user to accept a checkpoint, the trust anchor for verification. Without a terminal the command fails unless `--yes` is passed. Agents should pass `--yes` only after the user has approved the checkpoint.',

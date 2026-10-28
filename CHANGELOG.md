@@ -8,6 +8,8 @@ record, and documented RPC contracts.
 
 ## [0.1.0] - 2026-10-28
 
+First stable release, the same code as 0.1.0-rc.9.
+
 ## [0.1.0-rc.9] - 2026-10-27
 
 ### Added

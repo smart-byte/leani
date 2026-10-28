@@ -10,7 +10,7 @@ Leani is an Ethereum Mainnet indexing node you run yourself. It verifies
 consensus with a light client, reads execution data from P2P peers or public
 datasets, runs *processors* that turn blocks into application data, and keeps
 only their results. One binary provides the CLI, the node (`leani serve`), a
-native HTTP API with streaming, and a JSON-RPC subset. It is alpha software.
+native HTTP API with streaming, and a JSON-RPC subset.
 
 The binary carries this guide for its own release: `leani guide` prints it and
 `leani guide processors` prints the processor reference. A skill copy can be
