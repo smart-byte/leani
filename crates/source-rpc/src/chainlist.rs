@@ -1,6 +1,6 @@
 //! Public endpoints chainlist.org lists for a chain: keyless HTTPS ones whose
-//! operators state that they keep no logs. Anyone can list an endpoint
-//! there, so these only carry blocks the node checks itself.
+//! operators state that they track nothing or little. Anyone can list an
+//! endpoint there, so these only carry blocks the node checks itself.
 
 use std::{
     path::Path,
@@ -27,7 +27,7 @@ struct Kept {
 }
 
 /// The endpoints `export` lists for `chain_id` that use HTTPS, need no key,
-/// and keep no logs by their operator's statement.
+/// and track nothing or little by their operator's statement.
 #[must_use]
 pub fn listed(export: &Value, chain_id: u64) -> Vec<Url> {
     let Some(chain) = export
@@ -42,7 +42,7 @@ pub fn listed(export: &Value, chain_id: u64) -> Vec<Url> {
     for rpc in chain["rpc"].as_array().into_iter().flatten() {
         let endpoint = rpc["url"]
             .as_str()
-            .filter(|_| rpc["tracking"].as_str() == Some("none"))
+            .filter(|_| matches!(rpc["tracking"].as_str(), Some("none" | "limited")))
             // Keyed endpoints carry a `${API_KEY}` placeholder.
             .filter(|url| !url.contains(['$', '{']))
             .and_then(|url| Url::parse(url).ok())
@@ -127,7 +127,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn only_keyless_https_endpoints_that_keep_no_logs_are_listed() {
+    fn only_keyless_https_endpoints_that_track_little_are_listed() {
         let export = serde_json::json!([
             {"chainId": 1, "rpc": [{"url": "https://other.example/", "tracking": "none"}]},
             {"chainId": 42161, "rpc": [
@@ -147,7 +147,11 @@ mod tests {
                 .iter()
                 .map(Url::as_str)
                 .collect::<Vec<_>>(),
-            ["https://a.example/arb", "https://h.example/"]
+            [
+                "https://a.example/arb",
+                "https://b.example/",
+                "https://h.example/"
+            ]
         );
         assert!(listed(&export, 10).is_empty());
     }

@@ -4453,8 +4453,8 @@ endpoints = ["https://ethereum-hoodi-beacon-api.publicnode.com/"]
             config.validation_errors()
         );
         let quorum = config.json_rpc_quorum().expect("entry endpoints");
-        assert_eq!((quorum.endpoints().len(), quorum.quorum()), (3, 2));
-        config.sources.json_rpc.quorum = Some(4);
+        assert_eq!((quorum.endpoints().len(), quorum.quorum()), (4, 2));
+        config.sources.json_rpc.quorum = Some(5);
         assert!(
             config
                 .validation_errors()
@@ -4478,7 +4478,7 @@ endpoints = ["https://ethereum-hoodi-beacon-api.publicnode.com/"]
         let own: Url = "https://own.example/key".parse().expect("url");
         config.sources.json_rpc.endpoints = vec![own.clone()];
         let pool = config.json_rpc_quorum().expect("own and entry endpoints");
-        assert_eq!((pool.endpoints().len(), pool.endpoints()[0]), (4, &own));
+        assert_eq!((pool.endpoints().len(), pool.endpoints()[0]), (5, &own));
         config.sources.json_rpc.public_endpoints = Some(PublicEndpoints::None);
         assert_eq!(
             config.json_rpc_quorum().expect("own endpoint").endpoints(),

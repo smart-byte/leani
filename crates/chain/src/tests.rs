@@ -292,7 +292,7 @@ fn nitro_chains_name_their_rpc_endpoints() {
     );
     assert_eq!(
         robinhood.defaults.rpc_endpoints[0].as_str(),
-        "https://rpc.mainnet.chain.robinhood.com/"
+        "https://robinhood.drpc.org/"
     );
     assert!(execution_chain_spec(&robinhood).is_err());
     assert_eq!(

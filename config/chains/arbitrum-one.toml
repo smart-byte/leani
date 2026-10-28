@@ -6,13 +6,14 @@ genesis_hash = "0x7ee576b35482195fc49205cec9af72ce14f003b9ae69f6ba0faef4514be8b4
 
 # Nitro chains run no public execution P2P: blocks come from JSON-RPC and
 # are checked against their own header, transactions, and receipts roots.
-# Public keyless endpoints, spread over and paced politely; operators may
-# list their own in sources.json_rpc.endpoints.
+# Public keyless endpoints, paced to the limits their operators announce;
+# operators may list their own in sources.json_rpc.endpoints.
 [defaults]
 rpc_endpoints = [
+  "https://arbitrum.drpc.org",
+  "https://arb-one.api.pocket.network",
   "https://arb1.arbitrum.io/rpc",
   "https://arbitrum-one-rpc.publicnode.com",
-  "https://arbitrum.drpc.org",
 ]
 
 # SonarX's export on AWS Open Data. Classic blocks before the Nitro

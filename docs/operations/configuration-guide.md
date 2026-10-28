@@ -553,7 +553,7 @@ account's keyed URL, paced at `sources.json_rpc.calls_per_second` (default
 
 | `public_endpoints` | Public endpoints | Default |
 | --- | --- | --- |
-| `chainlist` | The chain entry's vetted endpoints, then the keyless HTTPS endpoints chainlist.org lists for the chain whose operators state they keep no logs (`tracking: none`) | With `finality.kind = "sequencer_feed"` |
+| `chainlist` | The chain entry's vetted endpoints, then the keyless HTTPS endpoints chainlist.org lists for the chain whose operators state they track nothing or little (`tracking` `none` or `limited`) | With `finality.kind = "sequencer_feed"` |
 | `bundled` | The chain entry's vetted endpoints only | Otherwise |
 | `none` | None: only your own endpoints | |
 

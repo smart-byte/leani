@@ -10,13 +10,13 @@ record, and documented RPC contracts.
 
 - `sources.json_rpc.public_endpoints` picks the public endpoints behind your
   own `sources.json_rpc.endpoints`: `chainlist` (default under the
-  sequencer feed) adds chainlist.org's keyless HTTPS endpoints that keep no
-  logs to the chain entry's vetted ones, `bundled` (default otherwise) only
-  the vetted ones, `none` only yours. Your endpoints come first and keep
-  `calls_per_second`; public ones get 40 calls per second, at most eight of
-  them, and are dropped unless they qualify within 5 seconds. chainlist.org's
-  list is fetched at most daily and kept in the data directory. `chainlist`
-  is refused where endpoints vouch for blocks.
+  sequencer feed) adds chainlist.org's keyless HTTPS endpoints that track
+  nothing or little to the chain entry's vetted ones, `bundled` (default
+  otherwise) only the vetted ones, `none` only yours. Your endpoints come
+  first and keep `calls_per_second`; public ones get 40 calls per second, at
+  most eight of them, and are dropped unless they qualify within 5 seconds.
+  chainlist.org's list is fetched at most daily and kept in the data
+  directory. `chainlist` is refused where endpoints vouch for blocks.
 - JSON-RPC chains backfill history automatically below the finalized block,
   as Ethereum does: the block of the assertion the L1 anchor confirmed last,
   or else the endpoints' `finalized` block. Each processor with automatic
