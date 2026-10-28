@@ -14,8 +14,9 @@ record, and documented RPC contracts.
   logs to the chain entry's vetted ones, `bundled` (default otherwise) only
   the vetted ones, `none` only yours. Your endpoints come first and keep
   `calls_per_second`; public ones get 40 calls per second, at most eight of
-  them. chainlist.org's list is fetched at most daily and kept in the data
-  directory. `chainlist` is refused where endpoints vouch for blocks.
+  them, and are dropped unless they qualify within 5 seconds. chainlist.org's
+  list is fetched at most daily and kept in the data directory. `chainlist`
+  is refused where endpoints vouch for blocks.
 - JSON-RPC chains backfill history automatically below the finalized block,
   as Ethereum does: the block of the assertion the L1 anchor confirmed last,
   or else the endpoints' `finalized` block. Each processor with automatic
@@ -36,12 +37,16 @@ record, and documented RPC contracts.
   A restarted node proves the chain down to its stored tip the same way.
 - JSON-RPC endpoints form a pool: at start each must serve the configured
   chain and `eth_getBlockReceipts`; block ranges spread over the rest in
-  parallel, one part per endpoint at a time so that every endpoint serves
-  some, a failed range moves to another endpoint, and an idle endpoint takes
-  over a part a slower one still fetches (always another endpoint). Each
-  endpoint halves its pace once per burst of rate limits and recovers per
-  call served; its calls take their slots in turn, so calls queued during a
-  rate limit speed up once it lifts.
+  parallel, every endpoint taking a part before any takes a second and
+  keeping one in flight per 40 calls per second of its pace (at most 16). A
+  failed range moves to another endpoint, and an idle endpoint takes over a
+  part another still fetches once it would likely serve it first, or once
+  the other has taken twice as long as usual. Each endpoint keeps to the
+  limit its rate-limit headers announce (`RateLimit`/`X-RateLimit` policies,
+  or a limit and its reset) and to a 429's `Retry-After`, halves its pace
+  once per burst of rate limits and recovers per call served; its calls take
+  their slots in turn, so calls queued during a rate limit speed up once it
+  lifts. All lanes of a node share each endpoint's budget.
   The live lane fetches 256 blocks at a time while catching up. With
   `sequencer_feed`, the quorum defaults to 1 and no
   endpoint can claim a head the sequencer has not signed. Nitro entries list

@@ -580,8 +580,10 @@ take work first and a range another endpoint fails goes to them first; the
 public ones take what yours leave: more parallel work than yours can hold,
 and ranges yours fail or rate-limit. Block ranges spread over all of them in
 parallel, a faster endpoint taking more. Each public endpoint is paced at 40
-calls per second, slows down when it answers with a rate limit, and
-recovers gradually; it is shared and offered for light use, so list
+calls per second, or slower where its rate-limit headers announce a lower
+limit; it waits as long as a rate limit's `Retry-After` asks, slows down on
+each rate limit, and recovers gradually. All lanes of the node share each
+endpoint's pace. Public endpoints are shared and offered free, so list
 endpoints of your own for long backfills.
 
 ### L1 anchor
