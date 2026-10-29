@@ -6,6 +6,8 @@ record, and documented RPC contracts.
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-10-29
+
 ### Changed
 
 - The release coordinator promotes leani.dev under the Homebrew tap's
