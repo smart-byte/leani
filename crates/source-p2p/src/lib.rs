@@ -108,6 +108,10 @@ const MAX_HISTORY_HEADER_REQUEST_BLOCKS: u64 = 1_024;
 // bounded source chunks instead of one potentially multi-gigabyte gap. Each
 // open still uses smaller fixed-range ETH requests internally.
 const MAX_HISTORY_OPEN_BLOCKS: u64 = 256;
+// A history proof keeps the hashes of at least this many blocks from its first
+// (4 MiB). Backfill detours ask for ranges a little above earlier ones and
+// reuse it; a request further up downloads the chain to the anchor again.
+const RETAINED_PROOF_BLOCKS: u64 = 131_072;
 // Fetch enough blocks per verified material window to keep several peers busy,
 // while retaining the ETH response-size-safe body/receipt sub-batches below.
 const MAX_HISTORY_MATERIAL_WINDOW_BLOCKS: usize = 32;
@@ -7489,10 +7493,16 @@ impl RethP2pHistorySource {
                 .as_ref()
                 .is_none_or(|cached| !cached.covers(proof, retained))
             {
+                let kept_end = proof_start
+                    .0
+                    .saturating_add(RETAINED_PROOF_BLOCKS - 1)
+                    .clamp(material_end.0, proof.end().0);
+                let kept = BlockRange::new(proof_start, BlockNumber(kept_end))
+                    .map_err(|error| P2pError::InvalidConfig(error.to_string()))?;
                 let (session, assembled) = self
                     .connect_and_fetch_anchored_headers(
                         proof,
-                        retained,
+                        kept,
                         budget.max_in_flight_requests,
                         &cancellation,
                     )

@@ -21,6 +21,11 @@ record, and documented RPC contracts.
   blocks from 23,272,479 that lack their transaction rows alternated between
   Xatu and execution P2P one block at a time. Xatu now names every incomplete
   block of the chunk it read, from the first to the last.
+- Execution P2P history reuses the header chain an earlier request proved.
+  Every detour from another source downloaded the chain from its first block
+  up to the finalized anchor again, about two minutes at block 23,272,479. A
+  proof now keeps the hashes of at least 131,072 blocks from its first, so a
+  backfill's later detours skip that download.
 
 ## [0.1.0] - 2026-10-28
 
