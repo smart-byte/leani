@@ -14,6 +14,14 @@ record, and documented RPC contracts.
 - The install guide's source build clones the release tag instead of `main`,
   so it builds the version the guide documents.
 
+### Fixed
+
+- A hole in Xatu's published tables moves to the next source in one piece.
+  Xatu named only a hole's first block, so a backfill crossing the 20,915
+  blocks from 23,272,479 that lack their transaction rows alternated between
+  Xatu and execution P2P one block at a time. Xatu now names every incomplete
+  block of the chunk it read, from the first to the last.
+
 ## [0.1.0] - 2026-10-28
 
 First stable release, the same code as 0.1.0-rc.9.

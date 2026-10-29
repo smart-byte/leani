@@ -288,11 +288,12 @@ validation.
 A backfill splits its range into gaps of missing coverage and tries the
 configured history sources for each gap in `priority` order, lowest first. A
 source that fails on part of a gap passes only those blocks to the next
-source: the blocks a dataset hole names, or the chunk whose read failed. It
-keeps the blocks before them, and the first source takes the gap back after
-them. A source that has not published the blocks, whose schema changed, or
-that fails again before committing a block passes the rest of the gap instead,
-and one that cannot fill the processor's field groups is skipped for the job.
+source: a dataset hole, from its first to its last block in the chunk read, or
+the chunk whose read failed. It keeps the blocks before them, and the first
+source takes the gap back after them. A source that has not published the
+blocks, whose schema changed, or that fails again before committing a block
+passes the rest of the gap instead, and one that cannot fill the processor's
+field groups is skipped for the job.
 Each backfill retries up to three times the number of sources, at least five
 times, before it fails. When every history source fails and the live source is execution
 P2P, P2P can serve the gap within `sources.live.history_fallback_blocks`.
