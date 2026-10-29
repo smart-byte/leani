@@ -1,7 +1,10 @@
+//! A loopback eth/69 peer across a real ETH session.
+//!
 //! eth/68 and eth/69 peers stop a reply at their response size limit, so a
 //! body or receipt request may come back with only its first blocks. Exercise
-//! such replies across a real ETH session through the public probe, which uses
-//! the same batched body and receipt requests as history and the live lane.
+//! such replies through the public probe, which uses the same batched body and
+//! receipt requests as history and the live lane, and the history bridge's
+//! reuse of a proven header chain across requests.
 
 use std::{
     net::SocketAddr,
@@ -16,10 +19,17 @@ use alloy_consensus::{
 };
 use alloy_eips::{BlockHashOrNumber, eip2124::Head};
 use alloy_primitives::{B256, Signature};
-use leani_primitives::{BlockHash, BlockNumber, BlockRange};
-use leani_source_api::SourceBudget;
+use futures::TryStreamExt as _;
+use leani_primitives::{
+    BlockFrame, BlockHash, BlockNumber, BlockRange, BlockRef, Capability, CapabilitySet, ChainId,
+    ConsensusAnchor, Finality, LogFieldSet,
+};
+use leani_source_api::{
+    DataRequest, FieldProjection, FilterSet, HistorySource as _, SourceBudget, VerificationPolicy,
+};
 use leani_source_p2p::{
-    P2pError, P2pProbeResult, RethP2pConfig, RethP2pSource, parse_trusted_peer,
+    P2pError, P2pHistoryAnchor, P2pProbeResult, RethP2pConfig, RethP2pHistorySource, RethP2pSource,
+    parse_trusted_peer,
 };
 use reth_chainspec::MAINNET;
 use reth_ethereum_primitives::BlockBody;
@@ -314,4 +324,85 @@ async fn a_short_reply_with_a_wrong_body_is_fetched_again() {
 
     assert_complete(&result.expect("the wrong body is discarded"), 3);
     assert_eq!(requested(&log, Kind::Bodies), [3, 1, 1, 1]);
+}
+
+/// The block at `number` through the history bridge, requested alone as a
+/// backfill detour requests it.
+async fn detour(history: &RethP2pHistorySource, number: u64) -> Vec<u64> {
+    let request = DataRequest {
+        chain_id: ChainId(1),
+        range: BlockRange::single(BlockNumber(number)),
+        required: CapabilitySet::of(Capability::Header)
+            .with(Capability::Transactions)
+            .with(Capability::Receipts),
+        allow_filtered: false,
+        projection: FieldProjection::default(),
+        log_fields: LogFieldSet::NONE,
+        filters: FilterSet::default(),
+        minimum_finality: Finality::Finalized,
+        verification_policy: VerificationPolicy::CompleteCryptographic,
+    };
+    let budget = SourceBudget {
+        max_input_bytes: 1_000_000,
+        max_frame_bytes: 1_000_000,
+        max_frames: 1,
+        max_buffered_frames: 1,
+        max_in_flight_requests: 1,
+        temporary_disk_bytes: 1,
+        max_resident_bytes: 1_000_000,
+    };
+    let numbers = async {
+        let mut numbers = Vec::new();
+        for chunk in history.plan(&request).await.expect("plan").chunks {
+            let stream = history
+                .open(&chunk, budget, CancellationToken::new())
+                .await
+                .expect("open");
+            let frames: Vec<BlockFrame> = stream.try_collect().await.expect("frames");
+            numbers.extend(frames.iter().map(|frame| frame.block.number.0));
+        }
+        numbers
+    };
+    tokio::time::timeout(Duration::from_secs(20), numbers)
+        .await
+        .expect("bounded loopback detour")
+}
+
+#[tokio::test]
+async fn a_later_detour_reuses_the_proven_header_chain() {
+    let peer = LoopbackPeer::start(40, |_, _, requested| Reply::Blocks(requested)).await;
+    let source = peer.source(8);
+    let anchor = P2pHistoryAnchor {
+        block: BlockRef {
+            number: peer.range.end(),
+            hash: peer.tip,
+            parent_hash: BlockHash::ZERO,
+            timestamp: 0,
+        },
+        consensus: ConsensusAnchor {
+            finality: Finality::Finalized,
+            execution_block_hash: peer.tip,
+            beacon_slot: 1,
+            beacon_block_root: [0; 32],
+        },
+    };
+    let history =
+        RethP2pHistorySource::from_persistent_source(source.clone(), peer.range, anchor).unwrap();
+    let proof_headers = || {
+        source
+            .request_metrics()
+            .history_proof_headers
+            .requested_items
+    };
+
+    let first = detour(&history, 20).await;
+    let proven = proof_headers();
+    let second = detour(&history, 30).await;
+    let proven_again = proof_headers() - proven;
+    source.shutdown().await;
+    peer.stop();
+
+    assert_eq!((first, second), (vec![20], vec![30]));
+    assert_eq!(proven, 30, "blocks 20 to the anchor at 49");
+    assert_eq!(proven_again, 0);
 }
