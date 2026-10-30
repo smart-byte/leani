@@ -28,6 +28,7 @@ export type {
   operations as OpenApiOperations,
   paths as OpenApiPaths,
 } from "./openapi.generated.ts";
+import type { components } from "./openapi.generated.ts";
 
 export type Hex = `0x${string}`;
 export type Finality = "unattested" | "attested" | "finalized";
@@ -571,6 +572,89 @@ export interface ProcessorSubscribeOptions extends SubscribeOptions {
   processor?: string;
 }
 
+export interface WasmTemplate {
+  name: string;
+  description: string;
+  /** Its example parameters. */
+  params: Record<string, unknown>;
+  moduleHash: string;
+  moduleBytes: number;
+  sources: { rust: string; typescript: string };
+}
+
+/** The onchain data a generated processor keeps, as `leani processor create --spec` takes it. */
+export interface WasmSpec {
+  name?: string;
+  language?: "rust" | "typescript";
+  data: Record<string, unknown>;
+  keep?: Record<string, unknown>;
+}
+
+export interface ComposedProcessor {
+  name: string;
+  language: "rust" | "typescript";
+  /** Where the processor's source goes in its project. */
+  path: string;
+  source: string;
+  files: string[];
+  /** What the spec's `fields`, `by`, and `sum` may name. */
+  fields: unknown;
+}
+
+/** A Wasm module, as hex, or a bundled template, with its parameters. */
+export interface WasmModuleSource {
+  module?: string;
+  template?: string;
+  params?: Record<string, unknown>;
+}
+
+export interface WasmRunRequest extends WasmModuleSource {
+  /** Recent blocks to run over first: 1 to 1,024, 16 by default. */
+  blocks?: number;
+  follow?: boolean;
+  /** How long to follow: 1 to 3,600 seconds, 600 by default. */
+  maxSeconds?: number;
+}
+
+/** A run's processor: `ready` for the first, `reset` for each one swapped in. */
+export interface WasmRunReady {
+  run: string;
+  version: number;
+  manifest: Record<string, unknown>;
+  moduleHash: string;
+  window: { fromBlock: number; toBlock: number };
+  follow: boolean;
+  /** Where the blocks come from: the node's live `lane`, or the run's `own` feed. */
+  feed: string;
+}
+
+export interface WasmRunChange {
+  kind: string;
+  key: string;
+  operation: "upsert" | "delete";
+  undo: boolean;
+  value: unknown;
+}
+
+export interface WasmRunBlock {
+  number: number;
+  hash: string;
+  timestamp: number;
+  finality: Finality;
+  changes: WasmRunChange[];
+}
+
+/** A run's server-sent events, in order; `done` is the last. */
+export type WasmRunEvent =
+  | { event: "ready" | "reset"; data: WasmRunReady }
+  | { event: "block"; data: WasmRunBlock }
+  | { event: "undo"; data: { number: number; hash: string; changes: WasmRunChange[] } }
+  | { event: "attested"; data: { throughBlock: number; hash: string } }
+  | { event: "notice"; data: { message: string } }
+  | { event: "done"; data: { blocks: number; changes: number; elapsedMs: number } };
+
+export type AddProcessorRequest = components["schemas"]["AddProcessorRequest"];
+
 export interface LeaniClient {
   readonly baseUrl: URL;
   request<T>(
@@ -584,7 +668,48 @@ export interface LeaniClient {
   };
   status(options?: { signal?: AbortSignal }): Promise<NodeStatus>;
   capabilities(options?: { signal?: AbortSignal }): Promise<Capabilities>;
+  wasm: {
+    templates(options?: { signal?: AbortSignal }): Promise<WasmTemplate[]>;
+    /** The source a spec generates, as `leani processor create` writes it. */
+    compose(
+      spec: WasmSpec,
+      options?: { signal?: AbortSignal },
+    ): Promise<ComposedProcessor>;
+    /**
+     * Run a module or template over the node's recent blocks and, with
+     * `follow`, its live ones (admin route): the run's events until `done`.
+     * The run keeps nothing. An `error` event rejects with the node's error;
+     * aborting `signal` ends the run.
+     */
+    run(
+      request: WasmRunRequest,
+      options?: { signal?: AbortSignal },
+    ): AsyncGenerator<WasmRunEvent>;
+    /**
+     * Give a running run another module or parameters (admin route). The run
+     * reruns the blocks it holds with them and answers with its new version.
+     */
+    swap(
+      run: string,
+      source: WasmModuleSource,
+      options?: { signal?: AbortSignal },
+    ): Promise<{ version: number }>;
+  };
   processors: {
+    /**
+     * Add a processor to the running node (admin route; the node needs
+     * `api.allow_processor_changes = true`). The entry needs only `instance`
+     * and `start_block`; the node restarts its network lanes to run it.
+     */
+    add(
+      request: AddProcessorRequest,
+      options?: { signal?: AbortSignal },
+    ): Promise<ProcessorSummary>;
+    /** Remove a processor `add` added (admin route). Its stored data stays. */
+    remove(
+      instance: string,
+      options?: { signal?: AbortSignal },
+    ): Promise<{ instance: string; removed: boolean }>;
     list(options?: { signal?: AbortSignal }): Promise<ProcessorSummary[]>;
     status(
       id: string,
@@ -802,6 +927,9 @@ export function createLeaniClient(
       extraHeaders,
     );
 
+  const put = <T>(path: string, body: unknown, signal?: AbortSignal): Promise<T> =>
+    requestJson<T>(resolved, "PUT", path, undefined, body, signal);
+
   const remove = (
     path: string,
     signal?: AbortSignal,
@@ -845,7 +973,38 @@ export function createLeaniClient(
       get<NodeStatus>("v1/status", undefined, options?.signal),
     capabilities: (options?: { signal?: AbortSignal }) =>
       request<Capabilities>("v1/capabilities", undefined, options),
+    wasm: Object.freeze({
+      templates: async (options?: { signal?: AbortSignal }) => {
+        const response = await get<{ data: WasmTemplate[] }>(
+          "v1/wasm/templates",
+          undefined,
+          options?.signal,
+        );
+        return response.data;
+      },
+      compose: (spec: WasmSpec, options?: { signal?: AbortSignal }) =>
+        post<ComposedProcessor>("v1/wasm/compose", spec, options?.signal),
+      run: (request: WasmRunRequest, options?: { signal?: AbortSignal }) =>
+        runWasm(resolved, request, options?.signal),
+      swap: (
+        run: string,
+        source: WasmModuleSource,
+        options?: { signal?: AbortSignal },
+      ) =>
+        put<{ version: number }>(
+          `admin/v1/wasm/runs/${encodeURIComponent(run)}/processor`,
+          source,
+          options?.signal,
+        ),
+    }),
     processors: Object.freeze({
+      add: (request: AddProcessorRequest, options?: { signal?: AbortSignal }) =>
+        post<ProcessorSummary>("admin/v1/processors", request, options?.signal),
+      remove: (instance: string, options?: { signal?: AbortSignal }) =>
+        removeJson<{ instance: string; removed: boolean }>(
+          `admin/v1/processors/${encodeURIComponent(instance)}`,
+          options?.signal,
+        ),
       list: async (options?: { signal?: AbortSignal }) => {
         const response = await get<{ data: ProcessorSummary[] }>(
           "v1/processors",
@@ -1266,7 +1425,7 @@ function buildUrl(
 
 async function requestJson<T>(
   options: ResolvedOptions,
-  method: "GET" | "POST" | "DELETE",
+  method: "GET" | "POST" | "PUT" | "DELETE",
   path: string,
   query?: Record<string, QueryValue>,
   body?: unknown,
@@ -1453,6 +1612,53 @@ const MAX_SSE_EVENT_BYTES = 8 * 1024 * 1024;
 
 const LINE_FEED = 0x0a;
 const CARRIAGE_RETURN = 0x0d;
+
+/** One run's events: a run cannot resume, so it never reconnects. */
+async function* runWasm(
+  options: ResolvedOptions,
+  request: WasmRunRequest,
+  signal: AbortSignal | undefined,
+): AsyncGenerator<WasmRunEvent> {
+  const response = await send(
+    options.fetch,
+    buildUrl(options, "admin/v1/wasm/runs"),
+    {
+      method: "POST",
+      headers: headers(options, "text/event-stream", {
+        "content-type": "application/json",
+      }),
+      body: JSON.stringify(request),
+      signal,
+    },
+    signal,
+  );
+  if (!response.ok) {
+    throw await responseError(response);
+  }
+  if (!response.body) {
+    throw new LeaniError("run response has no body", {
+      status: response.status,
+      code: "internal",
+      retryable: false,
+    });
+  }
+  for await (const message of sseMessages(readChunks(response.body, signal), signal)) {
+    if (!message.data) {
+      continue;
+    }
+    const data: unknown = JSON.parse(message.data);
+    if (message.event === "error") {
+      throw errorFromBody(200, data);
+    }
+    yield { event: message.event, data } as WasmRunEvent;
+    if (message.event === "done") {
+      return;
+    }
+  }
+  if (!signal?.aborted) {
+    throw new TransportError("the run's stream ended before it was done");
+  }
+}
 
 export async function* parseSse(
   body: ReadableStream<Uint8Array>,

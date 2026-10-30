@@ -227,6 +227,18 @@ you run, and its **node configuration** tab [builds a node
 configuration](/docs/operations/configuration-guide/#build-a-configuration-from-requirements)
 from what you need.
 
+From TypeScript, `@smart-byte/leani-sdk` starts the same runs: `leani.wasm.run`
+yields a run's events until `done`, and `leani.wasm.swap` gives a running run
+another module or parameters:
+
+```ts
+for await (const event of leani.wasm.run({ template: "block-gas", blocks: 4 })) {
+  if (event.event === "block") {
+    console.log(event.data.number, event.data.changes);
+  }
+}
+```
+
 With `api.allow_wasm_builds = true`, the playground's editor compiles the
 code on the node and swaps the new module into the run; compiler errors point
 at their lines. Rust builds need cargo and the Wasm target on the node's host,
@@ -358,7 +370,8 @@ file says, with a warning. `DELETE /admin/v1/processors/usdc-transfers`
 removes an added processor and keeps its stored data. The node refuses a
 second processor of one kind, version, and parameters, which its live lane
 could not tell apart. With `api.bearer_token_env`, send the token as for any
-`/admin/v1` route.
+`/admin/v1` route. From TypeScript, `leani.processors.add` sends the same
+request and `leani.processors.remove` removes the processor.
 
 ## The contract
 
