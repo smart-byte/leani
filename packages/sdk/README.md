@@ -92,6 +92,25 @@ reset connection or a silent stream, is a retryable `TransportError`, a
 `LeaniError` with status 0. ResetRequiredError is a LeaniError with
 `code: "cursor_expired"`; rebuild application state from a fresh snapshot.
 
+## Wasm processors
+
+`leani.wasm.run` runs a module or bundled template over the node's recent
+blocks and, with `follow`, its live ones, and yields the run's events until
+`done`; `leani.processors.add` keeps a processor running on a node that allows
+processor changes. Both use admin routes.
+
+```ts
+for await (const event of leani.wasm.run({ template: "block-gas", blocks: 4 })) {
+  if (event.event === "block") {
+    console.log(event.data.number, event.data.changes);
+  }
+}
+await leani.processors.add({
+  processor: { instance: "gas", start_block: 21_000_000 },
+  template: "block-gas",
+});
+```
+
 ## License
 
 [MIT](LICENSE).

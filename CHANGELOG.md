@@ -216,6 +216,11 @@ record, and documented RPC contracts.
   or JSON-RPC lanes in-process for each change: a live pause for every
   processor.
 
+- SDK: `leani.wasm` lists the templates, generates a processor's source, runs
+  a module or template as an async iterator of the run's events, and swaps
+  another module into a running run; `leani.processors.add` and `remove`
+  change a node's processors where it allows that.
+
 ### Changed
 
 - The live lane keeps every block's header, which the P2P source fetches
