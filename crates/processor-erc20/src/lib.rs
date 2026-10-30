@@ -20,6 +20,13 @@ use serde::{Deserialize, Serialize};
 pub const BALANCE_COLLECTION: &str = "erc20.balances";
 pub const BALANCE_CHANGE_KIND: &str = "erc20.balance";
 const ZERO_ADDRESS: Address = Address::new([0; 20]);
+/// From Amsterdam (EIP-7708), every ETH transfer emits a `Transfer` log from
+/// this system address. It is ETH, not a token, and counts only when
+/// allowlisted.
+const ETH_TRANSFER_EMITTER: Address = Address::new([
+    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+    0xff, 0xff, 0xff, 0xfe,
+]);
 
 /// Immutable watchlist and completeness declaration.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -230,8 +237,10 @@ impl Processor for Erc20BalanceProcessor {
         let mut events = Vec::new();
         let mut skipped_logs = 0_u32;
         for log in accepted_logs(&block.logs)? {
+            let allowlisted = self.tokens.contains(&log.address);
             if log.topics.first() != Some(&signature)
-                || (!self.tokens.is_empty() && !self.tokens.contains(&log.address))
+                || (!self.tokens.is_empty() && !allowlisted)
+                || (log.address == ETH_TRANSFER_EMITTER && !allowlisted)
             {
                 continue;
             }
@@ -663,6 +672,45 @@ mod tests {
         assert_eq!(decoded.skipped_logs, 2);
         assert_eq!(decoded.events.len(), 1);
         assert_eq!(decoded.events[0].log_index, 2);
+    }
+
+    #[tokio::test]
+    async fn eth_transfer_logs_count_only_when_allowlisted() {
+        let alice = Address::new([1; 20]);
+        let bob = Address::new([2; 20]);
+        let token = Address::new([3; 20]);
+        let mut frame = fixture_frame(1, BlockHash::ZERO);
+        frame.logs = Material::Complete(vec![
+            transfer(ETH_TRANSFER_EMITTER, bob, alice, 7, 0),
+            transfer(token, bob, alice, 9, 1),
+        ]);
+        let tokens = |tokens: Vec<Address>| {
+            Erc20BalanceProcessor::new(Erc20BalanceConfig {
+                start_block: BlockNumber(1),
+                addresses: vec![alice],
+                tokens,
+                complete_from_start: false,
+            })
+            .expect("processor")
+        };
+        for (processor, expected) in [
+            (tokens(Vec::new()), vec![token]),
+            (
+                tokens(vec![ETH_TRANSFER_EMITTER]),
+                vec![ETH_TRANSFER_EMITTER],
+            ),
+        ] {
+            let delta = processor.map(&frame).await.expect("map");
+            let decoded: TransferDelta = postcard::from_bytes(&delta.payload).expect("delta");
+            assert_eq!(
+                decoded
+                    .events
+                    .iter()
+                    .map(|event| event.token)
+                    .collect::<Vec<_>>(),
+                expected
+            );
+        }
     }
 
     #[tokio::test]
