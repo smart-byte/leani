@@ -128,6 +128,8 @@ pub(crate) struct StarterApiConfig {
     pub bind: SocketAddr,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub allow_wasm_builds: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub allow_processor_changes: bool,
 }
 
 impl Default for StarterApiConfig {
@@ -135,6 +137,7 @@ impl Default for StarterApiConfig {
         Self {
             bind: default_starter_api_bind(),
             allow_wasm_builds: false,
+            allow_processor_changes: false,
         }
     }
 }
@@ -247,6 +250,7 @@ impl StarterConfig {
         config.processors = vec![processor];
         config.api.bind = self.api.bind;
         config.api.allow_wasm_builds = self.api.allow_wasm_builds;
+        config.api.allow_processor_changes = self.api.allow_processor_changes;
         Ok(config)
     }
 }
@@ -1448,6 +1452,10 @@ pub struct ApiConfig {
     /// does: a development feature, off unless set.
     #[serde(default)]
     pub allow_wasm_builds: bool,
+    /// Add and remove processors through the API, kept in the data
+    /// directory's `processors.toml`: off unless set.
+    #[serde(default)]
+    pub allow_processor_changes: bool,
     #[serde(default)]
     pub delivery: ApiDeliveryConfig,
 }
@@ -1846,7 +1854,29 @@ impl Config {
                     .into_owned();
             }
         }
+        let mut ignored = Vec::new();
+        for processor in crate::added_processors::read(&config.data_dir)? {
+            if config
+                .processors
+                .iter()
+                .any(|configured| configured.instance == processor.instance)
+            {
+                ignored.push(processor.instance);
+            } else {
+                config.processors.push(processor);
+            }
+        }
         let mut warnings = config.setting_warnings();
+        warnings.extend(ignored.into_iter().map(|instance| {
+            format!(
+                "processor {instance} in {} is ignored: {} configures it",
+                config
+                    .data_dir
+                    .join(crate::added_processors::FILE)
+                    .display(),
+                path.display()
+            )
+        }));
         if let Some(working_directory) = working_directory
             && written.is_relative()
             && !written.as_os_str().is_empty()
@@ -5243,6 +5273,89 @@ markets = ["LINK/ETH"]
                 "{value}"
             );
         }
+    }
+
+    /// A compact configuration in `directory`, with its data in `data`.
+    fn compact_config(directory: &std::path::Path, api: &str) -> PathBuf {
+        let path = directory.join("leani.toml");
+        fs::write(
+            &path,
+            format!(
+                r#"config_version = 1
+network = "ethereum-mainnet"
+data_dir = "data"
+
+[finality]
+checkpoint = "0x1111111111111111111111111111111111111111111111111111111111111111"
+checkpoint_slot = 15000000
+endpoints = ["https://ethereum-beacon-api.publicnode.com/"]
+
+[uniswap]
+markets = ["ETH/USDC"]
+
+[api]
+{api}
+"#
+            ),
+        )
+        .expect("write compact config");
+        path
+    }
+
+    #[test]
+    fn processors_added_through_the_api_follow_the_configured_ones() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let path = compact_config(temp.path(), "");
+        let (configured, _) = Config::load_with_warnings(&path, None).expect("loads");
+        let data = temp.path().join("data");
+        let module = data.join("modules/gas.wasm");
+        let mut added = crate::added_processors::tests::entries(&module);
+        added.truncate(1);
+        crate::added_processors::write(&data, &added).expect("added processors");
+        let (config, warnings) = Config::load_with_warnings(&path, None).expect("loads");
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(config.processors.len(), configured.processors.len() + 1);
+        let added = config.processors.last().expect("added");
+        assert_eq!(added.instance, "gas-tracker");
+        assert_eq!(
+            added.settings["module"].as_str(),
+            Some(&*data.join("modules/gas.wasm").to_string_lossy())
+        );
+    }
+
+    #[test]
+    fn a_configured_instance_wins_over_an_added_one() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let path = compact_config(temp.path(), "");
+        let (configured, _) = Config::load_with_warnings(&path, None).expect("loads");
+        let instance = configured.processors[0].instance.clone();
+        let data = temp.path().join("data");
+        let mut added = crate::added_processors::tests::entries(&data.join("modules/gas.wasm"));
+        added[1].instance.clone_from(&instance);
+        added.truncate(2);
+        crate::added_processors::write(&data, &added[1..]).expect("added processors");
+        let (config, warnings) = Config::load_with_warnings(&path, None).expect("loads");
+        assert_eq!(config.processors.len(), configured.processors.len());
+        assert_eq!(config.processors[0].id, configured.processors[0].id);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].contains(crate::added_processors::FILE) && warnings[0].contains(&instance),
+            "{warnings:?}"
+        );
+    }
+
+    #[test]
+    fn processor_changes_are_off_unless_opted_in() {
+        assert!(!config().api.allow_processor_changes);
+        let on: Config = toml::from_str(&format!(
+            "{VALID_CONFIG_TOML}allow_processor_changes = true\n"
+        ))
+        .expect("the switch is a setting");
+        assert!(on.api.allow_processor_changes);
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let path = compact_config(temp.path(), "allow_processor_changes = true");
+        let (compact, _) = Config::load_with_warnings(&path, None).expect("compact loads");
+        assert!(compact.api.allow_processor_changes);
     }
 
     #[test]

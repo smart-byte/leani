@@ -238,6 +238,9 @@ bind = "127.0.0.1:8080"
 # A development feature, not for production: rustc can read this host's
 # files while it compiles.
 # allow_wasm_builds = true
+# Add and remove processors through the API, kept in the data directory's
+# processors.toml. Each change pauses live processing.
+# allow_processor_changes = true
 
 [api.delivery.history_batches]
 target_encoded_bytes = "4MiB"

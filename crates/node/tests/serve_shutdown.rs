@@ -59,7 +59,13 @@ fn free_port() -> u16 {
 
 /// A node serving one block-summary processor from its own store: no live
 /// source, no finality, and no RPC history, so it never leaves the machine.
-fn write_config(directory: &Path, api: u16, rpc: u16, websocket: u16) -> PathBuf {
+fn write_config(
+    directory: &Path,
+    api: u16,
+    rpc: u16,
+    websocket: u16,
+    api_settings: &str,
+) -> PathBuf {
     let path = directory.join("leani.toml");
     fs::write(
         &path,
@@ -127,6 +133,7 @@ minimum_recent_blocks = 128
 
 [api]
 bind = "127.0.0.1:{api}"
+{api_settings}
 "#,
             data_dir = directory.join("data").display(),
         ),
@@ -135,9 +142,9 @@ bind = "127.0.0.1:{api}"
     path
 }
 
-fn start_node(directory: &Path) -> (Node, u16, u16) {
+fn start_node(directory: &Path, api_settings: &str) -> (Node, u16, u16) {
     let (api, rpc, websocket) = (free_port(), free_port(), free_port());
-    let config = write_config(directory, api, rpc, websocket);
+    let config = write_config(directory, api, rpc, websocket, api_settings);
     let log = directory.join("node.log");
     let output = fs::File::create(&log).expect("node log");
     let child = Command::new(env!("CARGO_BIN_EXE_leani"))
@@ -196,7 +203,7 @@ fn a_shutdown_signal_ends_open_streams_and_the_node_exits_promptly() {
     // Audit M-N2: an open change stream held the graceful shutdown forever,
     // because its body ignored the node's cancellation.
     let directory = tempfile::tempdir().expect("temporary directory");
-    let (mut node, api, websocket) = start_node(directory.path());
+    let (mut node, api, websocket) = start_node(directory.path(), "");
 
     let mut changes = TcpStream::connect(("127.0.0.1", api)).expect("connect to the API");
     write!(
@@ -244,4 +251,71 @@ fn a_shutdown_signal_ends_open_streams_and_the_node_exits_promptly() {
         .wait_for_exit(Duration::from_secs(5))
         .unwrap_or_else(|| panic!("leani serve did not exit:\n{}", node.log()));
     assert!(status.success(), "{status}\n{}", node.log());
+}
+
+/// One request to the node's API: its status and body.
+fn request(api: u16, method: &str, path: &str, body: &str) -> (u16, String) {
+    let mut stream = TcpStream::connect(("127.0.0.1", api)).expect("connect to the node");
+    write!(
+        stream,
+        "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{api}\r\nContent-Type: application/json\r\nx-leani-request: 1\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    )
+    .expect("send the request");
+    let mut response = String::new();
+    stream
+        .read_to_string(&mut response)
+        .expect("read the response");
+    let status = response[9..12].parse().expect("status code");
+    let body = response
+        .split_once("\r\n\r\n")
+        .map_or("", |(_, body)| body)
+        .to_owned();
+    (status, body)
+}
+
+fn instances(api: u16) -> Vec<String> {
+    let (status, body) = request(api, "GET", "/v1/processors", "");
+    assert_eq!(status, 200, "{body}");
+    let listed: serde_json::Value = serde_json::from_str(&body).expect("processors");
+    listed["data"]
+        .as_array()
+        .expect("processors")
+        .iter()
+        .map(|processor| processor["instance"].as_str().expect("instance").to_owned())
+        .collect()
+}
+
+fn restart(mut node: Node, directory: &Path, api_settings: &str) -> (Node, u16) {
+    node.interrupt();
+    node.wait_for_exit(Duration::from_secs(30))
+        .unwrap_or_else(|| panic!("the node did not exit:\n{}", node.log()));
+    let (node, api, _) = start_node(directory, api_settings);
+    (node, api)
+}
+
+#[test]
+fn processors_added_through_the_api_stay_until_removed() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let switch = "allow_processor_changes = true";
+    let (node, api, _) = start_node(directory.path(), switch);
+    let (status, body) = request(
+        api,
+        "POST",
+        "/admin/v1/processors",
+        r#"{"processor":{"instance":"gas","start_block":0},"template":"block-gas"}"#,
+    );
+    assert_eq!(status, 201, "{body}\n{}", node.log());
+    assert!(instances(api).contains(&"gas".to_owned()));
+    let kept = fs::read_to_string(directory.path().join("data/processors.toml")).expect("kept");
+    assert!(kept.contains("instance = \"gas\""), "{kept}");
+
+    let (node, api) = restart(node, directory.path(), switch);
+    assert!(instances(api).contains(&"gas".to_owned()), "{}", node.log());
+    let (status, body) = request(api, "DELETE", "/admin/v1/processors/gas", "");
+    assert_eq!(status, 200, "{body}");
+    assert!(!instances(api).contains(&"gas".to_owned()));
+
+    let (node, api) = restart(node, directory.path(), switch);
+    assert_eq!(instances(api), ["shutdown-blocks"], "{}", node.log());
 }

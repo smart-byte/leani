@@ -1,6 +1,7 @@
 //! Process-wide diagnostics, structured logging, cancellation, and exit policy.
 
 mod backfill;
+mod processor_admin;
 mod shutdown;
 mod wasm_project;
 mod wasm_run;
@@ -271,7 +272,9 @@ struct RunningJob {
 struct NativeBackfillControl {
     config: Arc<Config>,
     store: leani_store_sqlite::SqliteStore,
-    processors: Arc<Vec<Arc<dyn leani_processor_api::Processor>>>,
+    /// The processors, which the API may add to or remove from; `config`
+    /// holds the node's other settings, which stay.
+    set: tokio::sync::watch::Receiver<Arc<ProcessorSet>>,
     cancellation: CancellationToken,
     tasks: Arc<tokio::sync::Mutex<BTreeMap<String, RunningJob>>>,
     /// Wakes the durable job scheduler: a job was created, or a job's task
@@ -335,7 +338,7 @@ impl std::fmt::Debug for NativeBackfillControl {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("NativeBackfillControl")
-            .field("processors", &self.processors.len())
+            .field("processors", &self.current().processors.len())
             .field("cancelled", &self.cancellation.is_cancelled())
             .finish_non_exhaustive()
     }
@@ -351,10 +354,14 @@ impl NativeBackfillControl {
         material_coordinator: Option<leani_runtime::HistoricalMaterialCoordinator>,
         pipeline_budget: leani_runtime::HistoricalPipelineBudget,
     ) -> Self {
+        let (_, set) = tokio::sync::watch::channel(Arc::new(ProcessorSet {
+            config: config.clone(),
+            processors,
+        }));
         Self {
             config: Arc::new(config),
             store,
-            processors: Arc::new(processors),
+            set,
             cancellation,
             tasks: Arc::new(tokio::sync::Mutex::new(BTreeMap::new())),
             jobs_changed: Arc::new(tokio::sync::Notify::new()),
@@ -374,6 +381,15 @@ impl NativeBackfillControl {
     fn with_p2p_bridge_expected(mut self, expected: bool) -> Self {
         self.p2p_bridge_expected = expected;
         self
+    }
+
+    fn with_processor_set(mut self, set: tokio::sync::watch::Receiver<Arc<ProcessorSet>>) -> Self {
+        self.set = set;
+        self
+    }
+
+    fn current(&self) -> Arc<ProcessorSet> {
+        self.set.borrow().clone()
     }
 
     async fn update_p2p_bridge(
@@ -513,14 +529,15 @@ impl NativeBackfillControl {
         &self,
         selector: &str,
     ) -> Result<Arc<dyn leani_processor_api::Processor>, leani_api::BackfillControlError> {
-        if let Some(processor) = self
+        let current = self.current();
+        if let Some(processor) = current
             .processors
             .iter()
             .find(|processor| processor.descriptor().instance.as_str() == selector)
         {
             return Ok(processor.clone());
         }
-        let mut by_kind = self
+        let mut by_kind = current
             .processors
             .iter()
             .filter(|processor| processor.descriptor().id.as_str() == selector);
@@ -1069,10 +1086,10 @@ impl NativeBackfillControl {
             .min(requested_blocks);
         // Only the job's own instance counts. `Self::processor` also selects
         // by kind, which would count another instance of the job's kind.
-        let processor_configured = self
-            .processors
-            .iter()
-            .any(|processor| processor.descriptor().instance.as_str() == job.processor_instance);
+        let processor_configured =
+            self.current().processors.iter().any(|processor| {
+                processor.descriptor().instance.as_str() == job.processor_instance
+            });
         let state = subscription.as_ref().map_or_else(
             || Self::api_state(record.state),
             |subscription| Self::api_subscription_state(subscription.state),
@@ -1473,8 +1490,10 @@ impl NativeBackfillControl {
                 ))
             })?;
         let processor = self.processor(&job.processor_instance)?;
-        let configured = config_for_processor_descriptor(&self.config, processor.descriptor())
-            .map_err(|error| leani_api::BackfillControlError::Invalid(error.to_string()))?;
+        let current = self.current();
+        let configured =
+            config_for_processor_descriptor(&current.config, processor.descriptor())
+                .map_err(|error| leani_api::BackfillControlError::Invalid(error.to_string()))?;
         if job.owner == leani_runtime::HistoricalJobOwner::Materialization
             && configured.history_mode == crate::config::ProcessorHistoryMode::Automatic
         {
@@ -1614,6 +1633,7 @@ impl leani_runtime::FinalizedLiveGapRecovery for NativeBackfillControl {
         use futures::StreamExt;
 
         let processor = self
+            .current()
             .processors
             .iter()
             .find(|processor| processor.descriptor().instance == descriptor.instance)
@@ -1758,8 +1778,10 @@ impl leani_api::BackfillControl for NativeBackfillControl {
     ) -> Result<leani_api::BackfillStatus, leani_api::BackfillControlError> {
         Self::validate_idempotency_key(&request.idempotency_key)?;
         let processor = self.processor(&request.processor)?;
-        let configured = config_for_processor_descriptor(&self.config, processor.descriptor())
-            .map_err(|error| leani_api::BackfillControlError::Internal(error.to_string()))?;
+        let current = self.current();
+        let configured =
+            config_for_processor_descriptor(&current.config, processor.descriptor())
+                .map_err(|error| leani_api::BackfillControlError::Internal(error.to_string()))?;
         match owner {
             leani_api::HistoricalWorkOwner::Materialization => {
                 if configured.history_control != crate::config::ProcessorHistoryControl::NodeOwned {
@@ -6233,6 +6255,10 @@ async fn serve(path: &Path, registry: &ProcessorRegistry) -> Result<Exit> {
     let assembly = registry.instantiate_all_with_extensions(config.get())?;
     let processors = assembly.processors;
     let query_extensions = assembly.query_extensions;
+    let (processor_set, processor_sets) = tokio::sync::watch::channel(Arc::new(ProcessorSet {
+        config: config.get().clone(),
+        processors: processors.clone(),
+    }));
     let store = SqliteStore::open(
         configured_store_config(config.get(), config.get().data_dir.join("leani.sqlite"))
             .with_processors(processor_descriptors(&processors)),
@@ -6240,53 +6266,7 @@ async fn serve(path: &Path, registry: &ProcessorRegistry) -> Result<Exit> {
     .await
     .map_err(crate::uniswap_markets::explain_compact_refusal)?;
     for processor in &processors {
-        // Configured consumers reference the processor's default delivery
-        // stream. A new store has neither record until the processor is
-        // registered, so bootstrap the immutable processor/stream identity
-        // before restoring or creating its consumers. Runtime registration is
-        // deliberately idempotent and will verify the same identity later.
-        store
-            .register_processor(processor.descriptor())
-            .await
-            .map_err(crate::uniswap_markets::explain_compact_refusal)?;
-        for configured_consumer in &processor.descriptor().lifecycle.delivery.consumers {
-            let role = if configured_consumer.required {
-                leani_store_sqlite::ConsumerRole::Required
-            } else {
-                leani_store_sqlite::ConsumerRole::BestEffort
-            };
-            if let Some(existing) = store
-                .consumer(processor.descriptor(), &configured_consumer.id)
-                .await?
-            {
-                if existing.role != role {
-                    bail!(
-                        "durable consumer {} for processor instance {} has role {:?}, expected {:?}",
-                        configured_consumer.id,
-                        processor.descriptor().instance,
-                        existing.role,
-                        role
-                    );
-                }
-            } else {
-                store
-                    .create_consumer(
-                        processor.descriptor(),
-                        &configured_consumer.id,
-                        role,
-                        leani_store_sqlite::ConsumerStartPosition::EarliestRetained,
-                        std::time::Duration::from_secs(configured_consumer.lease_ttl_seconds),
-                    )
-                    .await
-                    .with_context(|| {
-                        format!(
-                            "register durable consumer {} for processor instance {}",
-                            configured_consumer.id,
-                            processor.descriptor().instance
-                        )
-                    })?;
-            }
-        }
+        bootstrap_processor(&store, processor.as_ref()).await?;
     }
     let live_required = matches!(
         config.get().sources.live.kind,
@@ -6452,7 +6432,8 @@ async fn serve(path: &Path, registry: &ProcessorRegistry) -> Result<Exit> {
             material_coordinator,
             pipeline_budget,
         )
-        .with_p2p_bridge_expected(p2p_bridge_expected),
+        .with_p2p_bridge_expected(p2p_bridge_expected)
+        .with_processor_set(processor_sets.clone()),
     );
     let mut background = BackgroundTasks::default();
     background.spawn("durable backfill scheduler", {
@@ -6662,6 +6643,14 @@ async fn serve(path: &Path, registry: &ProcessorRegistry) -> Result<Exit> {
                         Box::pin(async move { builder.build(source, language).await })
                     })
                 }),
+            processor_admin: config.get().api.allow_processor_changes.then(|| {
+                Arc::new(processor_admin::NodeProcessorAdmin::new(
+                    registry.clone(),
+                    store.clone(),
+                    processor_set,
+                    cancellation.clone(),
+                )) as Arc<dyn leani_api::ProcessorAdmin>
+            }),
             ..NativeApiConfig::default()
         },
     )?;
@@ -6753,7 +6742,7 @@ async fn serve(path: &Path, registry: &ProcessorRegistry) -> Result<Exit> {
     if network_lanes {
         let supervisor_config = config.get().clone();
         let supervisor_store = store.clone();
-        let supervisor_processors = processors.clone();
+        let supervisor_processors = processor_sets.clone();
         let supervisor_cancellation = cancellation.clone();
         let supervisor_handles = NetworkLaneHandles {
             readiness: readiness.clone(),
@@ -6790,7 +6779,7 @@ async fn serve(path: &Path, registry: &ProcessorRegistry) -> Result<Exit> {
     if rpc_lanes {
         let lane_config = config.get().clone();
         let lane_store = store.clone();
-        let lane_processors = processors.clone();
+        let lane_set = processor_sets.clone();
         let readiness = readiness.clone();
         let rpc_readiness = rpc_readiness.clone();
         let committed_events = committed_events.clone();
@@ -6809,39 +6798,42 @@ async fn serve(path: &Path, registry: &ProcessorRegistry) -> Result<Exit> {
                 },
             );
             let signed = follow_sequencer_feed(&lane_config, &lane_cancellation)?;
-            // A lane that fails restarts from the store after a pause: the
-            // endpoints' rate limits and outages are transient.
-            while !lane_cancellation.is_cancelled() {
-                let result = with_cold_backfills(&lane_cancellation, async |lanes, backfills| {
-                    Box::pin(run_rpc_lanes(
-                        &lane_config,
-                        lane_store.clone(),
-                        lane_processors.clone(),
-                        RpcLaneHandles {
-                            readiness: &readiness,
-                            rpc_readiness: &rpc_readiness,
-                            committed_events: committed_events.clone(),
-                            backfill_control: &backfill_control,
-                        },
-                        anchored.clone(),
-                        signed.clone(),
-                        lanes,
-                        backfills,
-                    ))
-                    .await
-                })
-                .await;
-                readiness.set_live_ready(false);
-                readiness.set_finality_ready(false);
-                rpc_readiness.set_live_ready(false);
-                if let Err(error) = result {
-                    warn!(error = %format!("{error:#}"), "json-rpc lanes failed; restarting");
+            supervise_rpc_lane_runs(lane_set, &lane_cancellation, |current, cancellation| {
+                let (store, readiness, rpc_readiness, backfill_control) = (
+                    lane_store.clone(),
+                    &readiness,
+                    &rpc_readiness,
+                    &backfill_control,
+                );
+                let (committed_events, anchored, signed) =
+                    (committed_events.clone(), anchored.clone(), signed.clone());
+                async move {
+                    let result = with_cold_backfills(&cancellation, async |lanes, backfills| {
+                        Box::pin(run_rpc_lanes(
+                            &current.config,
+                            store,
+                            current.processors.clone(),
+                            RpcLaneHandles {
+                                readiness,
+                                rpc_readiness,
+                                committed_events,
+                                backfill_control,
+                            },
+                            anchored,
+                            signed,
+                            lanes,
+                            backfills,
+                        ))
+                        .await
+                    })
+                    .await;
+                    readiness.set_live_ready(false);
+                    readiness.set_finality_ready(false);
+                    rpc_readiness.set_live_ready(false);
+                    result
                 }
-                tokio::select! {
-                    () = lane_cancellation.cancelled() => {}
-                    () = tokio::time::sleep(Duration::from_secs(5)) => {}
-                }
-            }
+            })
+            .await;
             Ok(())
         });
     }
@@ -7214,6 +7206,67 @@ async fn shutdown_signal() -> std::io::Result<()> {
     ShutdownSignals::new()?.recv().await
 }
 
+async fn bootstrap_processor(
+    store: &leani_store_sqlite::SqliteStore,
+    processor: &dyn leani_processor_api::Processor,
+) -> Result<()> {
+    // Configured consumers reference the processor's default delivery
+    // stream. A new store has neither record until the processor is
+    // registered, so bootstrap the immutable processor/stream identity
+    // before restoring or creating its consumers. Runtime registration is
+    // deliberately idempotent and will verify the same identity later.
+    store
+        .register_processor(processor.descriptor())
+        .await
+        .map_err(crate::uniswap_markets::explain_compact_refusal)?;
+    for configured_consumer in &processor.descriptor().lifecycle.delivery.consumers {
+        let role = if configured_consumer.required {
+            leani_store_sqlite::ConsumerRole::Required
+        } else {
+            leani_store_sqlite::ConsumerRole::BestEffort
+        };
+        if let Some(existing) = store
+            .consumer(processor.descriptor(), &configured_consumer.id)
+            .await?
+        {
+            if existing.role != role {
+                bail!(
+                    "durable consumer {} for processor instance {} has role {:?}, expected {:?}",
+                    configured_consumer.id,
+                    processor.descriptor().instance,
+                    existing.role,
+                    role
+                );
+            }
+        } else {
+            store
+                .create_consumer(
+                    processor.descriptor(),
+                    &configured_consumer.id,
+                    role,
+                    leani_store_sqlite::ConsumerStartPosition::EarliestRetained,
+                    std::time::Duration::from_secs(configured_consumer.lease_ttl_seconds),
+                )
+                .await
+                .with_context(|| {
+                    format!(
+                        "register durable consumer {} for processor instance {}",
+                        configured_consumer.id,
+                        processor.descriptor().instance
+                    )
+                })?;
+        }
+    }
+    Ok(())
+}
+
+/// The processors a node runs, with the configuration that names them in
+/// the same order. Processors added or removed through the API replace it.
+pub(crate) struct ProcessorSet {
+    pub(crate) config: Config,
+    pub(crate) processors: Vec<Arc<dyn leani_processor_api::Processor>>,
+}
+
 #[derive(Clone)]
 struct NetworkLaneHandles {
     readiness: leani_api::ReadinessHandle,
@@ -7356,10 +7409,15 @@ pub(crate) fn spawn_embedded_network_runtime(
                 )
             },
         ));
+    // Nothing changes an embedded runtime's processors.
+    let (_, set) = tokio::sync::watch::channel(Arc::new(ProcessorSet {
+        config: config.clone(),
+        processors,
+    }));
     let lanes = Box::pin(supervise_network_lanes(
         config,
         store,
-        processors,
+        set,
         handles,
         Some(execution_source.clone()),
     ));
@@ -7599,6 +7657,36 @@ async fn signed_anchor(
         tokio::select! {
             () = cancellation.cancelled() => return Ok(None),
             () = tokio::time::sleep(Duration::from_secs(1)) => {}
+        }
+    }
+}
+
+/// Run the JSON-RPC lanes with `run_once` until cancelled, each run with the
+/// current processor set. A new set restarts them at once.
+async fn supervise_rpc_lane_runs<T, F, Fut>(
+    mut set: tokio::sync::watch::Receiver<Arc<T>>,
+    cancellation: &CancellationToken,
+    mut run_once: F,
+) where
+    F: FnMut(Arc<T>, CancellationToken) -> Fut,
+    Fut: Future<Output = Result<()>>,
+{
+    // A lane that fails restarts from the store after a pause: the
+    // endpoints' rate limits and outages are transient.
+    while !cancellation.is_cancelled() {
+        match run_until_reconfigured(&mut set, cancellation, &mut run_once).await {
+            Err(error) if error.is::<Reconfigured>() => {
+                info!("the processors changed; the json-rpc lanes restart with them");
+                continue;
+            }
+            Err(error) => {
+                warn!(error = %format!("{error:#}"), "json-rpc lanes failed; restarting");
+            }
+            Ok(()) => {}
+        }
+        tokio::select! {
+            () = cancellation.cancelled() => {}
+            () = tokio::time::sleep(Duration::from_secs(5)) => {}
         }
     }
 }
@@ -8291,7 +8379,7 @@ async fn run_op_lanes(
 async fn supervise_network_lanes(
     config: Config,
     store: leani_store_sqlite::SqliteStore,
-    processors: Vec<std::sync::Arc<dyn leani_processor_api::Processor>>,
+    set: tokio::sync::watch::Receiver<Arc<ProcessorSet>>,
     handles: NetworkLaneHandles,
     live_source: Option<std::sync::Arc<leani_source_p2p::RethP2pSource>>,
 ) -> Result<NetworkLanesEnd> {
@@ -8332,14 +8420,34 @@ async fn supervise_network_lanes(
         None
     };
     let end = supervise_lane_runs(&handles, || {
-        Box::pin(run_network_lanes_once(
-            &config,
+        let mut set = set.clone();
+        let (handles, store, live_source, op_heads) = (
+            &handles,
             store.clone(),
-            processors.clone(),
-            handles.clone(),
             live_source.clone(),
             op_heads.clone(),
-        ))
+        );
+        Box::pin(async move {
+            run_until_reconfigured(
+                &mut set,
+                &handles.cancellation,
+                |current, cancellation| async move {
+                    Box::pin(run_network_lanes_once(
+                        &current.config,
+                        store,
+                        current.processors.clone(),
+                        NetworkLaneHandles {
+                            cancellation,
+                            ..handles.clone()
+                        },
+                        live_source,
+                        op_heads,
+                    ))
+                    .await
+                },
+            )
+            .await
+        })
     })
     .await;
     handles.network_telemetry.supervisor_stopped();
@@ -8432,6 +8540,44 @@ impl Drop for LaneReadinessGuard<'_> {
     }
 }
 
+/// The processors changed while the lanes ran.
+#[derive(Debug, thiserror::Error)]
+#[error("the processor set changed")]
+struct Reconfigured;
+
+/// Run the lanes `run` builds for the current processor set, under a child
+/// of `cancellation`, until they end or the set changes; a change cancels
+/// them, awaits their shutdown, and ends in [`Reconfigured`], so the
+/// supervisor restarts them with the new set.
+async fn run_until_reconfigured<T, F, Fut>(
+    set: &mut tokio::sync::watch::Receiver<Arc<T>>,
+    cancellation: &CancellationToken,
+    run: F,
+) -> Result<()>
+where
+    F: FnOnce(Arc<T>, CancellationToken) -> Fut,
+    Fut: Future<Output = Result<()>>,
+{
+    let current = set.borrow_and_update().clone();
+    let cancellation = cancellation.child_token();
+    let run = run(current, cancellation.clone());
+    tokio::pin!(run);
+    tokio::select! {
+        result = &mut run => result,
+        changed = set.changed() => {
+            if changed.is_err() {
+                // No one changes the set any more.
+                return run.await;
+            }
+            cancellation.cancel();
+            if let Err(error) = run.await {
+                tracing::debug!(%error, "the lanes ended for a new processor set");
+            }
+            Err(Reconfigured.into())
+        }
+    }
+}
+
 /// Run the network lanes with `run_once` until cancelled. A failed run
 /// restarts after a bounded exponential backoff, unless it halts or wedges
 /// (see [`network_lane_failure`]): the lanes then stay stopped and not
@@ -8459,6 +8605,14 @@ where
         let result = run_once().await;
         if handles.cancellation.is_cancelled() {
             break;
+        }
+        if result
+            .as_ref()
+            .is_err_and(anyhow::Error::is::<Reconfigured>)
+        {
+            info!("the processors changed; the network lanes restart with them");
+            retry = INITIAL_LANE_BACKOFF;
+            continue;
         }
         let failure = match network_lane_failure(&result, &mut reorgs) {
             LaneFailure::Wedge(failure) => {
@@ -10683,6 +10837,128 @@ mod tests {
             .expect("the supervisor stops once cancelled");
         assert_eq!(end, NetworkLanesEnd::Cancelled);
         assert_eq!(runs.load(std::sync::atomic::Ordering::SeqCst), 5);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_new_processor_set_restarts_the_lanes_at_once_with_it() {
+        let handles = lane_handles();
+        let (sender, receiver) = tokio::sync::watch::channel(Arc::new("first"));
+        let starts = std::sync::Mutex::new(Vec::new());
+        let supervisor = supervise_lane_runs(&handles, || {
+            let mut set = receiver.clone();
+            let (handles, starts) = (&handles, &starts);
+            async move {
+                run_until_reconfigured(&mut set, &handles.cancellation, |current, run| async move {
+                    starts
+                        .lock()
+                        .expect("starts")
+                        .push((*current, tokio::time::Instant::now()));
+                    // A lane runs until it is cancelled.
+                    run.cancelled().await;
+                    Ok(())
+                })
+                .await
+            }
+        });
+        let changes = async {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            sender.send(Arc::new("second")).expect("a receiver");
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            handles.cancellation.cancel();
+        };
+        let (end, ()) = tokio::join!(supervisor, changes);
+        assert_eq!(end, NetworkLanesEnd::Cancelled);
+        let starts = starts.into_inner().expect("starts");
+        assert_eq!(
+            starts.iter().map(|(set, _)| *set).collect::<Vec<_>>(),
+            ["first", "second"]
+        );
+        // No backoff: the new run starts as the old one ends.
+        assert_eq!(starts[1].1 - starts[0].1, Duration::from_secs(5));
+        assert_eq!(
+            handles.network_telemetry.snapshot().supervisor.last_error,
+            None
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_lane_failure_under_a_processor_set_still_backs_off() {
+        let handles = lane_handles();
+        let (_sender, receiver) = tokio::sync::watch::channel(Arc::new("only"));
+        let starts = std::sync::Mutex::new(Vec::new());
+        let supervisor = supervise_lane_runs(&handles, || {
+            let mut set = receiver.clone();
+            let (handles, starts) = (&handles, &starts);
+            async move {
+                run_until_reconfigured(&mut set, &handles.cancellation, |_, _| async move {
+                    let mut starts = starts.lock().expect("starts");
+                    starts.push(tokio::time::Instant::now());
+                    if starts.len() == 2 {
+                        handles.cancellation.cancel();
+                    }
+                    Err(anyhow::anyhow!("execution peers unavailable"))
+                })
+                .await
+            }
+        });
+        let end = tokio::time::timeout(Duration::from_mins(10), supervisor)
+            .await
+            .expect("the supervisor stops once cancelled");
+        assert_eq!(end, NetworkLanesEnd::Cancelled);
+        let starts = starts.into_inner().expect("starts");
+        assert_eq!(starts[1] - starts[0], INITIAL_LANE_BACKOFF);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_new_processor_set_restarts_the_json_rpc_lanes_at_once_with_it() {
+        let cancellation = CancellationToken::new();
+        let (sender, receiver) = tokio::sync::watch::channel(Arc::new("first"));
+        let starts = std::sync::Mutex::new(Vec::new());
+        let supervisor = supervise_rpc_lane_runs(receiver, &cancellation, |current, run| {
+            let starts = &starts;
+            async move {
+                starts
+                    .lock()
+                    .expect("starts")
+                    .push((*current, tokio::time::Instant::now()));
+                run.cancelled().await;
+                Ok(())
+            }
+        });
+        let changes = async {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            sender.send(Arc::new("second")).expect("a receiver");
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            cancellation.cancel();
+        };
+        tokio::join!(supervisor, changes);
+        let starts = starts.into_inner().expect("starts");
+        assert_eq!(
+            starts.iter().map(|(set, _)| *set).collect::<Vec<_>>(),
+            ["first", "second"]
+        );
+        // No pause: the new run starts as the old one ends.
+        assert_eq!(starts[1].1 - starts[0].1, Duration::from_secs(5));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_json_rpc_lane_failure_under_a_processor_set_still_pauses() {
+        let cancellation = CancellationToken::new();
+        let (_sender, receiver) = tokio::sync::watch::channel(Arc::new("only"));
+        let starts = std::sync::Mutex::new(Vec::new());
+        let supervisor = supervise_rpc_lane_runs(receiver, &cancellation, |_, _| {
+            let mut starts = starts.lock().expect("starts");
+            starts.push(tokio::time::Instant::now());
+            if starts.len() == 2 {
+                cancellation.cancel();
+            }
+            async { Err(anyhow::anyhow!("endpoints unavailable")) }
+        });
+        tokio::time::timeout(Duration::from_mins(10), supervisor)
+            .await
+            .expect("the supervisor stops once cancelled");
+        let starts = starts.into_inner().expect("starts");
+        assert_eq!(starts[1] - starts[0], Duration::from_secs(5));
     }
 
     #[tokio::test(start_paused = true)]
@@ -13505,6 +13781,61 @@ markets = ["ETH/USDT"]
             None,
             control.pipeline_budget.clone(),
         )
+    }
+
+    #[tokio::test]
+    async fn the_control_finds_processors_in_the_current_set() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let store = leani_store_sqlite::SqliteStore::open(leani_store_sqlite::StoreConfig::new(
+            directory.path().join("node.sqlite"),
+        ))
+        .await
+        .expect("store");
+        let processor: Arc<dyn Processor> = Arc::new(BlockLocalCounter::default());
+        let instance = processor.descriptor().instance.to_string();
+        let mut empty: Config =
+            toml::from_str(crate::config::VALID_CONFIG_TOML).expect("configuration fixture");
+        let mut counted = empty.clone();
+        counted.processors[0].instance.clone_from(&instance);
+        counted.processors.truncate(1);
+        empty.processors.clear();
+        let (sets, set) = tokio::sync::watch::channel(Arc::new(ProcessorSet {
+            config: empty.clone(),
+            processors: Vec::new(),
+        }));
+        let control = NativeBackfillControl::new(
+            empty.clone(),
+            store,
+            Vec::new(),
+            CancellationToken::new(),
+            None,
+            None,
+            leani_runtime::HistoricalPipelineBudget::new(1, 1, 1_024).expect("pipeline budget"),
+        )
+        .with_processor_set(set);
+        assert!(control.processor(&instance).is_err());
+        sets.send(Arc::new(ProcessorSet {
+            config: counted,
+            processors: vec![processor.clone()],
+        }))
+        .expect("a receiver");
+        assert_eq!(
+            control.processor(&instance).expect("added").descriptor(),
+            processor.descriptor()
+        );
+        sets.send(Arc::new(ProcessorSet {
+            config: empty,
+            processors: Vec::new(),
+        }))
+        .expect("a receiver");
+        let removed = control
+            .processor(&instance)
+            .map(|_| ())
+            .expect_err("removed");
+        assert!(
+            format!("{removed:?}").contains("not configured"),
+            "{removed:?}"
+        );
     }
 
     #[tokio::test]

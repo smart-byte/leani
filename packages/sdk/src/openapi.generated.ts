@@ -864,6 +864,48 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/admin/v1/processors": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Add a processor to the running node
+         * @description Needs `api.allow_processor_changes = true` in the node's configuration; without it, 404. `processor` is one `[[processors]]` configuration entry as JSON. It needs only `instance` and `start_block`; the rest defaults as the playground's configuration snippet does: `id` `wasm`, `version` `1.0.0`, `history_mode` `on_demand`, `publish` `unattested`, durable state, full output, window delivery, three automatic checkpoints. A `wasm` processor's module comes as `module`, its bytes as hex, or as a bundled `template`, whose example parameters apply unless the entry sets `settings.params`; the node keeps it, so the entry names no module path. The node validates the entry as the configuration file would, keeps it in its data directory's `processors.toml`, loaded after the configuration file on every start, and restarts its network or JSON-RPC lanes in-process to run it: a live pause for every processor.
+         */
+        post: operations["addProcessor"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/admin/v1/processors/{processor}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                processor: components["parameters"]["Processor"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /**
+         * Remove a processor added through the API
+         * @description Removes a processor `POST /admin/v1/processors` added and restarts the network or JSON-RPC lanes in-process without it. Its stored data stays.
+         */
+        delete: operations["removeProcessor"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/admin/v1/processors/{processor}/lanes/live/reset": {
         parameters: {
             query?: never;
@@ -1594,6 +1636,19 @@ export interface components {
          * @enum {string}
          */
         Finality: "unattested" | "attested" | "finalized";
+        AddProcessorRequest: {
+            /** @description One `[[processors]]` configuration entry, with the configuration's field names. */
+            processor: {
+                instance: string;
+                start_block: number;
+            } & {
+                [key: string]: unknown;
+            };
+            /** @description A `wasm` processor's module bytes as hex; or name a `template` instead. */
+            module?: string;
+            /** @description A bundled template, whose module the processor runs. */
+            template?: string;
+        };
         ProcessorSummary: {
             id: string;
             instance: string;
@@ -3510,6 +3565,100 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content?: never;
+            };
+            default: components["responses"]["Error"];
+        };
+    };
+    addProcessor: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AddProcessorRequest"];
+            };
+        };
+        responses: {
+            /** @description The added processor. */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProcessorSummary"];
+                };
+            };
+            /** @description The node does not change its processors through the API. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description `processor_conflict`: the instance exists, or another processor runs with the same kind, version, and parameters, which the live lane could not tell apart. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            default: components["responses"]["Error"];
+        };
+    };
+    removeProcessor: {
+        parameters: {
+            query?: never;
+            header?: {
+                /**
+                 * @description Marks a mutating request without a JSON body as sent by a Leani
+                 *     client. A POST, PUT, or DELETE needs `content-type: application/json`
+                 *     or this header, and gets HTTP 415 otherwise.
+                 */
+                "x-leani-request"?: components["parameters"]["LeaniRequest"];
+            };
+            path: {
+                processor: components["parameters"]["Processor"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Removed. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        instance: string;
+                        removed: boolean;
+                    };
+                };
+            };
+            /** @description The node does not change its processors through the API, or it did not add this processor. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description `processor_conflict`: the configuration file configures it; remove it there. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
             };
             default: components["responses"]["Error"];
         };

@@ -867,6 +867,97 @@ paths:
           description: Released backfill lease.
         default:
           $ref: "#/components/responses/Error"
+  /admin/v1/processors:
+    post:
+      summary: Add a processor to the running node
+      operationId: addProcessor
+      description: >-
+        Needs `api.allow_processor_changes = true` in the node's
+        configuration; without it, 404. `processor` is one `[[processors]]`
+        configuration entry as JSON. It needs only `instance` and
+        `start_block`; the rest defaults as the playground's configuration
+        snippet does: `id` `wasm`, `version` `1.0.0`, `history_mode`
+        `on_demand`, `publish` `unattested`, durable state, full output,
+        window delivery, three automatic checkpoints. A `wasm` processor's
+        module comes as `module`, its bytes as hex, or as a bundled
+        `template`, whose example parameters apply unless the entry sets
+        `settings.params`; the node keeps it, so the entry names no module
+        path. The node validates the entry as the configuration file would,
+        keeps it in its data directory's `processors.toml`, loaded after the
+        configuration file on every start, and restarts its network or
+        JSON-RPC lanes in-process to run it: a live pause for every
+        processor.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AddProcessorRequest"
+      responses:
+        "201":
+          description: The added processor.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProcessorSummary"
+        "404":
+          description: The node does not change its processors through the API.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorBody"
+        "409":
+          description: >-
+            `processor_conflict`: the instance exists, or another processor
+            runs with the same kind, version, and parameters, which the live
+            lane could not tell apart.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorBody"
+        default:
+          $ref: "#/components/responses/Error"
+  /admin/v1/processors/{processor}:
+    parameters:
+      - $ref: "#/components/parameters/Processor"
+    delete:
+      summary: Remove a processor added through the API
+      operationId: removeProcessor
+      description: >-
+        Removes a processor `POST /admin/v1/processors` added and restarts the
+        network or JSON-RPC lanes in-process without it. Its stored data stays.
+      parameters:
+        - $ref: "#/components/parameters/LeaniRequest"
+      responses:
+        "200":
+          description: Removed.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [instance, removed]
+                properties:
+                  instance:
+                    type: string
+                  removed:
+                    type: boolean
+        "404":
+          description: >-
+            The node does not change its processors through the API, or it did
+            not add this processor.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorBody"
+        "409":
+          description: "`processor_conflict`: the configuration file configures it; remove it there."
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorBody"
+        default:
+          $ref: "#/components/responses/Error"
   /admin/v1/processors/{processor}/lanes/live/reset:
     parameters:
       - $ref: "#/components/parameters/Processor"
@@ -1813,6 +1904,28 @@ components:
         (Xatu, EraE), the label reflects that source's trust model, not an
         independent proof. A record's `data.finality`, when present, always
         equals the envelope `finality`.
+    AddProcessorRequest:
+      type: object
+      additionalProperties: false
+      required: [processor]
+      properties:
+        processor:
+          type: object
+          description: One `[[processors]]` configuration entry, with the configuration's field names.
+          additionalProperties: true
+          required: [instance, start_block]
+          properties:
+            instance:
+              type: string
+            start_block:
+              type: integer
+              minimum: 0
+        module:
+          type: string
+          description: A `wasm` processor's module bytes as hex; or name a `template` instead.
+        template:
+          type: string
+          description: A bundled template, whose module the processor runs.
     ProcessorSummary:
       type: object
       additionalProperties: false

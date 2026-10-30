@@ -207,6 +207,15 @@ record, and documented RPC contracts.
   toggles tuning recipes, and downloads, copies, or checks the result
   (`POST /admin/v1/config/check`) as `leani doctor` would.
 
+- Processors added to a running node: with `api.allow_processor_changes = true`,
+  `POST /admin/v1/processors` takes a processor entry, which needs only
+  `instance` and `start_block`, with a Wasm module's bytes or a template, and
+  runs it without a restart; `DELETE /admin/v1/processors/{processor}` removes
+  one it added. The node keeps them in its data directory's `processors.toml`,
+  loaded after the configuration file on every start, and restarts its network
+  or JSON-RPC lanes in-process for each change: a live pause for every
+  processor.
+
 ### Changed
 
 - The live lane keeps every block's header, which the P2P source fetches

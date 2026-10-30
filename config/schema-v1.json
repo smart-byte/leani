@@ -70,7 +70,8 @@
       "additionalProperties": false,
       "properties": {
         "bind": { "$ref": "#/$defs/socketAddress", "default": "127.0.0.1:18080" },
-        "allow_wasm_builds": { "$ref": "#/$defs/allowWasmBuilds" }
+        "allow_wasm_builds": { "$ref": "#/$defs/allowWasmBuilds" },
+        "allow_processor_changes": { "$ref": "#/$defs/allowProcessorChanges" }
       }
     },
     "advancedConfig": {
@@ -794,6 +795,7 @@
           "description": "Browser origins, besides loopback ones on any port, that may call the API. Any other Origin gets HTTP 403."
         },
         "allow_wasm_builds": { "$ref": "#/$defs/allowWasmBuilds" },
+        "allow_processor_changes": { "$ref": "#/$defs/allowProcessorChanges" },
         "delivery": {
           "type": "object",
           "additionalProperties": false,
@@ -808,6 +810,11 @@
       "type": "boolean",
       "default": false,
       "description": "Compile processor source sent to POST /admin/v1/wasm/build, as the playground's editor does. A development feature, not for production: rustc can read the host's files while it compiles, so Rust builds only for requests from the node's own machine, TypeScript for any client the API admits. Build modules where you write them and configure the module file instead."
+    },
+    "allowProcessorChanges": {
+      "type": "boolean",
+      "default": false,
+      "description": "Add and remove processors through POST /admin/v1/processors and DELETE /admin/v1/processors/{instance}. The node keeps them in its data directory's processors.toml and loads them after this file, which wins for an instance it configures too. Each change restarts the network or JSON-RPC lanes in-process: a live pause for every processor."
     },
     "deliveryBatch": {
       "type": "object",

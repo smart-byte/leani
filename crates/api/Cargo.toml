@@ -39,6 +39,7 @@ tracing.workspace = true
 
 [dev-dependencies]
 leani-testkit = { path = "../testkit" }
+tokio = { workspace = true, features = ["test-util"] }
 tower.workspace = true
 
 [lints]
