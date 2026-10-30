@@ -55,16 +55,42 @@ fn hoodi_digest_matches_a_live_node_record() {
     let hoodi = ChainRegistry::standard().get("hoodi").unwrap();
     let beacon = hoodi.beacon().unwrap();
     // The `eth2` field of a Lodestar Hoodi node record at epoch 131409: Fulu
-    // with the second blob-parameter fork, Gloas next at 132352.
+    // with the second blob-parameter fork.
     assert_eq!(
         beacon.fork_digest(131_409 * SLOTS_PER_EPOCH),
         [0xc6, 0xec, 0xb7, 0x6c]
     );
-    assert_eq!(beacon.fork("gloas").unwrap().epoch, 132_352);
+}
+
+#[test]
+fn execution_and_consensus_glamsterdam_activate_together() {
+    use reth_chainspec::{EthereumHardfork, ForkCondition, Hardforks as _};
+
+    for chain in ChainRegistry::standard()
+        .iter()
+        .filter(|chain| chain.beacon.is_some())
+    {
+        let beacon = chain.beacon().unwrap();
+        let gloas = beacon.fork("gloas").map(|fork| {
+            beacon.genesis_time + fork.epoch * SLOTS_PER_EPOCH * beacon.seconds_per_slot
+        });
+        let amsterdam = match execution_chain_spec(chain)
+            .unwrap()
+            .fork(EthereumHardfork::Amsterdam)
+        {
+            ForkCondition::Timestamp(timestamp) => Some(timestamp),
+            _ => None,
+        };
+        assert_eq!(amsterdam, gloas, "{}", chain.name);
+    }
+    // Sepolia forked at epoch 353024; Hoodi's fork is not scheduled.
+    let sepolia = ChainRegistry::standard().get("sepolia").unwrap();
     assert_eq!(
-        beacon.fork("gloas").unwrap().version,
-        [0x80, 0x00, 0x09, 0x10]
+        sepolia.beacon().unwrap().fork("gloas").unwrap().epoch,
+        353_024
     );
+    let hoodi = ChainRegistry::standard().get("hoodi").unwrap();
+    assert!(hoodi.beacon().unwrap().fork("gloas").is_none());
 }
 
 #[test]

@@ -8874,7 +8874,7 @@ alloy-eips 1.8.3 — https://github.com/alloy-rs/alloy
 alloy-eips 2.5.0 — https://github.com/alloy-rs/alloy
 alloy-evm 0.38.0 — https://github.com/alloy-rs/alloy-evm
 alloy-genesis 2.4.1 — https://github.com/alloy-rs/alloy
-alloy-hardforks 0.4.10 — https://github.com/alloy-rs/hardforks
+alloy-hardforks 0.4.11 — https://github.com/alloy-rs/hardforks
 alloy-json-abi 1.7.3 — https://github.com/alloy-rs/core
 alloy-network-primitives 1.8.3 — https://github.com/alloy-rs/alloy
 alloy-network-primitives 2.5.0 — https://github.com/alloy-rs/alloy
