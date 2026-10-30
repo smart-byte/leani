@@ -10933,7 +10933,9 @@ fn validate_receipts_against_headers(
             }
             previous_gas = receipt.cumulative_gas_used();
         }
-        if previous_gas != header.gas_used {
+        // From Amsterdam a header's gas counts gas before refunds (EIP-7778),
+        // which receipts' cumulative gas does not.
+        if header.block_access_list_hash.is_none() && previous_gas != header.gas_used {
             return Err(P2pError::InvalidResponse(format!(
                 "final cumulative gas {previous_gas} differs from header gas {} at block {}",
                 header.gas_used, header.number
@@ -15818,6 +15820,20 @@ mod tests {
         let receipts = with_known_empty_receipts(&headers, vec![vec![receipt(21_000)]]);
         assert_eq!(receipts, [Vec::new(), vec![receipt(21_000)], Vec::new()]);
         validate_receipts_against_headers(&headers, &receipts).expect("committed receipts");
+    }
+
+    #[test]
+    fn amsterdam_header_gas_may_exceed_the_receipts_cumulative_gas() {
+        let receipts = [vec![receipt(21_000)]];
+        let mut header = header_committing(12, &receipts[0]);
+        header.gas_used = 30_000;
+        assert!(
+            validate_receipts_against_headers(std::slice::from_ref(&header), &receipts).is_err(),
+            "a pre-Amsterdam header's gas equals its receipts' cumulative gas"
+        );
+        header.block_access_list_hash = Some(alloy_primitives::B256::ZERO);
+        validate_receipts_against_headers(std::slice::from_ref(&header), &receipts)
+            .expect("an Amsterdam header counts gas before refunds");
     }
 
     #[tokio::test]
