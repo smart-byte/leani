@@ -165,19 +165,21 @@ leani processor create usdc-volume --spec - --json <<'EOF'
           "events": ["Transfer(address indexed from, address indexed to, uint256 value)"]},
  "keep": {"kind": "totals", "by": "to", "sum": ["value"]}}
 EOF
-(cd usdc-volume && cargo build --release --target wasm32-unknown-unknown)
-leani processor run usdc-volume/target/wasm32-unknown-unknown/release/usdc_volume.wasm --from-block 21000000 --to-block 21000099
+leani processor run usdc-volume --from-block 21000000 --to-block 21000099
 ```
 
 `data.kind` is `events` (`contracts`, `events`), `transactions` (`to`,
 `from`, and `functions`, whose calls it decodes), or `blocks`; `fields` picks
 what to keep, all by default. `keep.kind` is `rows`, or `totals` with `by` (one
-field, or none for one total) and `sum` (unsigned fields). Install the target
-once with `rustup target add wasm32-unknown-unknown`.
+field, or none for one total) and `sum` (unsigned fields). Given the project's
+directory, `leani processor run` builds it first (cargo, or npm for
+TypeScript) and runs the module; compiler errors go to stderr and a failed
+build runs nothing. Install the target once with
+`rustup target add wasm32-unknown-unknown`.
 
 `--language typescript` writes the same processor as a TypeScript package
 instead (AssemblyScript: TypeScript syntax, Wasm types such as `u64`), edited
-in `assembly/index.ts` and built with `npm install && npm run build` into
+in `assembly/index.ts`, which `leani processor run <dir>` builds with npm into
 `build/<name>.wasm`; it needs Node.js 20 or later. Each bundled template has a
 TypeScript twin that publishes the same changes
 (`--template <name> --language typescript`).

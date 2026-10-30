@@ -94,9 +94,7 @@ cat > spec.json <<'EOF'
 }
 EOF
 leani processor create usdc-volume --spec spec.json
-(cd usdc-volume && cargo build --release --target wasm32-unknown-unknown)
-leani processor run usdc-volume/target/wasm32-unknown-unknown/release/usdc_volume.wasm \
-  --from-block 19426589 --to-block 19426600
+leani processor run usdc-volume --from-block 19426589 --to-block 19426600
 ```
 
 `data.kind` is `events` (`contracts`, `events`), `transactions` (`to`, `from`,
@@ -109,7 +107,12 @@ starts from that template's source instead, and without either
 crate carries the `leani-wasm-guest` SDK of the installed binary, its build
 settings, and a lockfile, so it builds against exactly the ABI that binary
 runs. Building needs the Wasm target once:
-`rustup target add wasm32-unknown-unknown`.
+`rustup target add wasm32-unknown-unknown`. Given the project's directory,
+`leani processor run` builds it as
+`cargo build --release --target wasm32-unknown-unknown` does, into
+`target/wasm32-unknown-unknown/release/usdc_volume.wasm`, and runs that
+module; the compiler's errors print as it writes them, and a failed build runs
+nothing.
 
 Edit `src/lib.rs` where a spec falls short. A processor declares what it
 needs, maps one block to a delta, and reduces the delta into state and
@@ -178,17 +181,17 @@ above:
 
 ```bash
 leani processor create usdc-volume-ts --language typescript --spec spec.json
-(cd usdc-volume-ts && npm install && npm run build)
-leani processor run usdc-volume-ts/build/usdc-volume-ts.wasm \
-  --from-block 19426589 --to-block 19426600
+leani processor run usdc-volume-ts --from-block 19426589 --to-block 19426600
 ```
 
 A spec, a template (`--template event-decoder --language typescript`), and
 the starter generate the same processor as in Rust: the same manifest, rows,
 and totals. The package carries the TypeScript SDK of the installed binary in
-`assembly/leani/` and a lockfile pinning the AssemblyScript compiler; building
-needs Node.js 20 or later. Every template has a TypeScript twin beside its
-Rust source, `examples/wasm-processors/<name>/assembly/index.ts`.
+`assembly/leani/` and a lockfile pinning the AssemblyScript compiler; the run
+installs that compiler with npm and builds the package with `npm run build`
+into `build/usdc-volume-ts.wasm`, which needs Node.js 20 or later. Every
+template has a TypeScript twin beside its Rust source,
+`examples/wasm-processors/<name>/assembly/index.ts`.
 
 Where Rust and TypeScript differ:
 

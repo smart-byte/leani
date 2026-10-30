@@ -1590,9 +1590,8 @@ function snippetText() {
           ...(state.selected === "compose"
             ? [`leani processor create ${crate}${flag} --spec - <<'EOF'`, JSON.stringify(specJson(), null, 2), "EOF"]
             : [`leani processor create ${crate}${flag}`]),
-          typescript ? `(cd ${crate} && npm install && npm run build)` : `(cd ${crate} && cargo build --release --target wasm32-unknown-unknown)`,
           FINALIZED_NOTE,
-          `leani processor run ${file} \\`,
+          `leani processor run ${crate} \\`,
           [`  --from-block ${from} --to-block ${to}`, ...(Object.keys(params).length ? [`  --params '${JSON.stringify(params)}'`] : [])].join(" \\\n"),
         ].join("\n");
       }

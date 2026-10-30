@@ -2,6 +2,7 @@
 
 mod backfill;
 mod shutdown;
+mod wasm_project;
 mod wasm_run;
 
 use std::{

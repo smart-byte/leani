@@ -157,7 +157,8 @@ record, and documented RPC contracts.
   crate, compile it to `wasm32-unknown-unknown`, and run it in the stock
   binary without rebuilding the node. Configure it as a `wasm` processor with
   `settings.module`, or run it once over finalized history with
-  `leani processor run`. Modules run in the wasmi interpreter, sandboxed and
+  `leani processor run`, which also takes the processor's project directory
+  and builds it first. Modules run in the wasmi interpreter, sandboxed and
   metered, in a fresh instance per call that sees only the material its
   manifest requires; their code hash is the module's BLAKE3 hash. Native
   processors are unchanged. The binary ships four example modules as

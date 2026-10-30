@@ -45,8 +45,24 @@ pub(super) async fn run(
         BlockNumber(options.from_block),
         BlockNumber(options.to_block),
     )?;
+    // Before a build, which can take minutes the first time.
+    let mut config = Config::load(config_path).with_context(|| {
+        if config_path.exists() {
+            format!("load configuration {}", config_path.display())
+        } else {
+            format!(
+                "`leani processor run` takes its sources from {}; create one with `leani init blocks`",
+                config_path.display()
+            )
+        }
+    })?;
     let temporary = tempfile::tempdir().context("create a run directory")?;
     let (module, example) = match (&options.module, &options.template) {
+        (Some(project), None) if project.is_dir() => (
+            std::fs::canonicalize(super::wasm_project::build(project).await?)
+                .context("read the built module")?,
+            None,
+        ),
         (Some(module), None) => (
             std::fs::canonicalize(module)
                 .with_context(|| format!("read Wasm module {}", module.display()))?,
@@ -66,16 +82,6 @@ pub(super) async fn run(
         }
         _ => parameters(options.params_json.as_deref(), &options.params)?,
     };
-    let mut config = Config::load(config_path).with_context(|| {
-        if config_path.exists() {
-            format!("load configuration {}", config_path.display())
-        } else {
-            format!(
-                "`leani processor run` takes its sources from {}; create one with `leani init blocks`",
-                config_path.display()
-            )
-        }
-    })?;
     config.data_dir = options
         .data_dir
         .unwrap_or_else(|| temporary.path().to_path_buf());
@@ -292,7 +298,7 @@ pub(super) fn new_project(
     let module = generated.module_path();
     let build = generated.build_command();
     let run = format!(
-        "leani processor run {}/{module} --from-block <first> --to-block <last>",
+        "leani processor run {} --from-block <first> --to-block <last>",
         directory.display()
     );
     if json {
@@ -321,9 +327,10 @@ pub(super) fn new_project(
             generated.language.source_path()
         );
         println!(
-            // The build in a subshell, so that `leani processor run` finds the
-            // module and the node's configuration from where you are.
-            "Created {}: {layout}.\n\nNext:\n  (cd {} && {build})\n  {run}\n  or watch the module in the node's /playground, which applies each rebuild live.",
+            // The build alone in a subshell, so the module path stays relative
+            // to where you are.
+            "Created {}: {layout}.\n\nNext, build it and run it over finalized history:\n  {run}\nor build it alone, `(cd {} && {build})`, and watch {}/{module} in the node's /playground, which applies each rebuild live.",
+            directory.display(),
             directory.display(),
             directory.display()
         );

@@ -1424,13 +1424,13 @@
           {
             "name": "run",
             "about": "Run a Wasm processor over finalized history and print its changes",
-            "usage": "Usage: leani processor run [OPTIONS] --from-block <FROM_BLOCK> --to-block <TO_BLOCK> [MODULE]",
+            "usage": "Usage: leani processor run [OPTIONS] --from-block <FROM_BLOCK> --to-block <TO_BLOCK> [MODULE|PROJECT]",
             "arguments": [
               {
                 "id": "module",
                 "long": null,
                 "short": null,
-                "help": "Wasm module built with leani-wasm-guest",
+                "help": "A Wasm module built with leani-wasm-guest, or a processor project's directory, which is built first",
                 "required": false,
                 "action": "Set",
                 "defaultValues": [],
