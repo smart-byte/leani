@@ -7692,9 +7692,12 @@ async fn run_network_lanes(
                 BeaconApiConfig::new(config.chain_entry()?, config.finality.endpoints.clone());
             beacon_config.minimum_agreement = config.finality.minimum_agreement;
             beacon_config.anchor = anchor_file;
-            // Verified optimistic updates bound what the live lane includes.
+            // Verified optimistic updates bound what the live lane includes;
+            // execution peers number the blocks Gloas headers name by hash.
             let source = Arc::new(
-                VerifiedBeaconApi::new(beacon_config)?.with_attested_heads(attested_heads),
+                VerifiedBeaconApi::new(beacon_config)?
+                    .with_attested_heads(attested_heads)
+                    .with_execution_headers(live_source.clone()),
             );
             let probe = source.probe_root(trusted_checkpoint).await;
             if !probe.accepted {

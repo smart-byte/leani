@@ -21,9 +21,16 @@ record, and documented RPC contracts.
   config's `network`) now names a built-in chain entry; its chain id, slot
   clock, Beacon network (genesis validators root, fork schedule from the
   network's upstream `config.yaml`), execution DNS tree, and bootnodes follow
-  from it. Hoodi follows live over P2P with Beacon API finality; Sepolia
-  needs the Gloas light client first. eraE, Xatu, consensus P2P finality,
-  and built-in subscriptions stay mainnet-only.
+  from it. Both follow live over P2P with Beacon API finality. eraE, Xatu,
+  consensus P2P finality, and built-in subscriptions stay mainnet-only.
+- Glamsterdam: Beacon API finality verifies Gloas light-client data, whose
+  headers prove the payload their block builds on by hash alone; execution
+  peers number that block from a header checked against the hash. Execution
+  P2P accepts Amsterdam receipts, whose header gas counts gas before refunds
+  (EIP-7778). Sepolia, past the fork, follows at every level. Consensus P2P
+  finality still stops at Gloas, fail-closed. ERC-20 balances skip the
+  EIP-7708 ETH transfer logs of `0xff…fe` unless `tokens` lists it; blocks
+  before Amsterdam carry none.
 - With the P2P live source, `sources.history` may be empty: execution P2P
   serves finalized history, and no archive reconciliation runs. On-demand
   JSON-RPC history then must be `disabled`.

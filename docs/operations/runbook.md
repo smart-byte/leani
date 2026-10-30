@@ -618,13 +618,14 @@ most every five minutes.
 
 ### Network fork this release does not support
 
-Each release verifies the consensus forks it knows; Glamsterdam's Gloas is
-not among them yet. Once mainnet activates a fork a release does not know,
-finality stays unavailable and the live lane stops, fail-closed: consensus
-peers answer with a fork digest the node does not know, which it logs once as
+Each release verifies the consensus forks it knows. Beacon API finality
+knows Glamsterdam's Gloas; consensus P2P finality does not yet. Once mainnet
+activates a fork a release does not know, finality stays unavailable and the
+live lane stops, fail-closed: consensus peers answer with a fork digest the
+node does not know, which it logs once as
 `consensus peers serve a fork this release cannot verify`, and a Beacon API
 endpoint fails with an error naming the fork, such as
-``serves `gloas` light-client data``. No peer is banned for it. Upgrade to a
+``serves `heze` light-client data``. No peer is banned for it. Upgrade to a
 release that supports the fork before its mainnet activation. Upgraded
 within 14 days, the node resumes from its persisted finality anchor; later,
 it needs a fresh `finality.checkpoint`.

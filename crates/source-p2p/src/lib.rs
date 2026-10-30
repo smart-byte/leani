@@ -55,11 +55,11 @@ use leani_primitives::{
 };
 use leani_source_api::{
     AttestedHead, AttestedHeadReceiver, BlockFrameStream, ChainEvent, ChainEventStream,
-    DataRequest, FinalityModel, HistorySource, LiveSource, LiveStart, NetworkDisconnectReason,
-    NetworkLane, NetworkPeerOrigin, NetworkPeerQualification, NetworkPhase,
-    NetworkSessionTelemetry, NetworkTelemetry, NetworkTelemetrySnapshot, Partitioning,
-    SourceAcquisitionMetrics, SourceBudget, SourceChunk, SourceDescriptor, SourceError, SourcePlan,
-    UnattestedUndo,
+    DataRequest, ExecutionHeaders, FinalityModel, HistorySource, LiveSource, LiveStart,
+    NetworkDisconnectReason, NetworkLane, NetworkPeerOrigin, NetworkPeerQualification,
+    NetworkPhase, NetworkSessionTelemetry, NetworkTelemetry, NetworkTelemetrySnapshot,
+    Partitioning, SourceAcquisitionMetrics, SourceBudget, SourceChunk, SourceDescriptor,
+    SourceError, SourcePlan, UnattestedUndo,
 };
 use reth_chainspec::{ChainSpec, MAINNET};
 use reth_dns_discovery::{
@@ -4512,6 +4512,47 @@ impl RethP2pSource {
             .with_trusted_nodes(self.config.trusted_peers.clone())
     }
 
+    /// A session for one-off requests: the running network with its
+    /// advertised head unchanged, or one started at genesis while none runs.
+    async fn request_session(
+        &self,
+        cancellation: &CancellationToken,
+    ) -> Result<P2pSession, P2pError> {
+        let running = self
+            .network
+            .state
+            .lock()
+            .await
+            .as_ref()
+            .filter(|running| !running.network_task.is_finished())
+            .map(|running| P2pSession {
+                network: self.network.clone(),
+                generation: running.generation,
+                handle: running.handle.clone(),
+                fetch: running.fetch.clone(),
+                telemetry: running.telemetry.clone(),
+            });
+        let session = match running {
+            Some(session) => session,
+            None => {
+                self.network_session(genesis_block(&self.chain_spec), NetworkLane::Live)
+                    .await?
+                    .0
+            }
+        };
+        // A request waits for a peer as long as for its answer: finality
+        // polls wait on the lookup.
+        wait_for_connected_peers(
+            &session,
+            &self.network.direct_peers,
+            1,
+            self.config.request_timeout,
+            cancellation,
+        )
+        .await?;
+        Ok(session)
+    }
+
     async fn connect(
         &self,
         advertised: BlockRef,
@@ -8750,6 +8791,36 @@ fn validate_retained_canonical(
     Ok(())
 }
 
+/// Numbers the execution blocks Gloas light-client headers name by hash, from
+/// a peer's header checked against the hash.
+#[async_trait]
+impl ExecutionHeaders for RethP2pSource {
+    async fn block_number(&self, hash: BlockHash) -> Result<BlockNumber, SourceError> {
+        let cancellation = CancellationToken::new();
+        let mut attempts = 0;
+        loop {
+            // Peers that accept a session and then refuse it as full drop
+            // requests in flight, so a lookup outlasts a few of them.
+            let error = match self.request_session(&cancellation).await {
+                Ok(session) => match self
+                    .fetch_header_by_hash(&session, hash, &cancellation)
+                    .await
+                {
+                    Ok(header) => return Ok(BlockNumber(header.number)),
+                    Err(error) => error,
+                },
+                Err(error) => error,
+            };
+            attempts += 1;
+            if attempts == HEADER_NUMBER_ATTEMPTS {
+                return Err(error.into());
+            }
+            debug!(%hash, attempts, %error, "retrying an execution header lookup");
+            retry_pause(session_retry_delay(&self.config, attempts), &cancellation).await?;
+        }
+    }
+}
+
 #[async_trait]
 impl LiveSource for RethP2pSource {
     fn descriptor(&self) -> &SourceDescriptor {
@@ -10148,6 +10219,10 @@ const fn reorg_failure(
         ReorgFailure::Report
     }
 }
+
+/// Lookups of one execution header by hash, with exponential pauses between
+/// them: about half a minute of peer churn.
+const HEADER_NUMBER_ATTEMPTS: usize = 8;
 
 async fn retry_pause(duration: Duration, cancellation: &CancellationToken) -> Result<(), P2pError> {
     tokio::select! {

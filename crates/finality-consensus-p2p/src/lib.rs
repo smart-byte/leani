@@ -28,9 +28,9 @@ use helios_consensus_core::{
 };
 use leani_finality_beacon_api::{
     AnchorFile, AnchorWriter, BeaconApiError, CheckpointOrigin, Clock, DEFAULT_MAX_CHECKPOINT_AGE,
-    HELIOS_REVISION, LightClientVerifier, StartAnchor, TrustedCheckpoint, VerifiedFinalityAnchor,
-    current_slot, known_mainnet_fork_digests, mainnet_fork_digest, resolve_start_anchor,
-    signed_implausibly_ahead, until_next_attested_poll, verification_slot,
+    HELIOS_REVISION, HeaderAnchor, LightClientVerifier, StartAnchor, TrustedCheckpoint,
+    VerifiedFinalityAnchor, current_slot, known_mainnet_fork_digests, mainnet_fork_digest,
+    resolve_start_anchor, signed_implausibly_ahead, until_next_attested_poll, verification_slot,
 };
 use leani_primitives::{
     BlockNumber, Capability, CapabilitySet, ChainId, SourceId, SourceKind, TrustModel,
@@ -261,8 +261,12 @@ impl VerifiedConsensusP2p {
                     checkpoint_root,
                     checkpoint_slot,
                     accepted: true,
-                    selected: client.verifier.finalized_anchor().ok(),
-                    checkpoint_anchor: Some(client.verifier.checkpoint_anchor()),
+                    selected: client
+                        .verifier
+                        .finalized_anchor()
+                        .and_then(HeaderAnchor::numbered)
+                        .ok(),
+                    checkpoint_anchor: client.verifier.checkpoint_anchor().numbered().ok(),
                     updates_verified: client.verifier.updates_verified(),
                     discovered_peers: client.network.discovered_peers,
                     connected_peers: client.network.connected_count(),
@@ -339,6 +343,7 @@ impl FinalitySource for VerifiedConsensusP2p {
         let pending = client
             .verifier
             .finalized_anchor()
+            .and_then(HeaderAnchor::numbered)
             .map_err(|error| beacon_source_error(&error))?;
         let state = SubscriptionState {
             client,
@@ -613,19 +618,23 @@ impl P2pLightClient {
             match self
                 .verifier
                 .verify_attested_head(&update, self.source.clock.now())
+                .map(HeaderAnchor::numbered)
             {
-                Ok(head)
+                Ok(Ok(head))
                     if published
                         .is_none_or(|published| head.beacon_slot > published.beacon_slot) =>
                 {
-                    return Some(head);
+                    return Some(head.attested_head());
                 }
-                Ok(head) => {
+                Ok(Ok(head)) => {
                     debug!(
                         %peer,
                         beacon_slot = head.beacon_slot,
                         "consensus peer's attested head is no newer than the published one"
                     );
+                }
+                Ok(Err(error)) => {
+                    debug!(%peer, %error, "consensus peer's attested head has no execution block number");
                 }
                 Err(error) if error.is_unusable_head() => {
                     debug!(%peer, %error, "consensus peer's optimistic update anchors no head");
@@ -691,14 +700,16 @@ impl P2pLightClient {
             match self
                 .verifier
                 .apply_finality_update(&update, self.source.clock.now())
+                .map(HeaderAnchor::numbered)
             {
-                Ok(anchor) => {
+                Ok(Ok(anchor)) => {
                     self.source
                         .anchor_writer
                         .persist(anchor, self.start.checkpoint_root)
                         .await;
                     return Ok(anchor);
                 }
+                Ok(Err(error)) => errors.push(format!("{peer}: {error}")),
                 Err(error) if error.is_stale_update() => errors.push(format!("{peer}: {error}")),
                 Err(error) => errors.push(self.network.ban(peer, error)),
             }
@@ -1109,7 +1120,7 @@ fn decode_light_client_response(
                 .map_err(|error| {
                     PeerFailure::Invalid(format!("invalid optimistic update SSZ: {error:?}"))
                 })?;
-            let slot = update.attested_header.beacon().slot;
+            let slot = update.attested_header().beacon().slot;
             (LightClientResponse::Optimistic(Box::new(update)), slot)
         }
     };
@@ -2511,7 +2522,7 @@ mod tests {
     fn optimistic_ssz(update: &OptimisticUpdate<MainnetConsensusSpec>) -> Vec<u8> {
         use ssz::Encode as _;
 
-        let header = &update.attested_header;
+        let header = update.attested_header();
         let beacon = header.beacon().as_ssz_bytes();
         let branch = header
             .execution_branch()
@@ -2528,7 +2539,7 @@ mod tests {
             .extend_from_slice(&u32::try_from(header_offset).expect("offset").to_le_bytes());
         encoded_header.extend_from_slice(&branch);
         encoded_header.extend_from_slice(&execution);
-        let aggregate = update.sync_aggregate.as_ssz_bytes();
+        let aggregate = update.sync_aggregate().as_ssz_bytes();
         let offset = 4 + aggregate.len() + 8;
         assert_eq!(offset, 172);
         let mut encoded = u32::try_from(offset)
@@ -2536,7 +2547,7 @@ mod tests {
             .to_le_bytes()
             .to_vec();
         encoded.extend_from_slice(&aggregate);
-        encoded.extend_from_slice(&update.signature_slot.to_le_bytes());
+        encoded.extend_from_slice(&update.signature_slot().to_le_bytes());
         encoded.extend_from_slice(&encoded_header);
         encoded
     }
@@ -2579,12 +2590,16 @@ mod tests {
         let verifier = fixture_verifier(now);
         let head = verifier
             .verify_attested_head(&update, now)
-            .expect("verified attested head");
+            .and_then(HeaderAnchor::numbered)
+            .expect("verified attested head")
+            .attested_head();
         assert_eq!(
             head,
             verifier
                 .verify_attested_head(&fixture_optimistic(Behaviour::Honest), now)
+                .and_then(HeaderAnchor::numbered)
                 .expect("verified JSON update")
+                .attested_head()
         );
         assert_eq!(
             (head.beacon_slot, head.block_number, head.block_hash),
