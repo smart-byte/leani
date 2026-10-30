@@ -26,6 +26,7 @@
 # archives live under one explicitly private tree. This is not a backup.
 /.private/
 **/AGENTS.md
+!/AGENTS.md
 **/CLAUDE.md
 **/.agents/
 **/.codex/
