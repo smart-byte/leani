@@ -59,6 +59,14 @@ cases = {
     FileUtils.mkdir_p("site")
     Dir.chdir("site") { check("HEAD", success: false, includes: "private working file") }
   },
+  "only the root AGENTS.md is public" => lambda {
+    write("AGENTS.md", "Guidance for coding agents.\n")
+    git("add", ".")
+    check("--staged", success: true)
+    write("crates/node/AGENTS.md", "Local agent notes.\n")
+    git("add", ".")
+    check("--staged", success: false, includes: "private working file")
+  },
   "credentials and Windows paths are rejected without echoing them" => lambda {
     token = "gh" + "p_" + "a" * 36
     windows_path = ["C:", "Users", "fixture-person", "project"].join("\\")
